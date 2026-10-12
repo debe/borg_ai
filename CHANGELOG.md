@@ -66,6 +66,8 @@ First release.
 ### Harnesses and operations
 
 - Claude Code hooks; omp and opencode adapters (turn-end check, learning, steering).
+- opencode 2 support: the opencode adapter serves opencode 1.x and 2.x from one file, queen questions
+  included (2.x: the `setup` plugin API).
 - `borg install|uninstall` with dry run, backups and idempotent merging; `borg status`, `borg doctor`.
 - Hooks fail open; the turn-end model call has a 45 s limit.
 
