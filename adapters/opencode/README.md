@@ -6,7 +6,7 @@ the collective. It turns opencode's hooks and events into borg's canonical hook 
 
 | opencode | borg event | what borg does |
 |---|---|---|
-| `chat.message` (the engineer's text) | `prompt` | records the task; a correction becomes an episode |
+| `chat.message` (the engineer's text) | `prompt` | records the task; a correction becomes an episode; borg's context for the prompt (a queen question) joins the message as a synthetic text part, which the drone reads and the TUI hides; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
 | `tool.execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg steer --pause` (refuses the call); fails open after 2 s |
 | `tool.execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `filePath` → `file_path`) |
 | a tool part that ends in `error`, including a permission rejected with feedback | `post_tool_failure` | the engineer's feedback becomes an episode |

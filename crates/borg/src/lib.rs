@@ -13,6 +13,7 @@ pub mod install;
 pub mod learn;
 pub mod memory;
 pub mod notes;
+pub mod notify;
 pub mod outcome;
 pub mod predict;
 pub mod prefilter;

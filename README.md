@@ -359,11 +359,39 @@ internet. To check it by hand:
 | `borg notes attach [<commit>]` | Write the redacted reasoning note for a session's commits (runs at session end) |
 | `borg notes fetch [<commit>...]` | Get reasoning notes from team members over the mesh |
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked |
-| `borg queen` / `borg queen answer <id> "<text>"` | Open questions to the engineer; an answer becomes a lesson |
+| `borg queen` | Open decisions for the engineer, numbered and grouped by repo; see [Answering the queen](#answering-the-queen) |
+| `borg queen ask` | Answer them one by one in the terminal |
+| `borg queen answer <n> <text\|a\|b>` | Answer one; the answer becomes a lesson. `a`, `b` or `1`, `2` pick an option; a lone letter or number that names no option is refused |
+| `borg queen show <n>` / `skip <n>` / `dismiss <n> [reason]` | Details; ask again in 3 days; drop it without a lesson |
+| `borg queen --json` / `borg queen next --json [--repo NAME]` | The open questions, or the one to ask now, for drones and scripts |
+| `borg queen dedupe [--apply]` / `borg queen notify` | Dismiss near-duplicates (dry run first); one desktop summary |
 | `borg vectors [--fetch\|--rebuild]` | Vector model and index |
 | `borg mesh <id\|init\|invite\|invites\|join\|revoke\|members\|peer\|serve\|sync>` | Team sync, see above |
 | `borg assimilate ...` | Import past sessions or team documents, see above |
 | `borg install\|uninstall <claude\|omp\|opencode\|all> [--apply]` | Wire or unwire the hooks |
+
+### Answering the queen
+
+The queen queue holds decisions the team's documents leave open (`borg assimilate --from-dir`) and, with
+`BORG_QUEEN=on`, questions raised at a turn end. A desktop notification says when new ones are queued.
+Similar questions are not queued twice; `borg queen dedupe --apply` cleans up an older queue.
+
+```console
+$ borg queen
+lumen_handbook (1)
+  1  Should spikes be capped at 3 story points, or estimated like any other story?
+     a) cap spikes at 3 points (default) · b) estimate spikes like any other story
+answer: borg queen ask · borg queen answer <n> <text|a|b> · borg queen show <n>
+$ borg queen answer 1 b
+```
+
+You can also answer inside your harness. At the first prompt of a session in a repo that has an open
+question, Borg adds that one question to the drone's context. Claude Code asks it in its question
+dialog; omp and opencode ask it at the start of the reply. Pick an option, type your own answer or
+skip. The drone records the answer with `borg queen answer`, then does what you asked. Each session gets at most
+one question, and only one of its own repos. A skipped question waits 3 days. One left unanswered
+comes back after 3 more sessions. A question belongs to its git repo, whichever subdirectory or worktree it
+was asked in. `BORG_QUEEN_ASK=off` turns this off, and so does `BORG_LEARN=off`.
 
 Commands for debugging and evaluation: `borg recall`, `borg prefilter`, `borg resolve`, `borg expert`,
 `borg facets`. Their usage is in the header of [`crates/borg/src/main.rs`](crates/borg/src/main.rs).
@@ -403,6 +431,8 @@ and are kept for further experiments.
 | `BORG_VECTOR_K` | `10` | Vector hits added to the shortlist |
 | `BORG_VECTOR_URL` | Hugging Face | Mirror for `borg vectors --fetch` |
 | `BORG_EXPERT_MODEL` | `sonnet` | Model of the optional expert drone |
+| `BORG_QUEEN_ASK` | on | `off`: no queen question in the harness at a session's first prompt (nor with `BORG_LEARN=off`) |
+| `BORG_NOTIFY` | on | `off`: no desktop notification (`notify-send`) when questions are queued |
 | `BORG_QUEEN` | off | **Experimental.** `on`: the turn end may ask the engineer (failed its test) |
 | `BORG_CONCEPTS` | off | **Experimental.** `on`: boost lessons that share engineering concepts with the work; `BORG_CONCEPTS_BETA` (0.5) sets the strength |
 | `BORG_FACETS` | off | **Experimental.** `on`: `learn` and `assimilate` write facets (failed its test) |

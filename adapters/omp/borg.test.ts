@@ -4,7 +4,7 @@
 // runner.ts, session/agent-session.ts in the omp bundle).
 
 import { strict as assert } from "node:assert";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -78,6 +78,28 @@ test("prompt and tool touches reach borg's session context", async () => {
 		ctx,
 	);
 	assert.equal(ctxFile(), "make the relay delivery lock-free\nsrc/relay.rs\nsrc/queue.rs\n");
+});
+
+test("borg's prompt context (a queen question) joins the turn once, as a hidden custom message", async () => {
+	const { dir, ctx } = env();
+	const queue = join(dir, "home", "queen");
+	mkdirSync(queue, { recursive: true });
+	const entry = {
+		id: "qrelay", decision_key: "open_decision:relay:x", kind: "open_decision", question: "Is the relay queue bounded?",
+		options: ["bound it at 1024", "leave it unbounded"], default: "bound it at 1024", evidence: [], session: "seed",
+		cwd: ctx.cwd, engineer: "e@x", ms: 1,
+	};
+	writeFileSync(join(queue, "queue.jsonl"), JSON.stringify(entry) + "\n");
+	const h = load();
+	await h.input({ type: "input", text: "make the relay delivery lock-free", source: "interactive" }, ctx);
+	const out = await h.before_agent_start({ type: "before_agent_start", prompt: "make the relay delivery lock-free", systemPrompt: [] }, ctx);
+	assert.equal(out?.message?.customType, "borg");
+	assert.equal(out.message.display, false);
+	assert.match(out.message.content, /Start your reply with this one question/);
+	assert.match(out.message.content, /borg' queen answer 'qrelay' '<answer>' --dir '/);
+	// Once per session: the next turn gets nothing.
+	await h.input({ type: "input", text: "now the queue", source: "interactive" }, ctx);
+	assert.equal(await h.before_agent_start({ type: "before_agent_start", prompt: "now the queue", systemPrompt: [] }, ctx), undefined);
 });
 
 test("/commands and !shell lines are not prompts: no context, no task, no denial reason", async () => {

@@ -1,7 +1,9 @@
 // borg adapter for omp (oh-my-pi): translates omp extension events into the canonical,
 // Claude-shaped events of `borg hook omp <event>` and borg's answer back into omp.
 //
-//   input / before_agent_start  -> prompt             (the engineer's prompt; not /commands or !shell)
+//   input / before_agent_start  -> prompt             (the engineer's prompt; not /commands or !shell;
+//                                                      borg's additionalContext, e.g. a queen question,
+//                                                      joins the turn as a hidden custom message)
 //   tool_call                   -> pre_tool          (a paused drone's call is blocked with borg's reason)
 //   tool_result                 -> post_tool | post_tool_failure (error = the result text)
 //   tool_approval_resolved deny -> post_tool_failure  (error = omp's "Tool call denied by user: <tool>")
@@ -99,6 +101,13 @@ export function denialEvent(ctx: any, ev: Json, input: unknown): Canonical {
 	};
 }
 
+/** borg's `additionalContext` for a prompt as the custom message `before_agent_start` adds to the
+ *  turn (hidden from the engineer, read by the drone), or undefined. */
+export function contextMessage(out: Json | null): { customType: string; content: string; display: boolean } | undefined {
+	const context = (out as any)?.hookSpecificOutput?.additionalContext;
+	return typeof context === "string" && context.trim() ? { customType: "borg", content: context, display: false } : undefined;
+}
+
 export function stopEvent(ctx: any, ev: Json): Canonical {
 	return {
 		...where(ctx, ev),
@@ -178,6 +187,8 @@ export default function borg(pi: any): void {
 	// if one does start an agent run (a prompt template, a skill), its expansion arrives through
 	// before_agent_start instead.
 	let command = false;
+	// borg's context for the prompt seen at `input`, handed to the turn at its before_agent_start.
+	let context: ReturnType<typeof contextMessage>;
 
 	pi.on(
 		"input",
@@ -186,7 +197,7 @@ export default function borg(pi: any): void {
 			inputSeen = true;
 			const said = ev.text.trim();
 			command = isCommand(said);
-			if (said && !command) await runBorg("prompt", promptEvent(ctx, ev.text), FAST_MS);
+			context = said && !command ? contextMessage(await runBorg("prompt", promptEvent(ctx, ev.text), FAST_MS)) : undefined;
 		}),
 	);
 
@@ -196,8 +207,11 @@ export default function borg(pi: any): void {
 			const fromCommand = command;
 			command = false;
 			if ((!inputSeen || fromCommand) && typeof ev.prompt === "string" && ev.prompt.trim() && ev.prompt.trim() !== asked) {
-				await runBorg("prompt", promptEvent(ctx, ev.prompt), FAST_MS);
+				context = contextMessage(await runBorg("prompt", promptEvent(ctx, ev.prompt), FAST_MS)) ?? context;
 			}
+			const message = context;
+			context = undefined;
+			return message ? { message } : undefined;
 		}),
 	);
 

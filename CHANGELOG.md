@@ -45,6 +45,24 @@ First release.
 - `borg top` and `borg steer`: see and steer running drones, locally and across the mesh.
 - Reasoning notes: redacted excerpts of a session's commits as git notes (`borg notes`, `borg why`).
 
+### Answering the queen
+
+- `borg queen` lists open questions numbered and grouped by repo, with their options. `show`, `ask`
+  (interactive), `answer <n> <text|a|b>`, `skip` (3 days), `dismiss` (no lesson) and `dedupe` work on them.
+- `borg queen --json` and `borg queen next --json` give drones a stable schema with exact
+  answer, skip and dismiss commands.
+- Near-duplicate questions of the same repo are not queued again.
+- In the harness: the first prompt of a session in a repo with an open question gets that one
+  question as context. Claude Code asks it with AskUserQuestion; omp and opencode ask at the start of
+  the reply. The drone records the answer. One question per session, only the session's repos, 0 model
+  calls; `BORG_QUEEN_ASK=off` or `BORG_LEARN=off` disables it. The recording commands carry `--dir` and
+  the hook's own binary. An adapter that will not wait for the prompt's context sends `"context": false`
+  and gets none, so nothing is marked delivered unseen.
+- A question's repo is its git root's name (worktrees folded), recorded when it is queued, as the hooks
+  name it.
+- A desktop notification (`notify-send`) when questions are queued, one per run; `borg queen notify`
+  sends a summary. `BORG_NOTIFY=off` disables it.
+
 ### Harnesses and operations
 
 - Claude Code hooks; omp and opencode adapters (turn-end check, learning, steering).

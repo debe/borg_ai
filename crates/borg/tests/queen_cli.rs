@@ -28,6 +28,7 @@ fn borg_queen(root: &Path, base: &Path, args: &[&str], stdin: &str, dir: &Path, 
         .env("BORG_HOME", base)
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_MATCH", "bm25") // word matching only: no model call from a test
+        .env("BORG_NOTIFY", "off") // never a desktop notification from a test
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -98,14 +99,16 @@ fn queen_asks_in_the_routed_store_and_the_answer_reaches_the_conscience() {
     assert!(base.join("collectives/mine/queen/queue.jsonl").exists());
     assert!(!base.join("collectives/corp/queen").exists());
 
-    // `borg queen` lists it for the private collective only.
+    // `borg queen` lists it for the private collective only, numbered; `show` has the rest.
     let (list, _, _) = borg(&root, &base, &["queen"], "", &private);
-    assert!(list.contains("force-push") && list.contains("p@x"), "{list}");
+    assert!(list.starts_with("app (1)\n  1  ") && list.contains("force-push"), "{list}");
+    let (shown, _, _) = borg(&root, &base, &["queen", "show", "1"], "", &private);
+    assert!(shown.starts_with("#1  q") && shown.contains("p@x") && shown.contains("status:   open"), "{shown}");
     let (corp_list, _, _) = borg(&root, &base, &["queen", "--dir", corp.to_str().unwrap()], "", &private);
     assert!(corp_list.contains("no open queen questions"), "{corp_list}");
     let (off_list, _, _) = borg(&root, &base, &["queen"], "", &secret);
     assert!(off_list.starts_with("off:"), "{off_list}");
-    let id = list.split_whitespace().next().unwrap().to_string();
+    let id = shown.split_whitespace().nth(1).unwrap().to_string();
 
     // The engineer answers; the answer is a lesson of the private collective.
     let (said, err, code) = borg(&root, &base, &["queen", "answer", &id, "Never force-push main; push a new branch."], "", &private);
@@ -242,5 +245,48 @@ fn the_queen_is_off_unless_borg_queen_is_on() {
     assert!(!base.join("queen/queue.jsonl").exists(), "nothing queued");
     let (out, _, _) = borg_queen(&root, &base, &hook, &stop("s-on", &project, PLAN), &project, Some("on"));
     assert!(out.contains("Borg asked the engineer (e@x)"), "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_queue_answers_by_number_dismisses_and_speaks_json() {
+    let root = tmp("json");
+    let project = root.join("app");
+    repo(&project, "e@x");
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    // No collectives config: the default collective lives at BORG_HOME.
+    let base = root.join("store");
+    std::fs::create_dir_all(base.join("queen")).unwrap();
+    let entry = |id: &str, q: &str| {
+        serde_json::json!({"id": id, "decision_key": format!("k{id}"), "kind": "open_decision", "question": q, "options": ["monthly", "quarterly"],
+            "default": "monthly", "evidence": ["docs/a.md:1: open"], "session": "import", "cwd": project, "engineer": "e@x", "ms": 1})
+        .to_string()
+    };
+    let questions = [entry("qa", "Do service tokens rotate monthly or quarterly?"), entry("qb", "Which retry budget does the webhook consumer get?")];
+    std::fs::write(base.join("queen/queue.jsonl"), questions.join("\n") + "\n").unwrap();
+
+    let (out, _, code) = borg(&root, &base, &["queen", "--json"], "", &project);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (v[0]["n"].as_u64(), v[1]["id"].as_str(), v[1]["answer_cmd"].as_str(), code),
+        (Some(1), Some("qb"), Some("borg queen answer 'qb' '<answer>'"), Some(0))
+    );
+    let (out, _, _) = borg(&root, &base, &["queen", "next", "--json", "--repo", "app"], "", &project);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"], "qa");
+
+    // An option's letter answers with its text; a number names the question.
+    let (_, err, code) = borg(&root, &base, &["queen", "answer", "1", "b"], "", &project);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(std::fs::read_to_string(base.join("lessons.jsonl")).unwrap().contains("\"consequence\":\"quarterly\""));
+    // Numbers follow the open list: qb is now 1.
+    let (out, _, code) = borg(&root, &base, &["queen", "dismiss", "1", "not", "ours"], "", &project);
+    assert_eq!((out.trim(), code), ("qb dismissed (not ours); no lesson written", Some(0)));
+    let (out, _, _) = borg(&root, &base, &["queen", "next", "--json"], "", &project);
+    assert_eq!(out.trim(), "null");
+    let (out, _, _) = borg(&root, &base, &["queen"], "", &project);
+    assert!(out.starts_with("no open queen questions"), "{out}");
+    // `ask` wants a terminal.
+    let (_, err, code) = borg(&root, &base, &["queen", "ask"], "", &project);
+    assert_eq!(code, Some(2), "{err}");
     let _ = std::fs::remove_dir_all(root);
 }

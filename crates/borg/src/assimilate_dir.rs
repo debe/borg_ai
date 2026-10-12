@@ -580,12 +580,15 @@ pub fn build(repo: &str, cwd: &str, c: &Chunk, v: &Value, prov: &Provenance, now
             evidence: vec![format!("{}:{}: {}", c.path, line(x), s(x, "evidence"))],
             session: "import".into(),
             cwd: cwd.into(),
+            repo: repo.into(),
             engineer: prov.engineers.last().cloned().unwrap_or_default(),
             ms: now,
             answer: None,
             answered_by: None,
             answered_ms: None,
             disagreeing: Vec::new(),
+            dismissed: None,
+            dismissed_ms: None,
         });
     }
     let skip = crate::assimilate::skip_words();
@@ -645,6 +648,8 @@ pub struct Report {
     pub done: Vec<Done>,
     pub new_lessons: usize,
     pub new_decisions: usize,
+    /// The queue entries this run added (one desktop notification for all of them, notify.rs).
+    pub queued: Vec<Entry>,
     /// Which repos route to the receiving collective, in words.
     pub routed: String,
     /// `--apply --plan`: chunks the plan does not answer (absent, or their source changed since the dry
@@ -840,7 +845,10 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: Ask, now: i64
         }
         report.new_lessons += fresh.len();
         for e in &d.decisions {
-            report.new_decisions += queen::seed(&home, e).unwrap_or(false) as usize;
+            if queen::seed(&home, e).unwrap_or(false) {
+                report.new_decisions += 1;
+                report.queued.push(e.clone());
+            }
         }
         // Recorded last: a chunk whose lessons could not be written is retried by the next run.
         let rec = Imported {
@@ -1013,6 +1021,7 @@ pub fn main(args: &[&str], ask: Ask) -> i32 {
     let opts = Options { dir, spec, apply: args.contains(&"--apply"), plan, jobs, target };
     let report = run(&opts, cfg.as_ref(), &learn::home(), ask, learn::now_ms());
     print!("{}", render(&report, opts.apply));
+    crate::notify::queued(&report.queued);
     // The imported lessons get their search facets (facets.rs), one more call each.
     if let Some((_, home)) = report.collective.as_ref().filter(|_| opts.apply && report.new_lessons > 0 && crate::facets::enabled()) {
         let ids: HashSet<String> = report.done.iter().flat_map(|d| d.lessons.iter().map(|l| l.id.clone())).collect();

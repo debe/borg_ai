@@ -23,8 +23,10 @@
 //!        borg notes attach [<commit>] [--session ID] [--dir DIR]
 //!                                                     (redacted reasoning of a session's commits as git notes in
 //!                                                      refs/notes/borg, never pushed; notes.rs)
-//!        borg queen [--dir DIR] | borg queen answer <id> "<text>" [--dir DIR]
-//!                                                     (open questions to the engineer; an answer becomes a lesson; queen.rs)
+//!        borg queen [--json] [--repo NAME] | show <n|id> | ask | answer <n|id> <text|a|b> | dismiss <n|id> [reason]
+//!                   | skip <n|id> | next --json | dedupe [--apply] | notify   [--dir DIR | --collective NAME]
+//!                                                     (open questions to the engineer, numbered; an answer becomes a
+//!                                                      lesson, a dismissal none; --json for drones; queen.rs)
 //!        borg trust [--dir DIR]                      (trust per engineer x area in the collective DIR routes to; trust.rs)
 //!        borg top [--dir DIR] [--watch] [--json]      (the drones of each collective, local and remote; top.rs)
 //!        borg steer <drone|session|all> "<text>" | --pause | --resume [--dir DIR]
@@ -84,6 +86,12 @@
 //!                    BORG_CONCEPTS_BETA its strength (default 0.5)
 //!   BORG_QUEEN       "on" lets the Stop hook ask the engineer (queen.rs); off by default (the queen
 //!                    test failed its pre-registered bar, reports/queen-test.md)
+//!   BORG_QUEEN_ASK  "off" disables queen questions in the harness: the first prompt of a session in a repo
+//!                    with an open queen question gets that one question as context, to ask the engineer and
+//!                    record with `borg queen answer` (claude, omp, opencode; 0 model calls; queen.rs `deliver`);
+//!                    BORG_LEARN=off disables them too, and a prompt payload with `"context": false` (an
+//!                    adapter that will not wait for the answer) gets no context at all
+//!   BORG_NOTIFY      "off" disables the desktop notification (notify-send) when questions are queued (notify.rs)
 //!   BORG_PREDICT_MODEL  model for the consequence model (default sonnet)
 //!   BORG_VECTORS     "off" disables vector recall at the Stop step (vectors.rs; builds with the `vectors`
 //!                    feature): BORG_VECTOR_MODEL (model dir, default ~/.local/share/borg/models/
@@ -555,9 +563,41 @@ fn queued(hook_event: &str, session: &str) -> Option<String> {
     Some(text)
 }
 
+/// One open queen question for the engineer (queen.rs `deliver`), at the first prompt of the session
+/// where one of its work repos (the cwd's and the touched ones, systems.rs `work_repos`) has one: never
+/// another repo's. Its commands run this binary in the session's `cwd`, wherever the drone's shell has
+/// gone since. 0 model calls; fails open. Off with `BORG_QUEEN_ASK=off` or `BORG_LEARN=off` (nothing
+/// recorded; eval drones cannot answer), and in the eval modes BORG_ONLY and BORG_CRITIC.
+fn queen_ask(harness: &str, session: &str, cwd: &str) -> Option<String> {
+    if !learning() || !borg::queen::ask_enabled() || std::env::var_os("BORG_ONLY").is_some() || std::env::var_os("BORG_CRITIC").is_some() {
+        return None;
+    }
+    let repos = || {
+        let mut repos = borg::systems::work_repos(&std::fs::read_to_string(where_file(session)).unwrap_or_default());
+        let here = repo_of(cwd);
+        if !here.is_empty() && !repos.contains(&here) {
+            repos.insert(0, here);
+        }
+        repos
+    };
+    let scope = if cwd.is_empty() { String::new() } else { format!(" --dir {}", borg::queen::sh_quote(cwd)) };
+    let mut q = borg::queen::deliver(&learn::home(), session, repos, &scope, learn::now_ms())?;
+    if let Ok(exe) = std::env::current_exe() {
+        q = q.run_by(&borg::queen::sh_quote(&exe.display().to_string()));
+    }
+    let text = borg::queen::render_delivery(&q, harness);
+    log_cost(session, &format!("free event=UserPromptSubmit queen={} chars={}", q.id, text.len()));
+    Some(text)
+}
+
 /// The free context of a prompt or touch: waiting graded lessons first, then an early delivery.
 fn free_context(harness: &str, hook_event: &str, session: &str, text: &str) -> Option<Value> {
-    let parts: Vec<String> = [queued(hook_event, session), early(harness, hook_event, session, text)].into_iter().flatten().collect();
+    free_context_with(harness, hook_event, session, text, None)
+}
+
+/// `free_context` plus `extra` (a queen question) last.
+fn free_context_with(harness: &str, hook_event: &str, session: &str, text: &str, extra: Option<String>) -> Option<Value> {
+    let parts: Vec<String> = [queued(hook_event, session), early(harness, hook_event, session, text), extra].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| json!({"hookSpecificOutput": {"hookEventName": hook_event, "additionalContext": parts.join("\n\n")}}))
 }
 
@@ -579,7 +619,13 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             capture_prompt(session, input, prompt);
             note_where(session, &repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()));
             let _ = std::fs::write(state_file(session).with_extension("lastprompt"), prompt);
-            free_context(harness, "UserPromptSubmit", session, prompt)
+            // An adapter that will not wait for the answer (`"context": false`) gets none: what is handed
+            // over here is marked delivered and would be lost.
+            if input.get("context") == Some(&Value::Bool(false)) {
+                return None;
+            }
+            let ask = queen_ask(harness, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            free_context_with(harness, "UserPromptSubmit", session, prompt, ask)
         }
         "post_tool_failure" => {
             capture_rejection(session, input);
@@ -982,7 +1028,7 @@ fn main() {
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         _ => {
             eprintln!(
-                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [answer <id> <text>] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
+                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
             );
             std::process::exit(2);
         }

@@ -7,7 +7,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "./borg.ts"
@@ -197,6 +197,8 @@ test("an engineer prompt during a slow stop drops the stale questions", async ()
     const calls = recorded(rec)
     assert.deepEqual(calls.map((c) => c[0]), ["prompt", "stop", "prompt", "stop"])
     assert.equal(calls[2][1].last_assistant_message, PLAN, "the correction is against the proposal the engineer saw")
+    assert.equal(calls[0][1].context, undefined)
+    assert.equal(calls[2][1].context, false, "a prompt that will not wait for borg's context asks for none")
     assert.equal(calls[3][1].stop_hook_active, false)
   } finally {
     delete process.env.STOP_SLEEP
@@ -220,6 +222,34 @@ test("an echo that differs from what we sent cannot make the plugin loop", async
   // A marked echo is recognised even when no echo is pending.
   await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("anything", marked))
   assert.equal(recorded(rec).filter((c) => c[0] === "prompt").length, 1)
+})
+
+test("borg's prompt context (a queen question) joins the engineer's message as a synthetic part, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "borg-home-"))
+  process.env.BORG_BIN = BORG
+  process.env.BORG_HOME = home
+  process.env.BORG_STATE = join(home, "state")
+  process.env.BORG_CONFIG = join(home, "no-collectives.json")
+  process.env.BORG_MATCH = "bm25"
+  mkdirSync(join(home, "queen"))
+  const entry = {
+    id: "qrepo", decision_key: "open_decision:repo:x", kind: "open_decision", question: "Is the relay queue bounded?",
+    options: ["bound it at 1024", "leave it unbounded"], default: "bound it at 1024", evidence: [], session: "seed",
+    cwd: "/work/repo", engineer: "e@x", ms: 1,
+  }
+  writeFileSync(join(home, "queen", "queue.jsonl"), JSON.stringify(entry) + "\n")
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  const first = { message: {} as any, parts: [{ id: "prt_a1", sessionID: SESSION, messageID: "msg_1", type: "text", text: "Fix the relay race" }] as any[] }
+  await hooks["chat.message"]!({ sessionID: SESSION }, first as any)
+  assert.equal(first.parts.length, 2)
+  const added = first.parts[1]
+  assert.deepEqual([added.id, added.sessionID, added.messageID, added.type, added.synthetic], ["prt_a10", SESSION, "msg_1", "text", true])
+  assert.match(added.text, /Start your reply with this one question/)
+  assert.match(added.text, /borg' queen answer 'qrepo' '<answer>' --dir '\/work\/repo'/)
+  const second = userMessage("now the queue")
+  await hooks["chat.message"]!({ sessionID: SESSION }, second)
+  assert.equal(second.parts.length, 1, "one question per session")
 })
 
 test("fails open when borg is missing", async () => {

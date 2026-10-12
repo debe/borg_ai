@@ -3,7 +3,9 @@
 // Translates opencode plugin hooks and bus events into borg's one canonical, Claude-shaped hook
 // event and pipes it to `borg hook opencode <event>`:
 //
-//   chat.message (user text)                 -> prompt
+//   chat.message (user text)                 -> prompt; borg's additionalContext (e.g. a queen
+//                                               question) joins the message as a synthetic text
+//                                               part: the drone reads it, the engineer's TUI hides it
 //   tool.execute.before                      -> pre_tool (throws borg's reason: a paused drone's
 //                                               tool call is refused)
 //   tool.execute.after                       -> post_tool
@@ -33,6 +35,9 @@ import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 
 const TIMEOUT_MS = 60_000 // a stop with lessons makes one model call (the consequence model)
 const PRE_MS = 2_000 // before every tool call: borg answers in a few ms (a stat when nobody steers)
+// How long the engineer's message waits for borg's prompt context (file appends, no model call); a
+// later answer is dropped.
+const PROMPT_MS = 5_000
 // Hard cap on questions sent back into a session per engineer prompt, so nothing can make the
 // plugin prompt the drone in a loop.
 const MAX_ROUNDS = 1
@@ -290,7 +295,28 @@ const server: Plugin = async ({ client, directory }) => {
       // Take the proposal now: by the time the queue reaches this prompt, the drone may be
       // streaming its reply to it.
       const prior = lastAssistant(id)
-      send(id, "prompt", async () => ({ prompt, last_assistant_message: (await prior).text }))
+      // Behind a stop still thinking (a model call), the message does not wait for borg's context, so
+      // borg is told to hand none over (it would count as delivered, e.g. a queen question, unseen).
+      const busy = s.stopping
+      const answer = send(id, "prompt", async () => ({ prompt, last_assistant_message: (await prior).text, ...(busy ? { context: false } : {}) }))
+      if (busy) return
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const late = new Promise<null>((r) => (timer = setTimeout(() => r(null), PROMPT_MS)))
+      const out = await Promise.race([answer, late])
+      clearTimeout(timer)
+      const context = out?.hookSpecificOutput?.additionalContext
+      if (typeof context !== "string" || !context.trim()) return
+      // opencode gave the parts their ids already; ours sorts right after the last one.
+      const last = parts[parts.length - 1]
+      parts.push({
+        ...(last?.id ? { id: `${last.id}0` } : {}),
+        sessionID: last?.sessionID ?? id,
+        messageID: last?.messageID ?? (input as any).messageID,
+        type: "text",
+        text: context,
+        synthetic: true,
+      })
+      note(`${id}: borg's prompt context added (${context.length} chars)`)
     },
 
     "tool.execute.before": async (input, output) => {

@@ -4,7 +4,7 @@
 
 | omp event | borg event | Notes |
 |---|---|---|
-| `input` (interactive, RPC) | `prompt` | The engineer's raw text. `/commands` and `!shell` lines are skipped: omp emits `input` before handling them. |
+| `input` (interactive, RPC) | `prompt` | The engineer's raw text. `/commands` and `!shell` lines are skipped: omp emits `input` before handling them. borg's context for the prompt (a queen question) joins the turn at `before_agent_start` as a hidden custom message. |
 | `before_agent_start` | `prompt` | Used until an `input` arrives, because `omp -p` emits no `input`, and for a `/command` that starts an agent run (its expansion). borg's own questions are skipped. |
 | `tool_call` | `pre_tool` | A drone paused by `borg steer --pause` gets `{block: true, reason}`; anything else (or no answer within 2 s) lets the call run. |
 | `tool_result` | `post_tool` / `post_tool_failure` | A failure passes the result text as `error`. Tool names map to Claude's (`bash` → `Bash`, `find` → `Glob`, …). |
