@@ -812,7 +812,7 @@ fn doctor(t: &Targets) -> i32 {
         (None, None) => checks.push((Level::Warn, "borg: not on PATH and BORG_BIN unset (omp and opencode adapters need one)".into())),
     }
     let borg_found = env_bin.as_deref().is_some_and(executable) || on_path.is_some();
-    for (cli, tested) in [("claude", ""), ("omp", " (adapter tested with 18.8.5)"), ("opencode", " (adapter tested with 1.18.32)")] {
+    for (cli, tested) in [("claude", ""), ("omp", " (adapter tested with 18.8.5)"), ("opencode", " (adapter tested with 1.18.32 and 2.0.23)")] {
         match which(cli) {
             None => checks.push((Level::Ok, format!("{cli}: not installed"))),
             Some(p) => match version(&p) {

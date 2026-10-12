@@ -307,3 +307,288 @@ test("real borg: conscience asks once per session, corrections and rejections be
   assert.equal(episodes[1].correction, "keep the public API unchanged")
   assert.match(episodes[1].rejected_tool, /^Edit .*relay\.rs/)
 })
+
+// ---- opencode 2.x: the same contract through `setup(ctx)`.
+
+test("one module serves both plugin APIs: opencode 2 reads id + setup, opencode 1 id + server", () => {
+  assert.equal(plugin.id, "borg")
+  assert.equal(typeof plugin.setup, "function")
+  assert.equal(typeof plugin.server, "function")
+})
+
+/** A stand-in for opencode 2's plugin context: registered hooks, an event stream the test feeds,
+ *  the session's active context and a record of prompts sent back. `emit` resolves once the plugin
+ *  has handled the event (it asks the stream for the next one). */
+function fakeCtx(assistantText: () => string) {
+  const hooks: Record<string, (e: any) => any> = {}
+  const prompts: any[] = []
+  const synthetics: any[] = []
+  const queue: any[] = []
+  let deliver: ((r: IteratorResult<any>) => void) | null = null
+  let handled: (() => void) | null = null
+  let closed = false
+  const register = (domain: string) => async (name: string, cb: (e: any) => any) => {
+    hooks[`${domain}.${name}`] = cb
+    return { dispose: async () => {} }
+  }
+  const ctx = {
+    location: { directory: "/work/repo" },
+    session: {
+      hook: register("session"),
+      context: async () => [
+        { type: "user", text: "fix it" },
+        { type: "assistant", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: assistantText() }, { type: "tool" }] },
+      ],
+      prompt: async (input: any) => {
+        prompts.push(input)
+      },
+      synthetic: async (input: any) => {
+        synthetics.push(input)
+      },
+    },
+    tool: { hook: register("tool") },
+    event: {
+      subscribe: ({ signal }: { signal: AbortSignal }) => {
+        signal.addEventListener("abort", () => {
+          closed = true
+          deliver?.({ value: undefined, done: true })
+        })
+        return {
+          [Symbol.asyncIterator]() {
+            return this
+          },
+          next(): Promise<IteratorResult<any>> {
+            handled?.()
+            handled = null
+            if (queue.length) return Promise.resolve({ value: queue.shift(), done: false })
+            if (closed) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((r) => (deliver = r))
+          },
+        }
+      },
+    },
+  }
+  const emit = (type: string, data: object) =>
+    new Promise<void>((resolve) => {
+      handled = resolve
+      const event = { id: "evt_1", created: 0, type, data }
+      if (deliver) {
+        const d = deliver
+        deliver = null
+        d({ value: event, done: false })
+      } else queue.push(event)
+    })
+  return { ctx, hooks, prompts, synthetics, emit, closed: () => closed }
+}
+
+async function setupV2(assistantText: () => string = () => PLAN) {
+  const f = fakeCtx(assistantText)
+  const cleanup = await plugin.setup(f.ctx)
+  // A user prompt as opencode 2 hands it to the prompt hook.
+  const say = (text: string, metadata?: object, sessionID = SESSION) =>
+    f.hooks["session.prompt"]({ sessionID, messageID: "msg_1", prompt: { text }, metadata, delivery: "steer" })
+  return { ...f, cleanup, say }
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 50))
+
+test("opencode 2: the plugin speaks borg's canonical event", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { hooks, prompts, emit, cleanup, say } = await setupV2()
+
+  say("Fix the relay race")
+  await hooks["tool.execute.before"]({ tool: "read", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c1", input: { path: "/work/repo/relay.rs" } })
+  await hooks["tool.execute.after"]({ tool: "read", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c1", input: { path: "/work/repo/relay.rs" }, status: "completed", result: { content: [] } })
+  await hooks["tool.execute.before"]({ tool: "shell", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c2", input: { command: "rm -rf x" } })
+  await hooks["tool.execute.after"]({
+    tool: "shell", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c2", input: { command: "rm -rf x" }, status: "error",
+    error: { _tag: "Tool.Error", message: "Unable to run command", error: { _tag: "Permission.CorrectedError", feedback: "use git clean instead" } },
+  })
+  await emit("session.execution.succeeded", { sessionID: SESSION })
+  await emit("session.deleted", { sessionID: SESSION })
+  await settle()
+
+  const calls = recorded(rec)
+  const queued = calls.filter((c) => c[0] !== "pre_tool")
+  assert.deepEqual(queued.map((c) => c[0]), ["prompt", "post_tool", "post_tool_failure", "stop", "end"])
+  const [prompt, post, fail, stop, end] = queued.map((c) => c[1])
+  const pid = process.pid
+  assert.deepEqual(prompt, { session_id: SESSION, cwd: "/work/repo", pid, prompt: "Fix the relay race", last_assistant_message: PLAN })
+  assert.deepEqual(calls.find((c) => c[0] === "pre_tool")![1], { session_id: SESSION, cwd: "/work/repo", pid, tool_name: "Read", tool_input: { path: "/work/repo/relay.rs", file_path: "/work/repo/relay.rs" } })
+  assert.equal(post.tool_name, "Read")
+  assert.equal(post.tool_input.file_path, "/work/repo/relay.rs")
+  assert.equal(fail.tool_name, "Bash")
+  assert.equal(fail.tool_input.command, "rm -rf x")
+  assert.match(fail.error, /want to proceed with this tool use.*the user said:\nuse git clean instead/s)
+  assert.deepEqual(stop, { session_id: SESSION, cwd: "/work/repo", pid, last_assistant_message: PLAN, stop_hook_active: false })
+  assert.deepEqual(end, { session_id: SESSION, cwd: "/work/repo", pid })
+  assert.deepEqual(prompts, [{ sessionID: SESSION, text: "Q?", metadata: { borg: true }, delivery: "queue" }])
+  await cleanup()
+})
+
+test("opencode 2: a paused drone's tool call and its subagents' are refused", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "borg-oc-"))
+  const rec = join(dir, "rec.jsonl")
+  const bin = join(dir, "borg-pause-root")
+  writeFileSync(bin, `#!/bin/sh\nin=$(cat)\nprintf '%s\\t%s\\n' "$3" "$in" >> "${rec}"\n[ "$3" = pre_tool ] && case "$in" in *'"session_id":"${SESSION}"'*) echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[borg] paused"}}';; esac\nexit 0\n`)
+  chmodSync(bin, 0o755)
+  process.env.BORG_BIN = bin
+  const { hooks, emit, cleanup, say } = await setupV2()
+  await emit("session.created", { sessionID: "ses_child", parentID: SESSION })
+  const call = (sessionID: string) => hooks["tool.execute.before"]({ tool: "edit", sessionID, id: `c-${sessionID}`, input: { path: "/work/repo/x.rs" } })
+  await assert.rejects(call(SESSION), /\[borg\] paused/)
+  await assert.rejects(call("ses_child"), /\[borg\] paused/)
+  await call("ses_other")
+  // The child's own prompt (the subagent's task) and tool results send nothing.
+  say("explore the repo", undefined, "ses_child")
+  await hooks["tool.execute.after"]({ tool: "edit", sessionID: "ses_child", id: "c4", input: {}, status: "completed", result: {} })
+  await emit("session.execution.succeeded", { sessionID: "ses_child" })
+  await settle()
+  assert.deepEqual(recorded(rec).map((c) => [c[0], c[1].session_id]), [["pre_tool", SESSION], ["pre_tool", SESSION], ["pre_tool", "ses_other"]])
+  await cleanup()
+})
+
+test("opencode 2: no stop when the turn was halted; a declined call is still a failure", async () => {
+  for (const [type, data] of [
+    ["session.execution.interrupted", { reason: "user" }],
+    ["session.execution.failed", { error: { type: "provider.rate-limit", message: "slow down" } }],
+  ] as const) {
+    const [bin, rec] = recorder()
+    process.env.BORG_BIN = bin
+    const { prompts, emit, cleanup, say } = await setupV2()
+    say("Fix the relay race")
+    await emit(type, { sessionID: SESSION, ...data })
+    await settle()
+    assert.deepEqual(prompts, [], type)
+    assert.deepEqual(recorded(rec).map((c) => c[0]), ["prompt"], type)
+    await cleanup()
+  }
+
+  // Declined without feedback: no execute.after, a session.tool.failed, then the turn is interrupted.
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { hooks, prompts, emit, cleanup, say } = await setupV2()
+  say("Fix the relay race")
+  await hooks["tool.execute.before"]({ tool: "write", sessionID: SESSION, id: "c7", input: { path: "/work/repo/relay.rs", content: "x" } })
+  await emit("session.tool.failed", { sessionID: SESSION, assistantMessageID: "msg_2", id: "c7", error: { type: "aborted", message: "The user declined this tool call" }, executed: false })
+  await emit("session.execution.interrupted", { sessionID: SESSION, reason: "shutdown" })
+  await settle()
+  assert.deepEqual(prompts, [])
+  const calls = recorded(rec).filter((c) => c[0] !== "pre_tool")
+  assert.deepEqual(calls.map((c) => c[0]), ["prompt", "post_tool_failure"])
+  assert.equal(calls[1][1].tool_name, "Write")
+  assert.equal(calls[1][1].tool_input.file_path, "/work/repo/relay.rs")
+  assert.equal(calls[1][1].error, "The user declined this tool call")
+  await cleanup()
+})
+
+test("opencode 2: questions once per engineer prompt; the marked echo is not the engineer", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { prompts, emit, cleanup, say } = await setupV2()
+  say("Fix the relay race")
+  for (let i = 0; i < 3; i++) {
+    await emit("session.execution.succeeded", { sessionID: SESSION })
+    await settle()
+    // opencode runs our prompt through the prompt hook with the metadata we gave it.
+    if (prompts.length > i) say(prompts[i].text, prompts[i].metadata)
+  }
+  assert.equal(prompts.length, 1)
+  const calls = recorded(rec)
+  assert.deepEqual(calls.filter((c) => c[0] === "prompt").map((c) => c[1].prompt), ["Fix the relay race"])
+  assert.deepEqual(calls.filter((c) => c[0] === "stop").map((c) => c[1].stop_hook_active), [false, true, false])
+  await cleanup()
+})
+
+test("opencode 2: cleanup ends every session and closes the event stream", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { closed, cleanup, say } = await setupV2()
+  say("Fix the relay race")
+  say("look at the docs", undefined, "ses_two")
+  await cleanup()
+  assert.ok(closed())
+  assert.deepEqual(recorded(rec).filter((c) => c[0] === "end").map((c) => c[1].session_id).sort(), [SESSION, "ses_two"])
+})
+
+test("opencode 2: fails open when borg is missing", async () => {
+  process.env.BORG_BIN = "/nonexistent/borg"
+  const { hooks, prompts, emit, cleanup, say } = await setupV2()
+  say("hello")
+  await hooks["tool.execute.before"]({ tool: "shell", sessionID: SESSION, id: "c1", input: { command: "ls" } })
+  await emit("session.execution.succeeded", { sessionID: SESSION })
+  await settle()
+  assert.equal(prompts.length, 0)
+  await cleanup()
+})
+
+test("opencode 2: borg's prompt context (a queen question) reaches the drone as a hidden synthetic input, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "borg-home-"))
+  process.env.BORG_BIN = BORG
+  process.env.BORG_HOME = home
+  process.env.BORG_STATE = join(home, "state")
+  process.env.BORG_CONFIG = join(home, "no-collectives.json")
+  process.env.BORG_MATCH = "bm25"
+  mkdirSync(join(home, "queen"))
+  const entry = {
+    id: "qrepo", decision_key: "open_decision:repo:x", kind: "open_decision", question: "Is the relay queue bounded?",
+    options: ["bound it at 1024", "leave it unbounded"], default: "bound it at 1024", evidence: [], session: "seed",
+    cwd: "/work/repo", engineer: "e@x", ms: 1,
+  }
+  writeFileSync(join(home, "queen", "queue.jsonl"), JSON.stringify(entry) + "\n")
+  const { synthetics, cleanup, say } = await setupV2()
+  // The hook is awaited: the synthetic input is in before opencode stores the prompt.
+  await say("Fix the relay race")
+  assert.equal(synthetics.length, 1)
+  const [added] = synthetics
+  assert.deepEqual([added.sessionID, added.delivery, added.resume, added.description], [SESSION, "steer", false, undefined])
+  assert.match(added.text, /Start your reply with this one question/)
+  assert.match(added.text, /borg' queen answer 'qrepo' '<answer>' --dir '\/work\/repo'/)
+  await say("now the queue")
+  assert.equal(synthetics.length, 1, "one question per session")
+  await cleanup()
+})
+
+test("opencode 2, real borg: conscience asks once, a rejection with feedback becomes an episode", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "borg-home-"))
+  process.env.BORG_BIN = BORG
+  process.env.BORG_HOME = home
+  process.env.BORG_STATE = join(home, "state")
+  delete process.env.BORG_LEARN
+  // Never the engineer's real collectives config, and no model call at Stop.
+  process.env.BORG_CONFIG = join(home, "no-collectives.json")
+  process.env.BORG_MATCH = "bm25"
+  writeFileSync(join(home, "lessons.jsonl"), JSON.stringify({ id: "toctou", origin_ms: 1, question: "Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?" }) + "\n")
+  let said = PLAN
+  const { hooks, prompts, emit, cleanup, say } = await setupV2(() => said)
+  const done = async () => {
+    await emit("session.execution.succeeded", { sessionID: SESSION })
+    await settle()
+  }
+
+  say("Fix the relay race in relay.rs")
+  await done()
+  assert.equal(prompts.length, 1, "borg's questions go back into the session")
+  assert.match(prompts[0].text, /\n1\. \[toctou\] Is any check-then-act on an AtomicBoolean flag TOCTOU-safe/)
+  say(prompts[0].text, prompts[0].metadata)
+  await done()
+  assert.equal(prompts.length, 1)
+
+  said = "I will add a second AtomicBoolean to guard the first."
+  say("no, don't add another flag, use a channel")
+  await hooks["tool.execute.before"]({ tool: "edit", sessionID: SESSION, id: "c9", input: { path: "/work/repo/relay.rs", oldString: "a", newString: "b" } })
+  await hooks["tool.execute.after"]({
+    tool: "edit", sessionID: SESSION, id: "c9", input: { path: "/work/repo/relay.rs", oldString: "a", newString: "b" }, status: "error",
+    error: { _tag: "Tool.Error", message: "Unable to edit /work/repo/relay.rs", error: { _tag: "Permission.CorrectedError", feedback: "keep the public API unchanged" } },
+  })
+  await done()
+  await cleanup()
+
+  const episodes = readFileSync(join(home, "episodes.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+  assert.equal(episodes.length, 2)
+  assert.equal(episodes[0].correction, "no, don't add another flag, use a channel")
+  assert.equal(episodes[0].agent, "I will add a second AtomicBoolean to guard the first.")
+  assert.equal(episodes[1].correction, "keep the public API unchanged")
+  assert.match(episodes[1].rejected_tool, /^Edit .*relay\.rs/)
+})

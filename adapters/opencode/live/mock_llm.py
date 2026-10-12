@@ -1,6 +1,7 @@
 # Minimal OpenAI-compatible chat endpoint for the live test: logs every request as JSONL and
 # answers with a fixed plan, so a real `opencode run` exercises the plugin for 0 tokens.
 # The first turn of a task calls tools first: a read that works and one of a missing file (fails).
+# The read's argument is named after the tool's schema: filePath (opencode 1) or path (opencode 2).
 # usage: python3 mock_llm.py <port> <log.jsonl> <workdir>
 import json
 import sys
@@ -10,6 +11,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = sys.argv[2]
 WORK = sys.argv[3]
 REPLY = "Plan: I check closed.get() on the AtomicBoolean before deliver() in relay.rs."
+
+
+def read_arg(tools):
+    """The read tool's path argument: "path" when its schema has one, else "filePath"."""
+    for t in tools:
+        fn = t.get("function", t)
+        if fn.get("name") == "read" and "path" in (fn.get("parameters") or {}).get("properties", {}):
+            return "path"
+    return "filePath"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -27,8 +37,9 @@ class Handler(BaseHTTPRequestHandler):
         msgs = body.get("messages", [])
         calls = None
         if body.get("tools") and not any(m.get("role") == "tool" for m in msgs):
+            key = read_arg(body["tools"])
             calls = [{"index": i, "id": f"call_{i}", "type": "function",
-                      "function": {"name": "read", "arguments": json.dumps({"filePath": f"{WORK}/{f}"})}}
+                      "function": {"name": "read", "arguments": json.dumps({key: f"{WORK}/{f}"})}}
                      for i, f in enumerate(["relay.rs", "missing.rs"])]
         base = {"id": "mock", "created": int(time.time()), "model": body.get("model", "m")}
         usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
