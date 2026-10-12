@@ -4,6 +4,7 @@
 pub mod assimilate;
 pub mod assimilate_dir;
 pub mod collective;
+pub mod completions;
 pub mod concepts;
 pub mod conscience;
 pub mod expert;

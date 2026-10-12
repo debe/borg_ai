@@ -25,6 +25,14 @@
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked |
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
 
+**Shell completion:** `borg completions <bash|zsh|fish>` prints a completion script.
+
+```sh
+borg completions bash > ~/.local/share/bash-completion/completions/borg
+borg completions zsh > "${fpath[1]}/_borg"
+borg completions fish > ~/.config/fish/completions/borg.fish
+```
+
 For debugging and evaluation: `borg recall`, `borg prefilter`, `borg resolve`, `borg expert`,
 `borg facets`. Their usage is in the header of [`crates/borg/src/main.rs`](../crates/borg/src/main.rs).
 

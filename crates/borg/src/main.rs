@@ -993,6 +993,7 @@ fn main() {
             borg::stats::rollup(&learn::home());
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
+        ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),
         ["reach", rest @ ..] => {
             borg::stats::set_purpose("reach");
             std::process::exit(borg::reach::main(rest))
@@ -1089,7 +1090,7 @@ fn main() {
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         _ => {
             eprintln!(
-                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg reach [--plan FILE] [--apply] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
+                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg reach [--plan FILE] [--apply] | borg completions <bash|zsh|fish> | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
             );
             std::process::exit(2);
         }
