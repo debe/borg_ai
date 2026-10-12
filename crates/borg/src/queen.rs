@@ -424,7 +424,20 @@ pub fn seed(store: &Path, e: &Entry) -> std::io::Result<bool> {
         return Ok(false);
     }
     append_line(&queue_path(store), e)?;
+    counted(store, crate::stats::QUEEN_QUEUED, e, e.ms, |_| {});
     Ok(true)
+}
+
+/// The queen's queue in the usage statistics: one event about entry `e` at `ms`.
+fn counted(store: &Path, kind: &str, e: &Entry, ms: i64, fill: impl FnOnce(&mut crate::stats::Event)) {
+    crate::stats::count(store, kind, &e.session, |ev| {
+        ev.ms = ms;
+        ev.engineer = e.engineer.clone();
+        ev.repo = e.repo.clone();
+        ev.lessons = vec![e.id.clone()];
+        ev.text = crate::stats::excerpt(&e.question, 160);
+        fill(ev);
+    });
 }
 
 /// Questions still waiting for an answer (neither answered nor dismissed), in asking order: `borg
@@ -552,6 +565,7 @@ pub fn consider(cp: &Checkpoint) -> std::io::Result<Vec<Entry>> {
     }
     for e in &ask {
         append_line(&queue_path(cp.store), e)?;
+        counted(cp.store, crate::stats::QUEEN_QUEUED, e, e.ms, |_| {});
     }
     crate::notify::queued(&ask);
     Ok(ask)
@@ -751,6 +765,15 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     e.answered_by = Some(author.into());
     e.answered_ms = Some(now);
     append_line(&queue_path(store), &e).map_err(|err| err.to_string())?;
+    counted(store, crate::stats::QUEEN_ANSWERED, &e, now, |ev| {
+        ev.engineer = author.into();
+        ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
+        ev.text = crate::stats::excerpt(text, 160);
+    });
+    counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
+        ev.engineer = author.into();
+        ev.why = "queen".into();
+    });
     Ok(e)
 }
 
@@ -873,6 +896,7 @@ pub fn dismiss(store: &Path, id: &str, reason: &str, now: i64) -> Result<Entry, 
     e.dismissed = Some(Some(reason.trim()).filter(|r| !r.is_empty()).unwrap_or("dismissed").to_string());
     e.dismissed_ms = Some(now);
     append_line(&queue_path(store), &e).map_err(|err| err.to_string())?;
+    counted(store, crate::stats::QUEEN_DISMISSED, &e, now, |ev| ev.why = e.dismissed.clone().unwrap_or_default());
     Ok(e)
 }
 
@@ -880,6 +904,7 @@ pub fn dismiss(store: &Path, id: &str, reason: &str, now: i64) -> Result<Entry, 
 pub fn skip(store: &Path, id: &str, session: &str, now: i64) -> Result<Entry, String> {
     let e = find_open(store, id)?;
     append_line(&skips_path(store), &Mark { id: e.id.clone(), session: session.into(), ms: now }).map_err(|err| err.to_string())?;
+    counted(store, crate::stats::QUEEN_SKIPPED, &e, now, |ev| ev.session = session.into());
     Ok(e)
 }
 
@@ -1076,6 +1101,7 @@ pub fn deliver(store: &Path, session: &str, repos: impl FnOnce() -> Vec<String>,
     }
     let (i, e) = eligible(&open, &skips(store), &delivered, &visits, session, &repos, now)?;
     append_line(&delivered_path(store), &Mark { id: e.id.clone(), session: session.into(), ms: now }).ok()?;
+    counted(store, crate::stats::QUEEN_DELIVERED, e, now, |ev| ev.session = session.into());
     Some(Question::of(e, i + 1, scope))
 }
 

@@ -1,0 +1,23 @@
+[package]
+name = "borg-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "A local, live page of a collective's knowledge and usage statistics"
+
+# A separate binary, like borg-mesh: the web stack stays out of the hook. `borg web ...` forwards here.
+# The page is a Leptos client (ui/, its own workspace) built to ui/dist with trunk and embedded below,
+# so installing this crate needs no wasm toolchain.
+[[bin]]
+name = "borg-web"
+path = "src/main.rs"
+
+[dependencies]
+borg = { path = "../borg", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+futures-util = { version = "0.3", default-features = false }

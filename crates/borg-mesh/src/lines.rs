@@ -20,12 +20,13 @@ use serde_json::Value;
 
 /// The logs a mesh syncs, relative to the collective's store.
 ///
-/// Lessons only. A lesson already carries its `episodes` ids and `engineers`; the raw episodes stay
+/// Lessons, and the daily usage rollups (borg stats.rs): versioned records like lessons, one bucket per
+/// (node, engineer, day), counts only. Not episodes: a lesson already carries its `episodes` ids and `engineers`; the raw episodes stay
 /// on the node that captured them, so exactly one node learns each episode. Synced episodes were
 /// pending on every node (learn.rs skips only episodes cited by a lesson or rejected locally), so
 /// each member paid a model call per peer episode, and two members could learn the same correction
 /// into two lessons under different ids. Episodes also hold the engineer's raw words.
-pub const SYNCED: [&str; 1] = ["lessons.jsonl"];
+pub const SYNCED: [&str; 2] = ["lessons.jsonl", "stats.jsonl"];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).

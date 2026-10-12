@@ -169,7 +169,29 @@ pub fn engineer(cwd: &str) -> String {
 }
 
 pub fn record_episode(e: &Episode) -> std::io::Result<()> {
-    append_jsonl(&home().join("episodes.jsonl"), e)
+    append_jsonl(&home().join("episodes.jsonl"), e)?;
+    count_correction(&home(), e);
+    Ok(())
+}
+
+/// A correction in the usage statistics: a rejected tool call or a pushback, with a short excerpt.
+pub fn count_correction(store: &Path, e: &Episode) {
+    let snippet = crate::stats::excerpt(&e.correction, 160);
+    crate::stats::count(store, crate::stats::CORRECTION, &e.session, |ev| {
+        ev.ms = e.ms;
+        ev.engineer = e.engineer.clone();
+        ev.repo = e.repo.clone();
+        match &e.rejected_tool {
+            Some(tool) => {
+                ev.why = "rejected_tool".into();
+                ev.text = format!("{tool}: {snippet}");
+            }
+            None => {
+                ev.why = "pushback".into();
+                ev.text = snippet;
+            }
+        }
+    });
 }
 
 /// The latest version of every lesson.
@@ -366,6 +388,20 @@ pub fn ask_claude(prompt: &str) -> Option<Value> {
 /// The model call behind `ask_claude`, for any JSON schema: the structured answer and its cost in USD
 /// (None when the CLI reported none). `BORG_LEARN_MODEL` picks the model (default sonnet).
 pub fn ask_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
+    let started = std::time::Instant::now();
+    let answer = call_model(prompt, schema);
+    crate::stats::count(&home(), crate::stats::MODEL_CALL, "", |ev| {
+        ev.why = crate::stats::purpose().into();
+        ev.usd = answer.as_ref().and_then(|(_, c)| *c).unwrap_or(0.0);
+        ev.dur_ms = started.elapsed().as_millis() as u64;
+        if answer.is_none() {
+            ev.text = "no answer".into();
+        }
+    });
+    answer
+}
+
+fn call_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
     let model = std::env::var("BORG_LEARN_MODEL").unwrap_or_else(|_| "sonnet".into());
     let out = Command::new("claude")
         .args(["-p", prompt, "--model", &model, "--tools", "", "--output-format", "json"])
@@ -483,6 +519,13 @@ pub fn learn_in_reporting(
                     new += 1
                 }
                 let _ = append_jsonl(&lessons_path, &l);
+                let kind = if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW };
+                crate::stats::count(home, kind, &e.session, |ev| {
+                    ev.engineer = e.engineer.clone();
+                    ev.repo = e.repo.clone();
+                    ev.lessons = vec![l.id.clone()];
+                    ev.why = "session".into();
+                });
                 let target = (l.version > 1).then_some(l.id.as_str());
                 let contradicted = match track {
                     true => outcome::contradicted(&outcomes, &e.session, e.ms, target, &l.supersedes),
@@ -507,6 +550,7 @@ pub fn learn_in_reporting(
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&skipped_path) {
                     let _ = writeln!(f, "{}", e.id);
                 }
+                crate::stats::count(home, crate::stats::NOT_A_LESSON, &e.session, |ev| ev.engineer = e.engineer.clone());
             }
         }
     }

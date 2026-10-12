@@ -217,6 +217,11 @@ pub const DROPPED_BYTES: u64 = 128 * 1024;
 
 /// Appends one line to the refusal log, keeping it bounded (fail quietly: it is for the engineer).
 pub fn log_dropped(home: &Path, line: &str) {
+    let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+    crate::stats::count(home, crate::stats::STEER_DROPPED, "", |ev| {
+        ev.engineer = v["engineer"].as_str().unwrap_or_default().into();
+        ev.why = v["why"].as_str().unwrap_or_default().into();
+    });
     let p = dropped_path(home);
     let _ = std::fs::create_dir_all(dir(home));
     if std::fs::metadata(&p).is_ok_and(|m| m.len() > 2 * DROPPED_BYTES) {
@@ -293,6 +298,12 @@ fn claim(home: &Path, session: &str, notices: Vec<Accepted>, switches: &[String]
     }
     let take = |id: &str| std::fs::OpenOptions::new().write(true).create_new(true).open(d.join(safe(id))).is_ok();
     let won: Vec<Accepted> = notices.into_iter().filter(|a| !a.d.id.is_empty() && take(&a.d.id)).collect();
+    for a in &won {
+        crate::stats::count(home, crate::stats::STEER_DELIVERED, session, |ev| {
+            ev.why = a.d.kind.clone();
+            ev.text = crate::stats::excerpt(&format!("{}: {}", a.d.engineer, a.d.text), 160);
+        });
+    }
     if won.iter().any(|a| a.d.kind != SAY) {
         for id in switches {
             take(id);
@@ -367,6 +378,9 @@ pub fn around(home: &Path, harness: &str, event: &str, input: &Value, started: O
     match event {
         "pre_tool" => {
             let a = p.paused?;
+            crate::stats::count(home, crate::stats::PAUSE_REFUSED, session, |ev| {
+                ev.why = input.get("tool_name").and_then(Value::as_str).unwrap_or_default().into();
+            });
             Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": pause_reason(&a)}}))
         }
         "stop" => {

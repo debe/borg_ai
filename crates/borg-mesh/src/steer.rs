@@ -214,6 +214,14 @@ pub fn issue(home: &Path, collective: &str, may_sync: bool, engineer: &str, targ
         None => Authority::Local { me: &key },
     };
     file(home, collective, &auth, &key, membership.is_some(), &d, now)?;
+    borg::stats::count(home, borg::stats::STEER_ISSUED, "", |ev| {
+        ev.engineer = engineer.into();
+        ev.why = kind.into();
+        ev.text = borg::stats::excerpt(text, 160);
+        if let Some(d) = drone {
+            ev.repo = d.p.repo.clone();
+        }
+    });
     let whom = match drone {
         None => "every running drone".to_string(),
         Some(d) => format!("{} (session {}, {})", d.designation, d.p.session, if d.p.engineer.is_empty() { "?" } else { &d.p.engineer }),

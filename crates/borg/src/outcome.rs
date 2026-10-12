@@ -68,7 +68,22 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
         std::fs::create_dir_all(d)?;
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{}", serde_json::to_string(o).unwrap())
+    writeln!(f, "{}", serde_json::to_string(o).unwrap())?;
+    // The results count in the usage statistics; `asked` is already counted as the Stop's block.
+    let kind = match o.kind.as_str() {
+        CHANGED => crate::stats::CHANGED,
+        IGNORED => crate::stats::IGNORED,
+        CORRECTED => crate::stats::CORRECTED,
+        NOT_CORRECTED => crate::stats::NOT_CORRECTED,
+        _ => return Ok(()),
+    };
+    if let Some(home) = path.parent() {
+        crate::stats::count(home, kind, &o.session, |e| {
+            e.repo = o.repo.clone();
+            e.lessons = o.lessons.clone();
+        });
+    }
+    Ok(())
 }
 
 /// Did the conscience ask `lesson` in `session` before `ms`?

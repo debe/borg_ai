@@ -15,6 +15,7 @@
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness, weight, and long-term or dormant state |
 | `borg vectors [--fetch\|--rebuild]` | Vector model and index ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
+| `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1 ([details](statistics.md)) |
 | `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
 | `borg steer <drone\|session\|all> "<text>"` | Send a signed instruction to running drones; `--pause`, `--resume` |
 | `borg why <path>[:<line>[-<line>]] \| <commit> [--full] [--json]` | The reasoning behind code: blame, Borg notes, linked lessons |

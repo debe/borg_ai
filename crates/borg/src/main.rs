@@ -139,6 +139,18 @@ fn repo_of(cwd: &str) -> String {
     borg_trace::repo_key(cwd).rsplit('/').next().unwrap_or_default().to_string()
 }
 
+/// Counts one event of this session in the collective's statistics (stats.rs); `fill` adds details.
+fn stat(session: &str, input: &Value, kind: &str, fill: impl FnOnce(&mut borg::stats::Event)) {
+    let home = learn::home();
+    let mut ev = borg::stats::Event::new(kind, learn::now_ms());
+    ev.session = session.into();
+    ev.repo = repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default());
+    // The engineer as presence.rs already resolved it at this hook: no second `git config` call.
+    ev.engineer = borg::presence::read(&home, session).map(|p| p.engineer).unwrap_or_default();
+    fill(&mut ev);
+    borg::stats::record(&home, &ev);
+}
+
 /// The engineer's prompts this session (the queen's criterion 3; the state file mixes in touches).
 fn prompts_file(session: &str) -> PathBuf {
     state_file(session).with_extension("prompts")
@@ -523,6 +535,10 @@ fn early(harness: &str, hook_event: &str, session: &str, text: &str) -> Option<S
         let _ = writeln!(f, "#borg-early {ids}");
     }
     log_cost(session, &format!("free event={hook_event} lessons={} chars={}", delivered.len(), text.len()));
+    borg::stats::count(&learn::home(), borg::stats::EARLY, session, |e| {
+        e.n = delivered.len() as u64;
+        e.lessons = delivered.iter().map(|c| c.id.clone()).collect();
+    });
     Some(text)
 }
 
@@ -560,6 +576,10 @@ fn queued(hook_event: &str, session: &str) -> Option<String> {
         let _ = writeln!(f, "#borg-queued {ids}");
     }
     log_cost(session, &format!("free event={hook_event} lessons={n} chars={} graded dropped={}", text.len(), wanted.len() - n));
+    borg::stats::count(&learn::home(), borg::stats::QUEUED_FREE, session, |e| {
+        e.n = n as u64;
+        e.lessons = wanted[..n].iter().map(|c| c.id.clone()).collect();
+    });
     Some(text)
 }
 
@@ -698,6 +718,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
                 return None;
             }
+            stat(session, input, borg::stats::TURN_END, |_| {});
             let mut context = std::fs::read_to_string(state_file(session)).unwrap_or_default();
             // A lesson is asked once per session: the drone answered it at that turn end, and asking it again
             // at every later one is noise (and a model call spent on it). A lesson delivered early
@@ -732,6 +753,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                     };
                     if let Some(score) = skip {
                         append(session, &format!("#borg-skip {score}"));
+                        stat(session, input, borg::stats::GATE_SKIP, |e| e.why = score.clone());
                         let prompts = std::fs::read_to_string(prompts_file(session)).unwrap_or_default();
                         return borg::queen::stop(session, input, &prompts, &[]);
                     }
@@ -765,11 +787,21 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                     let pend = pending(session, &state, &all, &full_proposal(input));
                     let extra = predict::judge_section(&pend).len();
                     let graded = borg::whole::graded();
+                    let called = std::time::Instant::now();
                     let pred = if whole && !borg::whole::classic() {
-                        predict::predict_whole(&context, &shortlist, &pend, &model, graded)?
+                        predict::predict_whole(&context, &shortlist, &pend, &model, graded)
                     } else {
-                        predict::predict(&context, &shortlist, &pend, &model, graded)?
+                        predict::predict(&context, &shortlist, &pend, &model, graded)
                     };
+                    stat(session, input, borg::stats::CHECK, |e| {
+                        e.n = shortlist.len() as u64;
+                        e.dur_ms = called.elapsed().as_millis() as u64;
+                        e.usd = pred.as_ref().map_or(0.0, |p| p.cost);
+                        if pred.is_none() {
+                            e.why = "failed".into();
+                        }
+                    });
+                    let pred = pred?;
                     append(session, &format!("#borg-predict-cost {:.4}", pred.cost));
                     if !pend.is_empty() {
                         let call = state.lines().filter(|l| l.starts_with("#borg-predict-cost")).count() + 1;
@@ -839,6 +871,10 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             let out = queen.or_else(|| Some(json!({"decision": "block", "reason": conscience::render(&selected)})));
             let chars = out.as_ref().and_then(|o| o["reason"].as_str()).map_or(0, str::len);
             log_cost(session, &format!("block questions={} chars={chars}", selected.len()));
+            stat(session, input, borg::stats::BLOCK, |e| {
+                e.n = selected.len() as u64;
+                e.lessons = selected.iter().map(|c| c.id.clone()).collect();
+            });
             out
         }
         _ => None,
@@ -929,7 +965,16 @@ fn main() {
             eprintln!("borg mesh: cannot run borg-mesh ({err}); cargo install --path crates/borg-mesh");
             std::process::exit(1);
         }
+        ["web", rest @ ..] => {
+            // The live page (crates/borg-web): its web stack stays out of the hook binary too.
+            use std::os::unix::process::CommandExt;
+            let beside = std::env::current_exe().ok().map(|e| e.with_file_name("borg-web")).filter(|p| p.exists());
+            let err = std::process::Command::new(beside.unwrap_or_else(|| "borg-web".into())).args(rest).exec();
+            eprintln!("borg web: cannot run borg-web ({err}); cargo install --path crates/borg-web");
+            std::process::exit(1);
+        }
         ["learn", rest @ ..] => {
+            borg::stats::set_purpose("learn");
             let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
             let store = learn::home().join("lessons.jsonl");
             let from = borg::facets::len_of(&store);
@@ -941,13 +986,22 @@ fn main() {
             }
             facets_for_written(&store, from);
             borg::vectors::refresh(&store);
+            // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
+            borg::stats::rollup(&learn::home());
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
         ["assimilate", rest @ ..] if rest.contains(&"--from-dir") => {
+            borg::stats::set_purpose("assimilate");
             std::process::exit(borg::assimilate_dir::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema)))
         }
-        ["facets", rest @ ..] => std::process::exit(borg::facets::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema))),
-        ["assimilate", rest @ ..] => std::process::exit(borg::assimilate::main(rest, &learn::ask_claude)),
+        ["facets", rest @ ..] => {
+            borg::stats::set_purpose("facets");
+            std::process::exit(borg::facets::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema)))
+        }
+        ["assimilate", rest @ ..] => {
+            borg::stats::set_purpose("assimilate");
+            std::process::exit(borg::assimilate::main(rest, &learn::ask_claude))
+        }
         ["prefilter", path, rest @ ..] => {
             // The Stop gate's score for a state file + final message on stdin (eval/preempt/stop_prefilter.py).
             let before = rest.first().and_then(|v| v.parse().ok());
@@ -1028,7 +1082,7 @@ fn main() {
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         _ => {
             eprintln!(
-                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
+                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
             );
             std::process::exit(2);
         }

@@ -15,6 +15,9 @@ for f in crates/borg-eval/src/preempt.rs crates/borg-eval/src/queen_replay.rs cr
     if [ -f "$f" ]; then rustfmt --check --edition 2024 "$f"; fi
 done
 
+step "borg web page: ui/dist built from the current sources"
+scripts/ui.sh --check
+
 step "cargo clippy (workspace, all targets, -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 

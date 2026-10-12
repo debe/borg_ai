@@ -1,0 +1,25 @@
+[package]
+name = "borg-web-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The borg web page: a Leptos client built to dist/ with trunk and embedded by borg-web"
+
+# Its own workspace: it builds for wasm32 only, never with the native workspace.
+[workspace]
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+serde_json = "1"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["EventSource", "MessageEvent", "Location", "HashChangeEvent", "KeyboardEvent"] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

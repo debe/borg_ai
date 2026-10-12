@@ -469,6 +469,10 @@ fn append(path: &Path, eps: &mut [Found], engineers: &mut HashMap<String, String
         x.episode.repo = repo_of(&x.cwd);
         x.episode.engineer = engineers.entry(x.cwd.clone()).or_insert_with(|| learn::engineer(&x.cwd)).clone();
         writeln!(f, "{}", serde_json::to_string(&x.episode)?)?;
+        // An imported correction counts at the time it was made.
+        if let Some(store) = path.parent() {
+            learn::count_correction(store, &x.episode);
+        }
     }
     Ok(())
 }

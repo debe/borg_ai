@@ -468,6 +468,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "borg-web"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "borg",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

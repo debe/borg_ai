@@ -286,6 +286,14 @@ fn ask_one(e: &ExpertSource, dep: &Dep, plan: &str, room: usize, world: &World, 
         let rec = json!({"ms": learn::now_ms(), "session": session, "repo": dir_name(cwd), "expert": e.name, "pin": pin,
             "via": via, "status": status, "claims": items.len(), "cost_usd": cost});
         let _ = append(&world.home.join("experts.jsonl"), &rec);
+        // Only the expert drone calls a model; an index lookup costs nothing.
+        if via == "drone" {
+            crate::stats::count(world.home, crate::stats::MODEL_CALL, session, |ev| {
+                ev.why = "expert".into();
+                ev.repo = dir_name(cwd);
+                ev.usd = cost.unwrap_or(0.0);
+            });
+        }
     }
     (!items.is_empty()).then(|| Section { name: e.name.clone(), pin, items })
 }

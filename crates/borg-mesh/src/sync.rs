@@ -56,7 +56,7 @@ use crate::recon::{self, Recon};
 use crate::{from_hex, peers, to_hex};
 use crate::{live, steer};
 
-pub const ALPN: &[u8] = b"borg/mesh/4";
+pub const ALPN: &[u8] = b"borg/mesh/5";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
@@ -839,6 +839,32 @@ mod tests {
         (a, b)
     }
 
+    fn rollup(node: &str, version: u64, turns: u64) -> String {
+        json!({"id": format!("stat:{node}:dev@x:2026-10-12"), "version": version, "day": "2026-10-12", "node": node,
+            "engineer": "dev@x", "counts": {"turn_end": turns}, "usd": 0.0, "dur_ms": 0})
+        .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_rollups_sync_and_the_latest_version_wins() {
+        let (pa, pb) = team("stats");
+        let (a, b) = (home(&pa), home(&pb));
+        write(&a, "stats.jsonl", &[rollup("na", 1, 3), rollup("na", 2, 5)]);
+        write(&b, "stats.jsonl", &[rollup("nb", 1, 7)]);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        let (served, synced) = (served.unwrap(), synced.unwrap());
+        assert_eq!((synced.received, served.received), (2, 1), "both of alice's lines reach bob, bob's one reaches alice");
+        for h in [&a, &b] {
+            let r = borg::stats::rollups(h);
+            assert_eq!(r.len(), 2, "one bucket per node");
+            assert_eq!(r["stat:na:dev@x:2026-10-12"].counts["turn_end"], 5, "the newest version of alice's bucket");
+            assert_eq!(r["stat:nb:dev@x:2026-10-12"].counts["turn_end"], 7);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn two_members_end_with_the_union_and_resync_moves_only_digests() {
         let (pa, pb) = team("union");
@@ -872,8 +898,9 @@ mod tests {
         assert!(asked(&a).contains(&("L1".into(), "lock order, also in tests?".into())), "the newer version wins on alice too");
 
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        let quiet = Report { rounds: 1, fps: 1, ..Report::default() };
-        assert_eq!(synced.unwrap(), quiet, "re-sync: one fingerprint, nothing new");
+        // One round and one fingerprint per synced log (lessons, stats), nothing else.
+        let quiet = Report { rounds: SYNCED.len(), fps: SYNCED.len(), ..Report::default() };
+        assert_eq!(synced.unwrap(), quiet, "re-sync: one fingerprint per log, nothing new");
         assert_eq!(served.unwrap(), quiet);
         alice.close().await;
         bob.close().await;

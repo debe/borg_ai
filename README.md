@@ -20,7 +20,7 @@ to peer, with no server.
 - [Development](#development)
 
 Reference: [Configuration](docs/configuration.md) · [Team sync](docs/team-sync.md) ·
-[Commands](docs/commands.md) · [Reports](reports/)
+[Commands](docs/commands.md) · [Statistics and the live page](docs/statistics.md) · [Reports](reports/)
 
 ## How it works
 
@@ -95,6 +95,7 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 git clone https://github.com/debe/borg_ai borg && cd borg
 cargo install --path crates/borg --locked        # the CLI and hook binary, vectors included
 cargo install --path crates/borg-mesh --locked   # only for team sync, borg top across machines, borg steer
+cargo install --path crates/borg-web --locked    # only for borg web, the live page
 ```
 
 Both land in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it there.
@@ -149,6 +150,7 @@ Borg runs on its own. These commands show what it does:
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
 | `borg top` · `borg steer` | Running drones across the team; send them a signed instruction |
 | `borg why <path>:<line>` | The reasoning behind a line of code |
+| `borg web` | A live page of the knowledge and what the collective did, on 127.0.0.1 |
 
 All commands: [Commands](docs/commands.md). Every switch: [Environment variables](docs/configuration.md#environment-variables).
 
@@ -172,7 +174,9 @@ corrections), transcripts, source code, `collectives.json`, per-session state.
 - reasoning excerpts of landed commits, redacted, each held by two members;
 - presence for `borg top`: session, harness, email, repo, first line of your latest prompt (redacted),
   recently touched paths;
-- steering instructions and the signed member list.
+- steering instructions and the signed member list;
+- daily usage counts per engineer: checks, questions, outcomes, corrections, cost, lesson ids
+  ([Statistics](docs/statistics.md#privacy)).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content. Run your own relay to
 keep even that in-house; see [Privacy on the mesh](docs/team-sync.md#privacy-on-the-mesh).

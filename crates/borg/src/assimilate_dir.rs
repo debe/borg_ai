@@ -844,6 +844,13 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: Ask, now: i64
             continue;
         }
         report.new_lessons += fresh.len();
+        for l in &fresh {
+            crate::stats::count(&home, crate::stats::LESSON_NEW, "", |ev| {
+                ev.lessons = vec![l.id.clone()];
+                ev.repo = repo.clone();
+                ev.why = "import".into();
+            });
+        }
         for e in &d.decisions {
             if queen::seed(&home, e).unwrap_or(false) {
                 report.new_decisions += 1;
@@ -861,6 +868,11 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: Ask, now: i64
             ms: now,
         };
         let _ = append_jsonl(&home.join("assimilated.jsonl"), &[rec]);
+        // Its model calls are counted as they happen (learn.rs `ask_model`); this counts the chunk.
+        crate::stats::count(&home, crate::stats::ASSIMILATED, "", |ev| {
+            ev.repo = repo.clone();
+            ev.n = fresh.len() as u64;
+        });
     }
     report.done = done;
     report

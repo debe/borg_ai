@@ -1,0 +1,6 @@
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"
+# Stable names: borg-web embeds these files by name (crates/borg-web/src/main.rs).
+filehash = false

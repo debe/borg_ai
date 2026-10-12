@@ -1,7 +1,8 @@
 //! Usefulness as the memory dynamics of a collective brain (reports/phase-r.md "R1 design").
 //!
-//! Everything here is derived from the append-only outcome log (outcome.rs), so merging two logs (the
-//! mesh syncs them) merges memory, whatever the line order. Per lesson:
+//! Everything here is derived from the append-only outcome log (outcome.rs), so merging two logs merges
+//! memory, whatever the line order. The mesh does not sync outcomes (yet): memory is this machine's
+//! view. Per lesson:
 //!
 //! - **Uses.** A use is an `asked_then_changed` record: after the Stop block asked the lesson, the
 //!   drone changed its work on that point and the change avoids the consequence, as judged by the

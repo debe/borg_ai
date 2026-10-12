@@ -8,3 +8,4 @@ node_modules/
 .env.*
 # eval runs and sandboxes write under target/ (target/eval-runs, target/dogfood); eval data and
 # borg's own stores live outside the repo (~/.local/share/borg, ~/.config/borg).
+/crates/borg-web/ui/target
