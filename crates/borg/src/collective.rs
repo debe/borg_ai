@@ -140,6 +140,9 @@ pub struct Config {
     /// Engineers known under several git emails (see the module doc).
     #[serde(default, deserialize_with = "engineers")]
     pub engineers: Vec<Engineer>,
+    /// The local collective that receives personal lessons (reach.rs); optional when there is exactly one.
+    #[serde(default)]
+    pub personal: Option<String>,
 }
 
 /// The `engineers` section; its errors name it, so `borg status` and `borg doctor` point at it.
@@ -248,6 +251,11 @@ pub fn load_from(p: &Path) -> Result<Option<Config>, String> {
 impl Config {
     /// Every collective must have a store of its own (see the module doc).
     pub fn check(&self) -> Result<(), String> {
+        if let Some(p) = &self.personal
+            && !self.collectives.iter().any(|c| &c.name == p && c.share == Share::Local)
+        {
+            return Err(format!("personal: {p:?} is not a collective with \"share\": \"local\""));
+        }
         let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
         for c in &self.collectives {
             if let Some(other) = seen.insert(store_name(&c.name).to_lowercase(), &c.name) {
@@ -324,6 +332,24 @@ fn store_name(name: &str) -> String {
 /// A collective's own store under the root store `base`.
 pub fn store(base: &Path, name: &str) -> PathBuf {
     base.join("collectives").join(store_name(name))
+}
+
+/// The store of the local collective that receives an engineer's personal lessons (reach.rs): the one
+/// `personal` names, else the only `share: local` collective; none when there is none or several. `home`
+/// is any collective's store (or the root store), the root is derived from it.
+pub fn personal_store(cfg: Option<&Config>, home: &Path) -> Option<PathBuf> {
+    let cfg = cfg?;
+    let base = match home.parent() {
+        Some(p) if p.file_name().is_some_and(|n| n == "collectives") => p.parent()?.to_path_buf(),
+        _ => home.to_path_buf(),
+    };
+    let local: Vec<&Entry> = cfg.collectives.iter().filter(|c| c.share == Share::Local).collect();
+    let pick = match &cfg.personal {
+        Some(name) => local.iter().find(|c| &c.name == name).copied(),
+        None if local.len() == 1 => local.first().copied(),
+        None => None,
+    }?;
+    Some(store(&base, &pick.name))
 }
 
 /// A `share: local` collective of `cfg` whose store is `home`, if any. Second guard for a sync: even

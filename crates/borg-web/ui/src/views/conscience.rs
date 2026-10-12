@@ -65,9 +65,11 @@ pub fn Conscience() -> impl IntoView {
             ("corrected anyway".into(), t.n("corrected"), "var(--c-heat)".into()),
         ]
     });
+    // Only verdicts that say whether a question helped: used, ignored or corrected anyway. "No
+    // correction followed" says nothing either way, so it is not in the denominator.
     let useful = Signal::derive(move || {
         let t = t();
-        pct(t.n("changed"), t.n("changed") + t.n("ignored") + t.n("corrected"))
+        format!("{} of {}", t.n("changed"), t.n("changed") + t.n("ignored") + t.n("corrected"))
     });
     let rank = move |f: fn(&Lesson) -> f64| Signal::derive(move || d.lessons.with(|ls| ls.iter().map(|l| (l.clone(), f(l))).collect::<Vec<_>>()));
     let check_cost = move || {
@@ -90,7 +92,7 @@ pub fn Conscience() -> impl IntoView {
         <section class="two">
             <div class="panel">
                 <h2>"What the questions led to"</h2>
-                <Donut parts=outcomes center=useful caption="used when judged" />
+                <Donut parts=outcomes center=useful caption="judged questions changed the work" />
             </div>
             <div class="panel">
                 <h2>"Asked most"</h2>

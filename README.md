@@ -53,6 +53,11 @@ sessions, not days, so a holiday erases nothing.
 
 <p align="center"><img src="docs/img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
 
+**Reach.** A correction about the code becomes a team lesson. One about how *you* like the agent to
+work (commit style, AI attribution, branching) is personal: it goes to your private collective and
+never reaches the team. A convention of one repo is delivered only there. See
+[Who hears a lesson](docs/configuration.md#who-hears-a-lesson).
+
 **Collectives.** Each repo path belongs to one collective, or to none:
 
 - **team** collectives sync to their members over the [peer mesh](docs/team-sync.md);

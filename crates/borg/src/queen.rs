@@ -61,6 +61,9 @@ pub enum Kind {
     /// queue by `borg assimilate --from-dir` (assimilate_dir.rs). Never raised by a checkpoint and not a
     /// message to anyone, so it does not use up an engineer's budget.
     OpenDecision,
+    /// Who should hear an existing lesson (reach.rs `borg reach`): the team, its repo, or only the
+    /// engineer. Queued by a cleanup, not a checkpoint; answering it moves the lesson, writes none.
+    Reach,
 }
 
 impl Kind {
@@ -71,6 +74,7 @@ impl Kind {
             Kind::PublicApi => "a public API or schema change",
             Kind::CrossRepo => "a cross-repo or cross-team decision",
             Kind::OpenDecision => "a decision the team's documents leave open",
+            Kind::Reach => "who should hear a lesson",
         }
     }
 
@@ -83,6 +87,7 @@ impl Kind {
             Kind::PublicApi => ("proceed as planned", "keep the old contract working (additive change, versioning)"),
             Kind::CrossRepo => ("proceed as planned", "leave the other repo's or team's side to its owners"),
             Kind::OpenDecision => ("keep the documented interim rule", "decide it now"),
+            Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
         }
     }
 }
@@ -479,7 +484,7 @@ pub fn within_budget(store: &Path, engineer: &str, session: &str) -> bool {
 /// engineer's emails under `aliases` share one budget; open decisions imported from documents use none.
 pub fn budget_allows(asked: &[Entry], seen: &[Seen], engineer: &str, session: &str, aliases: &collective::Aliases) -> bool {
     let me = aliases.canon(engineer);
-    let sent = asked.iter().filter(|e| e.kind != Kind::OpenDecision);
+    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach));
     let Some(last) = sent.filter(|e| aliases.canon(&e.engineer) == me).max_by_key(|e| e.ms) else { return true };
     if last.session == session {
         return false; // one message per session at most
@@ -758,9 +763,14 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     if e.dismissed.is_some() {
         return Err(format!("{id} was dismissed"));
     }
-    // The lesson first: a question marked answered without its lesson would be lost.
-    let lessons = lesson_lines(&store.join("lessons.jsonl"));
-    append_line(&store.join("lessons.jsonl"), &lesson(&e, text, author, now, &lessons)).map_err(|err| err.to_string())?;
+    // The lesson first: a question marked answered without its lesson would be lost. A reach question
+    // writes none: its answer moves the lesson it is about (reach.rs).
+    if e.kind == Kind::Reach {
+        crate::reach::answer(store, &e, text)?;
+    } else {
+        let lessons = lesson_lines(&store.join("lessons.jsonl"));
+        append_line(&store.join("lessons.jsonl"), &lesson(&e, text, author, now, &lessons)).map_err(|err| err.to_string())?;
+    }
     e.answer = Some(text.into());
     e.answered_by = Some(author.into());
     e.answered_ms = Some(now);
@@ -770,10 +780,12 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
         ev.text = crate::stats::excerpt(text, 160);
     });
-    counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
-        ev.engineer = author.into();
-        ev.why = "queen".into();
-    });
+    if e.kind != Kind::Reach {
+        counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
+            ev.engineer = author.into();
+            ev.why = "queen".into();
+        });
+    }
     Ok(e)
 }
 
@@ -1130,8 +1142,11 @@ pub fn render_delivery(q: &Question, harness: &str) -> String {
     // Queued in an earlier session (or imported from a document): the drone must not take a checkpoint
     // question's quoted plan for its own.
     let (question, origin) = match q.question.strip_prefix("The drone's plan says: ") {
-        Some(rest) if q.kind != Kind::OpenDecision => (format!("An earlier session's plan said: {rest}"), "queued by an earlier session"),
+        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach) => {
+            (format!("An earlier session's plan said: {rest}"), "queued by an earlier session")
+        }
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
+        _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1464,6 +1479,10 @@ pub fn main(args: &[&str]) -> i32 {
         ["answer", key, text @ ..] if !text.is_empty() => {
             let author = learn::engineer(&cwd);
             match find(key).and_then(|e| answer(&store, &e.id, &option_answer(&e, &text.join(" "))?, &author, now)) {
+                Ok(e) if e.kind == Kind::Reach => {
+                    println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
+                    0
+                }
                 Ok(e) => {
                     println!("{} answered; lesson queen-{} added to {}", e.id, e.decision_key, store.join("lessons.jsonl").display());
                     0

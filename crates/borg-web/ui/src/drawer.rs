@@ -79,6 +79,7 @@ pub fn Drawer() -> impl IntoView {
                 </div>
                 <dl class="facts-dl">
                     <dt>"Source"</dt><dd>{l.source_label()}</dd>
+                    <dt>"Heard by"</dt><dd>{if l.reach == "repo" { format!("only sessions in {}", l.repo) } else { "the whole team".to_string() }}</dd>
                     <dt>"First learned"</dt><dd>{if l.origin_ms > 0.0 { long_day(day_of_ms(l.origin_ms)) } else { "unknown".into() }}</dd>
                     <dt>"Version"</dt><dd>{format!("{} (sharpened {} time{})", l.version, l.version.saturating_sub(1), if l.version == 2 { "" } else { "s" })}</dd>
                     <dt>"Taught by"</dt><dd>{if l.engineers.is_empty() { "—".to_string() } else { l.engineers.iter().map(|e| who(e)).collect::<Vec<_>>().join(", ") }}</dd>

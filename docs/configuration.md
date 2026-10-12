@@ -3,6 +3,7 @@
 [← README](../README.md)
 
 - [Collectives](#collectives)
+- [Who hears a lesson](#who-hears-a-lesson)
 - [Storage](#storage)
 - [System map](#system-map)
 - [What `borg install` writes](#what-borg-install-writes)
@@ -42,6 +43,7 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `engineers` | Optional. Merges one person's git emails into one author for trust, `borg status` and `borg top`. Never synced |
 | `relay` | Optional, per collective. How the mesh crosses NAT; see [Relays](team-sync.md#how-peers-find-each-other) |
 | `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`) |
+| `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
 
 An invalid config (bad JSON, two collectives sharing one store, an email under two engineers) routes
 **everything off**, and `borg doctor` reports it.
@@ -50,6 +52,34 @@ An invalid config (bad JSON, two collectives sharing one store, an email under t
 borg collective ~/work/some-repo   # -> platform-team (Team, may sync: true) store ~/.local/share/borg/collectives/platform-team
 borg collective ~/personal/notes   # -> private (Local, may sync: false) ...
 ```
+
+## Who hears a lesson
+
+`borg learn` gives every lesson a **reach**:
+
+| Reach | What it is | Where it goes |
+|---|---|---|
+| team | An engineering concern about the code, design or verification | The collective it was learned in, delivered to everyone |
+| repo | A convention of one repo, such as its branch or deploy workflow | The same collective, delivered only in that repo |
+| personal | How you like the agent to work: commit style, AI attribution, when to branch or push, tone | Your private collective, which never syncs; without one it is dropped |
+
+The model decides by asking: would a teammate working on the same code get this correction too?
+Imported team documents are always team; their repo conventions are scoped by system already.
+
+Personal lessons go to the `local` collective named by `personal`, or to your only `local` collective.
+A personal lesson already shared with the team is withdrawn there: a newer version replaces its text
+with a tombstone that is never delivered, and peers receive that version too.
+
+**Clean up lessons learned before reach existed:**
+
+```sh
+borg reach                              # dry run: one model call per lesson learned from sessions (~$0.02 each), writes a plan
+borg reach --apply --plan <store>/reach-plan.json
+```
+
+The plan lists what moves to your private collective, what becomes repo-only, and what the model was
+unsure about. `--apply` makes the sure moves and turns the unsure ones into queen questions, which you
+answer with `borg queen`. Answering one moves the lesson; it writes no new lesson.
 
 ## Storage
 

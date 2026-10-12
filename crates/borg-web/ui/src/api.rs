@@ -152,6 +152,8 @@ pub struct Lesson {
     pub dormant: bool,
     pub consolidated: bool,
     pub usage: BTreeMap<String, f64>,
+    /// Who hears it: empty for the team, `repo` for its repo only (reach.rs in borg).
+    pub reach: String,
 }
 
 impl Lesson {
@@ -214,7 +216,10 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             dormant: l["dormant"].as_bool().unwrap_or(false),
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
             usage: map(&l["usage"]),
+            reach: s(&l["reach"]),
         })
+        // A personal lesson withdrawn to a private collective is a tombstone here: nothing to show.
+        .filter(|l| l.reach != "personal")
         .collect()
 }
 

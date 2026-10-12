@@ -277,10 +277,13 @@ fn lessons(session: &str) -> Vec<conscience::Challenge> {
     let mut all = conscience::load_for(&lessons_path(), before, Some(session));
     // The system gate (systems.rs): where the repo says which system this is, lessons scoped to other
     // systems score 0, however much the conversation names them.
+    let where_text = std::fs::read_to_string(where_file(session)).unwrap_or_default();
+    let repos = borg::systems::work_repos(&where_text);
     if borg::systems::on() {
-        let where_text = std::fs::read_to_string(where_file(session)).unwrap_or_default();
-        borg::systems::gate(&mut all, &borg::systems::work_repos(&where_text));
+        borg::systems::gate(&mut all, &repos);
     }
+    // Reach (reach.rs): a withdrawn personal lesson is never delivered, a repo convention only in its repo.
+    all.retain(|c| borg::reach::deliverable(c, &repos));
     // Spike (concepts.rs): lessons sharing engineering concepts with the code written, the touched paths
     // and the latest prompt rank higher; never a filter.
     if borg::concepts::on() {
@@ -990,6 +993,10 @@ fn main() {
             borg::stats::rollup(&learn::home());
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
+        ["reach", rest @ ..] => {
+            borg::stats::set_purpose("reach");
+            std::process::exit(borg::reach::main(rest))
+        }
         ["assimilate", rest @ ..] if rest.contains(&"--from-dir") => {
             borg::stats::set_purpose("assimilate");
             std::process::exit(borg::assimilate_dir::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema)))
@@ -1082,7 +1089,7 @@ fn main() {
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         _ => {
             eprintln!(
-                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
+                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg reach [--plan FILE] [--apply] | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
             );
             std::process::exit(2);
         }

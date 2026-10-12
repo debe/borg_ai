@@ -156,6 +156,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
                 "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
                 "usage": usage.get(&c.id).cloned().unwrap_or_default(),
                 "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
+                "reach": c.reach,
             })
         })
         .collect();

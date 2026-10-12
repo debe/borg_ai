@@ -399,6 +399,7 @@ pub fn lesson_card(l: Lesson, open: RwSignal<Option<String>>) -> impl IntoView {
                 {l.scope.iter().take(2).map(|s| view! { <span class="chip a">{s.clone()}</span> }).collect_view()}
                 <span class="chip">{l.area()}</span>
                 {(l.source == "queen").then(|| view! { <span class="chip v">"queen"</span> })}
+                {(l.reach == "repo").then(|| view! { <span class="chip" title="a convention of its repo, delivered only there">{format!("only in {}", l.repo)}</span> })}
                 {l.consolidated.then(|| view! { <span class="chip g">"long-term"</span> })}
                 {l.dormant.then(|| view! { <span class="chip">"dormant"</span> })}
                 <span class="stat" title="asked · used · corrected anyway">{format!("? {} · ✓ {} · ! {}", num(l.asked()), num(l.changed), num(l.corrected))}</span>

@@ -125,6 +125,10 @@ pub struct Lesson {
     /// (conscience.rs `rank`); never shown to a drone. Empty for lessons learned before facets existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<String>,
+    /// Who should hear the lesson (reach.rs): empty for the team, `repo` for its repo only, `personal`
+    /// for a tombstone withdrawn to an engineer's private collective.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reach: String,
 }
 
 fn other_area() -> String {
@@ -135,7 +139,7 @@ pub fn home() -> PathBuf {
     std::env::var("BORG_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/borg"))
 }
 
-fn append_jsonl<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+pub(crate) fn append_jsonl<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
@@ -242,6 +246,14 @@ const PROMPT: &str = "An engineer corrected a coding agent. Decide whether the c
 lesson: a critical concern about quality, design, correctness, reuse, spec conformance or root cause that this engineer would \
 plausibly raise again about similar future work. Operational remarks (\"still working?\", \"stop\", \"push\", \"restart\") are NOT lessons.
 
+Then decide its reach: who should hear it. Ask: would a teammate working on the same code get this correction too?
+- personal: how this one engineer likes the agent to work with them, not a property of the code: commit message style \
+or length, AI attribution or co-author trailers, whether and when to commit, push, branch or open a PR, what to stage, \
+how to report or ask, language and tone, their own tooling habits.
+- repo: a convention of the repo it happened in that other repos do not share (its branch or deploy workflow, a tool \
+or command it mandates).
+- team: everything else: an engineering concern about the code, design, correctness or verification.
+
 If it is a lesson, write:
 - question: ONE question the agent should ask itself next time, general enough to transfer, keeping the technical substance;
 - situations: 1-3 lines, each `<action> on/in <kind of state or component> [under <condition>]`, without project/class names;
@@ -262,8 +274,9 @@ fn schema() -> Value {
         "is_lesson": {"type": "boolean"}, "question": {"type": "string"},
         "situations": {"type": "array", "items": {"type": "string"}}, "consequence": {"type": "string"},
         "same_as": {"type": "string"}, "area": {"type": "string", "enum": trust::AREAS},
-        "supersedes": {"type": "array", "items": {"type": "string"}}},
-        "required": ["is_lesson", "question", "situations", "consequence", "same_as", "area", "supersedes"]})
+        "supersedes": {"type": "array", "items": {"type": "string"}},
+        "reach": {"type": "string", "enum": ["team", "repo", "personal"]}},
+        "required": ["is_lesson", "question", "situations", "consequence", "same_as", "area", "supersedes", "reach"]})
 }
 
 /// The model call failed (quota, rate limit, not logged in, network, malformed answer): unlike a
@@ -279,6 +292,9 @@ const MAX_FAILURES: usize = 3;
 /// of an existing one, `Ok(None)` not a lesson, `Err` no verdict. `ask` performs the model call
 /// (injectable for tests).
 pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<Lesson>, AskFailed> {
+    // A withdrawn personal lesson (reach.rs) is no merge target: it lives in a private collective now.
+    let library: Vec<Lesson> = library.iter().filter(|l| l.reach != crate::reach::PERSONAL).cloned().collect();
+    let library = library.as_slice();
     let as_challenges: Vec<Challenge> = library
         .iter()
         .map(|l| Challenge {
@@ -316,6 +332,7 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
     let question = v["question"].as_str().filter(|q| !q.trim().is_empty()).ok_or(AskFailed)?.to_string();
     let consequence = v["consequence"].as_str().unwrap_or("").to_string();
     let area = trust::area(v["area"].as_str().unwrap_or_default()).to_string();
+    let reach = v["reach"].as_str().filter(|r| [crate::reach::REPO, crate::reach::PERSONAL].contains(r)).unwrap_or_default();
     let same_as = similar.iter().find(|l| v["same_as"].as_str() == Some(l.id.as_str()));
     // Only lessons the model was shown can be superseded, and never the one it merges into.
     let mut supersedes: Vec<String> =
@@ -353,6 +370,7 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
                 supersedes,
                 // New wording: the old facets describe the old wording; `borg learn` generates new ones.
                 facets: Vec::new(),
+                reach: crate::reach::narrower(&old.reach, reach).to_string(),
                 ..(*old).clone()
             }
         }
@@ -376,6 +394,7 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
             overrides: String::new(),
             origin: String::new(),
             facets: Vec::new(),
+            reach: reach.to_string(),
         },
     }))
 }
@@ -518,13 +537,21 @@ pub fn learn_in_reporting(
                 } else {
                     new += 1
                 }
-                let _ = append_jsonl(&lessons_path, &l);
-                let kind = if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW };
-                crate::stats::count(home, kind, &e.session, |ev| {
+                // A personal lesson goes to the engineer's private collective, never into a team store (reach.rs).
+                let placed = crate::reach::place(home, &l);
+                let (kind, why, counted_in) = match &placed {
+                    crate::reach::Placed::Here(l) => {
+                        let _ = append_jsonl(&lessons_path, &**l);
+                        (if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW }, "session", home.to_path_buf())
+                    }
+                    crate::reach::Placed::Private(store) => (crate::stats::LESSON_NEW, "personal", store.clone()),
+                    crate::reach::Placed::Dropped => (crate::stats::NOT_A_LESSON, "personal", home.to_path_buf()),
+                };
+                crate::stats::count(&counted_in, kind, &e.session, |ev| {
                     ev.engineer = e.engineer.clone();
                     ev.repo = e.repo.clone();
                     ev.lessons = vec![l.id.clone()];
-                    ev.why = "session".into();
+                    ev.why = why.into();
                 });
                 let target = (l.version > 1).then_some(l.id.as_str());
                 let contradicted = match track {
@@ -697,6 +724,7 @@ mod tests {
             overrides: String::new(),
             origin: String::new(),
             facets: vec![],
+            reach: String::new(),
         };
         let lib = [lesson("L0", 1, "Is the closed flag guarded by the ReentrantLock?", &[]), lesson("L1", 2, "Would a CAS suffice?", &["L0"])];
         // ann reverts to the lock: the model only sees L1 (in L0's place), contradicts it, and the

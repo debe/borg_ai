@@ -554,6 +554,7 @@ pub fn build(repo: &str, cwd: &str, c: &Chunk, v: &Value, prov: &Provenance, now
             area: trust::area(&s(x, "area")).into(),
             supersedes: Vec::new(),
             source: "import".into(),
+            reach: String::new(),
             // The repository the knowledge is written in is where it was kept, not where it applies; a
             // ticket prefix (the source says `LUMEN-213`) names a tracker project, not a system.
             scope: strs(x, "scope").into_iter().filter(|t| !t.eq_ignore_ascii_case(repo) && !ticket_prefix(t, &c.text)).collect(),

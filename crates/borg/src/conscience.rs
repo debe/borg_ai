@@ -52,6 +52,9 @@ pub struct Challenge {
     /// The repo the lesson was learned in (for an import: where the knowledge was written down).
     #[serde(default)]
     pub repo: String,
+    /// Who should hear it (reach.rs): empty for the team, `repo`, or `personal` (a withdrawn tombstone).
+    #[serde(default)]
+    pub reach: String,
     /// Scoped to systems none of which is the work's known system (systems.rs `gate`): scores 0.
     #[serde(skip)]
     pub off_system: bool,
@@ -100,6 +103,7 @@ impl Default for Challenge {
             overrides: String::new(),
             facets: Vec::new(),
             repo: String::new(),
+            reach: String::new(),
             off_system: false,
             weight: 1.0,
             dormant: false,
