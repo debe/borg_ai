@@ -1,0 +1,17 @@
+[package]
+name = "borg-eval"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Run drone arms on eval workloads and measure cost per solved task"
+
+[dependencies]
+borg-trace = { path = "../borg-trace" }
+borg = { path = "../borg" }
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+# sandbox-exec: the sandbox dies with its caller (PR_SET_PDEATHSIG)
+libc = "0.2"

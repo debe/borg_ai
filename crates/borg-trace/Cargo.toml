@@ -1,0 +1,14 @@
+[package]
+name = "borg-trace"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Parse Claude Code / omp transcripts into canonical touch streams"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+regex.workspace = true

@@ -1,0 +1,35 @@
+[package]
+name = "borg"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Collective mind for coding-agent drones: CLI and harness hooks"
+
+[[bin]]
+name = "borg"
+path = "src/main.rs"
+
+[dependencies]
+borg-trace = { path = "../borg-trace" }
+serde.workspace = true
+# preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
+serde_json = { workspace = true, features = ["preserve_order"] }
+regex.workspace = true
+# the expert drone: its own process group, killed with borg (expert_route.rs)
+libc = "0.2"
+# Vector recall at the Stop step (vectors.rs, reports/vectors.md): embedded SeekStorm, and a Model2Vec
+# embedder that maps the model file instead of reading it.
+seekstorm = { version = "=3.3.13", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+safetensors = { version = "0.5", optional = true }
+memmap2 = { version = "0.9", optional = true }
+half = { version = "2", optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[features]
+# Vectors are on by default; `--no-default-features` builds a lean binary (BM25 only).
+default = ["vectors"]
+vectors = ["dep:seekstorm", "dep:tokio", "dep:tokenizers", "dep:safetensors", "dep:memmap2", "dep:half", "dep:sha2"]

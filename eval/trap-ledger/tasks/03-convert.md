@@ -1,0 +1,1 @@
+Add `convert(money, to_currency)` in `ledger.plugins` that converts a `Money` using the exchange rates in `RATES` and returns a new `Money` in the target currency, rounded to cents the same way the rest of the library rounds. Converting to the same currency returns the money unchanged; an unknown pair raises `KeyError`. Add tests and make sure the whole test suite passes.

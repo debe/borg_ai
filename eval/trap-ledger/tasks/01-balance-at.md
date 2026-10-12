@@ -1,0 +1,1 @@
+Add `Ledger.balance_at(day)` to the ledger library. It takes a `YYYY-MM-DD` string and returns the balance (a `Money`) of all transactions on or before that day. Add a unit test for it and make sure the whole test suite passes.

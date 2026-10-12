@@ -1,0 +1,1 @@
+Add `Money.split(n)` returning a list of `n` `Money` values (same currency) that add up exactly to the original amount. Leftover cents go to the first parts, one cent each (e.g. 10.00 split 3 → 3.34, 3.33, 3.33). Reject `n < 1` with `ValueError`. Add tests and make sure the whole test suite passes.

@@ -1,0 +1,1681 @@
+{
+  "_doc": "Engineering concept taxonomy (concepts.rs): parent -> leaf -> {words, code}. 'words' match case-insensitively at a word start as a prefix ('retr' would match 'retry'), or as the whole word with a trailing '='; English and German. Text is also matched with camelCase and snake_case identifiers split into words, so 'RetryPolicy.java' says 'retry policy'. 'code' are API identifiers and must match case-sensitively at a word start (Java, Rust, TS/JS, Python, SQL, HTTP, Petri nets).",
+  "concurrency": {
+    "lock": {
+      "words": [
+        "lock=",
+        "locks=",
+        "locked=",
+        "locking=",
+        "mutex",
+        "mutual exclusion",
+        "critical section",
+        "semaphore",
+        "monitor lock",
+        "sperre",
+        "gesperrt",
+        "kritischer abschnitt",
+        "unlock="
+      ],
+      "code": [
+        "synchronized",
+        "ReentrantLock",
+        "ReadWriteLock",
+        "ReentrantReadWriteLock",
+        "StampedLock",
+        "Semaphore",
+        "Mutex",
+        "RwLock",
+        "MutexGuard",
+        "parking_lot",
+        "threading.Lock",
+        "threading.RLock",
+        "asyncio.Lock",
+        "Lock()",
+        "lock()",
+        "tryLock",
+        "flock",
+        "fcntl",
+        "LOCK_EX"
+      ]
+    },
+    "atomics": {
+      "words": [
+        "atomic",
+        "compare-and-set",
+        "compare and set",
+        "compare-and-swap",
+        "cas=",
+        "lock-free",
+        "lock free",
+        "atomar"
+      ],
+      "code": [
+        "AtomicBoolean",
+        "AtomicInteger",
+        "AtomicLong",
+        "AtomicReference",
+        "LongAdder",
+        "compareAndSet",
+        "getAndSet",
+        "AtomicUsize",
+        "AtomicBool",
+        "AtomicU64",
+        "AtomicI64",
+        "Ordering::SeqCst",
+        "Ordering::Acquire",
+        "Ordering::Relaxed",
+        "fetch_add",
+        "compare_exchange"
+      ]
+    },
+    "race": {
+      "words": [
+        "race",
+        "races=",
+        "racy",
+        "check-then-act",
+        "check then act",
+        "toctou",
+        "data race",
+        "interleav",
+        "concurrent modification",
+        "wettlauf",
+        "race condition",
+        "lost update",
+        "double submit",
+        "zwei threads",
+        "two threads"
+      ],
+      "code": [
+        "ConcurrentModificationException"
+      ]
+    },
+    "deadlock": {
+      "words": [
+        "deadlock",
+        "livelock",
+        "starvation",
+        "lock order",
+        "verklemm",
+        "hangs forever",
+        "hängt",
+        "blocks forever",
+        "never returns"
+      ],
+      "code": []
+    },
+    "threads": {
+      "words": [
+        "thread",
+        "threads=",
+        "thread pool",
+        "threadpool",
+        "executor",
+        "worker pool",
+        "virtual thread",
+        "nebenläufig",
+        "parallel",
+        "concurren",
+        "multithread",
+        "spawn"
+      ],
+      "code": [
+        "ExecutorService",
+        "Executors",
+        "ForkJoinPool",
+        "Thread.ofVirtual",
+        "newVirtualThreadPerTaskExecutor",
+        "Runnable",
+        "std::thread",
+        "thread::spawn",
+        "rayon",
+        "ThreadPoolExecutor",
+        "threading.Thread",
+        "Worker("
+      ]
+    },
+    "visibility": {
+      "words": [
+        "volatile",
+        "memory visibility",
+        "happens-before",
+        "happens before",
+        "memory barrier",
+        "memory ordering",
+        "shared mutable",
+        "shared state",
+        "thread-safe",
+        "thread safe",
+        "threadsafe",
+        "thread-local",
+        "geteilter zustand"
+      ],
+      "code": [
+        "volatile",
+        "ThreadLocal",
+        "Arc<",
+        "Rc<",
+        "RefCell",
+        "Cell<",
+        "ConcurrentHashMap",
+        "CopyOnWriteArrayList",
+        "Collections.synchronized"
+      ]
+    },
+    "future": {
+      "words": [
+        "future",
+        "promise",
+        "completable",
+        "async=",
+        "await",
+        "asynchron",
+        "non-blocking",
+        "nicht blockierend",
+        "reactive",
+        "callback"
+      ],
+      "code": [
+        "CompletableFuture",
+        "CompletionStage",
+        "thenApply",
+        "thenCompose",
+        "Future<",
+        "Promise",
+        "Promise.all",
+        "async fn",
+        ".await",
+        "async ",
+        "await ",
+        "asyncio",
+        "Mono",
+        "Flux",
+        "Uni<",
+        "Multi<",
+        "tokio",
+        "futures::",
+        "join!",
+        "select!"
+      ]
+    },
+    "task-spawn": {
+      "words": [
+        "background task",
+        "fire-and-forget",
+        "fire and forget",
+        "detached",
+        "spawned",
+        "hintergrund",
+        "event loop",
+        "eventloop"
+      ],
+      "code": [
+        "tokio::spawn",
+        "spawn_blocking",
+        "JoinHandle",
+        "asyncio.create_task",
+        "create_task",
+        "setImmediate",
+        "queueMicrotask",
+        "process.nextTick",
+        "runAsync",
+        "supplyAsync",
+        "submit("
+      ]
+    },
+    "cancellation": {
+      "words": [
+        "cancel",
+        "abort",
+        "interrupt",
+        "shutdown",
+        "graceful",
+        "abbrech",
+        "abbruch"
+      ],
+      "code": [
+        "AbortController",
+        "AbortSignal",
+        "CancellationToken",
+        "cancel(",
+        "interrupt()",
+        "shutdownNow",
+        "abort()",
+        "isCancelled",
+        "CancelledError"
+      ]
+    }
+  },
+  "messaging": {
+    "channel-queue": {
+      "words": [
+        "channel",
+        "queue",
+        "message queue",
+        "producer",
+        "consumer",
+        "backpressure",
+        "buffer",
+        "warteschlange",
+        "nachrichten",
+        "inbox",
+        "mailbox",
+        "drain"
+      ],
+      "code": [
+        "mpsc",
+        "crossbeam",
+        "BlockingQueue",
+        "LinkedBlockingQueue",
+        "ArrayBlockingQueue",
+        "SynchronousQueue",
+        "Channel<",
+        "broadcast::",
+        "oneshot",
+        "watch::",
+        "asyncio.Queue",
+        "queue.Queue",
+        "Kafka",
+        "SQS",
+        "PubSub",
+        "RabbitMQ"
+      ]
+    },
+    "events": {
+      "words": [
+        "event",
+        "listener",
+        "subscriber",
+        "subscribe",
+        "publish",
+        "pub/sub",
+        "pubsub",
+        "observer",
+        "emit",
+        "webhook",
+        "ereignis"
+      ],
+      "code": [
+        "EventEmitter",
+        "addEventListener",
+        "onMessage",
+        "Listener",
+        "Observer",
+        "EventBus",
+        "@Observes"
+      ]
+    },
+    "streaming": {
+      "words": [
+        "stream",
+        "websocket",
+        "server-sent",
+        "sse=",
+        "chunk",
+        "realtime",
+        "real-time",
+        "echtzeit",
+        "partial result"
+      ],
+      "code": [
+        "WebSocket",
+        "ReadableStream",
+        "EventSource",
+        "Stream<",
+        "StreamExt",
+        "AsyncIterator",
+        "sendText",
+        "onText",
+        "Flow.Publisher",
+        "SseEmitter"
+      ]
+    },
+    "http": {
+      "words": [
+        "http",
+        "endpoint",
+        "status code",
+        "header",
+        "api call",
+        "redirect",
+        "cors",
+        "anfrage",
+        "schnittstelle",
+        "rest api",
+        "rest=",
+        "http client",
+        "http request",
+        "http response",
+        "api endpoint"
+      ],
+      "code": [
+        "HttpClient",
+        "HttpRequest",
+        "HttpResponse",
+        "fetch(",
+        "axios",
+        "reqwest",
+        "requests.",
+        "@GET",
+        "@POST",
+        "@Path",
+        "RestClient",
+        "@RegisterRestClient",
+        "Content-Type",
+        "curl"
+      ]
+    }
+  },
+  "data-structure": {
+    "map": {
+      "words": [
+        "map=",
+        "maps=",
+        "hashmap",
+        "hash map",
+        "dictionary",
+        "dict=",
+        "lookup table",
+        "key-value",
+        "key/value",
+        "zuordnung"
+      ],
+      "code": [
+        "HashMap",
+        "BTreeMap",
+        "TreeMap",
+        "LinkedHashMap",
+        "ConcurrentHashMap",
+        "Map<",
+        "Map.of",
+        "new Map(",
+        "dict(",
+        "defaultdict",
+        "Record<",
+        "EnumMap"
+      ]
+    },
+    "set": {
+      "words": [
+        "hashset",
+        "dedup",
+        "deduplicat",
+        "duplicate",
+        "unique",
+        "distinct",
+        "duplikat",
+        "eindeutig"
+      ],
+      "code": [
+        "HashSet",
+        "BTreeSet",
+        "TreeSet",
+        "Set<",
+        "new Set(",
+        "frozenset",
+        "set(",
+        "EnumSet",
+        "DISTINCT"
+      ]
+    },
+    "queue-deque": {
+      "words": [
+        "deque",
+        "fifo",
+        "lifo",
+        "stack=",
+        "priority queue",
+        "heap="
+      ],
+      "code": [
+        "ArrayDeque",
+        "VecDeque",
+        "PriorityQueue",
+        "BinaryHeap",
+        "heapq",
+        "Deque<",
+        "collections.deque"
+      ]
+    },
+    "ring-buffer": {
+      "words": [
+        "ring buffer",
+        "ringbuffer",
+        "circular buffer",
+        "bounded buffer",
+        "capped",
+        "sliding window",
+        "ringpuffer",
+        "evict",
+        "overflow",
+        "cap of",
+        "capacity"
+      ],
+      "code": [
+        "RingBuffer",
+        "CircularBuffer",
+        "EvictingQueue",
+        "maxlen",
+        "with_capacity"
+      ]
+    },
+    "tree-graph": {
+      "words": [
+        "tree",
+        "graph",
+        "dag=",
+        "trie",
+        "topolog",
+        "hierarch",
+        "baum",
+        "knoten",
+        "parent-child"
+      ],
+      "code": [
+        "TreeNode",
+        "petgraph",
+        "Graph<",
+        "DiGraph",
+        "networkx"
+      ]
+    },
+    "index": {
+      "words": [
+        "index",
+        "inverted index",
+        "lookup",
+        "secondary index",
+        "posting",
+        "indizes",
+        "indexier"
+      ],
+      "code": [
+        "CREATE INDEX",
+        "IndexMap",
+        "tantivy",
+        "seekstorm",
+        "Lucene",
+        "Elasticsearch",
+        "OpenSearch",
+        "Vespa",
+        "FAISS"
+      ]
+    }
+  },
+  "algorithm": {
+    "search-ranking": {
+      "words": [
+        "ranking",
+        "rank=",
+        "ranked",
+        "rerank",
+        "relevance",
+        "bm25",
+        "tf-idf",
+        "tfidf",
+        "recall",
+        "precision",
+        "retrieval",
+        "suche",
+        "embedding",
+        "vector search",
+        "similarity",
+        "top-k",
+        "top k",
+        "nearest neighbo",
+        "ndcg",
+        "mrr=",
+        "search engine",
+        "search quality",
+        "search result",
+        "search index",
+        "suchergebnis"
+      ],
+      "code": [
+        "bm25",
+        "cosine",
+        "rerank",
+        "topK",
+        "top_k",
+        "kNN",
+        "ANN"
+      ]
+    },
+    "sorting": {
+      "words": [
+        "sort",
+        "order by",
+        "ordering",
+        "stable order",
+        "tie-break",
+        "tiebreak",
+        "sortier",
+        "reihenfolge"
+      ],
+      "code": [
+        "sort_by",
+        "sort_unstable",
+        "Collections.sort",
+        "Comparator",
+        "compareTo",
+        "sorted(",
+        ".sort(",
+        "ORDER BY",
+        "Ord for",
+        "PartialOrd"
+      ]
+    },
+    "hashing": {
+      "words": [
+        "hash",
+        "checksum",
+        "digest",
+        "fingerprint",
+        "content address",
+        "prüfsumme"
+      ],
+      "code": [
+        "sha256",
+        "SHA-256",
+        "Sha256",
+        "MessageDigest",
+        "hashCode",
+        "Hasher",
+        "md5",
+        "xxhash",
+        "fnv",
+        "blake3",
+        "hashlib"
+      ]
+    },
+    "retry-backoff": {
+      "words": [
+        "retry",
+        "retries",
+        "retried",
+        "backoff",
+        "back-off",
+        "exponential",
+        "jitter",
+        "re-ask",
+        "retry",
+        "wiederhol",
+        "erneut versuch",
+        "circuit breaker",
+        "transient"
+      ],
+      "code": [
+        "@Retry",
+        "RetryPolicy",
+        "Retry",
+        "backoff",
+        "tenacity",
+        "CircuitBreaker",
+        "@Fallback",
+        "RETRY"
+      ]
+    },
+    "rate-limit": {
+      "words": [
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "throttl",
+        "quota",
+        "429",
+        "token bucket",
+        "drossel",
+        "kontingent",
+        "limit per"
+      ],
+      "code": [
+        "RateLimiter",
+        "Bulkhead",
+        "TooManyRequests",
+        "429",
+        "Semaphore"
+      ]
+    },
+    "caching": {
+      "words": [
+        "cache",
+        "cached",
+        "caching",
+        "memoiz",
+        "stale",
+        "invalidat",
+        "ttl=",
+        "zwischenspeicher",
+        "warm-up",
+        "prompt cache"
+      ],
+      "code": [
+        "Cache<",
+        "Caffeine",
+        "LoadingCache",
+        "lru_cache",
+        "functools.cache",
+        "OnceLock",
+        "OnceCell",
+        "lazy_static",
+        "Lazy<",
+        "@Cacheable",
+        "LruCache",
+        "Redis",
+        "memcached"
+      ]
+    },
+    "scheduling": {
+      "words": [
+        "schedul",
+        "cron",
+        "periodic",
+        "interval",
+        "delay",
+        "debounce",
+        "timer",
+        "every n",
+        "zeitplan",
+        "takt",
+        "polling",
+        "poll="
+      ],
+      "code": [
+        "ScheduledExecutorService",
+        "scheduleAtFixedRate",
+        "setInterval",
+        "setTimeout",
+        "@Scheduled",
+        "tokio::time",
+        "sleep(",
+        "Thread.sleep",
+        "Timer",
+        "cron"
+      ]
+    }
+  },
+  "state": {
+    "state-machine": {
+      "words": [
+        "state machine",
+        "state-machine",
+        "fsm=",
+        "state transition",
+        "lifecycle",
+        "phase",
+        "status transition",
+        "zustandsautomat",
+        "zustandsmaschine",
+        "zustandsübergang",
+        "workflow state",
+        "terminal state",
+        "terminal event"
+      ],
+      "code": [
+        "enum State",
+        "StateMachine",
+        "State::",
+        "Status::",
+        "transitionTo",
+        "onEnter"
+      ]
+    },
+    "immutability": {
+      "words": [
+        "immutable",
+        "immutability",
+        "read-only",
+        "readonly",
+        "frozen",
+        "unveränderlich",
+        "copy-on-write",
+        "defensive copy",
+        "mutate",
+        "mutation",
+        "mutable",
+        "append-only"
+      ],
+      "code": [
+        "final ",
+        "record ",
+        "Collections.unmodifiable",
+        "List.copyOf",
+        "Map.copyOf",
+        "Object.freeze",
+        "readonly",
+        "Readonly<",
+        "frozen=True",
+        "&mut",
+        "Cow<",
+        "ImmutableList"
+      ]
+    },
+    "idempotency": {
+      "words": [
+        "idempoten",
+        "exactly once",
+        "exactly-once",
+        "at-least-once",
+        "at least once",
+        "at-most-once",
+        "replay",
+        "re-run",
+        "rerun",
+        "deduplication key",
+        "twice",
+        "zweimal",
+        "doppelt"
+      ],
+      "code": [
+        "Idempotency-Key",
+        "idempotencyKey",
+        "ON CONFLICT",
+        "upsert",
+        "INSERT OR IGNORE",
+        "putIfAbsent",
+        "computeIfAbsent"
+      ]
+    },
+    "session-state": {
+      "words": [
+        "per-user",
+        "per user",
+        "per-turn",
+        "per turn",
+        "conversation state",
+        "context window",
+        "sitzung",
+        "turn=",
+        "session state",
+        "user session",
+        "per session",
+        "session-scoped",
+        "session scope"
+      ],
+      "code": [
+        "HttpSession",
+        "@SessionScoped",
+        "@RequestScoped",
+        "SessionId",
+        "sessionId",
+        "session_id"
+      ]
+    }
+  },
+  "petri-net": {
+    "place-token": {
+      "words": [
+        "place",
+        "places=",
+        "marking",
+        "markierung",
+        "stelle",
+        "marke",
+        "colour",
+        "colored token",
+        "coloured",
+        "budget place"
+      ],
+      "code": [
+        "Place<",
+        "Place.of",
+        "Token<",
+        "Marking",
+        "EnvironmentPlace",
+        "tokenOf",
+        "inputPlace",
+        "outputPlace"
+      ]
+    },
+    "transition-firing": {
+      "words": [
+        "transition",
+        "firing",
+        "fires=",
+        "enabled=",
+        "übergang",
+        "transition fires",
+        "schaltet",
+        "schalten",
+        "timed transition"
+      ],
+      "code": [
+        "Transition.builder",
+        "Transition<",
+        "TransitionAction",
+        "timing("
+      ]
+    },
+    "arc": {
+      "words": [
+        "reset arc",
+        "inhibitor",
+        "read arc",
+        "input arc",
+        "output arc",
+        "arc=",
+        "arcs=",
+        "kante",
+        "bogen",
+        "reset-arc"
+      ],
+      "code": [
+        "Arc.reset",
+        "Arc.inhibitor",
+        "Arc.read",
+        "In.one",
+        "Out.place",
+        "In.all",
+        "Out.and",
+        "Out.xor"
+      ]
+    },
+    "net-structure": {
+      "words": [
+        "petri",
+        "net=",
+        "nets=",
+        "subnet",
+        "fork/join",
+        "fork-join",
+        "join=",
+        "fork=",
+        "xor-split",
+        "and-join",
+        "composition",
+        "netz",
+        "teilnetz",
+        "workflow net"
+      ],
+      "code": [
+        "PetriNet",
+        "NetBuilder",
+        "Subnet",
+        "compose(",
+        "BitmapNetExecutor",
+        "NetExecutor",
+        "SplitInput"
+      ]
+    },
+    "verification": {
+      "words": [
+        "invariant",
+        "p-invariant",
+        "siphon",
+        "trap=",
+        "reachab",
+        "liveness",
+        "deadlock-free",
+        "boundedness",
+        "bounded=",
+        "state class",
+        "smt",
+        "z3=",
+        "model check",
+        "beweis",
+        "formal verification",
+        "formally verif",
+        "verifier"
+      ],
+      "code": [
+        "SmtVerifier",
+        "Z3",
+        "z3",
+        "PInvariant",
+        "StateClassGraph",
+        "verify("
+      ]
+    }
+  },
+  "reliability": {
+    "timeout": {
+      "words": [
+        "timeout",
+        "time out",
+        "timed out",
+        "deadline",
+        "time limit",
+        "zeitüberschreitung",
+        "zeitlimit",
+        "hängen",
+        "latency",
+        "latenz",
+        "hangs=",
+        "hung="
+      ],
+      "code": [
+        "Duration.of",
+        "Duration::from",
+        "orTimeout",
+        "completeOnTimeout",
+        "@Timeout",
+        "timeout(",
+        "connectTimeout",
+        "readTimeout",
+        "AbortSignal.timeout",
+        "asyncio.wait_for",
+        "SocketTimeoutException",
+        "TimeoutException"
+      ]
+    },
+    "transaction": {
+      "words": [
+        "transaction",
+        "rollback",
+        "atomically",
+        "all-or-nothing",
+        "two-phase",
+        "isolation level",
+        "transaktion",
+        "konsistent",
+        "partial write",
+        "half-written",
+        "torn write",
+        "atomic rename",
+        "fsync"
+      ],
+      "code": [
+        "@Transactional",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "TransactionTemplate",
+        "fsync",
+        "rename(",
+        "sync_all",
+        "tempfile"
+      ]
+    },
+    "error-handling": {
+      "words": [
+        "exception",
+        "error handling",
+        "swallow",
+        "fail open",
+        "fail-open",
+        "fail closed",
+        "fail-closed",
+        "fallback",
+        "fehlerbehandlung",
+        "silently",
+        "stillschweigend",
+        "graceful degradation",
+        "panic",
+        "crash",
+        "unwrap"
+      ],
+      "code": [
+        "catch (",
+        "catch(",
+        "try {",
+        "Result<",
+        "unwrap()",
+        "panic!",
+        "throw new",
+        "except ",
+        "raise ",
+        "Optional",
+        "orElse"
+      ]
+    },
+    "resource-cleanup": {
+      "words": [
+        "leak",
+        "cleanup",
+        "clean up",
+        "dispose",
+        "file handle",
+        "connection pool",
+        "ressource",
+        "aufräumen",
+        "orphan",
+        "zombie",
+        "dangling",
+        "leftover",
+        "not closed",
+        "unclosed",
+        "close it",
+        "closes the",
+        "is closed"
+      ],
+      "code": [
+        "try-with-resources",
+        "AutoCloseable",
+        "close()",
+        "Drop for",
+        "finally",
+        "defer",
+        "with open",
+        "__exit__",
+        "kill(",
+        "process group"
+      ]
+    },
+    "observability": {
+      "words": [
+        "logging",
+        "metric",
+        "tracing",
+        "monitoring",
+        "dashboard",
+        "alert",
+        "telemetry",
+        "observability",
+        "prometheus",
+        "grafana",
+        "protokoll",
+        "log=",
+        "logs=",
+        "logged=",
+        "log line",
+        "log level"
+      ],
+      "code": [
+        "Logger",
+        "log::",
+        "tracing::",
+        "println!",
+        "eprintln!",
+        "console.log",
+        "logging.",
+        "Micrometer",
+        "MeterRegistry",
+        "@Counted",
+        "@Timed",
+        "OpenTelemetry",
+        "Span"
+      ]
+    }
+  },
+  "data": {
+    "schema-migration": {
+      "words": [
+        "schema",
+        "migration",
+        "migrate",
+        "backward compat",
+        "backwards compat",
+        "forward compat",
+        "compatib",
+        "breaking change",
+        "column",
+        "rückwärtskompatib",
+        "migrieren",
+        "field rename",
+        "old stores",
+        "older stores",
+        "versioned format"
+      ],
+      "code": [
+        "ALTER TABLE",
+        "CREATE TABLE",
+        "flyway",
+        "Flyway",
+        "liquibase",
+        "Liquibase",
+        "#[serde(default",
+        "@JsonIgnoreProperties",
+        "skip_serializing_if",
+        "alembic"
+      ]
+    },
+    "serialization": {
+      "words": [
+        "serializ",
+        "deserializ",
+        "serialis",
+        "deserialis",
+        "json",
+        "jsonl",
+        "yaml",
+        "protobuf",
+        "encoding",
+        "decode",
+        "encode",
+        "parse",
+        "parsing",
+        "marshal",
+        "base64",
+        "utf-8",
+        "utf8",
+        "escape"
+      ],
+      "code": [
+        "serde",
+        "Serialize",
+        "Deserialize",
+        "serde_json",
+        "ObjectMapper",
+        "JsonNode",
+        "@JsonProperty",
+        "Jackson",
+        "JSON.parse",
+        "JSON.stringify",
+        "json.loads",
+        "json.dumps",
+        "pydantic",
+        "Base64",
+        "toJson",
+        "fromJson"
+      ]
+    },
+    "sql-query": {
+      "words": [
+        "sql",
+        "database",
+        "datenbank",
+        "join query",
+        "n+1",
+        "postgres",
+        "mysql",
+        "sqlite",
+        "bigquery"
+      ],
+      "code": [
+        "SELECT ",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE FROM",
+        "WHERE ",
+        "JOIN ",
+        "PreparedStatement",
+        "JdbcTemplate",
+        "sqlx",
+        "diesel",
+        "EntityManager",
+        "CqlSession",
+        "BigQuery"
+      ]
+    },
+    "config": {
+      "words": [
+        "config",
+        "configuration",
+        "property",
+        "properties",
+        "environment variable",
+        "env var",
+        "feature flag",
+        "default value",
+        "konfiguration",
+        "umgebungsvariable"
+      ],
+      "code": [
+        "microprofile-config",
+        "@ConfigProperty",
+        "application.properties",
+        "application.yaml",
+        "std::env::var",
+        "process.env",
+        "os.environ",
+        "getenv",
+        "System.getenv",
+        ".env"
+      ]
+    },
+    "file-io": {
+      "words": [
+        "directory",
+        "filesystem",
+        "file system",
+        "datei",
+        "verzeichnis",
+        "pfad",
+        "file path",
+        "temp file",
+        "read the file",
+        "write the file",
+        "file write",
+        "file read"
+      ],
+      "code": [
+        "std::fs",
+        "Files.",
+        "Path.of",
+        "fs.readFile",
+        "fs.writeFile",
+        "open(",
+        "OpenOptions",
+        "PathBuf",
+        "pathlib",
+        "read_to_string"
+      ]
+    }
+  },
+  "security": {
+    "secrets": {
+      "words": [
+        "secret",
+        "credential",
+        "api key",
+        "api-key",
+        "apikey",
+        "password",
+        "vault",
+        "keystore",
+        "private key",
+        "geheimnis",
+        "zugangsdaten",
+        "passwort",
+        "redact",
+        "leak a key",
+        "plaintext"
+      ],
+      "code": [
+        "Vault",
+        "SecretManager",
+        "secretmanager",
+        "KeyVault",
+        "API_KEY",
+        "_TOKEN",
+        "_SECRET",
+        "PASSWORD",
+        ".env",
+        "Secret<"
+      ]
+    },
+    "auth": {
+      "words": [
+        "authentication",
+        "authorization",
+        "authorisation",
+        "oauth",
+        "oidc",
+        "jwt",
+        "bearer",
+        "login",
+        "sign-in",
+        "permission",
+        "rbac",
+        "iam=",
+        "access control",
+        "berechtigung",
+        "anmeldung",
+        "service account",
+        "workload identity",
+        "auth=",
+        "authn",
+        "authz",
+        "auth token",
+        "auth flow"
+      ],
+      "code": [
+        "@RolesAllowed",
+        "Authorization",
+        "Bearer",
+        "JWT",
+        "OIDC",
+        "OAuth",
+        "SecurityContext",
+        "IAM",
+        "ServiceAccount",
+        "gcloud auth"
+      ]
+    },
+    "injection": {
+      "words": [
+        "injection",
+        "sanitiz",
+        "escap",
+        "untrusted",
+        "user input",
+        "xss",
+        "csrf",
+        "prompt injection",
+        "validate input",
+        "eingabevalid"
+      ],
+      "code": [
+        "PreparedStatement",
+        "innerHTML",
+        "dangerouslySetInnerHTML",
+        "eval(",
+        "shell=True",
+        "sh -c"
+      ]
+    }
+  },
+  "llm": {
+    "structured-output": {
+      "words": [
+        "structured output",
+        "json schema",
+        "tool call",
+        "function call",
+        "tool use",
+        "response format",
+        "output schema",
+        "strukturierte ausgabe",
+        "parse the model",
+        "model output",
+        "response_format"
+      ],
+      "code": [
+        "response_format",
+        "json_schema",
+        "tool_choice",
+        "tools=",
+        "--json-schema",
+        "output_schema",
+        "outputSchema",
+        "StructuredOutput",
+        "ResponseFormat"
+      ]
+    },
+    "prompt": {
+      "words": [
+        "prompt",
+        "system prompt",
+        "instruction",
+        "few-shot",
+        "few shot",
+        "template",
+        "persona",
+        "wording",
+        "anweisung",
+        "systemprompt",
+        "skill text"
+      ],
+      "code": [
+        "PromptTemplate",
+        "SYSTEM_PROMPT",
+        "systemPrompt",
+        "system_prompt",
+        "prompt.md",
+        ".prompt"
+      ]
+    },
+    "eval-judge": {
+      "words": [
+        "eval",
+        "evaluation",
+        "judge",
+        "llm-as-judge",
+        "benchmark",
+        "baseline",
+        "control arm",
+        "a/b",
+        "ablation",
+        "labelled set",
+        "labeled set",
+        "ground truth",
+        "qrels",
+        "golden set",
+        "regression set",
+        "bewertung",
+        "auswertung",
+        "arm="
+      ],
+      "code": [
+        "judge",
+        "eval",
+        "qrels",
+        "rubric"
+      ]
+    },
+    "model-choice": {
+      "words": [
+        "llm",
+        "gpt",
+        "gemini",
+        "claude",
+        "sonnet",
+        "opus",
+        "haiku",
+        "temperature",
+        "reasoning effort",
+        "model call",
+        "model id",
+        "model choice",
+        "which model",
+        "language model",
+        "sprachmodell"
+      ],
+      "code": [
+        "gpt-4",
+        "gpt-5",
+        "gemini-",
+        "claude-",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort"
+      ]
+    },
+    "token-budget": {
+      "words": [
+        "token cost",
+        "token budget",
+        "tokens per",
+        "context window",
+        "context length",
+        "truncat",
+        "cost",
+        "kosten",
+        "abschneid",
+        "prompt size"
+      ],
+      "code": [
+        "max_tokens",
+        "maxTokens",
+        "input_tokens",
+        "output_tokens",
+        "usage",
+        "cache_control"
+      ]
+    }
+  },
+  "testing": {
+    "flaky-test": {
+      "words": [
+        "flaky",
+        "flake",
+        "intermittent",
+        "nondeterministic",
+        "non-deterministic",
+        "sometimes fails",
+        "random failure",
+        "seed",
+        "order-dependent",
+        "wackelig",
+        "sporadisch",
+        "timing-dependent"
+      ],
+      "code": [
+        "@RepeatedTest",
+        "@Flaky",
+        "Thread.sleep",
+        "Awaitility",
+        "await()",
+        "tokio::time::pause",
+        "--test-threads",
+        "random.seed",
+        "StdRng"
+      ]
+    },
+    "test-design": {
+      "words": [
+        "unit test",
+        "integration test",
+        "end-to-end",
+        "e2e",
+        "test case",
+        "regression test",
+        "assert",
+        "fixture",
+        "mock",
+        "stub",
+        "fake",
+        "test double",
+        "coverage",
+        "acceptance test",
+        "testfall",
+        "testabdeckung",
+        "red test",
+        "tdd"
+      ],
+      "code": [
+        "@Test",
+        "#[test]",
+        "assert_eq!",
+        "assertThat",
+        "assertEquals",
+        "Mockito",
+        "mock(",
+        "pytest",
+        "expect(",
+        "jest",
+        "vitest",
+        "WireMock",
+        "Testcontainers"
+      ]
+    },
+    "test-isolation": {
+      "words": [
+        "test isolation",
+        "temp dir",
+        "tempdir",
+        "temporary directory",
+        "sandbox",
+        "hermetic",
+        "real config",
+        "production data",
+        "shared state between tests",
+        "isolier",
+        "pin the env",
+        "env var in test"
+      ],
+      "code": [
+        "tempfile",
+        "TempDir",
+        "@TempDir",
+        "env_clear",
+        "BORG_CONFIG",
+        "tmp_path",
+        "monkeypatch"
+      ]
+    }
+  },
+  "build": {
+    "version-pinning": {
+      "words": [
+        "version pin",
+        "pinned version",
+        "pin the version",
+        "pin=",
+        "pinned=",
+        "lockfile",
+        "lock file",
+        "semver",
+        "upgrade",
+        "downgrade",
+        "bump",
+        "exact version",
+        "version range",
+        "versionier",
+        "major version"
+      ],
+      "code": [
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock",
+        "gradle.lockfile",
+        "requirements.txt",
+        "poetry.lock",
+        "uv.lock",
+        "=1.",
+        "^1.",
+        "~1.",
+        "SNAPSHOT"
+      ]
+    },
+    "dependency": {
+      "words": [
+        "dependency",
+        "dependencies",
+        "library",
+        "transitive",
+        "classpath",
+        "artifact",
+        "abhängigkeit",
+        "bibliothek",
+        "third-party",
+        "vendored",
+        "bom="
+      ],
+      "code": [
+        "build.gradle",
+        "pom.xml",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "implementation(",
+        "<dependency>",
+        "[dependencies]",
+        "npm install",
+        "cargo add",
+        "pip install"
+      ]
+    },
+    "ci-deploy": {
+      "words": [
+        "ci=",
+        "pipeline",
+        "deploy",
+        "deployment",
+        "release pipeline",
+        "github actions",
+        "workflow file",
+        "container",
+        "docker",
+        "kubernetes",
+        "helm",
+        "terraform",
+        "cloud run",
+        "staging",
+        "rollout",
+        "bereitstell"
+      ],
+      "code": [
+        "Dockerfile",
+        ".github/workflows",
+        "kubectl",
+        "helm",
+        "terraform",
+        "gcloud run",
+        "docker build",
+        "docker-compose",
+        "k8s"
+      ]
+    },
+    "git-workflow": {
+      "words": [
+        "git",
+        "commit",
+        "branch",
+        "merge",
+        "rebase",
+        "push",
+        "pull request",
+        "worktree",
+        "cherry-pick",
+        "stash",
+        "squash",
+        "force push",
+        "history rewrite"
+      ],
+      "code": [
+        "git commit",
+        "git push",
+        "git merge",
+        "git rebase",
+        "git stash",
+        "git worktree",
+        "gh pr",
+        "--force",
+        "Co-Authored-By"
+      ]
+    }
+  }
+}

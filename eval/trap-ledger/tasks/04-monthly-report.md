@@ -1,0 +1,1 @@
+Add `Ledger.monthly_report(year, month)` returning a dict mapping each category to the total `Money` of that month's transactions in it, plus a `"total"` key for the whole month. Months without transactions return `{"total": Money(0, currency)}`. Add tests and make sure the whole test suite passes.

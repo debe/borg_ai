@@ -1,0 +1,50 @@
+[package]
+name = "borg-search"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Eval only: lesson retrieval arms (borg BM25 vs embedded SeekStorm lexical/vector/hybrid), reports/hybrid-search.md"
+publish = false
+
+[features]
+# Off by default: the default workspace build does not compile SeekStorm, tokio or Model2Vec.
+seekstorm = ["dep:seekstorm", "dep:tokio", "dep:model2vec-rs"]
+# The product's Stop-step vectors (reports/vectors.md).
+vectors = ["borg/vectors"]
+
+[dependencies]
+borg = { path = "../borg" }
+serde.workspace = true
+serde_json.workspace = true
+seekstorm = { version = "=3.3.13", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+# the version SeekStorm links, for the full-length query embedding variant (descriptive arms)
+model2vec-rs = { version = "0.2.1", optional = true }
+
+[[bin]]
+name = "hs-bm25"
+path = "src/bin/hs-bm25.rs"
+
+[[bin]]
+name = "hs"
+path = "src/bin/hs.rs"
+required-features = ["seekstorm"]
+
+[[bin]]
+name = "hs-facets"
+path = "src/bin/hs-facets.rs"
+
+[[bin]]
+name = "hs-vectors"
+path = "src/bin/hs-vectors.rs"
+required-features = ["vectors"]
+
+[[bin]]
+name = "hs-concepts"
+path = "src/bin/hs-concepts.rs"
+
+[[bin]]
+name = "hs-whole"
+path = "src/bin/hs-whole.rs"

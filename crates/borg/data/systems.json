@@ -1,0 +1,15 @@
+{
+  "_doc": "System gate (systems.rs). This shipped map is an example; put your own in $BORG_SYSTEMS (default: systems.json next to the collectives config, ~/.config/borg/systems.json), which replaces it. 'systems': a system and the name parts that mean it, matched as contiguous name parts (Names): 'orion' matches harbor_orion, OrionConfig. 'repos': exact repo names whose systems are fixed here, overriding the name parts; an empty list means the repo spans systems (a team handbook), so its work has no known system. Scope names of the collective that a known repo name contains are systems too (derived, no entry needed).",
+  "systems": {
+    "orion": ["orion"],
+    "lumen": ["lumen"],
+    "beacon": ["beacon"],
+    "sr3": ["sr3"],
+    "borg": ["borg"]
+  },
+  "repos": {
+    "lumen_orion": ["orion"],
+    "lumen_handbook": [],
+    "borg-ai": ["borg"]
+  }
+}

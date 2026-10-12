@@ -1,0 +1,3 @@
+# Matches the existing wide style of the code base.
+max_width = 160
+use_small_heuristics = "Max"
