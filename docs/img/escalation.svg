@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" width="1000" height="300" role="img" aria-label="Escalation: memory, an expert repo, a live drone, the engineer; each step only when the one before cannot answer">
+<title>Escalation: memory, an expert repo, a live drone, the engineer; each step only when the one before cannot answer</title>
+<style>
+.bg{fill:#ffffff;stroke:#d5d9e0}
+text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#12161c}
+.d{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;font-weight:700}
+.m{fill:#5a6371}.a{fill:#1f49c7}.h{fill:#b8471f}
+.box{fill:#ffffff;stroke:#d5d9e0;stroke-width:1.2}
+.box-a{fill:#e2e8fa;stroke:#1f49c7;stroke-width:1.4}
+.box-h{fill:#f6e4dc;stroke:#b8471f;stroke-width:1.4}
+.ln{stroke:#5a6371;stroke-width:1.3;fill:none}
+.ln-a{stroke:#1f49c7;stroke-width:1.7;fill:none}
+.dash{stroke-dasharray:5 5}
+.grid{stroke:#d5d9e0;stroke-width:1}
+.f-a{fill:#1f49c7}.f-h{fill:#b8471f}.f-m{fill:#5a6371;opacity:.45}.f-g{fill:#1f7a4d}
+.cell{fill:#ffffff;stroke:#d5d9e0;stroke-width:.8}
+.lit{fill:#1f49c7;stroke:#d5d9e0;stroke-width:.8}
+.lit-h{fill:#b8471f;stroke:#d5d9e0;stroke-width:.8}
+@media (prefers-color-scheme:dark){
+.bg{fill:#141922;stroke:#272f3b}
+text{fill:#e3e7ee}
+.m{fill:#8d97a7}.a{fill:#8aa6ff}.h{fill:#f08a5d}
+.box{fill:#141922;stroke:#272f3b}
+.box-a{fill:#18213a;stroke:#8aa6ff}
+.box-h{fill:#2c1a12;stroke:#f08a5d}
+.ln{stroke:#8d97a7}.ln-a{stroke:#8aa6ff}.grid{stroke:#272f3b}
+.f-a{fill:#8aa6ff}.f-h{fill:#f08a5d}.f-m{fill:#8d97a7}.f-g{fill:#5fc994}
+.cell{fill:#141922;stroke:#272f3b}.lit{fill:#8aa6ff;stroke:#272f3b}.lit-h{fill:#f08a5d;stroke:#272f3b}
+}
+</style>
+<rect x="0.5" y="0.5" width="999" height="299" rx="6" class="bg"/>
+
+<rect x="20" y="40" width="220" height="200" rx="4" class="box-a"/><text x="34" y="66" class="d" font-size="14">1 · Memory</text>
+<text x="34" y="90" class="m" font-size="11">lessons of this collective,</text><text x="34" y="106" class="m" font-size="11">graded by the model at the</text><text x="34" y="122" class="m" font-size="11">turn end, free early delivery</text>
+<text x="34" y="156" class="a" font-size="11">live · measured</text>
+<rect x="260" y="40" width="220" height="200" rx="4" class="box"/><text x="274" y="66" class="d" font-size="14">2 · Expert repo</text>
+<text x="274" y="90" class="m" font-size="11">the work crosses into another</text><text x="274" y="106" class="m" font-size="11">repo's API: read its code at</text><text x="274" y="122" class="m" font-size="11">the pinned version</text>
+<text x="274" y="156" class="m" font-size="11">built · unproven</text>
+<rect x="500" y="40" width="220" height="200" rx="4" class="box"/><text x="514" y="66" class="d" font-size="14">3 · A live drone</text>
+<text x="514" y="90" class="m" font-size="11">someone's drone works in that</text><text x="514" y="106" class="m" font-size="11">repo right now (borg top):</text><text x="514" y="122" class="m" font-size="11">ask it over the mesh; it</text><text x="514" y="138" class="m" font-size="11">answers at its next hook</text>
+<text x="514" y="172" class="h" font-size="11">not built</text>
+<rect x="740" y="40" width="240" height="200" rx="4" class="box-h"/><text x="754" y="66" class="d" font-size="14">4 · An engineer (the queen)</text>
+<text x="754" y="90" class="m" font-size="11">an open decision no lesson</text><text x="754" y="106" class="m" font-size="11">answers waits in a queue; the</text><text x="754" y="122" class="m" font-size="11">drone asks it at the next</text><text x="754" y="138" class="m" font-size="11">session's first prompt</text>
+<text x="754" y="172" class="h" font-size="11">queue live · turn-end asking off</text>
+<line x1="240" y1="140" x2="260" y2="140" class="ln-a"/><line x1="480" y1="140" x2="500" y2="140" class="ln-a"/><line x1="720" y1="140" x2="740" y2="140" class="ln-a"/>
+<text x="500" y="276" text-anchor="middle" class="m" font-size="11">nothing waits: answers arrive as free context in a later turn, and every answer becomes a lesson</text>
+</svg>

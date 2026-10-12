@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 412" width="1000" height="412" role="img" aria-label="Machines linked peer to peer: a member's laptop, an offline member whose lessons keep working, a new member joining, an optional always-on peer">
+<title>Machines linked peer to peer: a member's laptop, an offline member whose lessons keep working, a new member joining, an optional always-on peer</title>
+<style>
+.bg{fill:#ffffff;stroke:#d5d9e0}
+text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#12161c}
+.d{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;font-weight:700}
+.m{fill:#5a6371}.a{fill:#1f49c7}.h{fill:#b8471f}
+.box{fill:#ffffff;stroke:#d5d9e0;stroke-width:1.2}
+.box-a{fill:#e2e8fa;stroke:#1f49c7;stroke-width:1.4}
+.box-h{fill:#f6e4dc;stroke:#b8471f;stroke-width:1.4}
+.ln{stroke:#5a6371;stroke-width:1.3;fill:none}
+.ln-a{stroke:#1f49c7;stroke-width:1.7;fill:none}
+.dash{stroke-dasharray:5 5}
+.grid{stroke:#d5d9e0;stroke-width:1}
+.f-a{fill:#1f49c7}.f-h{fill:#b8471f}.f-m{fill:#5a6371;opacity:.45}.f-g{fill:#1f7a4d}
+.cell{fill:#ffffff;stroke:#d5d9e0;stroke-width:.8}
+.lit{fill:#1f49c7;stroke:#d5d9e0;stroke-width:.8}
+.lit-h{fill:#b8471f;stroke:#d5d9e0;stroke-width:.8}
+@media (prefers-color-scheme:dark){
+.bg{fill:#141922;stroke:#272f3b}
+text{fill:#e3e7ee}
+.m{fill:#8d97a7}.a{fill:#8aa6ff}.h{fill:#f08a5d}
+.box{fill:#141922;stroke:#272f3b}
+.box-a{fill:#18213a;stroke:#8aa6ff}
+.box-h{fill:#2c1a12;stroke:#f08a5d}
+.ln{stroke:#8d97a7}.ln-a{stroke:#8aa6ff}.grid{stroke:#272f3b}
+.f-a{fill:#8aa6ff}.f-h{fill:#f08a5d}.f-m{fill:#8d97a7}.f-g{fill:#5fc994}
+.cell{fill:#141922;stroke:#272f3b}.lit{fill:#8aa6ff;stroke:#272f3b}.lit-h{fill:#f08a5d;stroke:#272f3b}
+}
+</style>
+<rect x="0.5" y="0.5" width="999" height="411" rx="6" class="bg"/>
+
+<defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" class="f-a"/></marker></defs>
+<circle cx="500" cy="190" r="70" class="box-a"/>
+<text x="500" y="186" text-anchor="middle" class="d" font-size="18">shared lessons</text>
+<text x="500" y="206" text-anchor="middle" class="m" font-size="11">on every machine</text>
+<rect x="40" y="60" width="230" height="120" rx="5" class="box"/>
+<text x="56" y="86" class="d" font-size="15">DevA · laptop</text>
+<text x="56" y="106" class="m" font-size="11">3 drones, 2 repos</text>
+<circle cx="74" cy="140" r="11" class="f-a"/><circle cx="110" cy="140" r="11" class="f-a"/><circle cx="146" cy="140" r="11" class="f-a"/>
+<rect x="730" y="60" width="230" height="120" rx="5" class="box"/>
+<text x="746" y="86" class="d" font-size="15">DevB · on vacation</text>
+<text x="746" y="106" class="m" font-size="11">offline; their lessons keep</text>
+<text x="746" y="122" class="m" font-size="11">steering everyone's drones</text>
+<circle cx="764" cy="152" r="11" class="f-m"/><circle cx="800" cy="152" r="11" class="f-m"/>
+<rect x="40" y="250" width="230" height="120" rx="5" class="box-h"/>
+<text x="56" y="276" class="d" font-size="15">DevC · joins today</text>
+<text x="56" y="296" class="m" font-size="11">joins with an invite ticket;</text>
+<text x="56" y="312" class="m" font-size="11">gets every lesson in seconds;</text>
+<text x="56" y="328" class="m" font-size="11">trust earned by outcomes</text>
+<circle cx="74" cy="352" r="9" class="f-h"/>
+<rect x="730" y="250" width="230" height="120" rx="5" class="box"/>
+<text x="746" y="276" class="d" font-size="15">CI box · optional</text>
+<text x="746" y="296" class="m" font-size="11">always-on peer for storage,</text>
+<text x="746" y="312" class="m" font-size="11">never a coordinator</text>
+<path class="ln-a dash" d="M270 120 L432 168"/>
+<path class="ln dash" d="M730 120 L568 168"/>
+<path class="ln-a" d="M270 310 L436 222" marker-end="url(#ar2)"/>
+<path class="ln-a dash" d="M730 310 L566 220"/>
+<text x="300" y="128" class="m" font-size="10">encrypted peer mesh</text>
+<text x="300" y="300" class="h" font-size="10.5">catch-up ∝ what changed</text>
+<text x="500" y="396" text-anchor="middle" class="m" font-size="11">Reasoning travels as git notes when work lands, plus copies on two peers. Code stays in git.</text>
+</svg>

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 430" width="1000" height="430" role="img" aria-label="One sync session between two peers in six steps: hello, membership, reconcile lessons, reasoning replicas, ask, live presence and steering">
+<title>One sync session between two peers in six steps: hello, membership, reconcile lessons, reasoning replicas, ask, live presence and steering</title>
+<style>
+.bg{fill:#ffffff;stroke:#d5d9e0}
+text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#12161c}
+.d{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;font-weight:700}
+.m{fill:#5a6371}.a{fill:#1f49c7}.h{fill:#b8471f}
+.box{fill:#ffffff;stroke:#d5d9e0;stroke-width:1.2}
+.box-a{fill:#e2e8fa;stroke:#1f49c7;stroke-width:1.4}
+.box-h{fill:#f6e4dc;stroke:#b8471f;stroke-width:1.4}
+.ln{stroke:#5a6371;stroke-width:1.3;fill:none}
+.ln-a{stroke:#1f49c7;stroke-width:1.7;fill:none}
+.dash{stroke-dasharray:5 5}
+.grid{stroke:#d5d9e0;stroke-width:1}
+.f-a{fill:#1f49c7}.f-h{fill:#b8471f}.f-m{fill:#5a6371;opacity:.45}.f-g{fill:#1f7a4d}
+.cell{fill:#ffffff;stroke:#d5d9e0;stroke-width:.8}
+.lit{fill:#1f49c7;stroke:#d5d9e0;stroke-width:.8}
+.lit-h{fill:#b8471f;stroke:#d5d9e0;stroke-width:.8}
+@media (prefers-color-scheme:dark){
+.bg{fill:#141922;stroke:#272f3b}
+text{fill:#e3e7ee}
+.m{fill:#8d97a7}.a{fill:#8aa6ff}.h{fill:#f08a5d}
+.box{fill:#141922;stroke:#272f3b}
+.box-a{fill:#18213a;stroke:#8aa6ff}
+.box-h{fill:#2c1a12;stroke:#f08a5d}
+.ln{stroke:#8d97a7}.ln-a{stroke:#8aa6ff}.grid{stroke:#272f3b}
+.f-a{fill:#8aa6ff}.f-h{fill:#f08a5d}.f-m{fill:#8d97a7}.f-g{fill:#5fc994}
+.cell{fill:#141922;stroke:#272f3b}.lit{fill:#8aa6ff;stroke:#272f3b}.lit-h{fill:#f08a5d;stroke:#272f3b}
+}
+</style>
+<rect x="0.5" y="0.5" width="999" height="429" rx="6" class="bg"/>
+
+<defs><marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" class="f-a"/></marker></defs>
+<rect x="16" y="16" width="200" height="398" rx="5" class="box"/>
+<text x="116" y="44" text-anchor="middle" class="d" font-size="16">Peer A</text>
+<text x="116" y="62" text-anchor="middle" class="m" font-size="10.5">ed25519 key = its address</text>
+<rect x="784" y="16" width="200" height="398" rx="5" class="box"/>
+<text x="884" y="44" text-anchor="middle" class="d" font-size="16">Peer B</text>
+<text x="884" y="62" text-anchor="middle" class="m" font-size="10.5">same loop, no leader</text>
+<text x="500" y="44" text-anchor="middle" class="m" font-size="11">one encrypted QUIC connection (iroh), keys checked in the handshake</text>
+<g font-size="11.5">
+<path class="ln-a" d="M220 92 L780 92" marker-end="url(#ar4)"/><text x="236" y="84" class="d" font-size="13">1 · Hello</text><text x="380" y="84" class="m">which collective; a different name is refused</text>
+<path class="ln-a" d="M220 148 L780 148" marker-end="url(#ar4)"/><text x="236" y="140" class="d" font-size="13">2 · Membership first</text><text x="420" y="140" class="m">signed member list; revocations before data</text>
+<path class="ln-a" d="M220 204 L780 204" marker-end="url(#ar4)"/><text x="236" y="196" class="d" font-size="13">3 · Reconcile lessons</text><text x="430" y="196" class="m">compare fingerprints, send only missing lines</text>
+<path class="ln-a dash" d="M220 260 L780 260" marker-end="url(#ar4)"/><text x="236" y="252" class="d" font-size="13">4 · Reasoning replicas</text><text x="440" y="252" class="m">git-note excerpts to 2 chosen peers, not all</text>
+<path class="ln-a dash" d="M780 316 L220 316" marker-end="url(#ar4)"/><text x="236" y="308" class="d" font-size="13">5 · Ask</text><text x="330" y="308" class="m">"why was commit 3f2a made?" any holder answers</text>
+<path class="ln-a dash" d="M220 372 L780 372" marker-end="url(#ar4)"/><text x="236" y="364" class="d" font-size="13">6 · Live</text><text x="330" y="364" class="m">who runs which drone; signed steering; kept a day at most</text>
+</g>
+<text x="116" y="100" text-anchor="middle" class="m" font-size="10.5">lessons.jsonl</text>
+<text x="116" y="116" text-anchor="middle" class="m" font-size="10.5">membership</text>
+<text x="116" y="132" text-anchor="middle" class="m" font-size="10.5">reasoning excerpts</text>
+<text x="116" y="148" text-anchor="middle" class="m" font-size="10.5">presence, directives</text>
+<text x="116" y="380" text-anchor="middle" class="a" font-size="10.5">episodes stay here</text>
+<text x="116" y="396" text-anchor="middle" class="a" font-size="10.5">private stays here</text>
+</svg>

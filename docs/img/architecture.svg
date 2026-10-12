@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 260" width="1000" height="260" role="img" aria-label="Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust">
+<title>Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust</title>
+<style>
+.bg{fill:#ffffff;stroke:#d5d9e0}
+text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#12161c}
+.d{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;font-weight:700}
+.m{fill:#5a6371}.a{fill:#1f49c7}.h{fill:#b8471f}
+.box{fill:#ffffff;stroke:#d5d9e0;stroke-width:1.2}
+.box-a{fill:#e2e8fa;stroke:#1f49c7;stroke-width:1.4}
+.box-h{fill:#f6e4dc;stroke:#b8471f;stroke-width:1.4}
+.ln{stroke:#5a6371;stroke-width:1.3;fill:none}
+.ln-a{stroke:#1f49c7;stroke-width:1.7;fill:none}
+.dash{stroke-dasharray:5 5}
+.grid{stroke:#d5d9e0;stroke-width:1}
+.f-a{fill:#1f49c7}.f-h{fill:#b8471f}.f-m{fill:#5a6371;opacity:.45}.f-g{fill:#1f7a4d}
+.cell{fill:#ffffff;stroke:#d5d9e0;stroke-width:.8}
+.lit{fill:#1f49c7;stroke:#d5d9e0;stroke-width:.8}
+.lit-h{fill:#b8471f;stroke:#d5d9e0;stroke-width:.8}
+@media (prefers-color-scheme:dark){
+.bg{fill:#141922;stroke:#272f3b}
+text{fill:#e3e7ee}
+.m{fill:#8d97a7}.a{fill:#8aa6ff}.h{fill:#f08a5d}
+.box{fill:#141922;stroke:#272f3b}
+.box-a{fill:#18213a;stroke:#8aa6ff}
+.box-h{fill:#2c1a12;stroke:#f08a5d}
+.ln{stroke:#8d97a7}.ln-a{stroke:#8aa6ff}.grid{stroke:#272f3b}
+.f-a{fill:#8aa6ff}.f-h{fill:#f08a5d}.f-m{fill:#8d97a7}.f-g{fill:#5fc994}
+.cell{fill:#141922;stroke:#272f3b}.lit{fill:#8aa6ff;stroke:#272f3b}.lit-h{fill:#f08a5d;stroke:#272f3b}
+}
+</style>
+<rect x="0.5" y="0.5" width="999" height="259" rx="6" class="bg"/>
+
+<rect x="16" y="14" width="968" height="40" rx="3" class="box"/><text x="32" y="39" class="d" font-size="14">Harness hooks</text><text x="330" y="39" class="m" font-size="11.5">Claude Code · omp · opencode → one event set (prompt, tool, failure, stop, end)</text>
+<rect x="16" y="62" width="968" height="40" rx="3" class="box-a"/><text x="32" y="87" class="d" font-size="14">borg CLI</text><text x="330" y="87" class="m" font-size="11.5">one process per hook, a few ms, fails open; capture costs no tokens</text>
+<rect x="16" y="110" width="478" height="40" rx="3" class="box"/><text x="32" y="135" class="d" font-size="14">Local store</text><text x="160" y="135" class="m" font-size="11">append-only JSONL per collective</text>
+<rect x="506" y="110" width="478" height="40" rx="3" class="box"/><text x="522" y="135" class="d" font-size="14">Turn-end check</text><text x="680" y="135" class="m" font-size="11">free gate → one graded model call</text>
+<rect x="16" y="158" width="968" height="40" rx="3" class="box"/><text x="32" y="183" class="d" font-size="14">Peer mesh</text><text x="330" y="183" class="m" font-size="11.5">iroh QUIC, signed membership, set reconciliation, no leader, no model calls</text>
+<rect x="16" y="206" width="968" height="40" rx="3" class="box-h"/><text x="32" y="231" class="d" font-size="14">Team trust</text><text x="330" y="231" class="m" font-size="11.5">identity keys, signed steering, trust per engineer × area, redaction at origin</text>
+</svg>
