@@ -125,13 +125,18 @@ They see no lesson, member list, repo name or email. To keep the metadata in-hou
 or use `"disabled"` on a LAN or VPN. The default and self-hosted settings ask your router to open a port
 (UPnP, NAT-PMP, PCP); `"disabled"` does not.
 
+The relay's and the address lookup's TLS certificates are checked against the system trust store
+(Mozilla's roots if the machine has none). A corporate proxy that re-signs TLS with a CA installed on the
+machine therefore sees the relay traffic: the metadata above, but not the content, which stays
+end-to-end encrypted between member keys.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | `join` hangs, then says the admin did not answer | The admin's `borg mesh serve` is not running, or the two sides use different `relay` settings |
 | `the invite was already used` / `has expired` | Ask the admin for a new ticket |
-| `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync |
+| `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync. Behind a proxy that re-signs TLS (corporate VPN), its CA must be in the system trust store |
 | `no direct address ... relays are disabled` | With `"relay": "disabled"`, give peers as `<key>@<ip:port>` |
 | `collective "x" is not in collectives.json` | Run `join` with `--apply`, or add the entry by hand |
 | Nothing syncs after joining | Replace the placeholder path; `borg collective <repo>` must name the team collective with `may sync: true` |

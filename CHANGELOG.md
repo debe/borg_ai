@@ -39,6 +39,8 @@ First release.
 - `borg-mesh`: peer-to-peer sync of a team collective's lessons with signed membership, no server.
 - Mesh across NAT: peers are dialled by key, with iroh hole punching and relay fallback. The relay is
   set per collective (`relay`: n0's public relays by default, a self-hosted URL, or `disabled`).
+- The relay's TLS certificate is checked against the system trust store, so a corporate VPN that
+  re-signs TLS with its own installed CA no longer cuts the node off its relay.
 - Onboarding by ticket: `borg mesh invite` prints a signed, expiring, single-use ticket and its QR
   code; `borg mesh join <ticket> [--apply]` adds the collective to the config (dry run first),
   joins and syncs.

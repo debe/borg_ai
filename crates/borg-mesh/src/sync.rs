@@ -44,6 +44,7 @@ use std::time::Duration;
 use borg::collective::{self, Config, Route};
 use iroh::Endpoint;
 use iroh::endpoint::{Builder, Connection, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::addr::{self, Hint, Relay, Target};
@@ -231,6 +232,18 @@ enum Msg {
     },
 }
 
+/// Which CAs vouch for a relay's, address lookup's or DNS-over-HTTPS server's certificate: the
+/// system store, so a company proxy that re-signs TLS with its own CA (installed on the machine)
+/// does not cut the node off its relay. A machine with no readable store falls back to Mozilla's.
+/// Peer connections never depend on this: iroh checks those by key.
+fn ca_trust() -> CaTlsConfig {
+    let system = CaTlsConfig::system();
+    match system.server_cert_verifier(iroh::tls::default_provider()) {
+        Ok(_) => system,
+        Err(_) => CaTlsConfig::embedded(),
+    }
+}
+
 /// One node of one collective: its key, its store and an iroh endpoint.
 pub struct Node {
     place: Place,
@@ -276,7 +289,7 @@ impl Node {
             // Direct addresses only: no relay, no lookup, no probing of the LAN's router.
             Relay::Disabled => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()).portmapper_config(PortmapperConfig::Disabled),
         };
-        let mut builder = builder.secret_key(me.iroh_secret()).alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]).clear_ip_transports();
+        let mut builder = builder.secret_key(me.iroh_secret()).alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]).clear_ip_transports().ca_tls_config(ca_trust());
         if let Some(a) = addr {
             builder = builder.bind_addr(a).map_err(|e| e.to_string())?;
         }
