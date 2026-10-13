@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/cube.svg" width="260" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
+<p align="center"><img src="docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
 
 # Borg
 

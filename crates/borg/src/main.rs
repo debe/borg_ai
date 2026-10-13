@@ -902,6 +902,80 @@ fn facets_for_written(store: &std::path::Path, from: u64) {
     }
 }
 
+/// `borg help`: the commands grouped by what they are for, one line each.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Everyday",
+        &[
+            ("status", "each collective's lessons, outcomes and wiring"),
+            ("doctor", "what is broken: config, hooks, adapters, the claude CLI"),
+            ("top [--watch] [--json] [--dir DIR]", "the drones running across the team"),
+            ("web [--port PORT] [--dir DIR]", "a live page of knowledge and stats on 127.0.0.1"),
+            ("why <path>[:<line>[-<line>]] | <commit>", "the reasoning behind code  [--full] [--json]"),
+            ("queen [show|ask|answer|skip|dismiss|next]", "open decisions waiting for you"),
+        ],
+    ),
+    (
+        "Setup",
+        &[
+            ("install <claude|omp|opencode|all> [--apply]", "wire the hooks (a dry run without --apply)"),
+            ("uninstall <claude|omp|opencode|all> [--apply]", "unwire them"),
+            ("collective [DIR]", "which collective a directory belongs to"),
+            ("vectors [--fetch|--rebuild|--query]", "the vector model and index"),
+            ("completions <bash|zsh|fish>", "a shell completion script"),
+        ],
+    ),
+    (
+        "Knowledge",
+        &[
+            ("learn [--session ID]", "turn waiting corrections into lessons now"),
+            ("assimilate [--apply] [--since DATE] [--limit N]", "import corrections from past sessions"),
+            ("assimilate --from-dir DIR [--plan FILE] [--apply]", "import lessons from team documents"),
+            ("reach [--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal"),
+            ("trust [--dir DIR]", "trust per engineer and area"),
+            ("notes attach|fetch [<commit>...]", "reasoning notes behind commits"),
+        ],
+    ),
+    (
+        "Team",
+        &[
+            ("mesh <command>", "sync with team members (borg mesh --help)"),
+            ("steer <drone|all> <text> | --pause | --resume", "a signed instruction to running drones"),
+        ],
+    ),
+    (
+        "Debugging and evaluation",
+        &[
+            ("memory <lessons.jsonl> [--session ID]", "each lesson's activation and usefulness"),
+            ("recall <lessons.jsonl> [before_ms]", "rank lessons for text on stdin"),
+            ("prefilter <state> [before_ms]", "the free gate's score for a turn on stdin"),
+            ("facets [--apply] [--store FILE] [--jobs N]", "search facets for lessons"),
+            ("expert <repo> --at <commit> --q <text>", "ask an expert repo"),
+            ("hook <claude|omp|opencode> <event>", "what the harness runs; not for people"),
+        ],
+    ),
+];
+
+/// Whether file descriptor `fd` is a terminal (bold headings only there, and never with NO_COLOR).
+fn atty(fd: i32) -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    std::env::var_os("NO_COLOR").is_none() && unsafe { libc::isatty(fd) } == 1
+}
+
+fn help(color: bool) -> String {
+    let bold = |t: &str| if color { format!("\x1b[1m{t}\x1b[0m") } else { t.to_string() };
+    let width = HELP.iter().flat_map(|(_, rows)| rows.iter().map(|(c, _)| c.chars().count())).max().unwrap_or(0);
+    let mut out = format!("{}\n\n{} borg <command> [options]\n", bold("borg: a shared memory for coding agents"), bold("Usage:"));
+    for (group, rows) in HELP {
+        out.push_str(&format!("\n{}\n", bold(group)));
+        for (cmd, what) in *rows {
+            out.push_str(&format!("  {cmd:<width$}  {what}\n"));
+        }
+    }
+    out.push_str("\nMore: docs/commands.md, or https://github.com/debe/borg_ai\n");
+    out
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -1088,10 +1162,9 @@ fn main() {
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
+        [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1))),
         _ => {
-            eprintln!(
-                "usage: borg hook <claude|omp|opencode> <event> | borg learn [--session ID] | borg assimilate [--apply] [--since DATE] [--limit N] | borg install|uninstall <harness|all> [--apply] | borg status | borg doctor | borg collective [DIR] | borg mesh <command> | borg notes attach [<commit>] | borg queen [show|ask|answer|dismiss|skip|next|dedupe|notify] | borg trust [--dir DIR] | borg top [--watch] [--json] | borg steer <drone|all> <text>|--pause|--resume | borg why <path>[:<line>[-<line>]]|<commit> [--full] [--json] | borg web [--port PORT] [--dir DIR] | borg reach [--plan FILE] [--apply] | borg completions <bash|zsh|fish> | borg recall <lessons.jsonl> [before_ms] | borg facets [--apply] [--store LESSONS.jsonl] [--jobs N] | borg expert <repo> --at <commit> [--version <v>] --q <text> | borg vectors [--rebuild|--fetch|--query]"
-            );
+            eprint!("{}", help(atty(2)));
             std::process::exit(2);
         }
     }

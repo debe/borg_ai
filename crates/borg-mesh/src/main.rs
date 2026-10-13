@@ -311,7 +311,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             println!("{} note(s) written to {} (not pushed)", written.len(), borg::notes::NOTES_REF);
         }
         Some("steer") => println!("{}", steer_cmd(&place, &r, &args[1..])?),
-        _ => return Err("usage: borg mesh <id|init|invite [--role R] [--expires 7d] [--uses 1] [--png FILE]|invite KEY [--role R]|invites [--revoke ID]|join TICKET [--apply]|join FILE|revoke KEY|members|peer [KEY[@HINTS]]|serve [--bind IP:PORT] [--interval SECS]|sync KEY[@HINTS]|fetch [COMMIT...]> [--dir DIR | --collective NAME]".into()),
+        _ => return Err(format!("unknown command\n\n{}", help())),
     }
     Ok(())
 }
@@ -363,9 +363,54 @@ async fn stop() {
     }
 }
 
+/// `borg mesh --help`: the commands grouped by who runs them.
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Start a team (admin)",
+        &[
+            ("init", "found the collective; you become its admin"),
+            ("invite [--role R] [--expires 7d] [--uses 1] [--png FILE]", "a ticket (and QR code) for a new member"),
+            ("invite KEY [--role R]", "add a member by key (the manual flow)"),
+            ("invites [--revoke ID]", "open tickets, or withdraw one"),
+            ("revoke KEY", "remove a member"),
+        ],
+    ),
+    (
+        "Join and run",
+        &[
+            ("join TICKET [--apply]", "join with a ticket (a dry run without --apply)"),
+            ("join FILE", "join with a membership history file (the manual flow)"),
+            ("serve [--bind IP:PORT] [--interval SECS]", "keep syncing; leave it running"),
+            ("sync KEY[@HINTS]", "sync once with one member"),
+            ("peer [KEY[@HINTS]]", "the peers this node dials, or add one"),
+        ],
+    ),
+    (
+        "Look up",
+        &[("id", "this node's public key in the collective"), ("members", "the signed member list"), ("fetch [COMMIT...]", "reasoning notes from members")],
+    ),
+];
+
+fn help() -> String {
+    let width = HELP.iter().flat_map(|(_, rows)| rows.iter().map(|(c, _)| c.chars().count())).max().unwrap_or(0);
+    let mut out = String::from("Usage: borg mesh <command> [--dir DIR | --collective NAME]\n");
+    for (group, rows) in HELP {
+        out.push_str(&format!("\n{group}\n"));
+        for (cmd, what) in *rows {
+            out.push_str(&format!("  {cmd:<width$}  {what}\n"));
+        }
+    }
+    out.push_str("\nThe collective is the one the current directory belongs to, unless --dir or --collective names another.\n");
+    out
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
+        print!("{}", help());
+        return;
+    }
     if let Err(e) = run(&args).await {
         eprintln!("borg mesh: {e}");
         std::process::exit(1);
