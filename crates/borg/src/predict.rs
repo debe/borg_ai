@@ -254,8 +254,9 @@ fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
 }
 
 /// How long the Stop step waits for the model before failing open (the drone just finishes):
-/// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit.
-fn timeout() -> std::time::Duration {
+/// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit. Live mode's lock goes stale
+/// after twice this (live.rs).
+pub fn timeout() -> std::time::Duration {
     let secs = std::env::var("BORG_PREDICT_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(45u64);
     std::time::Duration::from_secs(secs)
 }

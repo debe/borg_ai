@@ -1,0 +1,9 @@
+{"type":"user","message":{"role":"user","content":"Fix the retry handling"},"timestamp":"2026-10-14T10:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Earlier turn: retries now use backoff."}]},"timestamp":"2026-10-14T10:00:05Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Now drain the budget place in the Orion net"}]},"timestamp":"2026-10-14T10:01:00Z"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"<system-reminder>a note</system-reminder>"}]},"timestamp":"2026-10-14T10:01:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"I will replace the reset arc."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x/net.rs"}}]},"timestamp":"2026-10-14T10:01:02Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn net() {}"}]},"timestamp":"2026-10-14T10:01:03Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/x/net.rs","old_string":"reset","new_string":"drain"}}]},"timestamp":"2026-10-14T10:01:04Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]},"timestamp":"2026-10-14T10:01:05Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cargo   test\n  -p net"}}]},"timestamp":"2026-10-14T10:01:06Z"}

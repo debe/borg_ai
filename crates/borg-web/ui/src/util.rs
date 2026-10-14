@@ -139,6 +139,8 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "gate_skip" => ("skipped free", "var(--c-slate)", "○"),
         "check" => ("model checks", "var(--c-accent)", "◆"),
         "block" => ("extra rounds", "var(--c-violet)", "?"),
+        "live_check" => ("live checks", "var(--c-teal)", "◆"),
+        "live_ask" => ("live questions", "var(--c-teal)", "?"),
         "early" => ("early deliveries", "var(--c-teal)", "↯"),
         "queued_free" => ("free hand-overs", "var(--c-teal)", "↯"),
         "changed" => ("used", "var(--c-good)", "✓"),

@@ -40,16 +40,32 @@ pub struct Totals {
     pub counts: BTreeMap<String, f64>,
     pub usd: f64,
     pub usd_by: BTreeMap<String, f64>,
+    /// The conscience's check cost per delivery mode (`hook`, `live`): part of `usd`, never stacked with `usd_by`.
+    pub usd_mode: BTreeMap<String, f64>,
+    /// Events per `<kind>@<channel>` (`changed@live`, `block@stop`).
+    pub channels: BTreeMap<String, f64>,
     pub dur_ms: f64,
 }
 
 impl Totals {
     fn parse(v: &Value) -> Self {
-        Totals { counts: map(&v["counts"]), usd: f(&v["usd"]), usd_by: map(&v["usd_by"]), dur_ms: f(&v["dur_ms"]) }
+        Totals {
+            counts: map(&v["counts"]),
+            usd: f(&v["usd"]),
+            usd_by: map(&v["usd_by"]),
+            usd_mode: map(&v["usd_mode"]),
+            channels: map(&v["channels"]),
+            dur_ms: f(&v["dur_ms"]),
+        }
     }
 
     pub fn n(&self, kind: &str) -> f64 {
         self.counts.get(kind).copied().unwrap_or(0.0)
+    }
+
+    /// Events of `kind` that came through `channel` (`live`, `stop`).
+    pub fn via(&self, kind: &str, channel: &str) -> f64 {
+        self.channels.get(&format!("{kind}@{channel}")).copied().unwrap_or(0.0)
     }
 
     pub fn add(&mut self, o: &Totals) {
@@ -58,6 +74,12 @@ impl Totals {
         }
         for (k, v) in &o.usd_by {
             *self.usd_by.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &o.usd_mode {
+            *self.usd_mode.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &o.channels {
+            *self.channels.entry(k.clone()).or_default() += v;
         }
         self.usd += o.usd;
         self.dur_ms += o.dur_ms;
@@ -173,8 +195,9 @@ impl Lesson {
         a / (a + b)
     }
 
+    /// Times asked: in a turn-end block or by a live check (live mode).
     pub fn asked(&self) -> f64 {
-        self.usage.get("block").copied().unwrap_or(0.0)
+        self.usage.get("block").copied().unwrap_or(0.0) + self.usage.get("live_ask").copied().unwrap_or(0.0)
     }
 
     pub fn source_label(&self) -> &'static str {
@@ -390,7 +413,8 @@ impl Source {
 #[derive(Clone, Copy)]
 pub struct Data {
     pub collective: RwSignal<String>,
-    pub collectives: RwSignal<Vec<(String, String)>>,
+    /// Name, share and delivery mode (`hook` or `live`) of each collective.
+    pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
     pub sources: [Source; 5],
     pub stats: Memo<Stats>,
@@ -407,6 +431,12 @@ pub struct Data {
 impl Data {
     pub fn source(&self, path: &str) -> Source {
         *self.sources.iter().find(|s| s.path == path).expect("known view")
+    }
+
+    /// The delivery mode of the shown collective (`hook` when the server does not say).
+    pub fn mode(&self) -> String {
+        let c = self.collective.get();
+        self.collectives.with(|cs| cs.iter().find(|x| x.0 == c).map(|x| x.2.clone())).filter(|m| !m.is_empty()).unwrap_or_else(|| "hook".into())
     }
 
     pub fn lesson(&self, id: &str) -> Option<Lesson> {
@@ -439,8 +469,15 @@ pub fn provide() -> Data {
 
     spawn_local(async move {
         if let Some(v) = get("/api/collectives".into()).await {
-            d.collectives
-                .set(v["collectives"].as_array().into_iter().flatten().map(|c| (s(&c["name"]), s(&c["share"]))).filter(|(n, _)| !n.is_empty()).collect());
+            d.collectives.set(
+                v["collectives"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| (s(&c["name"]), s(&c["share"]), s(&c["mode"])))
+                    .filter(|(n, ..)| !n.is_empty())
+                    .collect(),
+            );
             d.collective.set(s(&v["first"]));
         }
     });

@@ -51,9 +51,12 @@ fn App() -> impl IntoView {
                 <h1>"Borg Collective"</h1>
             </div>
             <select on:change=move |e| d.collective.set(event_target_value(&e)) prop:value=move || d.collective.get()>
-                {move || d.collectives.get().into_iter().map(|(n, s)| view! { <option value=n.clone()>{format!("{n} · {s}")}</option> }).collect_view()}
+                {move || d.collectives.get().into_iter().map(|(n, s, _)| view! { <option value=n.clone()>{format!("{n} · {s}")}</option> }).collect_view()}
             </select>
             <span class="grow"></span>
+            <span class=move || format!("mode-badge {}", d.mode()) title="delivery mode: hook judges the work at the turn end, live also during the turn">
+                {move || format!("{} mode", d.mode())}
+            </span>
             <span class="drones-now" title="drones working right now">{move || format!("{} working", working())}</span>
             <span class=move || if d.live.get() { "live on" } else { "live" } title="live updates from the store">
                 <i></i>{move || if d.live.get() { "live" } else { "offline" }}

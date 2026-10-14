@@ -22,6 +22,9 @@
 //! between collectives in either direction. `share: "local"` means the collective must never be
 //! synced to any peer: `may_sync` is the one gate a mesh has to ask.
 //!
+//! A collective may also set `"mode": "live"` (live.rs): its conscience then also judges the work during
+//! the turn, not only at its end. `BORG_MODE` overrides it; absent or unknown is `"hook"`.
+//!
 //! A collective may also list `experts` (expert repos its drones consult at the Stop checkpoint,
 //! see expert_route.rs); only the routed collective's experts are ever read, and never one whose
 //! repo lies under an `off` path or in another collective with `share: "local"`.
@@ -77,6 +80,11 @@ pub struct Entry {
     /// only (LAN or VPN), or the URL of a self-hosted `iroh-relay`. `BORG_RELAY` overrides it.
     #[serde(default)]
     pub relay: Option<String>,
+    /// When the conscience judges the work (live.rs): `"hook"` (the default) at the turn end, or
+    /// `"live"` also during the turn. `BORG_MODE` overrides it; any other value is hook, with a warning
+    /// in `borg doctor`. A string, not an enum: an unknown value must not invalidate the whole config.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// An expert repo: the engineer's local checkout of a dependency, consulted when a drone's

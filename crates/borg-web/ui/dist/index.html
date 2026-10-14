@@ -59,6 +59,8 @@ header.top { max-width: 1180px; margin: 0 auto; padding: 16px 16px 10px; display
 select, input.search { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 6px 10px; max-width: 100%; }
 input.search { width: min(420px, 100%); }
 .drones-now { font: 500 .75rem var(--mono); color: var(--muted); }
+.mode-badge { font: 500 .72rem var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--muted); padding: 2px 8px; border: 1px solid var(--rule); border-radius: 10px; }
+.mode-badge.live, .badge.mode-live { color: var(--c-teal); border-color: var(--c-teal); }
 .live { font: 500 .72rem var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--c-slate); display: inline-block; }
 .live.on i { background: var(--c-good); box-shadow: 0 0 0 0 var(--c-good); animation: pulse 2.4s ease-out infinite; }
@@ -279,6 +281,6 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
 .drone-doing, .drone-who { overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
 </style>
-<link rel="modulepreload" href="/borg-web-ui.js" crossorigin="anonymous" integrity="sha384-j8dO5QaFkK5dBPoAbsGtbzLotrqegM49HpvC6SXDGvtOBfhGgmCHSVDXL7tSDAi7"><link rel="preload" href="/borg-web-ui_bg.wasm" crossorigin="anonymous" integrity="sha384-UYyWGz5bIRvdweAVjpckyM/F8Iv2jyVMYN9Igt/+GWRMmu0USKY17lUyYJH5T8f1" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/borg-web-ui.js" crossorigin="anonymous" integrity="sha384-j8dO5QaFkK5dBPoAbsGtbzLotrqegM49HpvC6SXDGvtOBfhGgmCHSVDXL7tSDAi7"><link rel="preload" href="/borg-web-ui_bg.wasm" crossorigin="anonymous" integrity="sha384-b4TlNXDxLBOUsqa4lVcPdCF+5NgSV75JksmI6sxWtfZcmZRzHJ9rN9k0uBwL0zJv" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>

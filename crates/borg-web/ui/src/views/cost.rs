@@ -40,6 +40,16 @@ pub fn Cost() -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     });
+    // The conscience's checks by delivery mode: hook (one check at the turn end) and live (also during it).
+    let mode_series = vec![Series::new("hook", "hook mode", "var(--c-accent)"), Series::new("live", "live mode", "var(--c-teal)")];
+    let mode_rows = Signal::derive(move || {
+        st.with(|s| {
+            s.days
+                .iter()
+                .map(|day| Row { label: short_day(day.day), vals: ["hook", "live"].iter().map(|m| day.t.usd_mode.get(*m).copied().unwrap_or(0.0)).collect() })
+                .collect::<Vec<_>>()
+        })
+    });
     let by_purpose = Signal::derive(move || t().usd_by.into_iter().map(|(k, v)| (kind(&k).0.to_string(), v)).filter(|x| x.1 > 0.0).collect::<Vec<_>>());
     let by_engineer = Signal::derive(move || st.with(|s| s.engineers.iter().map(|e| (who(&e.name), e.t.usd)).filter(|x| x.1 > 0.0).collect::<Vec<_>>()));
     let per = move |n: f64| if n > 0.0 { usd(t().usd / n) } else { "–".into() };
@@ -55,11 +65,15 @@ pub fn Cost() -> impl IntoView {
                 if c > 0.0 { usd(t.usd_by.get("check").copied().unwrap_or(t.usd) / c) } else { "–".into() }
             }) />
             <Tile label="Per used lesson" value=Signal::derive(move || per(t().n("changed"))) sub=Signal::derive(|| "all cost over lessons that changed the work".to_string()) color="var(--c-good)" />
-            <Tile label="Per question" value=Signal::derive(move || per(t().n("block_n"))) color="var(--c-violet)" />
+            <Tile label="Per question" value=Signal::derive(move || per(t().n("block_n") + t().n("live_ask_n"))) sub=Signal::derive(|| "asked at a stop or live".to_string()) color="var(--c-violet)" />
         </section>
         <section class="panel">
             <h2>"Cost per day"<small>"by purpose, with the running total"</small></h2>
             <StackedChart rows=rows series=series money=true cumulative=true ranges=true />
+        </section>
+        <section class="panel">
+            <h2>"Checks by delivery mode"<small>"the conscience's model calls per day: hook at the turn end, live also during the turn"</small></h2>
+            <StackedChart rows=mode_rows series=mode_series money=true ranges=true />
         </section>
         <section class="two">
             <div class="panel"><h2>"By purpose"</h2><HBars items=by_purpose color="var(--c-amber)" money=true /></div>

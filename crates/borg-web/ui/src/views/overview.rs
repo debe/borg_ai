@@ -107,7 +107,11 @@ pub fn Overview() -> impl IntoView {
         if let Some(e) = s.engineers.iter().max_by(|a, b| a.t.n("turn_end").total_cmp(&b.t.n("turn_end"))).filter(|e| e.t.n("turn_end") > 0.0) {
             out.push(Fact {
                 big: who(&e.name),
-                text: format!("ran the most drone turns: {} turn ends, {} questions asked.", num(e.t.n("turn_end")), num(e.t.n("block_n"))),
+                text: format!(
+                    "ran the most drone turns: {} turn ends, {} questions asked.",
+                    num(e.t.n("turn_end")),
+                    num(e.t.n("block_n") + e.t.n("live_ask_n"))
+                ),
                 lesson: None,
                 tone: "a",
             });
@@ -149,12 +153,18 @@ pub fn Overview() -> impl IntoView {
         out
     });
 
+    // Questions at a stop block (each block an extra round) plus questions a live check asked during the
+    // turn (no extra round): both count as asked, as their verdicts count as used or ignored.
+    let questions = |t: &crate::api::Totals| {
+        let live = t.n("live_ask_n");
+        if live > 0.0 { format!("{} questions, {} more live", num(t.n("block_n")), num(live)) } else { format!("{} questions", num(t.n("block_n"))) }
+    };
     let funnel = Signal::derive(move || {
         let t = t();
         vec![
             ("turn ends".to_string(), t.n("turn_end"), "var(--c-muted)".to_string(), String::new()),
             ("model checks".into(), t.n("check"), "var(--c-accent)".into(), format!("{} skipped free", num(t.n("gate_skip")))),
-            ("extra rounds".into(), t.n("block"), "var(--c-violet)".into(), format!("{} questions", num(t.n("block_n")))),
+            ("extra rounds".into(), t.n("block"), "var(--c-violet)".into(), questions(&t)),
             ("used".into(), t.n("changed"), "var(--c-good)".into(), format!("{} ignored · {} corrected anyway", num(t.n("ignored")), num(t.n("corrected")))),
         ]
     });
@@ -164,9 +174,16 @@ pub fn Overview() -> impl IntoView {
             <Tile label="Turn ends" value=Signal::derive(move || num(t().n("turn_end")))
                 sub=Signal::derive(move || format!("{} skipped free", pct(t().n("gate_skip"), t().n("turn_end"))))
                 spark=spark("turn_end") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("turn_end")))) color="var(--c-muted)" />
-            <Tile label="Questions asked" value=Signal::derive(move || num(t().n("block_n")))
-                sub=Signal::derive(move || format!("in {} extra rounds", num(t().n("block"))))
-                spark=spark("block") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("block_n")))) color="var(--c-violet)" />
+            <Tile label="Questions asked" value=Signal::derive(move || num(t().n("block_n") + t().n("live_ask_n")))
+                sub=Signal::derive(move || {
+                    let live = t().n("live_ask_n");
+                    if live > 0.0 {
+                        format!("in {} extra rounds; {} live, without one", num(t().n("block")), num(live))
+                    } else {
+                        format!("in {} extra rounds", num(t().n("block")))
+                    }
+                })
+                spark=spark("block") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("block_n") + t.n("live_ask_n")))) color="var(--c-violet)" />
             <Tile label="Lessons used" value=Signal::derive(move || num(t().n("changed")))
                 sub=Signal::derive(move || format!("{} ignored · {} corrected anyway", num(t().n("ignored")), num(t().n("corrected"))))
                 spark=spark("changed") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("changed")))) color="var(--c-good)" />

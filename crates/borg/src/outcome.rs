@@ -51,6 +51,10 @@ pub struct Outcome {
     /// `asked` only: the asked lessons rendered as one disagreement (conscience.rs `disagreements`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
+    /// How the lessons were asked (`asked` and the judge's results): `stop` (a turn-end block) or `live`
+    /// (a live check during the turn, live.rs). Empty in records from before delivery modes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel: String,
 }
 
 /// The outcomes store next to a lessons file.
@@ -81,6 +85,7 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
         crate::stats::count(home, kind, &o.session, |e| {
             e.repo = o.repo.clone();
             e.lessons = o.lessons.clone();
+            e.channel = o.channel.clone();
         });
     }
     Ok(())

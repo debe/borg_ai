@@ -555,6 +555,14 @@ fn print_status(t: &Targets) {
         let s = stats(home);
         println!("\ncollective {name} ({share:?}, may sync: {})", collective::may_sync(&r));
         println!("  store        {}", home.display());
+        let m = crate::live::of(cfg.as_ref().ok().and_then(Option::as_ref), name);
+        let off = (m.mode == crate::live::Mode::Live).then(crate::live::unsupported).flatten();
+        let note = match (&m.warning, off) {
+            (Some(_), _) => "; unknown value, see borg doctor".to_string(),
+            (None, Some(why)) => format!("; off here: {why} replaces the consequence model, so checks run at the turn end only"),
+            (None, None) => String::new(),
+        };
+        println!("  mode         {} ({}){note}", m.mode.name(), m.source);
         println!("  lessons      {}", s.lessons);
         println!("  episodes     {}", s.episodes);
         println!("  outcomes     {}", s.outcomes);
@@ -563,6 +571,9 @@ fn print_status(t: &Targets) {
         println!("  last capture {}", s.last_capture_ms.map(human).unwrap_or_else(|| "never".into()));
         let g = crate::prefilter::tally(&home.join("state"));
         println!("  stop gate    {} turn ends skipped at 0 tokens, {} asked the model (${:.2} so far)", g.skipped, g.asked, g.cost);
+        if g.live_checks > 0 {
+            println!("  live checks  {} during the turn, {} lessons read (${:.2} so far)", g.live_checks, g.live_lessons, g.live_cost);
+        }
         println!(
             "  cost         {} extra rounds (Stop blocks, {} questions, ~{} tokens); {} free deliveries ({} lessons, ~{} tokens, no extra round)",
             g.rounds,
@@ -723,6 +734,18 @@ pub fn collective_checks(cfg: &Result<Option<collective::Config>, String>, base:
     }
     for r in collectives(cfg, base) {
         let Route::Collective { name, home, .. } = &r else { continue };
+        let m = crate::live::of(cfg, name);
+        match m.warning {
+            Some(w) => out.push((Level::Warn, format!("collective {name}: {w}"))),
+            None => out.push((Level::Ok, format!("collective {name}: delivery mode {} ({})", m.mode.name(), m.source))),
+        }
+        // Live mode cannot run without the consequence model; the hook only notes it on stderr, which the
+        // agent's UI does not show.
+        if m.mode == crate::live::Mode::Live
+            && let Some(why) = crate::live::unsupported()
+        {
+            out.push((Level::Warn, format!("collective {name}: live mode is off while {why} is set; its drones check at the turn end only (hook mode)")));
+        }
         let probe = home.join(".borg-doctor-probe");
         let ok = std::fs::create_dir_all(home).and_then(|_| std::fs::write(&probe, b"ok")).and_then(|_| std::fs::remove_file(&probe));
         match ok {

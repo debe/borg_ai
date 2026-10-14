@@ -25,6 +25,11 @@ pub const GATE_SKIP: &str = "gate_skip";
 pub const CHECK: &str = "check";
 /// A block: one extra round of agent work (`n`: questions, `lessons`: the asked ids).
 pub const BLOCK: &str = "block";
+/// Live mode (live.rs): one model call during the turn (`n`, `usd`, `dur_ms`, `why: "failed"`, as `check`).
+pub const LIVE_CHECK: &str = "live_check";
+/// Live mode: grade-3 lessons a live check asked, delivered with the next prompt or tool call (`n`,
+/// `lessons`). Never an extra round: the drone answers as it works.
+pub const LIVE_ASK: &str = "live_ask";
 /// Lessons handed over free at a prompt or touch (`n`, `lessons`).
 pub const EARLY: &str = "early";
 /// Grade-2 and grade-1 lessons queued to arrive free at the next prompt (`n`, `lessons`).
@@ -82,6 +87,13 @@ pub struct Event {
     /// A short excerpt for this machine's own feed (a correction's words). Never folded into a rollup.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    /// The delivery mode the hook ran in (live.rs: `hook` or `live`); empty outside a hook.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    /// How an asked lesson reached the drone: `stop` (a block), `live` (a live check), `early`, `queued`.
+    /// On asks and on their results (`changed`, `ignored`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel: String,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -93,8 +105,10 @@ fn is_zero_f(v: &f64) -> bool {
 }
 
 impl Event {
+    /// An event now, in the delivery mode of this process (the hook exports `BORG_MODE`, main.rs).
     pub fn new(kind: &str, ms: i64) -> Self {
-        Event { kind: kind.into(), ms, ..Default::default() }
+        let mode = std::env::var("BORG_MODE").map(|_| crate::live::current().name().to_string()).unwrap_or_default();
+        Event { kind: kind.into(), ms, mode, ..Default::default() }
     }
 }
 
@@ -116,12 +130,23 @@ pub struct Bucket {
     /// Events per kind for each lesson they named.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lessons: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The conscience's model cost (`check` and `live_check`) per delivery mode (`hook`, `live`). A
+    /// split of part of `usd`, so never stacked with `usd_by`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usd_mode: BTreeMap<String, f64>,
+    /// Events per `<kind>@<channel>` for events that name a channel (`block@stop`, `changed@live`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channels: BTreeMap<String, u64>,
 }
 
 impl Bucket {
     /// Equal counts, cost and lessons: nothing to publish (`id` and `version` aside).
     fn same(&self, other: &Bucket) -> bool {
-        self.counts == other.counts && self.lessons == other.lessons && self.dur_ms == other.dur_ms && (self.usd - other.usd).abs() < 1e-9
+        self.counts == other.counts
+            && self.lessons == other.lessons
+            && self.channels == other.channels
+            && self.dur_ms == other.dur_ms
+            && (self.usd - other.usd).abs() < 1e-9
     }
 
     /// Adds `other`'s counts (team totals across nodes and engineers).
@@ -137,6 +162,12 @@ impl Bucket {
         }
         for (k, v) in &other.usd_by {
             *self.usd_by.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &other.usd_mode {
+            *self.usd_mode.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &other.channels {
+            *self.channels.entry(k.clone()).or_default() += v;
         }
         self.usd += other.usd;
         self.dur_ms += other.dur_ms;
@@ -266,7 +297,9 @@ fn derive_history(home: &Path) -> Vec<Event> {
     }
     let engineer = |session: &str| who.get(session).cloned().unwrap_or_default();
     for o in lines(&home.join("outcomes.jsonl")) {
+        let live = o["channel"] == "live";
         let kind = match o["kind"].as_str().unwrap_or_default() {
+            crate::outcome::ASKED if live => LIVE_ASK,
             crate::outcome::ASKED => BLOCK,
             crate::outcome::CHANGED => CHANGED,
             crate::outcome::IGNORED => IGNORED,
@@ -282,8 +315,9 @@ fn derive_history(home: &Path) -> Vec<Event> {
             engineer: engineer(&session),
             session,
             repo: s(&o, "repo"),
-            n: if kind == BLOCK { lessons.len() as u64 } else { 0 },
+            n: if kind == BLOCK || kind == LIVE_ASK { lessons.len() as u64 } else { 0 },
             lessons,
+            channel: s(&o, "channel"),
             ..Default::default()
         });
     }
@@ -466,6 +500,14 @@ pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
         if e.usd > 0.0 {
             *b.usd_by.entry(e.kind.clone()).or_default() += e.usd;
         }
+        // Checks from before modes existed were all turn-end checks: hook mode.
+        if e.usd > 0.0 && (e.kind == CHECK || e.kind == LIVE_CHECK) {
+            let mode = if e.mode.is_empty() { "hook" } else { e.mode.as_str() };
+            *b.usd_mode.entry(mode.into()).or_default() += e.usd;
+        }
+        if !e.channel.is_empty() {
+            *b.channels.entry(format!("{}@{}", e.kind, e.channel)).or_default() += 1;
+        }
         b.dur_ms += e.dur_ms;
         for l in &e.lessons {
             *b.lessons.entry(l.clone()).or_default().entry(e.kind.clone()).or_default() += 1;
@@ -572,6 +614,25 @@ mod tests {
         let a = &b["stat:n1:a@x:1970-01-01"];
         assert_eq!((a.counts[TURN_END], a.counts[CHECK], a.counts["check_n"], a.counts["block_n"]), (1, 1, 7, 2));
         assert_eq!(a.lessons["L1"][BLOCK], 1);
+    }
+
+    #[test]
+    fn fold_splits_check_cost_by_mode_and_asks_by_channel() {
+        let with = |kind: &str, usd: f64, mode: &str, channel: &str| Event { usd, mode: mode.into(), channel: channel.into(), ..ev(kind, 10, "a@x", &[], 0) };
+        let evs = [
+            with(CHECK, 0.05, "", ""),
+            with(CHECK, 0.04, "live", ""),
+            with(LIVE_CHECK, 0.03, "live", ""),
+            with(MODEL_CALL, 0.5, "live", ""),
+            with(BLOCK, 0.0, "live", "stop"),
+            with(LIVE_ASK, 0.0, "live", "live"),
+            with(CHANGED, 0.0, "", "live"),
+        ];
+        let b = &fold("n1", &evs)["stat:n1:a@x:1970-01-01"];
+        assert!((b.usd_mode["hook"] - 0.05).abs() < 1e-9 && (b.usd_mode["live"] - 0.07).abs() < 1e-9, "{:?}", b.usd_mode);
+        assert_eq!(b.usd_mode.len(), 2, "only the conscience's checks: {:?}", b.usd_mode);
+        assert_eq!((b.channels["block@stop"], b.channels["live_ask@live"], b.channels["changed@live"]), (1, 1, 1));
+        assert_eq!((b.counts[CHECK], b.counts[LIVE_CHECK]), (2, 1), "live checks are counted apart from turn-end checks");
     }
 
     #[test]

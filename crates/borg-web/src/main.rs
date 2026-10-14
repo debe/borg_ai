@@ -32,6 +32,8 @@ struct Mind {
     name: String,
     home: PathBuf,
     share: Share,
+    /// The delivery mode its drones run in (borg live.rs: `hook` or `live`).
+    mode: &'static str,
 }
 
 struct App {
@@ -60,7 +62,10 @@ fn minds(dir: &str) -> Result<(Vec<Mind>, String), String> {
     let minds: Vec<Mind> = install::collectives(cfg.as_ref(), &base)
         .into_iter()
         .filter_map(|r| match r {
-            Route::Collective { name, home, share } => Some(Mind { name, home, share }),
+            Route::Collective { name, home, share } => {
+                let mode = borg::live::of(cfg.as_ref(), &name).mode.name();
+                Some(Mind { name, home, share, mode })
+            }
             Route::Off => None,
         })
         .collect();
@@ -76,7 +81,8 @@ fn not_found(what: &str) -> Response {
 }
 
 async fn collectives(State(app): State<Arc<App>>) -> Json<Value> {
-    let list: Vec<Value> = app.minds.iter().map(|m| json!({"name": m.name, "share": if m.share == Share::Team { "team" } else { "local" }})).collect();
+    let list: Vec<Value> =
+        app.minds.iter().map(|m| json!({"name": m.name, "share": if m.share == Share::Team { "team" } else { "local" }, "mode": m.mode})).collect();
     Json(json!({"first": app.first, "collectives": list}))
 }
 
@@ -90,7 +96,7 @@ fn sum_by(buckets: &[stats::Bucket], key: impl Fn(&stats::Bucket) -> String) -> 
 }
 
 fn totals(b: &stats::Bucket) -> Value {
-    json!({"counts": b.counts, "usd": b.usd, "usd_by": b.usd_by, "dur_ms": b.dur_ms})
+    json!({"counts": b.counts, "usd": b.usd, "usd_by": b.usd_by, "usd_mode": b.usd_mode, "channels": b.channels, "dur_ms": b.dur_ms})
 }
 
 /// One entry per day from `first` to `last`, zero where nothing was counted.

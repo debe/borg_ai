@@ -30,6 +30,15 @@ First release.
   next prompt or touch (Claude Code).
 - System gate: lessons scoped to other systems are not delivered in a repo that maps to a known system.
   The system map is read from `~/.config/borg/systems.json` (`BORG_SYSTEMS`); a neutral example ships.
+- Delivery modes per collective (`"mode"` in collectives.json, `BORG_MODE` overrides): `hook` (default)
+  checks at the turn end; `live` also checks during the turn. In live mode a state-changing tool call
+  starts a detached `borg check` of the turn so far (one at a time, at most one start per
+  `BORG_LIVE_DEBOUNCE_S`, default 45 s); its grade-3 lessons arrive with the next tool call as "borg check
+  of your work so far", and a stop whose changes a live check of the same turn already covered skips its
+  model call (a grade 3 still waiting is asked there). Claude Code only for now (omp and opencode drones
+  run and count in hook mode; `borg doctor` warns when bm25, BORG_ONLY or BORG_CRITIC turn live off). `borg status`, `borg doctor` and `borg web` show the
+  mode; stats and outcomes carry `mode` and `channel` (`live_check`, `live_ask`, `usd_mode`, `channels`).
+  The default stays hook until the live-vs-hook eval (reports/live-vs-hook.md) decides by its fixed rule.
 - Optional vector recall at the turn end (`--features vectors`, `borg vectors --fetch/--rebuild`).
 - Expert repos per collective: cited claims from a local checkout of a dependency, at the pinned version.
 

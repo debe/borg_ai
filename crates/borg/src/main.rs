@@ -5,6 +5,9 @@
 //!        tool_input, error, last_assistant_message, transcript_path, stop_hook_active) and gets
 //!        Claude-shaped output ({"decision":"block","reason"} at stop); adapters translate both ways.
 //!        borg learn [--session ID]                   (generalise captured corrections into lessons)
+//!        borg check --session ID --transcript FILE --cwd DIR
+//!                                                     (internal: live mode's check of the work so far, spawned by
+//!                                                      the PostToolUse hook; live.rs)
 //!        borg collective [DIR]                       (which collective DIR belongs to; see collective.rs)
 //!        borg install|uninstall <claude|omp|opencode|all> [--apply] [--home DIR]
 //!                                                     (wire borg into a harness's user config; dry run by default; install.rs)
@@ -92,7 +95,13 @@
 //!                    BORG_LEARN=off disables them too, and a prompt payload with `"context": false` (an
 //!                    adapter that will not wait for the answer) gets no context at all
 //!   BORG_NOTIFY      "off" disables the desktop notification (notify-send) when questions are queued (notify.rs)
-//!   BORG_PREDICT_MODEL  model for the consequence model (default sonnet)
+//!   BORG_PREDICT_MODEL  model for the consequence model: unset = through the drone's own harness (runner.rs;
+//!                    the claude CLI runs sonnet, omp and opencode their own default), `<runner>:<model>` pins
+//!                    one runner and model (`claude:claude-sonnet-5-5`), "off" = no model call
+//!   BORG_MODE        delivery mode, overriding the collective's `mode` (live.rs): "hook" (default) judges the
+//!                    work at the turn end; "live" also judges it during the turn, after state-changing tool
+//!                    calls, in a detached `borg check` (Claude Code only). Anything else is hook
+//!   BORG_LIVE_DEBOUNCE_S  live mode: the least time between the starts of two checks (default 45)
 //!   BORG_VECTORS     "off" disables vector recall at the Stop step (vectors.rs; builds with the `vectors`
 //!                    feature): BORG_VECTOR_MODEL (model dir, default ~/.local/share/borg/models/
 //!                    potion-multilingual-128M), BORG_VECTOR_K (hits added to the shortlist, default 10)
@@ -103,7 +112,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use borg::learn::learning;
-use borg::{collective, conscience, expert, install, learn, outcome, predict, prefilter};
+use borg::{collective, conscience, expert, install, learn, live, outcome, predict, prefilter};
 use borg_trace::fingerprint::bash_read_paths;
 use serde_json::{Value, json};
 
@@ -114,9 +123,11 @@ fn state_file(session: &str) -> PathBuf {
     dir.join(format!("{safe}.ctx"))
 }
 
+/// One line (or several, kept together) at the end of the state file, in one write: a check running in
+/// the background appends to the same file, and its lines never land between these.
 fn append(session: &str, text: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state_file(session)) {
-        let _ = writeln!(f, "{text}");
+        let _ = f.write_all(format!("{text}\n").as_bytes());
     }
 }
 
@@ -154,6 +165,12 @@ fn stat(session: &str, input: &Value, kind: &str, fill: impl FnOnce(&mut borg::s
 /// The engineer's prompts this session (the queen's criterion 3; the state file mixes in touches).
 fn prompts_file(session: &str) -> PathBuf {
     state_file(session).with_extension("prompts")
+}
+
+/// Which turn the session is in: the size of its prompts file, which every prompt grows. A live check
+/// records the turn it started in (live.rs `Mark`), so it covers that turn's stop only.
+fn turn_id(session: &str) -> u64 {
+    std::fs::metadata(prompts_file(session)).map_or(0, |m| m.len())
 }
 
 /// Where the session works: the repo it runs in and the paths it touched (`where_now` adds the latest
@@ -393,7 +410,9 @@ const MAX_JUDGE_TRIES: usize = 2;
 /// the consequence model (predict.rs `Pending`): the blocked message (before), and after it the drone's
 /// answer, its edits and later messages since, and this turn's message (`final_msg`), each part capped at
 /// `predict::JUDGE_PART` characters. `#borg-judged <id>=<label>` lines in the state file record verdicts.
-fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str) -> Vec<predict::Pending<'a>> {
+/// `answered_only` (a live check, mid-turn): questions the drone has not answered yet (no `#borg-answer`
+/// after them, written at the stop) wait for the stop's judge, which sees the answer, as in hook mode.
+fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str, answered_only: bool) -> Vec<predict::Pending<'a>> {
     let mut tries: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut settled = std::collections::HashSet::new();
     for l in state.lines().filter_map(|l| l.strip_prefix("#borg-judged ")) {
@@ -412,6 +431,9 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
         let before = p.checked_sub(1).map(|b| lines[b]).filter(|b| !b.starts_with("#borg-")).unwrap_or_default();
         let later = &lines[p + 1..];
         let answers: Vec<&str> = later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect();
+        if answered_only && answers.is_empty() {
+            continue;
+        }
         let work: Vec<&str> = later.iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
         let after = format!(
             "answer: {}\nwork since: {}\nthis turn: {}",
@@ -456,13 +478,37 @@ fn record_verdicts(session: &str, input: &Value, pending: &[predict::Pending], r
     log_cost(session, &format!("judge call={call} pending={} resolved={} chars={chars}", pending.len(), changed.len() + ignored.len()));
     if learning() {
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        // One record per channel: the statistics split what the questions led to by how they were asked.
+        let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
+        let live = live_asked(&edits);
         for (kind, lessons) in [(outcome::CHANGED, changed), (outcome::IGNORED, ignored)] {
-            if !lessons.is_empty() {
-                let o = outcome::Outcome { kind: kind.into(), session: session.into(), lessons, ms: learn::now_ms(), repo: repo_of(cwd), ..Default::default() };
-                let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &o);
+            let (by_live, by_stop): (Vec<String>, Vec<String>) = lessons.into_iter().partition(|id| live.contains(id.as_str()));
+            for (channel, lessons) in [("live", by_live), ("stop", by_stop)] {
+                if !lessons.is_empty() {
+                    let o = outcome::Outcome {
+                        kind: kind.into(),
+                        session: session.into(),
+                        lessons,
+                        ms: learn::now_ms(),
+                        repo: repo_of(cwd),
+                        channel: channel.into(),
+                        ..Default::default()
+                    };
+                    let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &o);
+                }
             }
         }
     }
+}
+
+/// Lessons a live check asked (`#borg-live <ids> ms=<epoch ms>`, right after their `#borg-asked` line).
+fn live_asked(text: &str) -> std::collections::HashSet<&str> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("#borg-live "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .flat_map(|ids| ids.split(','))
+        .filter(|i| !i.is_empty())
+        .collect()
 }
 
 /// Ids listed on the state file's `marker` lines (`#borg-asked a,b`).
@@ -541,50 +587,137 @@ fn early(harness: &str, hook_event: &str, session: &str, text: &str) -> Option<S
     borg::stats::count(&learn::home(), borg::stats::EARLY, session, |e| {
         e.n = delivered.len() as u64;
         e.lessons = delivered.iter().map(|c| c.id.clone()).collect();
+        e.channel = "early".into();
     });
     Some(text)
 }
 
-/// Graded Stop (default): ids graded 2 or 1 at a turn end that did not block, one
-/// comma-separated line per such Stop, waiting for the session's next prompt or touch (`queued`).
+/// Graded Stop (default): ids graded 2 or 1 at a turn end that did not block, one comma-separated line
+/// per such Stop, waiting for the session's next prompt or touch (`queued`). In live mode a check during
+/// the turn (`live_check`) adds its 2s and 1s the same way, and its 3s as a `live <ids>` line.
 fn queued_file(session: &str) -> PathBuf {
     state_file(session).with_extension("queued")
+}
+
+/// One line at the end of the `.queued` file, under its lock (live.rs `locked`): never into a file a
+/// hook is taking at the same moment.
+fn enqueue(session: &str, line: &str) {
+    let q = queued_file(session);
+    live::locked(&q, || {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&q).and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
+    });
+}
+
+/// The whole `.queued` file, taken under its lock (a rename, then read): what a check appends after
+/// starts a new file, delivered next time.
+fn take_queue(session: &str) -> Option<String> {
+    let q = queued_file(session);
+    let taken = state_file(session).with_extension(format!("queued.{}", std::process::id()));
+    live::locked(&q, || std::fs::rename(&q, &taken)).ok()?;
+    let text = std::fs::read_to_string(&taken).unwrap_or_default();
+    let _ = std::fs::remove_file(&taken);
+    Some(text)
+}
+
+/// Live mode, at the stop: the live checks' asks still waiting in the `.queued` file (`live <ids>`), taken
+/// out of it; the 2s and 1s stay for the next prompt or touch.
+fn take_live(session: &str) -> Vec<String> {
+    let Some(text) = take_queue(session) else { return Vec::new() };
+    let (live, rest): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.starts_with("live "));
+    for line in rest {
+        enqueue(session, line);
+    }
+    live.iter().flat_map(|l| l["live ".len()..].split(',')).map(str::trim).filter(|i| !i.is_empty()).map(String::from).collect()
 }
 
 /// The waiting graded lessons as free context, once: those not asked, delivered early or handed over
 /// since, as many as one early delivery fits (`conscience::render_early`); the rest are dropped. Marked
 /// `#borg-queued` in the state and .edits files, so neither this queue nor early delivery repeats them,
-/// and Stop treats them as early lessons (done once acted on).
-fn queued(hook_event: &str, session: &str) -> Option<String> {
-    let ids = std::fs::read_to_string(queued_file(session)).ok()?;
-    let _ = std::fs::remove_file(queued_file(session));
+/// and Stop treats them as early lessons (done once acted on). A live check's asks (`live` lines) come
+/// first, as questions to answer (`ask_live`).
+fn queued(hook_event: &str, session: &str, input: &Value) -> Option<String> {
+    let ids = take_queue(session)?;
     let all = lessons(session);
     let state = std::fs::read_to_string(state_file(session)).unwrap_or_default();
     let mut done = listed(&state, "#borg-asked ");
     done.extend(listed(&state, "#borg-early "));
     done.extend(listed(&state, "#borg-queued "));
-    let mut wanted: Vec<&conscience::Challenge> = Vec::new();
-    for id in ids.lines().flat_map(|l| l.split(',')).map(str::trim) {
-        if let Some(c) = all.iter().find(|c| c.id == id)
-            && !done.contains(id)
-            && !wanted.iter().any(|w| w.id == id)
-        {
-            wanted.push(c);
+    let (mut firm, mut wanted): (Vec<&conscience::Challenge>, Vec<&conscience::Challenge>) = (Vec::new(), Vec::new());
+    for line in ids.lines() {
+        let (live, list) = line.strip_prefix("live ").map_or((false, line), |l| (true, l));
+        for id in list.split(',').map(str::trim) {
+            if let Some(c) = all.iter().find(|c| c.id == id)
+                && !done.contains(id)
+                && !firm.iter().chain(&wanted).any(|w| w.id == id)
+            {
+                if live { firm.push(c) } else { wanted.push(c) }
+            }
         }
     }
-    let (text, n) = conscience::render_early(&wanted, &[])?;
-    let ids = wanted[..n].iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",");
-    append(session, &format!("#borg-queued {ids}"));
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
-        let _ = writeln!(f, "#borg-queued {ids}");
+    let mut parts: Vec<String> = Vec::new();
+    if !firm.is_empty() {
+        parts.push(ask_live(hook_event, session, input, &mut firm));
     }
-    log_cost(session, &format!("free event={hook_event} lessons={n} chars={} graded dropped={}", text.len(), wanted.len() - n));
-    borg::stats::count(&learn::home(), borg::stats::QUEUED_FREE, session, |e| {
-        e.n = n as u64;
-        e.lessons = wanted[..n].iter().map(|c| c.id.clone()).collect();
-    });
-    Some(text)
+    if let Some((text, n)) = conscience::render_early(&wanted, &[]) {
+        let ids = wanted[..n].iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",");
+        append(session, &format!("#borg-queued {ids}"));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
+            let _ = writeln!(f, "#borg-queued {ids}");
+        }
+        log_cost(session, &format!("free event={hook_event} lessons={n} chars={} graded dropped={}", text.len(), wanted.len() - n));
+        borg::stats::count(&learn::home(), borg::stats::QUEUED_FREE, session, |e| {
+            e.n = n as u64;
+            e.lessons = wanted[..n].iter().map(|c| c.id.clone()).collect();
+            e.channel = "queued".into();
+        });
+        parts.push(text);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
+
+/// Live mode: a live check's asks, delivered now (conscience.rs `render_live`). Asked is recorded here, at
+/// delivery, where the drone sees them: `#borg-asked <ids>` and `#borg-live <ids> ms=<now>` in the state
+/// file, the same in .edits after the work so far (the judge's evidence before them, `pending`), the
+/// outcome `asked` with channel live, and the stat `live_ask`. No extra round: a free delivery in the cost.
+fn ask_live(hook_event: &str, session: &str, input: &Value, firm: &mut [&conscience::Challenge]) -> String {
+    borg::memory::shuffle(firm, session);
+    let ids = firm.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",");
+    let now = learn::now_ms();
+    // One write: `prefilter::turn` and E3 read the `#borg-live` line right after its `#borg-asked`.
+    append(session, &format!("#borg-asked {ids}\n#borg-live {ids} ms={now}"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
+        let _ = writeln!(f, "{}\n#borg-asked {ids}\n#borg-live {ids} ms={now}", one_line(&work_so_far(input), 4000));
+    }
+    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    if learning() {
+        let asked = outcome::Outcome {
+            kind: outcome::ASKED.into(),
+            session: session.into(),
+            lessons: firm.iter().map(|c| c.id.clone()).collect(),
+            ms: now,
+            repo: repo_of(cwd),
+            groups: conscience::disagreement_ids(firm),
+            channel: "live".into(),
+        };
+        let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
+    }
+    let text = conscience::render_live(firm);
+    log_cost(session, &format!("free event={hook_event} lessons={} chars={} live", firm.len(), text.len()));
+    stat(session, input, borg::stats::LIVE_ASK, |e| {
+        e.n = firm.len() as u64;
+        e.lessons = firm.iter().map(|c| c.id.clone()).collect();
+        e.channel = "live".into();
+    });
+    text
+}
+
+/// Live mode: this turn's work so far, from the transcript (learn.rs `turn_so_far`).
+fn work_so_far(input: &Value) -> String {
+    learn::turn_so_far(input.get("transcript_path").and_then(Value::as_str).unwrap_or_default().as_ref(), LIVE_WORK_CHARS)
+}
+
+/// How much of the turn so far a live check reads: as much as the blocked message `pending` keeps.
+const LIVE_WORK_CHARS: usize = 4000;
 
 /// One open queen question for the engineer (queen.rs `deliver`), at the first prompt of the session
 /// where one of its work repos (the cwd's and the touched ones, systems.rs `work_repos`) has one: never
@@ -614,14 +747,231 @@ fn queen_ask(harness: &str, session: &str, cwd: &str) -> Option<String> {
 }
 
 /// The free context of a prompt or touch: waiting graded lessons first, then an early delivery.
-fn free_context(harness: &str, hook_event: &str, session: &str, text: &str) -> Option<Value> {
-    free_context_with(harness, hook_event, session, text, None)
+fn free_context(harness: &str, hook_event: &str, session: &str, input: &Value, text: &str) -> Option<Value> {
+    free_context_with(harness, hook_event, session, input, text, None)
 }
 
 /// `free_context` plus `extra` (a queen question) last.
-fn free_context_with(harness: &str, hook_event: &str, session: &str, text: &str, extra: Option<String>) -> Option<Value> {
-    let parts: Vec<String> = [queued(hook_event, session), early(harness, hook_event, session, text), extra].into_iter().flatten().collect();
+fn free_context_with(harness: &str, hook_event: &str, session: &str, input: &Value, text: &str, extra: Option<String>) -> Option<Value> {
+    let parts: Vec<String> = [queued(hook_event, session, input), early(harness, hook_event, session, text), extra].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| json!({"hookSpecificOutput": {"hookEventName": hook_event, "additionalContext": parts.join("\n\n")}}))
+}
+
+/// What one model check of the work decided (`check`).
+enum Verdict {
+    /// The free gate skipped the model call: the score, or `noedit`.
+    Skip(String),
+    /// The model gave no answer: fail open.
+    Failed,
+    /// The ids to ask: in a block at the stop, with the next prompt or tool call in live mode.
+    Ask(Vec<String>),
+}
+
+/// The work a check judges, as the stop or a live check read it.
+struct Work<'a> {
+    /// Every lesson of the session (the judge's pending lessons and the ungraded widening look here).
+    all: &'a [conscience::Challenge],
+    /// The lessons that may be asked: not done, not of another system.
+    challenges: &'a [conscience::Challenge],
+    done: &'a std::collections::HashSet<&'a str>,
+    /// The state file as read before the check.
+    state: &'a str,
+    /// The state file plus the drone's work text: what the gate and the model read.
+    context: &'a str,
+    scope_text: &'a str,
+    /// The drone's message for the judge (`pending`): its final message at the stop, the turn so far live.
+    message: &'a str,
+    /// BORG_STOP_GATE=edits: whether the turn changed anything.
+    changed: bool,
+    /// Whether this check judges the pending lessons: not while another check (holding the session's
+    /// lock) may be judging the same ones.
+    judge: bool,
+}
+
+/// The consequence model's check of `w`, shared by the stop and live mode's `borg check` (`live`): the
+/// free gate, the pool, one graded call that also judges the pending lessons, and the graded split. The
+/// 2s and 1s of a graded call wait in the `.queued` file (Claude Code only); what to ask is returned.
+/// A live call is logged as `live_check` with a `live usd=… lessons=…` cost line, the stop's as `check`.
+fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
+    // The free gate (prefilter.rs): a turn whose words touch no lesson costs no model call; the conscience
+    // then asked nothing. BORG_STOP_GATE=edits instead: a turn that changed nothing costs no model call.
+    let skip = if prefilter::edits_gate() {
+        (!w.changed).then(|| "noedit".to_string())
+    } else {
+        prefilter::skip(w.challenges, w.context).map(|score| format!("{score:.2}"))
+    };
+    if let Some(score) = skip {
+        return Verdict::Skip(score);
+    }
+    // BM25's top 30, plus lessons the vector index finds that word matching missed (vectors.rs; here only,
+    // where the model call dwarfs loading the embedder). Top 30 found as much as top 20 + vectors; both
+    // together find the most (reports/vectors.md).
+    let started = std::time::Instant::now();
+    let shortlist_now = || {
+        let (list, added) = borg::vectors::shortlist(&lessons_path(), w.challenges, w.context, w.scope_text, borg::vectors::SHORTLIST);
+        if borg::vectors::enabled() {
+            log_cost(session, &format!("vectors added={added} ms={}", started.elapsed().as_millis()));
+        }
+        list
+    };
+    // The whole pool (whole.rs, default): every lesson the Stop allows, up to a token budget; the
+    // shortlist's order decides only when they do not all fit. BORG_STOP_FORMAT=classic asks about that
+    // pool in the shortlist's layout (predict::prompt).
+    let whole = borg::whole::on();
+    let shortlist = if whole {
+        let ranked = conscience::rank_scoped(w.challenges, w.context, w.scope_text);
+        let eligible = borg::whole::eligible(w.challenges, &ranked, w.scope_text);
+        let n = eligible.len();
+        let (shown, fell) = borg::whole::select(eligible, shortlist_now, &ranked, borg::whole::tokens());
+        log_cost(session, &format!("pool mode=all eligible={n} shown={} budget={}", shown.len(), if fell { "full" } else { "fits" }));
+        shown
+    } else {
+        shortlist_now()
+    };
+    let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
+    // R1: the same call judges what the drone did with lessons asked earlier this session.
+    let pend = if w.judge { pending(session, w.state, w.all, w.message, live) } else { Vec::new() };
+    let extra = predict::judge_section(&pend).len();
+    let graded = borg::whole::graded();
+    let called = std::time::Instant::now();
+    let pred = if whole && !borg::whole::classic() {
+        predict::predict_whole(w.context, &shortlist, &pend, &model, graded)
+    } else {
+        predict::predict(w.context, &shortlist, &pend, &model, graded)
+    };
+    stat(session, input, if live { borg::stats::LIVE_CHECK } else { borg::stats::CHECK }, |e| {
+        e.n = shortlist.len() as u64;
+        e.dur_ms = called.elapsed().as_millis() as u64;
+        e.usd = pred.as_ref().map_or(0.0, |p| p.cost);
+        if pred.is_none() {
+            e.why = "failed".into();
+        }
+    });
+    let Some(pred) = pred else { return Verdict::Failed };
+    // Live calls log this line too: the judge's call numbering counts every model call of the session.
+    append(session, &format!("#borg-predict-cost {:.4}", pred.cost));
+    if live {
+        log_cost(session, &format!("live usd={:.4} lessons={}", pred.cost, shortlist.len()));
+    }
+    if !pend.is_empty() {
+        let call = w.state.lines().filter(|l| l.starts_with("#borg-predict-cost")).count() + 1;
+        record_verdicts(session, input, &pend, &pred.resolved, extra, call);
+    }
+    let applied: Vec<(&conscience::Challenge, u8)> =
+        pred.applies.iter().zip(&pred.grades).filter_map(|(i, g)| shortlist.iter().find(|c| &c.id == i).map(|c| (*c, *g))).collect();
+    let ids = |cs: &[&conscience::Challenge]| cs.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+    if graded {
+        // Graded (default): ask only for a lesson graded 3; a check without one hands its 2s and 1s over
+        // free at the next prompt or touch (conscience.rs `graded`).
+        let (ask, free) = conscience::graded(&applied);
+        let queue = !free.is_empty() && harness == "claude";
+        log_cost(session, &format!("graded applied={} ask={} free={} {}", applied.len(), ask.len(), free.len(), if queue { "queued" } else { "dropped" }));
+        if queue {
+            enqueue(session, &free.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(","));
+        }
+        Verdict::Ask(ids(&ask))
+    } else {
+        // R3b: the model decides whether to ask (at the stop, an extra round); once it does, the questions
+        // also carry every other lesson over the low bar (conscience.rs `widen`).
+        let predicted: Vec<&conscience::Challenge> = applied.iter().map(|(c, _)| *c).collect();
+        let widened = conscience::widen(&conscience::rank_scoped(w.all, w.context, w.scope_text), &predicted, w.done);
+        Verdict::Ask(widened.into_iter().filter(|c| w.challenges.iter().any(|x| x.id == c.id)).map(|c| c.id.clone()).collect())
+    }
+}
+
+/// Live mode (live.rs), in the PostToolUse hook after a state-changing tool call: counts the change and,
+/// when no check runs, something changed since the last one and the debounce has passed, starts `borg
+/// check` detached. The hook returns at once; the drone waits for nothing.
+fn live_trigger(session: &str, input: &Value, tool: &str) {
+    let ctx = state_file(session);
+    if let Some(why) = live::unsupported() {
+        // Said once per session: the hook would otherwise repeat it after every change.
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(ctx.with_extension("live.off")).is_ok() {
+            eprintln!("borg: live mode needs the consequence model, which {why} replaces; this session stays in hook mode");
+        }
+        return;
+    }
+    live::bump(&ctx, tool);
+    let now = learn::now_ms();
+    // A paused drone (steer.rs) is waiting for its engineer, not working: nothing to check.
+    let home = learn::home();
+    if borg::steer::inbox(&home).exists() {
+        let started = borg::presence::read(&home, session).map_or(i64::MAX, |p| p.started);
+        if borg::steer::pending(&home, session, started, now).paused.is_some() {
+            return;
+        }
+    }
+    let lock = live::lock_state(&ctx, now, live::stale_ms(), live::alive);
+    if live::decide(live::Mode::Live, lock, live::count(&ctx), live::read_mark(&ctx), now, live::debounce_ms()).is_err() {
+        return;
+    }
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    // As `end` starts `borg learn`: this binary, detached, inheriting the collective's store and state.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["check", "--session", session, "--transcript", &s("transcript_path"), "--cwd", &s("cwd")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+/// `borg check` (live.rs): one check of the session's work so far, in the background. Takes the
+/// session's lock (or leaves: a check runs), decides again under it, then runs the stop's check on this
+/// turn so far: the 3s wait in the `.queued` file as a `live <ids>` line, the 2s and 1s as at the stop.
+/// It writes no `#borg-asked` (that happens at delivery, `ask_live`) and no `#borg-skip` (that closes a
+/// stop's turn): a gate skip is `#borg-live-skip`. The mark records the changes a completed check covered.
+fn live_check(session: &str, input: &Value) {
+    let ctx = state_file(session);
+    let started = learn::now_ms();
+    let Some(_lock) = live::acquire(&ctx, started) else { return };
+    let n = live::count(&ctx);
+    let mark = live::read_mark(&ctx);
+    if live::unsupported().is_some() || live::decide(live::current(), live::Lock::Free, n, mark, started, live::debounce_ms()).is_err() {
+        return;
+    }
+    let harness = std::env::var("BORG_HARNESS").unwrap_or_else(|_| "claude".into());
+    let turn = turn_id(session);
+    let all = lessons(session);
+    let state = std::fs::read_to_string(&ctx).unwrap_or_default();
+    let message = work_so_far(input);
+    // Done as at the stop, and also what still waits for delivery: it is decided already.
+    let acted = early_acted(session, &all, &message);
+    let mut done = listed(&state, "#borg-asked ");
+    done.extend(listed(&state, "#borg-early ").into_iter().chain(listed(&state, "#borg-queued ")).filter(|i| acted.contains(*i)));
+    let waiting = std::fs::read_to_string(queued_file(session)).unwrap_or_default();
+    done.extend(waiting.lines().flat_map(|l| l.strip_prefix("live ").unwrap_or(l).split(',')).map(str::trim).filter(|i| !i.is_empty()));
+    let challenges: Vec<conscience::Challenge> = all.iter().filter(|c| !done.contains(c.id.as_str()) && !c.off_system).cloned().collect();
+    let context = format!("{state}{message}");
+    let scope_text = format!("{}\n{message}", where_now(session));
+    let work = Work {
+        all: &all,
+        challenges: &challenges,
+        done: &done,
+        state: &state,
+        context: &context,
+        scope_text: &scope_text,
+        message: &message,
+        changed: true,
+        judge: true,
+    };
+    let before = mark.map_or(0, |m| m.covered);
+    let covered = match check(&harness, session, input, &work, true) {
+        // A skipped or failed check covered nothing: the stop decides for itself.
+        Verdict::Skip(score) => {
+            append(session, &format!("#borg-live-skip {score}"));
+            before
+        }
+        Verdict::Failed => before,
+        Verdict::Ask(ids) => {
+            if !ids.is_empty() {
+                enqueue(session, &format!("live {}", ids.join(",")));
+            }
+            n
+        }
+    };
+    live::write_mark(&ctx, live::Mark { covered, started_ms: started, turn: Some(turn) });
 }
 
 fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
@@ -648,7 +998,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                 return None;
             }
             let ask = queen_ask(harness, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
-            free_context_with(harness, "UserPromptSubmit", session, prompt, ask)
+            free_context_with(harness, "UserPromptSubmit", session, input, prompt, ask)
         }
         "post_tool_failure" => {
             capture_rejection(session, input);
@@ -696,7 +1046,11 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             {
                 let _ = writeln!(f, "{edit}");
             }
-            free_context(harness, "PostToolUse", session, &touch)
+            // Live mode (live.rs): a change starts a check of the work so far, in the background.
+            if harness == "claude" && prefilter::changes(tool, tool_input) && live::current() == live::Mode::Live {
+                live_trigger(session, input, tool);
+            }
+            free_context(harness, "PostToolUse", session, input, &touch)
         }
         "stop" => {
             if learning() {
@@ -722,6 +1076,15 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                 return None;
             }
             stat(session, input, borg::stats::TURN_END, |_| {});
+            // Live mode: a check still running finishes first (bounded), so this stop reads what it wrote.
+            // Then the stop holds the session's lock itself, so no check starts beside it; when a check
+            // still holds it, the stop leaves the pending lessons to that check's judge.
+            let live_mode = harness == "claude" && live::current() == live::Mode::Live;
+            let lock = if live_mode { live::wait_free(&state_file(session), live::STOP_WAIT_MS) } else { live::Lock::Free };
+            let guard = if live_mode && lock != live::Lock::Held { live::acquire(&state_file(session), learn::now_ms()) } else { None };
+            let lock = if live_mode && guard.is_none() { live::Lock::Held } else { lock };
+            // A live check's 3s that no tool call delivered yet: this stop asks them (it would have).
+            let waiting = if live_mode { take_live(session) } else { Vec::new() };
             let mut context = std::fs::read_to_string(state_file(session)).unwrap_or_default();
             // A lesson is asked once per session: the drone answered it at that turn end, and asking it again
             // at every later one is noise (and a model call spent on it). A lesson delivered early
@@ -746,91 +1109,46 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                 // Word matching alone always finds *some* lesson, so it asked at every turn end; the
                 // consequence model may abstain, and it is the mechanism the sealed eval measured.
                 Err(_) if std::env::var("BORG_MATCH").as_deref() != Ok("bm25") => {
-                    // The free gate (prefilter.rs): a turn whose words touch no lesson costs no model
-                    // call; the conscience then asked nothing, and the queen (0 tokens) decides as usual.
-                    // BORG_STOP_GATE=edits instead: a turn that changed nothing costs no model call.
-                    let skip = if prefilter::edits_gate() {
-                        (!changed).then(|| "noedit".to_string())
-                    } else {
-                        prefilter::skip(&challenges, &context).map(|score| format!("{score:.2}"))
-                    };
-                    if let Some(score) = skip {
-                        append(session, &format!("#borg-skip {score}"));
-                        stat(session, input, borg::stats::GATE_SKIP, |e| e.why = score.clone());
+                    let skip = |why: &str| {
+                        append(session, &format!("#borg-skip {why}"));
+                        stat(session, input, borg::stats::GATE_SKIP, |e| e.why = why.to_string());
                         let prompts = std::fs::read_to_string(prompts_file(session)).unwrap_or_default();
-                        return borg::queen::stop(session, input, &prompts, &[]);
-                    }
-                    // BM25's top 30, plus lessons the vector index finds that word matching missed (vectors.rs;
-                    // here only, where the model call dwarfs loading the embedder). Top 30 found as much as
-                    // top 20 + vectors; both together find the most (reports/vectors.md).
-                    let started = std::time::Instant::now();
-                    let shortlist_now = || {
-                        let (list, added) = borg::vectors::shortlist(&lessons_path(), &challenges, &context, &scope_text, borg::vectors::SHORTLIST);
-                        if borg::vectors::enabled() {
-                            log_cost(session, &format!("vectors added={added} ms={}", started.elapsed().as_millis()));
-                        }
-                        list
+                        borg::queen::stop(session, input, &prompts, &[])
                     };
-                    // The whole pool (whole.rs, default): every lesson the Stop allows, up to a token budget; the
-                    // shortlist's order decides only when they do not all fit. BORG_STOP_FORMAT=classic asks
-                    // about that pool in the shortlist's layout (predict::prompt).
-                    let whole = borg::whole::on();
-                    let shortlist = if whole {
-                        let ranked = conscience::rank_scoped(&challenges, &context, &scope_text);
-                        let eligible = borg::whole::eligible(&challenges, &ranked, &scope_text);
-                        let n = eligible.len();
-                        let (shown, fell) = borg::whole::select(eligible, shortlist_now, &ranked, borg::whole::tokens());
-                        log_cost(session, &format!("pool mode=all eligible={n} shown={} budget={}", shown.len(), if fell { "full" } else { "fits" }));
-                        shown
-                    } else {
-                        shortlist_now()
-                    };
-                    let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
-                    // R1: the same call judges what the drone did with lessons asked earlier this session.
-                    let pend = pending(session, &state, &all, &full_proposal(input));
-                    let extra = predict::judge_section(&pend).len();
-                    let graded = borg::whole::graded();
-                    let called = std::time::Instant::now();
-                    let pred = if whole && !borg::whole::classic() {
-                        predict::predict_whole(&context, &shortlist, &pend, &model, graded)
-                    } else {
-                        predict::predict(&context, &shortlist, &pend, &model, graded)
-                    };
-                    stat(session, input, borg::stats::CHECK, |e| {
-                        e.n = shortlist.len() as u64;
-                        e.dur_ms = called.elapsed().as_millis() as u64;
-                        e.usd = pred.as_ref().map_or(0.0, |p| p.cost);
-                        if pred.is_none() {
-                            e.why = "failed".into();
+                    let waiting: Vec<&conscience::Challenge> = waiting.iter().filter_map(|i| challenges.iter().find(|c| &c.id == i)).collect();
+                    // Live mode: a check that started in this turn covered every change and none came since:
+                    // its verdict stands (its waiting asks are asked now), and this stop costs no model call
+                    // (live.rs `covered`).
+                    let ctx = state_file(session);
+                    if live_mode && live::covered(lock, live::count(&ctx), live::read_mark(&ctx), turn_id(session)) {
+                        if waiting.is_empty() {
+                            return skip("live_covered");
                         }
-                    });
-                    let pred = pred?;
-                    append(session, &format!("#borg-predict-cost {:.4}", pred.cost));
-                    if !pend.is_empty() {
-                        let call = state.lines().filter(|l| l.starts_with("#borg-predict-cost")).count() + 1;
-                        record_verdicts(session, input, &pend, &pred.resolved, extra, call);
-                    }
-                    let applied: Vec<(&conscience::Challenge, u8)> =
-                        pred.applies.iter().zip(&pred.grades).filter_map(|(i, g)| shortlist.iter().find(|c| &c.id == i).map(|c| (*c, *g))).collect();
-                    if graded {
-                        // Graded (default): block only for a lesson graded 3; a turn without a block hands
-                        // its 2s and 1s over free at the next prompt or touch (conscience.rs `graded`).
-                        let (ask, free) = conscience::graded(&applied);
-                        let queue = !free.is_empty() && harness == "claude";
-                        log_cost(
-                            session,
-                            &format!("graded applied={} ask={} free={} {}", applied.len(), ask.len(), free.len(), if queue { "queued" } else { "dropped" }),
-                        );
-                        if queue && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(queued_file(session)) {
-                            let _ = writeln!(f, "{}", free.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(","));
-                        }
-                        ask
+                        waiting
                     } else {
-                        // R3b: the model decides whether to block (an extra round); once it does, the block
-                        // also carries every other lesson over the low bar (conscience.rs `widen`).
-                        let predicted: Vec<&conscience::Challenge> = applied.iter().map(|(c, _)| *c).collect();
-                        let widened = conscience::widen(&conscience::rank_scoped(&all, &context, &scope_text), &predicted, &done);
-                        widened.into_iter().filter_map(|c| challenges.iter().find(|x| x.id == c.id)).collect()
+                        let work = Work {
+                            all: &all,
+                            challenges: &challenges,
+                            done: &done,
+                            state: &state,
+                            context: &context,
+                            scope_text: &scope_text,
+                            message: &full_proposal(input),
+                            changed,
+                            judge: !live_mode || guard.is_some(),
+                        };
+                        let mut asked: Vec<&conscience::Challenge> = match check(harness, session, input, &work, false) {
+                            Verdict::Skip(_) | Verdict::Failed if !waiting.is_empty() => Vec::new(),
+                            Verdict::Skip(score) => return skip(&score),
+                            Verdict::Failed => return None,
+                            Verdict::Ask(ids) => ids.iter().filter_map(|i| challenges.iter().find(|c| &c.id == i)).collect(),
+                        };
+                        for c in waiting {
+                            if !asked.iter().any(|a| a.id == c.id) {
+                                asked.push(c);
+                            }
+                        }
+                        asked
                     }
                 }
                 // R3b (conscience.rs `budget`): block only for a lesson near the best match not yet done;
@@ -868,6 +1186,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                     ms: learn::now_ms(),
                     repo: repo_of(cwd),
                     groups: conscience::disagreement_ids(&selected),
+                    channel: "stop".into(),
                 };
                 let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
             }
@@ -877,6 +1196,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             stat(session, input, borg::stats::BLOCK, |e| {
                 e.n = selected.len() as u64;
                 e.lessons = selected.iter().map(|c| c.id.clone()).collect();
+                e.channel = "stop".into();
             });
             out
         }
@@ -986,15 +1306,21 @@ fn main() {
             // Which mind is this repo part of? Decided before anything is read or written: an off repo
             // (or a broken config) leaves no trace at all.
             let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
-            let route = match collective::load() {
+            let cfg = collective::load();
+            let route = match &cfg {
                 Ok(cfg) => collective::route(cfg.as_ref(), cwd, &learn::home()),
                 Err(_) => collective::Route::Off,
             };
             let collective::Route::Collective { home, name, .. } = route else { return };
+            // The delivery mode (live.rs): BORG_MODE, else the collective's `mode`, else hook. Exported as the
+            // mode this drone runs in, which the statistics record: live is Claude Code only so far, so omp
+            // and opencode drones of a live collective run (and count) in hook mode.
+            let mode = if *harness == "claude" { live::of(cfg.as_ref().ok().and_then(Option::as_ref), &name).mode } else { live::Mode::Hook };
             // SAFETY: single-threaded at this point; everything below (and the background `borg learn`
-            // it spawns) inherits the collective's own store and scratch state.
+            // or `borg check` it spawns) inherits the collective's own store, scratch state and mode.
             unsafe {
                 std::env::set_var("BORG_HOME", &home);
+                std::env::set_var("BORG_MODE", mode.name());
                 // borg's own model calls go through the drone's harness (runner.rs).
                 std::env::set_var("BORG_HARNESS", harness);
                 if std::env::var_os("BORG_STATE").is_none() {
@@ -1067,6 +1393,16 @@ fn main() {
             borg::vectors::refresh(&store);
             // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
             borg::stats::rollup(&learn::home());
+        }
+        ["check", rest @ ..] => {
+            // Live mode's check (live.rs), spawned by the PostToolUse hook with the hook's environment.
+            let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied().unwrap_or_default();
+            let session = flag("--session");
+            if session.is_empty() {
+                eprintln!("borg check: --session ID is required (internal: the PostToolUse hook runs it in live mode)");
+                std::process::exit(2);
+            }
+            live_check(session, &json!({"session_id": session, "cwd": flag("--cwd"), "transcript_path": flag("--transcript")}));
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
         ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),

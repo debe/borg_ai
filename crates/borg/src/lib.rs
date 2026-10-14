@@ -12,6 +12,7 @@ pub mod expert_route;
 pub mod facets;
 pub mod install;
 pub mod learn;
+pub mod live;
 pub mod memory;
 pub mod notes;
 pub mod notify;

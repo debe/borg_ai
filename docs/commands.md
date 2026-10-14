@@ -6,8 +6,8 @@
 
 | Command | Shows or does |
 |---|---|
-| `borg status` | Each collective's store (lessons, episodes, outcomes) and what is wired |
-| `borg doctor` | What is broken: config, hooks, adapters, the `claude` CLI, `borg` on `PATH` |
+| `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks) and what is wired |
+| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the `claude` CLI, `borg` on `PATH` |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
 | `borg install\|uninstall <claude\|omp\|opencode\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
@@ -35,6 +35,13 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 
 For debugging and evaluation: `borg recall`, `borg prefilter`, `borg resolve`, `borg expert`,
 `borg facets`. Their usage is in the header of [`crates/borg/src/main.rs`](../crates/borg/src/main.rs).
+
+**Internal:** `borg check --session ID --transcript FILE --cwd DIR` is live mode's check of the work so
+far ([Delivery modes](../README.md#delivery-modes)). The Claude Code PostToolUse hook starts it detached
+after a state-changing tool call, with the hook's environment; it takes the session's lock
+(`<state>/<session>.live.lock`), runs one graded model call on the turn so far, and leaves its verdict
+in the session's `.queued` file for the next prompt or tool call. It is not meant to be run by hand and
+is not listed in `borg help`.
 
 ## Answering the queen
 

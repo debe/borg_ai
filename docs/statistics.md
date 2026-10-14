@@ -25,8 +25,8 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 
 | API | Returns |
 |---|---|
-| `/api/collectives` | The collectives on this machine and which one to show first |
-| `/api/stats?c=` | Totals, a zero-filled series per day, and the same per engineer |
+| `/api/collectives` | The collectives on this machine, each with its delivery `mode` (`hook` or `live`), and which one to show first |
+| `/api/stats?c=` | Totals, a zero-filled series per day, and the same per engineer. Totals carry `counts`, `usd`, `usd_by` (cost per kind), `usd_mode` (check cost per delivery mode) and `channels` (asks and results per channel) |
 | `/api/lessons?c=` | Every lesson with its memory state and how often it was asked, used, ignored or corrected |
 | `/api/feed?c=&limit=` | This machine's notable events, newest first |
 | `/api/queen?c=` | The queen's questions and answers |
@@ -55,6 +55,8 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `gate_skip` | The free gate decided no lesson applies: no model call, 0 tokens |
 | `check` | The turn-end model call; `n` lessons shown, its cost and duration. `why: failed` when it gave no answer |
 | `block` | An extra round: the drone was stopped and asked `n` questions |
+| `live_check` | Live mode: a model call during the turn (`borg check`); as `check`, but never a turn end |
+| `live_ask` | Live mode: `n` grade-3 lessons of a live check, delivered with the next prompt or tool call. No extra round |
 | `early`, `queued_free` | Lessons handed over free at a prompt or touch |
 | `changed`, `ignored`, `corrected`, `not_corrected` | What happened after a lesson was asked: used, ignored, corrected anyway, or no correction followed |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
@@ -66,6 +68,27 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.
+
+**Mode and channel.** Events from a hook carry `mode`: the delivery mode it ran in (`hook` or `live`,
+[Delivery modes](../README.md#delivery-modes)). Live mode is Claude Code only, so an omp or opencode
+drone of a live collective records `hook`. Asks and their results carry `channel`: how the lesson
+reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or `queued` (free). The
+`asked` outcome records and the judge's `asked_then_changed` and `asked_ignored` records in
+`outcomes.jsonl` carry the same `channel`. Rollups keep two splits beside the counts:
+
+- `usd_mode`: the cost of `check` and `live_check` per mode. Checks from before modes existed count as
+  `hook`. It is part of `usd`, never added to `usd_by`.
+- `channels`: events per `<kind>@<channel>`, for example `changed@live` (a question a live check asked
+  that changed the work) or `block@stop`.
+
+The Conscience page splits the turn-end chart into turn-end and live checks and states what the
+questions led to per channel; the Cost page shows check cost by mode per day.
+
+The session state file (`<store>/state/<session>.ctx`) marks live mode too: `#borg-asked <ids>`
+followed by `#borg-live <ids> ms=<epoch ms>` when a live check's lessons were delivered, and
+`#borg-live-skip <score>` when a live check's free gate skipped the model. A live check's model call is
+logged as `#borg-predict-cost`, like a turn end's, and as `live usd=… lessons=…` in the `.cost` file,
+so `borg status` counts it apart.
 
 ## Privacy
 

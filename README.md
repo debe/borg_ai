@@ -11,6 +11,7 @@ to peer, with no server.
 [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [How it works](#how-it-works)
+- [Delivery modes](#delivery-modes)
 - [Quick start](#quick-start)
 - [Daily use](#daily-use)
 - [Cost](#cost)
@@ -42,7 +43,8 @@ lesson. A new correction on the same point updates the existing lesson.
    top lessons to the context. Word matching only. Claude Code only.
 2. **Turn end, graded.** A free word gate skips most turns. Otherwise one model call grades every
    eligible lesson: 3 = certain, 2 = likely, 1 = worth a thought. A grade 3 blocks the stop and the agent
-   works one more round. Grades 2 and 1 arrive free with the next prompt or touch.
+   works one more round. Grades 2 and 1 arrive free with the next prompt or touch. In
+   [live mode](#delivery-modes) the same call also runs during the turn, after the agent changes something.
 3. **Judged by meaning.** The same call checks whether earlier questions changed the agent's work.
 4. **System gate.** When the repo maps to a known system, lessons scoped to other systems stay out, even
    if the conversation names them.
@@ -82,6 +84,48 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 
 ![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](docs/img/architecture.svg)
 
+## Delivery modes
+
+Each collective delivers in one of two modes. Both use the same lessons, the same graded model call and
+the same questions. They differ in *when* the call runs.
+
+- **hook** (the default): the call runs at the turn end. A lesson that applies mostly arrives after the
+  work is done, and a grade 3 costs the agent a redo round.
+- **live**: the call also runs *during* the turn, so a lesson can land before a mistake spreads across
+  ten edits. It reuses the hook machinery: no daemon, no extra process between turns.
+
+| | hook | live |
+|---|---|---|
+| Prompt | Early delivery and waiting grade-2/1 lessons, free | The same, plus questions from a live check that finished since |
+| Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background. Its grade-3 lessons arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Grades 2 and 1 arrive free, as at the turn end |
+| Turn end | The free gate, then one graded call; a grade 3 blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's grade 3 that no tool call delivered yet blocks the stop, as in hook mode. Lessons asked live are not asked again |
+| Model calls | At most one per turn end; the gate skips most | One per burst of changes (at most one running at a time, at most one start per 45 s), plus the turn end when changes came after the last check |
+| Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s for a check still running |
+| Harnesses | Claude Code, omp, opencode | Claude Code (omp and opencode follow) |
+
+**Switch** per collective with `"mode": "live"` in its entry of `collectives.json`, or for one shell with
+`BORG_MODE=live` (or `hook`), which overrides the config. `BORG_LIVE_DEBOUNCE_S` sets the least time
+between two checks (default 45). An unknown value means hook, and `borg doctor` warns. Switching back
+is the same edit; nothing is migrated.
+
+**See what it does:** `borg status` and `borg doctor` print each collective's mode and where it came
+from, and `borg status` counts live checks apart from turn-end checks. In `borg web`, the header and the
+drone cards show the mode, the Conscience page splits live checks from turn-end checks and what the
+questions led to by channel (live check or turn end), and the Cost page shows check cost by mode per day.
+
+A live check still running when the stop gives up waiting (15 s) can finish after the turn ended; its
+grade-3 lessons then arrive with the next prompt, or never if the session ends there.
+
+Live mode needs the consequence model. Under `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC` it does
+nothing: the drones run in hook mode. `borg doctor` warns and `borg status` notes it on the mode line
+(the hook's own stderr note is not shown by the agent). omp and opencode drones of a live collective
+run, and count in the statistics, in hook mode.
+
+**Which is better?** Not yet known, so the default stays hook. The decision rule was fixed before the
+run: live becomes the default only if, on the workbench eval, it passes at least as many
+criteria as hook (mean difference > 0, 95% CI lower bound ≥ −0.5) and causes no more redo rounds per run.
+Method and result: [reports/live-vs-hook.md](reports/live-vs-hook.md).
+
 ## Quick start
 
 **Requirements**
@@ -90,7 +134,7 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 - Linux or macOS. Tested on Linux only.
 - A harness: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets every feature. omp
   (tested with 18.8.5) and opencode get the turn-end check, learning and steering, but no early delivery
-  ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
+  and no live mode yet ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
 - One logged-in model CLI on `PATH`: `claude`, `omp` or `opencode`. Borg's model steps (learning, the
   turn-end check) run headless through the harness the drone runs in (Sonnet by default for `claude`,
   the configured default model for omp and opencode), and through another installed one if it gives
@@ -151,7 +195,7 @@ Borg runs on its own. These commands show what it does:
 
 | Command | Shows or does |
 |---|---|
-| `borg status` | Each collective's lessons, episodes and outcomes, and what is wired |
+| `borg status` | Each collective's mode, lessons, episodes and outcomes, and what is wired |
 | `borg doctor` | What is broken: config, hooks, adapters, the `claude` CLI |
 | `borg collective [DIR]` | Which collective a directory belongs to |
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
@@ -163,10 +207,15 @@ All commands: [Commands](docs/commands.md). Every switch: [Environment variables
 
 ## Cost
 
-- **Most turn ends cost 0 tokens.** The free gate skipped 78% of real turn ends. Early delivery and
-  grade-2 and grade-1 lessons never call a model.
+- **Most turn ends cost 0 tokens** (hook mode). The free gate skipped 78% of real turn ends. Early
+  delivery and grade-2 and grade-1 lessons never call a model.
 - **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s.
-- **An extra round** happens only for a grade-3 lesson, billed by your harness as normal agent work.
+- **An extra round** happens only for a grade-3 lesson at the turn end, billed by your harness as normal
+  agent work.
+- **Live mode** adds one call of the same kind per burst of changes during the turn, in the background.
+  The turn end then skips its own call when a live check covered every change. Questions asked live
+  cost no extra round. There is no cost cap: `borg status` and the Cost page show what each mode spent.
+  Real-session cost per turn is not measured yet ([reports/live-vs-hook.md](reports/live-vs-hook.md)).
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66).
 - `assimilate --from-dir` makes one call per document chunk and prints each call's cost.
 
@@ -197,7 +246,8 @@ excerpts and presence. Lessons skip it: the model writes them as general questio
 
 **Hooks fail open.** A missing binary, a crash, an invalid config, an unreachable model or a locked index
 lets the agent continue untouched. The turn-end call stops after 45 s; if it fails, the turn ends without
-questions. Unlearned episodes wait for the next run.
+questions. A live check that fails asks nothing, and the turn end checks as in hook mode. Unlearned
+episodes wait for the next run.
 
 ## Evidence and limits
 
@@ -216,6 +266,7 @@ author's sessions, so their data is not in this repository.
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms |
 | Public data ([SWE-chat](reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
 | End-to-end run in a sandboxed home ([dogfood](reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
+| Live vs hook mode, workbench ([live-vs-hook](reports/live-vs-hook.md)) | not run yet; the rule that decides the default is fixed |
 
 **Known limits:**
 
@@ -224,7 +275,7 @@ author's sessions, so their data is not in this repository.
 - Small samples (16 negative and 51 positive turn-end cases; 10 sessions for memory quality). The
   intervals are wide.
 - Turn-end asking of the engineer (`BORG_QUEEN=on`) failed its test and is off.
-- omp and opencode get lessons only at the turn end.
+- omp and opencode get lessons only at the turn end, and live mode is Claude Code only.
 - Borg learns only from corrections. Knowledge nobody corrected enters only through
   `assimilate --from-dir`.
 

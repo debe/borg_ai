@@ -18,13 +18,16 @@ pub const MARKERS: [&str; 2] = ["#borg-asked", "#borg-skip"];
 pub const THRESHOLD: f64 = 8.0;
 
 /// What the state file gained since the last Stop: this turn's prompt and touches (plus the drone's
-/// final message, appended by the caller).
+/// final message, appended by the caller). A live check's ask (`#borg-asked` followed by `#borg-live`,
+/// main.rs `ask_live`) comes during the turn and does not end it.
 pub fn turn(context: &str) -> &str {
     let mut start = 0;
     let mut at = 0;
-    for line in context.split_inclusive('\n') {
+    let mut lines = context.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
         at += line.len();
-        if MARKERS.iter().any(|m| line.starts_with(m)) {
+        let live = lines.peek().is_some_and(|next| next.starts_with("#borg-live "));
+        if MARKERS.iter().any(|m| line.starts_with(m)) && !live {
             start = at;
         }
     }
@@ -119,7 +122,8 @@ pub fn changes(tool: &str, input: &serde_json::Value) -> bool {
 
 /// What the gate did in a store's session state (`borg status`): turn ends skipped at 0 tokens, turn
 /// ends that asked the model, and the model's cost as logged by `#borg-predict-cost` (USD for Claude,
-/// tokens for `codex:<model>`).
+/// tokens for `codex:<model>`). Live checks (live.rs) log `#borg-predict-cost` too, and a `live` cost
+/// line each: they are counted apart (`live_checks`, `live_cost`), not as turn ends.
 #[derive(Debug, Default, PartialEq)]
 pub struct Tally {
     pub skipped: usize,
@@ -139,6 +143,10 @@ pub struct Tally {
     pub judged: usize,
     pub judge_resolved: usize,
     pub judge_chars: usize,
+    /// Live mode (main.rs `live_check`): model calls during the turn, their cost and lessons shown.
+    pub live_checks: usize,
+    pub live_cost: f64,
+    pub live_lessons: usize,
 }
 
 pub fn tally(state: &std::path::Path) -> Tally {
@@ -155,6 +163,10 @@ pub fn tally(state: &std::path::Path) -> Tally {
                     t.free += 1;
                     t.free_lessons += field("lessons=");
                     t.free_chars += field("chars=");
+                } else if line.starts_with("live ") {
+                    t.live_checks += 1;
+                    t.live_lessons += field("lessons=");
+                    t.live_cost += line.split_whitespace().find_map(|w| w.strip_prefix("usd=")).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
                 } else if line.starts_with("judge ") {
                     t.judge_calls += 1;
                     t.judged += field("pending=");
@@ -176,6 +188,8 @@ pub fn tally(state: &std::path::Path) -> Tally {
             }
         }
     }
+    t.asked = t.asked.saturating_sub(t.live_checks);
+    t.cost = (t.cost - t.live_cost).max(0.0);
     t
 }
 
@@ -210,6 +224,8 @@ mod tests {
         assert_eq!(turn(ctx), "third\nsrc/b.rs\n");
         assert_eq!(turn("only\n"), "only\n");
         assert_eq!(turn("x\n#borg-asked \n"), "");
+        // A live check's ask is part of the turn, not its end.
+        assert_eq!(turn("a\n#borg-asked L1\nb\n#borg-asked L2\n#borg-live L2 ms=5\nc\n"), "b\n#borg-asked L2\n#borg-live L2 ms=5\nc\n");
     }
 
     #[test]
@@ -295,10 +311,17 @@ mod tests {
         std::fs::write(d.join("b.cost"), "free event=PostToolUse lessons=1 chars=300\njudge call=2 pending=3 resolved=2 chars=4100\n").unwrap();
         let t = tally(&d);
         assert_eq!((t.skipped, t.asked), (2, 2));
+        assert_eq!((t.live_checks, t.live_lessons), (0, 0));
         assert_eq!((t.rounds, t.questions, t.block_chars), (2, 9, 2700));
         assert_eq!((t.free, t.free_lessons, t.free_chars), (2, 4, 1200));
         assert_eq!((t.judge_calls, t.judged, t.judge_resolved, t.judge_chars), (1, 3, 2, 4100));
         assert!((t.cost - 0.075).abs() < 1e-9);
+        // A live check logs its call like a turn end's, and a `live` cost line: it is counted apart.
+        std::fs::write(d.join("c.ctx"), "p\n#borg-predict-cost 0.0400\n#borg-live-skip 1.00\n").unwrap();
+        std::fs::write(d.join("c.cost"), "live usd=0.0400 lessons=8\n").unwrap();
+        let t = tally(&d);
+        assert_eq!((t.skipped, t.asked, t.live_checks, t.live_lessons), (2, 2, 1, 8));
+        assert!((t.cost - 0.075).abs() < 1e-9 && (t.live_cost - 0.04).abs() < 1e-9);
         assert_eq!(tally(&d.join("absent")), Tally::default());
     }
 }

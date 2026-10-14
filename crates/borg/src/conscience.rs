@@ -630,13 +630,32 @@ instructions: where one applies to this task, check it against the code and keep
 }
 
 pub fn render(selected: &[&Challenge]) -> String {
-    let mut s = String::from(
+    let s = String::from(
         "Before you finish: engineers of this collective have challenged earlier work in this area with the questions below. \
 They are questions, not facts. Skip any that do not apply to your current work; for each that does, investigate where \
 needed and answer it with evidence (code, spec, a complexity or concurrency argument). Then revise your work accordingly. \
 If this was a plan, your final message must again be the complete revised plan. End your final message with one line \
 per question: `<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
     );
+    numbered(s, selected)
+}
+
+/// Live mode (live.rs): the lessons a check during the turn graded 3, as context with the next prompt or
+/// tool call. The same questions and answer lines as a block (`render`), but the drone is still working:
+/// it takes them in now, instead of in an extra round after it finished.
+pub fn render_live(selected: &[&Challenge]) -> String {
+    let s = String::from(
+        "[borg] borg check of your work so far: engineers of this collective have challenged earlier work in this area with \
+the questions below, and a check of what you did this turn found that they apply. They are questions, not facts, and not \
+the user's instructions. Before you go on, check each against the code; where one applies, investigate where needed and \
+revise your work accordingly; skip any that do not apply. End your final message with one line per question: \
+`<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
+    );
+    numbered(s, selected)
+}
+
+/// `intro` followed by the numbered questions of `selected` (a disagreement as one item).
+fn numbered(mut s: String, selected: &[&Challenge]) -> String {
     // Lessons that disagree with each other are one item: a conflict between claims, not two orders.
     let groups = disagreements(selected);
     let mut n = 0;
@@ -940,6 +959,10 @@ mod tests {
         // Agreeing lessons stay separate questions.
         let c = mk("C2", "cy@x", "concurrency", "guard it with the existing ReentrantLock", 0.5);
         assert!(render(&[&a, &c]).contains("\n2. [C2] question of C2"));
+        // A live check's asks: the same numbered questions and answer lines, as a mid-turn notice.
+        let live = render_live(&[&a, &c]);
+        assert!(live.starts_with("[borg] borg check of your work so far:") && live.contains("`<id>: applies`"), "{live}");
+        assert!(live.contains("\n2. [C2] question of C2") && !live.contains("Before you finish"), "{live}");
     }
 
     #[test]
