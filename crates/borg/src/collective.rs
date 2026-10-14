@@ -80,8 +80,8 @@ pub struct Entry {
     /// only (LAN or VPN), or the URL of a self-hosted `iroh-relay`. `BORG_RELAY` overrides it.
     #[serde(default)]
     pub relay: Option<String>,
-    /// When the conscience judges the work (live.rs): `"hook"` (the default) at the turn end, or
-    /// `"live"` also during the turn. `BORG_MODE` overrides it; any other value is hook, with a warning
+    /// When the conscience judges the work (live.rs): `"hook"` at the turn end, or `"live"` (the
+    /// default) also during the turn. `BORG_MODE` overrides it; any other value is the default, with a warning
     /// in `borg doctor`. A string, not an enum: an unknown value must not invalidate the whole config.
     #[serde(default)]
     pub mode: Option<String>,

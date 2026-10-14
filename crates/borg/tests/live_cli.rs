@@ -169,7 +169,7 @@ fn hook_mode_and_word_matching_start_no_check() {
         let ev = json!({"session_id": "h1", "cwd": cwd, "tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "new_string": "reset arc"}});
         borg(&root, "post_tool", &ev, env)
     };
-    edit(&[("BORG_PREFILTER", "off")]);
+    edit(&[("BORG_MODE", "hook"), ("BORG_PREFILTER", "off")]);
     edit(&[("BORG_MODE", "live"), ("BORG_MATCH", "bm25")]);
     std::thread::sleep(Duration::from_millis(500));
     assert!(prompts(&root).is_empty());

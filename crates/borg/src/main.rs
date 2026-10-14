@@ -98,9 +98,9 @@
 //!   BORG_PREDICT_MODEL  model for the consequence model: unset = through the drone's own harness (runner.rs;
 //!                    the claude CLI runs sonnet, omp and opencode their own default), `<runner>:<model>` pins
 //!                    one runner and model (`claude:claude-sonnet-5-5`), "off" = no model call
-//!   BORG_MODE        delivery mode, overriding the collective's `mode` (live.rs): "hook" (default) judges the
-//!                    work at the turn end; "live" also judges it during the turn, after state-changing tool
-//!                    calls, in a detached `borg check` (Claude Code only). Anything else is hook
+//!   BORG_MODE        delivery mode, overriding the collective's `mode` (live.rs): "hook" judges the
+//!                    work at the turn end; "live" (default) also judges it during the turn, after state-changing tool
+//!                    calls, in a detached `borg check` (Claude Code only). Anything else is live
 //!   BORG_LIVE_DEBOUNCE_S  live mode: the least time between the starts of two checks (default 45)
 //!   BORG_VECTORS     "off" disables vector recall at the Stop step (vectors.rs; builds with the `vectors`
 //!                    feature): BORG_VECTOR_MODEL (model dir, default ~/.local/share/borg/models/
@@ -1320,7 +1320,7 @@ fn main() {
                 Err(_) => collective::Route::Off,
             };
             let collective::Route::Collective { home, name, .. } = route else { return };
-            // The delivery mode (live.rs): BORG_MODE, else the collective's `mode`, else hook. Exported as the
+            // The delivery mode (live.rs): BORG_MODE, else the collective's `mode`, else live. Exported as the
             // mode this drone runs in, which the statistics record: live is Claude Code only so far, so omp
             // and opencode drones of a live collective run (and count) in hook mode.
             let mode = if *harness == "claude" { live::of(cfg.as_ref().ok().and_then(Option::as_ref), &name).mode } else { live::Mode::Hook };

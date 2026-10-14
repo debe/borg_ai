@@ -44,7 +44,8 @@ lesson. A new correction on the same point updates the existing lesson.
 2. **Turn end, graded.** A free word gate skips most turns. Otherwise one model call grades every
    eligible lesson: 3 = certain, 2 = likely, 1 = worth a thought. A grade 3 blocks the stop and the agent
    works one more round. Grades 2 and 1 arrive free with the next prompt or touch. In
-   [live mode](#delivery-modes) the same call also runs during the turn, after the agent changes something.
+   [live mode](#delivery-modes), the default, the same call also runs during the turn, after the agent
+   changes something.
 3. **Judged by meaning.** The same call checks whether earlier questions changed the agent's work.
 4. **System gate.** When the repo maps to a known system, lessons scoped to other systems stay out, even
    if the conversation names them.
@@ -89,23 +90,24 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 Each collective delivers in one of two modes. Both use the same lessons, the same graded model call and
 the same questions. They differ in *when* the call runs.
 
-- **hook** (the default): the call runs at the turn end. A lesson that applies mostly arrives after the
-  work is done, and a grade 3 costs the agent a redo round.
-- **live**: the call also runs *during* the turn, so a lesson can land before a mistake spreads across
+- **live** (the default): the call also runs *during* the turn, so a lesson can land before a mistake spreads across
   ten edits. It reuses the hook machinery: no daemon, no extra process between turns.
+- **hook**: the call runs at the turn end only. A lesson that applies mostly arrives after the work is
+  done, and a grade 3 costs the agent a redo round. It costs about a tenth of live on borg's side.
 
 | | hook | live |
 |---|---|---|
 | Prompt | Early delivery and waiting grade-2/1 lessons, free | The same, plus questions from a live check that finished since |
-| Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background. Its grade-3 lessons arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Grades 2 and 1 arrive free, as at the turn end |
+| Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background; a later tool call starts one while changes wait unchecked. A live check has no word gate: a turn half done has too few words for it. Its grade-3 lessons arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Grades 2 and 1 arrive free, as at the turn end |
 | Turn end | The free gate, then one graded call; a grade 3 blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's grade 3 that no tool call delivered yet blocks the stop, as in hook mode. Lessons asked live are not asked again |
 | Model calls | At most one per turn end; the gate skips most | One per burst of changes (at most one running at a time, at most one start per 45 s), plus the turn end when changes came after the last check |
 | Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s for a check still running |
 | Harnesses | Claude Code, omp, opencode | Claude Code (omp and opencode follow) |
 
-**Switch** per collective with `"mode": "live"` in its entry of `collectives.json`, or for one shell with
-`BORG_MODE=live` (or `hook`), which overrides the config. `BORG_LIVE_DEBOUNCE_S` sets the least time
-between two checks (default 45). An unknown value means hook, and `borg doctor` warns. Switching back
+**Switch back to hook** per collective with `"mode": "hook"` in its entry of `collectives.json`, or for
+one shell with `BORG_MODE=hook` (or `live`), which overrides the config. `BORG_LIVE_DEBOUNCE_S` sets the
+least time between two checks (default 45). An unknown value means the default, live, and `borg doctor`
+warns. Switching back
 is the same edit; nothing is migrated.
 
 **See what it does:** `borg status` and `borg doctor` print each collective's mode and where it came
@@ -121,10 +123,25 @@ nothing: the drones run in hook mode. `borg doctor` warns and `borg status` note
 (the hook's own stderr note is not shown by the agent). omp and opencode drones of a live collective
 run, and count in the statistics, in hook mode.
 
-**Which is better?** Not yet known, so the default stays hook. The decision rule was fixed before the
-run: live becomes the default only if, on an internal benchmark of real engineering tasks with graded
-outcomes, it passes at least as many criteria as hook (mean difference > 0, 95% CI lower bound ≥ −0.5)
-and causes no more redo rounds per run.
+**Why live is the default.** The rule was fixed before the run: live becomes the default if, on an
+internal benchmark of real engineering tasks with graded outcomes, it passes more criteria than hook
+(mean difference > 0, 95% CI lower bound ≥ −0.5) and causes no more redo rounds per run. 3 tasks × 3
+seeds per mode, the same lessons, solver (Claude Opus 5) and check model (Sonnet 5.5):
+
+| Per run | hook | live |
+|---|---|---|
+| Criteria passed, live − hook (8 pairs; one live run timed out and its pair is dropped) | | +0.38, 95% CI [0, +0.88] |
+| Redo rounds from a blocked stop | 0.5 | 0 |
+| Lessons delivered during the turn | 0 | 9.6 |
+| Borg's own model cost | $0.07 | $0.56 |
+| Whole run cost (agent, borg) | $4.97 | $5.05 |
+| Wall time | 464 s | 467 s |
+
+The rule fired. Live never passed fewer criteria than hook on the same task and seed; it passed more in
+2 of 8 pairs. The gain is small and the sample is small (p = 0.50), so treat it as "not worse, sometimes
+better, never blocked" rather than a proven win. Borg's side costs about 8× more ($0.49 more per task),
+yet whole runs cost about the same ($5.05 vs $4.97). Switch back with `"mode": "hook"` when borg's own
+spend matters more.
 
 ## Quick start
 
@@ -207,15 +224,15 @@ All commands: [Commands](docs/commands.md). Every switch: [Environment variables
 
 ## Cost
 
-- **Most turn ends cost 0 tokens** (hook mode). The free gate skipped 78% of real turn ends. Early
+- **Most turn ends cost 0 tokens** in hook mode. The free gate skipped 78% of real turn ends. Early
   delivery and grade-2 and grade-1 lessons never call a model.
 - **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s.
 - **An extra round** happens only for a grade-3 lesson at the turn end, billed by your harness as normal
   agent work.
-- **Live mode** adds one call of the same kind per burst of changes during the turn, in the background.
-  The turn end then skips its own call when a live check covered every change. Questions asked live
-  cost no extra round. There is no cost cap: `borg status` and the Cost page show what each mode spent.
-  Real-session cost per turn is not measured yet.
+- **Live mode** (the default) adds one call of the same kind per burst of changes during the turn, in the
+  background. The turn end then skips its own call when a live check covered every change. Questions
+  asked live cost no extra round. On the benchmark, borg's side cost $0.56 per task in live mode and
+  $0.07 in hook mode. There is no cost cap: `borg status` and the Cost page show what each mode spent.
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66).
 - `assimilate --from-dir` makes one call per document chunk and prints each call's cost.
 
@@ -266,7 +283,7 @@ author's sessions, so their data is not in this repository.
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms |
 | Public data ([SWE-chat](reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
 | End-to-end run in a sandboxed home ([dogfood](reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
-| Live vs hook mode, internal task benchmark | not run yet; the rule that decides the default is fixed |
+| Live vs hook mode, internal task benchmark (9 tasks per mode) | live +0.38 criteria per task [0, +0.88], 0 redo rounds vs 0.5; live is the default |
 
 **Known limits:**
 

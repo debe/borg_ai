@@ -1,15 +1,15 @@
 //! Delivery modes: when the conscience judges the work (README "Delivery modes").
 //!
-//! - **hook** (the default): early delivery and queued lessons are free word matching; one graded model
+//! - **hook**: early delivery and queued lessons are free word matching; one graded model
 //!   call runs at the turn end (main.rs `stop`), and only a grade 3 blocks the stop.
-//! - **live**: the same graded call also runs *during* the turn. After a state-changing tool call
+//! - **live** (the default, chosen by the live-vs-hook eval): the same graded call also runs *during* the turn. After a state-changing tool call
 //!   (prefilter.rs `changes`), the PostToolUse hook spawns a detached `borg check` and returns at once;
 //!   the check judges the work so far and leaves its verdict in the `.queued` file, which the next
 //!   prompt or tool call delivers (main.rs `queued`). The stop still runs as the backstop, and skips its
 //!   own model call when a live check this turn already covered every change (`covered`).
 //!
 //! The mode is chosen per collective (`"mode"` in collectives.json, collective.rs) and `BORG_MODE`
-//! overrides it; anything else is `hook`. Slice 1 is Claude Code only: omp and opencode stay in hook mode.
+//! overrides it; unset or anything else is `DEFAULT`. Slice 1 is Claude Code only: omp and opencode stay in hook mode.
 //!
 //! Three small files per session beside its state file, no daemon:
 //! - `<S>.live.n`: one line per state-changing tool call (the change counter);
@@ -39,7 +39,7 @@ impl Mode {
 }
 
 /// The mode in force and where it came from (`BORG_MODE`, `config` or `default`), with a warning
-/// when a value was not a mode (`borg doctor` shows it; the mode is then `hook`).
+/// when a value was not a mode (`borg doctor` shows it; the mode is then `DEFAULT`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub mode: Mode,
@@ -47,18 +47,22 @@ pub struct Resolved {
     pub warning: Option<String>,
 }
 
-/// `env` (BORG_MODE) wins over `configured` (the collective's `mode`), else `hook`. An unknown value is
-/// `hook` plus a warning: a typo must never break the hooks.
+/// The mode when neither BORG_MODE nor the collective sets one: live, which passed the eval's fixed
+/// rule against hook (README "Delivery modes"). `"mode": "hook"` or `BORG_MODE=hook` switches back.
+pub const DEFAULT: Mode = Mode::Live;
+
+/// `env` (BORG_MODE) wins over `configured` (the collective's `mode`), else `DEFAULT`. An unknown value
+/// is `DEFAULT` plus a warning: a typo must never break the hooks.
 pub fn resolve(env: Option<&str>, configured: Option<&str>) -> Resolved {
     let pick = |v: &str, source: &'static str| match v.trim().to_ascii_lowercase().as_str() {
         "hook" => Resolved { mode: Mode::Hook, source, warning: None },
         "live" => Resolved { mode: Mode::Live, source, warning: None },
-        _ => Resolved { mode: Mode::Hook, source, warning: Some(format!("{source}: mode {v:?} is neither \"hook\" nor \"live\"; using hook")) },
+        _ => Resolved { mode: DEFAULT, source, warning: Some(format!("{source}: mode {v:?} is neither \"hook\" nor \"live\"; using {}", DEFAULT.name())) },
     };
     match (env.filter(|v| !v.trim().is_empty()), configured.filter(|v| !v.trim().is_empty())) {
         (Some(v), _) => pick(v, "BORG_MODE"),
         (None, Some(v)) => pick(v, "config"),
-        (None, None) => Resolved { mode: Mode::Hook, source: "default", warning: None },
+        (None, None) => Resolved { mode: DEFAULT, source: "default", warning: None },
     }
 }
 
@@ -301,14 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn env_beats_config_and_unknown_values_fall_back_to_hook() {
-        assert_eq!(resolve(None, None), Resolved { mode: Mode::Hook, source: "default", warning: None });
+    fn env_beats_config_and_unknown_values_fall_back_to_the_default() {
+        assert_eq!(resolve(None, None), Resolved { mode: Mode::Live, source: "default", warning: None });
         assert_eq!(resolve(None, Some("live")).mode, Mode::Live);
         assert_eq!(resolve(Some("hook"), Some("live")), Resolved { mode: Mode::Hook, source: "BORG_MODE", warning: None });
         assert_eq!(resolve(Some(" LIVE "), None).mode, Mode::Live);
         assert_eq!(resolve(Some(""), Some("live")).source, "config", "an empty BORG_MODE is unset");
         let r = resolve(None, Some("eager"));
-        assert_eq!(r.mode, Mode::Hook);
+        assert_eq!(r.mode, Mode::Live);
         assert!(r.warning.unwrap().contains("\"eager\""));
     }
 

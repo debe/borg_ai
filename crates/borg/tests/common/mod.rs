@@ -64,6 +64,8 @@ pub fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> St
         .env("BORG_QUEEN", "off")
         .env("BORG_LEARN", "off")
         .env("BORG_VECTORS", "off")
+        // These tests pin the turn-end behaviour; the live ones pass BORG_MODE=live.
+        .env("BORG_MODE", "hook")
         .envs(env.iter().copied())
         .current_dir(root)
         .stdin(Stdio::piped())
