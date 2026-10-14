@@ -10,7 +10,7 @@
 | `borg doctor` | What is broken: config, hooks, adapters, the `claude` CLI, `borg` on `PATH` |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
 | `borg install\|uninstall <claude\|omp\|opencode\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
-| `borg assimilate ...` | Import past sessions or team documents ([details](configuration.md#import-what-you-already-have)) |
+| `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
 | `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end) |
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness, weight, and long-term or dormant state |

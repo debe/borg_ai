@@ -1,0 +1,169 @@
+{
+  "info": {
+    "id": "ses_24b11b83cffekoulQkcRrALTlS",
+    "slug": "playful-engine",
+    "projectID": "1111111111111111111111111111111111111111",
+    "directory": "/home/dev/work/service-a",
+    "title": "Session title",
+    "version": "1.14.19",
+    "summary": {
+      "additions": 504,
+      "deletions": 13,
+      "files": 4
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 127,
+      "output": 61743,
+      "reasoning": 0,
+      "cache": {
+        "read": 11174309,
+        "write": 930652
+      }
+    },
+    "time": {
+      "created": 1776857008067,
+      "updated": 1776860222161
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "claude-opus-4.6",
+          "variant": "high"
+        },
+        "agent": "build",
+        "time": {
+          "created": 1776858854849
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_db50a75c1001P2ewezqZJPU24w",
+        "sessionID": "ses_24b11b83cffekoulQkcRrALTlS"
+      },
+      "parts": [
+        {
+          "type": "compaction",
+          "auto": true,
+          "overflow": false,
+          "id": "prt_db50a75c1003I3BLoErNEOhmc0",
+          "sessionID": "ses_24b11b83cffekoulQkcRrALTlS",
+          "messageID": "msg_db50a75c1001P2ewezqZJPU24w"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "parentID": "msg_db50a75c1001P2ewezqZJPU24w",
+        "mode": "compaction",
+        "agent": "compaction",
+        "variant": "high",
+        "summary": true,
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 128652,
+          "input": 3,
+          "output": 1876,
+          "reasoning": 0,
+          "cache": {
+            "write": 126773,
+            "read": 0
+          }
+        },
+        "modelID": "claude-opus-4.6",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776858854861,
+          "completed": 1776858902728
+        },
+        "finish": "stop",
+        "id": "msg_db50a75cd001ANPacWVjMRpM6r",
+        "sessionID": "ses_24b11b83cffekoulQkcRrALTlS"
+      },
+      "parts": [
+        {
+          "snapshot": "3333333333333333333333333333333333333333",
+          "type": "step-start",
+          "id": "prt_db50a91a4001clWgAMxavkAGNf",
+          "sessionID": "ses_24b11b83cffekoulQkcRrALTlS",
+          "messageID": "msg_db50a75cd001ANPacWVjMRpM6r"
+        },
+        {
+          "type": "text",
+          "text": "I will look at the relevant file and then make the change.",
+          "time": {
+            "start": 1776858861989,
+            "end": 1776858902697
+          },
+          "id": "prt_db50a91a5001ojloJ8Sk4c7jHB",
+          "sessionID": "ses_24b11b83cffekoulQkcRrALTlS",
+          "messageID": "msg_db50a75cd001ANPacWVjMRpM6r"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "3333333333333333333333333333333333333333",
+          "type": "step-finish",
+          "tokens": {
+            "total": 128652,
+            "input": 3,
+            "output": 1876,
+            "reasoning": 0,
+            "cache": {
+              "write": 126773,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_db50b30ac001b4CyDU2r5UKXJs",
+          "sessionID": "ses_24b11b83cffekoulQkcRrALTlS",
+          "messageID": "msg_db50a75cd001ANPacWVjMRpM6r"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1776858902729
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "claude-opus-4.6",
+          "variant": "high"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_db50b30c9001gINqzznzORRotn",
+        "sessionID": "ses_24b11b83cffekoulQkcRrALTlS"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "metadata": {
+            "compaction_continue": true
+          },
+          "synthetic": true,
+          "text": "<synthetic: Continue if you have next steps, or stop and ask for clarifi ...>",
+          "time": {
+            "start": 1776858902730,
+            "end": 1776858902730
+          },
+          "id": "prt_db50b30ca0015seSeIOJzI7Kqx",
+          "sessionID": "ses_24b11b83cffekoulQkcRrALTlS",
+          "messageID": "msg_db50b30c9001gINqzznzORRotn"
+        }
+      ]
+    }
+  ]
+}

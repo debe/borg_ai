@@ -1,0 +1,142 @@
+{
+  "info": {
+    "id": "ses_ec5cc4f1cffeXqxPhW1y0Xk07K",
+    "parentID": "ses_ec5cd46d0ffeGGDxs4GhqC9Ifu",
+    "projectID": "9999999999999999999999999999999999999999",
+    "agent": "general",
+    "cost": 0,
+    "tokens": {
+      "input": 20,
+      "output": 10,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "outcome": "succeeded",
+    "time": {
+      "created": 1791977828593,
+      "updated": 1791977828597,
+      "idle": 1791977828725
+    },
+    "title": "check relay",
+    "location": {
+      "directory": "/home/dev/work"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_13a33b0f4001xTjEMfDA7pxDU7",
+      "time": {
+        "created": 1791977828610
+      },
+      "text": "You are a subagent spawned by another session.\nCHILDTASK read relay.rs and report",
+      "type": "user"
+    },
+    {
+      "id": "msg_13a33b109001lU0RPvtHaffo7A",
+      "time": {
+        "created": 1791977828640,
+        "streamed": 1791977828653,
+        "completed": 1791977828669
+      },
+      "type": "assistant",
+      "agent": "general",
+      "model": {
+        "id": "m",
+        "providerID": "mock"
+      },
+      "content": [
+        {
+          "type": "tool",
+          "id": "call_1791977828643_0",
+          "name": "read",
+          "executed": false,
+          "state": {
+            "status": "completed",
+            "input": {
+              "path": "/home/dev/work/relay.rs"
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "Read file /home/dev/work/relay.rs, lines 1-1\n1: fn deliver() {}"
+              }
+            ],
+            "metadata": {
+              "truncated": false
+            }
+          },
+          "time": {
+            "created": 1791977828646,
+            "ran": 1791977828651,
+            "completed": 1791977828658
+          }
+        }
+      ],
+      "snapshot": {
+        "start": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "end": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "files": []
+      },
+      "finish": "tool-calls",
+      "rawFinish": "tool_calls",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_13a33b149001MsLidvJfKHxjRy",
+      "time": {
+        "created": 1791977828700,
+        "streamed": 1791977828711,
+        "completed": 1791977828721
+      },
+      "type": "assistant",
+      "agent": "general",
+      "model": {
+        "id": "m",
+        "providerID": "mock"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Done: the mock finished this turn."
+        }
+      ],
+      "snapshot": {
+        "start": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "end": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "files": []
+      },
+      "finish": "stop",
+      "rawFinish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_13a33b175001SwfQ28pu2oeJV7",
+      "time": {
+        "created": 1791977828725
+      },
+      "type": "idle",
+      "outcome": "succeeded"
+    }
+  ]
+}

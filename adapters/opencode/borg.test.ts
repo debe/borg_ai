@@ -267,6 +267,7 @@ test("real borg: conscience asks once per session, corrections and rejections be
   process.env.BORG_HOME = home
   process.env.BORG_STATE = join(home, "state")
   delete process.env.BORG_LEARN
+  process.env.BORG_LEARN_MODEL = "off" // episodes are recorded; the `borg learn` they start never calls a model
   // Never the engineer's real collectives config, and no model call at Stop.
   process.env.BORG_CONFIG = join(home, "no-collectives.json")
   process.env.BORG_MATCH = "bm25"
@@ -479,7 +480,60 @@ test("opencode 2: no stop when the turn was halted; a declined call is still a f
   assert.deepEqual(calls.map((c) => c[0]), ["prompt", "post_tool_failure"])
   assert.equal(calls[1][1].tool_name, "Write")
   assert.equal(calls[1][1].tool_input.file_path, "/work/repo/relay.rs")
-  assert.equal(calls[1][1].error, "The user declined this tool call")
+  assert.equal(calls[1][1].error, "The user doesn't want to proceed with this tool use.", "a wordless denial in Claude's wording")
+  await cleanup()
+})
+
+test("opencode 1: a rejection without feedback reaches borg as Claude's plain rejection; other errors as they are", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  await hooks.event!(toolError("c1", "bash", { command: "rm -rf x" }, "The user rejected permission to use this specific tool call."))
+  await hooks.event!(toolError("c2", "write", { filePath: "/work/repo/x" }, "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []"))
+  await hooks.event!(toolError("c3", "question", {}, "The user dismissed this question"))
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  const errors = recorded(rec).filter((c) => c[0] === "post_tool_failure").map((c) => c[1].error)
+  assert.deepEqual(errors, [
+    "The user doesn't want to proceed with this tool use.",
+    "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []",
+    "The user dismissed this question",
+  ])
+})
+
+test("opencode 1: the plain rejections that follow a rejection with words are its cascade, not denials", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("Fix the relay race"))
+  await hooks.event!(toolError("c1", "read", { filePath: "/work/repo/relay.rs" }, "The user rejected permission to use this specific tool call with the following feedback: use compareAndSet"))
+  await hooks.event!(toolError("c2", "read", { filePath: "/work/repo/queue.rs" }, "The user rejected permission to use this specific tool call."))
+  // After the engineer's next prompt a plain rejection is theirs again.
+  await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("now add a test for it"))
+  await hooks.event!(toolError("c3", "bash", { command: "rm -rf x" }, "The user rejected permission to use this specific tool call."))
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  const fails = recorded(rec).filter((c) => c[0] === "post_tool_failure").map((c) => [c[1].tool_name, c[1].error])
+  assert.deepEqual(fails.map((f) => f[0]), ["Read", "Bash"])
+  assert.match(fails[0][1], /the user said:\nuse compareAndSet$/)
+  assert.equal(fails[1][1], "The user doesn't want to proceed with this tool use.")
+})
+
+test("opencode 2: opencode run's own auto-reject is no feedback from the engineer", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { hooks, cleanup, say } = await setupV2()
+  say("remove the old file")
+  await hooks["tool.execute.after"]({
+    tool: "shell", sessionID: SESSION, id: "c5", input: { command: "rm -f relay.rs" }, status: "error",
+    error: {
+      _tag: "Tool.Error", message: "Unable to execute command: rm -f relay.rs",
+      error: { _tag: "Permission.CorrectedError", feedback: "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action." },
+    },
+  })
+  await settle()
+  const fail = recorded(rec).find((c) => c[0] === "post_tool_failure")![1]
+  assert.equal(fail.error, "Unable to execute command: rm -f relay.rs")
   await cleanup()
 })
 
@@ -556,6 +610,7 @@ test("opencode 2, real borg: conscience asks once, a rejection with feedback bec
   process.env.BORG_HOME = home
   process.env.BORG_STATE = join(home, "state")
   delete process.env.BORG_LEARN
+  process.env.BORG_LEARN_MODEL = "off" // episodes are recorded; the `borg learn` they start never calls a model
   // Never the engineer's real collectives config, and no model call at Stop.
   process.env.BORG_CONFIG = join(home, "no-collectives.json")
   process.env.BORG_MATCH = "bm25"
@@ -591,4 +646,46 @@ test("opencode 2, real borg: conscience asks once, a rejection with feedback bec
   assert.equal(episodes[0].agent, "I will add a second AtomicBoolean to guard the first.")
   assert.equal(episodes[1].correction, "keep the public API unchanged")
   assert.match(episodes[1].rejected_tool, /^Edit .*relay\.rs/)
+})
+
+test("real borg: a call declined without words makes the engineer's next prompt the reason, in both versions", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+  const fresh = () => {
+    const home = mkdtempSync(join(tmpdir(), "borg-home-"))
+    process.env.BORG_BIN = BORG
+    process.env.BORG_HOME = home
+    process.env.BORG_STATE = join(home, "state")
+    delete process.env.BORG_LEARN
+    process.env.BORG_LEARN_MODEL = "off" // episodes are recorded; the `borg learn` they start never calls a model
+    process.env.BORG_CONFIG = join(home, "no-collectives.json")
+    process.env.BORG_MATCH = "bm25"
+    return () => readFileSync(join(home, "episodes.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+  }
+
+  // opencode 1: the bare REJECTED on a tool part.
+  let episodes = fresh()
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("Fix the relay race in relay.rs"))
+  await hooks.event!(toolError("c1", "bash", { command: "rm -rf build" }, "The user rejected permission to use this specific tool call."))
+  await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("keep the build cache, clean only target"))
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  let got = episodes()
+  assert.equal(got.length, 1)
+  assert.equal(got[0].correction, "keep the build cache, clean only target")
+  assert.match(got[0].rejected_tool, /^Bash .*rm -rf build/)
+
+  // opencode 2: a declined call (session.tool.failed "aborted"), then the engineer's reason.
+  episodes = fresh()
+  const v2 = await setupV2()
+  v2.say("Fix the relay race in relay.rs")
+  await v2.hooks["tool.execute.before"]({ tool: "shell", sessionID: SESSION, id: "c7", input: { command: "rm -rf build" } })
+  await v2.emit("session.tool.failed", { sessionID: SESSION, assistantMessageID: "msg_2", id: "c7", error: { type: "aborted", message: "The user declined this tool call" }, executed: false })
+  await v2.emit("session.execution.interrupted", { sessionID: SESSION, reason: "shutdown" })
+  await settle()
+  await v2.say("keep the build cache, clean only target")
+  await v2.cleanup()
+  got = episodes()
+  assert.equal(got.length, 1)
+  assert.equal(got[0].correction, "keep the build cache, clean only target")
+  assert.match(got[0].rejected_tool, /^Bash .*rm -rf build/)
 })

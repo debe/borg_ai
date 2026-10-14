@@ -1,0 +1,123 @@
+{
+  "info": {
+    "id": "ses_24eff71aaffec0ofZq2dtWmQRv",
+    "slug": "shiny-comet",
+    "projectID": "1111111111111111111111111111111111111111",
+    "directory": "/home/dev/work/service-a",
+    "title": "Session title",
+    "version": "1.14.19",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 32,
+      "output": 30227,
+      "reasoning": 0,
+      "cache": {
+        "read": 1881350,
+        "write": 132113
+      }
+    },
+    "time": {
+      "created": 1776791096917,
+      "updated": 1776792000418
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "parentID": "msg_db1008e5a001c55LpEkR6jlANr",
+        "role": "assistant",
+        "mode": "plan",
+        "agent": "plan",
+        "variant": "high",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 67516,
+          "input": 1,
+          "output": 9354,
+          "reasoning": 0,
+          "cache": {
+            "write": 1038,
+            "read": 57123
+          }
+        },
+        "modelID": "claude-opus-4.6",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776791439495,
+          "completed": 1776791544767
+        },
+        "finish": "tool-calls",
+        "id": "msg_db105c887002M34OMVWOHmBIJU",
+        "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv"
+      },
+      "parts": [
+        {
+          "snapshot": "6666666666666666666666666666666666666666",
+          "type": "step-start",
+          "id": "prt_db105d5ca001jse7WutOM5w7CG",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db105c887002M34OMVWOHmBIJU"
+        },
+        {
+          "type": "text",
+          "text": "I will look at the relevant file and then make the change.",
+          "time": {
+            "start": 1776791442891,
+            "end": 1776791443243
+          },
+          "id": "prt_db105d5cb001Jhpr2VlCebc8OT",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db105c887002M34OMVWOHmBIJU"
+        },
+        {
+          "type": "tool",
+          "tool": "write",
+          "callID": "toolu_01HEzuaZDv5cC23a2CNbEU5Y",
+          "state": {
+            "status": "error",
+            "input": {
+              "filePath": "<redacted>",
+              "content": "<redacted>"
+            },
+            "error": "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{\"permission\":\"*\",\"action\":\"allow\",\"pattern\":\"*\"},{\"permission\":\"edit\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"edit\",\"pattern\":\".opencode/plans/*.md\",\"action\":\"allow\"},{\"permission\":\"edit\",\"pattern\":\"../../.local/share/opencode/plans/*.md\",\"action\":\"allow\"}]",
+            "time": {
+              "start": 1776791536434,
+              "end": 1776791544734
+            }
+          },
+          "id": "prt_db105d72c002R6NIRwimGEyaSW",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db105c887002M34OMVWOHmBIJU"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "6666666666666666666666666666666666666666",
+          "type": "step-finish",
+          "tokens": {
+            "total": 67516,
+            "input": 1,
+            "output": 9354,
+            "reasoning": 0,
+            "cache": {
+              "write": 1038,
+              "read": 57123
+            }
+          },
+          "cost": 0,
+          "id": "prt_db10763a0001p03risp6573zs2",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db105c887002M34OMVWOHmBIJU"
+        }
+      ]
+    }
+  ]
+}

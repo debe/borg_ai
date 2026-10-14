@@ -36,6 +36,36 @@ as its root session, so a drone paused by `borg steer --pause` cannot keep worki
 The plugin fails open. If borg is missing, slow (60 s limit) or broken, opencode carries on as if
 the plugin were not there.
 
+Rejections reach borg in Claude Code's wording. A rejection with feedback carries the engineer's
+words. A rejection without feedback (opencode 1: `The user rejected permission to use this specific
+tool call.`, opencode 2: `The user declined this tool call`) becomes Claude's plain rejection, so the
+engineer's next prompt is recorded as the reason. `opencode run` rejects permission asks by itself
+on opencode 2 ("This non-interactive run cannot ask the user for permission..."); that is not feedback
+and records nothing.
+
+## borg's model calls and `borg assimilate`
+
+borg can answer its own model calls (learning, assimilate, the turn-end check) with opencode, so an
+opencode-only engineer needs no `claude` CLI. borg tells opencode 1.x from 2.x by whether
+`opencode run --help` offers `--standalone`. opencode 1.x runs `opencode run --pure` with every
+permission denied (`OPENCODE_PERMISSION`). opencode 2.x runs `opencode run --standalone`, a private
+server rather than the background service, which would load this plugin and ignore the call's
+environment. It also gets an empty `OPENCODE_CONFIG_DIR`, which keeps every plugin out, your providers'
+config (`OPENCODE_CONFIG`: the file you set it to, else your global `opencode.json`), and a deny-all config
+(`OPENCODE_CONFIG_CONTENT`). Each call is stored as a session titled `borg (model call)` under the
+temp dir.
+
+`borg assimilate` imports corrections from past opencode sessions of both versions through the CLI.
+It only reads: `opencode db` and `opencode export` on 1.x, and `opencode session list` and
+`opencode session export` with `--standalone` on 2.x, in the same env as a model call (no plugins,
+no project config). opencode 2.x lists sessions per project, so borg reads the projects it knows: the
+directories of your Claude Code and omp sessions, the collectives' paths and the git repos up to two
+levels inside them. opencode 2.x does not list the sessions it migrated from 1.x; export those with an
+opencode 1.x (2.x keeps the 1.x tables) into a directory and pass `--opencode DIR`, which reads a
+directory of exports of either version. Sub-agent sessions, borg's own calls, its echoed questions and
+synthetic context are skipped, and so are the plain rejections opencode 1.x adds to the other pending
+calls when you reject one with words.
+
 ## Install
 
 `borg install opencode` shows what it would write; `borg install opencode --apply` copies the plugin

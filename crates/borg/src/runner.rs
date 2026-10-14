@@ -14,10 +14,22 @@
 //! opencode without plugins and with every permission denied. No adapter loads, so a call never
 //! recurses into borg, and transcript text in the prompt cannot make the model act. Each child runs
 //! in a process group of its own that is killed when it ends or outlives the deadline.
+//!
+//! opencode 1.x and 2.x take a headless call differently (`Opencode`, told by capability from
+//! `opencode run --help`, once per process): 1.x drops plugins with `--pure` and reads the deny-all
+//! from `OPENCODE_PERMISSION`; 2.x knows neither, and without `--standalone` its call goes to the
+//! engineer's background service, which loads borg's own plugin and ignores the call's environment.
+//! Both store every call as a session (there is no ephemeral mode), filed under `PWD` rather than
+//! the process cwd: `PWD` is the temp dir, so the calls stay out of the engineer's projects, and
+//! their title (`OPENCODE_TITLE`) keeps them out of `borg assimilate`.
 
 use serde_json::Value;
+use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
+use std::os::unix::fs::DirBuilderExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +70,12 @@ const CLAUDE_DEFAULT: &str = "sonnet";
 
 /// The runners to try, in order: `spec` is the configured model (`BORG_LEARN_MODEL`,
 /// `BORG_PREDICT_MODEL`), `harness` the drone's, `on_path` whether a CLI is installed. Empty: no
-/// runner is installed.
+/// runner is installed, or the model is `off` (tests that record episodes but must never spend).
 pub fn pick(spec: Option<&str>, harness: Option<&str>, on_path: &dyn Fn(&str) -> bool) -> Vec<Choice> {
     let spec = spec.map(str::trim).filter(|s| !s.is_empty());
+    if spec == Some("off") {
+        return Vec::new();
+    }
     if let Some((r, m)) = spec.and_then(|s| s.split_once(':')).and_then(|(r, m)| Some((Runner::of(r)?, m))) {
         return vec![Choice { runner: r, model: Some(m.to_string()).filter(|m| !m.is_empty()) }];
     }
@@ -79,7 +94,8 @@ pub fn choose(spec: Option<&str>) -> Vec<Choice> {
     pick(spec, harness.as_deref(), &on_path)
 }
 
-fn on_path(cmd: &str) -> bool {
+/// Whether a CLI of this name is on PATH.
+pub fn on_path(cmd: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }
 
@@ -98,12 +114,20 @@ fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(V
     match c.runner {
         Runner::Claude => claude(prompt, c.model.as_deref().unwrap_or(CLAUDE_DEFAULT), schema, timeout),
         Runner::Codex => codex(prompt, c.model.as_deref().unwrap_or("gpt-5"), schema, timeout),
-        Runner::Omp | Runner::Opencode => {
-            let out = run_capped(command(c, &with_schema(prompt, schema)), None, timeout)?;
-            let (text, cost) = match c.runner {
-                Runner::Omp => omp_answer(&out)?,
-                _ => opencode_answer(&out)?,
+        Runner::Omp => {
+            let (text, cost) = omp_answer(&run_capped(omp_command(c.model.as_deref(), &with_schema(prompt, schema)), None, timeout)?)?;
+            Some((last_json(&text)?, cost))
+        }
+        Runner::Opencode => {
+            let cli = opencode();
+            // 2.x: an empty config dir of this call's own keeps every plugin out (borg's among them).
+            let scratch = match cli {
+                Opencode::V2 => Some(Scratch::new("opencode")?),
+                Opencode::V1 => None,
             };
+            let empty = scratch.as_ref().map(|s| s.0.as_path());
+            let cmd = opencode_command(c.model.as_deref(), &with_schema(prompt, schema), cli, empty, engineers_config());
+            let (text, cost) = opencode_answer(&run_capped(cmd, None, timeout)?)?;
             Some((last_json(&text)?, cost))
         }
     }
@@ -115,36 +139,125 @@ pub const OPENCODE_TITLE: &str = "borg (model call)";
 
 const SYSTEM: &str = "You are a careful analyst. You never use tools. You answer with exactly one JSON object and nothing else.";
 
-/// The headless command for omp or opencode.
-fn command(c: &Choice, prompt: &str) -> Command {
-    let mut cmd = Command::new(c.runner.name());
-    match c.runner {
-        Runner::Omp => {
-            cmd.args(["-p", "--mode", "json", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules"]).args([
-                "--no-title",
-                "--no-lsp",
-                "--system-prompt",
-                SYSTEM,
-            ]);
-            if let Some(m) = &c.model {
-                cmd.args(["--model", m]);
-            }
-        }
-        _ => {
+/// The headless omp command.
+fn omp_command(model: Option<&str>, prompt: &str) -> Command {
+    let mut cmd = Command::new("omp");
+    cmd.args(["-p", "--mode", "json", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules"]).args([
+        "--no-title",
+        "--no-lsp",
+        "--system-prompt",
+        SYSTEM,
+    ]);
+    if let Some(m) = model {
+        cmd.args(["--model", m]);
+    }
+    cmd.arg(prompt).current_dir(std::env::temp_dir());
+    cmd
+}
+
+/// Which `opencode run` this machine has (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opencode {
+    /// `--pure`, `OPENCODE_PERMISSION`.
+    V1,
+    /// `--standalone`, a private server; config only through `OPENCODE_CONFIG*`.
+    V2,
+}
+
+impl Opencode {
+    /// From the text of `opencode run --help`: a capability, not a version number.
+    pub fn of_help(help: &str) -> Opencode {
+        if help.contains("--standalone") { Opencode::V2 } else { Opencode::V1 }
+    }
+}
+
+/// This machine's opencode, asked once per process (V1 when it cannot be asked: nothing runs then).
+pub fn opencode() -> Opencode {
+    static CLI: OnceLock<Opencode> = OnceLock::new();
+    *CLI.get_or_init(|| opencode_on(None))
+}
+
+/// The `opencode` found on `path` (None: this process's PATH). 1.x prints its help to stderr, 2.x
+/// to stdout, so both are read.
+fn opencode_on(path: Option<&OsStr>) -> Opencode {
+    let tmp = std::env::temp_dir();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "exec opencode run --help 2>&1"]).current_dir(&tmp).env("PWD", &tmp);
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    Opencode::of_help(&String::from_utf8_lossy(&run_capped(cmd, None, Duration::from_secs(15)).unwrap_or_default()))
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+fn config_home() -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"),
+    }
+}
+
+/// The engineer's global opencode config file under `config_home`, the first that exists. A 2.x call
+/// replaces the config dir (and with it the plugins in it) by an empty one; this file brings back
+/// the providers and models the call needs.
+fn global_config(config_home: &Path) -> Option<PathBuf> {
+    ["opencode.jsonc", "opencode.json", "config.json"].iter().map(|f| config_home.join("opencode").join(f)).find(|p| p.is_file())
+}
+
+/// The config file that holds the engineer's providers: the `OPENCODE_CONFIG` they set themselves
+/// (`inherited`) when it names a file (a dotfiles setup keeps providers there), else `global_config`.
+fn provider_config(inherited: Option<PathBuf>, config_home: &Path) -> Option<PathBuf> {
+    inherited.filter(|p| p.is_file()).or_else(|| global_config(config_home))
+}
+
+/// `provider_config` of this process.
+pub(crate) fn engineers_config() -> Option<PathBuf> {
+    provider_config(std::env::var_os("OPENCODE_CONFIG").filter(|v| !v.is_empty()).map(PathBuf::from), &config_home())
+}
+
+/// The env a 2.x `--standalone` server gets from borg (a model call, `borg assimilate`'s listing and
+/// exports): `--standalone` alone still loads the global plugins dir (borg's adapter among them) and
+/// the project's `.opencode`. `empty` is an empty config dir of the call's own, which keeps the
+/// plugins out; `config` (`provider_config`) brings back the providers; the project config stays
+/// out. Credentials are in opencode's database, which none of this moves.
+pub(crate) fn standalone_env(cmd: &mut Command, empty: Option<&Path>, config: Option<PathBuf>) {
+    if let Some(d) = empty {
+        cmd.env("OPENCODE_CONFIG_DIR", d);
+    }
+    match config {
+        Some(c) => cmd.env("OPENCODE_CONFIG", c),
+        None => cmd.env_remove("OPENCODE_CONFIG"),
+    };
+    cmd.env("OPENCODE_DISABLE_PROJECT_CONFIG", "1").env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+}
+
+/// The headless opencode command. `empty` is the call's own empty config dir (2.x), `config` the
+/// file with the engineer's providers (`provider_config`).
+fn opencode_command(model: Option<&str>, prompt: &str, cli: Opencode, empty: Option<&Path>, config: Option<PathBuf>) -> Command {
+    let mut cmd = Command::new("opencode");
+    match cli {
+        Opencode::V1 => {
             // --pure drops plugins (borg's adapter among them), not tools: every permission is denied
             // instead, and the skill and CLAUDE.md scans are skipped (they only add prompt tokens).
             cmd.args(["run", "--pure", "--format", "json", "--title", OPENCODE_TITLE])
                 .env("OPENCODE_PERMISSION", r#"{"*":"deny"}"#)
                 .env("OPENCODE_DISABLE_CLAUDE_CODE", "1")
-                .env("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1")
-                .env("OPENCODE_DISABLE_PROJECT_CONFIG", "1")
-                .env("OPENCODE_DISABLE_AUTOUPDATE", "1");
-            if let Some(m) = &c.model {
-                cmd.args(["-m", m]);
-            }
+                .env("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1");
+        }
+        Opencode::V2 => {
+            // A private server that reads this env (the background service would not). The deny-all
+            // goes in as config: with it the model is offered no tools at all.
+            cmd.args(["run", "--standalone", "--format", "json", "--title", OPENCODE_TITLE]).env("OPENCODE_CONFIG_CONTENT", r#"{"permission":{"*":"deny"}}"#);
+            standalone_env(&mut cmd, empty, config);
         }
     }
-    cmd.arg(prompt).current_dir(std::env::temp_dir());
+    cmd.env("OPENCODE_DISABLE_PROJECT_CONFIG", "1").env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+    if let Some(m) = model {
+        cmd.args(["-m", m]);
+    }
+    // opencode files the session under PWD, which current_dir does not change.
+    let tmp = std::env::temp_dir();
+    cmd.arg(prompt).env("PWD", &tmp).current_dir(&tmp);
     cmd
 }
 
@@ -170,24 +283,41 @@ fn omp_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
     Some((text_of(&m["content"]), m["usage"]["cost"]["total"].as_f64()))
 }
 
-/// opencode `run --format json`: the text of the last step and the summed `step_finish` costs.
-/// An `error` event (an unavailable model, a failed request) is no answer.
+/// opencode `run --format json`, 1.x or 2.x: the text of the last step and the summed `step_finish`
+/// costs. A step is one assistant message: its text restarts at a `step_start` or at a new
+/// `messageID`, since 2.x leaves out the answer step's `step_start` and `step_finish` (a text-only
+/// call has neither). The cost is None when no step was priced or the answer's step was never
+/// finished (2.x keeps that cost in the session only). An `error` event (1.x `error.name`, 2.x
+/// `error.type`: an unavailable model, a failed request) is no answer.
 fn opencode_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
-    let (mut text, mut cost, mut priced) = (String::new(), 0.0, false);
+    let (mut text, mut step, mut cost, mut priced, mut open) = (String::new(), None::<String>, 0.0, false, false);
     for e in events(out) {
+        let part = &e["part"];
+        let message = part["messageID"].as_str().map(str::to_string);
         match e["type"].as_str() {
             Some("error") => return None,
-            Some("step_start") => text.clear(),
-            Some("text") => text.push_str(e["part"]["text"].as_str().unwrap_or_default()),
+            Some("step_start") => {
+                text.clear();
+                step = message;
+            }
+            Some("text") => {
+                if message.is_some() && message != step {
+                    text.clear();
+                    step = message;
+                }
+                text.push_str(part["text"].as_str().unwrap_or_default());
+                open = true;
+            }
             Some("step_finish") => {
-                if let Some(c) = e["part"]["cost"].as_f64() {
+                if let Some(c) = part["cost"].as_f64() {
                     (cost, priced) = (cost + c, true);
                 }
+                open = false;
             }
             _ => {}
         }
     }
-    Some((text, Some(cost).filter(|_| priced)))
+    Some((text, Some(cost).filter(|_| priced && !open)))
 }
 
 /// The last top-level JSON object in a model's text; fences and prose around it are ignored.
@@ -217,16 +347,19 @@ fn claude(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Optio
     Some((v, res["total_cost_usd"].as_f64()))
 }
 
-/// A scratch dir of one codex call, removed when the call ends on any path. Calls run in parallel
-/// (facets, reach), so each gets its own.
-struct Scratch(std::path::PathBuf);
+/// A scratch dir of one codex or opencode call (or one output file), removed when the call ends on any path. Calls run in
+/// parallel (facets, reach), so each gets its own. It starts empty: a stale dir of the same name is
+/// removed first, and one that cannot be (someone else's in the shared temp dir) fails the call. It
+/// is private (0700): it can hold a whole session export, and the temp dir is shared.
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Scratch {
-    fn new() -> Option<Scratch> {
+    pub(crate) fn new(kind: &str) -> Option<Scratch> {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("borg-codex-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
+        let dir = std::env::temp_dir().join(format!("borg-{kind}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
         Some(Scratch(dir))
     }
 }
@@ -239,7 +372,7 @@ impl Drop for Scratch {
 
 /// codex reports tokens, not dollars: the "cost" is input plus output tokens.
 fn codex(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Option<(Value, Option<f64>)> {
-    let dir = Scratch::new()?;
+    let dir = Scratch::new("codex")?;
     std::fs::write(dir.0.join("schema.json"), schema.to_string()).ok()?;
     let mut cmd = Command::new("codex");
     cmd.args(["exec", "-m", model, "--ignore-user-config", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--json"])
@@ -351,6 +484,11 @@ mod tests {
     }
 
     #[test]
+    fn off_picks_no_runner_even_when_all_are_installed() {
+        assert!(pick(Some("off"), Some("opencode"), &only(&["claude", "omp", "opencode"])).is_empty());
+    }
+
+    #[test]
     fn without_a_harness_path_order_decides_and_nothing_installed_is_empty() {
         let c = pick(None, None, &only(&["claude", "omp"]));
         assert_eq!(c[0], Choice { runner: Runner::Claude, model: Some("sonnet".into()) });
@@ -366,7 +504,7 @@ mod tests {
         let c = [Choice { runner: Runner::Omp, model: Some("x".into()) }, Choice { runner: Runner::Opencode, model: None }];
         let fake = std::env::temp_dir().join(format!("borg-runner-nopath-{}", std::process::id()));
         std::fs::create_dir_all(&fake).unwrap();
-        let mut cmd = command(&c[0], "p");
+        let mut cmd = omp_command(Some("x"), "p");
         cmd.env("PATH", &fake);
         assert!(run_capped(cmd, None, Duration::from_secs(2)).is_none());
         assert!(structured(&[], "p", &json!({}), Duration::from_secs(5)).is_none());
@@ -428,21 +566,154 @@ mod tests {
         assert_eq!(last_json("[1,2]"), None);
     }
 
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn env(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect()
+    }
+
+    fn set(cmd: &Command, k: &str, v: &str) -> bool {
+        env(cmd).contains(&(k.to_string(), Some(v.to_string())))
+    }
+
     #[test]
     fn omp_and_opencode_run_headless_without_borgs_adapter_or_tools() {
-        let args = |c: &Choice| command(c, "p").get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        let omp = args(&Choice { runner: Runner::Omp, model: None });
+        let omp = args(&omp_command(None, "p"));
         for f in ["-p", "--no-extensions", "--no-tools", "--no-session"] {
             assert!(omp.contains(&f.to_string()), "{f}");
         }
         assert!(!omp.contains(&"--model".to_string()));
-        let c = Choice { runner: Runner::Opencode, model: Some("p/m".into()) };
-        let oc = args(&c);
+        let tmp = std::env::temp_dir();
+        let cmd = opencode_command(Some("p/m"), "p", Opencode::V1, None, None);
+        let oc = args(&cmd);
         assert!(oc.contains(&"--pure".to_string()) && oc.windows(2).any(|w| w == ["-m", "p/m"]));
+        assert!(oc.windows(2).any(|w| w == ["--title", OPENCODE_TITLE]));
         assert_eq!(oc.last().unwrap(), "p");
-        let cmd = command(&c, "p");
-        let env: Vec<_> = cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
-        assert!(env.contains(&("OPENCODE_PERMISSION".into(), Some(r#"{"*":"deny"}"#.into()))));
+        assert!(set(&cmd, "OPENCODE_PERMISSION", r#"{"*":"deny"}"#) && set(&cmd, "OPENCODE_DISABLE_PROJECT_CONFIG", "1"));
+        // The session opencode stores lands in the temp dir, not in the engineer's project (PWD wins).
+        assert!(set(&cmd, "PWD", &tmp.to_string_lossy()) && cmd.get_current_dir() == Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn opencode_2_runs_standalone_with_an_empty_config_dir_and_the_engineers_providers() {
+        let tmp = std::env::temp_dir();
+        let (empty, global) = (tmp.join("borg-empty"), tmp.join("cfg/opencode/opencode.json"));
+        let cmd = opencode_command(Some("p/m"), "p", Opencode::V2, Some(&empty), Some(global.clone()));
+        let oc = args(&cmd);
+        assert_eq!(&oc[..6], ["run", "--standalone", "--format", "json", "--title", OPENCODE_TITLE]);
+        assert!(!oc.contains(&"--pure".to_string()), "2.x rejects --pure");
+        assert!(oc.windows(2).any(|w| w == ["-m", "p/m"]) && oc.last().unwrap() == "p");
+        assert!(set(&cmd, "OPENCODE_CONFIG_DIR", &empty.to_string_lossy()));
+        assert!(set(&cmd, "OPENCODE_CONFIG", &global.to_string_lossy()));
+        assert!(set(&cmd, "OPENCODE_CONFIG_CONTENT", r#"{"permission":{"*":"deny"}}"#));
+        assert!(set(&cmd, "OPENCODE_DISABLE_PROJECT_CONFIG", "1") && set(&cmd, "OPENCODE_DISABLE_AUTOUPDATE", "1"));
+        assert!(set(&cmd, "PWD", &tmp.to_string_lossy()) && cmd.get_current_dir() == Some(tmp.as_path()));
+        // 2.x does not read OPENCODE_PERMISSION; without a global config file none is passed on.
+        assert!(!env(&cmd).iter().any(|(k, _)| k == "OPENCODE_PERMISSION"));
+        let bare = opencode_command(None, "p", Opencode::V2, Some(&empty), None);
+        assert!(env(&bare).contains(&("OPENCODE_CONFIG".into(), None)), "unset, not inherited");
+        assert!(!args(&bare).contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn opencode_version_is_told_by_capability_from_its_run_help() {
+        assert_eq!(Opencode::of_help(include_str!("../tests/fixtures/opencode/v1/run-help.txt")), Opencode::V1);
+        assert_eq!(Opencode::of_help(include_str!("../tests/fixtures/opencode/v2/run-help.txt")), Opencode::V2);
+        assert_eq!(Opencode::of_help(""), Opencode::V1, "no opencode: nothing runs anyway");
+    }
+
+    #[test]
+    fn the_global_config_is_the_first_file_that_exists() {
+        let home = std::env::temp_dir().join(format!("borg-runner-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("opencode")).unwrap();
+        assert_eq!(global_config(&home), None);
+        std::fs::write(home.join("opencode/config.json"), "{}").unwrap();
+        assert_eq!(global_config(&home), Some(home.join("opencode/config.json")));
+        std::fs::write(home.join("opencode/opencode.json"), "{}").unwrap();
+        assert_eq!(global_config(&home), Some(home.join("opencode/opencode.json")));
+        std::fs::write(home.join("opencode/opencode.jsonc"), "{}").unwrap();
+        assert_eq!(global_config(&home), Some(home.join("opencode/opencode.jsonc")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_inherited_opencode_config_keeps_the_engineers_providers() {
+        let home = std::env::temp_dir().join(format!("borg-runner-inherited-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("opencode")).unwrap();
+        let (custom, global) = (home.join("dotfiles-opencode.json"), home.join("opencode/opencode.json"));
+        std::fs::write(&custom, "{}").unwrap();
+        std::fs::write(&global, "{}").unwrap();
+        assert_eq!(provider_config(Some(custom.clone()), &home), Some(custom.clone()));
+        assert_eq!(provider_config(Some(home.join("gone.json")), &home), Some(global.clone()), "a missing file is no config");
+        assert_eq!(provider_config(None, &home), Some(global));
+        let cmd = opencode_command(None, "p", Opencode::V2, Some(&home), provider_config(Some(custom.clone()), &home));
+        assert!(set(&cmd, "OPENCODE_CONFIG", &custom.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// PATH with the fake `opencode` (tests/fixtures/opencode/fake) first.
+    fn fake_path() -> std::ffi::OsString {
+        let fake = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/opencode/fake"));
+        let rest = std::env::var_os("PATH").unwrap_or_default();
+        std::env::join_paths(std::iter::once(fake).chain(std::env::split_paths(&rest))).unwrap()
+    }
+
+    #[test]
+    fn the_version_sniff_reads_help_printed_on_stderr() {
+        // The fake prints 2.x's flag on stderr, where 1.x prints its help.
+        assert_eq!(opencode_on(Some(&fake_path())), Opencode::V2);
+        let nowhere = std::env::temp_dir().join(format!("borg-runner-noopencode-{}", std::process::id()));
+        std::fs::create_dir_all(&nowhere).unwrap();
+        let bare = std::env::join_paths([nowhere.clone(), "/usr/bin".into(), "/bin".into()]).unwrap();
+        assert_eq!(opencode_on(Some(&bare)), Opencode::V1, "no opencode");
+        let _ = std::fs::remove_dir_all(nowhere);
+    }
+
+    #[test]
+    fn a_scratch_dir_starts_empty_and_is_removed_after_the_call() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let s = Scratch::new("test").unwrap();
+        let dir = s.0.clone();
+        assert!(dir.is_dir() && std::fs::read_dir(&dir).unwrap().next().is_none());
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700, "other users cannot read an export");
+        drop(s);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn opencode_answers_of_both_versions_parse_from_real_run_output() {
+        let v1 = |f: &str| opencode_answer(f.as_bytes());
+        let (text, cost) = v1(include_str!("../tests/fixtures/opencode/v1/run.jsonl")).unwrap();
+        assert_eq!((last_json(&text), cost), (Some(json!({"ok": true})), Some(0.003544025)));
+        // Denied tool calls first, then the answer: only the last step's text counts.
+        let (text, cost) = v1(include_str!("../tests/fixtures/opencode/v1/run-deny-all-forced-tool-call.jsonl")).unwrap();
+        assert_eq!((text.as_str(), cost), ("Plan: I check closed.get() on the AtomicBoolean before deliver() in relay.rs.", Some(0.0)));
+        assert_eq!(v1(include_str!("../tests/fixtures/opencode/v1/run-error-unknown-model.jsonl")), None, "1.x error.name");
+        // 2.x: a text-only answer has no step events at all, so its cost is unknown.
+        let (text, cost) = v1(include_str!("../tests/fixtures/opencode/v2/run.jsonl")).unwrap();
+        assert_eq!((last_json(&text), cost), (Some(json!({"ok": true})), None));
+        // 2.x: the answer step after a tool step has no step_finish: the answer alone, cost unknown.
+        let (text, cost) = v1(include_str!("../tests/fixtures/opencode/v2/run-tools.jsonl")).unwrap();
+        assert_eq!((text.as_str(), cost), ("Done: the mock finished this turn.", None));
+        assert_eq!(v1(include_str!("../tests/fixtures/opencode/v2/run-error.jsonl")), None, "2.x error.type");
+    }
+
+    #[test]
+    fn a_new_message_starts_a_new_step_even_without_step_start() {
+        let out = [
+            json!({"type": "text", "part": {"messageID": "m1", "text": "Let me look {"}}),
+            json!({"type": "text", "part": {"messageID": "m2", "text": "{\"ok\": "}}),
+            json!({"type": "text", "part": {"messageID": "m2", "text": "true}"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(opencode_answer(out.as_bytes()).unwrap(), ("{\"ok\": true}".to_string(), None));
     }
 
     #[test]

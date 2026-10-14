@@ -1,0 +1,17 @@
+#!/bin/sh
+# A fake opencode for borg's tests. `run --help` answers on stderr, as 1.x does, naming 2.x's flag;
+# anything else records its directory, arguments and OPENCODE_* env in the directory it runs in and
+# prints a session list of more than 64 KiB (a pipe would cut it off).
+if [ "$1 $2" = "run --help" ]; then
+  echo "  --standalone  run without the background service" >&2
+  exit 0
+fi
+printf '%s\n' "$PWD" "$@" > args.txt
+env | grep '^OPENCODE_' | sort > env.txt
+printf '['
+i=0
+while [ $i -lt 3000 ]; do
+  printf '{"id": "ses_%05d", "title": "a session of the fake opencode"},' $i
+  i=$((i + 1))
+done
+printf '{"id": "ses_last"}]'

@@ -10,13 +10,16 @@ First release.
   prompt after a wordless denial (omp).
 - `borg learn` (run at session end) turns episodes into lessons: question, situations, consequence,
   optional scope. A new correction on the same point updates the existing lesson.
-- `borg assimilate` imports corrections from past Claude Code and omp transcripts (dry run by default).
+- `borg assimilate` imports corrections from past Claude Code, omp and opencode 1.x/2.x sessions (dry run
+  by default). opencode sessions are read through its CLI, or from a directory of exports (`--opencode DIR`).
 - `borg assimilate --from-dir` imports a team's written knowledge as scoped lessons and open decisions,
   with a reviewable plan file.
 - `BORG_ASSIMILATE_SKIP` keeps episodes and documents that mention given words out of the import.
 - Model calls run through the drone's own harness (`claude -p`, `omp -p`, `opencode run`), falling back to
   any other installed one, so omp- or opencode-only engineers need no `claude` CLI. Runner prefixes
-  (`omp:`, `opencode:provider/model`, `claude:`, `codex:`) pin one.
+  (`omp:`, `opencode:provider/model`, `claude:`, `codex:`) pin one. opencode 2 runs through
+  `--standalone` with an empty config dir, opencode 1 through `--pure`; either way borg's calls are
+  filed under the temp dir, not the engineer's project.
 
 ### Delivery
 

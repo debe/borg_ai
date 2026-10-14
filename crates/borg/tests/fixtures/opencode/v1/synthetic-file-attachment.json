@@ -1,0 +1,93 @@
+{
+  "info": {
+    "id": "ses_24eff71aaffec0ofZq2dtWmQRv",
+    "slug": "shiny-comet",
+    "projectID": "1111111111111111111111111111111111111111",
+    "directory": "/home/dev/work/service-a",
+    "title": "Session title",
+    "version": "1.14.19",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 32,
+      "output": 30227,
+      "reasoning": 0,
+      "cache": {
+        "read": 1881350,
+        "write": 132113
+      }
+    },
+    "time": {
+      "created": 1776791096917,
+      "updated": 1776792000418
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1776791096930
+        },
+        "agent": "plan",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "claude-opus-4.6",
+          "variant": "high"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_db1008e5a001c55LpEkR6jlANr",
+        "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Read @docs/plan.md and tell me what is missing.",
+          "id": "prt_db1008e5a002BIpXSdZ7luFVrv",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db1008e5a001c55LpEkR6jlANr"
+        },
+        {
+          "type": "file",
+          "mime": "text/plain",
+          "filename": "docs/plan.md",
+          "url": "file:///home/dev/work/service-a/docs/plan.md",
+          "source": {
+            "text": {
+              "value": "@docs/plan.md",
+              "start": 52,
+              "end": 100
+            },
+            "type": "file",
+            "path": "docs/plan.md"
+          },
+          "id": "prt_db1008e5a0035GZWKhRkDau45L",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db1008e5a001c55LpEkR6jlANr"
+        },
+        {
+          "type": "text",
+          "synthetic": true,
+          "text": "<synthetic: Called the Read tool with the following input: {\"filePath\":\" ...>",
+          "id": "prt_db1008e7800192EIunNGOC53He",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db1008e5a001c55LpEkR6jlANr"
+        },
+        {
+          "type": "text",
+          "synthetic": true,
+          "text": "<synthetic: <path>/home/dev/work/service-a/docs/plan.md</path> <type>fil ...>",
+          "id": "prt_db1008e78002A2uvnqsjyqAbO1",
+          "sessionID": "ses_24eff71aaffec0ofZq2dtWmQRv",
+          "messageID": "msg_db1008e5a001c55LpEkR6jlANr"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "info": {
+    "id": "ses_1b56eeeedffeAemnkt2fDJZ5Em",
+    "slug": "neon-falcon",
+    "projectID": "8888888888888888888888888888888888888888",
+    "directory": "/home/dev/work/service-a",
+    "path": "",
+    "title": "Session title",
+    "agent": "build",
+    "model": {
+      "id": "claude-opus-4.6",
+      "providerID": "github-copilot",
+      "variant": "high"
+    },
+    "version": "1.15.5",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 4,
+      "output": 286,
+      "reasoning": 0,
+      "cache": {
+        "read": 14804,
+        "write": 17997
+      }
+    },
+    "time": {
+      "created": 1779367481618,
+      "updated": 1779367495235
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1779367481642
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "claude-opus-4.6",
+          "variant": "high"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_e4a91111a001W0wVKoBg5FKjMQ",
+        "sessionID": "ses_1b56eeeedffeAemnkt2fDJZ5Em"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "<synthetic: <system-reminder>Note: The user opened the file \"/home/dev/w ...>",
+          "synthetic": true,
+          "metadata": {
+            "kind": "editor_context",
+            "source": "zed",
+            "filePath": "/home/dev/work/service-a/.github/workflows/pipeline.yaml",
+            "ranges": [
+              {
+                "text": "",
+                "selection": {
+                  "start": {
+                    "line": 46,
+                    "character": 69
+                  },
+                  "end": {
+                    "line": 46,
+                    "character": 69
+                  }
+                }
+              }
+            ]
+          },
+          "id": "prt_e4a91111a002wZ5ZJNS1Mwdbcx",
+          "sessionID": "ses_1b56eeeedffeAemnkt2fDJZ5Em",
+          "messageID": "msg_e4a91111a001W0wVKoBg5FKjMQ"
+        },
+        {
+          "type": "text",
+          "text": "Please make the requested change in this project.",
+          "id": "prt_e4a91111a003XFyozFdJt7ZAv6",
+          "sessionID": "ses_1b56eeeedffeAemnkt2fDJZ5Em",
+          "messageID": "msg_e4a91111a001W0wVKoBg5FKjMQ"
+        }
+      ]
+    }
+  ]
+}

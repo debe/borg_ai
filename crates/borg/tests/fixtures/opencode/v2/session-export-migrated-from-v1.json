@@ -1,0 +1,72 @@
+{
+  "info": {
+    "id": "ses_ec5c57e4affeOtPigDoU8fNFME",
+    "projectID": "global",
+    "agent": "build",
+    "model": {
+      "id": "m",
+      "providerID": "mock",
+      "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 10,
+      "output": 5,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1791978275253,
+      "updated": 1791978276640
+    },
+    "title": "v1 legacy",
+    "subpath": "home/dev/.oc-research/v1home/work",
+    "location": {
+      "directory": "/home/dev/legacy-work"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_13a3a81f4001Xx0EAI7boy216F",
+      "time": {
+        "created": 1791978275316
+      },
+      "text": "\"no, that is wrong, use a Mutex instead\"",
+      "type": "user"
+    },
+    {
+      "id": "msg_13a3a84b2001K19n9s4WCcK2rT",
+      "time": {
+        "created": 1791978276018,
+        "completed": 1791978276621
+      },
+      "type": "assistant",
+      "agent": "build",
+      "model": {
+        "id": "m",
+        "providerID": "mock",
+        "variant": "default"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Understood, the mock adjusts the plan."
+        }
+      ],
+      "finish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 10,
+        "output": 5,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    }
+  ]
+}

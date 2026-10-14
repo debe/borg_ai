@@ -1,0 +1,231 @@
+{
+  "info": {
+    "id": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+    "slug": "shiny-eagle",
+    "projectID": "1111111111111111111111111111111111111111",
+    "directory": "/home/dev/work/service-a",
+    "parentID": "ses_24ac9717bffex25PQQPEMNF6Ov",
+    "title": "Sub task (@explore subagent)",
+    "version": "1.14.19",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 4,
+      "output": 734,
+      "reasoning": 0,
+      "cache": {
+        "read": 10497,
+        "write": 14651
+      }
+    },
+    "permission": [
+      {
+        "permission": "todowrite",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "task",
+        "action": "deny",
+        "pattern": "*"
+      }
+    ],
+    "time": {
+      "created": 1776861791740,
+      "updated": 1776861815269
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1776861791744
+        },
+        "tools": {
+          "todowrite": false,
+          "task": false
+        },
+        "agent": "explore",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "claude-opus-4.6"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_db53745ff001dHG9Ojr72hBT1y",
+        "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Read the action class and report how its input and output places are used.",
+          "id": "prt_db5374600001whOleGHTJcGaPx",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db53745ff001dHG9Ojr72hBT1y"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_db53745ff001dHG9Ojr72hBT1y",
+        "role": "assistant",
+        "mode": "explore",
+        "agent": "explore",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 10591,
+          "input": 3,
+          "output": 91,
+          "reasoning": 0,
+          "cache": {
+            "write": 10497,
+            "read": 0
+          }
+        },
+        "modelID": "claude-opus-4.6",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776861791750,
+          "completed": 1776861795189
+        },
+        "finish": "tool-calls",
+        "id": "msg_db5374606001MW2xgg0EEsdDG0",
+        "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1"
+      },
+      "parts": [
+        {
+          "snapshot": "7777777777777777777777777777777777777777",
+          "type": "step-start",
+          "id": "prt_db53751c8001Tcylao4SsqMaub",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5374606001MW2xgg0EEsdDG0"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "toolu_01RTCrmXeZg8EfRJASNhBrKN",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "<redacted>"
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "preview": "<redacted>",
+              "truncated": false,
+              "loaded": []
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776861795147,
+              "end": 1776861795151
+            }
+          },
+          "id": "prt_db53751c9001ghsmZvfQksUXga",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5374606001MW2xgg0EEsdDG0"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "7777777777777777777777777777777777777777",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10591,
+            "input": 3,
+            "output": 91,
+            "reasoning": 0,
+            "cache": {
+              "write": 10497,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_db5375350001dk8FPmiU4r5KH7",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5374606001MW2xgg0EEsdDG0"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_db53745ff001dHG9Ojr72hBT1y",
+        "role": "assistant",
+        "mode": "explore",
+        "agent": "explore",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 15295,
+          "input": 1,
+          "output": 643,
+          "reasoning": 0,
+          "cache": {
+            "write": 4154,
+            "read": 10497
+          }
+        },
+        "modelID": "claude-opus-4.6",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776861795191,
+          "completed": 1776861815192
+        },
+        "finish": "stop",
+        "id": "msg_db5375377001kltkqu3WtwHp1a",
+        "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1"
+      },
+      "parts": [
+        {
+          "snapshot": "7777777777777777777777777777777777777777",
+          "type": "step-start",
+          "id": "prt_db5375fc7001qbAYVM9Js1yJnV",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5375377001kltkqu3WtwHp1a"
+        },
+        {
+          "type": "text",
+          "text": "I will look at the relevant file and then make the change.",
+          "time": {
+            "start": 1776861798344,
+            "end": 1776861810140
+          },
+          "id": "prt_db5375fc800142XiDx2W1HCv2U",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5375377001kltkqu3WtwHp1a"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "7777777777777777777777777777777777777777",
+          "type": "step-finish",
+          "tokens": {
+            "total": 15295,
+            "input": 1,
+            "output": 643,
+            "reasoning": 0,
+            "cache": {
+              "write": 4154,
+              "read": 10497
+            }
+          },
+          "cost": 0,
+          "id": "prt_db537a17e0015D4NFcusWXo9NM",
+          "sessionID": "ses_24ac8ba04ffeqcY0eFdHSZXJa1",
+          "messageID": "msg_db5375377001kltkqu3WtwHp1a"
+        }
+      ]
+    }
+  ]
+}

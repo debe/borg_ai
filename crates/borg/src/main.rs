@@ -9,8 +9,8 @@
 //!        borg install|uninstall <claude|omp|opencode|all> [--apply] [--home DIR]
 //!                                                     (wire borg into a harness's user config; dry run by default; install.rs)
 //!        borg status | borg doctor [--home DIR]       (each collective's store; what is wired; what is broken)
-//!        borg assimilate [--apply] [--claude DIR] [--omp DIR] [--since DATE] [--limit N]
-//!                                                     (bootstrap the collectives from past transcripts;
+//!        borg assimilate [--apply] [--claude DIR] [--omp DIR] [--opencode DIR] [--since DATE] [--limit N]
+//!                                                     (bootstrap the collectives from past Claude Code, omp and opencode sessions;
 //!                                                      dry run unless --apply; assimilate.rs)
 //!        borg assimilate --from-dir DIR [--apply] [--plan FILE] [--knowledge|--retros|--families|--decisions GLOB]...
 //!                                                     (a team's written knowledge -> scoped lessons, open decisions ->

@@ -49,6 +49,15 @@ const MAX_ROUNDS = 1
 const MARK = { borg: true }
 // opencode's PermissionRejectedError: the engineer said no without feedback, which halts the turn.
 const REJECTED = "The user rejected permission to use this specific tool call."
+// opencode 1's rejection with the engineer's words after it.
+const FEEDBACK = /rejected permission to use this specific tool call with the following feedback:\s*([\s\S]*)/i
+// opencode 2's call the engineer declined without feedback (error type "aborted").
+const DECLINED = "The user declined this tool call"
+// opencode 2's `opencode run` rejects every permission ask by itself, as a Permission.CorrectedError
+// with this "feedback": nobody's correction.
+const AUTO_REJECTED = "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action."
+// Claude's plain rejection, which borg takes for a wordless denial: the engineer's next prompt is the reason.
+const DENIED = "The user doesn't want to proceed with this tool use."
 
 // opencode tool ids -> the Claude names borg matches on (borg reads Bash command, Grep/Glob pattern,
 // else file_path/path from tool_input). Unknown tools keep their id.
@@ -75,12 +84,19 @@ function toolInput(tool: string, args: any): Record<string, unknown> {
   return input
 }
 
-// opencode says "The user rejected permission to use this specific tool call with the following
-// feedback: X"; borg's rejection capture speaks Claude's wording, so re-phrase it.
+/** borg's wording for a permission rejected with feedback (opencode 1's "...with the following
+ *  feedback: X", opencode 2's Permission.CorrectedError). */
+const corrected = (feedback: string) =>
+  `The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\n${feedback}`
+
+// borg's rejection capture speaks Claude's wording, so opencode's is re-phrased: a rejection with
+// feedback carries the engineer's words; one without (opencode 1's REJECTED, opencode 2's DECLINED)
+// becomes Claude's plain rejection, a wordless denial. Every other error goes as it is.
 function canonicalError(error: string): string {
-  const m = /rejected permission to use this specific tool call with the following feedback:\s*([\s\S]*)/i.exec(error)
-  if (!m) return error
-  return `The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\n${m[1]}`
+  const m = FEEDBACK.exec(error)
+  if (m) return corrected(m[1])
+  const bare = error.trim()
+  return bare === REJECTED || bare === DECLINED ? DENIED : error
 }
 
 /** The engineer- or drone-visible text of message parts (no synthetic or ignored parts). */
@@ -165,6 +181,7 @@ type Session = {
   ended: boolean
   args: Map<string, { tool: string; args: any }> // callID -> call, for failures reported without input
   failed: Set<string> // callIDs already reported as failures
+  worded: boolean // opencode 1: a call was rejected with the engineer's words since their last prompt
 }
 
 /** What the session state machine needs from one opencode version. */
@@ -184,7 +201,7 @@ function drones(io: Io) {
   const get = (id: string): Session => {
     let s = sessions.get(id)
     if (!s) {
-      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set() }
+      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set(), worded: false }
       sessions.set(id, s)
     }
     return s
@@ -249,6 +266,7 @@ function drones(io: Io) {
     s.gen++
     s.continued = false
     s.rounds = 0
+    s.worded = false
     // Take the proposal now: by the time the queue reaches this prompt, the drone may be
     // streaming its reply to it.
     const prior = lastText(id)
@@ -294,6 +312,10 @@ function drones(io: Io) {
     s.args.delete(callID)
     if (s.child || s.failed.has(callID)) return
     s.failed.add(callID)
+    // When the engineer rejects a call with words, opencode 1 rejects every other pending call with
+    // the plain REJECTED: that cascade is nobody's denial (borg assimilate drops it too).
+    if (FEEDBACK.test(error)) s.worded = true
+    else if (s.worded && error.trim() === REJECTED) return
     const name = tool ?? call?.tool ?? ""
     send(id, "post_tool_failure", async () => ({
       tool_name: TOOL_NAMES[name] ?? name,
@@ -444,10 +466,6 @@ const server: Plugin = async ({ client, directory }) => {
 
 // ---- opencode 2.x: `setup(ctx)` registers hooks and reads the event stream.
 
-/** borg's wording for a permission rejected with feedback (opencode 2's Permission.CorrectedError). */
-const corrected = (feedback: string) =>
-  `The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\n${feedback}`
-
 async function setup(ctx: any) {
   const d = drones({
     directory: ctx.location?.directory ?? process.cwd(),
@@ -491,7 +509,9 @@ async function setup(ctx: any) {
   await ctx.tool.hook("execute.after", (e: any) => {
     if (e.status !== "error") return d.postTool(e.sessionID, e.id, e.tool, e.input)
     const cause = e.error?.error
-    const feedback = cause?._tag === "Permission.CorrectedError" && typeof cause.feedback === "string" ? cause.feedback : undefined
+    // `opencode run`'s own auto-reject arrives as the same error: no feedback, an ordinary failure.
+    const feedback =
+      cause?._tag === "Permission.CorrectedError" && typeof cause.feedback === "string" && cause.feedback.trim() !== AUTO_REJECTED ? cause.feedback : undefined
     d.failure(e.sessionID, e.id, e.tool, e.input, feedback !== undefined ? corrected(feedback) : String(e.error?.message ?? ""))
   })
 
@@ -507,6 +527,7 @@ async function setup(ctx: any) {
             break
           case "session.tool.failed":
             // A call the engineer declined without feedback: no execute.after, the turn is interrupted.
+            // Its DECLINED reaches borg as Claude's plain rejection (canonicalError).
             if (p.sessionID && p.id && p.error?.type === "aborted") d.failure(p.sessionID, p.id, undefined, undefined, String(p.error.message ?? ""))
             break
           // Each busy period ends with exactly one of these; only a finished turn gets a stop

@@ -1,0 +1,640 @@
+{
+  "info": {
+    "id": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+    "slug": "happy-wolf",
+    "projectID": "1111111111111111111111111111111111111111",
+    "directory": "/home/dev/work/service-a",
+    "title": "Session title",
+    "version": "1.14.19",
+    "summary": {
+      "additions": 11,
+      "deletions": 7,
+      "files": 2
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 148686,
+      "output": 10719,
+      "reasoning": 10305,
+      "cache": {
+        "read": 4396416,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1776795346968,
+      "updated": 1776797022626
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "parentID": "msg_db142b625001icEaH6od7i4w3T",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "variant": "high",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 94748,
+          "input": 691,
+          "output": 105,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 93952
+          }
+        },
+        "modelID": "gpt-5.4",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776795957173,
+          "completed": 1776795970210
+        },
+        "finish": "tool-calls",
+        "id": "msg_db14ab7b5001AuDB28DCvDN1x1",
+        "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v"
+      },
+      "parts": [
+        {
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-start",
+          "id": "prt_db14abed9001O0HGoPPTxA5FAH",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14ab7b5001AuDB28DCvDN1x1"
+        },
+        {
+          "type": "tool",
+          "tool": "todowrite",
+          "callID": "call_tkpUl9DaZa6v9PZx55KSk3XA",
+          "state": {
+            "status": "completed",
+            "input": {
+              "todos": [
+                {
+                  "content": "<redacted>",
+                  "status": "<redacted>",
+                  "priority": "<redacted>"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "<redacted>",
+                  "priority": "<redacted>"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "<redacted>",
+                  "priority": "<redacted>"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "<redacted>",
+                  "priority": "<redacted>"
+                }
+              ]
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "todos": [
+                {
+                  "content": "<redacted>",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "completed",
+                  "priority": "high"
+                },
+                {
+                  "content": "<redacted>",
+                  "status": "in_progress",
+                  "priority": "high"
+                }
+              ],
+              "truncated": false
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776795959962,
+              "end": 1776795959963
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14abee5001x82pU7gUpA7nMI",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14ab7b5001AuDB28DCvDN1x1"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-finish",
+          "tokens": {
+            "total": 94748,
+            "input": 691,
+            "output": 105,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 93952
+            }
+          },
+          "cost": 0,
+          "id": "prt_db14aea86001fRjxTI2wKKCDkF",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14ab7b5001AuDB28DCvDN1x1"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_db142b625001icEaH6od7i4w3T",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "variant": "high",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 95002,
+          "input": 308,
+          "output": 102,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 94592
+          }
+        },
+        "modelID": "gpt-5.4",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776795970215,
+          "completed": 1776795978773
+        },
+        "finish": "tool-calls",
+        "id": "msg_db14aeaa7001BKJVUGDCFNRzKD",
+        "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v"
+      },
+      "parts": [
+        {
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-start",
+          "id": "prt_db14af2b3001cqNWlVI20X9hO6",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14aeaa7001BKJVUGDCFNRzKD"
+        },
+        {
+          "type": "text",
+          "text": "I will look at the relevant file and then make the change.",
+          "time": {
+            "start": 1776795972283,
+            "end": 1776795972846
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14af2bb001qwswhhTFws76LX",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14aeaa7001BKJVUGDCFNRzKD"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_BnI4hbkvmShstizg3OIIIvjg",
+          "state": {
+            "status": "error",
+            "input": {
+              "command": "<redacted>",
+              "workdir": "<redacted>",
+              "timeout": 120000,
+              "description": "<redacted>"
+            },
+            "error": "The user rejected permission to use this specific tool call.",
+            "time": {
+              "start": 1776795973707,
+              "end": 1776795977788
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14af50f001XJTW66vhJz9HYE",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14aeaa7001BKJVUGDCFNRzKD"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-finish",
+          "tokens": {
+            "total": 95002,
+            "input": 308,
+            "output": 102,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 94592
+            }
+          },
+          "cost": 0,
+          "id": "prt_db14b0bfb001Ga319GRpIYUaj6",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14aeaa7001BKJVUGDCFNRzKD"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1776796011992
+        },
+        "agent": "plan",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "gpt-5.4",
+          "variant": "high"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_db14b8dd4001rl9LtxguRwxtYp",
+        "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "wait, revert that one. no, that is wrong, use the existing close constant instead",
+          "id": "prt_db14b8dd4002yrggUkqoxnR9xd",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dd4001rl9LtxguRwxtYp"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_db14b8dd4001rl9LtxguRwxtYp",
+        "role": "assistant",
+        "mode": "plan",
+        "agent": "plan",
+        "variant": "high",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 95903,
+          "input": 511,
+          "output": 189,
+          "reasoning": 355,
+          "cache": {
+            "write": 0,
+            "read": 94848
+          }
+        },
+        "modelID": "gpt-5.4",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776796011998,
+          "completed": 1776796028561
+        },
+        "finish": "tool-calls",
+        "id": "msg_db14b8dde002kg3BCgNZ7HynqU",
+        "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v"
+      },
+      "parts": [
+        {
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-start",
+          "id": "prt_db14badff001h2zginz1M2qXH6",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        },
+        {
+          "type": "reasoning",
+          "text": "Thinking about the next step.",
+          "time": {
+            "start": 1776796020230,
+            "end": 1776796020231
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>",
+              "reasoningEncryptedContent": "<redacted>"
+            }
+          },
+          "id": "prt_db14bae06001ALDYWvqz7p2Qja",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        },
+        {
+          "type": "text",
+          "text": "I will look at the relevant file and then make the change.",
+          "time": {
+            "start": 1776796020232,
+            "end": 1776796022338
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14bae080016uDHM0Y1KgZRV5",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        },
+        {
+          "type": "tool",
+          "tool": "grep",
+          "callID": "call_bNUK2dVyvA5Zkp8csev6udYV",
+          "state": {
+            "status": "completed",
+            "input": {
+              "pattern": "<redacted>",
+              "path": "<redacted>",
+              "include": "<redacted>"
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "matches": 22,
+              "truncated": false
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796022363,
+              "end": 1776796022375
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14bb655001u79L1Z7Mv7eNML",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        },
+        {
+          "type": "tool",
+          "tool": "grep",
+          "callID": "call_lWT5LOS2khVUuQdM5wHqJzdS",
+          "state": {
+            "status": "completed",
+            "input": {
+              "pattern": "<redacted>",
+              "path": "<redacted>",
+              "include": "<redacted>"
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "matches": 19,
+              "truncated": false
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796022455,
+              "end": 1776796024935
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14bb65b002aPTf8WzdVtiW1H",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-finish",
+          "tokens": {
+            "total": 95903,
+            "input": 511,
+            "output": 189,
+            "reasoning": 355,
+            "cache": {
+              "write": 0,
+              "read": 94848
+            }
+          },
+          "cost": 0,
+          "id": "prt_db14bce7700111Cwej32hJLKB5",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14b8dde002kg3BCgNZ7HynqU"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_db14b8dd4001rl9LtxguRwxtYp",
+        "role": "assistant",
+        "mode": "plan",
+        "agent": "plan",
+        "variant": "high",
+        "path": {
+          "cwd": "/home/dev/work/service-a",
+          "root": "/home/dev/work/service-a"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 96989,
+          "input": 1526,
+          "output": 231,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 95232
+          }
+        },
+        "modelID": "gpt-5.4",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1776796028565,
+          "completed": 1776796036499
+        },
+        "finish": "tool-calls",
+        "id": "msg_db14bce950024XRbMfoquIR24K",
+        "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v"
+      },
+      "parts": [
+        {
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-start",
+          "id": "prt_db14be85a001FOsQWlTf5KtE3x",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_xRI55jF8QzI6Hgv714hIm04W",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "<redacted>",
+              "offset": 1,
+              "limit": 120
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "preview": "<redacted>",
+              "truncated": false,
+              "loaded": []
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796035171,
+              "end": 1776796035184
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14be8610019PY4kZzuUSp20L",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_gNPk62SslIQoKMs5tthHhPoX",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "<redacted>",
+              "offset": 387,
+              "limit": 50
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "preview": "<redacted>",
+              "truncated": false,
+              "loaded": []
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796035176,
+              "end": 1776796035187
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14be863002Yla07jKx3nDIr8",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_EHWQ1JSYtbEmxg5jNOMe2wen",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "<redacted>",
+              "offset": 27,
+              "limit": 70
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "preview": "<redacted>",
+              "truncated": false,
+              "loaded": []
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796035178,
+              "end": 1776796035188
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14be869001MZOA5xTEsABLRZ",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_k6QbkFvAyQ5kP3cQKhrSXJl4",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "<redacted>",
+              "offset": 1,
+              "limit": 110
+            },
+            "output": "<redacted tool output>",
+            "metadata": {
+              "preview": "<redacted>",
+              "truncated": true,
+              "loaded": []
+            },
+            "title": "<redacted title>",
+            "time": {
+              "start": 1776796035269,
+              "end": 1776796035273
+            }
+          },
+          "metadata": {
+            "openai": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_db14be86a002mZin7EBG9f8wgo",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "2222222222222222222222222222222222222222",
+          "type": "step-finish",
+          "tokens": {
+            "total": 96989,
+            "input": 1526,
+            "output": 231,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 95232
+            }
+          },
+          "cost": 0,
+          "id": "prt_db14bed7a001Pt9Tkd7FJdJb6t",
+          "sessionID": "ses_24ebe97e7ffekcGM4YPjS3zN1v",
+          "messageID": "msg_db14bce950024XRbMfoquIR24K"
+        }
+      ]
+    }
+  ]
+}

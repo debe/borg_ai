@@ -287,7 +287,7 @@ impl Config {
     }
 }
 
-fn expand(p: &str) -> PathBuf {
+pub(crate) fn expand(p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
         None if p == "~" => PathBuf::from(std::env::var("HOME").unwrap_or_default()),

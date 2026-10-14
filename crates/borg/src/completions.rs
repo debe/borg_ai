@@ -20,6 +20,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
             "--limit",
             "--claude",
             "--omp",
+            "--opencode",
             "--from-dir",
             "--plan",
             "--for",

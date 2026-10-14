@@ -1,0 +1,175 @@
+{
+  "info": {
+    "id": "ses_ec61935dbffeQz0dwu4bgsih4g",
+    "slug": "cosmic-falcon",
+    "projectID": "4444444444444444444444444444444444444444",
+    "directory": "/home/dev/repositories/borg-ai",
+    "path": "",
+    "title": "borg (model call)",
+    "agent": "build",
+    "model": {
+      "id": "gpt-6.1-sol",
+      "providerID": "github-copilot",
+      "variant": "default"
+    },
+    "version": "1.19.0",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0.007891,
+    "tokens": {
+      "input": 2393,
+      "output": 125,
+      "reasoning": 66,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "permission": [
+      {
+        "permission": "question",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_enter",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_exit",
+        "pattern": "*",
+        "action": "deny"
+      }
+    ],
+    "time": {
+      "created": 1791972788773,
+      "updated": 1791972798945
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1791972788841
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "github-copilot",
+          "modelID": "gpt-6.1-sol"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_139e6ca690016RlArwLav683hx",
+        "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "An engineer corrected a coding agent. Decide whether the correction expresses a reusable engineering lesson. <redacted transcript>\n\nAnswer with only one JSON object that matches this JSON schema, no prose and no code fence:\n{\"type\":\"object\"}",
+          "id": "prt_139e6ca76001eQeFL6idlePIRY",
+          "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g",
+          "messageID": "msg_139e6ca690016RlArwLav683hx"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_139e6ca690016RlArwLav683hx",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/dev/repositories/borg-ai",
+          "root": "/home/dev/repositories/borg-ai"
+        },
+        "cost": 0.007891,
+        "tokens": {
+          "total": 2584,
+          "input": 2393,
+          "output": 125,
+          "reasoning": 66,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "gpt-6.1-sol",
+        "providerID": "github-copilot",
+        "time": {
+          "created": 1791972789994,
+          "completed": 1791972798939
+        },
+        "finish": "stop",
+        "id": "msg_139e6ceea001E5dxm06FJrAhla",
+        "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g"
+      },
+      "parts": [
+        {
+          "snapshot": "5555555555555555555555555555555555555555",
+          "type": "step-start",
+          "id": "prt_139e6e48a001DcECEIFbrKpnuC",
+          "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g",
+          "messageID": "msg_139e6ceea001E5dxm06FJrAhla"
+        },
+        {
+          "type": "reasoning",
+          "text": "",
+          "time": {
+            "start": 1791972795536,
+            "end": 1791972795540
+          },
+          "metadata": {
+            "copilot": {
+              "itemId": "<redacted>",
+              "reasoningEncryptedContent": "<redacted>"
+            }
+          },
+          "id": "prt_139e6e490001KatzfU7k7v5HnP",
+          "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g",
+          "messageID": "msg_139e6ceea001E5dxm06FJrAhla"
+        },
+        {
+          "type": "text",
+          "text": "{\"is_lesson\":true,\"question\":\"Is the check done before the action?\"}",
+          "time": {
+            "start": 1791972795543,
+            "end": 1791972798858
+          },
+          "metadata": {
+            "copilot": {
+              "itemId": "<redacted>"
+            }
+          },
+          "id": "prt_139e6e497001SO5RiBHX6ZsZbJ",
+          "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g",
+          "messageID": "msg_139e6ceea001E5dxm06FJrAhla"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "5555555555555555555555555555555555555555",
+          "type": "step-finish",
+          "tokens": {
+            "total": 2584,
+            "input": 2393,
+            "output": 125,
+            "reasoning": 66,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0.007891,
+          "id": "prt_139e6f1be001BVyO7sWDUQNgvb",
+          "sessionID": "ses_ec61935dbffeQz0dwu4bgsih4g",
+          "messageID": "msg_139e6ceea001E5dxm06FJrAhla"
+        }
+      ]
+    }
+  ]
+}

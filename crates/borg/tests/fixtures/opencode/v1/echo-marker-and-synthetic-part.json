@@ -1,0 +1,352 @@
+{
+  "info": {
+    "id": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+    "slug": "misty-river",
+    "projectID": "global",
+    "directory": "/home/dev/work",
+    "path": "/home/dev/work",
+    "title": "echo and synthetic",
+    "agent": "build",
+    "model": {
+      "id": "m",
+      "providerID": "mock",
+      "variant": "default"
+    },
+    "version": "1.19.0",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 3,
+      "output": 3,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1791978184477,
+      "updated": 1791978186915
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1791978184490
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "mock",
+          "modelID": "m"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_13a391f2a001Vff3VH9t5RbjPM",
+        "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Fix the race in relay.rs",
+          "id": "prt_13a391f2d0019MRdPEwtGQXaNL",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f2a001Vff3VH9t5RbjPM"
+        },
+        {
+          "type": "text",
+          "text": "<borg>context the plugin adds for the drone</borg>",
+          "synthetic": true,
+          "id": "prt_13a391f2d002lu1mB53O9Cvr5x",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f2a001Vff3VH9t5RbjPM"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_13a391f2a001Vff3VH9t5RbjPM",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/dev/work",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 2,
+          "input": 1,
+          "output": 1,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "m",
+        "providerID": "mock",
+        "time": {
+          "created": 1791978184514,
+          "completed": 1791978184869
+        },
+        "finish": "tool-calls",
+        "id": "msg_13a391f420014aHg0S9Dh7u15e",
+        "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_13a391f65001wtZ56i3ZAmN3Xt",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f420014aHg0S9Dh7u15e"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_0",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/home/dev/work/relay.rs"
+            },
+            "output": "<path>/home/dev/work/relay.rs</path>\n<type>file</type>\n<content>\n1: fn deliver() {}\n\n(End of file - total 1 lines)\n</content>",
+            "metadata": {
+              "preview": "fn deliver() {}",
+              "truncated": false,
+              "loaded": [],
+              "display": {
+                "type": "file",
+                "path": "/home/dev/work/relay.rs",
+                "text": "fn deliver() {}",
+                "lineStart": 1,
+                "lineEnd": 1,
+                "totalLines": 1,
+                "truncated": false
+              }
+            },
+            "title": "/home/dev/work/relay.rs",
+            "time": {
+              "start": 1791978184556,
+              "end": 1791978184863
+            }
+          },
+          "id": "prt_13a391f67001QvC2rq6sbJVHFg",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f420014aHg0S9Dh7u15e"
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_1",
+          "state": {
+            "status": "error",
+            "input": {
+              "filePath": "/home/dev/work/missing.rs"
+            },
+            "error": "File not found: /home/dev/work/missing.rs",
+            "time": {
+              "start": 1791978184562,
+              "end": 1791978184858
+            }
+          },
+          "id": "prt_13a391f6e001CSgeNKFL6kdXk5",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f420014aHg0S9Dh7u15e"
+        },
+        {
+          "reason": "tool-calls",
+          "type": "step-finish",
+          "tokens": {
+            "total": 2,
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_13a3920a1001QfscNCSDZXPP7G",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a391f420014aHg0S9Dh7u15e"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_13a391f2a001Vff3VH9t5RbjPM",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/dev/work",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 2,
+          "input": 1,
+          "output": 1,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "m",
+        "providerID": "mock",
+        "time": {
+          "created": 1791978184871,
+          "completed": 1791978184913
+        },
+        "finish": "stop",
+        "id": "msg_13a3920a7001taHAjXwxdLpmwQ",
+        "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_13a3920c9001HETXhaSsvnxg2Y",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a3920a7001taHAjXwxdLpmwQ"
+        },
+        {
+          "type": "text",
+          "text": "Plan: I check closed.get() on the AtomicBoolean before deliver() in relay.rs.",
+          "time": {
+            "start": 1791978184907,
+            "end": 1791978184908
+          },
+          "id": "prt_13a3920cb001RG7C53r177IL05",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a3920a7001taHAjXwxdLpmwQ"
+        },
+        {
+          "reason": "stop",
+          "type": "step-finish",
+          "tokens": {
+            "total": 2,
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_13a3920ce0015yWjxJ3LkQZpwk",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a3920a7001taHAjXwxdLpmwQ"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1791978186868
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "mock",
+          "modelID": "m"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_13a392874001mwA1KuuBwRmv0P",
+        "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?",
+          "metadata": {
+            "borg": true
+          },
+          "id": "prt_13a3928750017pYFK4xGRDJp48",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a392874001mwA1KuuBwRmv0P"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_13a392874001mwA1KuuBwRmv0P",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/dev/work",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 2,
+          "input": 1,
+          "output": 1,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "m",
+        "providerID": "mock",
+        "time": {
+          "created": 1791978186877,
+          "completed": 1791978186911
+        },
+        "finish": "stop",
+        "id": "msg_13a39287d001OTDY7JJkT32D27",
+        "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_13a392897001Y0VZg2ZAwa2LaF",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a39287d001OTDY7JJkT32D27"
+        },
+        {
+          "type": "text",
+          "text": "Plan: I check closed.get() on the AtomicBoolean before deliver() in relay.rs.",
+          "time": {
+            "start": 1791978186905,
+            "end": 1791978186907
+          },
+          "id": "prt_13a392899001wGUuY71241Ag37",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a39287d001OTDY7JJkT32D27"
+        },
+        {
+          "reason": "stop",
+          "type": "step-finish",
+          "tokens": {
+            "total": 2,
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_13a39289c0010GWEQ2U27mFqKk",
+          "sessionID": "ses_ec5c6e0e2ffeHiEJnGFgYJ416E",
+          "messageID": "msg_13a39287d001OTDY7JJkT32D27"
+        }
+      ]
+    }
+  ]
+}

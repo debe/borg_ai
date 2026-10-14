@@ -110,7 +110,7 @@ The adapters are compiled into the binary, so an installed `borg` needs no check
 
 ## Import what you already have
 
-**Past sessions.** Mine your Claude Code and omp transcripts for corrections:
+**Past sessions.** Mine your Claude Code, omp and opencode sessions for corrections:
 
 ```sh
 borg assimilate                         # dry run: what it found, per collective; no model calls
@@ -118,9 +118,16 @@ borg assimilate --apply --limit 50      # learn the newest 50 new episodes (mode
 borg assimilate --apply --since 2026-09-01
 ```
 
-It reads `~/.claude/projects` and `~/.omp/agent/sessions` (`--claude DIR`, `--omp DIR`). Each episode
-routes by the directory it happened in, so off repos contribute nothing. A second run adds nothing
-twice. `BORG_ASSIMILATE_SKIP=word1,word2` drops every episode that mentions one of those words, such as
+It reads `~/.claude/projects` and `~/.omp/agent/sessions` (`--claude DIR`, `--omp DIR`), and opencode
+1.x and 2.x sessions through the `opencode` CLI when it is installed (read-only exports; `--opencode DIR`
+reads a directory of `opencode export` / `opencode session export` files instead). opencode 1.x lists
+every session with one query. opencode 2.x lists sessions per project only, so Borg asks it for the
+projects it knows: the directories of your Claude Code and omp sessions, the collectives' paths and
+the git repos up to two levels inside them. opencode 2.x does not list the sessions it migrated from
+1.x, under any project; export those with an opencode 1.x (2.x keeps the 1.x tables) into a directory
+and pass `--opencode DIR`. Sub-agent sessions and Borg's own model calls are skipped. The first output lines count the sessions
+per source. Each episode routes by the directory it happened in, so off repos contribute nothing. A
+second run adds nothing twice. `BORG_ASSIMILATE_SKIP=word1,word2` drops every episode that mentions one of those words, such as
 an abandoned project's name.
 
 **Team documents.** Turn a git checkout of written team knowledge into scoped lessons:
@@ -171,7 +178,7 @@ All are optional.
 | Variable | Default | Effect |
 |---|---|---|
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
-| `BORG_LEARN_MODEL` | the harness's | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*) |
+| `BORG_LEARN_MODEL` | the harness's | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*); `off`: no model call, episodes wait |
 | `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
@@ -188,7 +195,12 @@ one answers. A model name with a runner prefix pins the runner: `claude:opus`, `
 `omp:<model>`, `opencode:github-copilot/gpt-6.1-sol`, `codex:gpt-5`. A name without a prefix is a
 Claude model (default `sonnet`); omp and opencode then use their own configured default model.
 Each call runs without tools, plugins or extensions (opencode with every permission denied), and is
-killed with everything it started when its time limit passes or borg itself is killed.
+killed with everything it started when its time limit passes or borg itself is killed. opencode 1.x
+runs with `--pure`; opencode 2.x runs with `--standalone` (a private server, never your background
+service) and an empty config directory, with your providers' config passed on: the file your own
+`OPENCODE_CONFIG` names, else your global `opencode.json`.
+opencode stores every call as a session titled `borg (model call)` in the temp directory, not in your
+project.
 
 **Turn-end check**
 
@@ -201,7 +213,7 @@ killed with everything it started when its time limit passes or borg itself is k
 | `BORG_STOP_POOL_TOKENS` | `12000` | Token budget of the lesson pool |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
-| `BORG_PREDICT_MODEL` | the harness's | Model for the turn-end check (see *Model runner*) |
+| `BORG_PREDICT_MODEL` | the harness's | Model for the turn-end check (see *Model runner*); `off`: no model call |
 | `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call |
 | `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it) |
 | `BORG_VECTORS` | on | `off`: no vector recall |
