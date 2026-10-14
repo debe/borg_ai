@@ -19,5 +19,5 @@ borg = { path = "../borg", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 futures-util = { version = "0.3", default-features = false }

@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use borg::collective::{self, Route, Share};
 use borg::{conscience, install, learn, memory, outcome, presence, stats, top};
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -38,6 +38,8 @@ struct App {
     minds: Vec<Mind>,
     /// The collective the page opens with: the one the start directory routes to.
     first: String,
+    /// Turns true on Ctrl-C. Event streams end on it, else graceful shutdown waits for every open page.
+    stop: tokio::sync::watch::Receiver<bool>,
 }
 
 impl App {
@@ -282,6 +284,10 @@ async fn events(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
             last = now;
         }
     });
+    let mut stop = app.stop.clone();
+    let stream = stream.take_until(async move {
+        let _ = stop.wait_for(|s| *s).await;
+    });
     Sse::new(Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>).keep_alive(KeepAlive::default()).into_response()
 }
 
@@ -359,9 +365,11 @@ async fn main() {
         }
     };
     println!("borg web: http://{addr}/  ({} collectives, showing {first}; Ctrl-C stops)", minds.len());
-    let app = Arc::new(App { minds, first });
-    let stop = async {
+    let (stopping, stop) = tokio::sync::watch::channel(false);
+    let app = Arc::new(App { minds, first, stop });
+    let stop = async move {
         let _ = tokio::signal::ctrl_c().await;
+        let _ = stopping.send(true);
     };
     if let Err(e) = axum::serve(listener, router(app)).with_graceful_shutdown(stop).await {
         eprintln!("borg web: {e}");
