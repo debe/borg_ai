@@ -14,6 +14,9 @@ First release.
 - `borg assimilate --from-dir` imports a team's written knowledge as scoped lessons and open decisions,
   with a reviewable plan file.
 - `BORG_ASSIMILATE_SKIP` keeps episodes and documents that mention given words out of the import.
+- Model calls run through the drone's own harness (`claude -p`, `omp -p`, `opencode run`), falling back to
+  any other installed one, so omp- or opencode-only engineers need no `claude` CLI. Runner prefixes
+  (`omp:`, `opencode:provider/model`, `claude:`, `codex:`) pin one.
 
 ### Delivery
 

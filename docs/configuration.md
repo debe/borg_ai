@@ -171,13 +171,24 @@ All are optional.
 | Variable | Default | Effect |
 |---|---|---|
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
-| `BORG_LEARN_MODEL` | `sonnet` | Model for `borg learn` and `borg assimilate` |
+| `BORG_LEARN_MODEL` | the harness's | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*) |
+| `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
 | `BORG_EARLY` | on | `off`: no early delivery |
 | `BORG_SYSTEM_GATE` | on | `off`: no system gate |
 | `BORG_SYSTEMS` | `systems.json` next to `BORG_CONFIG` | Your system map |
 | `BORG_CONSCIENCE` | the routed store's `lessons.jsonl` | Read lessons from another file |
+
+**Model runner**
+
+Borg's own model calls run headless through a CLI: the harness the drone runs in first (the hook
+passes it on as `BORG_HARNESS`), then every other installed one of `claude`, `omp`, `opencode`, until
+one answers. A model name with a runner prefix pins the runner: `claude:opus`, `omp:` (omp's default),
+`omp:<model>`, `opencode:github-copilot/gpt-6.1-sol`, `codex:gpt-5`. A name without a prefix is a
+Claude model (default `sonnet`); omp and opencode then use their own configured default model.
+Each call runs without tools, plugins or extensions (opencode with every permission denied), and is
+killed with everything it started when its time limit passes or borg itself is killed.
 
 **Turn-end check**
 
@@ -190,7 +201,7 @@ All are optional.
 | `BORG_STOP_POOL_TOKENS` | `12000` | Token budget of the lesson pool |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
-| `BORG_PREDICT_MODEL` | `sonnet` | Model for the turn-end check |
+| `BORG_PREDICT_MODEL` | the harness's | Model for the turn-end check (see *Model runner*) |
 | `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call |
 | `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it) |
 | `BORG_VECTORS` | on | `off`: no vector recall |

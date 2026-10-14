@@ -10,8 +10,6 @@
 //! of the session (R1, `Pending`): no extra call and no extra round; the section is added only when
 //! such lessons are pending.
 
-use std::process::Command;
-
 use serde_json::{Value, json};
 
 use crate::conscience::Challenge;
@@ -208,10 +206,8 @@ pub fn predict_whole(context: &str, pool: &[&Challenge], pending: &[Pending], mo
 fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, graded: bool) -> Option<Prediction> {
     let judging = !pending.is_empty();
     let s = schema(judging, graded);
-    let (v, cost) = match model.strip_prefix("codex:") {
-        Some(m) => codex(p, m, &s)?,
-        None => claude(p, model, &s)?,
-    };
+    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout())?;
+    let cost = cost.unwrap_or(0.0);
     let (applies, grades) = applies(&v, shortlist)?.into_iter().unzip();
     Some(Prediction { applies, grades, resolved: resolved(&v, pending), cost })
 }
@@ -257,38 +253,6 @@ fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
     Some(out)
 }
 
-/// GPT through the Codex subscription: `codex exec` with a strict output schema.
-fn codex(prompt: &str, model: &str, schema: &Value) -> Option<(Value, f64)> {
-    use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("borg-codex-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(dir.join("schema.json"), schema.to_string()).ok()?;
-    let mut child = Command::new("codex")
-        .args(["exec", "-m", model, "--ignore-user-config", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--json"])
-        .arg("--output-schema")
-        .arg(dir.join("schema.json"))
-        .arg("-o")
-        .arg(dir.join("out.json"))
-        .arg("-")
-        .current_dir(&dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
-    let out = bounded(child)?;
-    let tokens: f64 = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|e| e["type"] == "turn.completed")
-        .map(|e| e["usage"]["input_tokens"].as_f64().unwrap_or(0.0) + e["usage"]["output_tokens"].as_f64().unwrap_or(0.0))
-        .sum();
-    let v = serde_json::from_str(&std::fs::read_to_string(dir.join("out.json")).ok()?).ok()?;
-    let _ = std::fs::remove_dir_all(&dir);
-    Some((v, tokens))
-}
-
 /// How long the Stop step waits for the model before failing open (the drone just finishes):
 /// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit.
 fn timeout() -> std::time::Duration {
@@ -296,62 +260,9 @@ fn timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// The child's output, or None (and the child killed) when it outlives `timeout()`.
-fn bounded(mut child: std::process::Child) -> Option<std::process::Output> {
-    let deadline = std::time::Instant::now() + timeout();
-    let mut stdout = child.stdout.take();
-    // Drain stdout while waiting, so a large answer cannot block the child on a full pipe.
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = std::io::Read::read_to_end(s, &mut buf);
-        }
-        buf
-    });
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(std::process::Output { status, stdout: reader.join().ok()?, stderr: Vec::new() }),
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
-fn claude(prompt: &str, model: &str, schema: &Value) -> Option<(Value, f64)> {
-    let child = Command::new("claude")
-        .args(["-p", prompt, "--model", model, "--tools", "", "--output-format", "json"])
-        .args(["--json-schema", &schema.to_string(), "--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
-        .current_dir(std::env::temp_dir())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let out = bounded(child)?;
-    let res: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let v = res.get("structured_output").cloned().or_else(|| serde_json::from_str(res["result"].as_str()?).ok())?;
-    Some((v, res["total_cost_usd"].as_f64().unwrap_or(0.0)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_model_call_that_hangs_is_cut_off_and_fails_open() {
-        unsafe { std::env::set_var("BORG_PREDICT_TIMEOUT_S", "1") };
-        let started = std::time::Instant::now();
-        let child = Command::new("sleep").arg("30").stdout(std::process::Stdio::piped()).spawn().unwrap();
-        assert!(bounded(child).is_none());
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        let child = Command::new("echo").arg("{}").stdout(std::process::Stdio::piped()).spawn().unwrap();
-        assert_eq!(String::from_utf8_lossy(&bounded(child).unwrap().stdout).trim(), "{}");
-        unsafe { std::env::remove_var("BORG_PREDICT_TIMEOUT_S") };
-    }
 
     #[test]
     fn applies_keeps_known_ids_once_in_model_order() {

@@ -785,7 +785,7 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                     } else {
                         shortlist_now()
                     };
-                    let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_else(|_| "sonnet".into());
+                    let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
                     // R1: the same call judges what the drone did with lessons asked earlier this session.
                     let pend = pending(session, &state, &all, &full_proposal(input));
                     let extra = predict::judge_section(&pend).len();
@@ -995,6 +995,8 @@ fn main() {
             // it spawns) inherits the collective's own store and scratch state.
             unsafe {
                 std::env::set_var("BORG_HOME", &home);
+                // borg's own model calls go through the drone's harness (runner.rs).
+                std::env::set_var("BORG_HARNESS", harness);
                 if std::env::var_os("BORG_STATE").is_none() {
                     std::env::set_var("BORG_STATE", home.join("state"));
                 }

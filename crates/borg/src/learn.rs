@@ -399,13 +399,13 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
     }))
 }
 
-/// One structured call to Claude (the drone side of the collective stays on Claude).
+/// One structured call to the drone's model (runner.rs picks claude, omp or opencode).
 pub fn ask_claude(prompt: &str) -> Option<Value> {
     ask_model(prompt, &schema()).map(|(v, _)| v)
 }
 
 /// The model call behind `ask_claude`, for any JSON schema: the structured answer and its cost in USD
-/// (None when the CLI reported none). `BORG_LEARN_MODEL` picks the model (default sonnet).
+/// (None when the CLI reported none). `BORG_LEARN_MODEL` picks the model, `runner::choose` the CLI.
 pub fn ask_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
     let started = std::time::Instant::now();
     let answer = call_model(prompt, schema);
@@ -421,17 +421,14 @@ pub fn ask_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
 }
 
 fn call_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
-    let model = std::env::var("BORG_LEARN_MODEL").unwrap_or_else(|_| "sonnet".into());
-    let out = Command::new("claude")
-        .args(["-p", prompt, "--model", &model, "--tools", "", "--output-format", "json"])
-        .args(["--json-schema", &schema.to_string(), "--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
-        .current_dir(std::env::temp_dir())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let res: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let answer = res.get("structured_output").cloned().or_else(|| serde_json::from_str(res["result"].as_str()?).ok())?;
-    Some((answer, res["total_cost_usd"].as_f64()))
+    let candidates = crate::runner::choose(std::env::var("BORG_LEARN_MODEL").ok().as_deref());
+    crate::runner::structured(&candidates, prompt, schema, learn_timeout())
+}
+
+/// How long one learn-side model call may take (`BORG_LEARN_TIMEOUT_S`, default 300 s): it runs in
+/// the background, but a hung runner must not keep `borg learn` alive forever.
+fn learn_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("BORG_LEARN_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300))
 }
 
 pub fn now_ms() -> i64 {

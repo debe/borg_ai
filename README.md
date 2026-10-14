@@ -91,8 +91,10 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 - A harness: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets every feature. omp
   (tested with 18.8.5) and opencode get the turn-end check, learning and steering, but no early delivery
   ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
-- The `claude` CLI on `PATH`, logged in. Every model step runs `claude -p` (Sonnet by default) on your
-  account. Without it, Borg still records episodes and delivers by word matching, but learns nothing.
+- One logged-in model CLI on `PATH`: `claude`, `omp` or `opencode`. Borg's model steps (learning, the
+  turn-end check) run headless through the harness the drone runs in (Sonnet by default for `claude`,
+  the configured default model for omp and opencode), and through another installed one if it gives
+  no answer. Without any, Borg still records episodes and delivers by word matching, but learns nothing.
 
 **1. Install.**
 

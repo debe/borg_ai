@@ -28,10 +28,9 @@
 //! the drone's checkpoint as it was.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -358,7 +357,7 @@ fn claude_drone(repo: &Path, prompt: &str, cap: Duration) -> DroneRun {
         .args(["--strict-mcp-config", "--setting-sources", "project", "--settings", r#"{"disableAllHooks":true}"#])
         .args(["--append-system-prompt", DRONE_SYSTEM])
         .current_dir(repo);
-    match run_capped(cmd, cap) {
+    match crate::runner::run_capped(cmd, None, cap) {
         None => DroneRun { status: "timeout".into(), ..Default::default() },
         Some(out) => drone_result(&out),
     }
@@ -377,56 +376,6 @@ fn drone_result(out: &[u8]) -> DroneRun {
         return DroneRun { answer: Some(answer).filter(|_| status == "ok"), cost_usd, status: status.into() };
     }
     DroneRun { answer: None, cost_usd, status: format!("error:{subtype}") }
-}
-
-/// Stdout of `cmd`, or None when it cannot start, fails to finish within `timeout` (then killed).
-///
-/// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
-/// `cmd` exits (nothing it started outlives it). On Linux it also dies with this process: a harness
-/// that kills `borg` (its own hook timeout) never leaves an uncapped drone running and spending.
-fn run_capped(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
-    use std::os::unix::process::CommandExt as _;
-    cmd.process_group(0);
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) between fork and exec.
-        let parent = unsafe { libc::getpid() };
-        unsafe {
-            cmd.pre_exec(move || {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                if libc::getppid() != parent {
-                    libc::_exit(1); // borg already died between fork and prctl
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let group = child.id() as libc::pid_t;
-    // SAFETY: kill(2) on the child's own process group (a negative pid), which this process created.
-    let kill_group = || unsafe { libc::kill(-group, libc::SIGKILL) };
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                kill_group(); // a straggler holding stdout open would block the reader forever
-                return reader.join().ok();
-            }
-            Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(100)),
-            _ => {
-                kill_group();
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
 }
 
 /// "nothing", or one short sentence starting with it that names no version, id or exception.
@@ -1182,14 +1131,14 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
         let mut slow = Command::new("sleep");
         slow.arg("5");
         let t = Instant::now();
-        assert_eq!(run_capped(slow, Duration::from_millis(300)), None);
+        assert_eq!(crate::runner::run_capped(slow, None, Duration::from_millis(300)), None);
         assert!(t.elapsed() < Duration::from_secs(3), "killed at the cap");
         // What the drone started dies with it: the whole process group is killed at the cap.
         let d = tmp("group");
         let pidfile = d.0.join("pid");
         let mut sh = Command::new("sh");
         sh.arg("-c").arg("sleep 30 & echo $! > \"$1\"; wait").arg("sh").arg(&pidfile);
-        assert_eq!(run_capped(sh, Duration::from_millis(500)), None);
+        assert_eq!(crate::runner::run_capped(sh, None, Duration::from_millis(500)), None);
         let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
         let alive = || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|st| !st.contains(") Z "));
         let t = Instant::now();
@@ -1199,6 +1148,6 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
         assert!(!alive(), "the drone's own child outlived the cap");
         let mut echo = Command::new("echo");
         echo.arg("hi");
-        assert_eq!(run_capped(echo, Duration::from_secs(5)).unwrap(), b"hi\n");
+        assert_eq!(crate::runner::run_capped(echo, None, Duration::from_secs(5)).unwrap(), b"hi\n");
     }
 }
