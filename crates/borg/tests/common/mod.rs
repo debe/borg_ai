@@ -52,9 +52,15 @@ pub fn setup(name: &str) -> PathBuf {
 }
 
 pub fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> String {
+    borg_as(root, "claude", event, input, env)
+}
+
+/// `borg` as the hook of `harness` (claude, omp, opencode). Off Claude Code, pass
+/// `BORG_PREDICT_MODEL=claude:…`: the model call would otherwise go through that harness's real CLI.
+pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&str, &str)]) -> String {
     let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
-    c.args(["hook", "claude", event])
+    c.args(["hook", harness, event])
         .env_clear()
         .env("PATH", path)
         .env("HOME", root.join("home"))

@@ -70,8 +70,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.
 
 **Mode and channel.** Events from a hook carry `mode`: the delivery mode it ran in (`hook` or `live`,
-[Delivery modes](../README.md#delivery-modes)). Live mode is Claude Code only, so an omp or opencode
-drone of a live collective records `hook`. Asks and their results carry `channel`: how the lesson
+[Delivery modes](../README.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson
 reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or `queued` (free). The
 `asked` outcome records and the judge's `asked_then_changed` and `asked_ignored` records in
 `outcomes.jsonl` carry the same `channel`. Rollups keep two splits beside the counts:

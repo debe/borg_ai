@@ -11,6 +11,7 @@
 //! such lessons are pending.
 
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::conscience::Challenge;
 
@@ -180,9 +181,10 @@ pub fn prompt(context: &str, shortlist: &[&Challenge], pending: &[Pending], grad
 
 /// Ids the model predicts apply, in its order, restricted to the shortlist, with their grades; its
 /// verdicts on the pending lessons; and the call's cost (USD for Claude; total tokens for
-/// `codex:<model>`). None on any failure: the caller fails open, and pending lessons stay pending.
-pub fn predict(context: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, graded: bool) -> Option<Prediction> {
-    ask(&prompt(context, shortlist, pending, graded), shortlist, pending, model, graded)
+/// `codex:<model>`). None on any failure or after `timeout`: the caller fails open, and pending lessons
+/// stay pending.
+pub fn predict(context: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, graded: bool, timeout: Duration) -> Option<Prediction> {
+    ask(&prompt(context, shortlist, pending, graded), shortlist, pending, model, graded, timeout)
 }
 
 /// The whole-store prompt (whole.rs): instructions, then every shown lesson as one compact line, then
@@ -199,14 +201,14 @@ pub fn prompt_whole(context: &str, pool: &[&Challenge], pending: &[Pending], gra
 }
 
 /// `predict` over the whole-store pool (`prompt_whole`): same schema, same tolerant parsing.
-pub fn predict_whole(context: &str, pool: &[&Challenge], pending: &[Pending], model: &str, graded: bool) -> Option<Prediction> {
-    ask(&prompt_whole(context, pool, pending, graded), pool, pending, model, graded)
+pub fn predict_whole(context: &str, pool: &[&Challenge], pending: &[Pending], model: &str, graded: bool, timeout: Duration) -> Option<Prediction> {
+    ask(&prompt_whole(context, pool, pending, graded), pool, pending, model, graded, timeout)
 }
 
-fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, graded: bool) -> Option<Prediction> {
+fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, graded: bool, timeout: Duration) -> Option<Prediction> {
     let judging = !pending.is_empty();
     let s = schema(judging, graded);
-    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout())?;
+    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout)?;
     let cost = cost.unwrap_or(0.0);
     let (applies, grades) = applies(&v, shortlist)?.into_iter().unzip();
     Some(Prediction { applies, grades, resolved: resolved(&v, pending), cost })
@@ -254,11 +256,11 @@ fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
 }
 
 /// How long the Stop step waits for the model before failing open (the drone just finishes):
-/// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit. Live mode's lock goes stale
-/// after twice this (live.rs).
-pub fn timeout() -> std::time::Duration {
+/// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit. At the stop it is capped
+/// by the harness's budget (live.rs `call_limit`). Live mode's lock goes stale after twice this (live.rs).
+pub fn timeout() -> Duration {
     let secs = std::env::var("BORG_PREDICT_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(45u64);
-    std::time::Duration::from_secs(secs)
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]

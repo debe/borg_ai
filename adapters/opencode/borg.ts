@@ -1,5 +1,6 @@
 // borg adapter for opencode, one module for both plugin APIs: opencode 1.x (`server`, written
-// against 1.18.32) and opencode 2.x (`setup`, written against 2.0.23).
+// against 1.18.32, verified on 1.19.0) and opencode 2.x (`setup`, written against 2.0.23, verified on
+// 2.0.29).
 //
 // Translates opencode plugin hooks and events into borg's one canonical, Claude-shaped hook event
 // and pipes it to `borg hook opencode <event>`:
@@ -24,6 +25,14 @@
 // engineer's TUI: opencode 1 adds it to the message as a synthetic text part, opencode 2 as a
 // synthetic session input without a description, just before the prompt.
 //
+// After a tool call, borg's additionalContext (live mode: a check's questions, graded lessons) reaches
+// the model before its next step; both after-hooks are awaited. opencode 1 appends it to the tool's
+// output (stored with the call: the TUI hides it for built-in tools, exports show it); opencode 2 sends
+// it as a steer synthetic input and leaves the tool result alone (the TUI shows that). opencode 1 runs
+// no after-hook for a failed call, so text waiting then comes with the next successful call or prompt.
+// An answer later than POST_MS (a prompt's: PROMPT_MS) is kept for the next call or prompt: borg already
+// counts it delivered.
+//
 // Subagent (child) sessions are ignored, like Claude's hooks ignore subagents, with one exception:
 // a child's tool call still asks pre_tool, as its root session, so a paused drone cannot carry on
 // through a subagent.
@@ -37,14 +46,21 @@ import { spawn } from "node:child_process"
 import { appendFileSync } from "node:fs"
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 
-const TIMEOUT_MS = 60_000 // a stop with lessons makes one model call (the consequence model)
+// A stop with lessons makes one model call (the consequence model). opencode sets no limit of its own;
+// this is the stop's BORG_STOP_BUDGET_MS, which leaves room for a live check's 15 s wait, the 45 s
+// call and an expert drone.
+const TIMEOUT_MS = 90_000
 const PRE_MS = 2_000 // before every tool call: borg answers in a few ms (a stat when nobody steers)
+// How long a tool call's result waits for borg's context (file appends, no model call).
+const POST_MS = 2_000
 // How long the engineer's message waits for borg's prompt context (file appends, no model call); a
-// later answer is dropped.
+// later answer is kept for the next call or prompt, like a tool call's.
 const PROMPT_MS = 5_000
 // Hard cap on questions sent back into a session per engineer prompt, so nothing can make the
 // plugin prompt the drone in a loop.
 const MAX_ROUNDS = 1
+// A wait's timeout, told apart from an answer without context.
+const LATE = Symbol("late")
 // Marks the text part we send back, so its chat.message echo is recognised without comparing text.
 const MARK = { borg: true }
 // opencode's PermissionRejectedError: the engineer said no without feedback, which halts the turn.
@@ -117,6 +133,12 @@ function halted(msg: any): string {
   return rejected ? "permission rejected" : ""
 }
 
+/** borg's additionalContext in an answer, if it has any text. */
+function contextOf(out: any): string | undefined {
+  const t = out?.hookSpecificOutput?.additionalContext
+  return typeof t === "string" && t.trim() ? t : undefined
+}
+
 function note(msg: string) {
   const file = process.env.BORG_OPENCODE_LOG
   if (!file) return
@@ -138,7 +160,8 @@ function borg(event: string, payload: Record<string, unknown>, timeoutMs = TIMEO
     }
     let child: ReturnType<typeof spawn>
     try {
-      // BORG_STOP_BUDGET_MS: borg keeps its expert drone inside this timeout, so its answer arrives.
+      // BORG_STOP_BUDGET_MS: at a stop borg keeps its wait for a live check, its model call and its expert
+      // drone inside this timeout, so its answer arrives.
       const env = { ...process.env, BORG_STOP_BUDGET_MS: String(TIMEOUT_MS) }
       child = spawn(process.env.BORG_BIN || "borg", ["hook", "opencode", event], { stdio: ["pipe", "pipe", "ignore"], env })
     } catch (e) {
@@ -182,6 +205,7 @@ type Session = {
   args: Map<string, { tool: string; args: any }> // callID -> call, for failures reported without input
   failed: Set<string> // callIDs already reported as failures
   worded: boolean // opencode 1: a call was rejected with the engineer's words since their last prompt
+  late: string[] // context that came after POST_MS or PROMPT_MS: delivered with the next call or prompt
 }
 
 /** What the session state machine needs from one opencode version. */
@@ -201,7 +225,7 @@ function drones(io: Io) {
   const get = (id: string): Session => {
     let s = sessions.get(id)
     if (!s) {
-      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set(), worded: false }
+      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set(), worded: false, late: [] }
       sessions.set(id, s)
     }
     return s
@@ -275,12 +299,28 @@ function drones(io: Io) {
     const busy = s.stopping
     const answer = send(id, "prompt", async () => ({ prompt: text, last_assistant_message: await prior, ...(busy ? { context: false } : {}) }))
     if (busy) return
+    return withLate(s, await within(id, answer.then(contextOf), PROMPT_MS, "prompt"))
+  }
+
+  /** borg's context if it comes within `ms`; a later answer waits in `late` for the next call or
+   *  prompt (borg already counts it delivered). */
+  const within = async (id: string, answer: Promise<string | undefined>, ms: number, what: string) => {
     let timer: ReturnType<typeof setTimeout> | undefined
-    const late = new Promise<null>((r) => (timer = setTimeout(() => r(null), PROMPT_MS)))
-    const out = await Promise.race([answer, late])
+    const late = new Promise<typeof LATE>((r) => (timer = setTimeout(() => r(LATE), ms)))
+    const t = await Promise.race([answer, late])
     clearTimeout(timer)
-    const context = out?.hookSpecificOutput?.additionalContext
-    return typeof context === "string" && context.trim() ? context : undefined
+    if (t !== LATE) return t
+    void answer.then((text) => {
+      if (!text) return
+      get(id).late.push(text)
+      note(`${id}: borg's ${what} context came late, kept for the next call or prompt`)
+    })
+  }
+
+  /** Context that came late before, then `t`. */
+  const withLate = (s: Session, t: string | undefined) => {
+    const parts = [...s.late.splice(0), t].filter((x): x is string => !!x)
+    return parts.length ? parts.join("\n\n") : undefined
   }
 
   /** Before a tool call: throws borg's reason when the drone is paused by signed steering
@@ -298,11 +338,15 @@ function drones(io: Io) {
     }
   }
 
-  const postTool = (id: string, callID: string, tool: string, args: any) => {
+  /** A finished tool call. Resolves to the text for the model's next step: context that came late
+   *  before, then borg's answer, if it came within POST_MS; a later answer waits in `late`. */
+  const postTool = async (id: string, callID: string, tool: string, args: any): Promise<string | undefined> => {
     const s = get(id)
     s.args.delete(callID)
     if (s.child) return
-    send(id, "post_tool", async () => ({ tool_name: TOOL_NAMES[tool] ?? tool, tool_input: toolInput(tool, args) }))
+    const answer = send(id, "post_tool", async () => ({ tool_name: TOOL_NAMES[tool] ?? tool, tool_input: toolInput(tool, args) })).then(contextOf)
+    // Behind a stop still thinking (a model call) the answer can only come late: the call does not wait.
+    return withLate(s, await within(id, answer, s.stopping ? 0 : POST_MS, "tool"))
   }
 
   /** A failed tool call; `args` undefined takes the input seen before the call. */
@@ -428,8 +472,10 @@ const server: Plugin = async ({ client, directory }) => {
       await d.preTool(input.sessionID, input.callID, input.tool, output.args)
     },
 
-    "tool.execute.after": async (input) => {
-      d.postTool(input.sessionID, input.callID, input.tool, input.args)
+    // Awaited before the next step; the output is what the model reads (and what opencode stores).
+    "tool.execute.after": async (input, output) => {
+      const t = await d.postTool(input.sessionID, input.callID, input.tool, input.args)
+      if (t) output.output = `${output.output}\n\n${t}`
     },
 
     event: async ({ event }) => {
@@ -506,8 +552,21 @@ async function setup(ctx: any) {
     await d.preTool(e.sessionID, e.id, e.tool, e.input)
   })
 
-  await ctx.tool.hook("execute.after", (e: any) => {
-    if (e.status !== "error") return d.postTool(e.sessionID, e.id, e.tool, e.input)
+  await ctx.tool.hook("execute.after", async (e: any) => {
+    if (e.status !== "error") {
+      // Awaited before the next step. A steer, not the tool result: the TUI shows the result.
+      const t = await d.postTool(e.sessionID, e.id, e.tool, e.input)
+      if (!t) return
+      try {
+        await ctx.session.synthetic({ sessionID: e.sessionID, text: t, delivery: "steer", resume: false, metadata: MARK })
+        note(`${e.sessionID}: borg's tool context steered in (${t.length} chars)`)
+      } catch (err) {
+        // borg already counts it delivered: the next call or prompt carries it.
+        d.get(e.sessionID).late.unshift(t)
+        note(`steering borg's tool context into ${e.sessionID} failed: ${err}`)
+      }
+      return
+    }
     const cause = e.error?.error
     // `opencode run`'s own auto-reject arrives as the same error: no feedback, an ordinary failure.
     const feedback =

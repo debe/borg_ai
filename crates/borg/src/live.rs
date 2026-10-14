@@ -9,7 +9,10 @@
 //!   own model call when a live check this turn already covered every change (`covered`).
 //!
 //! The mode is chosen per collective (`"mode"` in collectives.json, collective.rs) and `BORG_MODE`
-//! overrides it; unset or anything else is `DEFAULT`. Slice 1 is Claude Code only: omp and opencode stay in hook mode.
+//! overrides it; unset or anything else is `DEFAULT`. Every harness runs it: Claude Code and omp take the
+//! next tool call's context as PostToolUse `additionalContext`, the opencode adapter adds it to the tool
+//! output (1.x) or steers it into the session (2.x). Without a Claude transcript the work so far is the
+//! turn's tool calls (main.rs `turn_file`).
 //!
 //! Three small files per session beside its state file, no daemon:
 //! - `<S>.live.n`: one line per state-changing tool call (the change counter);
@@ -22,6 +25,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -293,6 +297,20 @@ pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
 /// How long a stop in live mode waits for a running check.
 pub const STOP_WAIT_MS: u64 = 15_000;
 
+/// The stop's wait for a running check, inside the harness's budget (`BORG_STOP_BUDGET_MS`; none: Claude
+/// Code's): at most a quarter of it. omp's 28 s gives 7 s.
+pub fn stop_wait(budget: Option<Duration>) -> Duration {
+    let wait = Duration::from_millis(STOP_WAIT_MS);
+    budget.map_or(wait, |b| wait.min(b / 4))
+}
+
+/// The stop's model call's limit, `spent` into the hook: what the harness's budget leaves but 3 s for the
+/// rest of the hook, never over the model's own limit. omp's 28 s gives at most 18 s, after a 7 s wait.
+pub fn call_limit(budget: Option<Duration>, spent: Duration) -> Duration {
+    let Some(b) = budget else { return crate::predict::timeout() };
+    crate::predict::timeout().min(b.saturating_sub(spent).saturating_sub(Duration::from_secs(3)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +401,17 @@ mod tests {
         assert!(!covered(Lock::Free, 3, m, 41), "the check was an earlier turn's");
         assert!(!covered(Lock::Free, 3, Some(Mark { covered: 3, started_ms: 0, turn: None }), 40), "a mark without its turn");
         assert!(!covered(Lock::Free, 0, None, 40));
+    }
+
+    #[test]
+    fn the_stop_fits_its_wait_and_model_call_into_the_harness_budget() {
+        let s = Duration::from_secs;
+        assert_eq!((stop_wait(None), call_limit(None, s(30))), (s(15), s(45)), "Claude Code: unchanged");
+        assert_eq!((stop_wait(Some(s(90))), call_limit(Some(s(90)), s(15))), (s(15), s(45)), "opencode: room for both");
+        assert_eq!((stop_wait(Some(s(28))), call_limit(Some(s(28)), s(7))), (s(7), s(18)), "omp");
+        assert_eq!(call_limit(Some(s(28)), s(11)), s(14), "time spent before the call comes off it");
+        assert_eq!(call_limit(Some(s(28)), s(27)), Duration::ZERO);
+        assert_eq!(stop_wait(Some(s(8))), s(2));
     }
 
     #[test]

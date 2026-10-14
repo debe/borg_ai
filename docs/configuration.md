@@ -42,7 +42,7 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `share` | `"team"` (default) syncs over the mesh; `"local"` never leaves the machine |
 | `engineers` | Optional. Merges one person's git emails into one author for trust, `borg status` and `borg top`. Never synced |
 | `relay` | Optional, per collective. How the mesh crosses NAT; see [Relays](team-sync.md#how-peers-find-each-other) |
-| `mode` | Optional, per collective. `"live"` (default): the conscience judges the work at the turn end and also during the turn, after state-changing tool calls (Claude Code only; omp and opencode drones stay in hook mode). `"hook"`: at the turn end only, about a tenth of live's own cost. `BORG_MODE` overrides it. An unknown value is live, with a warning in `borg doctor`. See [Delivery modes](../README.md#delivery-modes) |
+| `mode` | Optional, per collective. `"live"` (default): the conscience judges the work at the turn end and also during the turn, after state-changing tool calls (Claude Code, omp ≥18.4.4, opencode 1.x and 2.x). `"hook"`: at the turn end only, about a tenth of live's own cost. `BORG_MODE` overrides it. An unknown value is live, with a warning in `borg doctor`. See [Delivery modes](../README.md#delivery-modes) |
 | `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`) |
 | `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
 
@@ -214,11 +214,11 @@ project.
 | `BORG_STOP_POOL_TOKENS` | `12000` | Token budget of the lesson pool |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
-| `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; its grade-3 lessons arrive with the next tool call (Claude Code only: omp and opencode drones run in hook mode; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A grade 3 no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
-| `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it |
+| `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; its grade-3 lessons arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A grade 3 no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
+| `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it, or a quarter of `BORG_STOP_BUDGET_MS` when that is less |
 | `BORG_PREDICT_MODEL` | the harness's | Model for the turn-end check (see *Model runner*); `off`: no model call |
-| `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (and of a live check's call; a live check's lock goes stale after twice this plus 30 s) |
-| `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it) |
+| `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (and of a live check's call; a live check's lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`) |
+| `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it: omp 28 s, opencode 90 s). It bounds the expert drone and, when set, sizes the stop's wait for a live check (at most a quarter of it, never over 15 s) and its model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp 7 s and at most 18 s |
 | `BORG_VECTORS` | on | `off`: no vector recall |
 | `BORG_VECTOR_MODEL` | `~/.local/share/borg/models/potion-multilingual-128M` | Model directory |
 | `BORG_VECTOR_K` | `10` | Vector hits added to the shortlist |

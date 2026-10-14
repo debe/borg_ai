@@ -1,14 +1,15 @@
 //! Live mode (live.rs) end to end through the binary: a change in PostToolUse starts a detached `borg
 //! check`, its verdict waits in `.queued`, the next tool call delivers it as "borg check of your work so
 //! far", and a stop whose changes a check already covered costs no model call. The model is the fake
-//! `claude` of tests/common: no test makes a real model call.
+//! `claude` of tests/common: no test makes a real model call. omp and opencode send no transcript: their
+//! checks read the turn's tool calls (`.turn`).
 
 mod common;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{answer, borg, context, prompts, setup, state};
+use common::{answer, borg, borg_as, context, prompts, setup, state};
 use serde_json::{Value, json};
 
 const ENV: [(&str, &str); 3] = [("BORG_MODE", "live"), ("BORG_PREFILTER", "off"), ("BORG_EARLY", "off")];
@@ -211,4 +212,114 @@ fn a_live_check_has_no_word_gate_and_a_later_tool_call_checks_a_change_the_debou
     let mark = wait_for(&root, "g1", "live.mark", |m| m.starts_with("2 "));
     assert!(mark.starts_with("2 "), "the held-back change was checked at the next tool call: {mark}");
     assert_eq!(state(&root, "g1", "live.n").lines().count(), 2, "a read is no change");
+}
+
+/// Off Claude Code the model call is pinned to the fake `claude`: it would otherwise go through the
+/// harness's own CLI.
+const PINNED: (&str, &str) = ("BORG_PREDICT_MODEL", "claude:sonnet");
+
+#[test]
+fn omp_and_opencode_run_live_without_a_transcript() {
+    for harness in ["omp", "opencode"] {
+        let root = setup(&format!("live-{harness}"));
+        let cwd = root.join("harbor_orion");
+        let env = [ENV[0], ENV[1], ENV[2], PINNED];
+        let hook = |event: &str, extra: Value| {
+            let mut ev = json!({"session_id": "o1", "cwd": cwd});
+            ev.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            borg_as(&root, harness, event, &ev, &env)
+        };
+        hook("prompt", json!({"prompt": "Tidy the budget handling of the Orion net"}));
+        answer(&root, &[("Mdrain", 3)]);
+        let out = hook("post_tool", json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}}));
+        assert!(context(&out).is_empty(), "{harness}: {out}");
+        assert_eq!(wait_for(&root, "o1", "queued", |q| q.contains("live ")), "live Mdrain\n", "{harness}");
+        wait_for(&root, "o1", "live.mark", |m| !m.is_empty());
+        let p = &prompts(&root)[0];
+        assert!(p.contains("[Edit] /x/net.rs") && p.contains("reset arc"), "{harness}: the turn's tool calls are the work so far: {p}");
+
+        let next = context(&hook("post_tool", json!({"tool_name": "Read", "tool_input": {"file_path": "/x/budget.rs"}})));
+        assert!(next.contains("borg check of your work so far") && next.contains("[Mdrain]"), "{harness}: {next}");
+        assert!(state(&root, "o1", "edits").contains("[Edit] /x/net.rs"), "{harness}: the judge's evidence: {}", state(&root, "o1", "edits"));
+
+        let out = hook("stop", json!({"last_assistant_message": "Done: the budget place is drained.", "stop_hook_active": false}));
+        assert!(!out.contains("block"), "{harness}: {out}");
+        assert_eq!(prompts(&root).len(), 1, "{harness}: covered, no second model call");
+        assert!(state(&root, "o1", "ctx").ends_with("#borg-skip live_covered\n"), "{harness}: {}", state(&root, "o1", "ctx"));
+        // The next prompt starts a new turn: its work so far starts empty.
+        hook("prompt", json!({"prompt": "now the retries"}));
+        assert_eq!(state(&root, "o1", "turn"), "", "{harness}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn graded_2s_wait_for_the_next_prompt_on_omp() {
+    let root = setup("live-graded-omp");
+    let cwd = root.join("harbor_orion");
+    let env = [("BORG_MODE", "hook"), ENV[1], ENV[2], PINNED];
+    let hook = |event: &str, extra: Value| {
+        let mut ev = json!({"session_id": "q1", "cwd": cwd});
+        ev.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        borg_as(&root, "omp", event, &ev, &env)
+    };
+    hook("prompt", json!({"prompt": "Tidy the budget handling of the Orion net"}));
+    hook("post_tool", json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "new_string": "reset arc"}}));
+    answer(&root, &[("Mdrain", 2)]);
+    let out = hook("stop", json!({"last_assistant_message": "I dropped the budget token with a reset arc.", "stop_hook_active": false}));
+    assert!(!out.contains("block"), "a 2 does not block: {out}");
+    assert!(state(&root, "q1", "cost").contains("queued"), "{}", state(&root, "q1", "cost"));
+    let next = context(&hook("prompt", json!({"prompt": "now the retries"})));
+    assert!(next.contains("drain the budget place"), "the 2 arrives with the next prompt: {next}");
+    assert!(state(&root, "q1", "ctx").contains("#borg-queued Mdrain"), "{}", state(&root, "q1", "ctx"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn stop_wait_and_model_limit_fit_the_harness_budget() {
+    let root = setup("live-budget");
+    let cwd = root.join("harbor_orion");
+    let env = [ENV[0], ENV[1], ENV[2], PINNED, ("BORG_STOP_BUDGET_MS", "28000")];
+    borg_as(&root, "omp", "prompt", &json!({"session_id": "b1", "cwd": cwd, "prompt": "Tidy the budget handling"}), &env);
+    // A check that never finishes: its process (this test) lives and its lock is fresh.
+    let lock = root.join("store/collectives/corp/state/b1.live.lock");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    std::fs::write(&lock, format!("{} {now}\n", std::process::id())).unwrap();
+    answer(&root, &[("Mdrain", 3)]);
+    let started = Instant::now();
+    let out = borg_as(
+        &root,
+        "omp",
+        "stop",
+        &json!({"session_id": "b1", "cwd": cwd, "last_assistant_message": "I drop the budget token with a reset arc.", "stop_hook_active": false}),
+        &env,
+    );
+    let took = started.elapsed();
+    assert!(out.contains("block") && out.contains("[Mdrain]"), "the stop still checks: {out}");
+    assert!(took >= Duration::from_millis(6500) && took < Duration::from_secs(12), "a quarter of omp's 28 s, not 15 s: {took:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_live_ask_at_the_next_prompt_keeps_the_last_turns_work_as_evidence_on_omp() {
+    let root = setup("live-prompt-evidence");
+    let cwd = root.join("harbor_orion");
+    let env = [("BORG_MODE", "hook"), ENV[1], ENV[2], PINNED];
+    let hook = |event: &str, extra: Value| {
+        let mut ev = json!({"session_id": "e1", "cwd": cwd});
+        ev.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        borg_as(&root, "omp", event, &ev, &env)
+    };
+    hook("prompt", json!({"prompt": "Tidy the budget handling of the Orion net"}));
+    hook("post_tool", json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "new_string": "reset arc"}}));
+    // A live check that finished after the stop: its ask waits for the next prompt.
+    std::fs::write(root.join("store/collectives/corp/state/e1.queued"), "live Mdrain\n").unwrap();
+    let next = context(&hook("prompt", json!({"prompt": "now the retries"})));
+    assert!(next.contains("[Mdrain]"), "{next}");
+    let edits = state(&root, "e1", "edits");
+    let lines: Vec<&str> = edits.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("#borg-asked Mdrain")).expect(&edits);
+    assert!(at > 0 && lines[at - 1].contains("[Edit] /x/net.rs"), "the judge's evidence is the last turn's work: {edits}");
+    assert_eq!(state(&root, "e1", "turn"), "", "the new turn starts empty");
+    let _ = std::fs::remove_dir_all(root);
 }

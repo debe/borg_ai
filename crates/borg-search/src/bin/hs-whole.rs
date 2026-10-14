@@ -172,9 +172,9 @@ fn run(queries: &str, ranks: &str, out: &str, ids_file: &str, cap: f64, model: &
             let list = if arm == "A" { &a } else { &b };
             let started = std::time::Instant::now();
             let call = || match arm {
-                "B" => predict::predict_whole(text, list, &[], model, false),
-                "D" => predict::predict_whole(text, list, &[], model, true),
-                _ => predict::predict(text, list, &[], model, false),
+                "B" => predict::predict_whole(text, list, &[], model, false, predict::timeout()),
+                "D" => predict::predict_whole(text, list, &[], model, true, predict::timeout()),
+                _ => predict::predict(text, list, &[], model, false, predict::timeout()),
             };
             let mut pred = call();
             let mut tries = 1;

@@ -146,7 +146,7 @@ fn no_early_delivery_without_a_named_scope_off_claude_or_when_disabled() {
     let k2 = json!({"session_id": "k2", "cwd": cwd, "prompt": "Set up the replay comparison with the named live judge and a control arm."});
     assert_eq!(borg(&root, "claude", "prompt", &k2, &[]).trim(), "");
     assert!(!state(&root, "k2").contains("#borg-early"));
-    // omp and opencode read borg's answer only at a stop: the lessons stay with Stop.
+    // Early delivery is Claude Code only so far: on omp the lessons stay with Stop.
     assert_eq!(borg(&root, "omp", "prompt", &p("omp"), &[]).trim(), "");
     assert!(!state(&root, "omp").contains("#borg-early"), "nothing recorded as delivered");
     assert_eq!(borg(&root, "claude", "prompt", &p("off"), &[("BORG_EARLY", "off")]).trim(), "");

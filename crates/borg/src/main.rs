@@ -78,8 +78,8 @@
 //!                    (work first, situations -> consequence)
 //!   BORG_STOP_GRADED default: the model grades each lesson it applies (3 certain, 2 likely, 1 worth a thought);
 //!                    the Stop blocks only for a 3 and then asks the 3s, 2s and 1s up to 10 (conscience.rs
-//!                    `graded`). Without a block, the 2s and 1s go free with the next prompt or touch (Claude
-//!                    Code only; as much as one early delivery fits, the rest dropped). "off" = no grades:
+//!                    `graded`). Without a block, the 2s and 1s go free with the next prompt or touch (as
+//!                    much as one early delivery fits, the rest dropped). "off" = no grades:
 //!                    any apply blocks, and the block widens over the low bar
 //!   BORG_EARLY      "off" disables early delivery: a prompt or touch that first names a lesson's scope
 //!                    gets that scope's top lessons as context at once (Claude Code only; conscience.rs `early`)
@@ -100,7 +100,7 @@
 //!                    one runner and model (`claude:claude-sonnet-5-5`), "off" = no model call
 //!   BORG_MODE        delivery mode, overriding the collective's `mode` (live.rs): "hook" judges the
 //!                    work at the turn end; "live" (default) also judges it during the turn, after state-changing tool
-//!                    calls, in a detached `borg check` (Claude Code only). Anything else is live
+//!                    calls, in a detached `borg check` (every harness). Anything else is live
 //!   BORG_LIVE_DEBOUNCE_S  live mode: the least time between the starts of two checks (default 45)
 //!   BORG_VECTORS     "off" disables vector recall at the Stop step (vectors.rs; builds with the `vectors`
 //!                    feature): BORG_VECTOR_MODEL (model dir, default ~/.local/share/borg/models/
@@ -522,7 +522,8 @@ fn listed<'a>(context: &'a str, marker: &str) -> std::collections::HashSet<&'a s
 /// this event's, already in the state file). Each lesson once per session (`#borg-early`; Stop does not
 /// ask it again). A topic is settled (`#borg-topic`) once a delivery covered it or none of its lessons is
 /// left; until then each prompt or touch looks again. At most `MAX_EARLY_DELIVERIES` per session. Claude
-/// Code only: omp and opencode read borg's answer at a stop alone, so for them the lessons stay with Stop. `BORG_EARLY=off` disables it;
+/// Code only so far: omp and opencode take a prompt's and a tool call's context too (live mode), but
+/// early delivery to them is not wired yet, so for them the lessons stay with Stop. `BORG_EARLY=off` disables it;
 /// so do the eval modes BORG_ONLY and BORG_CRITIC.
 /// Early deliveries per session at most (each up to `conscience::render_early`'s lesson cap).
 const MAX_EARLY_DELIVERIES: usize = 3;
@@ -711,9 +712,23 @@ fn ask_live(hook_event: &str, session: &str, input: &Value, firm: &mut [&conscie
     text
 }
 
-/// Live mode: this turn's work so far, from the transcript (learn.rs `turn_so_far`).
+/// Live mode: this turn's work so far, from the transcript (learn.rs `turn_so_far`). A harness without a
+/// Claude transcript (omp, opencode) has the turn's tool calls instead (`turn_file`): no prose.
 fn work_so_far(input: &Value) -> String {
-    learn::turn_so_far(input.get("transcript_path").and_then(Value::as_str).unwrap_or_default().as_ref(), LIVE_WORK_CHARS)
+    let transcript = input.get("transcript_path").and_then(Value::as_str).unwrap_or_default();
+    if !transcript.is_empty() && std::fs::metadata(transcript).is_ok() {
+        return learn::turn_so_far(transcript.as_ref(), LIVE_WORK_CHARS);
+    }
+    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+    let text = std::fs::read_to_string(turn_file(session)).unwrap_or_default();
+    let n = text.chars().count();
+    text.chars().skip(n.saturating_sub(LIVE_WORK_CHARS)).collect()
+}
+
+/// This turn's tool calls, one `[tool] touch` line each, and their edit text: the work so far where the
+/// harness sends no transcript. Emptied at each prompt.
+fn turn_file(session: &str) -> PathBuf {
+    state_file(session).with_extension("turn")
 }
 
 /// How much of the turn so far a live check reads: as much as the blocked message `pending` keeps.
@@ -786,13 +801,17 @@ struct Work<'a> {
     /// Whether this check judges the pending lessons: not while another check (holding the session's
     /// lock) may be judging the same ones.
     judge: bool,
+    /// The harness's stop budget (none: the model's own limit) and when the hook started: the model call
+    /// gets what is left of it when it starts (live.rs `call_limit`).
+    budget: Option<std::time::Duration>,
+    started: std::time::Instant,
 }
 
 /// The consequence model's check of `w`, shared by the stop and live mode's `borg check` (`live`): the
 /// free gate, the pool, one graded call that also judges the pending lessons, and the graded split. The
-/// 2s and 1s of a graded call wait in the `.queued` file (Claude Code only); what to ask is returned.
+/// 2s and 1s of a graded call wait in the `.queued` file; what to ask is returned.
 /// A live call is logged as `live_check` with a `live usd=… lessons=…` cost line, the stop's as `check`.
-fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
+fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     // The free gate (prefilter.rs): a turn whose words touch no lesson costs no model call; the conscience
     // then asked nothing. BORG_STOP_GATE=edits instead: a turn that changed nothing costs no model call.
     // A live check has no gate: it runs only after a change, the debounce bounds it, and a turn half done
@@ -837,11 +856,12 @@ fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> V
     let pend = if w.judge { pending(session, w.state, w.all, w.message, live) } else { Vec::new() };
     let extra = predict::judge_section(&pend).len();
     let graded = borg::whole::graded();
+    let timeout = live::call_limit(w.budget, w.started.elapsed());
     let called = std::time::Instant::now();
     let pred = if whole && !borg::whole::classic() {
-        predict::predict_whole(w.context, &shortlist, &pend, &model, graded)
+        predict::predict_whole(w.context, &shortlist, &pend, &model, graded, timeout)
     } else {
-        predict::predict(w.context, &shortlist, &pend, &model, graded)
+        predict::predict(w.context, &shortlist, &pend, &model, graded, timeout)
     };
     stat(session, input, if live { borg::stats::LIVE_CHECK } else { borg::stats::CHECK }, |e| {
         e.n = shortlist.len() as u64;
@@ -868,7 +888,7 @@ fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> V
         // Graded (default): ask only for a lesson graded 3; a check without one hands its 2s and 1s over
         // free at the next prompt or touch (conscience.rs `graded`).
         let (ask, free) = conscience::graded(&applied);
-        let queue = !free.is_empty() && harness == "claude";
+        let queue = !free.is_empty();
         log_cost(session, &format!("graded applied={} ask={} free={} {}", applied.len(), ask.len(), free.len(), if queue { "queued" } else { "dropped" }));
         if queue {
             enqueue(session, &free.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(","));
@@ -937,7 +957,6 @@ fn live_check(session: &str, input: &Value) {
     if live::unsupported().is_some() || live::decide(live::current(), live::Lock::Free, n, mark, started, live::debounce_ms()).is_err() {
         return;
     }
-    let harness = std::env::var("BORG_HARNESS").unwrap_or_else(|_| "claude".into());
     let turn = turn_id(session);
     let all = lessons(session);
     let state = std::fs::read_to_string(&ctx).unwrap_or_default();
@@ -961,9 +980,11 @@ fn live_check(session: &str, input: &Value) {
         message: &message,
         changed: true,
         judge: true,
+        budget: None,
+        started: std::time::Instant::now(),
     };
     let before = mark.map_or(0, |m| m.covered);
-    let covered = match check(&harness, session, input, &work, true) {
+    let covered = match check(session, input, &work, true) {
         // A skipped or failed check covered nothing: the stop decides for itself.
         Verdict::Skip(score) => {
             append(session, &format!("#borg-live-skip {score}"));
@@ -1000,11 +1021,15 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             let _ = std::fs::write(state_file(session).with_extension("lastprompt"), prompt);
             // An adapter that will not wait for the answer (`"context": false`) gets none: what is handed
             // over here is marked delivered and would be lost.
-            if input.get("context") == Some(&Value::Bool(false)) {
-                return None;
+            let out = (input.get("context") != Some(&Value::Bool(false))).then(|| {
+                let ask = queen_ask(harness, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
+                free_context_with(harness, "UserPromptSubmit", session, input, prompt, ask)
+            });
+            // A new turn's work starts, after a live ask handed over here took the last turn's as its evidence.
+            if input.get("transcript_path").and_then(Value::as_str).unwrap_or_default().is_empty() {
+                let _ = std::fs::write(turn_file(session), "");
             }
-            let ask = queen_ask(harness, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
-            free_context_with(harness, "UserPromptSubmit", session, input, prompt, ask)
+            out.flatten()
         }
         "post_tool_failure" => {
             capture_rejection(session, input);
@@ -1047,20 +1072,31 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             if prefilter::edits_gate() && prefilter::changes(tool, tool_input) {
                 let _ = std::fs::OpenOptions::new().create(true).append(true).open(changes_file(session)).and_then(|mut f| writeln!(f, "{tool}"));
             }
-            if let Some(edit) = edit_text(tool, input.get("tool_input").unwrap_or(&Value::Null))
+            let edit = edit_text(tool, tool_input);
+            if let Some(edit) = &edit
                 && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session))
             {
                 let _ = writeln!(f, "{edit}");
             }
+            // No transcript (omp, opencode): the turn's tool calls are the work so far a live check reads.
+            if input.get("transcript_path").and_then(Value::as_str).unwrap_or_default().is_empty()
+                && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(turn_file(session))
+            {
+                let _ = writeln!(f, "[{tool}] {touch}");
+                if let Some(edit) = &edit {
+                    let _ = writeln!(f, "{edit}");
+                }
+            }
             // Live mode (live.rs): a change starts a check of the work so far, in the background. Any later
             // tool call starts one too while changes wait unchecked, so a change inside the debounce is
             // checked once it has passed, not only at the stop.
-            if harness == "claude" && live::current() == live::Mode::Live {
+            if live::current() == live::Mode::Live {
                 live_trigger(session, input, tool, prefilter::changes(tool, tool_input));
             }
             free_context(harness, "PostToolUse", session, input, &touch)
         }
         "stop" => {
+            let started = std::time::Instant::now();
             if learning() {
                 // The drone's latest proposal, for the reasoning note of what it commits (notes.rs).
                 borg::notes::remember_proposal(&borg::notes::state_dir(), session, &full_proposal(input));
@@ -1086,9 +1122,11 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             stat(session, input, borg::stats::TURN_END, |_| {});
             // Live mode: a check still running finishes first (bounded), so this stop reads what it wrote.
             // Then the stop holds the session's lock itself, so no check starts beside it; when a check
-            // still holds it, the stop leaves the pending lessons to that check's judge.
-            let live_mode = harness == "claude" && live::current() == live::Mode::Live;
-            let lock = if live_mode { live::wait_free(&state_file(session), live::STOP_WAIT_MS) } else { live::Lock::Free };
+            // still holds it, the stop leaves the pending lessons to that check's judge. The wait and the
+            // model call share the harness's budget (omp gives a stop 30 s).
+            let live_mode = live::current() == live::Mode::Live;
+            let budget = borg::expert_route::stop_budget();
+            let lock = if live_mode { live::wait_free(&state_file(session), live::stop_wait(budget).as_millis() as u64) } else { live::Lock::Free };
             let guard = if live_mode && lock != live::Lock::Held { live::acquire(&state_file(session), learn::now_ms()) } else { None };
             let lock = if live_mode && guard.is_none() { live::Lock::Held } else { lock };
             // A live check's 3s that no tool call delivered yet: this stop asks them (it would have).
@@ -1144,8 +1182,10 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
                             message: &full_proposal(input),
                             changed,
                             judge: !live_mode || guard.is_some(),
+                            budget,
+                            started,
                         };
-                        let mut asked: Vec<&conscience::Challenge> = match check(harness, session, input, &work, false) {
+                        let mut asked: Vec<&conscience::Challenge> = match check(session, input, &work, false) {
                             Verdict::Skip(_) | Verdict::Failed if !waiting.is_empty() => Vec::new(),
                             Verdict::Skip(score) => return skip(&score),
                             Verdict::Failed => return None,
@@ -1321,9 +1361,8 @@ fn main() {
             };
             let collective::Route::Collective { home, name, .. } = route else { return };
             // The delivery mode (live.rs): BORG_MODE, else the collective's `mode`, else live. Exported as the
-            // mode this drone runs in, which the statistics record: live is Claude Code only so far, so omp
-            // and opencode drones of a live collective run (and count) in hook mode.
-            let mode = if *harness == "claude" { live::of(cfg.as_ref().ok().and_then(Option::as_ref), &name).mode } else { live::Mode::Hook };
+            // mode this drone runs in, which the statistics record.
+            let mode = live::of(cfg.as_ref().ok().and_then(Option::as_ref), &name).mode;
             // SAFETY: single-threaded at this point; everything below (and the background `borg learn`
             // or `borg check` it spawns) inherits the collective's own store, scratch state and mode.
             unsafe {

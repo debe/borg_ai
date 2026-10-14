@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live test for opencode 2.x (written against 2.0.23; run.sh is the 1.x test): a private
+# Live test for opencode 2.x (written against 2.0.23, verified on 2.0.29; run.sh is the 1.x test): a private
 # `opencode serve` loads the borg plugin through its v2 `setup` API, `opencode run --server` drives
 # it headless, with every home, config, state and tmp dir isolated in a temp dir and a local mock
 # LLM (0 tokens). Never talks to the engineer's background service: the temp service config is
@@ -7,8 +7,9 @@
 #
 #   cargo build -p borg && adapters/opencode/live/run-v2.sh
 #
-# Passes when the plugin loaded, the prompt, a successful and a failed tool call reached borg, the
-# conscience's question went back into the session (the mock LLM saw it) exactly once and its echo
+# Passes when the plugin loaded, the prompt, a successful and a failed tool call reached borg, a lesson
+# waiting in the session's queue reached the LLM right after the tool results (a steer, live mode's
+# mid-turn channel), the conscience's question went back into the session (the mock LLM saw it) exactly once and its echo
 # carried the borg marker, a queen question reached the LLM through a hidden synthetic input, and
 # deleting the session ended it. Then it reports, without failing,
 # whether a second session gets `end` when the server shuts down normally (setup's cleanup).
@@ -38,7 +39,20 @@ echo '{"disabled": true}' > "$cfg/service.json"
 # borg behind a wrapper that logs each hook event and its canonical JSON. The prompt event runs with
 # learning on, which queen delivery needs (no model call at prompt); everything else keeps it off,
 # so no background `borg learn` starts.
-printf '#!/bin/sh\nin=$(cat)\nprintf "%%s %%s\\n" "$3" "$in" >> "%s"\n[ "$3" = prompt ] && unset BORG_LEARN\nprintf "%%s" "$in" | exec "%s" "$@"\n' "$tmp/events.log" "$borg" > "$BORG_BIN"
+# At the first successful tool call the wrapper also leaves the lesson `drain` in the session's queue,
+# as a live check would (a real check needs the consequence model; crates/borg/tests/live_cli.rs runs
+# one on a fake): borg hands it over with that call, and the next LLM request must carry it.
+cat > "$BORG_BIN" <<EOF
+#!/bin/sh
+in=\$(cat)
+printf "%s %s\n" "\$3" "\$in" >> "$tmp/events.log"
+if [ "\$3" = post_tool ] && [ ! -e "$tmp/seeded" ]; then
+  sid=\$(printf '%s' "\$in" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9-')
+  mkdir -p "$BORG_STATE" && echo "live drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
+fi
+[ "\$3" = prompt ] && unset BORG_LEARN
+printf '%s' "\$in" | exec "$borg" "\$@"
+EOF
 chmod +x "$BORG_BIN"
 cp "$here/../borg.ts" "$cfg/plugins/borg.ts"
 # The spy: every bus event and every prompt (with its metadata), as the v2 plugin API hands them over.
@@ -74,10 +88,25 @@ cat > "$cfg/opencode.json" <<EOF
   }
 }
 EOF
-echo '{"id":"toctou","origin_ms":1,"question":"Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?"}' > "$BORG_HOME/lessons.jsonl"
+printf '%s\n' '{"id":"toctou","origin_ms":1,"question":"Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?"}' \
+  '{"id":"drain","origin_ms":1,"question":"Does every reader see the published head before it is reused?"}' > "$BORG_HOME/lessons.jsonl"
 # An open queen question for this repo: borg hands it over at the first prompt as context.
 mkdir -p "$BORG_HOME/queen"
 printf '{"id":"qrepo","decision_key":"open_decision:repo:x","kind":"open_decision","question":"Is the relay queue bounded?","options":["bound it at 1024","leave it unbounded"],"default":"bound it at 1024","evidence":[],"session":"seed","cwd":"%s","engineer":"e@x","ms":1}\n' "$tmp/work" > "$BORG_HOME/queen/queue.jsonl"
+
+# The queued lesson reached the LLM in the request after a tool call, in or after its tool message, and
+# before the stop's questions (whose block may name it too).
+live_after_tool() {
+  python3 -I -c '
+import json, sys
+for line in open(sys.argv[1]):
+    msgs = json.loads(line)["body"].get("messages", [])
+    hit = [i for i, m in enumerate(msgs) if "published head before it is reused" in json.dumps(m)]
+    if hit:
+        tools = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+        sys.exit(0 if tools and hit[0] >= tools[0] and "TOCTOU-safe" not in json.dumps(msgs) else 1)
+sys.exit(1)' "$tmp/llm.jsonl"
+}
 
 python3 "$here/mock_llm.py" "$port" "$tmp/llm.jsonl" "$tmp/work" &
 mock=$!
@@ -152,4 +181,5 @@ grep -q "#borg-asked toctou" "$BORG_STATE"/*.ctx || fail "the conscience did not
 grep -q "borg's prompt context added" "$tmp/adapter.log" || fail "borg's prompt context was not added"
 [ "$queen" -ge 1 ] || fail "the queen question never reached the LLM"
 grep -q "^end .*\"$sid\"" "$tmp/events.log" || fail "deleting the session sent no end"
+live_after_tool || fail "the queued lesson did not reach the LLM after a tool call"
 echo PASS

@@ -689,3 +689,139 @@ test("real borg: a call declined without words makes the engineer's next prompt 
   assert.equal(got[0].correction, "keep the build cache, clean only target")
   assert.match(got[0].rejected_tool, /^Bash .*rm -rf build/)
 })
+
+/** A fake borg that answers post_tool with $CTX as additionalContext (after $POST_SLEEP seconds) and
+ *  prompt with $PROMPT_CTX (after $PROMPT_SLEEP seconds). */
+function contextBorg(): string {
+  const dir = mkdtempSync(join(tmpdir(), "borg-oc-live-"))
+  const bin = join(dir, "borg-context")
+  writeFileSync(
+    bin,
+    `#!/bin/sh\ncat >/dev/null\nanswer() { printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\\n' "$1" "$2"; }\n` +
+      `[ "$3" = post_tool ] && [ -n "$POST_SLEEP" ] && sleep "$POST_SLEEP"\n` +
+      `[ "$3" = post_tool ] && [ -n "$CTX" ] && answer PostToolUse "$CTX"\n` +
+      `[ "$3" = prompt ] && [ -n "$PROMPT_SLEEP" ] && sleep "$PROMPT_SLEEP"\n` +
+      `[ "$3" = prompt ] && [ -n "$PROMPT_CTX" ] && answer UserPromptSubmit "$PROMPT_CTX"\nexit 0\n`,
+  )
+  chmodSync(bin, 0o755)
+  return bin
+}
+
+const after1 = (hooks: any, callID: string) => {
+  const output = { title: "", output: "fn deliver() {}", metadata: {} }
+  return hooks["tool.execute.after"]!({ tool: "edit", sessionID: SESSION, callID, args: { filePath: "/work/repo/relay.rs" } }, output).then(() => output.output)
+}
+
+test("opencode 1: borg's tool context (a live check's questions) is appended to the tool output the model reads next", async () => {
+  process.env.BORG_BIN = contextBorg()
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("Fix the relay race"))
+  assert.equal(await after1(hooks, "c1"), "fn deliver() {}", "no context: the output as it was")
+  process.env.CTX = "[borg] borg check of your work so far: Q?"
+  try {
+    assert.equal(await after1(hooks, "c2"), "fn deliver() {}\n\n[borg] borg check of your work so far: Q?")
+  } finally {
+    delete process.env.CTX
+  }
+})
+
+test("opencode 2: borg's tool context is steered into the session; the tool result stays as it is", async () => {
+  process.env.BORG_BIN = contextBorg()
+  const { hooks, synthetics, cleanup, say } = await setupV2()
+  await say("Fix the relay race")
+  const result = { content: [{ type: "text", text: "fn deliver() {}" }] }
+  const after = (id: string) =>
+    hooks["tool.execute.after"]({ tool: "edit", sessionID: SESSION, agent: "build", messageID: "msg_2", id, input: { path: "/work/repo/relay.rs" }, status: "completed", result })
+  assert.equal(await after("c1"), undefined)
+  assert.equal(synthetics.length, 0, "no context: nothing sent")
+  process.env.CTX = "[borg] borg check of your work so far: Q?"
+  try {
+    const e = { tool: "edit", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c2", input: { path: "/work/repo/relay.rs" }, status: "completed", result }
+    assert.equal(await hooks["tool.execute.after"](e), undefined, "the hook returns nothing")
+    assert.equal(e.result, result)
+    assert.deepEqual(result.content, [{ type: "text", text: "fn deliver() {}" }])
+    assert.deepEqual(synthetics, [{ sessionID: SESSION, text: "[borg] borg check of your work so far: Q?", delivery: "steer", resume: false, metadata: { borg: true } }])
+  } finally {
+    delete process.env.CTX
+  }
+  await cleanup()
+})
+
+test("a tool context slower than POST_MS is never lost: it comes with the next tool call or the next prompt", async () => {
+  process.env.BORG_BIN = contextBorg()
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  try {
+    // opencode 1: the next tool call.
+    const { client } = fakeClient(() => PLAN)
+    const hooks = await load(client, "/work/repo")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("Fix the relay race"))
+    process.env.CTX = "LATE-1"
+    process.env.POST_SLEEP = "3"
+    assert.equal(await after1(hooks, "c1"), "fn deliver() {}", "the tool call does not wait for it")
+    delete process.env.CTX
+    delete process.env.POST_SLEEP
+    assert.equal(await after1(hooks, "c2"), "fn deliver() {}\n\nLATE-1")
+    assert.equal(await after1(hooks, "c3"), "fn deliver() {}", "delivered once")
+
+    // opencode 2: the next prompt, before borg's own prompt context.
+    const v2 = await setupV2()
+    await v2.say("Fix the relay race")
+    process.env.CTX = "LATE-2"
+    process.env.POST_SLEEP = "3"
+    await v2.hooks["tool.execute.after"]({ tool: "edit", sessionID: SESSION, id: "c1", input: { path: "/work/repo/relay.rs" }, status: "completed", result: { content: [] } })
+    assert.equal(v2.synthetics.length, 0)
+    delete process.env.CTX
+    delete process.env.POST_SLEEP
+    await wait(1500)
+    process.env.PROMPT_CTX = "PROMPT-CONTEXT"
+    await v2.say("now the queue")
+    assert.deepEqual(v2.synthetics.map((s: any) => s.text), ["LATE-2\n\nPROMPT-CONTEXT"])
+    await v2.cleanup()
+  } finally {
+    delete process.env.CTX
+    delete process.env.POST_SLEEP
+    delete process.env.PROMPT_CTX
+  }
+})
+
+test("a prompt context slower than PROMPT_MS is never lost: it comes with the next tool call", async () => {
+  process.env.BORG_BIN = contextBorg()
+  try {
+    const { client } = fakeClient(() => PLAN)
+    const hooks = await load(client, "/work/repo")
+    process.env.PROMPT_CTX = "LATE-PROMPT"
+    process.env.PROMPT_SLEEP = "6"
+    const msg = userMessage("Fix the relay race")
+    await hooks["chat.message"]!({ sessionID: SESSION }, msg)
+    assert.equal(msg.parts.length, 1, "the message does not wait for it")
+    delete process.env.PROMPT_CTX
+    delete process.env.PROMPT_SLEEP
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.equal(await after1(hooks, "c1"), "fn deliver() {}\n\nLATE-PROMPT")
+    assert.equal(await after1(hooks, "c2"), "fn deliver() {}", "delivered once")
+  } finally {
+    delete process.env.PROMPT_CTX
+    delete process.env.PROMPT_SLEEP
+  }
+})
+
+test("opencode 2: a tool context whose steer fails is kept for the next call or prompt", async () => {
+  process.env.BORG_BIN = contextBorg()
+  const v2 = await setupV2()
+  await v2.say("Fix the relay race")
+  const synthetic = v2.ctx.session.synthetic
+  v2.ctx.session.synthetic = async () => {
+    throw new Error("session busy")
+  }
+  process.env.CTX = "STEER-FAILED"
+  try {
+    await v2.hooks["tool.execute.after"]({ tool: "edit", sessionID: SESSION, id: "c1", input: { path: "/work/repo/relay.rs" }, status: "completed", result: { content: [] } })
+  } finally {
+    delete process.env.CTX
+    v2.ctx.session.synthetic = synthetic
+  }
+  await v2.say("go on")
+  assert.deepEqual(v2.synthetics.map((s: any) => s.text), ["STEER-FAILED"])
+  await v2.cleanup()
+})

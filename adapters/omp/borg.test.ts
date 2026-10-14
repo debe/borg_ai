@@ -246,6 +246,44 @@ test("session_stop: borg's questions block once, then stop_hook_active lets the 
 	assert.equal(ctxFile(), "make the relay delivery lock-free\n#borg-asked L1\n");
 });
 
+test("tool_result hands borg's context (a live check's questions) to omp as additionalContext; nothing else", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "borg-omp-live-"));
+	const bin = join(dir, "borg-live");
+	writeFileSync(bin, `#!/bin/sh\ncat >/dev/null\n[ "$3" = post_tool ] && [ -n "$ASK" ] && echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[borg] borg check of your work so far: Q?"}}'\nexit 0\n`);
+	chmodSync(bin, 0o755);
+	process.env.BORG_BIN = bin;
+	const h = load();
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const result = (isError = false) =>
+		h.tool_result({ type: "tool_result", toolName: "edit", toolCallId: "c1", input: { path: "a.rs" }, content: [{ type: "text", text: "ok" }], isError }, ctx);
+	assert.equal(await result(), undefined, "no answer: nothing");
+	process.env.ASK = "1";
+	assert.deepEqual(await result(), { additionalContext: "[borg] borg check of your work so far: Q?" });
+	assert.equal(await result(true), undefined, "a failure is post_tool_failure: borg answers nothing");
+	delete process.env.ASK;
+});
+
+test("session_stop: when omp gives up on the handler (its signal aborts), borg is killed and nothing is returned", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "borg-omp-abort-"));
+	const bin = join(dir, "borg-slow");
+	const pidFile = join(dir, "pid");
+	writeFileSync(bin, `#!/bin/sh\ncat >/dev/null\necho $$ > "${pidFile}"\nexec sleep 30\n`);
+	chmodSync(bin, 0o755);
+	process.env.BORG_BIN = bin;
+	const h = load();
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const abort = new AbortController();
+	const started = Date.now();
+	const out = h.session_stop({ type: "session_stop", last_assistant_message: "done", signal: abort.signal }, ctx);
+	while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) await new Promise((r) => setTimeout(r, 20));
+	abort.abort();
+	assert.equal(await out, undefined);
+	assert.ok(Date.now() - started < 5_000, "resolved at the abort, not after borg's 30 s");
+	const pid = Number(readFileSync(pidFile, "utf8").trim());
+	await new Promise((r) => setTimeout(r, 100));
+	assert.throws(() => process.kill(pid, 0), "borg is gone");
+});
+
 test("session_shutdown reaches borg end", async () => {
 	const { ctx, ctxFile } = env();
 	process.env.BORG_LEARN = "off"; // `end` would otherwise start `borg learn` (a model call)

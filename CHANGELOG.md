@@ -27,7 +27,7 @@ First release.
   as context, without a model call (Claude Code).
 - Turn-end check: a free word-matching gate, then one graded model call over every eligible lesson.
   Only a grade-3 lesson blocks the stop for another round. Grade-2 and grade-1 lessons go free with the
-  next prompt or touch (Claude Code).
+  next prompt or touch.
 - System gate: lessons scoped to other systems are not delivered in a repo that maps to a known system.
   The system map is read from `~/.config/borg/systems.json` (`BORG_SYSTEMS`); a neutral example ships.
 - Delivery modes per collective (`"mode"` in collectives.json, `BORG_MODE` overrides): `live` (default)
@@ -35,13 +35,19 @@ First release.
   starts a detached `borg check` of the turn so far (one at a time, at most one start per
   `BORG_LIVE_DEBOUNCE_S`, default 45 s); its grade-3 lessons arrive with the next tool call as "borg check
   of your work so far", and a stop whose changes a live check of the same turn already covered skips its
-  model call (a grade 3 still waiting is asked there). Claude Code only for now (omp and opencode drones
-  run and count in hook mode; `borg doctor` warns when bm25, BORG_ONLY or BORG_CRITIC turn live off). `borg status`, `borg doctor` and `borg web` show the
+  model call (a grade 3 still waiting is asked there). `borg doctor` warns when bm25, BORG_ONLY or
+  BORG_CRITIC turn live off. `borg status`, `borg doctor` and `borg web` show the
   mode; stats and outcomes carry `mode` and `channel` (`live_check`, `live_ask`, `usd_mode`, `channels`).
   Live is the default because it met the rule fixed before the live-vs-hook eval: on an internal benchmark
   of real engineering tasks (3 tasks × 3 seeds per mode), +0.38 criteria per task (95% CI [0, +0.88]),
   0 redo rounds against 0.5, borg's own cost $0.56 against $0.07 per task. `"mode": "hook"` or
   `BORG_MODE=hook` switches back; an unknown value means live.
+- Live mode for omp and opencode 1.x/2.x: questions from a live check arrive with the next tool call
+  (omp ≥18.4.4: the `tool_result` handler's `additionalContext`; opencode 1.x: appended to the tool
+  output; opencode 2.x: a steer synthetic input); graded 2s and 1s wait for the next prompt as on Claude
+  Code. Without a Claude transcript a live check reads the turn's tool calls and edits. The stop sizes its
+  wait and model call to the harness's budget (`BORG_STOP_BUDGET_MS`; omp 28 s: a 7 s wait, then the call
+  gets what is left but 3 s, at most 18 s; opencode 90 s).
 - Optional vector recall at the turn end (`--features vectors`, `borg vectors --fetch/--rebuild`).
 - Expert repos per collective: cited claims from a local checkout of a dependency, at the pinned version.
 
@@ -85,11 +91,12 @@ First release.
 
 ### Harnesses and operations
 
-- Claude Code hooks; omp and opencode adapters (turn-end check, learning, steering).
+- Claude Code hooks; omp and opencode adapters (turn-end check, live mode, learning, steering).
 - opencode 2 support: the opencode adapter serves opencode 1.x and 2.x from one file, queen questions
   included (2.x: the `setup` plugin API).
 - `borg install|uninstall` with dry run, backups and idempotent merging; `borg status`, `borg doctor`.
-- Hooks fail open; the turn-end model call has a 45 s limit.
+- Hooks fail open; the turn-end model call has a 45 s limit (on omp at most 18 s, inside its fixed 30 s
+  stop limit).
 
 ### Off by default (experimental)
 

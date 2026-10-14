@@ -36,9 +36,11 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 For debugging and evaluation: `borg recall`, `borg prefilter`, `borg resolve`, `borg expert`,
 `borg facets`. Their usage is in the header of [`crates/borg/src/main.rs`](../crates/borg/src/main.rs).
 
-**Internal:** `borg check --session ID --transcript FILE --cwd DIR` is live mode's check of the work so
-far ([Delivery modes](../README.md#delivery-modes)). The Claude Code PostToolUse hook starts it detached
-after a state-changing tool call, with the hook's environment; it takes the session's lock
+**Internal:** `borg check --session ID [--transcript FILE] --cwd DIR` is live mode's check of the work
+so far ([Delivery modes](../README.md#delivery-modes)). Every harness's post-tool event (Claude Code and
+omp PostToolUse, opencode `tool.execute.after`) starts it detached after a state-changing tool call, with
+the hook's environment. Without a transcript (omp, opencode) the work so far is the turn's tool calls
+from `<state>/<session>.turn`. It takes the session's lock
 (`<state>/<session>.live.lock`), runs one graded model call on the turn so far, and leaves its verdict
 in the session's `.queued` file for the next prompt or tool call. It is not meant to be run by hand and
 is not listed in `borg help`.

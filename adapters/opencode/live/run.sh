@@ -6,8 +6,10 @@
 #
 #   cargo build -p borg && adapters/opencode/live/run.sh
 #
-# Passes when the prompt, a successful and a failed tool call reached borg, the conscience's question
-# went back into the session (the mock LLM saw it) once, and deleting the session ended it.
+# Passes when the prompt, a successful and a failed tool call reached borg, a lesson waiting in the
+# session's queue reached the LLM with the tool output (live mode's mid-turn channel), the
+# conscience's question went back into the session (the mock LLM saw it) once, and deleting the
+# session ended it.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
@@ -25,7 +27,19 @@ unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT
 export OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_DEFAULT_PLUGINS=1
 mkdir -p "$HOME" "$XDG_CONFIG_HOME/opencode/plugins" "$BORG_HOME" "$tmp/work"
 # borg behind a wrapper that logs each hook event and its canonical JSON.
-printf '#!/bin/sh\nin=$(cat)\nprintf "%%s %%s\\n" "$3" "$in" >> "%s"\nprintf "%%s" "$in" | exec "%s" "$@"\n' "$tmp/events.log" "$borg" > "$BORG_BIN"
+# At the first successful tool call the wrapper also leaves the lesson `drain` in the session's queue,
+# as a live check would (a real check needs the consequence model; crates/borg/tests/live_cli.rs runs
+# one on a fake): borg hands it over with that call, and the next LLM request must carry it.
+cat > "$BORG_BIN" <<EOF
+#!/bin/sh
+in=\$(cat)
+printf "%s %s\n" "\$3" "\$in" >> "$tmp/events.log"
+if [ "\$3" = post_tool ] && [ ! -e "$tmp/seeded" ]; then
+  sid=\$(printf '%s' "\$in" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9-')
+  mkdir -p "$BORG_STATE" && echo "live drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
+fi
+printf '%s' "\$in" | exec "$borg" "\$@"
+EOF
 chmod +x "$BORG_BIN"
 cp "$here/../borg.ts" "$XDG_CONFIG_HOME/opencode/plugins/borg.ts"
 cat > "$XDG_CONFIG_HOME/opencode/opencode.json" <<EOF
@@ -45,7 +59,22 @@ cat > "$XDG_CONFIG_HOME/opencode/opencode.json" <<EOF
   }
 }
 EOF
-echo '{"id":"toctou","origin_ms":1,"question":"Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?"}' > "$BORG_HOME/lessons.jsonl"
+printf '%s\n' '{"id":"toctou","origin_ms":1,"question":"Is any check-then-act on an AtomicBoolean flag TOCTOU-safe across threads?"}' \
+  '{"id":"drain","origin_ms":1,"question":"Does every reader see the published head before it is reused?"}' > "$BORG_HOME/lessons.jsonl"
+
+# The queued lesson reached the LLM in the request after a tool call, in or after its tool message, and
+# before the stop's questions (whose block may name it too).
+live_after_tool() {
+  python3 -I -c '
+import json, sys
+for line in open(sys.argv[1]):
+    msgs = json.loads(line)["body"].get("messages", [])
+    hit = [i for i, m in enumerate(msgs) if "published head before it is reused" in json.dumps(m)]
+    if hit:
+        tools = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+        sys.exit(0 if tools and hit[0] >= tools[0] and "TOCTOU-safe" not in json.dumps(msgs) else 1)
+sys.exit(1)' "$tmp/llm.jsonl"
+}
 
 python3 "$here/mock_llm.py" "$port" "$tmp/llm.jsonl" "$tmp/work" &
 mock=$!
@@ -83,4 +112,5 @@ grep -q "^post_tool_failure " "$tmp/events.log"
 grep -q "relay.rs" "$BORG_STATE"/*.ctx
 # The echo of our questions came back carrying the borg metadata marker.
 ! grep -q "taken as their echo" "$tmp/adapter.log"
+live_after_tool || { echo "FAIL: the queued lesson did not reach the LLM after a tool call"; exit 1; }
 echo PASS

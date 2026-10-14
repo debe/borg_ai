@@ -40,7 +40,7 @@ lesson. A new correction on the same point updates the existing lesson.
 ![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](docs/img/turn.svg)
 
 1. **Early, free.** When a prompt or touched file first names a lesson's topic, Borg adds that topic's
-   top lessons to the context. Word matching only. Claude Code only.
+   top lessons to the context. Word matching only. Claude Code only so far.
 2. **Turn end, graded.** A free word gate skips most turns. Otherwise one model call grades every
    eligible lesson: 3 = certain, 2 = likely, 1 = worth a thought. A grade 3 blocks the stop and the agent
    works one more round. Grades 2 and 1 arrive free with the next prompt or touch. In
@@ -101,8 +101,8 @@ the same questions. They differ in *when* the call runs.
 | Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background; a later tool call starts one while changes wait unchecked. A live check has no word gate: a turn half done has too few words for it. Its grade-3 lessons arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Grades 2 and 1 arrive free, as at the turn end |
 | Turn end | The free gate, then one graded call; a grade 3 blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's grade 3 that no tool call delivered yet blocks the stop, as in hook mode. Lessons asked live are not asked again |
 | Model calls | At most one per turn end; the gate skips most | One per burst of changes (at most one running at a time, at most one start per 45 s), plus the turn end when changes came after the last check |
-| Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s for a check still running |
-| Harnesses | Claude Code, omp, opencode | Claude Code (omp and opencode follow) |
+| Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s (omp: 7 s) for a check still running |
+| Harnesses | Claude Code, omp, opencode | Claude Code, omp (≥18.4.4), opencode 1.x/2.x |
 
 **Switch back to hook** per collective with `"mode": "hook"` in its entry of `collectives.json`, or for
 one shell with `BORG_MODE=hook` (or `live`), which overrides the config. `BORG_LIVE_DEBOUNCE_S` sets the
@@ -115,13 +115,19 @@ from, and `borg status` counts live checks apart from turn-end checks. In `borg 
 drone cards show the mode, the Conscience page splits live checks from turn-end checks and what the
 questions led to by channel (live check or turn end), and the Cost page shows check cost by mode per day.
 
-A live check still running when the stop gives up waiting (15 s) can finish after the turn ended; its
-grade-3 lessons then arrive with the next prompt, or never if the session ends there.
+A live check still running when the stop gives up waiting (15 s; on omp 7 s, a quarter of its stop
+budget) can finish after the turn ended; its grade-3 lessons then arrive with the next prompt, or never
+if the session ends there.
+
+**On omp and opencode** a tool call's context reaches the model before its next step, as on Claude
+Code: omp takes it as the `tool_result` handler's `additionalContext` (a hidden message; the tool output
+stays as it is), opencode 1.x appends it to the tool output, and opencode 2.x steers it into the session
+as a hidden input. Neither harness writes a Claude transcript, so a live check there reads the turn's
+tool calls and edits, not the agent's prose. The stop still reads the agent's last message.
 
 Live mode needs the consequence model. Under `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC` it does
 nothing: the drones run in hook mode. `borg doctor` warns and `borg status` notes it on the mode line
-(the hook's own stderr note is not shown by the agent). omp and opencode drones of a live collective
-run, and count in the statistics, in hook mode.
+(the hook's own stderr note is not shown by the agent).
 
 **Why live is the default.** The rule was fixed before the run: live becomes the default if, on an
 internal benchmark of real engineering tasks with graded outcomes, it passes more criteria than hook
@@ -150,8 +156,9 @@ spend matters more.
 - Rust 1.88 or newer (edition 2024), via [rustup](https://rustup.rs).
 - Linux or macOS. Tested on Linux only.
 - A harness: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets every feature. omp
-  (tested with 18.8.5) and opencode get the turn-end check, learning and steering, but no early delivery
-  and no live mode yet ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
+  (tested with 18.8.5 and 18.10.4; live mode needs 18.4.4 or newer) and opencode (1.19.0 and 2.0.29) get
+  live mode, the turn-end check, learning and steering, but no early delivery yet
+  ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
 - One logged-in model CLI on `PATH`: `claude`, `omp` or `opencode`. Borg's model steps (learning, the
   turn-end check) run headless through the harness the drone runs in (Sonnet by default for `claude`,
   the configured default model for omp and opencode), and through another installed one if it gives
@@ -262,9 +269,9 @@ excerpts and presence. Lessons skip it: the model writes them as general questio
 `lessons.jsonl` before you share a collective that handled secrets.
 
 **Hooks fail open.** A missing binary, a crash, an invalid config, an unreachable model or a locked index
-lets the agent continue untouched. The turn-end call stops after 45 s; if it fails, the turn ends without
-questions. A live check that fails asks nothing, and the turn end checks as in hook mode. Unlearned
-episodes wait for the next run.
+lets the agent continue untouched. The turn-end call stops after 45 s (on omp after at most 18 s, inside
+its fixed 30 s stop limit); if it fails, the turn ends without questions. A live check that fails asks
+nothing, and the turn end checks as in hook mode. Unlearned episodes wait for the next run.
 
 ## Evidence and limits
 
@@ -292,7 +299,14 @@ author's sessions, so their data is not in this repository.
 - Small samples (16 negative and 51 positive turn-end cases; 10 sessions for memory quality). The
   intervals are wide.
 - Turn-end asking of the engineer (`BORG_QUEEN=on`) failed its test and is off.
-- omp and opencode get lessons only at the turn end, and live mode is Claude Code only.
+- omp and opencode get no early delivery yet.
+- omp gives a stop 30 s, which no setting changes. borg budgets 28 s, so the turn-end call there stops
+  after at most 18 s (less what the stop spent before it); about one in eight measured turn-end calls took longer, and such a turn ends without
+  questions. A stop that a live check covered makes no call.
+- On omp and opencode a live check sees the turn's tool calls and edits, not the agent's prose.
+- opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
+  successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
+  TUI hides it for built-in tools, but session exports show it.
 - Borg learns only from corrections. Knowledge nobody corrected enters only through
   `assimilate --from-dir`.
 

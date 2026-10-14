@@ -5,7 +5,11 @@
 //                                                      borg's additionalContext, e.g. a queen question,
 //                                                      joins the turn as a hidden custom message)
 //   tool_call                   -> pre_tool          (a paused drone's call is blocked with borg's reason)
-//   tool_result                 -> post_tool | post_tool_failure (error = the result text)
+//   tool_result                 -> post_tool | post_tool_failure (error = the result text; borg's
+//                                                      context for a successful call, e.g. a live check's
+//                                                      questions, is returned as additionalContext: omp
+//                                                      >= 18.4.4 shows it to the model as a hidden message
+//                                                      before its next step and leaves the tool output as is)
 //   tool_approval_resolved deny -> post_tool_failure  (error = omp's "Tool call denied by user: <tool>")
 //   session_stop                -> stop               ({"decision":"block","reason"} is returned to omp,
 //                                                      which injects it as a continuation and sets
@@ -116,8 +120,9 @@ export function stopEvent(ctx: any, ev: Json): Canonical {
 	};
 }
 
-/** Run `borg hook omp <event>`; resolves to borg's JSON answer, or null (fail open). */
-export function runBorg(event: string, payload: Canonical, timeoutMs: number): Promise<Json | null> {
+/** Run `borg hook omp <event>`; resolves to borg's JSON answer, or null (fail open). An aborted
+ *  `signal` (omp gave up on the handler) kills borg, so it stops writing state for an answer nobody reads. */
+export function runBorg(event: string, payload: Canonical, timeoutMs: number, signal?: AbortSignal): Promise<Json | null> {
 	return new Promise((resolve) => {
 		let out = "";
 		let done = false;
@@ -125,23 +130,29 @@ export function runBorg(event: string, payload: Canonical, timeoutMs: number): P
 			if (!done) {
 				done = true;
 				clearTimeout(timer);
+				signal?.removeEventListener("abort", kill);
 				resolve(v);
 			}
 		};
+		// Before spawning: a spawn failure (ENOENT) is emitted later, with no listener to take it.
+		if (signal?.aborted) return resolve(null);
 		let child: ReturnType<typeof spawn>;
 		try {
-			// BORG_STOP_BUDGET_MS: borg keeps its expert drone inside this timeout, so its answer arrives.
+			// BORG_STOP_BUDGET_MS: at a stop borg keeps its wait for a live check, its model call and its
+			// expert drone inside this timeout, so its answer arrives.
 			const env = { ...process.env, BORG_STOP_BUDGET_MS: String(timeoutMs) };
 			child = spawn(process.env.BORG_BIN || "borg", ["hook", "omp", event], { stdio: ["pipe", "pipe", "ignore"], env });
 		} catch {
 			return resolve(null);
 		}
-		const timer = setTimeout(() => {
+		const kill = () => {
 			try {
 				child.kill();
 			} catch {}
 			finish(null);
-		}, timeoutMs);
+		};
+		const timer = setTimeout(kill, timeoutMs);
+		signal?.addEventListener("abort", kill, { once: true });
 		child.on("error", () => finish(null)); // e.g. ENOENT: borg not installed
 		child.stdout?.on("data", (d) => (out += d));
 		child.on("close", () => {
@@ -157,11 +168,13 @@ export function runBorg(event: string, payload: Canonical, timeoutMs: number): P
 }
 
 // Per-event budgets: capture is file appends (ms); stop may call a model (the consequence model) but omp
-// gives handlers 30 s; omp waits only 2 s on session_shutdown, and borg detaches `borg learn` anyway.
+// gives handlers a fixed 30 s (no setting changes it for session_stop), so the stop sizes its wait for a
+// live check and its model call from BORG_STOP_BUDGET_MS = STOP_MS; omp waits only 2 s on
+// session_shutdown, and borg detaches `borg learn` anyway.
 const FAST_MS = 5_000;
 // Before every tool call: borg answers in a few ms (a stat when nobody steers); fail open after 2 s.
 const PRE_MS = 2_000;
-const STOP_MS = 25_000;
+const STOP_MS = 28_000;
 const END_MS = 1_500;
 
 export default function borg(pi: any): void {
@@ -235,7 +248,10 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			calls.delete(String(ev.toolCallId));
 			const [event, payload] = toolEvent(ctx, ev);
-			await runBorg(event, payload, FAST_MS);
+			// A live check's questions (or graded lessons) waiting since an earlier call reach the model
+			// before its next step, as a hidden message; the tool output stays as it is.
+			const c = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
+			return typeof c === "string" && c.trim() ? { additionalContext: c } : undefined;
 		}),
 	);
 
@@ -253,7 +269,7 @@ export default function borg(pi: any): void {
 	pi.on(
 		"session_stop",
 		safe(async (ev, ctx) => {
-			const out = await runBorg("stop", stopEvent(ctx, ev), STOP_MS);
+			const out = await runBorg("stop", stopEvent(ctx, ev), STOP_MS, ev.signal);
 			if (out?.decision === "block" && typeof out.reason === "string" && out.reason) {
 				asked = out.reason.trim();
 				return { decision: "block", reason: out.reason };

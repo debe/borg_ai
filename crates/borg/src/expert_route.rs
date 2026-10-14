@@ -132,9 +132,15 @@ pub fn checkpoint(event: &str, input: &Value, conscience: impl FnOnce() -> Optio
     }
     let Ok(cfg) = collective::load() else { return conscience };
     let state = PathBuf::from(std::env::var("BORG_STATE").unwrap_or_else(|_| "/tmp/borg".into()));
-    let budget = std::env::var(STOP_BUDGET_ENV).ok().and_then(|v| v.trim().parse().ok()).map(Duration::from_millis);
+    let budget = stop_budget();
     let world = World { home: &learn::home(), state: &state, drone: &claude_drone, drone_cap: drone_cap(budget, started.elapsed()) };
     run(cfg.as_ref(), input, conscience, &world)
+}
+
+/// The stop hook's time budget the harness named (`BORG_STOP_BUDGET_MS`), if any. Read at the stop only:
+/// the omp adapter sets it for every event, and a `borg check` spawned by a tool call inherits it.
+pub fn stop_budget() -> Option<Duration> {
+    std::env::var(STOP_BUDGET_ENV).ok().and_then(|v| v.trim().parse().ok()).map(Duration::from_millis)
 }
 
 /// How long the drone may take: at most `DRONE_TIMEOUT`, and what is left of the stop hook's
@@ -1023,7 +1029,7 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
     #[test]
     fn the_drone_fits_in_the_stop_hooks_budget() {
         let s = Duration::from_secs;
-        assert_eq!(drone_cap(Some(Duration::from_millis(25_000)), s(1)), s(19), "omp: 25 s, less the conscience, less the margin");
+        assert_eq!(drone_cap(Some(Duration::from_millis(28_000)), s(1)), s(22), "omp: 28 s, less the conscience, less the margin");
         assert_eq!(drone_cap(None, Duration::ZERO), DEFAULT_STOP_BUDGET - STOP_MARGIN, "no budget named: Claude Code's default");
         assert_eq!(drone_cap(Some(s(600)), Duration::ZERO), DRONE_TIMEOUT, "never above the drone's own cap");
         assert_eq!(drone_cap(Some(s(5)), s(20)), Duration::ZERO);

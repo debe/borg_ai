@@ -1,8 +1,9 @@
 # borg for opencode
 
 `borg.ts` is an opencode plugin that connects opencode sessions to the collective. One file serves
-both plugin APIs: opencode 1.x (the `server` entrypoint, built against 1.18.32; object entrypoints
-need 1.18.29 or newer) and opencode 2.x (the `setup` entrypoint, built against 2.0.23). It turns
+both plugin APIs: opencode 1.x (the `server` entrypoint, built against 1.18.32 and verified on
+1.19.0; object entrypoints need 1.18.29 or newer) and opencode 2.x (the `setup` entrypoint, built
+against 2.0.23 and verified on 2.0.29). It turns
 opencode's hooks and events into borg's canonical hook event and pipes it to
 `borg hook opencode <event>`:
 
@@ -10,7 +11,7 @@ opencode's hooks and events into borg's canonical hook event and pipes it to
 |---|---|---|---|
 | `chat.message` (the engineer's text) | session hook `prompt` | `prompt` | records the task; a correction becomes an episode; borg's context for the prompt (a queen question) reaches the drone but stays hidden in the TUI: on 1.x a synthetic text part of the message, on 2.x a synthetic session input without a description, just before the prompt; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
 | `tool.execute.before` | tool hook `execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg steer --pause` (refuses the call); fails open after 2 s |
-| `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`) |
+| `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`); borg's context for the call (in live mode a check's questions, or waiting graded lessons) reaches the model before its next step, see below |
 | a tool part that ends in `error`, including a permission rejected with feedback | `execute.after` with an error (a rejection with feedback carries it), or `session.tool.failed` for a call declined without feedback | `post_tool_failure` | the engineer's feedback becomes an episode |
 | `session.idle` | `session.execution.succeeded` | `stop` | the conscience may answer `{"decision":"block","reason"}`; the plugin sends the reason back into the session as a user message |
 | `session.deleted`, opencode shutting down | `session.deleted`, the plugin's cleanup (reload, shutdown) | `end` | runs `borg learn --session ID` in the background |
@@ -27,14 +28,27 @@ prompting the drone on its own:
   ends such a turn with `session.execution.interrupted` or `session.execution.failed` instead of
   `succeeded`. Claude Code's
   Stop hook does not fire on an interrupt either.
-- If the engineer types while borg is still answering a stop (up to 60 s with `BORG_MATCH=predict`),
+- If the engineer types while borg is still answering a stop (up to 90 s with the consequence model),
   the questions about the earlier turn are dropped.
+
+**Live mode.** Both after-hooks are awaited, so borg's answer to a tool call reaches the model at its
+next step. opencode 1.x appends it to the tool's output, which opencode stores with the call: the TUI
+does not show it for built-in tools, but session exports do. opencode 2.x sends it into the session as a
+synthetic input with `delivery: "steer"` and leaves the tool result alone (the TUI shows the result).
+The plugin waits 2 s for borg's answer (while a stop is still answering, not at all); one that comes
+later is kept and goes with the next tool call or the next prompt, since borg already counts it as
+delivered. The same holds for the prompt's context after 5 s, and for a steer that opencode 2.x refuses. opencode 1.x runs no after-hook for a
+failed tool call, so a question waiting then goes with the next successful call, the next prompt or the
+stop. opencode writes no Claude transcript, so borg's live check reads the turn's tool calls and edits,
+not the drone's prose.
 
 The plugin ignores subagent (child) sessions, except before a tool call: a child's `pre_tool` asks
 as its root session, so a drone paused by `borg steer --pause` cannot keep working through a subagent.
 
-The plugin fails open. If borg is missing, slow (60 s limit) or broken, opencode carries on as if
-the plugin were not there.
+The plugin fails open. If borg is missing, slow or broken, opencode carries on as if the plugin were
+not there. A stop gets 90 s (opencode sets no limit of its own), which the plugin passes to borg as
+`BORG_STOP_BUDGET_MS`: room for a 15 s wait for a running live check, the 45 s model call and an
+expert drone.
 
 Rejections reach borg in Claude Code's wording. A rejection with feedback carries the engineer's
 words. A rejection without feedback (opencode 1: `The user rejected permission to use this specific
@@ -142,16 +156,21 @@ adapters/opencode/live/run-v2.sh             # real opencode 2.x, likewise (neve
 - `borg.test.ts` is the contract test, for both entrypoints (`server` and `setup`). It sends opencode-shaped hooks and events to the plugin and
   checks the exact canonical JSON the plugin produces. It checks the guards above: no stop after a
   halted turn, no stale questions after the engineer spoke during a slow stop, and no loop when the
-  echo comes back changed. It then runs the real borg binary and checks that borg's questions return
+  echo comes back changed. It checks that borg's tool-call context is appended to the tool output on
+  1.x and steered in on 2.x (the tool result untouched), and that an answer later than 2 s comes with
+  the next tool call or prompt. It then runs the real borg binary and checks that borg's questions return
   once per idle cycle, that the echoed question is not treated as the engineer's prompt, and that a
   correction and a rejected edit are recorded as episodes.
 - `live/run.sh` starts `opencode serve` with every home and config directory in a temp dir, plus a
   local OpenAI-compatible mock LLM. It then runs `opencode run --attach` and checks that the plugin
-  loads and that prompt, `post_tool` and `post_tool_failure` reach borg. It also checks that the
+  loads and that prompt, `post_tool` and `post_tool_failure` reach borg. A wrapper leaves a lesson in
+  the session's queue at the first tool call, as a live check would, and the test checks that the LLM
+  request after that call carries it in the tool output. It also checks that the
   conscience's question reaches the LLM exactly once, that its echo comes back with the borg marker,
   and that deleting the session sends `end`. Set
   `OPENCODE=/path/to/opencode` if opencode is not on `PATH` (e.g. a 1.x binary from the
   `opencode-linux-x64` npm package).
-- `live/run-v2.sh` checks the same against opencode 2 with a private `opencode serve` (its own
+- `live/run-v2.sh` checks the same against opencode 2 (the queued lesson right after the tool
+  results, as a steer) with a private `opencode serve` (its own
   password, a disabled service config, every client pointed at it with `--server`), and reports
   whether a normal shutdown ends an undeleted session through the plugin's cleanup.
