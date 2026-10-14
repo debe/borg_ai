@@ -38,7 +38,7 @@ First release.
   model call (a grade 3 still waiting is asked there). Claude Code only for now (omp and opencode drones
   run and count in hook mode; `borg doctor` warns when bm25, BORG_ONLY or BORG_CRITIC turn live off). `borg status`, `borg doctor` and `borg web` show the
   mode; stats and outcomes carry `mode` and `channel` (`live_check`, `live_ask`, `usd_mode`, `channels`).
-  The default stays hook until the live-vs-hook eval (reports/live-vs-hook.md) decides by its fixed rule.
+  The default stays hook until the live-vs-hook eval decides by its fixed rule.
 - Optional vector recall at the turn end (`--features vectors`, `borg vectors --fetch/--rebuild`).
 - Expert repos per collective: cited claims from a local checkout of a dependency, at the pinned version.
 

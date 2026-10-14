@@ -122,9 +122,9 @@ nothing: the drones run in hook mode. `borg doctor` warns and `borg status` note
 run, and count in the statistics, in hook mode.
 
 **Which is better?** Not yet known, so the default stays hook. The decision rule was fixed before the
-run: live becomes the default only if, on the workbench eval, it passes at least as many
-criteria as hook (mean difference > 0, 95% CI lower bound ≥ −0.5) and causes no more redo rounds per run.
-Method and result: [reports/live-vs-hook.md](reports/live-vs-hook.md).
+run: live becomes the default only if, on an internal benchmark of real engineering tasks with graded
+outcomes, it passes at least as many criteria as hook (mean difference > 0, 95% CI lower bound ≥ −0.5)
+and causes no more redo rounds per run.
 
 ## Quick start
 
@@ -215,7 +215,7 @@ All commands: [Commands](docs/commands.md). Every switch: [Environment variables
 - **Live mode** adds one call of the same kind per burst of changes during the turn, in the background.
   The turn end then skips its own call when a live check covered every change. Questions asked live
   cost no extra round. There is no cost cap: `borg status` and the Cost page show what each mode spent.
-  Real-session cost per turn is not measured yet ([reports/live-vs-hook.md](reports/live-vs-hook.md)).
+  Real-session cost per turn is not measured yet.
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66).
 - `assimilate --from-dir` makes one call per document chunk and prints each call's cost.
 
@@ -266,7 +266,7 @@ author's sessions, so their data is not in this repository.
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms |
 | Public data ([SWE-chat](reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
 | End-to-end run in a sandboxed home ([dogfood](reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
-| Live vs hook mode, workbench ([live-vs-hook](reports/live-vs-hook.md)) | not run yet; the rule that decides the default is fixed |
+| Live vs hook mode, internal task benchmark | not run yet; the rule that decides the default is fixed |
 
 **Known limits:**
 

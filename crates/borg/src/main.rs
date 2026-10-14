@@ -795,7 +795,11 @@ struct Work<'a> {
 fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     // The free gate (prefilter.rs): a turn whose words touch no lesson costs no model call; the conscience
     // then asked nothing. BORG_STOP_GATE=edits instead: a turn that changed nothing costs no model call.
-    let skip = if prefilter::edits_gate() {
+    // A live check has no gate: it runs only after a change, the debounce bounds it, and a turn half done
+    // has too few words for the gate (the E3 smoke skipped every mid-turn check at 2.8 and 7.7 of 8).
+    let skip = if live {
+        None
+    } else if prefilter::edits_gate() {
         (!w.changed).then(|| "noedit".to_string())
     } else {
         prefilter::skip(w.challenges, w.context).map(|score| format!("{score:.2}"))
@@ -879,10 +883,10 @@ fn check(harness: &str, session: &str, input: &Value, w: &Work, live: bool) -> V
     }
 }
 
-/// Live mode (live.rs), in the PostToolUse hook after a state-changing tool call: counts the change and,
+/// Live mode (live.rs), in the PostToolUse hook: counts a state-changing tool call as a change and,
 /// when no check runs, something changed since the last one and the debounce has passed, starts `borg
 /// check` detached. The hook returns at once; the drone waits for nothing.
-fn live_trigger(session: &str, input: &Value, tool: &str) {
+fn live_trigger(session: &str, input: &Value, tool: &str, changed: bool) {
     let ctx = state_file(session);
     if let Some(why) = live::unsupported() {
         // Said once per session: the hook would otherwise repeat it after every change.
@@ -891,7 +895,9 @@ fn live_trigger(session: &str, input: &Value, tool: &str) {
         }
         return;
     }
-    live::bump(&ctx, tool);
+    if changed {
+        live::bump(&ctx, tool);
+    }
     let now = learn::now_ms();
     // A paused drone (steer.rs) is waiting for its engineer, not working: nothing to check.
     let home = learn::home();
@@ -1046,9 +1052,11 @@ fn claude_hook(harness: &str, event: &str, input: &Value) -> Option<Value> {
             {
                 let _ = writeln!(f, "{edit}");
             }
-            // Live mode (live.rs): a change starts a check of the work so far, in the background.
-            if harness == "claude" && prefilter::changes(tool, tool_input) && live::current() == live::Mode::Live {
-                live_trigger(session, input, tool);
+            // Live mode (live.rs): a change starts a check of the work so far, in the background. Any later
+            // tool call starts one too while changes wait unchecked, so a change inside the debounce is
+            // checked once it has passed, not only at the stop.
+            if harness == "claude" && live::current() == live::Mode::Live {
+                live_trigger(session, input, tool, prefilter::changes(tool, tool_input));
             }
             free_context(harness, "PostToolUse", session, input, &touch)
         }

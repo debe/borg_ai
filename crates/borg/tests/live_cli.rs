@@ -176,3 +176,39 @@ fn hook_mode_and_word_matching_start_no_check() {
     assert_eq!(state(&root, "h1", "live.n"), "", "neither counts a change for a check");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn a_live_check_has_no_word_gate_and_a_later_tool_call_checks_a_change_the_debounce_held_back() {
+    let root = setup("live-gate");
+    let cwd = root.join("harbor_orion");
+    // Words that touch no lesson: the stop's gate would skip this turn; a live check must not.
+    let lines = [
+        json!({"type": "user", "message": {"role": "user", "content": "Rename the helper"}}),
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "/x/a.rs"}}]}}),
+    ];
+    let transcript = root.join("transcript.jsonl");
+    std::fs::write(&transcript, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    answer(&root, &[("Mdrain", 3)]);
+    let env = [("BORG_MODE", "live"), ("BORG_EARLY", "off"), ("BORG_LIVE_DEBOUNCE_S", "1")];
+    let call = |name: &str, input: Value| {
+        let ev = json!({"session_id": "g1", "cwd": cwd, "transcript_path": transcript, "tool_name": name, "tool_input": input});
+        borg(&root, "post_tool", &ev, &env)
+    };
+
+    call("Edit", json!({"file_path": "/x/a.rs", "old_string": "a", "new_string": "b"}));
+    let mark = wait_for(&root, "g1", "live.mark", |m| m.starts_with("1 "));
+    assert!(mark.starts_with("1 "), "the check ran despite the gate and covered the change: {mark}");
+    assert!(!state(&root, "g1", "ctx").contains("#borg-live-skip"), "{}", state(&root, "g1", "ctx"));
+    assert_eq!(prompts(&root).len(), 1);
+
+    // A second change inside the debounce starts nothing; a read once it has passed checks it.
+    call("Edit", json!({"file_path": "/x/a.rs", "old_string": "b", "new_string": "c"}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(prompts(&root).len(), 1, "debounced");
+    std::thread::sleep(Duration::from_millis(1000));
+    call("Read", json!({"file_path": "/x/a.rs"}));
+    let mark = wait_for(&root, "g1", "live.mark", |m| m.starts_with("2 "));
+    assert!(mark.starts_with("2 "), "the held-back change was checked at the next tool call: {mark}");
+    assert_eq!(state(&root, "g1", "live.n").lines().count(), 2, "a read is no change");
+}
