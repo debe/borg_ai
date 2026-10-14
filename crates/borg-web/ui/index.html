@@ -112,13 +112,14 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
 
 /* donut */
 .donut { display: grid; grid-template-columns: minmax(140px, 200px) 1fr; gap: 16px; align-items: center; }
-@media (max-width: 520px) { .donut { grid-template-columns: 1fr; } .donut svg { max-width: 200px; margin: 0 auto; } }
+@media (max-width: 520px) { .donut { grid-template-columns: 1fr; } .donut-fig { max-width: 200px; margin: 0 auto; } }
 .donut svg { width: 100%; height: auto; }
 .donut-seg { fill: none; stroke-width: 14; transition: opacity .15s; cursor: default; }
 .donut-seg.dim { opacity: .3; }
 .donut-empty { fill: none; stroke: var(--rule); stroke-width: 14; }
 .donut-v { font: 700 15px var(--sans); fill: var(--ink); }
-.donut-c { font: 6px var(--mono); fill: var(--muted); }
+.donut-fig { margin: 0; text-align: center; }
+.donut-c { font: .75rem var(--mono); color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
 .dl-row { display: grid; grid-template-columns: 9px 1fr auto 44px; gap: 8px; align-items: center; font-size: .86rem; padding: 4px 6px; border-radius: 6px; }
 .dl-row.hl { background: var(--panel-2); }
 .dl-row b { font-family: var(--mono); font-weight: 500; }

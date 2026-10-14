@@ -367,11 +367,15 @@ pub fn Donut(#[prop(into)] parts: Signal<Vec<(String, f64, String)>>, #[prop(int
     };
     view! {
         <div class="donut">
-            <svg viewBox="0 0 100 100">
-                <g transform="rotate(-90 50 50)">{rings}</g>
-                <text x="50" y="49" text-anchor="middle" class="donut-v">{move || center.get()}</text>
-                <text x="50" y="62" text-anchor="middle" class="donut-c">{caption}</text>
-            </svg>
+            // The caption is HTML under the ring, not SVG text inside it: SVG text never wraps, and a
+            // caption wider than the hole runs across the ring.
+            <figure class="donut-fig">
+                <svg viewBox="0 0 100 100">
+                    <g transform="rotate(-90 50 50)">{rings}</g>
+                    <text x="50" y="50" text-anchor="middle" dominant-baseline="central" class="donut-v">{move || center.get()}</text>
+                </svg>
+                <figcaption class="donut-c">{caption}</figcaption>
+            </figure>
             <div class="donut-legend">{legend}</div>
         </div>
     }
