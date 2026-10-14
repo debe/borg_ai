@@ -268,13 +268,15 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
 .badge.remote { color: var(--c-sky); border-color: var(--c-sky); }
 .toggle { font-size: .85rem; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
 .drones { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
-.drone { display: grid; gap: 6px; align-content: start; padding: 12px; border-radius: 10px; background: var(--panel-2); border-top: 3px solid var(--c-slate); }
+.drone { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 6px; align-content: start; padding: 12px; border-radius: 10px; background: var(--panel-2); border-top: 3px solid var(--c-slate); }
 .drone.working { border-top-color: var(--c-good); } .drone.waiting { border-top-color: var(--c-violet); } .drone.idle { border-top-color: var(--c-amber); } .drone.ended { opacity: .6; }
 .drone-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .drone-name { font-weight: 650; margin-right: auto; }
 .drone-who { font-size: .82rem; color: var(--muted); }
 .drone-doing { font-size: .86rem; }
 .drone-files { display: flex; flex-wrap: wrap; gap: 6px; color: var(--muted); }
+.drone-files .mono { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drone-doing, .drone-who { overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
 </style>
 <link rel="modulepreload" href="/borg-web-ui.js" crossorigin="anonymous" integrity="sha384-j8dO5QaFkK5dBPoAbsGtbzLotrqegM49HpvC6SXDGvtOBfhGgmCHSVDXL7tSDAi7"><link rel="preload" href="/borg-web-ui_bg.wasm" crossorigin="anonymous" integrity="sha384-UYyWGz5bIRvdweAVjpckyM/F8Iv2jyVMYN9Igt/+GWRMmu0USKY17lUyYJH5T8f1" as="fetch" type="application/wasm"></head>
