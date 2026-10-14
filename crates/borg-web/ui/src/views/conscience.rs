@@ -56,17 +56,18 @@ pub fn Conscience() -> impl IntoView {
         Series::new("quiet", "checked, nothing to ask", "var(--c-accent)"),
         Series::new("block", "extra round with questions", "var(--c-violet)"),
     ];
+    // Only verdicts that say whether a question helped: used, ignored or corrected anyway. "No
+    // correction followed" says nothing either way, so it is neither a ring segment nor in the
+    // denominator: ring, legend shares and centre all count the same questions.
     let outcomes = Signal::derive(move || {
         let t = t();
         vec![
             ("used".to_string(), t.n("changed"), "var(--c-good)".to_string()),
-            ("no correction followed".into(), t.n("not_corrected"), "var(--c-sky)".into()),
             ("ignored".into(), t.n("ignored"), "var(--c-slate)".into()),
             ("corrected anyway".into(), t.n("corrected"), "var(--c-heat)".into()),
         ]
     });
-    // Only verdicts that say whether a question helped: used, ignored or corrected anyway. "No
-    // correction followed" says nothing either way, so it is not in the denominator.
+    let unjudged = move || t().n("not_corrected");
     let useful = Signal::derive(move || {
         let t = t();
         format!("{} of {}", t.n("changed"), t.n("changed") + t.n("ignored") + t.n("corrected"))
@@ -93,6 +94,7 @@ pub fn Conscience() -> impl IntoView {
             <div class="panel">
                 <h2>"What the questions led to"</h2>
                 <Donut parts=outcomes center=useful caption="judged questions changed the work" />
+                <p class="empty">{move || format!("{} more asked with no verdict: no correction followed, which says nothing either way.", num(unjudged()))}</p>
             </div>
             <div class="panel">
                 <h2>"Asked most"</h2>
