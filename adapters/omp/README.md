@@ -7,7 +7,7 @@
 | `input` (interactive, RPC) | `prompt` | The engineer's raw text. `/commands` and `!shell` lines are skipped: omp emits `input` before handling them. borg's context for the prompt (a queen question) joins the turn at `before_agent_start` as a hidden custom message. |
 | `before_agent_start` | `prompt` | Used until an `input` arrives, because `omp -p` emits no `input`, and for a `/command` that starts an agent run (its expansion). borg's own questions are skipped. |
 | `tool_call` | `pre_tool` | A drone paused by `borg steer --pause` gets `{block: true, reason}`; anything else (or no answer within 2 s) lets the call run. |
-| `tool_result` | `post_tool` / `post_tool_failure` | A failure passes the result text as `error`. Tool names map to Claude's (`bash` → `Bash`, `find` → `Glob`, …). borg's context for a successful call (in live mode a check's questions, or waiting graded lessons) is returned as `additionalContext`: omp 18.4.4 and newer show it to the model before its next step as a hidden message and leave the tool output as it is. Older omp ignores it, and the text is lost. |
+| `tool_result` | `post_tool` / `post_tool_failure` | A failure passes the result text as `error`. Tool names map to Claude's (`bash` → `Bash`, `find` → `Glob`, …), and so do the input keys of a read, write or edit: `path` → `file_path`, an edit's patch → `new_string` (its files, from the patch headers, → `file_path`). borg's context for a successful call (in live mode a check's questions, or waiting graded lessons) is returned as `additionalContext`: omp 18.4.4 and newer show it to the model before its next step as a hidden message and leave the tool output as it is. Older omp ignores it, and the text is lost. |
 | `tool_approval_resolved`, denied by the user | `post_tool_failure` | `error` is omp's own text, `Tool call denied by user: <tool>`. |
 | `session_stop` | `stop` | borg's `{"decision":"block","reason"}` goes straight back to omp. omp then continues the turn with the reason and sets `stop_hook_active` for the next stop, so you get one round of questions per turn. omp gives the handler a fixed 30 s, so the extension gives borg 28 s (`BORG_STOP_BUDGET_MS`): borg waits at most 7 s for a running live check and gives its model call what is left but 3 s (at most 18 s). If omp gives up on the handler anyway, the extension kills borg. |
 | `session_shutdown` | `end` | borg starts `borg learn --session` in the background. |
@@ -57,5 +57,6 @@ note only inside that collective.
 ```sh
 cargo build -p borg
 node --test adapters/omp/borg.test.ts   # contract test: omp-shaped events -> adapter -> real `borg hook omp`
+node --test adapters/conformance/conformance.test.ts   # the installed adapter through the harness conformance scenario
 adapters/omp/smoke/smoke.sh < /dev/null # one real headless omp run (temp HOME and agent dir, local mock model, no tokens)
 ```

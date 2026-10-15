@@ -11,7 +11,7 @@ opencode's hooks and events into borg's canonical hook event and pipes it to
 |---|---|---|---|
 | `chat.message` (the engineer's text) | session hook `prompt` | `prompt` | records the task; a correction becomes an episode; borg's context for the prompt (a queen question) reaches the drone but stays hidden in the TUI: on 1.x a synthetic text part of the message, on 2.x a synthetic session input without a description, just before the prompt; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
 | `tool.execute.before` | tool hook `execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg steer --pause` (refuses the call); fails open after 2 s |
-| `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`); borg's context for the call (in live mode a check's questions, or waiting graded lessons) reaches the model before its next step, see below |
+| `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`, an edit's `newString` → `new_string`); borg's context for the call (in live mode a check's questions, or waiting graded lessons) reaches the model before its next step, see below |
 | a tool part that ends in `error`, including a permission rejected with feedback | `execute.after` with an error (a rejection with feedback carries it), or `session.tool.failed` for a call declined without feedback | `post_tool_failure` | the engineer's feedback becomes an episode |
 | `session.idle` | `session.execution.succeeded` | `stop` | the conscience may answer `{"decision":"block","reason"}`; the plugin sends the reason back into the session as a user message |
 | `session.deleted`, opencode shutting down | `session.deleted`, the plugin's cleanup (reload, shutdown) | `end` | runs `borg learn --session ID` in the background |
@@ -149,10 +149,13 @@ note only inside that collective.
 ```sh
 cargo build -p borg
 node --test adapters/opencode/borg.test.ts   # Node >= 23.6 runs the TypeScript directly
+node --test adapters/conformance/conformance.test.ts   # the installed plugin (1.x and 2.x) through the harness conformance scenario
 adapters/opencode/live/run.sh                # real opencode 1.x, isolated homes, mock LLM, 0 tokens
 adapters/opencode/live/run-v2.sh             # real opencode 2.x, likewise (never the background service)
 ```
 
+- The fake hosts (opencode 1's SDK client, opencode 2's plugin context) are in `fakes.ts`, shared with the
+  harness conformance suite ([docs/harnesses.md](../../docs/harnesses.md)).
 - `borg.test.ts` is the contract test, for both entrypoints (`server` and `setup`). It sends opencode-shaped hooks and events to the plugin and
   checks the exact canonical JSON the plugin produces. It checks the guards above: no stop after a
   halted turn, no stale questions after the engineer spoke during a slow stop, and no loop when the

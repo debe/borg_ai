@@ -1,0 +1,18 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat src/budget.rs",
+    "description": "show"
+  },
+  "tool_response": {
+    "stdout": "",
+    "stderr": "",
+    "interrupted": false
+  },
+  "tool_use_id": "toolu_05"
+}

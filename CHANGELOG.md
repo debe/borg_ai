@@ -97,6 +97,28 @@ First release.
 - `borg install|uninstall` with dry run, backups and idempotent merging; `borg status`, `borg doctor`.
 - Hooks fail open; the turn-end model call has a 45 s limit (on omp at most 18 s, inside its fixed 30 s
   stop limit).
+- One `Harness` trait (`crates/borg/src/harness/`, [docs/harnesses.md](docs/harnesses.md)): each harness
+  is one module plus a line in `harness::ALL`, with its wiring, config path, doctor probe and a capability
+  table (`Caps`) that the hook, install and steering consult instead of the harness's name. The capability
+  flags are unchanged and pinned by a test. Help, `install` usage and completions are generated from
+  `ALL`. `borg hook <unknown> <event>` now fails open (exit 0, no output) instead of printing usage.
+- The command-hook merge is generic: each hook runs `<borg> hook <harness> <event>` with its own
+  harness's name.
+- Harness conformance suites: `crates/borg/tests/conformance_cli.rs` runs the installed command hooks
+  (Claude Code and a hidden simulated harness, `sim`, whose capabilities `BORG_SIM_CAPS` sets; only a
+  process with `BORG_TEST_HARNESS` set knows `sim` by name, so `borg install sim` stays a usage error), and
+  `adapters/conformance/conformance.test.ts` runs the installed omp and opencode 1.x/2.x adapters. Both
+  cover the same scenario: install, hooks, live mode and `borg top --json`. `crates/borg-web/tests/drones_api.rs`
+  checks the page's `/api/drones` and `/api/collectives` (borg-web now has a library target).
+- `scripts/arch.sh` measures the abstraction (lizard, cargo-coupling, rust-code-analysis) against the
+  commit before it and gates harness-name branches, name tables, cycles and complexity;
+  `crates/borg/tests/harness_arch.rs` runs the tool-free gates in `cargo test`. Without that commit in
+  the history the script skips the before column and still runs the gates.
+- Fixed: the omp adapter passed `edit` and `write` input raw, so an omp edit reached borg without its
+  file (`.edits`, live checks) or its patch text. It now sends Claude's keys: `file_path` (an edit's files
+  from its patch headers) and `new_string`. The opencode adapter now maps an edit's `newString` too.
+- `borg doctor` checks for any model CLI borg can run its calls through (claude, omp or opencode), not
+  only `claude`.
 
 ### Off by default (experimental)
 

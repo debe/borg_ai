@@ -38,6 +38,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::collective::{self, Config, ExpertSource};
+use crate::harness::Harness;
 use crate::{expert, learn};
 
 /// The expert drone's caps: one cited answer, never resident.
@@ -105,7 +106,7 @@ pub type Drone<'a> = &'a dyn Fn(&Path, &str, Duration) -> DroneRun;
 /// opencode adapters set to their own timeout): Claude Code's default command-hook timeout. `borg
 /// install claude` gives the Stop hook a longer `timeout` (install.rs), so this keeps a margin even
 /// on an install that predates it.
-pub const DEFAULT_STOP_BUDGET: Duration = Duration::from_secs(60);
+pub const DEFAULT_STOP_BUDGET: Duration = crate::harness::DEFAULT_STOP_BUDGET;
 pub const STOP_BUDGET_ENV: &str = "BORG_STOP_BUDGET_MS";
 /// Time kept back from the budget for the rest of the hook (merge, log, print).
 const STOP_MARGIN: Duration = Duration::from_secs(5);
@@ -119,12 +120,15 @@ pub struct World<'a> {
     pub state: &'a Path,
     pub drone: Drone<'a>,
     pub drone_cap: Duration,
+    /// The drone's harness: its plan in a stop event is its last message (`harness::plan`).
+    pub harness: &'a dyn Harness,
 }
 
 /// The one call from the hook: the checkpoint's block (`conscience`, Claude-shaped, or None) with
 /// the experts' claims merged in. Any event but a first-round stop passes through untouched.
-/// `conscience` is computed here so its time counts against the stop hook's budget.
-pub fn checkpoint(event: &str, input: &Value, conscience: impl FnOnce() -> Option<Value>) -> Option<Value> {
+/// `conscience` is computed here so its time counts against the stop hook's budget, `h`'s own when
+/// it names none.
+pub fn checkpoint(h: &dyn Harness, event: &str, input: &Value, conscience: impl FnOnce() -> Option<Value>) -> Option<Value> {
     let started = Instant::now();
     let conscience = conscience();
     if event != "stop" || input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) || std::env::var("BORG_CRITIC").as_deref() == Ok("generic") {
@@ -132,15 +136,16 @@ pub fn checkpoint(event: &str, input: &Value, conscience: impl FnOnce() -> Optio
     }
     let Ok(cfg) = collective::load() else { return conscience };
     let state = PathBuf::from(std::env::var("BORG_STATE").unwrap_or_else(|_| "/tmp/borg".into()));
-    let budget = stop_budget();
-    let world = World { home: &learn::home(), state: &state, drone: &claude_drone, drone_cap: drone_cap(budget, started.elapsed()) };
+    let world = World { home: &learn::home(), state: &state, drone: &claude_drone, drone_cap: drone_cap(stop_budget(h), started.elapsed()), harness: h };
     run(cfg.as_ref(), input, conscience, &world)
 }
 
-/// The stop hook's time budget the harness named (`BORG_STOP_BUDGET_MS`), if any. Read at the stop only:
-/// the omp adapter sets it for every event, and a `borg check` spawned by a tool call inherits it.
-pub fn stop_budget() -> Option<Duration> {
-    std::env::var(STOP_BUDGET_ENV).ok().and_then(|v| v.trim().parse().ok()).map(Duration::from_millis)
+/// The stop hook's time budget: the one the event's harness named (`BORG_STOP_BUDGET_MS`), else its
+/// caps' `stop_budget`; None when neither names one. The live wait, the stop's model call and the expert
+/// drone all keep inside it. Read at the stop only: the omp adapter sets the variable for every event,
+/// and a `borg check` spawned by a tool call inherits it.
+pub fn stop_budget(h: &dyn Harness) -> Option<Duration> {
+    std::env::var(STOP_BUDGET_ENV).ok().and_then(|v| v.trim().parse().ok()).map(Duration::from_millis).or(h.caps().stop_budget)
 }
 
 /// How long the drone may take: at most `DRONE_TIMEOUT`, and what is left of the stop hook's
@@ -165,7 +170,7 @@ pub fn consult(cfg: &Config, input: &Value, world: &World) -> Vec<Section> {
     if experts.is_empty() {
         return Vec::new();
     }
-    let plan = plan_of(input);
+    let plan = crate::harness::plan(world.harness.caps(), input);
     if plan.trim().is_empty() {
         return Vec::new();
     }
@@ -229,14 +234,6 @@ impl Told {
 fn asked_key(sentences: &[String]) -> String {
     let h = sentences.join("\n").bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
     format!("asked:{h:016x}")
-}
-
-/// The drone's plan: its last message, else the transcript's last assistant text.
-fn plan_of(input: &Value) -> String {
-    match input.get("last_assistant_message").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
-        Some(t) => t.to_string(),
-        None => learn::last_assistant_text(input.get("transcript_path").and_then(Value::as_str).unwrap_or_default().as_ref()),
-    }
 }
 
 /// Ask one expert about the plan, if the plan touches it; what the session was told before is left
@@ -809,7 +806,7 @@ mod tests {
 
     impl Env {
         fn at<'a>(&'a self, drone: Drone<'a>) -> World<'a> {
-            World { home: &self.home, state: &self.home, drone, drone_cap: DRONE_TIMEOUT }
+            World { home: &self.home, state: &self.home, drone, drone_cap: DRONE_TIMEOUT, harness: &crate::harness::claude::Claude }
         }
     }
 
@@ -1063,10 +1060,10 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
         let empty: Config = serde_json::from_str(r#"{"collectives": [{"name": "x", "paths": ["/"]}]}"#).unwrap();
         assert!(empty.collectives[0].experts.is_empty(), "absent = off");
         // Other events and the second round of a stop pass through.
-        assert_eq!(checkpoint("prompt", &stop(&w.consumer, PLAN), || c.clone()), c);
+        assert_eq!(checkpoint(&crate::harness::claude::Claude, "prompt", &stop(&w.consumer, PLAN), || c.clone()), c);
         let mut again = stop(&w.consumer, PLAN);
         again["stop_hook_active"] = json!(true);
-        assert_eq!(checkpoint("stop", &again, || None), None);
+        assert_eq!(checkpoint(&crate::harness::claude::Claude, "stop", &again, || None), None);
         assert!(log(&w).is_empty());
     }
 

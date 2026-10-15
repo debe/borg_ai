@@ -1,0 +1,9 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": true,
+  "last_assistant_message": "Mdrain: applies, I put the explicit consumer back."
+}

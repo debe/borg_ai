@@ -63,7 +63,7 @@ pub struct Choice {
 }
 
 /// The order borg tries runners in after the drone's own harness.
-const FALLBACK: [Runner; 3] = [Runner::Claude, Runner::Omp, Runner::Opencode];
+pub const FALLBACK: [Runner; 3] = [Runner::Claude, Runner::Omp, Runner::Opencode];
 
 /// Claude's model when none is configured.
 const CLAUDE_DEFAULT: &str = "sonnet";

@@ -52,6 +52,31 @@ export function toolName(omp: string): string {
 	return TOOL_NAMES[omp] ?? omp;
 }
 
+/** File headers inside omp's edit patch: `[src/x.rs#06FE]` or `*** Update File: src/x.rs`. */
+const PATCH_FILE = /^(?:\[([^\]#\n]+)(?:#[^\]\n]*)?\]|\*\*\* (?:Update|Add|Delete) File: (.+))$/gm;
+
+/** omp's tool input in Claude's keys, which borg reads: a read's, write's or edit's `path` becomes
+ *  `file_path`, an edit's patch (`input`) its `new_string`, and an edit without a path names its files
+ *  from the patch's headers. Everything else stays as omp sent it. */
+export function toolInput(omp: string, input: unknown): unknown {
+	if (!input || typeof input !== "object" || Array.isArray(input)) return input ?? {};
+	const { path, input: patch, _input, ...rest } = input as Json;
+	const out: Json = { ...rest };
+	const local = (p: string) => p.trim().replace(/^local:\/\//, "");
+	const file = ["read", "write", "edit"].includes(omp);
+	if (typeof path === "string") out[file ? "file_path" : "path"] = file ? local(path) : path;
+	const text = patch ?? _input;
+	if (omp === "edit" && typeof text === "string") {
+		const files = [...new Set([...text.matchAll(PATCH_FILE)].map((m) => local(m[1] ?? m[2])))];
+		if (out.file_path === undefined && files.length) out.file_path = files.join(" ");
+		out.new_string = text;
+	} else {
+		if (patch !== undefined) out.input = patch;
+		if (_input !== undefined) out._input = _input;
+	}
+	return out;
+}
+
 /** The text of a message, content array or string (omp messages and tool results). */
 export function text(v: unknown): string {
 	if (typeof v === "string") return v;
@@ -90,7 +115,7 @@ export function promptEvent(ctx: any, prompt: string): Canonical {
 
 /** A finished tool call: failures carry the result text as `error` (borg looks for rejections in it). */
 export function toolEvent(ctx: any, ev: Json): ["post_tool" | "post_tool_failure", Canonical] {
-	const base = { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: ev.input ?? {} };
+	const base = { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: toolInput(String(ev.toolName ?? ""), ev.input) };
 	return ev.isError ? ["post_tool_failure", { ...base, error: text(ev.content) }] : ["post_tool", base];
 }
 
@@ -100,7 +125,7 @@ export function denialEvent(ctx: any, ev: Json, input: unknown): Canonical {
 	return {
 		...where(ctx),
 		tool_name: toolName(String(ev.toolName ?? "")),
-		tool_input: input ?? {},
+		tool_input: toolInput(String(ev.toolName ?? ""), input),
 		error: `Tool call denied by user: ${ev.toolName}`,
 	};
 }
@@ -234,7 +259,7 @@ export default function borg(pi: any): void {
 			if (calls.size > 256) calls.delete(calls.keys().next().value as string);
 			calls.set(String(ev.toolCallId), ev.input);
 			// A drone paused by signed steering (borg steer --pause) has its tool calls refused.
-			const out = await runBorg("pre_tool", { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: ev.input ?? {} }, PRE_MS);
+			const out = await runBorg("pre_tool", { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: toolInput(String(ev.toolName ?? ""), ev.input) }, PRE_MS);
 			const deny = (out as any)?.hookSpecificOutput;
 			if (deny?.permissionDecision === "deny" && typeof deny.permissionDecisionReason === "string") {
 				return { block: true, reason: deny.permissionDecisionReason };

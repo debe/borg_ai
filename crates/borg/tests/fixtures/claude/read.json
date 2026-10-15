@@ -1,0 +1,18 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "{{cwd}}/src/net.rs"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "{{cwd}}/src/net.rs"
+    }
+  },
+  "tool_use_id": "toolu_02"
+}

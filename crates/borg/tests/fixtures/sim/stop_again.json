@@ -1,0 +1,8 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "SimStop",
+  "stop_hook_active": true,
+  "last_assistant_message": "Mdrain: applies, I put the explicit consumer back."
+}

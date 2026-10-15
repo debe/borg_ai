@@ -1,0 +1,17 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "{{cwd}}/src/net.rs",
+    "old_string": "drain the budget",
+    "new_string": "use a reset arc on the budget place"
+  },
+  "tool_response": {
+    "filePath": "{{cwd}}/src/net.rs"
+  },
+  "tool_use_id": "toolu_03"
+}

@@ -1,0 +1,11 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "SimPostTool",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat src/budget.rs",
+    "description": "show"
+  }
+}

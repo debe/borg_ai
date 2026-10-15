@@ -11,6 +11,7 @@ to peer, with no server.
 [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [How it works](#how-it-works)
+- [Supported agents](#supported-agents)
 - [Delivery modes](#delivery-modes)
 - [Quick start](#quick-start)
 - [Daily use](#daily-use)
@@ -21,7 +22,8 @@ to peer, with no server.
 - [Development](#development)
 
 Reference: [Configuration](docs/configuration.md) · [Team sync](docs/team-sync.md) ·
-[Commands](docs/commands.md) · [Statistics and the live page](docs/statistics.md) · [Reports](reports/)
+[Commands](docs/commands.md) · [Statistics and the live page](docs/statistics.md) ·
+[Harnesses](docs/harnesses.md) · [Reports](reports/)
 
 ## How it works
 
@@ -84,6 +86,18 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 ![Escalation: memory, an expert repo, a live drone, the engineer](docs/img/escalation.svg)
 
 ![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](docs/img/architecture.svg)
+
+## Supported agents
+
+| Agent | Wired by `borg install` | Gets |
+|---|---|---|
+| Claude Code | Command hooks in `~/.claude/settings.json` | Every feature, including early delivery, steering at the next tool call, and queen questions as a dialog |
+| omp (oh-my-pi) 18.8.5, 18.10.4 | The extension [adapters/omp](adapters/omp/README.md) | Live mode (omp 18.4.4 or newer), the turn-end check, learning and steering at the stop |
+| opencode 1.19.0, 2.0.29 | The plugin [adapters/opencode](adapters/opencode/README.md) | The same as omp |
+
+Each agent is one module behind one trait. The same conformance suite checks every agent: install,
+hooks, live mode and the drones page. [Harnesses](docs/harnesses.md) has the capability table, how to
+add an agent, and the measured gates.
 
 ## Delivery modes
 
@@ -198,7 +212,7 @@ in [Configuration](docs/configuration.md#collectives).
 ```sh
 borg install all              # dry run: prints the diff for claude, omp and opencode
 borg install all --apply
-borg doctor                   # checks wiring, config, the claude CLI and the stores
+borg doctor                   # checks wiring, config, the model CLI and the stores
 ```
 
 **4. Import what you have (optional).**
@@ -220,7 +234,7 @@ Borg runs on its own. These commands show what it does:
 | Command | Shows or does |
 |---|---|
 | `borg status` | Each collective's mode, lessons, episodes and outcomes, and what is wired |
-| `borg doctor` | What is broken: config, hooks, adapters, the `claude` CLI |
+| `borg doctor` | What is broken: config, hooks, adapters, the model CLI (claude, omp or opencode) |
 | `borg collective [DIR]` | Which collective a directory belongs to |
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
 | `borg top` · `borg steer` | Running drones across the team; send them a signed instruction |
@@ -343,6 +357,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                               # max_width 160
 node --test adapters/omp/borg.test.ts         # adapter tests; need target/debug/borg and Node 23.6+ or bun
 node --test adapters/opencode/borg.test.ts
+node --test adapters/conformance/conformance.test.ts   # harness conformance (docs/harnesses.md)
+scripts/arch.sh                               # the harness abstraction's metrics and gates
 python3 scripts/figures.py                    # regenerates the figures in docs/img
 ```
 
@@ -353,6 +369,7 @@ python3 scripts/figures.py                    # regenerates the figures in docs/
 | `crates/borg-trace` | Parses Claude Code and omp transcripts |
 | `crates/borg-eval`, `crates/borg-search`, `eval/` | Eval harness and benchmarks; not shipped, use local paths under `~/.local/share/borg/eval/` |
 | `adapters/omp`, `adapters/opencode` | TypeScript adapters, compiled into `borg` |
+| `adapters/conformance` | The harness conformance suite for the adapters ([Harnesses](docs/harnesses.md)) |
 | `reports/` | Measured results |
 
 License: MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).

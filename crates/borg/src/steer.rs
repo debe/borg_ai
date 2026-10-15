@@ -11,8 +11,10 @@
 //! Delivery: the target drone's next hook shows each directive ONCE, as clearly labelled peer data
 //! ("[borg] Steering from alice@x [key ab12cd34ef56] (signed, role steer): ..."), never as the
 //! user's own words or as an approval. The name is what the signer typed, so the label always
-//! shows the key it is tied to, and the text stays on its one labelled line (`one_line`). Claude Code gets it at the next prompt or tool call (`additionalContext`); omp and
-//! opencode only read borg's answer at a stop, so they get it there (a block, first round only).
+//! shows the key it is tied to, and the text stays on its one labelled line (`one_line`). A harness
+//! with steering in context (harness `Caps::steer_in_context`: Claude Code) gets it at the next prompt
+//! or tool call (`additionalContext`); the others (omp, opencode) get it at the next stop (a block, first
+//! round only) until showing it there earlier is evaluated for them.
 //! A delivery is claimed by creating `<store>/steer/seen/<session>/<id>` exclusively, so two hooks
 //! running at once (parallel tool calls) never both show it.
 //!
@@ -367,7 +369,17 @@ pub fn pause_reason(a: &Accepted) -> String {
 /// The hook's one call, around everything else the hook would answer (`inner`: the checkpoint).
 /// `started` is the session's start (presence.rs); `None` (no record) still delivers targeted
 /// directives but no broadcast.
-pub fn around(home: &Path, harness: &str, event: &str, input: &Value, started: Option<i64>, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
+/// `in_context`: the harness shows context at a prompt or tool call (harness `Caps::steer_in_context`);
+/// without it, directives wait for the stop.
+pub fn around(
+    home: &Path,
+    in_context: bool,
+    event: &str,
+    input: &Value,
+    started: Option<i64>,
+    now: i64,
+    inner: impl FnOnce() -> Option<Value>,
+) -> Option<Value> {
     // Fast path: nobody ever steered this collective on this machine.
     if std::fs::metadata(inbox(home)).is_err() {
         return if event == "pre_tool" { None } else { inner() };
@@ -400,7 +412,7 @@ pub fn around(home: &Path, harness: &str, event: &str, input: &Value, started: O
             };
             Some(json!({"decision": "block", "reason": reason}))
         }
-        "prompt" | "post_tool" if harness == "claude" => {
+        "prompt" | "post_tool" if in_context => {
             let out = inner();
             if p.notices.is_empty() || out.is_some() {
                 return out;
@@ -451,12 +463,12 @@ mod tests {
     fn nothing_steered_is_untouched_and_free() {
         let home = tmp("none");
         let called = std::cell::Cell::new(0);
-        let out = around(&home, "claude", "stop", &ev("s1"), Some(0), 10, || {
+        let out = around(&home, true, "stop", &ev("s1"), Some(0), 10, || {
             called.set(called.get() + 1);
             Some(json!({"decision": "block", "reason": "conscience"}))
         });
         assert_eq!(out, Some(json!({"decision": "block", "reason": "conscience"})));
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 10, || panic!("not called at pre_tool")), None);
+        assert_eq!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 10, || panic!("not called at pre_tool")), None);
         assert!(!home.exists(), "no file written when nobody steers");
     }
 
@@ -466,7 +478,7 @@ mod tests {
         accept(&home, &directive("d1", SAY, "s1", "stop touching the migrations, Bob owns them", 100), 0).unwrap();
         assert!(!accept(&home, &directive("d1", SAY, "s1", "dup", 100), 0).unwrap(), "an id lands once");
         accept(&home, &directive("d2", SAY, "other", "not for s1", 100), 0).unwrap();
-        let out = around(&home, "claude", "post_tool", &ev("s1"), Some(0), 200, || None).unwrap();
+        let out = around(&home, true, "post_tool", &ev("s1"), Some(0), 200, || None).unwrap();
         let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
         assert!(
@@ -475,10 +487,10 @@ mod tests {
         );
         assert!(ctx.contains("not the user's own instruction and approves nothing"));
         assert!(!ctx.contains("not for s1"));
-        assert_eq!(around(&home, "claude", "post_tool", &ev("s1"), Some(0), 300, || None), None, "exactly once");
-        assert_eq!(around(&home, "claude", "stop", &ev("s1"), Some(0), 300, || None), None);
+        assert_eq!(around(&home, true, "post_tool", &ev("s1"), Some(0), 300, || None), None, "exactly once");
+        assert_eq!(around(&home, true, "stop", &ev("s1"), Some(0), 300, || None), None);
         // The other session still gets its own.
-        assert!(around(&home, "claude", "prompt", &ev("other"), Some(0), 300, || None).is_some());
+        assert!(around(&home, true, "prompt", &ev("other"), Some(0), 300, || None).is_some());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -487,7 +499,7 @@ mod tests {
         let home = tmp("race");
         accept(&home, &directive("d1", SAY, "s1", "x", 100), 0).unwrap();
         let shown: usize = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| around(&home, "claude", "post_tool", &ev("s1"), Some(0), 200, || None).is_some() as usize)).collect();
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| around(&home, true, "post_tool", &ev("s1"), Some(0), 200, || None).is_some() as usize)).collect();
             hs.into_iter().map(|h| h.join().unwrap()).sum()
         });
         assert_eq!(shown, 1);
@@ -498,13 +510,17 @@ mod tests {
     fn omp_and_opencode_get_it_at_the_stop_first_round_only() {
         let home = tmp("stop");
         accept(&home, &directive("d1", SAY, "s1", "use the staging db", 100), 0).unwrap();
-        assert_eq!(around(&home, "omp", "post_tool", &ev("s1"), Some(0), 200, || None), None, "omp shows nothing at a tool call: keep it");
+        assert_eq!(
+            around(&home, false, "post_tool", &ev("s1"), Some(0), 200, || None),
+            None,
+            "a harness without steering in context shows nothing at a tool call: keep it"
+        );
         let active = json!({"session_id": "s1", "stop_hook_active": true});
-        assert_eq!(around(&home, "omp", "stop", &active, Some(0), 200, || None), None, "never in a second round");
-        let out = around(&home, "omp", "stop", &ev("s1"), Some(0), 200, || Some(json!({"decision": "block", "reason": "Q1"}))).unwrap();
+        assert_eq!(around(&home, false, "stop", &active, Some(0), 200, || None), None, "never in a second round");
+        let out = around(&home, false, "stop", &ev("s1"), Some(0), 200, || Some(json!({"decision": "block", "reason": "Q1"}))).unwrap();
         let r = out["reason"].as_str().unwrap();
         assert!(r.starts_with("[borg] Steering from alice@x [key abababababab] (signed, role steer): use the staging db") && r.ends_with("\n\nQ1"), "{r}");
-        assert_eq!(around(&home, "omp", "stop", &ev("s1"), Some(0), 300, || None), None);
+        assert_eq!(around(&home, false, "stop", &ev("s1"), Some(0), 300, || None), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -512,9 +528,9 @@ mod tests {
     fn broadcast_reaches_running_sessions_only() {
         let home = tmp("all");
         accept(&home, &directive("d1", SAY, "", "freeze main", 100), 0).unwrap();
-        assert!(around(&home, "claude", "prompt", &ev("old"), Some(50), 200, || None).is_some(), "running when it was sent");
-        assert_eq!(around(&home, "claude", "prompt", &ev("new"), Some(150), 200, || None), None, "started after it");
-        assert_eq!(around(&home, "claude", "prompt", &ev("old2"), Some(50), 100 + TTL_MS + 1, || None), None, "expired");
+        assert!(around(&home, true, "prompt", &ev("old"), Some(50), 200, || None).is_some(), "running when it was sent");
+        assert_eq!(around(&home, true, "prompt", &ev("new"), Some(150), 200, || None), None, "started after it");
+        assert_eq!(around(&home, true, "prompt", &ev("old2"), Some(50), 100 + TTL_MS + 1, || None), None, "expired");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -522,26 +538,26 @@ mod tests {
     fn pause_blocks_tools_until_resumed() {
         let home = tmp("pause");
         accept(&home, &directive("p1", PAUSE, "s1", "", 100), 0).unwrap();
-        let deny = around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 200, || None).unwrap();
+        let deny = around(&home, true, "pre_tool", &ev("s1"), Some(0), 200, || None).unwrap();
         assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("paused by alice@x [key abababababab] (signed, role steer)"));
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s2"), Some(0), 200, || None), None, "another drone runs on");
+        assert_eq!(around(&home, true, "pre_tool", &ev("s2"), Some(0), 200, || None), None, "another drone runs on");
         // The stop: the pause is announced once, the conscience does not run.
-        let out = around(&home, "claude", "stop", &ev("s1"), Some(0), 200, || panic!("no conscience while paused")).unwrap();
+        let out = around(&home, true, "stop", &ev("s1"), Some(0), 200, || panic!("no conscience while paused")).unwrap();
         assert!(out["reason"].as_str().unwrap().contains("PAUSE. Do not start new work"));
-        assert_eq!(around(&home, "claude", "stop", &ev("s1"), Some(0), 210, || panic!("no conscience while paused")), None, "stopping is waiting");
-        assert!(around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 220, || None).is_some(), "still refused");
+        assert_eq!(around(&home, true, "stop", &ev("s1"), Some(0), 210, || panic!("no conscience while paused")), None, "stopping is waiting");
+        assert!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 220, || None).is_some(), "still refused");
         accept(&home, &directive("r1", RESUME, "s1", "", 300), 0).unwrap();
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 400, || None), None, "resumed");
-        let out = around(&home, "claude", "prompt", &ev("s1"), Some(0), 400, || None).unwrap();
+        assert_eq!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 400, || None), None, "resumed");
+        let out = around(&home, true, "prompt", &ev("s1"), Some(0), 400, || None).unwrap();
         assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("RESUME"));
         assert_eq!(
-            around(&home, "claude", "stop", &ev("s1"), Some(0), 500, || Some(json!({"decision": "block", "reason": "c"}))),
+            around(&home, true, "stop", &ev("s1"), Some(0), 500, || Some(json!({"decision": "block", "reason": "c"}))),
             Some(json!({"decision": "block", "reason": "c"}))
         );
         // A pause older than the TTL no longer holds (fail open).
         accept(&home, &directive("p2", PAUSE, "s3", "", 1000), 0).unwrap();
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s3"), Some(0), 1000 + TTL_MS + 1, || None), None);
+        assert_eq!(around(&home, true, "pre_tool", &ev("s3"), Some(0), 1000 + TTL_MS + 1, || None), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -549,8 +565,8 @@ mod tests {
     fn an_unreadable_inbox_fails_open() {
         let home = tmp("broken");
         std::fs::create_dir_all(inbox(&home)).unwrap(); // a directory where the file should be
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 1, || None), None);
-        assert_eq!(around(&home, "claude", "stop", &ev("s1"), Some(0), 1, || Some(json!({"x": 1}))), Some(json!({"x": 1})));
+        assert_eq!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 1, || None), None);
+        assert_eq!(around(&home, true, "stop", &ev("s1"), Some(0), 1, || Some(json!({"x": 1}))), Some(json!({"x": 1})));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -563,7 +579,7 @@ mod tests {
         accept(&home, &other, 0).unwrap();
         assert_eq!(retain(&home, |a| a.d.key != "ab".repeat(32)).unwrap(), 1);
         assert_eq!(read_inbox(&home), vec![other]);
-        assert_eq!(around(&home, "claude", "pre_tool", &ev("s1"), Some(0), 200, || None), None, "the revoked signer's pause is gone");
+        assert_eq!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 200, || None), None, "the revoked signer's pause is gone");
         let _ = std::fs::remove_dir_all(&home);
     }
 

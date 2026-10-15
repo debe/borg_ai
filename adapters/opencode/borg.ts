@@ -92,6 +92,8 @@ function toolInput(tool: string, args: any): Record<string, unknown> {
   const input: Record<string, unknown> = { ...(args ?? {}) }
   if (typeof input.filePath === "string") input.file_path = input.filePath
   else if (FILE_TOOLS.has(tool) && typeof input.path === "string") input.file_path = input.path
+  // An edit's new text, as Claude's Edit names it (borg keeps it with the change, .edits).
+  if (typeof input.newString === "string") input.new_string = input.newString
   // apply_patch (opencode 1, GPT models) and patch (opencode 2) name their files only inside the patch text.
   if ((tool === "apply_patch" || tool === "patch") && typeof input.patchText === "string") {
     const files = [...input.patchText.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1].trim())

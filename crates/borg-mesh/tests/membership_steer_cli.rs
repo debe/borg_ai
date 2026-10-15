@@ -52,7 +52,7 @@ fn paused_by(root: &Path, m: &Membership, by: &Identity) {
 
 fn pre_tool(root: &Path) -> Option<Value> {
     let ev = json!({"session_id": "s1", "cwd": root.join("work/app"), "tool_name": "Bash"});
-    borg::steer::around(&store(root), "claude", "pre_tool", &ev, Some(0), now(), || None)
+    borg::steer::around(&store(root), true, "pre_tool", &ev, Some(0), now(), || None)
 }
 
 #[test]

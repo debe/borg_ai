@@ -1450,7 +1450,7 @@ mod tests {
         assert!(!std::fs::read_to_string(crate::steer::outbox(&b)).unwrap().contains("ship it"), "an observer's directive is not relayed");
         // Alice's hook refuses tools until bob resumes.
         let pre = json!({"session_id": "alice-s1", "cwd": pa.dir, "tool_name": "Bash"});
-        let deny = borg::steer::around(&a, "claude", "pre_tool", &pre, Some(now), now + 1, || None).unwrap();
+        let deny = borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 1, || None).unwrap();
         assert!(
             deny["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
@@ -1461,7 +1461,7 @@ mod tests {
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
         synced.unwrap();
         assert_eq!(served.unwrap().steered, 1);
-        assert_eq!(borg::steer::around(&a, "claude", "pre_tool", &pre, Some(now), now + 3, || None), None);
+        assert_eq!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 3, || None), None);
 
         // Bob is revoked: his directives stop holding at alice.
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
@@ -1469,13 +1469,13 @@ mod tests {
         crate::steer::issue(&b, "work", true, "bob@x", "One", borg::steer::PAUSE, "", now + 4).unwrap();
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
         let _ = (served.unwrap(), synced.unwrap());
-        assert!(borg::steer::around(&a, "claude", "pre_tool", &pre, Some(now), now + 5, || None).is_some(), "paused again");
+        assert!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 5, || None).is_some(), "paused again");
         let mut m = Membership::load(&a).unwrap().unwrap();
         m.revoke(&alice_id, &bob_id.public(), now + 5).unwrap();
         m.save(&a).unwrap();
         alice.enforce().unwrap();
         assert!(borg::steer::read_inbox(&a).is_empty(), "the revoked signer's directives are gone");
-        assert_eq!(borg::steer::around(&a, "claude", "pre_tool", &pre, Some(now), now + 6, || None), None, "and the pause no longer holds");
+        assert_eq!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 6, || None), None, "and the pause no longer holds");
         alice.close().await;
         bob.close().await;
     }

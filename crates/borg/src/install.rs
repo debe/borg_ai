@@ -1,14 +1,10 @@
 //! Wiring borg into a harness, and seeing whether it works:
-//! `borg install|uninstall <claude|omp|opencode|all> [--apply] [--home DIR]`, `borg status`, `borg doctor`.
+//! `borg install|uninstall <harness|all> [--apply] [--home DIR]`, `borg status`, `borg doctor`.
 //!
-//! The wiring is exactly what each adapter README describes, written into the engineer's *user* config:
-//! - Claude Code: one hook group per event in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`), each
-//!   running `<this borg> hook claude <event>`;
-//! - omp: `adapters/omp/borg.ts` as `~/.omp/agent/extensions/borg.ts` (`$PI_CODING_AGENT_DIR/extensions`);
-//! - opencode: `adapters/opencode/borg.ts` as `~/.config/opencode/plugins/borg.ts`
-//!   (`$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`).
-//!
-//! The adapters are compiled into the binary, so an installed borg needs no checkout.
+//! The wiring is exactly what each adapter README describes, written into the engineer's *user* config,
+//! as each harness's module says (harness/): command hooks merged into a JSON file (Claude Code's
+//! `~/.claude/settings.json`, each running `<this borg> hook claude <event>`), or a compiled-in adapter
+//! copied whole (omp's extension, opencode's plugin). An installed borg needs no checkout.
 //!
 //! Someone else's config is precious, so: the default is a dry run that prints the exact diff;
 //! `--apply` first writes a timestamped backup next to every file it changes; merging keeps every
@@ -21,113 +17,47 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
 use crate::collective::{self, Route, Share};
+pub use crate::harness::Level;
+use crate::harness::wiring::Hooks;
+use crate::harness::{self, Harness, Wiring};
 use crate::{learn, outcome};
 
-pub const OMP_ADAPTER: &str = include_str!("../../../adapters/omp/borg.ts");
-pub const OPENCODE_ADAPTER: &str = include_str!("../../../adapters/opencode/borg.ts");
-
-/// Claude Code hook events and the canonical borg events they become.
-pub const CLAUDE_EVENTS: [(&str, &str); 6] = [
-    ("UserPromptSubmit", "prompt"),
-    // Only a paused drone's tool calls are refused here (steer.rs); otherwise a stat and out.
-    ("PreToolUse", "pre_tool"),
-    ("PostToolUse", "post_tool"),
-    ("PostToolUseFailure", "post_tool_failure"),
-    ("Stop", "stop"),
-    ("SessionEnd", "end"),
-];
-
-/// Seconds Claude Code gives borg's Stop hook (its own default for a command hook is 60 s). The
-/// expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow drone never costs the
-/// conscience's answer.
-pub const CLAUDE_STOP_TIMEOUT_S: u64 = 90;
-
-/// borg's hook entry for one canonical event.
-fn claude_hook_entry(bin: &Path, ev: &str) -> Value {
-    match ev {
-        "stop" => json!({"type": "command", "command": claude_command(bin, ev), "timeout": CLAUDE_STOP_TIMEOUT_S}),
-        _ => json!({"type": "command", "command": claude_command(bin, ev)}),
+/// `all` (every visible harness) or one harness by name.
+fn parse(s: &str) -> Option<Vec<&'static dyn Harness>> {
+    match s {
+        "all" => Some(harness::visible().collect()),
+        _ => harness::by_name(s).map(|h| vec![h]),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Harness {
-    Claude,
-    Omp,
-    Opencode,
-}
-
-pub const HARNESSES: [Harness; 3] = [Harness::Claude, Harness::Omp, Harness::Opencode];
-
-impl Harness {
-    pub fn name(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Omp => "omp",
-            Harness::Opencode => "opencode",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Vec<Harness>> {
-        match s {
-            "all" => Some(HARNESSES.to_vec()),
-            _ => HARNESSES.iter().copied().find(|h| h.name() == s).map(|h| vec![h]),
-        }
-    }
-}
-
-/// Where each harness reads its user config.
+/// Where the harnesses read their user config.
 #[derive(Debug, Clone)]
 pub struct Targets {
-    pub claude_settings: PathBuf,
-    pub omp_extension: PathBuf,
-    pub opencode_plugin: PathBuf,
+    home: PathBuf,
+    /// Whether each harness's own config-dir variables count (not under `--home`).
+    env: bool,
+}
+
+fn var(k: &str) -> Option<PathBuf> {
+    std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 impl Targets {
     /// Everything under `home`, no environment consulted (tests, `--home`).
     pub fn under(home: &Path) -> Self {
-        Targets {
-            claude_settings: home.join(".claude/settings.json"),
-            omp_extension: home.join(".omp/agent/extensions/borg.ts"),
-            opencode_plugin: home.join(".config/opencode/plugins/borg.ts"),
-        }
+        Targets { home: home.to_path_buf(), env: false }
     }
 
     /// The real locations, honouring each harness's own config-dir variables.
     pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let home = var("HOME").unwrap_or_default();
-        let mut t = Targets::under(&home);
-        if let Some(d) = var("CLAUDE_CONFIG_DIR") {
-            t.claude_settings = d.join("settings.json");
-        }
-        if let Some(d) = var("PI_CODING_AGENT_DIR") {
-            t.omp_extension = d.join("extensions/borg.ts");
-        }
-        if let Some(d) = var("OPENCODE_CONFIG_DIR").or_else(|| var("XDG_CONFIG_HOME").map(|x| x.join("opencode"))) {
-            t.opencode_plugin = d.join("plugins/borg.ts");
-        }
-        t
+        Targets { home: var("HOME").unwrap_or_default(), env: true }
     }
 
-    pub fn path(&self, h: Harness) -> &Path {
-        match h {
-            Harness::Claude => &self.claude_settings,
-            Harness::Omp => &self.omp_extension,
-            Harness::Opencode => &self.opencode_plugin,
-        }
-    }
-}
-
-fn adapter(h: Harness) -> &'static str {
-    match h {
-        Harness::Claude => "",
-        Harness::Omp => OMP_ADAPTER,
-        Harness::Opencode => OPENCODE_ADAPTER,
+    pub fn path(&self, h: &dyn Harness) -> PathBuf {
+        h.target(&self.home, &|k| if self.env { var(k) } else { None })
     }
 }
 
@@ -140,147 +70,6 @@ pub struct Change {
     /// Settings files are often symlinks into a dotfiles repo: write through them. An adapter file
     /// symlinked into a borg checkout (README's `ln -s`) is replaced instead, never written through.
     pub through_links: bool,
-}
-
-// ---------------------------------------------------------------- Claude Code settings.json
-
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:@%".contains(c)) {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
-
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    match s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        Some(inner) => inner.replace(r"'\''", "'"),
-        None => s.to_string(),
-    }
-}
-
-pub fn claude_command(bin: &Path, event: &str) -> String {
-    format!("{} hook claude {event}", shell_quote(&bin.display().to_string()))
-}
-
-/// `(binary, canonical event)` if this hook command is one borg installs: `<…/borg> hook claude <event>`.
-pub fn borg_command(cmd: &str) -> Option<(PathBuf, &'static str)> {
-    CLAUDE_EVENTS.iter().find_map(|(_, ev)| {
-        let prog = cmd.trim().strip_suffix(&format!(" hook claude {ev}"))?;
-        let prog = PathBuf::from(unquote(prog));
-        let base = prog.file_name()?.to_string_lossy().into_owned();
-        (base == "borg" || base == "borg.exe").then_some((prog, *ev))
-    })
-}
-
-fn parse_settings(text: Option<&str>) -> Result<Map<String, Value>, String> {
-    match text.filter(|t| !t.trim().is_empty()) {
-        None => Ok(Map::new()),
-        Some(t) => match serde_json::from_str(t) {
-            Ok(Value::Object(m)) => Ok(m),
-            Ok(_) => Err("settings.json is not a JSON object".into()),
-            Err(e) => Err(format!("settings.json is not valid JSON ({e}); fix it first, nothing was changed")),
-        },
-    }
-}
-
-/// Serialises like Claude Code does (2-space JSON), keeping the original's trailing newline.
-fn render(m: Map<String, Value>, original: Option<&str>) -> String {
-    let mut s = serde_json::to_string_pretty(&Value::Object(m)).unwrap_or_default();
-    if original.is_none_or(|o| o.trim().is_empty() || o.ends_with('\n')) {
-        s.push('\n');
-    }
-    s
-}
-
-/// Removes borg's hook entries for `ev` from one event's groups; a group left empty by that goes too.
-fn remove_borg(groups: &mut Vec<Value>, ev: &str) -> usize {
-    let mut removed = 0;
-    groups.retain_mut(|g| {
-        let Some(hooks) = g.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
-        let n = hooks.len();
-        hooks.retain(|h| h.get("command").and_then(Value::as_str).and_then(borg_command).is_none_or(|(_, e)| e != ev));
-        removed += n - hooks.len();
-        !(hooks.is_empty() && n > 0)
-    });
-    removed
-}
-
-/// settings.json with borg's hooks merged in (`Ok(None)`: already exactly so).
-///
-/// `bin` must be named `borg`: that basename is how [`borg_command`] recognises its own hooks, so a
-/// binary named otherwise would be duplicated on every install and never removed by uninstall.
-pub fn claude_install(text: Option<&str>, bin: &Path) -> Result<Option<String>, String> {
-    let base = bin.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
-    if base != "borg" && base != "borg.exe" {
-        return Err(format!(
-            "{} is not named borg, so its hooks could not be recognised again (duplicates, no uninstall); point BORG_BIN at a binary named borg (a symlink will do)",
-            bin.display()
-        ));
-    }
-    let mut m = parse_settings(text)?;
-    let orig = m.clone();
-    let hooks = m.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks) = hooks.as_object_mut() else { return Err("settings.json: \"hooks\" is not an object".into()) };
-    for (event, ev) in CLAUDE_EVENTS {
-        let want = claude_hook_entry(bin, ev);
-        let groups = hooks.entry(event).or_insert_with(|| json!([]));
-        let Some(groups) = groups.as_array_mut() else { return Err(format!("settings.json: hooks.{event} is not an array")) };
-        let ours: Vec<Value> = groups
-            .iter()
-            .flat_map(|g| g.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default())
-            .filter(|h| h.get("command").and_then(Value::as_str).and_then(borg_command).is_some_and(|(_, e)| e == ev))
-            .collect();
-        if ours == [want.clone()] {
-            continue; // already wired to this binary, with this timeout
-        }
-        remove_borg(groups, ev); // stale binary, timeout or duplicates: replace with exactly one
-        groups.push(json!({"hooks": [want]}));
-    }
-    Ok((m != orig).then(|| render(m, text)))
-}
-
-/// settings.json without borg's hooks (`Ok(None)`: there were none; `Ok(Some(None))`: nothing else
-/// was in it, so the file goes). An event list or `hooks` object that only borg filled goes with them.
-pub fn claude_uninstall(text: Option<&str>) -> Result<Option<Option<String>>, String> {
-    if text.is_none() {
-        return Ok(None);
-    }
-    let mut m = parse_settings(text)?;
-    let Some(hooks) = m.get_mut("hooks").and_then(Value::as_object_mut) else { return Ok(None) };
-    let mut removed = 0;
-    for (event, ev) in CLAUDE_EVENTS {
-        let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) else { continue };
-        let n = remove_borg(groups, ev);
-        if n > 0 && groups.is_empty() {
-            hooks.shift_remove(event);
-        }
-        removed += n;
-    }
-    if removed == 0 {
-        return Ok(None);
-    }
-    if hooks.is_empty() {
-        m.shift_remove("hooks");
-    }
-    Ok(Some((!m.is_empty()).then(|| render(m, text))))
-}
-
-/// Which canonical events settings.json sends to borg, and to which binary.
-pub fn claude_wired(text: Option<&str>) -> Vec<(&'static str, PathBuf)> {
-    let Ok(m) = parse_settings(text) else { return Vec::new() };
-    let mut out = Vec::new();
-    for (event, _) in CLAUDE_EVENTS {
-        for g in m.get("hooks").and_then(|h| h.get(event)).and_then(Value::as_array).into_iter().flatten() {
-            for h in g.get("hooks").and_then(Value::as_array).into_iter().flatten() {
-                if let Some((bin, ev)) = h.get("command").and_then(Value::as_str).and_then(borg_command) {
-                    out.push((ev, bin));
-                }
-            }
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------- plans
@@ -301,17 +90,18 @@ pub enum Action {
     Uninstall,
 }
 
-/// What `action` would change for `h`, plus notes for things deliberately left alone.
-pub fn plan(action: Action, h: Harness, t: &Targets, bin: &Path) -> Result<(Option<Change>, Vec<String>), String> {
-    let path = t.path(h).to_path_buf();
+/// What `action` would change for `h`, plus notes: things deliberately left alone, and on install the
+/// steps the harness itself asks of the engineer (`Harness::install_notes`).
+pub fn plan(action: Action, h: &dyn Harness, t: &Targets, bin: &Path) -> Result<(Option<Change>, Vec<String>), String> {
+    let path = t.path(h);
     let before = read(&path).map_err(|e| format!("{}: cannot read ({e}); nothing was changed", path.display()))?;
     let mut notes = Vec::new();
-    let after = match (h, action) {
-        (Harness::Claude, Action::Install) => claude_install(before.as_deref(), bin)?.map(Some),
-        (Harness::Claude, Action::Uninstall) => claude_uninstall(before.as_deref())?,
-        (_, Action::Install) => (before.as_deref() != Some(adapter(h))).then(|| Some(adapter(h).to_string())),
-        (_, Action::Uninstall) => match before.as_deref() {
-            Some(b) if b == adapter(h) => Some(None),
+    let after = match (Hooks::of(h), action) {
+        (Some(k), Action::Install) => k.install(before.as_deref(), bin)?.map(Some),
+        (Some(k), Action::Uninstall) => k.uninstall(before.as_deref())?,
+        (None, Action::Install) => (before.as_deref() != Some(h.wiring().adapter())).then(|| Some(h.wiring().adapter().to_string())),
+        (None, Action::Uninstall) => match before.as_deref() {
+            Some(b) if b == h.wiring().adapter() => Some(None),
             Some(_) => {
                 notes.push(format!("{}: left alone, its content is not this borg's adapter (yours, or an older borg's)", path.display()));
                 None
@@ -319,7 +109,11 @@ pub fn plan(action: Action, h: Harness, t: &Targets, bin: &Path) -> Result<(Opti
             None => None,
         },
     };
-    Ok((after.map(|after| Change { path, before, after, through_links: h == Harness::Claude }), notes))
+    if action == Action::Install {
+        notes.extend(h.install_notes());
+    }
+    let through_links = matches!(h.wiring(), Wiring::CommandHooks { through_links: true, .. });
+    Ok((after.map(|after| Change { path, before, after, through_links }), notes))
 }
 
 /// UTC `YYYYMMDDTHHMMSS` for an epoch-ms time (no time crate for one format).
@@ -512,29 +306,28 @@ pub fn collectives(cfg: Option<&collective::Config>, base: &Path) -> Vec<Route> 
 }
 
 /// How `h` is wired under `t`, in one line.
-pub fn wiring(h: Harness, t: &Targets) -> String {
+pub fn wiring(h: &dyn Harness, t: &Targets) -> String {
     let path = t.path(h);
-    let text = match read(path) {
+    let text = match read(&path) {
         Ok(t) => t,
         Err(e) => return format!("UNREADABLE: {} ({e})", path.display()),
     };
-    match h {
-        Harness::Claude => {
-            let w = claude_wired(text.as_deref());
-            let events: Vec<&str> = CLAUDE_EVENTS.iter().map(|(_, e)| *e).filter(|e| w.iter().any(|(x, _)| x == e)).collect();
-            let mut bins: Vec<String> = w.iter().map(|(_, b)| b.display().to_string()).collect();
-            bins.dedup();
-            match events.len() {
-                0 => format!("not wired ({})", path.display()),
-                n if n == CLAUDE_EVENTS.len() => format!("wired: {} -> {}", path.display(), bins.join(", ")),
-                _ => format!("PARTIAL ({} only): {} -> {}", events.join(","), path.display(), bins.join(", ")),
-            }
-        }
-        _ => match text {
+    let Some(k) = Hooks::of(h) else {
+        return match text {
             None => format!("not wired ({})", path.display()),
-            Some(t) if t == adapter(h) => format!("wired: {}", path.display()),
+            Some(t) if t == h.wiring().adapter() => format!("wired: {}", path.display()),
             Some(_) => format!("wired, but {} differs from this borg's adapter (older or edited)", path.display()),
-        },
+        };
+    };
+    let w = k.wired(text.as_deref());
+    let missing = k.missing(&w);
+    let events: Vec<&str> = k.events.iter().map(|(_, e)| *e).filter(|e| !missing.contains(e)).collect();
+    let mut bins: Vec<String> = w.iter().map(|(_, b)| b.display().to_string()).collect();
+    bins.dedup();
+    match events.len() {
+        0 => format!("not wired ({})", path.display()),
+        n if n == k.events.len() => format!("wired: {} -> {}", path.display(), bins.join(", ")),
+        _ => format!("PARTIAL ({} only): {} -> {}", events.join(","), path.display(), bins.join(", ")),
     }
 }
 
@@ -601,19 +394,16 @@ fn print_status(t: &Targets) {
         }
     }
     println!("\nharnesses");
-    for h in HARNESSES {
-        println!("  {:<9} {}", h.name(), wiring(h, t));
+    for &h in harness::ALL {
+        let line = wiring(h, t);
+        // A hidden harness (the simulated one) only once someone wired it.
+        if !h.hidden() || !line.starts_with("not wired") {
+            println!("  {:<9} {line}", h.name());
+        }
     }
 }
 
 // ---------------------------------------------------------------- doctor
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
-    Ok,
-    Warn,
-    Fail,
-}
 
 #[cfg(unix)]
 fn executable(p: &Path) -> bool {
@@ -651,56 +441,73 @@ fn version(cli: &Path) -> Option<String> {
 }
 
 /// Checks on the wiring alone (pure: no PATH, no processes), so they can be tested on fixtures.
-/// `borg_found`: whether the omp/opencode adapters can find a borg (`$BORG_BIN` or PATH).
+/// `borg_found`: whether the adapters can find a borg (`$BORG_BIN` or PATH).
 pub fn wiring_checks(t: &Targets, borg_found: bool) -> Vec<(Level, String)> {
     let mut out = Vec::new();
-    let text = read(&t.claude_settings).unwrap_or_else(|e| {
-        out.push((Level::Fail, format!("claude: {}: cannot read ({e}); borg install will not touch it", t.claude_settings.display())));
-        None
-    });
-    if text.is_some()
-        && let Err(e) = parse_settings(text.as_deref())
-    {
-        out.push((Level::Fail, format!("claude: {}: {e}", t.claude_settings.display())));
-    }
-    let wired = claude_wired(text.as_deref());
-    if !wired.is_empty() {
-        let missing: Vec<&str> = CLAUDE_EVENTS.iter().map(|(_, e)| *e).filter(|e| !wired.iter().any(|(x, _)| x == e)).collect();
-        if !missing.is_empty() {
-            out.push((Level::Warn, format!("claude: hooks missing for {} (borg install claude)", missing.join(", "))));
-        }
-        for (ev, bin) in &wired {
-            if !executable(bin) {
-                out.push((
-                    Level::Fail,
-                    format!("claude: hook {ev} runs {}, which does not exist or is not executable (borg install claude --apply)", bin.display()),
-                ));
-            }
-        }
-        if out.iter().all(|(l, _)| *l == Level::Ok) {
-            out.push((Level::Ok, format!("claude: hooks wired to {}", wired[0].1.display())));
-        }
-    }
-    for h in [Harness::Omp, Harness::Opencode] {
-        let text = match read(t.path(h)) {
-            Ok(Some(text)) => text,
-            Ok(None) => continue,
-            Err(e) => {
-                out.push((Level::Fail, format!("{}: {}: cannot read ({e})", h.name(), t.path(h).display())));
-                continue;
-            }
-        };
-        if text != adapter(h) {
-            out.push((Level::Warn, format!("{}: {} differs from this borg's adapter (borg install {})", h.name(), t.path(h).display(), h.name())));
-        } else {
-            out.push((Level::Ok, format!("{}: adapter installed at {}", h.name(), t.path(h).display())));
-        }
-        if !borg_found {
-            out.push((Level::Fail, format!("{}: the adapter finds borg via $BORG_BIN or PATH, and neither has one: it silently does nothing", h.name())));
+    // Every harness: an unwired one adds nothing, so a hidden one shows only once someone wired it.
+    for &h in harness::ALL {
+        match Hooks::of(h) {
+            Some(k) => out.extend(hook_checks(h, &k, t)),
+            None => out.extend(adapter_checks(h, t, borg_found)),
         }
     }
     if out.is_empty() {
         out.push((Level::Warn, "no harness is wired to borg (borg install all)".into()));
+    }
+    out
+}
+
+/// A command-hook harness: its config readable and valid, every event wired, to a binary that runs.
+fn hook_checks(h: &dyn Harness, k: &Hooks, t: &Targets) -> Vec<(Level, String)> {
+    let (name, path) = (h.name(), t.path(h));
+    let mut out = Vec::new();
+    let text = read(&path).unwrap_or_else(|e| {
+        out.push((Level::Fail, format!("{name}: {}: cannot read ({e}); borg install will not touch it", path.display())));
+        None
+    });
+    if text.is_some()
+        && let Err(e) = k.parse(text.as_deref())
+    {
+        out.push((Level::Fail, format!("{name}: {}: {e}", path.display())));
+    }
+    let wired = k.wired(text.as_deref());
+    if wired.is_empty() {
+        return out;
+    }
+    let missing = k.missing(&wired);
+    if !missing.is_empty() {
+        out.push((Level::Warn, format!("{name}: hooks missing for {} (borg install {name})", missing.join(", "))));
+    }
+    for (ev, bin) in &wired {
+        if !executable(bin) {
+            out.push((
+                Level::Fail,
+                format!("{name}: hook {ev} runs {}, which does not exist or is not executable (borg install {name} --apply)", bin.display()),
+            ));
+        }
+    }
+    if out.iter().all(|(l, _)| *l == Level::Ok) {
+        out.push((Level::Ok, format!("{name}: hooks wired to {}", wired[0].1.display())));
+    }
+    out
+}
+
+/// An adapter harness: the installed file is this borg's adapter, and the adapter can find borg.
+fn adapter_checks(h: &dyn Harness, t: &Targets, borg_found: bool) -> Vec<(Level, String)> {
+    let (name, path) = (h.name(), t.path(h));
+    let text = match read(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Vec::new(),
+        Err(e) => return vec![(Level::Fail, format!("{name}: {}: cannot read ({e})", path.display()))],
+    };
+    let mut out = Vec::new();
+    if text != h.wiring().adapter() {
+        out.push((Level::Warn, format!("{name}: {} differs from this borg's adapter (borg install {name})", path.display())));
+    } else {
+        out.push((Level::Ok, format!("{name}: adapter installed at {}", path.display())));
+    }
+    if !borg_found {
+        out.push((Level::Fail, format!("{name}: the adapter finds borg via $BORG_BIN or PATH, and neither has one: it silently does nothing")));
     }
     out
 }
@@ -824,6 +631,23 @@ fn git_identities() -> Vec<(String, String)> {
     out
 }
 
+/// Each harness's CLI (its version, as its [`harness::Probe`] says) and its own checks (`Harness::checks`).
+fn harness_checks<'a>(hs: impl Iterator<Item = &'a dyn Harness>, t: &Targets) -> Vec<(Level, String)> {
+    let mut checks = Vec::new();
+    for h in hs {
+        let harness::Probe { cli, tested } = h.probe();
+        match which(cli) {
+            None => checks.push((Level::Ok, format!("{cli}: not installed"))),
+            Some(p) => match version(&p) {
+                Some(v) => checks.push((Level::Ok, format!("{cli}: {v}{tested}"))),
+                None => checks.push((Level::Warn, format!("{cli}: {} did not answer --version", p.display()))),
+            },
+        }
+        checks.extend(h.checks(&t.path(h)));
+    }
+    checks
+}
+
 fn doctor(t: &Targets) -> i32 {
     let mut checks = Vec::new();
     let env_bin = std::env::var_os("BORG_BIN").filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -832,22 +656,13 @@ fn doctor(t: &Targets) -> i32 {
         (Some(b), _) if !executable(b) => checks.push((Level::Fail, format!("BORG_BIN={} does not exist or is not executable", b.display()))),
         (Some(b), _) => checks.push((Level::Ok, format!("borg: BORG_BIN={}", b.display()))),
         (None, Some(p)) => checks.push((Level::Ok, format!("borg: on PATH at {}", p.display()))),
-        (None, None) => checks.push((Level::Warn, "borg: not on PATH and BORG_BIN unset (omp and opencode adapters need one)".into())),
-    }
-    let borg_found = env_bin.as_deref().is_some_and(executable) || on_path.is_some();
-    for (cli, tested) in [
-        ("claude", ""),
-        ("omp", " (adapter tested with 18.8.5 and 18.10.4; live mode needs 18.4.4 or newer)"),
-        ("opencode", " (adapter tested with 1.18.32, 1.19.0, 2.0.23 and 2.0.29)"),
-    ] {
-        match which(cli) {
-            None => checks.push((Level::Ok, format!("{cli}: not installed"))),
-            Some(p) => match version(&p) {
-                Some(v) => checks.push((Level::Ok, format!("{cli}: {v}{tested}"))),
-                None => checks.push((Level::Warn, format!("{cli}: {} did not answer --version", p.display()))),
-            },
+        (None, None) => {
+            let adapters: Vec<&str> = harness::visible().filter(|h| matches!(h.wiring(), Wiring::AdapterFile { .. })).map(|h| h.name()).collect();
+            checks.push((Level::Warn, format!("borg: not on PATH and BORG_BIN unset ({} adapters need one)", adapters.join(" and "))));
         }
     }
+    let borg_found = env_bin.as_deref().is_some_and(executable) || on_path.is_some();
+    checks.extend(harness_checks(harness::visible(), t));
     checks.extend(wiring_checks(t, borg_found));
     let cfg = collective::load();
     checks.extend(collective_checks(&cfg, &learn::home()));
@@ -863,11 +678,18 @@ fn doctor(t: &Targets) -> i32 {
         let aliases = c.as_ref().map(collective::Config::aliases).unwrap_or_default();
         checks.extend(alias_hints(&emails, &git_identities(), &aliases).into_iter().map(|h| (Level::Warn, h)));
     }
-    match which("claude") {
-        Some(_) => checks.push((Level::Ok, "claude CLI available: borg learn and the consequence model at Stop can run".into())),
-        None => {
-            checks.push((Level::Warn, "claude CLI not on PATH: borg learn cannot turn episodes into lessons, and the conscience stays silent at Stop".into()))
-        }
+    // borg's model steps run through any installed runner (runner.rs), not only `claude`.
+    let runners: Vec<&str> = crate::runner::pick(None, None, &crate::runner::on_path).iter().map(|c| c.runner.name()).collect();
+    let [tried @ .., last] = crate::runner::FALLBACK.map(crate::runner::Runner::name);
+    match runners.as_slice() {
+        [] => checks.push((
+            Level::Warn,
+            format!(
+                "no model CLI on PATH ({} or {last}): borg learn cannot turn episodes into lessons, and the conscience stays silent at Stop",
+                tried.join(", ")
+            ),
+        )),
+        some => checks.push((Level::Ok, format!("model CLI available ({}): borg learn and the consequence model at Stop can run", some.join(", ")))),
     }
     for (l, msg) in &checks {
         let tag = match l {
@@ -882,7 +704,9 @@ fn doctor(t: &Targets) -> i32 {
 
 // ---------------------------------------------------------------- CLI
 
-const USAGE: &str = "usage: borg install|uninstall <claude|omp|opencode|all> [--apply] [--home DIR] | borg status [--home DIR] | borg doctor [--home DIR]";
+fn usage_line() -> String {
+    format!("usage: borg install|uninstall <{}|all> [--apply] [--home DIR] | borg status [--home DIR] | borg doctor [--home DIR]", harness::names("|"))
+}
 
 /// `borg install|uninstall|status|doctor`; returns the exit code.
 pub fn main(cmd: &str, args: &[&str]) -> i32 {
@@ -915,7 +739,7 @@ pub fn main(cmd: &str, args: &[&str]) -> i32 {
         }
         "doctor" if which_h.is_none() && !apply_flag => doctor(&targets),
         "install" | "uninstall" => {
-            let Some(hs) = which_h.and_then(Harness::parse) else { return usage() };
+            let Some(hs) = which_h.and_then(parse) else { return usage() };
             let action = if cmd == "install" { Action::Install } else { Action::Uninstall };
             let bin = match std::env::var_os("BORG_BIN").filter(|v| !v.is_empty()) {
                 Some(b) => PathBuf::from(b),
@@ -950,11 +774,11 @@ fn isolate(cmd: &str, home: &Path) {
 }
 
 fn usage() -> i32 {
-    eprintln!("{USAGE}");
+    eprintln!("{}", usage_line());
     2
 }
 
-fn run(action: Action, hs: &[Harness], t: &Targets, bin: &Path, apply_flag: bool) -> i32 {
+fn run(action: Action, hs: &[&dyn Harness], t: &Targets, bin: &Path, apply_flag: bool) -> i32 {
     let stamp = format!("{}Z", utc(learn::now_ms()));
     let mut code = 0;
     for &h in hs {
@@ -997,6 +821,16 @@ fn run(action: Action, hs: &[Harness], t: &Targets, bin: &Path, apply_flag: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{claude, omp, opencode};
+    use serde_json::json;
+
+    const CLAUDE: &dyn Harness = &claude::Claude;
+    const OMP: &dyn Harness = &omp::Omp;
+    const OPENCODE: &dyn Harness = &opencode::Opencode;
+
+    fn claude_hooks() -> Hooks {
+        Hooks::of(CLAUDE).unwrap()
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-install-{name}-{}", std::process::id()));
@@ -1054,7 +888,7 @@ mod tests {
 
     fn install_all(t: &Targets, bin: &Path, action: Action, stamp: &str) -> usize {
         let mut n = 0;
-        for h in HARNESSES {
+        for h in harness::visible() {
             if let (Some(c), _) = plan(action, h, t, bin).unwrap() {
                 apply(&c, stamp).unwrap();
                 n += 1;
@@ -1067,33 +901,33 @@ mod tests {
     fn install_preserves_existing_hooks_and_settings() {
         let home = tmp("preserve");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
-        std::fs::write(&t.claude_settings, EXISTING).unwrap();
+        std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
+        std::fs::write(t.path(CLAUDE), EXISTING).unwrap();
         let bin = Path::new("/opt/borg dir/borg");
         assert_eq!(install_all(&t, bin, Action::Install, "s1"), 3);
 
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(&t.claude_settings).unwrap()).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()).unwrap();
         assert_eq!(v["model"], "opus");
         assert_eq!(v["zz_last"], true);
         assert_eq!(v["permissions"]["allow"][0], "Bash(git status)");
         assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/usr/local/bin/guard");
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "notify-send done", "their Stop hook stays first");
         assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], "'/opt/borg dir/borg' hook claude stop");
-        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], CLAUDE_STOP_TIMEOUT_S, "the stop hook's budget is explicit");
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], claude::STOP_TIMEOUT_S, "the stop hook's budget is explicit");
         assert!(v["hooks"]["PostToolUse"][0]["hooks"][0].get("timeout").is_none());
         // An install from before the timeout is brought up to it.
         let old = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/b/borg hook claude stop"}]}]}}"#;
-        let up: Value = serde_json::from_str(&claude_install(Some(old), Path::new("/b/borg")).unwrap().unwrap()).unwrap();
+        let up: Value = serde_json::from_str(&claude_hooks().install(Some(old), Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         assert_eq!(up["hooks"]["Stop"].as_array().unwrap().len(), 1);
-        assert_eq!(up["hooks"]["Stop"][0]["hooks"][0]["timeout"], CLAUDE_STOP_TIMEOUT_S);
+        assert_eq!(up["hooks"]["Stop"][0]["hooks"][0]["timeout"], claude::STOP_TIMEOUT_S);
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "permissions", "hooks", "zz_last"], "key order kept");
-        let wired = claude_wired(Some(&std::fs::read_to_string(&t.claude_settings).unwrap()));
-        assert_eq!(wired.len(), CLAUDE_EVENTS.len());
+        let wired = claude_hooks().wired(Some(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()));
+        assert_eq!(wired.len(), claude::EVENTS.len());
         assert!(wired.iter().all(|(_, b)| b == bin), "quoted path parsed back");
-        assert_eq!(std::fs::read_to_string(&t.omp_extension).unwrap(), OMP_ADAPTER);
-        assert_eq!(std::fs::read_to_string(&t.opencode_plugin).unwrap(), OPENCODE_ADAPTER);
-        let backup = t.claude_settings.with_file_name("settings.json.borg-backup-s1");
+        assert_eq!(std::fs::read_to_string(t.path(OMP)).unwrap(), omp::ADAPTER);
+        assert_eq!(std::fs::read_to_string(t.path(OPENCODE)).unwrap(), opencode::ADAPTER);
+        let backup = t.path(CLAUDE).with_file_name("settings.json.borg-backup-s1");
         assert_eq!(std::fs::read_to_string(backup).unwrap(), EXISTING, "backup of the original");
     }
 
@@ -1108,9 +942,9 @@ mod tests {
         assert_eq!(all_files(&home), snapshot, "and writes nothing, not even a backup");
 
         // A moved binary: each event points at the new one, never twice.
-        let text = claude_install(read(&t.claude_settings).unwrap().as_deref(), Path::new("/new/borg")).unwrap().unwrap();
-        let wired = claude_wired(Some(&text));
-        assert_eq!(wired.len(), CLAUDE_EVENTS.len());
+        let text = claude_hooks().install(read(&t.path(CLAUDE)).unwrap().as_deref(), Path::new("/new/borg")).unwrap().unwrap();
+        let wired = claude_hooks().wired(Some(&text));
+        assert_eq!(wired.len(), claude::EVENTS.len());
         assert!(wired.iter().all(|(_, b)| b == Path::new("/new/borg")));
     }
 
@@ -1120,13 +954,13 @@ mod tests {
             let home = tmp(&format!("restore-{name}"));
             let t = Targets::under(&home);
             if let Some(o) = original {
-                std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
-                std::fs::write(&t.claude_settings, o).unwrap();
+                std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
+                std::fs::write(t.path(CLAUDE), o).unwrap();
             }
             install_all(&t, Path::new("/usr/bin/borg"), Action::Install, "i");
             assert_eq!(install_all(&t, Path::new("/elsewhere/borg"), Action::Uninstall, "u"), 3);
-            assert_eq!(read(&t.claude_settings).unwrap().as_deref(), original, "{name}: byte for byte");
-            assert!(!t.omp_extension.exists() && !t.opencode_plugin.exists());
+            assert_eq!(read(&t.path(CLAUDE)).unwrap().as_deref(), original, "{name}: byte for byte");
+            assert!(!t.path(OMP).exists() && !t.path(OPENCODE).exists());
             assert_eq!(install_all(&t, Path::new("/usr/bin/borg"), Action::Uninstall, "u2"), 0, "nothing left to remove");
         }
     }
@@ -1135,26 +969,26 @@ mod tests {
     fn uninstall_leaves_foreign_files_alone() {
         let home = tmp("foreign");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.omp_extension.parent().unwrap()).unwrap();
-        std::fs::write(&t.omp_extension, "// my own borg.ts").unwrap();
-        let (change, notes) = plan(Action::Uninstall, Harness::Omp, &t, Path::new("/b/borg")).unwrap();
+        std::fs::create_dir_all(t.path(OMP).parent().unwrap()).unwrap();
+        std::fs::write(t.path(OMP), "// my own borg.ts").unwrap();
+        let (change, notes) = plan(Action::Uninstall, OMP, &t, Path::new("/b/borg")).unwrap();
         assert!(change.is_none());
         assert_eq!(notes.len(), 1);
         // A hook that merely mentions borg but is not borg's own command stays.
         let s = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/notborg hook claude stop"}]}]}}"#;
-        assert_eq!(claude_uninstall(Some(s)).unwrap(), None);
+        assert_eq!(claude_hooks().uninstall(Some(s)).unwrap(), None);
     }
 
     #[test]
     fn dry_run_writes_nothing() {
         let home = tmp("dry");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
-        std::fs::write(&t.claude_settings, EXISTING).unwrap();
+        std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
+        std::fs::write(t.path(CLAUDE), EXISTING).unwrap();
         let before = all_files(&home);
-        assert_eq!(run(Action::Install, &HARNESSES, &t, Path::new("/usr/bin/borg"), false), 0);
+        assert_eq!(run(Action::Install, &harness::visible().collect::<Vec<_>>(), &t, Path::new("/usr/bin/borg"), false), 0);
         assert_eq!(all_files(&home), before);
-        let (c, _) = plan(Action::Install, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         let c = c.unwrap();
         let d = diff(&c.path, c.before.as_deref(), c.after.as_deref());
         assert!(d.contains("+            \"command\": \"/usr/bin/borg hook claude stop\""), "{d}");
@@ -1163,8 +997,8 @@ mod tests {
 
     #[test]
     fn invalid_settings_are_never_overwritten() {
-        assert!(claude_install(Some("{ not json"), Path::new("/b/borg")).is_err());
-        assert!(claude_install(Some(r#"{"hooks": []}"#), Path::new("/b/borg")).is_err());
+        assert!(claude_hooks().install(Some("{ not json"), Path::new("/b/borg")).is_err());
+        assert!(claude_hooks().install(Some(r#"{"hooks": []}"#), Path::new("/b/borg")).is_err());
     }
 
     #[cfg(unix)]
@@ -1174,12 +1008,12 @@ mod tests {
         let t = Targets::under(&home);
         let src = home.join("checkout-borg.ts");
         std::fs::write(&src, "// older adapter in a checkout").unwrap();
-        std::fs::create_dir_all(t.omp_extension.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&src, &t.omp_extension).unwrap();
-        let (c, _) = plan(Action::Install, Harness::Omp, &t, Path::new("/b/borg")).unwrap();
+        std::fs::create_dir_all(t.path(OMP).parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&src, t.path(OMP)).unwrap();
+        let (c, _) = plan(Action::Install, OMP, &t, Path::new("/b/borg")).unwrap();
         apply(&c.unwrap(), "x").unwrap();
         assert_eq!(std::fs::read_to_string(&src).unwrap(), "// older adapter in a checkout");
-        assert_eq!(std::fs::read_to_string(&t.omp_extension).unwrap(), OMP_ADAPTER);
+        assert_eq!(std::fs::read_to_string(t.path(OMP)).unwrap(), omp::ADAPTER);
     }
 
     #[test]
@@ -1239,7 +1073,7 @@ mod tests {
     fn doctor_flags_a_missing_binary_and_an_invalid_config() {
         let home = tmp("doctor");
         let t = Targets::under(&home);
-        plan(Action::Install, Harness::Claude, &t, Path::new("/nonexistent/borg")).unwrap().0.map(|c| apply(&c, "d").unwrap());
+        plan(Action::Install, CLAUDE, &t, Path::new("/nonexistent/borg")).unwrap().0.map(|c| apply(&c, "d").unwrap());
         let checks = wiring_checks(&t, true);
         assert!(checks.iter().any(|(l, m)| *l == Level::Fail && m.contains("/nonexistent/borg")), "{checks:?}");
         let bad = collective_checks(&Err("x.json: expected value".into()), &home);
@@ -1258,8 +1092,8 @@ mod tests {
     fn full_claude_install_reports_wired_not_partial() {
         let home = tmp("wired-status");
         let t = Targets::under(&home);
-        assert_eq!(run(Action::Install, &[Harness::Claude], &t, Path::new("/b/borg"), true), 0);
-        assert!(wiring(Harness::Claude, &t).starts_with("wired: "), "{}", wiring(Harness::Claude, &t));
+        assert_eq!(run(Action::Install, &[CLAUDE], &t, Path::new("/b/borg"), true), 0);
+        assert!(wiring(CLAUDE, &t).starts_with("wired: "), "{}", wiring(CLAUDE, &t));
     }
 
     #[cfg(unix)]
@@ -1267,30 +1101,30 @@ mod tests {
     fn unreadable_files_are_errors_not_absent() {
         let home = tmp("unreadable");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
         let precious = r#"{"model":"precious"}"#;
-        std::fs::write(&t.claude_settings, precious).unwrap();
-        chmod(&t.claude_settings, 0o000);
-        if std::fs::read(&t.claude_settings).is_ok() {
-            chmod(&t.claude_settings, 0o600);
+        std::fs::write(t.path(CLAUDE), precious).unwrap();
+        chmod(&t.path(CLAUDE), 0o000);
+        if std::fs::read(t.path(CLAUDE)).is_ok() {
+            chmod(&t.path(CLAUDE), 0o600);
             return; // running as root: permissions do not apply
         }
-        let before = std::fs::read_dir(t.claude_settings.parent().unwrap()).unwrap().count();
+        let before = std::fs::read_dir(t.path(CLAUDE).parent().unwrap()).unwrap().count();
         for action in [Action::Install, Action::Uninstall] {
-            assert!(plan(action, Harness::Claude, &t, Path::new("/b/borg")).is_err());
+            assert!(plan(action, CLAUDE, &t, Path::new("/b/borg")).is_err());
         }
-        assert_eq!(run(Action::Install, &[Harness::Claude], &t, Path::new("/b/borg"), true), 1);
-        assert!(wiring(Harness::Claude, &t).starts_with("UNREADABLE"));
+        assert_eq!(run(Action::Install, &[CLAUDE], &t, Path::new("/b/borg"), true), 1);
+        assert!(wiring(CLAUDE, &t).starts_with("UNREADABLE"));
         assert!(wiring_checks(&t, true).iter().any(|(l, m)| *l == Level::Fail && m.contains("cannot read")));
-        chmod(&t.claude_settings, 0o600);
-        assert_eq!(std::fs::read_to_string(&t.claude_settings).unwrap(), precious, "untouched");
-        assert_eq!(std::fs::read_dir(t.claude_settings.parent().unwrap()).unwrap().count(), before, "no new files");
+        chmod(&t.path(CLAUDE), 0o600);
+        assert_eq!(std::fs::read_to_string(t.path(CLAUDE)).unwrap(), precious, "untouched");
+        assert_eq!(std::fs::read_dir(t.path(CLAUDE).parent().unwrap()).unwrap().count(), before, "no new files");
 
         // Not UTF-8: an adapter file someone else wrote, likewise never replaced.
-        std::fs::create_dir_all(t.omp_extension.parent().unwrap()).unwrap();
-        std::fs::write(&t.omp_extension, [0xff, 0xfe, 0x00]).unwrap();
-        assert!(plan(Action::Install, Harness::Omp, &t, Path::new("/b/borg")).is_err());
-        assert_eq!(std::fs::read(&t.omp_extension).unwrap(), [0xff, 0xfe, 0x00]);
+        std::fs::create_dir_all(t.path(OMP).parent().unwrap()).unwrap();
+        std::fs::write(t.path(OMP), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(plan(Action::Install, OMP, &t, Path::new("/b/borg")).is_err());
+        assert_eq!(std::fs::read(t.path(OMP)).unwrap(), [0xff, 0xfe, 0x00]);
     }
 
     #[test]
@@ -1298,17 +1132,17 @@ mod tests {
         let home = tmp("borg-dev");
         let t = Targets::under(&home);
         for bin in ["/x/borg-dev", "/x/borg-ai", "/x/notborg"] {
-            let e = plan(Action::Install, Harness::Claude, &t, Path::new(bin)).unwrap_err();
+            let e = plan(Action::Install, CLAUDE, &t, Path::new(bin)).unwrap_err();
             assert!(e.contains("BORG_BIN"), "{e}");
         }
-        assert!(!t.claude_settings.exists());
+        assert!(!t.path(CLAUDE).exists());
         // Named borg: installed once, however often it runs.
         for stamp in ["1", "2", "3"] {
             install_all(&t, Path::new("/x/dev/borg"), Action::Install, stamp);
         }
-        let text = std::fs::read_to_string(&t.claude_settings).unwrap();
+        let text = std::fs::read_to_string(t.path(CLAUDE)).unwrap();
         assert_eq!(text.matches("hook claude stop").count(), 1);
-        assert_eq!(claude_wired(Some(&text)).len(), CLAUDE_EVENTS.len());
+        assert_eq!(claude_hooks().wired(Some(&text)).len(), claude::EVENTS.len());
     }
 
     #[cfg(unix)]
@@ -1318,37 +1152,37 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let home = tmp("perms");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
-        std::fs::write(&t.claude_settings, r#"{"env":{"SECRET":"x"}}"#).unwrap();
-        chmod(&t.claude_settings, 0o600);
-        let (c, _) = plan(Action::Install, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
+        std::fs::write(t.path(CLAUDE), r#"{"env":{"SECRET":"x"}}"#).unwrap();
+        chmod(&t.path(CLAUDE), 0o600);
+        let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         let backup = apply(&c.unwrap(), "p").unwrap().unwrap();
-        assert_eq!(mode(&t.claude_settings), 0o600, "settings stay 0600");
+        assert_eq!(mode(&t.path(CLAUDE)), 0o600, "settings stay 0600");
         assert_eq!(mode(&backup), 0o600, "backup is 0600");
 
-        chmod(&t.claude_settings, 0o640);
-        let (c, _) = plan(Action::Uninstall, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        chmod(&t.path(CLAUDE), 0o640);
+        let (c, _) = plan(Action::Uninstall, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         apply(&c.unwrap(), "q").unwrap();
-        assert_eq!(mode(&t.claude_settings), 0o640, "whatever the original had");
+        assert_eq!(mode(&t.path(CLAUDE)), 0o640, "whatever the original had");
 
         let fresh = tmp("perms-new");
         let t = Targets::under(&fresh);
-        let (c, _) = plan(Action::Install, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         apply(&c.unwrap(), "n").unwrap();
-        assert_eq!(mode(&t.claude_settings), 0o600, "a new settings.json is private");
+        assert_eq!(mode(&t.path(CLAUDE)), 0o600, "a new settings.json is private");
     }
 
     #[test]
     fn a_backup_is_never_overwritten() {
         let home = tmp("backups");
         let t = Targets::under(&home);
-        std::fs::create_dir_all(t.claude_settings.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
         let orig = r#"{"model":"orig"}"#;
-        std::fs::write(&t.claude_settings, orig).unwrap();
+        std::fs::write(t.path(CLAUDE), orig).unwrap();
         // Install then uninstall within one stamp (the same second).
-        let (c, _) = plan(Action::Install, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         let b1 = apply(&c.unwrap(), "same").unwrap().unwrap();
-        let (c, _) = plan(Action::Uninstall, Harness::Claude, &t, Path::new("/usr/bin/borg")).unwrap();
+        let (c, _) = plan(Action::Uninstall, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
         let b2 = apply(&c.unwrap(), "same").unwrap().unwrap();
         assert_ne!(b1, b2);
         assert_eq!(std::fs::read_to_string(&b1).unwrap(), orig, "the original survives");
@@ -1364,5 +1198,45 @@ mod tests {
         }
         assert!(home_overrides("doctor").contains(&"BORG_BIN"));
         assert!(!home_overrides("install").contains(&"BORG_BIN"), "install still wires $BORG_BIN");
+    }
+
+    /// A harness with a step of its own in the harness (as Codex's hook trust will be).
+    struct Noted;
+
+    impl Harness for Noted {
+        fn name(&self) -> &'static str {
+            "noted"
+        }
+        fn caps(&self) -> harness::Caps {
+            CLAUDE.caps()
+        }
+        fn wiring(&self) -> Wiring {
+            CLAUDE.wiring()
+        }
+        fn target(&self, home: &Path, _var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
+            home.join(".noted/hooks.json")
+        }
+        fn probe(&self) -> harness::Probe {
+            harness::Probe { cli: "borg-test-no-such-cli", tested: "" }
+        }
+        fn checks(&self, target: &Path) -> Vec<(Level, String)> {
+            vec![(Level::Warn, format!("noted: {} is not trusted", target.display()))]
+        }
+        fn install_notes(&self) -> Vec<String> {
+            vec!["run /hooks in noted and trust borg".into()]
+        }
+    }
+
+    #[test]
+    fn a_harness_adds_its_own_install_notes_and_doctor_checks() {
+        let home = tmp("noted");
+        let t = Targets::under(&home);
+        let (change, notes) = plan(Action::Install, &Noted, &t, Path::new("/b/borg")).unwrap();
+        assert!(change.is_some());
+        assert_eq!(notes, ["run /hooks in noted and trust borg"]);
+        assert_eq!(plan(Action::Uninstall, &Noted, &t, Path::new("/b/borg")).unwrap().1, Vec::<String>::new());
+        let checks = harness_checks([&Noted as &dyn Harness].into_iter(), &t);
+        assert_eq!(checks[0], (Level::Ok, "borg-test-no-such-cli: not installed".into()));
+        assert_eq!(checks[1], (Level::Warn, format!("noted: {} is not trusted", home.join(".noted/hooks.json").display())));
     }
 }

@@ -1,0 +1,9 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "I replaced the drain of the Orion budget place with a reset arc."
+}

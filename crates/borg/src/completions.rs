@@ -1,15 +1,19 @@
 //! `borg completions <bash|zsh|fish>`: a shell completion script for borg, printed to stdout.
 //!
 //! One table (`COMMANDS`) of commands, their subcommands and flags feeds all three shells, so a new
-//! command needs one line here. Paths complete as files where a command takes one (`why`, `memory`).
+//! command needs one line here; `HARNESSES` stands for the harnesses' names (harness/mod.rs `ALL`). Paths
+//! complete as files where a command takes one (`why`, `memory`).
+
+/// In a subcommand list: every visible harness's name.
+const HARNESSES: &str = "<harnesses>";
 
 /// (command, subcommands, flags, takes a path)
 const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("status", &[], &[], false),
     ("doctor", &[], &[], false),
     ("collective", &[], &[], true),
-    ("install", &["claude", "omp", "opencode", "all"], &["--apply", "--home"], false),
-    ("uninstall", &["claude", "omp", "opencode", "all"], &["--apply", "--home"], false),
+    ("install", &[HARNESSES, "all"], &["--apply", "--home"], false),
+    ("uninstall", &[HARNESSES, "all"], &["--apply", "--home"], false),
     ("learn", &[], &["--session"], false),
     (
         "assimilate",
@@ -72,6 +76,11 @@ pub fn main(args: &[&str]) -> i32 {
     0
 }
 
+/// A command's subcommands, `HARNESSES` spelled out.
+fn subs_of(subs: &[&'static str]) -> Vec<&'static str> {
+    subs.iter().flat_map(|s| if *s == HARNESSES { crate::harness::visible().map(|h| h.name()).collect() } else { vec![*s] }).collect()
+}
+
 fn names() -> String {
     COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>().join(" ")
 }
@@ -79,7 +88,7 @@ fn names() -> String {
 pub fn bash() -> String {
     let mut cases = String::new();
     for (cmd, subs, flags, path) in COMMANDS {
-        let words = subs.iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
+        let words = subs_of(subs).iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
         let files = if *path { " -f" } else { "" };
         cases.push_str(&format!("        {cmd}) words=\"{words}\"; files=\"{files}\" ;;\n"));
     }
@@ -107,7 +116,7 @@ complete -o default -F _borg borg
 pub fn zsh() -> String {
     let mut cases = String::new();
     for (cmd, subs, flags, path) in COMMANDS {
-        let words = subs.iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
+        let words = subs_of(subs).iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
         let files = if *path { "; _files" } else { "" };
         cases.push_str(&format!("        {cmd}) compadd -- {words}{files} ;;\n"));
     }
@@ -134,7 +143,7 @@ pub fn fish() -> String {
     for (cmd, subs, flags, path) in COMMANDS {
         let when = format!("__fish_seen_subcommand_from {cmd}");
         if !subs.is_empty() {
-            out.push_str(&format!("complete -c borg -n '{when}' -a '{}'\n", subs.join(" ")));
+            out.push_str(&format!("complete -c borg -n '{when}' -a '{}'\n", subs_of(subs).join(" ")));
         }
         for f in *flags {
             out.push_str(&format!("complete -c borg -n '{when}' -l {}\n", f.trim_start_matches("--")));
@@ -160,5 +169,7 @@ mod tests {
         assert!(bash().contains("queen) words=\"show ask answer"));
         assert!(zsh().starts_with("#compdef borg"));
         assert!(fish().contains("-n '__fish_seen_subcommand_from install' -l apply"));
+        assert!(bash().contains("install) words=\"claude omp opencode all --apply"), "{}", bash());
+        assert!(!bash().contains(" sim ") && !bash().contains(HARNESSES), "the simulated harness stays hidden");
     }
 }

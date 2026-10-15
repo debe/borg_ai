@@ -7,7 +7,7 @@
 | Command | Shows or does |
 |---|---|
 | `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks) and what is wired |
-| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the `claude` CLI, `borg` on `PATH` |
+| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode), `borg` on `PATH` |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
 | `borg install\|uninstall <claude\|omp\|opencode\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |

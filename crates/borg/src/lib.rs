@@ -10,6 +10,8 @@ pub mod conscience;
 pub mod expert;
 pub mod expert_route;
 pub mod facets;
+pub mod harness;
+pub mod hook;
 pub mod install;
 pub mod learn;
 pub mod live;

@@ -297,8 +297,8 @@ pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
 /// How long a stop in live mode waits for a running check.
 pub const STOP_WAIT_MS: u64 = 15_000;
 
-/// The stop's wait for a running check, inside the harness's budget (`BORG_STOP_BUDGET_MS`; none: Claude
-/// Code's): at most a quarter of it. omp's 28 s gives 7 s.
+/// The stop's wait for a running check, inside the harness's budget (expert_route.rs `stop_budget`; none:
+/// Claude Code's): at most a quarter of it. omp's 28 s gives 7 s.
 pub fn stop_wait(budget: Option<Duration>) -> Duration {
     let wait = Duration::from_millis(STOP_WAIT_MS);
     budget.map_or(wait, |b| wait.min(b / 4))

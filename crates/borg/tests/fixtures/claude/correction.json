@@ -1,0 +1,8 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "no, keep the budget token: do not use a reset arc, drain it with an explicit consumer"
+}

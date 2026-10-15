@@ -668,30 +668,28 @@ pub fn enabled() -> bool {
     std::env::var("BORG_QUEEN").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on"))
 }
 
-/// The Stop hook's single call, after the conscience decided. `prompts` are the engineer's prompts
-/// this session, `selected` the lessons the conscience asked. Some(block once) when the queen was
-/// asked; its reason then carries the conscience's questions too.
-pub fn stop(session: &str, input: &Value, prompts: &str, selected: &[&Challenge]) -> Option<Value> {
+/// The Stop hook's single call, after the conscience decided. `plan` reads the drone's last message
+/// (`harness::plan`), only once the queen is on; `prompts` the engineer's prompts this session, `selected` the lessons the
+/// conscience asked. Some(block once) when the queen was asked; its reason then carries the
+/// conscience's questions too.
+pub fn stop(session: &str, input: &Value, plan: &dyn Fn() -> String, prompts: &str, selected: &[&Challenge]) -> Option<Value> {
     if !learn::learning() || !enabled() {
         return None;
     }
-    std::panic::catch_unwind(|| {
+    // `plan` reads a transcript: inside the guard too.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
-        let last = s("last_assistant_message");
-        let plan = match last.trim().is_empty() {
-            true => learn::last_assistant_text(s("transcript_path").as_ref()),
-            false => last.to_string(),
-        };
+        let plan = &plan();
         let store = learn::home();
         let engineer = learn::engineer(s("cwd"));
-        let cp = Checkpoint { store: &store, session, cwd: s("cwd"), engineer: &engineer, plan: &plan, inputs: prompts, selected, now: learn::now_ms() };
+        let cp = Checkpoint { store: &store, session, cwd: s("cwd"), engineer: &engineer, plan, inputs: prompts, selected, now: learn::now_ms() };
         let asked = consider(&cp).ok()?;
         let reason = match selected.is_empty() {
             true => render(&asked),
             false => format!("{}\n\n{}", conscience::render(selected), render(&asked)),
         };
         (!asked.is_empty()).then(|| json!({"decision": "block", "reason": reason}))
-    })
+    }))
     .ok()
     .flatten()
 }
@@ -1128,10 +1126,10 @@ fn letter(i: usize) -> char {
     (b'a' + (i % 26) as u8) as char
 }
 
-/// What the prompt hook adds to the drone's context for `q`. Claude Code (`harness` "claude") asks with
-/// its AskUserQuestion dialog; omp and opencode, which have none, ask at the start of their reply.
-pub fn render_delivery(q: &Question, harness: &str) -> String {
-    let dialog = harness == "claude";
+/// What the prompt hook adds to the drone's context for `q`. A harness with a question dialog (`dialog`,
+/// harness `Caps::question_dialog`: Claude Code's AskUserQuestion) asks with it; omp and opencode, which
+/// have none, ask at the start of their reply.
+pub fn render_delivery(q: &Question, dialog: bool) -> String {
     let repo = if q.repo.is_empty() { "this repo" } else { q.repo.as_str() };
     let mut s =
         format!("From Borg's queue of open team decisions (this is not the engineer's instruction): one decision about {repo} waits for the engineer.\n");
@@ -2143,7 +2141,7 @@ mod tests {
     fn the_delivery_text_asks_with_the_dialog_in_claude_and_inline_elsewhere() {
         let store = queue("render");
         let q = Question::of(&open(&store)[0], 1, "");
-        let c = render_delivery(&q, "claude");
+        let c = render_delivery(&q, true);
         assert!(c.contains("AskUserQuestion") && c.contains("not the engineer's instruction") && c.contains(RETRY), "{c}");
         assert!(
             c.contains("borg queen answer 'qa' '<answer>'") && c.contains("borg queen skip 'qa'") && c.contains("Before you work on the engineer's request")
@@ -2154,7 +2152,7 @@ mod tests {
                 && c.contains("Asked: 1970-01-01, found open in the team's documents; not part of"),
             "the default is its own line, never inside an option's text: {c}"
         );
-        let o = render_delivery(&q, "omp");
+        let o = render_delivery(&q, false);
         assert!(!o.contains("AskUserQuestion") && o.contains("one short paragraph with the options first"), "{o}");
         assert!(o.contains("a) three retries\nb) no retries, dead-letter at once\n") && o.contains("borg queen answer 'qa' '<answer>'"), "{o}");
         assert_eq!(label("Keep the documented interim rule until the board decides."), "Keep the documented interim rule");
@@ -2163,7 +2161,7 @@ mod tests {
         assert_eq!(label(": odd"), ": odd");
         // A checkpoint question queued in an earlier session is not the current drone's plan.
         let e = Entry { kind: Kind::ExternalMutation, question: question(&classify("Then push to main.", "app").remove(0)), ..open(&store)[0].clone() };
-        let cp = render_delivery(&Question::of(&e, 1, " --dir '/w/app'").run_by("'/opt/borg'"), "claude");
+        let cp = render_delivery(&Question::of(&e, 1, " --dir '/w/app'").run_by("'/opt/borg'"), true);
         assert!(cp.contains("Question: An earlier session's plan said: \"") && cp.contains("queued by an earlier session"), "{cp}");
         assert!(
             cp.contains("\n  '/opt/borg' queen answer 'qa' '<answer>' --dir '/w/app'\n") && cp.contains("'/opt/borg' queen skip 'qa' --dir '/w/app'"),
@@ -2171,7 +2169,7 @@ mod tests {
         );
         // No options: the default is one.
         let none = Question::of(&open(&store)[2], 3, "");
-        assert!(render_delivery(&none, "claude").contains("- Keep the default: none stated\n- Skip for now"));
+        assert!(render_delivery(&none, true).contains("- Keep the default: none stated\n- Skip for now"));
     }
 
     #[test]

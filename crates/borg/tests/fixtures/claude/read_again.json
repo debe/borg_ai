@@ -1,0 +1,15 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "{{cwd}}/src/budget.rs"
+  },
+  "tool_response": {
+    "type": "text"
+  },
+  "tool_use_id": "toolu_04"
+}

@@ -1,0 +1,10 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "SimPostTool",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "{{cwd}}/src/budget.rs"
+  }
+}

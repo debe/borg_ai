@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
-import borg, { runBorg, text, toolEvent } from "./borg.ts";
+import borg, { runBorg, text, toolEvent, toolInput } from "./borg.ts";
 
 const root = resolve(import.meta.dirname, "../..");
 const BORG = process.env.BORG_BIN || join(root, "target/debug/borg");
@@ -60,6 +60,16 @@ test("maps tool names, texts and failures", () => {
 	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
 	const [ev, p] = toolEvent(ctx, { toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true });
 	assert.deepEqual([ev, p], ["post_tool_failure", { session_id: "s", cwd: "/r", pid: process.pid, tool_name: "Bash", tool_input: { command: "ls" }, error: "boom" }]);
+});
+
+test("edit and write name their file as file_path, an edit's patch is its new_string", () => {
+	const patch = "*** Begin Patch\n[src/net.rs#06FE]\nPUT 1:\n+drain it\n[local://plan.md#01]\n*** Update File: src/net.rs\n";
+	assert.deepEqual(toolInput("edit", { input: patch }), { file_path: "src/net.rs plan.md", new_string: patch });
+	assert.deepEqual(toolInput("write", { path: "/r/a.rs", content: "x" }), { file_path: "/r/a.rs", content: "x" });
+	assert.deepEqual(toolInput("read", { path: "local://plan.md" }), { file_path: "plan.md" });
+	assert.deepEqual(toolInput("bash", { command: "ls" }), { command: "ls" });
+	assert.deepEqual(toolInput("grep", { pattern: "x", path: "src" }), { pattern: "x", path: "src" }, "a search's path is not a file it touched");
+	assert.deepEqual(toolInput("edit", undefined), {});
 });
 
 test("prompt and tool touches reach borg's session context", async () => {
@@ -215,7 +225,7 @@ test("an ACP rejection result is a wordless denial too", async () => {
 	);
 	await h.input({ type: "input", text: "keep the old entry point, callers depend on it", source: "rpc" }, ctx);
 	const ep = JSON.parse(readFileSync(join(dir, "home", "episodes.jsonl"), "utf8").trim());
-	assert.equal(ep.rejected_tool, 'Edit {"path":"src/parse.rs"}');
+	assert.equal(ep.rejected_tool, 'Edit {"file_path":"src/parse.rs"}');
 });
 
 test("session_stop: borg's questions block once, then stop_hook_active lets the drone stop", async () => {

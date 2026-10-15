@@ -1,0 +1,69 @@
+//! The page's drones API over a seeded store, in process (no port): every visible harness's drone shows
+//! in `/api/drones` with its harness and state, its collective in `/api/collectives`. The hook writes
+//! these records (presence.rs `touch`); crates/borg/tests/conformance_cli.rs proves that end to end.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use borg::collective::Share;
+use borg::{harness, learn, presence};
+use borg_web::{App, Mind, router};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+/// GET `uri` from the page's router: (status, JSON body).
+async fn get(app: Arc<App>, uri: &str) -> (StatusCode, Value) {
+    let res = router(app).oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn every_harness_drone_shows_with_its_harness_and_state() {
+    let home: PathBuf = std::env::temp_dir().join(format!("borg-web-drones-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let now = learn::now_ms();
+    let names: Vec<&str> = harness::visible().map(|h| h.name()).collect();
+    for (i, name) in names.iter().enumerate() {
+        let ev = |extra: Value| {
+            let mut v = json!({"session_id": format!("s-{name}"), "cwd": "/work/harbor_orion"});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        presence::touch(&home, "corp", name, "prompt", &ev(json!({"prompt": format!("Tidy the Orion net {i}")})), now).unwrap();
+        presence::touch(&home, "corp", name, "post_tool", &ev(json!({"tool_name": "Edit", "tool_input": {"file_path": "/work/harbor_orion/src/net.rs"}})), now)
+            .unwrap();
+    }
+    // The last one's turn ended, and the drone with it.
+    let last = names.last().unwrap();
+    presence::touch(&home, "corp", last, "end", &json!({"session_id": format!("s-{last}"), "cwd": "/work/harbor_orion"}), now).unwrap();
+
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+
+    let (status, v) = get(app.clone(), "/api/collectives").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["collectives"], json!([{"name": "corp", "share": "local", "mode": "live"}]), "{v}");
+    assert_eq!(v["first"], "corp");
+
+    let (status, v) = get(app.clone(), "/api/drones?c=corp").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["collective"], "corp");
+    let drones = v["drones"].as_array().unwrap();
+    assert_eq!(drones.len(), names.len(), "{v}");
+    for name in &names {
+        let d = drones.iter().find(|d| d["session"] == format!("s-{name}")).unwrap_or_else(|| panic!("{name}: {v}"));
+        assert_eq!(d["harness"], *name, "{d}");
+        assert_eq!(d["state"], if name == last { "ended" } else { "working" }, "{d}");
+        assert_eq!(d["files"][0], "src/net.rs", "{d}");
+        assert!(d["prompt"].as_str().unwrap().starts_with("Tidy the Orion net"), "{d}");
+    }
+
+    let (status, _) = get(app, "/api/drones?c=nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&home);
+}
