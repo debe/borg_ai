@@ -10,7 +10,7 @@
 //!
 //! Claude and codex enforce the JSON schema themselves; omp and opencode get it in the prompt and
 //! the answer is the last JSON object in their final text. Every child runs headless in the temp
-//! dir: claude without tools or user settings, codex read-only, omp without tools and extensions,
+//! dir: claude without tools or user settings, codex read-only and without hooks, omp without tools and extensions,
 //! opencode without plugins and with every permission denied. No adapter loads, so a call never
 //! recurses into borg, and transcript text in the prompt cannot make the model act. Each child runs
 //! in a process group of its own that is killed when it ends or outlives the deadline.
@@ -50,8 +50,11 @@ impl Runner {
         }
     }
 
+    /// Every runner borg knows.
+    pub const ALL: [Runner; 4] = [Runner::Claude, Runner::Omp, Runner::Opencode, Runner::Codex];
+
     fn of(name: &str) -> Option<Runner> {
-        [Runner::Claude, Runner::Omp, Runner::Opencode, Runner::Codex].into_iter().find(|r| r.name() == name)
+        Runner::ALL.into_iter().find(|r| r.name() == name)
     }
 }
 
@@ -86,6 +89,28 @@ pub fn pick(spec: Option<&str>, harness: Option<&str>, on_path: &dyn Fn(&str) ->
         .filter(|r| on_path(r.name()))
         .map(|runner| Choice { runner, model: (runner == Runner::Claude).then(|| spec.unwrap_or(CLAUDE_DEFAULT).to_string()) })
         .collect()
+}
+
+/// `borg doctor`'s word on whether borg's model steps have a runner: any installed CLI of [`FALLBACK`],
+/// else the installed one `spec` pins (Err: none). A CLI that answers only when pinned (codex) is named
+/// with the settings that pin it.
+pub fn availability(spec: Option<&str>, on_path: &dyn Fn(&str) -> bool) -> Result<String, String> {
+    let installed = |spec| pick(spec, None, on_path).iter().map(|c| c.runner.name()).filter(|r| on_path(r)).collect::<Vec<_>>();
+    let mut runners = installed(None);
+    if runners.is_empty() {
+        runners = installed(spec);
+    }
+    if !runners.is_empty() {
+        return Ok(format!("model CLI available ({}): borg learn and the consequence model at Stop can run", runners.join(", ")));
+    }
+    let [tried @ .., last] = FALLBACK.map(Runner::name);
+    let mut msg =
+        format!("no model CLI on PATH ({} or {last}): borg learn cannot turn episodes into lessons, and the conscience stays silent at Stop", tried.join(", "));
+    for r in Runner::ALL.into_iter().filter(|r| !FALLBACK.contains(r) && on_path(r.name())) {
+        let r = r.name();
+        msg.push_str(&format!("; {r} answers only when pinned: set BORG_PREDICT_MODEL and BORG_LEARN_MODEL to {r}:<model>"));
+    }
+    Err(msg)
 }
 
 /// `pick` for this process: the harness from `BORG_HARNESS`, CLIs looked up on PATH.
@@ -370,19 +395,26 @@ impl Drop for Scratch {
     }
 }
 
+/// One codex call in `dir`: read-only, without the engineer's config and without any hook.
+fn codex_command(model: &str, dir: &Path) -> Command {
+    let mut cmd = Command::new("codex");
+    // `--ignore-user-config` skips config.toml but still loads `$CODEX_HOME/hooks.json`, borg's own hooks:
+    // only the feature switch keeps them out of this call (never `--dangerously-bypass-hook-trust`).
+    cmd.args(["exec", "-m", model, "--ignore-user-config", "-c", "features.hooks=false", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--json"])
+        .arg("--output-schema")
+        .arg(dir.join("schema.json"))
+        .arg("-o")
+        .arg(dir.join("out.json"))
+        .arg("-")
+        .current_dir(dir);
+    cmd
+}
+
 /// codex reports tokens, not dollars: the "cost" is input plus output tokens.
 fn codex(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Option<(Value, Option<f64>)> {
     let dir = Scratch::new("codex")?;
     std::fs::write(dir.0.join("schema.json"), schema.to_string()).ok()?;
-    let mut cmd = Command::new("codex");
-    cmd.args(["exec", "-m", model, "--ignore-user-config", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "--json"])
-        .arg("--output-schema")
-        .arg(dir.0.join("schema.json"))
-        .arg("-o")
-        .arg(dir.0.join("out.json"))
-        .arg("-")
-        .current_dir(&dir.0);
-    let out = run_capped(cmd, Some(prompt.as_bytes()), timeout)?;
+    let out = run_capped(codex_command(model, &dir.0), Some(prompt.as_bytes()), timeout)?;
     let tokens: f64 = events(&out)
         .filter(|e| e["type"] == "turn.completed")
         .map(|e| e["usage"]["input_tokens"].as_f64().unwrap_or(0.0) + e["usage"]["output_tokens"].as_f64().unwrap_or(0.0))
@@ -481,6 +513,28 @@ mod tests {
         assert_eq!(c[1], Choice { runner: Runner::Claude, model: Some("opus".into()) }, "an unprefixed name is a Claude model");
         // The harness's CLI is missing: the installed ones answer.
         assert_eq!(runners(&pick(None, Some("opencode"), &only(&["omp"]))), [Runner::Omp]);
+    }
+
+    #[test]
+    fn doctor_names_the_settings_a_pinned_only_runner_needs() {
+        let m = availability(None, &only(&["codex"])).unwrap_err();
+        assert!(m.contains("no model CLI") && m.contains("BORG_PREDICT_MODEL and BORG_LEARN_MODEL to codex:<model>"), "{m}");
+        let m = availability(Some("codex:gpt-5"), &only(&["codex"])).unwrap();
+        assert!(m.contains("(codex)"), "a pinned codex runs: {m}");
+        assert!(availability(Some("codex:gpt-5"), &only(&[])).is_err(), "pinned, but not installed");
+        assert_eq!(
+            availability(None, &only(&["omp", "codex"])).as_deref(),
+            Ok("model CLI available (omp): borg learn and the consequence model at Stop can run"),
+            "as before whenever a fallback CLI is installed"
+        );
+    }
+
+    #[test]
+    fn a_codex_call_runs_no_hook_not_even_borgs_own() {
+        let cmd = codex_command("gpt-5", Path::new("/tmp/x"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["-c", "features.hooks=false"]), "{args:?}");
+        assert!(args.iter().any(|a| a == "--ignore-user-config") && !args.iter().any(|a| a.contains("bypass-hook-trust")), "{args:?}");
     }
 
     #[test]

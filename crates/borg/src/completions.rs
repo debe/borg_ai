@@ -169,7 +169,7 @@ mod tests {
         assert!(bash().contains("queen) words=\"show ask answer"));
         assert!(zsh().starts_with("#compdef borg"));
         assert!(fish().contains("-n '__fish_seen_subcommand_from install' -l apply"));
-        assert!(bash().contains("install) words=\"claude omp opencode all --apply"), "{}", bash());
+        assert!(bash().contains("install) words=\"claude omp opencode codex all --apply"), "{}", bash());
         assert!(!bash().contains(" sim ") && !bash().contains(HARNESSES), "the simulated harness stays hidden");
     }
 }

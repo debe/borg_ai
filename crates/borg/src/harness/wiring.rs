@@ -109,6 +109,15 @@ impl Hooks {
         removed
     }
 
+    /// borg's (first) hook entry for `ev` among one event's groups.
+    fn slot_of<'a>(&self, groups: &'a mut [Value], ev: &str) -> Option<&'a mut Value> {
+        groups
+            .iter_mut()
+            .filter_map(|g| g.get_mut("hooks").and_then(Value::as_array_mut))
+            .flatten()
+            .find(|h| h.get("command").and_then(Value::as_str).and_then(|c| self.recognise(c)).is_some_and(|(_, e)| e == ev))
+    }
+
     /// The config with borg's hooks merged in (`Ok(None)`: already exactly so).
     ///
     /// `bin` must be named `borg`: that basename is how [`Hooks::recognise`] knows its own hooks, so a
@@ -137,7 +146,15 @@ impl Hooks {
             if ours == [want.clone()] {
                 continue; // already wired to this binary, with this timeout
             }
-            self.remove_borg(groups, ev); // stale binary, timeout or duplicates: replace with exactly one
+            if ours.len() == 1 {
+                // A stale binary or timeout: replace it where it stands, so no other hook changes position
+                // (Codex keys its trust by a hook's index).
+                if let Some(slot) = self.slot_of(groups, ev) {
+                    *slot = want;
+                    continue;
+                }
+            }
+            self.remove_borg(groups, ev); // none yet, or duplicates: exactly one, after everything else
             groups.push(json!({"hooks": [want]}));
         }
         Ok((m != orig).then(|| render(m, text)))
@@ -215,5 +232,20 @@ mod tests {
         let v: Value = serde_json::from_str(&k.install(None, Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         let timeout = |native: &str| v["hooks"][native][0]["hooks"][0].get("timeout").cloned();
         assert_eq!((timeout("SimPrompt"), timeout("SimStop"), timeout("SimEnd")), (Some(json!(30)), Some(json!(90)), None));
+    }
+
+    #[test]
+    fn a_reinstall_from_another_path_replaces_borgs_hook_where_it_stands() {
+        let sim = Hooks::of(&crate::harness::sim::Sim).unwrap();
+        let text = sim.install(None, Path::new("/old/borg")).unwrap().unwrap();
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v["hooks"]["SimStop"].as_array_mut().unwrap().push(json!({"hooks": [{"type": "command", "command": "echo user-after"}]}));
+        let text = serde_json::to_string_pretty(&v).unwrap();
+        let v: Value = serde_json::from_str(&sim.install(Some(&text), Path::new("/new/borg")).unwrap().unwrap()).unwrap();
+        let commands = |native: &str| -> Vec<String> {
+            v["hooks"][native].as_array().unwrap().iter().map(|g| g["hooks"][0]["command"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(commands("SimStop"), ["/new/borg hook sim stop", "echo user-after"], "the user's hook keeps its index");
+        assert_eq!(commands("SimEnd"), ["/new/borg hook sim end"]);
     }
 }

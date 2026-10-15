@@ -1,0 +1,11 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a13e37-2ced-7321-85d6-083a1195dcbc",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "Stop",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "I replaced the drain of the Orion budget place with a reset arc."
+}

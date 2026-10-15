@@ -1,6 +1,6 @@
 //! borg: collective mind for coding-agent drones.
 //!
-//! usage: borg hook <claude|omp|opencode> <prompt|pre_tool|post_tool|post_tool_failure|stop|end>   (hook JSON on stdin)
+//! usage: borg hook <claude|omp|opencode|codex> <prompt|pre_tool|post_tool|post_tool_failure|stop|end>   (hook JSON on stdin)
 //!        Every harness speaks one canonical, Claude-shaped event (session_id, cwd, prompt, tool_name,
 //!        tool_input, error, last_assistant_message, transcript_path, stop_hook_active) and gets
 //!        Claude-shaped output ({"decision":"block","reason"} at stop); adapters translate both ways.
@@ -9,7 +9,7 @@
 //!                                                     (internal: live mode's check of the work so far, spawned by
 //!                                                      the PostToolUse hook; live.rs)
 //!        borg collective [DIR]                       (which collective DIR belongs to; see collective.rs)
-//!        borg install|uninstall <claude|omp|opencode|all> [--apply] [--home DIR]
+//!        borg install|uninstall <claude|omp|opencode|codex|all> [--apply] [--home DIR]
 //!                                                     (wire borg into a harness's user config; dry run by default; install.rs)
 //!        borg status | borg doctor [--home DIR]       (each collective's store; what is wired; what is broken)
 //!        borg assimilate [--apply] [--claude DIR] [--omp DIR] [--opencode DIR] [--since DATE] [--limit N]

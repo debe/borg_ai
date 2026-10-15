@@ -631,7 +631,8 @@ fn git_identities() -> Vec<(String, String)> {
     out
 }
 
-/// Each harness's CLI (its version, as its [`harness::Probe`] says) and its own checks (`Harness::checks`).
+/// Each harness's CLI (its version, as its [`harness::Probe`] says) and, once the CLI answered, its own
+/// checks (`Harness::checks`: they may ask the CLI, which a missing or hung one cannot answer).
 fn harness_checks<'a>(hs: impl Iterator<Item = &'a dyn Harness>, t: &Targets) -> Vec<(Level, String)> {
     let mut checks = Vec::new();
     for h in hs {
@@ -639,11 +640,13 @@ fn harness_checks<'a>(hs: impl Iterator<Item = &'a dyn Harness>, t: &Targets) ->
         match which(cli) {
             None => checks.push((Level::Ok, format!("{cli}: not installed"))),
             Some(p) => match version(&p) {
-                Some(v) => checks.push((Level::Ok, format!("{cli}: {v}{tested}"))),
+                Some(v) => {
+                    checks.push((Level::Ok, format!("{cli}: {v}{tested}")));
+                    checks.extend(h.checks(&t.path(h)));
+                }
                 None => checks.push((Level::Warn, format!("{cli}: {} did not answer --version", p.display()))),
             },
         }
-        checks.extend(h.checks(&t.path(h)));
     }
     checks
 }
@@ -678,19 +681,11 @@ fn doctor(t: &Targets) -> i32 {
         let aliases = c.as_ref().map(collective::Config::aliases).unwrap_or_default();
         checks.extend(alias_hints(&emails, &git_identities(), &aliases).into_iter().map(|h| (Level::Warn, h)));
     }
-    // borg's model steps run through any installed runner (runner.rs), not only `claude`.
-    let runners: Vec<&str> = crate::runner::pick(None, None, &crate::runner::on_path).iter().map(|c| c.runner.name()).collect();
-    let [tried @ .., last] = crate::runner::FALLBACK.map(crate::runner::Runner::name);
-    match runners.as_slice() {
-        [] => checks.push((
-            Level::Warn,
-            format!(
-                "no model CLI on PATH ({} or {last}): borg learn cannot turn episodes into lessons, and the conscience stays silent at Stop",
-                tried.join(", ")
-            ),
-        )),
-        some => checks.push((Level::Ok, format!("model CLI available ({}): borg learn and the consequence model at Stop can run", some.join(", ")))),
-    }
+    let spec = std::env::var("BORG_PREDICT_MODEL").ok();
+    checks.push(match crate::runner::availability(spec.as_deref(), &crate::runner::on_path) {
+        Ok(m) => (Level::Ok, m),
+        Err(m) => (Level::Warn, m),
+    });
     for (l, msg) in &checks {
         let tag = match l {
             Level::Ok => "ok  ",
@@ -904,7 +899,7 @@ mod tests {
         std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
         std::fs::write(t.path(CLAUDE), EXISTING).unwrap();
         let bin = Path::new("/opt/borg dir/borg");
-        assert_eq!(install_all(&t, bin, Action::Install, "s1"), 3);
+        assert_eq!(install_all(&t, bin, Action::Install, "s1"), harness::visible().count(), "one file per harness");
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()).unwrap();
         assert_eq!(v["model"], "opus");
@@ -936,7 +931,7 @@ mod tests {
         let home = tmp("idem");
         let t = Targets::under(&home);
         let bin = Path::new("/usr/bin/borg");
-        assert_eq!(install_all(&t, bin, Action::Install, "a"), 3);
+        assert_eq!(install_all(&t, bin, Action::Install, "a"), harness::visible().count(), "one file per harness");
         let snapshot = all_files(&home);
         assert_eq!(install_all(&t, bin, Action::Install, "b"), 0, "second install changes nothing");
         assert_eq!(all_files(&home), snapshot, "and writes nothing, not even a backup");
@@ -958,9 +953,9 @@ mod tests {
                 std::fs::write(t.path(CLAUDE), o).unwrap();
             }
             install_all(&t, Path::new("/usr/bin/borg"), Action::Install, "i");
-            assert_eq!(install_all(&t, Path::new("/elsewhere/borg"), Action::Uninstall, "u"), 3);
+            assert_eq!(install_all(&t, Path::new("/elsewhere/borg"), Action::Uninstall, "u"), harness::visible().count(), "one file per harness");
             assert_eq!(read(&t.path(CLAUDE)).unwrap().as_deref(), original, "{name}: byte for byte");
-            assert!(!t.path(OMP).exists() && !t.path(OPENCODE).exists());
+            assert!(!t.path(OMP).exists() && !t.path(OPENCODE).exists() && !t.path(&crate::harness::codex::Codex).exists());
             assert_eq!(install_all(&t, Path::new("/usr/bin/borg"), Action::Uninstall, "u2"), 0, "nothing left to remove");
         }
     }
@@ -1201,7 +1196,8 @@ mod tests {
     }
 
     /// A harness with a step of its own in the harness (as Codex's hook trust will be).
-    struct Noted;
+    /// A harness with its own install notes and doctor check; its CLI is `.0`.
+    struct Noted(&'static str);
 
     impl Harness for Noted {
         fn name(&self) -> &'static str {
@@ -1217,7 +1213,7 @@ mod tests {
             home.join(".noted/hooks.json")
         }
         fn probe(&self) -> harness::Probe {
-            harness::Probe { cli: "borg-test-no-such-cli", tested: "" }
+            harness::Probe { cli: self.0, tested: "" }
         }
         fn checks(&self, target: &Path) -> Vec<(Level, String)> {
             vec![(Level::Warn, format!("noted: {} is not trusted", target.display()))]
@@ -1231,12 +1227,14 @@ mod tests {
     fn a_harness_adds_its_own_install_notes_and_doctor_checks() {
         let home = tmp("noted");
         let t = Targets::under(&home);
-        let (change, notes) = plan(Action::Install, &Noted, &t, Path::new("/b/borg")).unwrap();
+        let (change, notes) = plan(Action::Install, &Noted("git"), &t, Path::new("/b/borg")).unwrap();
         assert!(change.is_some());
         assert_eq!(notes, ["run /hooks in noted and trust borg"]);
-        assert_eq!(plan(Action::Uninstall, &Noted, &t, Path::new("/b/borg")).unwrap().1, Vec::<String>::new());
-        let checks = harness_checks([&Noted as &dyn Harness].into_iter(), &t);
-        assert_eq!(checks[0], (Level::Ok, "borg-test-no-such-cli: not installed".into()));
+        assert_eq!(plan(Action::Uninstall, &Noted("git"), &t, Path::new("/b/borg")).unwrap().1, Vec::<String>::new());
+        let checks = harness_checks([&Noted("git") as &dyn Harness].into_iter(), &t);
+        assert!(checks[0].0 == Level::Ok && checks[0].1.starts_with("git: git version"), "{checks:?}");
         assert_eq!(checks[1], (Level::Warn, format!("noted: {} is not trusted", home.join(".noted/hooks.json").display())));
+        let missing = harness_checks([&Noted("borg-test-no-such-cli") as &dyn Harness].into_iter(), &t);
+        assert_eq!(missing, [(Level::Ok, "borg-test-no-such-cli: not installed".into())], "no CLI to ask: its own checks wait");
     }
 }

@@ -92,6 +92,16 @@ First release.
 ### Harnesses and operations
 
 - Claude Code hooks; omp and opencode adapters (turn-end check, live mode, learning, steering).
+- Codex CLI support (tested with 0.153.2): `borg install codex` appends command hooks to
+  `~/.codex/hooks.json` (`$CODEX_HOME`) with an explicit timeout each (prompt 30 s, pre-tool 10 s,
+  post-tool 30 s, stop 90 s, end 3 s). An `apply_patch` call becomes an edit of every file the patch
+  names. Codex runs a new or changed hook only after you trust it (`/hooks` in codex) and skips it
+  silently otherwise: install says so, and `borg doctor` asks codex (`codex app-server`, `hooks/list`)
+  which of borg's hooks it does not trust. borg never writes that trust. `adapters/codex/smoke.sh` runs
+  a real `codex exec` against a local mock of the model API (0 tokens).
+- borg's own model calls through codex (`codex:` runner) pass `-c features.hooks=false`:
+  `--ignore-user-config` still loads `$CODEX_HOME/hooks.json`, so without it a codex drone's call
+  could run borg's hooks inside borg.
 - opencode 2 support: the opencode adapter serves opencode 1.x and 2.x from one file, queen questions
   included (2.x: the `setup` plugin API).
 - `borg install|uninstall` with dry run, backups and idempotent merging; `borg status`, `borg doctor`.

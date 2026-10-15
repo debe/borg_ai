@@ -1,7 +1,8 @@
 //! The coding agents borg runs in ("harnesses"), each one module behind one trait.
 //!
 //! Every harness already speaks one canonical, Claude-shaped hook event and gets a Claude-shaped answer
-//! back (hook.rs `dispatch`): a TS adapter translates for omp and opencode, Claude Code's command hooks need none.
+//! back (hook.rs `dispatch`): a TS adapter translates for omp and opencode, Claude Code's command hooks need
+//! none, and Codex's need only its patch tool turned into an edit (`Harness::normalise`).
 //! So the core differs per harness only in data: how `borg install` wires it ([`Wiring`], `target`),
 //! what reaches its model and when ([`Caps`]), where the turn's work and the drone's last message come
 //! from ([`Transcript`]), and the stop's time budget. The hook (hook.rs), install (install.rs) and
@@ -16,6 +17,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 pub mod claude;
+pub mod codex;
 pub mod omp;
 pub mod opencode;
 pub mod sim;
@@ -136,7 +138,7 @@ pub const DEFAULT_STOP_BUDGET: Duration = Duration::from_secs(60);
 pub const TEST_ENV: &str = "BORG_TEST_HARNESS";
 
 /// Every harness, in the order help, status and `all` list them. Adding one is a line here.
-pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Opencode, &sim::Sim];
+pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Opencode, &codex::Codex, &sim::Sim];
 
 /// The harness called `name`; a hidden one only under [`TEST_ENV`].
 pub fn by_name(name: &str) -> Option<&'static dyn Harness> {
@@ -149,7 +151,7 @@ pub fn visible() -> impl Iterator<Item = &'static dyn Harness> {
     ALL.iter().copied().filter(|h| !h.hidden())
 }
 
-/// `claude|omp|opencode`: the visible names, for usage lines.
+/// `claude|omp|opencode|codex`: the visible names, for usage lines.
 pub fn names(sep: &str) -> String {
     visible().map(|h| h.name()).collect::<Vec<_>>().join(sep)
 }
@@ -217,9 +219,12 @@ mod tests {
         for n in ["omp", "opencode"] {
             assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true), "{n}");
         }
-        for h in ALL {
-            assert_eq!(h.caps().stop_budget, None, "{}: the expert drone keeps inside Claude Code's 60 s, the model call its own limit", h.name());
-        }
+        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false));
+        // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; codex: its
+        // stop hook's timeout.
+        let budgets = [("claude", None), ("omp", None), ("opencode", None), ("codex", Some(90)), ("sim", None)];
+        let got: Vec<(&str, Option<u64>)> = ALL.iter().map(|h| (h.name(), h.caps().stop_budget.map(|d| d.as_secs()))).collect();
+        assert_eq!(got, budgets, "every harness's stop budget");
         let Wiring::CommandHooks { timeouts, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
         assert_eq!((timeouts, through_links), (&[("stop", 90)][..], true), "a timeout on the stop only");
     }
@@ -230,7 +235,7 @@ mod tests {
             assert_eq!(by_name(h.name()).map(|x| x.name()), Some(h.name()));
         }
         assert_eq!(ALL.iter().filter(|h| ALL.iter().filter(|x| x.name() == h.name()).count() > 1).count(), 0);
-        assert_eq!(names("|"), "claude|omp|opencode");
+        assert_eq!(names("|"), "claude|omp|opencode|codex");
         assert!(ALL.iter().any(|h| h.name() == "sim" && h.hidden()));
         // Known by name only under TEST_ENV (conformance_cli.rs runs `borg` with and without it).
         assert_eq!(by_name("sim").is_some(), std::env::var_os(TEST_ENV).is_some());

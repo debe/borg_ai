@@ -1,0 +1,15 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a13e37-2ced-7321-85d6-083a1195dcbc",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "sed -n 1,40p src/budget.rs"
+  },
+  "tool_response": "fn budget() {}\n",
+  "tool_use_id": "exec-c6335392-4e5c-478c-98d1-45c05f27a69d"
+}

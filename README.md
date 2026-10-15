@@ -94,6 +94,7 @@ When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; ste
 | Claude Code | Command hooks in `~/.claude/settings.json` | Every feature, including early delivery, steering at the next tool call, and queen questions as a dialog |
 | omp (oh-my-pi) 18.8.5, 18.10.4 | The extension [adapters/omp](adapters/omp/README.md) | Live mode (omp 18.4.4 or newer), the turn-end check, learning and steering at the stop |
 | opencode 1.19.0, 2.0.29 | The plugin [adapters/opencode](adapters/opencode/README.md) | The same as omp |
+| Codex CLI 0.153.2 | Command hooks in `~/.codex/hooks.json` ([adapters/codex](adapters/codex/README.md)); trust them with `/hooks` in codex, and again when borg's path changes (`borg doctor` says when codex skips them) | The same as omp, without learning from denied tool calls (Codex reports none). Borg's own model calls need `claude`, `omp` or `opencode` on `PATH`, or `codex:<model>` pinned |
 
 Each agent is one module behind one trait. The same conformance suite checks every agent: install,
 hooks, live mode and the drones page. [Harnesses](docs/harnesses.md) has the capability table, how to
@@ -172,11 +173,15 @@ spend matters more.
 - A harness: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets every feature. omp
   (tested with 18.8.5 and 18.10.4; live mode needs 18.4.4 or newer) and opencode (1.19.0 and 2.0.29) get
   live mode, the turn-end check, learning and steering, but no early delivery yet
-  ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)).
+  ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)). The Codex CLI (tested with
+  0.153.2) gets the same ([codex](adapters/codex/README.md)).
 - One logged-in model CLI on `PATH`: `claude`, `omp` or `opencode`. Borg's model steps (learning, the
   turn-end check) run headless through the harness the drone runs in (Sonnet by default for `claude`,
   the configured default model for omp and opencode), and through another installed one if it gives
   no answer. Without any, Borg still records episodes and delivers by word matching, but learns nothing.
+  `codex` runs them only when pinned: a Codex drone with no other CLI installed needs
+  `BORG_PREDICT_MODEL=codex:<model>` and `BORG_LEARN_MODEL=codex:<model>`, or its live checks never judge
+  and Borg learns nothing.
 
 **1. Install.**
 
@@ -210,7 +215,7 @@ in [Configuration](docs/configuration.md#collectives).
 **3. Wire the hooks.** Every step is a dry run until `--apply`, and each changed file gets a backup.
 
 ```sh
-borg install all              # dry run: prints the diff for claude, omp and opencode
+borg install all              # dry run: prints the diff for claude, omp, opencode and codex
 borg install all --apply
 borg doctor                   # checks wiring, config, the model CLI and the stores
 ```
@@ -313,11 +318,15 @@ author's sessions, so their data is not in this repository.
 - Small samples (16 negative and 51 positive turn-end cases; 10 sessions for memory quality). The
   intervals are wide.
 - Turn-end asking of the engineer (`BORG_QUEEN=on`) failed its test and is off.
-- omp and opencode get no early delivery yet.
+- omp, opencode and Codex get no early delivery yet.
 - omp gives a stop 30 s, which no setting changes. borg budgets 28 s, so the turn-end call there stops
   after at most 18 s (less what the stop spent before it); about one in eight measured turn-end calls took longer, and such a turn ends without
   questions. A stop that a live check covered makes no call.
-- On omp and opencode a live check sees the turn's tool calls and edits, not the agent's prose.
+- On omp, opencode and Codex a live check sees the turn's tool calls and edits, not the agent's prose.
+- Codex skips an untrusted hook without a word, and fires no PostToolUse for a failed `apply_patch`, a
+  patch run through a shell heredoc or a command still running when it yields: borg never sees those
+  edits. In code mode borg's context reaches the model only after the whole `exec` script, and codex cuts
+  context over about 2,500 tokens ([codex](adapters/codex/README.md#what-borg-misses)).
 - opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
   successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
   TUI hides it for built-in tools, but session exports show it.
@@ -330,13 +339,15 @@ author's sessions, so their data is not in this repository.
 git pull
 cargo install --path crates/borg --locked --force
 cargo install --path crates/borg-mesh --locked --force   # if installed
-borg install all              # dry run: shows adapter changes for omp and opencode
+borg install all              # dry run: shows adapter changes for omp and opencode, hook changes for codex
 borg install all --apply      # only if the dry run shows a diff
 borg doctor
 ```
 
-Claude Code hooks call the binary by path, so a reinstall needs no rewiring. Stores are append-only
-JSONL and need no migration.
+Claude Code hooks call the binary by path, so a reinstall needs no rewiring. Codex hooks do too, but
+codex trusts each hook's command and timeout: after an upgrade that moves borg or changes a hook's
+timeout, codex skips borg's hooks until you trust them again with `/hooks` in codex, and `borg doctor`
+says so. Stores are append-only JSONL and need no migration.
 
 ```sh
 borg uninstall all --apply    # removes only what install added; keeps a backup

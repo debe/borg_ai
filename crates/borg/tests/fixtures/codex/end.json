@@ -1,0 +1,7 @@
+{
+  "session_id": "{{session}}",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "SessionEnd",
+  "reason": "other"
+}

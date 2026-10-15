@@ -1,0 +1,15 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a13e37-2ced-7321-85d6-083a1195dcbc",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat src/net.rs"
+  },
+  "tool_response": "fn net() {}\n",
+  "tool_use_id": "call_shell1"
+}

@@ -1,0 +1,15 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a13e37-2ced-7321-85d6-083a1195dcbc",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "tool_name": "apply_patch",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: src/net.rs\n@@\n-drain the budget\n+use a reset arc on the budget place\n*** End Patch\n"
+  },
+  "tool_response": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM src/net.rs\n",
+  "tool_use_id": "call_patch1"
+}

@@ -106,6 +106,10 @@ testing.
   `SessionEnd`. Each runs `<path to borg> hook claude <event>`. Your other keys and hooks stay.
 - **omp:** copies the adapter to `~/.omp/agent/extensions/borg.ts`.
 - **opencode:** copies the adapter to `~/.config/opencode/plugins/borg.ts`.
+- **Codex CLI:** one hook per event appended to `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`):
+  `UserPromptSubmit` (30 s), `PreToolUse` (10 s), `PostToolUse` (30 s), `Stop` (90 s) and `SessionEnd`
+  (3 s, Codex's maximum). Each runs `<path to borg> hook codex <event>`. Codex runs them only after you
+  trust them: open codex and run `/hooks`. `borg doctor` reports any of borg's hooks codex does not trust.
 
 The adapters are compiled into the binary, so an installed `borg` needs no checkout.
 
@@ -179,7 +183,7 @@ All are optional.
 | Variable | Default | Effect |
 |---|---|---|
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
-| `BORG_LEARN_MODEL` | the harness's | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*); `off`: no model call, episodes wait |
+| `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*); `off`: no model call, episodes wait |
 | `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
@@ -194,7 +198,11 @@ Borg's own model calls run headless through a CLI: the harness the drone runs in
 passes it on as `BORG_HARNESS`), then every other installed one of `claude`, `omp`, `opencode`, until
 one answers. A model name with a runner prefix pins the runner: `claude:opus`, `omp:` (omp's default),
 `omp:<model>`, `opencode:github-copilot/gpt-6.1-sol`, `codex:gpt-5`. A name without a prefix is a
-Claude model (default `sonnet`); omp and opencode then use their own configured default model.
+Claude model (default `sonnet`); omp and opencode then use their own configured default model. codex
+answers only when pinned with `codex:`, even for a Codex drone; its call ignores your codex config and
+runs with hooks off (`-c features.hooks=false`). A Codex drone on a machine with no `claude`, `omp` or
+`opencode` therefore needs `BORG_PREDICT_MODEL=codex:<model>` and `BORG_LEARN_MODEL=codex:<model>`:
+without them its live and turn-end checks never judge and Borg learns nothing. `borg doctor` says so.
 Each call runs without tools, plugins or extensions (opencode with every permission denied), and is
 killed with everything it started when its time limit passes or borg itself is killed. opencode 1.x
 runs with `--pure`; opencode 2.x runs with `--standalone` (a private server, never your background
@@ -216,7 +224,7 @@ project.
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
 | `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; its grade-3 lessons arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A grade 3 no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
 | `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it, or a quarter of `BORG_STOP_BUDGET_MS` when that is less |
-| `BORG_PREDICT_MODEL` | the harness's | Model for the turn-end check (see *Model runner*); `off`: no model call |
+| `BORG_PREDICT_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for the turn-end check (see *Model runner*); `off`: no model call |
 | `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (and of a live check's call; a live check's lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`) |
 | `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it: omp 28 s, opencode 90 s). It bounds the expert drone and, when set, sizes the stop's wait for a live check (at most a quarter of it, never over 15 s) and its model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp 7 s and at most 18 s |
 | `BORG_VECTORS` | on | `off`: no vector recall |

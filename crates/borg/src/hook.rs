@@ -43,8 +43,25 @@ fn touched(input: &Value, tool: &str) -> String {
         }
         "Grep" => format!("{} {}", s("pattern"), s("path")),
         "Glob" => s("pattern"),
-        _ => [s("file_path"), s("notebook_path"), s("path")].join(" ").trim().to_string(),
+        _ => {
+            let mut t = [s("file_path"), s("notebook_path"), s("path")].join(" ").trim().to_string();
+            // An edit of several files (a Codex patch) names the further ones in its `edits`.
+            for p in further_files(input) {
+                if !t.is_empty() {
+                    t.push(' ');
+                }
+                t.push_str(p);
+            }
+            t
+        }
     }
+}
+
+/// The files an edit names in its `edits` beside its own `file_path` (a Codex patch of several files;
+/// Claude's MultiEdit names none there). They reach `.ctx` and `.edits`; presence (`borg top`) shows
+/// one file per drone, the edit's own `file_path`.
+fn further_files(input: &Value) -> impl Iterator<Item = &str> {
+    input.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e.get("file_path").and_then(Value::as_str)).filter(|p| !p.is_empty())
 }
 
 fn repo_of(cwd: &str) -> String {
@@ -262,13 +279,22 @@ fn early_acted(session: &str, all: &[conscience::Challenge], final_msg: &str) ->
     out
 }
 
-/// An edit tool's path and the start of its new text, on one line; None for other tools.
+/// An edit tool's paths (every file it names, so the cut never drops one) and the start of its new
+/// text, on one line; None for other tools.
 fn edit_text(tool: &str, input: &Value) -> Option<String> {
     if !["edit", "write", "multiedit", "notebookedit"].contains(&tool.to_ascii_lowercase().as_str()) {
         return None;
     }
     let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-    let mut text = [s(input, "file_path"), s(input, "notebook_path"), s(input, "new_string"), s(input, "content"), s(input, "new_source")].join(" ");
+    let mut text = [s(input, "file_path"), s(input, "notebook_path")].join(" ");
+    for p in further_files(input) {
+        text.push(' ');
+        text.push_str(p);
+    }
+    for k in ["new_string", "content", "new_source"] {
+        text.push(' ');
+        text.push_str(&s(input, k));
+    }
     for e in input.get("edits").and_then(Value::as_array).into_iter().flatten() {
         text.push(' ');
         text.push_str(&s(e, "new_string"));
@@ -1048,7 +1074,7 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     // BORG_STOP_GATE=edits: whether this turn changed anything; every Stop consumes the marker, so
     // the rework after a block does not count for the next turn.
     let changed = std::fs::remove_file(changes_file(session)).is_ok();
-    // One round of self-questioning per stop; never loop.
+    // One round of self-questioning per turn (the harness's stop_hook_active); never loop.
     if second_round {
         return None;
     }
@@ -1236,5 +1262,22 @@ pub fn main(name: &str, event: &str) {
         crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input))
     }) {
         println!("{out}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_file_of_an_edit_survives_the_cut_of_its_text() {
+        let long = "x".repeat(700);
+        let input = json!({"file_path": "/w/a.rs", "new_string": long, "edits": [{"file_path": "/w/b.rs", "new_string": "more"}]});
+        let text = edit_text("Edit", &input).unwrap();
+        assert!(text.starts_with("/w/a.rs /w/b.rs x"), "{}", &text[..40]);
+        assert_eq!(text.chars().count(), 600);
+        let multi = json!({"file_path": "/w/a.rs", "edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]});
+        assert_eq!(edit_text("MultiEdit", &multi).as_deref(), Some("/w/a.rs b d"), "Claude's MultiEdit reads as before");
+        assert_eq!(touched(&input, "Edit"), "/w/a.rs /w/b.rs");
     }
 }

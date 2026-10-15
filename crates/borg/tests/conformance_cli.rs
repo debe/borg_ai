@@ -221,6 +221,26 @@ impl Drop for Drone<'_> {
     }
 }
 
+/// Whether `h` wires a hook for canonical `event` (Codex has no failure event, say).
+fn wires(h: &dyn Harness, event: &str) -> bool {
+    matches!(h.wiring(), Wiring::CommandHooks { events, .. } if events.iter().any(|(_, e)| *e == event))
+}
+
+/// The scenario's step and the canonical event it is sent as.
+const STEPS: [(&str, &str); 11] = [
+    ("prompt", "prompt"),
+    ("pre_tool", "pre_tool"),
+    ("read", "post_tool"),
+    ("edit", "post_tool"),
+    ("read_again", "post_tool"),
+    ("bash", "post_tool"),
+    ("deny", "post_tool_failure"),
+    ("correction", "prompt"),
+    ("stop", "stop"),
+    ("stop_again", "stop"),
+    ("end", "end"),
+];
+
 fn fixture_dir(harness: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(harness)
 }
@@ -241,11 +261,28 @@ fn files(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn every_command_hook_harness_has_fixtures_for_the_scenario() {
     for p in profiles() {
-        for step in ["prompt", "pre_tool", "read", "edit", "read_again", "bash", "deny", "correction", "stop", "stop_again", "end"] {
+        // A step whose event the harness has no hook for has no fixture either.
+        for (step, _) in STEPS.iter().filter(|(_, ev)| wires(p.h, ev)) {
             assert!(fixture_dir(p.h.name()).join(format!("{step}.json")).is_file(), "{}: tests/fixtures/{}/{step}.json", p.tag(), p.h.name());
         }
     }
     assert!(profiles().len() >= 2, "claude and the simulated harness at least");
+}
+
+/// Every environment variable a harness reads to find its config (`Harness::target` asks for them).
+fn config_vars() -> Vec<String> {
+    let seen = std::cell::RefCell::new(Vec::new());
+    for h in harness::ALL {
+        h.target(Path::new("/h"), &|k| {
+            seen.borrow_mut().push(k.to_string());
+            None
+        });
+    }
+    let mut seen = seen.into_inner();
+    seen.sort();
+    seen.dedup();
+    assert!(["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"].iter().all(|k| seen.iter().any(|s| s == k)), "{seen:?}");
+    seen
 }
 
 #[test]
@@ -262,8 +299,8 @@ fn install_is_a_dry_run_first_then_idempotent_kept_apart_and_reversible() {
         // A real HOME and every harness's config-dir variable point outside --home: none of them counts.
         let outside = root.join("outside");
         let mut env: Vec<(String, String)> = vec![(harness::TEST_ENV.into(), "1".into()), ("HOME".into(), outside.join("home").display().to_string())];
-        for k in ["CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
-            env.push((k.into(), outside.join(k).display().to_string()));
+        for k in config_vars() {
+            env.push((k.clone(), outside.join(&k).display().to_string()));
         }
 
         let (out, code) = borg_cli(&root, &["install", p.h.name(), "--home", &h], &env);
@@ -455,7 +492,12 @@ fn a_wordless_denial_and_the_next_prompt_become_an_episode() {
         d.with("BORG_LEARN", "on");
         d.with("BORG_PREDICT_MODEL", "off");
         d.step("prompt", "prompt");
-        d.step("post_tool_failure", "deny");
+        // A harness without a failure event cannot send its denials: it captures none.
+        if wires(p.h, "post_tool_failure") {
+            d.step("post_tool_failure", "deny");
+        } else {
+            assert!(!p.caps().deny_capture, "{}: denials captured, but no hook receives them", p.tag());
+        }
         d.step("prompt", "correction");
         let episodes = std::fs::read_to_string(d.root.join("store/collectives/corp/episodes.jsonl")).unwrap_or_default();
         if p.caps().deny_capture {

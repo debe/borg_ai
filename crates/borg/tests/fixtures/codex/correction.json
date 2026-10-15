@@ -1,0 +1,10 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a13e37-2ced-7321-85d6-083a1195dcbc",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5.5",
+  "permission_mode": "default",
+  "prompt": "no, keep the budget token: do not use a reset arc, drain it with an explicit consumer"
+}

@@ -7,9 +7,9 @@
 | Command | Shows or does |
 |---|---|
 | `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks) and what is wired |
-| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode), `borg` on `PATH` |
+| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode, or a pinned `codex:<model>`), `borg` on `PATH`, and which of borg's hooks codex would skip as untrusted (asked of codex itself, `codex app-server`) |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
-| `borg install\|uninstall <claude\|omp\|opencode\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
+| `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
 | `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end) |
