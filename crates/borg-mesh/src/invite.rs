@@ -28,6 +28,8 @@ use crate::identity::{self, Identity};
 use crate::membership::Membership;
 use crate::{from_hex, to_hex};
 
+pub mod join_config;
+
 pub const PREFIX: &str = "BORG1";
 /// The roles a ticket may carry; admins are made by name (`borg mesh invite <key> --role admin`).
 pub const ROLES: [&str; 3] = ["member", "steer", "observe"];
@@ -265,39 +267,6 @@ pub fn load_reach(home: &Path) -> Vec<Hint> {
     v.and_then(|v| v.get("hints")?.as_str().map(str::to_string)).and_then(|h| addr::hints(&h).ok()).unwrap_or_default()
 }
 
-/// What `join` would add to the joiner's collectives config: the collective, `share: team`, a
-/// placeholder path that routes no repo until the joiner replaces it, and the admin's relay
-/// setting unless it is the default. `None` when the config already lists the collective as team;
-/// an error when it lists it as local (the joiner decided it never leaves the machine) or is broken.
-pub fn config_change(config: &Path, name: &str, relay: &Relay) -> Result<Option<borg::install::Change>, String> {
-    let before = match std::fs::read_to_string(config) {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{}: {e}", config.display())),
-    };
-    if let Some(cfg) = borg::collective::load_from(config)? {
-        match cfg.collectives.iter().find(|c| c.name == name).map(|c| c.share) {
-            Some(borg::collective::Share::Team) => return Ok(None),
-            Some(borg::collective::Share::Local) => {
-                return Err(format!("{} lists {name:?} as local (never leaves this machine): change that first if you mean to join", config.display()));
-            }
-            None => {}
-        }
-    }
-    let mut entry = serde_json::json!({ "name": name, "paths": [placeholder(name)], "share": "team" });
-    if *relay != Relay::Default {
-        entry["relay"] = relay.setting().into();
-    }
-    let mut doc: serde_json::Value = match &before {
-        Some(t) => serde_json::from_str(t).map_err(|e| format!("{}: {e}", config.display()))?,
-        None => serde_json::json!({ "default": "off", "collectives": [] }),
-    };
-    let list = doc.as_object_mut().ok_or(format!("{}: not a JSON object", config.display()))?.entry("collectives").or_insert(serde_json::json!([]));
-    list.as_array_mut().ok_or(format!("{}: collectives is not a list", config.display()))?.push(entry);
-    let after = serde_json::to_string_pretty(&doc).unwrap() + "\n";
-    Ok(Some(borg::install::Change { path: config.to_path_buf(), before, after: Some(after), through_links: true }))
-}
-
 /// The path `join` writes for a new collective: routes nothing (it does not exist) until replaced.
 pub fn placeholder(name: &str) -> String {
     format!("~/CHANGE-ME/repos-of-{name}")
@@ -478,37 +447,6 @@ mod tests {
         m.save(&home).unwrap();
         // His own earlier use does not count: he is no longer listed.
         assert!(redeem(&home, &admin, "corp", &inv, &bob, 4000).unwrap_err().contains("revoked"));
-    }
-
-    #[test]
-    fn join_adds_the_collective_with_a_placeholder_and_never_routes_a_repo() {
-        let dir = std::env::temp_dir().join(format!("borg-mesh-invite-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("collectives.json");
-        // No config yet: a new one, default off, the collective with its placeholder path.
-        let c = config_change(&cfg, "corp", &Relay::parse("https://relay.corp.example").unwrap()).unwrap().unwrap();
-        assert!(c.before.is_none());
-        borg::install::apply(&c, "t").unwrap();
-        let loaded = borg::collective::load_from(&cfg).unwrap().unwrap();
-        assert_eq!(loaded.default, "off");
-        assert_eq!(
-            (loaded.collectives[0].paths.clone(), loaded.collectives[0].relay.clone()),
-            (vec![placeholder("corp")], Some("https://relay.corp.example/".into()))
-        );
-        let r = borg::collective::route(Some(&loaded), &dir.join("some/repo").display().to_string(), &dir);
-        assert_eq!(r, borg::collective::Route::Off, "no repo routes to it until the joiner names one");
-        assert!(config_change(&cfg, "corp", &Relay::Default).unwrap().is_none(), "already listed: nothing to change");
-
-        // An existing config keeps its entries; the default relay is not written.
-        std::fs::write(&cfg, r#"{"default": "off", "collectives": [{"name": "mine", "paths": ["~/p"], "share": "local"}]}"#).unwrap();
-        let c = config_change(&cfg, "corp", &Relay::Default).unwrap().unwrap();
-        let after: serde_json::Value = serde_json::from_str(c.after.as_deref().unwrap()).unwrap();
-        assert_eq!(after["collectives"][0]["name"], "mine");
-        assert_eq!(after["collectives"][1], serde_json::json!({"name": "corp", "paths": [placeholder("corp")], "share": "team"}));
-        assert!(config_change(&cfg, "mine", &Relay::Default).unwrap_err().contains("local"));
-        std::fs::write(&cfg, "{broken").unwrap();
-        assert!(config_change(&cfg, "corp", &Relay::Default).is_err());
     }
 
     #[test]

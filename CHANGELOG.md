@@ -4,6 +4,27 @@
 
 First release.
 
+### Setup
+
+- `borg setup`: one guided command from a fresh install to a working borg. It detects the harnesses,
+  the model CLI and git identity; asks for a personal collective, a team or company collective (found
+  one, or join with a `BORG1...` ticket), their repo directories, off paths and the default (`off`
+  recommended); for a founded team, the relay (n0, `disabled` or a company `iroh-relay`) and the mode.
+  It shows one plan (the config diff, the mesh command, the vector fetch, the wiring diffs) and writes
+  nothing until you confirm. Then: the config with a backup, `borg mesh init` or `join`, the vector
+  model and indexes, the wiring, an optional import, `borg doctor`. An existing config is only added
+  to. Mesh and vector failures end as WARNs with their fix, never as an abort. Flags answer the
+  questions (`--yes`, `--no-vectors`, `--harness`, `--private`, `--team`, `--paths`, `--relay`,
+  `--join`, `--home`); without a terminal setup needs `--yes`. A second run changes nothing.
+- The `borg` skill: `borg install` copies `SKILL.md` and its references into each harness's skills
+  directory (Claude Code, omp, opencode, Codex), so the agent itself can explain borg, edit
+  `collectives.json` and run setup, doctor, the mesh and vectors, dry run first. Uninstall removes only
+  files exactly as shipped. `borg status` and `borg doctor` report a missing or stale skill. A test
+  checks that every command and flag the skill names exists.
+- `borg mesh join <ticket> --paths DIR...` writes your repo directories instead of the
+  `~/CHANGE-ME/repos-of-<name>` placeholder; joining again with `--paths` replaces the placeholder.
+- `borg install --apply` prints a one-line hint when the vector model is missing.
+
 ### Learning
 
 - Captures corrections as episodes: correcting prompts, tool calls rejected with a reason, and the next
@@ -48,7 +69,9 @@ First release.
   Code. Without a Claude transcript a live check reads the turn's tool calls and edits. The stop sizes its
   wait and model call to the harness's budget (`BORG_STOP_BUDGET_MS`; omp 28 s: a 7 s wait, then the call
   gets what is left but 3 s, at most 18 s; opencode 90 s).
-- Optional vector recall at the turn end (`--features vectors`, `borg vectors --fetch/--rebuild`).
+- Vector recall at the turn end, on by default (`borg vectors --fetch` once; the index then keeps
+  itself current after learn, assimilate and mesh sync; `borg doctor` warns while the model or an index
+  is missing; `BORG_VECTORS=off` or a `--no-default-features` build for BM25 only).
 - Expert repos per collective: cited claims from a local checkout of a dependency, at the pinned version.
 
 ### Memory

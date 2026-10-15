@@ -85,7 +85,7 @@ pub fn select<'a>(
     }
     let allowed: HashSet<&str> = eligible.iter().map(|c| c.id.as_str()).collect();
     let mut rest: Vec<&Challenge> = eligible.clone();
-    rest.sort_by(|a, b| b.origin_ms.cmp(&a.origin_ms));
+    rest.sort_by_key(|l| std::cmp::Reverse(l.origin_ms));
     let order = shortlist().into_iter().chain(ranked.iter().map(|(_, c)| *c)).chain(rest);
     let mut picked: HashSet<&str> = HashSet::new();
     let mut used = 0;

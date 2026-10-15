@@ -285,7 +285,8 @@ fn sandbox_exec(raw: &[String]) {
     // A caller that kills us on its own timeout (the handbook runner SIGKILLs its claude) must not
     // leave the sandboxed drone running: `timeout` gets SIGKILL when we die, and bwrap
     // (--die-with-parent) takes the sandbox down with it.
-    // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
+    // SAFETY: prctl is async-signal-safe and touches no memory of the parent. Linux only, as bwrap is.
+    #[cfg(target_os = "linux")]
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {

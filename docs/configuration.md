@@ -46,7 +46,8 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`) |
 | `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
 
-An invalid config (bad JSON, two collectives sharing one store, an email under two engineers) routes
+An invalid config (bad JSON, two collectives sharing one store, an email under two engineers, `personal`
+naming a collective that is not `local`) routes
 **everything off**, and `borg doctor` reports it.
 
 ```sh
@@ -111,7 +112,19 @@ testing.
   (3 s, Codex's maximum). Each runs `<path to borg> hook codex <event>`. Codex runs them only after you
   trust them: open codex and run `/hooks`. `borg doctor` reports any of borg's hooks codex does not trust.
 
-The adapters are compiled into the binary, so an installed `borg` needs no checkout.
+- **The `borg` skill,** for every harness above: `SKILL.md` and `references/*.md` in
+  `~/.claude/skills/borg` (or `$CLAUDE_CONFIG_DIR/skills/borg`), `~/.omp/agent/skills/borg`,
+  `~/.config/opencode/skills/borg` and `~/.codex/skills/borg` (or `$CODEX_HOME/skills/borg`). It teaches
+  the agent what borg is, how `collectives.json` works, and when to run `setup`, `doctor`, `mesh` and
+  `vectors`; it tells the agent to show you every dry run before `--apply`. Each file is copied whole.
+  Uninstall removes only files exactly as this borg ships them, then the empty directory; a file you
+  edited stays and is named. A skill directory that is a symlink is yours and left alone. `borg status`
+  and `borg doctor` report a missing or stale skill; `borg install <harness> --apply` updates it there.
+  A replaced skill file is backed up beside it, so after an upgrade that changed the skill, uninstall
+  keeps those backups and their directory.
+
+The adapters and the skill are compiled into the binary, so an installed `borg` needs no checkout.
+After an upgrade, `borg install all --apply` brings both up to date.
 
 ## Import what you already have
 
@@ -154,15 +167,26 @@ Lessons go to the collective the directory routes to, unless you pass `--collect
 Vectors find lessons that share no rare word with the work: paraphrases, German work against English
 lessons, renamed identifiers. Only the turn-end check uses them.
 
+They are **on by default**: built into the default binary and used unless `BORG_VECTORS=off`. They need
+the model once; `borg setup` fetches it and indexes every store with lessons (`--no-vectors` skips
+that). By hand:
+
 ```sh
 borg vectors --fetch      # downloads the model once (~490 MB, pinned revision, sha256 checked)
-borg vectors --rebuild    # indexes the store the current directory routes to
+borg vectors --rebuild    # indexes the store the current directory routes to (--store FILE: any store)
 borg vectors              # model and index status
 ```
 
-The model is Model2Vec potion-multilingual-128M. The index updates itself after `borg learn` and
-`borg assimilate --apply`. No hook downloads the model; without model or index, Borg matches words
-only.
+The model is Model2Vec potion-multilingual-128M. The index updates itself after `borg learn`,
+`borg assimilate --apply` and a mesh sync that brought new lessons; the first of these builds a missing
+index. `--rebuild` is needed only for a store that already had lessons when the model arrived, or whose
+index another model built. `borg doctor` warns while the model or an index is missing and names the
+command. No hook downloads the model; without model or index, Borg matches words only.
+
+**Behind a proxy or offline.** `--fetch` downloads with `curl`, which honours `HTTPS_PROXY` and
+`CURL_CA_BUNDLE`. `BORG_VECTOR_URL` points it at a mirror that serves the same three files
+(`config.json`, `tokenizer.json`, `model.safetensors`), `file://` included; each must match its pinned
+sha256. A lean build (`--no-default-features`) has no vectors.
 
 ## Environment variables
 

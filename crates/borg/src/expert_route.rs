@@ -376,7 +376,7 @@ fn drone_result(out: &[u8]) -> DroneRun {
     if subtype == "success" && v["is_error"].as_bool() != Some(true) {
         let answer = v["result"].as_str().unwrap_or_default().to_string();
         let status = if says_nothing(&answer) { "nothing" } else { "ok" };
-        return DroneRun { answer: Some(answer).filter(|_| status == "ok"), cost_usd, status: status.into() };
+        return DroneRun { answer: (status == "ok").then_some(answer), cost_usd, status: status.into() };
     }
     DroneRun { answer: None, cost_usd, status: format!("error:{subtype}") }
 }

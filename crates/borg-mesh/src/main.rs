@@ -6,8 +6,10 @@
 //!                                             (admin: print a ticket and its QR code; invite.rs)
 //!        borg-mesh invite <key> [--role R]    (admin: add or change a member by key, re-sign)
 //!        borg-mesh invites [--revoke ID]      (admin: the tickets still usable; withdraw one)
-//!        borg-mesh join <ticket> [--apply]    (new member: add the collective to collectives.json
-//!                                              (dry-run diff first), then dial the admin, join, sync)
+//!        borg-mesh join <ticket> [--paths DIR...] [--apply]
+//!                                             (new member: add the collective to collectives.json with the
+//!                                              repo dirs DIR, a placeholder without them (dry-run diff
+//!                                              first), then dial the admin, join, sync)
 //!        borg-mesh join <file>                (install the membership.json, or membership-history.jsonl,
 //!                                              the admin handed over)
 //!        borg-mesh revoke <key>               (admin: remove a member; spreads with the next sync)
@@ -36,7 +38,7 @@ use borg::collective::Route;
 use borg_mesh::addr::Relay;
 use borg_mesh::daemon::{self, Event, Options};
 use borg_mesh::identity::Identity;
-use borg_mesh::invite::{self, Ticket};
+use borg_mesh::invite::{self, Ticket, join_config};
 use borg_mesh::membership::{self, Membership};
 use borg_mesh::sync::{Node, Place, Report};
 use borg_mesh::{origin, peers};
@@ -104,29 +106,17 @@ fn invite_ticket(place: &Place, args: &[String]) -> Result<(), String> {
 }
 
 /// `join <ticket>`: the collective goes into collectives.json first (dry run unless `--apply`),
-/// with a placeholder path, so no repo is routed into it without the joiner choosing one.
-async fn join_ticket(place: &Place, text: &str, apply: bool) -> Result<(), String> {
+/// with the joiner's `paths` or else a placeholder path, so no repo is routed into it without the
+/// joiner choosing one.
+async fn join_ticket(place: &Place, text: &str, apply: bool, paths: &[String]) -> Result<(), String> {
     let t = Ticket::decode(text)?;
     let name = t.invite.collective.clone();
     if t.invite.expires_ms <= borg::learn::now_ms() {
         return Err(format!("this ticket expired at {}: ask the admin for a new one", borg::install::utc(t.invite.expires_ms)));
     }
     println!("ticket: join {name:?} as {} (admin {}, expires {})", t.invite.role, short(&t.invite.admin), borg::install::utc(t.invite.expires_ms));
-    if let Some(change) = invite::config_change(&place.config, &name, &t.relay)? {
-        print!("{}", borg::install::diff(&change.path, change.before.as_deref(), change.after.as_deref()));
-        if change.before.is_none() {
-            println!("note: there is no collectives config yet. Without one every repo belongs to the implicit `default`");
-            println!("      team collective; with this file, repos it does not list belong to no collective (off).");
-        }
-        if !apply {
-            println!("(dry run: nothing written, nobody dialled; add --apply to write the config, with a backup, and join)");
-            return Ok(());
-        }
-        let stamp = format!("{}Z", borg::install::utc(borg::learn::now_ms()));
-        if let Some(b) = borg::install::apply(&change, &stamp).map_err(|e| format!("{}: {e}", change.path.display()))? {
-            println!("backup: {}", b.display());
-        }
-        println!("wrote {}", change.path.display());
+    if !join_config::write(&place.config, &name, &t.relay, paths, apply)? {
+        return Ok(());
     }
     let jp = place.named(&name);
     let node = Node::joining(&jp, "0.0.0.0:0".parse().unwrap()).await?.quiet();
@@ -136,8 +126,14 @@ async fn join_ticket(place: &Place, text: &str, apply: bool) -> Result<(), Strin
     let (m, rep) = result.map_err(|_| "the admin's node did not answer within 60 s: is `borg mesh serve` running there?".to_string())??;
     let me = node.public();
     println!("joined {name} v{} as {}; first sync: {}", m.version, m.role_of(&me).unwrap_or("?"), show(&rep));
-    println!("next: replace {} in {} with the repos that belong to {name},", invite::placeholder(&name), place.config.display());
-    println!("      then keep `borg mesh serve --collective {name}` running (or `borg mesh serve` inside one of those repos)");
+    if paths.is_empty() {
+        println!(
+            "next: replace {} in {} with the repos that belong to {name} (or join again with --paths DIR...),",
+            invite::placeholder(&name),
+            place.config.display()
+        );
+    }
+    println!("next: keep `borg mesh serve --collective {name}` running (or `borg mesh serve` inside one of those repos)");
     Ok(())
 }
 
@@ -178,7 +174,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
         }
         Some("join") if positional(args).is_some_and(|a| a.trim().to_ascii_uppercase().starts_with(invite::PREFIX)) => {
-            join_ticket(&place, positional(args).unwrap(), args.iter().any(|a| a == "--apply")).await?
+            join_ticket(&place, positional(args).unwrap(), args.iter().any(|a| a == "--apply"), &join_config::paths(args)).await?
         }
         Some("invite") => {
             let key = args.get(1).ok_or("invite <key>")?;
@@ -378,7 +374,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Join and run",
         &[
-            ("join TICKET [--apply]", "join with a ticket (a dry run without --apply)"),
+            ("join TICKET [--paths DIR...] [--apply]", "join with a ticket; DIR: your repos for it (a dry run without --apply)"),
             ("join FILE", "join with a membership history file (the manual flow)"),
             ("serve [--bind IP:PORT] [--interval SECS]", "keep syncing; leave it running"),
             ("sync KEY[@HINTS]", "sync once with one member"),

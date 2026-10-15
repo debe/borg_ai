@@ -6,15 +6,16 @@
 
 | Command | Shows or does |
 |---|---|
-| `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks) and what is wired |
-| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode, or a pinned `codex:<model>`), `borg` on `PATH`, and which of borg's hooks codex would skip as untrusted (asked of codex itself, `codex app-server`) |
+| `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks), what is wired and whether the `borg` skill is current |
+| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode, or a pinned `codex:<model>`), `borg` on `PATH`, a missing or stale `borg` skill, the vector model and each store's index, and which of borg's hooks codex would skip as untrusted (asked of codex itself, `codex app-server`) |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
-| `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks; a dry run without `--apply` |
+| `borg setup [--yes] [--no-vectors] [--harness LIST] [--private DIR...] [--team NAME --paths DIR... [--relay URL\|disabled] \| --join TICKET [--paths DIR...]] [--home DIR]` | Guided setup: collectives (personal, team or company, off paths), the team's mesh, the vector model, wiring, an optional import, then `borg doctor`. Shows one plan and writes nothing until you confirm; `--yes` takes every default without asking. Flags answer their question. An existing `collectives.json` is only added to. A second run changes nothing ([Quick start](../README.md#quick-start)) |
+| `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks or adapter and the `borg` skill; a dry run without `--apply` ([details](configuration.md#what-borg-install-writes)) |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
 | `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end) |
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness, weight, and long-term or dormant state |
-| `borg vectors [--fetch\|--rebuild]` | Vector model and index ([details](configuration.md#vectors)) |
+| `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
 | `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1 ([details](statistics.md)) |
 | `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
@@ -23,7 +24,7 @@
 | `borg notes attach [<commit>]` | Write the redacted reasoning note for a session's commits (normally at session end) |
 | `borg notes fetch [<commit>...]` | Get reasoning notes from team members over the mesh |
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked |
-| `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
+| `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join` (`--paths DIR...` names your repos), `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
 
 **Shell completion:** `borg completions <bash|zsh|fish>` prints a completion script.
 

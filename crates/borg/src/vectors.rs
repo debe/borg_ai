@@ -11,13 +11,15 @@
 //!   already in it, under the same scope rule and done set (`extend`). The model decides relevance;
 //!   vectors only add recall. R3b's widening stays BM25-based.
 //! - **Index:** an embedded SeekStorm vector index per store (`<store>/vectors/`), one vector per lesson
-//!   (question + situations + consequence), updated after `borg learn` / `borg assimilate --apply` and by
-//!   `borg vectors --rebuild`. A lesson without a vector is simply BM25-only.
+//!   (question + situations + consequence), updated after `borg learn` / `borg assimilate --apply`, after a
+//!   mesh sync brings new lessons, and by `borg vectors --rebuild`; a missing index is built by the first
+//!   update. A lesson without a vector is simply BM25-only.
 //! - **Model:** Model2Vec potion-multilingual-128M from a local directory (`BORG_VECTOR_MODEL`), fetched
 //!   once by `borg vectors --fetch`; never downloaded inside a hook. The embedding matrix is mapped, not
 //!   read: a query touches only the rows of its own tokens.
-//! - **Fail open:** no model, no index, a locked index or any error = BM25 only. `BORG_VECTORS=off`
-//!   disables it; a build without the `vectors` feature never has it.
+//! - **Fail open:** no model, no index, a locked index or any error = BM25 only. On by default:
+//!   `borg doctor` warns about a missing model or index (doctor.rs); `BORG_VECTORS=off` disables it; a lean
+//!   build (`--no-default-features`) never has it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -25,49 +27,22 @@ use std::path::{Path, PathBuf};
 use crate::conscience::{self, Challenge, Names};
 use crate::trust;
 
+pub mod doctor;
+pub mod model;
 #[cfg(feature = "vectors")]
 mod unigram;
 
+pub use model::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, enabled, index_dir, model_dir, model_present};
+
 /// Vector hits added to the shortlist at most (`BORG_VECTOR_K`).
 pub const DEFAULT_K: usize = 10;
-/// The Hugging Face repository of the default model and the revision `--fetch` pins.
-pub const MODEL_REPO: &str = "minishlab/potion-multilingual-128M";
-pub const MODEL_REVISION: &str = "73908c3438cf03b6a01bcb9611d62b23d0726f08";
-/// The files `--fetch` downloads, with their sha256 at `MODEL_REVISION`.
-pub const MODEL_FILES: [(&str, &str); 3] = [
-    ("config.json", "595e4cab2093732efd5dbe084fd5c1826b5eea693b73b4c1fd971672867d2e54"),
-    ("tokenizer.json", "19f1909063da3cfe3bd83a782381f040dccea475f4816de11116444a73e1b6a1"),
-    ("model.safetensors", "14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397"),
-];
 
 /// BM25 lessons the Stop's consequence model sees before vector additions.
 pub const SHORTLIST: usize = 30;
 
-/// Off only with `BORG_VECTORS=off` (or a build without the `vectors` feature).
-pub fn enabled() -> bool {
-    cfg!(feature = "vectors") && std::env::var("BORG_VECTORS").as_deref() != Ok("off")
-}
-
 /// How many vector hits the Stop step adds at most (`BORG_VECTOR_K`, default `DEFAULT_K`).
 pub fn k() -> usize {
     std::env::var("BORG_VECTOR_K").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_K)
-}
-
-/// The model directory: `BORG_VECTOR_MODEL`, default `~/.local/share/borg/models/potion-multilingual-128M`.
-pub fn model_dir() -> PathBuf {
-    std::env::var_os("BORG_VECTOR_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/borg/models/potion-multilingual-128M"))
-}
-
-/// Whether the model's files are there (no load).
-pub fn model_present(dir: &Path) -> bool {
-    MODEL_FILES.iter().all(|(f, _)| dir.join(f).is_file())
-}
-
-/// The vector index of a lessons file: `vectors/` beside it.
-pub fn index_dir(lessons: &Path) -> PathBuf {
-    lessons.with_file_name("vectors")
 }
 
 /// The text a lesson is embedded from: question, situations, consequence.
@@ -149,8 +124,9 @@ pub fn recall(lessons: &Path, text: &str, n: usize) -> Vec<String> {
 }
 
 /// Bring the index of `lessons` up to date after lessons were written (`borg learn`, `borg assimilate
-/// --apply`). Quiet and fail-open: without the model or with vectors off it does nothing; an error is one
-/// line on stderr. Returns the number of lessons embedded.
+/// --apply`, a mesh sync), building it if it is missing (the first lesson after `--fetch` needs no
+/// `--rebuild`). Quiet and fail-open: without the model or with vectors off it does nothing; an error is
+/// one line on stderr. Returns the number of lessons embedded.
 pub fn refresh(lessons: &Path) -> usize {
     #[cfg(feature = "vectors")]
     {
@@ -198,7 +174,7 @@ pub fn main(args: &[&str]) -> i32 {
     #[cfg(not(feature = "vectors"))]
     {
         let _ = store;
-        eprintln!("borg vectors: this borg was built without the `vectors` feature (cargo install --path crates/borg --features vectors)");
+        eprintln!("borg vectors: this borg is a lean build (--no-default-features); reinstall without that flag: cargo install --path crates/borg --locked");
         1
     }
     #[cfg(feature = "vectors")]
@@ -282,11 +258,10 @@ pub mod engine {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
+    pub use super::model::MANIFEST;
+    use super::model::identity;
     use super::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, lesson_text};
     use crate::conscience;
-
-    /// Beside the SeekStorm files: which model the vectors come from and which lesson versions they hold.
-    pub const MANIFEST: &str = "borg-vectors.json";
 
     #[derive(Serialize, Deserialize, Default)]
     struct Manifest {
@@ -425,14 +400,6 @@ pub mod engine {
             F16 => Some(2),
             I8 => Some(1),
             _ => None,
-        }
-    }
-
-    /// The model's identity in the manifest: its pinned revision (REVISION file) or the matrix's size.
-    fn identity(model: &Path) -> String {
-        match std::fs::read_to_string(model.join("REVISION")) {
-            Ok(r) if !r.trim().is_empty() => r.trim().to_string(),
-            _ => format!("size:{}", std::fs::metadata(model.join("model.safetensors")).map_or(0, |m| m.len())),
         }
     }
 
@@ -584,7 +551,7 @@ pub mod engine {
         let _lock = lock(&index, true, true).ok_or("cannot lock the index")?;
         let current: Vec<conscience::Challenge> = conscience::load_unweighted(lessons, None);
         let wanted: BTreeMap<String, String> = current.iter().map(|c| (c.id.clone(), hash(&lesson_text(c)))).collect();
-        let old = read_manifest(&index).filter(|m| !rebuild && m.model == identity(model) && index.join("index.json").is_file());
+        let old = read_manifest(&index).filter(|_| !rebuild && super::model::built_with(lessons, model) == Some(true));
         let (fresh, mut manifest) = match old {
             Some(m) if m.lessons.iter().all(|(id, h)| wanted.get(id) == Some(h)) => (false, m),
             _ => (true, Manifest { model: identity(model), ..Default::default() }),
@@ -662,7 +629,7 @@ pub mod engine {
         let m = read_manifest(&index).ok_or(format!("none at {} (`borg vectors --rebuild`)", index.display()))?;
         let current = conscience::load_unweighted(lessons, None);
         let stale = current.iter().filter(|c| m.lessons.get(&c.id) != Some(&hash(&lesson_text(c)))).count();
-        let other = if m.model == identity(model) { "" } else { " (built with another model: `borg vectors --rebuild`)" };
+        let other = if super::model::built_with(lessons, model) == Some(false) { " (built with another model: `borg vectors --rebuild`)" } else { "" };
         Ok(format!("index: {} lessons with vectors, {stale} of {} without a current one{other} ({})", m.lessons.len(), current.len(), index.display()))
     }
 
@@ -825,6 +792,37 @@ mod tests {
         std::fs::write(path, lines.join("\n") + "\n").unwrap();
     }
 
+    /// `borg doctor`'s lines for a given model directory (no environment read).
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn doctor_warns_about_a_missing_model_or_index_with_its_fix() {
+        use crate::collective::{Route, Share};
+        use crate::harness::Level;
+        let levels = |v: &[(Level, String)]| v.iter().map(|(l, _)| *l).collect::<Vec<_>>();
+        let root = std::env::temp_dir().join(format!("borg-vectors-doctor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (model, team) = (root.join("model"), root.join("team"));
+        let route = |name: &str, home: PathBuf| Route::Collective { name: name.into(), home, share: Share::Local };
+        let routes = vec![route("team", team.clone()), route("empty", root.join("empty")), Route::Off];
+        let none = doctor::against(&routes, &root.join("no-model"));
+        assert_eq!(levels(&none), [Level::Warn]);
+        assert!(none[0].1.contains("borg vectors --fetch"), "{none:?}");
+
+        fake_model(&model);
+        std::fs::create_dir_all(&team).unwrap();
+        let lessons = team.join("lessons.jsonl");
+        write_lessons(&lessons, &[("dl", "deadlock")]);
+        let missing = doctor::against(&routes, &model);
+        assert_eq!(levels(&missing), [Level::Ok, Level::Warn], "only a store with lessons needs an index: {missing:?}");
+        assert!(missing[1].1.contains(&format!("borg vectors --rebuild --store {}", lessons.display())), "{missing:?}");
+        engine::update(&lessons, &model, false).unwrap();
+        assert_eq!(levels(&doctor::against(&routes, &model)), [Level::Ok]);
+        std::fs::write(model.join("REVISION"), "another").unwrap();
+        let other = doctor::against(&routes, &model);
+        assert!(levels(&other) == [Level::Ok, Level::Warn] && other[1].1.contains("another model"), "{other:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// One test for everything that reads the environment (BORG_VECTOR_MODEL, BORG_VECTORS), so no two
     /// tests race on it.
     #[cfg(feature = "vectors")]
@@ -842,7 +840,8 @@ mod tests {
             std::env::set_var("BORG_VECTOR_MODEL", &model);
             std::env::remove_var("BORG_VECTORS");
         }
-        assert_eq!(refresh(&lessons), 3);
+        assert_eq!(doctor::hint(), None, "the model is there");
+        assert_eq!(refresh(&lessons), 3, "no index yet: the first refresh builds it");
         assert_eq!(refresh(&lessons), 0, "nothing new, nothing embedded");
         // German work, English lessons: BM25 finds nothing, the vectors find the deadlock lesson.
         let pool = conscience::load(&lessons, None);
@@ -864,6 +863,11 @@ mod tests {
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
         let (list, added) = shortlist(&lessons, &pool, "verklemmung", "", 20);
         assert_eq!((list.len(), added), (0, 0));
+        let off = doctor::checks(&[]);
+        assert!(off.len() == 1 && off[0].0 == crate::harness::Level::Ok && off[0].1.contains("off"), "{off:?}");
+        unsafe { std::env::set_var("BORG_VECTOR_MODEL", root.join("no-model")) };
+        assert_eq!(doctor::hint(), None, "off by choice: no hint");
+        unsafe { std::env::set_var("BORG_VECTOR_MODEL", &model) };
         unsafe { std::env::remove_var("BORG_VECTORS") };
         // Fail open: another model's index, a missing model, a missing index.
         std::fs::write(model.join("REVISION"), "another").unwrap();
@@ -873,9 +877,17 @@ mod tests {
         unsafe { std::env::set_var("BORG_VECTOR_MODEL", root.join("no-model")) };
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
         assert_eq!(refresh(&lessons), 0);
+        assert!(doctor::hint().is_some_and(|h| h.contains("borg vectors --fetch")));
+        assert_eq!(doctor::checks(&[])[0].0, crate::harness::Level::Warn);
         unsafe { std::env::set_var("BORG_VECTOR_MODEL", &model) };
         std::fs::remove_dir_all(index_dir(&lessons)).unwrap();
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
+        // As after a mesh sync (borg-mesh sync.rs `reindex`): from a blocking thread of a running runtime.
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let path = lessons.clone();
+        let n = rt.block_on(async { tokio::task::spawn_blocking(move || refresh(&path)).await.unwrap() });
+        assert_eq!(n, 4, "a lost index is rebuilt by the next refresh");
+        assert_eq!(recall(&lessons, "verklemmung", 1), ["ca"]);
         unsafe { std::env::remove_var("BORG_VECTOR_MODEL") };
         let _ = std::fs::remove_dir_all(&root);
     }

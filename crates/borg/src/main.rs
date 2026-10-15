@@ -9,6 +9,7 @@
 //!                                                     (internal: live mode's check of the work so far, spawned by
 //!                                                      the PostToolUse hook; live.rs)
 //!        borg collective [DIR]                       (which collective DIR belongs to; see collective.rs)
+//!        borg setup [--yes] [--no-vectors] [...]      (guided first setup, nothing written unconfirmed; install/setup.rs)
 //!        borg install|uninstall <claude|omp|opencode|codex|all> [--apply] [--home DIR]
 //!                                                     (wire borg into a harness's user config; dry run by default; install.rs)
 //!        borg status | borg doctor [--home DIR]       (each collective's store; what is wired; what is broken)
@@ -148,10 +149,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Setup",
         &[
+            ("setup [--yes] [--no-vectors]", "guided setup: collectives, team, vectors, wiring"),
             ("install <HARNESS|all> [--apply]", "wire the hooks (a dry run without --apply)"),
             ("uninstall <HARNESS|all> [--apply]", "unwire them"),
             ("collective [DIR]", "which collective a directory belongs to"),
-            ("vectors [--fetch|--rebuild|--query]", "the vector model and index"),
+            ("vectors [--fetch|--rebuild|--query] [--store LESSONS]", "the vector model and index"),
             ("completions <bash|zsh|fish>", "a shell completion script"),
         ],
     ),
@@ -208,6 +210,15 @@ fn help(color: bool) -> String {
     out
 }
 
+/// Runs `borg-<part>` (beside this borg, else on PATH) in place of this process.
+fn exec(part: &str, args: &[&str]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let bin = format!("borg-{part}");
+    let err = std::process::Command::new(borg::install::sibling(part).unwrap_or_else(|| bin.clone().into())).args(args).exec();
+    eprintln!("borg {part}: cannot run {bin} ({err}); cargo install --path crates/{bin}");
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -220,11 +231,10 @@ fn main() {
             let cwd = std::path::absolute(&dir).unwrap_or(dir).display().to_string();
             match collective::load() {
                 Err(e) => println!("off (invalid config: {e})"),
-                Ok(cfg) => match collective::route(cfg.as_ref(), &cwd, &learn::home()) {
+                Ok(cfg) => match &collective::route(cfg.as_ref(), &cwd, &learn::home()) {
                     collective::Route::Off => println!("off: {cwd} belongs to no collective; hooks do nothing here"),
-                    r @ collective::Route::Collective { .. } => {
-                        let collective::Route::Collective { name, home, share } = &r else { unreachable!() };
-                        println!("{name} ({share:?}, may sync: {}) store {}", collective::may_sync(&r), home.display());
+                    r @ collective::Route::Collective { name, home, share } => {
+                        println!("{name} ({share:?}, may sync: {}) store {}", collective::may_sync(r), home.display());
                     }
                 },
             }
@@ -232,21 +242,11 @@ fn main() {
         [cmd @ ("mesh" | "steer"), rest @ ..] => {
             // The mesh is its own binary (crates/borg-mesh): the networking stack stays out of the hook.
             // So is steering: it signs with the member key and checks the membership (steer.rs).
-            use std::os::unix::process::CommandExt;
-            let beside = std::env::current_exe().ok().map(|e| e.with_file_name("borg-mesh")).filter(|p| p.exists());
             let args: Vec<&str> = if *cmd == "steer" { std::iter::once("steer").chain(rest.iter().copied()).collect() } else { rest.to_vec() };
-            let err = std::process::Command::new(beside.unwrap_or_else(|| "borg-mesh".into())).args(args).exec();
-            eprintln!("borg mesh: cannot run borg-mesh ({err}); cargo install --path crates/borg-mesh");
-            std::process::exit(1);
+            exec("mesh", &args)
         }
-        ["web", rest @ ..] => {
-            // The live page (crates/borg-web): its web stack stays out of the hook binary too.
-            use std::os::unix::process::CommandExt;
-            let beside = std::env::current_exe().ok().map(|e| e.with_file_name("borg-web")).filter(|p| p.exists());
-            let err = std::process::Command::new(beside.unwrap_or_else(|| "borg-web".into())).args(rest).exec();
-            eprintln!("borg web: cannot run borg-web ({err}); cargo install --path crates/borg-web");
-            std::process::exit(1);
-        }
+        // The live page (crates/borg-web): its web stack stays out of the hook binary too.
+        ["web", rest @ ..] => exec("web", rest),
         ["learn", rest @ ..] => {
             borg::stats::set_purpose("learn");
             let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
@@ -275,6 +275,7 @@ fn main() {
             borg::hook::live_check(harness::current(), session, &input);
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
+        ["setup", rest @ ..] => std::process::exit(borg::install::setup::main(rest)),
         ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),
         ["reach", rest @ ..] => {
             borg::stats::set_purpose("reach");

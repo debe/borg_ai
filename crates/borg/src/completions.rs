@@ -12,6 +12,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("status", &[], &[], false),
     ("doctor", &[], &[], false),
     ("collective", &[], &[], true),
+    ("setup", &[], crate::install::setup::FLAGS, false),
     ("install", &[HARNESSES, "all"], &["--apply", "--home"], false),
     ("uninstall", &[HARNESSES, "all"], &["--apply", "--home"], false),
     ("learn", &[], &["--session"], false),
@@ -47,10 +48,10 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     (
         "mesh",
         &["id", "init", "invite", "invites", "join", "revoke", "members", "peer", "serve", "sync", "fetch"],
-        &["--collective", "--apply", "--role", "--expires", "--uses", "--png", "--revoke"],
+        &["--collective", "--apply", "--paths", "--role", "--expires", "--uses", "--png", "--revoke"],
         false,
     ),
-    ("vectors", &[], &["--fetch", "--rebuild", "--query"], false),
+    ("vectors", &[], &["--fetch", "--rebuild", "--query", "--store"], false),
     ("memory", &[], &["--session"], true),
     ("facets", &[], &["--apply", "--store", "--jobs"], false),
     ("expert", &[], &["--at", "--version", "--q"], true),
@@ -81,17 +82,17 @@ fn subs_of(subs: &[&'static str]) -> Vec<&'static str> {
     subs.iter().flat_map(|s| if *s == HARNESSES { crate::harness::visible().map(|h| h.name()).collect() } else { vec![*s] }).collect()
 }
 
+/// The shell's `case` lines: `line(command, its subcommands and flags, takes a path)` for each command.
+fn cases(line: impl Fn(&str, &str, bool) -> String) -> String {
+    COMMANDS.iter().map(|(cmd, subs, flags, path)| line(cmd, &[subs_of(subs).as_slice(), flags].concat().join(" "), *path)).collect()
+}
+
 fn names() -> String {
     COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>().join(" ")
 }
 
 pub fn bash() -> String {
-    let mut cases = String::new();
-    for (cmd, subs, flags, path) in COMMANDS {
-        let words = subs_of(subs).iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
-        let files = if *path { " -f" } else { "" };
-        cases.push_str(&format!("        {cmd}) words=\"{words}\"; files=\"{files}\" ;;\n"));
-    }
+    let cases = cases(|cmd, words, path| format!("        {cmd}) words=\"{words}\"; files=\"{}\" ;;\n", if path { " -f" } else { "" }));
     format!(
         r#"# bash completion for borg (borg completions bash)
 _borg() {{
@@ -114,12 +115,7 @@ complete -o default -F _borg borg
 }
 
 pub fn zsh() -> String {
-    let mut cases = String::new();
-    for (cmd, subs, flags, path) in COMMANDS {
-        let words = subs_of(subs).iter().chain(flags.iter()).copied().collect::<Vec<_>>().join(" ");
-        let files = if *path { "; _files" } else { "" };
-        cases.push_str(&format!("        {cmd}) compadd -- {words}{files} ;;\n"));
-    }
+    let cases = cases(|cmd, words, path| format!("        {cmd}) compadd -- {words}{} ;;\n", if path { "; _files" } else { "" }));
     format!(
         r#"#compdef borg
 # zsh completion for borg (borg completions zsh)
@@ -138,8 +134,8 @@ _borg "$@"
 }
 
 pub fn fish() -> String {
-    let mut out = String::from("# fish completion for borg (borg completions fish)\ncomplete -c borg -f\n");
-    out.push_str(&format!("complete -c borg -n __fish_use_subcommand -a '{}'\n", names()));
+    let mut out =
+        format!("# fish completion for borg (borg completions fish)\ncomplete -c borg -f\ncomplete -c borg -n __fish_use_subcommand -a '{}'\n", names());
     for (cmd, subs, flags, path) in COMMANDS {
         let when = format!("__fish_seen_subcommand_from {cmd}");
         if !subs.is_empty() {

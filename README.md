@@ -192,10 +192,49 @@ cargo install --path crates/borg-mesh --locked   # only for team sync, borg top 
 cargo install --path crates/borg-web --locked    # only for borg web, the live page
 ```
 
-Both land in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it there.
+They land in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it there.
 `--no-default-features` builds a lean binary without vectors.
 
-**2. Configure collectives.** Do this before you wire the hooks. Without a config, every repo joins one
+**2. Set up.**
+
+```sh
+borg setup
+```
+
+`borg setup` asks a few questions, shows everything it will change, and writes nothing until you
+confirm:
+
+- **Harnesses:** which agents to wire; the default is every one whose CLI is on `PATH`.
+- **Collectives:** a personal collective (`"share": "local"`), a team or company collective (found one
+  and become its admin, or join one with a `BORG1...` ticket), or both. Then the repo directories of
+  each, the repos no collective may ever see, and where every other repo goes (`off` is recommended).
+  An existing `collectives.json` is only ever added to, with a backup.
+- **Team:** for a team you found, the relay (n0's public relays, `disabled` for LAN or VPN only, or
+  your company's `iroh-relay`) and the [delivery mode](#delivery-modes). Then it runs `borg mesh init`,
+  or `borg mesh join` with your ticket.
+- **Vectors:** fetches the model (~490 MB, once) and indexes every store with lessons. A failed
+  download asks for a mirror (`BORG_VECTOR_URL`) and never stops setup.
+- **Wiring:** the hooks or adapter of each harness, and the `borg` skill, which teaches the agent itself
+  to explain borg, edit `collectives.json` and run these commands for you.
+- **Import:** optionally learns the 50 newest corrections from your past sessions (model calls).
+
+It ends with `borg doctor`. A second run changes nothing. Flags answer the questions for scripts:
+
+```sh
+borg setup --yes --private ~/src                              # no questions; defaults for the rest
+borg setup --team platform --paths ~/work --relay disabled    # found a team collective
+borg setup --join BORG1... --paths ~/work                     # join one with a ticket
+borg setup --no-vectors --harness claude,codex
+```
+
+For a team, continue with [Team sync](docs/team-sync.md); for a company,
+[Company collective](docs/team-sync.md#company-collective).
+
+### Manual setup
+
+The same steps by hand.
+
+**Configure collectives.** Do this before you wire the hooks. Without a config, every repo joins one
 team collective named `default`, which a mesh would share. A minimal
 `~/.config/borg/collectives.json`:
 
@@ -212,21 +251,27 @@ team collective named `default`, which a mesh would share. A minimal
 Check the routing with `borg collective ~/work/some-repo`. Rules, the `off` list and engineer aliases are
 in [Configuration](docs/configuration.md#collectives).
 
-**3. Wire the hooks.** Every step is a dry run until `--apply`, and each changed file gets a backup.
+**Wire the hooks.** Every step is a dry run until `--apply`, and each changed file gets a backup.
 
 ```sh
 borg install all              # dry run: prints the diff for claude, omp, opencode and codex
 borg install all --apply
-borg doctor                   # checks wiring, config, the model CLI and the stores
+borg doctor                   # checks wiring, the skill, config, the model CLI, the stores and vectors
 ```
 
-**4. Import what you have (optional).**
+**Vectors.** On by default, once the model is there:
+
+```sh
+borg vectors --fetch          # ~490 MB, once; then each store indexes itself as lessons arrive
+borg vectors --rebuild        # only for a store that already has lessons
+```
+
+**Import what you have (optional).**
 
 ```sh
 borg assimilate --apply --limit 50                                  # corrections from past sessions
 borg assimilate --from-dir ~/work/handbook --plan /tmp/plan.json    # team documents: writes a plan (model calls)
 borg assimilate --from-dir ~/work/handbook --apply --plan /tmp/plan.json
-borg vectors --fetch && borg vectors --rebuild                      # ~490 MB model, better recall on paraphrases and German
 ```
 
 Details: [Import](docs/configuration.md#import-what-you-already-have),
@@ -239,7 +284,7 @@ Borg runs on its own. These commands show what it does:
 | Command | Shows or does |
 |---|---|
 | `borg status` | Each collective's mode, lessons, episodes and outcomes, and what is wired |
-| `borg doctor` | What is broken: config, hooks, adapters, the model CLI (claude, omp or opencode) |
+| `borg doctor` | What is broken: config, hooks, adapters, the skill, the model CLI (claude, omp or opencode), vectors |
 | `borg collective [DIR]` | Which collective a directory belongs to |
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
 | `borg top` · `borg steer` | Running drones across the team; send them a signed instruction |
@@ -339,7 +384,7 @@ author's sessions, so their data is not in this repository.
 git pull
 cargo install --path crates/borg --locked --force
 cargo install --path crates/borg-mesh --locked --force   # if installed
-borg install all              # dry run: shows adapter changes for omp and opencode, hook changes for codex
+borg install all              # dry run: shows adapter, hook and skill changes
 borg install all --apply      # only if the dry run shows a diff
 borg doctor
 ```
@@ -354,7 +399,7 @@ borg uninstall all --apply    # removes only what install added; keeps a backup
 cargo uninstall borg borg-mesh
 ```
 
-Uninstall leaves an edited adapter copy in place and reports it. Your data stays too: delete
+Uninstall leaves an edited adapter or skill file in place and reports it. Your data stays too: delete
 `~/.local/share/borg` and `~/.config/borg` to remove it, and `git update-ref -d refs/notes/borg` in each
 repo for the reasoning notes.
 

@@ -187,7 +187,7 @@ fn record(session: &str, input: &Value, task: String, agent: String, rejected_to
     let ms = learn::now_ms();
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
     let e = learn::Episode {
-        id: format!("{}-{ms}", &session.chars().take(8).collect::<String>()),
+        id: format!("{}-{ms}", session.chars().take(8).collect::<String>()),
         ms,
         repo: repo_of(cwd),
         session: session.into(),

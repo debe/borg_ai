@@ -57,6 +57,8 @@ use crate::recon::{self, Recon};
 use crate::{from_hex, peers, to_hex};
 use crate::{live, steer};
 
+mod vectors;
+
 pub const ALPN: &[u8] = b"borg/mesh/5";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
@@ -432,7 +434,7 @@ impl Node {
         }
         .await;
         conn.close(0u32.into(), if result.is_ok() { b"done" } else { b"error" });
-        result
+        vectors::reindexed(&self.home, result).await
     }
 
     /// Joins with an invite ticket (invite.rs): dials the admin that issued it, presents the signed
@@ -521,14 +523,7 @@ impl Node {
             _ => None,
         };
         let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
-        if conn.alpn() == JOIN_ALPN {
-            let result = self.admit(&conn, observed).await;
-            if let Err(e) = &result {
-                conn.close(1u32.into(), e.as_bytes());
-            }
-            return result;
-        }
-        let result = async {
+        let session = async {
             let (name, home) = self.gate()?;
             let (name, home) = (name.as_str(), home.as_path());
             let membership = members(home)?;
@@ -546,12 +541,12 @@ impl Node {
             let _ = tx.finish();
             conn.closed().await; // the dialler closes once it has read everything
             Ok(report)
-        }
-        .await;
+        };
+        let result = if conn.alpn() == JOIN_ALPN { self.admit(&conn, observed).await } else { session.await };
         if let Err(e) = &result {
             conn.close(1u32.into(), e.as_bytes());
         }
-        result
+        vectors::reindexed(&self.home, result).await
     }
 
     pub async fn close(&self) {

@@ -4,14 +4,19 @@
 //! The wiring is exactly what each adapter README describes, written into the engineer's *user* config,
 //! as each harness's module says (harness/): command hooks merged into a JSON file (Claude Code's
 //! `~/.claude/settings.json`, each running `<this borg> hook claude <event>`), or a compiled-in adapter
-//! copied whole (omp's extension, opencode's plugin). An installed borg needs no checkout.
+//! copied whole (omp's extension, opencode's plugin), plus the `borg` skill wherever the harness loads
+//! skills (`install/skill.rs`). An installed borg needs no checkout.
 //!
 //! Someone else's config is precious, so: the default is a dry run that prints the exact diff;
 //! `--apply` first writes a timestamped backup next to every file it changes; merging keeps every
 //! other key and hook as it was; re-running changes nothing; uninstall removes only what install adds
-//! (borg's own hook commands, and adapter files whose content is this borg's adapter). `--home`
+//! (borg's own hook commands, and adapter and skill files whose content is this borg's). `--home`
 //! replaces HOME *and ignores every config-dir variable* (the harnesses' and `$BORG_HOME`/`$BORG_CONFIG`,
 //! see [`home_overrides`]), so a test can never reach a real config or store.
+
+pub mod change;
+pub mod setup;
+pub mod skill;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,6 +29,8 @@ pub use crate::harness::Level;
 use crate::harness::wiring::Hooks;
 use crate::harness::{self, Harness, Wiring};
 use crate::{learn, outcome};
+use change::read;
+pub use change::{Action, Change, apply, diff};
 
 /// `all` (every visible harness) or one harness by name.
 fn parse(s: &str) -> Option<Vec<&'static dyn Harness>> {
@@ -59,40 +66,19 @@ impl Targets {
     pub fn path(&self, h: &dyn Harness) -> PathBuf {
         h.target(&self.home, &|k| if self.env { var(k) } else { None })
     }
-}
 
-/// One file as it is and as it would be (`None` = absent).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Change {
-    pub path: PathBuf,
-    pub before: Option<String>,
-    pub after: Option<String>,
-    /// Settings files are often symlinks into a dotfiles repo: write through them. An adapter file
-    /// symlinked into a borg checkout (README's `ln -s`) is replaced instead, never written through.
-    pub through_links: bool,
+    /// Where `h` loads the `borg` skill from; None for a harness without skills.
+    pub fn skill_dir(&self, h: &dyn Harness) -> Option<PathBuf> {
+        skill::dir(h, &self.home, &|k| if self.env { var(k) } else { None })
+    }
 }
 
 // ---------------------------------------------------------------- plans
 
-/// A file's text; `Ok(None)` only when it does not exist. Unreadable (permissions, not UTF-8) is an
-/// error, never "absent": treating it as absent would replace the file without a backup.
-fn read(p: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(p) {
-        Ok(t) => Ok(Some(t)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Install,
-    Uninstall,
-}
-
-/// What `action` would change for `h`, plus notes: things deliberately left alone, and on install the
-/// steps the harness itself asks of the engineer (`Harness::install_notes`).
-pub fn plan(action: Action, h: &dyn Harness, t: &Targets, bin: &Path) -> Result<(Option<Change>, Vec<String>), String> {
+/// What `action` would change for `h`: its hook config or adapter first, then each skill file
+/// (`install/skill.rs`); plus notes: things deliberately left alone, and on install the steps the harness
+/// itself asks of the engineer (`Harness::install_notes`).
+pub fn plan(action: Action, h: &dyn Harness, t: &Targets, bin: &Path) -> Result<(Vec<Change>, Vec<String>), String> {
     let path = t.path(h);
     let before = read(&path).map_err(|e| format!("{}: cannot read ({e}); nothing was changed", path.display()))?;
     let mut notes = Vec::new();
@@ -109,11 +95,15 @@ pub fn plan(action: Action, h: &dyn Harness, t: &Targets, bin: &Path) -> Result<
             None => None,
         },
     };
+    let through_links = matches!(h.wiring(), Wiring::CommandHooks { through_links: true, .. });
+    let mut changes: Vec<Change> = after.map(|after| Change { path, before, after, through_links, backup: true }).into_iter().collect();
+    let (skill, left) = skill::plan(action, t.skill_dir(h).as_deref())?;
+    changes.extend(skill);
+    notes.extend(left);
     if action == Action::Install {
         notes.extend(h.install_notes());
     }
-    let through_links = matches!(h.wiring(), Wiring::CommandHooks { through_links: true, .. });
-    Ok((after.map(|after| Change { path, before, after, through_links }), notes))
+    Ok((changes, notes))
 }
 
 /// UTC `YYYYMMDDTHHMMSS` for an epoch-ms time (no time crate for one format).
@@ -136,132 +126,6 @@ pub fn utc(ms: i64) -> String {
 fn human(ms: i64) -> String {
     let s = utc(ms);
     format!("{}-{}-{} {}:{}:{} UTC", &s[0..4], &s[4..6], &s[6..8], &s[9..11], &s[11..13], &s[13..15])
-}
-
-/// Mode for files borg creates where none existed: settings.json often holds secrets in `env`.
-#[cfg(unix)]
-const NEW_FILE_MODE: u32 = 0o600;
-
-/// Creates `p` (never an existing file) with `text` and permissions `mode` (unix; ignored elsewhere).
-/// The mode is set at creation, so the file is never readable by more people than intended, and
-/// set again afterwards, because creation is narrowed by the umask.
-fn create_with_mode(p: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    if let Some(m) = mode {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(m);
-    }
-    let mut f = o.open(p)?;
-    #[cfg(unix)]
-    if let Some(m) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(m))?;
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()
-}
-
-/// `<file>.borg-backup-<stamp>`, or `-1`, `-2`, … after it: an existing backup is never overwritten
-/// (an install and an uninstall in the same second would otherwise lose the original).
-fn write_backup(path: &Path, name: &str, stamp: &str, text: &str, mode: Option<u32>) -> std::io::Result<PathBuf> {
-    for n in 0u32.. {
-        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-        let p = path.with_file_name(format!("{name}.borg-backup-{stamp}{suffix}"));
-        match create_with_mode(&p, text, mode) {
-            Ok(()) => return Ok(p),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("u32 backups")
-}
-
-#[cfg(unix)]
-fn mode_of(p: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn mode_of(_: &Path) -> Option<u32> {
-    None
-}
-
-/// Writes one change: a backup of the existing file first, then an atomic replace. Returns the backup.
-/// The replacement and the backup keep the original's permissions (a 0600 file stays 0600); a file
-/// that did not exist is created 0600.
-pub fn apply(c: &Change, stamp: &str) -> std::io::Result<Option<PathBuf>> {
-    let name = c.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mode = mode_of(&c.path); // follows a symlink: the mode of the file actually read
-    let backup = match &c.before {
-        Some(b) => Some(write_backup(&c.path, &name, stamp, b, mode)?),
-        None => None,
-    };
-    let is_link = std::fs::symlink_metadata(&c.path).is_ok_and(|m| m.file_type().is_symlink());
-    match &c.after {
-        None => std::fs::remove_file(&c.path)?,
-        Some(text) => {
-            let target = if is_link && c.through_links { std::fs::canonicalize(&c.path)? } else { c.path.clone() };
-            if let Some(d) = target.parent() {
-                std::fs::create_dir_all(d)?;
-            }
-            #[cfg(unix)]
-            let mode = mode.or(Some(NEW_FILE_MODE));
-            let tmp = target.with_file_name(format!(".{name}.borg-tmp"));
-            let _ = std::fs::remove_file(&tmp); // a leftover of an interrupted run, with whatever mode it had
-            create_with_mode(&tmp, text, mode)?;
-            std::fs::rename(&tmp, &target)?; // replaces a symlink itself when not writing through it
-        }
-    }
-    Ok(backup)
-}
-
-/// A unified diff of two texts, 3 lines of context.
-pub fn diff(path: &Path, before: Option<&str>, after: Option<&str>) -> String {
-    let a: Vec<&str> = before.map(|t| t.lines().collect()).unwrap_or_default();
-    let b: Vec<&str> = after.map(|t| t.lines().collect()).unwrap_or_default();
-    let (n, m) = (a.len(), b.len());
-    // Longest common subsequence, then walk it into ' ', '-', '+' lines.
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if a[i] == b[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
-        }
-    }
-    let (mut i, mut j, mut ops) = (0, 0, Vec::new());
-    while i < n || j < m {
-        if i < n && j < m && a[i] == b[j] {
-            ops.push((' ', a[i]));
-            (i, j) = (i + 1, j + 1);
-        } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
-            ops.push(('+', b[j]));
-            j += 1;
-        } else {
-            ops.push(('-', a[i]));
-            i += 1;
-        }
-    }
-    let label = |t: Option<&str>| if t.is_some() { path.display().to_string() } else { "/dev/null".into() };
-    let mut out = format!("--- {}\n+++ {}\n", label(before), label(after));
-    let near = |k: usize| ops[k.saturating_sub(3)..(k + 4).min(ops.len())].iter().any(|(o, _)| *o != ' ');
-    let mut gap = true;
-    for (k, (o, line)) in ops.iter().enumerate() {
-        if near(k) {
-            if gap {
-                out.push_str("@@\n");
-            }
-            out.push_str(&format!("{o}{line}\n"));
-            gap = false;
-        } else {
-            gap = true;
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------- status
@@ -305,8 +169,17 @@ pub fn collectives(cfg: Option<&collective::Config>, base: &Path) -> Vec<Route> 
     }
 }
 
-/// How `h` is wired under `t`, in one line.
+/// How `h` is wired under `t`, in one line: its hooks or adapter, then its skill.
 pub fn wiring(h: &dyn Harness, t: &Targets) -> String {
+    let line = hooks_line(h, t);
+    match skill::status(h.name(), t.skill_dir(h).as_deref()) {
+        Some(skill) => format!("{line}; {skill}"),
+        None => line,
+    }
+}
+
+/// How `h`'s hooks or adapter are wired under `t`.
+fn hooks_line(h: &dyn Harness, t: &Targets) -> String {
     let path = t.path(h);
     let text = match read(&path) {
         Ok(t) => t,
@@ -420,6 +293,14 @@ pub fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| executable(p))
 }
 
+/// `borg-<part>` beside this borg, else on PATH: main.rs runs it, `borg setup` runs borg-mesh.
+#[must_use]
+pub fn sibling(part: &str) -> Option<PathBuf> {
+    let bin = format!("borg-{part}");
+    let beside = std::env::current_exe().ok().map(|e| e.with_file_name(&bin)).filter(|p| p.exists());
+    beside.or_else(|| which(&bin))
+}
+
 /// First line of `<cli> --version`, if it answers within 5 s.
 fn version(cli: &Path) -> Option<String> {
     let mut child = std::process::Command::new(cli)
@@ -446,10 +327,12 @@ pub fn wiring_checks(t: &Targets, borg_found: bool) -> Vec<(Level, String)> {
     let mut out = Vec::new();
     // Every harness: an unwired one adds nothing, so a hidden one shows only once someone wired it.
     for &h in harness::ALL {
-        match Hooks::of(h) {
-            Some(k) => out.extend(hook_checks(h, &k, t)),
-            None => out.extend(adapter_checks(h, t, borg_found)),
-        }
+        let found = match Hooks::of(h) {
+            Some(k) => hook_checks(h, &k, t),
+            None => adapter_checks(h, t, borg_found),
+        };
+        let skill = skill::checks(h.name(), t.skill_dir(h).as_deref(), !found.is_empty());
+        out.extend(found.into_iter().chain(skill));
     }
     if out.is_empty() {
         out.push((Level::Warn, "no harness is wired to borg (borg install all)".into()));
@@ -670,7 +553,9 @@ fn doctor(t: &Targets) -> i32 {
     let cfg = collective::load();
     checks.extend(collective_checks(&cfg, &learn::home()));
     if let Ok(c) = &cfg {
-        let emails: BTreeSet<String> = collectives(c.as_ref(), &learn::home())
+        let routes = collectives(c.as_ref(), &learn::home());
+        checks.extend(crate::vectors::doctor::checks(&routes));
+        let emails: BTreeSet<String> = routes
             .iter()
             .filter_map(|r| match r {
                 Route::Collective { home, .. } => Some(store_emails(home)),
@@ -736,29 +621,35 @@ pub fn main(cmd: &str, args: &[&str]) -> i32 {
         "install" | "uninstall" => {
             let Some(hs) = which_h.and_then(parse) else { return usage() };
             let action = if cmd == "install" { Action::Install } else { Action::Uninstall };
-            let bin = match std::env::var_os("BORG_BIN").filter(|v| !v.is_empty()) {
-                Some(b) => PathBuf::from(b),
-                None => std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_else(|_| PathBuf::from("borg")),
-            };
-            run(action, &hs, &targets, &bin, apply_flag)
+            run(action, &hs, &targets, &bin(), apply_flag)
         }
         _ => usage(),
     }
 }
 
-/// Variables `--home` removes, so every path borg resolves falls under the given HOME: the store
-/// (`$BORG_HOME`, default `HOME/.local/share/borg`) and the collectives config (`$BORG_CONFIG`, default
-/// `HOME/.config/borg/collectives.json`). For status and doctor `$BORG_BIN` goes too (a real binary to
-/// check); install keeps it, since there it only names the binary to wire, not a place to write.
-/// Harness config-dir variables need no removing: `Targets::under` never reads them.
-pub fn home_overrides(cmd: &str) -> &'static [&'static str] {
-    match cmd {
-        "install" | "uninstall" => &["BORG_HOME", "BORG_CONFIG"],
-        _ => &["BORG_HOME", "BORG_CONFIG", "BORG_BIN"],
+/// The borg the hooks run: `$BORG_BIN`, else this binary.
+pub(crate) fn bin() -> PathBuf {
+    match std::env::var_os("BORG_BIN").filter(|v| !v.is_empty()) {
+        Some(b) => PathBuf::from(b),
+        None => std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_else(|_| PathBuf::from("borg")),
     }
 }
 
-fn isolate(cmd: &str, home: &Path) {
+/// Variables `--home` removes, so every path borg resolves falls under the given HOME: the store
+/// (`$BORG_HOME`, default `HOME/.local/share/borg`), the collectives config (`$BORG_CONFIG`, default
+/// `HOME/.config/borg/collectives.json`) and the vector model (`$BORG_VECTOR_MODEL`, default under
+/// `HOME/.local/share/borg/models`). For status and doctor `$BORG_BIN` goes too (a real binary to
+/// check); install (and `borg setup`, which installs) keeps it, since there it only names the binary to
+/// wire, not a place to write.
+/// Harness config-dir variables need no removing: `Targets::under` never reads them.
+pub fn home_overrides(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "install" | "uninstall" | "setup" => &["BORG_HOME", "BORG_CONFIG", "BORG_VECTOR_MODEL"],
+        _ => &["BORG_HOME", "BORG_CONFIG", "BORG_VECTOR_MODEL", "BORG_BIN"],
+    }
+}
+
+pub(crate) fn isolate(cmd: &str, home: &Path) {
     // SAFETY: single-threaded CLI start, before anything reads the environment.
     unsafe {
         std::env::set_var("HOME", home);
@@ -777,38 +668,63 @@ fn run(action: Action, hs: &[&dyn Harness], t: &Targets, bin: &Path, apply_flag:
     let stamp = format!("{}Z", utc(learn::now_ms()));
     let mut code = 0;
     for &h in hs {
-        match plan(action, h, t, bin) {
+        let changes = match plan(action, h, t, bin) {
             Err(e) => {
                 eprintln!("{}: {e}", h.name());
                 code = 1;
+                continue;
             }
-            Ok((change, notes)) => {
+            Ok((changes, notes)) => {
                 for n in notes {
                     println!("{}: {n}", h.name());
                 }
-                let Some(c) = change else {
-                    println!("{}: nothing to change ({})", h.name(), t.path(h).display());
-                    continue;
-                };
-                if !apply_flag {
-                    print!("{}", diff(&c.path, c.before.as_deref(), c.after.as_deref()));
-                    continue;
-                }
-                match apply(&c, &stamp) {
-                    Ok(backup) => {
-                        let b = backup.map(|b| format!(" (backup {})", b.display())).unwrap_or_default();
-                        println!("{}: wrote {}{b}", h.name(), c.path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("{}: {}: {e}", h.name(), c.path.display());
-                        code = 1;
-                    }
-                }
+                changes
+            }
+        };
+        if changes.is_empty() {
+            println!("{}: nothing to change ({})", h.name(), t.path(h).display());
+        } else if apply_flag {
+            code = code.max(write(h, &changes, &stamp));
+            t.skill_dir(h).inspect(|d| skill::tidy(d));
+        } else {
+            for c in &changes {
+                print!("{}", diff(&c.path, c.before.as_deref(), c.after.as_deref()));
             }
         }
     }
-    if !apply_flag && code == 0 {
+    footer(action, apply_flag, code);
+    code
+}
+
+/// After a clean run: the dry-run note, or after an install what is left that install never does.
+fn footer(action: Action, apply_flag: bool, code: i32) {
+    if code != 0 {
+        return;
+    }
+    if !apply_flag {
         println!("(dry run: nothing written; add --apply to write, with a backup of every changed file)");
+    } else if action == Action::Install
+        && let Some(hint) = crate::vectors::doctor::hint()
+    {
+        println!("{hint}");
+    }
+}
+
+/// Writes `h`'s changes in order, each reported on its own line; 1 if any failed.
+pub(crate) fn write(h: &dyn Harness, changes: &[Change], stamp: &str) -> i32 {
+    let mut code = 0;
+    for c in changes {
+        match apply(c, stamp) {
+            Ok(backup) => {
+                let b = backup.map(|b| format!(" (backup {})", b.display())).unwrap_or_default();
+                let what = if c.after.is_some() { "wrote" } else { "removed" };
+                println!("{}: {what} {}{b}", h.name(), c.path.display());
+            }
+            Err(e) => {
+                eprintln!("{}: {}: {e}", h.name(), c.path.display());
+                code = 1;
+            }
+        }
     }
     code
 }
@@ -881,15 +797,23 @@ mod tests {
         out
     }
 
+    /// Applies every visible harness's plan as `run` does; the number of files changed.
     fn install_all(t: &Targets, bin: &Path, action: Action, stamp: &str) -> usize {
         let mut n = 0;
         for h in harness::visible() {
-            if let (Some(c), _) = plan(action, h, t, bin).unwrap() {
+            for c in plan(action, h, t, bin).unwrap().0 {
                 apply(&c, stamp).unwrap();
                 n += 1;
             }
+            t.skill_dir(h).inspect(|d| skill::tidy(d));
         }
         n
+    }
+
+    /// The files a full install writes: one config or adapter per harness, and the skill's files
+    /// wherever the harness loads skills.
+    fn files_per_install(t: &Targets) -> usize {
+        harness::visible().map(|h| 1 + t.skill_dir(h).map_or(0, |_| skill::FILES.len())).sum()
     }
 
     #[test]
@@ -899,7 +823,7 @@ mod tests {
         std::fs::create_dir_all(t.path(CLAUDE).parent().unwrap()).unwrap();
         std::fs::write(t.path(CLAUDE), EXISTING).unwrap();
         let bin = Path::new("/opt/borg dir/borg");
-        assert_eq!(install_all(&t, bin, Action::Install, "s1"), harness::visible().count(), "one file per harness");
+        assert_eq!(install_all(&t, bin, Action::Install, "s1"), files_per_install(&t), "one config per harness, and the skill");
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()).unwrap();
         assert_eq!(v["model"], "opus");
@@ -931,7 +855,7 @@ mod tests {
         let home = tmp("idem");
         let t = Targets::under(&home);
         let bin = Path::new("/usr/bin/borg");
-        assert_eq!(install_all(&t, bin, Action::Install, "a"), harness::visible().count(), "one file per harness");
+        assert_eq!(install_all(&t, bin, Action::Install, "a"), files_per_install(&t), "one config per harness, and the skill");
         let snapshot = all_files(&home);
         assert_eq!(install_all(&t, bin, Action::Install, "b"), 0, "second install changes nothing");
         assert_eq!(all_files(&home), snapshot, "and writes nothing, not even a backup");
@@ -953,9 +877,12 @@ mod tests {
                 std::fs::write(t.path(CLAUDE), o).unwrap();
             }
             install_all(&t, Path::new("/usr/bin/borg"), Action::Install, "i");
-            assert_eq!(install_all(&t, Path::new("/elsewhere/borg"), Action::Uninstall, "u"), harness::visible().count(), "one file per harness");
+            assert_eq!(install_all(&t, Path::new("/elsewhere/borg"), Action::Uninstall, "u"), files_per_install(&t), "everything install wrote");
             assert_eq!(read(&t.path(CLAUDE)).unwrap().as_deref(), original, "{name}: byte for byte");
             assert!(!t.path(OMP).exists() && !t.path(OPENCODE).exists() && !t.path(&crate::harness::codex::Codex).exists());
+            for h in harness::visible() {
+                assert!(t.skill_dir(h).is_none_or(|d| !d.exists()), "{name}: {}'s skill directory removed", h.name());
+            }
             assert_eq!(install_all(&t, Path::new("/usr/bin/borg"), Action::Uninstall, "u2"), 0, "nothing left to remove");
         }
     }
@@ -967,8 +894,17 @@ mod tests {
         std::fs::create_dir_all(t.path(OMP).parent().unwrap()).unwrap();
         std::fs::write(t.path(OMP), "// my own borg.ts").unwrap();
         let (change, notes) = plan(Action::Uninstall, OMP, &t, Path::new("/b/borg")).unwrap();
-        assert!(change.is_none());
+        assert!(change.is_empty());
         assert_eq!(notes.len(), 1);
+        // The engineer's own file in borg's skill directory: left alone, and so is the directory.
+        let skill = t.skill_dir(CLAUDE).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "my own skill").unwrap();
+        std::fs::write(skill.join("notes.md"), "mine").unwrap();
+        install_all(&t, Path::new("/b/borg"), Action::Install, "i");
+        assert_eq!(install_all(&t, Path::new("/b/borg"), Action::Uninstall, "u"), files_per_install(&t));
+        assert_eq!(std::fs::read_to_string(skill.join("notes.md")).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(skill.join("SKILL.md.borg-backup-i")).unwrap(), "my own skill", "replaced with a backup");
         // A hook that merely mentions borg but is not borg's own command stays.
         let s = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/notborg hook claude stop"}]}]}}"#;
         assert_eq!(claude_hooks().uninstall(Some(s)).unwrap(), None);
@@ -984,7 +920,7 @@ mod tests {
         assert_eq!(run(Action::Install, &harness::visible().collect::<Vec<_>>(), &t, Path::new("/usr/bin/borg"), false), 0);
         assert_eq!(all_files(&home), before);
         let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        let c = c.unwrap();
+        let c = &c[0];
         let d = diff(&c.path, c.before.as_deref(), c.after.as_deref());
         assert!(d.contains("+            \"command\": \"/usr/bin/borg hook claude stop\""), "{d}");
         assert!(!d.lines().any(|l| l.starts_with('-') && !l.starts_with("---")), "pure addition:\n{d}");
@@ -1006,7 +942,7 @@ mod tests {
         std::fs::create_dir_all(t.path(OMP).parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&src, t.path(OMP)).unwrap();
         let (c, _) = plan(Action::Install, OMP, &t, Path::new("/b/borg")).unwrap();
-        apply(&c.unwrap(), "x").unwrap();
+        apply(&c[0], "x").unwrap();
         assert_eq!(std::fs::read_to_string(&src).unwrap(), "// older adapter in a checkout");
         assert_eq!(std::fs::read_to_string(t.path(OMP)).unwrap(), omp::ADAPTER);
     }
@@ -1068,7 +1004,7 @@ mod tests {
     fn doctor_flags_a_missing_binary_and_an_invalid_config() {
         let home = tmp("doctor");
         let t = Targets::under(&home);
-        plan(Action::Install, CLAUDE, &t, Path::new("/nonexistent/borg")).unwrap().0.map(|c| apply(&c, "d").unwrap());
+        plan(Action::Install, CLAUDE, &t, Path::new("/nonexistent/borg")).unwrap().0.iter().for_each(|c| drop(apply(c, "d").unwrap()));
         let checks = wiring_checks(&t, true);
         assert!(checks.iter().any(|(l, m)| *l == Level::Fail && m.contains("/nonexistent/borg")), "{checks:?}");
         let bad = collective_checks(&Err("x.json: expected value".into()), &home);
@@ -1151,19 +1087,19 @@ mod tests {
         std::fs::write(t.path(CLAUDE), r#"{"env":{"SECRET":"x"}}"#).unwrap();
         chmod(&t.path(CLAUDE), 0o600);
         let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        let backup = apply(&c.unwrap(), "p").unwrap().unwrap();
+        let backup = apply(&c[0], "p").unwrap().unwrap();
         assert_eq!(mode(&t.path(CLAUDE)), 0o600, "settings stay 0600");
         assert_eq!(mode(&backup), 0o600, "backup is 0600");
 
         chmod(&t.path(CLAUDE), 0o640);
         let (c, _) = plan(Action::Uninstall, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        apply(&c.unwrap(), "q").unwrap();
+        apply(&c[0], "q").unwrap();
         assert_eq!(mode(&t.path(CLAUDE)), 0o640, "whatever the original had");
 
         let fresh = tmp("perms-new");
         let t = Targets::under(&fresh);
         let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        apply(&c.unwrap(), "n").unwrap();
+        apply(&c[0], "n").unwrap();
         assert_eq!(mode(&t.path(CLAUDE)), 0o600, "a new settings.json is private");
     }
 
@@ -1176,9 +1112,9 @@ mod tests {
         std::fs::write(t.path(CLAUDE), orig).unwrap();
         // Install then uninstall within one stamp (the same second).
         let (c, _) = plan(Action::Install, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        let b1 = apply(&c.unwrap(), "same").unwrap().unwrap();
+        let b1 = apply(&c[0], "same").unwrap().unwrap();
         let (c, _) = plan(Action::Uninstall, CLAUDE, &t, Path::new("/usr/bin/borg")).unwrap();
-        let b2 = apply(&c.unwrap(), "same").unwrap().unwrap();
+        let b2 = apply(&c[0], "same").unwrap().unwrap();
         assert_ne!(b1, b2);
         assert_eq!(std::fs::read_to_string(&b1).unwrap(), orig, "the original survives");
         assert!(std::fs::read_to_string(&b2).unwrap().contains("hook claude stop"));
@@ -1187,9 +1123,9 @@ mod tests {
 
     #[test]
     fn home_overrides_cover_store_and_config() {
-        for cmd in ["install", "uninstall", "status", "doctor"] {
+        for cmd in ["install", "uninstall", "setup", "status", "doctor"] {
             let v = home_overrides(cmd);
-            assert!(v.contains(&"BORG_HOME") && v.contains(&"BORG_CONFIG"), "{cmd}");
+            assert!(v.contains(&"BORG_HOME") && v.contains(&"BORG_CONFIG") && v.contains(&"BORG_VECTOR_MODEL"), "{cmd}");
         }
         assert!(home_overrides("doctor").contains(&"BORG_BIN"));
         assert!(!home_overrides("install").contains(&"BORG_BIN"), "install still wires $BORG_BIN");
@@ -1228,7 +1164,7 @@ mod tests {
         let home = tmp("noted");
         let t = Targets::under(&home);
         let (change, notes) = plan(Action::Install, &Noted("git"), &t, Path::new("/b/borg")).unwrap();
-        assert!(change.is_some());
+        assert_eq!(change.len(), 1 + skill::FILES.len(), "the hook config and the skill");
         assert_eq!(notes, ["run /hooks in noted and trust borg"]);
         assert_eq!(plan(Action::Uninstall, &Noted("git"), &t, Path::new("/b/borg")).unwrap().1, Vec::<String>::new());
         let checks = harness_checks([&Noted("git") as &dyn Harness].into_iter(), &t);

@@ -342,7 +342,7 @@ fn opencode_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
             _ => {}
         }
     }
-    Some((text, Some(cost).filter(|_| priced && !open)))
+    Some((text, (priced && !open).then_some(cost)))
 }
 
 /// The last top-level JSON object in a model's text; fences and prose around it are ignored.

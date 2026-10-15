@@ -10,6 +10,7 @@ never calls a model.
 ![Machines linked peer to peer around shared lessons](img/team.svg)
 
 - [Set up a team](#set-up-a-team)
+- [Company collective](#company-collective)
 - [How a sync works](#how-a-sync-works)
 - [How peers find each other](#how-peers-find-each-other)
 - [Privacy on the mesh](#privacy-on-the-mesh)
@@ -20,6 +21,9 @@ never calls a model.
 
 Install `borg-mesh` next to `borg` (see the [README](../README.md#quick-start)). Private collectives and
 off repos are refused before any connection opens.
+
+`borg setup` covers both sides: it founds a team collective and runs `borg mesh init`, or joins one
+with a ticket. The steps below are what it runs, for doing them by hand.
 
 **1. Admin, once.** Inside a repo of the team collective (or with `--collective NAME`):
 
@@ -43,13 +47,13 @@ an unused ticket can join with its role. Defaults: role `member`, one use, valid
 **3. New member.** Install Borg, then:
 
 ```sh
-borg mesh join BORG1...            # dry run: shows the collectives.json change
-borg mesh join BORG1... --apply    # writes it (with a backup), dials the admin, joins, syncs
+borg mesh join BORG1... --paths ~/work            # dry run: shows the collectives.json change
+borg mesh join BORG1... --paths ~/work --apply    # writes it (with a backup), dials the admin, joins, syncs
 ```
 
-`join` adds the collective with the placeholder path `~/CHANGE-ME/repos-of-<name>`. Replace it with your
-repo paths; until then no repo routes into the team collective. Then keep `borg mesh serve` running in
-one of those repos (or with `--collective <name>`).
+`--paths` names your repo directories for the team collective. Without it, `join` adds the
+placeholder path `~/CHANGE-ME/repos-of-<name>`, which routes no repo: replace it, or join again with
+`--paths`. Then keep `borg mesh serve` running in one of those repos (or with `--collective <name>`).
 
 The admin's `serve` must run while the member joins. It checks the ticket's signature, expiry and
 remaining uses, adds the member's key to the signed membership and hands over the history. Other
@@ -59,6 +63,48 @@ key cannot rejoin with an old ticket; an admin must re-invite it by key.
 **Other commands:** `borg mesh members`, `borg mesh revoke <key>` (admin), `borg mesh id`,
 `borg mesh sync <key>` (once), `borg mesh peer [<key>[@<ip:port>]]`. The older manual flow still works:
 `borg mesh invite <key>` and `borg mesh join membership-history.jsonl`.
+
+## Company collective
+
+There is no separate company type. A company collective is a team collective (`"share": "team"`) with
+the settings a company network needs: its own relay, confidential repos kept `off`, and often a mirror
+for the vector model.
+
+**Admin, once:**
+
+```sh
+borg setup --team acme --paths ~/work/acme --relay https://relay.acme.example
+borg mesh serve --collective acme      # keep it running, as a service
+borg mesh invite --collective acme     # one ticket per member
+```
+
+Setup asks for the repos no collective may ever see (`off`) and where every other repo goes; it then
+runs `borg mesh init` and offers a first invite (with `--relay disabled` it names the next step instead:
+`borg mesh serve`, then `borg mesh invite`). Without `--relay` it asks: n0's public relays,
+`disabled` (LAN or VPN only), or a company relay URL. Choose the relay before the first invite: each
+ticket carries it and `join` copies it, and every member must use the same one.
+
+**Each engineer:**
+
+```sh
+borg setup --join BORG1... --paths ~/work/acme
+```
+
+Setup runs `borg mesh join BORG1... --paths ~/work/acme --apply`, which writes the collective with the
+admin's relay, joins and syncs. Then keep `borg mesh serve --collective acme` running.
+
+**Relay.** A company relay keeps even the metadata in-house: the `iroh-relay` binary
+(`cargo install iroh-relay --features server`) on a host with a public DNS name and a TLS certificate.
+`"disabled"` needs no relay but reaches only peers on the same LAN or VPN, given as `<key>@<ip:port>`.
+
+**Proxy.** The mesh does not use `HTTPS_PROXY`. A proxy that re-signs TLS works when its CA is in the
+system trust store ([Privacy on the mesh](#privacy-on-the-mesh)). Where the only way out is an HTTP
+proxy, run a relay inside the network, or use `"disabled"` over the VPN.
+
+**Vector model.** Setup downloads it with `curl`, which does honour `HTTPS_PROXY` (and
+`CURL_CA_BUNDLE` for a re-signing proxy). When the download fails, setup asks for a mirror URL. Set it
+in advance with `BORG_VECTOR_URL=https://mirror.acme.example/potion-multilingual-128M`: a mirror serves
+the three model files of the pinned revision ([Vectors](configuration.md#vectors)).
 
 ## How a sync works
 
@@ -139,7 +185,7 @@ end-to-end encrypted between member keys.
 | `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync. Behind a proxy that re-signs TLS (corporate VPN), its CA must be in the system trust store |
 | `no direct address ... relays are disabled` | With `"relay": "disabled"`, give peers as `<key>@<ip:port>` |
 | `collective "x" is not in collectives.json` | Run `join` with `--apply`, or add the entry by hand |
-| Nothing syncs after joining | Replace the placeholder path; `borg collective <repo>` must name the team collective with `may sync: true` |
+| Nothing syncs after joining | Replace the placeholder path (or join again with `--paths`); `borg collective <repo>` must name the team collective with `may sync: true` |
 
 ## Testing across real NATs
 

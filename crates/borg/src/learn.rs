@@ -344,7 +344,7 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
             }
         }
         None => Lesson {
-            id: format!("L{}", &e.id),
+            id: format!("L{}", e.id),
             origin_ms: e.ms,
             repo: e.repo.clone(),
             question,

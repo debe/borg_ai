@@ -459,7 +459,7 @@ fn main() {
     println!("| Thinking blocks with readable text | {} / {} ({:.0}%) |", r_nonempty, r_blocks, pct(r_nonempty as u64, r_blocks as u64));
     println!("| Edits with visible narration/intent right before | {} / {} ({:.0}%) |", r_narr, r_edits, pct(r_narr as u64, r_edits as u64));
 
-    per_repo.sort_by(|a, b| b.2.cmp(&a.2));
+    per_repo.sort_by_key(|r| std::cmp::Reverse(r.2));
     println!("\n## Top repos by exploration tokens\n");
     println!("| Repo | Sessions | Exploration | Re-read share |\n|---|---|---|---|");
     for (repo, n, ex, rr) in per_repo.iter().take(12) {
