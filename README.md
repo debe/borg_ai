@@ -11,6 +11,14 @@ to peer, with no server.
 the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits)
 before you rely on it.
 
+**Install** (Linux x86_64/arm64, macOS on Apple silicon; prebuilt and sha256-checked, then `borg setup`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
+```
+
+Or `cargo install borg-ai --locked`. All options are in [Quick start](#quick-start).
+
 - [How it works](#how-it-works)
 - [Supported agents](#supported-agents)
 - [Delivery modes](#delivery-modes)
@@ -203,6 +211,21 @@ spend matters more.
 
 **1. Install.** Pick one of three ways.
 
+*The one-liner* (prebuilt `borg`, `borg-mesh` and `borg-web`, sha256-checked, into `~/.local/bin`,
+then `borg setup`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
+```
+
+Options go after `sh -s --`, e.g. a pinned version into another directory without setup:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.1.0 --dir ~/bin --no-setup
+```
+
+Read the script first if you prefer: [scripts/install.sh](https://github.com/debe/borg_ai/blob/main/scripts/install.sh).
+
 *From crates.io* (the package is `borg-ai`; the binary is `borg`):
 
 ```sh
@@ -210,15 +233,6 @@ cargo install borg-ai --locked      # the CLI and hook binary, vectors included
 cargo install borg-mesh --locked    # only for team sync, borg top across machines, borg steer
 cargo install borg-web --locked     # only for borg web, the live page
 ```
-
-*The release binaries* (all three, sha256-checked, into `~/.local/bin`, then `borg setup`):
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
-```
-
-`sh -s -- --version vX.Y.Z --dir DIR --no-setup` picks a version, a directory, or skips setup.
-Read the script first if you prefer: it is [scripts/install.sh](https://github.com/debe/borg_ai/blob/main/scripts/install.sh).
 
 *From source:*
 
