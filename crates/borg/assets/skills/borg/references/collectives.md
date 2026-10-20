@@ -131,3 +131,22 @@ under an `off` path or inside another `local` collective is never consulted.
 with those repo directories. Without `--paths` it writes the placeholder path
 `~/CHANGE-ME/repos-of-<name>`; replace it with the real repo directories (or join again with
 `--paths`), since until then no repo routes into the team collective.
+
+## Decision → fix links
+
+At session end borg links each commit the session landed to the earlier decisions whose lines it
+removed or changed: origins with borg reasoning, from another session, at least two days older
+(`BORG_REGRESS_MIN_AGE`). What the share allows:
+
+| Repo | Links in both commits' git notes | Link record synced over the mesh | Regret lesson (`BORG_REGRESS=learn`) |
+|---|---|---|---|
+| `"share": "team"` | yes | yes | yes |
+| `"share": "local"` | yes | no | no |
+| `off` | no | no | no |
+
+`BORG_REGRESS` is `links` by default (record, learn nothing), `learn` or `off`. Show the engineer
+`borg regress --replay <A..B> --explain` on their own history, and `borg regress --session ID --explain`
+on a few real sessions, before they turn on `learn`: both are dry runs that list the candidates left out
+and why. A replay has no test runs or prompts, so a live run can make fix links the replay never showed. `borg why <path>:<line>` shows a link from either end.
+A rebase drops notes unless the repo has `git config notes.rewriteRef refs/notes/borg`; suggest it,
+and let the engineer run it.

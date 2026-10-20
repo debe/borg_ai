@@ -1,0 +1,8 @@
+fix	decision	verdict
+fix: cache keys ignore the currency	Price cache in front of the upstream lookup	regret
+Timeouts are read in seconds	Rename TIMEOUT to UPSTREAM_TIMEOUT	regret
+Revert "Log every cache miss"	Log every cache miss	regret
+fix: back off between retries	Retry failed upstream calls	regret
+fix: cache entries never expire	Price cache in front of the upstream lookup	regret
+fix: default port back to 8080	Default port 80	unreachable: the decision has no note
+fix: the TTL ignores the config	fix: cache entries never expire	unreachable: one day old

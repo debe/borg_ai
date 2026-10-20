@@ -32,6 +32,8 @@ use crate::conscience::{self, Challenge};
 use crate::outcome;
 use crate::trust;
 
+pub mod regret;
+
 static CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(no\b|nope|don'?t|do not|stop|wrong|that'?s not|not what|why did you|why do you|i said|instead|you should|never\b|always\b|please don'?t|double check|carefully check|check against|are you sure|hmm|but\b|just a second|still\b|can'?t we|don'?t we|isn'?t)").unwrap()
 });
@@ -60,7 +62,7 @@ pub fn denied(error: &str) -> bool {
     rejection(error).is_none() && DENIAL.is_match(error)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Episode {
     pub id: String,
     pub ms: i64,
@@ -73,6 +75,11 @@ pub struct Episode {
     /// Who corrected: `git config user.email` in the episode's cwd, empty if unknown.
     #[serde(default)]
     pub engineer: String,
+    /// Empty for a correction; `regret::KIND` for a decision a later session fixed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regret: Option<regret::Regret>,
 }
 
 /// A lesson as stored: the conscience's `Challenge` plus provenance and consolidation state.
@@ -173,28 +180,33 @@ pub fn engineer(cwd: &str) -> String {
 }
 
 pub fn record_episode(e: &Episode) -> std::io::Result<()> {
-    append_jsonl(&home().join("episodes.jsonl"), e)?;
-    count_correction(&home(), e);
+    record_episode_in(&home(), e)
+}
+
+/// `record_episode` into `store` (the end-of-session job writes to the route's store).
+///
+/// # Errors
+/// When the episode cannot be appended.
+pub fn record_episode_in(store: &Path, e: &Episode) -> std::io::Result<()> {
+    append_jsonl(&store.join("episodes.jsonl"), e)?;
+    count_correction(store, e);
     Ok(())
 }
 
-/// A correction in the usage statistics: a rejected tool call or a pushback, with a short excerpt.
+/// A correction in the usage statistics: a rejected tool call, a pushback or a regret, with a short excerpt.
 pub fn count_correction(store: &Path, e: &Episode) {
     let snippet = crate::stats::excerpt(&e.correction, 160);
+    let (why, text) = match &e.rejected_tool {
+        _ if e.kind == regret::KIND => ("regret", snippet),
+        Some(tool) => ("rejected_tool", format!("{tool}: {snippet}")),
+        None => ("pushback", snippet),
+    };
     crate::stats::count(store, crate::stats::CORRECTION, &e.session, |ev| {
         ev.ms = e.ms;
-        ev.engineer = e.engineer.clone();
-        ev.repo = e.repo.clone();
-        match &e.rejected_tool {
-            Some(tool) => {
-                ev.why = "rejected_tool".into();
-                ev.text = format!("{tool}: {snippet}");
-            }
-            None => {
-                ev.why = "pushback".into();
-                ev.text = snippet;
-            }
-        }
+        ev.engineer.clone_from(&e.engineer);
+        ev.repo.clone_from(&e.repo);
+        ev.why = why.into();
+        ev.text = text;
     });
 }
 
@@ -211,32 +223,54 @@ pub fn lessons(path: &Path) -> Vec<Lesson> {
     v
 }
 
-const PROMPT: &str = "An engineer corrected a coding agent. Decide whether the correction expresses a reusable engineering \
+/// The correction prompt's opening.
+const OPENING: &str = "An engineer corrected a coding agent. Decide whether the correction expresses a reusable engineering \
 lesson: a critical concern about quality, design, correctness, reuse, spec conformance or root cause that this engineer would \
-plausibly raise again about similar future work. Operational remarks (\"still working?\", \"stop\", \"push\", \"restart\") are NOT lessons.
+plausibly raise again about similar future work. Operational remarks (\"still working?\", \"stop\", \"push\", \"restart\") are NOT lessons.";
 
-Then decide its reach: who should hear it. Ask: would a teammate working on the same code get this correction too?
+/// Who should hear a lesson: shared by the correction and the regret prompt.
+const REACH_RULES: &str = "Then decide its reach: who should hear it. Ask: would a teammate working on the same code get this correction too?
 - personal: how this one engineer likes the agent to work with them, not a property of the code: commit message style \
 or length, AI attribution or co-author trailers, whether and when to commit, push, branch or open a PR, what to stage, \
 how to report or ask, language and tone, their own tooling habits.
 - repo: a convention of the repo it happened in that other repos do not share (its branch or deploy workflow, a tool \
 or command it mandates).
-- team: everything else: an engineering concern about the code, design, correctness or verification.
+- team: everything else: an engineering concern about the code, design, correctness or verification.";
 
-If it is a lesson, write:
+const FIELDS: &str = "If it is a lesson, write:
 - question: ONE question the agent should ask itself next time, general enough to transfer, keeping the technical substance;
 - situations: 1-3 lines, each `<action> on/in <kind of state or component> [under <condition>]`, without project/class names;
-- consequence: one line, what goes wrong or what the engineer requires instead;
-- area: the one kind of concern: concurrency, spec-conformance, reuse-existing, architecture-boundary, verification, minimality, \
-protocol-correctness, data-source, security, dependency-version, scope, or other if none fits.
+- consequence: one line, what goes wrong or what the engineer requires instead;";
 
-Existing lessons that may express the same concern are listed. If one of them IS the same concern (the same kind of mistake) \
+/// The last field of either prompt.
+const AREA: &str = "- area: the one kind of concern: concurrency, spec-conformance, reuse-existing, architecture-boundary, verification, minimality, \
+protocol-correctness, data-source, security, dependency-version, scope, or other if none fits.";
+
+/// Merging and superseding: shared by the correction and the regret prompt.
+const MERGE_RULES: &str = "Existing lessons that may express the same concern are listed. If one of them IS the same concern (the same kind of mistake) \
 and agrees with this correction, set same_as to its id and write the merged, improved wording in question/situations/consequence. \
 Otherwise same_as is empty.
 
 If this correction contradicts or replaces a listed lesson (in the same situation it requires something different or the \
 opposite, e.g. the engineer reversed an earlier correction), list that lesson's id in supersedes; never the same_as lesson. \
 Otherwise supersedes is empty.";
+
+/// The prompt for one episode: a correction's, or a regret's (regret.rs) when it is one.
+fn episode_prompt(e: &Episode, listed: &[String]) -> String {
+    let existing = if listed.is_empty() { "(none)".into() } else { listed.join("\n") };
+    if let Some(r) = e.regret.as_ref().filter(|_| e.kind == regret::KIND) {
+        let (head, sections) = (regret::head(r), regret::sections(r, &e.task));
+        let (reach, merge) = (regret::neutral(REACH_RULES), regret::neutral(MERGE_RULES));
+        return format!("{head}\n\n{reach}\n\n{}\n{AREA}\n\n{merge}\n\n{sections}## Existing lessons\n{existing}\n", regret::FIELDS);
+    }
+    format!(
+        "{OPENING}\n\n{REACH_RULES}\n\n{FIELDS}\n{AREA}\n\n{MERGE_RULES}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{}\n{}\n\n## Engineer's correction\n{}\n\n## Existing lessons\n{existing}\n",
+        e.task.chars().take(1500).collect::<String>(),
+        e.agent,
+        e.rejected_tool.as_deref().unwrap_or(""),
+        e.correction,
+    )
+}
 
 fn schema() -> Value {
     json!({"type": "object", "additionalProperties": false, "properties": {
@@ -257,13 +291,43 @@ pub struct AskFailed;
 /// asking about every remaining episode would only burn time (and quota once it comes back).
 const MAX_FAILURES: usize = 3;
 
-/// Generalise one episode against the existing library: `Ok(Some)` a new lesson or a merged version
-/// of an existing one, `Ok(None)` not a lesson, `Err` no verdict. `ask` performs the model call
-/// (injectable for tests).
-pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<Lesson>, AskFailed> {
-    // A withdrawn personal lesson (reach.rs) is no merge target: it lives in a private collective now.
-    let library: Vec<Lesson> = library.iter().filter(|l| l.reach != crate::reach::PERSONAL).cloned().collect();
-    let library = library.as_slice();
+/// The model's verdict on an episode that is a lesson.
+struct Answer {
+    question: String,
+    situations: Vec<String>,
+    consequence: String,
+    area: String,
+    reach: String,
+    same_as: String,
+    supersedes: Vec<String>,
+}
+
+impl Answer {
+    /// `Ok(None)` not a lesson; `Err` no usable verdict.
+    fn parse(v: &Value) -> Result<Option<Answer>, AskFailed> {
+        match v["is_lesson"].as_bool() {
+            Some(true) => {}
+            Some(false) => return Ok(None),
+            None => return Err(AskFailed),
+        }
+        let strs = |k: &str| v[k].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>();
+        let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        let question = v["question"].as_str().filter(|q| !q.trim().is_empty()).ok_or(AskFailed)?.to_string();
+        let reach = v["reach"].as_str().filter(|r| [crate::reach::REPO, crate::reach::PERSONAL].contains(r)).unwrap_or_default();
+        Ok(Some(Answer {
+            question,
+            situations: strs("situations"),
+            consequence: text("consequence"),
+            area: trust::area(v["area"].as_str().unwrap_or_default()).to_string(),
+            reach: reach.to_string(),
+            same_as: text("same_as"),
+            supersedes: strs("supersedes"),
+        }))
+    }
+}
+
+/// The library's lessons most like the episode (at most 5), offered for merging.
+fn similar<'a>(e: &Episode, library: &'a [Lesson]) -> Vec<&'a Lesson> {
     let as_challenges: Vec<Challenge> = library
         .iter()
         .map(|l| Challenge {
@@ -281,90 +345,86 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
         })
         .collect();
     let query = format!("{} {} {}", e.task, e.agent, e.correction);
-    let similar: Vec<&Lesson> = conscience::select(&as_challenges, &query, 5).iter().filter_map(|c| library.iter().find(|l| l.id == c.id)).collect();
-    let listed: Vec<String> = similar.iter().map(|l| format!("[{}] {} -> {}", l.id, l.question, l.consequence)).collect();
-    let prompt = format!(
-        "{PROMPT}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{}\n{}\n\n## Engineer's correction\n{}\n\n## Existing lessons\n{}\n",
-        e.task.chars().take(1500).collect::<String>(),
-        e.agent,
-        e.rejected_tool.as_deref().unwrap_or(""),
-        e.correction,
-        if listed.is_empty() { "(none)".into() } else { listed.join("\n") }
-    );
-    let v = ask(&prompt).ok_or(AskFailed)?;
-    match v["is_lesson"].as_bool() {
-        Some(true) => {}
-        Some(false) => return Ok(None),
-        None => return Err(AskFailed),
+    conscience::select(&as_challenges, &query, 5).iter().filter_map(|c| library.iter().find(|l| l.id == c.id)).collect()
+}
+
+/// `old` with the episode merged in: the new wording, the old one kept in `history`.
+fn merged(old: &Lesson, e: &Episode, a: Answer, mut supersedes: Vec<String>) -> Lesson {
+    let mut history = old.history.clone();
+    history.push(json!({"question": old.question, "consequence": old.consequence, "version": old.version}));
+    let mut episodes = old.episodes.clone();
+    episodes.push(e.id.clone());
+    let (mut engineers, mut joined) = (old.engineers.clone(), old.joined.clone());
+    // Emails compare case-insensitively; an alias (collective.rs "Engineers") is stored as
+    // its raw email and mapped when read, so the store never depends on this machine's config.
+    let same = |x: &String| x.trim().to_lowercase() == e.engineer.trim().to_lowercase();
+    if !e.engineer.trim().is_empty() && !engineers.iter().any(same) {
+        engineers.push(e.engineer.clone());
+        joined.insert(e.engineer.clone(), e.ms);
     }
-    let strs = |k: &str| v[k].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>();
-    let question = v["question"].as_str().filter(|q| !q.trim().is_empty()).ok_or(AskFailed)?.to_string();
-    let consequence = v["consequence"].as_str().unwrap_or("").to_string();
-    let area = trust::area(v["area"].as_str().unwrap_or_default()).to_string();
-    let reach = v["reach"].as_str().filter(|r| [crate::reach::REPO, crate::reach::PERSONAL].contains(r)).unwrap_or_default();
-    let same_as = similar.iter().find(|l| v["same_as"].as_str() == Some(l.id.as_str()));
-    // Only lessons the model was shown can be superseded, and never the one it merges into.
-    let mut supersedes: Vec<String> =
-        strs("supersedes").into_iter().filter(|id| similar.iter().any(|l| &l.id == id) && same_as.is_none_or(|m| &m.id != id)).collect();
-    Ok(Some(match same_as {
-        Some(old) => {
-            let mut history = old.history.clone();
-            history.push(json!({"question": old.question, "consequence": old.consequence, "version": old.version}));
-            let mut episodes = old.episodes.clone();
-            episodes.push(e.id.clone());
-            let (mut engineers, mut joined) = (old.engineers.clone(), old.joined.clone());
-            // Emails compare case-insensitively; an alias (collective.rs "Engineers") is stored as
-            // its raw email and mapped when read, so the store never depends on this machine's config.
-            let same = |x: &String| x.trim().to_lowercase() == e.engineer.trim().to_lowercase();
-            if !e.engineer.trim().is_empty() && !engineers.iter().any(same) {
-                engineers.push(e.engineer.clone());
-                joined.insert(e.engineer.clone(), e.ms);
-            }
-            for id in old.supersedes.iter().rev() {
-                if !supersedes.contains(id) {
-                    supersedes.insert(0, id.clone());
-                }
-            }
-            Lesson {
-                question,
-                situations: strs("situations"),
-                consequence,
-                support: old.support + 1,
-                episodes,
-                history,
-                version: old.version + 1,
-                engineers,
-                joined,
-                area,
-                supersedes,
-                // New wording: the old facets describe the old wording; `borg learn` generates new ones.
-                facets: Vec::new(),
-                reach: crate::reach::narrower(&old.reach, reach).to_string(),
-                ..(*old).clone()
-            }
+    for id in old.supersedes.iter().rev() {
+        if !supersedes.contains(id) {
+            supersedes.insert(0, id.clone());
         }
-        None => Lesson {
-            id: format!("L{}", e.id),
-            origin_ms: e.ms,
-            repo: e.repo.clone(),
-            question,
-            situations: strs("situations"),
-            consequence,
-            support: 1,
-            episodes: vec![e.id.clone()],
-            history: vec![],
-            version: 1,
-            engineers: Some(e.engineer.clone()).filter(|x| !x.is_empty()).into_iter().collect(),
-            joined: Default::default(),
-            area,
-            supersedes,
-            source: String::new(),
-            scope: Vec::new(),
-            overrides: String::new(),
-            origin: String::new(),
-            facets: Vec::new(),
-            reach: reach.to_string(),
-        },
+    }
+    Lesson {
+        question: a.question,
+        situations: a.situations,
+        consequence: a.consequence,
+        support: old.support + 1,
+        episodes,
+        history,
+        version: old.version + 1,
+        engineers,
+        joined,
+        area: a.area,
+        supersedes,
+        // New wording: the old facets describe the old wording; `borg learn` generates new ones.
+        facets: Vec::new(),
+        reach: crate::reach::narrower(&old.reach, &a.reach).to_string(),
+        ..old.clone()
+    }
+}
+
+/// A new lesson from the episode alone.
+fn fresh(e: &Episode, a: Answer, supersedes: Vec<String>) -> Lesson {
+    Lesson {
+        id: format!("L{}", e.id),
+        origin_ms: e.ms,
+        repo: e.repo.clone(),
+        question: a.question,
+        situations: a.situations,
+        consequence: a.consequence,
+        support: 1,
+        episodes: vec![e.id.clone()],
+        version: 1,
+        engineers: Some(e.engineer.clone()).filter(|x| !x.is_empty()).into_iter().collect(),
+        area: a.area,
+        supersedes,
+        reach: a.reach,
+        ..Lesson::default()
+    }
+}
+
+/// Generalise one episode against the existing library: `Ok(Some)` a new lesson or a merged version
+/// of an existing one, `Ok(None)` not a lesson, `Err` no verdict. `ask` performs the model call
+/// (injectable for tests). A regret (regret.rs) gets its own prompt, the same verdict.
+///
+/// # Errors
+/// `AskFailed` when the model gave no usable verdict.
+pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<Lesson>, AskFailed> {
+    // A withdrawn personal lesson (reach.rs) is no merge target: it lives in a private collective now.
+    let library: Vec<Lesson> = library.iter().filter(|l| l.reach != crate::reach::PERSONAL).cloned().collect();
+    let similar = similar(e, &library);
+    let listed: Vec<String> = similar.iter().map(|l| format!("[{}] {} -> {}", l.id, l.question, l.consequence)).collect();
+    let Some(a) = Answer::parse(&ask(&episode_prompt(e, &listed)).ok_or(AskFailed)?)? else { return Ok(None) };
+    let same_as = similar.iter().find(|l| a.same_as == l.id);
+    // Only lessons the model was shown can be superseded, and never the one it merges into.
+    let supersedes: Vec<String> =
+        a.supersedes.iter().filter(|id| similar.iter().any(|l| &l.id == *id) && same_as.is_none_or(|m| &m.id != *id)).cloned().collect();
+    Ok(Some(match same_as {
+        Some(old) => merged(old, e, a, supersedes),
+        None => fresh(e, a, supersedes),
     }))
 }
 
@@ -568,6 +628,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_regret_is_asked_with_its_own_prompt_and_the_shared_rules() {
+        let r = regret::Regret {
+            decision_task: "read the flag in b".into(),
+            fix_subject: "fix: take the lock".into(),
+            signals: vec!["subject".into()],
+            age_days: 3,
+            ..regret::Regret::default()
+        };
+        let e = Episode {
+            kind: regret::KIND.into(),
+            regret: Some(r),
+            task: "make the flag safe".into(),
+            ..ep("Rdddd-ffff", "Fixed later (3d, subject): fix: take the lock")
+        };
+        let shown = std::cell::RefCell::new(String::new());
+        let l = generalise(&e, &[], &|p| {
+            *shown.borrow_mut() = p.to_string();
+            Some(json!({"is_lesson": true, "question": "Before reading a shared flag without a lock, has a concurrent writer been considered?",
+                "situations": ["reading a shared flag across threads"], "consequence": "a race", "same_as": "", "area": "concurrency", "supersedes": []}))
+        })
+        .unwrap()
+        .unwrap();
+        let p = shown.into_inner();
+        assert!(p.starts_with("A coding agent made a decision in an earlier session") && p.contains("3 days later"), "{p}");
+        for part in [
+            regret::neutral(REACH_RULES).as_str(),
+            regret::FIELDS,
+            AREA,
+            regret::neutral(MERGE_RULES).as_str(),
+            "## The decision (task)\nread the flag in b",
+            "## The fix (subject, task)\nfix: take the lock\nmake the flag safe",
+        ] {
+            assert!(p.contains(part), "{part}");
+        }
+        assert!(!p.contains("## Engineer's correction") && !p.contains(OPENING) && !p.contains("correction"), "{p}");
+        assert_eq!((l.id.as_str(), l.area.as_str(), l.episodes.as_slice()), ("LRdddd-ffff", "concurrency", &["Rdddd-ffff".to_string()][..]));
+        // A correction keeps its prompt; a kind without its regret is asked as a correction.
+        assert!(episode_prompt(&ep("e1", "no, the lock"), &[]).starts_with(OPENING));
+        assert!(episode_prompt(&Episode { kind: regret::KIND.into(), ..ep("e2", "no") }, &[]).starts_with(OPENING));
+    }
+
+    #[test]
     fn detects_corrections_and_rejections() {
         assert!(is_correction("double check against spec document"));
         assert!(is_correction("No, let's not move this into the net"));
@@ -595,7 +697,7 @@ mod tests {
             agent: "one ReentrantLock guards delivery".into(),
             rejected_tool: None,
             correction: correction.into(),
-            engineer: String::new(),
+            ..Episode::default()
         }
     }
 

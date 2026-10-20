@@ -70,6 +70,32 @@ Release checklist (the heading keeps "unreleased" until the tag exists):
   `--standalone` with an empty config dir, opencode 1 through `--pure`; either way borg's calls are
   filed under the temp dir, not the engineer's project.
 
+### Decision → fix links
+
+- At session end, in the background notes job, each landed commit's removed or changed lines are blamed
+  at its parent (`-w -M -C`). An origin with Borg reasoning from another session, at least
+  `BORG_REGRESS_MIN_AGE` (2 days) older, becomes a link in both notes (`borg fixed in:`, `borg fixes:`)
+  and, for a team collective, a `kind: "regress"` record in `reasoning.jsonl` that the mesh replicates
+  and `borg notes fetch` brings back. Private collectives keep the links in their notes; off repos get
+  nothing. Redacted before writing and again when shown.
+- A link is a *fix* on a revert (a `git revert` in the session counts), a fix-shaped subject, or a test
+  that failed and then passed in the session (the hook now records test runs in
+  `<state>/<session>.tests`) together with the engineer's words about a bug; otherwise a weak
+  *revisited* link that is never learned from. Formatter hunks, moves (a swapped line is no move),
+  pure additions, lock and generated files and commits over 40 files or 2,000 lines link nothing; at
+  most 5 links per session.
+- `BORG_REGRESS=learn` turns fix links into `regret` episodes (team and private collectives), which `borg learn`
+  words as a question for the decision point ("Before X, has Y been considered?"). The default `links`
+  records without learning. `borg learn` now starts after the notes job, not beside it.
+- `borg regress [--replay A..B] [--explain] [--any-origin] [--json]`: the links Borg would make, as a
+  dry run. `borg why` shows both ends: "→ fixed in" on the decision, "← decided in … → fixed here" on
+  the fix (`fixed_in` and `fixes` in `--json`).
+- Every git call has a 10 s limit (`BORG_REGRESS_TIMEOUT_S`) inside a 60 s run; it fails open.
+- The mesh answers a link record for either of its commits, and a bare `borg notes fetch` asks for the
+  last 200 commits on HEAD, noted ones too, so later links to a decision noted here arrive.
+- [reports/regress.md](reports/regress.md): a replay of this repository (no notes, so no links) and of a
+  scripted repo with known answers.
+
 ### Delivery
 
 - Early delivery: the first prompt or file touch that names a lesson's topic gets that topic's top lessons

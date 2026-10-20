@@ -8,7 +8,7 @@
 //! and its HEAD at the session's first prompt).
 //!
 //! **Only the session's own commits** (`landed`): a commit gets this session's note only if HEAD's
-//! reflog says `commit` (or `commit (amend)`, `commit (initial)`) created it while the session was
+//! reflog says `commit` (or `commit (amend)`, `commit (initial)`, `revert`, `cherry-pick`) created it while the session was
 //! working (between one of its prompts and the stop that followed, `<state>/<session>.active`) and
 //! it is still on HEAD. A `git pull`, a merge, a checkout of another branch, or a commit made while
 //! this session was idle (the engineer, or another session in the same repo) gets nothing from it.
@@ -23,7 +23,11 @@
 //! survives the author being offline. Only when `collective::may_sync` allows it: a local (private)
 //! collective's excerpts stay in that repo's notes, and an off repo gets nothing at all.
 //! `borg notes fetch [<commit>...]` reads it back: it asks the known members (borg-mesh `fetch`,
-//! author or replica) and writes what they hold as notes (`restore`).
+//! author or replica) and writes what they hold as notes (restore.rs).
+//!
+//! **Links** (regress.rs): after `attach`, the landed commits are matched against the earlier
+//! decisions whose lines they changed; a note then lists them under `borg fixed in:` (on the
+//! decision) and `borg fixes:` (on the fix), links.rs.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,6 +38,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{collective, learn};
+
+pub mod links;
+pub mod reasoning;
+pub mod regress;
+pub mod regress_cli;
+pub mod regress_cosmetic;
+pub mod regress_diff;
+pub mod regress_git;
+pub mod regress_learn;
+pub mod regress_signals;
+pub mod regret;
+pub mod restore;
+
+use links::LinkRef;
+pub use restore::{restore, wanted};
 
 pub const NOTES_REF: &str = "refs/notes/borg";
 /// At most this many commits get a note per run (a session that landed more is unusual; the
@@ -112,7 +131,8 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("BORG_STATE").unwrap_or_else(|_| "/tmp/borg".into()))
 }
 
-fn safe(session: &str) -> String {
+/// `session` as a file name in the state dir.
+pub(crate) fn safe(session: &str) -> String {
     session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect()
 }
 
@@ -120,7 +140,7 @@ fn state(dir: &Path, session: &str, ext: &str) -> PathBuf {
     dir.join(format!("{}.{ext}", safe(session)))
 }
 
-fn git(repo: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -205,7 +225,7 @@ pub fn remember_proposal(dir: &Path, session: &str, text: &str) {
 }
 
 /// The redacted reasoning of one landed commit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Excerpt {
     pub kind: String,
     pub commit: String,
@@ -219,6 +239,12 @@ pub struct Excerpt {
     /// excerpts from before it was recorded.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub collective: String,
+    /// Later commits that fixed (or revisited) this commit's lines (regress.rs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixed_by: Vec<LinkRef>,
+    /// The earlier decisions this commit fixed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<LinkRef>,
 }
 
 impl Excerpt {
@@ -229,17 +255,20 @@ impl Excerpt {
         if !self.episodes.is_empty() {
             s.push_str(&format!("\nCorrections (episodes): {}\n", self.episodes.join(", ")));
         }
+        s.push_str(&links::sections(&self.fixed_by, &self.fixes));
         s
     }
 
     /// The excerpt a borg note holds (the inverse of `note`), for `commit`; `None` if the text is
     /// not a borg reasoning note.
     pub fn from_note(commit: &str, text: &str) -> Option<Excerpt> {
+        let (text, fixed_by, fixes) = links::split(text);
         let (head, rest) = text.split_once('\n')?;
         let inner = head.trim().strip_prefix("borg reasoning (session ")?.strip_suffix(')')?;
         let (session, collective) = inner.split_once(", collective ").unwrap_or((inner, ""));
-        let rest = rest.trim_start().strip_prefix("Task:\n")?;
-        let (task, rest) = rest.split_once("\n\nLast proposal:\n").unwrap_or((rest, ""));
+        // git drops the blank lines an empty task or proposal leaves, and `git` trims the end.
+        let rest = rest.trim_start().strip_prefix("Task:")?;
+        let (task, rest) = rest.split_once("\nLast proposal:").map_or((rest, ""), |(t, p)| (t, p.strip_prefix('\n').unwrap_or(p)));
         let (proposal, episodes) = match rest.rsplit_once("\nCorrections (episodes): ") {
             Some((p, e)) => (p, e.trim().split(", ").filter(|e| !e.is_empty()).map(str::to_string).collect()),
             None => (rest, Vec::new()),
@@ -254,6 +283,8 @@ impl Excerpt {
             episodes,
             ms: 0,
             collective: collective.into(),
+            fixed_by,
+            fixes,
         })
     }
 }
@@ -271,7 +302,7 @@ pub fn excerpt(dir: &Path, session: &str, repo: &str, commit: &str, now: i64) ->
         proposal: redact(&read("proposal")),
         episodes,
         ms: now,
-        collective: String::new(),
+        ..Excerpt::default()
     }
 }
 
@@ -288,7 +319,7 @@ pub fn landed(repo: &Path, start: &Start, windows: &[(i64, i64)]) -> Vec<String>
     for l in reflog.lines() {
         let mut f = l.splitn(3, '\t');
         let (Some(c), Some(at), Some(subject)) = (f.next(), f.next(), f.next()) else { continue };
-        let own = ["commit:", "commit (amend):", "commit (initial):"].iter().any(|p| subject.starts_with(p));
+        let own = ["commit:", "commit (amend):", "commit (initial):", "revert:", "cherry-pick:"].iter().any(|p| subject.starts_with(p));
         let secs = at.rsplit_once('{').and_then(|(_, t)| t.trim_end_matches('}').parse::<i64>().ok());
         if own && secs.is_some_and(within) && on_head.contains(c) && !out.iter().any(|o| o == c) {
             out.push(c.to_string());
@@ -305,34 +336,13 @@ pub fn toplevel(dir: &str) -> Option<PathBuf> {
     git(Path::new(dir), &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
-/// The commits to ask the mesh about: the named ones (any form git resolves), or else the last 200
-/// on HEAD that have no borg note.
-pub fn wanted(repo: &Path, named: &[&str]) -> Result<Vec<String>, String> {
-    if !named.is_empty() {
-        return named.iter().map(|c| git(repo, &["rev-parse", "--verify", &format!("{c}^{{commit}}")]).ok_or(format!("{c} is not a commit"))).collect();
-    }
-    Ok(git(repo, &["rev-list", "--max-count=200", "HEAD"]).unwrap_or_default().lines().filter(|c| !has_note(repo, c)).map(str::to_string).collect())
+/// The borg note of `commit`, parsed; `None` without one.
+#[must_use]
+pub fn note_of(repo: &Path, commit: &str) -> Option<Excerpt> {
+    Excerpt::from_note(commit, &git(repo, &["notes", &format!("--ref={NOTES_REF}"), "show", commit])?)
 }
 
-/// Writes the excerpts `store`'s reasoning.jsonl holds for `commits` of `repo` as borg notes,
-/// where the commit exists and has no borg note yet. Returns the commits noted.
-pub fn restore(repo: &Path, store: &Path, commits: &[String]) -> Result<Vec<String>, String> {
-    let text = std::fs::read_to_string(store.join("reasoning.jsonl")).unwrap_or_default();
-    let mut done: Vec<String> = Vec::new();
-    for e in text.lines().filter_map(|l| serde_json::from_str::<Excerpt>(l).ok()) {
-        if e.kind != "reasoning" || !commits.contains(&e.commit) || done.contains(&e.commit) {
-            continue;
-        }
-        if git(repo, &["cat-file", "-e", &format!("{}^{{commit}}", e.commit)]).is_none() || has_note(repo, &e.commit) {
-            continue;
-        }
-        write_note(repo, &e)?;
-        done.push(e.commit);
-    }
-    Ok(done)
-}
-
-fn has_note(repo: &Path, commit: &str) -> bool {
+pub(crate) fn has_note(repo: &Path, commit: &str) -> bool {
     git(repo, &["notes", &format!("--ref={NOTES_REF}"), "list", commit]).is_some()
 }
 
@@ -364,22 +374,28 @@ pub struct Attached {
     pub replicated: usize,
 }
 
-/// Notes for `commits` of `repo` from `session` in the collective `route` names (an off route
-/// attaches nothing); excerpts go to `store`'s reasoning.jsonl only if the route may sync. `force`
-/// replaces an existing borg note (an explicitly named commit).
-pub fn attach(dir: &Path, session: &str, repo: &Path, commits: &[String], store: &Path, route: &collective::Route, force: bool) -> Result<Attached, String> {
-    let collective::Route::Collective { name: within, .. } = route else { return Ok(Attached::default()) };
-    let may_sync = collective::may_sync(route);
-    let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+/// Notes for `l.commits` from `l.session` in the collective `l.route` names (an off route attaches
+/// nothing); excerpts go to `l.store`'s reasoning.jsonl only if the route may sync. `force`
+/// replaces an existing borg note (an explicitly named commit), keeping the links it lists.
+///
+/// # Errors
+/// A note git would not write, or a store that cannot be appended to.
+pub fn attach(l: &Landed, force: bool) -> Result<Attached, String> {
+    let collective::Route::Collective { name: within, .. } = l.route else { return Ok(Attached::default()) };
+    let may_sync = collective::may_sync(l.route);
+    let name = l.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut done = Attached::default();
-    for c in commits {
-        if !force && has_note(repo, c) {
+    for c in l.commits {
+        if !force && has_note(l.repo, c) {
             continue;
         }
-        let e = Excerpt { collective: within.clone(), ..excerpt(dir, session, &name, c, learn::now_ms()) };
-        write_note(repo, &e)?;
+        let mut e = Excerpt { collective: within.clone(), ..excerpt(l.dir, l.session, &name, c, learn::now_ms()) };
+        if let Some(old) = note_of(l.repo, c).filter(|_| force) {
+            (e.fixed_by, e.fixes) = (old.fixed_by, old.fixes);
+        }
+        write_note(l.repo, &e)?;
         if may_sync {
-            append_reasoning(store, &e).map_err(|err| format!("{}: {err}", store.display()))?;
+            append_reasoning(l.store, &e).map_err(|err| format!("{}: {err}", l.store.display()))?;
             done.replicated += 1;
         }
         done.notes.push(c.clone());
@@ -387,7 +403,7 @@ pub fn attach(dir: &Path, session: &str, repo: &Path, commits: &[String], store:
     Ok(done)
 }
 
-fn append_reasoning(store: &Path, e: &Excerpt) -> std::io::Result<()> {
+pub(crate) fn append_reasoning(store: &Path, e: &Excerpt) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(store)?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(store.join("reasoning.jsonl"))?;
@@ -395,7 +411,8 @@ fn append_reasoning(store: &Path, e: &Excerpt) -> std::io::Result<()> {
 }
 
 /// The session that last started in `repo`, from the `.head` files in `dir`.
-fn latest_session(dir: &Path, repo: &str) -> Option<(String, Start)> {
+#[must_use]
+pub fn latest_session(dir: &Path, repo: &str) -> Option<(String, Start)> {
     std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -409,27 +426,61 @@ fn latest_session(dir: &Path, repo: &str) -> Option<(String, Start)> {
 }
 
 /// Hook, `end`: if the session started in a git repo, attach notes in the background (never delays
-/// the drone; any failure is silent).
-pub fn on_end(session: &str, input: &Value) {
+/// the drone; any failure is silent), and `borg learn --session` after them (`--then-learn`), so
+/// learning sees the regret episodes the links made. False when no job was started: the caller
+/// then starts `borg learn` itself.
+#[must_use]
+pub fn on_end(session: &str, input: &Value) -> bool {
     let dir = state_dir();
     let started = std::fs::read_to_string(state(&dir, session, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok());
     if started.is_none() {
-        return;
+        return false;
     }
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
-    let (Ok(exe), Some(store)) = (std::env::current_exe(), std::env::var_os("BORG_HOME")) else { return };
-    let _ = Command::new(exe)
-        .args(["notes", "attach", "--session", session, "--dir", cwd, "--store"])
+    let (Ok(exe), Some(store)) = (std::env::current_exe(), std::env::var_os("BORG_HOME")) else { return false };
+    Command::new(exe)
+        .args(["notes", "attach", "--session", session, "--dir", cwd, "--then-learn", "--store"])
         .arg(store)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
-/// `borg notes attach [<commit>] [--session ID] [--dir DIR] [--store DIR]`, or
+/// `--then-learn`: `borg learn [--session ID]` in the background once attach is done, whatever it
+/// did, on the store the run used (`--store`, else the caller's `BORG_HOME`).
+fn then_learn(args: &[&str]) {
+    let flag = |f: &str| args.iter().position(|a| *a == f).and_then(|i| args.get(i + 1)).copied();
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut c = Command::new(exe);
+    c.arg("learn").args(flag("--session").map(|s| ["--session", s]).into_iter().flatten());
+    if let Some(store) = flag("--store") {
+        c.env("BORG_HOME", store);
+    }
+    let _ = c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
+/// A run's commits and where they go: what `attach` notes, and what runs after it (main.rs passes
+/// `regress_learn.rs`, which links them to the earlier decisions they fixed).
+pub struct Landed<'a> {
+    pub dir: &'a Path,
+    pub session: &'a str,
+    pub repo: &'a Path,
+    pub store: &'a Path,
+    pub route: &'a collective::Route,
+    pub commits: &'a [String],
+    /// Where the session started (its work windows come from it).
+    pub start: Option<&'a Start>,
+}
+
+/// Runs after `attach` for the session's landed commits (not for a named one); its text ends the
+/// run's message.
+pub type After = fn(&Landed) -> String;
+
+/// `borg notes attach [<commit>] [--session ID] [--dir DIR] [--store DIR] [--then-learn]`, or
 /// `borg notes fetch [<commit>...] [--dir DIR]` (runs `borg-mesh fetch`: the network is there).
-pub fn main(args: &[&str]) -> i32 {
+pub fn main(args: &[&str], after: Option<After>) -> i32 {
     if args.first() == Some(&"fetch") {
         let beside = std::env::current_exe().ok().map(|e| e.with_file_name("borg-mesh")).filter(|p| p.exists());
         return match Command::new(beside.unwrap_or_else(|| "borg-mesh".into())).args(args).status() {
@@ -440,7 +491,9 @@ pub fn main(args: &[&str]) -> i32 {
             }
         };
     }
-    match run(args) {
+    // A panic in what runs after attach must not keep `--then-learn` from starting learning.
+    let ran = std::panic::catch_unwind(|| run(args, after)).unwrap_or_else(|_| Err("internal error; the notes written so far are kept".into()));
+    let code = match ran {
         Ok(msg) => {
             println!("{msg}");
             0
@@ -449,49 +502,86 @@ pub fn main(args: &[&str]) -> i32 {
             eprintln!("borg notes: {e}");
             1
         }
+    };
+    if args.contains(&"--then-learn") {
+        then_learn(args);
     }
+    code
 }
 
-fn run(args: &[&str]) -> Result<String, String> {
-    let flag = |f: &str| args.iter().position(|a| *a == f).and_then(|i| args.get(i + 1)).copied();
-    if args.first() != Some(&"attach") {
-        return Err("usage: borg notes attach [<commit>] [--session ID] [--dir DIR] | borg notes fetch [<commit>...] [--dir DIR]".into());
-    }
-    let commit = args.get(1).filter(|a| !a.starts_with("--")).copied();
-    let cwd = flag("--dir").map(str::to_string).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().display().to_string());
+const USAGE: &str = "usage: borg notes attach [<commit>] [--session ID] [--dir DIR] | borg notes fetch [<commit>...] [--dir DIR]";
+
+/// Where an attach run works: the collective `cwd` routes to, its store and state dir, the repo.
+struct Place {
+    route: collective::Route,
+    store: PathBuf,
+    dir: PathBuf,
+    repo: String,
+}
+
+/// The place of `--dir` (else the cwd), with `--store` in place of the collective's home.
+fn place(dir: Option<&str>, store: Option<&str>) -> Result<Place, String> {
+    let cwd = dir.map(str::to_string).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().display().to_string());
     // The gate is the config as it is now: the share decides replication whatever the caller says.
     let cfg = collective::load().map_err(|e| format!("invalid config, nothing is attached: {e}"))?;
     let route = collective::route(cfg.as_ref(), &cwd, &learn::home());
     let collective::Route::Collective { home, .. } = &route else {
         return Err(format!("{cwd} belongs to no collective (off): nothing is attached"));
     };
-    let store = flag("--store").map(PathBuf::from).unwrap_or_else(|| home.clone());
-    let dir = std::env::var_os("BORG_STATE").map(PathBuf::from).unwrap_or_else(|| store.join("state"));
+    let store = store.map_or_else(|| home.clone(), PathBuf::from);
+    let dir = std::env::var_os("BORG_STATE").map_or_else(|| store.join("state"), PathBuf::from);
     let repo = git(Path::new(&cwd), &["rev-parse", "--show-toplevel"]).ok_or(format!("{cwd} is not in a git repo"))?;
-    let (session, start) = match flag("--session") {
-        Some(s) => (s.to_string(), std::fs::read_to_string(state(&dir, s, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok())),
-        None => latest_session(&dir, &repo).map(|(s, st)| (s, Some(st))).ok_or("no drone session started in this repo; pass --session ID")?,
+    Ok(Place { route, store, dir, repo })
+}
+
+/// The session named (`--session`), else the latest one that started in the repo, and its start.
+fn session_of(named: Option<&str>, p: &Place) -> Result<(String, Option<Start>), String> {
+    match named {
+        Some(s) => Ok((s.to_string(), std::fs::read_to_string(state(&p.dir, s, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok()))),
+        None => latest_session(&p.dir, &p.repo).map(|(s, st)| (s, Some(st))).ok_or_else(|| "no drone session started in this repo; pass --session ID".into()),
+    }
+}
+
+/// The commit named, else the session's landed commits.
+fn commits_of(named: Option<&str>, start: Option<&Start>, p: &Place, session: &str) -> Result<Vec<String>, String> {
+    match (named, start) {
+        (Some(c), _) => Ok(vec![git(Path::new(&p.repo), &["rev-parse", "--verify", &format!("{c}^{{commit}}")]).ok_or(format!("{c} is not a commit"))?]),
+        (None, Some(st)) if st.repo == p.repo => Ok(landed(Path::new(&p.repo), st, &windows(&p.dir, session, st))),
+        _ => Err("the session did not start in this repo; name a commit".into()),
+    }
+}
+
+/// The run's message: the notes written, where the excerpts went, and what ran after (`then`).
+fn message(done: &Attached, route: &collective::Route, then: &str) -> String {
+    let queued = if collective::may_sync(route) {
+        format!("{} excerpt(s) queued for the mesh's replicas", done.replicated)
+    } else {
+        "local collective: nothing leaves this machine".into()
     };
-    let commits = match (commit, &start) {
-        (Some(c), _) => vec![git(Path::new(&repo), &["rev-parse", "--verify", &format!("{c}^{{commit}}")]).ok_or(format!("{c} is not a commit"))?],
-        (None, Some(st)) if st.repo == repo => landed(Path::new(&repo), st, &windows(&dir, &session, st)),
-        _ => return Err("the session did not start in this repo; name a commit".into()),
-    };
-    let done = attach(&dir, &session, Path::new(&repo), &commits, &store, &route, commit.is_some())?;
-    Ok(format!(
-        "{} note(s) in {NOTES_REF} (not pushed); {}",
-        done.notes.len(),
-        if collective::may_sync(&route) {
-            format!("{} excerpt(s) queued for the mesh's replicas", done.replicated)
-        } else {
-            "local collective: nothing leaves this machine".into()
-        }
-    ))
+    format!("{} note(s) in {NOTES_REF} (not pushed); {queued}{then}", done.notes.len())
+}
+
+fn run(args: &[&str], after: Option<After>) -> Result<String, String> {
+    let flag = |f: &str| args.iter().position(|a| *a == f).and_then(|i| args.get(i + 1)).copied();
+    if args.first() != Some(&"attach") {
+        return Err(USAGE.into());
+    }
+    let commit = args.get(1).filter(|a| !a.starts_with("--")).copied();
+    let p = place(flag("--dir"), flag("--store"))?;
+    let (session, start) = session_of(flag("--session"), &p)?;
+    let commits = commits_of(commit, start.as_ref(), &p, &session)?;
+    let repo = Path::new(&p.repo);
+    let landed = Landed { dir: &p.dir, session: &session, repo, store: &p.store, route: &p.route, commits: &commits, start: start.as_ref() };
+    let done = attach(&landed, commit.is_some())?;
+    // What runs after (regress.rs) is for the session's landed commits, not for a named one.
+    let then = after.filter(|_| commit.is_none()).map(|f| f(&landed)).unwrap_or_default();
+    Ok(message(&done, &p.route, &then))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use links::Link;
 
     #[test]
     fn redacts_secrets_and_keeps_the_reasoning() {
@@ -593,7 +683,9 @@ mod tests {
         let commits = landed(&repo, &start, &windows(&dir, "s-1", &start));
         assert_eq!(commits.len(), 2, "only the session's commits");
 
-        let done = attach(&dir, "s-1", &repo, &commits, &store, &route("corp", collective::Share::Team), false).unwrap();
+        let corp = route("corp", collective::Share::Team);
+        let l = Landed { dir: &dir, session: "s-1", repo: &repo, store: &store, route: &corp, commits: &commits, start: None };
+        let done = attach(&l, false).unwrap();
         assert_eq!((done.notes.len(), done.replicated), (2, 2));
         let note = sh(&repo, &["notes", "--ref=refs/notes/borg", "show", &commits[0]]);
         assert!(note.contains("fix the login") && note.contains("take the lock first") && note.contains("s-1-100, s-1-200"), "{note}");
@@ -607,7 +699,7 @@ mod tests {
         assert_eq!(sh(&repo, &["remote"]), "", "nothing to push to, nothing pushed");
 
         // Idempotent: a second run (another `end`) adds nothing.
-        assert_eq!(attach(&dir, "s-1", &repo, &commits, &store, &route("corp", collective::Share::Team), false).unwrap(), Attached::default());
+        assert_eq!(attach(&l, false).unwrap(), Attached::default());
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
 
@@ -618,7 +710,9 @@ mod tests {
         std::fs::write(dir.join("s-2.task"), "private refactor").unwrap();
         sh(&repo, &["commit", "-q", "--allow-empty", "-m", "private work"]);
         let head = sh(&repo, &["rev-parse", "HEAD"]);
-        let done = attach(&dir, "s-2", &repo, std::slice::from_ref(&head), &store, &route("private", collective::Share::Local), false).unwrap();
+        let private = route("private", collective::Share::Local);
+        let l = Landed { dir: &dir, session: "s-2", repo: &repo, store: &store, route: &private, commits: std::slice::from_ref(&head), start: None };
+        let done = attach(&l, false).unwrap();
         assert_eq!((done.notes.len(), done.replicated), (1, 0));
         assert!(sh(&repo, &["notes", "--ref=refs/notes/borg", "show", &head]).contains("private refactor"), "the note itself is written");
         assert!(!store.join("reasoning.jsonl").exists(), "nothing is queued for any peer");
@@ -692,6 +786,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
 
+    /// The link sections survive a note's round trip; a note without them parses as before, and a
+    /// proposal that merely says "fixed in" is left alone.
+    #[test]
+    fn link_sections_round_trip() {
+        let r =
+            |c: &str, s: &str| LinkRef { commit: c.into(), session: "s-7".into(), task: "fix the race".into(), date: "2026-10-12".into(), strength: s.into() };
+        let e = Excerpt {
+            kind: "reasoning".into(),
+            commit: "c".into(),
+            session: "s-1".into(),
+            task: "take the lock".into(),
+            proposal: "Fixed in the next commit, maybe.".into(),
+            episodes: vec!["s-1-1".into()],
+            collective: "work".into(),
+            fixed_by: vec![r("f1", links::FIX), r("f2", links::REVISITED)],
+            fixes: vec![r("d0", links::FIX)],
+            ..Excerpt::default()
+        };
+        assert_eq!(Excerpt::from_note("c", &e.note()), Some(e.clone()));
+        let old = Excerpt { fixed_by: vec![], fixes: vec![], ..e.clone() };
+        assert_eq!(Excerpt::from_note("c", &old.note()), Some(old.clone()));
+        assert_eq!(Excerpt::from_note("c", old.note().trim_end()).map(|x| x.episodes), Some(vec!["s-1-1".to_string()]));
+        // As git hands it back: an empty proposal (or task) loses its blank lines, the end is trimmed.
+        let empty = Excerpt { proposal: String::new(), episodes: vec![], ..old.clone() };
+        let stored = empty.note().replace("\n\n\n", "\n\n");
+        assert_eq!(Excerpt::from_note("c", stored.trim_end()), Some(empty.clone()), "{stored:?}");
+        let linked = Excerpt { fixes: vec![r("d0", links::FIX)], ..empty.clone() };
+        assert_eq!(Excerpt::from_note("c", linked.note().replace("\n\n\n", "\n\n").trim_end()), Some(linked));
+        let no_task = Excerpt { task: String::new(), ..empty };
+        assert_eq!(Excerpt::from_note("c", no_task.note().replace("\n\n\n", "\n\n").trim_end()), Some(no_task));
+    }
+
+    /// A forced re-attach (a named commit) rewrites the reasoning and keeps the links the note lists;
+    /// a `git revert` the session made is one of its commits.
+    #[test]
+    fn a_forced_attach_keeps_the_links_and_a_revert_lands() {
+        let (repo, dir, store) = repo("force");
+        remember_start(&dir, "s-1", &repo.display().to_string());
+        let start: Start = serde_json::from_str(&std::fs::read_to_string(dir.join("s-1.head")).unwrap()).unwrap();
+        std::fs::write(dir.join("s-1.task"), "use a ttl cache").unwrap();
+        std::fs::write(repo.join("cache.rs"), "ttl\n").unwrap();
+        sh(&repo, &["add", "cache.rs"]);
+        sh(&repo, &["commit", "-q", "-m", "use a ttl cache"]);
+        sh(&repo, &["revert", "--no-edit", "HEAD"]);
+        let head = sh(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(landed(&repo, &start, &windows(&dir, "s-1", &start)).first(), Some(&head), "the revert is the session's");
+        let r = |c: &str| LinkRef { commit: c.into(), session: "s-7".into(), task: "fix it".into(), date: "2026-10-12".into(), strength: links::FIX.into() };
+        let linked = Excerpt {
+            kind: "reasoning".into(),
+            commit: head.clone(),
+            session: "s-0".into(),
+            fixed_by: vec![r("f1")],
+            fixes: vec![r("d0")],
+            ..Excerpt::default()
+        };
+        write_note(&repo, &linked).unwrap();
+        let route = route("private", collective::Share::Local);
+        let l = Landed { dir: &dir, session: "s-1", repo: &repo, store: &store, route: &route, commits: std::slice::from_ref(&head), start: None };
+        attach(&l, true).unwrap();
+        let e = note_of(&repo, &head).unwrap();
+        assert_eq!((e.session.as_str(), e.task.as_str()), ("s-1", "use a ttl cache"));
+        assert_eq!((e.fixed_by, e.fixes), (vec![r("f1")], vec![r("d0")]));
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
     /// `restore` writes the excerpts the store holds for the asked commits as notes, once.
     #[test]
     fn restore_writes_held_excerpts_as_notes() {
@@ -706,7 +865,7 @@ mod tests {
             proposal: "take it first".into(),
             episodes: vec![],
             ms: 1,
-            collective: String::new(),
+            ..Excerpt::default()
         };
         let other = Excerpt { commit: "0".repeat(40), ..e.clone() };
         append_reasoning(&store, &other).unwrap();
@@ -715,7 +874,51 @@ mod tests {
         assert_eq!(restore(&repo, &store, std::slice::from_ref(&head)).unwrap(), vec![head.clone()]);
         assert!(sh(&repo, &["notes", "--ref=refs/notes/borg", "show", &head]).contains("take it first"));
         assert!(restore(&repo, &store, std::slice::from_ref(&head)).unwrap().is_empty(), "an existing note is kept");
-        assert!(wanted(&repo, &[]).unwrap().is_empty());
+        assert_eq!(wanted(&repo, &[]).unwrap(), vec![head.clone()], "noted commits are asked too: links to them come later");
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn restore_brings_the_fetched_links_into_both_notes() {
+        let (repo, _, store) = repo("relink");
+        let mut shas = Vec::new();
+        for msg in ["decide", "fix", "other"] {
+            sh(&repo, &["commit", "-q", "--allow-empty", "-m", msg]);
+            shas.push(sh(&repo, &["rev-parse", "HEAD"]));
+        }
+        let (dec, fix, other) = (&shas[0], &shas[1], &shas[2]);
+        let e = |c: &str, session: &str| Excerpt {
+            kind: "reasoning".into(),
+            commit: c.into(),
+            session: session.into(),
+            task: "take the lock".into(),
+            collective: "work".into(),
+            ..Excerpt::default()
+        };
+        // What `borg notes fetch` received: the decision's excerpt and its links, one of another collective.
+        append_reasoning(&store, &e(dec, "s-1")).unwrap();
+        for (to, collective) in [(fix, "work"), (other, "private")] {
+            let side = links::Side { session: "s-7".into(), task: "fix it".into(), date: "2026-10-12".into(), ..links::Side::default() };
+            let l = Link {
+                kind: links::KIND.into(),
+                commit: dec.clone(),
+                fix: to.clone(),
+                collective: collective.into(),
+                strength: links::FIX.into(),
+                fixed: side,
+                ..Link::default()
+            };
+            learn::append_jsonl(&store.join("reasoning.jsonl"), &l).unwrap();
+        }
+        // The fix's note is there already (this machine wrote it); the decision's is not.
+        write_note(&repo, &e(fix, "s-7")).unwrap();
+        write_note(&repo, &e(other, "s-8")).unwrap();
+        assert_eq!(restore(&repo, &store, std::slice::from_ref(dec)).unwrap(), [dec.clone(), fix.clone()]);
+        let decision = note_of(&repo, dec).unwrap();
+        assert_eq!((decision.fixed_by.len(), decision.fixed_by[0].commit.as_str(), decision.fixed_by[0].task.as_str()), (1, fix.as_str(), "fix it"));
+        assert_eq!(note_of(&repo, fix).unwrap().fixes[0].commit, *dec);
+        assert!(note_of(&repo, other).unwrap().fixes.is_empty(), "a record of another collective changes no note here");
+        assert!(restore(&repo, &store, std::slice::from_ref(dec)).unwrap().is_empty(), "once");
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
 }

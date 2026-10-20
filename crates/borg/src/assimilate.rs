@@ -38,6 +38,24 @@ use crate::runner;
 /// Two episodes of one session this close together are the same correction.
 const SAME_MS: i64 = 5_000;
 
+/// Its flags and `--from-dir`'s (completions.rs).
+pub const FLAGS: &[&str] = &[
+    "--apply",
+    "--since",
+    "--limit",
+    "--claude",
+    "--omp",
+    "--opencode",
+    "--from-dir",
+    "--plan",
+    "--for",
+    "--collective",
+    "--knowledge",
+    "--retros",
+    "--families",
+    "--decisions",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Claude,
@@ -176,7 +194,7 @@ impl Replay {
             agent: self.said.0.clone(),
             rejected_tool,
             correction,
-            engineer: String::new(),
+            ..Episode::default()
         };
         self.out.push(Found { cwd: self.cwd.clone(), task_cwd: self.task.1.clone(), agent_cwd: self.said.1.clone(), tool_cwd, episode });
     }
@@ -1153,7 +1171,7 @@ mod tests {
             agent: String::new(),
             rejected_tool: None,
             correction: "no".into(),
-            engineer: String::new(),
+            ..Episode::default()
         };
         std::fs::write(corp.join("episodes.jsonl"), serde_json::to_string(&live).unwrap() + "\n").unwrap();
         let cfg: Config = serde_json::from_str(CFG).unwrap();

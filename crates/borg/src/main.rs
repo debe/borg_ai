@@ -27,6 +27,8 @@
 //!        borg notes attach [<commit>] [--session ID] [--dir DIR]
 //!                                                     (redacted reasoning of a session's commits as git notes in
 //!                                                      refs/notes/borg, never pushed; notes.rs)
+//!        borg regress [--session ID] [--replay <A..B>] [--any-origin] [--explain] [--json] [--dir DIR]
+//!                                                     (dry run: earlier decisions later commits fixed; notes/regress.rs)
 //!        borg queen [--json] [--repo NAME] | show <n|id> | ask | answer <n|id> <text|a|b> | dismiss <n|id> [reason]
 //!                   | skip <n|id> | next --json | dedupe [--apply] | notify   [--dir DIR | --collective NAME]
 //!                                                     (open questions to the engineer, numbered; an answer becomes a
@@ -59,6 +61,9 @@
 //!   BORG_CONSCIENCE  lessons JSONL for the conscience at Stop (default $BORG_HOME/lessons.jsonl);
 //!                    weighted by the outcomes.jsonl beside it, if any, and by its authors' trust (trust.rs)
 //!   BORG_LEARN       "off" disables live capture of corrections and outcomes (eval drones)
+//!   BORG_REGRESS     decision → fix links at session end (notes/regress.rs): "links" (default) records
+//!                    them in both notes and the store; "learn" also makes strong ones regret episodes,
+//!                    which `borg learn` words as a question at the decision point; "off" records none
 //!   BORG_BEFORE      only use challenges learned before this epoch ms (eval replay)
 //!   BORG_CRITIC      "generic" = ask a generic self-review instead (control arm)
 //!   BORG_ONLY        comma-separated challenge ids to ask (eval oracle: perfect retrieval)
@@ -166,6 +171,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("reach [--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal"),
             ("trust [--dir DIR]", "trust per engineer and area"),
             ("notes attach|fetch [<commit>...]", "reasoning notes behind commits"),
+            ("regress [--replay A..B] [--explain] [--json]", "which earlier decisions later commits fixed (dry run)"),
         ],
     ),
     (
@@ -219,26 +225,103 @@ fn exec(part: &str, args: &[&str]) -> ! {
     std::process::exit(1);
 }
 
+/// `borg collective [DIR]`: which collective a directory belongs to (default: the current one), and
+/// whether it may sync. Routing compares path text, so a relative argument ("." or "../x") is made
+/// absolute first, as hooks' cwd is.
+fn collective_cmd(rest: &[&str]) {
+    let dir = rest.first().map_or_else(|| std::env::current_dir().unwrap_or_default(), std::path::PathBuf::from);
+    let cwd = std::path::absolute(&dir).unwrap_or(dir).display().to_string();
+    match collective::load() {
+        Err(e) => println!("off (invalid config: {e})"),
+        Ok(cfg) => match &collective::route(cfg.as_ref(), &cwd, &learn::home()) {
+            collective::Route::Off => println!("off: {cwd} belongs to no collective; hooks do nothing here"),
+            r @ collective::Route::Collective { name, home, share } => {
+                println!("{name} ({share:?}, may sync: {}) store {}", collective::may_sync(r), home.display());
+            }
+        },
+    }
+}
+
+/// The challenges of the state file `path` (before the time `rest` may name), and stdin.
+fn challenges_and_stdin(path: &str, rest: &[&str]) -> (Vec<conscience::Challenge>, String) {
+    let before = rest.first().and_then(|v| v.parse().ok());
+    let challenges = conscience::load(path.as_ref(), before);
+    let mut context = String::new();
+    let _ = std::io::stdin().read_to_string(&mut context);
+    (challenges, context)
+}
+
+/// `borg learn [--session ID]`.
+fn learn_cmd(rest: &[&str]) {
+    borg::stats::set_purpose("learn");
+    let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
+    let store = learn::home().join("lessons.jsonl");
+    let from = borg::facets::len_of(&store);
+    let (new, merged, waiting) =
+        learn::learn_in_reporting(&learn::home(), session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
+    println!("{new} new lessons, {merged} merged into existing ones");
+    if waiting > 0 {
+        eprintln!("borg learn: the model gave no answer; {waiting} episodes still pending, re-run `borg learn` later");
+    }
+    facets_for_written(&store, from);
+    borg::vectors::refresh(&store);
+    // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
+    borg::stats::rollup(&learn::home());
+}
+
+/// Live mode's check (live.rs), spawned by the `PostToolUse` hook with the hook's environment.
+fn check_cmd(rest: &[&str]) {
+    let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied().unwrap_or_default();
+    let session = flag("--session");
+    if session.is_empty() {
+        eprintln!("borg check: --session ID is required (internal: the PostToolUse hook runs it in live mode)");
+        std::process::exit(2);
+    }
+    let input = json!({"session_id": session, "cwd": flag("--cwd"), "transcript_path": flag("--transcript")});
+    borg::hook::live_check(harness::current(), session, &input);
+}
+
+/// Each lesson's memory (memory.rs) from the outcomes beside it, as JSON lines; with --session,
+/// that session's view (its clock tick and usefulness sample).
+fn memory_cmd(path: &str, rest: &[&str]) {
+    let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
+    let path = std::path::Path::new(path);
+    let lessons = conscience::load_unweighted(path, None);
+    let outcomes = outcome::read(&outcome::path_beside(path));
+    let memory = borg::memory::derive(&outcomes, &lessons, session);
+    let weights = outcome::weights(&outcomes);
+    for c in &lessons {
+        let m = &memory[&c.id];
+        println!(
+            "{}",
+            json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
+                "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
+                "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
+        );
+    }
+}
+
+/// R1 offline: `{"asked": [ids], "before": text, "edits": text, "final": text, "min_new": n}` on
+/// stdin -> `{"changed", "ignored"}`.
+fn resolve_cmd(path: &str) {
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let all = conscience::load_unweighted(path.as_ref(), None);
+    let ids: Vec<&str> = v["asked"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let asked: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| all.iter().find(|c| c.id == *i)).collect();
+    let min = v["min_new"].as_u64().map_or(borg::memory::NOVEL_WORDS, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let s = |k: &str| v[k].as_str().unwrap_or_default();
+    let (changed, ignored) = borg::memory::resolve(&asked, &all, s("before"), s("edits"), s("final"), min);
+    println!("{}", json!({"changed": changed, "ignored": ignored}));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         // The harness's event on stdin (hook.rs); an unknown harness fails open, like any hook error.
         ["hook", name, event] => borg::hook::main(name, event),
-        ["collective", rest @ ..] => {
-            // Which collective a directory belongs to (default: the current one), and whether it may sync.
-            // Routing compares path text, so a relative argument ("." or "../x") is made absolute first, as hooks' cwd is.
-            let dir = rest.first().map(std::path::PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let cwd = std::path::absolute(&dir).unwrap_or(dir).display().to_string();
-            match collective::load() {
-                Err(e) => println!("off (invalid config: {e})"),
-                Ok(cfg) => match &collective::route(cfg.as_ref(), &cwd, &learn::home()) {
-                    collective::Route::Off => println!("off: {cwd} belongs to no collective; hooks do nothing here"),
-                    r @ collective::Route::Collective { name, home, share } => {
-                        println!("{name} ({share:?}, may sync: {}) store {}", collective::may_sync(r), home.display());
-                    }
-                },
-            }
-        }
+        ["collective", rest @ ..] => collective_cmd(rest),
         [cmd @ ("mesh" | "steer"), rest @ ..] => {
             // The mesh is its own binary (crates/borg-mesh): the networking stack stays out of the hook.
             // So is steering: it signs with the member key and checks the membership (steer.rs).
@@ -247,33 +330,8 @@ fn main() {
         }
         // The live page (crates/borg-web): its web stack stays out of the hook binary too.
         ["web", rest @ ..] => exec("web", rest),
-        ["learn", rest @ ..] => {
-            borg::stats::set_purpose("learn");
-            let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
-            let store = learn::home().join("lessons.jsonl");
-            let from = borg::facets::len_of(&store);
-            let (new, merged, waiting) =
-                learn::learn_in_reporting(&learn::home(), session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
-            println!("{new} new lessons, {merged} merged into existing ones");
-            if waiting > 0 {
-                eprintln!("borg learn: the model gave no answer; {waiting} episodes still pending, re-run `borg learn` later");
-            }
-            facets_for_written(&store, from);
-            borg::vectors::refresh(&store);
-            // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
-            borg::stats::rollup(&learn::home());
-        }
-        ["check", rest @ ..] => {
-            // Live mode's check (live.rs), spawned by the PostToolUse hook with the hook's environment.
-            let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied().unwrap_or_default();
-            let session = flag("--session");
-            if session.is_empty() {
-                eprintln!("borg check: --session ID is required (internal: the PostToolUse hook runs it in live mode)");
-                std::process::exit(2);
-            }
-            let input = json!({"session_id": session, "cwd": flag("--cwd"), "transcript_path": flag("--transcript")});
-            borg::hook::live_check(harness::current(), session, &input);
-        }
+        ["learn", rest @ ..] => learn_cmd(rest),
+        ["check", rest @ ..] => check_cmd(rest),
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
         ["setup", rest @ ..] => std::process::exit(borg::install::setup::main(rest)),
         ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),
@@ -293,80 +351,23 @@ fn main() {
             borg::stats::set_purpose("assimilate");
             std::process::exit(borg::assimilate::main(rest, &learn::ask_claude))
         }
+        // The Stop gate's score for a state file + final message on stdin (eval/preempt/stop_prefilter.py).
         ["prefilter", path, rest @ ..] => {
-            // The Stop gate's score for a state file + final message on stdin (eval/preempt/stop_prefilter.py).
-            let before = rest.first().and_then(|v| v.parse().ok());
-            let challenges = conscience::load(path.as_ref(), before);
-            let mut context = String::new();
-            let _ = std::io::stdin().read_to_string(&mut context);
+            let (challenges, context) = challenges_and_stdin(path, rest);
             println!("{}", prefilter::features(&challenges, &context));
         }
-        ["memory", path, rest @ ..] => {
-            // Each lesson's memory (memory.rs) from the outcomes beside it, as JSON lines; with --session,
-            // that session's view (its clock tick and usefulness sample).
-            let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
-            let path = std::path::Path::new(path);
-            let lessons = conscience::load_unweighted(path, None);
-            let outcomes = outcome::read(&outcome::path_beside(path));
-            let memory = borg::memory::derive(&outcomes, &lessons, session);
-            let weights = outcome::weights(&outcomes);
-            for c in &lessons {
-                let m = &memory[&c.id];
-                println!(
-                    "{}",
-                    json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
-                        "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
-                        "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
-                );
-            }
-        }
-        ["resolve", path] => {
-            // R1 offline: {"asked": [ids], "before": text, "edits": text, "final": text, "min_new": n} on stdin
-            // -> {"changed", "ignored"}.
-            let mut raw = String::new();
-            let _ = std::io::stdin().read_to_string(&mut raw);
-            let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-            let all = conscience::load_unweighted(path.as_ref(), None);
-            let ids: Vec<&str> = v["asked"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-            let asked: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| all.iter().find(|c| c.id == *i)).collect();
-            let min = v["min_new"].as_u64().map_or(borg::memory::NOVEL_WORDS, |n| n as usize);
-            let s = |k: &str| v[k].as_str().unwrap_or_default();
-            let (changed, ignored) = borg::memory::resolve(&asked, &all, s("before"), s("edits"), s("final"), min);
-            println!("{}", json!({"changed": changed, "ignored": ignored}));
-        }
+        ["memory", path, rest @ ..] => memory_cmd(path, rest),
+        ["resolve", path] => resolve_cmd(path),
         ["recall", path, rest @ ..] => {
-            let before = rest.first().and_then(|v| v.parse().ok());
-            let challenges = conscience::load(path.as_ref(), before);
-            let mut context = String::new();
-            let _ = std::io::stdin().read_to_string(&mut context);
+            let (challenges, context) = challenges_and_stdin(path, rest);
             for (score, c) in conscience::rank(&challenges, &context) {
                 println!("{} {score:.3}", c.id);
             }
         }
-        ["expert", repo, rest @ ..] => {
-            let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied();
-            let Some(at) = flag("--at") else {
-                eprintln!("borg expert: --at <commit> is required");
-                std::process::exit(2);
-            };
-            let query = match flag("--q") {
-                Some(q) => q.to_string(),
-                None => {
-                    let mut q = String::new();
-                    let _ = std::io::stdin().read_to_string(&mut q);
-                    q
-                }
-            };
-            match expert::ask(repo.as_ref(), at, flag("--version"), &query, std::env::var(expert::CEILING_ENV).ok().filter(|c| !c.is_empty()).as_deref()) {
-                Ok(answer) => print!("{}", answer.render()),
-                Err(e) => {
-                    eprintln!("borg expert: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        ["expert", repo, rest @ ..] => std::process::exit(expert::main(repo, rest)),
         ["queen", rest @ ..] => std::process::exit(borg::queen::main(rest)),
-        ["notes", rest @ ..] => std::process::exit(borg::notes::main(rest)),
+        ["notes", rest @ ..] => std::process::exit(borg::notes::main(rest, Some(borg::notes::regress_learn::after_notes))),
+        ["regress", rest @ ..] => std::process::exit(borg::notes::regress_cli::main(rest)),
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),

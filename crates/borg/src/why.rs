@@ -10,6 +10,10 @@
 //! and those the mesh replicated to it from peers). No network and no model call: `borg notes fetch`
 //! is the step that asks peers. Lessons come from the routed collective's `lessons.jsonl` only.
 //!
+//! **Links** (notes/regress.rs): a decision shows the later commits that fixed its lines (`→ fixed
+//! in Y (task: …)`), a fix the decisions it fixed (`← decided in X (task: …) → fixed here`), from
+//! the notes and the store's link records, at most 3 each unless `--full` (why/linked.rs).
+//!
 //! **Privacy**: decided before git is asked anything. A cwd (or target) that routes off, or an
 //! invalid config, prints nothing and exits 0. A note or excerpt that names another collective is
 //! never shown (a private collective's note only where the cwd routes to that same collective);
@@ -28,14 +32,19 @@
 //! runs it: nothing injects it.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde::Serialize;
 
 use crate::collective::{self, Config, Route};
 use crate::learn;
-use crate::notes::{self, Excerpt, redact};
+use crate::notes::reasoning::{git_in, notes_of, stored_of};
+use crate::notes::{Excerpt, redact, regress};
+
+mod linked;
+
+pub use linked::LinkLine;
 
 const MAX_COMMITS: usize = 8;
 const MAX_LESSONS: usize = 3;
@@ -76,34 +85,6 @@ pub fn parse_span(arg: &str) -> Result<(String, Option<(u32, u32)>), String> {
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     git_in(dir, args, None).map(|o| String::from_utf8_lossy(&o).into_owned())
-}
-
-/// git in `dir`, with `input` on stdin (written from a thread so a large output cannot block it).
-fn git_in(dir: &Path, args: &[&str], input: Option<String>) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run git: {e}"))?;
-    let writer = match (input, child.stdin.take()) {
-        (Some(text), Some(mut stdin)) => Some(std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(text.as_bytes());
-        })),
-        _ => None,
-    };
-    let o = child.wait_with_output().map_err(|e| format!("cannot run git: {e}"))?;
-    if let Some(w) = writer {
-        let _ = w.join();
-    }
-    if !o.status.success() {
-        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
-    }
-    Ok(o.stdout)
 }
 
 /// `p` absolute with symlinks resolved (routing compares path text, git follows the real path);
@@ -175,6 +156,12 @@ pub struct Why {
     pub subject: String,
     pub reasoning: Option<Reasoning>,
     pub lessons: Vec<LessonLine>,
+    /// Later commits that fixed (or revisited) this one's lines (why/linked.rs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixed_in: Vec<LinkLine>,
+    /// The earlier decisions this commit fixed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<LinkLine>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -201,61 +188,6 @@ fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether an excerpt tagged `tag` may be shown in collective `here` (module doc).
-fn visible(tag: &str, here: &str) -> bool {
-    tag.is_empty() || tag == here
-}
-
-/// The borg notes of `shas` that are visible in `here`, by commit: one `notes list` for the note
-/// objects and one `cat-file --batch` for the notes of `shas` that have one.
-fn notes_of(repo: &Path, here: &str, shas: &[String]) -> HashMap<String, Excerpt> {
-    let list = git(repo, &["notes", &format!("--ref={}", notes::NOTES_REF), "list"]).unwrap_or_default();
-    let wanted: HashSet<&str> = shas.iter().map(String::as_str).collect();
-    let blobs: Vec<(&str, &str)> = list.lines().filter_map(|l| l.split_once(' ')).filter(|(_, commit)| wanted.contains(commit)).collect();
-    if blobs.is_empty() {
-        return HashMap::new();
-    }
-    let input: String = blobs.iter().map(|(blob, _)| format!("{blob}\n")).collect();
-    let Ok(out) = git_in(repo, &["cat-file", "--batch"], Some(input)) else { return HashMap::new() };
-    let mut found = HashMap::new();
-    let mut rest = &out[..];
-    for (_, commit) in blobs {
-        // "<oid> blob <size>\n<content>\n", or "<oid> missing\n".
-        let Some(nl) = rest.iter().position(|&b| b == b'\n') else { break };
-        let head = String::from_utf8_lossy(&rest[..nl]).into_owned();
-        rest = &rest[nl + 1..];
-        let Some(size) = head.split(' ').nth(2).and_then(|n| n.parse::<usize>().ok()) else { continue };
-        if rest.len() < size {
-            break;
-        }
-        let text = String::from_utf8_lossy(&rest[..size]).into_owned();
-        rest = rest.get(size + 1..).unwrap_or_default();
-        if let Some(e) = Excerpt::from_note(commit, &text).filter(|e| visible(&e.collective, here)) {
-            found.insert(commit.to_string(), e);
-        }
-    }
-    found
-}
-
-/// The newest excerpt visible in `here` for each of `shas`, from the store's reasoning.jsonl,
-/// read once.
-fn stored_of(store: &Path, here: &str, shas: &HashSet<&str>) -> HashMap<String, Excerpt> {
-    let mut found: HashMap<String, Excerpt> = HashMap::new();
-    if shas.is_empty() {
-        return found;
-    }
-    let text = std::fs::read_to_string(store.join("reasoning.jsonl")).unwrap_or_default();
-    for e in text.lines().filter_map(|l| serde_json::from_str::<Excerpt>(l).ok()) {
-        if e.kind != "reasoning" || !shas.contains(e.commit.as_str()) || !visible(&e.collective, here) {
-            continue;
-        }
-        if found.get(&e.commit).is_none_or(|old| e.ms > old.ms) {
-            found.insert(e.commit.clone(), e);
-        }
-    }
-    found
-}
-
 /// Defence in depth: whatever wrote the note, it is redacted again before anyone sees it.
 fn shown(e: Excerpt, source: &str) -> Reasoning {
     Reasoning {
@@ -276,34 +208,49 @@ fn lessons_of(lessons: &[learn::Lesson], episodes: &[String]) -> Vec<LessonLine>
         .collect()
 }
 
-/// The explanation of `target` (an argument as typed) from `cwd`, or `None` when `cwd`, the
-/// target or the repo they lie in routes off or elsewhere. `base` is the root store (`BORG_HOME`).
-/// Paths are routed resolved (absolute, symlinks followed), as git sees them.
-pub fn explain(cfg: Option<&Config>, base: &Path, cwd: &str, target: &str, full: bool) -> Result<Option<Report>, String> {
+/// Where `borg why` reads: the cwd's collective and store, the repo and the target in it.
+struct Place {
+    name: String,
+    home: PathBuf,
+    repo: PathBuf,
+    /// Where git runs for a span: the file's directory.
+    dir: PathBuf,
+    file: PathBuf,
+    path: String,
+    target: Target,
+}
+
+/// The target as a file span in the cwd's collective, or a commit; `None` when the file routes off.
+fn target_of(cfg: Option<&Config>, base: &Path, cwd: &Path, route: &Route, target: &str) -> Result<Option<(Target, PathBuf, String)>, String> {
+    let (path, lines) = parse_span(target)?;
+    let file = resolve(&cwd.join(&path));
+    if file.is_file() {
+        // The file itself may lie under an off path or in another collective than the cwd.
+        return match collective::route(cfg, &file.to_string_lossy(), base) {
+            Route::Off => Ok(None),
+            r if r != *route => Err(format!("{path} belongs to another collective than {}; run borg why from its repo", cwd.display())),
+            _ => Ok(Some((Target::Span { path: path.clone(), lines }, file, path))),
+        };
+    }
+    if lines.is_some() {
+        return Err(format!("{path}: no such file"));
+    }
+    Ok(Some((Target::Commit(target.to_string()), file, path)))
+}
+
+/// The place `target` is read from `cwd`, or `None` when the cwd, the target or the repo they lie
+/// in routes off or elsewhere (module doc).
+fn place(cfg: Option<&Config>, base: &Path, cwd: &str, target: &str) -> Result<Option<Place>, String> {
     if cwd.trim().is_empty() {
         return Ok(None);
     }
-    let cwd_path = resolve(Path::new(cwd));
-    let cwd = cwd_path.to_string_lossy().into_owned();
-    let route = collective::route(cfg, &cwd, base);
+    let cwd = resolve(Path::new(cwd));
+    let route = collective::route(cfg, &cwd.to_string_lossy(), base);
     let Route::Collective { name, home, .. } = &route else { return Ok(None) };
-    let (path, lines) = parse_span(target)?;
-    let file = resolve(&cwd_path.join(&path));
-    let target_kind = if file.is_file() {
-        // The file itself may lie under an off path or in another collective than the cwd.
-        match collective::route(cfg, &file.to_string_lossy(), base) {
-            Route::Off => return Ok(None),
-            r if r != route => return Err(format!("{path} belongs to another collective than {cwd}; run borg why from its repo")),
-            _ => Target::Span { path: path.clone(), lines },
-        }
-    } else if lines.is_some() {
-        return Err(format!("{path}: no such file"));
-    } else {
-        Target::Commit(target.to_string())
-    };
-    let dir = match &target_kind {
-        Target::Span { .. } => file.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd_path.clone()),
-        Target::Commit(_) => cwd_path.clone(),
+    let Some((target, file, path)) = target_of(cfg, base, &cwd, &route, target)? else { return Ok(None) };
+    let dir = match &target {
+        Target::Span { .. } => file.parent().map_or_else(|| cwd.clone(), Path::to_path_buf),
+        Target::Commit(_) => cwd.clone(),
     };
     let repo = git(&dir, &["rev-parse", "--show-toplevel"]).map(|s| PathBuf::from(s.trim())).map_err(|_| format!("{} is not in a git repo", dir.display()))?;
     // The repo itself must route where the cwd does: a symlinked directory or a submodule may put
@@ -312,107 +259,143 @@ pub fn explain(cfg: Option<&Config>, base: &Path, cwd: &str, target: &str, full:
     if collective::route(cfg, &repo.to_string_lossy(), base) != route {
         return Ok(None);
     }
-    let (mut shas, uncommitted) = match &target_kind {
+    Ok(Some(Place { name: name.clone(), home: home.clone(), repo, dir, file, path, target }))
+}
+
+/// The commits behind the target with their author time, and the span's lines not committed yet.
+fn commits_of(p: &Place) -> Result<(Vec<(String, i64)>, usize), String> {
+    match &p.target {
         Target::Span { lines, .. } => {
-            let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = p.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let mut args = vec!["blame".to_string(), "--porcelain".into()];
             if let Some((a, b)) = lines {
                 args.push(format!("-L{a},{b}"));
             }
             args.extend(["--".into(), name]);
-            let out = git(&dir, &args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| format!("git blame {path}: {e}"))?;
-            blamed(&out)
+            let out = git(&p.dir, &args.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| format!("git blame {}: {e}", p.path))?;
+            Ok(blamed(&out))
         }
         Target::Commit(c) => {
-            let sha = git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{commit}}")])
-                .map_err(|_| format!("{c} is neither a file nor a commit in {}", repo.display()))?;
-            (vec![(sha.trim().to_string(), 0)], 0)
+            let sha = git(&p.repo, &["rev-parse", "--verify", "--quiet", &format!("{c}^{{commit}}")])
+                .map_err(|_| format!("{c} is neither a file nor a commit in {}", p.repo.display()))?;
+            Ok((vec![(sha.trim().to_string(), 0)], 0))
         }
-    };
-    // Newest first by author time (from the blame headers), and the cap before any per-commit work.
-    shas.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
-    let mut more = 0;
-    if !full {
-        more = shas.len().saturating_sub(MAX_COMMITS);
-        shas.truncate(MAX_COMMITS);
     }
-    let shas: Vec<String> = shas.into_iter().map(|(s, _)| s).collect();
-    if shas.is_empty() {
-        return Ok(Some(Report { target: target.into(), collective: name.clone(), commits: Vec::new(), more, uncommitted }));
-    }
-    // One `git log` for the shown commits' headers.
+}
+
+/// One `git log` for the shown commits' headers: short sha, author, date and subject by commit.
+fn headers(repo: &Path, shas: &[String]) -> Result<HashMap<String, [String; 4]>, String> {
     let input: String = shas.iter().map(|s| format!("{s}\n")).collect();
-    let log = git_in(&repo, &["log", "--no-walk=unsorted", "--stdin", "--date=short", "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%s"], Some(input))
+    let log = git_in(repo, &["log", "--no-walk=unsorted", "--stdin", "--date=short", "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%s"], Some(input))
         .map_err(|e| format!("git log: {e}"))?;
-    let mut info: HashMap<String, [String; 4]> = HashMap::new();
+    let mut info = HashMap::new();
     for l in String::from_utf8_lossy(&log).lines() {
         let f: Vec<&str> = l.splitn(5, '\x1f').collect();
         if let [sha, short, author, date, subject] = f[..] {
             info.insert(sha.to_string(), [short.into(), author.into(), date.into(), subject.into()]);
         }
     }
-    let mut from_notes = notes_of(&repo, name, &shas);
+    Ok(info)
+}
+
+/// Each shown commit with its reasoning (note, else store), the lessons learned from its episodes
+/// and its decision → fix links.
+fn describe(p: &Place, shas: &[String]) -> Result<Vec<Why>, String> {
+    let mut info = headers(&p.repo, shas)?;
+    let mut from_notes = notes_of(&p.repo, &p.name, shas);
     let missing: HashSet<&str> = shas.iter().map(String::as_str).filter(|s| !from_notes.contains_key(*s)).collect();
-    let mut from_store = stored_of(home, name, &missing);
-    let lessons = learn::lessons(&home.join("lessons.jsonl"));
+    let mut from_store = stored_of(&p.home, &p.name, &missing);
+    let lessons = learn::lessons(&p.home.join("lessons.jsonl"));
+    let stored_links = regress::links_of(&p.home, &p.name, &shas.iter().map(String::as_str).collect::<HashSet<_>>());
     let mut commits = Vec::new();
-    for sha in &shas {
+    for sha in shas {
         let Some([short, author, date, subject]) = info.remove(sha) else { return Err(format!("git log {sha}: unexpected output")) };
-        let reasoning = match from_notes.remove(sha) {
-            Some(e) => Some(shown(e, "note")),
-            None => from_store.remove(sha).map(|e| shown(e, "store")),
+        let (excerpt, source) = match from_notes.remove(sha) {
+            Some(e) => (Some(e), "note"),
+            None => (from_store.remove(sha), "store"),
         };
+        let (fixed_in, fixes) = linked::of(sha, excerpt.as_ref(), &stored_links);
+        let reasoning = excerpt.map(|e| shown(e, source));
         let lessons = reasoning.as_ref().map(|r| lessons_of(&lessons, &r.episodes)).unwrap_or_default();
-        commits.push(Why { sha: sha.clone(), short, author, date, subject: redact(&subject), reasoning, lessons });
+        commits.push(Why { sha: sha.clone(), short, author, date, subject: redact(&subject), reasoning, lessons, fixed_in, fixes });
     }
+    Ok(commits)
+}
+
+/// The compact form of a commit: capped lessons and links, the task's first line, the proposal's end.
+fn compact(w: &mut Why) {
+    w.lessons.truncate(MAX_LESSONS);
+    for l in &mut w.lessons {
+        l.question = first_chars(&one_line(&l.question), LESSON_CAP);
+        l.consequence = first_chars(&one_line(&l.consequence), LESSON_CAP);
+    }
+    if let Some(r) = &mut w.reasoning {
+        r.task = first_chars(r.task.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim(), TASK_CAP);
+        r.proposal = last_chars(&one_line(&r.proposal), PROPOSAL_CAP);
+    }
+    linked::compact(&mut w.fixed_in);
+    linked::compact(&mut w.fixes);
+}
+
+/// The explanation of `target` (an argument as typed) from `cwd`, or `None` when `cwd`, the
+/// target or the repo they lie in routes off or elsewhere. `base` is the root store (`BORG_HOME`).
+/// Paths are routed resolved (absolute, symlinks followed), as git sees them.
+///
+/// # Errors
+/// A bad line range, a missing file or commit, a file of another collective, or git failing.
+pub fn explain(cfg: Option<&Config>, base: &Path, cwd: &str, target: &str, full: bool) -> Result<Option<Report>, String> {
+    let Some(p) = place(cfg, base, cwd, target)? else { return Ok(None) };
+    let (mut shas, uncommitted) = commits_of(&p)?;
+    // Newest first by author time (from the blame headers), and the cap before any per-commit work.
+    shas.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+    let more = if full { 0 } else { shas.len().saturating_sub(MAX_COMMITS) };
+    shas.truncate(if full { usize::MAX } else { MAX_COMMITS });
+    let shas: Vec<String> = shas.into_iter().map(|(s, _)| s).collect();
+    let mut commits = if shas.is_empty() { Vec::new() } else { describe(&p, &shas)? };
     if !full {
-        for w in &mut commits {
-            w.lessons.truncate(MAX_LESSONS);
-            for l in &mut w.lessons {
-                l.question = first_chars(&one_line(&l.question), LESSON_CAP);
-                l.consequence = first_chars(&one_line(&l.consequence), LESSON_CAP);
-            }
-            if let Some(r) = &mut w.reasoning {
-                r.task = first_chars(r.task.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim(), TASK_CAP);
-                r.proposal = last_chars(&one_line(&r.proposal), PROPOSAL_CAP);
-            }
-        }
+        commits.iter_mut().for_each(compact);
     }
-    Ok(Some(Report { target: target.into(), collective: name.clone(), commits, more, uncommitted }))
+    Ok(Some(Report { target: target.into(), collective: p.name, commits, more, uncommitted }))
+}
+
+/// The reasoning lines of a commit.
+fn render_reasoning(s: &mut String, r: Option<&Reasoning>) {
+    let Some(x) = r else {
+        s.push_str("  (no borg reasoning recorded)\n");
+        return;
+    };
+    let from = if x.source == "note" { String::new() } else { " (from the collective's store; `borg notes fetch` writes it as a note)".into() };
+    let _ = writeln!(s, "  task: {}{from}", x.task.trim());
+    if !x.proposal.trim().is_empty() {
+        let _ = writeln!(s, "  proposal: {}", x.proposal.trim());
+    }
+    if !x.episodes.is_empty() {
+        let _ = writeln!(s, "  episodes: {}", x.episodes.join(", "));
+    }
 }
 
 /// The report as text.
+#[must_use]
 pub fn render(r: &Report) -> String {
     let mut s = String::new();
     for w in &r.commits {
-        s.push_str(&format!("{} {} {} {}\n", w.short, w.date, w.author, w.subject));
-        match &w.reasoning {
-            None => s.push_str("  (no borg reasoning recorded)\n"),
-            Some(x) => {
-                let from = if x.source == "note" { String::new() } else { " (from the collective's store; `borg notes fetch` writes it as a note)".into() };
-                s.push_str(&format!("  task: {}{from}\n", x.task.trim()));
-                if !x.proposal.trim().is_empty() {
-                    s.push_str(&format!("  proposal: {}\n", x.proposal.trim()));
-                }
-                if !x.episodes.is_empty() {
-                    s.push_str(&format!("  episodes: {}\n", x.episodes.join(", ")));
-                }
-            }
-        }
+        let _ = writeln!(s, "{} {} {} {}", w.short, w.date, w.author, w.subject);
+        render_reasoning(&mut s, w.reasoning.as_ref());
+        s.push_str(&linked::render(&w.fixed_in, &w.fixes));
         for l in &w.lessons {
-            s.push_str(&format!("  lesson {}: {} -> {}\n", l.id, l.question.trim(), l.consequence.trim()));
+            let _ = writeln!(s, "  lesson {}: {} -> {}", l.id, l.question.trim(), l.consequence.trim());
         }
     }
     if r.more > 0 {
-        s.push_str(&format!("... {} older commit(s) not shown (--full)\n", r.more));
+        let _ = writeln!(s, "... {} older commit(s) not shown (--full)", r.more);
     }
     if r.uncommitted > 0 {
-        s.push_str(&format!("{} line(s) not committed yet\n", r.uncommitted));
+        let _ = writeln!(s, "{} line(s) not committed yet", r.uncommitted);
     }
     if r.commits.is_empty() {
-        s.push_str(&format!("no commits behind {}\n", r.target));
+        let _ = writeln!(s, "no commits behind {}", r.target);
     } else if r.commits.iter().all(|w| w.reasoning.is_none()) {
-        s.push_str(&format!("no borg reasoning found for {} (in collective {}; `borg notes fetch` asks the mesh)\n", r.target, r.collective));
+        let _ = writeln!(s, "no borg reasoning found for {} (in collective {}; `borg notes fetch` asks the mesh)", r.target, r.collective);
     }
     s
 }
@@ -462,6 +445,8 @@ fn usage() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes;
+    use std::process::Command;
 
     fn sh(dir: &Path, args: &[&str]) -> String {
         let o = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
@@ -540,6 +525,7 @@ mod tests {
                 episodes: episodes.iter().map(|s| s.to_string()).collect(),
                 ms: 1,
                 collective: collective.into(),
+                ..Excerpt::default()
             };
             notes::write_note(repo, &e).unwrap();
         }
@@ -781,7 +767,7 @@ author-time 999
             proposal: format!("start {long} end"),
             episodes: vec![],
             ms: 1,
-            collective: String::new(),
+            ..Excerpt::default()
         };
         notes::write_note(&fx.repo, &e).unwrap();
         let compact = fx.why(&fx.repo, "HEAD", false).unwrap().unwrap();

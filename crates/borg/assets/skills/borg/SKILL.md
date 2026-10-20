@@ -1,13 +1,14 @@
 ---
 name: borg
-description: How borg works and how to run it for the engineer. Use when the engineer mentions borg, a collective, a lesson, a drone, the queen, the mesh, team sync, vectors or collectives.json, asks why borg blocked or asked something, wants to set up borg, add or keep a repo out of a collective, share lessons with a team or company, or fix what borg doctor reports.
+description: How borg works and how to run it for the engineer. Use when the engineer mentions borg, a collective, a lesson, a drone, the queen, the mesh, team sync, vectors or collectives.json, asks why borg blocked or asked something, which later commit fixed a decision, wants to set up borg, add or keep a repo out of a collective, share lessons with a team or company, or fix what borg doctor reports.
 ---
 
 # borg
 
 borg is a shared memory for coding agents. Hooks in each harness (Claude Code, omp, opencode, Codex)
 capture the engineer's corrections, `borg learn` turns them into lessons, and at the end of a turn
-(and, in live mode, during it) a model checks the work against the lessons that apply. Lessons stay
+(and, in live mode, during it) a model checks the work against the lessons that apply. At session
+end borg also links each landed commit to the earlier decisions whose lines it fixed. Lessons stay
 on this machine unless the collective they belong to is synced with a team over the mesh.
 
 ## Vocabulary
@@ -20,6 +21,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | reach | Who hears a lesson: `team` (everyone in the collective), `repo` (only that repo) or `personal` (only the engineer, in their private collective) |
 | queen | The queue of open decisions waiting for the engineer (`borg queen`) |
 | mesh | Peer-to-peer sync of a `share: "team"` collective between members' machines (`borg mesh`, a separate `borg-mesh` binary) |
+| link | A decision → fix pair: an earlier commit with borg reasoning whose lines a later session's commit changed. A *fix* link (revert, fix-shaped subject, test failed then passed, the engineer named a bug) can become a `regret` lesson; a *revisited* link never does |
 | vectors | A local embedding index that finds lessons sharing no word with the work (paraphrases, other languages) |
 
 ## What to run when
@@ -33,6 +35,8 @@ on this machine unless the collective they belong to is synced with a team over 
 | To wire or unwire a harness | `borg install <harness\|all>`, `borg uninstall <harness\|all>` |
 | To answer borg's open questions | `borg queen`, `borg queen show <n>`, `borg queen answer <n> <text>` |
 | The reasoning behind a line or commit | `borg why <path>[:<line>]` or `borg why <commit>` |
+| Which later commit fixed a decision, or which decision a fix corrected | `borg why <path>[:<line>]` ("→ fixed in", "← decided in") |
+| The decision → fix links borg would make, before learning from them | `borg regress --replay <A..B> --explain` (dry run; [details](references/collectives.md#decision--fix-links)) |
 | To redirect or pause running drones | `borg steer <drone\|all> "<text>"`, `borg steer <drone> --pause`, `borg steer <drone> --resume` |
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
@@ -55,7 +59,12 @@ on this machine unless the collective they belong to is synced with a team over 
 4. **`share: "local"` never syncs.** Put private and client work in a `local` collective or under
    `off`. Never move a repo into a `team` collective without the engineer saying so: its lessons then
    reach everyone in that team.
-5. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg reach` and
+5. **Learning from fixes is the engineer's call.** `BORG_REGRESS` defaults to `links`: links are
+   recorded, nothing is learned. Before suggesting `BORG_REGRESS=learn`, run
+   `borg regress --replay <A..B> --explain` on their history and `borg regress --session ID --explain`
+   on a few real sessions, and let them check the fix links: a replay cannot see test runs or prompts,
+   so a live run makes fix links the replay never showed.
+6. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg reach` and
    `borg assimilate --from-dir` spend model calls; say roughly how many before running them.
 
 ## Setting up

@@ -9,6 +9,7 @@
 - [What `borg install` writes](#what-borg-install-writes)
 - [Import what you already have](#import-what-you-already-have)
 - [Vectors](#vectors)
+- [Decision → fix links](#decision--fix-links)
 - [Environment variables](#environment-variables)
 
 ## Collectives
@@ -86,7 +87,8 @@ answer with `borg queen`. Answering one moves the lesson; it writes no new lesso
 ## Storage
 
 Each collective keeps plain files in `~/.local/share/borg/collectives/<name>/` (`BORG_HOME` moves the
-root): `episodes.jsonl`, `lessons.jsonl`, `outcomes.jsonl`, and, when used, `vectors/`, `mesh/`, `queen/`
+root): `episodes.jsonl`, `lessons.jsonl`, `outcomes.jsonl`, `reasoning.jsonl` (reasoning excerpts and
+decision → fix links from the mesh), and, when used, `vectors/`, `mesh/`, `queen/`
 and `presence/`. Per-session scratch state lives in `/tmp/borg` (`BORG_STATE`).
 
 ## System map
@@ -188,6 +190,90 @@ command. No hook downloads the model; without model or index, Borg matches words
 (`config.json`, `tokenizer.json`, `model.safetensors`), `file://` included; each must match its pinned
 sha256. A lean build (`--no-default-features`) has no vectors.
 
+## Decision → fix links
+
+Some choices look fine and break weeks later. At each session end, after `borg notes attach` has
+written the session's reasoning notes, the same background job looks for the earlier decisions the
+session's commits fixed. `borg learn` starts only after it, so it sees what the job wrote. The hook
+itself does no extra work.
+
+**What links.** For each commit the session landed, the lines it removed or changed are blamed at its
+parent (`git blame -w -M -C`: a reformat, a move or a copy in between keeps the original author). An
+origin commit becomes a link when it
+
+- has a Borg note or a reasoning record of this collective (one `borg notes fetch` brought counts);
+- comes from another session;
+- is at least `BORG_REGRESS_MIN_AGE` older (default `2d`, by commit times);
+- is an ancestor of the fix and not linked to it yet.
+
+Left out: merges and root commits, pure additions (they blame nobody), formatter hunks (identical once
+whitespace and trailing commas are removed), moved lines (added again in another file, further away, or
+as a block; a line swapped with its neighbour still counts), binary, lock, snapshot, minified and
+generated files (`*.pb.*`, `*_generated.*`, `openapi*.json`, or `linguist-generated` / `-diff` in
+`.gitattributes`), and any commit over 40 files or 2,000 changed lines (a refactor). At most 5 links per
+session, fixes first. `borg regress --explain` names the reason for each.
+
+**Fix or revisited.** A link is a *fix* when the commit reverts the decision (a `git revert` the session
+made counts), or its subject reads like a fix (`fix: ...`, `Fix ...`, `resolves #12`, `ABC-12`,
+"regression"), or both of these hold:
+
+- a test run failed and a later one passed in the session (the hook notes `cargo test`, `pytest`,
+  `npm test` and the like in `<state>/<session>.tests`, 0 tokens; a build that did not compile is no
+  test run);
+- the engineer's prompts or task name a bug, crash, regression, a failing or flaky test. "Error",
+  "issue", a bare "fail" and "fail open" do not count.
+
+Either of the last two alone is no fix: writing a feature test first also goes red, then green.
+Otherwise the link is a weak *revisited* one, stored and shown but never learned from. A commit that
+changed several decisions' lines is also weak for each decision it only renamed something in.
+
+**Where it is written.** The decision's note gets a `borg fixed in:` section, the fix's note a
+`borg fixes:` section; an older Borg shows them as part of the note's text (or of its episode list). A
+forced `borg notes attach <commit>` rewrites the reasoning and keeps both sections. Everything is redacted before it
+is written and again when `borg why` shows it.
+
+| Repo | Both notes | Link record in `reasoning.jsonl`, replicated by the mesh | Regret episode (`BORG_REGRESS=learn`) |
+|---|---|---|---|
+| team collective | yes | yes | yes |
+| private collective (`"share": "local"`) | yes | no | yes (stays on the machine) |
+| off | no | no | no |
+
+**Learning from it.** `BORG_REGRESS` sets how far it goes:
+
+- `links` (default): record the links, learn nothing from them.
+- `learn`: also make each fix link an episode of kind `regret` (id
+  `R<decision>-<fix>`, written once). `borg learn` makes one model call for it, with the decision's task
+  and proposal, the fix's task, subject, the fixing session's prompts and proposal, and a redacted diff
+  of the decision's files, and words the lesson as a question
+  for the decision point: "Before <doing X> in <situation>, has <risk Y> been considered?". Reach
+  follows [the usual rules](#who-hears-a-lesson).
+- `off`: no links.
+
+Before you switch to `learn`, check what the detector finds in your own history:
+
+```sh
+borg regress --replay HEAD~200..HEAD --explain
+```
+
+A replay takes each commit's session and task from its note. It has no test runs and no prompts, so it
+cannot see the tests and words signals: a live run makes fix links a replay never showed, and those are
+the ones most likely wrong. Before you switch, also check a few real sessions with
+`borg regress --session ID --explain` (the session's own test runs and prompts). Method and results on a
+scripted repo, which measures only the subject and revert signals:
+[reports/regress.md](../reports/regress.md).
+
+**Rebases.** A rebase or an amend gives commits new ids, and their notes stay behind unless git copies
+them. Run this once per repo, or a rebased decision can no longer be linked:
+
+```sh
+git config notes.rewriteRef refs/notes/borg
+```
+
+**Fails open.** Each git call stops after `BORG_REGRESS_TIMEOUT_S` (10 s), and the whole run, regret
+episodes included, after 60 s of git.
+A call past either, a shallow clone's boundary or an unreadable diff means fewer links, never a failed
+hook.
+
 ## Environment variables
 
 All are optional.
@@ -209,6 +295,9 @@ All are optional.
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
 | `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*); `off`: no model call, episodes wait |
 | `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call |
+| `BORG_REGRESS` | `links` | [Decision → fix links](#decision--fix-links): `learn` also makes fix links regret episodes (team or private); `off`: no links |
+| `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
+| `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
 | `BORG_EARLY` | on | `off`: no early delivery |

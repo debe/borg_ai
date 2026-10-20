@@ -96,6 +96,34 @@ impl Answer {
 
 static HEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{4,40}$").unwrap());
 
+/// `borg expert <repo> --at <commit> [--version <v>] [--q <text>]` (the question on stdin without
+/// `--q`).
+pub fn main(repo: &str, rest: &[&str]) -> i32 {
+    let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied();
+    let Some(at) = flag("--at") else {
+        eprintln!("borg expert: --at <commit> is required");
+        return 2;
+    };
+    let query = flag("--q").map_or_else(
+        || {
+            let mut q = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut q);
+            q
+        },
+        str::to_string,
+    );
+    match ask(repo.as_ref(), at, flag("--version"), &query, std::env::var(CEILING_ENV).ok().filter(|c| !c.is_empty()).as_deref()) {
+        Ok(answer) => {
+            print!("{}", answer.render());
+            0
+        }
+        Err(e) => {
+            eprintln!("borg expert: {e}");
+            1
+        }
+    }
+}
+
 /// Ask the expert repo at `at` (any commit-ish), for a consumer pinned at `version`. With a
 /// `ceiling`, `at` must be a hex hash naming the ceiling or one of its ancestors.
 pub fn ask(repo: &Path, at: &str, version: Option<&str>, query: &str, ceiling: Option<&str>) -> Result<Answer, String> {

@@ -22,8 +22,8 @@
 //!    each excerpt (`replicas`), so the reasoning survives the author being offline without every
 //!    member holding all of it.
 //! 5. `Ask`: the commits whose reasoning a member wants (`borg notes fetch`); any node that holds
-//!    an admitted excerpt for one answers with it, author or replica, so the "why" can be read
-//!    back while its author is offline.
+//!    an admitted excerpt for one (or a link record with it on either side) answers with it, author
+//!    or replica, so the "why" can be read back while its author is offline.
 //! 6. `Live`: ephemeral, never reconciled into a log: presence (live.rs: which drones run where,
 //!    latest per member and session, a day at most) and signed steering directives (steer.rs:
 //!    checked against the membership on receipt; refused ones are dropped and logged).
@@ -638,19 +638,14 @@ impl Node {
         };
         let held = lines::read(&path);
         let set = origin::admitted(held.clone(), &origin::load(home), &mine);
-        let answer: Vec<&Hash> = set.iter().filter(|(_, l)| commit_of(l).is_some_and(|c| asked(&theirs, &c))).map(|(h, _)| h).take(MAX_ASK).collect();
+        let answer: Vec<&Hash> = set.iter().filter(|(_, l)| about(&theirs, l)).map(|(h, _)| h).take(MAX_ASK).collect();
         let give = signed(&set, &origin::load(home), answer.into_iter());
         report.answered += give.len();
         self.gate()?; // again just before lines leave
         let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
             return Err("protocol: expected lines".into());
         };
-        let want: BTreeSet<Hash> = got
-            .iter()
-            .filter(|s| commit_of(&s.line).is_some_and(|c| asked(&ask, &c)))
-            .map(|s| lines::hash(&s.line))
-            .filter(|h| !held.contains_key(h))
-            .collect();
+        let want: BTreeSet<Hash> = got.iter().filter(|s| about(&ask, &s.line)).map(|s| lines::hash(&s.line)).filter(|h| !held.contains_key(h)).collect();
         self.store_lines(&path, got, &want, &mine, None, &mut report)?;
 
         // Live: presence and steering, ephemeral (live.rs, steer.rs).
@@ -716,9 +711,11 @@ fn heard(home: &Path, key: &str, listen: Option<String>, relay: Option<String>, 
     let _ = peers::remember(home, key, &hints.join(","));
 }
 
-/// The commit a reasoning excerpt belongs to.
-fn commit_of(line: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(line).ok()?.get("commit")?.as_str().map(str::to_string)
+/// Whether a line of reasoning.jsonl is about one of `commits`: an excerpt by its `commit`, a
+/// decision → fix link record (borg notes/links.rs) by either side, so fetching the fix brings it too.
+fn about(commits: &[String], line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+    ["commit", "fix"].iter().filter_map(|k| v.get(k)?.as_str()).any(|c| asked(commits, c))
 }
 
 /// Whether `commit` is one of `asked` (full ids, or abbreviations of at least 7 characters).
@@ -800,6 +797,16 @@ async fn recv(rx: &mut RecvStream) -> Result<Msg, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An excerpt is asked for by its commit; a link record by its decision or by its fix.
+    #[test]
+    fn lines_about_the_asked_commits() {
+        let ask = vec!["d0d0d0d".to_string(), "f1f1f1f1f1".to_string()];
+        let excerpt = json!({"kind": "reasoning", "commit": "d0d0d0d0d0"}).to_string();
+        let link = |c: &str, f: &str| json!({"kind": "regress", "commit": c, "fix": f}).to_string();
+        assert!(about(&ask, &excerpt) && about(&ask, &link("aaaaaaaaaa", "f1f1f1f1f1")) && about(&ask, &link("d0d0d0d0d0", "bbbbbbbbbb")));
+        assert!(!about(&ask, &link("aaaaaaaaaa", "bbbbbbbbbb")) && !about(&ask, "not json"));
+    }
 
     /// One node's machine: a root store (`BORG_HOME`), a config (`BORG_CONFIG`) and a repo that
     /// routes to collective "work" with `share`.

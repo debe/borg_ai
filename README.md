@@ -39,6 +39,17 @@ shared memory for a set of repos and engineers.
 tool call with a reason. At session end, `borg learn` makes one model call per episode and writes a
 lesson. A new correction on the same point updates the existing lesson.
 
+**Regrets.** Some choices look fine and break weeks later. At session end, after the reasoning notes are
+written, Borg blames the lines each landed commit removed or changed and finds the decision behind
+them: an earlier commit with Borg reasoning, from another session, at least two days older. The link
+goes into both commits' notes and, for a team collective, to the mesh. It is a *fix* when the commit
+reverts the decision, its subject reads like a fix, or a test failed and then passed in the session
+while your prompts spoke of a bug; otherwise it is a weak *revisited* link that Borg never learns from. With
+`BORG_REGRESS=learn`, a fix becomes an episode, and `borg learn` words it as a question for the
+decision point: "Before choosing X here, has Y been considered?" Links are recorded by default;
+learning from them waits until you have checked a dry run (`borg regress --replay A..B`). See
+[Decision → fix links](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#decision--fix-links).
+
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
 ![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/turn.svg)
@@ -76,7 +87,8 @@ A session reads only its own collective's lessons.
 **Also included:**
 
 - `borg why <file>:<line>` shows the redacted reasoning behind a commit, kept as a git note
-  (`refs/notes/borg`, never pushed).
+  (`refs/notes/borg`, never pushed), and both ends of a decision → fix link: "→ fixed in Y" on the
+  decision, "← decided in X → fixed here" on the fix.
 - `borg top` lists the drones running across the team; `borg steer` sends them a signed instruction.
 - **Expert repos:** a collective can name local checkouts of its dependencies. A turn end that touches
   one gets at most three cited claims from that checkout, at the pinned version.
@@ -312,7 +324,8 @@ Borg runs on its own. These commands show what it does:
 | `borg collective [DIR]` | Which collective a directory belongs to |
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
 | `borg top` · `borg steer` | Running drones across the team; send them a signed instruction |
-| `borg why <path>:<line>` | The reasoning behind a line of code |
+| `borg why <path>:<line>` | The reasoning behind a line of code, and which later commit fixed it |
+| `borg regress --replay A..B` | Which earlier decisions the commits of a range fixed (dry run) |
 | `borg web` | A live page of the knowledge and what the collective did, on 127.0.0.1 |
 
 All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).
@@ -340,6 +353,7 @@ corrections), transcripts, source code, `collectives.json`, per-session state.
 
 - lessons: question, situations, consequence, scope, author emails, repo names;
 - reasoning excerpts of landed commits, redacted, each held by two members;
+- decision → fix links: both commits, their sessions, redacted tasks and subjects, the lines;
 - presence for `borg top`: session, harness, email, repo, first line of your latest prompt (redacted),
   recently touched paths;
 - steering instructions and the signed member list;
@@ -380,6 +394,7 @@ author's and a few colleagues' sessions, so their data is not in this repository
 | Public data ([SWE-chat](https://github.com/debe/borg_ai/blob/main/reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
 | End-to-end run in a sandboxed home ([dogfood](https://github.com/debe/borg_ai/blob/main/reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
 | Live vs hook mode, internal task benchmark (9 tasks per mode) | live +0.38 criteria per task [0, +0.88], 0 redo rounds vs 0.5; live is the default |
+| Decision → fix links, replay of a scripted repo with known answers ([regress](https://github.com/debe/borg_ai/blob/main/reports/regress.md)) | fix links 4 of 5 right, 4 of 5 reachable fixes found (subject and revert signals only; tests and prompts are not measured); no real-repo precision yet |
 
 **Known limits:**
 
@@ -399,8 +414,11 @@ author's and a few colleagues' sessions, so their data is not in this repository
 - opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
   successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
   TUI hides it for built-in tools, but session exports show it.
-- Borg learns only from corrections. Knowledge nobody corrected enters only through
-  `assimilate --from-dir`.
+- Borg learns from corrections and, with `BORG_REGRESS=learn`, from later fixes of earlier decisions.
+  Knowledge nobody corrected or fixed enters only through `assimilate --from-dir`.
+- Decision → fix links have been measured only on a scripted repo, not on real notes, and only for
+  the subject and revert signals: check `borg regress --replay` on your own history and
+  `borg regress --session ID --explain` on a few real sessions before `BORG_REGRESS=learn`.
 
 ## Upgrade and uninstall
 

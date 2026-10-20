@@ -196,6 +196,7 @@ fn record(session: &str, input: &Value, task: String, agent: String, rejected_to
         rejected_tool,
         correction,
         engineer: learn::engineer(cwd),
+        ..learn::Episode::default()
     };
     let _ = learn::record_episode(&e);
     append(session, &format!("#borg-episode {}", e.id));
@@ -926,6 +927,7 @@ pub fn dispatch(h: &dyn Harness, event: &str, input: &Value) -> Option<Value> {
     match event {
         "prompt" => on_prompt(h, session, input),
         "post_tool_failure" => {
+            capture_test(session, input, true);
             if h.caps().deny_capture {
                 capture_rejection(h, session, input);
             }
@@ -935,7 +937,10 @@ pub fn dispatch(h: &dyn Harness, event: &str, input: &Value) -> Option<Value> {
             on_end(h, session, input);
             None
         }
-        "post_tool" => on_post_tool(h, session, input),
+        "post_tool" => {
+            capture_test(session, input, false);
+            on_post_tool(h, session, input)
+        }
         "stop" => on_stop(h, session, input),
         _ => None,
     }
@@ -969,6 +974,23 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     out.flatten()
 }
 
+/// A shell command that ran tests leaves `fail <ms>` or `pass <ms>` in `<state>/<session>.tests`: the
+/// regress `tests` signal (`notes/regress_signals.rs`), whether or not the harness reports denials.
+fn capture_test(session: &str, input: &Value, failed: bool) {
+    if !learning() || input.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+        return;
+    }
+    let command = input.pointer("/tool_input/command").and_then(Value::as_str).unwrap_or_default();
+    if !crate::notes::regress_signals::runs_tests(command) {
+        return;
+    }
+    if let Some(what) = crate::notes::regress_signals::test_outcome(command, &crate::notes::regress_signals::tool_output(input), failed)
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state_file(session).with_extension("tests"))
+    {
+        let _ = writeln!(f, "{what} {}", learn::now_ms());
+    }
+}
+
 fn on_end(h: &dyn Harness, session: &str, input: &Value) {
     let _ = std::fs::remove_file(denied_file(session));
     if !learning() {
@@ -977,9 +999,11 @@ fn on_end(h: &dyn Harness, session: &str, input: &Value) {
     // The session's landed commits get a redacted reasoning note, in the background.
     crate::notes::remember_proposal(&crate::notes::state_dir(), session, &full_proposal(h, input));
     crate::notes::mark(&crate::notes::state_dir(), session, "stop");
-    crate::notes::on_end(session, input);
-    // Generalise this session's corrections in the background; never delay the drone.
-    if let Ok(exe) = std::env::current_exe() {
+    // Generalise this session's corrections in the background; never delay the drone. The notes job
+    // starts it once its links are recorded, so learning sees their regret episodes.
+    if !crate::notes::on_end(session, input)
+        && let Ok(exe) = std::env::current_exe()
+    {
         let _ = std::process::Command::new(exe)
             .args(["learn", "--session", session])
             .stdin(std::process::Stdio::null())
