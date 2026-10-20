@@ -39,7 +39,7 @@ fn the_whole_pool_is_every_allowed_lesson_lessons_first_and_done_ones_drop_out()
     let p2 = &prompts(&root)[1];
     assert_eq!(shown(p2), ["New", "G0", "G1", "G2", "G3", "G4", "G5"]);
 
-    // The default is the whole pool, compact and graded (reports/whole-store.md, "Graded follow-up").
+    // The default is the whole pool, compact and graded (internal evaluation "whole-store", "Graded follow-up", not published).
     turn(&root, "w3", "Tidy the budget handling of the net", &[], "Done: the budget place is drained.", &[("BORG_PREFILTER", "off")]);
     let p3 = &prompts(&root)[2];
     assert_eq!(shown(p3), ["Mdrain", "New", "G0", "G1", "G2", "G3", "G4", "G5"]);

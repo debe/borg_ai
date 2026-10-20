@@ -1,4 +1,4 @@
-//! Lesson retrieval arms for reports/hybrid-search.md (eval only; not used by the borg binary).
+//! Lesson retrieval arms for the internal evaluation "hybrid-search" (not published; eval only; not used by the borg binary).
 //!
 //! Arms A and B (borg's own BM25) live here and need no extra dependency. The SeekStorm arms (C, D, E)
 //! are in `seek` behind the `seekstorm` feature, so the default workspace build stays as it was.
@@ -26,7 +26,7 @@ pub struct Lesson {
     pub consequence: String,
     #[serde(default)]
     pub scope: Vec<String>,
-    /// Search facets (reports/facets.md); empty in stores without them.
+    /// Search facets (internal evaluation "facets", not published); empty in stores without them.
     #[serde(default)]
     pub facets: Vec<String>,
 }
@@ -75,7 +75,7 @@ pub fn rank_b(lessons: &[Lesson], query: &str) -> Vec<(String, f64)> {
     scored.into_iter().map(|(s, l)| (l.id.clone(), s)).collect()
 }
 
-/// The facet arms of reports/facets.md: each lesson a group of documents, scored by
+/// The facet arms of the internal evaluation "facets" (not published): each lesson a group of documents, scored by
 /// `conscience::bm25_groups` (best document + `second` × second best, idf over lessons), no scope rule,
 /// ties newer first. `F`: question + facets; `FB`: arm B's all-fields text + facets.
 pub fn rank_groups(lessons: &[Lesson], all_fields: bool, second: f64, query: &str) -> Vec<(String, f64)> {

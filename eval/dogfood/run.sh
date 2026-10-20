@@ -10,5 +10,5 @@
 # model sonnet; about $0.5 per run.
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
-cargo build --release --manifest-path "$root/Cargo.toml" -p borg -p borg-eval
+cargo build --release --manifest-path "$root/Cargo.toml" -p borg-ai -p borg-eval
 exec "$root/target/release/borg-eval" dogfood "$@"

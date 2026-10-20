@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(names("/home/u/private/app"), ["own", "team"], "a local collective may read its own and team repos, never off ones");
         assert!(names("/home/u/secret/app").is_empty());
         // A symlink into an off path is resolved.
-        let d = std::env::temp_dir().join(format!("borg-collective-link-{}", std::process::id()));
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!("borg-collective-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("secret/sdk")).unwrap();
         std::os::unix::fs::symlink(d.join("secret/sdk"), d.join("link")).unwrap();

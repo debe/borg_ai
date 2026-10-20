@@ -113,7 +113,7 @@ pub fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() > n { format!("{}…", t.trim_end()) } else { t }
 }
 
-/// "dennis.berger@example.com" → "dennis.berger"; names stay as they are.
+/// "ann@example.com" → "ann"; names stay as they are.
 pub fn who(e: &str) -> String {
     if e.is_empty() { "someone".into() } else { e.split('@').next().unwrap_or(e).to_string() }
 }

@@ -1,21 +1,25 @@
 [package]
 name = "borg-search"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-description = "Eval only: lesson retrieval arms (borg BM25 vs embedded SeekStorm lexical/vector/hybrid), reports/hybrid-search.md"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Eval only: lesson retrieval arms (borg BM25 vs embedded SeekStorm lexical/vector/hybrid), internal evaluation hybrid-search (not published)"
 publish = false
 
 [features]
 # Off by default: the default workspace build does not compile SeekStorm, tokio or Model2Vec.
 seekstorm = ["dep:seekstorm", "dep:tokio", "dep:model2vec-rs"]
-# The product's Stop-step vectors (reports/vectors.md).
+# The product's Stop-step vectors (internal evaluation "vectors", not published).
 vectors = ["borg/vectors"]
 
 [dependencies]
-borg = { path = "../borg" }
+borg = { package = "borg-ai", path = "../borg", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 seekstorm = { version = "=3.3.13", default-features = false, optional = true }

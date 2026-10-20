@@ -40,7 +40,7 @@ pub fn setup(name: &str) -> PathBuf {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\nn=$(ls {d} | wc -l)\nprintf '%s' \"$2\" > {d}/$n.txt\nif [ -f {a} ]; then cat {a}; else echo '{{\"structured_output\":{{\"moves\":[],\"applies\":[{{\"id\":\"Mdrain\",\"why\":\"w\",\"grade\":3}}]}},\"total_cost_usd\":0.05}}'; fi\n",
+            "#!/bin/sh\nn=$(( $(ls {d} | wc -l) ))\nprintf '%s' \"$2\" > {d}/$n.txt\nif [ -f {a} ]; then cat {a}; else echo '{{\"structured_output\":{{\"moves\":[],\"applies\":[{{\"id\":\"Mdrain\",\"why\":\"w\",\"grade\":3}}]}},\"total_cost_usd\":0.05}}'; fi\n",
             d = root.join("prompts").display(),
             a = root.join("answer.json").display()
         ),

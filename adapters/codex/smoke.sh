@@ -25,7 +25,7 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 BORG=${BORG_TEST_BIN:-$REPO/target/debug/borg}
 REAL_CODEX=$(command -v codex) || { echo "smoke: codex is not installed" >&2; exit 1; }
-[ -x "$BORG" ] || { echo "smoke: no borg binary at $BORG (cargo build -p borg)" >&2; exit 1; }
+[ -x "$BORG" ] || { echo "smoke: no borg binary at $BORG (cargo build -p borg-ai)" >&2; exit 1; }
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/borg-codex-smoke.XXXXXX")
 PIDS=()
@@ -53,7 +53,7 @@ printf '{"default":"off","collectives":[{"name":"corp","paths":["%s"],"share":"l
 # The fake consequence model (crates/borg/tests/common): Mdrain at grade 3.
 cat > "$W/bin/claude" <<EOF
 #!/bin/sh
-n=\$(ls $W/prompts | wc -l)
+n=\$(( \$(ls $W/prompts | wc -l) ))
 printf '%s' "\$2" > $W/prompts/\$n.txt
 echo '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'
 EOF

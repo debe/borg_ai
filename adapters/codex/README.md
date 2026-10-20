@@ -64,5 +64,5 @@ write trust. A shim also forces the flag onto borg's own codex call, to show tha
 `-c features.hooks=false` alone keeps the hooks out. borg itself never passes the flag.
 
 ```sh
-cargo build -p borg && adapters/codex/smoke.sh     # KEEP=1 keeps the temp dir
+cargo build -p borg-ai && adapters/codex/smoke.sh     # KEEP=1 keeps the temp dir
 ```

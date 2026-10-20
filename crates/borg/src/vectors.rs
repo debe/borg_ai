@@ -1,4 +1,4 @@
-//! Vector recall for the Stop step (reports/vectors.md).
+//! Vector recall for the Stop step (internal evaluation "vectors", not published).
 //!
 //! Word matching (BM25) shortlists the lessons the consequence model reads at a turn end. It misses lessons
 //! that share no rare word with the work: paraphrased or abstract ones, German work against English
@@ -174,7 +174,7 @@ pub fn main(args: &[&str]) -> i32 {
     #[cfg(not(feature = "vectors"))]
     {
         let _ = store;
-        eprintln!("borg vectors: this borg is a lean build (--no-default-features); reinstall without that flag: cargo install --path crates/borg --locked");
+        eprintln!("borg vectors: this borg is a lean build (--no-default-features); reinstall without that flag: cargo install borg-ai --locked --force");
         1
     }
     #[cfg(feature = "vectors")]

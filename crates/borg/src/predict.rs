@@ -41,7 +41,7 @@ Then, for each lesson, predict whether its consequence would plausibly follow fr
 kind of move (or omits the same thing) on the same kind of state. Topic overlap alone is not enough. Return only lessons \
 that apply, most consequential first; return none if none apply.";
 
-/// Graded applies (the default; `BORG_STOP_GRADED=off` turns them off, reports/whole-store.md "Graded follow-up"): appended to the
+/// Graded applies (the default; `BORG_STOP_GRADED=off` turns them off, internal evaluation "whole-store", "Graded follow-up", not published): appended to the
 /// instructions; each applied lesson then carries a grade, and the Stop blocks only for a 3
 /// (conscience.rs `graded`).
 const GRADE: &str = "Grade each lesson you return: 3 = this work clearly runs into the consequence unless the lesson \

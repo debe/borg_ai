@@ -1,4 +1,4 @@
-//! Eval only (reports/whole-store.md): the Stop model step over today's shortlist (arm A) vs the whole
+//! Eval only (internal evaluation "whole-store", not published): the Stop model step over today's shortlist (arm A) vs the whole
 //! store (arm B), on recorded Stop contexts with known relevant lessons.
 //!
 //!   hs-whole plan <queries.jsonl> <vector-rank.jsonl> <out.jsonl>
@@ -14,7 +14,7 @@
 //! product generates none by default), no outcome weights (none exist in these stores), the system gate for
 //! the query's `repos`, nothing done yet, the query as context and as scope text.
 //! - A: BM25 top 30 (`select_scoped`) + up to 10 vector hits (`vectors::extend`) from the vector ranking
-//!   recorded for the same query and corpus (reports/vectors.md, rank.jsonl `vector`): the shortlist the
+//!   recorded for the same query and corpus (internal evaluation "vectors", not published, rank.jsonl `vector`): the shortlist the
 //!   product builds with the `vectors` feature, without loading the model here.
 //! - B: `whole::eligible` + `whole::select` at the default budget (`whole::TOKENS`), arm A's list as the
 //!   fallback order.

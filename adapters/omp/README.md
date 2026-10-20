@@ -23,7 +23,7 @@ The extension fails open. If the borg binary is missing, crashes, times out or p
 `borg install omp` shows what it would write; `borg install omp --apply` copies the adapter (built into the binary) to `~/.omp/agent/extensions/borg.ts`, with a backup of anything it replaces. `borg uninstall omp --apply` removes it again, `borg doctor` checks the wiring. By hand:
 
 ```sh
-cargo install --path crates/borg            # or put target/release/borg on PATH, or set BORG_BIN
+cargo install borg-ai --locked              # or --path crates/borg, target/release/borg on PATH, or BORG_BIN
 mkdir -p ~/.omp/agent/extensions
 ln -s "$PWD/adapters/omp/borg.ts" ~/.omp/agent/extensions/borg.ts
 ```
@@ -55,7 +55,7 @@ note only inside that collective.
 ## Tests
 
 ```sh
-cargo build -p borg
+cargo build -p borg-ai
 node --test adapters/omp/borg.test.ts   # contract test: omp-shaped events -> adapter -> real `borg hook omp`
 node --test adapters/conformance/conformance.test.ts   # the installed adapter through the harness conformance scenario
 adapters/omp/smoke/smoke.sh < /dev/null # one real headless omp run (temp HOME and agent dir, local mock model, no tokens)

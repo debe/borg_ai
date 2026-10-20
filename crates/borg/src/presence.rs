@@ -256,9 +256,9 @@ pub fn state(p: &Presence, now: i64, alive: impl Fn(u32) -> bool) -> State {
     }
 }
 
-/// Whether a local process runs (Linux /proc; elsewhere every pid counts as alive).
+/// Whether a local process runs (signal 0, so Linux and macOS alike).
 pub fn alive(pid: u32) -> bool {
-    !Path::new("/proc/self").exists() || Path::new(&format!("/proc/{pid}")).exists()
+    i32::try_from(pid).is_ok_and(crate::live::alive)
 }
 
 #[cfg(test)]

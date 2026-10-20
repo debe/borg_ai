@@ -9,7 +9,7 @@ fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("borg-queen-cli-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    d.canonicalize().unwrap() // macOS: /var -> /private/var
 }
 
 /// borg with a clean environment: only the given store, config and a temp HOME (git reads no user config).

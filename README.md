@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
 
 # Borg
 
@@ -7,8 +7,9 @@ and brings each lesson back when a later session, yours or a teammate's, meets t
 runs as hooks in Claude Code and as extensions in omp (oh-my-pi) and opencode. Teams share lessons peer
 to peer, with no server.
 
-**Status:** 0.1.0, early. One engineer has used it on one machine. Read
-[Evidence and limits](#evidence-and-limits) before you rely on it.
+**Status:** 0.1.0. In daily use at a company, with lessons syncing between engineers' machines over
+the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits)
+before you rely on it.
 
 - [How it works](#how-it-works)
 - [Supported agents](#supported-agents)
@@ -21,9 +22,10 @@ to peer, with no server.
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 - [Development](#development)
 
-Reference: [Configuration](docs/configuration.md) · [Team sync](docs/team-sync.md) ·
-[Commands](docs/commands.md) · [Statistics and the live page](docs/statistics.md) ·
-[Harnesses](docs/harnesses.md) · [Reports](reports/)
+Reference: [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md) · [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md) ·
+[Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md) · [Statistics and the live page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md) ·
+[Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) · [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports) ·
+[Contributing](https://github.com/debe/borg_ai/blob/main/CONTRIBUTING.md) · [Security](https://github.com/debe/borg_ai/blob/main/SECURITY.md)
 
 ## How it works
 
@@ -31,7 +33,7 @@ A **drone** is one agent session. A **lesson** is what a correction becomes: a q
 ask itself, the situations where it applies, and the consequence it prevents. A **collective** is one
 shared memory for a set of repos and engineers.
 
-![A correction becomes a lesson, changes another drone's work, reaches a colleague over the mesh and becomes long-term memory](docs/img/one-correction.svg)
+![A correction becomes a lesson, changes another drone's work, reaches a colleague over the mesh and becomes long-term memory](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/one-correction.svg)
 
 **Learning.** Borg records an *episode* when you push back on the agent ("no, use a channel") or reject a
 tool call with a reason. At session end, `borg learn` makes one model call per episode and writes a
@@ -39,7 +41,7 @@ lesson. A new correction on the same point updates the existing lesson.
 
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
-![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](docs/img/turn.svg)
+![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/turn.svg)
 
 1. **Early, free.** When a prompt or touched file first names a lesson's topic, Borg adds that topic's
    top lessons to the context. Word matching only. Claude Code only so far.
@@ -56,16 +58,16 @@ lesson. A new correction on the same point updates the existing lesson.
 collective goes dormant. Only a strong match wakes it, and nothing is deleted. The clock counts
 sessions, not days, so a holiday erases nothing.
 
-<p align="center"><img src="docs/img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
 
 **Reach.** A correction about the code becomes a team lesson. One about how *you* like the agent to
 work (commit style, AI attribution, branching) is personal: it goes to your private collective and
 never reaches the team. A convention of one repo is delivered only there. See
-[Who hears a lesson](docs/configuration.md#who-hears-a-lesson).
+[Who hears a lesson](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#who-hears-a-lesson).
 
 **Collectives.** Each repo path belongs to one collective, or to none:
 
-- **team** collectives sync to their members over the [peer mesh](docs/team-sync.md);
+- **team** collectives sync to their members over the [peer mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md);
 - **private** collectives (`"share": "local"`) never leave the machine;
 - **off** repos are invisible: Borg returns before it reads or writes anything.
 
@@ -79,25 +81,25 @@ A session reads only its own collective's lessons.
 - **Expert repos:** a collective can name local checkouts of its dependencies. A turn end that touches
   one gets at most three cited claims from that checkout, at the pinned version.
 - **The queen** holds open decisions for the engineer. A drone asks one at the first prompt of a session.
-  See [Answering the queen](docs/commands.md#answering-the-queen).
+  See [Answering the queen](https://github.com/debe/borg_ai/blob/main/docs/commands.md#answering-the-queen).
 
 When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; step 3 is not:
 
-![Escalation: memory, an expert repo, a live drone, the engineer](docs/img/escalation.svg)
+![Escalation: memory, an expert repo, a live drone, the engineer](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/escalation.svg)
 
-![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](docs/img/architecture.svg)
+![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/architecture.svg)
 
 ## Supported agents
 
 | Agent | Wired by `borg install` | Gets |
 |---|---|---|
 | Claude Code | Command hooks in `~/.claude/settings.json` | Every feature, including early delivery, steering at the next tool call, and queen questions as a dialog |
-| omp (oh-my-pi) 18.8.5, 18.10.4 | The extension [adapters/omp](adapters/omp/README.md) | Live mode (omp 18.4.4 or newer), the turn-end check, learning and steering at the stop |
-| opencode 1.19.0, 2.0.29 | The plugin [adapters/opencode](adapters/opencode/README.md) | The same as omp |
-| Codex CLI 0.153.2 | Command hooks in `~/.codex/hooks.json` ([adapters/codex](adapters/codex/README.md)); trust them with `/hooks` in codex, and again when borg's path changes (`borg doctor` says when codex skips them) | The same as omp, without learning from denied tool calls (Codex reports none). Borg's own model calls need `claude`, `omp` or `opencode` on `PATH`, or `codex:<model>` pinned |
+| omp (oh-my-pi) 18.8.5, 18.10.4 | The extension [adapters/omp](https://github.com/debe/borg_ai/blob/main/adapters/omp/README.md) | Live mode (omp 18.4.4 or newer), the turn-end check, learning and steering at the stop |
+| opencode 1.19.0, 2.0.29 | The plugin [adapters/opencode](https://github.com/debe/borg_ai/blob/main/adapters/opencode/README.md) | The same as omp |
+| Codex CLI 0.153.2 | Command hooks in `~/.codex/hooks.json` ([adapters/codex](https://github.com/debe/borg_ai/blob/main/adapters/codex/README.md)); trust them with `/hooks` in codex, and again when borg's path changes (`borg doctor` says when codex skips them) | The same as omp, without learning from denied tool calls (Codex reports none). Borg's own model calls need `claude`, `omp` or `opencode` on `PATH`, or `codex:<model>` pinned |
 
 Each agent is one module behind one trait. The same conformance suite checks every agent: install,
-hooks, live mode and the drones page. [Harnesses](docs/harnesses.md) has the capability table, how to
+hooks, live mode and the drones page. [Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) has the capability table, how to
 add an agent, and the measured gates.
 
 ## Delivery modes
@@ -168,13 +170,16 @@ spend matters more.
 
 **Requirements**
 
-- Rust 1.88 or newer (edition 2024), via [rustup](https://rustup.rs).
-- Linux or macOS. Tested on Linux only.
+- Linux or macOS (x86_64 or arm64 Linux, arm64 macOS for the release binaries). Tested on both.
+- For `cargo install` or a build from source: Rust 1.91 or newer (edition 2024), via
+  [rustup](https://rustup.rs). On macOS the vectors build needs the Xcode command line tools; if
+  `esaxx-rs` cannot find the C++ headers, set
+  `CXXFLAGS="-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1"`.
 - A harness: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) gets every feature. omp
   (tested with 18.8.5 and 18.10.4; live mode needs 18.4.4 or newer) and opencode (1.19.0 and 2.0.29) get
   live mode, the turn-end check, learning and steering, but no early delivery yet
-  ([omp](adapters/omp/README.md), [opencode](adapters/opencode/README.md)). The Codex CLI (tested with
-  0.153.2) gets the same ([codex](adapters/codex/README.md)).
+  ([omp](https://github.com/debe/borg_ai/blob/main/adapters/omp/README.md), [opencode](https://github.com/debe/borg_ai/blob/main/adapters/opencode/README.md)). The Codex CLI (tested with
+  0.153.2) gets the same ([codex](https://github.com/debe/borg_ai/blob/main/adapters/codex/README.md)).
 - One logged-in model CLI on `PATH`: `claude`, `omp` or `opencode`. Borg's model steps (learning, the
   turn-end check) run headless through the harness the drone runs in (Sonnet by default for `claude`,
   the configured default model for omp and opencode), and through another installed one if it gives
@@ -183,17 +188,36 @@ spend matters more.
   `BORG_PREDICT_MODEL=codex:<model>` and `BORG_LEARN_MODEL=codex:<model>`, or its live checks never judge
   and Borg learns nothing.
 
-**1. Install.**
+**1. Install.** Pick one of three ways.
+
+*From crates.io* (the package is `borg-ai`; the binary is `borg`):
+
+```sh
+cargo install borg-ai --locked      # the CLI and hook binary, vectors included
+cargo install borg-mesh --locked    # only for team sync, borg top across machines, borg steer
+cargo install borg-web --locked     # only for borg web, the live page
+```
+
+*The release binaries* (all three, sha256-checked, into `~/.local/bin`, then `borg setup`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
+```
+
+`sh -s -- --version vX.Y.Z --dir DIR --no-setup` picks a version, a directory, or skips setup.
+Read the script first if you prefer: it is [scripts/install.sh](https://github.com/debe/borg_ai/blob/main/scripts/install.sh).
+
+*From source:*
 
 ```sh
 git clone https://github.com/debe/borg_ai borg && cd borg
-cargo install --path crates/borg --locked        # the CLI and hook binary, vectors included
-cargo install --path crates/borg-mesh --locked   # only for team sync, borg top across machines, borg steer
-cargo install --path crates/borg-web --locked    # only for borg web, the live page
+cargo install --path crates/borg --locked
+cargo install --path crates/borg-mesh --locked
+cargo install --path crates/borg-web --locked
 ```
 
-They land in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it there.
-`--no-default-features` builds a lean binary without vectors.
+`cargo install` puts them in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it where
+you installed it. `--no-default-features` builds a lean `borg` without vectors.
 
 **2. Set up.**
 
@@ -227,8 +251,8 @@ borg setup --join BORG1... --paths ~/work                     # join one with a 
 borg setup --no-vectors --harness claude,codex
 ```
 
-For a team, continue with [Team sync](docs/team-sync.md); for a company,
-[Company collective](docs/team-sync.md#company-collective).
+For a team, continue with [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company,
+[Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 
 ### Manual setup
 
@@ -249,7 +273,7 @@ team collective named `default`, which a mesh would share. A minimal
 ```
 
 Check the routing with `borg collective ~/work/some-repo`. Rules, the `off` list and engineer aliases are
-in [Configuration](docs/configuration.md#collectives).
+in [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#collectives).
 
 **Wire the hooks.** Every step is a dry run until `--apply`, and each changed file gets a backup.
 
@@ -274,8 +298,8 @@ borg assimilate --from-dir ~/work/handbook --plan /tmp/plan.json    # team docum
 borg assimilate --from-dir ~/work/handbook --apply --plan /tmp/plan.json
 ```
 
-Details: [Import](docs/configuration.md#import-what-you-already-have),
-[Vectors](docs/configuration.md#vectors). For a team, continue with [Team sync](docs/team-sync.md).
+Details: [Import](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#import-what-you-already-have),
+[Vectors](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#vectors). For a team, continue with [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md).
 
 ## Daily use
 
@@ -291,7 +315,7 @@ Borg runs on its own. These commands show what it does:
 | `borg why <path>:<line>` | The reasoning behind a line of code |
 | `borg web` | A live page of the knowledge and what the collective did, on 127.0.0.1 |
 
-All commands: [Commands](docs/commands.md). Every switch: [Environment variables](docs/configuration.md#environment-variables).
+All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).
 
 ## Cost
 
@@ -320,10 +344,11 @@ corrections), transcripts, source code, `collectives.json`, per-session state.
   recently touched paths;
 - steering instructions and the signed member list;
 - daily usage counts per engineer: checks, questions, outcomes, corrections, cost, lesson ids
-  ([Statistics](docs/statistics.md#privacy)).
+  ([Statistics](https://github.com/debe/borg_ai/blob/main/docs/statistics.md#privacy)).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content. Run your own relay to
-keep even that in-house; see [Privacy on the mesh](docs/team-sync.md#privacy-on-the-mesh).
+keep even that in-house; see [Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh) and
+[Running your own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md).
 
 **The model provider** receives what each model step needs: the turn and the eligible lessons, or the
 episode being learned.
@@ -340,7 +365,7 @@ nothing, and the turn end checks as in hook mode. Unlearned episodes wait for th
 ## Evidence and limits
 
 Each change to the defaults was tested against a rule written before the paid run. Most tests used the
-author's sessions, so their data is not in this repository.
+author's and a few colleagues' sessions, so their data is not in this repository.
 
 | Experiment | Result |
 |---|---|
@@ -352,14 +377,13 @@ author's sessions, so their data is not in this repository.
 | System gate, real cross-system session | wrong-system deliveries 83 → 0; no relevant lesson lost |
 | Free gate, 1,117 real turn ends | 78% skipped at 0 tokens |
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms |
-| Public data ([SWE-chat](reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
-| End-to-end run in a sandboxed home ([dogfood](reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
+| Public data ([SWE-chat](https://github.com/debe/borg_ai/blob/main/reports/swe-chat.md)), 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one |
+| End-to-end run in a sandboxed home ([dogfood](https://github.com/debe/borg_ai/blob/main/reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
 | Live vs hook mode, internal task benchmark (9 tasks per mode) | live +0.38 criteria per task [0, +0.88], 0 redo rounds vs 0.5; live is the default |
 
 **Known limits:**
 
-- One engineer, one machine. No team has used the mesh in daily work, and real NAT traversal is
-  untested.
+- Most measurements come from the author's and a few colleagues' sessions, not from a broad user base.
 - Small samples (16 negative and 51 positive turn-end cases; 10 sessions for memory quality). The
   intervals are wide.
 - Turn-end asking of the engineer (`BORG_QUEEN=on`) failed its test and is off.
@@ -371,7 +395,7 @@ author's sessions, so their data is not in this repository.
 - Codex skips an untrusted hook without a word, and fires no PostToolUse for a failed `apply_patch`, a
   patch run through a shell heredoc or a command still running when it yields: borg never sees those
   edits. In code mode borg's context reaches the model only after the whole `exec` script, and codex cuts
-  context over about 2,500 tokens ([codex](adapters/codex/README.md#what-borg-misses)).
+  context over about 2,500 tokens ([codex](https://github.com/debe/borg_ai/blob/main/adapters/codex/README.md#what-borg-misses)).
 - opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
   successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
   TUI hides it for built-in tools, but session exports show it.
@@ -381,9 +405,8 @@ author's sessions, so their data is not in this repository.
 ## Upgrade and uninstall
 
 ```sh
-git pull
-cargo install --path crates/borg --locked --force
-cargo install --path crates/borg-mesh --locked --force   # if installed
+cargo install borg-ai --locked --force       # or install.sh again, or git pull and --path crates/borg
+cargo install borg-mesh --locked --force     # if installed
 borg install all              # dry run: shows adapter, hook and skill changes
 borg install all --apply      # only if the dry run shows a diff
 borg doctor
@@ -396,7 +419,7 @@ says so. Stores are append-only JSONL and need no migration.
 
 ```sh
 borg uninstall all --apply    # removes only what install added; keeps a backup
-cargo uninstall borg borg-mesh
+cargo uninstall borg-ai borg-mesh borg-web    # or delete them from ~/.local/bin after install.sh
 ```
 
 Uninstall leaves an edited adapter or skill file in place and reports it. Your data stays too: delete
@@ -408,7 +431,7 @@ repo for the reasoning notes.
 ```sh
 scripts/check.sh                              # everything below; run before a release
 cargo test --workspace
-cargo test -p borg --no-default-features      # the lean build
+cargo test -p borg-ai --no-default-features   # the lean build
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                               # max_width 160
 node --test adapters/omp/borg.test.ts         # adapter tests; need target/debug/borg and Node 23.6+ or bun
@@ -420,12 +443,16 @@ python3 scripts/figures.py                    # regenerates the figures in docs/
 
 | Path | What |
 |---|---|
-| `crates/borg` | The product: CLI, hooks, learning, turn-end check, memory, collectives, install, vectors |
+| `crates/borg` | The product (crate `borg-ai`, binary and library `borg`): CLI, hooks, learning, turn-end check, memory, collectives, install, vectors. `assets/` holds the skill and the TS adapters it compiles in |
 | `crates/borg-mesh` | Peer sync, membership, presence, steering (iroh); separate so the hook binary stays small |
 | `crates/borg-trace` | Parses Claude Code and omp transcripts |
+| `crates/borg-web` | `borg web`, the live page; `dist/` is its built Leptos client (`ui/`), committed |
 | `crates/borg-eval`, `crates/borg-search`, `eval/` | Eval harness and benchmarks; not shipped, use local paths under `~/.local/share/borg/eval/` |
-| `adapters/omp`, `adapters/opencode` | TypeScript adapters, compiled into `borg` |
-| `adapters/conformance` | The harness conformance suite for the adapters ([Harnesses](docs/harnesses.md)) |
+| `adapters/omp`, `adapters/opencode` | TypeScript adapters, compiled into `borg` (`borg.ts` links to `crates/borg/assets/adapters/`) |
+| `skills/borg` | The `borg` skill `borg install` copies into each harness (a link to `crates/borg/assets/skills/borg`) |
+| `adapters/conformance` | The harness conformance suite for the adapters ([Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md)) |
 | `reports/` | Measured results |
 
-License: MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
+Contributing: [CONTRIBUTING.md](https://github.com/debe/borg_ai/blob/main/CONTRIBUTING.md). Security reports: [SECURITY.md](https://github.com/debe/borg_ai/blob/main/SECURITY.md).
+
+License: MIT OR Apache-2.0 ([LICENSE-MIT](https://github.com/debe/borg_ai/blob/main/LICENSE-MIT), [LICENSE-APACHE](https://github.com/debe/borg_ai/blob/main/LICENSE-APACHE)).

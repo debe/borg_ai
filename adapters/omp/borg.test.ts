@@ -1,5 +1,5 @@
 // Contract test: recorded-shape omp extension events -> adapter -> the real `borg hook omp`.
-// Run: cargo build -p borg && node --test adapters/omp/borg.test.ts
+// Run: cargo build -p borg-ai && node --test adapters/omp/borg.test.ts
 // Event shapes are those omp 18.8.5 emits (packages/coding-agent/src/extensibility/extensions/wrapper.ts,
 // runner.ts, session/agent-session.ts in the omp bundle).
 

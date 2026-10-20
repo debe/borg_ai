@@ -746,7 +746,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     }
     // BM25's top 30, plus lessons the vector index finds that word matching missed (vectors.rs; here only,
     // where the model call dwarfs loading the embedder). Top 30 found as much as top 20 + vectors; both
-    // together find the most (reports/vectors.md).
+    // together find the most (internal evaluation "vectors", not published).
     let started = std::time::Instant::now();
     let shortlist_now = || {
         let (list, added) = crate::vectors::shortlist(&lessons_path(), w.challenges, w.context, w.scope_text, crate::vectors::SHORTLIST);

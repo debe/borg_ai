@@ -59,7 +59,7 @@ fn all_mentions() -> Vec<(String, Vec<String>)> {
 
 #[test]
 fn every_markdown_file_of_the_skill_is_installed() {
-    let dir = root().join("skills/borg");
+    let dir = root().join("crates/borg/assets/skills/borg");
     let mut on_disk = Vec::new();
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
@@ -72,7 +72,7 @@ fn every_markdown_file_of_the_skill_is_installed() {
         }
     }
     let shipped: BTreeSet<String> = FILES.iter().map(|(f, _)| (*f).to_string()).collect();
-    assert_eq!(on_disk.into_iter().collect::<BTreeSet<_>>(), shipped, "install/skill.rs FILES lists every file under skills/borg");
+    assert_eq!(on_disk.into_iter().collect::<BTreeSet<_>>(), shipped, "install/skill.rs FILES lists every file under assets/skills/borg");
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! SeekStorm arms (C lexical, D vector, E hybrid) for reports/hybrid-search.md.
+//! SeekStorm arms (C lexical, D vector, E hybrid) for the internal evaluation "hybrid-search" (not published).
 //!
 //!   hs rank-all <out.jsonl> <index root> <queries.jsonl>...   top 20 of every SeekStorm arm for every query
 //!   hs build <lessons.jsonl> <before_ms> <index dir> <lex|model name>

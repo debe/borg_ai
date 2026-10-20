@@ -1,25 +1,37 @@
 [package]
-name = "borg"
-version = "0.1.0"
+name = "borg-ai"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 description = "Collective mind for coding-agent drones: CLI and harness hooks"
+# The canonical skill and TS adapters live in assets/ (symlinked from the repo's skills/ and adapters/)
+# so include_str! stays inside the package. Integration tests read the repo around the crate: not shipped.
+include = ["/src/**", "/assets/**", "/data/**", "/tests/fixtures/**", "/LICENSE-*"]
+
+# Published as borg-ai (the crates.io name); the library and the binary stay `borg`.
+[lib]
+name = "borg"
+path = "src/lib.rs"
 
 [[bin]]
 name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace" }
+borg-trace = { path = "../borg-trace", version = "0.1.0" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 serde_json = { workspace = true, features = ["preserve_order"] }
 regex.workspace = true
 # the expert drone: its own process group, killed with borg (expert_route.rs)
 libc = "0.2"
-# Vector recall at the Stop step (vectors.rs, reports/vectors.md): embedded SeekStorm, and a Model2Vec
+# Vector recall at the Stop step (vectors.rs, internal evaluation "vectors", not published): embedded SeekStorm, and a Model2Vec
 # embedder that maps the model file instead of reading it.
 seekstorm = { version = "=3.3.13", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }

@@ -1,7 +1,7 @@
 // Contract test: opencode-shaped hooks/events go into the plugin, the plugin's canonical JSON goes
 // into `borg hook opencode`, and borg's answer comes back into the session.
 //
-//   cargo build -p borg && node --test adapters/opencode/
+//   cargo build -p borg-ai && node --test adapters/opencode/
 //
 // Node >= 23.6 runs the TypeScript directly. BORG_TEST_BIN overrides the borg binary under test.
 
@@ -201,7 +201,7 @@ test("an echo that differs from what we sent cannot make the plugin loop", async
   assert.equal(recorded(rec).filter((c) => c[0] === "prompt").length, 1)
 })
 
-test("borg's prompt context (a queen question) joins the engineer's message as a synthetic part, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+test("borg's prompt context (a queen question) joins the engineer's message as a synthetic part, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home
@@ -238,7 +238,7 @@ test("fails open when borg is missing", async () => {
   assert.equal(prompts.length, 0)
 })
 
-test("real borg: conscience asks once per session, corrections and rejections become episodes", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+test("real borg: conscience asks once per session, corrections and rejections become episodes", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home
@@ -303,7 +303,8 @@ async function setupV2(assistantText: () => string = () => PLAN) {
   return { ...f, cleanup, say }
 }
 
-const settle = () => new Promise((r) => setTimeout(r, 50))
+// Long enough for the recorder's spawn: a sandboxed macOS takes ~300 ms to exec a shell script.
+const settle = () => new Promise((r) => setTimeout(r, 500))
 
 test("opencode 2: the plugin speaks borg's canonical event", async () => {
   const [bin, rec] = recorder()
@@ -489,7 +490,7 @@ test("opencode 2: fails open when borg is missing", async () => {
   await cleanup()
 })
 
-test("opencode 2: borg's prompt context (a queen question) reaches the drone as a hidden synthetic input, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+test("opencode 2: borg's prompt context (a queen question) reaches the drone as a hidden synthetic input, once", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home
@@ -516,7 +517,7 @@ test("opencode 2: borg's prompt context (a queen question) reaches the drone as 
   await cleanup()
 })
 
-test("opencode 2, real borg: conscience asks once, a rejection with feedback becomes an episode", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+test("opencode 2, real borg: conscience asks once, a rejection with feedback becomes an episode", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home
@@ -560,7 +561,7 @@ test("opencode 2, real borg: conscience asks once, a rejection with feedback bec
   assert.match(episodes[1].rejected_tool, /^Edit .*relay\.rs/)
 })
 
-test("real borg: a call declined without words makes the engineer's next prompt the reason, in both versions", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg)` }, async () => {
+test("real borg: a call declined without words makes the engineer's next prompt the reason, in both versions", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
   const fresh = () => {
     const home = mkdtempSync(join(tmpdir(), "borg-home-"))
     process.env.BORG_BIN = BORG

@@ -232,7 +232,7 @@ pub fn tokens(text: &str) -> Vec<String> {
 
 /// BM25 over the challenges' own question text, queried with the drone's
 /// context (prompt, touches, its plan). Evaluated against keyword-IDF, dense
-/// and reranked retrieval on graded qrels (reports/retrieval-plan-queries.md):
+/// and reranked retrieval on graded qrels (internal evaluation "retrieval-plan-queries", not published):
 /// BM25 ranked the relevant lessons highest. Each score is multiplied by the
 /// challenge's outcome weight, so a lesson that keeps being asked and then
 /// corrected anyway sinks below equally relevant ones, and by its authors'
@@ -486,7 +486,7 @@ pub const GENERIC_CAP: usize = 3;
 
 /// The Stop's two decisions over a ranking of the whole store (best first, as `rank` returns it; the
 /// top is the store's best match, done or not), with `done` the lessons this session already asked,
-/// or delivered early and acted on (R3b, reports/phase-r.md):
+/// or delivered early and acted on (R3b, internal evaluation "phase-r", not published):
 /// - **whether to block** (the cost: one more round): only when a lesson not done scores at least
 ///   `BLOCK` × the top. A context whose best lessons were delivered early and acted on does not block.
 /// - **what to ask once blocking** (cheap): every lesson not done scoring at least `LOW` × the top,
@@ -518,7 +518,7 @@ pub fn widen<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challenge], d
     in_scope_first(explored(pool))
 }
 
-/// The graded Stop decision (the default, unless `BORG_STOP_GRADED=off`; reports/whole-store.md "Graded follow-up") over the
+/// The graded Stop decision (the default, unless `BORG_STOP_GRADED=off`; internal evaluation "whole-store", "Graded follow-up", not published) over the
 /// model's graded applies, in its order (3 certain, 2 likely, 1 worth a thought). Returns what to ask in
 /// a block and what to hand over free:
 /// - **block** (an extra round) only when at least one lesson is graded 3; then ask every 3 and 2, and

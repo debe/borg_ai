@@ -1,5 +1,5 @@
 //! Facets: one lesson phrased several ways, so keyword search finds it from different angles
-//! (document expansion, "doc2query"; reports/facets.md).
+//! (document expansion, "doc2query"; internal evaluation "facets", not published).
 //!
 //! A lesson is written once, in the words of the correction it came from. A drone meets the same
 //! concern in other words: as a symptom it observes, as the edit it is about to make, in German, or
@@ -12,7 +12,7 @@
 //! **When:** after `borg learn` and `borg assimilate --from-dir --apply`, for the lessons they wrote
 //! (`fill` with their ids), and by `borg facets [--apply]` for a store learned before facets existed
 //! (a dry run with a cost estimate by default). Every call's cost is recorded in `facets.jsonl` beside
-//! the store. Off by default (the pre-registered test failed, reports/facets.md): `BORG_FACETS=on` turns the
+//! the store. Off by default (the pre-registered test failed, internal evaluation "facets", not published): `BORG_FACETS=on` turns the
 //! automatic step on; `borg facets --apply` works either way.
 
 use std::collections::HashSet;
@@ -38,7 +38,7 @@ pub const FACET_CHARS: usize = 300;
 /// A model answer with fewer usable facets is no answer (retried by the next run).
 const MIN_FACETS: usize = 3;
 
-/// The cost estimate of a dry run, USD per lesson: the measured mean on the eval stores, $0.0112 (reports/facets.md), rounded up.
+/// The cost estimate of a dry run, USD per lesson: the measured mean on the eval stores, $0.0112 (internal evaluation "facets", not published), rounded up.
 pub const EST_USD_PER_LESSON: f64 = 0.012;
 
 const PROMPT: &str = "You index one lesson for keyword search (BM25). Coding agents will be matched against it with what \
@@ -144,7 +144,7 @@ pub fn len_of(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// True only with BORG_FACETS=on: `borg learn` and `borg assimilate` then write facets (reports/facets.md: off by default).
+/// True only with BORG_FACETS=on: `borg learn` and `borg assimilate` then write facets (internal evaluation "facets", not published: off by default).
 pub fn enabled() -> bool {
     std::env::var("BORG_FACETS").as_deref() == Ok("on")
 }

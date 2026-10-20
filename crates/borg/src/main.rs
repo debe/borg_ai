@@ -89,7 +89,7 @@
 //!   BORG_CONCEPTS    "on" (spike) boosts lessons sharing engineering concepts with the work (concepts.rs);
 //!                    BORG_CONCEPTS_BETA its strength (default 0.5)
 //!   BORG_QUEEN       "on" lets the Stop hook ask the engineer (queen.rs); off by default (the queen
-//!                    test failed its pre-registered bar, reports/queen-test.md)
+//!                    test failed its pre-registered bar, internal evaluation "queen-test", not published)
 //!   BORG_QUEEN_ASK  "off" disables queen questions in the harness: the first prompt of a session in a repo
 //!                    with an open queen question gets that one question as context, to ask the engineer and
 //!                    record with `borg queen answer` (claude, omp, opencode; 0 model calls; queen.rs `deliver`);
@@ -215,7 +215,7 @@ fn exec(part: &str, args: &[&str]) -> ! {
     use std::os::unix::process::CommandExt;
     let bin = format!("borg-{part}");
     let err = std::process::Command::new(borg::install::sibling(part).unwrap_or_else(|| bin.clone().into())).args(args).exec();
-    eprintln!("borg {part}: cannot run {bin} ({err}); cargo install --path crates/{bin}");
+    eprintln!("borg {part}: cannot run {bin} ({err}); cargo install {bin} --locked");
     std::process::exit(1);
 }
 

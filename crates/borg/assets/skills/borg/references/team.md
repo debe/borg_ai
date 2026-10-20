@@ -4,7 +4,7 @@ A team collective is a `share: "team"` entry in collectives.json whose lessons s
 machines over the mesh: peer to peer, end-to-end encrypted, no server of ours. Each machine runs
 `borg mesh serve`. Hooks only read and write local files, so drones never wait for the mesh and borg
 keeps working offline. `borg mesh` runs the separate `borg-mesh` binary; if it is missing:
-`cargo install --path crates/borg-mesh --locked` from a borg checkout.
+`cargo install borg-mesh --locked` (or `--path crates/borg-mesh` from a borg checkout).
 
 Only lessons travel (each line signed by its writer). Raw episodes stay where they were captured.
 `share: "local"` collectives and `off` repos are refused before any connection opens.
@@ -21,9 +21,13 @@ overrides it for all), and **every member must use the same setting**.
 | `"https://relay.example.com"` | anywhere both sides reach that host | your relay only |
 | `"disabled"` | LAN or VPN only | nobody outside the network; peers must be given as `<key>@<ip:port>` |
 
-**Self-hosted relay (company):** the `iroh-relay` binary (`cargo install iroh-relay --features server`)
-on a host with a public DNS name and a TLS certificate. Put its URL in the collective's `relay` before
-the admin prints invites: each ticket carries the admin's relay setting and `join` copies it.
+**Self-hosted relay (company):** the `iroh-relay` binary of the iroh version borg-mesh uses
+(`cargo install iroh-relay@1.3.0 --features server --locked`) on a host with a DNS name and a TLS
+certificate. Put its URL in the collective's `relay` before the admin prints invites: each ticket
+carries the admin's relay setting and `join` copies it. Several URLs, comma-separated, give redundancy.
+The full guide (ports 443/TCP, 7842/UDP and 80/TCP, Let's Encrypt or your own certificate, the config
+file, a systemd unit, a container, load balancers, an `allowlist` of members' `borg mesh id` keys) is
+docs/relay.md in the borg repository: https://github.com/debe/borg_ai/blob/main/docs/relay.md
 
 **Corporate networks:**
 - A TLS-inspecting proxy that re-signs with a company CA: the relay's and address lookup's certificates

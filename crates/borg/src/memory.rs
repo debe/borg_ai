@@ -1,4 +1,4 @@
-//! Usefulness as the memory dynamics of a collective brain (reports/phase-r.md "R1 design").
+//! Usefulness as the memory dynamics of a collective brain (internal evaluation "phase-r", "R1 design", not published).
 //!
 //! Everything here is derived from the append-only outcome log (outcome.rs), so merging two logs merges
 //! memory, whatever the line order. The mesh does not sync outcomes (yet): memory is this machine's
@@ -244,7 +244,7 @@ pub const NOVEL_WORDS: usize = 3;
 
 /// The word rule: what the drone did with each asked lesson after it was delivered: (changed, ignored).
 /// Never an outcome: its labels measured shared vocabulary (55% "changed" against 38% on a mismatched
-/// control, reports/phase-r.md R1). It only decides whether an early-delivered lesson counts as done
+/// control, internal evaluation "phase-r" R1, not published). It only decides whether an early-delivered lesson counts as done
 /// (main.rs `early_acted`) and serves the offline replay (`borg resolve`); asked lessons are labelled by
 /// the consequence model (main.rs `pending`).
 /// - Declared, in its final message: `<id>: applies` is a change, `<id>: skip` an ignore (the block

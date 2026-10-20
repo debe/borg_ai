@@ -435,7 +435,7 @@ pub fn main(args: &[&str]) -> i32 {
         return match Command::new(beside.unwrap_or_else(|| "borg-mesh".into())).args(args).status() {
             Ok(s) => s.code().unwrap_or(1),
             Err(e) => {
-                eprintln!("borg notes: cannot run borg-mesh ({e}); cargo install --path crates/borg-mesh");
+                eprintln!("borg notes: cannot run borg-mesh ({e}); cargo install borg-mesh --locked");
                 1
             }
         };

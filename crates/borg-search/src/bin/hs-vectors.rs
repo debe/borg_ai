@@ -1,4 +1,4 @@
-//! The offline check of reports/vectors.md: what the consequence model would see at the Stop step.
+//! The offline check of the internal evaluation "vectors" (not published): what the consequence model would see at the Stop step.
 //!
 //!   hs-vectors rank <out.jsonl> <corpus root> <queries.jsonl>...
 //!       per query: BM25's top 30 (the product's `select_scoped`, the query as its own scope text), the

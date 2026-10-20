@@ -1,4 +1,4 @@
-//! Eval only (reports/concepts.md): the product ranking (`conscience::rank_scoped`: BM25 over questions,
+//! Eval only (internal evaluation "concepts", not published): the product ranking (`conscience::rank_scoped`: BM25 over questions,
 //! scope rule, supersession, no memory weights, facets dropped as in the product's stores) today vs with
 //! the concept boost (concepts.rs) at several strengths, 0 tokens.
 //!

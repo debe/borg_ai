@@ -89,7 +89,7 @@ replaces. `borg uninstall opencode --apply` removes it again, `borg doctor` chec
 1. Build borg and put it on `PATH`, or point `BORG_BIN` at it:
 
    ```sh
-   cargo build --release -p borg
+   cargo build --release -p borg-ai
    export BORG_BIN=$PWD/target/release/borg   # or copy it into a directory on PATH
    ```
 
@@ -147,7 +147,7 @@ note only inside that collective.
 ## Tests
 
 ```sh
-cargo build -p borg
+cargo build -p borg-ai
 node --test adapters/opencode/borg.test.ts   # Node >= 23.6 runs the TypeScript directly
 node --test adapters/conformance/conformance.test.ts   # the installed plugin (1.x and 2.x) through the harness conformance scenario
 adapters/opencode/live/run.sh                # real opencode 1.x, isolated homes, mock LLM, 0 tokens

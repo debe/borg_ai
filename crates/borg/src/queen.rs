@@ -1,5 +1,5 @@
 //! The queen: the rare, budgeted escalation to a human engineer (PLAN.md "Expertise and
-//! the queen"; reports/expertise.md §2, L4).
+//! the queen"; internal evaluation "expertise" §2, L4, not published).
 //!
 //! At the Stop checkpoint, after the conscience decided, the drone's plan goes to the queen only if
 //! all four hold:
@@ -18,7 +18,7 @@
 //! turns the engineer's answer into a lesson of the collective, so later drones get it from the
 //! conscience (L1) instead of the queen.
 //!
-//! Off by default: the queen test (reports/queen-test.md, rounds 1–3) failed its pre-registered bar,
+//! Off by default: the queen test (internal evaluation "queen-test", rounds 1–3, not published) failed its pre-registered bar,
 //! so the Stop hook asks the queen only with `BORG_QUEEN=on`. `borg queen` (list, answer) works either way.
 //!
 //! Answering the queue: `borg queen` numbers the open questions (asking order) for the terminal, `--json`
@@ -1620,7 +1620,7 @@ mod tests {
         }
     }
 
-    /// Rules tuned on the development half of replayed history (reports/queen-replay.md).
+    /// Rules tuned on the development half of replayed history (internal evaluation "queen-replay", not published).
     #[test]
     fn criterion_1_handed_over_asked_described_and_routine_moves_are_not_asked() {
         for p in [

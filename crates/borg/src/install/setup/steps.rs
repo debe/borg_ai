@@ -32,7 +32,7 @@ pub fn config(c: &Change, stamp: &str) -> i32 {
 fn run_mesh(args: &[String], warns: &mut Vec<String>) -> bool {
     let line = format!("borg mesh {}", args.join(" "));
     let Some(bin) = install::sibling("mesh") else {
-        warns.push(format!("borg-mesh is not installed: cargo install --path crates/borg-mesh --locked, then `{line}`"));
+        warns.push(format!("borg-mesh is not installed: cargo install borg-mesh --locked, then `{line}`"));
         return false;
     };
     println!("running: {line}");

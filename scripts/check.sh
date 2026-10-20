@@ -16,14 +16,14 @@ for f in crates/borg-eval/src/preempt.rs crates/borg-eval/src/queen_replay.rs cr
     if [ -f "$f" ]; then rustfmt --check --edition 2024 "$f"; fi
 done
 
-step "borg web page: ui/dist built from the current sources"
+step "borg web page: crates/borg-web/dist built from the current sources"
 scripts/ui.sh --check
 
 step "cargo clippy (workspace, all targets, -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
-step "cargo clippy -p borg --no-default-features (all targets, -D warnings)"
-cargo clippy -p borg --all-targets --no-default-features -- -D warnings
+step "cargo clippy -p borg-ai --no-default-features (all targets, -D warnings)"
+cargo clippy -p borg-ai --all-targets --no-default-features -- -D warnings
 
 step "cargo test --workspace"
 cargo test --workspace
@@ -31,13 +31,13 @@ cargo test --workspace
 step "harness architecture gates (scripts/arch.sh; rows of a missing tool are skipped)"
 scripts/arch.sh
 
-step "cargo test -p borg --no-default-features"
-cargo test -p borg --no-default-features
+step "cargo test -p borg-ai --no-default-features"
+cargo test -p borg-ai --no-default-features
 
 # The adapter contract tests drive the borg just built, wherever cargo puts it (the conformance suite
 # fails without one). They are TypeScript run directly by `node --test` (Node 23.6+ strips types by
 # default) or by bun.
-cargo build -p borg
+cargo build -p borg-ai
 BORG_TEST_BIN="$(cargo metadata --format-version 1 --no-deps | sed -E 's/.*"target_directory":"([^"]*)".*/\1/')/debug/borg"
 export BORG_TEST_BIN
 if command -v node >/dev/null 2>&1 && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 23 || (a === 23 && b >= 6) ? 0 : 1)'; then

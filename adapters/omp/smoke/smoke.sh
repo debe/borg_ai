@@ -6,7 +6,7 @@
 # for that tool call reaches the model's next request after the tool output (tool_result
 # additionalContext), borg's questions block the first stop (omp continues the turn with them) and the
 # second stop ends the run.
-# Usage: cargo build -p borg && adapters/omp/smoke/smoke.sh < /dev/null   (needs omp and python3;
+# Usage: cargo build -p borg-ai && adapters/omp/smoke/smoke.sh < /dev/null   (needs omp and python3;
 # without the redirect `omp -p` waits for piped input)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)

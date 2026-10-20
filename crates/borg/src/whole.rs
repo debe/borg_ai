@@ -1,4 +1,4 @@
-//! The whole-store Stop pool (the default; `BORG_STOP_POOL=shortlist` turns it off, reports/whole-store.md): instead of a shortlist, the
+//! The whole-store Stop pool (the default; `BORG_STOP_POOL=shortlist` turns it off, internal evaluation "whole-store", not published): instead of a shortlist, the
 //! consequence model (predict.rs) reads every lesson that the Stop path would allow, one compact line
 //! each, up to a token budget.
 //!
@@ -21,7 +21,7 @@ pub const QUESTION_CHARS: usize = 240;
 /// ...and this many of the consequence.
 pub const CONSEQUENCE_CHARS: usize = 160;
 
-/// The whole-store pool is the default (reports/whole-store.md, "Graded follow-up": with graded applies it
+/// The whole-store pool is the default (internal evaluation "whole-store", "Graded follow-up", not published: with graded applies it
 /// passed); `BORG_STOP_POOL=shortlist` keeps the shortlist instead.
 pub fn on() -> bool {
     !std::env::var("BORG_STOP_POOL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("shortlist"))
@@ -29,7 +29,7 @@ pub fn on() -> bool {
 
 /// `BORG_STOP_FORMAT=classic` shows the whole-store pool in the shortlist's layout (`predict::prompt`:
 /// work first, `situations -> consequence`) instead of the compact lessons-first layout
-/// (`predict::prompt_whole`). Only the lesson set differs from the shortlist then (reports/whole-store.md,
+/// (`predict::prompt_whole`). Only the lesson set differs from the shortlist then (internal evaluation "whole-store", not published,
 /// arm C).
 pub fn classic() -> bool {
     std::env::var("BORG_STOP_FORMAT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("classic"))

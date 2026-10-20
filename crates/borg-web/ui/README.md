@@ -1,7 +1,8 @@
 # borg web UI
 
 The page `borg web` serves: a Leptos client compiled to WebAssembly. `borg-web` embeds the built files
-in `dist/` (committed), so installing it needs no wasm toolchain. Rebuild `dist/` after changing
+in `crates/borg-web/dist/` (committed, and outside `ui/` because cargo leaves a directory with its own
+`Cargo.toml` out of a package), so installing it needs no wasm toolchain. Rebuild it after changing
 anything here:
 
 ```sh

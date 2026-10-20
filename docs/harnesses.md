@@ -170,9 +170,9 @@ on. The TypeScript suite reads the flags from the harness's module, fails when t
 timeout.
 
 ```sh
-cargo test -p borg --test conformance_cli                    # Claude Code, Codex and sim: the installed command string, native fixtures
+cargo test -p borg-ai --test conformance_cli                    # Claude Code, Codex and sim: the installed command string, native fixtures
 adapters/codex/smoke.sh                                      # a real codex exec against a mock model API: install, edit, live ask, stop, runner, doctor
-cargo build -p borg && node --test adapters/conformance/conformance.test.ts   # omp, opencode 1.x and 2.x: the installed adapter
+cargo build -p borg-ai && node --test adapters/conformance/conformance.test.ts   # omp, opencode 1.x and 2.x: the installed adapter
 cargo test -p borg-web --test drones_api                     # the page's /api/drones and /api/collectives over a seeded store
 ```
 

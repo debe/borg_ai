@@ -21,7 +21,7 @@ borg web --port 8080 --dir ~/work/some-repo
 The page listens on 127.0.0.1 only and updates live: within about a second of a store file changing,
 it fetches the views that changed. It reads the same files as `borg top`, so it needs no
 `borg mesh serve` and also shows private collectives. Install it with
-`cargo install --path crates/borg-web --locked`.
+`cargo install borg-web --locked` (or `--path crates/borg-web` from a checkout).
 
 | API | Returns |
 |---|---|

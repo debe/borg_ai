@@ -401,7 +401,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "borg"
+name = "borg-ai"
 version = "0.1.0"
 dependencies = [
  "borg-trace",
@@ -422,7 +422,7 @@ dependencies = [
 name = "borg-eval"
 version = "0.1.0"
 dependencies = [
- "borg",
+ "borg-ai",
  "borg-trace",
  "libc",
  "regex",
@@ -435,7 +435,7 @@ name = "borg-mesh"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "borg",
+ "borg-ai",
  "data-encoding",
  "ed25519-dalek",
  "iroh",
@@ -449,7 +449,7 @@ dependencies = [
 name = "borg-search"
 version = "0.1.0"
 dependencies = [
- "borg",
+ "borg-ai",
  "model2vec-rs",
  "seekstorm",
  "serde",
@@ -472,7 +472,7 @@ name = "borg-web"
 version = "0.1.0"
 dependencies = [
  "axum",
- "borg",
+ "borg-ai",
  "futures-util",
  "serde",
  "serde_json",

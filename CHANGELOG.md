@@ -2,7 +2,35 @@
 
 ## 0.1.0 (unreleased)
 
-First release.
+First release. In use at a company with lessons syncing between engineers over the mesh, across NATs;
+tested on Linux and macOS.
+
+Release checklist (the heading keeps "unreleased" until the tag exists):
+
+1. `scripts/check.sh` passes on main, and CI is green on Linux and macOS.
+2. `cargo publish --dry-run --workspace` passes.
+3. Replace "(unreleased)" above with the date, commit, and tag `v0.1.0`. The release workflow builds
+   the tarballs, attaches them with their sha256 files and publishes the crates in order.
+4. `scripts/install.sh` from that release in a clean home, then `borg doctor`.
+
+### Packaging
+
+- On crates.io as `borg-trace`, `borg-ai` (the `borg` binary and library), `borg-mesh` and `borg-web`,
+  in that order; `borg-eval` and `borg-search` are not published. The skill and the TS adapters moved
+  into `crates/borg/assets/` so the package holds what `include_str!` compiles in; `skills/borg` and
+  `adapters/{omp,opencode}/borg.ts` are links to them. borg-web's built page moved from `ui/dist` to
+  `crates/borg-web/dist` (cargo leaves a directory with its own `Cargo.toml` out of a package).
+  Rust 1.91 or newer (iroh 1.3).
+- Three ways to install: `cargo install borg-ai` (with `borg-mesh` and `borg-web`), the release
+  binaries through `scripts/install.sh` (Linux x86_64 and arm64, macOS arm64; sha256-checked), or from
+  source.
+- `docs/relay.md`: running your own `iroh-relay` 1.3.0 for a company collective (ports, TLS through
+  Let's Encrypt or your own certificate, the config file, a systemd unit, a container, load balancers,
+  an allowlist of member keys, two relays for redundancy). Linked from Team sync, the README and the
+  skill.
+- `SECURITY.md`, `CONTRIBUTING.md` (check.sh, the arch.sh gates, the metric bar) and issue templates.
+  Source comments that cited reports not in the repository now say "internal evaluation (not
+  published)".
 
 ### Setup
 

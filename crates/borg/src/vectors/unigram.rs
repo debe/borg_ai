@@ -6,7 +6,7 @@
 //! (`Unigram::encode_optimized`: best total score, the shortest piece first on ties, unknown characters
 //! scored `min_score - 10` and fused into one unknown token). Normalisation and pre-tokenisation are
 //! the model's own (`tokenizers` normalizer and pre-tokenizer from the same file). The offline check
-//! compares the token ids with `tokenizers` on every eval text (reports/vectors.md).
+//! compares the token ids with `tokenizers` on every eval text (internal evaluation "vectors", not published).
 
 use std::borrow::Cow;
 use std::collections::HashMap;

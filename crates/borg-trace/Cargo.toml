@@ -1,10 +1,15 @@
 [package]
 name = "borg-trace"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+include = ["/src/**", "/LICENSE-*"]
 description = "Parse Claude Code / omp transcripts into canonical touch streams"
 
 [dependencies]

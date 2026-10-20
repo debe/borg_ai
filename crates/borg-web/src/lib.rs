@@ -300,10 +300,10 @@ async fn events(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
     Sse::new(Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>).keep_alive(KeepAlive::default()).into_response()
 }
 
-/// The built Leptos client (ui/dist, see ui/README.md).
-const INDEX: &str = include_str!("../ui/dist/index.html");
-const JS: &[u8] = include_bytes!("../ui/dist/borg-web-ui.js");
-const WASM: &[u8] = include_bytes!("../ui/dist/borg-web-ui_bg.wasm");
+/// The built Leptos client (dist/, built from ui/, see ui/README.md).
+const INDEX: &str = include_str!("../dist/index.html");
+const JS: &[u8] = include_bytes!("../dist/borg-web-ui.js");
+const WASM: &[u8] = include_bytes!("../dist/borg-web-ui_bg.wasm");
 
 fn asset(kind: &'static str, body: &'static [u8]) -> Response {
     ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "no-cache")], body).into_response()

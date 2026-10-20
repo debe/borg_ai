@@ -5,7 +5,7 @@
 // harnesses' (crates/borg/tests/conformance_cli.rs): install, the hooks, live mode, and what
 // `borg top --json` (the web page's drones) shows. The model is a fake `claude` on PATH: 0 tokens.
 //
-//   cargo build -p borg && node --test adapters/conformance/conformance.test.ts
+//   cargo build -p borg-ai && node --test adapters/conformance/conformance.test.ts
 //
 // A missing binary fails every test (BORG_TEST_BIN names another; scripts/check.sh passes cargo's).
 // An assertion that depends on a capability reads the flag from the harness's module
@@ -47,7 +47,7 @@ function adapterConst(harness: string, name: string): number {
 /** A Orion repo routed to the collective `corp`, its Orion-scoped lesson, and a fake `claude` that saves
  *  each prompt and grades `Mdrain` 3 (as crates/borg/tests/common). `borg` is on PATH as itself. */
 function world(tag: string) {
-  assert.ok(existsSync(BORG), `no borg binary at ${BORG} (cargo build -p borg)`)
+  assert.ok(existsSync(BORG), `no borg binary at ${BORG} (cargo build -p borg-ai)`)
   const root = mkdtempSync(join(tmpdir(), `borg-conf-${tag}-`))
   for (const d of ["harbor_orion/src", "home", "bin", "prompts", "store/collectives/corp"]) mkdirSync(join(root, d), { recursive: true })
   const lesson = { id: "Mdrain", origin_ms: 1, scope: ["Orion"], question: "Does the Orion net drain the budget place with an explicit consumer instead of a reset arc?", consequence: "a reset arc drops the budget token" }
@@ -56,7 +56,7 @@ function world(tag: string) {
   const prompts = join(root, "prompts")
   writeFileSync(
     join(root, "bin/claude"),
-    `#!/bin/sh\nn=$(ls ${prompts} | wc -l)\nprintf '%s' "$2" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'\n`,
+    `#!/bin/sh\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$2" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'\n`,
   )
   chmodSync(join(root, "bin/claude"), 0o755)
   symlinkSync(BORG, join(root, "bin/borg"))

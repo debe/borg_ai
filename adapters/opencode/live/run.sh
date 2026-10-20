@@ -4,7 +4,7 @@
 # Never touches ~/.config/opencode. The first start installs @opencode-ai/plugin from npm into the
 # temp config dir (opencode does this for any plugin); when npm hangs, the run times out.
 #
-#   cargo build -p borg && adapters/opencode/live/run.sh
+#   cargo build -p borg-ai && adapters/opencode/live/run.sh
 #
 # Passes when the prompt, a successful and a failed tool call reached borg, a lesson waiting in the
 # session's queue reached the LLM with the tool output (live mode's mid-turn channel), the

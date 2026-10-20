@@ -5,7 +5,7 @@
 # LLM (0 tokens). Never talks to the engineer's background service: the temp service config is
 # disabled, every command names the private server, and nothing reads ~/.config/opencode.
 #
-#   cargo build -p borg && adapters/opencode/live/run-v2.sh
+#   cargo build -p borg-ai && adapters/opencode/live/run-v2.sh
 #
 # Passes when the plugin loaded, the prompt, a successful and a failed tool call reached borg, a lesson
 # waiting in the session's queue reached the LLM right after the tool results (a steer, live mode's

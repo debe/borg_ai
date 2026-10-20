@@ -614,7 +614,7 @@ pub fn main(raw: &[String]) {
     }
     let root = fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let borg = root.join("target/release/borg");
-    assert!(borg.exists(), "cargo build --release -p borg first");
+    assert!(borg.exists(), "cargo build --release -p borg-ai first");
     let dir = root.join("target/dogfood").join(&run);
     assert!(!dir.exists(), "{} exists; pick another --run", dir.display());
     fs::create_dir_all(dir.join("home")).unwrap();
@@ -925,6 +925,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "uuid() reads /proc")]
     fn prepare_home_copies_only_a_valid_oauth_entry() {
         let (real, home) = (tmp("real"), tmp("home"));
         fs::create_dir_all(real.join(".claude")).unwrap();
@@ -962,7 +963,7 @@ mod tests {
     }
 
     /// Install, doctor, routing, status and uninstall inside the sandbox HOME, as a process: no model
-    /// calls. Needs bwrap, `cargo build --release -p borg` and a Claude login valid for an hour.
+    /// calls. Needs bwrap, `cargo build --release -p borg-ai` and a Claude login valid for an hour.
     /// cargo test -p borg-eval dogfood_setup -- --ignored --nocapture
     #[test]
     #[ignore]

@@ -1,4 +1,4 @@
-//! Engineering concepts (spike, behind `BORG_CONCEPTS=on`, reports/concepts.md): what a lesson and the
+//! Engineering concepts (spike, behind `BORG_CONCEPTS=on`, internal evaluation "concepts", not published): what a lesson and the
 //! current work are about in engineering terms (lock, atomics, retry/backoff, reset arc, schema
 //! migration ...), from a small hierarchical taxonomy in data/concepts.json, by rules alone (0 tokens).
 //!

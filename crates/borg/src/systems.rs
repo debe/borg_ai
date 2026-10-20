@@ -1,4 +1,4 @@
-//! The system gate (reports/tags.md, reports/concepts.md): the system a session works on comes from the
+//! The system gate (internal evaluations "tags" and "concepts", not published): the system a session works on comes from the
 //! repo it runs in and the repos of the paths it touches, never from what the prompts or the drone's
 //! messages talk about. When that repo maps to a known system, a lesson scoped to other systems scores 0
 //! (early delivery and Stop), however often the conversation names them. When it maps to none (an

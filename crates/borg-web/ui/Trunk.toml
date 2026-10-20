@@ -1,6 +1,7 @@
 [build]
 target = "index.html"
-dist = "dist"
+# Outside ui/: cargo leaves a directory holding a Cargo.toml out of borg-web's package.
+dist = "../dist"
 public_url = "/"
 # Stable names: borg-web embeds these files by name (crates/borg-web/src/main.rs).
 filehash = false

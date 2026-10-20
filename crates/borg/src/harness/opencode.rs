@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Caps, Harness, Probe, Transcript, Wiring};
 
-pub const ADAPTER: &str = include_str!("../../../../adapters/opencode/borg.ts");
+pub const ADAPTER: &str = include_str!("../../assets/adapters/opencode/borg.ts");
 
 pub struct Opencode;
 

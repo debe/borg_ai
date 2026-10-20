@@ -94,8 +94,10 @@ Setup runs `borg mesh join BORG1... --paths ~/work/acme --apply`, which writes t
 admin's relay, joins and syncs. Then keep `borg mesh serve --collective acme` running.
 
 **Relay.** A company relay keeps even the metadata in-house: the `iroh-relay` binary
-(`cargo install iroh-relay --features server`) on a host with a public DNS name and a TLS certificate.
-`"disabled"` needs no relay but reaches only peers on the same LAN or VPN, given as `<key>@<ip:port>`.
+(`cargo install iroh-relay@1.3.0 --features server --locked`) on a host with a DNS name and a TLS
+certificate. [Running your own relay](relay.md) covers ports, TLS, the config file, a systemd unit, a
+container, load balancers, access control and two relays for redundancy. `"disabled"` needs no relay
+but reaches only peers on the same LAN or VPN, given as `<key>@<ip:port>`.
 
 **Proxy.** The mesh does not use `HTTPS_PROXY`. A proxy that re-signs TLS works when its CA is in the
 system trust store ([Privacy on the mesh](#privacy-on-the-mesh)). Where the only way out is an HTTP
@@ -149,9 +151,9 @@ through a relay. Pick the relay per collective (`BORG_RELAY` overrides it for al
 { "name": "platform-team", "paths": ["~/work"], "share": "team", "relay": "https://relay.example.com" }
 ```
 
-A company relay is the `iroh-relay` binary (`cargo install iroh-relay --features server`) on a host with
-a public DNS name and a TLS certificate. Every member must use the same setting; `join` copies the
-admin's.
+A company relay is the `iroh-relay` binary on a host with a DNS name and a TLS certificate; see
+[Running your own relay](relay.md). Several relays, comma-separated, give redundancy. Every member must
+use the same setting; `join` copies the admin's.
 
 `<key>@<ip:port>` works as a hint for `peer` and `sync`. With `"disabled"` it is required.
 

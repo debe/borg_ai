@@ -1,0 +1,46 @@
+# scripts/check.sh on Linux and macOS for every push to main (no PR runs: work lands on main).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The adapter tests and the conformance suite run TypeScript with `node --test` (Node 23.6+).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # esaxx-rs (tokenizers) builds C++ against libc++; point it at the SDK's headers.
+      - name: libc++ headers (macOS)
+        if: runner.os == 'macOS'
+        run: echo "CXXFLAGS=-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1" >> "$GITHUB_ENV"
+      # Some tests commit in scratch repos; a runner has no git identity of its own.
+      - name: git identity
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+      - run: scripts/check.sh

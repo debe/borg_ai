@@ -1,4 +1,4 @@
-//! The arms of reports/facets.md over query sets whose stores carry facets.
+//! The arms of the internal evaluation "facets" (not published) over query sets whose stores carry facets.
 //!
 //!   hs-facets rank-all <out.jsonl> <queries.jsonl>...   top 20 of every arm, and the product gate scores
 //!

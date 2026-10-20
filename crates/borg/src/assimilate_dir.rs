@@ -1065,7 +1065,8 @@ mod tests {
         let d = std::env::temp_dir().join(format!("borg-assimilate-dir-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        // Resolved: collective paths match as written, and macOS's temp dir sits behind /var -> /private/var.
+        std::fs::canonicalize(&d).unwrap()
     }
 
     fn sh(dir: &Path, args: &[&str]) {

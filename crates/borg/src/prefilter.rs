@@ -1,4 +1,4 @@
-//! The free gate before the Stop model call (reports/stop-prefilter.md).
+//! The free gate before the Stop model call (internal evaluation "stop-prefilter", not published).
 //!
 //! The consequence model (predict.rs) costs one model call (~6 s, ~$0.03-0.07) per turn end, and
 //! most turn ends touch no lesson at all. So word matching first scores this turn alone: the best
@@ -13,7 +13,7 @@ use crate::conscience::{self, Challenge};
 /// State-file markers that close a turn (main.rs appends one at every Stop that reaches the conscience).
 pub const MARKERS: [&str; 2] = ["#borg-asked", "#borg-skip"];
 
-/// Pre-registered in reports/stop-prefilter.md: 0.9 × the lowest score of any labelled checkpoint
+/// Pre-registered in the internal evaluation "stop-prefilter" (not published): 0.9 × the lowest score of any labelled checkpoint
 /// with a relevant lesson in its shortlist (9.28), rounded down.
 pub const THRESHOLD: f64 = 8.0;
 
@@ -60,7 +60,7 @@ pub fn skip(challenges: &[Challenge], context: &str) -> Option<f64> {
     (s < threshold).then_some(s)
 }
 
-/// `BORG_STOP_GATE=edits` (reports/whole-store.md): instead of the lexical score, the model is asked
+/// `BORG_STOP_GATE=edits` (internal evaluation "whole-store", not published): instead of the lexical score, the model is asked
 /// whenever this turn changed something (an edit tool, or a shell command that is not read-only), and a
 /// read-only or talk-only turn skips. Default (unset or anything else): the lexical gate above.
 pub fn edits_gate() -> bool {
@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(score(&ls[..1], "nothing matches here"), 0.0, "a store of one has idf 0 or no match");
     }
 
-    /// Why the held-out result was fixed in advance (reports/stop-prefilter.md): query words are a set
+    /// Why the held-out result was fixed in advance (internal evaluation "stop-prefilter", not published): query words are a set
     /// and every BM25 term is positive, so adding words to a turn never lowers its score. A checkpoint
     /// whose brief alone reaches the threshold passes whatever the drone adds to it.
     #[test]
