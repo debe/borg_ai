@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs borg, borg-mesh and borg-web from a GitHub release: picks the tarball for this OS and CPU,
 # checks it against its .sha256, copies the binaries to ~/.local/bin (or BORG_INSTALL_DIR), then offers
-# `borg setup`. Linux x86_64/aarch64 (glibc) and macOS aarch64; elsewhere: cargo install borg-ai.
+# `borg setup`. Linux x86_64/aarch64 (glibc) and macOS on Apple silicon; elsewhere: cargo install borg-ai.
 #
 # usage: scripts/install.sh [--version vX.Y.Z] [--dir DIR] [--no-setup]
 #        curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh

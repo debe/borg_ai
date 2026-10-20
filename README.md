@@ -182,7 +182,8 @@ spend matters more.
 
 **Requirements**
 
-- Linux or macOS (x86_64 or arm64 Linux, arm64 macOS for the release binaries). Tested on both.
+- Linux (x86_64 or arm64) or macOS on Apple silicon; release binaries for all three. Tested on both.
+  Intel Macs are not supported by the release binaries (`cargo install borg-ai` may still build there).
 - For `cargo install` or a build from source: Rust 1.91 or newer (edition 2024), via
   [rustup](https://rustup.rs). On macOS the vectors build needs the Xcode command line tools; if
   `esaxx-rs` cannot find the C++ headers, set
