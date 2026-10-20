@@ -72,6 +72,9 @@ fn fixture(tag: &str, under: &str) -> (Fx, String) {
     std::fs::create_dir_all(&state).unwrap();
     fake_model(&root);
     git(&repo, &["init", "-q"]);
+    // borg's own `git notes add` needs an identity too (CI runners have none).
+    git(&repo, &["config", "user.name", "Ann"]);
+    git(&repo, &["config", "user.email", "ann@example.com"]);
     std::fs::write(repo.join("src/lib.rs"), "fn a() {}\nfn b() { read_the_flag(); }\nfn c() {}\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "add a b c"]);
