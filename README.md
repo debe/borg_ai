@@ -1,4 +1,4 @@
-<p align="center"><img src="https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
+<p align="center"><img src="docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
 
 # Borg
 
@@ -33,7 +33,7 @@ A **drone** is one agent session. A **lesson** is what a correction becomes: a q
 ask itself, the situations where it applies, and the consequence it prevents. A **collective** is one
 shared memory for a set of repos and engineers.
 
-![A correction becomes a lesson, changes another drone's work, reaches a colleague over the mesh and becomes long-term memory](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/one-correction.svg)
+![A correction becomes a lesson, changes another drone's work, reaches a colleague over the mesh and becomes long-term memory](docs/img/one-correction.svg)
 
 **Learning.** Borg records an *episode* when you push back on the agent ("no, use a channel") or reject a
 tool call with a reason. At session end, `borg learn` makes one model call per episode and writes a
@@ -52,7 +52,7 @@ learning from them waits until you have checked a dry run (`borg regress --repla
 
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
-![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/turn.svg)
+![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](docs/img/turn.svg)
 
 1. **Early, free.** When a prompt or touched file first names a lesson's topic, Borg adds that topic's
    top lessons to the context. Word matching only. Claude Code only so far.
@@ -69,7 +69,7 @@ learning from them waits until you have checked a dry run (`borg regress --repla
 collective goes dormant. Only a strong match wakes it, and nothing is deleted. The clock counts
 sessions, not days, so a holiday erases nothing.
 
-<p align="center"><img src="https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
+<p align="center"><img src="docs/img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
 
 **Reach.** A correction about the code becomes a team lesson. One about how *you* like the agent to
 work (commit style, AI attribution, branching) is personal: it goes to your private collective and
@@ -97,9 +97,9 @@ A session reads only its own collective's lessons.
 
 When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; step 3 is not:
 
-![Escalation: memory, an expert repo, a live drone, the engineer](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/escalation.svg)
+![Escalation: memory, an expert repo, a live drone, the engineer](docs/img/escalation.svg)
 
-![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](https://raw.githubusercontent.com/debe/borg_ai/main/docs/img/architecture.svg)
+![Layers: harness hooks, the borg CLI, the local store and the turn-end check, the peer mesh, team trust](docs/img/architecture.svg)
 
 ## Supported agents
 
