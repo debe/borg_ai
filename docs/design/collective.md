@@ -25,6 +25,8 @@ What we've seen so far: work that spans several repos goes better with one Claud
 | [Debate or vote](https://arxiv.org/abs/2508.17536) (2025), [More agents is all you need](https://arxiv.org/abs/2402.05120) (2024) | Most of debate's gain is majority voting, and plain voting scales with the number of samples. | Best-of-N with voting is a required baseline. |
 | [AI agents that matter](https://arxiv.org/abs/2407.01502) (2024), [Tran & Kiela](https://arxiv.org/abs/2604.02460) (2026) | Cheap retry baselines match complex agents. With thinking tokens held equal, a single agent ties or beats multi-agent setups. | Report accuracy against cost as a curve, not a single number. |
 
+| Anthropic, [Redesigning source control](https://www.anthropic.com/research/redesigning-source-control) (Oct 2026) | Merged changes grew from about 2,500 a day to over 30,000 a day in four months. Code is no longer the bottleneck; infrastructure, review and judgment are. Engineers supply "understanding of the high-level inter-system components and the design-level tradeoffs." "Very often, we found that the role of the engineers was to tell Claude 'no'": agents broke core constraints, and adversarial review over-engineered. Humans review "the intent of the change as opposed to reading every line of code," with semantic approval rules sending only consequential changes to people. "Superfan" Claudes each watch one component. | The engineer is the scarce resource and holds the system view. The hive must spend engineer attention carefully and turn every "no" into something durable. |
+
 Bottom line: extra parallel compute is not an advantage, because a single agent can buy the same with more tokens. A collective wins only where it has something more tokens can't buy.
 
 ## Thesis: what a borg hive has that subagents don't
@@ -35,6 +37,35 @@ Bottom line: extra parallel compute is not an advantage, because a single agent 
 4. **A task is done only when the oracle passes.** The goal includes an oracle command. A drone that holds a claim can't stop while the oracle fails, using the same blocking as the conscience check. A different drone verifies every finished task in a fresh context: central verification (4.4× instead of 17.2× error amplification) plus MAST's verifier gain.
 5. **Diversity that decorrelates errors.** Drones can run different harnesses and models (claude, codex, opencode) and carry different engineers' memories. Voting and verification help only when errors are decorrelated, and a hive gets that for free.
 6. **The collective keeps what it learns.** Lessons, contracts and decision links outlive the run, so a later goal of the same shape starts warm. Subagents can't do this, and it is measurable. [hive-learning.md](hive-learning.md) turns this into a self-improvement loop: drones run the work, the mesh shares their experience, and the hive learns lessons, playbooks and its own configuration without touching model weights.
+
+7. **The engineer says no and holds the system view.** Drones write code faster than people can read it, so the engineer's job shifts:
+   - choose the goal and its scale
+   - own the invariants and the picture of how systems fit together
+   - review intent instead of lines
+   - say "no"
+
+   The hive is built around that role. It doesn't route around the engineer.
+
+## The engineer's role
+
+Anthropic's source-control team found what we see too: engineers mostly add judgment, not code. The hive makes that judgment cheap to give, hard to forget and always respected.
+
+- **The engineer owns the goal.** Only a human signs a goal and approves its plan through the queen. Drones may propose goals; they never start one.
+- **Constraints are the engineer's system view, written down.** A constraint is a contract only an engineer can write or ratify, for example "merge-to-main lookups go through the review API, never the commit log." The two kinds differ:
+  - **Drone contracts are soft.** They are shown when relevant; a conflict goes to the queen.
+  - **Constraints are hard.** `pre_tool` and `on_stop` block an edit or completion that a constraint's check rejects. A check can be a command, a grep, an import rule, or for now a model-graded question.
+  - **Where they live:** constraints are kept in `constraints.jsonl` for each collective, not each goal, so they outlive the run.
+- **"No" is one cheap line.** `borg no <task|change|plan> "<why>"` and the queen's answer both send a signed `veto` directive. The vetoed task reopens with the reason attached, and the reason becomes a lesson, or a proposed constraint when it names an invariant. A drone may not argue a veto back in. It may ask one clarifying question through the queen.
+- **Review intent, not lines.** Every `done` task publishes an intent card:
+  - what changed and why, in a few lines
+  - the contracts and constraints it touched
+  - the risk class
+  - the verifier's verdict and the hidden-oracle result
+
+  Semantic approval rules choose the risk class: docs, comments and tests in scope are auto-approved, ordinary logic gets sampled review, and anything touching a constraint's scope, security or data migrations needs an engineer. The queen orders intent cards by risk, not by arrival time.
+- **The verifier is scoped against over-engineering.** It checks the work against the task, the contracts and the constraints. It doesn't invent hypothetical threats. Verifier suggestions that add scope go to the queen as proposals, not rejections.
+- **Superfan drones.** A drone can own one component for a long time and watch its logs and telemetry (context ownership, thesis 1). Its findings become `open` tasks the engineer can approve or veto.
+- **Engineer attention is a budget.** Every escalation costs minutes. The hive tracks engineer minutes per goal, the share of escalations answered "yes, fine" (wasted attention) and the share of "no" answers that arrived only after merge (missed escalation).
 
 ## Primitives
 
@@ -135,6 +166,7 @@ Each workload is labelled by its structure and drawn from company repos.
 - dollars, tokens and wall-clock time
 - duplicated work, merge conflicts and rework (count of reopened tasks)
 - contract conflicts
+- engineer minutes per goal, vetoes per goal, constraint violations caught before and after merge
 - failures tagged with MAST categories
 - at least 3 seeds per cell, reported with variance and as accuracy-against-cost curves
 
@@ -144,6 +176,7 @@ Each workload is labelled by its structure and drawn from company repos.
 - **H2:** on sequential work, the hive ties or loses to B. If so, we publish that.
 - **H3:** in the hive, a warm-start run costs less than a cold run of the same shape. B shows no such effect.
 - **H4:** turning contracts off raises cross-repo failures in the MAST misalignment category. This would show that contracts carry the win.
+- **H4b:** with constraints and intent cards, the hive needs fewer engineer minutes per solved goal than B, with no more constraint violations after merge.
 - **Kill criterion:** if H1 fails at N=3, stop before building mesh sync and write up why.
 
 ## Steps

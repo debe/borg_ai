@@ -91,6 +91,30 @@ R(task) = hidden_oracle_pass                    # runner-side, never visible to 
 - **Two oracles.** Drones see the *visible* oracle that gates `done`. The runner scores the *hidden* oracle, made of held-out tests outside every worktree. Learning updates use only the hidden reward.
 - **The verifier is a different drone** (collective.md). Its verdict is a reward, and it can be wrong. A `verified` task that later gets a regress link counts against the verifier as well as the author.
 
+### The engineer's "no" is the most valuable reward
+
+Tests only check what someone thought to test. A drone can pass every test and still break a core constraint or over-engineer the change, and Anthropic's source-control team found exactly that. The engineer's judgment is the reward that tests can't supply. It is sparse and precise, so the loop treats it as gold:
+
+- **A veto is the strongest negative signal.** A `veto` (collective.md) penalizes everything that was active when the vetoed work was planned or made: the lessons shown, the playbook version and the genome. That's weighted above `asked_then_corrected`.
+- **Every "no" should be the last of its kind.** Each veto reason is generalized: into a lesson, or into a proposed constraint when it names an invariant, which the engineer then ratifies. The learning target is *a falling rate of repeated vetoes*: the same reason should not need saying twice.
+- **A predictor of what the engineer would refuse.** Vetoes, approvals and queen answers train a predictor of what each engineer would say no to. This is RLHF's reward model, kept in memory instead of in weights: retrieval over past vetoes and constraints plus a model-graded check. The queen already predicts when to escalate, and this extends it. The predictor is only a router:
+  - It sends risky intent cards to the engineer first and catches likely vetoes before work starts.
+  - It is **never** a reward the hive optimizes directly. Pushing hard on a proxy for the human teaches drones to please the proxy (Goodhart; OpenAI's chain-of-thought finding).
+  - Real verdicts remain the ground truth, and a random sample of auto-approved cards still goes to the engineer to keep the predictor calibrated.
+- **Spend attention well.** The queen gets its own reward:
+  - minus for escalations answered "yes, fine" (wasted minutes)
+  - plus for escalations that ended in "no"
+  - a large minus for a "no" or a regress fix that arrives after merge without an escalation (a missed escalation)
+- **Over-engineering costs reward.** A complexity term covers the size of the diff relative to the task and the change in lizard and rust-code-analysis metrics (the same quality gates we use). Verifier rejections an engineer overturns count against the verifier.
+- **Learning never touches the engineer's system view.** Constraints and goals are written by engineers. The learning loop may *propose* a constraint, but it never edits, weakens or drops one, and promoting a playbook or genome can't override one.
+
+The reward from the earlier section gains two terms:
+
+```
+R(task) += − ν·veto − ξ·complexity_delta
+R(queen) = no_after_escalation − α·rubber_stamp − β·missed_escalation
+```
+
 ### Group-relative advantage, native to the hive
 
 When the budget allows, the hive runs a task as a **group of K rollouts**, with drones that differ in harness, model, playbook or genome. This is also arm F, best-of-N with voting.
@@ -145,6 +169,7 @@ Pre-registered hypotheses:
 - **H5:** L0+L1 lowers dollars per solve over the goal sequence; frozen stays flat.
 - **H6:** group-relative reflection (K=3) produces lessons that change behavior more often than lessons from single rollouts.
 - **H7:** IPS-tuned constants beat hand-set ones in off-policy estimates, and the win is confirmed by a live A/B.
+- **H5b:** across the goal sequence, repeated vetoes (the same reason given again) trend toward zero, and engineer minutes per solved goal fall while violations after merge do not rise.
 - **H8:** the guardrails keep the hacked rate under 2% on an ImpossibleBench-style set of tasks with conflicting tests.
 
 Kill criterion: if H5 fails after 8 goals, stop at L0.
@@ -160,6 +185,7 @@ Each step stands on its own and needs nothing after it.
 5. **L1 playbooks:** `playbooks.jsonl`, edited by deltas, shown through `on_prompt` matched to the task shape. Promotion through the queen.
 6. **Off-policy evaluation and tuning:** an `eval/ope` replay over logged `asked` records that proposes new constants.
 7. **L2 genome archive** in `borg-eval`: genome files as arms, a Pareto set, and parent choice by how much descendants improved.
+7b. **Engineer judgment:** `borg no`, the veto outcome kind, turning veto reasons into lessons or proposed constraints, intent cards with risk classes, and the queen's attention reward. Ship it with step 2, because the "no" signal matters more than the oracle signal.
 8. **Guardrails** (`pre_tool` flags on oracle paths, hacked detection, the hack monitor) ship together with step 2, not after.
 
 ## Open questions
