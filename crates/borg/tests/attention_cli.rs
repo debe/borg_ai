@@ -128,11 +128,51 @@ fn every_tenth_check_explores_and_is_logged_as_such() {
     assert!(line.starts_with("k=20 n=0 ") && line.contains(" source=explore "), "{line}");
     let g = graded(&root);
     assert_eq!((g["session"].as_str(), g["explore"].as_bool(), g["chosen"].as_array().map(Vec::len)), (Some("x1"), Some(true), Some(12)), "{g}");
+    // Propensities: the prior cut asks ranks 0-10 always, rank 11 only in the explored tenth.
+    let mixture: Vec<f64> = [1.0; 11].into_iter().chain([0.1]).collect();
+    assert_eq!(p_of(&g), mixture, "{g}");
+    let a = last_asked(&root);
+    let want: Vec<f64> = a["lessons"].as_array().unwrap().iter().map(|l| if l == "K11" { 0.1 } else { 1.0 }).collect();
+    assert_eq!((a["session"].as_str(), p_of(&a)), (Some("x1"), want), "{a}");
     // The next check is not explored: the prior cut, and no flag on its record.
     answer_ranked(&root, &ids);
     turn(&root, "x2", PROMPT, &[], LAST, &learn);
     assert_eq!(asked(&root, "x2").len(), 11);
     let g = graded(&root);
     assert_eq!((g["session"].as_str(), g.get("explore")), (Some("x2"), None), "{g}");
+    assert_eq!(p_of(&g), mixture, "the policy's marginal is the same whether or not this check explored");
+    let a = last_asked(&root);
+    assert_eq!((a["session"].as_str(), p_of(&a)), (Some("x2"), vec![1.0; 11]), "{a}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn p_of(o: &serde_json::Value) -> Vec<f64> {
+    o["p"].as_array().unwrap_or_else(|| panic!("no p: {o}")).iter().map(|x| x.as_f64().unwrap()).collect()
+}
+
+fn last_asked(root: &std::path::Path) -> serde_json::Value {
+    let store = std::fs::read_to_string(root.join("store/collectives/corp/outcomes.jsonl")).unwrap();
+    store.lines().rev().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|o| o["kind"] == "asked").unwrap()
+}
+
+fn last_graded(root: &std::path::Path) -> serde_json::Value {
+    let store = std::fs::read_to_string(root.join("store/collectives/corp/outcomes.jsonl")).unwrap();
+    store.lines().rev().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|o| o["kind"] == "graded").unwrap()
+}
+
+#[test]
+fn fixed_rule_logs_deterministic_propensities() {
+    let root = setup("attention-fixed-p");
+    let _ = std::fs::remove_file(root.join("store/collectives/corp/outcomes.jsonl"));
+    let ids = twelve(&root);
+    answer_ranked(&root, &ids);
+    turn(&root, "f1", PROMPT, &[], LAST, &[env("off").as_slice(), &[("BORG_LEARN", "on")]].concat());
+    // The fixed rule asks the 3, then the 1s up to its cap of ten: 1 for those, 0 for the two left.
+    let g = last_graded(&root);
+    let want: Vec<f64> = [1.0; 10].into_iter().chain([0.0; 2]).collect();
+    assert_eq!(p_of(&g), want, "{g}");
+    let a = last_asked(&root);
+    assert_eq!(p_of(&a), vec![1.0; 10], "{a}");
+    assert!(state(&root, "f1", "ctx").lines().any(|l| l.starts_with("#borg-p ") && !l.contains("K10") && l.contains("K00=1")), "{}", state(&root, "f1", "ctx"));
     let _ = std::fs::remove_dir_all(root);
 }

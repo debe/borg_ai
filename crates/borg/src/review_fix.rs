@@ -113,6 +113,8 @@ impl Finding {
             fix_subject: red(&self.title),
             diff: red(&detail),
             signals: vec![regret::REVIEW.into(), verdict.into()],
+            // The builder decided before the reviewer found it.
+            decision_ms: self.ms,
             ..regret::Regret::default()
         };
         Episode {
@@ -812,6 +814,7 @@ mod tests {
         assert_eq!((e.id.as_str(), e.kind.as_str(), e.session.as_str(), e.engineer.as_str()), ("Vwf_1#0", regret::KIND, "s1", "dev@x"));
         let r = e.regret.unwrap();
         assert!(regret::is_review(&r) && r.signals == ["review", "unchecked"]);
+        assert_eq!(r.decision_ms, e.ms, "decided before the finding: asks up to it are blamed");
         assert!(r.diff.starts_with("adapters/omp/borg.ts: ") && r.fix_subject == TITLE, "{r:?}");
         let _ = std::fs::remove_dir_all(p);
     }

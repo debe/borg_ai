@@ -58,7 +58,7 @@ fn trust_is_per_collective_store_and_off_has_none() {
 
     let c = borg(&["trust", "--dir", corp.to_str().unwrap()], &root);
     assert!(c.starts_with("collective corp") && c.contains("ann@x") && c.contains("0.67") && !c.contains("0.33"), "{c}");
-    assert!(c.contains("sessions on this machine only (outcomes are not synced)"), "{c}");
+    assert!(c.contains("sessions on this machine and the team's synced outcomes"), "{c}");
     let p = borg(&["trust", "--dir", private.to_str().unwrap()], &root);
     assert!(p.starts_with("collective private") && p.contains("0.33") && !p.contains("0.67"), "{p}");
     let x = borg(&["trust", "--dir", off.to_str().unwrap()], &root);

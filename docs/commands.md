@@ -13,19 +13,20 @@
 | `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks or adapter and the `borg` skill; a dry run without `--apply` ([details](configuration.md#what-borg-install-writes)) |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
-| `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end) |
-| `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness, weight, and long-term or dormant state |
+| `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end); also counts each learned regret against the lessons asked before its decision (`regretted`) |
+| `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness (with its `regretted` share of later fixes), weight, and long-term or dormant state, from this machine's outcomes and the team's synced ones |
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
 | `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1 ([details](statistics.md)) |
 | `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
 | `borg steer <drone\|session\|all> "<text>"` | Send a signed instruction to running drones; `--pause`, `--resume` |
+| `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson; see [below](#saying-no) |
 | `borg why <path>[:<line>[-<line>]] \| <commit> [--full] [--json]` | The reasoning behind code: blame, Borg notes, linked lessons, and both ends of a decision → fix link: "→ fixed in Y (task)" on the decision, "← decided in X (task) → fixed here" on the fix (three each, all with `--full`; `--json` adds `fixed_in` and `fixes`) |
 | `borg regress [--session ID] [--replay A..B] [--any-origin] [--explain] [--json] [--dir DIR]` | The decision → fix links Borg would make, as a dry run that writes nothing: for the latest session in this repo (or `--session`), or every commit of a range (`--replay`, at most 500). `--explain` lists each candidate left out and why (`format`, `move`, `too-large`, `no-reasoning`, `same-session`, `too-young`, `duplicate`, `cap`, ...); `--any-origin` also takes origins without Borg reasoning, to try the detector on a repo with no notes ([details](configuration.md#decision--fix-links)) |
 | `borg review-fix [--home DIR] [--since YYYY-MM-DD] [--json] [--apply [--only ID,…]]` | The bugs a sub-agent review found and a fix sub-agent fixed before any commit (Claude Code workflows, omp tasks, opencode subagents), per collective, with a chance-match control; 0 tokens. `--apply` records the strong ones as episodes and learns them ([details](configuration.md#review--fix-findings)) |
 | `borg notes attach [<commit>]` | Write the redacted reasoning note for a session's commits, then link them to the earlier decisions they fixed (normally at session end) |
 | `borg notes fetch [<commit>...]` | Get reasoning notes and decision → fix links from team members over the mesh: for the named commits, or the last 200 on HEAD; a link comes with either of its commits |
-| `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked |
+| `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked, on this machine and the team's |
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join` (`--paths DIR...` names your repos), `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
 
 **Shell completion:** `borg completions <bash|zsh|fish>` prints a completion script.
@@ -48,6 +49,57 @@ from `<state>/<session>.turn`. It takes the session's lock
 in the session's `.queued` file for the next prompt or tool call. It is not meant to be run by hand and
 is not listed in `borg help`.
 
+## Saying no
+
+A veto is the engineer's "no" to what a drone is doing, with the reason. It is the strongest negative
+signal Borg learns from, and it costs 0 tokens to say.
+
+```console
+$ borg no never look merges up in the commit log, use the review API
+vetoed One of Two (3f9c2a1b): 2 shown lesson(s) lose credit (L17, L42); the reason becomes a lesson when borg learn runs
+to stop it now: borg steer 3f9c2a1b --pause
+```
+
+**Which drone.** Without `--session`, the local drone working in the current repo (or `--dir`):
+
+- exactly one that has not ended: that one;
+- none still running: the most recently seen one (a veto right after its session ended);
+- several running: an error that lists them; name one with `--session` (a designation as `borg top`
+  shows it, its number, a session id or a prefix of at least 4 characters).
+
+A drone on another member's machine is never vetoed from here. Presence keeps only a repo's name, so two
+checkouts of repos with the same name count as one repo; use `--session` there.
+
+**Inside the session.** A prompt that starts with `borg no` is the same veto for that session:
+
+```text
+borg no: don't touch the public schema, add a v2 endpoint instead
+```
+
+The drone is told to stop the vetoed approach and not argue it back; it may ask one clarifying
+question. The prompt never becomes the session's task and is never also counted as a correction.
+`BORG_VETO=off` turns this off; the command keeps working.
+
+**What it does:**
+
+1. **Credit.** Every lesson shown in the session so far (asked at a stop or live, handed over early or
+   queued) gets a `vetoed` outcome. The usefulness belief weighs a veto three times, above a
+   correction (two), so lessons shown before vetoed work sink fast. Trust counts it as a correction.
+   Each lesson is credited once per session; a second veto in the same session counts again but
+   credits nothing new.
+2. **A lesson.** The reason is recorded as a veto episode. `borg learn` turns it into a lesson, or
+   merges it into an existing one, at the end of any session, so a veto of an ended session does not
+   wait for that session. A veto merged into a lesson that an earlier veto made counts as
+   `veto_repeat`: the same "no" said twice.
+3. **A proposed constraint.** When the reason names an invariant of the system ("merge lookups go
+   through the review API, never the commit log"), `borg learn` queues it in `borg queen` as a
+   question: keep it a lesson only (the default) or ratify it as a constraint. Only an engineer's
+   answer ratifies it, and a personal lesson never proposes one. A ratified constraint is appended to
+   `<store>/constraints.jsonl`. Nothing enforces constraints yet, and the mesh does not sync that file.
+
+With `BORG_LEARN=off` the command records nothing and says so. The page (`borg web`) shows vetoes and
+the share of them that repeated an earlier one; the goal is zero.
+
 ## Answering the queen
 
 The queen's queue holds decisions that no lesson answers: open decisions found in team documents
@@ -69,7 +121,7 @@ $ borg queen answer 1 b
 |---|---|
 | `borg queen` | Open questions, numbered and grouped by repo |
 | `borg queen ask` | Answer them one by one |
-| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson. A letter or number picks an option; one that names no option is refused |
+| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson (a reach question moves its lesson instead; a proposed constraint is ratified with `b`, see [Saying no](#saying-no)). A letter or number picks an option; one that names no option is refused |
 | `borg queen show <n\|id>` | One question with its evidence |
 | `borg queen skip <n\|id>` | Ask again in 3 days |
 | `borg queen dismiss <n\|id> [reason]` | Drop it without a lesson |

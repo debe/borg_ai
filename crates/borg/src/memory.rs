@@ -1,8 +1,11 @@
 //! Usefulness as the memory dynamics of a collective brain (internal evaluation "phase-r", "R1 design", not published).
 //!
 //! Everything here is derived from the append-only outcome log (outcome.rs), so merging two logs merges
-//! memory, whatever the line order. The mesh does not sync outcomes (yet): memory is this machine's
-//! view. Per lesson:
+//! memory, whatever the line order. The belief readers derive it from the team view (outcome.rs
+//! `read_team`): this machine's log plus the redacted results the mesh syncs from teammates, each
+//! remote session under its hashed id and counted once per lesson, so teammates converge on one
+//! memory. The activity clock then counts the collective's sessions on every node, not this machine's
+//! alone. BORG_SHARE_OUTCOMES=off keeps it this machine's view. Per lesson:
 //!
 //! - **Uses.** A use is an `asked_then_changed` record: after the Stop block asked the lesson, the
 //!   drone changed its work on that point and the change avoids the consequence, as judged by the
@@ -15,9 +18,13 @@
 //!   wall time: a holiday erases nothing. Uses spread over time keep a lesson active longer than the
 //!   same number massed early; with a fixed d that comes from the later last use (a decay that depends
 //!   on the activation at each use, Pavlik and Anderson's spacing model, is a possible refinement).
-//! - **Usefulness belief** `Beta(1 + changed, 1 + ignored + 2·corrected)`, one result per (session,
-//!   lesson), corrected > changed > ignored. `asked_not_corrected` (settled by `borg learn`) without a
-//!   change is ignored. A correction counts twice, as in outcome.rs.
+//! - **Usefulness belief** `Beta(1 + changed, 1 + ignored + 2·corrected + 3·vetoed + regretted)`, one result
+//!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
+//!   learn`) without a change is ignored. A correction counts twice, as in outcome.rs; a veto (`borg no`,
+//!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
+//!   the weighted share of later fixes of decisions the lesson was asked before (outcome.rs `regretted`),
+//!   each regret once, at most `REGRET` × 0.875: a separate, later event, added on top of the session's
+//!   result unless that result is a correction or a veto (the stronger result already counts it). A fractional β is sampled by randomised rounding (`round_seeded`).
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
 //!   (session, lesson) so a session sees one stable ranking, or the belief's mean without a session.
 //!   `squash(A) = 2 / (1 + e^(−A/2))` lies in (0, 2) and is 1 at A = 0, a lesson created this session;
@@ -40,6 +47,10 @@ use crate::conscience::Challenge;
 use crate::outcome::{self, Outcome};
 
 pub const D: f64 = 0.5;
+/// What one regret at full strength adds to a lesson's β: half a correction (a correction is
+/// same-session, same-concern evidence; a regret is delayed and shared among the lessons asked). A veto
+/// weighs more than a correction, so regret < corrected < vetoed.
+pub const REGRET: f64 = 1.0;
 pub const D_CONSOLIDATED: f64 = 0.3;
 pub const CONSOLIDATE_SESSIONS: usize = 3;
 pub const DORMANT_BELOW: f64 = -2.0;
@@ -96,10 +107,13 @@ pub fn squash(a: f64) -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Memory {
     pub activation: f64,
-    /// Sessions whose result for this lesson is a change, an ignore, a correction.
+    /// Sessions whose result for this lesson is a change, an ignore, a correction, a veto.
     pub changed: u32,
     pub ignored: u32,
     pub corrected: u32,
+    pub vetoed: u32,
+    /// Σ credit of the regrets that blame it (outcome.rs `regretted`), each regret once.
+    pub regretted: f64,
     pub consolidated: bool,
     pub dormant: bool,
 }
@@ -109,18 +123,18 @@ impl Memory {
         1 + self.changed
     }
 
-    pub fn beta(&self) -> u32 {
-        1 + self.ignored + 2 * self.corrected
+    pub fn beta(&self) -> f64 {
+        (1 + self.ignored + 2 * self.corrected + 3 * self.vetoed) as f64 + REGRET * self.regretted
     }
 
     pub fn mean(&self) -> f64 {
-        self.alpha() as f64 / (self.alpha() + self.beta()) as f64
+        self.alpha() as f64 / (self.alpha() as f64 + self.beta())
     }
 
     /// `squash(A) × (0.5 + x)`: x the Thompson sample for (`session`, `id`), or the mean without a session.
     pub fn weight(&self, id: &str, session: Option<&str>) -> f64 {
         let x = match session {
-            Some(s) => sample_beta(self.alpha(), self.beta(), seed(s, id)),
+            Some(s) => sample_beta(self.alpha(), round_seeded(self.beta(), seed(s, id) ^ 0x5265_6772), seed(s, id)),
             None => self.mean(),
         };
         squash(self.activation) * (0.5 + x)
@@ -131,12 +145,23 @@ impl Memory {
 pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>) -> HashMap<String, Memory> {
     let clock = Clock::of(outcomes);
     let now = clock.now(session);
-    // Per (lesson, session): 2 corrected > 1 changed > 0 ignored; and the repos of the changes.
+    // Per (lesson, session): 3 vetoed > 2 corrected > 1 changed > 0 ignored; and the repos of the changes.
     let mut result: HashMap<&str, HashMap<&str, u8>> = HashMap::new();
     let mut uses: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut repos: HashMap<&str, HashSet<&str>> = HashMap::new();
+    // Per (lesson, regret): its credit, the largest of duplicate lines (merging two logs merges memory),
+    // and the deciding session it blames.
+    let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
     for o in outcomes {
+        if o.kind == outcome::REGRETTED {
+            for l in &o.lessons {
+                let e = regret.entry((l.as_str(), o.cause.as_str())).or_insert((0.0, o.session.as_str()));
+                e.0 = e.0.max(o.credit.clamp(0.0, 1.0));
+            }
+            continue;
+        }
         let r = match o.kind.as_str() {
+            outcome::VETOED => 3,
             outcome::CORRECTED => 2,
             outcome::CHANGED => 1,
             outcome::IGNORED | outcome::NOT_CORRECTED => 0,
@@ -151,12 +176,20 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             }
         }
     }
+    // A regret of a session whose result for the lesson is a correction or a veto adds nothing: the
+    // stronger result already counts that session's failure, whichever was recorded first.
+    let mut regretted: HashMap<&str, f64> = HashMap::new();
+    for ((l, _), (credit, s)) in regret {
+        if result.get(l).and_then(|m| m.get(s)).is_none_or(|r| *r < 2) {
+            *regretted.entry(l).or_default() += credit;
+        }
+    }
     lessons
         .iter()
         .map(|c| {
             let per = result.get(c.id.as_str());
             let count = |k: u8| per.map_or(0, |m| m.values().filter(|r| **r == k).count() as u32);
-            let (changed, ignored, corrected) = (count(1), count(0), count(2));
+            let (changed, ignored, corrected, vetoed) = (count(1), count(0), count(2), count(3));
             // Uses: every session whose result is a change (a later correction in that session still
             // deposited the change: the drone did act on it), plus the lesson's creation.
             let used: Vec<u64> = uses.get(c.id.as_str()).map(|u| u.iter().map(|s| clock.of_session(s)).collect()).unwrap_or_default();
@@ -166,7 +199,8 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             let born = clock.at_ms(c.origin_ms);
             let ages = used.into_iter().chain([born]).map(|t| now.saturating_sub(t) + 1);
             let a = activation(ages, d);
-            let m = Memory { activation: a, changed, ignored, corrected, consolidated, dormant: !consolidated && a < DORMANT_BELOW };
+            let regretted = regretted.get(c.id.as_str()).copied().unwrap_or(0.0);
+            let m = Memory { activation: a, changed, ignored, corrected, vetoed, regretted, consolidated, dormant: !consolidated && a < DORMANT_BELOW };
             (c.id.clone(), m)
         })
         .collect()
@@ -201,6 +235,16 @@ impl Rng {
     /// Uniform in (0, 1).
     pub fn unit(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+}
+
+/// `x` rounded to an integer at random, unbiased: ⌊x⌋ + 1 with probability frac(x), drawn from `seed`.
+/// An integer `x` is returned as is without a draw, so a lesson without regrets samples as before.
+pub fn round_seeded(x: f64, seed: u64) -> u32 {
+    let (whole, frac) = (x.floor(), x - x.floor());
+    match frac == 0.0 || Rng::new(seed).unit() >= frac {
+        true => whole as u32,
+        false => whole as u32 + 1,
     }
 }
 
@@ -365,7 +409,67 @@ mod tests {
         ];
         let m = &derive(&log, &[l], None)["L"];
         assert_eq!((m.changed, m.ignored, m.corrected), (1, 2, 1));
-        assert_eq!((m.alpha(), m.beta()), (2, 5));
+        assert_eq!((m.alpha(), m.beta()), (2, 5.0));
+    }
+
+    #[test]
+    fn a_veto_outweighs_a_correction_and_a_change_in_its_session() {
+        let l = lesson("L", 0);
+        let log = vec![o(CHANGED, "a", "L", 1, "r"), o(CORRECTED, "a", "L", 2, "r"), o(outcome::VETOED, "a", "L", 3, "r"), o(CORRECTED, "b", "L", 4, "r")];
+        let m = &derive(&log, std::slice::from_ref(&l), None)["L"];
+        assert_eq!((m.changed, m.ignored, m.corrected, m.vetoed), (0, 0, 1, 1));
+        assert_eq!((m.alpha(), m.beta()), (1, (1 + 2 + 3) as f64));
+        // The veto's change still deposited a use: activation counts it.
+        let without = derive(&log[1..], std::slice::from_ref(&l), None)["L"].activation;
+        assert!(m.activation > without, "{} {without}", m.activation);
+        // With equal counts, a vetoed lesson's belief is below a corrected one's.
+        let only = |kind: &str| derive(&[o(kind, "a", "L", 1, "r")], std::slice::from_ref(&l), None)["L"].mean();
+        assert!(only(outcome::VETOED) < only(CORRECTED), "{} {}", only(outcome::VETOED), only(CORRECTED));
+        assert_eq!(only(outcome::VETOED), 1.0 / 5.0);
+    }
+
+    fn regret(session: &str, lesson: &str, ms: i64, cause: &str, credit: f64) -> Outcome {
+        Outcome { cause: cause.into(), credit, ..o(outcome::REGRETTED, session, lesson, ms, "r") }
+    }
+
+    #[test]
+    fn a_regret_lowers_belief_less_than_a_correction() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = o(outcome::ASKED, "a", "L", 1, "r");
+        let full = mem(&[asked.clone(), regret("a", "L", 9, "R1", 1.0)]);
+        assert_eq!((full.regretted, full.beta(), full.mean()), (1.0, 2.0, 1.0 / 3.0));
+        assert_eq!(mem(&[asked.clone(), o(CORRECTED, "a", "L", 9, "r")]).mean(), 1.0 / 4.0);
+        // Duplicate lines of one regret count once; two regrets add up; line order does not matter.
+        let log = vec![asked.clone(), regret("a", "L", 9, "R1", 0.25), regret("a", "L", 9, "R1", 0.25), regret("a", "L", 12, "R2", 0.5)];
+        assert_eq!(mem(&log).regretted, 0.75);
+        let mut reversed = log.clone();
+        reversed.reverse();
+        assert_eq!(mem(&reversed), mem(&log));
+        // On top of the session's result, never a use: activation is unchanged.
+        let changed = mem(&[asked.clone(), o(CHANGED, "a", "L", 5, "r"), regret("a", "L", 9, "R1", 0.5)]);
+        assert_eq!((changed.changed, changed.regretted), (1, 0.5));
+        assert_eq!(mem(&[asked.clone(), regret("a", "L", 9, "R1", 1.0)]).activation, mem(std::slice::from_ref(&asked)).activation);
+        // A correction or a veto of the deciding session, recorded before or after the regret, takes it.
+        for kind in [CORRECTED, outcome::VETOED] {
+            let late = mem(&[asked.clone(), regret("a", "L", 9, "R1", 0.5), o(kind, "a", "L", 12, "r")]);
+            assert_eq!(late.regretted, 0.0, "{kind}");
+            assert_eq!(late.beta(), mem(&[asked.clone(), o(kind, "a", "L", 12, "r")]).beta(), "{kind}");
+        }
+        let other = mem(&[asked.clone(), o(CORRECTED, "b", "L", 3, "r"), regret("a", "L", 9, "R1", 0.5)]);
+        assert_eq!(other.regretted, 0.5, "another session's correction leaves the regret");
+    }
+
+    #[test]
+    fn fractional_beta_sampling_is_unbiased_and_integer_beta_unchanged() {
+        let n = 20_000;
+        let mean = (0..n).map(|i| round_seeded(2.5, seed(&format!("s{i}"), "L")) as f64).sum::<f64>() / n as f64;
+        assert!((mean - 2.5).abs() < 0.02, "{mean}");
+        assert!((0..100).all(|i| round_seeded(3.0, i) == 3));
+        // A lesson without regrets draws exactly what it drew before fractional β (pinned).
+        let m = Memory { activation: 0.0, changed: 2, ignored: 1, corrected: 1, vetoed: 0, regretted: 0.0, consolidated: false, dormant: false };
+        assert_eq!(m.weight("L", Some("s")), squash(0.0) * (0.5 + sample_beta(3, 4, seed("s", "L"))));
+        assert_eq!(m.weight("L", Some("s")), 1.0618369485259265);
     }
 
     #[test]
@@ -425,7 +529,7 @@ mod tests {
         assert!(mean(&proven) > 0.8 && sd(&proven) < 0.1);
         assert!(mean(&harmful) < 0.1);
         assert!(new.iter().chain(&proven).all(|x| *x > 0.0 && *x < 1.0));
-        let m = Memory { activation: 0.0, changed: 20, ignored: 2, corrected: 0, consolidated: false, dormant: false };
+        let m = Memory { activation: 0.0, changed: 20, ignored: 2, corrected: 0, vetoed: 0, regretted: 0.0, consolidated: false, dormant: false };
         assert!(m.weight("L", Some("s")) > 1.2 && m.weight("L", Some("s")) < 1.5);
     }
 

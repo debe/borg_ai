@@ -26,7 +26,12 @@ use serde_json::Value;
 /// pending on every node (learn.rs skips only episodes cited by a lesson or rejected locally), so
 /// each member paid a model call per peer episode, and two members could learn the same correction
 /// into two lessons under different ids. Episodes also hold the engineer's raw words.
-pub const SYNCED: [&str; 2] = ["lessons.jsonl", "stats.jsonl"];
+///
+/// And the team's outcomes (borg outcome.rs `publish`): redacted lines, one per result, with the kind,
+/// lesson ids, time, asking propensity, hashed session and repo, and the node; never raw sessions,
+/// repos or text. Plain lines (no `id` + `version`), so `settle` leaves them alone; signed and
+/// quarantined like every synced log.
+pub const SYNCED: [&str; 3] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).

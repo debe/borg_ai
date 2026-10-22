@@ -1,7 +1,8 @@
 //! The end of `borg notes attach` for a session's landed commits (notes.rs `After`): link them to
 //! the earlier decisions they fixed (regress.rs), record the links, and with `BORG_REGRESS=learn`
 //! turn each strong link into a regret episode in the collective's store, team or local (regret.rs). One git
-//! deadline covers it all (`regress_git.rs`).
+//! deadline covers it all (`regress_git.rs`). Once learned as a lesson, `borg learn` credits each regret
+//! back to the lessons asked in the deciding session before the decision (learn.rs `credit_regrets`).
 
 use std::fmt::Write as _;
 use std::path::Path;

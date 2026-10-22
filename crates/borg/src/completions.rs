@@ -20,6 +20,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("reach", &[], &["--plan", "--apply", "--jobs"], false),
     ("queen", &["show", "ask", "answer", "skip", "dismiss", "next", "dedupe", "notify"], &["--json", "--repo", "--dir", "--collective", "--apply"], false),
     ("top", &[], &["--watch", "--json", "--dir"], false),
+    ("no", &[], crate::veto::FLAGS, false),
     ("steer", &["all"], &["--pause", "--resume"], false),
     ("why", &[], &["--full", "--json"], true),
     ("web", &[], &["--port", "--dir"], false),

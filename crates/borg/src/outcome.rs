@@ -19,12 +19,35 @@
 //!   and that the change avoids the consequence: a use, the deposit that keeps a lesson active
 //!   (memory.rs). The drone's `<id>: applies|skip` is evidence in that prompt, never a label alone;
 //! - `asked_ignored` (hook): the same judge found the drone changed nothing on that point.
+//! - `vetoed` (`borg no`, veto.rs, 0 tokens): the engineer said no to the session's work; every lesson
+//!   shown in the session before it is credited, the strongest negative result.
+//!
+//! - `regretted` (`borg learn`, 0 tokens): a regret episode (a later fix of a decision, or a review finding;
+//!   learn/regret.rs) generalised into a lesson blames the lessons asked in the deciding session before the
+//!   decision (`regretted`): asking did not prevent it. `credit` carries each lesson's share of the blame;
+//!   memory.rs weighs it below a correction. Deliberately not read by trust.rs (`sessions`), by `weight`
+//!   (the legacy single-number view) or by attention.rs: a regret is about a lesson, not about an
+//!   engineer following it.
 //!
 //! An unclear verdict, or a session whose later turn ends never reach the model (the prefilter skipped
 //! them, or BORG_MATCH=bm25), leaves the lesson pending: `settle` turns it into `asked_not_corrected`.
 //!
+//! `asked` and `graded` records carry `p`, each lesson's probability of being asked under the policy in
+//! force at that check (its propensity), for off-policy evaluation of another policy from this log.
+//!
+//! **Team outcomes.** The raw log stays on this machine (it holds session ids and repos). `publish`
+//! appends a redacted, deterministic projection of the results the team may see (`SHARED_KINDS`) to
+//! `outcomes-team.jsonl` (`TEAM_FILE`), which the mesh syncs (borg-mesh lines.rs `SYNCED`): kind,
+//! lesson ids, time, propensity, channel, the hashed session and repo (`tag`) and the node, never raw
+//! sessions, repos, groups, grades or text. Only the belief readers opt in to the team view
+//! (`read_team`): memory and trust in the conscience (conscience.rs `load_as`), `borg trust`, `borg
+//! memory` and borg-web's lessons. learn.rs (it would settle remote sessions), attention.rs (labels and
+//! the explore counter are this node's policy), stats.rs (rollups sync their own counts), install.rs and
+//! the hook's pending/judge read this machine's log only. BORG_SHARE_OUTCOMES=off publishes and reads
+//! nothing of the team's.
+//!
 //! A session counts once per lesson. If a resumed session gets both results, corrected wins.
-//! memory.rs derives activation and the usefulness belief from all four kinds; `weight` below is the
+//! memory.rs derives activation and the usefulness belief from these results; `weight` below is the
 //! earlier, single-number view (kept for reporting and for comparison in the R1 replay).
 
 use std::collections::HashMap;
@@ -44,6 +67,13 @@ pub const GRADED: &str = "graded";
 /// A lesson a graded check of the session found applying but did not ask, which a later correction
 /// in that session then merged into or superseded: a question that was needed and not asked (`missed`).
 pub const MISSED: &str = "applied_then_corrected";
+/// The engineer vetoed the session's work (`borg no`, veto.rs): every lesson shown in the session
+/// before it is credited. The strongest negative result.
+pub const VETOED: &str = "vetoed";
+/// A lesson asked in a session before a decision that a later fix (or a review finding) showed was
+/// wrong (learn.rs `credit_regrets`): asking did not prevent it. `cause` names the regret episode and
+/// `credit` carries the share of the blame, (0, 1]. Weaker than a correction (memory.rs `REGRET`).
+pub const REGRETTED: &str = "regretted";
 
 /// A session without asks or episodes for this long is treated as ended (24h).
 pub const IDLE_MS: i64 = 24 * 60 * 60 * 1000;
@@ -79,15 +109,180 @@ pub struct Outcome {
     /// so its outcomes label the cut (attention.rs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub explore: bool,
+    /// `regretted` only: the regret episode (`R…`/`V…` id), the idempotence key with the lesson.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cause: String,
+    /// `regretted` only: the lesson's share of the regret, (0, 1].
+    #[serde(default, skip_serializing_if = "is_zero_f")]
+    pub credit: f64,
+    /// `asked` and `graded`: per lesson (aligned with `lessons`), the probability that the policy in force
+    /// at that check asked it: 1 or 0 under the fixed graded rule, the explore mixture under the learned
+    /// cut (attention.rs `propensities`), the share of Thompson draws that give it a slot in
+    /// `budget`/`widen` (conscience.rs `propensity`). Rounded to 4 decimals (`round_p`). Empty in records
+    /// from before propensities and when unknown (BORG_ONLY, a state file from an older binary). For
+    /// off-policy evaluation (hive-learning.md "Credit assignment").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub p: Vec<f64>,
+}
+
+/// A propensity rounded to 4 decimals, so lines stay deterministic and short.
+pub fn round_p(p: f64) -> f64 {
+    (p * 1e4).round() / 1e4
 }
 
 fn is_zero(v: &u16) -> bool {
     *v == 0
 }
 
+fn is_zero_f(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// The outcomes store next to a lessons file.
 pub fn path_beside(lessons: &Path) -> std::path::PathBuf {
     lessons.with_file_name("outcomes.jsonl")
+}
+
+/// The redacted outcomes the team sees, at the store root beside `outcomes.jsonl` (module doc).
+pub const TEAM_FILE: &str = "outcomes-team.jsonl";
+/// Beside `TEAM_FILE`, never synced: the length of `outcomes.jsonl` at the last `publish`.
+pub const PUBLISHED: &str = "outcomes-team.published";
+
+/// The kinds `publish` shares. A whitelist: `graded`, `vetoed`, `regretted` and any later kind stay
+/// local until deliberately added here.
+pub const SHARED_KINDS: [&str; 6] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED];
+
+/// A session or repo as the team sees it: the first 32 hex digits of blake3("borg-outcome-v1\0" + s).
+/// Unsalted on purpose: the same session hashes to the same tag on every node, so a node can drop its
+/// own published copies (`read_team`).
+pub fn tag(s: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"borg-outcome-v1\0");
+    h.update(s.as_bytes());
+    h.finalize().to_hex()[..32].to_string()
+}
+
+/// `tag`, keeping an empty repo empty.
+fn tag_repo(repo: &str) -> String {
+    if repo.is_empty() { String::new() } else { tag(repo) }
+}
+
+/// One line of `TEAM_FILE`. Never carries `id` and `version` together (the mesh would settle it as a
+/// versioned record).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shared {
+    pub kind: String,
+    /// `tag` of the session.
+    pub s: String,
+    pub lessons: Vec<String>,
+    pub ms: i64,
+    /// The publishing node (stats.rs `node`), self-declared: dedup does not depend on it.
+    pub node: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub p: Vec<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel: String,
+    /// `tag` of the repo: memory.rs counts distinct repos to consolidate a lesson.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub r: String,
+}
+
+/// `o` as the team sees it, or None for a kind not in `SHARED_KINDS`.
+pub fn share(o: &Outcome, node: &str) -> Option<Shared> {
+    SHARED_KINDS.contains(&o.kind.as_str()).then(|| Shared {
+        kind: o.kind.clone(),
+        s: tag(&o.session),
+        lessons: o.lessons.clone(),
+        ms: o.ms,
+        node: node.into(),
+        p: o.p.clone(),
+        channel: o.channel.clone(),
+        r: tag_repo(&o.repo),
+    })
+}
+
+/// Team outcomes on: `BORG_SHARE_OUTCOMES` is not `off`.
+pub fn on() -> bool {
+    std::env::var("BORG_SHARE_OUTCOMES").as_deref() != Ok("off")
+}
+
+/// Appends to `TEAM_FILE` in `home` the shared lines of `home`'s `outcomes.jsonl` it lacks; returns
+/// how many. The lines are deterministic, so a re-run appends nothing; two runs at once may append the
+/// same line twice, which the mesh's union and the per-session count make harmless. Nothing when off.
+/// A local log no longer than at the last publish (`PUBLISHED`, its length then) is not read again: the
+/// log only grows, so nothing new can be in it.
+pub fn publish(home: &Path) -> usize {
+    let local = home.join("outcomes.jsonl");
+    let team = home.join(TEAM_FILE);
+    let mark = home.join(PUBLISHED);
+    let len = std::fs::metadata(&local).map_or(0, |m| m.len());
+    if !on() || len == 0 {
+        return 0;
+    }
+    let published = std::fs::read_to_string(&mark).ok().and_then(|t| t.trim().parse::<u64>().ok());
+    if team.exists() && published == Some(len) {
+        return 0;
+    }
+    let mine = std::fs::read_to_string(&local).unwrap_or_default();
+    let node = crate::stats::node(home);
+    let text = std::fs::read_to_string(&team).unwrap_or_default();
+    let mut have: std::collections::HashSet<String> = text.lines().map(str::to_string).collect();
+    let mut out = String::new();
+    let records = mine.lines().filter_map(|l| serde_json::from_str::<Outcome>(l).ok());
+    for line in records.filter_map(|o| share(&o, &node)).filter_map(|x| serde_json::to_string(&x).ok()) {
+        if have.insert(line.clone()) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        let _ = std::fs::write(&mark, mine.len().to_string());
+        return 0;
+    }
+    use std::io::Write;
+    let open = text.as_bytes().last().is_some_and(|c| *c != b'\n');
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&team)
+        .and_then(|mut f| f.write_all(format!("{}{out}", if open { "\n" } else { "" }).as_bytes()));
+    if written.is_err() {
+        return 0;
+    }
+    let _ = std::fs::write(&mark, mine.len().to_string());
+    out.lines().count()
+}
+
+/// The belief view of the outcomes beside `lessons`: this machine's log plus, unless
+/// BORG_SHARE_OUTCOMES=off, the team's (`team_view`).
+pub fn read_team(lessons: &Path) -> Vec<Outcome> {
+    team_view(lessons, on())
+}
+
+/// Off: this machine's log as is. On: its records with each repo as its `tag` (memory.rs only compares
+/// repos for distinctness, so beliefs are the same and comparable with the team's), then every
+/// `TEAM_FILE` line of a shared kind whose session is not one of this machine's (that drops this node's
+/// own published copies, whatever its node id), once per (kind, session, lessons, ms). A kind this
+/// binary does not share (a newer node's, or a forged `vetoed`) is ignored. A remote session then counts
+/// once per lesson like a local one (memory.rs `derive`, `sessions`).
+pub fn team_view(lessons: &Path, on: bool) -> Vec<Outcome> {
+    let mut out = read(&path_beside(lessons));
+    if !on {
+        return out;
+    }
+    let mine: std::collections::HashSet<String> = out.iter().map(|o| tag(&o.session)).collect();
+    for o in &mut out {
+        o.repo = tag_repo(&o.repo);
+    }
+    let text = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
+    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64)> = std::collections::HashSet::new();
+    for x in text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()) {
+        if !SHARED_KINDS.contains(&x.kind.as_str()) || mine.contains(&x.s) || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms)) {
+            continue;
+        }
+        out.push(Outcome { kind: x.kind, session: x.s, lessons: x.lessons, ms: x.ms, repo: x.r, p: x.p, channel: x.channel, ..Default::default() });
+    }
+    out
 }
 
 pub fn read(path: &Path) -> Vec<Outcome> {
@@ -101,12 +296,14 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", serde_json::to_string(o).unwrap())?;
-    // The results count in the usage statistics; `asked` is already counted as the Stop's block.
+    // The results count in the usage statistics; `asked` is already counted as the Stop's block, and a
+    // `vetoed` result as the `veto` that credited it (veto.rs).
     let kind = match o.kind.as_str() {
         CHANGED => crate::stats::CHANGED,
         IGNORED => crate::stats::IGNORED,
         CORRECTED => crate::stats::CORRECTED,
         NOT_CORRECTED => crate::stats::NOT_CORRECTED,
+        REGRETTED => crate::stats::REGRETTED,
         _ => return Ok(()),
     };
     if let Some(home) = path.parent() {
@@ -130,7 +327,7 @@ pub fn has(outcomes: &[Outcome], kind: &str, session: &str, lesson: &str) -> boo
 }
 
 /// The lessons a correction at `ms` in `session` shows were asked in vain, each asked in `session`
-/// before `ms` and not yet recorded as corrected there: the lessons the correction `supersedes`
+/// before `ms` and not yet recorded as corrected or vetoed there (a veto is the stronger result): the lessons the correction `supersedes`
 /// (it contradicts them), and `target`, the lesson it was merged into (the same concern came up
 /// again). When `target` was asked as one side of a rendered disagreement, the engineer sided with
 /// it: the other sides of that disagreement were corrected, not `target`. Sorted, unique.
@@ -151,7 +348,7 @@ pub fn contradicted(outcomes: &[Outcome], session: &str, ms: i64, target: Option
             false => out.extend(sides),
         }
     }
-    out.retain(|l| asked_before(outcomes, session, l, ms) && !has(outcomes, CORRECTED, session, l));
+    out.retain(|l| asked_before(outcomes, session, l, ms) && !has(outcomes, CORRECTED, session, l) && !has(outcomes, VETOED, session, l));
     out.sort();
     out.dedup();
     out
@@ -164,9 +361,7 @@ pub fn contradicted(outcomes: &[Outcome], session: &str, ms: i64, target: Option
 pub fn missed(outcomes: &[Outcome], session: &str, ms: i64, target: Option<&str>, supersedes: &[String]) -> Vec<String> {
     let mut out: Vec<String> = supersedes.iter().cloned().chain(target.map(str::to_string)).collect();
     let applied_unchosen = |l: &str| {
-        outcomes
-            .iter()
-            .any(|o| o.kind == GRADED && o.session == session && o.ms < ms && o.lessons.iter().any(|x| x == l) && !o.chosen.iter().any(|x| x == l))
+        outcomes.iter().any(|o| o.kind == GRADED && o.session == session && o.ms < ms && o.lessons.iter().any(|x| x == l) && !o.chosen.iter().any(|x| x == l))
     };
     out.retain(|l| applied_unchosen(l) && !asked_before(outcomes, session, l, ms) && !has(outcomes, MISSED, session, l));
     out.sort();
@@ -174,14 +369,60 @@ pub fn missed(outcomes: &[Outcome], session: &str, ms: i64, target: Option<&str>
     out
 }
 
-/// At session end: every lesson asked in `session` that has no result yet was not corrected.
+/// Has `lesson` been credited for the regret `cause` already (in any session)?
+fn credited(outcomes: &[Outcome], cause: &str, lesson: &str) -> bool {
+    outcomes.iter().any(|o| o.kind == REGRETTED && o.cause == cause && o.lessons.iter().any(|l| l == lesson))
+}
+
+/// The lessons a regret blames: those asked in `session` (the deciding one) before `before_ms`, without
+/// a correction or a veto there already (both outrank regretted, as in memory.rs) and not yet credited
+/// for `cause`. When some of `target` (the lesson the regret was folded into, and the lessons that lesson
+/// supersedes) were asked, they share the blame alone: the same concern came up again, and when all of
+/// them already took a correction or a veto for it, nobody else is blamed. Otherwise every asked lesson
+/// shares it equally (the Shapley value of a symmetric game). A lesson a graded check found applying but
+/// did not ask was never shown, so it is not blamed. One record per lesson, sorted, at `ms`,
+/// with `credit = strength / n`; n counts the blamed lessons before the already-credited ones are left
+/// out, so a re-run writes nothing and the shares never change. Every record's session has an earlier
+/// `asked` record, so it never moves memory.rs's `Clock`.
+#[allow(clippy::too_many_arguments)]
+pub fn regretted(outcomes: &[Outcome], session: &str, before_ms: i64, cause: &str, target: &[String], strength: f64, ms: i64, repo: &str) -> Vec<Outcome> {
+    if session.is_empty() || before_ms <= 0 || strength <= 0.0 {
+        return Vec::new();
+    }
+    let mut asked: Vec<&str> =
+        outcomes.iter().filter(|o| o.kind == ASKED && o.session == session && o.ms < before_ms).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
+    asked.sort_unstable();
+    asked.dedup();
+    if asked.iter().any(|l| target.iter().any(|t| t == l)) {
+        asked.retain(|l| target.iter().any(|t| t == l));
+    }
+    asked.retain(|l| !has(outcomes, CORRECTED, session, l) && !has(outcomes, VETOED, session, l));
+    let credit = (strength / asked.len().max(1) as f64).min(1.0);
+    asked
+        .into_iter()
+        .filter(|l| !credited(outcomes, cause, l))
+        .map(|l| Outcome {
+            kind: REGRETTED.into(),
+            session: session.into(),
+            lessons: vec![l.into()],
+            ms,
+            repo: repo.into(),
+            cause: cause.into(),
+            credit,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// At session end: every lesson asked in `session` that has no result yet was not corrected. A
+/// vetoed lesson already has its result.
 /// Sorted by lesson id so the appended lines are deterministic.
 pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
     let mut asked: Vec<(&str, &str)> = outcomes
         .iter()
         .filter(|o| o.kind == ASKED && o.session == session)
         .flat_map(|o| o.lessons.iter().map(move |l| (l.as_str(), o.repo.as_str())))
-        .filter(|(l, _)| !has(outcomes, CORRECTED, session, l) && !has(outcomes, NOT_CORRECTED, session, l))
+        .filter(|(l, _)| !has(outcomes, CORRECTED, session, l) && !has(outcomes, NOT_CORRECTED, session, l) && !has(outcomes, VETOED, session, l))
         .collect();
     asked.sort();
     asked.dedup_by_key(|(l, _)| *l);
@@ -233,12 +474,13 @@ pub fn counts(outcomes: &[Outcome]) -> HashMap<String, (u32, u32)> {
 
 /// Per lesson, per session with a result: (corrected, ms of the session's earliest result for the
 /// lesson). Corrected wins over a later (resumed) settle. trust.rs filters these by when an engineer
-/// joined the lesson.
+/// joined the lesson. A veto (`vetoed`) counts as a correction here, so trust and `weight` see it too
+/// (as heavy as a correction; only memory.rs weighs it above one).
 pub fn sessions(outcomes: &[Outcome]) -> HashMap<&str, HashMap<&str, (bool, i64)>> {
     let mut out: HashMap<&str, HashMap<&str, (bool, i64)>> = HashMap::new();
     for o in outcomes {
         let corrected = match o.kind.as_str() {
-            CORRECTED => true,
+            CORRECTED | VETOED => true,
             NOT_CORRECTED => false,
             _ => continue,
         };
@@ -346,6 +588,17 @@ mod tests {
         // A new lesson superseding C and E: only C was asked before it; D is already corrected.
         assert_eq!(contradicted(&all, "s1", 20, None, &ids(&["C", "E", "D", "Z"])), ["C"]);
         assert!(contradicted(&all, "s2", 20, Some("C"), &ids(&["A"])).is_empty(), "another session asked nothing");
+        let mut vetoed = all.clone();
+        vetoed.push(o(VETOED, "s1", &["C"], 12));
+        assert!(contradicted(&vetoed, "s1", 20, Some("C"), &[]).is_empty(), "a vetoed lesson already has the stronger result");
+    }
+
+    #[test]
+    fn a_vetoed_lesson_is_not_settled_and_counts_as_corrected() {
+        let all = vec![o(ASKED, "s1", &["A", "B"], 10), o(VETOED, "s1", &["A"], 20)];
+        assert_eq!(settle(&all, "s1", 99), vec![o(NOT_CORRECTED, "s1", &["B"], 99)]);
+        assert_eq!(sessions(&all)["A"]["s1"], (true, 20));
+        assert_eq!(weights(&all)["A"], weight(0, 1));
     }
 
     #[test]
@@ -364,6 +617,186 @@ mod tests {
         let episodes = HashMap::from([("busy".to_string(), 60)]);
         assert_eq!(idle_sessions(&all, &episodes, IDLE_MS + 10), ["old"]);
         assert_eq!(idle_sessions(&all, &episodes, IDLE_MS + 60), ["busy", "fresh", "old"]);
+    }
+
+    #[test]
+    fn regretted_blames_asks_before_the_decision_shared_or_by_target() {
+        let mut graded = o(GRADED, "s", &["G"], 5);
+        graded.chosen = vec![];
+        let log = vec![graded, o(ASKED, "s", &["B", "A"], 10), o(ASKED, "s", &["C"], 30), o(ASKED, "t", &["D"], 10)];
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let blame = |log: &[Outcome], target: &[String]| regretted(log, "s", 20, "R1", target, 0.5, 99, "r");
+        let got = blame(&log, &[]);
+        let want = |l: &str, credit: f64| Outcome { cause: "R1".into(), credit, ..o(REGRETTED, "s", &[l], 99) };
+        assert_eq!(got, vec![want("A", 0.25), want("B", 0.25)], "shared; C was asked after the decision, G never shown");
+        assert_eq!(blame(&log, &ids(&["B", "Z"])), vec![want("B", 0.5)], "the merge target takes it all");
+        assert_eq!(blame(&log, &ids(&["Z"])), got, "a target not asked: shared");
+        let mut corrected = log.clone();
+        corrected.push(o(CORRECTED, "s", &["B"], 15));
+        assert_eq!(blame(&corrected, &[]), vec![want("A", 0.5)], "corrected outranks regretted");
+        let mut vetoed = log.clone();
+        vetoed.push(o(VETOED, "s", &["B"], 15));
+        assert_eq!(blame(&vetoed, &[]), vec![want("A", 0.5)], "vetoed outranks regretted");
+        assert!(blame(&corrected, &ids(&["B"])).is_empty(), "the target took it as a correction: nobody else is blamed");
+        assert!(blame(&vetoed, &ids(&["B", "Z"])).is_empty(), "the target took it as a veto: nobody else is blamed");
+        assert_eq!(blame(&corrected, &ids(&["A", "B"])), vec![want("A", 0.5)], "the uncorrected target keeps its share");
+        let mut again = log.clone();
+        again.extend(got.clone());
+        assert!(blame(&again, &[]).is_empty(), "credited once per cause");
+        let mut half = log.clone();
+        half.push(got[0].clone());
+        assert_eq!(blame(&half, &[]), vec![want("B", 0.25)], "a partial run completes with the same share");
+        assert_eq!(regretted(&again, "s", 20, "R2", &[], 0.5, 99, "r").len(), 2, "another regret blames again");
+        assert!(regretted(&log, "u", 20, "R1", &[], 0.5, 99, "r").is_empty(), "another session asked nothing");
+        assert!(regretted(&log, "", 20, "R1", &[], 0.5, 99, "r").is_empty());
+        assert!(regretted(&log, "s", 0, "R1", &[], 0.5, 99, "r").is_empty(), "no decision time");
+        assert!(regretted(&log, "s", 20, "R1", &[], 0.0, 99, "r").is_empty(), "not strong");
+        // An old line without cause and credit still reads; a regretted line round-trips.
+        let old: Outcome = serde_json::from_str(r#"{"kind":"asked","session":"s","lessons":["A"],"ms":1,"repo":"r"}"#).unwrap();
+        assert_eq!(old, o(ASKED, "s", &["A"], 1));
+        assert!(!serde_json::to_string(&old).unwrap().contains("credit"));
+        let line = serde_json::to_string(&got[0]).unwrap();
+        assert!(line.contains(r#""cause":"R1","credit":0.25"#), "{line}");
+        assert_eq!(serde_json::from_str::<Outcome>(&line).unwrap(), got[0]);
+    }
+
+    #[test]
+    fn a_line_from_before_propensities_reads_and_writes_back_unchanged() {
+        let line = r#"{"kind":"asked","session":"s","lessons":["A","B"],"ms":1,"repo":"r","channel":"stop","grades":[3,1],"ranks":[0,1],"applied":2}"#;
+        let o: Outcome = serde_json::from_str(line).unwrap();
+        assert!(o.p.is_empty());
+        assert_eq!(serde_json::to_string(&o).unwrap(), line);
+        let with = Outcome { p: vec![round_p(1.0), round_p(1.0 / 3.0)], ..o };
+        assert!(serde_json::to_string(&with).unwrap().ends_with(r#""applied":2,"p":[1.0,0.3333]}"#));
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("borg-outcome-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn lines(path: &Path, v: &[String]) {
+        std::fs::write(path, v.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    }
+
+    fn changed(team: &[Outcome], lesson: &str) -> u32 {
+        let ls = [crate::conscience::Challenge { id: lesson.into(), ..Default::default() }];
+        crate::memory::derive(team, &ls, None)[lesson].changed
+    }
+
+    #[test]
+    fn share_redacts() {
+        let mut a = o(ASKED, "session-raw", &["A"], 5);
+        a.repo = "secret-repo".into();
+        a.groups = vec![vec!["A".into(), "B".into()]];
+        a.grades = vec![3];
+        a.ranks = vec![0];
+        a.p = vec![0.5];
+        let x = share(&a, "n1").unwrap();
+        let line = serde_json::to_string(&x).unwrap();
+        for raw in ["session-raw", "secret-repo", "groups", "grades", "ranks", "\"id\"", "version"] {
+            assert!(!line.contains(raw), "{raw} in {line}");
+        }
+        assert_eq!((x.s, x.r, x.p, x.node), (tag("session-raw"), tag("secret-repo"), vec![0.5], "n1".to_string()));
+        assert_eq!(tag("s").len(), 32);
+        for kind in [GRADED, VETOED, REGRETTED, "veto"] {
+            assert!(share(&o(kind, "s", &["A"], 1), "n1").is_none(), "{kind} is not shared");
+        }
+    }
+
+    #[test]
+    fn publish_is_idempotent() {
+        let home = tmp("publish");
+        assert_eq!(publish(&home), 0, "no outcomes, nothing to publish");
+        let mut asked = o(ASKED, "s1", &["A"], 1);
+        asked.p = vec![1.0];
+        lines(&home.join("outcomes.jsonl"), &[asked, o(GRADED, "s1", &["A"], 1), o(CHANGED, "s1", &["A"], 2)].map(|x| serde_json::to_string(&x).unwrap()));
+        assert_eq!(publish(&home), 2, "graded stays local");
+        let first = std::fs::read_to_string(home.join(TEAM_FILE)).unwrap();
+        assert_eq!(publish(&home), 0);
+        assert_eq!(std::fs::read_to_string(home.join(TEAM_FILE)).unwrap(), first);
+        assert!(first.contains(r#""p":[1.0]"#) && !first.contains("\"s1\""), "{first}");
+        // Unchanged since the last publish: the log is not read again; grown: only the new line goes.
+        assert_eq!(std::fs::read_to_string(home.join(PUBLISHED)).unwrap(), std::fs::metadata(home.join("outcomes.jsonl")).unwrap().len().to_string());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.join("outcomes.jsonl"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{}\n", serde_json::to_string(&o(IGNORED, "s2", &["A"], 3)).unwrap()).as_bytes()))
+            .unwrap();
+        assert_eq!(publish(&home), 1);
+        assert_eq!(publish(&home), 0);
+        // A team file gone (a fresh mesh) is published again in full.
+        std::fs::remove_file(home.join(TEAM_FILE)).unwrap();
+        assert_eq!(publish(&home), 3);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A store whose local log has s1 changed L1, and whose team file holds that result as published
+    /// by this node, a remote session's change of L1, the same remote line from another node's copy,
+    /// and a kind this binary does not share.
+    fn team_store(name: &str, shuffle: bool) -> std::path::PathBuf {
+        let home = tmp(name);
+        let mut local = o(CHANGED, "s1", &["L1"], 10);
+        local.repo = "app".into();
+        lines(&home.join("outcomes.jsonl"), &[serde_json::to_string(&local).unwrap()]);
+        let remote = |kind: &str, s: &str, node: &str| {
+            serde_json::to_string(&Shared {
+                kind: kind.into(),
+                s: s.into(),
+                lessons: vec!["L1".into()],
+                ms: 20,
+                node: node.into(),
+                p: vec![],
+                channel: String::new(),
+                r: tag("web"),
+            })
+            .unwrap()
+        };
+        let mut team = vec![
+            serde_json::to_string(&share(&local, "me").unwrap()).unwrap(),
+            remote(CHANGED, "x", "n2"),
+            remote(CHANGED, "x", "n3"),
+            remote(VETOED, "y", "n2"),
+            remote("veto", "z", "n2"),
+        ];
+        if shuffle {
+            team.reverse();
+            team.swap(0, 2);
+        }
+        lines(&home.join(TEAM_FILE), &team);
+        home
+    }
+
+    #[test]
+    fn read_team_drops_own_copies_and_keeps_remote() {
+        let home = team_store("team", false);
+        let team = team_view(&home.join("lessons.jsonl"), true);
+        assert_eq!(changed(&team, "L1"), 2, "{team:?}");
+        assert_eq!(team.iter().filter(|o| o.session == "x").count(), 1, "one remote line per (kind, session, lessons, ms)");
+        assert!(team.iter().all(|o| o.kind != VETOED && o.kind != "veto"), "unshared kinds are ignored");
+        assert!(team.iter().all(|o| o.repo != "app"), "local repos compare as tags");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn read_team_is_order_independent() {
+        let (a, b) = (team_store("order-a", false), team_store("order-b", true));
+        let ls = [crate::conscience::Challenge { id: "L1".into(), ..Default::default() }];
+        let m = |h: &Path| crate::memory::derive(&team_view(&h.join("lessons.jsonl"), true), &ls, None);
+        assert_eq!(m(&a), m(&b));
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    #[test]
+    fn off_keeps_beliefs_local() {
+        let home = team_store("off", false);
+        let local = team_view(&home.join("lessons.jsonl"), false);
+        assert_eq!(local, read(&home.join("outcomes.jsonl")));
+        assert_eq!(changed(&local, "L1"), 1);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

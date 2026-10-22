@@ -135,8 +135,9 @@ pub fn on() -> bool {
     std::env::var("BORG_STOP_ATTENTION").as_deref() == Ok("on")
 }
 
-/// What to ask, what to hand over free, and the cut (None under the fixed rule).
-pub type Split<'a> = (Vec<&'a Challenge>, Vec<&'a Challenge>, Option<Cut>);
+/// What to ask, what to hand over free, the cut (None under the fixed rule), and each apply's
+/// probability of being asked under the policy in force, aligned with the applies (`propensities`).
+pub type Split<'a> = (Vec<&'a Challenge>, Vec<&'a Challenge>, Option<Cut>, Vec<f64>);
 
 /// A graded check's split under `cut`: without a grade 3 nothing blocks, as in `conscience::graded`;
 /// with a 3, the applies ranked below `cut.k` are asked (at most `RAIL`) and the rest go free (at most
@@ -154,20 +155,38 @@ pub fn split<'a>(applied: &[(&'a Challenge, u8)], cut: &Cut) -> (Vec<&'a Challen
 /// A graded check's split: learned (`split`, cut from the outcomes in `home`) under
 /// `BORG_STOP_ATTENTION=on`, else `conscience::graded`. `BORG_STOP_ASK_CAP` and checks without a 3 keep
 /// the fixed rule. Every `EXPLORE`th graded check in the store explores (`explores`). Also returns the
-/// cut, for the log.
+/// cut, for the log, and the propensities: the fixed rule's choice (`fixed_p`), or the explore mixture
+/// over the cut set before the explore override (`propensities`).
 pub fn graded<'a>(applied: &[(&'a Challenge, u8)], home: &std::path::Path) -> Split<'a> {
     if !on() || conscience::ask_cap().is_some() || !applied.iter().any(|(_, g)| *g == 3) {
         let (ask, free) = conscience::graded(applied);
-        return (ask, free, None);
+        let p = fixed_p(applied, &ask);
+        return (ask, free, None, p);
     }
     let outcomes = outcome::read(&home.join("outcomes.jsonl"));
-    let c = cut(&labels(&outcomes));
+    let base = cut(&labels(&outcomes));
+    let p = propensities(applied.len(), base.k);
     let c = match explores(outcomes.iter().filter(|o| o.kind == outcome::GRADED).count()) {
-        true => Cut { k: RAIL, source: "explore", ..c },
-        false => c,
+        true => Cut { k: RAIL, source: "explore", ..base },
+        false => base,
     };
     let (ask, free) = split(applied, &c);
-    (ask, free, Some(c))
+    (ask, free, Some(c), p)
+}
+
+/// Under a deterministic rule each apply was asked with probability 1 or 0: whether `ask` holds it.
+pub fn fixed_p(applied: &[(&Challenge, u8)], ask: &[&Challenge]) -> Vec<f64> {
+    applied.iter().map(|(c, _)| if ask.iter().any(|a| a.id == c.id) { 1.0 } else { 0.0 }).collect()
+}
+
+/// The learned cut's propensity per rank of `n` applies under the base cut `k`: with q = 1/`EXPLORE`,
+/// p_r = (1 − q)·[r < min(k, RAIL, n)] + q·[r < min(RAIL, n)]. The explore schedule is a counter over
+/// the store's graded checks, independent of the check's content, so this marginal is the policy's
+/// propensity: valid for inverse propensity weighting.
+pub fn propensities(n: usize, k: usize) -> Vec<f64> {
+    let q = 1.0 / EXPLORE as f64;
+    let (cut, rail) = (k.min(RAIL).min(n), RAIL.min(n));
+    (0..n).map(|r| (1.0 - q) * f64::from(u8::from(r < cut)) + q * f64::from(u8::from(r < rail))).map(crate::outcome::round_p).collect()
 }
 
 /// Does the check after `graded` graded checks explore? Every `EXPLORE`th, never the first.
@@ -314,6 +333,27 @@ mod tests {
         let mut l: Vec<Labelled> = (0..25).map(|i| lab(&g, &[i % 4])).collect();
         l.extend((0..15).map(|_| lab(&g, &[11])));
         assert_eq!(cut(&l), Cut { k: 12, n: 40, alpha: 0.375, source: "crc" });
+    }
+
+    #[test]
+    fn propensities_mix_the_cut_and_the_explore_slice() {
+        let p = propensities(25, 3);
+        assert_eq!(&p[..3], &[1.0; 3]);
+        assert!(p[3..20].iter().all(|&x| x == 0.1), "{p:?}");
+        assert_eq!(&p[20..], &[0.0; 5]);
+        assert_eq!(propensities(2, 11), [1.0, 1.0], "the cut covers every apply");
+        assert_eq!(propensities(12, 11)[11], 0.1);
+    }
+
+    #[test]
+    fn fixed_rule_propensities_are_the_choice() {
+        let ls: Vec<Challenge> = (0..3).map(|i| Challenge { id: format!("L{i}"), ..Default::default() }).collect();
+        let blocking: Vec<(&Challenge, u8)> = ls.iter().zip([3, 2, 1]).collect();
+        let (ask, _) = conscience::graded_capped(&blocking, None);
+        assert_eq!(fixed_p(&blocking, &ask), [1.0, 1.0, 1.0]);
+        let soft: Vec<(&Challenge, u8)> = ls.iter().take(2).zip([2, 1]).collect();
+        let (ask, _) = conscience::graded_capped(&soft, None);
+        assert_eq!(fixed_p(&soft, &ask), [0.0, 0.0]);
     }
 
     #[test]

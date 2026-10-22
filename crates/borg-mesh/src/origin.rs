@@ -238,4 +238,41 @@ mod tests {
         assert_eq!(apply_if_new(&home, &m).unwrap(), 0, "checked against this membership already");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// Carol's outcome line, stamped after her revocation, moves to quarantine and stops counting.
+    #[test]
+    fn a_revoked_key_s_outcomes_are_quarantined() {
+        let home = std::env::temp_dir().join(format!("borg-mesh-origin-outcomes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (admin, carol) = (Identity::load_or_create(&home).unwrap(), Identity::load_or_create(&home.join("carol")).unwrap());
+        let mut m = Membership::found("work", &admin);
+        m.invite(&admin, &carol.public(), "member").unwrap();
+        std::fs::write(home.join("lessons.jsonl"), format!("{}\n", lesson("L1", 1, "one"))).unwrap();
+        let line = |s: &str| {
+            let x = borg::outcome::Shared {
+                kind: borg::outcome::CHANGED.into(),
+                s: s.into(),
+                lessons: vec!["L1".into()],
+                ms: 5,
+                node: "n".into(),
+                p: vec![],
+                channel: String::new(),
+                r: String::new(),
+            };
+            serde_json::to_string(&x).unwrap()
+        };
+        let (good, bad) = (line("t1"), line("t2"));
+        let team = home.join(borg::outcome::TEAM_FILE);
+        std::fs::write(&team, format!("{good}\n{bad}\n")).unwrap();
+        append(&home, &[Origin::new(&admin, &lines::hash(&good), 1), Origin::new(&carol, &lines::hash(&bad), 50)]).unwrap();
+        let l1 = [borg::conscience::Challenge { id: "L1".into(), ..Default::default() }];
+        let changed = || borg::memory::derive(&borg::outcome::read_team(&home.join("lessons.jsonl")), &l1, None)["L1"].changed;
+        assert_eq!(changed(), 2);
+        m.revoke(&admin, &carol.public(), 10).unwrap();
+        assert_eq!(apply(&home, &m).unwrap(), 1);
+        assert_eq!(changed(), 1, "the revoked key's result no longer counts");
+        assert!(std::fs::read_to_string(identity::dir(&home).join("quarantine.jsonl")).unwrap().contains("\"t2\""));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

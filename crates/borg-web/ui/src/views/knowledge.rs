@@ -402,7 +402,7 @@ pub fn lesson_card(l: Lesson, open: RwSignal<Option<String>>) -> impl IntoView {
                 {(l.reach == "repo").then(|| view! { <span class="chip" title="a convention of its repo, delivered only there">{format!("only in {}", l.repo)}</span> })}
                 {l.consolidated.then(|| view! { <span class="chip g">"long-term"</span> })}
                 {l.dormant.then(|| view! { <span class="chip">"dormant"</span> })}
-                <span class="stat" title="asked · used · corrected anyway">{format!("? {} · ✓ {} · ! {}", num(l.asked()), num(l.changed), num(l.corrected))}</span>
+                <span class="stat" title="asked · used · corrected anyway · vetoed">{format!("? {} · ✓ {} · ! {}{}", num(l.asked()), num(l.changed), num(l.corrected), if l.vetoed > 0.0 { format!(" · ⊘ {}", num(l.vetoed)) } else { String::new() })}</span>
                 <span class="stat" title="usefulness belief">{use_pct}</span>
             </span>
         </button>

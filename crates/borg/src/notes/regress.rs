@@ -381,12 +381,15 @@ fn link(run: &Run, fix: &Fix, o: &Origin, why: Option<&Excerpt>, found: &[String
             task: why.map(|e| first_line(&e.task, TEXT_CAP)).unwrap_or_default(),
             subject: String::new(),
             date: o.date.clone(),
+            // `dated` leaves i64::MAX for a time it could not parse.
+            secs: if o.secs == i64::MAX { 0 } else { o.secs },
         },
         fixed: Side {
             session: fix.session.clone(),
             task: first_line(&fix.task, TEXT_CAP),
             subject: first_line(&fix.subject, TEXT_CAP),
             date: fix.date.clone(),
+            secs: fix.secs,
         },
         files: touched(&o.lines),
         lines: o.lines.len(),

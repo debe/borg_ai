@@ -59,7 +59,10 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `live_ask` | Live mode: `n` grade-3 lessons of a live check, delivered with the next prompt or tool call. No extra round |
 | `early`, `queued_free` | Lessons handed over free at a prompt or touch |
 | `changed`, `ignored`, `corrected`, `not_corrected` | What happened after a lesson was asked: used, ignored, corrected anyway, or no correction followed |
+| `regretted` | `borg learn` counted a later fix, or a review finding, against a lesson asked before the decision (`lessons`: that lesson). Its share of the blame is the `credit` of the `regretted` record in `outcomes.jsonl`, keyed by the regret episode (`cause`) |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
+| `veto` | An engineer said no to a drone's work (`borg no`, or a prompt starting "borg no"); `lessons` the lessons shown in the session so far, `n` their number, `why` `cli` or `prompt` |
+| `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned, so the latest days can lag |
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
@@ -74,7 +77,11 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 [Delivery modes](../README.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson
 reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or `queued` (free). The
 `asked` outcome records and the judge's `asked_then_changed` and `asked_ignored` records in
-`outcomes.jsonl` carry the same `channel`. Rollups keep two splits beside the counts:
+`outcomes.jsonl` carry the same `channel`. A veto adds a `vetoed` record per lesson shown in the session
+before it (no channel; it is counted as the `veto` event, not as an outcome kind of its own). `asked`
+and `graded` records also carry `p`, each lesson's probability of being asked under the policy in force,
+for off-policy evaluation. `outcomes-team.jsonl` holds the redacted outcomes the mesh syncs (session and
+repo hashed); the statistics never read it, since the rollups already sync their counts. Rollups keep two splits beside the counts:
 
 - `usd_mode`: the cost of `check` and `live_check` per mode. Checks from before modes existed count as
   `hook`. It is part of `usd`, never added to `usd_by`.

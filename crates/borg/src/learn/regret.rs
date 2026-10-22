@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::notes::regress_signals::{REVERT, SUBJECT, TESTS, WORDS};
+
 /// `Episode::kind` of a regret.
 pub const KIND: &str = "regret";
 
@@ -38,6 +40,32 @@ pub struct Regret {
     pub fix_why: String,
     pub signals: Vec<String>,
     pub age_days: u32,
+    /// When the decision was made, epoch ms: the decision commit's committer time, or the review
+    /// finding's time. 0 when unknown (episodes from before it was kept): such a regret credits no lesson.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub decision_ms: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+/// How strongly a regret blames the decision, in (0, 1): `1 − 2^−g` over its independent grounds g: a
+/// revert, a fix-shaped subject, a red-then-green test run together with the engineer's words of a bug
+/// (regress_signals.rs `strong`); for a review regret the finding itself, and a verifier's confirmation.
+/// One ground 0.5, two 0.75, three 0.875; 0 for a regret that is not strong (never learned from anyway).
+/// A parameter-free count of evidence, not a tuning knob: the offline report breaks the credit down by g.
+#[must_use]
+pub fn strength(r: &Regret) -> f64 {
+    let has = |s: &str| r.signals.iter().any(|x| x == s);
+    let g = match is_review(r) {
+        true => 1 + u32::from(has("confirmed")),
+        false => u32::from(has(REVERT)) + u32::from(has(SUBJECT)) + u32::from(has(TESTS) && has(WORDS)),
+    };
+    match g {
+        0 => 0.0,
+        g => 1.0 - 0.5f64.powi(g as i32),
+    }
 }
 
 /// How a regret prompt opens (the correction prompt's reach and merge rules follow it).
@@ -132,6 +160,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strength_counts_independent_grounds() {
+        let of = |signals: &[&str]| strength(&Regret { signals: signals.iter().map(|s| s.to_string()).collect(), ..Regret::default() });
+        assert_eq!(of(&["subject"]), 0.5);
+        assert_eq!(of(&["revert", "subject"]), 0.75);
+        assert_eq!(of(&["revert", "subject", "tests", "words"]), 0.875);
+        assert_eq!(of(&["tests"]), 0.0, "red-then-green alone is how a feature is built");
+        assert_eq!(of(&["tests", "words"]), 0.5);
+        assert_eq!(of(&[REVIEW, "unchecked"]), 0.5);
+        assert_eq!(of(&[REVIEW, "confirmed"]), 0.75);
+        assert_eq!(of(&[]), 0.0);
+    }
+
+    #[test]
     fn a_review_regret_has_its_own_opening_and_sections() {
         let r = Regret {
             decision_task: "port the voice lane".into(),
@@ -144,7 +185,12 @@ mod tests {
         assert!(head(&r).starts_with("A coding agent built a change") && !head(&r).contains("days later"), "{}", head(&r));
         assert!(head(&r).contains("(a reviewer found it before any commit; a verifier confirmed it)"), "{}", head(&r));
         let s = sections(&r, "ignored");
-        for part in ["## The task the agent built\nport the voice lane", "Built it; all tests pass.", "before any commit)\nA failed recommendation", "error branch returns ok()"] {
+        for part in [
+            "## The task the agent built\nport the voice lane",
+            "Built it; all tests pass.",
+            "before any commit)\nA failed recommendation",
+            "error branch returns ok()",
+        ] {
             assert!(s.contains(part), "{part}: {s}");
         }
         assert!(!s.contains("ignored") && !is_review(&Regret::default()));

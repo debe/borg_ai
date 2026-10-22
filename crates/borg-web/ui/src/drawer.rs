@@ -30,6 +30,8 @@ pub fn Drawer() -> impl IntoView {
             ("used", l.changed, "var(--c-good)"),
             ("ignored", l.ignored, "var(--c-slate)"),
             ("corrected anyway", l.corrected, "var(--c-heat)"),
+            ("vetoed", l.vetoed, "var(--c-heat)"),
+            ("regretted later", l.regretted, "var(--c-pink)"),
             ("early, free", l.usage.get("early").copied().unwrap_or(0.0), "var(--c-teal)"),
         ];
         let umax = usage.iter().map(|u| u.1).fold(0.0, f64::max).max(1.0);

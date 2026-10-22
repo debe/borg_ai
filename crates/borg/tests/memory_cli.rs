@@ -232,6 +232,20 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     let mem = memory();
     assert_eq!((m(&mem, "Llock")["changed"].as_u64(), m(&mem, "Llock")["corrected"].as_u64()), (Some(0), Some(1)));
     assert!(m(&mem, "Llock")["weight"].as_f64().unwrap() < 1.0);
+    assert_eq!(m(&mem, "Ldrain")["regretted"].as_f64(), Some(0.0));
+
+    // A later fix of a decision Ldrain was asked before: half a correction at most, shown as `regretted`.
+    let before = m(&mem, "Ldrain")["mean"].as_f64().unwrap();
+    let regretted = json!({"kind": "regretted", "session": "s1", "lessons": ["Ldrain"], "ms": 4_000_000_000_001i64, "repo": "r", "cause": "R1", "credit": 0.5});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("store/collectives/corp/outcomes.jsonl"))
+        .unwrap()
+        .write_all(format!("{regretted}\n").as_bytes())
+        .unwrap();
+    let mem = memory();
+    assert_eq!(m(&mem, "Ldrain")["regretted"].as_f64(), Some(0.5));
+    assert!(m(&mem, "Ldrain")["mean"].as_f64().unwrap() < before);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -314,5 +328,29 @@ fn the_order_questions_are_shown_in_is_stable_per_session_and_varies_across_sess
     };
     let firsts: std::collections::HashSet<String> = (0..12).map(|i| order(&format!("o{i}"))[0].clone()).collect();
     assert!(firsts.len() >= 2, "the same lesson always first: {firsts:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn bm25_asks_log_slot_propensities() {
+    // Eight unscoped lessons on the plan's words compete for GENERIC_CAP slots: each asked one carries its
+    // chance of a slot under the session's draws (conscience.rs `propensity`), in (0, 1].
+    let root = setup("propensity");
+    let mut lessons = store_file(&root, "lessons.jsonl");
+    for i in 0..5 {
+        lessons += &format!(
+            "{}\n",
+            json!({"id": format!("Lws{i}"), "origin_ms": 1, "question": format!("Is the websocket delivery queue lock {i} released before the await?")})
+        );
+    }
+    std::fs::write(root.join("store/collectives/corp/lessons.jsonl"), lessons).unwrap();
+    let out = stop(&root, "s1", false, PLAN, false, &[]);
+    assert!(out.contains("block"), "{out}");
+    let a = outcomes(&root).into_iter().find(|o| o["kind"] == "asked").unwrap();
+    let p: Vec<f64> = a["p"].as_array().unwrap_or_else(|| panic!("{a}")).iter().map(|x| x.as_f64().unwrap()).collect();
+    assert_eq!(p.len(), a["lessons"].as_array().unwrap().len(), "{a}");
+    assert!(p.iter().all(|&x| x > 0.0 && x <= 1.0), "{a}");
+    assert!(p.iter().any(|&x| x < 1.0), "the pool overflows the slots: {a}");
+    assert!(store_file(&root, "state/s1.ctx").lines().any(|l| l.starts_with("#borg-p ")), "{}", store_file(&root, "state/s1.ctx"));
     let _ = std::fs::remove_dir_all(root);
 }

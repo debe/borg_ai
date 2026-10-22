@@ -67,6 +67,24 @@ building, so the next drone is asked before the reviewer has to catch the same b
 default (`BORG_REVIEW_FIX=off` turns it off); the page counts the findings learned. See
 [Review → fix findings](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#review--fix-findings).
 
+**Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
+against the lessons asked in the deciding session before the decision: asking them did not prevent it.
+The lesson it merged into takes the blame if it was asked; otherwise the asked lessons share it. It costs
+0 tokens, each regret counts once, and it weighs at most half a correction, so a lesson that keeps being
+asked before decisions that break sinks slowly. `borg memory` and the page show it as `regretted`;
+`BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by an offline check: the
+belief with the regret term must predict later outcomes at least as well as without it.
+
+**Saying no.** `borg no <reason>` (or a prompt that starts with "borg no") is your veto of what a drone
+is doing. It costs 0 tokens and has three effects. Every lesson the drone was shown in the session loses
+credit, weighed above a correction, so lessons that did not prevent the vetoed work sink. The reason
+becomes a lesson at the next session end, like a correction. When the reason names an invariant of the
+system, Borg also proposes it as a constraint in `borg queen`; only you can ratify it, and nothing
+enforces constraints yet. In the session, the drone is told to stop and not argue the veto back. The
+measure is the *repeat-veto rate*: vetoes that repeat an earlier one, which should fall toward zero.
+`borg web` shows it. The weight of a veto (three, against two for a correction) is a design choice
+with no eval behind it yet. See [Saying no](https://github.com/debe/borg_ai/blob/main/docs/commands.md#saying-no).
+
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
 ![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](docs/img/turn.svg)
@@ -348,6 +366,7 @@ Borg runs on its own. These commands show what it does:
 | `borg collective [DIR]` | Which collective a directory belongs to |
 | `borg queen` | Open decisions waiting for you; `borg queen ask` answers them one by one |
 | `borg top` · `borg steer` | Running drones across the team; send them a signed instruction |
+| `borg no <reason>` | Say no to a drone's work: its shown lessons lose credit, the reason becomes a lesson |
 | `borg why <path>:<line>` | The reasoning behind a line of code, and which later commit fixed it |
 | `borg regress --replay A..B` | Which earlier decisions the commits of a range fixed (dry run) |
 | `borg web` | A live page of the knowledge and what the collective did, on 127.0.0.1 |
@@ -382,7 +401,10 @@ corrections), transcripts, source code, `collectives.json`, per-session state.
   recently touched paths;
 - steering instructions and the signed member list;
 - daily usage counts per engineer: checks, questions, outcomes, corrections, cost, lesson ids
-  ([Statistics](https://github.com/debe/borg_ai/blob/main/docs/statistics.md#privacy)).
+  ([Statistics](https://github.com/debe/borg_ai/blob/main/docs/statistics.md#privacy));
+- outcomes: which lesson was asked, what followed, when, and how likely it was to be asked, with the
+  session and repo hashed, so lesson usefulness and trust are the team's (`BORG_SHARE_OUTCOMES=off`
+  keeps them local).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content. Run your own relay to
 keep even that in-house; see [Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh) and

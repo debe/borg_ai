@@ -38,6 +38,13 @@ pub struct Side {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subject: String,
     pub date: String,
+    /// Committer time, epoch seconds; 0 in records from before it was kept.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub secs: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 /// Lines of one file at the fix's parent, as inclusive ranges.

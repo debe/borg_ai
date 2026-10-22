@@ -17,8 +17,14 @@
 //! same session, or a new lesson superseding one it asked, means asking did not prevent the
 //! correction; a correction siding with one side of a rendered disagreement corrects the other
 //! sides instead; see outcome.rs.
+//!
+//! **Vetoes** (`borg no`, veto.rs): an engineer's "no" is an episode of kind `veto`, asked with its own
+//! prompt (`veto::OPENING`), whose answer may also name an invariant. It is learned at the end of any
+//! session, not only its own (a terminal veto may name an ended session). A veto merged into a lesson
+//! an earlier veto made counts as `veto_repeat`; an invariant of a lesson placed in this store becomes
+//! a proposed constraint in the queen's queue (`veto::propose`), never a constraint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -195,6 +201,10 @@ pub fn record_episode_in(store: &Path, e: &Episode) -> std::io::Result<()> {
 
 /// A correction in the usage statistics: a rejected tool call, a pushback or a regret, with a short excerpt.
 pub fn count_correction(store: &Path, e: &Episode) {
+    // A veto counts itself (`stats::VETO`, veto.rs).
+    if e.kind == crate::veto::KIND {
+        return;
+    }
     let snippet = crate::stats::excerpt(&e.correction, 160);
     let (why, text) = match &e.rejected_tool {
         _ if e.kind == regret::KIND => ("regret", snippet),
@@ -255,9 +265,19 @@ If this correction contradicts or replaces a listed lesson (in the same situatio
 opposite, e.g. the engineer reversed an earlier correction), list that lesson's id in supersedes; never the same_as lesson. \
 Otherwise supersedes is empty.";
 
-/// The prompt for one episode: a correction's, or a regret's (regret.rs) when it is one.
+/// The prompt for one episode: a correction's, a veto's (veto.rs) or a regret's (regret.rs).
 fn episode_prompt(e: &Episode, listed: &[String]) -> String {
     let existing = if listed.is_empty() { "(none)".into() } else { listed.join("\n") };
+    if e.kind == crate::veto::KIND {
+        let agent = if e.agent.trim().is_empty() { "(not available)" } else { e.agent.as_str() };
+        return format!(
+            "{}\n\n{REACH_RULES}\n\n{FIELDS}\n{AREA}\n{}\n\n{MERGE_RULES}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{agent}\n\n## Engineer's veto\n{}\n\n## Existing lessons\n{existing}\n",
+            crate::veto::OPENING,
+            crate::veto::INVARIANT,
+            e.task.chars().take(1500).collect::<String>(),
+            e.correction,
+        );
+    }
     if let Some(r) = e.regret.as_ref().filter(|_| e.kind == regret::KIND) {
         let (head, sections) = (regret::head(r), regret::sections(r, &e.task));
         let (reach, merge) = (regret::neutral(REACH_RULES), regret::neutral(MERGE_RULES));
@@ -282,6 +302,22 @@ fn schema() -> Value {
         "required": ["is_lesson", "question", "situations", "consequence", "same_as", "area", "supersedes", "reach"]})
 }
 
+/// `schema` plus the invariant a veto's reason may name (veto.rs).
+fn veto_schema() -> Value {
+    let mut s = schema();
+    s["properties"]["invariant"] = json!({"type": "string"});
+    if let Some(r) = s["required"].as_array_mut() {
+        r.push(json!("invariant"));
+    }
+    s
+}
+
+/// The answer schema for `prompt`: a veto's prompt (it starts with `veto::OPENING`) gets the invariant
+/// field; correction and regret calls stay as they were.
+pub fn schema_for(prompt: &str) -> Value {
+    if prompt.starts_with(crate::veto::OPENING) { veto_schema() } else { schema() }
+}
+
 /// The model call failed (quota, rate limit, not logged in, network, malformed answer): unlike a
 /// verdict of "not a lesson", the episode stays waiting and a later `borg learn` retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +336,8 @@ struct Answer {
     reach: String,
     same_as: String,
     supersedes: Vec<String>,
+    /// A veto's invariant (veto.rs); empty for every other episode, and when the model named none.
+    invariant: String,
 }
 
 impl Answer {
@@ -322,6 +360,7 @@ impl Answer {
             reach: reach.to_string(),
             same_as: text("same_as"),
             supersedes: strs("supersedes"),
+            invariant: text("invariant"),
         }))
     }
 }
@@ -413,6 +452,14 @@ fn fresh(e: &Episode, a: Answer, supersedes: Vec<String>) -> Lesson {
 /// # Errors
 /// `AskFailed` when the model gave no usable verdict.
 pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<Lesson>, AskFailed> {
+    generalise_with(e, library, ask).map(|o| o.map(|(l, _)| l))
+}
+
+/// `generalise`, with the invariant a veto's answer named (empty otherwise).
+///
+/// # Errors
+/// `AskFailed` when the model gave no usable verdict.
+pub fn generalise_with(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<(Lesson, String)>, AskFailed> {
     // A withdrawn personal lesson (reach.rs) is no merge target: it lives in a private collective now.
     let library: Vec<Lesson> = library.iter().filter(|l| l.reach != crate::reach::PERSONAL).cloned().collect();
     let similar = similar(e, &library);
@@ -422,15 +469,19 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
     // Only lessons the model was shown can be superseded, and never the one it merges into.
     let supersedes: Vec<String> =
         a.supersedes.iter().filter(|id| similar.iter().any(|l| &l.id == *id) && same_as.is_none_or(|m| &m.id != *id)).cloned().collect();
-    Ok(Some(match same_as {
-        Some(old) => merged(old, e, a, supersedes),
-        None => fresh(e, a, supersedes),
-    }))
+    let invariant = a.invariant.trim().to_string();
+    Ok(Some((
+        match same_as {
+            Some(old) => merged(old, e, a, supersedes),
+            None => fresh(e, a, supersedes),
+        },
+        invariant,
+    )))
 }
 
 /// One structured call to the drone's model (runner.rs picks claude, omp or opencode).
 pub fn ask_claude(prompt: &str) -> Option<Value> {
-    ask_model(prompt, &schema()).map(|(v, _)| v)
+    ask_model(prompt, &schema_for(prompt)).map(|(v, _)| v)
 }
 
 /// The model call behind `ask_claude`, for any JSON schema: the structured answer and its cost in USD
@@ -503,8 +554,72 @@ pub struct Step<'a> {
     pub secs: f64,
 }
 
+/// Whether a veto's lesson, placed as `placed`, proposes its `invariant` as a constraint: only a lesson
+/// placed in this store; a personal or dropped one never does, a preference being no invariant.
+fn proposes(placed: &crate::reach::Placed, invariant: &str) -> bool {
+    matches!(placed, crate::reach::Placed::Here(_)) && !invariant.trim().is_empty()
+}
+
+/// False when BORG_REGRET_CREDIT=off: a regret no longer counts against the lessons asked before the
+/// decision (`credit_regrets`).
+pub fn regret_credit() -> bool {
+    std::env::var("BORG_REGRET_CREDIT").as_deref() != Ok("off")
+}
+
+/// Each regret episode generalised into a lesson of this store (`library`, as stored: a lesson placed in
+/// a private store is not in it) blames the lessons asked in its deciding session before the decision
+/// (`outcome::regretted`). Runs over every such episode on every run, so regrets learned before this
+/// existed are credited once too; the (cause, lesson) key keeps it idempotent. A regret the model judged
+/// "not a lesson", one still waiting, and one without `decision_ms` credit nothing. For a review regret
+/// the deciding session is the episode's own: a lesson `contradicted` already marked corrected there is
+/// not blamed twice.
+///
+/// Indexed once per run, so a run costs one pass over the log and the library plus each deciding
+/// session's own records: `regretted` reads only the deciding session's records, and a regret's credits
+/// carry that session too.
+fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<outcome::Outcome>, path: &Path) {
+    let mut holder: HashMap<&str, &Lesson> = HashMap::new();
+    for l in library {
+        for id in &l.episodes {
+            holder.entry(id.as_str()).or_insert(l);
+        }
+    }
+    let deciding: HashSet<&str> = regrets.iter().filter_map(|e| e.regret.as_ref()).map(|r| r.decision_session.as_str()).collect();
+    let mut by_session: HashMap<String, Vec<outcome::Outcome>> = HashMap::new();
+    for o in outcomes.iter().filter(|o| deciding.contains(o.session.as_str())) {
+        by_session.entry(o.session.clone()).or_default().push(o.clone());
+    }
+    for e in regrets {
+        let Some(r) = &e.regret else { continue };
+        let Some(holder) = holder.get(e.id.as_str()) else { continue };
+        let target: Vec<String> = std::iter::once(holder.id.clone()).chain(holder.supersedes.iter().cloned()).collect();
+        let records = by_session.entry(r.decision_session.clone()).or_default();
+        for o in outcome::regretted(records, &r.decision_session, r.decision_ms, &e.id, &target, regret::strength(r), e.ms, &e.repo) {
+            let _ = outcome::append(path, &o);
+            records.push(o.clone());
+            outcomes.push(o);
+        }
+    }
+}
+
 /// `learn_in`, calling `report` after every model call (the CLI prints it; the hooks pass a no-op).
+///
+/// One run per store at a time (an exclusive lock on `lessons.jsonl.lock`): session-end runs of several
+/// drones share the veto episodes and the regret credits, and two runs reading the store before either
+/// writes would learn a veto twice and count its credits twice. A waiting run then reads what the first
+/// one wrote and has nothing left to do for them.
 pub fn learn_in_reporting(
+    home: &Path,
+    session: Option<&str>,
+    ask: &dyn Fn(&str) -> Option<Value>,
+    track: bool,
+    now: i64,
+    report: &mut dyn FnMut(Step),
+) -> (usize, usize, usize) {
+    crate::live::locked(&home.join("lessons.jsonl"), || learn_unlocked(home, session, ask, track, now, report))
+}
+
+fn learn_unlocked(
     home: &Path,
     session: Option<&str>,
     ask: &dyn Fn(&str) -> Option<Value>,
@@ -524,7 +639,11 @@ pub fn learn_in_reporting(
     let mut last_episode: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
     let episodes = read_jsonl::<Episode>(&ep_path);
-    let total = episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && session.is_none_or(|s| s == e.session)).count();
+    let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
+    // A veto is learned at the end of any session (veto.rs): a terminal veto may name one already ended.
+    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND;
+    let vetoes: HashSet<String> = episodes.iter().filter(|e| e.kind == crate::veto::KIND).map(|e| e.id.clone()).collect();
+    let total = episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && mine(e)).count();
     let mut asked = 0;
     for e in episodes {
         let last = last_episode.entry(e.session.clone()).or_insert(e.ms);
@@ -532,7 +651,7 @@ pub fn learn_in_reporting(
         if done.contains(&e.id) || skipped.contains(&e.id) {
             continue;
         }
-        if session.is_some_and(|s| s != e.session) {
+        if !mine(&e) {
             pending.insert(e.session.clone());
             continue;
         }
@@ -542,12 +661,12 @@ pub fn learn_in_reporting(
             continue;
         }
         let started = std::time::Instant::now();
-        let verdict = generalise(&e, &library, ask);
+        let verdict = generalise_with(&e, &library, ask);
         asked += 1;
         let what = match &verdict {
             Err(AskFailed) => "no answer from the model, left pending".to_string(),
-            Ok(Some(l)) if l.version > 1 => format!("merged into {}: {}", l.id, l.question),
-            Ok(Some(l)) => format!("new lesson {}: {}", l.id, l.question),
+            Ok(Some((l, _))) if l.version > 1 => format!("merged into {}: {}", l.id, l.question),
+            Ok(Some((l, _))) => format!("new lesson {}: {}", l.id, l.question),
             Ok(None) => "not a lesson".to_string(),
         };
         report(Step { done: asked, total, verdict: &what, secs: started.elapsed().as_secs_f64() });
@@ -557,7 +676,7 @@ pub fn learn_in_reporting(
                 failed += 1;
                 pending.insert(e.session.clone());
             }
-            Ok(Some(l)) => {
+            Ok(Some((l, invariant))) => {
                 if l.version > 1 {
                     merged += 1
                 } else {
@@ -569,6 +688,7 @@ pub fn learn_in_reporting(
                 let source = match &e.regret {
                     Some(r) if regret::is_review(r) => "review",
                     Some(_) => "regret",
+                    None if e.kind == crate::veto::KIND => "veto",
                     None => "session",
                 };
                 let (kind, why, counted_in) = match &placed {
@@ -585,8 +705,26 @@ pub fn learn_in_reporting(
                     ev.lessons = vec![l.id.clone()];
                     ev.why = why.into();
                 });
+                if e.kind == crate::veto::KIND {
+                    // The same "no" said twice: merged into a lesson an earlier veto made (H5b's numerator).
+                    let earlier = library.iter().find(|x| x.id == l.id);
+                    if l.version > 1 && earlier.is_some_and(|o| o.episodes.iter().any(|id| id != &e.id && vetoes.contains(id))) {
+                        crate::stats::count(&counted_in, crate::stats::VETO_REPEAT, &e.session, |ev| {
+                            ev.engineer = e.engineer.clone();
+                            ev.repo = e.repo.clone();
+                            ev.lessons = vec![l.id.clone()];
+                            ev.text = crate::stats::excerpt(&e.correction, 160);
+                        });
+                    }
+                    if proposes(&placed, &invariant) {
+                        let _ = crate::veto::propose(home, &l, &invariant, &e, now);
+                    }
+                }
                 let target = (l.version > 1).then_some(l.id.as_str());
-                let contradicted = match track {
+                // A veto credited the lessons shown before it already (veto.rs): it never doubles as a
+                // correction, nor as a missed question (`applied_then_corrected`).
+                let track_results = track && e.kind != crate::veto::KIND;
+                let contradicted = match track_results {
                     true => outcome::contradicted(&outcomes, &e.session, e.ms, target, &l.supersedes),
                     false => Vec::new(),
                 };
@@ -602,7 +740,7 @@ pub fn learn_in_reporting(
                     let _ = outcome::append(&outcomes_path, &o);
                     outcomes.push(o);
                 }
-                let missed = match track {
+                let missed = match track_results {
                     true => outcome::missed(&outcomes, &e.session, e.ms, target, &l.supersedes),
                     false => Vec::new(),
                 };
@@ -630,6 +768,9 @@ pub fn learn_in_reporting(
         }
     }
     if track {
+        if regret_credit() {
+            credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path);
+        }
         let mut ended: Vec<String> =
             outcome::idle_sessions(&outcomes, &last_episode, now).into_iter().filter(|s| !pending.contains(*s)).map(str::to_string).collect();
         if let Some(s) = session.filter(|s| !ended.iter().any(|x| x == s) && !pending.contains(*s)) {
@@ -689,6 +830,108 @@ mod tests {
         // A correction keeps its prompt; a kind without its regret is asked as a correction.
         assert!(episode_prompt(&ep("e1", "no, the lock"), &[]).starts_with(OPENING));
         assert!(episode_prompt(&Episode { kind: regret::KIND.into(), ..ep("e2", "no") }, &[]).starts_with(OPENING));
+    }
+
+    /// The injected model for vetoes: like `fake_ask` on the veto's section, plus `invariant:<rest>`.
+    fn fake_veto_ask(p: &str) -> Option<Value> {
+        let reason = p.split("## Engineer's veto\n").nth(1)?.lines().next()?;
+        let after = |k: &str| reason.split(k).nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
+        let invariant = reason.split("invariant:").nth(1).unwrap_or("").trim().to_string();
+        Some(json!({"is_lesson": true, "question": format!("Q {reason}"), "situations": [], "consequence": "c",
+            "same_as": after("merge:"), "supersedes": [], "invariant": invariant}))
+    }
+
+    fn veto(id: &str, session: &str, ms: i64, reason: &str) -> Episode {
+        Episode { kind: crate::veto::KIND.into(), ..at(id, session, ms, "ann@x", reason) }
+    }
+
+    #[test]
+    fn a_veto_is_asked_with_its_own_prompt_and_schema() {
+        let p = episode_prompt(&veto("no-s-1", "s", 1, "never read the commit log for merges"), &[]);
+        assert!(p.starts_with(crate::veto::OPENING), "{p}");
+        for part in [
+            "## Engineer's veto\nnever read the commit log for merges",
+            crate::veto::INVARIANT,
+            REACH_RULES,
+            FIELDS,
+            MERGE_RULES,
+            "## Task the agent had\nplan the relay",
+        ] {
+            assert!(p.contains(part), "{part}");
+        }
+        assert!(!p.contains(OPENING) && !p.contains("## Engineer's correction"));
+        let without = episode_prompt(&Episode { agent: String::new(), ..veto("no-s-2", "s", 1, "no") }, &[]);
+        assert!(without.contains("## What the agent proposed (excerpt)\n(not available)"), "{without}");
+        assert!(schema_for(&p)["required"].as_array().unwrap().contains(&json!("invariant")));
+        assert!(schema_for(&p)["properties"]["invariant"].is_object());
+        let correction = episode_prompt(&ep("e1", "no, the lock"), &[]);
+        assert_eq!(schema_for(&correction), schema(), "a correction's call is unchanged");
+        // The invariant comes back with the lesson; a correction's answer has none.
+        let (l, inv) =
+            generalise_with(&veto("no-s-3", "s", 1, "merge lookups invariant: lookups go through the review API"), &[], &fake_veto_ask).unwrap().unwrap();
+        assert_eq!((l.id.as_str(), inv.as_str()), ("Lno-s-3", "lookups go through the review API"));
+        let (_, none) = generalise_with(&ep("e2", "no, the lock merge:x"), &[], &fake_ask).unwrap().unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_veto_is_learned_at_any_sessions_end_and_never_counted_as_a_correction() {
+        let home = temp_home("veto-any");
+        crate::learn::record_episode_in(&home, &veto("no-s1-1", "s1", 1, "never read the commit log for merges")).unwrap();
+        append_jsonl(&home.join("episodes.jsonl"), &at("e1", "s1", 2, "ann@x", "a correction of s1")).unwrap();
+        assert!(!crate::stats::events(&home).iter().any(|e| e.kind == crate::stats::CORRECTION), "count_correction skips a veto");
+        // s2 ends: the veto of s1 is learned, s1's correction waits for its own session.
+        assert_eq!(learn_in(&home, Some("s2"), &fake_veto_ask, true, 3), (1, 0, 0));
+        let ls = lessons(&home.join("lessons.jsonl"));
+        assert_eq!(ls.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["Lno-s1-1"]);
+        let news: Vec<crate::stats::Event> = crate::stats::events(&home).into_iter().filter(|e| e.kind == crate::stats::LESSON_NEW).collect();
+        assert_eq!(news[0].why, "veto");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_veto_merged_into_an_earlier_vetos_lesson_is_a_repeat() {
+        let home = temp_home("veto-repeat");
+        let repeats = |home: &Path| crate::stats::events(home).iter().filter(|e| e.kind == crate::stats::VETO_REPEAT).count();
+        // A lesson from a correction, then a veto merged into it: no repeat (the first "no").
+        append_jsonl(&home.join("episodes.jsonl"), &at("e0", "s0", 1, "ann@x", "use the lock on the flag")).unwrap();
+        append_jsonl(&home.join("episodes.jsonl"), &veto("no-s1-2", "s1", 2, "the lock again merge:Le0")).unwrap();
+        // Le0 was asked in s1 before the veto: the veto credits it (veto.rs), learning never adds a correction.
+        let asked = outcome::Outcome { kind: outcome::ASKED.into(), session: "s1".into(), lessons: vec!["Le0".into()], ms: 1, ..Default::default() };
+        outcome::append(&home.join("outcomes.jsonl"), &asked).unwrap();
+        learn_in(&home, None, &|p| if p.starts_with(crate::veto::OPENING) { fake_veto_ask(p) } else { fake_ask(p) }, true, 3);
+        assert_eq!(repeats(&home), 0);
+        let results = outcome::read(&home.join("outcomes.jsonl"));
+        assert!(!results.iter().any(|o| o.kind == outcome::CORRECTED || o.kind == outcome::MISSED), "{results:?}");
+        assert!(!crate::stats::events(&home).iter().any(|e| e.kind == crate::stats::CORRECTED));
+        // A second veto with the same reason: merged into the lesson a veto is part of.
+        append_jsonl(&home.join("episodes.jsonl"), &veto("no-s2-4", "s2", 4, "the lock, third time merge:Le0")).unwrap();
+        assert_eq!(learn_in(&home, Some("s2"), &fake_veto_ask, true, 5), (0, 1, 0));
+        assert_eq!(repeats(&home), 1);
+        let r = crate::stats::events(&home).into_iter().find(|e| e.kind == crate::stats::VETO_REPEAT).unwrap();
+        assert_eq!((r.session.as_str(), r.lessons.clone()), ("s2", vec!["Le0".to_string()]));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_invariant_of_a_veto_becomes_a_proposed_constraint_never_a_constraint() {
+        let home = temp_home("veto-invariant");
+        append_jsonl(&home.join("episodes.jsonl"), &veto("no-s1-1", "s1", 1, "no commit log invariant: merge lookups use the review API")).unwrap();
+        append_jsonl(&home.join("episodes.jsonl"), &veto("no-s1-2", "s1", 2, "not now, later")).unwrap();
+        learn_in(&home, Some("s1"), &fake_veto_ask, true, 3);
+        let queue = crate::queen::entries(&home);
+        assert_eq!(queue.len(), 1, "only the veto that named an invariant");
+        assert_eq!((queue[0].kind, queue[0].session.as_str()), (crate::queen::Kind::Constraint, "s1"));
+        assert!(
+            queue[0].evidence.contains(&"invariant: merge lookups use the review API".to_string())
+                && queue[0].evidence.contains(&"lesson Lno-s1-1".to_string())
+        );
+        assert!(!crate::veto::constraints_path(&home).exists());
+        // A personal or dropped lesson never proposes; nor does one without an invariant.
+        let l = Lesson { id: "L".into(), ..Lesson::default() };
+        assert!(proposes(&crate::reach::Placed::Here(Box::new(l)), "x") && !proposes(&crate::reach::Placed::Dropped, "x"));
+        assert!(!proposes(&crate::reach::Placed::Private(home.clone()), "x") && !proposes(&crate::reach::Placed::Here(Box::default()), " "));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -901,6 +1144,62 @@ mod tests {
             ..Default::default()
         };
         outcome::append(&home.join("outcomes.jsonl"), &o).unwrap();
+    }
+
+    fn regret_at(id: &str, decision_ms: i64) -> Episode {
+        let r = regret::Regret { decision_session: "s-dec".into(), decision_ms, signals: vec!["subject".into()], ..regret::Regret::default() };
+        Episode { kind: regret::KIND.into(), regret: Some(r), ..at(id, "s-fix", 100, "bob@x", "Fixed later (3d, subject): fix: take the lock") }
+    }
+
+    /// The model's verdict on a regret: a lesson, or (`lesson` false) not one.
+    fn regret_ask(lesson: bool) -> impl Fn(&str) -> Option<Value> {
+        move |_| {
+            Some(json!({"is_lesson": lesson, "question": "Before reading a shared flag, has a writer been considered?", "situations": [],
+            "consequence": "a race", "same_as": "", "supersedes": []}))
+        }
+    }
+
+    #[test]
+    fn a_regret_blames_lessons_asked_before_the_decision_once() {
+        let regretted = |home: &Path| -> Vec<(String, String, f64, String)> {
+            outcome::read(&home.join("outcomes.jsonl"))
+                .into_iter()
+                .filter(|o| o.kind == outcome::REGRETTED)
+                .map(|o| (o.lessons.join(","), o.session, o.credit, o.cause))
+                .collect()
+        };
+        let setup = |name: &str, e: Episode| {
+            let home = temp_home(name);
+            asked(&home, "s-dec", 10, &["Le0", "Le1"]);
+            asked(&home, "s-dec", 50, &["Le2"]);
+            append_jsonl(&home.join("episodes.jsonl"), &e).unwrap();
+            home
+        };
+        let home = setup("regret", regret_at("R1", 20));
+        assert_eq!(learn_in(&home, None, &regret_ask(true), true, 200), (1, 0, 0));
+        let got = regretted(&home);
+        assert_eq!(
+            got,
+            [("Le0".into(), "s-dec".into(), 0.25, "R1".into()), ("Le1".into(), "s-dec".into(), 0.25, "R1".into())],
+            "Le2 was asked after the decision"
+        );
+        let before = std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap();
+        learn_in(&home, None, &regret_ask(true), true, 300);
+        assert_eq!(std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap(), before, "credited once");
+        let _ = std::fs::remove_dir_all(home);
+        // Not a lesson, no decision time, not tracking: nothing is blamed.
+        let home = setup("regret-no", regret_at("R1", 20));
+        learn_in(&home, None, &regret_ask(false), true, 200);
+        assert!(regretted(&home).is_empty(), "not a lesson");
+        let _ = std::fs::remove_dir_all(home);
+        let home = setup("regret-old", regret_at("R1", 0));
+        learn_in(&home, None, &regret_ask(true), true, 200);
+        assert!(regretted(&home).is_empty(), "a regret from before decision times were kept");
+        let _ = std::fs::remove_dir_all(home);
+        let home = setup("regret-untracked", regret_at("R1", 20));
+        learn_in(&home, None, &regret_ask(true), false, 200);
+        assert!(regretted(&home).is_empty(), "BORG_LEARN=off writes nothing");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

@@ -67,3 +67,27 @@ async fn every_harness_drone_shows_with_its_harness_and_state() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[tokio::test]
+async fn a_veto_shows_in_the_feed_and_on_the_lessons_it_credited() {
+    let home: PathBuf = std::env::temp_dir().join(format!("borg-web-veto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let lesson = json!({"id": "L1", "origin_ms": 1, "question": "Do merge lookups use the review API?", "consequence": "wrong merges"});
+    std::fs::write(home.join("lessons.jsonl"), format!("{lesson}\n")).unwrap();
+    let asked = borg::outcome::Outcome { kind: borg::outcome::ASKED.into(), session: "s1".into(), lessons: vec!["L1".into()], ms: 2, ..Default::default() };
+    borg::outcome::append(&home.join("outcomes.jsonl"), &asked).unwrap();
+    let said = borg::veto::Said { session: "s1", repo: "app", engineer: "a@x", task: "t", agent: "", reason: "never the commit log", ms: 3, via: "cli" };
+    borg::veto::record(&home, &said).unwrap();
+
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+    let (status, v) = get(app.clone(), "/api/feed?c=corp").await;
+    assert_eq!(status, StatusCode::OK);
+    let veto = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "veto").unwrap_or_else(|| panic!("{v}"));
+    assert_eq!((veto["lessons"].clone(), veto["text"].as_str()), (json!(["L1"]), Some("never the commit log")));
+    let (_, v) = get(app, "/api/lessons?c=corp").await;
+    assert_eq!(v["lessons"][0]["vetoed"], 1, "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -12,11 +12,14 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
     let head = match e.kind.as_str() {
         "correction" if e.why == "rejected_tool" => format!("{w} rejected a tool call"),
         "correction" => format!("{w} corrected the drone"),
+        "veto" => format!("{w} said no to a drone's work"),
+        "veto_repeat" => "A veto repeated an earlier one: the lesson did not hold".into(),
         "lesson_new" => match e.why.as_str() {
             "import" => "A lesson was imported from team documents".into(),
             "queen" => "A queen answer became a lesson".into(),
             "review" => "Borg learned a new lesson from a review finding".into(),
             "regret" => "Borg learned a new lesson from a later fix".into(),
+            "veto" => "Borg learned a new lesson from a veto".into(),
             _ => "Borg learned a new lesson from a correction".into(),
         },
         "lesson_merged" => "A new correction sharpened a lesson".into(),
@@ -27,6 +30,7 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
         "ignored" => "The drone ignored a question".into(),
         "corrected" => "Asked, and still corrected afterwards".into(),
         "not_corrected" => "Asked, and no correction followed".into(),
+        "regretted" => "A later fix counted against a question asked before the decision".into(),
         "early" => format!("{} lesson{} handed over early, free", num(e.n.max(1.0)), if e.n == 1.0 { "" } else { "s" }),
         "steer_issued" => format!("{w} steered drones"),
         "steer_delivered" => format!("A drone received a steer ({})", if e.why.is_empty() { "say" } else { &e.why }),

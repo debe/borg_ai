@@ -87,7 +87,11 @@ answer with `borg queen`. Answering one moves the lesson; it writes no new lesso
 ## Storage
 
 Each collective keeps plain files in `~/.local/share/borg/collectives/<name>/` (`BORG_HOME` moves the
-root): `episodes.jsonl`, `lessons.jsonl`, `outcomes.jsonl`, `reasoning.jsonl` (reasoning excerpts and
+root): `episodes.jsonl`, `lessons.jsonl`, `outcomes.jsonl`, `outcomes-team.jsonl` (the outcomes
+redacted for the team: lesson ids, what followed, when, the asking probability, session and repo hashed;
+the mesh syncs it for team collectives; `outcomes-team.published`, never synced, remembers how much of
+`outcomes.jsonl` was published), `lessons.jsonl.lock` (one `borg learn` per collective at a time),
+`reasoning.jsonl` (reasoning excerpts and
 decision → fix links from the mesh), and, when used, `vectors/`, `mesh/`, `queen/`
 and `presence/`. Per-session scratch state lives in `/tmp/borg` (`BORG_STATE`).
 
@@ -249,6 +253,16 @@ is written and again when `borg why` shows it.
   follows [the usual rules](#who-hears-a-lesson).
 - `off`: no links.
 
+**Regret reaches back.** With `learn`, each regret learned as a lesson also blames the lessons asked in
+the deciding session before the decision commit (its committer time): asking them did not prevent the
+decision. `borg learn` writes a `regretted` outcome for each, at 0 tokens and once per regret. If the
+lesson the regret merged into was asked, it takes all the blame; otherwise the asked lessons share it
+equally. The blame grows with the fix's evidence (one signal 0.5, two 0.75, three 0.875) and counts as at
+most half a correction in a lesson's usefulness (a veto counts more than a correction). It shows in the
+feed and in `borg memory` (`regretted`). A regret judged "not a lesson", or one whose lesson went to a
+private store, blames nothing. Outcomes are not synced yet, so a decision made on another machine finds
+no asks here. `BORG_REGRET_CREDIT=off` turns it off.
+
 Before you switch to `learn`, check what the detector finds in your own history:
 
 ```sh
@@ -319,6 +333,11 @@ redacted finding. It words the lesson as a question for the moment of building: 
 <risk Y> been considered?". `BORG_REVIEW_FIX=off` turns it off; `borg review-fix --apply` records past
 findings by hand.
 
+A finding learned as a lesson also reaches back, as [a later fix does](#decision--fix-links): the
+lessons asked in the session before the finding get a `regretted` outcome, half a correction at most
+(the finding alone 0.5, confirmed by a verifier 0.75). A lesson already marked corrected there is not
+blamed twice. `BORG_REGRET_CREDIT=off` turns this part off.
+
 Why on: in the value eval lessons from earlier findings raised the share of later bugs a plan avoided
 by 6 points, never worse overall, and 89% of the lessons state their finding faithfully. The interval
 still reaches −5.1, just past the −5 bar set before the run; the engineer turned it on, since a user who
@@ -351,6 +370,9 @@ All are optional.
 | `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
 | `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
 | `BORG_REVIEW_FIX` | on | [Review → fix findings](#review--fix-findings): `off`: the ended session's sub-agent review findings are not learned from |
+| `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
+| `BORG_SHARE_OUTCOMES` | on | `off`: publish no outcomes for the team and read none (lesson usefulness and trust from this machine only); lines already synced stay |
+| `BORG_VETO` | on | `off`: a prompt starting "borg no" is an ordinary prompt (the `borg no` command still works; [Saying no](commands.md#saying-no)) |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
 | `BORG_EARLY` | on | `off`: no early delivery |

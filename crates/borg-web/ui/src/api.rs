@@ -171,6 +171,10 @@ pub struct Lesson {
     pub changed: f64,
     pub ignored: f64,
     pub corrected: f64,
+    /// Sessions whose work the engineer vetoed after it was shown (`borg no`).
+    pub vetoed: f64,
+    /// The weighted share of later fixes (or review findings) of decisions it was asked before.
+    pub regretted: f64,
     pub dormant: bool,
     pub consolidated: bool,
     pub usage: BTreeMap<String, f64>,
@@ -188,10 +192,11 @@ impl Lesson {
         if self.area.is_empty() { "other".into() } else { self.area.clone() }
     }
 
-    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed, 1 + ignored + 2 corrected)).
+    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed, 1 + ignored + 2 corrected + 3 vetoed
+    /// + regretted)).
     pub fn usefulness(&self) -> f64 {
         let a = 1.0 + self.changed;
-        let b = 1.0 + self.ignored + 2.0 * self.corrected;
+        let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted;
         a / (a + b)
     }
 
@@ -236,6 +241,8 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             changed: f(&l["changed"]),
             ignored: f(&l["ignored"]),
             corrected: f(&l["corrected"]),
+            vetoed: f(&l["vetoed"]),
+            regretted: f(&l["regretted"]),
             dormant: l["dormant"].as_bool().unwrap_or(false),
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
             usage: map(&l["usage"]),

@@ -39,9 +39,17 @@ pub const CHANGED: &str = "changed";
 pub const IGNORED: &str = "ignored";
 pub const CORRECTED: &str = "corrected";
 pub const NOT_CORRECTED: &str = "not_corrected";
+/// A later fix, or a review finding, counted against a lesson asked before the decision (outcome.rs
+/// `regretted`; `lessons`: the blamed lesson).
+pub const REGRETTED: &str = "regretted";
 /// The engineer corrected the drone (an episode): `why` is `rejected_tool` or `pushback`, `text` a snippet.
 pub const CORRECTION: &str = "correction";
-/// A lesson written (`why`: its source, session/import/queen) or merged into an existing one.
+/// The engineer said no (`borg no`, veto.rs): `lessons` the lessons shown so far (credited `vetoed`),
+/// `n` their number, `why` `cli` or `prompt`, `text` the reason.
+pub const VETO: &str = "veto";
+/// `borg learn` merged a veto into a lesson an earlier veto made: the same "no" said twice.
+pub const VETO_REPEAT: &str = "veto_repeat";
+/// A lesson written (`why`: its source, session/import/queen/veto) or merged into an existing one.
 pub const LESSON_NEW: &str = "lesson_new";
 pub const LESSON_MERGED: &str = "lesson_merged";
 /// A review step's finding that a fix step fixed before any commit, recorded as an episode
@@ -287,6 +295,19 @@ fn derive_history(home: &Path) -> Vec<Event> {
             who.insert(s(&e, "session"), s(&e, "engineer"));
         }
         let snippet = excerpt(&s(&e, "correction"), 160);
+        // A veto (veto.rs) is counted as one, never as a correction.
+        if s(&e, "kind") == crate::veto::KIND {
+            out.push(Event {
+                ms: ms(&e, "ms"),
+                kind: VETO.into(),
+                session: s(&e, "session"),
+                engineer: s(&e, "engineer"),
+                repo: s(&e, "repo"),
+                text: snippet,
+                ..Default::default()
+            });
+            continue;
+        }
         out.push(Event {
             ms: ms(&e, "ms"),
             kind: CORRECTION.into(),
@@ -308,6 +329,7 @@ fn derive_history(home: &Path) -> Vec<Event> {
             crate::outcome::IGNORED => IGNORED,
             crate::outcome::CORRECTED => CORRECTED,
             crate::outcome::NOT_CORRECTED => NOT_CORRECTED,
+            crate::outcome::REGRETTED => REGRETTED,
             _ => continue,
         };
         let lessons = ids(&o, "lessons");

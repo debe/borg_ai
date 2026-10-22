@@ -73,6 +73,10 @@ pub struct Challenge {
     /// without a session.
     #[serde(skip, default = "one")]
     pub explore: f64,
+    /// The usefulness belief behind `explore` (memory.rs `Memory::alpha`, `beta`): Beta(α, β), (1, 1)
+    /// without outcomes. For the propensity of a slot (`propensity`).
+    #[serde(skip, default = "uniform")]
+    pub belief: (u32, f64),
     /// Mean trust of the lesson's authors in its area (trust.rs), 0.5 without evidence.
     #[serde(skip, default = "neutral")]
     pub trust: f64,
@@ -80,6 +84,10 @@ pub struct Challenge {
 
 fn one() -> f64 {
     1.0
+}
+
+fn uniform() -> (u32, f64) {
+    (1, 1.0)
 }
 
 fn neutral() -> f64 {
@@ -109,6 +117,7 @@ impl Default for Challenge {
             dormant: false,
             consolidated: false,
             explore: 1.0,
+            belief: uniform(),
             trust: trust::NEUTRAL,
         }
     }
@@ -116,8 +125,9 @@ impl Default for Challenge {
 
 /// Lessons known before `before_ms`. The store is append-only: when a lesson was consolidated,
 /// a later line carries the same id, and the latest version wins. Each carries its weight from
-/// `outcomes.jsonl` beside the lessons file (absent, e.g. for eval challenge files: all 1) and
-/// its authors' trust in its area, computed from this store alone (trust.rs). Engineers are
+/// `outcomes.jsonl` beside the lessons file and the team's synced outcomes (outcome.rs `read_team`;
+/// absent, e.g. for eval challenge files: all 1) and its authors' trust in its area, computed from
+/// this store alone (trust.rs). Engineers are
 /// canonical under this machine's aliases (collective.rs "Engineers").
 pub fn load(path: &Path, before_ms: Option<i64>) -> Vec<Challenge> {
     load_with(path, before_ms, collective::aliases())
@@ -135,7 +145,7 @@ pub fn load_for(path: &Path, before_ms: Option<i64>, session: Option<&str>) -> V
 }
 
 fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Option<&str>) -> Vec<Challenge> {
-    let outcomes = crate::outcome::read(&crate::outcome::path_beside(path));
+    let outcomes = crate::outcome::read_team(path);
     let mut out = load_unweighted_with(path, before_ms, aliases);
     let memory = crate::memory::derive(&outcomes, &out, session);
     let trust = trust::Trust::compute(&out, &outcomes);
@@ -146,6 +156,7 @@ fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Opti
             // a strong match below the bar.
             c.weight = m.weight(&c.id, None);
             c.explore = if session.is_some() { m.weight(&c.id, session) / c.weight } else { 1.0 };
+            c.belief = (m.alpha(), m.beta());
             c.dormant = m.dormant;
             c.consolidated = m.consolidated;
         }
@@ -493,16 +504,28 @@ pub const GENERIC_CAP: usize = 3;
 ///   scoped lessons first (`rank` already dropped those out of scope), at most `GENERIC_CAP` unscoped,
 ///   `CAP` in all, ordered by score × the session's usefulness draw (R1, `explored`).
 pub fn budget<'a>(ranked: &[(f64, &'a Challenge)], done: &HashSet<&str>) -> Vec<&'a Challenge> {
+    in_scope_first(explored(budget_pool(ranked, done)))
+}
+
+/// `budget`'s pool before the slots: every lesson not done over `LOW` × the top, with its score; empty
+/// when none not done clears `BLOCK` × the top.
+pub fn budget_pool<'a>(ranked: &[(f64, &'a Challenge)], done: &HashSet<&str>) -> Vec<(f64, &'a Challenge)> {
     let Some(&(top, _)) = ranked.first() else { return Vec::new() };
     if !ranked.iter().any(|(s, c)| *s >= BLOCK * top && !done.contains(c.id.as_str())) {
         return Vec::new();
     }
-    in_scope_first(explored(ranked.iter().copied().filter(|(s, c)| *s >= LOW * top && !done.contains(c.id.as_str()))))
+    ranked.iter().copied().filter(|(s, c)| *s >= LOW * top && !done.contains(c.id.as_str())).collect()
 }
 
 /// The consequence model decided to block (`predicted`, non-empty): ask its lessons and every other
 /// lesson not done over `LOW` × the best match, in-scope first, ordered by score × draw, at most `CAP`.
 pub fn widen<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challenge], done: &HashSet<&str>) -> Vec<&'a Challenge> {
+    in_scope_first(explored(widen_pool(ranked, predicted, done)))
+}
+
+/// `widen`'s pool before the slots: the model's picks (at least the top score) and every other lesson
+/// not done over `LOW` × the top, with their scores; empty when the model picked none.
+pub fn widen_pool<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challenge], done: &HashSet<&str>) -> Vec<(f64, &'a Challenge)> {
     if predicted.is_empty() {
         return Vec::new();
     }
@@ -515,7 +538,7 @@ pub fn widen<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challenge], d
             pool.push((s, c));
         }
     }
-    in_scope_first(explored(pool))
+    pool
 }
 
 /// The graded Stop decision (the default, unless `BORG_STOP_GRADED=off`; internal evaluation "whole-store", "Graded follow-up", not published) over the
@@ -552,7 +575,7 @@ pub fn graded_capped<'a>(applied: &[(&'a Challenge, u8)], cap: Option<usize>) ->
 
 /// Lessons that cleared the bar, in the order of score × the session's usefulness draw (`explore`):
 /// Thompson sampling over the slots. Without a session every draw is 1 and this is the score order.
-fn explored<'a>(passed: impl IntoIterator<Item = (f64, &'a Challenge)>) -> Vec<&'a Challenge> {
+pub fn explored<'a>(passed: impl IntoIterator<Item = (f64, &'a Challenge)>) -> Vec<&'a Challenge> {
     let mut v: Vec<(f64, &Challenge)> = passed.into_iter().map(|(s, c)| (s * c.explore, c)).collect();
     v.sort_by(|a, b| b.0.total_cmp(&a.0));
     v.into_iter().map(|(_, c)| c).collect()
@@ -562,6 +585,36 @@ fn explored<'a>(passed: impl IntoIterator<Item = (f64, &'a Challenge)>) -> Vec<&
 pub fn in_scope_first<'a>(candidates: impl IntoIterator<Item = &'a Challenge>) -> Vec<&'a Challenge> {
     let (scoped, generic): (Vec<&Challenge>, Vec<&Challenge>) = candidates.into_iter().partition(|c| !c.scope.is_empty());
     scoped.into_iter().chain(generic.into_iter().take(GENERIC_CAP)).take(CAP).collect()
+}
+
+/// Draws behind a propensity estimate (`propensity`): precision, not a tuning knob (standard error
+/// ≤ 1/(2√P_DRAWS) ≈ 0.022).
+pub const P_DRAWS: usize = 512;
+
+/// Each pooled lesson's chance of a slot under the session's posterior (`budget`, `widen`): the share of
+/// `P_DRAWS` alternative draws in which `in_scope_first`, over the pool ordered by score × draw, keeps
+/// it. A draw is the ratio `explore` is (memory.rs `Memory::weight`): (0.5 + x) / (0.5 + mean), x from
+/// the lesson's belief, seeded by (`session#p<i>`, id). Exactly 1 for every lesson when the pool fits the
+/// slots, without a draw. Deterministic.
+pub fn propensity(pool: &[(f64, &Challenge)], session: &str) -> std::collections::HashMap<String, f64> {
+    if pool.iter().filter(|(_, c)| c.scope.is_empty()).count() <= GENERIC_CAP && pool.len() <= CAP {
+        return pool.iter().map(|(_, c)| (c.id.clone(), 1.0)).collect();
+    }
+    let draw = |c: &Challenge, i: usize| {
+        let (a, b) = c.belief;
+        let seed = crate::memory::seed(&format!("{session}#p{i}"), &c.id);
+        let x = crate::memory::sample_beta(a, crate::memory::round_seeded(b, seed ^ 0x5265_6772), seed);
+        (0.5 + x) / (0.5 + a as f64 / (a as f64 + b))
+    };
+    let mut kept: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for i in 0..P_DRAWS {
+        let mut v: Vec<(f64, &Challenge)> = pool.iter().map(|&(s, c)| (s * draw(c, i), c)).collect();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for c in in_scope_first(v.into_iter().map(|(_, c)| c)) {
+            *kept.entry(c.id.as_str()).or_default() += 1;
+        }
+    }
+    pool.iter().map(|(_, c)| (c.id.clone(), kept.get(c.id.as_str()).copied().unwrap_or(0) as f64 / P_DRAWS as f64)).collect()
 }
 
 /// At most this many lessons per early delivery (`early`).
@@ -1153,6 +1206,49 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
         assert!(widen(&ranked, &[], &none).is_empty(), "the model abstained: no block");
         let w = ids(widen(&ranked, &[&gs[4]], &HashSet::from(["g0"])));
         assert_eq!(w, ["s1", "s2", "s3", "g4", "g1", "g2"], "the model's pick leads, below the bar or not");
+    }
+
+    #[test]
+    fn a_pool_that_fits_has_propensity_one() {
+        let sc = |id: &str| Challenge { scope: vec!["Beacon".into()], belief: (1, 40.0), ..ch(id, "") };
+        let ls: Vec<Challenge> = (0..7).map(|i| sc(&format!("s{i}"))).chain((0..3).map(|i| ch(&format!("g{i}"), ""))).collect();
+        let pool: Vec<(f64, &Challenge)> = ls.iter().enumerate().map(|(i, c)| (10.0 - i as f64, c)).collect();
+        let p = propensity(&pool, "s");
+        assert_eq!(p.len(), CAP);
+        assert!(p.values().all(|&x| x == 1.0), "{p:?}");
+    }
+
+    #[test]
+    fn propensities_fill_the_slots() {
+        let ls: Vec<Challenge> = (0..14).map(|i| Challenge { scope: vec!["Beacon".into()], ..ch(&format!("a{i}"), "") }).collect();
+        let pool: Vec<(f64, &Challenge)> = ls.iter().map(|c| (5.0, c)).collect();
+        let p = propensity(&pool, "s");
+        let sum: f64 = p.values().sum();
+        assert!((sum - CAP as f64).abs() < 0.05, "{sum}");
+        assert!(p.values().all(|&x| x > 0.0 && x < 1.0), "{p:?}");
+        // Unscoped lessons share GENERIC_CAP slots.
+        let gs: Vec<Challenge> = (0..6).map(|i| ch(&format!("g{i}"), "")).collect();
+        let pool: Vec<(f64, &Challenge)> = gs.iter().map(|c| (5.0, c)).collect();
+        assert!((propensity(&pool, "s").values().sum::<f64>() - GENERIC_CAP as f64).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_proven_lesson_outdraws_an_uncertain_one() {
+        let sc = |id: &str, belief: (u32, f64)| Challenge { scope: vec!["Beacon".into()], belief, ..ch(id, "") };
+        let mut ls: Vec<Challenge> = (0..10).map(|i| sc(&format!("a{i}"), (1, 1.0))).collect();
+        ls.push(sc("proven", (40, 2.0)));
+        ls.push(sc("harmful", (1, 40.0)));
+        let pool: Vec<(f64, &Challenge)> = ls.iter().map(|c| (5.0, c)).collect();
+        let p = propensity(&pool, "s");
+        assert!(p["proven"] > p["harmful"], "{p:?}");
+    }
+
+    #[test]
+    fn propensity_is_deterministic() {
+        let ls: Vec<Challenge> = (0..12).map(|i| Challenge { scope: vec!["Beacon".into()], belief: (1 + i, 2.5), ..ch(&format!("a{i}"), "") }).collect();
+        let pool: Vec<(f64, &Challenge)> = ls.iter().enumerate().map(|(i, c)| (5.0 + i as f64 / 10.0, c)).collect();
+        assert_eq!(propensity(&pool, "s"), propensity(&pool, "s"));
+        assert_ne!(propensity(&pool, "s"), propensity(&pool, "t"), "another session draws again");
     }
 
     #[test]

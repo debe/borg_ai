@@ -210,6 +210,17 @@ impl Replay {
         if !human(t) {
             return;
         }
+        // "borg no <reason>", as the prompt hook reads it (veto.rs): a veto episode that answers a pending
+        // wordless denial, never the session's task nor a correction.
+        if let Some(reason) = crate::veto::enabled().then(|| crate::veto::reason_in(t)).flatten() {
+            self.denied = None;
+            self.episode(ms, None, reason);
+            if let Some(f) = self.out.last_mut() {
+                f.episode.id = format!("no-{}", f.episode.id);
+                f.episode.kind = crate::veto::KIND.into();
+            }
+            return;
+        }
         if let Some(tool) = self.denied.take() {
             self.episode(ms, Some(tool), take(t, 1500));
             return;
@@ -890,9 +901,19 @@ fn append(path: &Path, eps: &mut [Found], engineers: &mut HashMap<String, String
         x.episode.repo = repo_of(&x.cwd);
         x.episode.engineer = engineers.entry(x.cwd.clone()).or_insert_with(|| learn::engineer(&x.cwd)).clone();
         writeln!(f, "{}", serde_json::to_string(&x.episode)?)?;
-        // An imported correction counts at the time it was made.
+        // An imported correction counts at the time it was made, an imported veto as a `veto` (veto.rs
+        // `record`; the lessons shown then are not known, so nothing is credited).
         if let Some(store) = path.parent() {
             learn::count_correction(store, &x.episode);
+            if x.episode.kind == crate::veto::KIND {
+                crate::stats::count(store, crate::stats::VETO, &x.episode.session, |ev| {
+                    ev.ms = x.episode.ms;
+                    ev.engineer.clone_from(&x.episode.engineer);
+                    ev.repo.clone_from(&x.episode.repo);
+                    ev.why = "prompt".into();
+                    ev.text = crate::stats::excerpt(&x.episode.correction, 160);
+                });
+            }
         }
     }
     Ok(())
@@ -1111,6 +1132,28 @@ mod tests {
         assert_eq!(e.ms, borg_trace::parse_ts("2026-09-01T10:01:00.000Z"));
         assert!(claude_session(&claude.join("-w-corp-app/s-corp-1/subagents/a.jsonl")).len() == 1, "parser itself is neutral");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_veto_prompt_is_replayed_as_the_hook_reads_it() {
+        let mut r = Replay { session: "sess-veto-1".into(), ..Default::default() };
+        r.prompt(1, "fix the merge lookup");
+        r.prompt(2, "borg no: never read the commit log");
+        r.prompt(3, "no, use the review API");
+        // After a wordless denial, the veto answers it: no rejected-tool correction.
+        r.denied = Some(("Bash git log".into(), String::new()));
+        r.prompt(5, "borg no, stop reading history");
+        let eps: Vec<&Episode> = r.out.iter().map(|f| &f.episode).collect();
+        let got: Vec<(&str, &str, &str, &str)> = eps.iter().map(|e| (e.id.as_str(), e.kind.as_str(), e.task.as_str(), e.correction.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("no-sess-vet-2", crate::veto::KIND, "fix the merge lookup", "never read the commit log"),
+                ("sess-vet-3", "", "fix the merge lookup", "no, use the review API"),
+                ("no-sess-vet-5", crate::veto::KIND, "fix the merge lookup", "stop reading history"),
+            ]
+        );
+        assert!(eps.iter().all(|e| e.rejected_tool.is_none()) && r.denied.is_none());
     }
 
     #[test]

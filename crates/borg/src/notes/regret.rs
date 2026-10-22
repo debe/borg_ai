@@ -89,6 +89,7 @@ pub fn episode(l: &Link, decision: Option<&Excerpt>, fix: &FixContext) -> Episod
         fix_why: tail(&fix.why),
         signals: l.signals.clone(),
         age_days: l.age_days,
+        decision_ms: l.decision.secs.saturating_mul(1000),
     };
     let correction = format!("Fixed later ({}d, {}): {}\n{}", r.age_days, r.signals.join(", "), r.fix_subject, r.diff);
     Episode {
@@ -153,8 +154,13 @@ mod tests {
         assert_eq!((r.decision_task.as_str(), r.age_days), ("read the flag in b\nwithout a lock", 3));
         assert!(r.decision_proposal.starts_with("No lock needed.") && !r.decision_proposal.contains("sk-abc"), "redacted: {}", r.decision_proposal);
         assert!(r.fix_why.starts_with("the sync test is flaky") && !r.fix_why.contains("hunter22"), "{}", r.fix_why);
+        assert_eq!(r.decision_ms, 0, "a link from before committer times were kept");
         // Without the decision's reasoning the link's task line stands in.
         assert_eq!(episode(&link(), None, &fix).regret.unwrap().decision_task, "first line");
+        // The decision's committer time, in ms: when `borg learn` credits the lessons asked before it.
+        let mut dated = link();
+        dated.decision.secs = 1_700_000_000;
+        assert_eq!(episode(&dated, None, &fix).regret.unwrap().decision_ms, 1_700_000_000_000);
     }
 
     #[test]

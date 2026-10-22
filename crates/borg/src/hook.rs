@@ -148,6 +148,27 @@ fn capture_prompt(h: &dyn Harness, session: &str, input: &Value, prompt: &str) {
     record(session, input, task, proposal(h, input), None, prompt.chars().take(1500).collect());
 }
 
+/// A veto said in the session (veto.rs): its episode, the shown lessons' credit and its stat. A pending
+/// wordless denial is answered by it, so it never becomes a correction later.
+fn veto(h: &dyn Harness, session: &str, input: &Value, reason: &str) {
+    let _ = std::fs::remove_file(denied_file(session));
+    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    let task = std::fs::read_to_string(task_file(session)).unwrap_or_default();
+    let said = crate::veto::Said {
+        session,
+        repo: &repo_of(cwd),
+        engineer: &learn::engineer(cwd),
+        task: &task,
+        agent: &proposal(h, input),
+        reason,
+        ms: learn::now_ms(),
+        via: "prompt",
+    };
+    if let Ok(v) = crate::veto::record(&learn::home(), &said) {
+        append(session, &format!("#borg-episode {}", v.episode));
+    }
+}
+
 /// A rejected tool call or plan that carries the engineer's words becomes an episode; a wordless
 /// denial waits for the next prompt (`capture_prompt`).
 fn capture_rejection(h: &dyn Harness, session: &str, input: &Value) {
@@ -618,6 +639,7 @@ fn ask_live(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, fir
     if learning() {
         let lessons: Vec<String> = firm.iter().map(|c| c.id.clone()).collect();
         let (grades, ranks, applied) = graded_of(session, &lessons);
+        let p = propensity_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
@@ -629,6 +651,7 @@ fn ask_live(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, fir
             grades,
             ranks,
             applied,
+            p,
             ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
@@ -812,8 +835,9 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     if graded {
         // Graded (default): ask only for a lesson graded 3; a check without one hands its 2s and 1s over
         // free at the next prompt or touch (conscience.rs `graded`).
-        let (ask, free, learned) = crate::attention::graded(&applied, &learn::home());
+        let (ask, free, learned, p) = crate::attention::graded(&applied, &learn::home());
         append(session, &graded_line(&applied));
+        append_p(session, applied.iter().zip(&p).filter(|((c, _), _)| ask.iter().any(|a| a.id == c.id)).map(|((c, _), p)| (c.id.as_str(), *p)));
         if learning() && !applied.is_empty() {
             let graded = outcome::Outcome {
                 kind: outcome::GRADED.into(),
@@ -827,6 +851,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
                 applied: applied.len() as u16,
                 chosen: ids(&ask),
                 explore: learned.as_ref().is_some_and(|c| c.source == "explore"),
+                p: p.iter().map(|x| outcome::round_p(*x)).collect(),
                 ..Default::default()
             };
             let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &graded);
@@ -844,8 +869,11 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
         // R3b: the model decides whether to ask (at the stop, an extra round); once it does, the questions
         // also carry every other lesson over the low bar (conscience.rs `widen`).
         let predicted: Vec<&conscience::Challenge> = applied.iter().map(|(c, _)| *c).collect();
-        let widened = conscience::widen(&conscience::rank_scoped(w.all, w.context, w.scope_text), &predicted, w.done);
-        Verdict::Ask(widened.into_iter().filter(|c| w.challenges.iter().any(|x| x.id == c.id)).map(|c| c.id.clone()).collect())
+        let pool = conscience::widen_pool(&conscience::rank_scoped(w.all, w.context, w.scope_text), &predicted, w.done);
+        let widened: Vec<&conscience::Challenge> =
+            conscience::in_scope_first(conscience::explored(pool.iter().copied())).into_iter().filter(|c| w.challenges.iter().any(|x| x.id == c.id)).collect();
+        append_p_of(session, &pool, &widened);
+        Verdict::Ask(ids(&widened))
     }
 }
 
@@ -985,14 +1013,20 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(prompts_file(session)) {
         let _ = writeln!(f, "{prompt}");
     }
-    capture_prompt(h, session, input, prompt);
+    // "borg no <reason>": the engineer's veto (veto.rs), never the session's task nor a correction.
+    let vetoed = (learning() && crate::veto::enabled()).then(|| crate::veto::reason_in(prompt)).flatten();
+    match &vetoed {
+        Some(reason) => veto(h, session, input, reason),
+        None => capture_prompt(h, session, input, prompt),
+    }
     note_where(session, &repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()));
     let _ = std::fs::write(state_file(session).with_extension("lastprompt"), prompt);
     // An adapter that will not wait for the answer (`"context": false`), or a harness whose model never
     // sees a prompt's context, gets none: what is handed over here is marked delivered and would be lost.
     let out = (h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false))).then(|| {
         let ask = queen_ask(h, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
-        free_context_with(h, "UserPromptSubmit", session, input, prompt, ask)
+        let extra: Vec<String> = [ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
+        free_context_with(h, "UserPromptSubmit", session, input, prompt, (!extra.is_empty()).then(|| extra.join("\n\n")))
     });
     // A new turn's work starts, after a live ask handed over here took the last turn's as its evidence.
     if harness::transcript(h.caps(), input).is_none() {
@@ -1179,10 +1213,15 @@ fn stop_select<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, 
         Err(_) if std::env::var("BORG_MATCH").as_deref() != Ok("bm25") => stop_check(h, session, input, w, live),
         // R3b (conscience.rs `budget`): block only for a lesson near the best match not yet done;
         // then ask everything over the low bar, in-scope first.
-        Err(_) => Ok(conscience::budget(&conscience::rank_scoped(w.all, w.context, w.scope_text), w.done)
-            .into_iter()
-            .filter_map(|c| w.challenges.iter().find(|x| x.id == c.id))
-            .collect()),
+        Err(_) => {
+            let pool = conscience::budget_pool(&conscience::rank_scoped(w.all, w.context, w.scope_text), w.done);
+            let asked: Vec<&conscience::Challenge> = conscience::in_scope_first(conscience::explored(pool.iter().copied()))
+                .into_iter()
+                .filter_map(|c| w.challenges.iter().find(|x| x.id == c.id))
+                .collect();
+            append_p_of(session, &pool, &asked);
+            Ok(asked)
+        }
     }
 }
 
@@ -1221,6 +1260,44 @@ fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, l
 fn graded_line(applied: &[(&conscience::Challenge, u8)]) -> String {
     let items: Vec<String> = applied.iter().enumerate().map(|(r, (c, g))| format!("{}:{g}:{r}", c.id)).collect();
     format!("#borg-graded n={} {}", applied.len(), items.join(","))
+}
+
+/// `#borg-p <id>=<p>,…`: the propensity (outcome.rs `p`) of each lesson a check chose to ask, so every
+/// entry is above 0 and the latest entry per id is the check that asked it; the `asked` outcome carries
+/// them (`propensity_of`). Nothing when no lesson was chosen.
+fn append_p<'a>(session: &str, chosen: impl IntoIterator<Item = (&'a str, f64)>) {
+    let items: Vec<String> = chosen.into_iter().map(|(id, p)| format!("{id}={}", outcome::round_p(p))).collect();
+    if !items.is_empty() {
+        append(session, &format!("#borg-p {}", items.join(",")));
+    }
+}
+
+/// `append_p` for lessons `budget`/`widen` asked from `pool`: their chance of a slot under the
+/// session's posterior (conscience.rs `propensity`).
+fn append_p_of(session: &str, pool: &[(f64, &conscience::Challenge)], asked: &[&conscience::Challenge]) {
+    if asked.is_empty() {
+        return;
+    }
+    let p = conscience::propensity(pool, session);
+    append_p(session, asked.iter().filter_map(|c| p.get(&c.id).map(|p| (c.id.as_str(), *p))));
+}
+
+/// For each of `ids`, its propensity in the session's latest `#borg-p` entry for it; empty when any of
+/// them has none (unknown, never a guess).
+fn propensity_of(session: &str, ids: &[String]) -> Vec<f64> {
+    propensity_in(&std::fs::read_to_string(state_file(session)).unwrap_or_default(), ids)
+}
+
+fn propensity_in(state: &str, ids: &[String]) -> Vec<f64> {
+    let mut seen: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for line in state.lines().filter_map(|l| l.strip_prefix("#borg-p ")) {
+        for (id, p) in line.split(',').filter_map(|it| it.rsplit_once('=')) {
+            if let Ok(p) = p.trim().parse::<f64>() {
+                seen.insert(id.trim(), p);
+            }
+        }
+    }
+    ids.iter().map(|i| seen.get(i.as_str()).copied()).collect::<Option<Vec<f64>>>().unwrap_or_default()
 }
 
 /// For each of `ids`: its grade and rank in the session's latest graded check that graded it, and that
@@ -1266,6 +1343,7 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
         let lessons: Vec<String> = selected.iter().map(|c| c.id.clone()).collect();
         let (grades, ranks, applied) = graded_of(session, &lessons);
+        let p = propensity_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
@@ -1277,6 +1355,7 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
             grades,
             ranks,
             applied,
+            p,
             ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
@@ -1361,5 +1440,15 @@ mod tests {
         let multi = json!({"file_path": "/w/a.rs", "edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]});
         assert_eq!(edit_text("MultiEdit", &multi).as_deref(), Some("/w/a.rs b d"), "Claude's MultiEdit reads as before");
         assert_eq!(touched(&input, "Edit"), "/w/a.rs /w/b.rs");
+    }
+
+    #[test]
+    fn propensity_of_takes_the_latest_entry_and_nothing_when_one_is_missing() {
+        let state = "#borg-p A=1,B=0.25\n#borg-asked A,B\n#borg-p B=0.5,C=0.1\n";
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(propensity_in(state, &ids(&["B", "A"])), [0.5, 1.0]);
+        assert_eq!(propensity_in(state, &ids(&["C"])), [0.1]);
+        assert!(propensity_in(state, &ids(&["A", "D"])).is_empty(), "D unknown: no guess");
+        assert!(propensity_in("", &ids(&["A"])).is_empty());
     }
 }

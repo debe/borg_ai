@@ -140,7 +140,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let path = m.home.join("lessons.jsonl");
     let list = conscience::load_unweighted(&path, None);
-    let outcomes = outcome::read(&outcome::path_beside(&path));
+    let outcomes = outcome::read_team(&path);
     let mem = memory::derive(&outcomes, &list, None);
     // How often each lesson took part in what stats.rs counted (asked in a block, so far), team-wide.
     let mut usage: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
@@ -163,7 +163,8 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
                 "area": c.area, "scope": c.scope, "source": c.source, "origin_ms": c.origin_ms,
                 "engineers": c.engineers.iter().map(|e| aliases.display(e)).collect::<Vec<_>>(),
                 "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
-                "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected),
+                "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
+                "regretted": mm.map_or(0.0, |x| x.regretted),
                 "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
                 "usage": usage.get(&c.id).cloned().unwrap_or_default(),
                 "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
@@ -176,13 +177,16 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 22] = [
+const NOTABLE: [&str; 25] = [
     stats::CORRECTION,
+    stats::VETO,
+    stats::VETO_REPEAT,
     stats::REVIEW_FINDING,
     stats::BLOCK,
     stats::CHANGED,
     stats::IGNORED,
     stats::CORRECTED,
+    stats::REGRETTED,
     stats::LESSON_NEW,
     stats::LESSON_MERGED,
     stats::NOT_A_LESSON,
@@ -262,7 +266,10 @@ fn mtime(m: &std::fs::Metadata) -> u128 {
 /// The views of the page and the store files each depends on.
 fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
     vec![
-        ("lessons", vec![home.join("lessons.jsonl"), home.join("outcomes.jsonl"), home.join("stats.jsonl"), stats::events_path(home)]),
+        (
+            "lessons",
+            vec![home.join("lessons.jsonl"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE), home.join("stats.jsonl"), stats::events_path(home)],
+        ),
         ("stats", vec![home.join("stats.jsonl"), stats::events_path(home)]),
         ("drones", vec![home.join("presence"), presence::remote_path(home)]),
         ("feed", vec![stats::events_path(home)]),
@@ -325,11 +332,13 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// Publishes this node's rollups of every collective once a minute (stats.rs `rollup`).
+/// Publishes this node's rollups and redacted outcomes of every collective once a minute (stats.rs
+/// `rollup`, outcome.rs `publish`).
 pub async fn publish(minds: Vec<Mind>) {
     loop {
         for m in &minds {
             stats::rollup(&m.home);
+            outcome::publish(&m.home);
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }

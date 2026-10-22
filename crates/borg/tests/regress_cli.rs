@@ -198,6 +198,27 @@ impl Fx {
         self.borg(&["notes", "attach", "--session", "s-7"], env)
     }
 
+    /// An `asked` outcome of `lesson` in `session` at `secs`.
+    fn asked(&self, session: &str, lesson: &str, secs: i64) {
+        let o = json!({"kind": "asked", "session": session, "lessons": [lesson], "ms": secs * 1000, "repo": "app"});
+        std::fs::create_dir_all(&self.store).unwrap();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.store.join("outcomes.jsonl")).unwrap();
+        writeln!(f, "{o}").unwrap();
+    }
+
+    /// The `regretted` outcomes, once at least `want` are written (at most 30 s).
+    fn regretted(&self, want: usize) -> Vec<Value> {
+        for i in 0..300 {
+            let text = std::fs::read_to_string(self.store.join("outcomes.jsonl")).unwrap_or_default();
+            let found: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["kind"] == "regretted").collect();
+            if found.len() >= want || i == 299 {
+                return found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Vec::new()
+    }
+
     fn records(&self) -> Vec<Value> {
         std::fs::read_to_string(self.store.join("reasoning.jsonl"))
             .unwrap_or_default()
@@ -397,12 +418,25 @@ fn with_learning_on_the_sessions_end_turns_a_strong_link_into_a_lesson_asked_bef
     let (fx, d) = fixture("learn", "work");
     fx.note(&d, "s-1", "work");
     let f = fx.fix(T0 + 3 * DAY, "src/lib.rs", FIXED, "fix: take the lock before the flag");
+    // The deciding session asked La before the decision commit (at T0) and Lb after it.
+    fx.asked("s-1", "La", T0 - 60);
+    fx.asked("s-1", "Lb", T0 + 60);
     // The drone's session ends: the hook starts the notes job, which links, writes the regret
     // episode and then starts `borg learn`, all in the background.
     let end = json!({"session_id": "s-7", "cwd": fx.repo, "last_assistant_message": "Took the lock."});
     fx.hook("end", &end, &[("BORG_REGRESS", "learn")]);
     let lessons = fx.lessons();
     let id = format!("R{}-{}", &d[..10], &f[..10]);
+    // The regret reaches back: La, asked before the decision, shares its blame alone (one ground, the
+    // fix's subject: 0.5); Lb, asked after it, is not blamed.
+    let blamed = fx.regretted(1);
+    assert_eq!(blamed.len(), 1, "{blamed:?}");
+    let b = &blamed[0];
+    assert_eq!(
+        (b["lessons"][0].as_str(), b["session"].as_str(), b["cause"].as_str(), b["credit"].as_f64()),
+        (Some("La"), Some("s-1"), Some(id.as_str()), Some(0.5))
+    );
+    assert_eq!(fx.records()[0]["decision"]["secs"], T0, "the decision's committer time is kept");
     assert_eq!(lessons.len(), 1, "{lessons:?}");
     assert_eq!((lessons[0]["id"].as_str(), lessons[0]["question"].as_str()), (Some(format!("L{id}").as_str()), Some(BEFORE)));
     let prompts = std::fs::read_to_string(fx.root.join("prompts.txt")).unwrap();
@@ -428,9 +462,30 @@ fn with_learning_on_the_sessions_end_turns_a_strong_link_into_a_lesson_asked_bef
     assert!(why.contains(&format!("← decided in {} ", &d[..7])) && why.contains("(task: read the flag in b) → fixed here"), "{why}");
     assert!(why.contains(&format!("lesson L{id}: {BEFORE}")), "{why}");
 
-    // The next end of this session writes the episode only once.
+    // The next end of this session writes the episode only once, and the regret blames La once.
     assert!(fx.borg(&["notes", "attach", "--session", "s-7"], &[("BORG_REGRESS", "learn")]).status.success());
     assert_eq!(fx.episodes().len(), 1);
+    assert!(fx.borg(&["learn"], &[("BORG_HOME", &fx.store.to_string_lossy())]).status.success());
+    assert_eq!(fx.regretted(0).len(), 1);
+}
+
+#[test]
+fn a_regret_learned_with_credit_off_blames_nothing_until_it_is_back_on() {
+    let (fx, d) = fixture("creditoff", "work");
+    fx.note(&d, "s-1", "work");
+    fx.fix(T0 + 3 * DAY, "src/lib.rs", FIXED, "fix: take the lock before the flag");
+    fx.asked("s-1", "La", T0 - 60);
+    assert!(fx.borg(&["notes", "attach", "--session", "s-7"], &[("BORG_REGRESS", "learn")]).status.success());
+    assert_eq!(fx.episodes().len(), 1);
+    // `borg learn` on the collective's store, as the session's end runs it.
+    let store = fx.store.to_string_lossy().into_owned();
+    assert!(fx.borg(&["learn"], &[("BORG_HOME", &store), ("BORG_REGRET_CREDIT", "off")]).status.success());
+    assert_eq!(fx.lessons().len(), 1, "learned as a lesson");
+    assert!(fx.regretted(0).is_empty(), "BORG_REGRET_CREDIT=off");
+    // Back on, the next run credits the regret learned before: once.
+    assert!(fx.borg(&["learn"], &[("BORG_HOME", &store)]).status.success());
+    assert!(fx.borg(&["learn"], &[("BORG_HOME", &store)]).status.success());
+    assert_eq!(fx.regretted(0).len(), 1);
 }
 
 #[test]

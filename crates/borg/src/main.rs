@@ -5,6 +5,9 @@
 //!        tool_input, error, last_assistant_message, transcript_path, stop_hook_active) and gets
 //!        Claude-shaped output ({"decision":"block","reason"} at stop); adapters translate both ways.
 //!        borg learn [--session ID]                   (generalise captured corrections into lessons)
+//!        borg no [--session ID|DRONE] [--dir DIR] [--json] <reason>
+//!                                                     (the engineer's veto: shown lessons lose credit, the reason
+//!                                                      becomes a lesson or a proposed constraint; veto.rs)
 //!        borg check --session ID --transcript FILE --cwd DIR
 //!                                                     (internal: live mode's check of the work so far, spawned by
 //!                                                      the PostToolUse hook; live.rs)
@@ -152,6 +155,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("web [--port PORT] [--dir DIR]", "a live page of knowledge and stats on 127.0.0.1"),
             ("why <path>[:<line>[-<line>]] | <commit>", "the reasoning behind code  [--full] [--json]"),
             ("queen [show|ask|answer|skip|dismiss|next]", "open decisions waiting for you"),
+            ("no [--session ID] <reason>", "say no to a drone's work: shown lessons lose credit, the reason becomes a lesson"),
         ],
     ),
     (
@@ -289,8 +293,10 @@ fn learn_store(home: &std::path::Path, session: Option<&str>) -> (usize, usize, 
     let got = learn::learn_in_reporting(home, session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
     facets_for_written(&store, from);
     borg::vectors::refresh(&store);
-    // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
+    // Session end runs this in the background: publish today's counts (stats.rs) and the redacted
+    // outcomes (outcome.rs `publish`) for the mesh.
     borg::stats::rollup(home);
+    borg::outcome::publish(home);
     got
 }
 
@@ -312,7 +318,7 @@ fn memory_cmd(path: &str, rest: &[&str]) {
     let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
     let path = std::path::Path::new(path);
     let lessons = conscience::load_unweighted(path, None);
-    let outcomes = outcome::read(&outcome::path_beside(path));
+    let outcomes = outcome::read_team(path);
     let memory = borg::memory::derive(&outcomes, &lessons, session);
     let weights = outcome::weights(&outcomes);
     for c in &lessons {
@@ -320,7 +326,7 @@ fn memory_cmd(path: &str, rest: &[&str]) {
         println!(
             "{}",
             json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
-                "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
+                "vetoed": m.vetoed, "regretted": m.regretted, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
                 "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
         );
     }
@@ -399,6 +405,7 @@ fn main() {
         }
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
+        ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1))),

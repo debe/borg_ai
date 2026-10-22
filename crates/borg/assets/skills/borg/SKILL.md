@@ -37,6 +37,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | The reasoning behind a line or commit | `borg why <path>[:<line>]` or `borg why <commit>` |
 | Which later commit fixed a decision, or which decision a fix corrected | `borg why <path>[:<line>]` ("→ fixed in", "← decided in") |
 | The decision → fix links borg would make, before learning from them | `borg regress --replay <A..B> --explain` (dry run; [details](references/collectives.md#decision--fix-links)) |
+| The engineer says no to a drone's work (a veto: shown lessons lose credit, the reason becomes a lesson) | `borg no "<reason>"`, or `borg no --session <drone> "<reason>"` when several drones work in the repo |
 | To redirect or pause running drones | `borg steer <drone\|all> "<text>"`, `borg steer <drone> --pause`, `borg steer <drone> --resume` |
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |

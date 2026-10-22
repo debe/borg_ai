@@ -31,8 +31,9 @@ pub fn kind_series(kinds: &[&str]) -> Vec<Series> {
         .collect()
 }
 
-const ACTIVITY: [&str; 12] = [
+const ACTIVITY: [&str; 13] = [
     "correction",
+    "veto",
     "review_finding",
     "lesson_new",
     "block",
@@ -112,6 +113,15 @@ pub fn Overview() -> impl IntoView {
             out.push(Fact {
                 big: num(corrections),
                 text: format!("corrections captured, {} of them rejected tool calls in the last 7 days.", week),
+                lesson: None,
+                tone: "h",
+            });
+        }
+        let vetoes = tt.n("veto");
+        if vetoes > 0.0 {
+            out.push(Fact {
+                big: pct(tt.n("veto_repeat"), vetoes),
+                text: format!("of {} vetoes repeated an earlier one (the same reason said again). The goal is zero.", num(vetoes)),
                 lesson: None,
                 tone: "h",
             });
@@ -209,6 +219,9 @@ pub fn Overview() -> impl IntoView {
                     }
                 })
                 spark=spark("correction") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("correction")))) color="var(--c-heat)" up_is_good=false />
+            <Tile label="Vetoes" value=Signal::derive(move || num(t().n("veto")))
+                sub=Signal::derive(move || format!("{} repeated", num(t().n("veto_repeat"))))
+                spark=spark("veto") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("veto")))) color="var(--c-heat)" up_is_good=false />
             <Tile label="Knowledge" value=Signal::derive(move || num(d.lessons.with(Vec::len) as f64))
                 sub=Signal::derive(move || {
                     let month = now_ms() - 30.0 * DAY_MS;

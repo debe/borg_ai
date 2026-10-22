@@ -64,6 +64,10 @@ pub enum Kind {
     /// Who should hear an existing lesson (reach.rs `borg reach`): the team, its repo, or only the
     /// engineer. Queued by a cleanup, not a checkpoint; answering it moves the lesson, writes none.
     Reach,
+    /// An invariant an engineer's veto named (veto.rs `propose`), proposed as a constraint of the
+    /// collective. Queued by `borg learn`, not a checkpoint; only an engineer's answer ratifies it, and
+    /// the default keeps it a lesson only.
+    Constraint,
 }
 
 impl Kind {
@@ -75,6 +79,7 @@ impl Kind {
             Kind::CrossRepo => "a cross-repo or cross-team decision",
             Kind::OpenDecision => "a decision the team's documents leave open",
             Kind::Reach => "who should hear a lesson",
+            Kind::Constraint => "an invariant proposed as a constraint",
         }
     }
 
@@ -88,6 +93,7 @@ impl Kind {
             Kind::CrossRepo => ("proceed as planned", "leave the other repo's or team's side to its owners"),
             Kind::OpenDecision => ("keep the documented interim rule", "decide it now"),
             Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
+            Kind::Constraint => (crate::veto::KEEP_OPTION, crate::veto::RATIFY_OPTION),
         }
     }
 }
@@ -422,6 +428,11 @@ pub fn open_decision_key(repo: &str, question: &str) -> String {
     decision_key(Kind::OpenDecision, repo, &norm(&question.to_lowercase()))
 }
 
+/// The key of a constraint proposed from a veto: its repo and normalised invariant.
+pub fn constraint_key(repo: &str, text: &str) -> String {
+    decision_key(Kind::Constraint, repo, &norm(&text.to_lowercase()))
+}
+
 /// Queue `e` (an imported open decision) unless its decision, or a near-duplicate question of its repo
 /// (`duplicate`), was ever queued in this collective. Returns whether it was added.
 pub fn seed(store: &Path, e: &Entry) -> std::io::Result<bool> {
@@ -481,10 +492,11 @@ pub fn within_budget(store: &Path, engineer: &str, session: &str) -> bool {
 }
 
 /// Criterion 4, pure: `asked` every question so far, `seen` every session in first-seen order. An
-/// engineer's emails under `aliases` share one budget; open decisions imported from documents use none.
+/// engineer's emails under `aliases` share one budget; open decisions imported from documents, reach
+/// questions and proposed constraints use none.
 pub fn budget_allows(asked: &[Entry], seen: &[Seen], engineer: &str, session: &str, aliases: &collective::Aliases) -> bool {
     let me = aliases.canon(engineer);
-    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach));
+    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint));
     let Some(last) = sent.filter(|e| aliases.canon(&e.engineer) == me).max_by_key(|e| e.ms) else { return true };
     if last.session == session {
         return false; // one message per session at most
@@ -762,8 +774,11 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         return Err(format!("{id} was dismissed"));
     }
     // The lesson first: a question marked answered without its lesson would be lost. A reach question
-    // writes none: its answer moves the lesson it is about (reach.rs).
-    if e.kind == Kind::Reach {
+    // writes none: its answer moves the lesson it is about (reach.rs). Nor does a proposed constraint:
+    // its veto is a lesson already, and ratifying it writes the constraint (veto.rs).
+    if e.kind == Kind::Constraint {
+        crate::veto::ratify(store, &e, text, author, now)?;
+    } else if e.kind == Kind::Reach {
         crate::reach::answer(store, &e, text)?;
     } else {
         let lessons = lesson_lines(&store.join("lessons.jsonl"));
@@ -778,7 +793,7 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
         ev.text = crate::stats::excerpt(text, 160);
     });
-    if e.kind != Kind::Reach {
+    if !matches!(e.kind, Kind::Reach | Kind::Constraint) {
         counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
             ev.engineer = author.into();
             ev.why = "queen".into();
@@ -1140,11 +1155,12 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
     // Queued in an earlier session (or imported from a document): the drone must not take a checkpoint
     // question's quoted plan for its own.
     let (question, origin) = match q.question.strip_prefix("The drone's plan says: ") {
-        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach) => {
+        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint) => {
             (format!("An earlier session's plan said: {rest}"), "queued by an earlier session")
         }
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
         _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
+        _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1479,6 +1495,13 @@ pub fn main(args: &[&str]) -> i32 {
             match find(key).and_then(|e| answer(&store, &e.id, &option_answer(&e, &text.join(" "))?, &author, now)) {
                 Ok(e) if e.kind == Kind::Reach => {
                     println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
+                    0
+                }
+                Ok(e) if e.kind == Kind::Constraint => {
+                    match e.answer.as_deref().is_some_and(|a| a.trim().to_lowercase().starts_with("ratify")) {
+                        true => println!("{} answered: constraint added to {}", e.id, crate::veto::constraints_path(&store).display()),
+                        false => println!("{} answered: kept as a lesson only", e.id),
+                    }
                     0
                 }
                 Ok(e) => {
@@ -1855,6 +1878,31 @@ mod tests {
         let e = Entry { disagreeing: vec!["x".into()], ..asked[0].clone() };
         let v = lesson(&e, "fine", "lead@x", 1, &[]);
         assert_eq!((v["supersedes"].clone(), v["area"].clone()), (json!(["x"]), json!("other")));
+    }
+
+    #[test]
+    fn a_proposed_constraint_uses_no_budget_and_its_answer_writes_no_lesson() {
+        let store = tmp("constraint");
+        let l = crate::learn::Lesson { id: "Lno-s1-1".into(), repo: "app".into(), ..Default::default() };
+        let e =
+            crate::learn::Episode { id: "no-s1-1".into(), session: "s1".into(), engineer: "lead@x".into(), correction: "never".into(), ..Default::default() };
+        assert!(crate::veto::propose(&store, &l, "merge lookups go through the review API", &e, 5).unwrap());
+        let q = entries(&store).remove(0);
+        assert_eq!((q.kind, q.default.as_str()), (Kind::Constraint, crate::veto::KEEP_OPTION));
+        assert!(budget_allows(&entries(&store), &[], "lead@x", "s1", &collective::Aliases::default()), "a constraint question is no message");
+        let kept = answer(&store, &q.id, &option_answer(&q, "a").unwrap(), "lead@x", 9).unwrap();
+        assert_eq!(kept.answer.as_deref(), Some(crate::veto::KEEP_OPTION));
+        assert!(!store.join("lessons.jsonl").exists() && !crate::veto::constraints_path(&store).exists());
+        assert!(!crate::stats::events(&store).iter().any(|ev| ev.kind == crate::stats::LESSON_NEW));
+        // Ratified (option b): one constraint, still no lesson.
+        let e2 = crate::learn::Episode { session: "s2".into(), ..e };
+        assert!(crate::veto::propose(&store, &l, "the public schema changes only additively", &e2, 10).unwrap());
+        let q2 = open(&store).remove(0);
+        answer(&store, &q2.id, &option_answer(&q2, "b").unwrap(), "lead@x", 11).unwrap();
+        assert_eq!(std::fs::read_to_string(crate::veto::constraints_path(&store)).unwrap().lines().count(), 1);
+        assert!(!store.join("lessons.jsonl").exists());
+        let q2 = Question::of(&entries(&store)[1], 1, "");
+        assert!(render_delivery(&q2, false).contains("proposed from an engineer's veto"));
     }
 
     #[test]

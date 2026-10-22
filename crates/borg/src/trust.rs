@@ -6,10 +6,11 @@
 //! the routed collective's own store (`lessons.jsonl` and the `outcomes.jsonl` beside it): a private
 //! collective's evidence never moves trust in a work one, and an off repo has none.
 //!
-//! **Local vs shared evidence**: a team mesh (borg-mesh) syncs `lessons.jsonl` only. `followed` and
-//! `corrected` come from `outcomes.jsonl`, which stays on the machine whose drones were asked, so they
-//! are this machine's sessions; `superseded` comes from the lessons and is shared. Teammates can
-//! therefore see different trust for the same engineer; `borg trust` says so.
+//! **Local and shared evidence**: `followed` and `corrected` come from this machine's `outcomes.jsonl`
+//! plus the teammates' results the mesh syncs as `outcomes-team.jsonl` (outcome.rs `read_team`: hashed
+//! sessions, each counted once), unless BORG_SHARE_OUTCOMES=off; `superseded` comes from the lessons and
+//! is shared. Teammates converge on the same trust once synced; results not yet synced, or kept local
+//! with BORG_SHARE_OUTCOMES=off, still make it differ, and `borg trust` says so.
 //!
 //! **Engineers** are canonical (collective.rs "Engineers"): emails compare case-insensitively and
 //! the emails an `engineers` entry lists are one engineer, mapped when lessons are read. The
@@ -166,7 +167,7 @@ pub fn of_store(home: &Path) -> Trust {
 /// `of_store` under explicit aliases.
 pub fn of_store_with(home: &Path, aliases: &collective::Aliases) -> Trust {
     let lessons = home.join("lessons.jsonl");
-    Trust::compute(&conscience::load_unweighted_with(&lessons, None, aliases), &outcome::read(&outcome::path_beside(&lessons)))
+    Trust::compute(&conscience::load_unweighted_with(&lessons, None, aliases), &outcome::read_team(&lessons))
 }
 
 /// Valid supersession edges (successor, replaced). "X supersedes Y" counts only if Y does not itself
@@ -286,7 +287,10 @@ pub fn main(args: &[&str]) -> i32 {
         Ok(collective::Route::Collective { name, home, .. }) => {
             println!("collective {name} ({})", home.display());
             println!("trust = (1 + followed) / (2 + followed + corrected + 2 x superseded); 0.50 = no evidence");
-            println!("followed/corrected: sessions on this machine only (outcomes are not synced); superseded: shared lessons\n");
+            match crate::outcome::on() {
+                true => println!("followed/corrected: sessions on this machine and the team's synced outcomes; superseded: shared lessons\n"),
+                false => println!("followed/corrected: sessions on this machine only (BORG_SHARE_OUTCOMES=off); superseded: shared lessons\n"),
+            }
             print!("{}", table(&of_store(&home)));
             0
         }

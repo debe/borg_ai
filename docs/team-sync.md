@@ -128,7 +128,11 @@ version wins everywhere. Cost grows with what changed: a laptop back from three 
 downloads three weeks of lessons.
 
 **What travels.** Lessons, each line signed by the machine that wrote it. Raw episodes stay where they
-were captured, so each is learned exactly once. Reasoning excerpts go to two peers chosen by hash, so
+were captured, so each is learned exactly once. Outcome lines say which lesson was asked, what followed,
+when, and the probability it was asked, with the session and repo hashed. They are signed and
+quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
+(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Peers on `borg/mesh/5` and earlier do not
+sync with this version: upgrade every member. Reasoning excerpts go to two peers chosen by hash, so
 the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key

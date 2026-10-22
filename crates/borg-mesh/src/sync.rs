@@ -13,8 +13,9 @@
 //!    same way everywhere). The peer must still be a member under the result, and revocations are
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
-//! 3. `lessons.jsonl`: range-based set reconciliation (recon.rs), cost ∝ difference: one
-//!    fingerprint when nothing changed. Then `Lines`: what the other side lacks, each line with its
+//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl` (lines.rs `SYNCED`), each in turn:
+//!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
+//!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
 //!    and the membership admits its origin key at its stamp time.
 //! 4. `reasoning.jsonl` (git-note excerpts, notes in the borg crate): not reconciled with everyone.
@@ -59,7 +60,7 @@ use crate::{live, steer};
 
 mod vectors;
 
-pub const ALPN: &[u8] = b"borg/mesh/5";
+pub const ALPN: &[u8] = b"borg/mesh/6";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
@@ -394,6 +395,8 @@ impl Node {
     /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
     pub fn stamp(&self) -> Result<usize, String> {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        // Fresh outcomes ship with every sync, stamped in the same step.
+        borg::outcome::publish(&self.home);
         origin::stamp(&self.home, &self.me, &logs(&self.home), borg::learn::now_ms())
     }
 
@@ -881,6 +884,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn team_outcomes_sync_and_count_once() {
+        let (pa, pb) = team("outcomes");
+        let (a, b) = (home(&pa), home(&pb));
+        write(&a, "lessons.jsonl", &[lesson("L1", 1, "lock order?")]);
+        let o = |kind: &str, ms| json!({"kind": kind, "session": "s1", "lessons": ["L1"], "ms": ms, "repo": "app", "groups": [["L1", "L2"]]}).to_string();
+        write(&a, "outcomes.jsonl", &[o("asked", 1), o("asked_then_changed", 2)]);
+        assert_eq!(borg::outcome::publish(&a), 2);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        served.unwrap();
+        synced.unwrap();
+        let team = borg::outcome::TEAM_FILE;
+        assert_eq!(lines::read(&b.join(team)), lines::read(&a.join(team)), "bob holds alice's outcomes");
+        let text = std::fs::read_to_string(b.join(team)).unwrap();
+        assert!(!text.contains("\"s1\"") && !text.contains("app") && !text.contains("groups"), "redacted: {text}");
+        assert!(!b.join("outcomes.jsonl").exists(), "the raw log stays with alice");
+        let l1 = [borg::conscience::Challenge { id: "L1".into(), ..Default::default() }];
+        let changed = |h: &Path| borg::memory::derive(&borg::outcome::read_team(&h.join("lessons.jsonl")), &l1, None)["L1"].changed;
+        assert_eq!(changed(&b), 1, "alice's session counts on bob");
+        assert_eq!(changed(&a), 1, "alice's own published copy does not count twice");
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        let quiet = Report { rounds: SYNCED.len(), fps: SYNCED.len(), ..Report::default() };
+        assert_eq!((synced.unwrap(), served.unwrap()), (quiet, quiet), "resync is quiet");
+        alice.close().await;
+        bob.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn two_members_end_with_the_union_and_resync_moves_only_digests() {
         let (pa, pb) = team("union");
         let (a, b) = (home(&pa), home(&pb));
@@ -913,7 +946,7 @@ mod tests {
         assert!(asked(&a).contains(&("L1".into(), "lock order, also in tests?".into())), "the newer version wins on alice too");
 
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        // One round and one fingerprint per synced log (lessons, stats), nothing else.
+        // One round and one fingerprint per synced log (lessons, stats, outcomes), nothing else.
         let quiet = Report { rounds: SYNCED.len(), fps: SYNCED.len(), ..Report::default() };
         assert_eq!(synced.unwrap(), quiet, "re-sync: one fingerprint per log, nothing new");
         assert_eq!(served.unwrap(), quiet);

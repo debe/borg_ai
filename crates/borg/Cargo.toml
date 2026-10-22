@@ -31,6 +31,8 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 regex.workspace = true
 # the expert drone: its own process group, killed with borg (expert_route.rs)
 libc = "0.2"
+# hashed session and repo ids in the outcomes the team sees (outcome.rs `tag`); the mesh uses it already
+blake3 = "1.8"
 # Vector recall at the Stop step (vectors.rs, internal evaluation "vectors", not published): embedded SeekStorm, and a Model2Vec
 # embedder that maps the model file instead of reading it.
 seekstorm = { version = "=3.3.13", default-features = false, optional = true }
