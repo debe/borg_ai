@@ -1,0 +1,2 @@
+{"type": "user", "cwd": "/w/app", "message": {"role": "user", "content": "review the diff"}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "StructuredOutput", "input": {"findings": [{"file": "src/net.rs:12", "severity": "High", "title": "The budget place is reset by an arc instead of drained"}]}}]}}

@@ -15,9 +15,12 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
         "lesson_new" => match e.why.as_str() {
             "import" => "A lesson was imported from team documents".into(),
             "queen" => "A queen answer became a lesson".into(),
+            "review" => "Borg learned a new lesson from a review finding".into(),
+            "regret" => "Borg learned a new lesson from a later fix".into(),
             _ => "Borg learned a new lesson from a correction".into(),
         },
         "lesson_merged" => "A new correction sharpened a lesson".into(),
+        "review_finding" => "A review step found a bug and a fix step fixed it, before any commit".into(),
         "not_a_lesson" => "A correction was judged not to be a lesson".into(),
         "block" => format!("Borg asked {} question{} before the drone finished", num(e.n.max(1.0)), if e.n == 1.0 { "" } else { "s" }),
         "changed" => "A question changed the drone's work".into(),

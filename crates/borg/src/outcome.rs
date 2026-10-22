@@ -37,6 +37,13 @@ pub const CORRECTED: &str = "asked_then_corrected";
 pub const NOT_CORRECTED: &str = "asked_not_corrected";
 pub const CHANGED: &str = "asked_then_changed";
 pub const IGNORED: &str = "asked_ignored";
+/// One graded check: every lesson the model graded as applying (`lessons`, in its order, with
+/// `grades` and `ranks`), and which of them the check chose to ask (`chosen`). The denominator for
+/// learning how many to ask: a lesson that applied but was not chosen can still turn out needed.
+pub const GRADED: &str = "graded";
+/// A lesson a graded check of the session found applying but did not ask, which a later correction
+/// in that session then merged into or superseded: a question that was needed and not asked (`missed`).
+pub const MISSED: &str = "applied_then_corrected";
 
 /// A session without asks or episodes for this long is treated as ended (24h).
 pub const IDLE_MS: i64 = 24 * 60 * 60 * 1000;
@@ -55,6 +62,27 @@ pub struct Outcome {
     /// (a live check during the turn, live.rs). Empty in records from before delivery modes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
+    /// `graded` and `asked`: each lesson's grade (3 certain, 2 likely, 1 worth a thought) and its rank in
+    /// the model's applies (0 first), aligned with `lessons`, and how many lessons the check graded as
+    /// applying; on `asked`, 0 where no check of the session graded the lesson. For learning how many to
+    /// ask (attention.rs reads them from `graded`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grades: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranks: Vec<u16>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub applied: u16,
+    /// `graded` only: the lessons the check chose to ask.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen: Vec<String>,
+    /// `graded` only: the check explored, asking every apply up to `attention::RAIL` whatever the cut,
+    /// so its outcomes label the cut (attention.rs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explore: bool,
+}
+
+fn is_zero(v: &u16) -> bool {
+    *v == 0
 }
 
 /// The outcomes store next to a lessons file.
@@ -124,6 +152,23 @@ pub fn contradicted(outcomes: &[Outcome], session: &str, ms: i64, target: Option
         }
     }
     out.retain(|l| asked_before(outcomes, session, l, ms) && !has(outcomes, CORRECTED, session, l));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The lessons a correction at `ms` in `session` shows were needed and not asked: of the lessons it
+/// `supersedes` and `target` (the lesson it was merged into), those a graded check of the session found
+/// applying before `ms` without choosing them, never asked in the session before `ms`, and not yet
+/// recorded as missed there. Sorted, unique.
+pub fn missed(outcomes: &[Outcome], session: &str, ms: i64, target: Option<&str>, supersedes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = supersedes.iter().cloned().chain(target.map(str::to_string)).collect();
+    let applied_unchosen = |l: &str| {
+        outcomes
+            .iter()
+            .any(|o| o.kind == GRADED && o.session == session && o.ms < ms && o.lessons.iter().any(|x| x == l) && !o.chosen.iter().any(|x| x == l))
+    };
+    out.retain(|l| applied_unchosen(l) && !asked_before(outcomes, session, l, ms) && !has(outcomes, MISSED, session, l));
     out.sort();
     out.dedup();
     out
@@ -228,6 +273,31 @@ mod tests {
             repo: "r".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn missed_is_an_applied_unasked_lesson_a_later_correction_lands_on() {
+        let graded = |ms: i64, chosen: &[&str]| Outcome {
+            kind: GRADED.into(),
+            session: "s".into(),
+            lessons: vec!["A".into(), "B".into()],
+            ms,
+            chosen: chosen.iter().map(|x| x.to_string()).collect(),
+            ..Default::default()
+        };
+        let none: Vec<String> = Vec::new();
+        let log = vec![graded(10, &["B"])];
+        assert_eq!(missed(&log, "s", 20, Some("A"), &none), ["A"]);
+        assert_eq!(missed(&log, "s", 20, None, &["A".into(), "B".into()]), ["A"], "B was chosen");
+        assert!(missed(&log, "s", 5, Some("A"), &none).is_empty(), "a correction before the check");
+        assert!(missed(&log, "t", 20, Some("A"), &none).is_empty(), "another session");
+        assert!(missed(&log, "s", 20, Some("C"), &none).is_empty(), "never applied");
+        let mut asked = log.clone();
+        asked.push(o(ASKED, "s", &["A"], 15));
+        assert!(missed(&asked, "s", 20, Some("A"), &none).is_empty(), "asked later in the session: not a miss");
+        let mut done = log.clone();
+        done.push(o(MISSED, "s", &["A"], 18));
+        assert!(missed(&done, "s", 20, Some("A"), &none).is_empty(), "recorded once");
     }
 
     #[test]

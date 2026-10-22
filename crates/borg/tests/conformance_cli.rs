@@ -93,6 +93,8 @@ impl<'a> Drone<'a> {
             ("BORG_QUEEN", "off"),
             ("BORG_LEARN", "off"),
             ("BORG_VECTORS", "off"),
+            // Delivery, not the learned choice of how many to ask (attention_cli.rs pins that).
+            ("BORG_STOP_ATTENTION", "off"),
             ("BORG_PREFILTER", "off"),
             ("BORG_EARLY", "off"),
             ("BORG_NOTIFY", "off"),

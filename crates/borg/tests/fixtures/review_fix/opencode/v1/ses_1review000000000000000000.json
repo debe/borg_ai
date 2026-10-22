@@ -1,0 +1,50 @@
+{
+ "info": {
+  "id": "ses_1review000000000000000000",
+  "directory": "/w/app",
+  "parentID": "ses_1root0000000000000000000",
+  "title": "review cache (@general subagent)"
+ },
+ "messages": [
+  {
+   "info": {
+    "role": "user",
+    "time": {
+     "created": 1776861710000
+    },
+    "agent": "general"
+   },
+   "parts": [
+    {
+     "type": "text",
+     "text": "Review src/cache."
+    }
+   ]
+  },
+  {
+   "info": {
+    "role": "assistant",
+    "time": {
+     "created": 1776861711000
+    },
+    "agent": "general"
+   },
+   "parts": [
+    {
+     "type": "tool",
+     "tool": "read",
+     "state": {
+      "status": "completed",
+      "input": {
+       "filePath": "/w/app/src/cache/key.ts"
+      }
+     }
+    },
+    {
+     "type": "text",
+     "text": "Reviewed the cache.\n\n```json\n{\"findings\": [{\"title\": \"Cache key ignores the tenant id\", \"severity\": \"high\", \"file\": \"src/cache/key.ts\", \"detail\": \"Two tenants share one entry.\"}]}\n```\n"
+    }
+   ]
+  }
+ ]
+}

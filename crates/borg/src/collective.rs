@@ -342,15 +342,20 @@ pub fn store(base: &Path, name: &str) -> PathBuf {
     base.join("collectives").join(store_name(name))
 }
 
+/// The root store of `home`, a collective's store (`<root>/collectives/<name>`) or the root itself.
+pub fn root_of(home: &Path) -> PathBuf {
+    match home.parent() {
+        Some(p) if p.file_name().is_some_and(|n| n == "collectives") => p.parent().map_or_else(|| home.to_path_buf(), Path::to_path_buf),
+        _ => home.to_path_buf(),
+    }
+}
+
 /// The store of the local collective that receives an engineer's personal lessons (reach.rs): the one
 /// `personal` names, else the only `share: local` collective; none when there is none or several. `home`
 /// is any collective's store (or the root store), the root is derived from it.
 pub fn personal_store(cfg: Option<&Config>, home: &Path) -> Option<PathBuf> {
     let cfg = cfg?;
-    let base = match home.parent() {
-        Some(p) if p.file_name().is_some_and(|n| n == "collectives") => p.parent()?.to_path_buf(),
-        _ => home.to_path_buf(),
-    };
+    let base = root_of(home);
     let local: Vec<&Entry> = cfg.collectives.iter().filter(|c| c.share == Share::Local).collect();
     let pick = match &cfg.personal {
         Some(name) => local.iter().find(|c| &c.name == name).copied(),

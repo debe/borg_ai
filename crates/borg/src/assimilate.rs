@@ -556,6 +556,24 @@ fn opencode_cli(v2: bool, path: Option<&OsStr>, args: &[String], dir: &Path) -> 
     std::fs::read(&out).ok()
 }
 
+/// One session's export through this machine's opencode CLI, run in `dir` (the opencode harness's
+/// subagents, harness/opencode.rs).
+pub(crate) fn opencode_export(id: &str, dir: &Path) -> Option<Value> {
+    let v2 = runner::opencode() == runner::Opencode::V2;
+    opencode_cli(v2, None, &export_args(v2, id), dir).and_then(|o| serde_json::from_slice(&o).ok())
+}
+
+/// The rows of a read-only query of opencode 1.x's database; None on 2.x, which has no such query,
+/// or when the call fails.
+pub(crate) fn opencode_db(sql: &str) -> Option<Vec<Value>> {
+    if runner::opencode() == runner::Opencode::V2 {
+        return None;
+    }
+    let mut a = strings(&["db", "--pure", "--format", "json"]);
+    a.push(sql.to_string());
+    opencode_cli(false, None, &a, &std::env::temp_dir()).and_then(|o| serde_json::from_slice(&o).ok())
+}
+
 fn strings(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|x| x.to_string()).collect()
 }

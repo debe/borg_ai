@@ -57,6 +57,7 @@ fn borg(root: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> String
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        .env("BORG_STOP_ATTENTION", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

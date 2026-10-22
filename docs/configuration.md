@@ -274,6 +274,58 @@ episodes included, after 60 s of git.
 A call past either, a shallow clone's boundary or an unreadable diff means fewer links, never a failed
 hook.
 
+## Review → fix findings
+
+Most bugs are not caught after a commit. They are caught inside a session: a workflow builds, a
+reviewer finds a problem, and a fix step fixes it, all before anything is committed. Decision → fix
+links never see these, because they need a commit from another session. `borg review-fix` reads them
+from the sub-agents your harness ran, with 0 tokens:
+
+| Harness | A run is | Read from |
+|---|---|---|
+| Claude Code | a workflow run | `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`), `<repo>/<session>/workflows/wf_*.json` and each agent's transcript under `<session>/subagents/workflows/<run>/` |
+| omp | a session's task agents | `~/.omp/agent/sessions/` (or `$PI_CODING_AGENT_DIR/sessions`), `<repo>/<ts>_<session>/<Task>.jsonl` beside the session's own file |
+| opencode | a session's subagents | the child sessions its task calls name, exported through `opencode` itself, read-only; only when `~/.local/share/opencode` (or `$XDG_DATA_HOME/opencode`) exists. Every session at once: 1.x only (2.x has no query that lists them); at session end, both |
+| Codex | none | nothing yet |
+
+`--home DIR` reads under another home; the harnesses' own directory variables still win.
+
+**What counts.** Workflow scripts and prompts are your own, so their output shapes vary. Borg reads
+each agent's output tolerantly: Claude Code's last `StructuredOutput`; omp's accepted `yield` calls,
+every finding gathered whether it yielded them one per call, as one array or inside one object
+(`{overall_correctness, explanation, findings}`); otherwise the last JSON object in the agent's text
+with a `findings` or `issues` array, starting a line (a fenced `json` block counts). opencode has no
+structured output, so only reviewers told to answer in JSON yield findings there.
+
+- A **finding** is an item of a `findings` or `issues` array that has a severity (or a `priority`: 0
+  to 3 or `P0` to `P3` reads as `p0` to `p3`) and a text (`title`, `claim`, `problem`, `description`,
+  `issue` or `body`). Its file is `file`, `path`, `file_path`, `fileLines` or `where`.
+- A **verdict** is a verifier's `real` flag or a `verdict` word (confirmed, refuted, …). It is linked
+  to its finding by id, title, label or prompt.
+- A finding is **fixed** when a later fix step of the same run (its label, phase or agent type says
+  fix or repair, and it found nothing itself) names the finding's file in any tool call or text.
+- A finding is **strong** when it was fixed and no verifier rejected it. Only strong findings are
+  learned from.
+
+A negative control asks the same question of a fix step from another session in the same repo. That
+rate is how often the file rule matches by chance. Run `borg review-fix` to see your own numbers.
+
+**Learning from it.** On by default, with nothing to set: at session end, `borg learn` first makes the
+session's strong findings episodes (from the runs of the drone's harness, `BORG_HARNESS`), of
+kind `regret` (id `V<run>#<n>`, written once). Each episode goes to the store its repo routes to; an
+off repo is skipped. Then it makes one model call per episode, with the builder's task and the end of
+its account of the build (only when the builder worked in the same repo as the reviewer), and the
+redacted finding. It words the lesson as a question for the moment of building: "Before <doing X>, has
+<risk Y> been considered?". `BORG_REVIEW_FIX=off` turns it off; `borg review-fix --apply` records past
+findings by hand.
+
+Why on: in the value eval lessons from earlier findings raised the share of later bugs a plan avoided
+by 6 points, never worse overall, and 89% of the lessons state their finding faithfully. The interval
+still reaches −5.1, just past the −5 bar set before the run; the engineer turned it on, since a user who
+never configures would otherwise never get it. `borg web` counts the findings learned, so you can
+watch it. Numbers in the README's *Evidence and limits*. Not read yet: Claude Code's plain Agent-tool
+reviews outside a workflow, and Codex (it has no sub-agent runs to read).
+
 ## Environment variables
 
 All are optional.
@@ -298,6 +350,7 @@ All are optional.
 | `BORG_REGRESS` | `links` | [Decision → fix links](#decision--fix-links): `learn` also makes fix links regret episodes (team or private); `off`: no links |
 | `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
 | `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
+| `BORG_REVIEW_FIX` | on | [Review → fix findings](#review--fix-findings): `off`: the ended session's sub-agent review findings are not learned from |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
 | `BORG_EARLY` | on | `off`: no early delivery |
@@ -335,6 +388,8 @@ project.
 | `BORG_STOP_POOL_TOKENS` | `12000` | Token budget of the lesson pool |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
+| `BORG_STOP_ATTENTION` | off | `on`: a blocking check asks the model's top `k` applying lessons and hands the rest over free. `k` is the smallest cut that, by conformal risk control over this collective's last 200 labelled checks, misses a needed lesson no more often than the fixed rule; ranks 0–10 until there are enough labels (at least ⌈1/α⌉ − 1, 999 while the fixed rule misses none). Labels come only from explored checks: every tenth blocking check asks every applying lesson, up to 20, so the cut never calibrates on what it chose not to ask. Off until its evaluation passes |
+| `BORG_STOP_ASK_CAP` | none | Evaluation only: a block asks only the first N grade-3 lessons |
 | `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; its grade-3 lessons arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A grade 3 no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
 | `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it, or a quarter of `BORG_STOP_BUDGET_MS` when that is less |
 | `BORG_PREDICT_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for the turn-end check (see *Model runner*); `off`: no model call |

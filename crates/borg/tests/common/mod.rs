@@ -70,6 +70,8 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
         .env("BORG_QUEEN", "off")
         .env("BORG_LEARN", "off")
         .env("BORG_VECTORS", "off")
+        // These tests pin delivery; how many to ask is learned (attention.rs) and pinned in attention_cli.rs.
+        .env("BORG_STOP_ATTENTION", "off")
         // These tests pin the turn-end behaviour; the live ones pass BORG_MODE=live.
         .env("BORG_MODE", "hook")
         .envs(env.iter().copied())

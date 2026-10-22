@@ -1,0 +1,83 @@
+{
+ "info": {
+  "id": "ses_1root0000000000000000000",
+  "directory": "/w/app",
+  "title": "cache tenancy",
+  "time": {
+   "created": 1776861700000
+  }
+ },
+ "messages": [
+  {
+   "info": {
+    "role": "user",
+    "time": {
+     "created": 1776861700000
+    }
+   },
+   "parts": [
+    {
+     "type": "text",
+     "text": "review the cache, then fix"
+    }
+   ]
+  },
+  {
+   "info": {
+    "role": "assistant",
+    "time": {
+     "created": 1776861701000
+    },
+    "agent": "build"
+   },
+   "parts": [
+    {
+     "type": "tool",
+     "tool": "task",
+     "callID": "call_ses_1review000000000000000000",
+     "state": {
+      "status": "completed",
+      "input": {
+       "subagent_type": "general",
+       "description": "review cache",
+       "prompt": "Review src/cache. Answer with a JSON object {\"findings\": [...]}."
+      },
+      "output": "<task id=\"ses_1review000000000000000000\" state=\"completed\">\n<task_result>\nReviewed the cache.\n\n```json\n{\"findings\": [{\"title\": \"Cache key ignores the tenant id\", \"severity\": \"high\", \"file\": \"src/cache/key.ts\", \"detail\": \"Two tenants share one entry.\"}]}\n```\n</task_result>\n</task>",
+      "metadata": {
+       "parentSessionId": "ses_1root0000000000000000000",
+       "sessionId": "ses_1review000000000000000000",
+       "truncated": false
+      },
+      "time": {
+       "start": 1776861710000,
+       "end": 1776861711000
+      }
+     }
+    },
+    {
+     "type": "tool",
+     "tool": "task",
+     "callID": "call_ses_1fix00000000000000000000",
+     "state": {
+      "status": "completed",
+      "input": {
+       "subagent_type": "general",
+       "description": "fix cache key",
+       "prompt": "Apply the review findings."
+      },
+      "output": "<task_result>Fixed.</task_result>",
+      "metadata": {
+       "parentSessionId": "ses_1root0000000000000000000",
+       "sessionId": "ses_1fix00000000000000000000",
+       "truncated": false
+      },
+      "time": {
+       "start": 1776861720000,
+       "end": 1776861721000
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

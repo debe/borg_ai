@@ -526,9 +526,23 @@ pub fn widen<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challenge], d
 /// - **without a block**, the 2s and then the 1s, at most `CAP`, go to the drone free as early context at
 ///   its next prompt or touch (main.rs `queued`).
 pub fn graded<'a>(applied: &[(&'a Challenge, u8)]) -> (Vec<&'a Challenge>, Vec<&'a Challenge>) {
+    graded_capped(applied, ask_cap())
+}
+
+/// `BORG_STOP_ASK_CAP=N` (evaluation only): a block asks only the 3s, the first `N` in the model's
+/// order; without a 3 nothing changes. Unset, a block asks as `graded` says.
+pub fn ask_cap() -> Option<usize> {
+    std::env::var("BORG_STOP_ASK_CAP").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0)
+}
+
+/// `graded` with an explicit cap on a block (`ask_cap`).
+pub fn graded_capped<'a>(applied: &[(&'a Challenge, u8)], cap: Option<usize>) -> (Vec<&'a Challenge>, Vec<&'a Challenge>) {
     let of = |g: u8| applied.iter().filter(move |(_, x)| *x == g).map(|(c, _)| *c);
     if of(3).next().is_none() {
         return (Vec::new(), of(2).chain(of(1)).take(CAP).collect());
+    }
+    if let Some(n) = cap {
+        return (of(3).take(n).collect(), Vec::new());
     }
     let mut ask: Vec<&Challenge> = of(3).chain(of(2)).collect();
     let room = CAP.saturating_sub(ask.len());
@@ -796,6 +810,13 @@ mod tests {
             })
             .collect();
         assert_eq!(ids(&graded(&full).0), ids(&ls[..10].iter().collect::<Vec<_>>()));
+        // A cap keeps only the first 3s; no 3, no change.
+        let two_threes = vec![(&ls[0], 2), (&ls[1], 3), (&ls[2], 1), (&ls[3], 3)];
+        let (ask, free) = graded_capped(&two_threes, Some(1));
+        assert_eq!((ids(&ask), free.len()), (vec!["L1".to_string()], 0));
+        assert_eq!(ids(&graded_capped(&two_threes, Some(5)).0), ["L1", "L3"]);
+        let (ask, free) = graded_capped(&soft, Some(1));
+        assert!(ask.is_empty() && free.len() == CAP);
         let (ask, free) = graded(&[]);
         assert!(ask.is_empty() && free.is_empty());
     }

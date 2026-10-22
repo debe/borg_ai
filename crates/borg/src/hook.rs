@@ -616,14 +616,20 @@ fn ask_live(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, fir
     }
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
     if learning() {
+        let lessons: Vec<String> = firm.iter().map(|c| c.id.clone()).collect();
+        let (grades, ranks, applied) = graded_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
-            lessons: firm.iter().map(|c| c.id.clone()).collect(),
+            lessons,
             ms: now,
             repo: repo_of(cwd),
             groups: conscience::disagreement_ids(firm),
             channel: "live".into(),
+            grades,
+            ranks,
+            applied,
+            ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
     }
@@ -806,7 +812,28 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     if graded {
         // Graded (default): ask only for a lesson graded 3; a check without one hands its 2s and 1s over
         // free at the next prompt or touch (conscience.rs `graded`).
-        let (ask, free) = conscience::graded(&applied);
+        let (ask, free, learned) = crate::attention::graded(&applied, &learn::home());
+        append(session, &graded_line(&applied));
+        if learning() && !applied.is_empty() {
+            let graded = outcome::Outcome {
+                kind: outcome::GRADED.into(),
+                session: session.into(),
+                lessons: applied.iter().map(|(c, _)| c.id.clone()).collect(),
+                ms: learn::now_ms(),
+                repo: repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()),
+                channel: if live { "live" } else { "stop" }.into(),
+                grades: applied.iter().map(|(_, g)| *g).collect(),
+                ranks: (0..applied.len() as u16).collect(),
+                applied: applied.len() as u16,
+                chosen: ids(&ask),
+                explore: learned.as_ref().is_some_and(|c| c.source == "explore"),
+                ..Default::default()
+            };
+            let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &graded);
+        }
+        if let Some(cut) = &learned {
+            append(session, &crate::attention::line(cut, applied.len()));
+        }
         let queue = !free.is_empty();
         log_cost(session, &format!("graded applied={} ask={} free={} {}", applied.len(), ask.len(), free.len(), if queue { "queued" } else { "dropped" }));
         if queue {
@@ -1189,6 +1216,31 @@ fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, l
     Ok(asked)
 }
 
+/// `#borg-graded n=<applied> <id>:<grade>:<rank>,…`: a graded check's applies in the model's order, so
+/// the `asked` outcome can carry each asked lesson's grade and rank (`graded_of`).
+fn graded_line(applied: &[(&conscience::Challenge, u8)]) -> String {
+    let items: Vec<String> = applied.iter().enumerate().map(|(r, (c, g))| format!("{}:{g}:{r}", c.id)).collect();
+    format!("#borg-graded n={} {}", applied.len(), items.join(","))
+}
+
+/// For each of `ids`: its grade and rank in the session's latest graded check that graded it, and that
+/// check's number of applies (the largest when the ids come from several checks); (0, 0) and 0 when none.
+fn graded_of(session: &str, ids: &[String]) -> (Vec<u8>, Vec<u16>, u16) {
+    let state = std::fs::read_to_string(state_file(session)).unwrap_or_default();
+    let mut seen: std::collections::HashMap<String, (u8, u16, u16)> = std::collections::HashMap::new();
+    for line in state.lines().filter_map(|l| l.strip_prefix("#borg-graded n=")) {
+        let Some((n, items)) = line.split_once(' ') else { continue };
+        let n: u16 = n.parse().unwrap_or(0);
+        for it in items.split(',') {
+            let mut p = it.rsplitn(3, ':');
+            let (Some(r), Some(g), Some(id)) = (p.next(), p.next(), p.next()) else { continue };
+            seen.insert(id.to_string(), (g.parse().unwrap_or(0), r.parse().unwrap_or(0), n));
+        }
+    }
+    let got: Vec<(u8, u16, u16)> = ids.iter().map(|i| seen.get(i).copied().unwrap_or((0, 0, 0))).collect();
+    (got.iter().map(|g| g.0).collect(), got.iter().map(|g| g.1).collect(), got.iter().map(|g| g.2).max().unwrap_or(0))
+}
+
 /// The stop asks `selected`: one block (the queen's, when it asks too), recorded as asked.
 fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&conscience::Challenge>) -> Option<Value> {
     // Shown in an order stable within the session but different across sessions: no lesson always
@@ -1212,14 +1264,20 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
     if learning() {
         // Outcome tracking (outcome.rs): `borg learn` later sees whether a correction followed.
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        let lessons: Vec<String> = selected.iter().map(|c| c.id.clone()).collect();
+        let (grades, ranks, applied) = graded_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
-            lessons: selected.iter().map(|c| c.id.clone()).collect(),
+            lessons,
             ms: learn::now_ms(),
             repo: repo_of(cwd),
             groups: conscience::disagreement_ids(&selected),
             channel: "stop".into(),
+            grades,
+            ranks,
+            applied,
+            ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
     }

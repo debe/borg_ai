@@ -26,6 +26,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("trust", &[], &["--dir"], false),
     ("notes", &["attach", "fetch"], &[], false),
     ("regress", &[], crate::notes::regress_cli::FLAGS, false),
+    ("review-fix", &[], crate::review_fix::FLAGS, false),
     (
         "mesh",
         &["id", "init", "invite", "invites", "join", "revoke", "members", "peer", "serve", "sync", "fetch"],

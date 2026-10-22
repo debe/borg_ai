@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 /// `Episode::kind` of a regret.
 pub const KIND: &str = "regret";
 
+/// The first signal of a regret from a review finding (review_fix.rs): found and fixed inside the
+/// session, before any commit. `decision_task` is then the built task, `decision_proposal` the
+/// builder's account, `fix_subject` the finding and `diff` its detail.
+pub const REVIEW: &str = "review";
+
 /// Each excerpt in the prompt is cut to this many characters.
 const CAP: usize = 1500;
 
@@ -41,6 +46,12 @@ in another session, the same lines were changed by a fix ({signals}). Decide whe
 the original decision: something the agent should have weighed at the moment it decided. A later change for an unrelated \
 reason that merely touched the same lines (a rename, a new feature, a dependency bump, a style change) is NOT a lesson.";
 
+/// How a review regret opens.
+const REVIEW_HEAD: &str = "A coding agent built a change (its task and its own account below). Before anything was committed, a \
+reviewer in the same session found the problem below ({signals}), and a fix step fixed it. Decide whether the finding reveals a \
+reusable lesson about the build: something the agent should have weighed while building. A typo, a style nit, or a one-off slip \
+with no risk that transfers to other work is NOT a lesson.";
+
 /// The fields a regret lesson is written in (the area line follows, shared with corrections).
 pub const FIELDS: &str = "If it is a lesson, write:
 - question: ONE question to ask at the decision point, in the form \"Before <choosing/doing X> in <kind of situation>, has \
@@ -56,6 +67,9 @@ fn said(signal: &str) -> &str {
         "subject" => "the fix's commit subject says it fixes something",
         "tests" => "a test failed, then passed in the fixing session",
         "words" => "the engineer spoke of a bug in that session",
+        REVIEW => "a reviewer found it before any commit",
+        "confirmed" => "a verifier confirmed it",
+        "unchecked" => "no verifier checked it",
         other => other,
     }
 }
@@ -64,7 +78,14 @@ fn said(signal: &str) -> &str {
 #[must_use]
 pub fn head(r: &Regret) -> String {
     let signals = if r.signals.is_empty() { "no stated reason".to_string() } else { r.signals.iter().map(|s| said(s)).collect::<Vec<_>>().join("; ") };
-    HEAD.replace("{age}", &r.age_days.to_string()).replace("{signals}", &signals)
+    let head = if is_review(r) { REVIEW_HEAD } else { HEAD };
+    head.replace("{age}", &r.age_days.to_string()).replace("{signals}", &signals)
+}
+
+/// A regret from a review finding, not from a later commit.
+#[must_use]
+pub fn is_review(r: &Regret) -> bool {
+    r.signals.first().is_some_and(|s| s == REVIEW)
 }
 
 /// The correction prompt's reach and merge rules (learn.rs), worded for a regret.
@@ -86,6 +107,15 @@ fn tail(s: &str) -> String {
 /// and its change.
 #[must_use]
 pub fn sections(r: &Regret, fix_task: &str) -> String {
+    if is_review(r) {
+        return format!(
+            "## The task the agent built\n{}\n\n## The agent's account of its build (excerpt)\n{}\n\n## The review finding (fixed in the same session, before any commit)\n{}\n{}\n\n",
+            cut(&r.decision_task),
+            tail(&r.decision_proposal),
+            r.fix_subject,
+            cut(&r.diff)
+        );
+    }
     let why = if r.fix_why.is_empty() { String::new() } else { format!("## Why it was fixed (the fixing session's words, excerpt)\n{}\n\n", tail(&r.fix_why)) };
     format!(
         "## The decision (task)\n{}\n\n## The decision's reasoning (excerpt)\n{}\n\n## The fix (subject, task)\n{}\n{}\n\n{why}## What the fix changed in the decision's files (excerpt)\n{}\n\n",
@@ -100,6 +130,25 @@ pub fn sections(r: &Regret, fix_task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_review_regret_has_its_own_opening_and_sections() {
+        let r = Regret {
+            decision_task: "port the voice lane".into(),
+            decision_proposal: "Built it; all tests pass.".into(),
+            fix_subject: "A failed recommendation reaches the model as status ok".into(),
+            diff: "src/Rec.java: the error branch returns ok()".into(),
+            signals: vec![REVIEW.into(), "confirmed".into()],
+            ..Regret::default()
+        };
+        assert!(head(&r).starts_with("A coding agent built a change") && !head(&r).contains("days later"), "{}", head(&r));
+        assert!(head(&r).contains("(a reviewer found it before any commit; a verifier confirmed it)"), "{}", head(&r));
+        let s = sections(&r, "ignored");
+        for part in ["## The task the agent built\nport the voice lane", "Built it; all tests pass.", "before any commit)\nA failed recommendation", "error branch returns ok()"] {
+            assert!(s.contains(part), "{part}: {s}");
+        }
+        assert!(!s.contains("ignored") && !is_review(&Regret::default()));
+    }
 
     #[test]
     fn the_prompt_names_age_signals_and_both_sides() {

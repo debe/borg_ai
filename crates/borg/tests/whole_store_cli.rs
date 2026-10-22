@@ -5,7 +5,7 @@
 mod common;
 
 use common::{answer, borg, context, prompts, setup, state, turn};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// The lesson ids in a prompt's lesson block (whole layout: between `## Lessons` and `## Current work`).
 fn shown(prompt: &str) -> Vec<String> {
@@ -167,6 +167,28 @@ fn graded_blocks_only_for_a_three_and_hands_twos_and_ones_over_free_once() {
     ids.sort();
     assert_eq!(ids, ["G1", "G2", "New"]);
     assert!(!root.join("store/collectives/corp/state/g1.queued").exists(), "a blocking turn queues nothing");
+    // With learning on, the asked outcome carries each lesson's grade and rank in the model's applies,
+    // and how many applied.
+    let learn_env = [env.as_slice(), &[("BORG_LEARN", "on")]].concat();
+    answer(&root, &[("G1", 1), ("New", 3), ("G2", 2)]);
+    turn(&root, "g9", "now the retries", &[], "Retries use a fixed delay, also for invoices and tomatoes.", &learn_env);
+    let outcomes = std::fs::read_to_string(root.join("store/collectives/corp/outcomes.jsonl")).unwrap();
+    let rec: Value = outcomes.lines().rev().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|o| o["kind"] == "asked").unwrap();
+    let by_id: std::collections::BTreeMap<String, (u64, u64)> = rec["lessons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.as_str().unwrap().to_string(), (rec["grades"][i].as_u64().unwrap(), rec["ranks"][i].as_u64().unwrap())))
+        .collect();
+    assert_eq!(by_id, [("G1".to_string(), (1, 0)), ("G2".into(), (2, 2)), ("New".into(), (3, 1))].into_iter().collect(), "{rec}");
+    assert_eq!(rec["applied"], 3);
+    // The check itself is recorded too: every applying lesson in the model's order, and what it chose.
+    let graded: Value = outcomes.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|o| o["kind"] == "graded").unwrap();
+    assert_eq!((graded["lessons"].clone(), graded["grades"].clone(), graded["ranks"].clone()), (json!(["G1", "New", "G2"]), json!([1, 3, 2]), json!([0, 1, 2])), "{graded}");
+    let mut chosen: Vec<&str> = graded["chosen"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    chosen.sort();
+    assert_eq!(chosen, ["G1", "G2", "New"]);
 
     // A lone 3 is asked alone: the graded block does not widen over the low bar...
     let last = |s: &str| state(&root, s, "ctx").lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap().to_string();

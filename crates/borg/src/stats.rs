@@ -44,6 +44,9 @@ pub const CORRECTION: &str = "correction";
 /// A lesson written (`why`: its source, session/import/queen) or merged into an existing one.
 pub const LESSON_NEW: &str = "lesson_new";
 pub const LESSON_MERGED: &str = "lesson_merged";
+/// A review step's finding that a fix step fixed before any commit, recorded as an episode
+/// (review_fix.rs; `why`: its severity, `text`: its redacted title, for this machine's feed only).
+pub const REVIEW_FINDING: &str = "review_finding";
 /// `borg learn` judged an episode not to be a lesson.
 pub const NOT_A_LESSON: &str = "not_a_lesson";
 /// A model call outside the turn end (`why`: learn, assimilate, facets, expert; `usd`, `dur_ms`).

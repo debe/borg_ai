@@ -148,6 +148,7 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "corrected" => ("corrected anyway", "var(--c-heat)", "!"),
         "not_corrected" => ("not corrected", "var(--c-sky)", "✓"),
         "correction" => ("corrections", "var(--c-heat)", "✎"),
+        "review_finding" => ("review fixes", "var(--c-amber)", "⚑"),
         "lesson_new" => ("new lessons", "var(--c-good)", "✦"),
         "lesson_merged" => ("merged lessons", "var(--c-sky)", "⊕"),
         "not_a_lesson" => ("not a lesson", "var(--c-slate)", "∅"),

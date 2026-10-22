@@ -58,6 +58,15 @@ decision point: "Before choosing X here, has Y been considered?" Links are recor
 learning from them waits until you have checked a dry run (`borg regress --replay A..B`). See
 [Decision → fix links](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#decision--fix-links).
 
+**Review → fix.** Most bugs never reach a commit. A workflow builds, a reviewer finds a problem, and a
+fix step fixes it, all inside one session, so commit-based links never see it. `borg review-fix` reads
+the sub-agent runs of Claude Code (workflows), omp (task agents) and opencode (subagents) at 0 tokens.
+It finds each reviewer finding that a later fix step of the same run fixed and no verifier rejected. At
+session end those findings become episodes, and `borg learn` words each as a question for the moment of
+building, so the next drone is asked before the reviewer has to catch the same bug again. It is on by
+default (`BORG_REVIEW_FIX=off` turns it off); the page counts the findings learned. See
+[Review → fix findings](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#review--fix-findings).
+
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
 ![One turn: free early delivery, a free word gate at the turn end, one graded model call, an extra round only for a grade-3 lesson](docs/img/turn.svg)
@@ -410,6 +419,9 @@ author's and a few colleagues' sessions, so their data is not in this repository
 | End-to-end run in a sandboxed home ([dogfood](https://github.com/debe/borg_ai/blob/main/reports/dogfood-e2e.md)) | all 18 plumbing checks pass; no measurable gain on that task |
 | Live vs hook mode, internal task benchmark (9 tasks per mode) | live +0.38 criteria per task [0, +0.88], 0 redo rounds vs 0.5; live is the default |
 | Decision → fix links, replay of a scripted repo with known answers ([regress](https://github.com/debe/borg_ai/blob/main/reports/regress.md)) | fix links 4 of 5 right, 4 of 5 reachable fixes found (subject and revert signals only; tests and prompts are not measured); no real-repo precision yet |
+| Review → fix findings as lessons, 14 sealed cases × 6 seeds from recurring real findings | later bugs avoided +6 points [−5.1, +18], never worse overall (9 cases won, 4 lost); a lesson handed over directly +7; 89% of lessons faithful to their finding, 9% add a claim it does not make; on by default although −5.1 misses the pre-set −5 bar by 0.1 |
+| How many lessons a check asks, learned from outcomes by an earlier policy, since retired (cold start: no outcomes yet), same 14 cases × 6 seeds | questions per run 19 → 5, but later bugs avoided −3 points [−9, +2] against the fixed rule and the right lesson asked in 18% of runs instead of 67%: missed its bar. `BORG_STOP_ATTENTION=on` now runs a conformal cut on the model's rank instead |
+| That conformal cut on the model's rank (cold start: the dated prior asks ranks 0–10), same 14 cases × 6 seeds | questions per run −5.7 [−9, −3] against the fixed rule, later bugs avoided +1 point [−7, +9], +8 [+1, +15] against no borg; the right lesson asked in 59% of runs instead of 67%. Missed its bar (lower bound −5), so it stays opt-in |
 
 **Known limits:**
 
@@ -429,8 +441,9 @@ author's and a few colleagues' sessions, so their data is not in this repository
 - opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
   successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
   TUI hides it for built-in tools, but session exports show it.
-- Borg learns from corrections and, with `BORG_REGRESS=learn`, from later fixes of earlier decisions.
-  Knowledge nobody corrected or fixed enters only through `assimilate --from-dir`.
+- Borg learns from corrections, from review → fix findings in sub-agent runs (Claude Code, omp; opencode
+  only when its reviewers answer in JSON, as it has no structured output), and, with `BORG_REGRESS=learn`,
+  from later fixes of earlier decisions.
 - Decision → fix links have been measured only on a scripted repo, not on real notes, and only for
   the subject and revert signals: check `borg regress --replay` on your own history and
   `borg regress --session ID --explain` on a few real sessions before `BORG_REGRESS=learn`.

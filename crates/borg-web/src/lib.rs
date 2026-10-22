@@ -176,8 +176,9 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 21] = [
+const NOTABLE: [&str; 22] = [
     stats::CORRECTION,
+    stats::REVIEW_FINDING,
     stats::BLOCK,
     stats::CHANGED,
     stats::IGNORED,

@@ -29,6 +29,9 @@
 //!                                                      refs/notes/borg, never pushed; notes.rs)
 //!        borg regress [--session ID] [--replay <A..B>] [--any-origin] [--explain] [--json] [--dir DIR]
 //!                                                     (dry run: earlier decisions later commits fixed; notes/regress.rs)
+//!        borg review-fix [--home DIR] [--since YYYY-MM-DD] [--json] [--apply [--only ID,…]]
+//!                                                     (sub-agent review findings and whether a fix step fixed them,
+//!                                                      no commit needed, 0 tokens; review_fix.rs)
 //!        borg queen [--json] [--repo NAME] | show <n|id> | ask | answer <n|id> <text|a|b> | dismiss <n|id> [reason]
 //!                   | skip <n|id> | next --json | dedupe [--apply] | notify   [--dir DIR | --collective NAME]
 //!                                                     (open questions to the engineer, numbered; an answer becomes a
@@ -172,6 +175,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("trust [--dir DIR]", "trust per engineer and area"),
             ("notes attach|fetch [<commit>...]", "reasoning notes behind commits"),
             ("regress [--replay A..B] [--explain] [--json]", "which earlier decisions later commits fixed (dry run)"),
+            ("review-fix [--since DATE] [--json]", "bugs workflow reviews found and fix steps fixed, before any commit"),
         ],
     ),
     (
@@ -255,18 +259,39 @@ fn challenges_and_stdin(path: &str, rest: &[&str]) -> (Vec<conscience::Challenge
 fn learn_cmd(rest: &[&str]) {
     borg::stats::set_purpose("learn");
     let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
-    let store = learn::home().join("lessons.jsonl");
-    let from = borg::facets::len_of(&store);
-    let (new, merged, waiting) =
-        learn::learn_in_reporting(&learn::home(), session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
+    // Unless BORG_REVIEW_FIX=off: the ended session's review → fix findings (its harness's sub-agent
+    // runs) become episodes first, each in the store its repo routes to; a store other than this one
+    // is learned here too, for this session.
+    let mut others = Vec::new();
+    if let Some(s) = session
+        && learn::learning()
+        && borg::review_fix::on()
+        && let Ok(cfg) = borg::collective::load()
+    {
+        let root = borg::collective::root_of(&learn::home());
+        let (_, homes) = borg::review_fix::record_session(&borg::review_fix::home_dir(), s, cfg.as_ref(), &root);
+        others = homes.into_iter().filter(|h| *h != learn::home()).collect();
+    }
+    for home in &others {
+        learn_store(home, session);
+    }
+    let (new, merged, waiting) = learn_store(&learn::home(), session);
     println!("{new} new lessons, {merged} merged into existing ones");
     if waiting > 0 {
         eprintln!("borg learn: the model gave no answer; {waiting} episodes still pending, re-run `borg learn` later");
     }
+}
+
+/// Learn one store's waiting episodes, then its facets, vectors and today's counts.
+fn learn_store(home: &std::path::Path, session: Option<&str>) -> (usize, usize, usize) {
+    let store = home.join("lessons.jsonl");
+    let from = borg::facets::len_of(&store);
+    let got = learn::learn_in_reporting(home, session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
     facets_for_written(&store, from);
     borg::vectors::refresh(&store);
     // Session end runs this in the background: publish today's counts (stats.rs) for the mesh.
-    borg::stats::rollup(&learn::home());
+    borg::stats::rollup(home);
+    got
 }
 
 /// Live mode's check (live.rs), spawned by the `PostToolUse` hook with the hook's environment.
@@ -368,6 +393,10 @@ fn main() {
         ["queen", rest @ ..] => std::process::exit(borg::queen::main(rest)),
         ["notes", rest @ ..] => std::process::exit(borg::notes::main(rest, Some(borg::notes::regress_learn::after_notes))),
         ["regress", rest @ ..] => std::process::exit(borg::notes::regress_cli::main(rest)),
+        ["review-fix", rest @ ..] => {
+            borg::stats::set_purpose("learn");
+            std::process::exit(borg::review_fix::main(rest, &learn::ask_claude))
+        }
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, Harness, Probe, Transcript, Wiring};
+use super::{Caps, Harness, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
 pub const EVENTS: [(&str, &str); 6] = [
@@ -57,6 +57,116 @@ impl Harness for Claude {
 
     fn probe(&self) -> Probe {
         Probe { cli: "claude", tested: "" }
+    }
+
+    /// Workflow runs: `<projects>/<slug>/<session>/workflows/wf_*.json` (`$CLAUDE_CONFIG_DIR/projects`,
+    /// else `home/.claude/projects`).
+    fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+        let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".claude"), PathBuf::from);
+        workflow_runs(&config.join("projects"), session, since)
+    }
+}
+
+// ---------------------------------------------------------------- workflow runs
+
+/// Every workflow run under a projects directory, oldest first: of `session` only when given, from
+/// runs that started at or after `since`. Each run file lists its agents (label, phase, start); each
+/// agent's transcript is `<session>/subagents/workflows/<runId>/agent-<id>.jsonl`, its output the
+/// last `StructuredOutput` call.
+pub fn workflow_runs(projects: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+    let mut runs = Vec::new();
+    for slug in read_dir(projects) {
+        let dirs = match session {
+            Some(s) => vec![slug.join(s)],
+            None => read_dir(&slug),
+        };
+        for dir in dirs.into_iter().filter(|p| p.is_dir()) {
+            let session = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            for f in read_dir(&dir.join("workflows")).into_iter().filter(|p| p.extension().is_some_and(|e| e == "json")) {
+                let Some(run) = std::fs::read_to_string(&f).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
+                let started = run.get("startTime").map_or(0, num);
+                if since.is_none_or(|s| started >= s) {
+                    let s = |k: &str| run.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+                    runs.push(Run { id: s("runId"), session: session.clone(), name: s("workflowName"), started, agents: agents(&dir, &run) });
+                }
+            }
+        }
+    }
+    runs.sort_by_key(|r| r.started);
+    runs
+}
+
+fn read_dir(p: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(p).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).collect();
+    v.sort();
+    v
+}
+
+fn num(v: &Value) -> i64 {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0)
+}
+
+/// The agents of one run, in start order.
+fn agents(session_dir: &Path, run: &Value) -> Vec<SubAgent> {
+    let id = run.get("runId").and_then(Value::as_str).unwrap_or_default();
+    let mut out: Vec<SubAgent> = run
+        .get("workflowProgress")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("type").and_then(Value::as_str) == Some("workflow_agent"))
+        .map(|p| {
+            let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let mut a = SubAgent { label: s("label"), phase: s("phaseTitle"), started: p.get("startedAt").map_or(0, num), ..Default::default() };
+            read_agent(&session_dir.join("subagents/workflows").join(id).join(format!("agent-{}.jsonl", s("agentId"))), &mut a);
+            a
+        })
+        .collect();
+    out.sort_by_key(|a| a.started);
+    out
+}
+
+fn text_of(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Read one agent transcript into `a`: its cwd, its first user message (the prompt), every tool input
+/// and text, and its last `StructuredOutput`.
+fn read_agent(path: &Path, a: &mut SubAgent) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if a.cwd.is_empty()
+            && let Some(c) = v.get("cwd").and_then(Value::as_str)
+        {
+            a.cwd = c.to_string();
+        }
+        let Some(content) = v.get("message").and_then(|m| m.get("content")) else { continue };
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") if a.prompt.is_empty() => a.prompt = text_of(content),
+            Some("assistant") => {
+                for b in content.as_array().into_iter().flatten() {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("tool_use") if b.get("name").and_then(Value::as_str) == Some("StructuredOutput") => a.output = b.get("input").cloned(),
+                        Some("tool_use") => {
+                            a.work.push_str(&b.get("input").map(Value::to_string).unwrap_or_default());
+                            a.work.push('\n');
+                        }
+                        Some("text") => {
+                            let t = b.get("text").and_then(Value::as_str).unwrap_or_default();
+                            a.work.push_str(t);
+                            a.work.push('\n');
+                            a.final_text = t.to_string();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

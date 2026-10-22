@@ -31,8 +31,20 @@ pub fn kind_series(kinds: &[&str]) -> Vec<Series> {
         .collect()
 }
 
-const ACTIVITY: [&str; 11] =
-    ["correction", "lesson_new", "block", "changed", "ignored", "corrected", "early", "steer_issued", "pause_refused", "queen_answered", "assimilated"];
+const ACTIVITY: [&str; 12] = [
+    "correction",
+    "review_finding",
+    "lesson_new",
+    "block",
+    "changed",
+    "ignored",
+    "corrected",
+    "early",
+    "steer_issued",
+    "pause_refused",
+    "queen_answered",
+    "assimilated",
+];
 
 #[derive(Clone, PartialEq)]
 struct Fact {
@@ -188,7 +200,14 @@ pub fn Overview() -> impl IntoView {
                 sub=Signal::derive(move || format!("{} ignored · {} corrected anyway", num(t().n("ignored")), num(t().n("corrected"))))
                 spark=spark("changed") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("changed")))) color="var(--c-good)" />
             <Tile label="Corrections" value=Signal::derive(move || num(t().n("correction")))
-                sub=Signal::derive(move || format!("{} rejected tool calls this week", rejected_week.get()))
+                sub=Signal::derive(move || {
+                    let review = t().n("review_finding");
+                    if review > 0.0 {
+                        format!("{} rejected tool calls this week · {} review findings fixed before a commit", rejected_week.get(), num(review))
+                    } else {
+                        format!("{} rejected tool calls this week", rejected_week.get())
+                    }
+                })
                 spark=spark("correction") delta=Signal::derive(move || st.with(|s| delta(s, |t| t.n("correction")))) color="var(--c-heat)" up_is_good=false />
             <Tile label="Knowledge" value=Signal::derive(move || num(d.lessons.with(Vec::len) as f64))
                 sub=Signal::derive(move || {

@@ -1,0 +1,6 @@
+{"type": "session", "version": 3, "id": "FinalReview.Scout-id", "timestamp": "2026-09-15T08:00:30.000Z", "cwd": "/w/app"}
+{"type": "model_change", "id": "a", "parentId": null, "timestamp": "2026-09-15T08:00:30.000Z", "model": "m"}
+{"type": "session_init", "id": "b", "parentId": "a", "timestamp": "2026-09-15T08:00:30.000Z", "systemPrompt": "(system)", "task": "Find the client code.", "tools": ["bash", "read", "yield"], "agent": "scout"}
+{"type": "message", "id": "c", "parentId": "b", "timestamp": "2026-09-15T08:00:30.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "Find the client code."}]}}
+{"type": "message", "id": "t1", "parentId": "c", "timestamp": "2026-09-14T13:16:00.000Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "call_1", "name": "yield", "arguments": {"type": "result", "data": {"summary": "client in src/net"}}}]}}
+{"type": "message", "id": "r1", "parentId": "t1", "timestamp": "2026-09-14T13:16:01.000Z", "message": {"role": "toolResult", "toolCallId": "call_1", "toolName": "yield", "content": [{"type": "text", "text": "Result submitted."}], "details": {"data": {"summary": "client in src/net"}, "status": "success", "type": "result"}, "isError": false}}

@@ -85,6 +85,7 @@ fn borg(root: &Path, args: &[&str], stdin: &str, model: bool, env: &[(&str, &str
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_VECTORS", "off")
         .env("BORG_EARLY", "off")
+        .env("BORG_STOP_ATTENTION", "off")
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -270,7 +271,7 @@ fn a_turn_end_the_prefilter_skips_leaves_questions_pending() {
     stop(&root, "s1", false, "Renamed a CSS token.", true, &[("BORG_PREFILTER", "1000000")]);
     assert_eq!(calls(&root).len(), 1);
     assert!(store_file(&root, "state/s1.ctx").contains("#borg-skip"));
-    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked"), "{:?}", outcomes(&root));
+    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked" || o["kind"] == "graded"), "nothing judged: {:?}", outcomes(&root));
     assert!(!store_file(&root, "state/s1.cost").contains("judge "));
     // The next turn end that reaches the model judges them.
     stop(&root, "s1", false, "Wired the writer thread.", true, &[]);
@@ -292,7 +293,7 @@ fn the_word_rule_and_a_declaration_alone_write_no_outcome() {
     assert_eq!(stop(&root, "s1", true, "Revised: no lock across the await.\nLlock: applies\nLdrain: skip\n", false, &[]).trim(), "");
     stop(&root, "s1", false, "Done.", false, &[]);
     assert!(calls(&root).is_empty());
-    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked"), "{:?}", outcomes(&root));
+    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked" || o["kind"] == "graded"), "nothing judged: {:?}", outcomes(&root));
     let edits = store_file(&root, "state/s1.edits");
     assert!(edits.contains("#borg-asked Llock") || edits.contains(",Llock"), "{edits}");
     assert_eq!(edits.matches("#borg-answer ").count(), 1, "one answer per block: {edits}");

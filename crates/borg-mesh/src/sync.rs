@@ -1141,7 +1141,9 @@ mod tests {
         append_lines(&b, "lessons.jsonl", std::slice::from_ref(&l2));
         eventually("bob's lesson at alice", Duration::from_secs(10), || holds(&a, "lessons.jsonl", &l2)).await;
         assert_eq!(peers::load(&a).get(&bob.public()), Some(&addr_of(&bob)), "alice learned bob's address from his hello");
-        assert!(synced.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        // The receiver holds a lesson once its served session wrote it; the dialler's round reports
+        // `Synced` only after it closes, a moment later.
+        eventually("a successful sync round", Duration::from_secs(10), || synced.load(std::sync::atomic::Ordering::Relaxed) > 0).await;
 
         // Alice's collective turns local: her loops stop dialling, bob is turned away.
         configure(&p[0], "local");

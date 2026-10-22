@@ -565,10 +565,16 @@ pub fn learn_in_reporting(
                 }
                 // A personal lesson goes to the engineer's private collective, never into a team store (reach.rs).
                 let placed = crate::reach::place(home, &l);
+                // Where it came from, for the feed: a review finding, a later fix, or a correction.
+                let source = match &e.regret {
+                    Some(r) if regret::is_review(r) => "review",
+                    Some(_) => "regret",
+                    None => "session",
+                };
                 let (kind, why, counted_in) = match &placed {
                     crate::reach::Placed::Here(l) => {
                         let _ = append_jsonl(&lessons_path, &**l);
-                        (if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW }, "session", home.to_path_buf())
+                        (if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW }, source, home.to_path_buf())
                     }
                     crate::reach::Placed::Private(store) => (crate::stats::LESSON_NEW, "personal", store.clone()),
                     crate::reach::Placed::Dropped => (crate::stats::NOT_A_LESSON, "personal", home.to_path_buf()),
@@ -587,6 +593,22 @@ pub fn learn_in_reporting(
                 for id in contradicted {
                     let o = outcome::Outcome {
                         kind: outcome::CORRECTED.into(),
+                        session: e.session.clone(),
+                        lessons: vec![id],
+                        ms: e.ms,
+                        repo: e.repo.clone(),
+                        ..Default::default()
+                    };
+                    let _ = outcome::append(&outcomes_path, &o);
+                    outcomes.push(o);
+                }
+                let missed = match track {
+                    true => outcome::missed(&outcomes, &e.session, e.ms, target, &l.supersedes),
+                    false => Vec::new(),
+                };
+                for id in missed {
+                    let o = outcome::Outcome {
+                        kind: outcome::MISSED.into(),
                         session: e.session.clone(),
                         lessons: vec![id],
                         ms: e.ms,
@@ -741,6 +763,40 @@ mod tests {
         append_jsonl(&home.join("episodes.jsonl"), &at("e1", "s1", 20, "bob@x", "no, CAS on the flag supersede:Le0")).unwrap();
         assert_eq!(learn_in(&home, Some("s1"), &fake_ask, true, 30), (1, 0, 0));
         assert_eq!(results(&home), [(outcome::CORRECTED.into(), "s1".into(), "Le0".into())]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_correction_of_a_lesson_that_applied_but_was_not_asked_is_a_miss() {
+        let home = temp_home("missed");
+        for e in [at("e0", "s0", 1, "ann@x", "use the lock on the flag"), at("e1", "s0", 2, "bob@x", "retry with jitter")] {
+            append_jsonl(&home.join("episodes.jsonl"), &e).unwrap();
+        }
+        learn_in(&home, Some("s0"), &fake_ask, true, 3);
+        // s1's check graded both as applying and chose to ask only Le1; the engineer then corrects the
+        // drone on Le0's concern: Le0 was needed and not asked.
+        let graded = outcome::Outcome {
+            kind: outcome::GRADED.into(),
+            session: "s1".into(),
+            lessons: vec!["Le0".into(), "Le1".into()],
+            ms: 10,
+            repo: "r".into(),
+            grades: vec![2, 3],
+            ranks: vec![0, 1],
+            applied: 2,
+            chosen: vec!["Le1".into()],
+            ..Default::default()
+        };
+        outcome::append(&home.join("outcomes.jsonl"), &graded).unwrap();
+        asked(&home, "s1", 11, &["Le1"]);
+        append_jsonl(&home.join("episodes.jsonl"), &at("e2", "s1", 20, "cy@x", "no, the lock on the flag merge:Le0")).unwrap();
+        assert_eq!(learn_in(&home, Some("s1"), &fake_ask, true, 30), (0, 1, 0));
+        let r = results(&home);
+        assert!(r.contains(&(outcome::MISSED.into(), "s1".into(), "Le0".into())), "{r:?}");
+        // The asked one is not a miss; a second run records nothing new.
+        assert!(!r.iter().any(|(k, _, l)| k == outcome::MISSED && l == "Le1"), "{r:?}");
+        learn_in(&home, Some("s1"), &fake_ask, true, 40);
+        assert_eq!(results(&home).iter().filter(|(k, ..)| k == outcome::MISSED).count(), 1);
         let _ = std::fs::remove_dir_all(home);
     }
 

@@ -52,6 +52,47 @@ pub trait Harness: Sync {
     fn install_notes(&self) -> Vec<String> {
         Vec::new()
     }
+    /// The groups of sub-agents its sessions ran under `home` (review_fix.rs), oldest first: of
+    /// `session` only (as its end hook names it), else of every session, from runs that started at
+    /// or after `since` (epoch ms). Default: none.
+    fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
+        Vec::new()
+    }
+}
+
+/// One sub-agent of a [`Run`], as its transcript shows it.
+#[derive(Debug, Clone, Default)]
+pub struct SubAgent {
+    /// What the run calls it (`review:rust`, `MappingReview`, a task's description).
+    pub label: String,
+    /// Its workflow phase (`Review`, `Fix`); empty where the harness has none.
+    pub phase: String,
+    /// Its agent type (`reviewer`, `task`, `explore`); empty where the harness has none.
+    pub kind: String,
+    /// Epoch ms.
+    pub started: i64,
+    pub cwd: String,
+    pub prompt: String,
+    /// Every tool input and text it produced.
+    pub work: String,
+    /// Its last text to whoever started it: its answer (where a harness has no structured output, the
+    /// only place findings can be).
+    pub final_text: String,
+    /// Its structured output; None where it gave text only.
+    pub output: Option<Value>,
+}
+
+/// The sub-agents one session ran together: a Claude Code workflow run, an omp session's task agents,
+/// an opencode session's subagents.
+#[derive(Debug, Clone, Default)]
+pub struct Run {
+    pub id: String,
+    pub session: String,
+    /// The workflow's or the session's name; may be empty.
+    pub name: String,
+    pub started: i64,
+    /// In start order.
+    pub agents: Vec<SubAgent>,
 }
 
 /// What a harness can do with borg's answers, and what it sends. Each flag gates one behaviour of the
@@ -158,7 +199,12 @@ pub fn names(sep: &str) -> String {
 
 /// The drone's harness in a process its hook started (`BORG_HARNESS`, `borg check`), else the first.
 pub fn current() -> &'static dyn Harness {
-    std::env::var("BORG_HARNESS").ok().and_then(|n| by_name(&n)).unwrap_or(ALL[0])
+    named_current().unwrap_or(ALL[0])
+}
+
+/// The drone's harness when its hook named it (`BORG_HARNESS`), else None.
+pub fn named_current() -> Option<&'static dyn Harness> {
+    std::env::var("BORG_HARNESS").ok().and_then(|n| by_name(&n))
 }
 
 /// The event's transcript, when the harness writes one and the event names it.

@@ -1,0 +1,44 @@
+{
+ "info": {
+  "id": "ses_2review000000000000000000",
+  "parentID": "ses_2root0000000000000000000",
+  "location": {
+   "directory": "/w/app"
+  },
+  "title": "review queue"
+ },
+ "messages": [
+  {
+   "id": "c1",
+   "time": {
+    "created": 1791977770000
+   },
+   "type": "user",
+   "text": "Review src/queue.rs; answer in JSON."
+  },
+  {
+   "id": "c2",
+   "time": {
+    "created": 1791977771000
+   },
+   "type": "assistant",
+   "agent": "review",
+   "content": [
+    {
+     "type": "tool",
+     "name": "read",
+     "state": {
+      "status": "completed",
+      "input": {
+       "path": "/w/app/src/queue.rs"
+      }
+     }
+    },
+    {
+     "type": "text",
+     "text": "{\"issues\": [{\"problem\": \"Queue bound is checked after the push\", \"severity\": \"medium\", \"where\": \"src/queue.rs:40\"}]}"
+    }
+   ]
+  }
+ ]
+}

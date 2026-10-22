@@ -60,6 +60,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `early`, `queued_free` | Lessons handed over free at a prompt or touch |
 | `changed`, `ignored`, `corrected`, `not_corrected` | What happened after a lesson was asked: used, ignored, corrected anyway, or no correction followed |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
+| `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
 | `steer_issued`, `steer_delivered`, `steer_dropped` | A signed directive sent, shown to a drone, or refused on receipt |
