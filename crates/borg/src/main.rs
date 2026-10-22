@@ -39,6 +39,9 @@
 //!                   | skip <n|id> | next --json | dedupe [--apply] | notify   [--dir DIR | --collective NAME]
 //!                                                     (open questions to the engineer, numbered; an answer becomes a
 //!                                                      lesson, a dismissal none; --json for drones; queen.rs)
+//!        borg hive init|board|join|leave|open|claim|progress|release|block|done|verify|contract [--session ID] [--dir DIR]
+//!                                                     (many drones, one goal, local spike: a board of leased tasks, contracts
+//!                                                      between drones, done gated by the goal's oracle; hive/mod.rs)
 //!        borg trust [--dir DIR]                      (trust per engineer x area in the collective DIR routes to; trust.rs)
 //!        borg top [--dir DIR] [--watch] [--json]      (the drones of each collective, local and remote; top.rs)
 //!        borg steer <drone|session|all> "<text>" | --pause | --resume [--dir DIR]
@@ -99,6 +102,8 @@
 //!                    maps to a known system, lessons scoped to other systems score 0 (systems.rs)
 //!   BORG_CONCEPTS    "on" (spike) boosts lessons sharing engineering concepts with the work (concepts.rs);
 //!                    BORG_CONCEPTS_BETA its strength (default 0.5)
+//!   BORG_HIVE        a hive goal id: the session joins that goal at its first hook (hive/mod.rs; the
+//!                    hive runner sets it on each drone); unknown goals are ignored
 //!   BORG_QUEEN       "on" lets the Stop hook ask the engineer (queen.rs); off by default (the queen
 //!                    test failed its pre-registered bar, internal evaluation "queen-test", not published)
 //!   BORG_QUEEN_ASK  "off" disables queen questions in the harness: the first prompt of a session in a repo
@@ -187,6 +192,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("mesh <command>", "sync with team members (borg mesh --help)"),
             ("steer <drone|all> <text> | --pause | --resume", "a signed instruction to running drones"),
+            ("hive init|board|join|claim|done|...", "many drones, one goal: the board, claims and contracts"),
         ],
     ),
     (
@@ -406,6 +412,7 @@ fn main() {
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
+        ["hive", rest @ ..] => std::process::exit(borg::hive::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1))),

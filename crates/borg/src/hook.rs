@@ -17,7 +17,7 @@ use crate::harness::{self, Harness};
 use crate::learn::learning;
 use crate::{collective, conscience, learn, live, outcome, predict, prefilter};
 
-fn state_file(session: &str) -> PathBuf {
+pub(crate) fn state_file(session: &str) -> PathBuf {
     let dir = PathBuf::from(std::env::var("BORG_STATE").unwrap_or_else(|_| "/tmp/borg".into()));
     let _ = std::fs::create_dir_all(&dir);
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
@@ -26,14 +26,14 @@ fn state_file(session: &str) -> PathBuf {
 
 /// One line (or several, kept together) at the end of the state file, in one write: a check running in
 /// the background appends to the same file, and its lines never land between these.
-fn append(session: &str, text: &str) {
+pub(crate) fn append(session: &str, text: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state_file(session)) {
         let _ = f.write_all(format!("{text}\n").as_bytes());
     }
 }
 
 /// What a tool call touched, as text for matching: paths and search patterns.
-fn touched(input: &Value, tool: &str) -> String {
+pub(crate) fn touched(input: &Value, tool: &str) -> String {
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     match tool {
         "Bash" => {
@@ -64,7 +64,7 @@ fn further_files(input: &Value) -> impl Iterator<Item = &str> {
     input.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e.get("file_path").and_then(Value::as_str)).filter(|p| !p.is_empty())
 }
 
-fn repo_of(cwd: &str) -> String {
+pub(crate) fn repo_of(cwd: &str) -> String {
     borg_trace::repo_key(cwd).rsplit('/').next().unwrap_or_default().to_string()
 }
 
@@ -303,7 +303,7 @@ fn early_acted(session: &str, all: &[conscience::Challenge], final_msg: &str) ->
 
 /// An edit tool's paths (every file it names, so the cut never drops one) and the start of its new
 /// text, on one line; None for other tools.
-fn edit_text(tool: &str, input: &Value) -> Option<String> {
+pub(crate) fn edit_text(tool: &str, input: &Value) -> Option<String> {
     if !["edit", "write", "multiedit", "notebookedit"].contains(&tool.to_ascii_lowercase().as_str()) {
         return None;
     }
@@ -325,7 +325,7 @@ fn edit_text(tool: &str, input: &Value) -> Option<String> {
 }
 
 /// `text` on one line, at most `n` characters.
-fn one_line(text: &str, n: usize) -> String {
+pub(crate) fn one_line(text: &str, n: usize) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(n).collect()
 }
 
@@ -457,7 +457,7 @@ fn live_asked(text: &str) -> std::collections::HashSet<&str> {
 }
 
 /// Ids listed on the state file's `marker` lines (`#borg-asked a,b`).
-fn listed<'a>(context: &'a str, marker: &str) -> std::collections::HashSet<&'a str> {
+pub(crate) fn listed<'a>(context: &'a str, marker: &str) -> std::collections::HashSet<&'a str> {
     context.lines().filter_map(|l| l.strip_prefix(marker)).flat_map(|ids| ids.split(',')).map(str::trim).filter(|i| !i.is_empty()).collect()
 }
 
@@ -1417,10 +1417,14 @@ pub fn main(name: &str, event: &str) {
         "pre_tool" => return,
         _ => crate::presence::touch(&home, &name, h.name(), event, &input, now),
     };
+    // A drone launched into a hive goal (BORG_HIVE) joins it at its first hook (hive/mod.rs).
+    crate::hive::bind_from_env(&home, session);
     // Signed steering (steer.rs) wraps the answer: shown once, and a pause holds tools and the stop.
-    // At a stop, the routed collective's experts join the conscience's block (expert_route.rs).
+    // Inside it the hive (hive/mod.rs): the drone's claim and board at a prompt, its oracle at the stop;
+    // nothing for a session in no hive goal. At a stop, the routed collective's experts join the
+    // conscience's block (expert_route.rs).
     if let Some(out) = crate::steer::around(&home, h.caps().steer_in_context, event, &input, me.map(|p| p.started), now, || {
-        crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input))
+        crate::hive::around(h, &home, event, &input, now, || crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input)))
     }) {
         println!("{out}");
     }

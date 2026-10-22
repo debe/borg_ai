@@ -200,6 +200,7 @@ pub fn propose(home: &Path, lesson: &learn::Lesson, invariant: &str, e: &learn::
         disagreeing: Vec::new(),
         dismissed: None,
         dismissed_ms: None,
+        payload: None,
     };
     queen::seed(home, &entry)
 }

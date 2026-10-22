@@ -273,6 +273,7 @@ pub fn apply(home: &Path, plan: &[Verdict], cfg: Option<&crate::collective::Conf
                     disagreeing: Vec::new(),
                     dismissed: None,
                     dismissed_ms: None,
+                    payload: None,
                 };
                 if crate::queen::seed(home, &e).map_err(|e| e.to_string())? {
                     done.asked += 1;

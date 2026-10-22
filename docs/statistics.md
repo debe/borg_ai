@@ -70,6 +70,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `pause_refused` | A tool call refused because its drone was paused |
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
+| `hive_claim`, `hive_done`, `hive_oracle_fail`, `hive_released`, `hive_shown` | The hive ([Hive](commands.md#hive)): a claim taken, a task's oracle passed and its done published, a stop blocked by a failing oracle, a claim released at a session's end, board context shown to a drone (with the contract ids it showed); each names its goal |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.
 

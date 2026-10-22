@@ -1,6 +1,6 @@
 ---
 name: borg
-description: How borg works and how to run it for the engineer. Use when the engineer mentions borg, a collective, a lesson, a drone, the queen, the mesh, team sync, vectors or collectives.json, asks why borg blocked or asked something, which later commit fixed a decision, wants to set up borg, add or keep a repo out of a collective, share lessons with a team or company, or fix what borg doctor reports.
+description: How borg works and how to run it for the engineer. Use when the engineer mentions borg, a collective, a lesson, a drone, the queen, a hive goal or its board, the mesh, team sync, vectors or collectives.json, asks why borg blocked or asked something, which later commit fixed a decision, wants to set up borg, add or keep a repo out of a collective, share lessons with a team or company, or fix what borg doctor reports.
 ---
 
 # borg
@@ -42,7 +42,15 @@ on this machine unless the collective they belong to is synced with a team over 
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
 | Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` |
+| Several drones on one goal (a hive: board, claims, contracts) | `borg hive board`, `borg hive init <goal> ...`, `borg hive join <goal> --session <drone>` |
 | Every command | `borg help`, `borg mesh --help` |
+
+**Hive (a local spike).** When the engineer mentions a hive, a goal or the board: `borg hive board` shows
+the tasks and who holds them; `borg hive init <goal> --spec ... --oracle NAME=CMD --budget USD --task
+"ID|role|title|files|deps"` makes a goal (show the engineer the oracle first: it decides "done");
+`borg hive join <goal> --session <drone>` or `BORG_HIVE=<goal>` brings a drone in; `borg hive open <goal>
+--id ID --again` reopens a blocked task. A drone in a goal finds its own commands (claim, done, verify,
+contract) in its hook context. Details: `docs/commands.md#hive`.
 
 ## Safety rules
 

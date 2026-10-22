@@ -68,6 +68,10 @@ pub enum Kind {
     /// collective. Queued by `borg learn`, not a checkpoint; only an engineer's answer ratifies it, and
     /// the default keeps it a lesson only.
     Constraint,
+    /// A drone's change to another drone's hive contract (hive/contract.rs `publish`). Queued by the
+    /// drone's `borg hive contract --supersedes`, not a checkpoint; only an engineer's answer lets it
+    /// supersede, and the default keeps the current contract.
+    Contract,
 }
 
 impl Kind {
@@ -80,6 +84,7 @@ impl Kind {
             Kind::OpenDecision => "a decision the team's documents leave open",
             Kind::Reach => "who should hear a lesson",
             Kind::Constraint => "an invariant proposed as a constraint",
+            Kind::Contract => "a change to another drone's contract",
         }
     }
 
@@ -94,6 +99,7 @@ impl Kind {
             Kind::OpenDecision => ("keep the documented interim rule", "decide it now"),
             Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
             Kind::Constraint => (crate::veto::KEEP_OPTION, crate::veto::RATIFY_OPTION),
+            Kind::Contract => (crate::hive::contract::KEEP_OPTION, crate::hive::contract::SUPERSEDE_OPTION),
         }
     }
 }
@@ -383,6 +389,10 @@ pub struct Entry {
     pub dismissed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_ms: Option<i64>,
+    /// What answering acts on, for a kind that carries more than its question (a `Contract`: the goal
+    /// and the proposed contract); None on every other kind and on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 
 pub fn dir(store: &Path) -> PathBuf {
@@ -496,7 +506,7 @@ pub fn within_budget(store: &Path, engineer: &str, session: &str) -> bool {
 /// questions and proposed constraints use none.
 pub fn budget_allows(asked: &[Entry], seen: &[Seen], engineer: &str, session: &str, aliases: &collective::Aliases) -> bool {
     let me = aliases.canon(engineer);
-    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint));
+    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract));
     let Some(last) = sent.filter(|e| aliases.canon(&e.engineer) == me).max_by_key(|e| e.ms) else { return true };
     if last.session == session {
         return false; // one message per session at most
@@ -656,6 +666,7 @@ pub fn decide(cp: &Checkpoint, asked: &[Entry], budget: impl FnOnce() -> bool, l
             disagreeing,
             dismissed: None,
             dismissed_ms: None,
+            payload: None,
         });
     }
     ask
@@ -778,6 +789,8 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     // its veto is a lesson already, and ratifying it writes the constraint (veto.rs).
     if e.kind == Kind::Constraint {
         crate::veto::ratify(store, &e, text, author, now)?;
+    } else if e.kind == Kind::Contract {
+        crate::hive::contract::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Reach {
         crate::reach::answer(store, &e, text)?;
     } else {
@@ -793,7 +806,7 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
         ev.text = crate::stats::excerpt(text, 160);
     });
-    if !matches!(e.kind, Kind::Reach | Kind::Constraint) {
+    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Contract) {
         counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
             ev.engineer = author.into();
             ev.why = "queen".into();
@@ -1155,12 +1168,13 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
     // Queued in an earlier session (or imported from a document): the drone must not take a checkpoint
     // question's quoted plan for its own.
     let (question, origin) = match q.question.strip_prefix("The drone's plan says: ") {
-        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint) => {
+        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract) => {
             (format!("An earlier session's plan said: {rest}"), "queued by an earlier session")
         }
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
         _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
         _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
+        _ if q.kind == Kind::Contract => (q.question.clone(), "proposed by a drone of a hive goal"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1348,7 +1362,7 @@ pub fn ask_loop(store: &Path, input: &mut dyn std::io::BufRead, out: &mut dyn Wr
 }
 
 /// The terminal's width in columns: `COLUMNS`, else the terminal of stdout, else none (no cut).
-fn width() -> usize {
+pub(crate) fn width() -> usize {
     if let Some(w) = std::env::var("COLUMNS").ok().and_then(|c| c.trim().parse::<usize>().ok()).filter(|w| *w > 20) {
         return w;
     }
@@ -1501,6 +1515,13 @@ pub fn main(args: &[&str]) -> i32 {
                     match e.answer.as_deref().is_some_and(|a| a.trim().to_lowercase().starts_with("ratify")) {
                         true => println!("{} answered: constraint added to {}", e.id, crate::veto::constraints_path(&store).display()),
                         false => println!("{} answered: kept as a lesson only", e.id),
+                    }
+                    0
+                }
+                Ok(e) if e.kind == Kind::Contract => {
+                    match e.answer.as_deref().is_some_and(crate::hive::contract::supersedes_answer) {
+                        true => println!("{} answered: the drone's contract supersedes the other one", e.id),
+                        false => println!("{} answered: the current contract stays", e.id),
                     }
                     0
                 }
@@ -1968,6 +1989,7 @@ mod tests {
             disagreeing: vec![],
             dismissed: None,
             dismissed_ms: None,
+            payload: None,
         }
     }
 

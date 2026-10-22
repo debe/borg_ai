@@ -424,13 +424,20 @@ fn codex(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Option
 }
 
 /// Stdout of `cmd` (fed `input` on stdin), or None when it cannot start or fails to finish within
-/// `timeout` (then killed).
+/// `timeout` (then killed). `run_capped_status` without the exit status.
+pub fn run_capped(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Vec<u8>> {
+    run_capped_status(cmd, input, timeout).map(|(_, out)| out)
+}
+
+/// The exit status and stdout of `cmd` (fed `input` on stdin), or None when it cannot start or fails
+/// to finish within `timeout` (then killed). Stderr is discarded: a caller that wants it merges it
+/// into stdout in the command itself (hive/oracle.rs runs `sh -c` with `exec 2>&1`).
 ///
 /// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
 /// `cmd` exits (nothing it started, such as an MCP server, outlives it). On Linux it also dies with
 /// this process: a harness that kills `borg` (its own hook timeout) never leaves a model call running
 /// and spending.
-pub fn run_capped(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Vec<u8>> {
+pub fn run_capped_status(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<(std::process::ExitStatus, Vec<u8>)> {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
@@ -468,9 +475,9 @@ pub fn run_capped(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> 
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 kill_group(); // a straggler holding stdout open would block the reader forever
-                return reader.join().ok();
+                return reader.join().ok().map(|out| (status, out));
             }
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
             _ => {
@@ -784,5 +791,22 @@ mod tests {
         let mut cat = Command::new("cat");
         cat.arg("-");
         assert_eq!(run_capped(cat, Some(b"{}"), Duration::from_secs(5)).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn run_capped_status_returns_the_exit_status_and_run_capped_drops_it() {
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let (ok, out) = run_capped_status(sh("echo yes"), None, Duration::from_secs(5)).unwrap();
+        assert!(ok.success());
+        assert_eq!(out, b"yes\n");
+        let (failed, out) = run_capped_status(sh("echo no; exit 3"), None, Duration::from_secs(5)).unwrap();
+        assert_eq!((failed.code(), out.as_slice()), (Some(3), b"no\n".as_slice()));
+        // A failing command still has its stdout through run_capped, as before.
+        assert_eq!(run_capped(sh("echo no; exit 3"), None, Duration::from_secs(5)).unwrap(), b"no\n");
+        assert!(run_capped_status(sh("sleep 5"), None, Duration::from_millis(200)).is_none());
     }
 }

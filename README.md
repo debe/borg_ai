@@ -371,6 +371,14 @@ Borg runs on its own. These commands show what it does:
 | `borg regress --replay A..B` | Which earlier decisions the commits of a range fixed (dry run) |
 | `borg web` | A live page of the knowledge and what the collective did, on 127.0.0.1 |
 
+**Hive (spike, preparation).** `borg hive` lets many drones work on one goal: a board of tasks with
+leased claims, contracts between drones, and done gated by the goal's oracle (shell checks run at the
+stop). It is a local, file-backed spike with no mesh sync. Its value metric (solve rate and wall-clock
+time at the same dollars as one session with subagents) is still to be measured by the H1 pilot
+([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)); until
+then it is preparation, not a claimed win. A session that never joins a goal sees no change.
+[Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive).
+
 All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).
 
 ## Cost

@@ -109,7 +109,7 @@ pub type Drone<'a> = &'a dyn Fn(&Path, &str, Duration) -> DroneRun;
 pub const DEFAULT_STOP_BUDGET: Duration = crate::harness::DEFAULT_STOP_BUDGET;
 pub const STOP_BUDGET_ENV: &str = "BORG_STOP_BUDGET_MS";
 /// Time kept back from the budget for the rest of the hook (merge, log, print).
-const STOP_MARGIN: Duration = Duration::from_secs(5);
+pub(crate) const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// Less time than this left: no drone (it could not finish an answer anyway).
 const DRONE_MIN: Duration = Duration::from_secs(10);
 

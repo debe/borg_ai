@@ -590,6 +590,7 @@ pub fn build(repo: &str, cwd: &str, c: &Chunk, v: &Value, prov: &Provenance, now
             disagreeing: Vec::new(),
             dismissed: None,
             dismissed_ms: None,
+            payload: None,
         });
     }
     let skip = crate::assimilate::skip_words();

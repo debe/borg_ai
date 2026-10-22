@@ -74,6 +74,14 @@ pub const QUEEN_SKIPPED: &str = "queen_skipped";
 pub const QUEEN_DISMISSED: &str = "queen_dismissed";
 /// One imported chunk of team documents (`n`: lessons, `usd`).
 pub const ASSIMILATED: &str = "assimilated";
+/// The hive (hive/mod.rs; `why`: the goal, `text`: the task): a claim taken, a task's oracle passed and
+/// its `done` published, a stop blocked because the oracle failed, a claim released at the session's
+/// end, and board context shown to a drone (`lessons`: the contract ids shown).
+pub const HIVE_CLAIM: &str = "hive_claim";
+pub const HIVE_DONE: &str = "hive_done";
+pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
+pub const HIVE_RELEASED: &str = "hive_released";
+pub const HIVE_SHOWN: &str = "hive_shown";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {

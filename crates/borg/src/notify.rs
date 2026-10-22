@@ -70,6 +70,7 @@ mod tests {
             disagreeing: vec![],
             dismissed: None,
             dismissed_ms: None,
+            payload: None,
         }
     }
 

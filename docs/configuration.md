@@ -430,6 +430,12 @@ project.
 | `BORG_QUEEN_ASK` | on | `off`: the drone asks no queued question at a session's first prompt (also off with `BORG_LEARN=off`) |
 | `BORG_NOTIFY` | on | `off`: no desktop notification (`notify-send`) for new questions |
 
+**Hive** (local spike; [Hive](commands.md#hive))
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored) |
+
 **Experimental**, off by default. Most failed a pre-registered test and stay for further experiments.
 
 | Variable | Effect when `on` |
