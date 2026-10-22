@@ -62,9 +62,20 @@ pub fn reason_in(prompt: &str) -> Option<String> {
 /// The lessons the drone was shown in `session` so far, sorted and unique: its `asked` outcomes (stop
 /// or live) and its stats events of the delivering kinds (early, queued, live asks, blocks).
 pub fn shown(home: &Path, session: &str) -> Vec<String> {
+    shown_between(home, session, i64::MIN, i64::MAX)
+}
+
+/// `shown`, of the records and events at `from_ms..=to_ms` only: what a hive drone was shown while it
+/// held a claim (hive/verdict.rs credits them with the task's verdict).
+pub fn shown_between(home: &Path, session: &str, from_ms: i64, to_ms: i64) -> Vec<String> {
     const DELIVERED: [&str; 4] = [stats::EARLY, stats::QUEUED_FREE, stats::LIVE_ASK, stats::BLOCK];
-    let asked = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| o.kind == outcome::ASKED && o.session == session).flat_map(|o| o.lessons);
-    let delivered = stats::events(home).into_iter().filter(|e| e.session == session && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
+    let within = |ms: i64| (from_ms..=to_ms).contains(&ms);
+    let asked = outcome::read(&home.join("outcomes.jsonl"))
+        .into_iter()
+        .filter(|o| o.kind == outcome::ASKED && o.session == session && within(o.ms))
+        .flat_map(|o| o.lessons);
+    let delivered =
+        stats::events(home).into_iter().filter(|e| e.session == session && within(e.ms) && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
     let mut out: Vec<String> = asked.chain(delivered).filter(|l| !l.is_empty()).collect();
     out.sort();
     out.dedup();
@@ -331,6 +342,25 @@ mod tests {
         assert_eq!(reason_in("borg no"), None);
         assert_eq!(reason_in("borg no: ok"), None, "too short a reason");
         assert_eq!(reason_in(&format!("borg no {}", "x".repeat(2000))).map(|r| r.chars().count()), Some(1500));
+    }
+
+    #[test]
+    fn shown_between_keeps_the_window_inclusive() {
+        let home = temp("window");
+        for (ms, l) in [(10, "A"), (20, "B"), (30, "C")] {
+            let o = Outcome { kind: outcome::ASKED.into(), session: "s".into(), lessons: vec![l.into()], ms, repo: "r".into(), ..Default::default() };
+            outcome::append(&home.join("outcomes.jsonl"), &o).unwrap();
+        }
+        let mut early = stats::Event::new(stats::EARLY, 25);
+        early.session = "s".into();
+        early.lessons = vec!["E".into()];
+        stats::record(&home, &early);
+        assert_eq!(shown_between(&home, "s", 20, 30), ["B", "C", "E"], "both bounds are in");
+        assert_eq!(shown_between(&home, "s", 11, 19), Vec::<String>::new());
+        assert_eq!(shown_between(&home, "s", i64::MIN, 10), ["A"]);
+        assert_eq!(shown(&home, "s"), ["A", "B", "C", "E"]);
+        assert!(shown_between(&home, "t", i64::MIN, i64::MAX).is_empty());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn drone(session: &str, repo: &str, state: State, ms: i64, node: &str, number: usize) -> top::Drone {

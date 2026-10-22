@@ -77,6 +77,10 @@ pub struct Task {
     /// Sessions that may not claim it: the work's author, for a verify task.
     #[serde(default)]
     pub not_by: Vec<String>,
+    /// A verify task's guard flags: what the work's author did to tests, CI or oracle files while it
+    /// held the claim (hive/guard.rs `render`), shown to the verifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,14 +130,39 @@ pub struct Event {
     /// A progress, rejection, block or done summary.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// On `rejected`: whether the verifier found the oracle gamed (set by the reward step; None in H1).
+    /// On `rejected`: the work changed protected files (tests or CI it was not scoped to) or touched
+    /// the oracle's (hive/verdict.rs `decide`), whatever the verifier said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hacked: Option<bool>,
+    /// On a claim of a work task: a commit of the claimant's working tree then (hive/verdict.rs
+    /// `snapshot`); on its `done`, `head`, the same at the done. The verdict diffs the two.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head: String,
+    /// On a claim: the drone the session is one iteration of (`borg hive run` names it, hive/run.rs);
+    /// empty for a session of its own. A verify task barred to an author drone is barred to all its
+    /// sessions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub drone: String,
 }
 
 impl Event {
     pub fn new(ev: Ev, task: &str, by: &str, ms: i64) -> Event {
-        Event { v: 1, ev, task: task.into(), ms, by: by.into(), node: String::new(), def: None, note: String::new(), hacked: None }
+        Event {
+            v: 1,
+            ev,
+            task: task.into(),
+            ms,
+            by: by.into(),
+            node: String::new(),
+            def: None,
+            note: String::new(),
+            hacked: None,
+            drone: String::new(),
+            base: String::new(),
+            head: String::new(),
+        }
     }
 
     pub fn open(t: Task, by: &str, ms: i64) -> Event {
@@ -142,6 +171,11 @@ impl Event {
 
     pub fn with_note(mut self, note: &str) -> Event {
         self.note = note.into();
+        self
+    }
+
+    pub fn with_drone(mut self, drone: &str) -> Event {
+        self.drone = drone.into();
         self
     }
 }
@@ -232,6 +266,21 @@ pub struct Board {
     /// Claims that lost a race or were invalid: (by, task, ms).
     pub lost: Vec<(String, TaskId, i64)>,
     pub spans: Vec<Span>,
+    /// The drone each session claimed as (`Event::drone`): session -> drone.
+    pub drones: BTreeMap<String, String>,
+}
+
+impl Board {
+    /// Whether `t` is barred to `session`: by its id, or by the drone it claims as.
+    pub fn barred(&self, t: &Task, session: &str) -> bool {
+        t.not_by.iter().any(|n| n == session || self.drones.get(session).is_some_and(|d| d == n))
+    }
+
+    /// The goal is reached: there are tasks, and every one is verified (a work task by its verify task,
+    /// a verify task by its verdict).
+    pub fn finished(&self) -> bool {
+        !self.tasks.is_empty() && self.tasks.values().all(|s| matches!(s.status, Status::Verified { .. }))
+    }
 }
 
 /// Appends `events` in one write(2) with O_APPEND: lines written together (a done and its verify
@@ -309,11 +358,18 @@ pub fn by_engineer(by: &str) -> bool {
 
 /// The board the events say, the same in any arrival order (see the module doc).
 pub fn fold(events: &[Event]) -> Board {
-    // Within one ms an open goes first: a task opened and claimed at once is claimed open.
-    type Key = (i64, bool, [u8; 32], [u8; 32]);
-    let mut keyed: Vec<(Key, &Event)> = events.iter().map(|e| ((e.ms, e.ev != Ev::Open, rank(e), line_hash(e)), e)).collect();
+    // Within one ms an open goes first (a task opened and claimed at once is claimed open), except a
+    // verify task's open, which goes after the `done` written with it: it takes effect only on a done
+    // the fold took.
+    type Key = (i64, u8, [u8; 32], [u8; 32]);
+    let order = |e: &Event| match (e.ev, e.def.as_ref().and_then(|d| d.of.as_ref())) {
+        (Ev::Open, None) => 0,
+        (Ev::Open, Some(_)) => 2,
+        _ => 1,
+    };
+    let mut keyed: Vec<(Key, &Event)> = events.iter().map(|e| ((e.ms, order(e), rank(e), line_hash(e)), e)).collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut b = Board::default();
+    let mut b = Board { drones: events.iter().filter(|e| !e.drone.is_empty()).map(|e| (e.by.clone(), e.drone.clone())).collect(), ..Board::default() };
     // The open span of each task's holder, by task: an index into `b.spans`.
     let mut open_span: BTreeMap<TaskId, usize> = BTreeMap::new();
     for (_, e) in keyed {
@@ -347,6 +403,14 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
     match e.ev {
         Ev::Open => {
             let Some(def) = e.def.as_ref().filter(|d| d.id == e.task) else { return };
+            // A verify task's open is part of its work's `done` (same session, same ms): a done the
+            // fold ignored (the lease had passed to another drone) opens nothing, so the verify task
+            // and its bar are those of the done that took effect.
+            if let Some(w) = def.of.as_ref()
+                && !matches!(b.tasks.get(w).map(|s| &s.status), Some(Status::Done { by, ms }) if *by == e.by && *ms == e.ms)
+            {
+                return;
+            }
             match b.tasks.get_mut(&e.task) {
                 None => {
                     let s = TaskState {
@@ -379,7 +443,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 }
                 return;
             }
-            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || s.task.not_by.contains(&e.by) {
+            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(&s.task, &e.by) {
                 b.lost.push((e.by.clone(), e.task.clone(), e.ms));
                 return;
             }
@@ -475,7 +539,7 @@ pub fn lost_since(b: &Board, session: &str, ms: i64) -> Vec<TaskId> {
 /// Whether `session` may claim `s` at `now` (the fold's rules a-c: open or expired, dependencies
 /// verified, not barred).
 pub fn claimable_by(b: &Board, s: &TaskState, session: &str, now: i64) -> bool {
-    s.claimable(now) && deps_met(&b.tasks, &s.task) && !s.task.not_by.iter().any(|n| n == session)
+    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(&s.task, session)
 }
 
 /// The task `session` in `repo` should take next at `now`, among those `allowed` lets it claim: its
@@ -582,6 +646,7 @@ mod tests {
             accept: vec![],
             of: None,
             not_by: vec![],
+            flags: vec![],
         }
     }
 
@@ -693,6 +758,22 @@ mod tests {
         assert_eq!(holder_of(&b, "t1.v1"), None);
         assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", 3));
         assert_eq!(b.tasks["t1"].author.as_deref(), Some("sa"));
+    }
+
+    #[test]
+    fn a_verify_task_barred_to_a_drone_is_barred_to_every_session_of_it() {
+        let mut v = verify("t1", "sa", 2);
+        v.not_by.push("d1".into());
+        let base =
+            vec![Event::open(task("t1"), "engineer:e", 0), ev(Ev::Claim, "t1", "sa", 1).with_drone("d1"), ev(Ev::Done, "t1", "sa", 2), Event::open(v, "sa", 2)];
+        // A later iteration of d1 (a new session) claims the verify task: it does not take effect.
+        let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa2", 3).with_drone("d1")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1"), None);
+        assert!(b.barred(&b.tasks["t1.v1"].task, "sa2") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", 3));
+        let b = fold(&[base, vec![ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d2"), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat());
+        assert_eq!(holder_of(&b, "t1.v1"), None);
+        assert!(b.finished(), "every task verified");
+        assert!(!Board::default().finished(), "an empty board is not a reached goal");
     }
 
     #[test]

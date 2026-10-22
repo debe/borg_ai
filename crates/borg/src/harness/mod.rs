@@ -58,6 +58,38 @@ pub trait Harness: Sync {
     fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
         Vec::new()
     }
+    /// The command that runs one headless drone session (`borg hive run`, hive/run.rs), with the
+    /// engineer's hooks on so borg's own hooks run in it; None: the harness's CLI cannot.
+    fn headless(&self, _run: &Headless) -> Option<std::process::Command> {
+        None
+    }
+    /// What a headless session's stdout says it cost and answered. Default: nothing known.
+    fn headless_end(&self, _out: &[u8]) -> HeadlessEnd {
+        HeadlessEnd::default()
+    }
+}
+
+/// One headless drone session the hive runner starts (hive/run.rs).
+pub struct Headless<'a> {
+    pub prompt: &'a str,
+    pub cwd: &'a Path,
+    pub model: Option<&'a str>,
+    /// The session id to run under, where the CLI takes one (a UUID); else the CLI picks its own and
+    /// [`HeadlessEnd::session`] names it.
+    pub session: &'a str,
+    /// The drone's dollars left: a harness that stops itself (`Caps::headless_budget`) gets it.
+    pub budget_usd: Option<f64>,
+    pub env: &'a [(&'a str, String)],
+}
+
+/// What one headless session reported.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HeadlessEnd {
+    /// Its cost in dollars; None where the CLI reports none (codex reports tokens only).
+    pub usd: Option<f64>,
+    pub session: String,
+    pub text: String,
+    pub error: bool,
 }
 
 /// One sub-agent of a [`Run`], as its transcript shows it.
@@ -121,6 +153,9 @@ pub struct Caps {
     /// `stop_budget`). None: the expert drone keeps inside [`DEFAULT_STOP_BUDGET`], the model call
     /// inside the model's own limit.
     pub stop_budget: Option<Duration>,
+    /// A headless session stops itself at a dollar budget it is given ([`Headless::budget_usd`]);
+    /// without it the hive runner checks the budget between iterations only (hive/run.rs).
+    pub headless_budget: bool,
 }
 
 /// Where the turn's work and the drone's last message come from.
@@ -259,13 +294,23 @@ mod tests {
     fn caps_are_todays() {
         let row = |n: &str| {
             let c = by_name(n).unwrap().caps();
-            (c.prompt_context, c.tool_context, c.early_delivery, c.steer_in_context, c.question_dialog, c.transcript, c.deny_capture, c.sends_pid)
+            (
+                c.prompt_context,
+                c.tool_context,
+                c.early_delivery,
+                c.steer_in_context,
+                c.question_dialog,
+                c.transcript,
+                c.deny_capture,
+                c.sends_pid,
+                c.headless_budget,
+            )
         };
-        assert_eq!(row("claude"), (true, true, true, true, true, Transcript::Claude, true, false));
+        assert_eq!(row("claude"), (true, true, true, true, true, Transcript::Claude, true, false, true));
         for n in ["omp", "opencode"] {
-            assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true), "{n}");
+            assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true, false), "{n}");
         }
-        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false));
+        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false, false));
         // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; codex: its
         // stop hook's timeout.
         let budgets = [("claude", None), ("omp", None), ("opencode", None), ("codex", Some(90)), ("sim", None)];
@@ -273,6 +318,48 @@ mod tests {
         assert_eq!(got, budgets, "every harness's stop budget");
         let Wiring::CommandHooks { timeouts, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
         assert_eq!((timeouts, through_links), (&[("stop", 90)][..], true), "a timeout on the stop only");
+    }
+
+    fn args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn headless_run(budget: Option<f64>) -> std::process::Command {
+        let env = [("BORG_HIVE", "g".to_string())];
+        let run = Headless { prompt: "go", cwd: Path::new("/w/app"), model: Some("sonnet"), session: "u-1", budget_usd: budget, env: &env };
+        by_name("claude").unwrap().headless(&run).unwrap()
+    }
+
+    #[test]
+    fn claude_runs_a_headless_drone_with_the_engineers_hooks_and_its_budget() {
+        let cmd = headless_run(Some(0.5));
+        let a = args(&cmd);
+        for want in [["-p", "go"], ["--permission-mode", "bypassPermissions"], ["--max-budget-usd", "0.50"], ["--session-id", "u-1"], ["--model", "sonnet"]] {
+            assert!(a.windows(2).any(|w| w == want), "{want:?} in {a:?}");
+        }
+        assert!(!a.iter().any(|x| x == "--setting-sources" || x == "--strict-mcp-config"), "borg's hooks must run in the drone: {a:?}");
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/w/app")));
+        assert!(cmd.get_envs().any(|(k, v)| k == "BORG_HIVE" && v == Some("g".as_ref())));
+        assert!(!args(&headless_run(None)).iter().any(|x| x == "--max-budget-usd"));
+        let h = by_name("claude").unwrap();
+        let out = br#"{"type":"result","subtype":"success","is_error":false,"result":"t1 done","session_id":"abc","total_cost_usd":0.4213}"#;
+        assert_eq!(h.headless_end(out), HeadlessEnd { usd: Some(0.4213), session: "abc".into(), text: "t1 done".into(), error: false });
+        assert_eq!(h.headless_end(b"not json"), HeadlessEnd::default());
+    }
+
+    #[test]
+    fn every_headless_command_runs_in_the_worktree_and_codex_keeps_its_hooks() {
+        let run = Headless { prompt: "go", cwd: Path::new("/w/app"), model: None, session: "", budget_usd: None, env: &[] };
+        let codex = by_name("codex").unwrap().headless(&run).unwrap();
+        let a = args(&codex);
+        assert!(a.windows(2).any(|w| w == ["-s", "workspace-write"]) && a.windows(2).any(|w| w == ["-C", "/w/app"]), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("features.hooks") || x == "--ignore-user-config"), "the drone's hooks stay on: {a:?}");
+        let end = by_name("codex").unwrap().headless_end(
+            b"{\"type\":\"thread.started\",\"thread_id\":\"th1\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n",
+        );
+        assert_eq!(end, HeadlessEnd { usd: None, session: "th1".into(), text: "ok".into(), error: false }, "codex reports tokens, never dollars");
+        let omp = args(&by_name("omp").unwrap().headless(&run).unwrap());
+        assert!(omp.contains(&"--auto-approve".to_string()) && omp.contains(&"--cwd=/w/app".to_string()), "{omp:?}");
     }
 
     #[test]

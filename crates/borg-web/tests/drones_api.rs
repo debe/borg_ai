@@ -91,3 +91,34 @@ async fn a_veto_shows_in_the_feed_and_on_the_lessons_it_credited() {
     assert_eq!(v["lessons"][0]["vetoed"], 1, "{v}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[tokio::test]
+async fn a_hacked_hive_task_shows_on_the_lessons_it_credited_and_in_the_feed() {
+    let home: PathBuf = std::env::temp_dir().join(format!("borg-web-hacked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let lesson = json!({"id": "L1", "origin_ms": 1, "question": "Is the parser's empty input handled?", "consequence": "a crash"});
+    std::fs::write(home.join("lessons.jsonl"), format!("{lesson}\n")).unwrap();
+    let hacked = borg::outcome::Outcome {
+        kind: borg::outcome::HACKED.into(),
+        session: "s1".into(),
+        lessons: vec!["L1".into()],
+        ms: 2,
+        cause: "g/t1.v1".into(),
+        ..Default::default()
+    };
+    borg::outcome::append(&home.join("outcomes.jsonl"), &hacked).unwrap();
+    let mut ev = borg::stats::Event::new(borg::stats::TASK_HACKED, 3);
+    ev.session = "s1".into();
+    ev.lessons = vec!["L1".into()];
+    borg::stats::record(&home, &ev);
+
+    let (_tx, stop) = tokio::sync::watch::channel(false);
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+    let (_, v) = get(app.clone(), "/api/lessons?c=corp").await;
+    assert_eq!((v["lessons"][0]["hacked"].clone(), v["lessons"][0]["verified"].clone()), (json!(1), json!(0)), "{v}");
+    let (_, v) = get(app, "/api/feed?c=corp").await;
+    assert!(v["events"].as_array().unwrap().iter().any(|e| e["kind"] == "task_hacked"), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}

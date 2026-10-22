@@ -76,7 +76,12 @@ pub fn run(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Ve
         }
         let mut cmd = Command::new("sh");
         // Stderr joins stdout, so the tail shows the failure.
-        cmd.arg("-c").arg(format!("exec 2>&1\n{}", c.cmd)).current_dir(dir_of(c, cwd)).env("BORG_LEARN", "off").env_remove(super::ENV);
+        cmd.arg("-c")
+            .arg(format!("exec 2>&1\n{}", c.cmd))
+            .current_dir(dir_of(c, cwd))
+            .env("BORG_LEARN", "off")
+            .env(super::ENV, "")
+            .env_remove(super::DRONE_ENV);
         let t0 = Instant::now();
         match crate::runner::run_capped_status(cmd, None, cap) {
             Some((status, _)) if status.success() => {}
@@ -150,6 +155,7 @@ mod tests {
             author: String::new(),
             created_ms: 0,
             sig: String::new(),
+            hidden: None,
         }
     }
 
@@ -164,6 +170,7 @@ mod tests {
             accept: vec![],
             of: None,
             not_by: vec![],
+            flags: vec![],
         }
     }
 

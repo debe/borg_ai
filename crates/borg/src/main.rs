@@ -39,9 +39,15 @@
 //!                   | skip <n|id> | next --json | dedupe [--apply] | notify   [--dir DIR | --collective NAME]
 //!                                                     (open questions to the engineer, numbered; an answer becomes a
 //!                                                      lesson, a dismissal none; --json for drones; queen.rs)
-//!        borg hive init|board|join|leave|open|claim|progress|release|block|done|verify|contract [--session ID] [--dir DIR]
+//!        borg hive init|board|join|leave|open|claim|progress|release|block|done|verify|score|contract [--session ID] [--dir DIR]
 //!                                                     (many drones, one goal, local spike: a board of leased tasks, contracts
-//!                                                      between drones, done gated by the goal's oracle; hive/mod.rs)
+//!                                                      between drones, done gated by the goal's oracle, verdicts guarded
+//!                                                      against gaming it and scored by a hidden oracle; hive/mod.rs)
+//!        borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]
+//!                                                     (N headless drones, each in a git worktree with a share of the
+//!                                                      goal's budget, until the board is finished; hive/run.rs)
+//!        borg hive join <goal> --here [--drone NAME] | leave --here
+//!                                                     (every new session in this repo or worktree joins the goal)
 //!        borg trust [--dir DIR]                      (trust per engineer x area in the collective DIR routes to; trust.rs)
 //!        borg top [--dir DIR] [--watch] [--json]      (the drones of each collective, local and remote; top.rs)
 //!        borg steer <drone|session|all> "<text>" | --pause | --resume [--dir DIR]
@@ -103,7 +109,10 @@
 //!   BORG_CONCEPTS    "on" (spike) boosts lessons sharing engineering concepts with the work (concepts.rs);
 //!                    BORG_CONCEPTS_BETA its strength (default 0.5)
 //!   BORG_HIVE        a hive goal id: the session joins that goal at its first hook (hive/mod.rs; the
-//!                    hive runner sets it on each drone); unknown goals are ignored
+//!                    hive runner sets it on each drone); unknown goals are ignored; empty: no goal, not
+//!                    even a directory's join record
+//!   BORG_HIVE_DRONE  the drone a session is one iteration of (the hive runner sets it): a verify task
+//!                    barred to the author drone is barred to all its sessions
 //!   BORG_QUEEN       "on" lets the Stop hook ask the engineer (queen.rs); off by default (the queen
 //!                    test failed its pre-registered bar, internal evaluation "queen-test", not published)
 //!   BORG_QUEEN_ASK  "off" disables queen questions in the harness: the first prompt of a session in a repo
@@ -193,6 +202,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("mesh <command>", "sync with team members (borg mesh --help)"),
             ("steer <drone|all> <text> | --pause | --resume", "a signed instruction to running drones"),
             ("hive init|board|join|claim|done|...", "many drones, one goal: the board, claims and contracts"),
+            ("hive run <goal> --drones N", "headless drones in worktrees, each with a share of the goal's budget"),
         ],
     ),
     (
@@ -332,7 +342,7 @@ fn memory_cmd(path: &str, rest: &[&str]) {
         println!(
             "{}",
             json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
-                "vetoed": m.vetoed, "regretted": m.regretted, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
+                "vetoed": m.vetoed, "regretted": m.regretted, "verified": m.verified, "rejected": m.rejected, "hacked": m.hacked, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
                 "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
         );
     }

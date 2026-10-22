@@ -177,10 +177,19 @@ fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String>
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
+        // The collective's hive goals (hive/view.rs): nothing at all for a store without a hive.
+        let hives = crate::hive::view::all(home, now);
         if json_out {
-            all.push(to_json(name, *share, &ds));
-        } else if !ds.is_empty() || dir.is_some() {
+            let mut v = to_json(name, *share, &ds);
+            if !hives.is_empty() {
+                v["hive"] = serde_json::to_value(&hives).unwrap_or_default();
+            }
+            all.push(v);
+        } else if !ds.is_empty() || dir.is_some() || !hives.is_empty() {
             text.push_str(&render(name, *share, &ds, now));
+            for h in &hives {
+                text.push_str(&crate::hive::view::render(h));
+            }
             text.push('\n');
         }
     }

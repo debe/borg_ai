@@ -71,8 +71,14 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
 | `hive_claim`, `hive_done`, `hive_oracle_fail`, `hive_released`, `hive_shown` | The hive ([Hive](commands.md#hive)): a claim taken, a task's oracle passed and its done published, a stop blocked by a failing oracle, a claim released at a session's end, board context shown to a drone (with the contract ids it showed); each names its goal |
+| `task_verified`, `task_rejected`, `task_hacked` | A hive task's verdict, once per attempt ([Guardrails](commands.md#guardrails-and-the-hidden-oracle)): verified, rejected (by its verifier, or by the hidden oracle when the goal has one), or hacked (its diff changed protected tests or CI, or its drone touched the oracle's files). `why` the goal, `lessons` the lessons credited, `n` their number. `task_hacked` over all three is the hacked rate the web page's overview shows; the goal is zero |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.
+
+**Hive verdicts.** The `verified`, `rejected` and `hacked` records in `outcomes.jsonl` carry `cause`
+(`<goal>/<verify task>`, the attempt judged), one per lesson shown in the author's claim. They are
+counted once per verdict as the `task_*` event above, never per record, and are not shared with the team
+(`outcomes-team.jsonl`) until hive lines sync over the mesh.
 
 **Mode and channel.** Events from a hook carry `mode`: the delivery mode it ran in (`hook` or `live`,
 [Delivery modes](../README.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, Harness, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
 pub const ADAPTER: &str = include_str!("../../assets/adapters/omp/borg.ts");
 
@@ -30,6 +30,28 @@ impl Harness for Omp {
             sends_pid: true,
             // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
             stop_budget: None,
+            headless_budget: false,
+        }
+    }
+
+    /// `omp -p --mode json` in the drone's worktree with its extensions (borg's adapter among them) and
+    /// every tool call approved (`--auto-approve`, checked against `omp --help` of 18.10.4). omp takes
+    /// no budget: the runner checks it between iterations.
+    fn headless(&self, run: &Headless) -> Option<std::process::Command> {
+        let mut cmd = std::process::Command::new("omp");
+        cmd.args(["-p", "--mode", "json", "--no-session", "--no-title", "--auto-approve"]).arg(format!("--cwd={}", run.cwd.display()));
+        if let Some(m) = run.model {
+            cmd.arg(format!("--model={m}"));
+        }
+        cmd.arg(run.prompt).current_dir(run.cwd).env("PWD", run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
+        Some(cmd)
+    }
+
+    /// The last assistant message and its cost (runner.rs `omp_answer`); none: an error.
+    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
+        match crate::runner::omp_answer(out) {
+            Some((text, usd)) => HeadlessEnd { usd, session: String::new(), text, error: false },
+            None => HeadlessEnd { error: true, ..HeadlessEnd::default() },
         }
     }
 

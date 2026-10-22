@@ -29,6 +29,15 @@
 //!   (the legacy single-number view) or by attention.rs: a regret is about a lesson, not about an
 //!   engineer following it.
 //!
+//! - `verified`, `rejected`, `hacked` (a hive verdict, hive/verdict.rs, 0 tokens): a drone's task in a
+//!   hive goal was judged, by its verifier or, when the goal has one, by the hidden oracle
+//!   (hive/hidden.rs); `hacked` is a done whose diff changed protected tests or CI, or whose drone
+//!   touched the oracle's files. Every lesson shown to the author's session while it held the claim is
+//!   credited, once per `cause` (`<goal>/<verify task>`). memory.rs weighs them; like `regretted` they
+//!   are deliberately not read by trust.rs (`sessions`), `weight` or attention.rs: a verdict is about
+//!   the drone's task, not about an engineer following a lesson. Counted once per verdict as `task_*`
+//!   (stats.rs), never shared (`SHARED_KINDS`).
+//!
 //! An unclear verdict, or a session whose later turn ends never reach the model (the prefilter skipped
 //! them, or BORG_MATCH=bm25), leaves the lesson pending: `settle` turns it into `asked_not_corrected`.
 //!
@@ -75,6 +84,18 @@ pub const VETOED: &str = "vetoed";
 /// `credit` carries the share of the blame, (0, 1]. Weaker than a correction (memory.rs `REGRET`).
 pub const REGRETTED: &str = "regretted";
 
+/// A hive verdict on a task (hive/verdict.rs): passed, rejected by its verifier (or failed by the
+/// hidden oracle), or hacked (protected files changed, or the oracle touched). Each credits the lessons
+/// shown in the author's claim, once per (`cause`, lesson).
+pub const VERIFIED: &str = "verified";
+pub const REJECTED: &str = "rejected";
+pub const HACKED: &str = "hacked";
+
+/// Whether `kind` is a hive verdict's.
+pub fn is_verdict(kind: &str) -> bool {
+    matches!(kind, VERIFIED | REJECTED | HACKED)
+}
+
 /// A session without asks or episodes for this long is treated as ended (24h).
 pub const IDLE_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -109,7 +130,8 @@ pub struct Outcome {
     /// so its outcomes label the cut (attention.rs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub explore: bool,
-    /// `regretted` only: the regret episode (`R…`/`V…` id), the idempotence key with the lesson.
+    /// `regretted`: the regret episode (`R…`/`V…` id); a verdict kind: `<goal>/<verify task>`, the
+    /// attempt judged. The idempotence key with the lesson.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cause: String,
     /// `regretted` only: the lesson's share of the regret, (0, 1].
@@ -150,6 +172,14 @@ pub const PUBLISHED: &str = "outcomes-team.published";
 
 /// The kinds `publish` shares. A whitelist: `graded`, `vetoed`, `regretted` and any later kind stay
 /// local until deliberately added here.
+///
+/// The hive verdicts (`verified`, `rejected`, `hacked`) stay out until hive lines go on the mesh
+/// (collective step 4), and come in then with a `c: tag(cause)` field: the hive spike is local and
+/// waits for H1's kill criterion; `Shared` has no cause, which memory's per-(lesson, cause) dedupe and
+/// `team_view`'s key would need; a verdict is a self-reported reward, so without the deferred
+/// poisoning guards (k distinct nodes, a trust-weighted median) a forged `verified` stream would
+/// inflate lessons and a forged `hacked` one sink them (`team_view` drops unshared kinds, so a forged
+/// line is ignored today); and hidden-oracle results are private to their goal.
 pub const SHARED_KINDS: [&str; 6] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED];
 
 /// A session or repo as the team sees it: the first 32 hex digits of blake3("borg-outcome-v1\0" + s).
@@ -296,8 +326,9 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", serde_json::to_string(o).unwrap())?;
-    // The results count in the usage statistics; `asked` is already counted as the Stop's block, and a
-    // `vetoed` result as the `veto` that credited it (veto.rs).
+    // The results count in the usage statistics; `asked` is already counted as the Stop's block, a
+    // `vetoed` result as the `veto` that credited it (veto.rs), and a hive verdict's as the one
+    // `task_*` event of its verdict (hive/verdict.rs).
     let kind = match o.kind.as_str() {
         CHANGED => crate::stats::CHANGED,
         IGNORED => crate::stats::IGNORED,
@@ -409,6 +440,31 @@ pub fn regretted(outcomes: &[Outcome], session: &str, before_ms: i64, cause: &st
             repo: repo.into(),
             cause: cause.into(),
             credit,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// The verdict records a hive verdict (`kind`, one of `is_verdict`) on the attempt `cause` writes for
+/// `lessons` (shown in `author`'s claim): one per lesson, sorted, skipping a lesson that already has a
+/// verdict record for `cause` (whatever its kind), so a re-run or a later score writes nothing.
+pub fn verdicts(outcomes: &[Outcome], kind: &str, author: &str, lessons: &[String], cause: &str, ms: i64, repo: &str) -> Vec<Outcome> {
+    if !is_verdict(kind) || author.is_empty() || cause.is_empty() {
+        return Vec::new();
+    }
+    let done = |l: &str| outcomes.iter().any(|o| is_verdict(&o.kind) && o.cause == cause && o.lessons.iter().any(|x| x == l));
+    let mut ids: Vec<&str> = lessons.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .filter(|l| !done(l))
+        .map(|l| Outcome {
+            kind: kind.into(),
+            session: author.into(),
+            lessons: vec![l.into()],
+            ms,
+            repo: repo.into(),
+            cause: cause.into(),
             ..Default::default()
         })
         .collect()
@@ -658,6 +714,52 @@ mod tests {
         let line = serde_json::to_string(&got[0]).unwrap();
         assert!(line.contains(r#""cause":"R1","credit":0.25"#), "{line}");
         assert_eq!(serde_json::from_str::<Outcome>(&line).unwrap(), got[0]);
+    }
+
+    #[test]
+    fn verdicts_credit_each_lesson_once_per_attempt_and_stay_local() {
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let first = verdicts(&[], HACKED, "s", &ids(&["B", "A", "B", ""]), "g/t1.v1", 9, "r");
+        let want = |l: &str| Outcome { cause: "g/t1.v1".into(), ..o(HACKED, "s", &[l], 9) };
+        assert_eq!(first, vec![want("A"), want("B")], "sorted, unique, one per lesson");
+        assert!(verdicts(&first, HACKED, "s", &ids(&["A", "B"]), "g/t1.v1", 10, "r").is_empty(), "a re-run writes nothing");
+        assert!(verdicts(&first, VERIFIED, "s", &ids(&["A"]), "g/t1.v1", 10, "r").is_empty(), "a later score of the same attempt neither");
+        assert_eq!(verdicts(&first, VERIFIED, "s", &ids(&["A"]), "g/t1.v2", 10, "r").len(), 1, "the next attempt is credited");
+        assert!(verdicts(&[], VETOED, "s", &ids(&["A"]), "c", 1, "r").is_empty() && verdicts(&[], VERIFIED, "", &ids(&["A"]), "c", 1, "r").is_empty());
+        for kind in [VERIFIED, REJECTED, HACKED] {
+            assert!(is_verdict(kind) && share(&o(kind, "s", &["A"], 1), "n1").is_none(), "{kind} is not shared");
+        }
+        assert!(!is_verdict(VETOED) && !is_verdict(REGRETTED));
+        // Not a session result: trust and `weight` never see a verdict, and settling still settles.
+        assert!(sessions(&first).is_empty() && weights(&first).is_empty());
+        let mut log = first.clone();
+        log.push(o(ASKED, "s", &["A"], 5));
+        assert_eq!(settle(&log, "s", 99), vec![o(NOT_CORRECTED, "s", &["A"], 99)]);
+        log.push(o(NOT_CORRECTED, "t", &["A"], 7));
+        let trust = |log: &[Outcome]| sessions(log).into_iter().map(|(l, m)| (l.to_string(), m.len())).collect::<Vec<_>>();
+        assert_eq!(trust(&log), trust(&log[first.len()..]), "trust reads the same without the verdicts");
+    }
+
+    #[test]
+    fn a_forged_team_verdict_is_ignored_and_a_local_one_counts_no_stat() {
+        let home = tmp("verdict-team");
+        let forged = Shared {
+            kind: HACKED.into(),
+            s: "x".into(),
+            lessons: vec!["L1".into()],
+            ms: 5,
+            node: "n2".into(),
+            p: vec![],
+            channel: String::new(),
+            r: String::new(),
+        };
+        lines(&home.join(TEAM_FILE), &[serde_json::to_string(&forged).unwrap()]);
+        assert!(team_view(&home.join("lessons.jsonl"), true).is_empty(), "an unshared kind from the team file is dropped");
+        let p = home.join("outcomes.jsonl");
+        append(&p, &Outcome { cause: "g/t1.v1".into(), ..o(HACKED, "s", &["L1"], 5) }).unwrap();
+        assert_eq!(read(&p).len(), 1);
+        assert!(crate::stats::events(&home).is_empty(), "counted as task_hacked by its verdict, not per record");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

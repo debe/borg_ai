@@ -68,6 +68,27 @@ effect of a refactor.
 | `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored) | yes | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event |
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
 | `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | none (the adapter sets 28 s) | none (the adapter sets 90 s) | 90 s, the Stop hook's timeout |
+| `headless_budget` | A headless hive drone stops itself at the dollar budget it is given; otherwise `borg hive run` checks the budget between sessions only | yes (`--max-budget-usd`) | no | no | no |
+
+**Headless drones** (`Harness::headless`, `headless_end`; `borg hive run`, hive/run.rs). A fact about
+each CLI, not a tuned behaviour, checked against its `--help`:
+
+| | Claude Code 2.1.308 | omp 18.10.4 | opencode 1.19.0 / 2.x | Codex CLI 0.153.2 |
+|---|---|---|---|---|
+| Command | `claude -p --output-format json --permission-mode bypassPermissions --no-session-persistence --session-id U [--max-budget-usd B]` | `omp -p --mode json --no-session --auto-approve --cwd=W` | 1.x: `opencode run --format json --auto --dir W`; 2.x: none yet (it would need borg's plugin, so no `--standalone`, and its service drops the env; unchecked live) | `codex exec --json -s workspace-write -C W` |
+| Cost | `total_cost_usd` | the last message's `usage.cost.total` | the summed `step_finish` costs | none (tokens only): one session per drone |
+| Hooks | your settings | your extensions | your plugins | your hooks (unlike borg's own codex calls) |
+
+**Hive guard flags** (hive/guard.rs, at `pre_tool`): which tool calls of a drone in a hive goal are
+checked for writes to tests, CI or the hidden oracle's files. The verdict's diff of the claim's
+snapshots (hive/verdict.rs) is the ground truth on every harness; a flag is an early sign for the
+verifier.
+
+| | Claude Code | omp | opencode 1.x / 2.x | Codex CLI |
+|---|---|---|---|---|
+| Edits | `file_path`, `notebook_path` | `tool_input` normalised to Claude's keys by the adapter (a patch of several files names them in one `file_path`, space-separated) | the same, by the adapter (a child session's call as its root session) | a patch's files (`edits[].file_path`, `normalise`) |
+| Shell | `Bash` `command` | the adapter's `Bash` | the adapter's `Bash` | `Bash` `command` |
+| Reads of the oracle | `Read`, `Grep`, `Glob` | as normalised | as normalised | shell only |
 
 omp and opencode already have channels for early delivery and steering in context. Both stay off until
 an evaluation shows they help.
@@ -183,6 +204,10 @@ cargo test -p borg-web --test drones_api                     # the page's /api/d
 | Live | An edit starts a detached check and the hook returns at once. The ask is queued and delivered with the next tool call; without tool context, with the next prompt; with neither, at the stop. A covered stop makes no model call. |
 | Web | `borg top --json` shows the drone with its `harness` and its state: working, then waiting, then ended. `/api/drones` and `/api/collectives` show the same. |
 | Capabilities | Context at a prompt and after a tool call, early delivery, steering in context, the transcript source, denials to episodes, and a gone pid, each on both sides. |
+
+The hive runner's suite (`cargo test -p borg-ai --test hive_run_cli`) runs `sim` drones with the flags
+`headless` (the sim harness gets a headless command: `borg hive sim-drone`, a scripted drone against the
+real hooks and board) and, where a test needs it, `budget` (`headless_budget`).
 
 `sim` runs four profiles: the default flags (`prompt,tool,deny`), no tool context (`prompt,deny`), no flag
 at all, and every flag on. Together they put `prompt_context`, `tool_context`, `early_delivery`,

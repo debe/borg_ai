@@ -165,6 +165,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
                 "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
                 "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
                 "regretted": mm.map_or(0.0, |x| x.regretted),
+                "verified": mm.map_or(0, |x| x.verified), "rejected": mm.map_or(0, |x| x.rejected), "hacked": mm.map_or(0, |x| x.hacked),
                 "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
                 "usage": usage.get(&c.id).cloned().unwrap_or_default(),
                 "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
@@ -177,7 +178,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 25] = [
+const NOTABLE: [&str; 28] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -187,6 +188,9 @@ const NOTABLE: [&str; 25] = [
     stats::IGNORED,
     stats::CORRECTED,
     stats::REGRETTED,
+    stats::TASK_VERIFIED,
+    stats::TASK_REJECTED,
+    stats::TASK_HACKED,
     stats::LESSON_NEW,
     stats::LESSON_MERGED,
     stats::NOT_A_LESSON,
@@ -246,6 +250,14 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
     Json(top::to_json(&m.name, m.share, &ds)).into_response()
 }
 
+/// The collective's hive goals (hive/view.rs): board, budget and spend per drone, newest contracts;
+/// `goals` is empty for a store without a hive.
+async fn hive(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    let goals = borg::hive::view::all(&m.home, learn::now_ms());
+    Json(json!({"collective": m.name, "goals": goals})).into_response()
+}
+
 /// Size and modification time of `path`, or of every file directly in it.
 fn stamp(path: &Path) -> Vec<(u64, u128)> {
     let one = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), mtime(&m)));
@@ -274,6 +286,8 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("drones", vec![home.join("presence"), presence::remote_path(home)]),
         ("feed", vec![stats::events_path(home)]),
         ("queen", vec![home.join("queen")]),
+        // The goal dirs are nested: their files by name, and the hive dir for a new goal.
+        ("hive", [vec![home.join("hive")], borg::hive::view::files(home)].concat()),
     ]
 }
 
@@ -328,6 +342,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/drones", get(drones))
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
+        .route("/api/hive", get(hive))
         .route("/api/events", get(events))
         .with_state(app)
 }

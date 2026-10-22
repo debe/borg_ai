@@ -304,7 +304,7 @@ pub(crate) fn expand(p: &str) -> PathBuf {
 }
 
 /// Lexically normalised absolute path (no filesystem access: the hook must stay fast).
-fn normal(p: &Path) -> Vec<String> {
+pub(crate) fn normal(p: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in p.components() {
         match c {
@@ -319,7 +319,7 @@ fn normal(p: &Path) -> Vec<String> {
 }
 
 /// Number of components of `prefix` if `path` lies inside it (whole components only).
-fn inside(path: &[String], prefix: &str) -> Option<usize> {
+pub(crate) fn inside(path: &[String], prefix: &str) -> Option<usize> {
     let pre = normal(&expand(prefix));
     (!pre.is_empty() && path.len() >= pre.len() && path[..pre.len()] == pre[..]).then_some(pre.len())
 }

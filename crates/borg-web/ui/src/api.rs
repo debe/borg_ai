@@ -175,6 +175,11 @@ pub struct Lesson {
     pub vetoed: f64,
     /// The weighted share of later fixes (or review findings) of decisions it was asked before.
     pub regretted: f64,
+    /// Hive tasks it was shown in, by verdict: verified, rejected, hacked (protected tests or CI
+    /// changed, or the oracle touched).
+    pub verified: f64,
+    pub rejected: f64,
+    pub hacked: f64,
     pub dormant: bool,
     pub consolidated: bool,
     pub usage: BTreeMap<String, f64>,
@@ -192,11 +197,11 @@ impl Lesson {
         if self.area.is_empty() { "other".into() } else { self.area.clone() }
     }
 
-    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed, 1 + ignored + 2 corrected + 3 vetoed
-    /// + regretted)).
+    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed + verified, 1 + ignored + 2 corrected
+    /// + 3 vetoed + regretted + rejected + 3 hacked)).
     pub fn usefulness(&self) -> f64 {
-        let a = 1.0 + self.changed;
-        let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted;
+        let a = 1.0 + self.changed + self.verified;
+        let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted + self.rejected + 3.0 * self.hacked;
         a / (a + b)
     }
 
@@ -243,6 +248,9 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             corrected: f(&l["corrected"]),
             vetoed: f(&l["vetoed"]),
             regretted: f(&l["regretted"]),
+            verified: f(&l["verified"]),
+            rejected: f(&l["rejected"]),
+            hacked: f(&l["hacked"]),
             dormant: l["dormant"].as_bool().unwrap_or(false),
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
             usage: map(&l["usage"]),
@@ -384,6 +392,84 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveTask {
+    pub id: String,
+    pub role: String,
+    pub title: String,
+    pub status: String,
+    pub holder: String,
+    pub lease_left_ms: f64,
+    pub files: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveDrone {
+    pub drone: String,
+    pub usd: f64,
+    pub share: f64,
+    pub iters: f64,
+    pub last_exit: String,
+    pub unmetered: bool,
+}
+
+/// One hive goal (borg hive/view.rs `HiveView`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveGoal {
+    pub goal: String,
+    pub spec: String,
+    pub budget_usd: f64,
+    pub spent_usd: f64,
+    pub finished: bool,
+    pub tasks: Vec<HiveTask>,
+    pub drones: Vec<HiveDrone>,
+    /// (task, text, scope) of the newest contracts, newest last.
+    pub contracts: Vec<(String, String, Vec<String>)>,
+}
+
+pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
+    v["goals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| HiveGoal {
+            goal: s(&g["goal"]),
+            spec: s(&g["spec"]),
+            budget_usd: f(&g["budget_usd"]),
+            spent_usd: f(&g["spent_usd"]),
+            finished: g["finished"].as_bool().unwrap_or(false),
+            tasks: g["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| HiveTask {
+                    id: s(&t["id"]),
+                    role: s(&t["role"]),
+                    title: s(&t["title"]),
+                    status: s(&t["status"]),
+                    holder: s(&t["holder"]),
+                    lease_left_ms: f(&t["lease_left_ms"]),
+                    files: strs(&t["files"]),
+                })
+                .collect(),
+            drones: g["drones"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|d| HiveDrone {
+                    drone: s(&d["drone"]),
+                    usd: f(&d["usd"]),
+                    share: f(&d["share"]),
+                    iters: f(&d["iters"]),
+                    last_exit: s(&d["last_exit"]),
+                    unmetered: d["unmetered"].as_bool().unwrap_or(false),
+                })
+                .collect(),
+            contracts: g["contracts"].as_array().into_iter().flatten().map(|c| (s(&c["task"]), s(&c["text"]), strs(&c["scope"]))).collect(),
+        })
+        .collect()
+}
+
 /// One view's raw JSON, whether the server has it (old servers lack feed and queen), and how to load it.
 #[derive(Clone, Copy)]
 pub struct Source {
@@ -423,12 +509,14 @@ pub struct Data {
     /// Name, share and delivery mode (`hook` or `live`) of each collective.
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
-    pub sources: [Source; 5],
+    pub sources: [Source; 6],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
     pub queen: Memo<Vec<QueenEntry>>,
     pub drones: Memo<Vec<Drone>>,
+    /// The collective's hive goals; empty without a hive (or on a server without `/api/hive`).
+    pub hive: Memo<Vec<HiveGoal>>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -457,8 +545,8 @@ pub fn data() -> Data {
 
 /// Creates the shared data, loads it for the shown collective and follows the change stream.
 pub fn provide() -> Data {
-    let sources = [Source::new("stats"), Source::new("lessons"), Source::new("feed"), Source::new("queen"), Source::new("drones")];
-    let [st, le, fe, qu, dr] = sources;
+    let sources = [Source::new("stats"), Source::new("lessons"), Source::new("feed"), Source::new("queen"), Source::new("drones"), Source::new("hive")];
+    let [st, le, fe, qu, dr, hi] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -469,6 +557,7 @@ pub fn provide() -> Data {
         feed: Memo::new(move |_| parse_feed(&fe.raw.get())),
         queen: Memo::new(move |_| parse_queen(&qu.raw.get())),
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
+        hive: Memo::new(move |_| parse_hive(&hi.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

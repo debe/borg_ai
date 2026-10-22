@@ -12,9 +12,9 @@ mod views;
 use leptos::prelude::*;
 
 use crate::drawer::Drawer;
-use crate::views::{conscience::Conscience, cost::Cost, drones::Drones, knowledge::Knowledge, overview::Overview, queen::Queen, steering::Steering};
+use crate::views::{conscience::Conscience, cost::Cost, drones::Drones, hive::Hive, knowledge::Knowledge, overview::Overview, queen::Queen, steering::Steering};
 
-const TABS: [(&str, &str); 7] = [
+const TABS: [(&str, &str); 8] = [
     ("overview", "Overview"),
     ("knowledge", "Knowledge"),
     ("conscience", "Conscience"),
@@ -22,7 +22,11 @@ const TABS: [(&str, &str); 7] = [
     ("queen", "Queen"),
     ("cost", "Cost"),
     ("drones", "Drones"),
+    ("hive", "Hive"),
 ];
+
+/// A tab shown only when the collective has something for it.
+const OPTIONAL: [&str; 1] = ["hive"];
 
 fn tab_now() -> String {
     let h = location_hash().unwrap_or_default();
@@ -65,7 +69,8 @@ fn App() -> impl IntoView {
         <nav class="tabs">
             {TABS.iter().map(|(k, label)| {
                 let k = *k;
-                view! { <a href=format!("#{k}") class:on=move || tab.get() == k>{*label}</a> }
+                let shown = move || !OPTIONAL.contains(&k) || !d.hive.with(Vec::is_empty);
+                view! { <a href=format!("#{k}") class:on=move || tab.get() == k style:display=move || if shown() { "" } else { "none" }>{*label}</a> }
             }).collect_view()}
         </nav>
         <main>
@@ -76,6 +81,7 @@ fn App() -> impl IntoView {
                 "queen" => view! { <Queen /> }.into_any(),
                 "cost" => view! { <Cost /> }.into_any(),
                 "drones" => view! { <Drones /> }.into_any(),
+                "hive" => view! { <Hive /> }.into_any(),
                 _ => view! { <Overview /> }.into_any(),
             }}
         </main>

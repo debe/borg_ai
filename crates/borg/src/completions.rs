@@ -21,7 +21,12 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("queen", &["show", "ask", "answer", "skip", "dismiss", "next", "dedupe", "notify"], &["--json", "--repo", "--dir", "--collective", "--apply"], false),
     ("top", &[], &["--watch", "--json", "--dir"], false),
     ("no", &[], crate::veto::FLAGS, false),
-    ("hive", &["init", "board", "join", "leave", "open", "claim", "progress", "release", "block", "done", "verify", "contract"], crate::hive::FLAGS, false),
+    (
+        "hive",
+        &["init", "run", "board", "join", "leave", "open", "claim", "progress", "release", "block", "done", "verify", "score", "contract"],
+        crate::hive::FLAGS,
+        false,
+    ),
     ("steer", &["all"], &["--pause", "--resume"], false),
     ("why", &[], &["--full", "--json"], true),
     ("web", &[], &["--port", "--dir"], false),

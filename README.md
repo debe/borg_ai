@@ -376,7 +376,14 @@ leased claims, contracts between drones, and done gated by the goal's oracle (sh
 stop). It is a local, file-backed spike with no mesh sync. Its value metric (solve rate and wall-clock
 time at the same dollars as one session with subagents) is still to be measured by the H1 pilot
 ([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)); until
-then it is preparation, not a claimed win. A session that never joins a goal sees no change.
+then it is preparation, not a claimed win. `borg hive run <goal> --drones N` starts N headless drones,
+each in a git worktree with an equal share of the goal's budget, until the board is finished (try
+`--dry-run` first); `borg top` and the web page show the board and the spend. Guardrails make gaming
+the oracle useless: a verdict on work whose diff changed tests or CI outside its scope is logged as
+hacked and the task reopens, every tool call that writes a test or peeks at the oracle is flagged for
+the verifier, and an optional hidden oracle (held-out checks outside the repo) decides what a verdict
+credits. Each verdict credits the lessons shown during the task; the web page shows the hacked rate. A
+session that never joins a goal sees no change.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive).
 
 All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).

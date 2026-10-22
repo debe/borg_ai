@@ -3,6 +3,7 @@
 
 pub mod assimilate;
 pub mod assimilate_dir;
+pub mod attention;
 pub mod collective;
 pub mod completions;
 pub mod concepts;
@@ -25,7 +26,6 @@ pub mod prefilter;
 pub mod presence;
 pub mod queen;
 pub mod reach;
-pub mod attention;
 pub mod review_fix;
 pub mod runner;
 pub mod stats;

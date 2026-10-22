@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, Harness, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
 pub const EVENTS: [(&str, &str); 6] = [
@@ -44,6 +44,7 @@ impl Harness for Claude {
             // Not the 90 s install gives: the expert drone keeps inside Claude Code's 60 s default
             // (`DEFAULT_STOP_BUDGET`), so an install that predates that timeout keeps a margin too.
             stop_budget: None,
+            headless_budget: true,
         }
     }
 
@@ -64,6 +65,36 @@ impl Harness for Claude {
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
         let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".claude"), PathBuf::from);
         workflow_runs(&config.join("projects"), session, since)
+    }
+
+    /// `claude -p` with the engineer's settings (so borg's hooks run in the drone) and every permission
+    /// granted inside the drone's worktree; `--max-budget-usd` stops it at the drone's share (checked
+    /// against `claude --help` of 2.1.308: it works only with `--print`).
+    fn headless(&self, run: &Headless) -> Option<std::process::Command> {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args(["-p", run.prompt, "--output-format", "json", "--permission-mode", "bypassPermissions", "--no-session-persistence"]);
+        if !run.session.is_empty() {
+            cmd.args(["--session-id", run.session]);
+        }
+        if let Some(b) = run.budget_usd {
+            cmd.args(["--max-budget-usd", &format!("{b:.2}")]);
+        }
+        if let Some(m) = run.model {
+            cmd.args(["--model", m]);
+        }
+        cmd.current_dir(run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
+        Some(cmd)
+    }
+
+    /// The one JSON object `--output-format json` prints.
+    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
+        let Ok(v) = serde_json::from_slice::<Value>(out) else { return HeadlessEnd::default() };
+        HeadlessEnd {
+            usd: v["total_cost_usd"].as_f64(),
+            session: v["session_id"].as_str().unwrap_or_default().into(),
+            text: v["result"].as_str().unwrap_or_default().into(),
+            error: v["is_error"].as_bool().unwrap_or(false),
+        }
     }
 }
 

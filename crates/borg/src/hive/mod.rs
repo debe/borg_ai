@@ -7,9 +7,20 @@
 //!   Claims are leases renewed by the drone's hooks; the lowest (ms, blake3 key) claim wins a race.
 //! - `contracts.jsonl` (contract.rs): what drones promise each other, shown once per session.
 //! - `oracle/` (oracle.rs): the tails of failed oracle runs.
+//! - `flags.jsonl` (guard.rs): what drones did to tests, CI or the oracle's files, flagged at each tool
+//!   call; `oracle.jsonl` (hidden.rs): the hidden oracle's score of each judged attempt (runner only).
+//!   verdict.rs turns a verifier's verdict into the reward: a diff of the claim's snapshots that changed
+//!   protected files makes it `hacked`, and the lessons shown during the claim are credited.
+//! - `joins.jsonl`: directories whose sessions join the goal (`borg hive join --here`, and each
+//!   worktree `borg hive run` makes, with the session of each iteration, left when the run ends).
+//! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost, each `borg hive run`.
+//! - `logs/` (run.rs): each iteration's output, local only: it never syncs.
 //!
-//! A session joins a goal by `borg hive join` or by `BORG_HIVE=<goal>` at its first hook; the
-//! membership is `<BORG_STATE>/<session>.hive` (`HiveSession`). The hook's [`around`] then adds the
+//! `borg hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
+//! board is finished or their budget share spent; view.rs is the hive in `borg top` and borg-web.
+//!
+//! A session joins a goal by `borg hive join`, by `BORG_HIVE=<goal>` at its first hook, or by a join
+//! record of the directory it starts in; the membership is `<BORG_STATE>/<session>.hive` (`HiveSession`). The hook's [`around`] then adds the
 //! drone's claim, the board's changes and the contracts in scope at a prompt, contracts and scope
 //! warnings after an edit, and at the stop runs the oracle: a failing one blocks the stop (at most
 //! `MAX_ORACLE_BLOCKS` times per claim), a passing one publishes `done`, opens its verify task and hands
@@ -18,7 +29,13 @@
 pub mod board;
 pub mod contract;
 pub mod goal;
+pub mod guard;
+pub mod hidden;
 pub mod oracle;
+pub mod run;
+mod sim_drone;
+pub mod verdict;
+pub mod view;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -46,6 +63,9 @@ pub struct DroneId {
 
 /// The goal a drone is launched into (the hive runner sets it on each drone): its first hook joins it.
 pub const ENV: &str = "BORG_HIVE";
+/// The drone a launched session is one iteration of (hive/run.rs): its claims carry it, so a verify
+/// task barred to the author drone is barred to all its sessions.
+pub const DRONE_ENV: &str = "BORG_HIVE_DRONE";
 /// A claim expires when its drone went idle (presence.rs).
 pub const LEASE_MS: i64 = presence::IDLE_MS;
 /// How often the hooks renew a held claim.
@@ -75,8 +95,19 @@ const TASK_MARKER: &str = "#borg-hive-task ";
 const REPO_MARKER: &str = "#borg-hive-repo";
 
 /// Said once, at a drone's first hive prompt (docs/design/hive-learning.md, inoculation framing).
-const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
-Gaming the oracle (editing or skipping its tests, special-casing its inputs) is visible on the board and useless to the task.";
+pub const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
+Every change to tests, CI config or oracle files is recorded and shown to the verifier; gaming a check is visible, allowed to happen, and useless: \
+the task counts as failed. If a check looks wrong, say so in your done note instead of changing it.";
+/// Added for a goal with a hidden oracle.
+pub const INOCULATION_HIDDEN: &str = "This goal is also scored by held-out checks you cannot see.";
+
+/// What a drone of `g` is told once (`INOCULATION`).
+pub fn inoculation(g: &Goal) -> String {
+    match g.hidden {
+        Some(_) => format!("{INOCULATION_HIDDEN} {INOCULATION}"),
+        None => INOCULATION.into(),
+    }
+}
 
 pub fn dir(home: &Path, goal: &str) -> PathBuf {
     home.join("hive").join(goal)
@@ -92,6 +123,10 @@ pub fn tasks_path(home: &Path, goal: &str) -> PathBuf {
 
 pub fn contracts_path(home: &Path, goal: &str) -> PathBuf {
     dir(home, goal).join("contracts.jsonl")
+}
+
+pub fn joins_path(home: &Path, goal: &str) -> PathBuf {
+    dir(home, goal).join("joins.jsonl")
 }
 
 /// A session's membership: `<BORG_STATE>/<session>.hive`.
@@ -120,6 +155,9 @@ pub struct HiveSession {
     /// The claim the counter counts for (`task@since`): a new claim starts it again.
     #[serde(default)]
     pub blocks_for: String,
+    /// The drone this session is an iteration of (`DRONE_ENV`); empty for a session of its own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub drone: String,
 }
 
 /// The session's goal; None when it joined none, or on any error (fail open).
@@ -137,8 +175,12 @@ fn save(session: &str, hs: &HiveSession) {
 /// # Errors
 /// When the membership cannot be written.
 pub fn bind(home: &Path, session: &str, goal: &str) -> std::io::Result<()> {
+    bind_as(home, session, goal, "")
+}
+
+fn bind_as(home: &Path, session: &str, goal: &str, drone: &str) -> std::io::Result<()> {
     let cursor = std::fs::metadata(tasks_path(home, goal)).map_or(0, |m| m.len());
-    let hs = HiveSession { goal: goal.into(), cursor, ..HiveSession::default() };
+    let hs = HiveSession { goal: goal.into(), cursor, drone: drone.into(), ..HiveSession::default() };
     steer::rewrite(&session_path(session), &serde_json::to_string(&hs).unwrap_or_default())
 }
 
@@ -147,13 +189,88 @@ pub fn unbind(session: &str) {
 }
 
 /// The hook's join: a session launched with `BORG_HIVE=<goal>` joins that goal of the routed store at
-/// its first hook, if the goal exists (anything else is ignored).
-pub fn bind_from_env(home: &Path, session: &str) {
-    let Ok(goal) = std::env::var(ENV) else { return };
-    let goal = goal.trim();
-    if goal::valid_id(goal) && goal_path(home, goal).is_file() && !session_path(session).exists() {
-        let _ = bind(home, session, goal);
+/// its first hook, if the goal exists (anything else is ignored); without the variable, the latest
+/// join record of a directory `cwd` is in decides (`joined`): a harness whose sessions drop the env
+/// (opencode 2.x's background service) still joins its worktree's goal. `BORG_HIVE=` (empty) joins
+/// nothing, records or not (the oracle's children). A store with no hive costs one failed stat.
+pub fn bind_from_env(home: &Path, session: &str, cwd: &str) {
+    // A session bound already reads no join record.
+    if session_path(session).exists() {
+        return;
     }
+    let (goal, drone) = match std::env::var(ENV) {
+        Ok(g) => (g.trim().to_string(), std::env::var(DRONE_ENV).unwrap_or_default()),
+        Err(_) => match joined(home, cwd) {
+            Some(j) => (j.goal, j.drone),
+            None => return,
+        },
+    };
+    if goal::valid_id(&goal) && goal_path(home, &goal).is_file() {
+        let _ = bind_as(home, session, &goal, drone.trim());
+    }
+}
+
+/// One line of joins.jsonl: sessions starting in `dir` (a git toplevel or worktree, absolute) join
+/// `goal`; `by` is `join` (`borg hive join --here`) or `run` (a worktree of `borg hive run`, with the
+/// iteration's `session` when the runner chose it). An empty `goal` is a leave: it shadows the joins
+/// before it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Join {
+    pub v: u8,
+    pub ms: i64,
+    pub goal: String,
+    pub dir: String,
+    #[serde(default)]
+    pub drone: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub harness: String,
+    pub by: String,
+}
+
+/// Appends `j` to `goal`'s joins.jsonl (one O_APPEND write).
+///
+/// # Errors
+/// When the file cannot be written.
+pub fn append_join(home: &Path, goal: &str, j: &Join) -> std::io::Result<()> {
+    append_line(&joins_path(home, goal), j)
+}
+
+/// One JSON line appended in one write(2) with O_APPEND.
+pub(crate) fn append_line<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let line = serde_json::to_string(v).map_err(std::io::Error::other)? + "\n";
+    std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
+}
+
+/// Every parsable line of a JSONL file, in file order (an incomplete or unknown line is skipped).
+pub(crate) fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
+    std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// Every join record of the store's goals (one pass over each tiny joins.jsonl); none when the store
+/// has no hive (one failed stat).
+pub fn joins(home: &Path) -> Vec<Join> {
+    if std::fs::metadata(home.join("hive")).is_err() {
+        return Vec::new();
+    }
+    goal::list(home).iter().flat_map(|g| read_lines::<Join>(&joins_path(home, g))).collect()
+}
+
+/// The newest join record whose `dir` holds `cwd` (whole path components: `/w/repo2` is not in
+/// `/w/repo`), the deepest dir first among equals; None when it is a leave or there is none.
+pub fn joined(home: &Path, cwd: &str) -> Option<Join> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let path = collective::normal(Path::new(cwd));
+    let best =
+        joins(home).into_iter().filter_map(|j| collective::inside(&path, &j.dir).map(|depth| (j.ms, depth, j))).max_by_key(|(ms, depth, _)| (*ms, *depth))?;
+    Some(best.2).filter(|j| !j.goal.is_empty())
 }
 
 /// Whether a drone in `repo` may claim `t`: a drone outside the goal's repos only claims tasks of its
@@ -198,13 +315,19 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
     }
     let checks: Vec<&str> = oracle::checks(g, t).iter().map(|c| c.name.as_str()).collect();
     match t.role {
-        Role::Verify => out.push_str(&format!(
-            ". Verify {} independently (its checks: {}), then give your verdict: `{}` or `{} \"why\"`.",
-            t.of.as_deref().unwrap_or("its work"),
-            checks.join(", "),
-            command("verify --pass", session, cwd),
-            command("verify --reject", session, cwd)
-        )),
+        Role::Verify => {
+            out.push_str(&format!(
+                ". Verify {} independently (its checks: {}), then end your turn with the line `VERDICT: pass` or `VERDICT: reject <why>` \
+(or run `{}` or `{} \"why\"`).",
+                t.of.as_deref().unwrap_or("its work"),
+                checks.join(", "),
+                command("verify --pass", session, cwd),
+                command("verify --reject", session, cwd)
+            ));
+            if !t.flags.is_empty() {
+                out.push_str(&format!(" Flagged while the work was done: {}.", t.flags.join("; ")));
+            }
+        }
         _ => out.push_str(&format!(
             "; done when: {} pass. Ending your turn runs them; a suite slower than the stop hook runs with `{}`. Stuck: `{} \"why\"`.",
             checks.join(", "),
@@ -311,7 +434,7 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
     let path = tasks_path(home, &g.id);
     let (events, end) = board::read_from(&path, 0);
     let b = board::fold(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
-    let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now };
+    let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started };
     match event {
         "prompt" => {
             heartbeat(home, &mut hs, &b, session, now);
@@ -350,9 +473,16 @@ struct Ctx<'a> {
     cwd: &'a str,
     repo: &'a str,
     now: i64,
+    started: Instant,
 }
 
 impl Ctx<'_> {
+    /// The time now: the hook's `now` moved on by what the hook has taken (the oracle, a snapshot), so
+    /// a line written late in the stop is not stamped with its start.
+    fn clock(&self) -> i64 {
+        self.now + self.started.elapsed().as_millis() as i64
+    }
+
     fn head(&self) -> String {
         format!("[borg hive {}]", self.g.id)
     }
@@ -365,7 +495,7 @@ impl Ctx<'_> {
         let mut marks: Vec<String> = Vec::new();
         let last = last_marked(&state, TASK_MARKER);
         if last.is_none() {
-            parts.push(INOCULATION.into());
+            parts.push(inoculation(self.g));
         }
         if !goal::in_scope(self.g, self.repo) && !state.lines().any(|l| l == REPO_MARKER) {
             let names: Vec<&str> = self.g.repos.iter().map(|r| r.name.as_str()).collect();
@@ -516,12 +646,34 @@ impl Ctx<'_> {
         }
         let total = crate::expert_route::stop_budget(self.h).unwrap_or(crate::expert_route::DEFAULT_STOP_BUDGET);
         let left = || total.saturating_sub(started.elapsed()).saturating_sub(crate::expert_route::STOP_MARGIN);
-        // A verify task ends with a verdict, not with an oracle run of its own.
+        // A verify task ends with a verdict, its last message's `VERDICT:` line, not with an oracle run.
+        let said = (task.role == Role::Verify).then(|| verdict::parse(&crate::harness::last_message(self.h.caps(), input))).flatten();
+        if let Some(said) = said {
+            let mut text = waiting;
+            let mut handed = false;
+            match verdict::record(self.home, self.g, &task.id, &said, self.session, self.cwd, self.now) {
+                Ok(r) => {
+                    text.push_str(&format!("[borg hive] {}\n\n", r.summary(&task.id)));
+                    if let Some(next) = self.hand_next(&path, left()) {
+                        text.push_str(&format!("[borg hive] Next: {next}\n\n"));
+                        handed = true;
+                        hs.beat_ms = self.now;
+                    }
+                }
+                Err(e) => text.push_str(&format!("[borg hive] verdict on {} not recorded: {e}\n\n", task.id)),
+            }
+            hs.oracle_blocks = 0;
+            hs.blocks_for.clear();
+            save(self.session, hs);
+            // SAFETY: single-threaded here, as hook.rs main.
+            unsafe { std::env::set_var(crate::expert_route::STOP_BUDGET_ENV, left().as_millis().to_string()) };
+            return with_reason(&text, inner(), first_round || handed);
+        }
         let verdict = if task.role == Role::Verify {
             oracle::Verdict::Fail {
                 check: "verdict".into(),
                 tail: format!(
-                    "no verdict yet: run `{}` or `{} \"why\"`",
+                    "no verdict yet: end your turn with the line `VERDICT: pass` or `VERDICT: reject <why>`, or run `{}` or `{} \"why\"`",
                     command("verify --pass", self.session, self.cwd),
                     command("verify --reject", self.session, self.cwd)
                 ),
@@ -574,7 +726,7 @@ impl Ctx<'_> {
                 self.g.id,
                 task.id
             ));
-        } else if let Some(next) = self.done(held, input, &path) {
+        } else if let Some(next) = self.done(held, input, &path, &left) {
             text.push_str(&next);
             handed = true;
             hs.beat_ms = self.now;
@@ -590,29 +742,57 @@ impl Ctx<'_> {
     }
 
     /// The oracle passed at the stop: `done` and the verify task's open in one write, then the next
-    /// open task claimed for this drone. The text to block with when it got one.
-    fn done(&self, held: &TaskState, input: &Value, path: &Path) -> Option<String> {
+    /// open task claimed for this drone. The text to block with when it got one. The done's snapshot
+    /// keeps within what is `left` of the hook's time; the next claim is made only when time is left.
+    fn done(&self, held: &TaskState, input: &Value, path: &Path, left: &dyn Fn() -> Duration) -> Option<String> {
         let task = &held.task;
         let message = crate::harness::plan(self.h.caps(), input);
-        let check = verify_task(task, held.rework, self.session);
+        let since = held.live(self.now).map_or(i64::MIN, |l| l.2);
+        let (done, check) = done_events(self.home, self.g, held, self.session, Path::new(self.cwd), since, left());
         let vid = check.id.clone();
-        let wrote = board::append(
-            path,
-            &[Event::new(Ev::Done, &task.id, self.session, self.now).with_note(&hook::one_line(&message, 200)), Event::open(check, self.session, self.now)],
-        );
-        wrote.ok()?;
+        let ms = done.ms;
+        board::append(path, &[done.with_note(&hook::one_line(&message, 200)), Event::open(check, self.session, ms)]).ok()?;
         count(self.home, stats::HIVE_DONE, self.session, &self.g.id, &task.id, self.repo);
+        let next = self.hand_next(path, left())?;
+        Some(format!("[borg hive] {} done, verify task {vid} opened. Next: {next}\n\n", task.id))
+    }
+
+    /// Claims the next open task for this drone (its snapshot within `left`): what it is told of it.
+    /// None when no task is open, or less than `MIN_ORACLE` of the hook's time is left: the next
+    /// prompt offers the task instead.
+    fn hand_next(&self, path: &Path, left: Duration) -> Option<String> {
+        if left < MIN_ORACLE {
+            return None;
+        }
+        let now = self.clock();
         let b = board::fold(&board::read(path));
-        let next = board::next_for(&b, self.session, self.repo, self.now, |t| may_claim(self.g, t, self.repo))?;
-        let won = claim(self.home, self.g, self.session, &next.task.id, self.now)?;
+        let next = board::next_for(&b, self.session, self.repo, now, |t| may_claim(self.g, t, self.repo))?;
+        let won = claim(self.home, self.g, self.session, &next.task, self.cwd, now, left)?;
         count(self.home, stats::HIVE_CLAIM, self.session, &self.g.id, &won.task.id, self.repo);
-        hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(self.now).map_or(0, |l| l.2)));
-        Some(format!("[borg hive] {} done, verify task {vid} opened. Next: {}\n\n", task.id, describe(self.g, &won, self.session, self.cwd)))
+        let now = self.clock();
+        hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2)));
+        Some(describe(self.g, &won, self.session, self.cwd))
     }
 }
 
-/// The verify task a `done` of `t` opens: the same scope and checks, never claimable by its author.
+/// The `done` of the claim `held` (claimed at `since`) by `session` in `dir`, with a snapshot of the
+/// work (`head`, verdict.rs, `within` that time), and the verify task it opens, listing the guard's
+/// flags of the claim. The done is stamped once its snapshot is taken: the line lands at its ms.
+fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, since: i64, within: Duration) -> (Event, Task) {
+    let head = verdict::snapshot(dir, within).unwrap_or_default();
+    let now = learn::now_ms();
+    let mut done = Event::new(Ev::Done, &held.task.id, session, now);
+    done.head = head;
+    let flags: Vec<String> = guard::flags_of(home, &g.id, session, since, now).iter().map(guard::render).collect();
+    let mut check = verify_task(&held.task, held.rework, session);
+    check.flags = flags;
+    (done, check)
+}
+
+/// The verify task a `done` of `t` opens: the same scope and checks, never claimable by its author
+/// (the session, and the drone it is an iteration of).
 pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
+    let drone = bound(author).map(|hs| hs.drone).filter(|d| !d.is_empty());
     Task {
         id: format!("{}.v{}", t.id, rework + 1),
         role: Role::Verify,
@@ -622,15 +802,31 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
         deps: Vec::new(),
         accept: t.accept.clone(),
         of: Some(t.id.clone()),
-        not_by: vec![author.into()],
+        not_by: std::iter::once(author.to_string()).chain(drone).collect(),
+        flags: Vec::new(),
     }
 }
 
-/// Claims `task` for `session` (a claim and a heartbeat in one write), waits for rivals' lines to land,
-/// and reads the board back: the task when the claim won.
-fn claim(home: &Path, g: &Goal, session: &str, task: &str, now: i64) -> Option<TaskState> {
+/// Claims `task` for `session` in `cwd` (a claim and a heartbeat in one write), waits for rivals' lines
+/// to land, and reads the board back: the task when the claim won. A claim of work carries the tree it
+/// starts from (`base`, verdict.rs), which the verdict diffs against the done's: the base of this
+/// drone's (or, without a drone, this session's) first claim of the task when it had one (a tree that
+/// an earlier attempt already changed, say a test it weakened, is no base: the rework's diff must
+/// show it), else a snapshot taken now, `within` that time. The claim is stamped after the snapshot
+/// (`now` moved on by it), so it lands at its ms and never wins a race it reached late.
+fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64, within: Duration) -> Option<TaskState> {
     let path = tasks_path(home, &g.id);
-    board::append(&path, &[Event::new(Ev::Claim, task, session, now), Event::new(Ev::Heartbeat, task, session, now)]).ok()?;
+    let drone = bound(session).map(|hs| hs.drone).unwrap_or_default();
+    let t0 = Instant::now();
+    let base = match task.role != Role::Verify && !cwd.is_empty() {
+        true => first_base(&board::read(&path), &task.id, session, &drone).or_else(|| verdict::snapshot(Path::new(cwd), within)).unwrap_or_default(),
+        false => String::new(),
+    };
+    let now = now + t0.elapsed().as_millis() as i64;
+    let mut c = Event::new(Ev::Claim, &task.id, session, now).with_drone(&drone);
+    c.base = base;
+    let task = task.id.as_str();
+    board::append(&path, &[c, Event::new(Ev::Heartbeat, task, session, now)]).ok()?;
     std::thread::sleep(CLAIM_SETTLE);
     let b = board::fold(&board::read(&path));
     let s = b.tasks.get(task)?;
@@ -640,6 +836,16 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &str, now: i64) -> Option<T
         save(session, &hs);
     }
     won.then(|| s.clone())
+}
+
+/// The base of the first claim of `task` by `drone` (by `session` when it has none) that has one.
+fn first_base(events: &[Event], task: &str, session: &str, drone: &str) -> Option<String> {
+    events
+        .iter()
+        .filter(|e| e.ev == Ev::Claim && e.task == task && !e.base.is_empty())
+        .filter(|e| if drone.is_empty() { e.by == session } else { e.drone == drone })
+        .min_by_key(|e| e.ms)
+        .map(|e| e.base.clone())
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -670,22 +876,39 @@ pub const FLAGS: &[&str] = &[
     "--again",
     "--json",
     "--watch",
+    "--drones",
+    "--harness",
+    "--model",
+    "--base",
+    "--iter-timeout",
+    "--dry-run",
+    "--here",
+    "--drone",
+    "--hidden-dir",
+    "--hidden",
+    "--hidden-timeout",
 ];
 
 /// The flags that take no value.
-const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch"];
+const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here"];
 
 const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   init <goal> --spec TEXT|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]...
        [--task \"ID|role|title|files,..|deps,..\"]...       a goal, its oracle and its first tasks
+       [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  held-out checks outside the repo, run after verdicts
+  score <goal>                                              the hidden oracle scores the judged tasks not scored yet
   board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
   join <goal> [--session ID|DRONE]                          a running drone joins the goal
-  leave                                                     it leaves (its claim is released)
+  join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
+  leave [--here]                                            the drone leaves (its claim is released); --here: new
+                                                            sessions here join no more (joined ones stay)
+  run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]
+                                                            N headless drones in worktrees until done or the budget is spent
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
        [--accept NAME=CMD]... [--again]                     an engineer opens a task (--again reopens a blocked one)
   drone commands (the goal is the session's):
   claim [TASK] | progress \"note\" | release | block \"why\" | done [--note N]
-  verify --pass | --reject \"why\" | contract \"text\" --scope a,b [--supersedes ID]";
+  verify --pass | --reject \"why\" (or end the turn with `VERDICT: pass|reject <why>`) | contract \"text\" --scope a,b [--supersedes ID]";
 
 /// The command line: words, flag values (repeatable), and switches.
 struct Args<'a> {
@@ -763,7 +986,7 @@ fn new_task(id: &str, role: Role, title: &str, repo: &str, files: Vec<String>, d
     if title.trim().is_empty() {
         return Err(format!("task {id} needs a title"));
     }
-    Ok(Task { id: id.into(), role, title: title.trim().into(), repo: repo.into(), files, deps, accept, of: None, not_by: Vec::new() })
+    Ok(Task { id: id.into(), role, title: title.trim().into(), repo: repo.into(), files, deps, accept, of: None, not_by: Vec::new(), flags: Vec::new() })
 }
 
 /// Where the command runs: the store the directory routes to, and the directory.
@@ -858,7 +1081,11 @@ pub fn main(args: &[&str]) -> i32 {
             Ok(g) => board_cmd(&here, &g, &a),
             Err(e) => fail(e),
         },
+        ("join", [id]) if a.on("--here") => join_here(&here, id, a.value("--drone")),
         ("join", [id]) => join(&here, id, session),
+        ("leave", []) if a.on("--here") => leave_here(&here),
+        ("run", [id]) => run_cmd(&here, &a, id),
+        ("sim-drone", []) if std::env::var_os(crate::harness::TEST_ENV).is_some() => sim_drone::main(&here),
         ("leave", []) => match here.drone(session) {
             Ok((s, hs)) => {
                 let b = goal::load(&here.home, &hs.goal).map(|g| here.board(&g)).unwrap_or_default();
@@ -879,9 +1106,10 @@ pub fn main(args: &[&str]) -> i32 {
         }
         ("release", []) => held_event(&here, session, Ev::Released, ""),
         ("done", []) => done_cmd(&here, session, a.value("--note").unwrap_or_default()),
+        ("score", [id]) => score_cmd(&here, id),
         ("verify", []) => match (a.on("--pass"), a.value("--reject")) {
-            (true, None) => verdict(&here, session, Ev::Verified, ""),
-            (false, Some(note)) if !note.trim().is_empty() => verdict(&here, session, Ev::Rejected, note),
+            (true, None) => verdict_cmd(&here, session, verdict::Said::Pass),
+            (false, Some(note)) if !note.trim().is_empty() => verdict_cmd(&here, session, verdict::Said::Reject(note.trim().into())),
             _ => {
                 eprintln!("borg hive verify: give --pass or --reject \"why\"");
                 2
@@ -934,8 +1162,23 @@ fn init(here: &Here, a: &Args, id: &str) -> i32 {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
+    let hidden = match (a.value("--hidden-dir"), a.all("--hidden")) {
+        (None, cmds) if cmds.is_empty() => None,
+        (Some(dir), cmds) if !cmds.is_empty() => {
+            let timeout_s = a.value("--hidden-timeout").and_then(|t| t.parse().ok()).unwrap_or(600);
+            let h = goal::Hidden { dir: dir.into(), commands: cmds.into_iter().map(String::from).collect(), timeout_s };
+            if let Err(e) = goal::validate_hidden(&h, run::repo_of(Path::new(&here.cwd)).as_deref()) {
+                return fail(e);
+            }
+            Some(h)
+        }
+        _ => {
+            eprintln!("borg hive init: a hidden oracle needs --hidden-dir DIR and at least one --hidden CMD");
+            return 2;
+        }
+    };
     let author = learn::engineer(&here.cwd);
-    let g = Goal { v: 1, id: id.into(), spec, oracle, budget_usd, repos, author: author.clone(), created_ms: here.now, sig: String::new() };
+    let g = Goal { v: 1, id: id.into(), spec, oracle, budget_usd, repos, author: author.clone(), created_ms: here.now, sig: String::new(), hidden };
     if let Err(e) = goal::create(&here.home, &g) {
         return fail(e);
     }
@@ -1011,6 +1254,71 @@ fn join(here: &Here, id: &str, named: Option<&str>) -> i32 {
     0
 }
 
+/// The directory a `--here` join names: the git toplevel of the command's directory (a worktree's own),
+/// else the directory.
+fn here_dir(here: &Here) -> String {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C", &here.cwd, "rev-parse", "--show-toplevel"]);
+    match crate::runner::run_capped_status(cmd, None, Duration::from_secs(5)) {
+        Some((s, out)) if s.success() && !out.trim_ascii().is_empty() => String::from_utf8_lossy(out.trim_ascii()).into_owned(),
+        _ => here.cwd.clone(),
+    }
+}
+
+fn join_here(here: &Here, id: &str, drone: Option<&str>) -> i32 {
+    if let Err(e) = goal::load(&here.home, id) {
+        return fail(e);
+    }
+    let dir = here_dir(here);
+    let drone = drone.map_or_else(|| format!("j-{}", &blake3::hash(dir.as_bytes()).to_hex()[..6]), String::from);
+    let harness = crate::harness::named_current().map(|h| h.name().to_string()).unwrap_or_default();
+    let j = Join { v: 1, ms: here.now, goal: id.into(), dir: dir.clone(), drone: drone.clone(), session: String::new(), harness, by: "join".into() };
+    if let Err(e) = append_join(&here.home, id, &j) {
+        return fail(e);
+    }
+    println!("joined {id} as {drone}: the next session in {dir} gets the board (`borg hive leave --here` undoes it)");
+    0
+}
+
+fn leave_here(here: &Here) -> i32 {
+    let dir = here_dir(here);
+    let Some(j) = joined(&here.home, &dir) else { return fail(format!("{dir} joined no hive goal")) };
+    let leave = Join { v: 1, ms: here.now.max(j.ms + 1), goal: String::new(), dir: dir.clone(), by: "join".into(), ..Join::default() };
+    if let Err(e) = append_join(&here.home, &j.goal, &leave) {
+        return fail(e);
+    }
+    println!("new sessions in {dir} join no hive goal ({} keeps the sessions that joined)", j.goal);
+    0
+}
+
+fn run_cmd(here: &Here, a: &Args, id: &str) -> i32 {
+    let Some(drones) = a.value("--drones").and_then(|n| n.parse::<usize>().ok()) else {
+        eprintln!("borg hive run: give --drones N (1 to {})", run::MAX_DRONES);
+        return 2;
+    };
+    let harness = match a.value("--harness") {
+        Some(n) => match crate::harness::by_name(n) {
+            Some(h) => h,
+            None => {
+                eprintln!("borg hive run: unknown harness {n} (one of {})", crate::harness::names(", "));
+                return 2;
+            }
+        },
+        None => crate::harness::current(),
+    };
+    let iter_timeout = match a.value("--iter-timeout").map(str::parse::<u64>) {
+        None => run::DEFAULT_ITER_TIMEOUT,
+        Some(Ok(s)) if s > 0 => Duration::from_secs(s),
+        Some(_) => {
+            eprintln!("borg hive run: --iter-timeout is seconds, above 0");
+            return 2;
+        }
+    };
+    let o =
+        run::Opts { goal: id, drones, harness, model: a.value("--model"), base: a.value("--base").unwrap_or("HEAD"), iter_timeout, dry_run: a.on("--dry-run") };
+    run::main(&here.home, &here.cwd, &o)
+}
+
 fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
     let g = match goal::load(&here.home, goal_id) {
         Ok(g) => g,
@@ -1084,9 +1392,9 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
             },
         };
         let id = pick.task.id.clone();
-        if let Some(won) = claim(&here.home, &g, &session, &id, now) {
+        if let Some(won) = claim(&here.home, &g, &session, &pick.task.clone(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
             count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
-            hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(now).map_or(0, |l| l.2)));
+            hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
             println!("claimed {id} for {}. {}", short(&session), describe(&g, &won, &session, &here.cwd));
             return 0;
         }
@@ -1131,10 +1439,11 @@ fn done_cmd(here: &Here, named: Option<&str>, note: &str) -> i32 {
     // No hook limit here: each check runs within its own timeout.
     match oracle::run(&g, &s.task, Path::new(&here.cwd), None) {
         oracle::Verdict::Pass => {
-            let now = learn::now_ms();
-            let check = verify_task(&s.task, s.rework, &session);
+            let since = s.live(learn::now_ms()).map_or(i64::MIN, |l| l.2);
+            let (done, check) = done_events(&here.home, &g, &s, &session, Path::new(&here.cwd), since, verdict::SNAPSHOT_TIMEOUT);
             let vid = check.id.clone();
-            let events = [Event::new(Ev::Done, &s.task.id, &session, now).with_note(&hook::one_line(note, 200)), Event::open(check, &session, now)];
+            let ms = done.ms;
+            let events = [done.with_note(&hook::one_line(note, 200)), Event::open(check, &session, ms)];
             if let Err(e) = board::append(&tasks_path(&here.home, &g.id), &events) {
                 return fail(e);
             }
@@ -1162,7 +1471,9 @@ fn done_cmd(here: &Here, named: Option<&str>, note: &str) -> i32 {
     }
 }
 
-fn verdict(here: &Here, named: Option<&str>, ev: Ev, note: &str) -> i32 {
+/// `borg hive verify --pass|--reject "why"`: the verdict of the session's verify claim (verdict.rs
+/// `record`: the guardrails, then the reward).
+fn verdict_cmd(here: &Here, named: Option<&str>, said: verdict::Said) -> i32 {
     let (session, g, s) = match held(here, named) {
         Ok(x) => x,
         Err(e) => return fail(e),
@@ -1170,15 +1481,53 @@ fn verdict(here: &Here, named: Option<&str>, ev: Ev, note: &str) -> i32 {
     if s.task.role != Role::Verify {
         return fail(format!("{} is not a verify task", s.task.id));
     }
-    if let Err(e) = board::append(&tasks_path(&here.home, &g.id), &[Event::new(ev, &s.task.id, &session, here.now).with_note(note.trim())]) {
-        return fail(e);
+    match verdict::record(&here.home, &g, &s.task.id, &said, &session, &here.cwd, here.now) {
+        Ok(r) => {
+            println!("{}", r.summary(&s.task.id));
+            0
+        }
+        Err(e) => fail(e),
     }
-    let of = s.task.of.as_deref().unwrap_or_default();
-    match ev {
-        Ev::Verified => println!("{} verified: {of} is verified", s.task.id),
-        _ => println!("{} rejected: {of} is open again with your note", s.task.id),
+}
+
+/// Whether this command runs for a drone: launched into a goal (`BORG_HIVE`, `BORG_HIVE_DRONE`), or in
+/// a worktree `borg hive run` made and has not left (a harness that drops the env).
+fn drone_here(here: &Here) -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    set(ENV) || set(DRONE_ENV) || joined(&here.home, &here.cwd).is_some_and(|j| j.by == "run")
+}
+
+/// `borg hive score <goal>`: the hidden oracle scores every judged attempt not scored yet. An engineer's
+/// command: a drone that learned the held-out checks' results could optimise against them.
+fn score_cmd(here: &Here, id: &str) -> i32 {
+    if drone_here(here) {
+        return fail("the hidden oracle is scored by the engineer, never by a drone of a hive goal");
     }
-    0
+    let g = match goal::load(&here.home, id) {
+        Ok(g) => g,
+        Err(e) => return fail(e),
+    };
+    if g.hidden.is_none() {
+        return fail(format!("goal {id} has no hidden oracle: its verdicts are credited at once"));
+    }
+    let Some(repo) = run::repo_of(Path::new(&here.cwd)) else { return fail(format!("{} is not in the goal's git repo", here.cwd)) };
+    let scored = hidden::score_pending(&here.home, &g, &repo, usize::MAX, here.now);
+    let scores = &scored.scores;
+    for s in scores {
+        let r = if s.pass {
+            "pass"
+        } else if s.timeout {
+            "timeout"
+        } else {
+            "fail"
+        };
+        println!("{}  {r}  {} ms{}", s.task, s.dur_ms, if s.agree { "" } else { "  (the verifier said otherwise)" });
+    }
+    for why in &scored.skipped {
+        println!("{why} (not scored: run it again from the goal's repo)");
+    }
+    println!("{} attempt(s) scored", scores.len());
+    i32::from(!scored.skipped.is_empty())
 }
 
 fn contract_cmd(here: &Here, named: Option<&str>, text: &str, scope: Vec<String>, supersedes: Option<&str>) -> i32 {
@@ -1224,6 +1573,38 @@ mod tests {
         assert!(parse_task("t1|chef|x").is_err());
         assert!(parse_task("../t|work|x").is_err());
         assert!(parse_task("t1|work").is_err());
+    }
+
+    #[test]
+    fn a_join_record_holds_the_directories_inside_it_and_a_leave_shadows_it() {
+        let home = std::env::temp_dir().join(format!("borg-hive-joins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(joined(&home, "/w/repo/src").is_none(), "no hive: nothing (one failed stat)");
+        let g = Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+        };
+        goal::create(&home, &g).unwrap();
+        let j =
+            |ms: i64, goal: &str, dir: &str| Join { v: 1, ms, goal: goal.into(), dir: dir.into(), drone: "j-1".into(), by: "join".into(), ..Join::default() };
+        append_join(&home, "g", &j(1, "g", "/w/repo")).unwrap();
+        assert_eq!(joined(&home, "/w/repo/src/x").map(|j| (j.goal, j.drone)), Some(("g".into(), "j-1".into())));
+        assert_eq!(joined(&home, "/w/repo").map(|j| j.goal).as_deref(), Some("g"));
+        assert!(joined(&home, "/w/repo2").is_none(), "whole path components only");
+        assert!(joined(&home, "/w").is_none() && joined(&home, "").is_none());
+        append_join(&home, "g", &j(2, "", "/w/repo")).unwrap();
+        assert!(joined(&home, "/w/repo/src").is_none(), "the later leave shadows the join");
+        append_join(&home, "g", &j(3, "g", "/w/repo/.worktrees/hive-g-1")).unwrap();
+        assert!(joined(&home, "/w/repo/.worktrees/hive-g-1/src").is_some() && joined(&home, "/w/repo/src").is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

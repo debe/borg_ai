@@ -60,7 +60,7 @@ pub(crate) fn touched(input: &Value, tool: &str) -> String {
 /// The files an edit names in its `edits` beside its own `file_path` (a Codex patch of several files;
 /// Claude's MultiEdit names none there). They reach `.ctx` and `.edits`; presence (`borg top`) shows
 /// one file per drone, the edit's own `file_path`.
-fn further_files(input: &Value) -> impl Iterator<Item = &str> {
+pub(crate) fn further_files(input: &Value) -> impl Iterator<Item = &str> {
     input.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e.get("file_path").and_then(Value::as_str)).filter(|p| !p.is_empty())
 }
 
@@ -1410,15 +1410,21 @@ pub fn main(name: &str, event: &str) {
     }
     // Who is working where (presence.rs, for `borg top`): one small atomic write per hook.
     let now = learn::now_ms();
-    // Not at pre_tool (every tool call): there only steering reads, and only once someone steered.
+    // Not at pre_tool (every tool call): there only the hive's guard flags (hive/guard.rs: one failed
+    // open for a session in no goal) and steering reads, only once someone steered.
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let me = match event {
-        "pre_tool" if crate::steer::inbox(&home).exists() => crate::presence::read(&home, session),
-        "pre_tool" => return,
+        "pre_tool" => {
+            crate::hive::guard::pre_tool(&home, &input, now);
+            if !crate::steer::inbox(&home).exists() {
+                return;
+            }
+            crate::presence::read(&home, session)
+        }
         _ => crate::presence::touch(&home, &name, h.name(), event, &input, now),
     };
     // A drone launched into a hive goal (BORG_HIVE) joins it at its first hook (hive/mod.rs).
-    crate::hive::bind_from_env(&home, session);
+    crate::hive::bind_from_env(&home, session, cwd);
     // Signed steering (steer.rs) wraps the answer: shown once, and a pause holds tools and the stop.
     // Inside it the hive (hive/mod.rs): the drone's claim and board at a prompt, its oracle at the stop;
     // nothing for a session in no hive goal. At a stop, the routed collective's experts join the

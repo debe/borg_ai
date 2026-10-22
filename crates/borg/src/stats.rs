@@ -82,6 +82,14 @@ pub const HIVE_DONE: &str = "hive_done";
 pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
 pub const HIVE_RELEASED: &str = "hive_released";
 pub const HIVE_SHOWN: &str = "hive_shown";
+/// A hive task's verdict, once per attempt (hive/verdict.rs; `why`: the goal, `text`: the task and an
+/// excerpt of the note, `lessons`: the lessons credited with it, `n` their number): verified, rejected
+/// (by its verifier or the hidden oracle), or hacked (protected tests or CI changed, or the oracle
+/// touched). With a hidden oracle, counted when it scored. `task_hacked` over all three is the hacked
+/// rate (borg-web's overview).
+pub const TASK_VERIFIED: &str = "task_verified";
+pub const TASK_REJECTED: &str = "task_rejected";
+pub const TASK_HACKED: &str = "task_hacked";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {

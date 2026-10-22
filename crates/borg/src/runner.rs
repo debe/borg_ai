@@ -299,7 +299,7 @@ fn text_of(content: &Value) -> String {
 }
 
 /// omp `--mode json`: the last assistant `message_end`'s text and `usage.cost.total`.
-fn omp_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
+pub(crate) fn omp_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
     let m = events(out).filter(|e| e["type"] == "message_end" && e["message"]["role"] == "assistant").last()?;
     let m = &m["message"];
     if m["stopReason"] == "error" {
@@ -314,7 +314,7 @@ fn omp_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
 /// call has neither). The cost is None when no step was priced or the answer's step was never
 /// finished (2.x keeps that cost in the session only). An `error` event (1.x `error.name`, 2.x
 /// `error.type`: an unavailable model, a failed request) is no answer.
-fn opencode_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
+pub(crate) fn opencode_answer(out: &[u8]) -> Option<(String, Option<f64>)> {
     let (mut text, mut step, mut cost, mut priced, mut open) = (String::new(), None::<String>, 0.0, false, false);
     for e in events(out) {
         let part = &e["part"];
@@ -431,13 +431,36 @@ pub fn run_capped(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Opti
 
 /// The exit status and stdout of `cmd` (fed `input` on stdin), or None when it cannot start or fails
 /// to finish within `timeout` (then killed). Stderr is discarded: a caller that wants it merges it
-/// into stdout in the command itself (hive/oracle.rs runs `sh -c` with `exec 2>&1`).
+/// into stdout in the command itself (hive/oracle.rs runs `sh -c` with `exec 2>&1`). `run_bounded`
+/// that drops a run cut off at the cap.
+pub fn run_capped_status(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    let b = run_bounded(cmd, input, timeout)?;
+    Some((b.status?, b.out))
+}
+
+/// One bounded run of a command: its stdout (as far as it got), and its exit status (None: cut off at
+/// the cap).
+#[derive(Debug)]
+pub struct Bounded {
+    pub out: Vec<u8>,
+    pub status: Option<std::process::ExitStatus>,
+}
+
+impl Bounded {
+    pub fn timed_out(&self) -> bool {
+        self.status.is_none()
+    }
+}
+
+/// `cmd` (fed `input` on stdin) run to its end or to `timeout`, whichever comes first; None only when
+/// it cannot start. A run cut off at the cap keeps what it printed so far (a hive drone's iteration,
+/// hive/run.rs).
 ///
 /// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
 /// `cmd` exits (nothing it started, such as an MCP server, outlives it). On Linux it also dies with
 /// this process: a harness that kills `borg` (its own hook timeout) never leaves a model call running
 /// and spending.
-pub fn run_capped_status(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Bounded> {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
@@ -467,27 +490,46 @@ pub fn run_capped_status(mut cmd: Command, input: Option<&[u8]>, timeout: Durati
         });
     }
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
     });
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 kill_group(); // a straggler holding stdout open would block the reader forever
-                return reader.join().ok().map(|out| (status, out));
+                return Some(Bounded { out: drain(&rx), status: Some(status) });
             }
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
             _ => {
                 kill_group();
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Some(Bounded { out: drain(&rx), status: None });
             }
         }
     }
+}
+
+/// How long the output of a command that ended is still read: its group is gone, so the pipe closes
+/// at once, unless a process that left the group (`setsid`, a daemon) holds it open.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// The reader's chunks until the pipe closes or `DRAIN_GRACE` passes: a process that left the group
+/// and holds the pipe costs what it prints later, never the bound.
+fn drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    let deadline = Instant::now() + DRAIN_GRACE;
+    let mut out = Vec::new();
+    while let Ok(chunk) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        out.extend_from_slice(&chunk);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -808,5 +850,33 @@ mod tests {
         // A failing command still has its stdout through run_capped, as before.
         assert_eq!(run_capped(sh("echo no; exit 3"), None, Duration::from_secs(5)).unwrap(), b"no\n");
         assert!(run_capped_status(sh("sleep 5"), None, Duration::from_millis(200)).is_none());
+    }
+
+    #[test]
+    fn a_run_cut_off_at_its_cap_keeps_what_it_printed() {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", "echo started; sleep 30"]);
+        let t0 = Instant::now();
+        let b = run_bounded(sh, None, Duration::from_millis(500)).unwrap();
+        assert!(b.timed_out() && t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(b.out, b"started\n");
+        let mut ok = Command::new("echo");
+        ok.arg("done");
+        let b = run_bounded(ok, None, Duration::from_secs(5)).unwrap();
+        assert!(!b.timed_out() && b.status.unwrap().success());
+        assert!(run_bounded(Command::new("/nonexistent/borg-no-such-cli"), None, Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_process_that_left_the_group_and_holds_stdout_never_blocks_a_finished_run() {
+        if Command::new("setsid").arg("--version").output().is_err() {
+            return;
+        }
+        let mut sh = Command::new("sh");
+        sh.args(["-c", "setsid sleep 30 & echo hi"]);
+        let t0 = Instant::now();
+        let b = run_bounded(sh, None, Duration::from_secs(20)).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!((b.out.as_slice(), b.status.is_some_and(|s| s.success())), (b"hi\n".as_slice(), true));
     }
 }

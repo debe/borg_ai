@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::wiring::Hooks;
-use super::{Caps, Harness, Level, Probe, Transcript, Wiring};
+use super::{Caps, Harness, Headless, HeadlessEnd, Level, Probe, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
 /// tool call fires no PostToolUse at all), so denials are not captured.
@@ -55,7 +55,35 @@ impl Harness for Codex {
             deny_capture: false,
             sends_pid: false,
             stop_budget: Some(Duration::from_secs(STOP_TIMEOUT_S)),
+            headless_budget: false,
         }
+    }
+
+    /// `codex exec --json` in the drone's worktree, sandboxed to it (`-s workspace-write`), with the
+    /// engineer's config and hooks on (unlike borg's own model calls, runner.rs `codex_command`), checked
+    /// against `codex exec --help` of 0.153.2. Codex takes no budget and reports tokens, not dollars.
+    fn headless(&self, run: &Headless) -> Option<Command> {
+        let mut cmd = Command::new("codex");
+        cmd.args(["exec", "--json", "-s", "workspace-write"]).arg("-C").arg(run.cwd);
+        if let Some(m) = run.model {
+            cmd.args(["-m", m]);
+        }
+        cmd.arg(run.prompt).current_dir(run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
+        Some(cmd)
+    }
+
+    /// The thread id, the last agent message and whether the turn failed; never a cost (tokens only).
+    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
+        let mut end = HeadlessEnd::default();
+        for e in out.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Value>(l).ok()) {
+            match e["type"].as_str() {
+                Some("thread.started") => end.session = e["thread_id"].as_str().unwrap_or_default().into(),
+                Some("item.completed") if e["item"]["type"] == "agent_message" => end.text = e["item"]["text"].as_str().unwrap_or_default().into(),
+                Some("turn.failed" | "error") => end.error = true,
+                _ => {}
+            }
+        }
+        end
     }
 
     fn wiring(&self) -> Wiring {

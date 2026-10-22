@@ -185,7 +185,11 @@ fn graded_blocks_only_for_a_three_and_hands_twos_and_ones_over_free_once() {
     assert_eq!(rec["applied"], 3);
     // The check itself is recorded too: every applying lesson in the model's order, and what it chose.
     let graded: Value = outcomes.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|o| o["kind"] == "graded").unwrap();
-    assert_eq!((graded["lessons"].clone(), graded["grades"].clone(), graded["ranks"].clone()), (json!(["G1", "New", "G2"]), json!([1, 3, 2]), json!([0, 1, 2])), "{graded}");
+    assert_eq!(
+        (graded["lessons"].clone(), graded["grades"].clone(), graded["ranks"].clone()),
+        (json!(["G1", "New", "G2"]), json!([1, 3, 2]), json!([0, 1, 2])),
+        "{graded}"
+    );
     let mut chosen: Vec<&str> = graded["chosen"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     chosen.sort();
     assert_eq!(chosen, ["G1", "G2", "New"]);

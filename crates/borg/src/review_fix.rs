@@ -1014,7 +1014,12 @@ mod tests {
         let echo = json!({"findings": [{"file": "src/a.rs", "severity": "high", "title": "the findings this fix step works through"}]});
         // A fix step that passes the findings to a tool stays a fix step, whatever its text says after.
         for last in ["", "Fixed src/a.rs."] {
-            let a = SubAgent { label: "fix".into(), work: format!("{{\"command\":\"cargo test\"}}\n{echo}\n{last}\n"), final_text: last.into(), ..Default::default() };
+            let a = SubAgent {
+                label: "fix".into(),
+                work: format!("{{\"command\":\"cargo test\"}}\n{echo}\n{last}\n"),
+                final_text: last.into(),
+                ..Default::default()
+            };
             let a = SubAgent { output: output_of(&a), ..a };
             assert!(a.output.is_none() && is_fix(&a), "{last:?}");
         }

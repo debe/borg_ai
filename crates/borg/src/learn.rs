@@ -577,6 +577,12 @@ pub fn regret_credit() -> bool {
 /// Indexed once per run, so a run costs one pass over the log and the library plus each deciding
 /// session's own records: `regretted` reads only the deciding session's records, and a regret's credits
 /// carry that session too.
+///
+/// The regret reaches back to a hive verifier too (hive/verdict.rs `verifications`): when the decision
+/// lies in a work claim of the deciding session that a verifier passed, the lessons asked in the
+/// verifier's claim of that verify task share `VERIFIER_REGRET` of the strength, under a cause of their
+/// own (`<episode>/verify`), so a lesson shown to both drones is credited once per role. Nothing without
+/// a hive.
 fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<outcome::Outcome>, path: &Path) {
     let mut holder: HashMap<&str, &Lesson> = HashMap::new();
     for l in library {
@@ -584,7 +590,10 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
             holder.entry(id.as_str()).or_insert(l);
         }
     }
-    let deciding: HashSet<&str> = regrets.iter().filter_map(|e| e.regret.as_ref()).map(|r| r.decision_session.as_str()).collect();
+    let mut deciding: HashSet<&str> = regrets.iter().filter_map(|e| e.regret.as_ref()).map(|r| r.decision_session.as_str()).collect();
+    let verifications = path.parent().map(crate::hive::verdict::verifications).unwrap_or_default();
+    let verifiers: Vec<&str> = verifications.iter().filter(|v| deciding.contains(v.author.as_str())).map(|v| v.verifier.as_str()).collect();
+    deciding.extend(verifiers);
     let mut by_session: HashMap<String, Vec<outcome::Outcome>> = HashMap::new();
     for o in outcomes.iter().filter(|o| deciding.contains(o.session.as_str())) {
         by_session.entry(o.session.clone()).or_default().push(o.clone());
@@ -599,8 +608,23 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
             records.push(o.clone());
             outcomes.push(o);
         }
+        for v in verifications.iter().filter(|v| v.author == r.decision_session && (v.work_from..=v.work_to).contains(&r.decision_ms)) {
+            let records = by_session.entry(v.verifier.clone()).or_default();
+            let strength = regret::strength(r) * VERIFIER_REGRET;
+            // Only what the verifier was asked while it held the verify task.
+            let tenure: Vec<outcome::Outcome> = records.iter().filter(|o| o.kind != outcome::ASKED || o.ms >= v.from).cloned().collect();
+            for o in outcome::regretted(&tenure, &v.verifier, v.ms, &format!("{}/verify", e.id), &[], strength, e.ms, &e.repo) {
+                let _ = outcome::append(path, &o);
+                records.push(o.clone());
+                outcomes.push(o);
+            }
+        }
     }
 }
+
+/// The share of a regret's strength that reaches the drone that verified the regretted work
+/// (design-chosen, to be tuned by hive-learning.md step 6): it passed the work, it did not decide it.
+pub const VERIFIER_REGRET: f64 = 0.5;
 
 /// `learn_in`, calling `report` after every model call (the CLI prints it; the hooks pass a no-op).
 ///
@@ -1199,6 +1223,87 @@ mod tests {
         let home = setup("regret-untracked", regret_at("R1", 20));
         learn_in(&home, None, &regret_ask(true), false, 200);
         assert!(regretted(&home).is_empty(), "BORG_LEARN=off writes nothing");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A hive goal in `home` whose work t1 was claimed by `s-dec` at 11, done at `done` and verified by
+    /// `s-ver` (claimed at `verified - 3`) at `verified`.
+    fn verified_by(home: &Path, done: i64, verified: i64) {
+        use crate::hive::{Event, Role, Task, board, goal};
+        let g = goal::Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+        };
+        goal::create(home, &g).unwrap();
+        let t1 = Task {
+            id: "t1".into(),
+            role: Role::Work,
+            title: "t".into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+        };
+        let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s-dec".into()], ..t1.clone() };
+        let ev = |kind, task: &str, by: &str, ms| Event::new(kind, task, by, ms);
+        use crate::hive::Ev::*;
+        let lines = [
+            Event::open(t1, "engineer:e", 1),
+            ev(Claim, "t1", "s-dec", 11),
+            ev(Done, "t1", "s-dec", done),
+            Event::open(v1, "s-dec", done),
+            ev(Claim, "t1.v1", "s-ver", verified - 3),
+            ev(Verified, "t1.v1", "s-ver", verified),
+        ];
+        board::append(&crate::hive::tasks_path(home, "g"), &lines).unwrap();
+    }
+
+    #[test]
+    fn a_regret_reaches_the_verifier_of_the_attempt_that_holds_the_decision_at_half_strength() {
+        let blamed = |home: &Path| -> Vec<(String, String, f64, String)> {
+            let mut v: Vec<_> = outcome::read(&home.join("outcomes.jsonl"))
+                .into_iter()
+                .filter(|o| o.kind == outcome::REGRETTED)
+                .map(|o| (o.lessons.join(","), o.session, o.credit, o.cause))
+                .collect();
+            v.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            v
+        };
+        let setup = |name: &str, done: i64, verified: i64| {
+            let home = temp_home(name);
+            asked(&home, "s-dec", 10, &["Le0"]);
+            // Before its verify claim (its own work, say), in it, and after its verdict.
+            asked(&home, "s-ver", verified - 4, &["Lpre"]);
+            asked(&home, "s-ver", verified - 2, &["Lv"]);
+            asked(&home, "s-ver", verified + 10, &["Lw"]);
+            append_jsonl(&home.join("episodes.jsonl"), &regret_at("R1", 20)).unwrap();
+            verified_by(&home, done, verified);
+            home
+        };
+        // The decision (20) lies in the verified attempt (11..=25): only the verify claim's lesson.
+        let home = setup("regret-verifier", 25, 30);
+        learn_in(&home, None, &regret_ask(true), true, 200);
+        // The regret's strength is 0.5 (one signal): the author's lesson takes it all, the verifier's half.
+        assert_eq!(blamed(&home), [("Le0".into(), "s-dec".into(), 0.5, "R1".into()), ("Lv".into(), "s-ver".into(), 0.25, "R1/verify".into())]);
+        let before = std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap();
+        learn_in(&home, None, &regret_ask(true), true, 300);
+        assert_eq!(std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap(), before, "credited once");
+        let _ = std::fs::remove_dir_all(home);
+        // The decision came after the verified attempt (11..=14): the verifier passed other work.
+        let home = setup("regret-verifier-early", 14, 18);
+        learn_in(&home, None, &regret_ask(true), true, 200);
+        assert_eq!(blamed(&home), [("Le0".into(), "s-dec".into(), 0.5, "R1".into())]);
         let _ = std::fs::remove_dir_all(home);
     }
 

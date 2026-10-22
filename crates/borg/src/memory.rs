@@ -18,13 +18,19 @@
 //!   wall time: a holiday erases nothing. Uses spread over time keep a lesson active longer than the
 //!   same number massed early; with a fixed d that comes from the later last use (a decay that depends
 //!   on the activation at each use, Pavlik and Anderson's spacing model, is a possible refinement).
-//! - **Usefulness belief** `Beta(1 + changed, 1 + ignored + 2·corrected + 3·vetoed + regretted)`, one result
+//! - **Usefulness belief** `Beta(1 + changed + verified, 1 + ignored + 2·corrected + 3·vetoed +
+//!   regretted + rejected + 3·hacked)`, one result
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
 //!   learn`) without a change is ignored. A correction counts twice, as in outcome.rs; a veto (`borg no`,
 //!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
 //!   the weighted share of later fixes of decisions the lesson was asked before (outcome.rs `regretted`),
 //!   each regret once, at most `REGRET` × 0.875: a separate, later event, added on top of the session's
 //!   result unless that result is a correction or a veto (the stronger result already counts it). A fractional β is sampled by randomised rounding (`round_seeded`).
+//!   `verified`, `rejected` and `hacked` are hive verdicts on the task a lesson was shown in
+//!   (hive/verdict.rs), one per (lesson, attempt), the worst of duplicates (hacked > rejected >
+//!   verified): additive to the session's result (a verdict is about the task, a session result about
+//!   the engineer's reaction), never a use, and never a tick of the activity clock. Weights in
+//!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`.
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
 //!   (session, lesson) so a session sees one stable ranking, or the belief's mean without a session.
 //!   `squash(A) = 2 / (1 + e^(−A/2))` lies in (0, 2) and is 1 at A = 0, a lesson created this session;
@@ -51,6 +57,13 @@ pub const D: f64 = 0.5;
 /// same-session, same-concern evidence; a regret is delayed and shared among the lessons asked). A veto
 /// weighs more than a correction, so regret < corrected < vetoed.
 pub const REGRET: f64 = 1.0;
+/// What one hive verdict adds to a lesson's belief (design-chosen, to be tuned by hive-learning.md
+/// step 6, like the veto's 3): a verified task adds one to α, like a change; a rejected one one to β,
+/// like an ignore (the verifier can be wrong); a hacked one three to β, as heavy as a veto and not
+/// above it: the hack test is a path heuristic that can be wrong, a veto is an engineer.
+pub const VERIFIED_W: u32 = 1;
+pub const REJECTED_W: u32 = 1;
+pub const HACKED_W: u32 = 3;
 pub const D_CONSOLIDATED: f64 = 0.3;
 pub const CONSOLIDATE_SESSIONS: usize = 3;
 pub const DORMANT_BELOW: f64 = -2.0;
@@ -66,7 +79,8 @@ pub struct Clock {
 impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
-        for o in outcomes {
+        // A hive verdict is about a task, never a session of the collective: it never moves the clock.
+        for o in outcomes.iter().filter(|o| !outcome::is_verdict(&o.kind)) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
         }
@@ -114,17 +128,22 @@ pub struct Memory {
     pub vetoed: u32,
     /// Σ credit of the regrets that blame it (outcome.rs `regretted`), each regret once.
     pub regretted: f64,
+    /// Hive tasks it was shown in, by verdict (outcome.rs `verified`, `rejected`, `hacked`), each
+    /// attempt once.
+    pub verified: u32,
+    pub rejected: u32,
+    pub hacked: u32,
     pub consolidated: bool,
     pub dormant: bool,
 }
 
 impl Memory {
     pub fn alpha(&self) -> u32 {
-        1 + self.changed
+        1 + self.changed + VERIFIED_W * self.verified
     }
 
     pub fn beta(&self) -> f64 {
-        (1 + self.ignored + 2 * self.corrected + 3 * self.vetoed) as f64 + REGRET * self.regretted
+        (1 + self.ignored + 2 * self.corrected + 3 * self.vetoed + REJECTED_W * self.rejected + HACKED_W * self.hacked) as f64 + REGRET * self.regretted
     }
 
     pub fn mean(&self) -> f64 {
@@ -152,7 +171,21 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
     // Per (lesson, regret): its credit, the largest of duplicate lines (merging two logs merges memory),
     // and the deciding session it blames.
     let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
+    // Per (lesson, attempt): its hive verdict, the worst of duplicates: 2 hacked > 1 rejected > 0 verified.
+    let mut verdict: HashMap<(&str, &str), u8> = HashMap::new();
     for o in outcomes {
+        if outcome::is_verdict(&o.kind) {
+            let r = match o.kind.as_str() {
+                outcome::HACKED => 2,
+                outcome::REJECTED => 1,
+                _ => 0,
+            };
+            for l in &o.lessons {
+                let e = verdict.entry((l.as_str(), o.cause.as_str())).or_insert(r);
+                *e = (*e).max(r);
+            }
+            continue;
+        }
         if o.kind == outcome::REGRETTED {
             for l in &o.lessons {
                 let e = regret.entry((l.as_str(), o.cause.as_str())).or_insert((0.0, o.session.as_str()));
@@ -184,6 +217,10 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             *regretted.entry(l).or_default() += credit;
         }
     }
+    let mut verdicts: HashMap<&str, [u32; 3]> = HashMap::new();
+    for ((l, _), r) in verdict {
+        verdicts.entry(l).or_default()[r as usize] += 1;
+    }
     lessons
         .iter()
         .map(|c| {
@@ -200,7 +237,20 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             let ages = used.into_iter().chain([born]).map(|t| now.saturating_sub(t) + 1);
             let a = activation(ages, d);
             let regretted = regretted.get(c.id.as_str()).copied().unwrap_or(0.0);
-            let m = Memory { activation: a, changed, ignored, corrected, vetoed, regretted, consolidated, dormant: !consolidated && a < DORMANT_BELOW };
+            let [verified, rejected, hacked] = verdicts.get(c.id.as_str()).copied().unwrap_or_default();
+            let m = Memory {
+                activation: a,
+                changed,
+                ignored,
+                corrected,
+                vetoed,
+                regretted,
+                verified,
+                rejected,
+                hacked,
+                consolidated,
+                dormant: !consolidated && a < DORMANT_BELOW,
+            };
             (c.id.clone(), m)
         })
         .collect()
@@ -460,6 +510,44 @@ mod tests {
         assert_eq!(other.regretted, 0.5, "another session's correction leaves the regret");
     }
 
+    fn verdict(kind: &str, session: &str, lesson: &str, ms: i64, cause: &str) -> Outcome {
+        Outcome { cause: cause.into(), ..o(kind, session, lesson, ms, "r") }
+    }
+
+    #[test]
+    fn hive_verdicts_weigh_like_a_change_an_ignore_and_a_veto() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = o(outcome::ASKED, "a", "L", 1, "r");
+        let one = |kind: &str| mem(&[asked.clone(), verdict(kind, "a", "L", 9, "g/t1.v1")]);
+        assert_eq!(one(outcome::HACKED).mean(), mem(&[asked.clone(), o(outcome::VETOED, "b", "L", 9, "r")]).mean(), "one hacked == one vetoed");
+        assert_eq!(one(outcome::REJECTED).mean(), mem(&[asked.clone(), o(IGNORED, "b", "L", 9, "r")]).mean(), "one rejected == one ignored");
+        assert_eq!(one(outcome::VERIFIED).mean(), mem(&[asked.clone(), o(CHANGED, "b", "L", 9, "r")]).mean(), "one verified == one change in α");
+        let v = one(outcome::VERIFIED);
+        assert_eq!((v.verified, v.rejected, v.hacked, v.changed), (1, 0, 0, 0));
+        // Never a use, never a tick: activation is as without it.
+        assert_eq!(v.activation, mem(std::slice::from_ref(&asked)).activation);
+        let lone = derive(&[verdict(outcome::VERIFIED, "z", "L", 9, "g/t1.v1")], std::slice::from_ref(&l), None);
+        assert_eq!(lone["L"].activation, 0.0, "a verdict of a session with no other line adds no tick");
+        assert_eq!(Clock::of(&[verdict(outcome::HACKED, "z", "L", 9, "c")]).now(None), 0);
+        // Additive to the session's result.
+        let both = mem(&[asked.clone(), o(CHANGED, "a", "L", 5, "r"), verdict(outcome::HACKED, "a", "L", 9, "g/t1.v1")]);
+        assert_eq!((both.changed, both.hacked, both.alpha(), both.beta()), (1, 1, 2, 4.0));
+        // Per attempt the worst of duplicates, in any line order; two attempts count twice.
+        let log = vec![
+            asked.clone(),
+            verdict(outcome::VERIFIED, "a", "L", 9, "g/t1.v1"),
+            verdict(outcome::HACKED, "a", "L", 10, "g/t1.v1"),
+            verdict(outcome::REJECTED, "a", "L", 11, "g/t1.v1"),
+            verdict(outcome::VERIFIED, "a", "L", 12, "g/t2.v1"),
+        ];
+        let m = mem(&log);
+        assert_eq!((m.verified, m.rejected, m.hacked), (1, 0, 1));
+        let mut reversed = log.clone();
+        reversed.reverse();
+        assert_eq!(mem(&reversed), m);
+    }
+
     #[test]
     fn fractional_beta_sampling_is_unbiased_and_integer_beta_unchanged() {
         let n = 20_000;
@@ -467,7 +555,19 @@ mod tests {
         assert!((mean - 2.5).abs() < 0.02, "{mean}");
         assert!((0..100).all(|i| round_seeded(3.0, i) == 3));
         // A lesson without regrets draws exactly what it drew before fractional β (pinned).
-        let m = Memory { activation: 0.0, changed: 2, ignored: 1, corrected: 1, vetoed: 0, regretted: 0.0, consolidated: false, dormant: false };
+        let m = Memory {
+            activation: 0.0,
+            changed: 2,
+            ignored: 1,
+            corrected: 1,
+            vetoed: 0,
+            regretted: 0.0,
+            verified: 0,
+            rejected: 0,
+            hacked: 0,
+            consolidated: false,
+            dormant: false,
+        };
         assert_eq!(m.weight("L", Some("s")), squash(0.0) * (0.5 + sample_beta(3, 4, seed("s", "L"))));
         assert_eq!(m.weight("L", Some("s")), 1.0618369485259265);
     }
@@ -529,7 +629,19 @@ mod tests {
         assert!(mean(&proven) > 0.8 && sd(&proven) < 0.1);
         assert!(mean(&harmful) < 0.1);
         assert!(new.iter().chain(&proven).all(|x| *x > 0.0 && *x < 1.0));
-        let m = Memory { activation: 0.0, changed: 20, ignored: 2, corrected: 0, vetoed: 0, regretted: 0.0, consolidated: false, dormant: false };
+        let m = Memory {
+            activation: 0.0,
+            changed: 20,
+            ignored: 2,
+            corrected: 0,
+            vetoed: 0,
+            regretted: 0.0,
+            verified: 0,
+            rejected: 0,
+            hacked: 0,
+            consolidated: false,
+            dormant: false,
+        };
         assert!(m.weight("L", Some("s")) > 1.2 && m.weight("L", Some("s")) < 1.5);
     }
 

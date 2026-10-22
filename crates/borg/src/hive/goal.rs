@@ -29,6 +29,57 @@ pub struct Goal {
     /// Empty until the mesh syncs goals: an admin's signature.
     #[serde(default)]
     pub sig: String,
+    /// The held-out checks (hive/hidden.rs): never shown to a drone, run outside every worktree after
+    /// a verdict. When goals sync (collective step 4) this field is stripped from the synced projection
+    /// and stays on the runner's node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<Hidden>,
+}
+
+/// A goal's hidden oracle: `commands` run by `sh -c` in a scratch checkout of the work, with
+/// `BORG_HIDDEN` naming `dir` (the held-out tests, outside every repo) and `BORG_WORK` the checkout.
+/// Passed when every command exits 0 within `timeout_s` (clamped to `HIDDEN_TIMEOUT`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hidden {
+    pub dir: String,
+    pub commands: Vec<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_s: u64,
+}
+
+/// The bounds of a hidden command's timeout, in seconds.
+pub const HIDDEN_TIMEOUT: std::ops::RangeInclusive<u64> = 30..=3600;
+
+impl Hidden {
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_s.clamp(*HIDDEN_TIMEOUT.start(), *HIDDEN_TIMEOUT.end()))
+    }
+}
+
+/// Whether `h` may be a goal's hidden oracle: its dir absolute, an existing directory, and outside
+/// `repo` (the repo the goal is made in, with every worktree `borg hive run` puts under it), so no
+/// drone's checkout holds the held-out checks.
+///
+/// # Errors
+/// What is wrong with it.
+pub fn validate_hidden(h: &Hidden, repo: Option<&Path>) -> Result<(), String> {
+    let dir = Path::new(&h.dir);
+    if !dir.is_absolute() {
+        return Err(format!("hidden oracle dir {} is relative: give an absolute path outside the repo", h.dir));
+    }
+    if !dir.is_dir() {
+        return Err(format!("hidden oracle dir {} is not a directory", h.dir));
+    }
+    if h.commands.iter().all(|c| c.trim().is_empty()) {
+        return Err("a hidden oracle needs at least one command".into());
+    }
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let Some(repo) = repo
+        && real(dir).starts_with(real(repo))
+    {
+        return Err(format!("hidden oracle dir {} lies inside the repo {}: drones would see it", h.dir, repo.display()));
+    }
+    Ok(())
 }
 
 /// A repo in scope, by name as the hooks name it (`queen::repo_name`), and the node expected to hold it
@@ -147,6 +198,7 @@ mod tests {
             author: "a@x".into(),
             created_ms: 1,
             sig: String::new(),
+            hidden: None,
         }
     }
 
@@ -166,5 +218,26 @@ mod tests {
         assert_eq!(Check::parse("unit=cargo test -q", 60).unwrap().cmd, "cargo test -q");
         assert_eq!(Check::parse("test -f ok", 60).unwrap().name, "test -f ok", "a bare command names itself");
         assert!(Check::parse("x=", 60).is_err());
+    }
+
+    #[test]
+    fn a_hidden_oracle_lies_outside_the_repo() {
+        let root = temp("hidden");
+        let (repo, held) = (root.join("app"), root.join("held"));
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::create_dir_all(&held).unwrap();
+        let h = |dir: &Path| Hidden { dir: dir.display().to_string(), commands: vec!["true".into()], timeout_s: 5 };
+        assert!(validate_hidden(&h(&held), Some(&repo)).is_ok());
+        assert!(validate_hidden(&h(&repo.join("tests")), Some(&repo)).unwrap_err().contains("inside the repo"));
+        assert!(validate_hidden(&h(Path::new("held")), Some(&repo)).unwrap_err().contains("relative"));
+        assert!(validate_hidden(&h(&root.join("gone")), Some(&repo)).unwrap_err().contains("not a directory"));
+        assert!(validate_hidden(&Hidden { commands: vec![], ..h(&held) }, None).is_err());
+        assert_eq!(h(&held).timeout(), std::time::Duration::from_secs(30), "clamped up to 30 s");
+        // An old goal.json without `hidden` reads; a goal without one writes none.
+        let mut g = goal("g-2");
+        assert!(!serde_json::to_string(&g).unwrap().contains("hidden"));
+        g.hidden = Some(h(&held));
+        assert_eq!(serde_json::from_str::<Goal>(&serde_json::to_string(&g).unwrap()).unwrap(), g);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
