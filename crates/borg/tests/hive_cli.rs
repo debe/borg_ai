@@ -151,6 +151,10 @@ fn init_join_claim_board_roundtrip() {
     let ctx = prompt(&root, "s1", &[]);
     assert!(ctx.contains("Your claim: t1 (work) Add the parser."), "the claim command described it in full already: {ctx}");
     assert!(!ctx.contains("oracle gates done"), "said once");
+    // A second drone asking for t1 is told who holds it and that it is not its own to work on.
+    join(&root, "s2");
+    let (_, err, code) = hive(&root, &["claim", "t1", "--session", "s2"]);
+    assert!(code == 1 && err.contains("t1 is not open to s2 (claimed by s1)") && err.contains("It is not yours: do not work on it"), "{err}");
     let human = ok(&root, &["board", "g1"]);
     assert!(human.contains("claimed (1)") && human.contains("t1") && human.contains("after t1"), "{human}");
     ok(&root, &["release", "--session", "s1"]);

@@ -329,6 +329,10 @@ fn command(sub: &str, session: &str, cwd: &str) -> String {
     format!("{} hive {sub} --session {}{dir}", exe(), queen::sh_quote(session))
 }
 
+/// What a refused or lost claim tells the drone: work done on a task it does not hold is never
+/// integrated (a drone in the W2 probe took "claimed" for its own claim and worked on).
+const NOT_YOURS: &str = "It is not yours: do not work on it. Claim another task (`borg hive claim`) or end your turn.";
+
 fn short(session: &str) -> String {
     session.chars().take(8).collect()
 }
@@ -1586,7 +1590,11 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
                     return fail(format!("{t} belongs to repo {}, and {repo} is outside the goal's repos", s.task.repo));
                 }
                 Some(s) if !board::claimable_by(&b, s, &session, now) => {
-                    return fail(format!("{t} is not open to {} ({})", short(&session), s.shown_status(now)));
+                    let held = match s.live(now) {
+                        Some((by, _, _)) if by != session => format!("claimed by {}", short(by)),
+                        _ => s.shown_status(now).to_string(),
+                    };
+                    return fail(format!("{t} is not open to {} ({held}). {NOT_YOURS}", short(&session)));
                 }
                 Some(s) => s,
             },
@@ -1607,7 +1615,7 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
                 return 0;
             }
             Err(Refused::Deps(why)) => return fail(why),
-            Err(Refused::Lost) => println!("lost {id}: another drone claimed it first"),
+            Err(Refused::Lost) => println!("lost {id}: another drone claimed it first. {NOT_YOURS}"),
         }
     }
     3
