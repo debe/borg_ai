@@ -208,7 +208,7 @@ fn a_verdict_on_a_diff_that_edited_tests_is_hacked_and_credits_the_claims_lesson
     let verdict = board_lines(&root, "g1").into_iter().find(|e| e["ev"] == "rejected").unwrap();
     assert_eq!((verdict["hacked"].as_bool(), verdict["by"].as_str()), (Some(true), Some("sb")));
     let hacked = outcomes(&root, "hacked");
-    assert_eq!(hacked.len(), 1, "Mdrain was shown during the claim, Pbeacon after the done: {hacked:?}");
+    assert_eq!(hacked.len(), 1, "Mdrain was shown during the claim, Pbeacon after the done: {hacked:?}\nboard: {:?}\noutcomes: {}", board_lines(&root, "g1"), std::fs::read_to_string(store(&root).join("outcomes.jsonl")).unwrap_or_default());
     assert_eq!((hacked[0]["lessons"][0].as_str(), hacked[0]["session"].as_str(), hacked[0]["cause"].as_str()), (Some("Mdrain"), Some("sa"), Some("g1/t1.v1")));
     let stat = stats(&root, "task_hacked");
     assert_eq!((stat.len(), stat[0]["n"].as_u64()), (1, Some(1)));

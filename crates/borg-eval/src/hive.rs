@@ -1,0 +1,2856 @@
+//! `borg-eval hive`: the hive pilot's harness (docs/design/collective.md "Proof protocol" and steps
+//! 2–3; the pre-registered rule is in tasks/todo.md "Hive pilot"). It measures the rule, it does not
+//! change it: arms A, B, D3 and F, 3 seeds per cell; H1 holds on a workload iff D3's median wall-clock
+//! ≤ 0.8 × B's AND D3's mean hidden solve share ≥ B's − 1/K.
+//!
+//! ```text
+//! borg-eval hive --workload DIR --arm a|b|d3|f --seed N --cap-usd X
+//!                [--model sonnet] [--timeout-s 3600] [--run NAME] [--stop-at-usd Y]
+//!                [--borg BIN] [--claude BIN] [--harness claude|sim]
+//! borg-eval hive validate --workload DIR [--timeout-s 3600]
+//! borg-eval hive report <results.jsonl>...
+//! ```
+//!
+//! A workload (`<W>/workload.json`, kept under `~/.local/share/borg/eval/hive-pilot/`, outside every
+//! repo and sandbox) names source repos at pinned commits, the visible task text and check, and the
+//! hidden checks (K of them) in a directory no agent sandbox ever sees. Each cell builds its workspace
+//! from `git archive` of each source (read-only on the source, no history), one commit `base`; every
+//! arm gets the same workspace, model, dollar cap, wall cap and sandbox HOME (dogfood.rs
+//! `prepare_home_with`: a fresh store, no lessons, the real HOME hidden).
+//!
+//! - A: one `claude -p` session, subagents disallowed. B: one session invited to use subagents.
+//! - F: three A sessions in parallel at cap/3 each, the best chosen by the visible check (then cost,
+//!   then index); wall = the slowest candidate + the selection.
+//! - D3: `borg hive init` + `borg hive run --drones 3` inside the sandbox (no hidden oracle there),
+//!   under the same wall cap as one A/B session, its drones' `claude` given the same appended system
+//!   prompt; then a deterministic runner-side merge of the drones' worktrees in fixed order (a
+//!   conflicting branch is dropped, so its checks fail); wall = run + merge.
+//!
+//! Every agent sandbox and the scorer have a PID namespace of their own: nothing started inside (a
+//! Gradle daemon) outlives them. Dollars are metered alike for every arm (`Cost`): `charged_usd` is
+//! what the sessions reported plus, for each one cut off without a report, the budget it was given.
+//!
+//! Scoring runs after the arm, in its own sandbox (no network, no credentials, git hooks off) on a
+//! fresh clone of the result commit, the check scripts read-only: the hidden checks (solve share), the
+//! visible check, and the test or CI files the result changed (`verdict::protected`, the same for
+//! every arm: `hacked`). One row per cell goes to `target/eval-runs/<run>/results.jsonl`, an
+//! errored one with its `error_stage`; `hive report` prints the H1 and kill lines.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Instant;
+
+use borg::hive::{board, goal, guard, run as hive_run, verdict};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::dogfood::{Secrets, prepare_home_bare, prepare_home_with};
+use crate::{Extra, sandbox_with};
+
+const GOAL: &str = "pilot";
+const DRONES: usize = 3;
+/// The sandbox HOME's collectives config: the workspace (`~/work/<W>`) routes to one local collective.
+const COLLECTIVES: &str = r#"{"default":"off","collectives":[{"name":"pilot","paths":["~/work"],"share":"local"}]}"#;
+/// B's invitation, appended to the prompt.
+const INVITE: &str = "Split the work into independent parts and run them in parallel with subagents (the Task tool); \
+integrate their results into this working tree before you finish.";
+/// Every model call of borg off inside an agent sandbox: no learning, no queen, no prediction model.
+const BORG_OFF: [(&str, &str); 10] = [
+    ("BORG_LEARN", "off"),
+    ("BORG_LEARN_MODEL", "off"),
+    ("BORG_QUEEN", "off"),
+    ("BORG_PREDICT_MODEL", "off"),
+    ("BORG_VECTORS", "off"),
+    ("BORG_MATCH", "bm25"),
+    ("BORG_STOP_ATTENTION", "off"),
+    ("BORG_MODE", "hook"),
+    ("BORG_REGRESS", "off"),
+    ("BORG_NOTIFY", "off"),
+];
+/// HOME-relative paths a workload may never bind into a sandbox: credentials, borg's own stores and
+/// config (real lessons, the eval data with its hidden oracles).
+const HOME_DENY: [&str; 14] = [
+    ".claude",
+    ".claude.json",
+    ".local/share/borg",
+    ".config/borg",
+    ".ssh",
+    ".gnupg",
+    ".config/gh",
+    ".git-credentials",
+    ".netrc",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".docker",
+    ".aws",
+    ".local/share/claude",
+];
+/// git with nothing a repo's own config could run (hooks, fsmonitor, signing) and the eval identity.
+const GIT: &str = "git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c user.name=eval -c user.email=eval@borg";
+/// The tail of a check's output kept in the row's score files.
+const TAIL: usize = 2000;
+/// What `build_workspace` allows each `git archive` and `tar`.
+const ARCHIVE_TIMEOUT_S: u32 = 600;
+const INTEGRATE_TIMEOUT_S: u32 = 600;
+
+// ------------------------------------------------------------------------------------- workload
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkload {
+    id: String,
+    shape: String,
+    repos: Vec<RawRepo>,
+    #[serde(default)]
+    inject: Option<String>,
+    spec: String,
+    visible: String,
+    #[serde(default = "default_visible_timeout")]
+    visible_timeout_s: u32,
+    hidden: RawHidden,
+    #[serde(default)]
+    reference: Option<String>,
+    hive: RawHive,
+    #[serde(default)]
+    home_ro: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    sim: Option<Value>,
+}
+
+fn default_visible_timeout() -> u32 {
+    600
+}
+
+fn default_check_timeout() -> u32 {
+    900
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepo {
+    src: String,
+    commit: String,
+    dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHidden {
+    dir: String,
+    checks: Vec<HiddenCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HiddenCheck {
+    id: String,
+    cmd: String,
+    #[serde(default = "default_check_timeout")]
+    timeout_s: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHive {
+    tasks: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Repo {
+    src: PathBuf,
+    commit: String,
+    dir: String,
+}
+
+/// A parsed, checked workload.
+#[derive(Debug, Clone)]
+struct Workload {
+    id: String,
+    shape: String,
+    repos: Vec<Repo>,
+    inject: Option<PathBuf>,
+    spec_path: PathBuf,
+    spec: String,
+    visible: String,
+    visible_timeout_s: u32,
+    hidden_dir: PathBuf,
+    checks: Vec<HiddenCheck>,
+    reference: Option<PathBuf>,
+    tasks: Vec<String>,
+    /// HOME-relative, bound read-only at the same place under a sandbox HOME.
+    home_ro: Vec<String>,
+    /// Values may name `$HOME`: the sandbox HOME.
+    env: Vec<(String, String)>,
+    sim: Option<Value>,
+    /// blake3 of workload.json and every file it names (spec, inject, reference, the hidden dir).
+    sha: String,
+}
+
+impl Workload {
+    fn k(&self) -> usize {
+        self.checks.len()
+    }
+
+    /// The task text every arm gets (D3's goal spec too).
+    fn prompt(&self) -> String {
+        format!("{}\n\nVisible check: run `{}` from the workspace root.", self.spec.trim_end(), self.visible)
+    }
+
+    /// `env` with `$HOME` as `home`.
+    fn env_for(&self, home: &Path) -> Vec<(String, String)> {
+        self.env.iter().map(|(k, v)| (k.clone(), v.replace("$HOME", &home.display().to_string()))).collect()
+    }
+
+    /// (resolved source under the real HOME, HOME-relative destination) of each `home_ro` that exists:
+    /// the bound source is the path `check_home_ro` checked, symlinks resolved.
+    fn home_binds(&self, real_home: &Path) -> Vec<(PathBuf, PathBuf)> {
+        self.home_ro.iter().filter_map(|r| fs::canonicalize(real_home.join(r)).ok().map(|src| (src, PathBuf::from(r)))).collect()
+    }
+}
+
+fn expand_home(p: &str, real_home: &Path) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => real_home.join(rest),
+        None if p == "~" => real_home.to_path_buf(),
+        None => PathBuf::from(p),
+    }
+}
+
+/// `p` lies under (or is) `root`, lexically after canonicalising both where they exist.
+fn under(p: &Path, root: &Path) -> bool {
+    let canon = |x: &Path| fs::canonicalize(x).unwrap_or_else(|_| x.to_path_buf());
+    canon(p).starts_with(canon(root))
+}
+
+fn valid_task_id(id: &str) -> bool {
+    (1..=40).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn plain_list(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/,*".contains(&b))
+}
+
+/// `ID|role|title[|files,..[|deps,..]]` as `borg hive init --task` takes it. A title cannot hold a
+/// `|`: the field after it would read as a file list, so one with spaces is refused as that.
+fn check_task(s: &str) -> Result<(), String> {
+    let f: Vec<&str> = s.split('|').map(str::trim).collect();
+    if !(3..=5).contains(&f.len()) {
+        return Err(format!("task {s:?}: give ID|role|title[|files,..[|deps,..]] (no `|` inside the title)"));
+    }
+    if !valid_task_id(f[0]) {
+        return Err(format!("task {s:?}: bad id {:?} (letters, digits, '.', '_', '-', at most 40)", f[0]));
+    }
+    if !["plan", "work", "verify", "integrate"].contains(&f[1]) {
+        return Err(format!("task {s:?}: role is plan, work, verify or integrate"));
+    }
+    if f[2].is_empty() {
+        return Err(format!("task {s:?}: empty title"));
+    }
+    if f.len() > 3 && !f[3..].iter().all(|x| plain_list(x)) {
+        return Err(format!("task {s:?}: a `|` inside the title (files and deps are plain comma lists)"));
+    }
+    if let Some(deps) = f.get(4)
+        && !deps.split(',').filter(|d| !d.is_empty()).all(valid_task_id)
+    {
+        return Err(format!("task {s:?}: bad dependency id"));
+    }
+    Ok(())
+}
+
+/// A `home_ro` entry: HOME-relative, plain, and neither a credential or borg store nor holding one,
+/// nor a source repo, nor the hidden checks, nor where workspaces are built. Checked on the path as
+/// written AND on where it resolves (bwrap follows symlinks: a link to the hidden dir would bind it).
+fn check_home_ro(rel: &str, real_home: &Path, srcs: &[PathBuf], hidden: &Path, runs: &Path) -> Result<(), String> {
+    let p = Path::new(rel);
+    if rel.is_empty() || p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("home_ro {rel:?}: give a plain path relative to HOME"));
+    }
+    for d in HOME_DENY {
+        let d = Path::new(d);
+        if p.starts_with(d) || d.starts_with(p) {
+            return Err(format!("home_ro {rel:?}: overlaps {} (credentials or borg's stores)", d.display()));
+        }
+    }
+    let abs = real_home.join(p);
+    let resolved = fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+    let deny = HOME_DENY.iter().map(|d| real_home.join(d));
+    for s in srcs.iter().cloned().chain([hidden.to_path_buf(), runs.to_path_buf()]).chain(deny) {
+        for a in [&abs, &resolved] {
+            if under(a, &s) || under(&s, a) {
+                return Err(format!("home_ro {rel:?}: {} overlaps {}", a.display(), s.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_tree(h: &mut blake3::Hasher, root: &Path, dir: &Path) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        if m.is_dir() {
+            hash_tree(h, root, &p);
+        } else if m.is_file() {
+            h.update(p.strip_prefix(root).unwrap_or(&p).to_string_lossy().as_bytes());
+            h.update(b"\0");
+            h.update(&fs::read(&p).unwrap_or_default());
+            h.update(b"\0");
+        }
+    }
+}
+
+/// Reads and checks `<dir>/workload.json`. `runs` is where every workspace is built
+/// (`target/eval-runs`): the hidden checks may not lie there or in a source.
+fn load_workload(dir: &Path, real_home: &Path, runs: &Path) -> Result<Workload, String> {
+    let dir = fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let bytes = fs::read(dir.join("workload.json")).map_err(|e| format!("workload.json: {e}"))?;
+    let raw: RawWorkload = serde_json::from_slice(&bytes).map_err(|e| format!("workload.json: {e}"))?;
+    let wl = parse_workload(raw, &dir, real_home, runs)?;
+    let mut h = blake3::Hasher::new();
+    h.update(&bytes);
+    for f in [Some(wl.spec_path.clone()), wl.inject.clone(), wl.reference.clone()].into_iter().flatten() {
+        h.update(&fs::read(f).unwrap_or_default());
+        h.update(b"\0");
+    }
+    hash_tree(&mut h, &wl.hidden_dir, &wl.hidden_dir);
+    Ok(Workload { sha: h.finalize().to_hex().to_string(), ..wl })
+}
+
+fn parse_workload(raw: RawWorkload, dir: &Path, real_home: &Path, runs: &Path) -> Result<Workload, String> {
+    if raw.id.is_empty() || raw.id.starts_with('.') || !raw.id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        return Err(format!("id {:?}: letters, digits, '.', '_', '-'", raw.id));
+    }
+    if !["parallel", "cross-repo"].contains(&raw.shape.as_str()) {
+        return Err(format!("shape {:?}: parallel or cross-repo", raw.shape));
+    }
+    if raw.repos.is_empty() {
+        return Err("repos: at least one".into());
+    }
+    let mut repos = Vec::new();
+    let mut dirs = BTreeSet::new();
+    for r in raw.repos {
+        if r.commit.len() != 40 || !r.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("repo {}: commit {:?} is not a 40-hex sha", r.src, r.commit));
+        }
+        let plain = !r.dir.is_empty() && !r.dir.starts_with('.') && r.dir.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        if !plain || !dirs.insert(r.dir.clone()) {
+            return Err(format!("repo dir {:?}: one plain, unique path component", r.dir));
+        }
+        let src = expand_home(&r.src, real_home);
+        let src = fs::canonicalize(&src).map_err(|e| format!("repo {}: {e}", src.display()))?;
+        repos.push(Repo { src, commit: r.commit.to_lowercase(), dir: r.dir });
+    }
+    let srcs: Vec<PathBuf> = repos.iter().map(|r| r.src.clone()).collect();
+    let rel = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { dir.join(p) };
+    let hidden_dir = fs::canonicalize(rel(&raw.hidden.dir)).map_err(|e| format!("hidden dir {}: {e}", raw.hidden.dir))?;
+    for s in srcs.iter().chain([&runs.to_path_buf()]) {
+        if under(&hidden_dir, s) || under(s, &hidden_dir) {
+            return Err(format!("hidden dir {} overlaps {}: it must stay outside every workspace and source", hidden_dir.display(), s.display()));
+        }
+    }
+    if raw.hidden.checks.is_empty() {
+        return Err("hidden.checks: at least one (K)".into());
+    }
+    let mut ids = BTreeSet::new();
+    for c in &raw.hidden.checks {
+        if !valid_task_id(&c.id) || !ids.insert(c.id.clone()) || c.cmd.trim().is_empty() || c.timeout_s == 0 {
+            return Err(format!("hidden check {:?}: a unique id, a command and a timeout above 0", c.id));
+        }
+    }
+    let file = |p: &Option<String>, what: &str| -> Result<Option<PathBuf>, String> {
+        p.as_deref().map(|p| fs::canonicalize(rel(p)).map_err(|e| format!("{what} {p}: {e}"))).transpose()
+    };
+    let inject = file(&raw.inject, "inject")?;
+    let reference = file(&raw.reference, "reference")?;
+    let spec_path = rel(&raw.spec);
+    let spec = fs::read_to_string(&spec_path).map_err(|e| format!("spec {}: {e}", raw.spec))?;
+    if raw.visible.trim().is_empty() || raw.visible_timeout_s == 0 {
+        return Err("visible: a command and a timeout above 0".into());
+    }
+    if raw.hive.tasks.is_empty() {
+        return Err("hive.tasks: at least one".into());
+    }
+    for t in &raw.hive.tasks {
+        check_task(t)?;
+    }
+    for r in &raw.home_ro {
+        check_home_ro(r, real_home, &srcs, &hidden_dir, runs)?;
+    }
+    let mut env = Vec::new();
+    for (k, v) in raw.env {
+        let name = !k.is_empty() && k.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        if !name || ["HOME", "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH"].contains(&k.as_str()) || k.starts_with("BORG_") || k.starts_with("CLAUDE") {
+            return Err(format!("env {k:?}: not settable by a workload"));
+        }
+        env.push((k, v));
+    }
+    Ok(Workload {
+        id: raw.id,
+        shape: raw.shape,
+        repos,
+        inject,
+        spec_path,
+        spec,
+        visible: raw.visible,
+        visible_timeout_s: raw.visible_timeout_s,
+        hidden_dir,
+        checks: raw.hidden.checks,
+        reference,
+        tasks: raw.hive.tasks,
+        home_ro: raw.home_ro,
+        env,
+        sim: raw.sim,
+        sha: String::new(),
+    })
+}
+
+// ------------------------------------------------------------------------------------- process
+
+/// Single-quoted for `sh`.
+fn q(s: impl AsRef<str>) -> String {
+    format!("'{}'", s.as_ref().replace('\'', r"'\''"))
+}
+
+/// `sh -c cmd` in `dir` under `timeout`, with the eval git identity: (success, exit code, output).
+fn run_t(dir: &Path, cmd: &str, timeout_s: u32) -> (bool, i32, String) {
+    let out = Command::new("timeout")
+        .args(["-k", "10", &timeout_s.to_string(), "sh", "-c", cmd])
+        .current_dir(dir)
+        .envs([("GIT_AUTHOR_NAME", "eval"), ("GIT_AUTHOR_EMAIL", "eval@borg"), ("GIT_COMMITTER_NAME", "eval"), ("GIT_COMMITTER_EMAIL", "eval@borg")])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), o.status.code().unwrap_or(-1), text)
+        }
+        Err(e) => (false, -1, e.to_string()),
+    }
+}
+
+/// Where post-arm scripts run: the scorer sandbox (no network, no credentials, a fresh empty HOME),
+/// or, in unit tests only, a plain `sh`.
+enum Jail {
+    Sandbox {
+        scorer_home: PathBuf,
+        extra_ro: Vec<PathBuf>,
+        env: Vec<(String, String)>,
+        home_ro: Vec<(PathBuf, PathBuf)>,
+    },
+    #[cfg(test)]
+    Plain,
+}
+
+impl Jail {
+    fn scorer(cell: &Path, wl: &Workload, real_home: &Path) -> Jail {
+        let scorer_home = cell.join("scorer-home");
+        let _ = fs::create_dir_all(&scorer_home);
+        Jail::Sandbox { scorer_home: scorer_home.clone(), extra_ro: Vec::new(), env: wl.env_for(&scorer_home), home_ro: wl.home_binds(real_home) }
+    }
+
+    fn extra(scorer_home: &Path, env: &[(String, String)], home_ro: &[(PathBuf, PathBuf)]) -> Extra {
+        Extra {
+            sandbox_home: Some(scorer_home.to_path_buf()),
+            env: env.to_vec(),
+            home_ro: home_ro.to_vec(),
+            unshare_net: true,
+            unshare_pid: true,
+            ..Extra::default()
+        }
+    }
+
+    /// `script` in `cwd`, `rw` writable and `ro` read-only: (exit code, output).
+    fn exec(&self, cwd: &Path, rw: &[&Path], ro: &[&Path], script: &str, timeout_s: u32) -> (i32, String) {
+        match self {
+            Jail::Sandbox { scorer_home, extra_ro, env, home_ro } => {
+                let mut ro: Vec<&Path> = ro.to_vec();
+                ro.extend(extra_ro.iter().map(PathBuf::as_path));
+                let (mut cmd, private) = sandbox_with(cwd, rw, &ro, &Self::extra(scorer_home, env, home_ro), timeout_s);
+                let out = cmd.args(["sh", "-c", script]).stdin(Stdio::null()).output();
+                let _ = fs::remove_dir_all(private);
+                match out {
+                    Ok(o) => (o.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
+                    Err(e) => (-1, e.to_string()),
+                }
+            }
+            #[cfg(test)]
+            Jail::Plain => {
+                let (_, code, out) = run_t(cwd, script, timeout_s);
+                (code, out)
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------- workspace
+
+/// The cell's workspace at `dst`: each source's tree at its pinned commit (`git archive`: read-only on
+/// the source, no history, refs, remotes or reflog), the injected patch, one commit. Returns `base`.
+fn build_workspace(wl: &Workload, dst: &Path) -> Result<String, String> {
+    if dst.exists() {
+        return Err(format!("{} exists", dst.display()));
+    }
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let parent = dst.parent().unwrap_or(dst);
+    for r in &wl.repos {
+        let into = dst.join(&r.dir);
+        fs::create_dir_all(&into).map_err(|e| e.to_string())?;
+        let tar = parent.join(format!(".archive-{}-{}.tar", wl.id, r.dir));
+        let cmd = format!(
+            "git -C {} archive --format=tar -o {} {} && tar -x -f {} -C {}; rc=$?; rm -f {}; exit $rc",
+            q(r.src.display().to_string()),
+            q(tar.display().to_string()),
+            q(&r.commit),
+            q(tar.display().to_string()),
+            q(into.display().to_string()),
+            q(tar.display().to_string())
+        );
+        let (ok, _, out) = run_t(parent, &cmd, ARCHIVE_TIMEOUT_S);
+        if !ok {
+            return Err(format!("archive {}@{}: {}", r.src.display(), r.commit, out.trim()));
+        }
+    }
+    let (ok, _, out) = run_t(dst, &format!("{GIT} init -q -b main"), 60);
+    if !ok {
+        return Err(format!("git init: {out}"));
+    }
+    if let Some(p) = &wl.inject {
+        let (ok, _, out) = run_t(dst, &format!("{GIT} apply --whitespace=nowarn {}", q(p.display().to_string())), 120);
+        if !ok {
+            return Err(format!("inject {}: {out}", p.display()));
+        }
+    }
+    let (ok, _, out) = run_t(dst, &format!("{GIT} add -A && {GIT} commit -q -m base && {GIT} rev-parse HEAD"), 600);
+    if !ok {
+        return Err(format!("base commit: {out}"));
+    }
+    Ok(out.trim().lines().last().unwrap_or_default().to_string())
+}
+
+/// Index locks a session killed mid-`git` left (it is over: nothing else writes the repo now).
+const STALE_LOCKS: &str = "find .git -name index.lock -type f -delete 2>/dev/null\n";
+
+/// The A/B/F result: everything the agent left, one commit on top of whatever it did.
+fn result_script() -> String {
+    format!("set -u\n{STALE_LOCKS}{GIT} add -A && {GIT} commit -q --allow-empty -m result && echo \"HEAD $({GIT} rev-parse HEAD)\"\n")
+}
+
+/// D3's merge: each drone's worktree committed as it is, then `result` from `base` with every drone
+/// branch merged in fixed order (d1, d2, d3); a conflicting one is aborted and dropped.
+fn integrate_script(base: &str) -> String {
+    let mut s = format!("set -u\nG=\"{GIT}\"\n{STALE_LOCKS}");
+    s.push_str(&format!(
+        "for n in {}; do\n  wt=.worktrees/hive-{GOAL}-$n\n  if [ -e \"$wt/.git\" ]; then $G -C \"$wt\" add -A && $G -C \"$wt\" commit -q --allow-empty -m \"drone $n\" || echo \"COMMIT-FAILED $n\"; fi\ndone\n",
+        (1..=DRONES).map(|n| n.to_string()).collect::<Vec<_>>().join(" ")
+    ));
+    s.push_str(&format!("$G checkout -q -f -B result {} || {{ echo CHECKOUT-FAILED; exit 3; }}\n", q(base)));
+    s.push_str(&format!(
+        "for n in {}; do\n  if $G rev-parse -q --verify \"refs/heads/hive/{GOAL}/$n\" >/dev/null; then\n    $G merge -q --no-ff --no-edit \"hive/{GOAL}/$n\" || {{ $G merge --abort 2>/dev/null || $G reset -q --hard HEAD; echo \"CONFLICT $n\"; }}\n  else echo \"MISSING $n\"; fi\ndone\n",
+        (1..=DRONES).map(|n| n.to_string()).collect::<Vec<_>>().join(" ")
+    ));
+    s.push_str("echo \"HEAD $($G rev-parse HEAD)\"\n");
+    s
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Integrated {
+    head: Option<String>,
+    conflicts: usize,
+    /// Drones whose branch conflicted and was dropped.
+    dropped: Vec<usize>,
+    /// Drones whose worktree could not be committed: only their earlier commits were merged.
+    commit_failed: Vec<usize>,
+    /// Drones with no branch: nothing of theirs was merged.
+    missing: Vec<usize>,
+}
+
+fn parse_integrate(out: &str) -> Integrated {
+    let mut r = Integrated::default();
+    let num = |n: &str| n.trim().parse::<usize>().ok();
+    for l in out.lines() {
+        if let Some(n) = l.strip_prefix("CONFLICT ") {
+            r.conflicts += 1;
+            r.dropped.extend(num(n));
+        } else if let Some(n) = l.strip_prefix("COMMIT-FAILED ") {
+            r.commit_failed.extend(num(n));
+        } else if let Some(n) = l.strip_prefix("MISSING ") {
+            r.missing.extend(num(n));
+        } else if let Some(h) = l.strip_prefix("HEAD ") {
+            let h = h.trim();
+            if h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                r.head = Some(h.to_string());
+            }
+        }
+    }
+    r
+}
+
+// ------------------------------------------------------------------------------------- scoring
+
+#[derive(Debug, Clone, PartialEq)]
+struct CheckResult {
+    id: String,
+    pass: bool,
+    timeout: bool,
+    dur_ms: u64,
+    tail: String,
+}
+
+#[derive(Debug, Default)]
+struct Score {
+    checks: Vec<CheckResult>,
+    visible_pass: Option<bool>,
+    hacked_paths: Vec<String>,
+}
+
+impl Score {
+    fn passed(&self) -> usize {
+        self.checks.iter().filter(|c| c.pass).count()
+    }
+
+    fn share(&self, k: usize) -> f64 {
+        self.passed() as f64 / k.max(1) as f64
+    }
+
+    fn json(&self, k: usize) -> Value {
+        json!({
+            "checks": self.checks.iter().map(|c| json!({"id": c.id, "pass": c.pass, "timeout": c.timeout, "dur_ms": c.dur_ms})).collect::<Vec<_>>(),
+            "passed": self.passed(),
+            "solve_share": self.share(k),
+        })
+    }
+}
+
+/// The scoring script: a fresh clone of `ws` at `head` in `<out>/tree` (no build output, untracked
+/// file or .git config of the agent's carries over), then each check from its own file under
+/// `checks` (bound read-only: code the result's build runs during one check cannot rewrite a later
+/// one), from the tree's root, with `BORG_HIDDEN` and `BORG_WORK`; per check `<id>.rc`, `<id>.ms` and
+/// `<id>.log` in `out`.
+fn score_script(ws: &Path, head: &str, out: &Path, checks_dir: &Path, hidden_dir: &Path, checks: &[(String, u32)]) -> String {
+    let tree = out.join("tree");
+    let (d, t, c) = (q(out.display().to_string()), q(tree.display().to_string()), q(checks_dir.display().to_string()));
+    let mut s = format!("set -u\nG=\"{GIT}\"\nrm -rf {t}\n");
+    s.push_str(&format!(
+        "$G clone -q --no-hardlinks {} {t} >{d}/clone.log 2>&1 && $G -C {t} checkout -q {} >>{d}/clone.log 2>&1 || {{ echo CLONE-FAILED; exit 3; }}\n",
+        q(ws.display().to_string()),
+        q(head)
+    ));
+    s.push_str(&format!(
+        "run() {{ s=$(date +%s%N); (cd {t} && BORG_HIDDEN={} BORG_WORK={t} timeout -k 5 \"$2\" sh {c}/\"$1\".sh) >{d}/\"$1\".log 2>&1 </dev/null; rc=$?; e=$(date +%s%N); echo $rc >{d}/\"$1\".rc; echo $(( (e - s) / 1000000 )) >{d}/\"$1\".ms; }}\n",
+        q(hidden_dir.display().to_string())
+    ));
+    for (id, timeout) in checks {
+        s.push_str(&format!("run {} {timeout}\n", q(id)));
+    }
+    s
+}
+
+fn tail(text: &str) -> String {
+    let start = text.len().saturating_sub(TAIL);
+    let start = (start..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
+    text[start..].to_string()
+}
+
+fn read_check(dir: &Path, id: &str) -> CheckResult {
+    let rc: i32 = fs::read_to_string(dir.join(format!("{id}.rc"))).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(-1);
+    let dur_ms = fs::read_to_string(dir.join(format!("{id}.ms"))).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+    let log = String::from_utf8_lossy(&fs::read(dir.join(format!("{id}.log"))).unwrap_or_default()).into_owned();
+    CheckResult { id: id.to_string(), pass: rc == 0, timeout: rc == 124 || rc == 137, dur_ms, tail: tail(&log) }
+}
+
+/// The repo files the visible check runs (guard.rs `oracle_files`, as the hive's verifier counts them).
+fn visible_files(wl: &Workload, root: &Path) -> Vec<String> {
+    let g = goal::Goal {
+        v: 1,
+        id: GOAL.into(),
+        spec: String::new(),
+        oracle: vec![goal::Check { name: "visible".into(), cmd: wl.visible.clone(), repo: String::new(), timeout_s: u64::from(wl.visible_timeout_s) }],
+        budget_usd: 0.0,
+        repos: vec![],
+        author: String::new(),
+        created_ms: 0,
+        sig: String::new(),
+        hidden: None,
+    };
+    guard::oracle_files(&g, root)
+}
+
+/// Which checks a scoring runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Hidden,
+    Visible,
+    Both,
+}
+
+/// Scores `head` of `ws` in `dir` inside `bx`: the hidden checks and/or the visible check (`which`), and the test/CI paths changed from `base` (on the fresh clone, whose .git config
+/// is git's own).
+fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path, which: Which) -> Result<Score, String> {
+    let (hidden, visible) = (which != Which::Visible, which != Which::Hidden);
+    let _ = fs::remove_dir_all(dir);
+    let (checks_dir, out_dir) = (dir.join("checks"), dir.join("out"));
+    fs::create_dir_all(&checks_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let mut list: Vec<(String, u32)> = Vec::new();
+    if hidden {
+        for c in &wl.checks {
+            fs::write(checks_dir.join(format!("h-{}.sh", c.id)), &c.cmd).map_err(|e| e.to_string())?;
+            list.push((format!("h-{}", c.id), c.timeout_s));
+        }
+    }
+    if visible {
+        fs::write(checks_dir.join("visible.sh"), &wl.visible).map_err(|e| e.to_string())?;
+        list.push(("visible".into(), wl.visible_timeout_s));
+    }
+    let script = score_script(ws, head, &out_dir, &checks_dir, &wl.hidden_dir, &list);
+    let total: u32 = list.iter().map(|(_, t)| t + 10).sum::<u32>() + 720;
+    let (code, out) = bx.exec(&out_dir, &[&out_dir], &[ws, &wl.hidden_dir, &checks_dir], &script, total);
+    fs::write(dir.join("score.log"), &out).map_err(|e| e.to_string())?;
+    if code == 3 || out.contains("CLONE-FAILED") {
+        return Err(format!("scoring clone failed: {}", out.trim()));
+    }
+    let mut s = Score::default();
+    if hidden {
+        s.checks = wl.checks.iter().map(|c| CheckResult { id: c.id.clone(), ..read_check(&out_dir, &format!("h-{}", c.id)) }).collect();
+        let tails: Value = s.checks.iter().map(|c| (c.id.clone(), json!(c.tail))).collect::<serde_json::Map<_, _>>().into();
+        let _ = fs::write(dir.join("tails.json"), serde_json::to_string_pretty(&tails).unwrap_or_default());
+    }
+    if visible {
+        s.visible_pass = Some(read_check(&out_dir, "visible").pass);
+    }
+    let tree = out_dir.join("tree");
+    let oracle_files = visible_files(wl, &tree);
+    s.hacked_paths =
+        verdict::changes(&tree, base, head).map(|c| verdict::protected(&c, &[], &oracle_files).into_iter().map(|c| c.path).collect()).unwrap_or_default();
+    // Disk: the tree may hold a build; the logs stay.
+    let _ = run_t(dir, &format!("chmod -R u+w {t} 2>/dev/null; rm -rf {t}", t = q(tree.display().to_string())), 600);
+    Ok(s)
+}
+
+// ------------------------------------------------------------------------------------- cost
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Tokens {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+}
+
+impl Tokens {
+    fn add(&mut self, o: Tokens) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_creation += o.cache_creation;
+    }
+
+    fn json(&self) -> Value {
+        json!({"input": self.input, "output": self.output, "cache_read": self.cache_read, "cache_creation": self.cache_creation})
+    }
+
+    fn of_usage(u: &Value) -> Tokens {
+        let n = |k: &str| u[k].as_u64().unwrap_or(0);
+        Tokens {
+            input: n("input_tokens"),
+            output: n("output_tokens"),
+            cache_read: n("cache_read_input_tokens"),
+            cache_creation: n("cache_creation_input_tokens"),
+        }
+    }
+}
+
+/// A claude result's tokens: summed over `modelUsage` (every model, subagents' too), else `usage`.
+fn tokens_of(result: &Value) -> Option<Tokens> {
+    if let Some(m) = result.get("modelUsage").and_then(Value::as_object).filter(|m| !m.is_empty()) {
+        let mut t = Tokens::default();
+        for u in m.values() {
+            let n = |k: &str| u[k].as_u64().unwrap_or(0);
+            t.add(Tokens {
+                input: n("inputTokens"),
+                output: n("outputTokens"),
+                cache_read: n("cacheReadInputTokens"),
+                cache_creation: n("cacheCreationInputTokens"),
+            });
+        }
+        return Some(t);
+    }
+    result.get("usage").filter(|u| u.is_object()).map(Tokens::of_usage)
+}
+
+fn models_of(result: &Value) -> Vec<String> {
+    result.get("modelUsage").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// A stream without a result (cut off): the assistant messages' usage, each message once (the stream
+/// repeats a message's usage on each of its content blocks).
+fn tokens_from_stream(stream: &str) -> Tokens {
+    let mut by_id: BTreeMap<String, Tokens> = BTreeMap::new();
+    let mut anon = Tokens::default();
+    for v in stream.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if v["type"] != "assistant" {
+            continue;
+        }
+        let u = &v["message"]["usage"];
+        if !u.is_object() {
+            continue;
+        }
+        match v["message"]["id"].as_str() {
+            Some(id) => {
+                by_id.insert(id.to_string(), Tokens::of_usage(u));
+            }
+            None => anon.add(Tokens::of_usage(u)),
+        }
+    }
+    by_id.values().fold(anon, |mut acc, t| {
+        acc.add(*t);
+        acc
+    })
+}
+
+/// A cell's money and tokens, metered the same way for every arm: `reported` sums what sessions said
+/// they cost; `charged` adds, for each session that said nothing (cut off at the wall cap, killed),
+/// the dollars it was allowed (its `--max-budget-usd`: an upper bound); `usd` is the total only when
+/// every session reported (`complete`).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Cost {
+    usd: Option<f64>,
+    complete: bool,
+    reported: f64,
+    charged: f64,
+    tokens: Tokens,
+    turns: Option<u64>,
+    models: Vec<String>,
+}
+
+impl Cost {
+    /// An empty sum to `add` sessions into.
+    fn zero() -> Cost {
+        Cost { usd: Some(0.0), complete: true, turns: Some(0), ..Cost::default() }
+    }
+
+    fn add(&mut self, o: &Cost) {
+        self.usd = self.usd.zip(o.usd).map(|(a, b)| a + b);
+        self.complete &= o.complete;
+        self.reported += o.reported;
+        self.charged += o.charged;
+        self.tokens.add(o.tokens);
+        self.turns = Some(self.turns.unwrap_or(0) + o.turns.unwrap_or(0));
+        for m in &o.models {
+            if !self.models.contains(m) {
+                self.models.push(m.clone());
+            }
+        }
+        self.models.sort();
+    }
+}
+
+/// One claude session's cost; `budget` is what it was allowed, charged when it reported nothing.
+fn session_cost(result: Option<&Value>, stream: &str, budget: f64) -> Cost {
+    let usd = result.and_then(|r| r["total_cost_usd"].as_f64());
+    let (tokens, turns, models) = match result {
+        Some(r) => (tokens_of(r).unwrap_or_else(|| tokens_from_stream(stream)), r["num_turns"].as_u64(), models_of(r)),
+        None => (tokens_from_stream(stream), None, Vec::new()),
+    };
+    Cost { usd, complete: usd.is_some(), reported: usd.unwrap_or(0.0), charged: usd.unwrap_or(budget), tokens, turns, models }
+}
+
+/// D3: the dollars `spend.jsonl` charges (`Spend::charged`: the cost, else a timed-out iteration's
+/// estimate), the dollars its lines reported, whether every line named its cost, and the number of
+/// iterations.
+fn d3_spend(path: &Path) -> (f64, f64, bool, usize) {
+    let lines: Vec<hive_run::Spend> =
+        fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<hive_run::Spend>(l).ok()).collect();
+    (lines.iter().map(hive_run::Spend::charged).sum(), lines.iter().filter_map(|s| s.usd).sum(), lines.iter().all(|s| s.usd.is_some()), lines.len())
+}
+
+/// D3: tokens and models over every iteration's log (`logs/*.out`, each one claude JSON object).
+fn d3_tokens(logs: &Path) -> (Tokens, Vec<String>) {
+    let mut t = Tokens::default();
+    let mut models = BTreeSet::new();
+    let mut files: Vec<PathBuf> = fs::read_dir(logs).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    files.sort();
+    for f in files.iter().filter(|p| p.extension().is_some_and(|e| e == "out")) {
+        let text = fs::read_to_string(f).unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+            if let Some(x) = tokens_of(&v) {
+                t.add(x);
+            }
+            models.extend(models_of(&v));
+        }
+    }
+    (t, models.into_iter().collect())
+}
+
+/// D3: what the sessions still running when the wall cap killed `borg hive run` are charged. They never
+/// got a spend.jsonl line: each iteration the runner started (a `by: "run"` line in joins.jsonl) whose
+/// session no spend line names. Each was launched with its drone's dollars left (`--max-budget-usd`),
+/// so it is charged that: the run's share (runs.jsonl, else `share`) less what the drone's lines
+/// charge. Returns (dollars, the drones cut off).
+fn d3_unreported(gdir: &Path, share: f64) -> (f64, Vec<String>) {
+    let lines: Vec<hive_run::Spend> =
+        fs::read_to_string(gdir.join("spend.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let seen: BTreeSet<&str> = lines.iter().flat_map(|s| s.session.split(',')).filter(|s| !s.is_empty()).collect();
+    let values =
+        |f: &str| -> Vec<Value> { fs::read_to_string(gdir.join(f)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
+    let share = values("runs.jsonl").last().and_then(|r| r["share_usd"].as_f64()).unwrap_or(share);
+    let mut cut: BTreeSet<String> = BTreeSet::new();
+    for j in values("joins.jsonl") {
+        let (Some(drone), Some(session)) = (j["drone"].as_str(), j["session"].as_str()) else { continue };
+        if j["by"] == "run" && !session.is_empty() && !seen.contains(session) {
+            cut.insert(drone.to_string());
+        }
+    }
+    let usd = cut.iter().map(|d| (share - lines.iter().filter(|s| &s.drone == d).map(hive_run::Spend::charged).sum::<f64>()).max(0.0)).sum();
+    (usd, cut.into_iter().collect())
+}
+
+/// Over the cap (10% slack), on the dollars charged.
+fn over_cap(charged: f64, cap: f64) -> bool {
+    charged > cap * 1.10
+}
+
+/// D3's board: (rework summed over tasks, verdicts rejected as hacked, tasks per shown status).
+fn board_facts(tasks: &Path) -> (u64, u64, BTreeMap<String, u64>) {
+    let events = board::read(tasks);
+    let b = board::fold(&events);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    let rework = b.tasks.values().map(|t| u64::from(t.rework)).sum();
+    let hacked = events.iter().filter(|e| e.ev == board::Ev::Rejected && e.hacked == Some(true)).count() as u64;
+    let mut counts = BTreeMap::new();
+    for t in b.tasks.values() {
+        *counts.entry(t.shown_status(now).to_string()).or_default() += 1;
+    }
+    (rework, hacked, counts)
+}
+
+/// Lines over every `lessons.jsonl` under `store`.
+fn lessons_lines(store: &Path) -> u64 {
+    fn walk(d: &Path, n: &mut u64) {
+        for e in fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, n);
+            } else if p.file_name().is_some_and(|f| f == "lessons.jsonl") {
+                *n += fs::read_to_string(&p).unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).count() as u64;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(store, &mut n);
+    n
+}
+
+// ------------------------------------------------------------------------------------- arms
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    A,
+    B,
+    D3,
+    F,
+}
+
+impl Arm {
+    fn parse(s: &str) -> Option<Arm> {
+        match s {
+            "a" => Some(Arm::A),
+            "b" => Some(Arm::B),
+            "d3" => Some(Arm::D3),
+            "f" => Some(Arm::F),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Arm::A => "a",
+            Arm::B => "b",
+            Arm::D3 => "d3",
+            Arm::F => "f",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Opts {
+    workload: PathBuf,
+    arm: Arm,
+    seed: u32,
+    cap: f64,
+    model: String,
+    timeout_s: u32,
+    run: String,
+    stop_at: Option<f64>,
+    borg: Option<PathBuf>,
+    claude: Option<PathBuf>,
+    sim: bool,
+}
+
+fn parse_opts(raw: &[String]) -> Result<Opts, String> {
+    let (mut workload, mut arm, mut seed, mut cap) = (None, None, None, None);
+    let mut o = Opts {
+        workload: PathBuf::new(),
+        arm: Arm::A,
+        seed: 0,
+        cap: 0.0,
+        model: "sonnet".into(),
+        timeout_s: 3600,
+        run: String::new(),
+        stop_at: None,
+        borg: None,
+        claude: None,
+        sim: false,
+    };
+    let mut it = raw.iter();
+    while let Some(flag) = it.next() {
+        let mut v = || it.next().cloned().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--workload" => workload = Some(PathBuf::from(v()?)),
+            "--arm" => {
+                let a = v()?;
+                arm = Some(Arm::parse(&a).ok_or_else(|| format!("--arm {a}: a, b, d3 or f"))?);
+            }
+            "--seed" => seed = Some(v()?.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
+            "--cap-usd" => cap = Some(v()?.parse::<f64>().map_err(|e| format!("--cap-usd: {e}"))?),
+            "--model" => o.model = v()?,
+            "--timeout-s" => o.timeout_s = v()?.parse().map_err(|e| format!("--timeout-s: {e}"))?,
+            "--run" => o.run = v()?,
+            "--stop-at-usd" => o.stop_at = Some(v()?.parse::<f64>().map_err(|e| format!("--stop-at-usd: {e}"))?),
+            "--borg" => o.borg = Some(PathBuf::from(v()?)),
+            "--claude" => o.claude = Some(PathBuf::from(v()?)),
+            "--harness" => match v()?.as_str() {
+                "claude" => o.sim = false,
+                "sim" => o.sim = true,
+                h => return Err(format!("--harness {h}: claude or sim")),
+            },
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    o.workload = workload.ok_or("--workload DIR is required")?;
+    o.arm = arm.ok_or("--arm a|b|d3|f is required")?;
+    o.seed = seed.ok_or("--seed N is required")?;
+    o.cap = cap.ok_or("--cap-usd X is required (no default: fixed after the probe)")?;
+    if !o.cap.is_finite() || o.cap <= 0.0 {
+        return Err(format!("--cap-usd {}: above 0", o.cap));
+    }
+    if o.timeout_s == 0 {
+        return Err("--timeout-s: above 0".into());
+    }
+    if o.stop_at.is_some_and(|y| !y.is_finite() || y <= 0.0) {
+        return Err("--stop-at-usd: above 0".into());
+    }
+    if o.sim && o.arm != Arm::D3 {
+        return Err("--harness sim runs the d3 arm only (A/B/F take --claude BIN for a fake)".into());
+    }
+    if o.run.is_empty() {
+        o.run = format!("hive-{}", now_s() as u64);
+    }
+    Ok(o)
+}
+
+fn now_s() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+fn usd(x: f64) -> String {
+    format!("{x:.2}")
+}
+
+/// The claude argv of one session of arm A, B or an F candidate (`budget`: its dollars).
+fn session_args(arm: Arm, prompt: &str, model: &str, budget: f64) -> Vec<String> {
+    let p = if arm == Arm::B { format!("{prompt}\n\n{INVITE}") } else { prompt.to_string() };
+    let mut a: Vec<String> = vec!["-p".into(), p, "--model".into(), model.into(), "--max-budget-usd".into(), usd(budget)];
+    a.extend(["--permission-mode", "bypassPermissions", "--append-system-prompt", crate::SYSTEM].map(String::from));
+    if arm != Arm::B {
+        a.extend(["--disallowedTools".to_string(), "Task Agent".to_string()]);
+    }
+    a
+}
+
+/// `borg hive init` of D3's goal: the prompt as its spec, the visible check as its oracle, the cap as
+/// its budget, the workload's tasks; no hidden oracle (it never enters the sandbox).
+fn d3_init_args(wl: &Workload, spec_file: &Path, cap: f64) -> Vec<String> {
+    let mut a: Vec<String> = ["borg", "hive", "init", GOAL, "--spec-file"].map(String::from).to_vec();
+    a.push(spec_file.display().to_string());
+    a.extend(["--oracle".into(), format!("visible={}", wl.visible), "--timeout".into(), wl.visible_timeout_s.to_string(), "--budget".into(), cap.to_string()]);
+    for t in &wl.tasks {
+        a.extend(["--task".into(), t.clone()]);
+    }
+    a
+}
+
+fn d3_run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool) -> Vec<String> {
+    let mut a: Vec<String> = ["borg", "hive", "run", GOAL, "--drones"].map(String::from).to_vec();
+    a.extend([DRONES.to_string(), "--model".into(), model.into(), "--base".into(), base.into(), "--iter-timeout".into(), iter_timeout_s.to_string()]);
+    if sim {
+        a.extend(["--harness".into(), "sim".into()]);
+    }
+    a
+}
+
+/// The env of every agent sandbox: a store and config in the sandbox HOME, every borg model call off,
+/// the workload's env; with the sim harness, its switches.
+fn agent_env(home: &Path, wl: &Workload, sim_script: Option<&Path>) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("BORG_HOME".to_string(), home.join(".local/share/borg").display().to_string()),
+        ("BORG_CONFIG".to_string(), home.join(".config/borg/collectives.json").display().to_string()),
+    ];
+    env.extend(BORG_OFF.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    if let Some(s) = sim_script {
+        env.push(("BORG_TEST_HARNESS".into(), "1".into()));
+        env.push(("BORG_SIM_CAPS".into(), "prompt,tool,deny,headless,budget".into()));
+        env.push(("BORG_SIM_SCRIPT".into(), s.display().to_string()));
+    }
+    env.extend(wl.env_for(home));
+    env
+}
+
+/// One agent home of a cell: the sandbox HOME, its secrets (none with a fake or simulated harness),
+/// the workspace, the env and the sandbox options.
+struct Agent {
+    home: PathBuf,
+    ws: PathBuf,
+    base: String,
+    secrets: Option<Secrets>,
+    env: Vec<(String, String)>,
+    home_binds: Vec<(PathBuf, PathBuf)>,
+    ro: Vec<PathBuf>,
+}
+
+impl Agent {
+    fn extra(&self) -> Extra {
+        Extra {
+            home_ro: self.home_binds.clone(),
+            setting_sources: Some("user,project".into()),
+            sandbox_home: Some(self.home.clone()),
+            file_rw: self.secrets.as_ref().map(|s| Secrets::binds(&s.dir, &self.home)).unwrap_or_default(),
+            env: self.env.clone(),
+            unshare_net: false,
+            // Nothing an agent starts (a Gradle daemon: a build keeps on) outlives its session into
+            // the next cells' wall-clock.
+            unshare_pid: true,
+        }
+    }
+
+    fn lessons(&self) -> u64 {
+        lessons_lines(&self.home.join(".local/share/borg"))
+    }
+
+    /// `argv` in the sandbox: (exit code, stdout, stderr).
+    fn exec(&self, cwd: &Path, argv: &[String], timeout_s: u32) -> (i32, String, String) {
+        let ro: Vec<&Path> = self.ro.iter().map(PathBuf::as_path).collect();
+        let (mut cmd, private) = sandbox_with(cwd, &[&self.home], &ro, &self.extra(), timeout_s);
+        let out = cmd.args(argv).stdin(Stdio::null()).output();
+        let _ = fs::remove_dir_all(private);
+        match out {
+            Ok(o) => (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned()),
+            Err(e) => (-1, String::new(), e.to_string()),
+        }
+    }
+}
+
+struct Env {
+    root: PathBuf,
+    real_home: PathBuf,
+    borg: PathBuf,
+}
+
+/// D3's `claude`: `target` with `--append-system-prompt SYSTEM` appended to the runner's argv, so a
+/// drone's session is told what an A, B or F session is (`session_args`); its task text is the hive's.
+fn claude_wrapper(target: &Path) -> String {
+    format!("#!/bin/sh\nexec {} \"$@\" --append-system-prompt {}\n", q(target.display().to_string()), q(crate::SYSTEM))
+}
+
+fn make_agent(dir: &Path, o: &Opts, wl: &Workload, env: &Env, sim_script: Option<&Path>) -> Result<Agent, String> {
+    let home = dir.join("home");
+    fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let secrets = if o.claude.is_some() || o.sim {
+        prepare_home_bare(&home, &env.borg, "{}", COLLECTIVES)?;
+        None
+    } else {
+        Some(prepare_home_with(&home, &env.real_home, &env.borg, "{}", COLLECTIVES, f64::from(o.timeout_s) + 900.0)?)
+    };
+    let mut ro = vec![env.borg.clone()];
+    if o.arm == Arm::D3 && !o.sim {
+        // The drones' `claude` (the runner finds it on PATH, `<home>/bin` first): the real one, or the
+        // fake, with the system prompt A, B and F get.
+        let target = o.claude.clone().unwrap_or_else(|| env.real_home.join(".local/bin/claude"));
+        let w = home.join("bin/claude");
+        fs::write(&w, claude_wrapper(&target)).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        ro.extend(o.claude.clone());
+    } else if let Some(c) = &o.claude {
+        std::os::unix::fs::symlink(c, home.join("bin/claude")).map_err(|e| e.to_string())?;
+        ro.push(c.clone());
+    }
+    let ws = home.join("work").join(&wl.id);
+    let base = build_workspace(wl, &ws)?;
+    Ok(Agent { env: agent_env(&home, wl, sim_script), home_binds: wl.home_binds(&env.real_home), home, ws, base, secrets, ro })
+}
+
+/// One finished claude session.
+struct Ran {
+    cost: Cost,
+    wall: f64,
+    timed_out: bool,
+}
+
+/// `budget`: the session's `--max-budget-usd`, charged when it reports no cost.
+fn claude_session(ag: &Agent, args: &[String], stream: &Path, timeout_s: u32, budget: f64) -> Ran {
+    let ro: Vec<&Path> = ag.ro.iter().map(PathBuf::as_path).collect();
+    let (result, wall, code) = crate::bwrap_claude_run(&ag.ws, &[&ag.home], &ro, &ag.extra(), args, stream, timeout_s);
+    let text = fs::read_to_string(stream).unwrap_or_default();
+    Ran { cost: session_cost(result.as_ref(), &text, budget), wall, timed_out: code == Some(124) || code == Some(137) }
+}
+
+/// Commits what the agent left as `result` in its workspace (scorer sandbox): the head.
+fn commit_result(bx: &Jail, ws: &Path) -> Result<String, String> {
+    let (_, out) = bx.exec(ws, &[ws], &[], &result_script(), 600);
+    parse_integrate(&out).head.ok_or_else(|| format!("result commit failed: {}", out.trim()))
+}
+
+/// F's pick: the visible check passed first, then the lower cost (unknown is dearest), then the lower
+/// index. Candidates are (visible_pass, cost_usd).
+fn choose(cands: &[(bool, Option<f64>)]) -> usize {
+    (0..cands.len())
+        .min_by(|&i, &j| {
+            let key = |k: usize| (!cands[k].0, cands[k].1.unwrap_or(f64::INFINITY));
+            let (a, b) = (key(i), key(j));
+            a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(i.cmp(&j))
+        })
+        .unwrap_or(0)
+}
+
+fn git_rev(root: &Path, paths: &str) -> String {
+    let (_, _, rev) = run_t(root, "git rev-parse --short=12 HEAD", 30);
+    let (_, _, dirty) = run_t(root, &format!("git status --porcelain -- {paths}"), 30);
+    format!("{}{}", rev.trim(), if dirty.trim().is_empty() { "" } else { "+dirty" })
+}
+
+/// The row skeleton: every key present.
+fn base_row(o: &Opts, wl: &Workload, env: &Env) -> serde_json::Map<String, Value> {
+    let v = json!({
+        "run": o.run, "workload": wl.id, "workload_sha": wl.sha, "shape": wl.shape, "arm": o.arm.name(), "model": o.model,
+        "models": [], "seed": o.seed, "cap_usd": o.cap, "K": wl.k(), "base": null, "result_head": null, "wall_s": null,
+        "timed_out": false, "cost_usd": null, "cost_complete": false, "over_cap": false, "tokens": Tokens::default().json(),
+        "turns": null, "sessions": null, "hidden": {"checks": [], "passed": 0, "solve_share": 0.0}, "visible_pass": null,
+        "rework": null, "merge_conflicts": 0, "dropped_drones": [], "hacked": 0, "hacked_paths": [], "hacked_verdicts": 0,
+        "d3": null, "f": null, "store_lessons_before": null, "store_lessons_after": null,
+        "borg_rev": git_rev(&env.root, "crates/borg crates/borg-trace"), "borg_eval_rev": git_rev(&env.root, "crates/borg-eval"),
+        "mast": [], "error": null,
+    });
+    let mut row = v.as_object().cloned().unwrap_or_default();
+    for k in ["reported_usd", "charged_usd", "error_stage", "cell", "attempt"] {
+        row.insert(k.into(), Value::Null);
+    }
+    for k in ["commit_failed_drones", "missing_drones"] {
+        row.insert(k.into(), json!([]));
+    }
+    row.insert("paid".into(), json!(false));
+    row
+}
+
+/// Every key `put_score` writes: hacked counts the final tree's test/CI changes for every arm alike
+/// (0 or 1, as the result changed a protected path or not); D3's verifier verdicts that caught a hack
+/// on the way (and may have been reworked away) are `hacked_verdicts`, reported apart.
+fn put_score(row: &mut serde_json::Map<String, Value>, s: &Score, k: usize, hacked_verdicts: u64) {
+    row.insert("hidden".into(), s.json(k));
+    row.insert("visible_pass".into(), json!(s.visible_pass));
+    row.insert("hacked_paths".into(), json!(s.hacked_paths));
+    row.insert("hacked_verdicts".into(), json!(hacked_verdicts));
+    row.insert("hacked".into(), json!(u64::from(!s.hacked_paths.is_empty())));
+}
+
+fn put_cost(row: &mut serde_json::Map<String, Value>, c: &Cost, cap: f64) {
+    row.insert("cost_usd".into(), json!(c.usd));
+    row.insert("reported_usd".into(), json!(c.reported));
+    row.insert("charged_usd".into(), json!(c.charged));
+    row.insert("cost_complete".into(), json!(c.complete));
+    row.insert("over_cap".into(), json!(over_cap(c.charged, cap)));
+    row.insert("tokens".into(), c.tokens.json());
+    row.insert("turns".into(), json!(c.turns));
+    row.insert("models".into(), json!(c.models));
+}
+
+/// Marks the row: a model call may have been made from here on (an error after it is not a setup
+/// error, and the cell's dollars count).
+fn mark_paid(row: &mut serde_json::Map<String, Value>) {
+    row.insert("paid".into(), json!(true));
+}
+
+/// Arm A or B: one session.
+fn arm_single(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let ag = make_agent(cell, o, wl, env, None)?;
+    row.insert("base".into(), json!(ag.base));
+    let before = ag.lessons();
+    row.insert("store_lessons_before".into(), json!(before));
+    if before != 0 {
+        return Err(format!("the fresh store holds {before} lesson line(s)"));
+    }
+    let args = session_args(o.arm, &wl.prompt(), &o.model, o.cap);
+    eprintln!("  {} {}: claude -p (cap ${:.2}, wall cap {}s) …", wl.id, o.arm.name(), o.cap, o.timeout_s);
+    mark_paid(row);
+    let ran = claude_session(&ag, &args, &cell.join("stream.jsonl"), o.timeout_s, o.cap);
+    // What the session cost and how long it ran are known now: recorded before anything below can fail.
+    put_cost(row, &ran.cost, o.cap);
+    row.insert("wall_s".into(), json!(ran.wall));
+    row.insert("timed_out".into(), json!(ran.timed_out));
+    row.insert("sessions".into(), json!(1));
+    let mut ag = ag;
+    // No token outlives the session.
+    ag.secrets = None;
+    let bx = Jail::scorer(cell, wl, &env.real_home);
+    let t0 = Instant::now();
+    let head = commit_result(&bx, &ag.ws)?;
+    row.insert("wall_s".into(), json!(ran.wall + t0.elapsed().as_secs_f64()));
+    row.insert("store_lessons_after".into(), json!(ag.lessons()));
+    row.insert("result_head".into(), json!(head));
+    let s = score(&bx, wl, &ag.ws, &ag.base, &head, &cell.join("score"), Which::Both)?;
+    put_score(row, &s, wl.k(), 0);
+    Ok(())
+}
+
+/// Arm F: three A sessions at cap/3 in parallel, the best by the visible check.
+fn arm_f(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let mut agents = Vec::new();
+    for i in 1..=3 {
+        agents.push(make_agent(&cell.join(format!("f{i}")), o, wl, env, None)?);
+    }
+    let before: u64 = agents.iter().map(Agent::lessons).sum();
+    row.insert("store_lessons_before".into(), json!(before));
+    if before != 0 {
+        return Err(format!("the fresh stores hold {before} lesson line(s)"));
+    }
+    let budget = o.cap / 3.0;
+    let args = session_args(Arm::F, &wl.prompt(), &o.model, budget);
+    eprintln!("  {} f: 3 × claude -p (${} each, wall cap {}s) …", wl.id, usd(budget), o.timeout_s);
+    mark_paid(row);
+    let rans: Vec<Ran> = std::thread::scope(|s| {
+        let hs: Vec<_> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, ag)| {
+                let (args, stream) = (&args, cell.join(format!("f{}/stream.jsonl", i + 1)));
+                s.spawn(move || claude_session(ag, args, &stream, o.timeout_s, budget))
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap_or(Ran { cost: session_cost(None, "", budget), wall: f64::from(o.timeout_s), timed_out: true })).collect()
+    });
+    for ag in &mut agents {
+        ag.secrets = None;
+    }
+    // The three sessions' dollars, tokens and wall: recorded before selection or scoring can fail.
+    let mut cost = Cost::zero();
+    for r in &rans {
+        cost.add(&r.cost);
+    }
+    put_cost(row, &cost, o.cap);
+    let slowest = rans.iter().map(|r| r.wall).fold(0.0, f64::max);
+    row.insert("wall_s".into(), json!(slowest));
+    row.insert("timed_out".into(), json!(rans.iter().any(|r| r.timed_out)));
+    row.insert("sessions".into(), json!(3));
+    // Selection: each candidate's result, its visible check on a fresh tree.
+    let t0 = Instant::now();
+    let mut heads = Vec::new();
+    let mut visible = Vec::new();
+    for (i, ag) in agents.iter().enumerate() {
+        let c = cell.join(format!("f{}", i + 1));
+        let bx = Jail::scorer(&c, wl, &env.real_home);
+        let head = commit_result(&bx, &ag.ws)?;
+        let s = score(&bx, wl, &ag.ws, &ag.base, &head, &c.join("select"), Which::Visible)?;
+        visible.push(s.visible_pass.unwrap_or(false));
+        heads.push(head);
+    }
+    let selection = t0.elapsed().as_secs_f64();
+    row.insert("wall_s".into(), json!(slowest + selection));
+    let chosen = choose(&visible.iter().zip(&rans).map(|(v, r)| (*v, r.cost.usd)).collect::<Vec<_>>());
+    let mut cands = Vec::new();
+    let mut chosen_score = None;
+    for (i, ag) in agents.iter().enumerate() {
+        let c = cell.join(format!("f{}", i + 1));
+        let bx = Jail::scorer(&c, wl, &env.real_home);
+        let s = score(&bx, wl, &ag.ws, &ag.base, &heads[i], &c.join("score"), Which::Hidden)?;
+        cands.push(json!({"i": i + 1, "cost_usd": rans[i].cost.usd, "charged_usd": rans[i].cost.charged, "wall_s": rans[i].wall, "visible_pass": visible[i],
+                          "solve_share": s.share(wl.k()), "base": ag.base, "result_head": heads[i], "timed_out": rans[i].timed_out}));
+        if i == chosen {
+            chosen_score = Some(s);
+        }
+    }
+    row.insert("base".into(), json!(agents[chosen].base));
+    row.insert("result_head".into(), json!(heads[chosen]));
+    row.insert("store_lessons_after".into(), json!(agents.iter().map(Agent::lessons).sum::<u64>()));
+    row.insert("f".into(), json!({"candidates": cands, "chosen": chosen + 1, "selection_s": selection}));
+    let s = chosen_score.ok_or("no chosen candidate")?;
+    put_score(row, &s, wl.k(), 0);
+    row.insert("visible_pass".into(), json!(visible[chosen]));
+    Ok(())
+}
+
+/// Hooks `borg install claude --apply` wired in the sandbox HOME's settings.json.
+fn wired_events(home: &Path) -> usize {
+    let v: Value = fs::read_to_string(home.join(".claude/settings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    ["UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop", "SessionEnd"]
+        .iter()
+        .filter(|e| v["hooks"][**e].to_string().contains("hook claude"))
+        .count()
+}
+
+/// Arm D3: borg installed, the goal made, `borg hive run --drones 3`, the runner-side merge. The run
+/// has the same wall cap as an A/B session (`--timeout-s`), and so does each iteration within it.
+fn arm_d3(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    // Inside the sandbox HOME: the cell dir itself is not bound into the sandbox.
+    let sim_script = cell.join("home/sim.json");
+    if o.sim {
+        fs::create_dir_all(cell.join("home")).map_err(|e| e.to_string())?;
+        fs::write(&sim_script, wl.sim.clone().unwrap_or(json!({})).to_string()).map_err(|e| e.to_string())?;
+    }
+    let ag = make_agent(cell, o, wl, env, o.sim.then_some(sim_script.as_path()))?;
+    row.insert("base".into(), json!(ag.base));
+    let before = ag.lessons();
+    row.insert("store_lessons_before".into(), json!(before));
+    if before != 0 {
+        return Err(format!("the fresh store holds {before} lesson line(s)"));
+    }
+    let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let (code, out, err) = ag.exec(&ag.home, &argv(&["borg", "install", "claude", "--apply"]), 60);
+    let wired = wired_events(&ag.home);
+    if code != 0 || wired != 5 {
+        return Err(format!("borg install: exit {code}, {wired}/5 events wired: {out}{err}"));
+    }
+    let spec = ag.home.join("goal/spec.md");
+    fs::create_dir_all(spec.parent().unwrap_or(&ag.home)).map_err(|e| e.to_string())?;
+    fs::write(&spec, wl.prompt()).map_err(|e| e.to_string())?;
+    let (code, out, err) = ag.exec(&ag.ws, &d3_init_args(wl, &spec, o.cap), 60);
+    if code != 0 {
+        return Err(format!("borg hive init: exit {code}: {out}{err}"));
+    }
+    eprintln!("  {} d3: borg hive run --drones {DRONES} (cap ${:.2}, wall cap {}s) …", wl.id, o.cap, o.timeout_s);
+    mark_paid(row);
+    let t0 = Instant::now();
+    let (code, out, err) = ag.exec(&ag.ws, &d3_run_args(&o.model, &ag.base, o.timeout_s, o.sim), o.timeout_s);
+    let run_wall = t0.elapsed().as_secs_f64();
+    let _ = fs::write(cell.join("run.out"), &out);
+    let _ = fs::write(cell.join("run.err"), &err);
+    let mut ag = ag;
+    ag.secrets = None;
+    // Dollars, tokens and wall first: known now, and nothing below may lose them.
+    let gdir = ag.home.join(".local/share/borg/collectives").join(GOAL).join("hive").join(GOAL);
+    let timed_out = code == 124 || code == 137;
+    let (charged, reported, all_named, iterations) = d3_spend(&gdir.join("spend.jsonl"));
+    let (cut_usd, cut) = d3_unreported(&gdir, o.cap / DRONES as f64);
+    let (tokens, models) = d3_tokens(&gdir.join("logs"));
+    let complete = all_named && cut.is_empty() && !timed_out;
+    let total = charged + cut_usd;
+    let cost = Cost { usd: complete.then_some(total), complete, reported, charged: total, tokens, turns: None, models };
+    put_cost(row, &cost, o.cap);
+    row.insert("wall_s".into(), json!(run_wall));
+    row.insert("timed_out".into(), json!(timed_out));
+    row.insert("sessions".into(), json!(iterations + cut.len()));
+    let (rework, hacked_verdicts, statuses) = board_facts(&gdir.join("tasks.jsonl"));
+    row.insert("rework".into(), json!(rework));
+    row.insert("hacked_verdicts".into(), json!(hacked_verdicts));
+    let ends: Vec<&str> = out.lines().filter(|l| l.starts_with('d') && l.contains(" end: ")).collect();
+    let spend_lines = fs::read_to_string(gdir.join("spend.jsonl")).unwrap_or_default().lines().count();
+    row.insert(
+        "d3".into(),
+        json!({"finished": code == 0, "exit": code, "iterations": iterations, "drone_ends": ends, "board": statuses, "spend_lines": spend_lines,
+               "cut_off_drones": cut, "cut_off_usd": cut_usd}),
+    );
+    let bx = Jail::scorer(cell, wl, &env.real_home);
+    let (_, log) = bx.exec(&ag.ws, &[&ag.ws], &[], &integrate_script(&ag.base), INTEGRATE_TIMEOUT_S);
+    row.insert("wall_s".into(), json!(t0.elapsed().as_secs_f64()));
+    let _ = fs::write(cell.join("integrate.log"), &log);
+    let merged = parse_integrate(&log);
+    row.insert("merge_conflicts".into(), json!(merged.conflicts));
+    row.insert("dropped_drones".into(), json!(merged.dropped));
+    row.insert("commit_failed_drones".into(), json!(merged.commit_failed));
+    row.insert("missing_drones".into(), json!(merged.missing));
+    let head = merged.head.clone().ok_or_else(|| format!("integrate failed: {}", log.trim()))?;
+    row.insert("result_head".into(), json!(head));
+    row.insert("store_lessons_after".into(), json!(ag.lessons()));
+    let s = score(&bx, wl, &ag.ws, &ag.base, &head, &cell.join("score"), Which::Both)?;
+    put_score(row, &s, wl.k(), hacked_verdicts);
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------- commands
+
+fn repo_root() -> PathBuf {
+    let r = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::canonicalize(&r).unwrap_or(r)
+}
+
+fn real_home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+}
+
+fn validate_log(runs: &Path) -> PathBuf {
+    runs.join("hive-validate/results.jsonl")
+}
+
+fn validated(runs: &Path, sha: &str) -> bool {
+    fs::read_to_string(validate_log(runs))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|v| v["validate"]["workload_sha"] == sha && v["validate"]["pass"] == true)
+}
+
+/// A row's dollars: what it charged (`Cost::charged`); a row from before that field, its cost; nothing
+/// for an error before any model call; else its cap.
+fn charged_of(r: &Value) -> f64 {
+    r["charged_usd"]
+        .as_f64()
+        .or_else(|| r["cost_usd"].as_f64())
+        .or_else(|| (r["paid"] == false && !r["error"].is_null()).then_some(0.0))
+        .or_else(|| r["cap_usd"].as_f64())
+        .unwrap_or(0.0)
+}
+
+/// The dollars a run already counts: each row's `charged_of`, and the cap of every cell attempt that
+/// started (`<cell>/cell.json`) but wrote no row (killed, crashed: its sessions may have spent it).
+fn spent_in(run_dir: &Path) -> f64 {
+    let rows: Vec<Value> =
+        fs::read_to_string(run_dir.join("results.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
+    let attempts: BTreeSet<&str> = rows.iter().filter_map(|r| r["attempt"].as_str()).collect();
+    let lost: f64 = fs::read_dir(run_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path().join("cell.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()))
+        .filter(|c| c["attempt"].as_str().is_some_and(|a| !attempts.contains(a)))
+        .map(|c| c["cap_usd"].as_f64().unwrap_or(0.0))
+        .sum();
+    rows.iter().map(charged_of).sum::<f64>() + lost
+}
+
+fn append_row(path: &Path, row: &Value) -> Result<(), String> {
+    if let Some(d) = path.parent() {
+        fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    writeln!(f, "{row}").map_err(|e| e.to_string())
+}
+
+pub fn main(raw: &[String]) {
+    match raw.first().map(String::as_str) {
+        Some("report") => {
+            let rows: Vec<Value> = raw[1..]
+                .iter()
+                .flat_map(|f| fs::read_to_string(f).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect::<Vec<_>>())
+                .filter(|v| v.get("arm").is_some())
+                .collect();
+            print!("{}", report_text(&rows));
+        }
+        Some("validate") => std::process::exit(validate_cmd(&raw[1..])),
+        _ => std::process::exit(cell_cmd(raw)),
+    }
+}
+
+fn cell_cmd(raw: &[String]) -> i32 {
+    let o = match parse_opts(raw) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("borg-eval hive: {e}");
+            return 2;
+        }
+    };
+    let root = repo_root();
+    let runs = root.join("target/eval-runs");
+    let real_home = real_home();
+    let wl = match load_workload(&o.workload, &real_home, &runs) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("borg-eval hive: {e}");
+            return 2;
+        }
+    };
+    if !validated(&runs, &wl.sha) {
+        eprintln!("borg-eval hive: workload {} ({}) has no passing `borg-eval hive validate` row; run it first", wl.id, &wl.sha[..12]);
+        return 2;
+    }
+    let borg = o.borg.clone().unwrap_or_else(|| root.join("target/release/borg"));
+    let Ok(borg) = fs::canonicalize(&borg) else {
+        eprintln!("borg-eval hive: {} not found (cargo build --release -p borg-ai)", borg.display());
+        return 2;
+    };
+    let o = Opts { claude: o.claude.as_ref().map(|c| fs::canonicalize(c).unwrap_or_else(|_| c.clone())), ..o };
+    let run_dir = runs.join(&o.run);
+    let results = run_dir.join("results.jsonl");
+    if let Some(y) = o.stop_at {
+        let spent = spent_in(&run_dir);
+        if spent + o.cap > y {
+            eprintln!("borg-eval hive: ${spent:.2} spent in run {} + cap ${:.2} > ${y:.2}: not started", o.run, o.cap);
+            return 2;
+        }
+    }
+    let cell = run_dir.join(format!("{}-{}-s{}", wl.id, o.arm.name(), o.seed));
+    if cell.exists() {
+        eprintln!("borg-eval hive: {} exists; one row per cell", cell.display());
+        return 2;
+    }
+    if let Err(e) = fs::create_dir_all(&cell) {
+        eprintln!("borg-eval hive: {e}");
+        return 1;
+    }
+    let name = cell.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let attempt = format!("{name}-{}", (now_s() * 1000.0) as u64);
+    // Before anything is spent: a cell killed before its row is written still counts its cap.
+    if let Err(e) = fs::write(cell.join("cell.json"), json!({"cell": name, "attempt": attempt, "cap_usd": o.cap}).to_string()) {
+        eprintln!("borg-eval hive: {e}");
+        return 1;
+    }
+    let env = Env { root, real_home, borg };
+    let mut row = base_row(&o, &wl, &env);
+    row.insert("cell".into(), json!(name));
+    row.insert("attempt".into(), json!(attempt));
+    eprintln!("hive cell {} · run {} · {}", cell.file_name().unwrap_or_default().to_string_lossy(), o.run, cell.display());
+    let done = match o.arm {
+        Arm::A | Arm::B => arm_single(&o, &wl, &env, &cell, &mut row),
+        Arm::F => arm_f(&o, &wl, &env, &cell, &mut row),
+        Arm::D3 => arm_d3(&o, &wl, &env, &cell, &mut row),
+    };
+    if let Err(e) = &done {
+        eprintln!("  error: {e}");
+        row.insert("error".into(), json!(e));
+        // "setup": no model call was made (nothing measured, rerun the cell); "after-session": the
+        // agents ran and their dollars and wall are in the row.
+        row.insert("error_stage".into(), json!(if row["paid"] == true { "after-session" } else { "setup" }));
+    }
+    let row = Value::Object(row);
+    if let Err(e) = append_row(&results, &row) {
+        eprintln!("borg-eval hive: {}: {e}", results.display());
+        return 1;
+    }
+    eprintln!(
+        "  wall {:.0}s · ${} · share {} · visible {} · conflicts {} · hacked {} → {}",
+        row["wall_s"].as_f64().unwrap_or(0.0),
+        row["charged_usd"].as_f64().map_or("?".into(), usd),
+        row["hidden"]["solve_share"],
+        row["visible_pass"],
+        row["merge_conflicts"],
+        row["hacked"],
+        results.display()
+    );
+    i32::from(done.is_err())
+}
+
+/// Validates a workload into `dir`: every hidden check fails on base and passes on the reference; the
+/// visible check passes on the reference (F picks by it) and, for a parallel workload, on the base too
+/// (the injected bugs get past the team's own suite).
+fn validate_in(wl: &Workload, dir: &Path, bx: &Jail) -> Result<(bool, Value), String> {
+    let ws = dir.join("work").join(&wl.id);
+    let base = build_workspace(wl, &ws)?;
+    let on_base = score(bx, wl, &ws, &base, &base, &dir.join("score-base"), Which::Both)?;
+    let reference = wl.reference.as_ref().ok_or("no reference patch")?;
+    let (ok, _, out) = run_t(
+        &ws,
+        &format!(
+            "{GIT} apply --whitespace=nowarn {} && {GIT} add -A && {GIT} commit -q -m reference && {GIT} rev-parse HEAD",
+            q(reference.display().to_string())
+        ),
+        600,
+    );
+    if !ok {
+        return Err(format!("reference.patch: {}", out.trim()));
+    }
+    let head = out.trim().lines().last().unwrap_or_default().to_string();
+    let on_ref = score(bx, wl, &ws, &base, &head, &dir.join("score-ref"), Which::Both)?;
+    let visible_ok = on_ref.visible_pass == Some(true) && (wl.shape != "parallel" || on_base.visible_pass == Some(true));
+    let pass = on_base.checks.iter().all(|c| !c.pass) && on_ref.checks.iter().all(|c| c.pass) && visible_ok;
+    let checks: Vec<Value> = wl
+        .checks
+        .iter()
+        .zip(on_base.checks.iter().zip(&on_ref.checks))
+        .map(|(c, (b, r))| json!({"id": c.id, "base_pass": b.pass, "base_timeout": b.timeout, "ref_pass": r.pass, "ref_timeout": r.timeout, "base_ms": b.dur_ms, "ref_ms": r.dur_ms}))
+        .collect();
+    let v = json!({"workload": wl.id, "workload_sha": wl.sha, "pass": pass, "K": wl.k(), "base": base, "reference_head": head, "checks": checks,
+                   "visible_base": on_base.visible_pass, "visible_ref": on_ref.visible_pass, "dir": dir.display().to_string()});
+    Ok((pass, v))
+}
+
+fn validate_cmd(raw: &[String]) -> i32 {
+    // `--timeout-s` is taken for symmetry with the arms; every check is bounded by its own timeout.
+    let mut workload = None;
+    let mut it = raw.iter();
+    while let Some(f) = it.next() {
+        match (f.as_str(), it.next()) {
+            ("--workload", Some(v)) => workload = Some(PathBuf::from(v)),
+            ("--timeout-s", Some(v)) if v.parse::<u32>().is_ok_and(|t| t > 0) => {}
+            (other, _) => {
+                eprintln!("borg-eval hive validate: unknown flag or missing value {other}");
+                return 2;
+            }
+        }
+    }
+    let Some(workload) = workload else {
+        eprintln!("borg-eval hive validate: --workload DIR is required");
+        return 2;
+    };
+    let root = repo_root();
+    let runs = root.join("target/eval-runs");
+    let real_home = real_home();
+    let wl = match load_workload(&workload, &real_home, &runs) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("borg-eval hive validate: {e}");
+            return 2;
+        }
+    };
+    let dir = runs.join("hive-validate").join(format!("{}-{}", wl.id, now_s() as u64));
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("borg-eval hive validate: {e}");
+        return 1;
+    }
+    let bx = Jail::scorer(&dir, &wl, &real_home);
+    let (pass, v) = match validate_in(&wl, &dir, &bx) {
+        Ok(x) => x,
+        Err(e) => (false, json!({"workload": wl.id, "workload_sha": wl.sha, "pass": false, "error": e})),
+    };
+    println!("validate {} ({}): {}", wl.id, &wl.sha[..12], if pass { "PASS" } else { "FAIL" });
+    println!("| check | base | reference |");
+    println!("|---|---|---|");
+    for c in v["checks"].as_array().into_iter().flatten() {
+        let cell = |p: &str, t: &str| {
+            if c[t] == true {
+                "timeout"
+            } else if c[p] == true {
+                "pass"
+            } else {
+                "fail"
+            }
+        };
+        println!("| {} | {} | {} |", c["id"].as_str().unwrap_or("?"), cell("base_pass", "base_timeout"), cell("ref_pass", "ref_timeout"));
+    }
+    println!("visible: base {} · reference {}", v["visible_base"], v["visible_ref"]);
+    if let Some(e) = v["error"].as_str() {
+        println!("error: {e}");
+    }
+    if let Err(e) = append_row(&validate_log(&runs), &json!({"validate": v, "ms": (now_s() * 1000.0) as i64})) {
+        eprintln!("borg-eval hive validate: {e}");
+        return 1;
+    }
+    i32::from(!pass)
+}
+
+// ------------------------------------------------------------------------------------- report
+
+fn median(mut xs: Vec<f64>) -> Option<f64> {
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    Some(if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 })
+}
+
+fn mean(xs: &[f64]) -> Option<f64> {
+    (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64)
+}
+
+/// Rounding slack for the boundary of the pre-registered inequalities (they are inclusive).
+const EPS: f64 = 1e-9;
+
+/// The rows a cell's numbers are read from: the runs that completed without an error. An errored row
+/// (a harness failure; its share was never scored, or its agents never ran) is left out of BOTH terms
+/// alike and counted in the Errors column; drive.py reruns such a cell.
+fn clean<'a>(rs: &[&'a Value]) -> Vec<&'a Value> {
+    rs.iter().copied().filter(|r| r["error"].is_null()).collect()
+}
+
+fn wall_of(rs: &[&Value]) -> Option<f64> {
+    median(rs.iter().filter_map(|r| r["wall_s"].as_f64()).collect())
+}
+
+fn share_of(rs: &[&Value]) -> Option<f64> {
+    mean(&rs.iter().map(|r| r["hidden"]["solve_share"].as_f64().unwrap_or(0.0)).collect::<Vec<_>>())
+}
+
+/// Seeds per cell in the pre-registered rule.
+const SEEDS: usize = 3;
+
+/// The pre-registered H1 on one workload: (holds, the line), over each arm's `clean` rows. None when
+/// D3 or B has none.
+fn h1(d3: &[&Value], b: &[&Value], k: usize) -> Option<(bool, String)> {
+    let (d3, b) = (clean(d3), clean(b));
+    let (dw, bw, ds, bs) = (wall_of(&d3)?, wall_of(&b)?, share_of(&d3)?, share_of(&b)?);
+    let slack = 1.0 / k.max(1) as f64;
+    let holds = dw <= 0.8 * bw + EPS && ds >= bs - slack - EPS;
+    let mut line = format!(
+        "D3 median wall {dw:.0}s ≤ 0.8×B {bw:.0}s ({:.0}s)? AND D3 mean share {ds:.3} ≥ B {bs:.3} − 1/K ({:.3}, K={k})? → {}",
+        0.8 * bw,
+        bs - slack,
+        if holds { "HOLDS" } else { "FAILS" }
+    );
+    if d3.len() < SEEDS || b.len() < SEEDS {
+        line.push_str(&format!(" (only {} D3 and {} B runs without error: rerun the errored cells before reading this)", d3.len(), b.len()));
+    }
+    Some((holds, line))
+}
+
+fn report_text(rows: &[Value]) -> String {
+    let mut out = String::new();
+    let mut by: BTreeMap<(String, String), Vec<&Value>> = BTreeMap::new();
+    let mut shapes: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for r in rows {
+        let w = r["workload"].as_str().unwrap_or("?").to_string();
+        by.entry((w.clone(), r["arm"].as_str().unwrap_or("?").to_string())).or_default().push(r);
+        shapes.insert(w, (r["shape"].as_str().unwrap_or("?").to_string(), r["K"].as_u64().unwrap_or(1) as usize));
+    }
+    out.push_str(
+        "| Workload | Arm | n | Median wall s | Mean solve share | Mean $ charged | Mean tokens | Mean rework | Conflicts | Hacked | Over cap | Errors |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    let f = |x: Option<f64>, p: usize| x.map_or("-".to_string(), |x| format!("{x:.p$}"));
+    for ((w, arm), rs) in &by {
+        // Wall and share as H1 reads them (rows without error); dollars over every row that ran agents.
+        let ok = clean(rs);
+        let (wall, share) = (wall_of(&ok), share_of(&ok));
+        let paid: Vec<&Value> = rs.iter().copied().filter(|r| r["paid"] != false).collect();
+        let cost = mean(&paid.iter().map(|r| charged_of(r)).collect::<Vec<_>>());
+        let tokens = mean(
+            &paid
+                .iter()
+                .map(|r| ["input", "output", "cache_read", "cache_creation"].iter().map(|k| r["tokens"][k].as_u64().unwrap_or(0)).sum::<u64>() as f64)
+                .collect::<Vec<_>>(),
+        );
+        let rework = mean(&rs.iter().filter_map(|r| r["rework"].as_f64()).collect::<Vec<_>>());
+        let sum = |k: &str| rs.iter().map(|r| r[k].as_u64().unwrap_or(0)).sum::<u64>();
+        let over = rs.iter().filter(|r| r["over_cap"] == true).count();
+        let errors = rs.iter().filter(|r| !r["error"].is_null()).count();
+        let incomplete = paid.iter().filter(|r| r["cost_complete"] != true).count();
+        out.push_str(&format!(
+            "| {w} | {arm} | {} | {} | {} | {}{} | {} | {} | {} | {} | {over} | {errors} |\n",
+            rs.len(),
+            f(wall, 0),
+            f(share, 3),
+            f(cost, 2),
+            if incomplete > 0 { format!(" ({incomplete} bounded)") } else { String::new() },
+            f(tokens, 0),
+            f(rework, 2),
+            sum("merge_conflicts"),
+            sum("hacked"),
+        ));
+    }
+    out.push('\n');
+    let mut verdicts: Vec<(String, String, Option<bool>)> = Vec::new();
+    for (w, (shape, k)) in &shapes {
+        let get = |arm: &str| by.get(&(w.clone(), arm.to_string())).cloned().unwrap_or_default();
+        match h1(&get("d3"), &get("b"), *k) {
+            Some((holds, line)) => {
+                out.push_str(&format!("H1 {w} ({shape}): {line}\n"));
+                verdicts.push((w.clone(), shape.clone(), Some(holds)));
+            }
+            None => {
+                out.push_str(&format!("H1 {w} ({shape}): no D3 or no B rows → not decided\n"));
+                verdicts.push((w.clone(), shape.clone(), None));
+            }
+        }
+    }
+    let holding: Vec<&(String, String, Option<bool>)> = verdicts.iter().filter(|v| v.2 == Some(true)).collect();
+    let decided = verdicts.iter().all(|v| v.2.is_some());
+    if decided && !verdicts.is_empty() && holding.is_empty() {
+        out.push_str("Kill: H1 fails on every workload → stop before mesh sync of hive lines; write up why.\n");
+    } else if decided && holding.len() < verdicts.len() {
+        let names: Vec<String> = holding.iter().map(|v| format!("{} ({})", v.1, v.0)).collect();
+        out.push_str(&format!("H1 holds on one shape: {} → report that shape, continue only for it.\n", names.join(", ")));
+    } else if decided && !verdicts.is_empty() {
+        out.push_str("H1 holds on every workload.\n");
+    }
+    out.push_str("3 seeds per cell: point estimates, no CI. Judge-free: hidden checks, wall clock and dollars only.\n");
+    out
+}
+
+// ------------------------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("borg-hive-eval-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::canonicalize(d).unwrap()
+    }
+
+    fn git(dir: &Path, cmd: &str) -> String {
+        let (ok, _, out) = run_t(dir, cmd, 60);
+        assert!(ok, "{cmd}: {out}");
+        out.trim().to_string()
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// A source repo: two commits and a branch; returns (src, first commit).
+    fn source(root: &Path) -> (PathBuf, String) {
+        let src = root.join("src-repo");
+        fs::create_dir_all(src.join("tests")).unwrap();
+        fs::write(src.join("a.txt"), "broken\n").unwrap();
+        fs::write(src.join("tests/sim_edit.txt"), "original\n").unwrap();
+        git(&src, "git init -q -b main && git add -A && git -c user.name=x -c user.email=x@y commit -q -m one");
+        let first = git(&src, "git rev-parse HEAD");
+        fs::write(src.join("later.txt"), "future\n").unwrap();
+        git(&src, "git add -A && git -c user.name=x -c user.email=x@y commit -q -m two && git branch side && git tag v1");
+        (src, first)
+    }
+
+    /// A workload dir with hidden checks, spec, reference patch; `edit` changes workload.json first.
+    fn workload(root: &Path, edit: impl FnOnce(&mut Value)) -> (PathBuf, PathBuf, PathBuf) {
+        let (src, first) = source(root);
+        let wd = root.join("wl");
+        fs::create_dir_all(wd.join("hidden")).unwrap();
+        fs::write(wd.join("spec.md"), "Fix a.txt.\n").unwrap();
+        fs::write(wd.join("hidden/marker"), "secret\n").unwrap();
+        fs::write(wd.join("reference.patch"), "diff --git a/r/a.txt b/r/a.txt\n--- a/r/a.txt\n+++ b/r/a.txt\n@@ -1 +1 @@\n-broken\n+fixed\n").unwrap();
+        let mut v = json!({
+            "id": "w-test", "shape": "parallel",
+            "repos": [{"src": src.display().to_string(), "commit": first, "dir": "r"}],
+            "inject": null, "spec": "spec.md", "visible": "true", "visible_timeout_s": 30,
+            "hidden": {"dir": "hidden", "checks": [{"id": "c1", "cmd": "grep -q fixed \"$BORG_WORK/r/a.txt\"", "timeout_s": 30}]},
+            "reference": "reference.patch",
+            "hive": {"tasks": ["t1|work|fix a.txt|r/a.txt"]},
+            "home_ro": [], "env": {}
+        });
+        edit(&mut v);
+        fs::write(wd.join("workload.json"), v.to_string()).unwrap();
+        (wd, src, root.join("runs"))
+    }
+
+    fn load(wd: &Path, root: &Path, runs: &Path) -> Result<Workload, String> {
+        load_workload(wd, root, runs)
+    }
+
+    #[test]
+    fn options_need_a_positive_cap_and_known_arms_and_flags() {
+        let base = ["--workload", "w", "--arm", "a", "--seed", "0"];
+        let with = |extra: &[&str]| parse_opts(&s(&[&base[..], extra].concat()));
+        assert!(with(&[]).unwrap_err().contains("--cap-usd"), "required, no default");
+        for bad in ["0", "-1", "inf", "NaN"] {
+            assert!(with(&["--cap-usd", bad]).is_err(), "{bad}");
+        }
+        let o = with(&["--cap-usd", "6"]).unwrap();
+        assert_eq!((o.arm, o.cap, o.model.as_str(), o.timeout_s), (Arm::A, 6.0, "sonnet", 3600));
+        assert!(parse_opts(&s(&["--workload", "w", "--arm", "c", "--seed", "0", "--cap-usd", "1"])).unwrap_err().contains("--arm c"));
+        assert!(with(&["--cap-usd", "1", "--frobnicate", "x"]).unwrap_err().contains("unknown flag"));
+        assert!(with(&["--cap-usd", "1", "--harness", "sim"]).is_err(), "sim is a d3 harness");
+        assert_eq!(usd(10.0 / 3.0), "3.33");
+        let f = session_args(Arm::F, "P", "sonnet", 10.0 / 3.0);
+        assert_eq!(f[f.iter().position(|a| a == "--max-budget-usd").unwrap() + 1], "3.33");
+    }
+
+    #[test]
+    fn each_arm_gets_its_argv() {
+        let at = |a: &[String], f: &str| a.iter().position(|x| x == f).map(|i| a[i + 1].clone());
+        let a = session_args(Arm::A, "P", "sonnet", 6.0);
+        assert_eq!(at(&a, "--disallowedTools").as_deref(), Some("Task Agent"));
+        assert_eq!(at(&a, "--max-budget-usd").as_deref(), Some("6.00"));
+        assert_eq!(at(&a, "--model").as_deref(), Some("sonnet"));
+        assert_eq!(at(&a, "-p").as_deref(), Some("P"));
+        assert_eq!(at(&a, "--permission-mode").as_deref(), Some("bypassPermissions"));
+        let b = session_args(Arm::B, "P", "sonnet", 6.0);
+        assert!(at(&b, "--disallowedTools").is_none());
+        assert!(at(&b, "-p").unwrap().ends_with(INVITE) && at(&b, "-p").unwrap().starts_with("P\n\n"));
+        assert_eq!(at(&b, "--max-budget-usd").as_deref(), Some("6.00"));
+        let f = session_args(Arm::F, "P", "sonnet", 2.0);
+        assert_eq!((at(&f, "--max-budget-usd").as_deref(), at(&f, "--disallowedTools").as_deref()), (Some("2.00"), Some("Task Agent")));
+
+        let root = tmp("argv");
+        let (wd, _, runs) = workload(&root, |_| {});
+        let wl = load(&wd, &root, &runs).unwrap();
+        let init = d3_init_args(&wl, Path::new("/h/goal/spec.md"), 6.0);
+        assert_eq!(at(&init, "--budget").as_deref(), Some("6"));
+        assert_eq!(at(&init, "--oracle").as_deref(), Some("visible=true"));
+        assert_eq!(at(&init, "--task").as_deref(), Some("t1|work|fix a.txt|r/a.txt"));
+        assert!(!init.iter().any(|x| x.starts_with("--hidden")), "no hidden oracle in the sandbox: {init:?}");
+        let run = d3_run_args("sonnet", "abc", 3600, false);
+        assert_eq!(at(&run, "--drones").as_deref(), Some("3"));
+        assert_eq!(at(&run, "--base").as_deref(), Some("abc"));
+        assert_eq!(at(&run, "--iter-timeout").as_deref(), Some("3600"));
+        assert_eq!(at(&run, "--model").as_deref(), Some("sonnet"));
+        assert!(!run.contains(&"--harness".to_string()));
+        assert!(d3_run_args("sonnet", "abc", 1, true).ends_with(&s(&["--harness", "sim"])));
+        assert!(wl.prompt().ends_with("Visible check: run `true` from the workspace root."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn agent_and_scorer_sandboxes_are_isolated() {
+        let root = tmp("iso");
+        let (wd, src, runs) = workload(&root, |v| v["env"] = json!({"GRADLE_RO_DEP_CACHE": "$HOME/.gradle/caches"}));
+        let wl = load(&wd, &root, &runs).unwrap();
+        let home = root.join("cell/home");
+        fs::create_dir_all(&home).unwrap();
+        let ag = Agent {
+            home: home.clone(),
+            ws: home.join("work/w-test"),
+            base: String::new(),
+            secrets: None,
+            env: agent_env(&home, &wl, None),
+            home_binds: vec![(root.join(".gradle/jdks"), PathBuf::from(".gradle/jdks"))],
+            ro: vec![PathBuf::from("/b/borg")],
+        };
+        let (cmd, private) = sandbox_with(&ag.ws, &[&ag.home], &[], &ag.extra(), 5);
+        let _ = fs::remove_dir_all(private);
+        let a = args_of(&cmd);
+        let at = |w: &[&str]| a.windows(w.len()).position(|x| x == w);
+        let real = std::env::var("HOME").unwrap();
+        assert!(at(&["--tmpfs", &real]).is_some(), "{a:?}");
+        let clear = at(&["--clearenv"]).expect("--clearenv");
+        let h = home.display().to_string();
+        for (k, v) in [
+            ("BORG_HOME", format!("{h}/.local/share/borg")),
+            ("BORG_CONFIG", format!("{h}/.config/borg/collectives.json")),
+            ("BORG_LEARN", "off".into()),
+            ("BORG_QUEEN", "off".into()),
+            ("BORG_PREDICT_MODEL", "off".into()),
+            ("BORG_MATCH", "bm25".into()),
+            ("GRADLE_RO_DEP_CACHE", format!("{h}/.gradle/caches")),
+        ] {
+            assert!(at(&["--setenv", k, &v]).is_some_and(|i| i > clear), "{k}={v}: {a:?}");
+        }
+        // The home_ro land in the sandbox HOME, after the HOME's own (writable) bind.
+        let jdk = at(&["--ro-bind", &root.join(".gradle/jdks").display().to_string(), &home.join(".gradle/jdks").display().to_string()]).expect("home_ro");
+        assert!(jdk > at(&["--bind", &h, &h]).unwrap());
+        assert!(!a.iter().any(|x| x == "--unshare-net"), "agents may reach the API");
+        assert!(a.iter().any(|x| x == "--unshare-pid"), "no agent process outlives its sandbox: {a:?}");
+        let sources: Vec<&String> = a.windows(2).filter(|w| w[0] == "--bind" || w[0] == "--ro-bind").map(|w| &w[1]).collect();
+        let forbidden = [
+            format!("{real}/.local/share/borg"),
+            format!("{real}/.config/borg"),
+            format!("{real}/src-repos"),
+            wl.hidden_dir.display().to_string(),
+            src.display().to_string(),
+        ];
+        for f in &forbidden {
+            assert!(!sources.iter().any(|s| s.starts_with(f.as_str())), "{f} bound: {a:?}");
+        }
+        // The scorer: no network, no credentials, its own empty HOME.
+        let bx = Jail::scorer(&root.join("cell"), &wl, &root);
+        let Jail::Sandbox { scorer_home, env, home_ro, .. } = &bx else { panic!() };
+        let (cmd, private) = sandbox_with(&root, &[&root], &[&wl.hidden_dir], &Jail::extra(scorer_home, env, home_ro), 5);
+        let _ = fs::remove_dir_all(private);
+        let a = args_of(&cmd);
+        assert!(a.contains(&"--unshare-net".to_string()) && a.contains(&"--unshare-pid".to_string()) && a.contains(&"--clearenv".to_string()));
+        assert!(!a.iter().any(|x| x.ends_with(".credentials.json") || x.ends_with(".claude.json")), "{a:?}");
+        assert!(a.windows(3).any(|w| w[0] == "--setenv" && w[1] == "HOME" && w[2] == scorer_home.display().to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workload_json_is_refused_when_it_could_leak() {
+        let root = tmp("wl");
+        let (wd, src, runs) = workload(&root, |_| {});
+        assert!(load(&wd, &root, &runs).is_ok());
+        let refuse = |edit: &dyn Fn(&mut Value), want: &str| {
+            let mut v: Value = serde_json::from_str(&fs::read_to_string(wd.join("workload.json")).unwrap()).unwrap();
+            edit(&mut v);
+            let t = root.join(format!("bad-{}", want.len()));
+            let _ = fs::remove_dir_all(&t);
+            fs::create_dir_all(&t).unwrap();
+            for f in ["spec.md", "reference.patch"] {
+                fs::copy(wd.join(f), t.join(f)).unwrap();
+            }
+            fs::write(t.join("workload.json"), v.to_string()).unwrap();
+            let err = load_workload(&t, &root, &runs).map(|_| ()).unwrap_err();
+            assert!(err.contains(want), "{want}: {err}");
+        };
+        let hidden = wd.join("hidden").display().to_string();
+        let set_hidden = |v: &mut Value| v["hidden"]["dir"] = json!(hidden);
+        let set_hidden = &set_hidden;
+        refuse(&|v| v["repos"][0]["commit"] = json!("main"), "40-hex");
+        refuse(&|v| v["repos"][0]["commit"] = json!("abc123"), "40-hex");
+        for deny in [
+            ".claude",
+            ".claude/skills",
+            ".",
+            ".local",
+            ".local/share/borg/eval",
+            ".config/borg",
+            ".ssh",
+            ".gradle/gradle.properties",
+            ".m2/settings.xml",
+            ".aws",
+        ] {
+            refuse(
+                &|v: &mut Value| {
+                    set_hidden(v);
+                    v["home_ro"] = json!([deny]);
+                },
+                "home_ro",
+            );
+        }
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["home_ro"] = json!(["../x"]);
+            },
+            "plain path",
+        );
+        // A home_ro holding a source repo (the fake HOME is `root`).
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["home_ro"] = json!([src.file_name().unwrap().to_string_lossy()]);
+            },
+            "overlaps",
+        );
+        // The hidden checks inside a source, or where workspaces are built.
+        let in_src = src.join("held");
+        fs::create_dir_all(&in_src).unwrap();
+        refuse(&|v| v["hidden"]["dir"] = json!(in_src.display().to_string()), "hidden dir");
+        fs::create_dir_all(runs.join("x")).unwrap();
+        refuse(&|v| v["hidden"]["dir"] = json!(runs.join("x").display().to_string()), "hidden dir");
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["hive"]["tasks"] = json!(["b1|work|fix the a | b operator"]);
+            },
+            "`|` inside the title",
+        );
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["hive"]["tasks"] = json!(["b 1|work|fix"]);
+            },
+            "bad id",
+        );
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["extra"] = json!(1);
+            },
+            "unknown field",
+        );
+        refuse(
+            &|v: &mut Value| {
+                set_hidden(v);
+                v["env"] = json!({"BORG_LEARN": "on"});
+            },
+            "not settable",
+        );
+        assert!(check_task("plan|plan|Change the API: rename x to y, adopt in app.").is_ok());
+        assert!(check_task("t1|work|write f1|f1.txt|t0").is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_symlinked_home_ro_is_checked_where_it_resolves_and_bound_resolved() {
+        let root = tmp("wl-link");
+        let (wd, src, runs) = workload(&root, |_| {});
+        let hidden = fs::canonicalize(wd.join("hidden")).unwrap();
+        fs::create_dir_all(root.join(".local/share/borg/eval")).unwrap();
+        fs::create_dir_all(root.join(".gradle/caches/modules-2")).unwrap();
+        fs::create_dir_all(root.join(".gradle/caches/build-cache-1")).unwrap();
+        fs::create_dir_all(&runs).unwrap();
+        fs::create_dir_all(root.join(".cache/ok")).unwrap();
+        let link = |name: &str, to: &Path| std::os::unix::fs::symlink(to, root.join(".cache").join(name)).unwrap();
+        link("store", &root.join(".local/share/borg/eval"));
+        link("hid", &hidden);
+        link("source", &src);
+        link("runs", &runs);
+        link("home", &root);
+        link("deps", &root.join(".gradle/caches/modules-2"));
+        let check = |rel: &str| check_home_ro(rel, &root, std::slice::from_ref(&src), &hidden, &runs);
+        for bad in [".cache/store", ".cache/hid", ".cache/source", ".cache/runs", ".cache/home"] {
+            assert!(check(bad).is_err(), "{bad} resolves into something no sandbox may see");
+        }
+        assert!(check(".cache/deps").is_ok() && check(".cache/ok").is_ok());
+        let mut wl = load(&wd, &root, &runs).unwrap();
+        wl.home_ro = vec![".cache/deps".into(), ".cache/missing".into()];
+        assert_eq!(wl.home_binds(&root), [(fs::canonicalize(root.join(".gradle/caches/modules-2")).unwrap(), PathBuf::from(".cache/deps"))]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_workspace_is_one_commit_and_the_source_is_untouched() {
+        let root = tmp("ws");
+        let (wd, src, runs) = workload(&root, |_| {});
+        fs::write(wd.join("inject.patch"), "diff --git a/r/new.txt b/r/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/r/new.txt\n@@ -0,0 +1 @@\n+bug\n")
+            .unwrap();
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(wd.join("workload.json")).unwrap()).unwrap();
+        v["inject"] = json!("inject.patch");
+        fs::write(wd.join("workload.json"), v.to_string()).unwrap();
+        let wl = load(&wd, &root, &runs).unwrap();
+        let state = |p: &Path| git(p, "git rev-parse HEAD && git for-each-ref && git status --porcelain && git stash list && git reflog | wc -l");
+        let before = state(&src);
+        let dst = root.join("cell/home/work/w-test");
+        let base = build_workspace(&wl, &dst).unwrap();
+        assert_eq!(state(&src), before, "the source is untouched");
+        assert_eq!(git(&dst, "git log --all --oneline | wc -l"), "1");
+        assert_eq!(git(&dst, "git rev-parse HEAD"), base);
+        assert!(git(&dst, "git remote").is_empty() && git(&dst, "git tag").is_empty());
+        assert_eq!(fs::read_to_string(dst.join("r/a.txt")).unwrap(), "broken\n");
+        assert_eq!(fs::read_to_string(dst.join("r/new.txt")).unwrap(), "bug\n", "inject applied");
+        assert!(!dst.join("r/later.txt").exists(), "the pinned commit, not the source's HEAD");
+        assert!(!dst.join("r/.git").exists());
+        assert!(git(&dst, "git status --porcelain").is_empty());
+        assert!(build_workspace(&wl, &dst).is_err(), "never over an existing one");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integrate_merges_in_order_drops_a_conflict_and_runs_no_hook() {
+        let root = tmp("integrate");
+        let ws = root.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "base\n").unwrap();
+        git(&ws, &format!("{GIT} init -q -b main && {GIT} add -A && {GIT} commit -q -m base && printf '/.worktrees/\\n' >> .git/info/exclude"));
+        let base = git(&ws, "git rev-parse HEAD");
+        for n in 1..=3 {
+            git(&ws, &format!("git worktree add -q -b hive/pilot/{n} .worktrees/hive-pilot-{n} {base}"));
+        }
+        fs::write(ws.join(".worktrees/hive-pilot-1/a.txt"), "d1\n").unwrap();
+        fs::write(ws.join(".worktrees/hive-pilot-2/a.txt"), "d2\n").unwrap();
+        fs::write(ws.join(".worktrees/hive-pilot-3/c.txt"), "d3\n").unwrap();
+        // Drone 3 was killed inside `git add`: its worktree's index lock is left.
+        fs::write(ws.join(".git/worktrees/hive-pilot-3/index.lock"), "").unwrap();
+        let marker = root.join("hook-ran");
+        for h in ["post-merge", "pre-commit", "post-commit", "post-checkout"] {
+            let p = ws.join(".git/hooks").join(h);
+            fs::write(&p, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (code, out) = Jail::Plain.exec(&ws, &[], &[], &integrate_script(&base), 60);
+        assert_eq!(code, 0, "{out}");
+        let r = parse_integrate(&out);
+        assert_eq!((r.conflicts, r.dropped.clone()), (1, vec![2]), "{out}");
+        let head = r.head.expect("head");
+        assert_eq!(git(&ws, "git rev-parse result"), head);
+        assert_eq!(git(&ws, &format!("git show {head}:a.txt")), "d1");
+        assert_eq!(git(&ws, &format!("git show {head}:c.txt")), "d3");
+        assert!(git(&ws, &format!("git ls-tree -r --name-only {head}")).lines().all(|l| !l.starts_with(".worktrees")));
+        assert!(!marker.exists(), "a planted hook never runs");
+        assert!(r.commit_failed.is_empty() && r.missing.is_empty(), "{out}");
+        let p = parse_integrate("COMMIT-FAILED 2\nMISSING 3\nCONFLICT 1\nHEAD 0123456789012345678901234567890123456789\n");
+        assert_eq!((p.commit_failed, p.missing, p.dropped, p.conflicts), (vec![2], vec![3], vec![1], 1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_result_commit_survives_a_stale_index_lock() {
+        let root = tmp("lock");
+        let ws = root.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "base\n").unwrap();
+        git(&ws, &format!("{GIT} init -q -b main && {GIT} add -A && {GIT} commit -q -m base"));
+        fs::write(ws.join("a.txt"), "agent\n").unwrap();
+        fs::write(ws.join(".git/index.lock"), "").unwrap();
+        let head = commit_result(&Jail::Plain, &ws).unwrap();
+        assert_eq!(git(&ws, &format!("git show {head}:a.txt")), "agent");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn d3_drones_get_the_system_prompt_a_b_and_f_get() {
+        let root = tmp("wrapper");
+        let target = root.join("fake claude");
+        fs::write(&target, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let w = root.join("claude");
+        fs::write(&w, claude_wrapper(&target)).unwrap();
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).unwrap();
+        let out = git(&root, &format!("{} -p 'drone prompt' --model sonnet", q(w.display().to_string())));
+        let args: Vec<&str> = out.lines().collect();
+        assert_eq!(args[..4], ["-p", "drone prompt", "--model", "sonnet"]);
+        assert_eq!(args[4..], ["--append-system-prompt", crate::SYSTEM]);
+        let a = session_args(Arm::A, "P", "sonnet", 1.0);
+        assert_eq!(a[a.iter().position(|x| x == "--append-system-prompt").unwrap() + 1], crate::SYSTEM, "the same text");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hidden_checks_score_a_fresh_clone_and_never_enter_the_workspace() {
+        let root = tmp("score");
+        let (wd, _, runs) = workload(&root, |v| {
+            v["hidden"]["checks"] = json!([
+                {"id": "ok", "cmd": "grep -q fixed \"$BORG_WORK/r/a.txt\" && test -f \"$BORG_HIDDEN/marker\"", "timeout_s": 30},
+                {"id": "no", "cmd": "exit 1", "timeout_s": 30},
+                {"id": "slow", "cmd": "sleep 5", "timeout_s": 1},
+                {"id": "untracked", "cmd": "test ! -e \"$BORG_WORK/junk.txt\" && test ! -e \"$BORG_WORK/build/out\"", "timeout_s": 30}
+            ]);
+        });
+        let wl = load(&wd, &root, &runs).unwrap();
+        let ws = root.join("cell/home/work/w-test");
+        let base = build_workspace(&wl, &ws).unwrap();
+        fs::write(ws.join("r/a.txt"), "fixed\n").unwrap();
+        let (code, out) = Jail::Plain.exec(&ws, &[], &[], &result_script(), 60);
+        let head = parse_integrate(&out).head.unwrap_or_else(|| panic!("{code}: {out}"));
+        // Left after the result commit: untracked files in ws do not reach the scored tree.
+        fs::write(ws.join("junk.txt"), "x").unwrap();
+        fs::create_dir_all(ws.join("build")).unwrap();
+        fs::write(ws.join("build/out"), "x").unwrap();
+        let s = score(&Jail::Plain, &wl, &ws, &base, &head, &root.join("cell/score"), Which::Both).unwrap();
+        let flags: Vec<(&str, bool, bool)> = s.checks.iter().map(|c| (c.id.as_str(), c.pass, c.timeout)).collect();
+        assert_eq!(flags, [("ok", true, false), ("no", false, false), ("slow", false, true), ("untracked", true, false)]);
+        assert!((s.share(wl.k()) - 0.5).abs() < 1e-12);
+        assert_eq!(s.visible_pass, Some(true));
+        assert!(s.hacked_paths.is_empty());
+        assert_eq!(s.json(wl.k())["passed"], 2);
+        // Three of them as the spec's minimal set: 1/3.
+        let three = Score { checks: s.checks[..3].to_vec(), ..Score::default() };
+        assert!((three.share(3) - 1.0 / 3.0).abs() < 1e-12);
+        let mut found = Vec::new();
+        fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(d).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    walk(&e.path(), out);
+                } else {
+                    out.push(e.path());
+                }
+            }
+        }
+        walk(&ws, &mut found);
+        assert!(!found.iter().any(|p| p.file_name().is_some_and(|n| n == "marker")), "no hidden file in ws");
+        assert!(!root.join("cell/score/out/tree").exists(), "the scored tree is removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_needs_every_check_failing_on_base_and_passing_on_the_reference() {
+        let root = tmp("validate");
+        let (wd, _, runs) = workload(&root, |_| {});
+        let wl = load(&wd, &root, &runs).unwrap();
+        let (pass, v) = validate_in(&wl, &root.join("v1"), &Jail::Plain).unwrap();
+        assert!(pass, "{v}");
+        assert_eq!(v["checks"][0]["base_pass"], false);
+        assert_eq!(v["checks"][0]["ref_pass"], true);
+        let root2 = tmp("validate2");
+        let (wd, _, runs) = workload(&root2, |v| {
+            v["hidden"]["checks"] = json!([{"id": "c1", "cmd": "grep -q fixed \"$BORG_WORK/r/a.txt\""}, {"id": "always", "cmd": "true"}]);
+        });
+        let wl = load(&wd, &root2, &runs).unwrap();
+        let (pass, v) = validate_in(&wl, &root2.join("v1"), &Jail::Plain).unwrap();
+        assert!(!pass, "a check passing on base: {v}");
+        // The visible check must pass on the reference, and on a parallel workload's base too.
+        let mut wl = load(&wd, &root2, &runs).unwrap();
+        wl.checks.truncate(1);
+        wl.visible = "grep -q broken r/a.txt".into();
+        let (pass, v) = validate_in(&wl, &root2.join("v2"), &Jail::Plain).unwrap();
+        assert!(!pass && v["visible_ref"] == false && v["visible_base"] == true, "{v}");
+        wl.visible = "grep -q fixed r/a.txt".into();
+        let (pass, v) = validate_in(&wl, &root2.join("v3"), &Jail::Plain).unwrap();
+        assert!(!pass && v["visible_base"] == false, "parallel: the injected bugs get past the visible suite: {v}");
+        wl.shape = "cross-repo".into();
+        let (pass, v) = validate_in(&wl, &root2.join("v4"), &Jail::Plain).unwrap();
+        assert!(pass, "cross-repo: red on base is expected: {v}");
+        // The validate log gates the arms by the workload's sha.
+        let log = validate_log(&runs);
+        append_row(&log, &json!({"validate": {"workload_sha": "x", "pass": false}})).unwrap();
+        assert!(!validated(&runs, "x"));
+        append_row(&log, &json!({"validate": {"workload_sha": "x", "pass": true}})).unwrap();
+        assert!(validated(&runs, "x") && !validated(&runs, "y"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root2);
+    }
+
+    #[test]
+    fn f_picks_visible_then_cost_then_index() {
+        assert_eq!(choose(&[(false, Some(0.1)), (true, Some(0.9)), (true, Some(0.5))]), 2);
+        assert_eq!(choose(&[(true, Some(0.5)), (true, Some(0.5))]), 0);
+        assert_eq!(choose(&[(false, None), (false, Some(3.0)), (false, Some(3.0))]), 1);
+        assert_eq!(choose(&[(true, None), (false, Some(0.1))]), 0);
+        assert_eq!(choose(&[(false, None), (false, None), (false, None)]), 0);
+    }
+
+    #[test]
+    fn cost_and_tokens_from_results_streams_spend_and_logs() {
+        let r = json!({"type": "result", "total_cost_usd": 1.25, "num_turns": 7, "usage": {"input_tokens": 1},
+            "modelUsage": {"claude-sonnet-4-5": {"inputTokens": 10, "outputTokens": 20, "cacheReadInputTokens": 30, "cacheCreationInputTokens": 40},
+                           "claude-haiku-4-5": {"inputTokens": 1, "outputTokens": 2, "cacheReadInputTokens": 3, "cacheCreationInputTokens": 4}}});
+        let c = session_cost(Some(&r), "", 6.0);
+        assert_eq!(c.tokens, Tokens { input: 11, output: 22, cache_read: 33, cache_creation: 44 });
+        assert_eq!((c.usd, c.complete, c.turns, c.models.len()), (Some(1.25), true, Some(7), 2));
+        assert_eq!((c.reported, c.charged), (1.25, 1.25));
+        let asst = |id: &str, i: u64| json!({"type": "assistant", "message": {"id": id, "usage": {"input_tokens": i, "output_tokens": 1}}}).to_string();
+        let stream = [asst("m1", 5), asst("m1", 5), asst("m2", 7)].join("\n");
+        let c = session_cost(None, &stream, 2.0);
+        assert_eq!((c.usd, c.complete, c.reported, c.charged), (None, false, 0.0, 2.0), "cut off: charged its budget");
+        // F's sum: one candidate cut off leaves the total unknown, charged at that candidate's budget.
+        let mut f = Cost::zero();
+        f.add(&session_cost(Some(&r), "", 2.0));
+        f.add(&c);
+        assert_eq!((f.usd, f.complete, f.reported, f.charged, f.turns), (None, false, 1.25, 3.25, Some(7)));
+        assert_eq!(c.tokens, Tokens { input: 12, output: 2, cache_read: 0, cache_creation: 0 }, "each message once");
+
+        let root = tmp("spend");
+        let line = |usd: Option<f64>, est: Option<f64>, exit: &str| {
+            json!({"v": 1, "ms": 1, "drone": "d1", "iter": 1, "harness": "claude", "usd": usd, "est": est, "session": "s", "exit": exit}).to_string()
+        };
+        fs::write(root.join("spend.jsonl"), [line(Some(0.5), None, "ok"), line(None, Some(0.7), "timeout"), line(Some(0.25), None, "ok")].join("\n")).unwrap();
+        let (charged, reported, all_named, n) = d3_spend(&root.join("spend.jsonl"));
+        assert!((charged - 1.45).abs() < 1e-12 && (reported - 0.75).abs() < 1e-12 && !all_named && n == 3);
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join("logs/d1-1.out"), r.to_string()).unwrap();
+        fs::write(root.join("logs/d2-1.out"), json!({"total_cost_usd": 0.1, "usage": {"input_tokens": 100, "output_tokens": 1}}).to_string()).unwrap();
+        fs::write(root.join("logs/d3-1.out"), "cut off mid-wr").unwrap();
+        let (t, models) = d3_tokens(&root.join("logs"));
+        assert_eq!(t, Tokens { input: 111, output: 23, cache_read: 33, cache_creation: 44 });
+        assert_eq!(models.len(), 2);
+        assert!(!over_cap(11.0, 10.0) && over_cap(11.01, 10.0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hacked_paths_and_board_facts() {
+        let root = tmp("hacked");
+        let (wd, _, runs) = workload(&root, |v| v["visible"] = json!("sh grade.sh && ./run_checks.sh"));
+        let wl = load(&wd, &root, &runs).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        for (f, t) in [("tests/x_test.py", "a"), ("grade.sh", "true"), ("src.py", "1")] {
+            fs::write(repo.join(f), t).unwrap();
+        }
+        git(&repo, &format!("{GIT} init -q -b main && {GIT} add -A && {GIT} commit -q -m base"));
+        let base = git(&repo, "git rev-parse HEAD");
+        fs::write(repo.join("tests/x_test.py"), "b").unwrap();
+        fs::write(repo.join("grade.sh"), "exit 0").unwrap();
+        fs::write(repo.join("src.py"), "2").unwrap();
+        git(&repo, &format!("{GIT} add -A && {GIT} commit -q -m hack"));
+        let hack = git(&repo, "git rev-parse HEAD");
+        let files = visible_files(&wl, &repo);
+        assert_eq!(files, ["grade.sh"]);
+        let paths: Vec<String> = verdict::protected(&verdict::changes(&repo, &base, &hack).unwrap(), &[], &files).into_iter().map(|c| c.path).collect();
+        assert_eq!(paths, ["grade.sh", "tests/x_test.py"]);
+        git(&repo, &format!("{GIT} checkout -q {base} && mkdir -p tests && echo n > tests/y_test.py && {GIT} add -A && {GIT} commit -q -m add"));
+        let add = git(&repo, "git rev-parse HEAD");
+        assert!(verdict::protected(&verdict::changes(&repo, &base, &add).unwrap(), &[], &files).is_empty(), "a new test is allowed");
+
+        let task = |id: &str| board::Task {
+            id: id.into(),
+            role: board::Role::Work,
+            title: "t".into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+        };
+        let mut ev = vec![board::Event::open(task("t1"), "e", 1), board::Event::open(task("t2"), "e", 1)];
+        let mut verify = task("t1.v1");
+        verify.role = board::Role::Verify;
+        verify.of = Some("t1".into());
+        ev.push(board::Event::new(board::Ev::Claim, "t1", "s1", 2));
+        ev.push(board::Event::new(board::Ev::Done, "t1", "s1", 3));
+        ev.push(board::Event::open(verify, "s1", 3));
+        ev.push(board::Event::new(board::Ev::Claim, "t1.v1", "s2", 4));
+        let mut rej = board::Event::new(board::Ev::Rejected, "t1.v1", "s2", 5);
+        rej.hacked = Some(true);
+        ev.push(rej);
+        board::append(&root.join("tasks.jsonl"), &ev).unwrap();
+        let (rework, hacked, counts) = board_facts(&root.join("tasks.jsonl"));
+        assert_eq!((rework, hacked), (1, 1), "{counts:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn d3_charges_the_sessions_the_wall_cap_cut_off() {
+        let root = tmp("cut");
+        let spend = |drone: &str, session: &str, usd: f64| {
+            json!({"v": 1, "ms": 1, "drone": drone, "iter": 1, "harness": "claude", "usd": usd, "session": session, "exit": "ok"}).to_string()
+        };
+        let join = |drone: &str, session: &str, by: &str| {
+            json!({"v": 1, "ms": 1, "goal": "pilot", "dir": "/w", "drone": drone, "session": session, "harness": "claude", "by": by}).to_string()
+        };
+        // d1: one finished iteration ($1.40) and one cut off; d2: cut off in its first; d3: finished.
+        fs::write(root.join("spend.jsonl"), [spend("d1", "s1", 1.4), spend("d3", "s5,s5b", 0.5)].join("\n")).unwrap();
+        fs::write(
+            root.join("joins.jsonl"),
+            [join("d1", "s1", "run"), join("d1", "s2", "run"), join("d2", "s3", "run"), join("d3", "s5", "run"), join("", "s9", "hook")].join("\n"),
+        )
+        .unwrap();
+        fs::write(root.join("runs.jsonl"), json!({"v": 1, "ms": 1, "drones": 3, "harness": "claude", "share_usd": 2.0, "base": "b"}).to_string()).unwrap();
+        let (usd, cut) = d3_unreported(&root, 9.0);
+        assert_eq!(cut, ["d1", "d2"]);
+        assert!((usd - (0.6 + 2.0)).abs() < 1e-9, "each at its drone's dollars left: {usd}");
+        let _ = fs::remove_file(root.join("runs.jsonl"));
+        assert!((d3_unreported(&root, 1.0).0 - 1.0).abs() < 1e-9, "no runs line: the cap's share, d1 past it");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_dollar_guard_counts_rows_and_cells_that_died_before_their_row() {
+        let root = tmp("spent");
+        let rows = [
+            json!({"arm": "a", "attempt": "w-a-s0-1", "charged_usd": 2.5, "cost_usd": null, "cap_usd": 6.0, "paid": true, "error": null}),
+            json!({"arm": "d3", "attempt": "w-d3-s0-1", "charged_usd": null, "cost_usd": null, "cap_usd": 6.0, "paid": false, "error": "borg install"}),
+            json!({"arm": "b", "cost_usd": 1.0, "cap_usd": 6.0}),
+        ];
+        for r in &rows {
+            append_row(&root.join("results.jsonl"), r).unwrap();
+        }
+        for (dir, attempt) in [("w-a-s0", "w-a-s0-1"), ("w-f-s0", "w-f-s0-9"), ("w-f-s0.attempt-1", "w-f-s0-7")] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("cell.json"), json!({"cell": dir, "attempt": attempt, "cap_usd": 6.0}).to_string()).unwrap();
+        }
+        assert!((spent_in(&root) - (2.5 + 0.0 + 1.0 + 6.0 + 6.0)).abs() < 1e-9, "{}", spent_in(&root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn errored_rows_leave_both_h1_terms_alike() {
+        let mut rows: Vec<Value> = [100.0, 100.0, 100.0].iter().map(|w| row("w1", "parallel", "b", *w, 1.0)).collect();
+        rows.extend([50.0, 50.0, 50.0].iter().map(|w| row("w1", "parallel", "d3", *w, 1.0)));
+        let mut err = row("w1", "parallel", "d3", 0.0, 0.0);
+        err["wall_s"] = Value::Null;
+        err["error"] = json!("borg hive init: exit 1");
+        err["paid"] = json!(false);
+        err["charged_usd"] = Value::Null;
+        rows.push(err);
+        let t = report_text(&rows);
+        assert!(t.contains("D3 mean share 1.000") && t.contains("→ HOLDS"), "an infra error is no 0 share: {t}");
+        assert!(t.contains("| w1 | d3 | 4 | 50 | 1.000 | 1.00 |") && t.contains("| 0 | 1 |\n"), "{t}");
+        assert!(!t.contains("runs without error"), "{t}");
+        let mut two = rows.clone();
+        two.remove(3);
+        assert!(report_text(&two).contains("only 2 D3 and 3 B runs without error"), "{}", report_text(&two));
+    }
+
+    fn row(w: &str, shape: &str, arm: &str, wall: f64, share: f64) -> Value {
+        json!({"workload": w, "shape": shape, "arm": arm, "K": 3, "wall_s": wall, "hidden": {"solve_share": share}, "cost_usd": 1.0,
+               "cost_complete": true, "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_creation": 0}, "merge_conflicts": 0, "hacked": 0, "error": null})
+    }
+
+    #[test]
+    fn the_report_applies_the_pre_registered_rule_inclusively() {
+        let b = [100.0, 120.0, 140.0];
+        let mut rows: Vec<Value> = b.iter().map(|w| row("w1", "parallel", "b", *w, 2.0 / 3.0)).collect();
+        // D3: median exactly 0.8 × 120 = 96, mean share exactly B − 1/K.
+        rows.extend([90.0, 96.0, 200.0].iter().map(|w| row("w1", "parallel", "d3", *w, 1.0 / 3.0)));
+        let t = report_text(&rows);
+        assert!(t.contains("H1 w1 (parallel): D3 median wall 96s ≤ 0.8×B 120s (96s)?") && t.contains("→ HOLDS"), "{t}");
+        assert!(t.contains("H1 holds on every workload") && t.contains("point estimates, no CI"), "{t}");
+        // A hair worse on wall.
+        let mut worse = rows.clone();
+        worse[4]["wall_s"] = json!(96.001);
+        assert!(report_text(&worse).contains("→ FAILS"));
+        // A hair worse on share.
+        let mut worse = rows.clone();
+        for r in worse.iter_mut().filter(|r| r["arm"] == "d3") {
+            r["hidden"]["solve_share"] = json!(1.0 / 3.0 - 1e-6);
+        }
+        assert!(report_text(&worse).contains("→ FAILS"));
+        // Both workloads fail → the kill line; one holds → that shape.
+        let mut both = worse.clone();
+        both.extend(b.iter().map(|w| row("w2", "cross-repo", "b", *w, 1.0)));
+        both.extend(b.iter().map(|w| row("w2", "cross-repo", "d3", *w, 1.0)));
+        let t = report_text(&both);
+        assert!(t.contains("Kill: H1 fails on every workload → stop before mesh sync"), "{t}");
+        let mut one = rows.clone();
+        one.extend(b.iter().map(|w| row("w2", "cross-repo", "b", *w, 1.0)));
+        one.extend(b.iter().map(|w| row("w2", "cross-repo", "d3", *w, 1.0)));
+        let t = report_text(&one);
+        assert!(t.contains("H1 holds on one shape: parallel (w1)"), "{t}");
+        assert!(t.contains("| w1 | d3 | 3 | 96 | 0.333 | 1.00 | 2 |"), "{t}");
+    }
+
+    // ---------------------------------------------------------------- end to end (bwrap, built borg)
+
+    /// A workload for the end-to-end runs: two work tasks writing f1.txt and f2.txt; hidden checks want
+    /// `done t1` / `done t2` in them. Not under /tmp: the sandbox mounts a fresh tmpfs there.
+    fn e2e_workload(tag: &str, sim: Value) -> (PathBuf, PathBuf) {
+        let root = repo_root().join("target/hive-test").join(format!("{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("README"), "fixture\n").unwrap();
+        git(&src, "git init -q -b main && git add -A && git -c user.name=x -c user.email=x@y commit -q -m one");
+        let commit = git(&src, "git rev-parse HEAD");
+        let wd = std::env::temp_dir().join(format!("borg-hive-e2e-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wd);
+        fs::create_dir_all(wd.join("hidden")).unwrap();
+        fs::write(wd.join("spec.md"), "Write `done t1` into w/f1.txt and `done t2` into w/f2.txt.\n").unwrap();
+        // At the workspace root, where the sim drone's `edit_tests` modifies it.
+        fs::write(
+            wd.join("inject.patch"),
+            "diff --git a/tests/sim_edit.txt b/tests/sim_edit.txt\nnew file mode 100644\n--- /dev/null\n+++ b/tests/sim_edit.txt\n@@ -0,0 +1 @@\n+original\n",
+        )
+        .unwrap();
+        fs::write(
+            wd.join("reference.patch"),
+            "diff --git a/w/f1.txt b/w/f1.txt\nnew file mode 100644\n--- /dev/null\n+++ b/w/f1.txt\n@@ -0,0 +1 @@\n+done t1\n\
+diff --git a/w/f2.txt b/w/f2.txt\nnew file mode 100644\n--- /dev/null\n+++ b/w/f2.txt\n@@ -0,0 +1 @@\n+done t2\n",
+        )
+        .unwrap();
+        let v = json!({
+            "id": format!("e2e-{tag}"), "shape": "parallel",
+            "repos": [{"src": src.display().to_string(), "commit": commit, "dir": "w"}],
+            "inject": "inject.patch", "spec": "spec.md", "visible": "true", "visible_timeout_s": 30,
+            "hidden": {"dir": "hidden", "checks": [
+                {"id": "t1", "cmd": "grep -q 'done t1' \"$BORG_WORK/w/f1.txt\"", "timeout_s": 30},
+                {"id": "t2", "cmd": "grep -q 'done t2' \"$BORG_WORK/w/f2.txt\"", "timeout_s": 30}]},
+            "reference": "reference.patch",
+            "hive": {"tasks": ["t1|work|write done t1 into w/f1.txt|w/f1.txt", "t2|work|write done t2 into w/f2.txt|w/f2.txt"]},
+            "sim": sim
+        });
+        fs::write(wd.join("workload.json"), v.to_string()).unwrap();
+        (wd, root)
+    }
+
+    /// The scorer sandbox (bwrap): a check cannot rewrite a later check's script, and nothing it starts
+    /// outlives the scoring. Skipped where bwrap cannot run.
+    #[test]
+    fn scorer_checks_are_read_only_and_leave_no_process_behind() {
+        if !Command::new("bwrap").args(["--ro-bind", "/", "/", "--unshare-pid", "true"]).status().is_ok_and(|s| s.success()) {
+            eprintln!("bwrap unavailable: skipped");
+            return;
+        }
+        let (wd, root) = e2e_workload("ro", json!(null));
+        let mut wl = load_workload(&wd, &real_home(), &repo_root().join("target/eval-runs")).unwrap();
+        wl.checks = vec![
+            HiddenCheck {
+                id: "c1".into(),
+                cmd: "o=$(dirname \"$BORG_WORK\"); (sleep 2; touch \"$o/late\") >/dev/null 2>&1 & echo 'exit 0' > \"$BORG_WORK/../../checks/h-c2.sh\"; exit 1"
+                    .into(),
+                timeout_s: 30,
+            },
+            HiddenCheck { id: "c2".into(), cmd: "exit 1".into(), timeout_s: 30 },
+        ];
+        let ws = root.join("cell/home/work").join(&wl.id);
+        let base = build_workspace(&wl, &ws).unwrap();
+        let cell = root.join("cell");
+        let bx = Jail::scorer(&cell, &wl, &real_home());
+        let s = score(&bx, &wl, &ws, &base, &base, &cell.join("score"), Which::Hidden).unwrap();
+        assert_eq!(s.checks.iter().map(|c| c.pass).collect::<Vec<_>>(), [false, false], "{:?}", s.checks);
+        assert_eq!(fs::read_to_string(cell.join("score/checks/h-c2.sh")).unwrap(), "exit 1");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(cell.join("score/out").is_dir() && !cell.join("score/out/late").exists(), "a check's background process died with the sandbox");
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Drops a fixture workload's validate rows and dirs from the shared validate log.
+    fn forget_validation(id: &str) {
+        let log = validate_log(&repo_root().join("target/eval-runs"));
+        let keep: String = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| serde_json::from_str::<Value>(l).map_or(true, |v| v["validate"]["workload"] != id))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let _ = fs::write(&log, keep);
+        let dir = log.parent().unwrap().to_path_buf();
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(&format!("{id}-")) {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
+
+    fn built_borg() -> PathBuf {
+        let root = repo_root();
+        ["target/debug/borg", "target/release/borg"].iter().map(|p| root.join(p)).find(|p| p.exists()).expect("cargo build -p borg-ai first")
+    }
+
+    fn rows_of(run: &str) -> Vec<Value> {
+        let p = repo_root().join("target/eval-runs").join(run).join("results.jsonl");
+        fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    fn e2e_d3(tag: &str, sim: Value) -> Value {
+        let (wd, root) = e2e_workload(tag, sim);
+        assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
+        let run = format!("hive-e2e-{tag}-{}", std::process::id());
+        let code = cell_cmd(&s(&[
+            "--workload",
+            &wd.display().to_string(),
+            "--arm",
+            "d3",
+            "--seed",
+            "0",
+            "--cap-usd",
+            "3",
+            "--timeout-s",
+            "120",
+            "--run",
+            &run,
+            "--harness",
+            "sim",
+            "--borg",
+            &built_borg().display().to_string(),
+        ]));
+        let rows = rows_of(&run);
+        forget_validation(&format!("e2e-{tag}"));
+        assert_eq!(rows.len(), 1, "one row");
+        let r = rows[0].clone();
+        assert_eq!(code, 0, "{r:#}");
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(repo_root().join("target/eval-runs").join(&run));
+        r
+    }
+
+    /// cargo build -p borg-ai && cargo test -p borg-eval hive_e2e -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn hive_e2e_d3_sim_solves_the_board() {
+        let r = e2e_d3("sim", json!({"usd_per_iter": 0.10}));
+        assert_eq!(r["hidden"]["solve_share"], 1.0, "{r:#}");
+        assert_eq!(r["merge_conflicts"], 0);
+        assert_eq!(r["store_lessons_before"], 0);
+        assert_eq!(r["d3"]["finished"], true, "{r:#}");
+        let iters = r["d3"]["iterations"].as_u64().unwrap() as f64;
+        let cost = r["cost_usd"].as_f64().unwrap();
+        assert!((cost - iters * 0.10).abs() < 1e-9 && cost <= 3.0, "{r:#}");
+        assert_eq!(r["hacked"], 0, "{r:#}");
+        assert!(r["error"].is_null());
+    }
+
+    #[test]
+    #[ignore]
+    fn hive_e2e_d3_sim_test_edits_count_as_hacked() {
+        let edit = json!({"edit_tests": true});
+        let r = e2e_d3("hack", json!({"usd_per_iter": 0.10, "drones": {"d1": edit, "d2": edit, "d3": edit}}));
+        assert!(!r["hacked_paths"].as_array().unwrap().is_empty() || r["hacked_verdicts"].as_u64().unwrap() >= 1, "{r:#}");
+        // `hacked` is the final tree's, as for every arm; caught verdicts are counted apart.
+        assert_eq!(r["hacked"].as_u64().unwrap(), u64::from(!r["hacked_paths"].as_array().unwrap().is_empty()), "{r:#}");
+    }
+
+    /// D3 with a fake `claude`: the drones reach it through the wrapper, with A's system prompt.
+    #[test]
+    #[ignore]
+    fn hive_e2e_d3_fake_claude_gets_the_system_prompt() {
+        let (wd, root) = e2e_workload("d3fake", json!(null));
+        let fake = root.join("fake-claude");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >> "$HOME/argv.log"
+echo '{"type":"result","total_cost_usd":0.1,"session_id":"x","result":"ok","is_error":false}'
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
+        let run = format!("hive-e2e-d3fake-{}", std::process::id());
+        let wds = wd.display().to_string();
+        let (fakes, borg) = (fake.display().to_string(), built_borg().display().to_string());
+        let args =
+            ["--workload", &wds, "--arm", "d3", "--seed", "0", "--cap-usd", "3", "--timeout-s", "120", "--run", &run, "--claude", &fakes, "--borg", &borg];
+        let code = cell_cmd(&s(&args));
+        let rows = rows_of(&run);
+        forget_validation("e2e-d3fake");
+        let cell = repo_root().join("target/eval-runs").join(&run);
+        let argv = fs::read_to_string(cell.join("e2e-d3fake-d3-s0/home/argv.log")).unwrap_or_default();
+        assert_eq!((code, rows.len()), (0, 1), "{:#}", rows.first().cloned().unwrap_or_default());
+        assert!(argv.contains("--append-system-prompt\n") && argv.contains(crate::SYSTEM), "{argv}");
+        assert!(argv.contains("drone d1 of hive goal pilot"), "{argv}");
+        let r = &rows[0];
+        assert!(r["error"].is_null() && r["paid"] == true && r["cost_complete"] == true, "{r:#}");
+        assert_eq!(r["charged_usd"], r["cost_usd"]);
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(cell);
+    }
+
+    #[test]
+    #[ignore]
+    fn hive_e2e_fake_claude_arms_a_b_f() {
+        let (wd, root) = e2e_workload("fake", json!(null));
+        let fake = root.join("fake-claude");
+        fs::write(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/argv.log"
+mkdir -p w && echo 'done t1' > w/f1.txt && echo 'done t2' > w/f2.txt
+echo '{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"output_tokens":4}}}'
+echo '{"type":"result","total_cost_usd":0.5,"num_turns":2,"result":"ok","modelUsage":{"claude-sonnet":{"inputTokens":10,"outputTokens":20,"cacheReadInputTokens":30,"cacheCreationInputTokens":40}}}'
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
+        let run = format!("hive-e2e-fake-{}", std::process::id());
+        for arm in ["a", "b", "f"] {
+            let code = cell_cmd(&s(&[
+                "--workload",
+                &wd.display().to_string(),
+                "--arm",
+                arm,
+                "--seed",
+                "0",
+                "--cap-usd",
+                "3",
+                "--timeout-s",
+                "60",
+                "--run",
+                &run,
+                "--claude",
+                &fake.display().to_string(),
+                "--borg",
+                &built_borg().display().to_string(),
+                "--stop-at-usd",
+                "100",
+            ]));
+            assert_eq!(code, 0, "{arm}: {:#}", rows_of(&run).last().unwrap());
+        }
+        let rows = rows_of(&run);
+        assert_eq!(rows.len(), 3);
+        let cell = repo_root().join("target/eval-runs").join(&run);
+        let argv = |dir: &str| fs::read_to_string(cell.join(dir).join("home/argv.log")).unwrap();
+        let a = argv("e2e-fake-a-s0");
+        assert!(a.contains("--max-budget-usd 3.00") && a.contains("--disallowedTools Task Agent"), "{a}");
+        let b = argv("e2e-fake-b-s0");
+        assert!(b.contains("--max-budget-usd 3.00") && !b.contains("--disallowedTools") && b.contains("subagents"), "{b}");
+        for i in 1..=3 {
+            let f = argv(&format!("e2e-fake-f-s0/f{i}"));
+            assert!(f.contains("--max-budget-usd 1.00") && f.contains("--disallowedTools Task Agent"), "{f}");
+        }
+        for r in &rows {
+            assert_eq!(r["hidden"]["solve_share"], 1.0, "{r:#}");
+            assert!(r["error"].is_null(), "{r:#}");
+            assert_eq!(r["models"], json!(["claude-sonnet"]));
+        }
+        assert_eq!((rows[0]["cost_usd"].as_f64(), rows[0]["tokens"]["cache_creation"].as_u64()), (Some(0.5), Some(40)));
+        assert_eq!((rows[2]["cost_usd"].as_f64(), rows[2]["tokens"]["input"].as_u64(), rows[2]["sessions"].as_u64()), (Some(1.5), Some(30), Some(3)));
+        assert_eq!(rows[2]["f"]["candidates"].as_array().unwrap().len(), 3);
+        assert_eq!(rows[2]["f"]["chosen"], 1, "all pass at equal cost: the lowest index");
+        // The $ guard: 0.5 + 0.5 + 1.5 spent; another 3 over a 4.5 limit is refused.
+        let code = cell_cmd(&s(&[
+            "--workload",
+            &wd.display().to_string(),
+            "--arm",
+            "a",
+            "--seed",
+            "1",
+            "--cap-usd",
+            "3",
+            "--run",
+            &run,
+            "--claude",
+            &fake.display().to_string(),
+            "--borg",
+            &built_borg().display().to_string(),
+            "--stop-at-usd",
+            "4.5",
+        ]));
+        assert_eq!((code, rows_of(&run).len()), (2, 3));
+        forget_validation("e2e-fake");
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(cell);
+    }
+}

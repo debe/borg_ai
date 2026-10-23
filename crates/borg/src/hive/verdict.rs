@@ -251,7 +251,8 @@ pub fn cause(goal: &str, verify: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn settle(home: &Path, goal: &str, verify: &str, a: &Attempt, kind: &str, note: &str, repo: &str, now: i64) -> Vec<String> {
     let credited = if credit_on() {
-        let lessons = veto::shown_between(home, &a.author, a.claim_ms, a.done_ms);
+        // Half-open [claim, done): a lesson asked in the done's own millisecond is taken as after the work.
+        let lessons = veto::shown_between(home, &a.author, a.claim_ms, a.done_ms - 1);
         let path = home.join("outcomes.jsonl");
         let records: Vec<Outcome> = outcome::verdicts(&outcome::read(&path), kind, &a.author, &lessons, &cause(goal, verify), now, repo);
         records.iter().filter(|o| outcome::append(&path, o).is_ok()).flat_map(|o| o.lessons.clone()).collect()

@@ -423,6 +423,7 @@ dependencies = [
 name = "borg-eval"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "borg-ai",
  "borg-trace",
  "libc",

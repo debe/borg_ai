@@ -265,7 +265,7 @@ impl Secrets {
     const FILES: [(&'static str, &'static str); 2] = [("credentials.json", ".claude/.credentials.json"), ("claude.json", ".claude.json")];
 
     /// (copy, where it appears inside the HOME) for each secret file.
-    fn binds(dir: &Path, home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    pub(crate) fn binds(dir: &Path, home: &Path) -> Vec<(PathBuf, PathBuf)> {
         Self::FILES.iter().map(|(src, dst)| (dir.join(src), home.join(dst))).collect()
     }
 }
@@ -284,15 +284,22 @@ impl Drop for Secrets {
 /// for an hour, so the sandbox never refreshes it and the real file is never written) and a
 /// sanitised `~/.claude.json`.
 pub(crate) fn prepare_home(home: &Path, real_home: &Path, borg: &Path) -> Result<Secrets, String> {
+    prepare_home_with(home, real_home, borg, ORIGINAL_SETTINGS, COLLECTIVES, 3600.0)
+}
+
+/// `prepare_home` with its own user `settings`, `collectives` config, and the time the token must
+/// stay valid for (`min_valid_s`: at least the sandbox's whole run, so it never refreshes it).
+pub(crate) fn prepare_home_with(home: &Path, real_home: &Path, borg: &Path, settings: &str, collectives: &str, min_valid_s: f64) -> Result<Secrets, String> {
     fs::create_dir_all(home.join(".claude")).map_err(|e| e.to_string())?;
     let creds: Value = serde_json::from_str(&fs::read_to_string(real_home.join(".claude/.credentials.json")).map_err(|e| format!("credentials: {e}"))?)
         .map_err(|e| format!("credentials: {e}"))?;
     let oauth = creds.get("claudeAiOauth").cloned().ok_or("credentials: no claudeAiOauth entry")?;
     let left_s = oauth["expiresAt"].as_f64().unwrap_or(0.0) / 1000.0 - now_s();
-    if left_s < 3600.0 {
+    if left_s < min_valid_s {
         return Err(format!(
-            "the Claude token expires in {:.0} min; a sandbox refresh could invalidate the real one. Run any claude command outside first.",
-            left_s / 60.0
+            "the Claude token expires in {:.0} min (needed: {:.0}); a sandbox refresh could invalidate the real one. Run any claude command outside first.",
+            left_s / 60.0,
+            min_valid_s / 60.0
         ));
     }
     let dir = std::env::temp_dir().join(format!("borg-dogfood-secrets-{}-{}", std::process::id(), uuid()));
@@ -308,12 +315,19 @@ pub(crate) fn prepare_home(home: &Path, real_home: &Path, borg: &Path) -> Result
         o.remove("mcpServers");
     }
     write_private(&secrets.dir.join("claude.json"), &cfg.to_string())?;
-    fs::write(home.join(".claude/settings.json"), ORIGINAL_SETTINGS).map_err(|e| e.to_string())?;
-    fs::create_dir_all(home.join(".config/borg")).map_err(|e| e.to_string())?;
-    fs::write(home.join(".config/borg/collectives.json"), COLLECTIVES).map_err(|e| e.to_string())?;
-    fs::create_dir_all(home.join("bin")).map_err(|e| e.to_string())?;
-    std::os::unix::fs::symlink(borg, home.join("bin/borg")).map_err(|e| e.to_string())?;
+    prepare_home_bare(home, borg, settings, collectives)?;
     Ok(secrets)
+}
+
+/// The sandbox HOME without any credentials (a fake or simulated harness): the user `settings`, the
+/// `collectives` config and `bin/borg`.
+pub(crate) fn prepare_home_bare(home: &Path, borg: &Path, settings: &str, collectives: &str) -> Result<(), String> {
+    fs::create_dir_all(home.join(".claude")).map_err(|e| e.to_string())?;
+    fs::write(home.join(".claude/settings.json"), settings).map_err(|e| e.to_string())?;
+    fs::create_dir_all(home.join(".config/borg")).map_err(|e| e.to_string())?;
+    fs::write(home.join(".config/borg/collectives.json"), collectives).map_err(|e| e.to_string())?;
+    fs::create_dir_all(home.join("bin")).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(borg, home.join("bin/borg")).map_err(|e| e.to_string())
 }
 
 /// `git rev-parse HEAD` of the harness, and whether the harness sources differ from it.

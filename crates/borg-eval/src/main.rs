@@ -10,6 +10,10 @@
 //! runs `git clean -fdx` (a fresh clone, as far as untracked state goes), and
 //! applies `drift/before-NN-*.sh` scripts. Results go to
 //! `target/eval-runs/<run>/results.jsonl`; `summary.md` is printed.
+//!
+//! Subcommands: `report`, `sandbox-exec`, `sandbox-probe`, `dogfood` (dogfood.rs), `hive` (hive.rs:
+//! the hive pilot's arms A, B, D3 and F, `hive validate` and `hive report`), and the replay evals
+//! when their private modules are present (build.rs).
 
 use std::fs;
 use std::io::Write;
@@ -21,6 +25,7 @@ use borg_trace::{Kind, claude};
 use serde_json::{Value, json};
 
 mod dogfood;
+mod hive;
 // Replay evals over private data: optional, see build.rs. rustfmt cannot resolve absent module files, so
 // `cargo fmt` skips these; scripts/check.sh checks them with rustfmt directly when they are present.
 #[cfg(replay_evals)]
@@ -143,6 +148,15 @@ pub(crate) struct Extra {
     /// Read-write file binds (source, absolute destination), mounted last: e.g. a credentials copy
     /// kept outside `sandbox_home` and visible inside it only while the sandbox runs.
     pub file_rw: Vec<(PathBuf, PathBuf)>,
+    /// Variables set inside a sandbox with its own HOME (`sandbox_home`), after the environment is
+    /// cleared; ignored otherwise.
+    pub env: Vec<(String, String)>,
+    /// No network inside (`--unshare-net`): the hive scorer runs agent-written code.
+    pub unshare_net: bool,
+    /// A PID namespace of its own (`--unshare-pid`): every process started inside (a Gradle daemon an
+    /// agent left, a build's orphan) is killed when the sandboxed command ends, and the host's
+    /// processes are not visible.
+    pub unshare_pid: bool,
 }
 
 /// The only variables a sandbox with its own HOME inherits (besides HOME and PATH, which it sets).
@@ -177,6 +191,9 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
         // `<own home>/bin` first (dogfood links borg there), then the claude binary.
         cmd.arg("--setenv").arg("PATH").arg(format!("{}:{}:/usr/local/bin:/usr/bin:/bin", own.join("bin").display(), home.join(".local/bin").display()));
         cmd.args(["--setenv", "DISABLE_AUTOUPDATER", "1"]);
+        for (k, v) in &extra.env {
+            cmd.arg("--setenv").arg(k).arg(v);
+        }
     } else {
         let mut cfg: Value = fs::read_to_string(home.join(".claude.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
         if let Some(o) = cfg.as_object_mut() {
@@ -189,8 +206,18 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
         cmd.arg("--bind").arg(&creds).arg(&creds);
         cmd.arg("--bind").arg(private.join("claude.json")).arg(home.join(".claude.json"));
     }
-    for (src, rel) in &extra.home_ro {
-        cmd.arg("--ro-bind").arg(src).arg(home.join(rel));
+    if extra.unshare_net {
+        cmd.arg("--unshare-net");
+    }
+    if extra.unshare_pid {
+        cmd.arg("--unshare-pid");
+    }
+    // Into the real (hidden) HOME; with a HOME of its own, into that one instead, after the writable
+    // binds below (which would otherwise shadow them).
+    if extra.sandbox_home.is_none() {
+        for (src, rel) in &extra.home_ro {
+            cmd.arg("--ro-bind").arg(src).arg(home.join(rel));
+        }
     }
     if !writable.iter().any(|w| cwd.starts_with(w)) {
         cmd.arg("--ro-bind").arg(cwd).arg(cwd);
@@ -200,6 +227,11 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
     }
     for rw in writable.iter().filter(|p| p.exists()) {
         cmd.arg("--bind").arg(rw).arg(rw);
+    }
+    if let Some(own) = &extra.sandbox_home {
+        for (src, rel) in &extra.home_ro {
+            cmd.arg("--ro-bind").arg(src).arg(own.join(rel));
+        }
     }
     for (src, dst) in &extra.file_rw {
         cmd.arg("--bind").arg(src).arg(dst);
@@ -223,6 +255,20 @@ pub(crate) fn bwrap_claude_with(
     stream: &Path,
     timeout_s: u32,
 ) -> (Option<Value>, f64) {
+    let (result, secs, _) = bwrap_claude_run(cwd, writable, readonly, extra, claude_args, stream, timeout_s);
+    (result, secs)
+}
+
+/// `bwrap_claude_with`, also returning the exit code (`timeout`'s 124 when the wall cap fired).
+pub(crate) fn bwrap_claude_run(
+    cwd: &Path,
+    writable: &[&Path],
+    readonly: &[&Path],
+    extra: &Extra,
+    claude_args: &[String],
+    stream: &Path,
+    timeout_s: u32,
+) -> (Option<Value>, f64, Option<i32>) {
     let (mut cmd, private) = sandbox_with(cwd, writable, readonly, extra, timeout_s);
     cmd.arg("claude").args(claude_args);
     cmd.args(["--output-format", "stream-json", "--verbose"]);
@@ -240,7 +286,7 @@ pub(crate) fn bwrap_claude_with(
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .rfind(|v| v.get("type").and_then(Value::as_str) == Some("result"));
-    (result, secs)
+    (result, secs, status.code())
 }
 
 fn run_drone(a: &Args, work: &Path, prompt: &str, stream: &Path) -> (Option<Value>, f64) {
@@ -381,6 +427,7 @@ fn main() {
         #[cfg(replay_evals)]
         Some("expert-hook") => return preempt::expert_hook(),
         Some("dogfood") => return dogfood::main(&raw[1..]),
+        Some("hive") => return hive::main(&raw[1..]),
         Some("sandbox-probe") => return sandbox_probe(raw.get(1).map(PathBuf::from).expect("sandbox-probe <cwd>")),
         _ => {}
     }
