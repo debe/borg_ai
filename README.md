@@ -373,10 +373,13 @@ Borg runs on its own. These commands show what it does:
 
 **Hive (spike, preparation).** `borg hive` lets many drones work on one goal: a board of tasks with
 leased claims, contracts between drones, and done gated by the goal's oracle (shell checks run at the
-stop). It is a local, file-backed spike with no mesh sync. Its value metric (solve rate and wall-clock
-time at the same dollars as one session with subagents) is still to be measured by the H1 pilot
-([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)); until
-then it is preparation, not a claimed win. `borg hive run <goal> --drones N` starts N headless drones,
+stop). It is a local, file-backed spike with no mesh sync. What is shown is that it works, not that it is
+better: on two private production codebases (six injected bugs in one service; a field rename across a
+service and its consumer, the consumer depending on the producer), three drones finished the board,
+integrated, and passed the visible suite and every held-out check in all 6 runs (3 seeds each, $8.48
+in total, 7–11 minutes per run), with no false hacked verdict. Whether a hive beats one session with
+subagents is not measured: these workloads were too easy to tell
+([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)). `borg hive run <goal> --drones N` starts N headless drones,
 each in a git worktree with an equal share of the goal's budget, until the board is finished (try
 `--dry-run` first). Once every task is verified, the runner merges the accepted work. It never merges
 a drone's whole branch. It runs the oracle on the combined tree, which ends up at
