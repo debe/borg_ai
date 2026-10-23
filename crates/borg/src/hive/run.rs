@@ -315,7 +315,10 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
                 return end;
             }
             Next::Wait => {
-                t.idle += 1;
+                // Work held by another drone may still open a verify task this drone can take.
+                if !b.in_flight(now) {
+                    t.idle += 1;
+                }
                 std::thread::sleep(IDLE_WAIT);
                 continue;
             }

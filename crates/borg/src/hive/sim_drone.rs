@@ -6,9 +6,10 @@
 //!
 //! The script (`BORG_SIM_SCRIPT`, JSON, every field optional): `{"usd_per_iter": 0.10, "drones": {"d2":
 //! {"fail_first": true, "contract": {"scope": ["api.rs"], "text": "fn f() -> u8"}, "hang": false,
-//! "edit_tests": false}}}`. `fail_first`: the drone's first work ends at a failing oracle (its stop
+//! "edit_tests": false, "work_s": 0}}}`. `fail_first`: the drone's first work ends at a failing oracle (its stop
 //! blocked, the claim still held); `hang`: once it holds a claim it sleeps past any iteration cap; `edit_tests`: it also
-//! writes `tests/sim_edit.txt` (a fixture for the reward step's guardrails); `contract`: it publishes it.
+//! writes `tests/sim_edit.txt` (a fixture for the reward step's guardrails); `contract`: it publishes it;
+//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ struct Plan {
     hang: bool,
     #[serde(default)]
     edit_tests: bool,
+    #[serde(default)]
+    work_s: u64,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -135,6 +138,7 @@ pub fn main(here: &Here) -> i32 {
             d.stop(false);
             break;
         }
+        std::thread::sleep(Duration::from_secs(plan.work_s));
         let file = task.files.first().cloned().unwrap_or_else(|| format!("{}.txt", task.id));
         let failed_once = hook::state_file(&format!("sim-{}-{name}", g.id)).with_extension("failed");
         let fail = plan.fail_first && !failed_once.exists();

@@ -281,6 +281,12 @@ impl Board {
     pub fn finished(&self) -> bool {
         !self.tasks.is_empty() && self.tasks.values().all(|s| matches!(s.status, Status::Verified { .. }))
     }
+
+    /// Some task is held under a live lease at `now`: its done will open a verify task, its release
+    /// reopens it, and an abandoned one becomes claimable when the lease runs out.
+    pub fn in_flight(&self, now: i64) -> bool {
+        self.tasks.values().any(|s| s.live(now).is_some())
+    }
 }
 
 /// Appends `events` in one write(2) with O_APPEND: lines written together (a done and its verify
@@ -719,6 +725,9 @@ mod tests {
         let b = fold(&[open, ev(Ev::Claim, "t1", "sa", 0), ev(Ev::Heartbeat, "t1", "sa", LEASE_MS - 1), ev(Ev::Claim, "t1", "sb", LEASE_MS + 1)]);
         assert_eq!(holder_of(&b, "t1").as_deref(), Some("sa"), "a heartbeat renews the lease");
         assert!(b.tasks["t1"].live(LEASE_MS - 1 + LEASE_MS).is_some() && b.tasks["t1"].live(2 * LEASE_MS).is_none());
+        assert!(b.in_flight(2 * LEASE_MS - 1) && !b.in_flight(2 * LEASE_MS), "in flight while the lease lives");
+        let b = fold(&[Event::open(task("t2"), "engineer:e", 0), ev(Ev::Claim, "t2", "sa", 0), ev(Ev::Done, "t2", "sa", 1)]);
+        assert!(!b.in_flight(2), "a done task is not in flight");
     }
 
     #[test]

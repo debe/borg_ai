@@ -117,6 +117,18 @@ fn events(root: &Path) -> Vec<board::Event> {
 }
 
 #[test]
+fn idle_drones_wait_for_work_in_flight_to_verify_it() {
+    // One task, three drones: whoever claims it works past the idle polls (3 × 3 s); the other two
+    // must still be there when its verify task opens, or nobody but its author is left to verify it.
+    let slow = json!({"work_s": 12});
+    let root = setup("in-flight", 1, "3", json!({"usd_per_iter": 0.10, "drones": {"d1": slow, "d2": slow, "d3": slow}}));
+    let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(fold(&root).finished(), "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn three_sim_drones_finish_a_board() {
     let root = setup("three", 3, "3", json!({"usd_per_iter": 0.10}));
     let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
