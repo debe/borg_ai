@@ -514,7 +514,7 @@ enum Jail {
         env: Vec<(String, String)>,
         home_ro: Vec<(PathBuf, PathBuf)>,
     },
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     Plain,
 }
 
@@ -569,7 +569,7 @@ impl Jail {
                     Err(e) => (-1, e.to_string()),
                 }
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             Jail::Plain => {
                 let (_, code, out) = run_t(cwd, script, timeout_s);
                 (code, out)
