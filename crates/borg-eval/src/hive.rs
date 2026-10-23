@@ -1173,7 +1173,7 @@ impl Agent {
             file_rw: self.secrets.as_ref().map(|s| Secrets::binds(&s.dir, &self.home)).unwrap_or_default(),
             env: self.env.clone(),
             unshare_net: false,
-            // Nothing an agent starts (a Gradle daemon: a build keeps on) outlives its session into
+            // Nothing an agent starts (a Gradle daemon a build keeps on) outlives its session into
             // the next cells' wall-clock.
             unshare_pid: true,
         }
