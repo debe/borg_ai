@@ -153,11 +153,18 @@ pub fn home() -> PathBuf {
 }
 
 pub(crate) fn append_jsonl<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
+    append_line(path, &serde_json::to_string(v)?)
+}
+
+/// Appends `line` and its newline in one write. Under O_APPEND one write lands whole; `writeln!` makes
+/// two (the record, then "\n"), so two writers at once (a hive's drones on one store) can leave
+/// `{A}{B}\n\n`, and every reader drops both unparseable records without a word.
+pub(crate) fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{}", serde_json::to_string(v).unwrap())
+    f.write_all(format!("{line}\n").as_bytes())
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -784,9 +791,7 @@ fn learn_unlocked(
                 library.push(l);
             }
             Ok(None) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&skipped_path) {
-                    let _ = writeln!(f, "{}", e.id);
-                }
+                let _ = append_line(&skipped_path, &e.id);
                 crate::stats::count(home, crate::stats::NOT_A_LESSON, &e.session, |ev| ev.engineer = e.engineer.clone());
             }
         }
@@ -813,6 +818,22 @@ fn learn_unlocked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_jsonl_appends_keep_every_line() {
+        let dir = std::env::temp_dir().join(format!("borg-learn-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("episodes.jsonl");
+        let (writers, each) = (8, 2000);
+        std::thread::scope(|scope| {
+            for w in 0..writers {
+                let p = &p;
+                scope.spawn(move || (0..each).for_each(|i| append_jsonl(p, &serde_json::json!({"w": w, "i": i})).unwrap()));
+            }
+        });
+        assert_eq!(read_jsonl::<Value>(&p).len(), writers * each);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_regret_is_asked_with_its_own_prompt_and_the_shared_rules() {

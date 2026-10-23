@@ -67,14 +67,14 @@ pub fn parse(message: &str) -> Option<Said> {
     }
 }
 
-/// `git -C dir args` within `GIT_TIMEOUT` and before `deadline`: its trimmed stdout on success.
+/// `git -C dir args` (git.rs) within `GIT_TIMEOUT` and before `deadline`: its trimmed stdout on success.
 fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Option<String> {
     let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
     if left.is_zero() {
         return None;
     }
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0").envs(env.iter().copied());
+    let mut cmd = super::git::command(dir);
+    cmd.args(args).envs(env.iter().copied());
     match runner::run_capped_status(cmd, None, left)? {
         (s, out) if s.success() => Some(String::from_utf8_lossy(&out).trim().to_string()),
         _ => None,
@@ -86,22 +86,28 @@ fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) ->
 /// unchanged files are not hashed again), `add -A`, `write-tree`, `commit-tree`, all `within` (each
 /// git call also within `GIT_TIMEOUT`: the stop hook passes what is left of its time). None outside a
 /// git repo or on any failure: the verdict then cannot check the work's diff, and says so.
+///
+/// The scratch index lies beside the real one, in the worktree's git dir: a fresh name created anew
+/// (never a planted file or link followed), removed with the lock git takes on it, which an `add -A`
+/// cut off at the deadline leaves behind.
 pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     let deadline = Instant::now() + within;
     let git = |dir: &Path, args: &[&str], env: &[(&str, &str)]| git_by(dir, args, env, deadline);
     let index = dir.join(git(dir, &["rev-parse", "--git-path", "index"], &[])?);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let tmp = std::env::temp_dir().join(format!("borg-hive-index-{}-{nanos}", std::process::id()));
+    let name = format!("borg-hive-index-{}-{nanos}", std::process::id());
+    let (tmp, lock) = (index.with_file_name(&name), index.with_file_name(format!("{name}.lock")));
+    let clean = || [&tmp, &lock].iter().for_each(|p| drop(std::fs::remove_file(p)));
     // The copy keeps the index's mtime: git re-reads an entry as old as its index (racy git), and a
     // fresh mtime would make it trust a same-size edit made in the second the index was written.
     if index.is_file() && copy_keeping_mtime(&index, &tmp).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        clean();
         return None;
     }
     let tmp_s = tmp.display().to_string();
     let env = [("GIT_INDEX_FILE", tmp_s.as_str())];
     let tree = git(dir, &["add", "-A"], &env).and_then(|_| git(dir, &["write-tree"], &env));
-    let _ = std::fs::remove_file(&tmp);
+    clean();
     let tree = tree?;
     let who = [("GIT_AUTHOR_NAME", "borg"), ("GIT_AUTHOR_EMAIL", "borg@localhost"), ("GIT_COMMITTER_NAME", "borg"), ("GIT_COMMITTER_EMAIL", "borg@localhost")];
     let mut args = vec!["commit-tree", tree.as_str(), "-m", "borg hive snapshot"];
@@ -112,14 +118,14 @@ pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     git(dir, &args, &who).filter(|c| !c.is_empty())
 }
 
-/// `from` copied to `to` with `from`'s mtime.
+/// `from` copied to `to`, a file it creates (none may be there), with `from`'s mtime.
 fn copy_keeping_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::copy(from, to)?;
-    let mtime = std::fs::metadata(from)?.modified()?;
-    std::fs::File::options().write(true).open(to)?.set_modified(mtime)
+    let mut out = std::fs::File::options().write(true).create_new(true).open(to)?;
+    std::io::copy(&mut std::fs::File::open(from)?, &mut out)?;
+    out.set_modified(std::fs::metadata(from)?.modified()?)
 }
 
-/// `git -C dir args` (fed `input`) within `GIT_TIMEOUT` and before `deadline`, its stderr merged into
+/// `git -C dir args` (git.rs; fed `input`) within `GIT_TIMEOUT` and before `deadline`, its stderr merged into
 /// its stdout: (success, untrimmed output). None when it did not run or finish.
 fn git_out(dir: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -> Option<(bool, String)> {
     let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
@@ -127,7 +133,7 @@ fn git_out(dir: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -
         return None;
     }
     let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", "exec 2>&1; exec git \"$@\"", "git", "-C"]).arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args(["-c", "exec 2>&1; exec git \"$@\"", "git"]).args(super::git::args(dir)).args(args).env("GIT_TERMINAL_PROMPT", "0");
     runner::run_capped_status(cmd, input, left).map(|(s, out)| (s.success(), String::from_utf8_lossy(&out).into_owned()))
 }
 
@@ -137,12 +143,17 @@ fn git_tail(out: &str) -> String {
     lines[lines.len().saturating_sub(3)..].join("; ")
 }
 
+/// The toplevel of the worktree `dir` is in.
+fn toplevel(dir: &Path, deadline: Instant) -> Option<String> {
+    git_by(dir, &["rev-parse", "--show-toplevel"], &[], deadline)
+}
+
 /// The change from `base` to `head` (commits of `dir`'s repo) as a binary patch, and `dir`'s toplevel,
 /// where it applies: from a subdirectory `git apply` would skip every path outside it.
 fn patch_of(dir: &Path, base: &str, head: &str, deadline: Instant) -> Result<(String, Vec<u8>), String> {
-    let top = git_by(dir, &["rev-parse", "--show-toplevel"], &[], deadline).ok_or_else(|| format!("{} is in no git worktree", dir.display()))?;
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(&top).args(["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).env("GIT_TERMINAL_PROMPT", "0");
+    let top = toplevel(dir, deadline).ok_or_else(|| format!("{} is in no git worktree", dir.display()))?;
+    let mut cmd = super::git::command(Path::new(&top));
+    cmd.args(["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", base, head]);
     let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
     match (!left.is_zero()).then(|| runner::run_capped_status(cmd, None, left)).flatten() {
         Some((s, out)) if s.success() => Ok((top, out)),
@@ -216,7 +227,8 @@ fn changes_by(dir: &Path, base: &str, head: &str, deadline: Instant) -> Option<V
     Some(parse_changes(&out))
 }
 
-/// One hunk of a test file's `-U0` diff: the old file's line it starts at, its removed and added lines.
+/// One run of changed lines of a test file's diff (what a `-U0` diff makes a hunk): the old file's line
+/// it starts at, its removed and added lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hunk {
     pub line: usize,
@@ -224,11 +236,14 @@ pub struct Hunk {
     pub added: Vec<String>,
 }
 
-/// The content diff of a modified test file.
+/// The content diff of a modified test file (or a [`guard::shared_config`] file): its runs of changed
+/// lines, and the whole file before and after (a diff with all of the file as context).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestEdit {
     pub hunks: Vec<Hunk>,
     pub binary: bool,
+    pub old: Vec<String>,
+    pub new: Vec<String>,
 }
 
 /// A line git writes for a conflict (`<<<<<<< x`, `=======`, `>>>>>>> x`, `||||||| x`): no test's line;
@@ -245,26 +260,40 @@ fn excerpt(line: &str) -> String {
     }
 }
 
-/// Why a test edit weakens the file; None when it preserves it: in each hunk every removed line that
-/// is not blank, a comment or a conflict marker is kept by one of the hunk's added lines, in order
-/// (guard.rs `keeps`: the same shape, no two names made one), the edit declares no fewer tests
-/// (guard.rs `declares_test`) and adds no more silencers (guard.rs `silencer`) than it removes. A
-/// renamed key, accessor or an updated value keep a line; a deleted, reshaped or tautological
-/// assertion, a test no longer declared (`#[test]` turned `#[inline]`), an added skip do not, nor
-/// does any binary edit.
-pub fn weakens(e: &TestEdit) -> Option<String> {
+/// Why a test edit weakens the file (`path`); None when it preserves it. Its removed lines: in each
+/// hunk every one that is not blank, a comment or a conflict marker is kept by one of the hunk's added
+/// lines, in order, at the same indentation (guard.rs `keeps`: the same shape, no two names made one;
+/// a line moved under a new block is no longer the same test). Its added lines: they open or close no
+/// block comment or triple-quoted string that the hunk's removed lines did not (guard.rs
+/// `delimiters`: delimiters around unchanged lines make them a comment or a string), declare no fewer
+/// tests (guard.rs `declares_test`) and add no more silencers (guard.rs `silencer`, an `if False:`
+/// among them) than the removed ones; in a Python file they bind no name the old file binds in the
+/// same scope to something else (guard.rs `python_bindings`: a second `def test_parse`, a `parse =
+/// lambda s: s`, replace the first). A renamed key, accessor or an updated value keep a line; a
+/// deleted, reshaped or tautological assertion, a test no longer declared (`#[test]` turned
+/// `#[inline]`), an added skip do not, nor does any binary edit.
+pub fn weakens(path: &str, e: &TestEdit) -> Option<String> {
     if e.binary {
         return Some("binary".into());
     }
+    let indent = |l: &str| l.len() - l.trim_start().len();
     for h in &e.hunks {
         let mut added = h.added.iter();
         for (i, r) in h.removed.iter().enumerate() {
             if guard::comment_only(r) || conflict_marker(r) {
                 continue;
             }
-            if !added.any(|a| guard::keeps(r, a)) {
+            if !added.any(|a| r[..indent(r)] == a[..indent(a)] && guard::keeps(r, a)) {
                 return Some(format!("line {} removed or reshaped: {}", h.line + i, excerpt(r)));
             }
+        }
+        let nesting = |lines: &[String]| {
+            lines.iter().filter(|l| !conflict_marker(l)).map(|l| guard::delimiters(l)).fold((0, 0), |(d, q), (dl, ql)| (d + dl, (q + ql) % 2))
+        };
+        if nesting(&h.added) != nesting(&h.removed) {
+            let first = h.added.iter().chain(&h.removed).find(|l| guard::delimiters(l) != (0, 0));
+            let what = first.map_or_else(String::new, |l| excerpt(l));
+            return Some(format!("line {} opens or closes a comment or string around unchanged lines: {what}", h.line));
         }
     }
     let count = |lines: &mut dyn Iterator<Item = &String>, f: fn(&str) -> bool| lines.filter(|l| f(l)).count();
@@ -276,6 +305,15 @@ pub fn weakens(e: &TestEdit) -> Option<String> {
     if count(&mut added(), guard::silencer) > count(&mut removed(), guard::silencer) {
         let first = added().find(|l| guard::silencer(l)).map_or_else(String::new, |l| excerpt(l));
         return Some(format!("adds a skip: {first}"));
+    }
+    if path.ends_with(".py") {
+        let (old, new) = (guard::python_bindings(&e.old), guard::python_bindings(&e.new));
+        let mut rebound: Vec<&(String, String)> = new.iter().filter(|(k, n)| old.get(*k).is_some_and(|o| *n > o)).map(|(k, _)| k).collect();
+        rebound.sort();
+        if let Some((scope, name)) = rebound.first() {
+            let what = if scope.is_empty() { name.clone() } else { format!("{scope}.{name}") };
+            return Some(format!("binds {what} again: the earlier one no longer runs"));
+        }
     }
     None
 }
@@ -289,23 +327,24 @@ pub struct Diff {
 }
 
 /// The diff of `dir` from `base` to `head`, within `DIFF_TIMEOUT`: the changed paths, then, when a
-/// test file (not a runner's config) was modified, one `-U0` diff of those files, read as literal
-/// pathspecs. None when git cannot list the paths; a content diff that fails leaves `edits` without
-/// them, and [`protected`] fails closed.
+/// test file (not a runner's config) was modified or a [`guard::shared_config`] file changed in any
+/// way, one diff of those files with the whole file as context, read as literal pathspecs from the
+/// toplevel (the paths are named from there, whatever subdirectory `dir` is). None when git cannot
+/// list the paths; a content diff that fails leaves `edits` without them, and [`protected`] fails
+/// closed.
 pub fn diff(dir: &Path, base: &str, head: &str) -> Option<Diff> {
     let deadline = Instant::now() + DIFF_TIMEOUT;
     let changes = changes_by(dir, base, head, deadline)?;
-    let tests: Vec<String> = changes
-        .iter()
-        .filter(|c| c.status == 'M' && !guard::runner_config(&c.path))
-        .filter(|c| guard::class_of(&c.path, Path::new("/"), &[], &[]) == Some(Class::Test))
-        .map(|c| format!(":(literal){}", c.path))
-        .collect();
+    let test = |c: &Change| c.status == 'M' && !guard::runner_config(&c.path) && guard::class_of(&c.path, Path::new("/"), &[], &[]) == Some(Class::Test);
+    let read: Vec<String> = changes.iter().filter(|c| test(c) || guard::shared_config(&c.path)).map(|c| format!(":(top,literal){}", c.path)).collect();
     let mut edits = HashMap::new();
-    if !tests.is_empty() {
-        let mut args = vec!["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
+    if !read.is_empty() {
+        // All of the file as context: what an added line rebinds or turns into a comment is judged
+        // against the lines around it. No rename: a renamed file's old path reads as deleted.
+        let all = format!("-U{}", i32::MAX);
+        let mut args = vec!["diff", all.as_str(), "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
         args.extend([base, head, "--"]);
-        args.extend(tests.iter().map(String::as_str));
+        args.extend(read.iter().map(String::as_str));
         if let Some(out) = git_by(dir, &args, &[], deadline) {
             edits = parse_test_edits(&out);
         }
@@ -313,10 +352,12 @@ pub fn diff(dir: &Path, base: &str, head: &str) -> Option<Diff> {
     Some(Diff { changes, edits })
 }
 
-/// `git diff -U0`'s file sections (each from a `diff --git ` line): the path from `+++ b/<path>` before
-/// the first hunk (or, for a binary file, the `diff --git a/<p> b/<p>` line), then each hunk's `-`
-/// and `+` lines (a removed `-- x` is content, never a header); `\ No newline` lines are skipped. A
-/// path git quoted matches no change and so fails closed.
+/// `git diff`'s file sections (each from a `diff --git ` line): the path from `--- a/<path>` and `+++
+/// b/<path>` before the first hunk (or, for a binary file, the `diff --git a/<p> b/<p>` line), then
+/// each hunk's lines: context (` `, or empty) ends a run of changes, `-` and `+` lines are its removed
+/// and added ones (a removed `-- x` is content, never a header), and all three make up the file before
+/// and after; `\ No newline` lines are skipped. A path git quoted matches no change and so fails
+/// closed.
 fn parse_test_edits(out: &str) -> HashMap<String, TestEdit> {
     let mut got = HashMap::new();
     let mut put = |path: Option<String>, e: TestEdit| {
@@ -324,32 +365,55 @@ fn parse_test_edits(out: &str) -> HashMap<String, TestEdit> {
             got.insert(p, e);
         }
     };
-    let (mut path, mut e, mut in_hunks): (Option<String>, TestEdit, bool) = (None, TestEdit::default(), false);
+    let (mut path, mut e, mut in_hunks, mut line): (Option<String>, TestEdit, bool, usize) = (None, TestEdit::default(), false, 0);
+    let mut run: Option<Hunk> = None;
     for l in out.lines() {
         if let Some(rest) = l.strip_prefix("diff --git ") {
+            e.hunks.extend(run.take());
             put(path.take(), std::mem::take(&mut e));
             in_hunks = false;
             // `a/<p> b/<p>`, the same path twice: what a binary file is known by.
             let n = rest.len().saturating_sub(5) / 2;
             path = rest.get(2..2 + n).filter(|p| rest == format!("a/{p} b/{p}")).map(String::from);
         } else if let Some(h) = l.strip_prefix("@@ -") {
+            e.hunks.extend(run.take());
             in_hunks = true;
-            let line = h.split([',', ' ']).next().and_then(|n| n.parse().ok()).unwrap_or(0);
-            e.hunks.push(Hunk { line, ..Hunk::default() });
+            line = h.split([',', ' ']).next().and_then(|n| n.parse().ok()).unwrap_or(0);
         } else if in_hunks {
-            let hunk = e.hunks.last_mut();
-            match (l.chars().next(), hunk) {
-                (Some('-'), Some(h)) => h.removed.push(l[1..].to_string()),
-                (Some('+'), Some(h)) => h.added.push(l[1..].to_string()),
+            let at = line;
+            match l.chars().next() {
+                Some('-') => {
+                    run.get_or_insert_with(|| Hunk { line: at, ..Hunk::default() }).removed.push(l[1..].to_string());
+                    e.old.push(l[1..].to_string());
+                    line += 1;
+                }
+                Some('+') => {
+                    run.get_or_insert_with(|| Hunk { line: at, ..Hunk::default() }).added.push(l[1..].to_string());
+                    e.new.push(l[1..].to_string());
+                }
+                Some(' ') | None => {
+                    e.hunks.extend(run.take());
+                    let text = l.get(1..).unwrap_or("").to_string();
+                    e.old.push(text.clone());
+                    e.new.push(text);
+                    line += 1;
+                }
                 _ => {}
             }
+        } else if let Some(p) = l.strip_prefix("--- a/") {
+            path = Some(p.strip_suffix('\t').unwrap_or(p).to_string());
         } else if let Some(p) = l.strip_prefix("+++ ") {
-            // Git ends a path holding a space with a tab here.
-            path = p.strip_prefix("b/").map(|p| p.strip_suffix('\t').unwrap_or(p).to_string());
+            // Git ends a path holding a space with a tab here; a deleted file's is `/dev/null`.
+            if let Some(p) = p.strip_prefix("b/") {
+                path = Some(p.strip_suffix('\t').unwrap_or(p).to_string());
+            } else if p.starts_with('"') {
+                path = None;
+            }
         } else if l.starts_with("Binary files ") {
             e.binary = true;
         }
     }
+    e.hunks.extend(run.take());
     put(path, e);
     got
 }
@@ -379,9 +443,11 @@ pub struct Protected {
 /// The protected changes of a diff ("tests may grow, never shrink"): any change to a file the visible
 /// check runs (`oracle_files`; the oracle itself, so even in the task's scope); outside the task's own
 /// `files`: CI config (guard.rs `class_of`) modified, deleted, renamed or retyped; a test runner's
-/// config (guard.rs `runner_config`) added or changed, as it changes how the existing tests run; a test
-/// deleted, renamed or retyped; a test modified so that it weakens ([`weakens`]), or whose content diff
-/// could not be read. Adding a test is allowed, and so is adding to one, renaming in it or updating a
+/// config (guard.rs `runner_config`) added or changed, as it changes how the existing tests run, and so
+/// is a change to the runner's part of a config it shares with the project (guard.rs `shared_config`,
+/// `runner_part`: an `addopts` in pyproject.toml, a `jest` key in package.json); a test deleted,
+/// renamed or retyped; a test modified so that it weakens ([`weakens`]), or whose content diff could
+/// not be read. Adding a test is allowed, and so is adding to one, renaming in it or updating a
 /// value: outside your task's files you may add tests and change names and values in existing ones,
 /// but you may not remove, skip or reshape a test or an assertion.
 pub fn protected(d: &Diff, files: &[String], oracle_files: &[String]) -> Vec<Protected> {
@@ -399,6 +465,14 @@ pub fn protected(d: &Diff, files: &[String], oracle_files: &[String]) -> Vec<Pro
             Some(format!("the visible check's file, {}", verb(c.status)))
         } else if globs.iter().any(|g| g.is_match(&c.path)) {
             None
+        } else if guard::shared_config(&c.path) {
+            match d.edits.get(&c.path) {
+                Some(e) if e.binary => Some("binary".into()),
+                Some(e) => {
+                    (guard::runner_part(&c.path, &e.old) != guard::runner_part(&c.path, &e.new)).then(|| format!("test runner config {}", verb(c.status)))
+                }
+                None => Some("its content diff could not be read (git failed or timed out)".into()),
+            }
         } else {
             match guard::class_of(&c.path, Path::new("/"), &[], &[]) {
                 Some(Class::Ci) if matches!(c.status, 'M' | 'D' | 'R' | 'T') => Some(format!("CI config {}", verb(c.status))),
@@ -407,7 +481,7 @@ pub fn protected(d: &Diff, files: &[String], oracle_files: &[String]) -> Vec<Pro
                 }
                 Some(Class::Test) if matches!(c.status, 'D' | 'R' | 'T') => Some(verb(c.status).to_string()),
                 Some(Class::Test) if c.status == 'M' => match d.edits.get(&c.path) {
-                    Some(e) => weakens(e),
+                    Some(e) => weakens(&c.path, e),
                     None => Some("its content diff could not be read (git failed or timed out)".into()),
                 },
                 _ => None,
@@ -626,7 +700,9 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
         return Err("the author cannot verify its own work".into());
     }
     let work: Option<&Task> = b.tasks.get(&a.work).map(|w| &w.task);
-    let root = Path::new(cwd);
+    // From a subdirectory as from the top: the visible check's files are named from there.
+    let top = toplevel(Path::new(cwd), Instant::now() + GIT_TIMEOUT);
+    let root = top.as_deref().map_or(Path::new(cwd), Path::new);
     // No snapshot: the diff is unchecked (a pass then rejects). Snapshots git cannot diff here (a
     // verifier outside the goal's repo): no verdict, never one that skipped the check.
     let checked = !a.base.is_empty() && !a.head.is_empty();
@@ -725,7 +801,7 @@ mod tests {
     /// A diff modifying the test `path` by one hunk at line 1 (`removed` and `added`, one line each).
     fn edit(path: &str, removed: &str, added: &str) -> Diff {
         let lines = |t: &str| t.lines().map(String::from).collect::<Vec<_>>();
-        let e = TestEdit { hunks: vec![Hunk { line: 1, removed: lines(removed), added: lines(added) }], binary: false };
+        let e = TestEdit { hunks: vec![Hunk { line: 1, removed: lines(removed), added: lines(added) }], ..TestEdit::default() };
         Diff { changes: vec![ch(path, 'M')], edits: HashMap::from([(path.to_string(), e)]) }
     }
 
@@ -795,7 +871,7 @@ mod tests {
                                 .to_vec(),
                         },
                     ],
-                    binary: false,
+                    ..TestEdit::default()
                 },
             )]),
         };
@@ -834,6 +910,14 @@ mod tests {
         }
         assert_eq!(none(&edit("tests/p.rs", "    #[test]", "    #[inline]"))[0].why, "drops a test: #[test]");
         assert!(none(&edit("tests/test_p.py", "def test_parse():", "def test_parse_v2():")).is_empty(), "a renamed test is kept");
+        // 5c. A block that never runs, a comment or string opened around lines the hunk leaves as they
+        //     are; a glob or a comment that holds a delimiter is none.
+        for (added, why) in [("    if False:", "adds a skip"), ("        if (false) {", "adds a skip"), ("/*", "line 1 opens"), ("'''", "line 1 opens")] {
+            assert!(none(&edit("tests/test_p.py", "", added))[0].why.starts_with(why), "{added:?}");
+        }
+        for added in ["    files = glob('tests/*')", "    /* it's a note */", "    \"\"\"Two.\"\"\""] {
+            assert!(none(&edit("tests/test_p.py", "", added)).is_empty(), "{added:?}");
+        }
         // 6. An already disabled test's annotation reworded: no more silencers than before.
         assert!(none(&edit("tests/ATest.java", "    @Disabled(\"flaky\")", "    @Disabled(\"flaky on CI, see #12\")")).is_empty());
         // 7. A removed comment or blank line, a removed conflict marker.
@@ -1190,6 +1274,151 @@ mod tests {
         assert_eq!(got.edits.len(), 2, "both read, a glob-like name literally: {:?}", got.edits.keys());
         let p = protected(&got, &[], &[]);
         assert_eq!((paths(&p), p[0].why.as_str()), (vec!["tests/test_weak [1].py"], "line 4 removed or reshaped: assert parse('a') == 'a'"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repo at `name` with `files` committed and snapshotted: (dir, base).
+    fn committed(name: &str, files: &[(&str, &str)]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("borg-hive-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        for (p, body) in files {
+            let p = dir.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        git_ok(&dir, &["add", "-A"]);
+        git_ok(&dir, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        let base = snapshot(&dir, SNAPSHOT_TIMEOUT).unwrap();
+        (dir, base)
+    }
+
+    /// The protected changes (outside `src/*`) of `path` written as `body` on top of `base`; the file is
+    /// restored afterwards.
+    fn judged(dir: &Path, base: &str, path: &str, body: &str) -> Vec<Protected> {
+        let p = dir.join(path);
+        let old = std::fs::read_to_string(&p).ok();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        let head = snapshot(dir, SNAPSHOT_TIMEOUT).unwrap();
+        let got = protected(&diff(dir, base, &head).unwrap(), &["src/*".into()], &[]);
+        match old {
+            Some(o) => std::fs::write(&p, o).unwrap(),
+            None => std::fs::remove_file(&p).unwrap(),
+        }
+        got
+    }
+
+    #[test]
+    fn added_lines_that_switch_off_existing_tests_shrink_them() {
+        let py = "from p import parse\n\n\ndef test_parse():\n    assert parse('a') == 'a'\n\n\ndef test_other():\n    assert parse('b') == 'b'\n";
+        let java = "class FooTest {\n    @Test\n    void parses() {\n        assertEquals(1, Foo.parse(\"1\"));\n    }\n\n    @Test\n    void parsesTwo() {\n        assertEquals(2, Foo.parse(\"2\"));\n    }\n}\n";
+        let (dir, base) = committed("switch-off", &[("tests/test_p.py", py), ("tests/FooTest.java", java)]);
+        let one = |path: &str, body: String, why: &str| {
+            let p = judged(&dir, &base, path, &body);
+            assert_eq!(paths(&p), [path], "{body}");
+            assert!(p[0].why.starts_with(why), "{body}: {}", p[0].why);
+        };
+        // A test of the same name appended shadows the real one; the function under test rebound.
+        one("tests/test_p.py", format!("{py}\n\ndef test_parse():\n    pass\n"), "binds test_parse again");
+        one("tests/test_p.py", format!("{py}\nparse = lambda s: s\n"), "binds parse again");
+        one("tests/test_p.py", format!("{py}\nfrom q import parse\n"), "binds parse again");
+        // An assertion put under `if False:`, or re-indented under any new block.
+        one("tests/test_p.py", py.replace("    assert parse('a')", "    if False:\n        assert parse('a')"), "line 5 removed or reshaped");
+        one("tests/test_p.py", py.replace("    assert parse('a')", "    with open('x'):\n        assert parse('a')"), "line 5 removed or reshaped");
+        // A test turned into a string or a comment by delimiters added around unchanged lines.
+        let around = |body: &str, open: &str, close: &str, first: &str, after: &str| {
+            body.replacen(first, &format!("{open}\n{first}"), 1).replacen(after, &format!("{close}\n{after}"), 1)
+        };
+        let opens = "line 4 opens or closes a comment or string";
+        one("tests/test_p.py", around(py, "'''", "'''", "def test_parse", "\n\ndef test_other"), opens);
+        one("tests/test_p.py", around(py, "\"\"\"", "\"\"\"", "def test_parse", "\n\ndef test_other"), opens);
+        one(
+            "tests/FooTest.java",
+            around(java, "    /*", "    */", "    @Test\n    void parses()", "\n    @Test\n    void parsesTwo"),
+            "line 2 opens or closes",
+        );
+        one(
+            "tests/FooTest.java",
+            java.replace("        assertEquals(1", "        if (false) {\n        assertEquals(1").replace("\"1\"));\n", "\"1\"));\n        }\n"),
+            "adds a skip",
+        );
+        // Growth stays allowed: a new test with docstrings and a block comment, a helper, a test of an
+        // existing name in a class of its own, a new import.
+        let grown = format!(
+            "import re\n{py}\n\ndef helper(s):\n    \"\"\"One line.\"\"\"\n    return s\n\n\ndef test_more():\n    \"\"\"\n    Two lines.\n    \"\"\"\n    assert helper('c') == 'c'\n\n\nclass TestAgain:\n    def test_parse(self):\n        assert parse('c') == 'c'\n"
+        );
+        assert!(judged(&dir, &base, "tests/test_p.py", &grown).is_empty());
+        let java_grown = java.strip_suffix("}\n").unwrap().to_string()
+            + "\n    /*\n     * Why: three.\n     */\n    @Test\n    void parsesThree() { /* inline */\n        assertEquals(3, Foo.parse(\"3\"));\n    }\n}\n";
+        assert!(judged(&dir, &base, "tests/FooTest.java", &java_grown).is_empty(), "{java_grown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_test_runners_section_in_a_shared_config_counts_as_its_config() {
+        let pyproject = "[project]\nname = \"p\"\nversion = \"1\"\n";
+        let cfg = "[metadata]\nname = p\n";
+        let pkg = "{\n  \"name\": \"p\",\n  \"scripts\": {\n    \"test\": \"jest\",\n    \"build\": \"tsc\"\n  }\n}\n";
+        let (dir, base) = committed("runner-section", &[("pyproject.toml", pyproject), ("setup.cfg", cfg), ("package.json", pkg)]);
+        let one = |path: &str, body: String| paths(&judged(&dir, &base, path, &body)).iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(one("pyproject.toml", format!("{pyproject}\n[tool.pytest.ini_options]\naddopts = \"-k 'not test_parse'\"\n")), ["pyproject.toml"]);
+        assert_eq!(one("setup.cfg", format!("{cfg}\n[tool:pytest]\naddopts = -k 'not test_parse'\n")), ["setup.cfg"]);
+        assert_eq!(
+            one("package.json", pkg.replace("\"name\": \"p\",", "\"name\": \"p\",\n  \"jest\": {\"testPathIgnorePatterns\": [\"parse\"]},")),
+            ["package.json"]
+        );
+        assert_eq!(one("package.json", pkg.replace("\"jest\"", "\"jest -t nothing\"")), ["package.json"]);
+        assert_eq!(one("sub/pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = [\"none\"]\n".into()), ["sub/pyproject.toml"], "an added one");
+        // Their other sections are no test's.
+        assert!(one("pyproject.toml", pyproject.replace("version = \"1\"", "version = \"2\"\ndependencies = [\"x\"]")).is_empty());
+        assert!(one("setup.cfg", format!("{cfg}version = 2\n")).is_empty());
+        assert!(one("package.json", pkg.replace("\"tsc\"", "\"tsc -b\"")).is_empty());
+        assert!(one("sub/package.json", "{\"name\": \"q\"}\n".into()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_users_diff_config_changes_no_patch_path_or_line() {
+        let (dir, base, head) = dep_fixture("config");
+        let repo = dir.join("repo");
+        for kv in ["diff.noprefix=true", "diff.relative=true", "diff.mnemonicPrefix=true", "diff.suppressBlankEmpty=true", "core.quotePath=true"] {
+            let (k, v) = kv.split_once('=').unwrap();
+            git_ok(&repo, &["config", k, v]);
+        }
+        assert_eq!(bring_in(&repo.join("sub"), &base, &head, SNAPSHOT_TIMEOUT), Ok(true));
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "1\ndep\n3\n");
+        let mut got = changes(&repo.join("sub"), &base, &head).unwrap();
+        got.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(got, [ch("a.txt", 'M'), ch("gone.txt", 'D'), ch("sub/new.bin", 'A')], "paths outside the subdirectory too");
+        assert_eq!(take_out(&repo.join("sub"), &base, &head, SNAPSHOT_TIMEOUT), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_cut_off_leaves_no_scratch_index_or_lock() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-snap-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("f.txt"), "1\n").unwrap();
+        git_ok(&dir, &["add", "-A"]);
+        git_ok(&dir, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        // A clean filter that outlasts the snapshot's time: `add -A` is killed holding its index lock.
+        git_ok(&dir, &["config", "filter.slow.clean", "sleep 5; cat"]);
+        std::fs::write(dir.join(".gitattributes"), "f.txt filter=slow\n").unwrap();
+        std::fs::write(dir.join("f.txt"), "2\n").unwrap();
+        let t0 = Instant::now();
+        assert_eq!(snapshot(&dir, Duration::from_secs(1)), None);
+        assert!(t0.elapsed() < Duration::from_secs(4));
+        let left: Vec<String> = std::fs::read_dir(dir.join(".git"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("borg") || n.ends_with(".lock"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

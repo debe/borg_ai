@@ -26,7 +26,6 @@
 //! credited to lessons: an integration is no verdict on any one attempt.
 
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::board::{Board, Ev, Event, Role, Status, Task, TaskState};
@@ -62,14 +61,14 @@ pub struct Merged {
 }
 
 /// `git -C repo args` with `env`, within `GIT_TIMEOUT` and before `deadline`, no hook run (`update-ref`
-/// runs `reference-transaction`): (exit code, stdout).
+/// runs `reference-transaction`; git.rs): (exit code, stdout).
 fn git(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<(i32, String), String> {
     let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
     if left.is_zero() {
         return Err("the merge ran out of time".into());
     }
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(repo).args(["-c", "core.hooksPath=/dev/null"]).args(args).env("GIT_TERMINAL_PROMPT", "0").envs(env.iter().copied());
+    let mut cmd = super::git::command(repo);
+    cmd.args(args).envs(env.iter().copied());
     match runner::run_capped_status(cmd, None, left) {
         Some((s, out)) => Ok((s.code().unwrap_or(-1), String::from_utf8_lossy(&out).into_owned())),
         None => Err(format!("git {} did not finish", args.first().unwrap_or(&""))),
@@ -291,19 +290,9 @@ impl Integrator<'_> {
             return self.rejected(repo, &m.head, &note, &format!("conflict in {}", paths.join(", ")), &tasks, checks);
         }
         let probe = Task { accept: checks.clone(), ..board_task(self.id) };
-        let beat = Duration::from_millis(super::HEARTBEAT_MS.max(1) as u64);
-        let ran = std::thread::scope(|s| {
-            let (tx, rx) = mpsc::channel::<()>();
-            let (path, id, session) = (self.path, self.id, self.session);
-            // The checks run for minutes: the lease is renewed until they return.
-            s.spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(beat) {
-                    let _ = board::append(path, &[Event::new(Ev::Heartbeat, id, session, learn::now_ms())]);
-                }
-            });
-            let ran = hidden::with_checkout(&super::dir(self.home, &self.g.id).join(DIR), repo, &m.head, self.id, |wt| oracle::run(self.g, &probe, wt, None));
-            drop(tx);
-            ran
+        // The checks run for minutes: the lease is renewed until they return.
+        let ran = super::renewing(self.path, self.id, self.session, super::HEARTBEAT, || {
+            hidden::with_checkout(&super::dir(self.home, &self.g.id).join(DIR), repo, &m.head, self.id, |wt| oracle::run(self.g, &probe, wt, None))
         });
         let v = match ran {
             Ok(v) => v,

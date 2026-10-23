@@ -267,6 +267,18 @@ fn a_verdict_on_work_that_only_adds_tests_verifies() {
 }
 
 #[test]
+fn a_verdict_given_from_a_subdirectory_reads_the_whole_diff() {
+    let root = setup("verdict-subdir");
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
+    work_done(&root, "g1", "tests/test_parse.py", |body| format!("{body}\ndef test_more():\n    assert parse('b') == 'b'\n"));
+    let src = work(&root).join("src");
+    let out = command(&root, &["hive", "verify", "--pass", "--session", "sb", "--dir", src.to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.contains("t1.v1 verified"), "an appended test read from src/ as from the top: {out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_clean_pass_given_at_the_stop_verifies_and_credits_at_once() {
     let root = setup("verdict-stop");
     ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);

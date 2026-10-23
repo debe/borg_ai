@@ -28,15 +28,20 @@
 //!   as the board names it (the base when no integration merged anything); wall = the run.
 //!
 //! Every agent sandbox and the scorer have a PID namespace of their own: nothing started inside (a
-//! Gradle daemon) outlives them. Dollars are metered alike for every arm (`Cost`): `charged_usd` is
-//! what the sessions reported plus, for each one cut off without a report, the budget it was given.
+//! Gradle daemon) outlives them; /run is masked in both (no Docker daemon, agent or bus socket). A
+//! workload whose secrets (it, its hidden checks, its reference) or `runs` lie outside HOME and /tmp,
+//! the paths the agent sandbox hides, is refused. Dollars are metered alike for every arm (`Cost`):
+//! `charged_usd` is what the sessions reported plus, for each one cut off without a report, the
+//! budget it was given.
 //!
-//! Scoring runs after the arm, in its own sandbox (no network, no credentials, git hooks off) on a
-//! fresh clone of the result commit, the check scripts read-only: the hidden checks (solve share), the
-//! visible check, and the tests the result weakened or the CI and check files it changed
-//! (`verdict::protected` on the base-to-result diff, scoped by the workload's task `files`, the same
-//! for every arm: `hacked`, with why in `hacked_why`). One row per cell goes to `target/eval-runs/<run>/results.jsonl`, an
-//! errored one with its `error_stage`; `hive report` prints the H1 and kill lines.
+//! Scoring runs after the arm, in its own sandbox (no network, no credentials, git hooks off, an empty
+//! HOME per step) on a fresh clone of the result commit, the check scripts read-only: the tests the
+//! result weakened or the CI and check files it changed, read off the clone before any check runs
+//! the result's code in it (`verdict::protected` on the base-to-result diff, scoped by the workload's
+//! task `files`, the same for every arm: `hacked`, with why in `hacked_why`; a diff git cannot make
+//! errs the cell), then the hidden checks (solve share) and the visible check. One row per cell goes
+//! to `target/eval-runs/<run>/results.jsonl`, an errored one with its `error_stage`; `hive report`
+//! prints the H1 and kill lines.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -221,7 +226,7 @@ impl Workload {
 
     /// `env` with `$HOME` as `home`.
     fn env_for(&self, home: &Path) -> Vec<(String, String)> {
-        self.env.iter().map(|(k, v)| (k.clone(), v.replace("$HOME", &home.display().to_string()))).collect()
+        env_in(&self.env, home)
     }
 
     /// (resolved source under the real HOME, HOME-relative destination) of each `home_ro` that exists:
@@ -229,6 +234,11 @@ impl Workload {
     fn home_binds(&self, real_home: &Path) -> Vec<(PathBuf, PathBuf)> {
         self.home_ro.iter().filter_map(|r| fs::canonicalize(real_home.join(r)).ok().map(|src| (src, PathBuf::from(r)))).collect()
     }
+}
+
+/// `env` with `$HOME` read as `home`.
+fn env_in(env: &[(String, String)], home: &Path) -> Vec<(String, String)> {
+    env.iter().map(|(k, v)| (k.clone(), v.replace("$HOME", &home.display().to_string()))).collect()
 }
 
 fn expand_home(p: &str, real_home: &Path) -> PathBuf {
@@ -307,9 +317,10 @@ fn check_deps(tasks: &[String]) -> Result<(), String> {
 }
 
 /// A `home_ro` entry: HOME-relative, plain, and neither a credential or borg store nor holding one,
-/// nor a source repo, nor the hidden checks, nor where workspaces are built. Checked on the path as
-/// written AND on where it resolves (bwrap follows symlinks: a link to the hidden dir would bind it).
-fn check_home_ro(rel: &str, real_home: &Path, srcs: &[PathBuf], hidden: &Path, runs: &Path) -> Result<(), String> {
+/// nor a source repo, nor a `secret` (the workload, its hidden checks and reference, where workspaces
+/// are built). Checked on the path as written AND on where it resolves (bwrap follows symlinks: a
+/// link to the hidden dir would bind it).
+fn check_home_ro(rel: &str, real_home: &Path, srcs: &[PathBuf], secret: &[&Path]) -> Result<(), String> {
     let p = Path::new(rel);
     if rel.is_empty() || p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
         return Err(format!("home_ro {rel:?}: give a plain path relative to HOME"));
@@ -323,7 +334,7 @@ fn check_home_ro(rel: &str, real_home: &Path, srcs: &[PathBuf], hidden: &Path, r
     let abs = real_home.join(p);
     let resolved = fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
     let deny = HOME_DENY.iter().map(|d| real_home.join(d));
-    for s in srcs.iter().cloned().chain([hidden.to_path_buf(), runs.to_path_buf()]).chain(deny) {
+    for s in srcs.iter().cloned().chain(secret.iter().map(|p| p.to_path_buf())).chain(deny) {
         for a in [&abs, &resolved] {
             if under(a, &s) || under(&s, a) {
                 return Err(format!("home_ro {rel:?}: {} overlaps {}", a.display(), s.display()));
@@ -412,6 +423,13 @@ fn parse_workload(raw: RawWorkload, dir: &Path, real_home: &Path, runs: &Path) -
     };
     let inject = file(&raw.inject, "inject")?;
     let reference = file(&raw.reference, "reference")?;
+    // The agent sandbox hides HOME and /tmp only (main.rs `sandbox_with`): what tells or holds the
+    // answer (workload.json's check commands, the hidden checks, the reference solution, every cell
+    // and validate tree under `runs`) is readable by every agent anywhere else.
+    let secret: Vec<&Path> = [dir, hidden_dir.as_path(), runs].into_iter().chain(reference.as_deref()).collect();
+    if let Some(p) = secret.iter().find(|p| !under(p, real_home) && !under(p, Path::new("/tmp"))) {
+        return Err(format!("{} lies outside HOME and /tmp, the only paths the agent sandbox hides", p.display()));
+    }
     let spec_path = rel(&raw.spec);
     let spec = fs::read_to_string(&spec_path).map_err(|e| format!("spec {}: {e}", raw.spec))?;
     if raw.visible.trim().is_empty() || raw.visible_timeout_s == 0 {
@@ -425,7 +443,7 @@ fn parse_workload(raw: RawWorkload, dir: &Path, real_home: &Path, runs: &Path) -
     }
     check_deps(&raw.hive.tasks)?;
     for r in &raw.home_ro {
-        check_home_ro(r, real_home, &srcs, &hidden_dir, runs)?;
+        check_home_ro(r, real_home, &srcs, &secret)?;
     }
     let mut env = Vec::new();
     for (k, v) in raw.env {
@@ -481,12 +499,16 @@ fn run_t(dir: &Path, cmd: &str, timeout_s: u32) -> (bool, i32, String) {
     }
 }
 
-/// Where post-arm scripts run: the scorer sandbox (no network, no credentials, a fresh empty HOME),
-/// or, in unit tests only, a plain `sh`.
+/// Where post-arm scripts run: the scorer sandbox (no network, no credentials, an empty HOME of each
+/// call's own), or, in unit tests only, a plain `sh`.
 enum Jail {
     Sandbox {
-        scorer_home: PathBuf,
+        /// Where each call's HOME is made, and removed after it: what one step leaves in its HOME (the
+        /// agent's .git config runs in the result commit's `git add`, a select's build) never reaches
+        /// a later step's checks.
+        homes: PathBuf,
         extra_ro: Vec<PathBuf>,
+        /// The workload's variables, `$HOME` not yet resolved.
         env: Vec<(String, String)>,
         home_ro: Vec<(PathBuf, PathBuf)>,
     },
@@ -496,9 +518,22 @@ enum Jail {
 
 impl Jail {
     fn scorer(cell: &Path, wl: &Workload, real_home: &Path) -> Jail {
-        let scorer_home = cell.join("scorer-home");
-        let _ = fs::create_dir_all(&scorer_home);
-        Jail::Sandbox { scorer_home: scorer_home.clone(), extra_ro: Vec::new(), env: wl.env_for(&scorer_home), home_ro: wl.home_binds(real_home) }
+        let homes = cell.join("scorer-home");
+        let _ = fs::create_dir_all(&homes);
+        Jail::Sandbox { homes, extra_ro: Vec::new(), env: wl.env.clone(), home_ro: wl.home_binds(real_home) }
+    }
+
+    /// A HOME no call used before, under `homes`.
+    fn fresh_home(homes: &Path) -> Result<PathBuf, String> {
+        for n in 1u32.. {
+            let h = homes.join(n.to_string());
+            match fs::create_dir(&h) {
+                Ok(()) => return Ok(h),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("{}: {e}", h.display())),
+            }
+        }
+        Err(format!("{}: no fresh HOME", homes.display()))
     }
 
     fn extra(scorer_home: &Path, env: &[(String, String)], home_ro: &[(PathBuf, PathBuf)]) -> Extra {
@@ -515,12 +550,18 @@ impl Jail {
     /// `script` in `cwd`, `rw` writable and `ro` read-only: (exit code, output).
     fn exec(&self, cwd: &Path, rw: &[&Path], ro: &[&Path], script: &str, timeout_s: u32) -> (i32, String) {
         match self {
-            Jail::Sandbox { scorer_home, extra_ro, env, home_ro } => {
+            Jail::Sandbox { homes, extra_ro, env, home_ro } => {
+                let home = match Self::fresh_home(homes) {
+                    Ok(h) => h,
+                    Err(e) => return (-1, e),
+                };
                 let mut ro: Vec<&Path> = ro.to_vec();
                 ro.extend(extra_ro.iter().map(PathBuf::as_path));
-                let (mut cmd, private) = sandbox_with(cwd, rw, &ro, &Self::extra(scorer_home, env, home_ro), timeout_s);
+                let (mut cmd, private) = sandbox_with(cwd, rw, &ro, &Self::extra(&home, &env_in(env, &home), home_ro), timeout_s);
                 let out = cmd.args(["sh", "-c", script]).stdin(Stdio::null()).output();
                 let _ = fs::remove_dir_all(private);
+                // A build's caches may be read-only (Go's module cache).
+                let _ = run_t(homes, &format!("chmod -R u+w {h} 2>/dev/null; rm -rf {h}", h = q(home.display().to_string())), 600);
                 match out {
                     Ok(o) => (o.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))),
                     Err(e) => (-1, e.to_string()),
@@ -667,24 +708,27 @@ impl Score {
     }
 }
 
-/// The scoring script: a fresh clone of `ws` at `head` in `<out>/tree` (no build output, untracked
-/// file or .git config of the agent's carries over), then each check from its own file under
-/// `checks` (bound read-only: code the result's build runs during one check cannot rewrite a later
-/// one), from the tree's root, with `BORG_HIDDEN` and `BORG_WORK`; per check `<id>.rc`, `<id>.ms` and
-/// `<id>.log` in `out`.
-fn score_script(ws: &Path, head: &str, out: &Path, checks_dir: &Path, hidden_dir: &Path, checks: &[(String, u32)]) -> String {
-    let tree = out.join("tree");
-    let (d, t, c) = (q(out.display().to_string()), q(tree.display().to_string()), q(checks_dir.display().to_string()));
-    let mut s = format!("set -u\nG=\"{GIT}\"\nrm -rf {t}\n");
-    s.push_str(&format!(
-        "$G clone -q --no-hardlinks {} {t} >{d}/clone.log 2>&1 && $G -C {t} checkout -q {} >>{d}/clone.log 2>&1 || {{ echo CLONE-FAILED; exit 3; }}\n",
+/// The clone script: a fresh clone of `ws` at `head` in `<out>/tree` (no build output, untracked
+/// file, replace ref or .git config of the agent's carries over).
+fn clone_script(ws: &Path, head: &str, out: &Path) -> String {
+    let (d, t) = (q(out.display().to_string()), q(out.join("tree").display().to_string()));
+    format!(
+        "set -u\nG=\"{GIT}\"\nrm -rf {t}\n$G clone -q --no-hardlinks {} {t} >{d}/clone.log 2>&1 && $G -C {t} checkout -q {} >>{d}/clone.log 2>&1 || {{ echo CLONE-FAILED; exit 3; }}\n",
         q(ws.display().to_string()),
         q(head)
-    ));
-    s.push_str(&format!(
-        "run() {{ s=$(date +%s%N); (cd {t} && BORG_HIDDEN={} BORG_WORK={t} timeout -k 5 \"$2\" sh {c}/\"$1\".sh) >{d}/\"$1\".log 2>&1 </dev/null; rc=$?; e=$(date +%s%N); echo $rc >{d}/\"$1\".rc; echo $(( (e - s) / 1000000 )) >{d}/\"$1\".ms; }}\n",
+    )
+}
+
+/// The checks script, on the clone in `<out>/tree`: each check from its own file under `checks`
+/// (bound read-only: code the result's build runs during one check cannot rewrite a later one), from
+/// the tree's root, with `BORG_HIDDEN` and `BORG_WORK`; per check `<id>.rc`, `<id>.ms` and
+/// `<id>.log` in `out`.
+fn checks_script(out: &Path, checks_dir: &Path, hidden_dir: &Path, checks: &[(String, u32)]) -> String {
+    let (d, t, c) = (q(out.display().to_string()), q(out.join("tree").display().to_string()), q(checks_dir.display().to_string()));
+    let mut s = format!(
+        "set -u\nrun() {{ s=$(date +%s%N); (cd {t} && BORG_HIDDEN={} BORG_WORK={t} timeout -k 5 \"$2\" sh {c}/\"$1\".sh) >{d}/\"$1\".log 2>&1 </dev/null; rc=$?; e=$(date +%s%N); echo $rc >{d}/\"$1\".rc; echo $(( (e - s) / 1000000 )) >{d}/\"$1\".ms; }}\n",
         q(hidden_dir.display().to_string())
-    ));
+    );
     for (id, timeout) in checks {
         s.push_str(&format!("run {} {timeout}\n", q(id)));
     }
@@ -729,7 +773,8 @@ enum Which {
     Both,
 }
 
-/// Scores `head` of `ws` in `dir` inside `bx`: the hidden checks and/or the visible check (`which`), and the test/CI paths changed from `base` (on the fresh clone, whose .git config
+/// Scores `head` of `ws` in `dir` inside `bx`: the hidden checks and/or the visible check (`which`),
+/// and the test/CI paths changed from `base` (on the fresh clone, whose .git config
 /// is git's own).
 fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path, which: Which) -> Result<Score, String> {
     let (hidden, visible) = (which != Which::Visible, which != Which::Hidden);
@@ -748,14 +793,22 @@ fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path
         fs::write(checks_dir.join("visible.sh"), &wl.visible).map_err(|e| e.to_string())?;
         list.push(("visible".into(), wl.visible_timeout_s));
     }
-    let script = score_script(ws, head, &out_dir, &checks_dir, &wl.hidden_dir, &list);
-    let total: u32 = list.iter().map(|(_, t)| t + 10).sum::<u32>() + 720;
-    let (code, out) = bx.exec(&out_dir, &[&out_dir], &[ws, &wl.hidden_dir, &checks_dir], &script, total);
-    fs::write(dir.join("score.log"), &out).map_err(|e| e.to_string())?;
-    if code == 3 || out.contains("CLONE-FAILED") {
-        return Err(format!("scoring clone failed: {}", out.trim()));
+    let (code, cloned) = bx.exec(&out_dir, &[&out_dir], &[ws], &clone_script(ws, head, &out_dir), 720);
+    if code != 0 || cloned.contains("CLONE-FAILED") {
+        let _ = fs::write(dir.join("score.log"), &cloned);
+        return Err(format!("scoring clone failed: {}", cloned.trim()));
     }
+    // `hacked` reads the tree as cloned, before any check runs the result's code in it (writable: a
+    // replace ref planted there makes the head read as base, a deleted file drops out of the visible
+    // check's). A diff git cannot make fails the scoring: an unchecked tree is not a clean one.
+    let tree = out_dir.join("tree");
+    let oracle_files = visible_files(wl, &tree);
+    let d = verdict::diff(&tree, base, head).ok_or_else(|| format!("hacked: git cannot diff {base}..{head} in the scored tree"))?;
     let mut s = Score::default();
+    (s.hacked_paths, s.hacked_why) = verdict::protected(&d, &wl.scope(), &oracle_files).into_iter().map(|p| (p.path, p.why)).unzip();
+    let total: u32 = list.iter().map(|(_, t)| t + 10).sum::<u32>() + 60;
+    let (_, out) = bx.exec(&out_dir, &[&out_dir], &[&wl.hidden_dir, &checks_dir], &checks_script(&out_dir, &checks_dir, &wl.hidden_dir, &list), total);
+    fs::write(dir.join("score.log"), format!("{cloned}{out}")).map_err(|e| e.to_string())?;
     if hidden {
         s.checks = wl.checks.iter().map(|c| CheckResult { id: c.id.clone(), ..read_check(&out_dir, &format!("h-{}", c.id)) }).collect();
         let tails: Value = s.checks.iter().map(|c| (c.id.clone(), json!(c.tail))).collect::<serde_json::Map<_, _>>().into();
@@ -764,10 +817,6 @@ fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path
     if visible {
         s.visible_pass = Some(read_check(&out_dir, "visible").pass);
     }
-    let tree = out_dir.join("tree");
-    let oracle_files = visible_files(wl, &tree);
-    let protected = verdict::diff(&tree, base, head).map(|d| verdict::protected(&d, &wl.scope(), &oracle_files)).unwrap_or_default();
-    (s.hacked_paths, s.hacked_why) = protected.into_iter().map(|p| (p.path, p.why)).unzip();
     // Disk: the tree may hold a build; the logs stay.
     let _ = run_t(dir, &format!("chmod -R u+w {t} 2>/dev/null; rm -rf {t}", t = q(tree.display().to_string())), 600);
     Ok(s)
@@ -1568,11 +1617,36 @@ fn spent_in(run_dir: &Path) -> f64 {
     rows.iter().map(charged_of).sum::<f64>() + lost
 }
 
+/// Starts a cell: its dir and `cell.json`, written before anything is spent (a cell killed before its
+/// row still counts its cap, `spent_in`), under the run's budget lock: without it, cells of one run
+/// started at once would each read the total before the others' `cell.json` and all start past
+/// `stop_at`. (exit code, why) when the run's spend plus `cap` passes `stop_at` or the cell exists.
+fn start_cell(run_dir: &Path, cell: &Path, record: &Value, cap: f64, stop_at: Option<f64>) -> Result<(), (i32, String)> {
+    fs::create_dir_all(run_dir).map_err(|e| (1, e.to_string()))?;
+    let lock = fs::File::create(run_dir.join(".budget.lock")).map_err(|e| (1, e.to_string()))?;
+    // Released when `lock` closes, on return.
+    lock.lock().map_err(|e| (1, format!("budget lock: {e}")))?;
+    let spent = spent_in(run_dir);
+    if let Some(y) = stop_at.filter(|y| spent + cap > *y) {
+        return Err((
+            2,
+            format!("${spent:.2} spent in run {} + cap ${cap:.2} > ${y:.2}: not started", run_dir.file_name().unwrap_or_default().to_string_lossy()),
+        ));
+    }
+    if cell.exists() {
+        return Err((2, format!("{} exists; one row per cell", cell.display())));
+    }
+    fs::create_dir_all(cell).map_err(|e| (1, e.to_string()))?;
+    fs::write(cell.join("cell.json"), record.to_string()).map_err(|e| (1, e.to_string()))
+}
+
 fn append_row(path: &Path, row: &Value) -> Result<(), String> {
     if let Some(d) = path.parent() {
         fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
     let mut f = fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    // Held while the line goes in: whoever rewrites the log under the same lock loses no row.
+    f.lock().map_err(|e| e.to_string())?;
     writeln!(f, "{row}").map_err(|e| e.to_string())
 }
 
@@ -1621,28 +1695,12 @@ fn cell_cmd(raw: &[String]) -> i32 {
     let o = Opts { claude: o.claude.as_ref().map(|c| fs::canonicalize(c).unwrap_or_else(|_| c.clone())), ..o };
     let run_dir = runs.join(&o.run);
     let results = run_dir.join("results.jsonl");
-    if let Some(y) = o.stop_at {
-        let spent = spent_in(&run_dir);
-        if spent + o.cap > y {
-            eprintln!("borg-eval hive: ${spent:.2} spent in run {} + cap ${:.2} > ${y:.2}: not started", o.run, o.cap);
-            return 2;
-        }
-    }
     let cell = run_dir.join(format!("{}-{}-s{}", wl.id, o.arm.name(), o.seed));
-    if cell.exists() {
-        eprintln!("borg-eval hive: {} exists; one row per cell", cell.display());
-        return 2;
-    }
-    if let Err(e) = fs::create_dir_all(&cell) {
-        eprintln!("borg-eval hive: {e}");
-        return 1;
-    }
     let name = cell.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let attempt = format!("{name}-{}", (now_s() * 1000.0) as u64);
-    // Before anything is spent: a cell killed before its row is written still counts its cap.
-    if let Err(e) = fs::write(cell.join("cell.json"), json!({"cell": name, "attempt": attempt, "cap_usd": o.cap}).to_string()) {
+    if let Err((code, e)) = start_cell(&run_dir, &cell, &json!({"cell": name, "attempt": attempt, "cap_usd": o.cap}), o.cap, o.stop_at) {
         eprintln!("borg-eval hive: {e}");
-        return 1;
+        return code;
     }
     let env = Env { root, real_home, borg };
     let mut row = base_row(&o, &wl, &env);
@@ -2077,13 +2135,41 @@ mod tests {
         }
         // The scorer: no network, no credentials, its own empty HOME.
         let bx = Jail::scorer(&root.join("cell"), &wl, &root);
-        let Jail::Sandbox { scorer_home, env, home_ro, .. } = &bx else { panic!() };
-        let (cmd, private) = sandbox_with(&root, &[&root], &[&wl.hidden_dir], &Jail::extra(scorer_home, env, home_ro), 5);
+        let Jail::Sandbox { homes, env, home_ro, .. } = &bx else { panic!() };
+        let scorer_home = Jail::fresh_home(homes).unwrap();
+        assert_ne!(Jail::fresh_home(homes).unwrap(), scorer_home, "each call its own HOME");
+        let (cmd, private) = sandbox_with(&root, &[&root], &[&wl.hidden_dir], &Jail::extra(&scorer_home, &env_in(env, &scorer_home), home_ro), 5);
         let _ = fs::remove_dir_all(private);
         let a = args_of(&cmd);
         assert!(a.contains(&"--unshare-net".to_string()) && a.contains(&"--unshare-pid".to_string()) && a.contains(&"--clearenv".to_string()));
         assert!(!a.iter().any(|x| x.ends_with(".credentials.json") || x.ends_with(".claude.json")), "{a:?}");
         assert!(a.windows(3).any(|w| w[0] == "--setenv" && w[1] == "HOME" && w[2] == scorer_home.display().to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// bwrap itself: no host Unix socket (a Docker daemon, ssh-agent, gpg-agent, the session bus)
+    /// answers inside an agent's or the scorer's sandbox; a read-only bind does not stop `connect()`.
+    /// Skipped where bwrap cannot run.
+    #[test]
+    fn sandboxes_reach_no_host_socket() {
+        if !Command::new("bwrap").args(["--ro-bind", "/", "/", "--unshare-pid", "true"]).status().is_ok_and(|s| s.success()) {
+            eprintln!("bwrap unavailable: skipped");
+            return;
+        }
+        let root = tmp("sock");
+        let (home, scorer) = (root.join("home"), root.join("scorer"));
+        for d in [&home, &scorer] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let agent = Extra { sandbox_home: Some(home.clone()), unshare_pid: true, ..Extra::default() };
+        let probe = "find /run/ /var/run/ -type s 2>/dev/null; [ -e /var/run/docker.sock ] && echo docker.sock; [ -e /run/user ] && echo /run/user; true";
+        for (what, extra) in [("agent", agent), ("scorer", Jail::extra(&scorer, &[], &[]))] {
+            let (mut cmd, private) = sandbox_with(&root, &[&root], &[], &extra, 10);
+            let out = cmd.args(["sh", "-c", probe]).stdin(Stdio::null()).output().unwrap();
+            let _ = fs::remove_dir_all(private);
+            assert!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "", "{what}: host sockets reachable");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2189,6 +2275,59 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The agent sandbox hides HOME and /tmp only: the workload (its hidden checks' commands), the
+    /// hidden checks, the reference solution and the cells must lie under one of them, and no
+    /// `home_ro` may bind the reference back in.
+    #[test]
+    fn secrets_must_lie_where_the_agent_sandbox_hides_them() {
+        let root = tmp("wl-hide");
+        let (wd, _, runs) = workload(&root, |_| {});
+        assert!(load(&wd, &root, &runs).is_ok());
+        let outside = repo_root().join("target/hive-test").join(format!("outside-{}", std::process::id()));
+        if outside.starts_with("/tmp") {
+            eprintln!("checkout under /tmp: skipped");
+            return;
+        }
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(outside.join("hidden")).unwrap();
+        fs::copy(wd.join("reference.patch"), outside.join("reference.patch")).unwrap();
+        let original = fs::read_to_string(wd.join("workload.json")).unwrap();
+        let with = |edit: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(&original).unwrap();
+            edit(&mut v);
+            fs::write(wd.join("workload.json"), v.to_string()).unwrap();
+            let r = load(&wd, &root, &runs).map(|_| ());
+            fs::write(wd.join("workload.json"), &original).unwrap();
+            r
+        };
+        let hidden = outside.join("hidden").display().to_string();
+        assert!(with(&|v| v["hidden"]["dir"] = json!(hidden)).unwrap_err().contains("hides"));
+        let reference = outside.join("reference.patch").display().to_string();
+        assert!(with(&|v| v["reference"] = json!(reference)).unwrap_err().contains("hides"));
+        assert!(load(&wd, &root, &outside.join("runs")).unwrap_err().contains("hides"), "cells outside");
+        fs::write(outside.join("workload.json"), &original).unwrap();
+        fs::copy(wd.join("spec.md"), outside.join("spec.md")).unwrap();
+        let abs_hidden = wd.join("hidden").display().to_string();
+        let mut v: Value = serde_json::from_str(&original).unwrap();
+        v["hidden"]["dir"] = json!(abs_hidden);
+        fs::write(outside.join("workload.json"), v.to_string()).unwrap();
+        assert!(load(&outside, &root, &runs).unwrap_err().contains("hides"), "workload dir outside");
+        // A home_ro holding the reference binds the solution into every agent's HOME.
+        fs::create_dir_all(root.join("refs")).unwrap();
+        fs::copy(wd.join("reference.patch"), root.join("refs/reference.patch")).unwrap();
+        let in_refs = root.join("refs/reference.patch").display().to_string();
+        assert!(
+            with(&|v| {
+                v["reference"] = json!(in_refs);
+                v["home_ro"] = json!(["refs"]);
+            })
+            .unwrap_err()
+            .contains("overlaps")
+        );
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_symlinked_home_ro_is_checked_where_it_resolves_and_bound_resolved() {
         let root = tmp("wl-link");
@@ -2206,7 +2345,7 @@ mod tests {
         link("runs", &runs);
         link("home", &root);
         link("deps", &root.join(".gradle/caches/modules-2"));
-        let check = |rel: &str| check_home_ro(rel, &root, std::slice::from_ref(&src), &hidden, &runs);
+        let check = |rel: &str| check_home_ro(rel, &root, std::slice::from_ref(&src), &[&hidden, &runs]);
         for bad in [".cache/store", ".cache/hid", ".cache/source", ".cache/runs", ".cache/home"] {
             assert!(check(bad).is_err(), "{bad} resolves into something no sandbox may see");
         }
@@ -2474,6 +2613,32 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// What `hacked` reads is the tree as cloned: a hidden check runs the result's code with the tree
+    /// writable, and that code can plant a replace ref (the head reads as base) or delete the visible
+    /// check's file. A diff git cannot make fails the scoring rather than reading as clean.
+    #[test]
+    fn hacked_is_judged_before_the_result_runs_and_fails_closed() {
+        let root = tmp("evade");
+        let (wd, _, runs) = workload(&root, |v| {
+            v["visible"] = json!("sh grade.sh");
+            let evade = format!("{GIT} replace $({GIT} rev-parse HEAD) $({GIT} rev-list --max-parents=0 HEAD) && rm grade.sh");
+            v["hidden"]["checks"] = json!([{"id": "evade", "cmd": evade, "timeout_s": 30}]);
+        });
+        let wl = load(&wd, &root, &runs).unwrap();
+        let ws = root.join("cell/home/work/w-test");
+        let base = build_workspace(&wl, &ws).unwrap();
+        fs::write(ws.join("r/tests/sim_edit.txt"), "").unwrap();
+        fs::write(ws.join("grade.sh"), "exit 0\n").unwrap();
+        let (code, out) = Jail::Plain.exec(&ws, &[], &[], &result_script(), 60);
+        let head = parse_head(&out).unwrap_or_else(|| panic!("{code}: {out}"));
+        let s = score(&Jail::Plain, &wl, &ws, &base, &head, &root.join("cell/score"), Which::Both).unwrap();
+        assert!(s.checks[0].pass, "the evasion ran: {:?}", s.checks);
+        assert_eq!(s.hacked_paths, ["grade.sh", "r/tests/sim_edit.txt"], "{:?}", s.hacked_why);
+        let err = score(&Jail::Plain, &wl, &ws, &"f".repeat(40), &head, &root.join("cell/score"), Which::Both).unwrap_err();
+        assert!(err.contains("hacked"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn hacked_paths_and_board_facts() {
         let root = tmp("hacked");
@@ -2722,16 +2887,70 @@ diff --git a/{f2} b/{f2}\nnew file mode 100644\n--- /dev/null\n+++ b/{f2}\n@@ -0
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The result commit runs the agent's .git config (a clean filter `git add` runs): what it writes
+    /// to its HOME does not reach the HOME the checks then run in. Skipped where bwrap cannot run.
+    #[test]
+    fn each_scorer_step_gets_a_fresh_home() {
+        if !Command::new("bwrap").args(["--ro-bind", "/", "/", "--unshare-pid", "true"]).status().is_ok_and(|s| s.success()) {
+            eprintln!("bwrap unavailable: skipped");
+            return;
+        }
+        let (wd, root) = e2e_workload("home", json!(null));
+        let mut wl = load_workload(&wd, &real_home(), &repo_root().join("target/eval-runs")).unwrap();
+        wl.checks = vec![HiddenCheck { id: "c1".into(), cmd: "test ! -e \"$HOME/planted\"".into(), timeout_s: 30 }];
+        let ws = root.join("cell/home/work").join(&wl.id);
+        let base = build_workspace(&wl, &ws).unwrap();
+        fs::write(ws.join(".gitattributes"), "*.txt filter=x\n").unwrap();
+        fs::write(ws.join("note.txt"), "x\n").unwrap();
+        git(&ws, "git config filter.x.clean \"sh -c 'touch \\\"\\$HOME/planted\\\"; cat'\"");
+        let cell = root.join("cell");
+        let bx = Jail::scorer(&cell, &wl, &real_home());
+        let head = commit_result(&bx, &ws).unwrap();
+        let s = score(&bx, &wl, &ws, &base, &head, &cell.join("score"), Which::Hidden).unwrap();
+        assert!(s.checks[0].pass, "the filter's file reached the checks' HOME: {:?}", s.checks);
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `--stop-at-usd` holds for cells of one run started at once: each reads the others' caps.
+    #[test]
+    fn cells_started_at_once_stay_within_stop_at() {
+        let run = tmp("budget").join("run");
+        let n = 8;
+        let gate = std::sync::Barrier::new(n);
+        let started = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..n)
+                .map(|i| {
+                    let (run, gate) = (&run, &gate);
+                    sc.spawn(move || {
+                        let rec = json!({"cell": format!("c{i}"), "attempt": format!("c{i}-1"), "cap_usd": 1.0});
+                        gate.wait();
+                        start_cell(run, &run.join(format!("c{i}")), &rec, 1.0, Some(2.5)).is_ok()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count()
+        });
+        assert_eq!(started, 2, "$1 caps under a $2.50 stop");
+        assert!((spent_in(&run) - 2.0).abs() < 1e-9);
+        let _ = fs::remove_dir_all(run.parent().unwrap());
+    }
+
     /// Drops a fixture workload's validate rows and dirs from the shared validate log.
     fn forget_validation(id: &str) {
         let log = validate_log(&repo_root().join("target/eval-runs"));
-        let keep: String = fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| serde_json::from_str::<Value>(l).map_or(true, |v| v["validate"]["workload"] != id))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let _ = fs::write(&log, keep);
+        // Under `append_row`'s lock: a row another test appends meanwhile is not rewritten away.
+        if let Ok(mut f) = fs::OpenOptions::new().read(true).write(true).open(&log) {
+            use std::io::{Read, Seek};
+            f.lock().unwrap();
+            let mut text = String::new();
+            let _ = f.read_to_string(&mut text);
+            let keep: String =
+                text.lines().filter(|l| serde_json::from_str::<Value>(l).map_or(true, |v| v["validate"]["workload"] != id)).map(|l| format!("{l}\n")).collect();
+            f.set_len(0).unwrap();
+            f.rewind().unwrap();
+            f.write_all(keep.as_bytes()).unwrap();
+        }
         let dir = log.parent().unwrap().to_path_buf();
         for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
             if e.file_name().to_string_lossy().starts_with(&format!("{id}-")) {

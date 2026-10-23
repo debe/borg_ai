@@ -60,7 +60,7 @@ pub const REGRET: f64 = 1.0;
 /// What one hive verdict adds to a lesson's belief (design-chosen, to be tuned by hive-learning.md
 /// step 6, like the veto's 3): a verified task adds one to α, like a change; a rejected one one to β,
 /// like an ignore (the verifier can be wrong); a hacked one three to β, as heavy as a veto and not
-/// above it: the hack test is a path heuristic that can be wrong, a veto is an engineer.
+/// above it: the hack test is a heuristic over a diff's lines that can be wrong, a veto is an engineer.
 pub const VERIFIED_W: u32 = 1;
 pub const REJECTED_W: u32 = 1;
 pub const HACKED_W: u32 = 3;
@@ -69,7 +69,10 @@ pub const CONSOLIDATE_SESSIONS: usize = 3;
 pub const DORMANT_BELOW: f64 = -2.0;
 
 /// The collective's activity clock: its sessions in the order they first appear in the outcome log
-/// (by first ms, then id: independent of line order).
+/// (by first ms, then id: independent of line order). Only the kinds the team shares
+/// (outcome.rs `SHARED_KINDS`) tick it, so every node counts the same sessions from the same first
+/// ms: a session that only graded, or a hive verdict (about a task, never a session of the
+/// collective), never moves it.
 #[derive(Debug, Default)]
 pub struct Clock {
     first: Vec<(i64, String)>,
@@ -79,8 +82,7 @@ pub struct Clock {
 impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
-        // A hive verdict is about a task, never a session of the collective: it never moves the clock.
-        for o in outcomes.iter().filter(|o| !outcome::is_verdict(&o.kind)) {
+        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str())) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
         }

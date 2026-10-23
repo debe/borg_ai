@@ -218,15 +218,7 @@ pub fn record(home: &Path, ev: &Event) {
     if !crate::learn::learning() {
         return;
     }
-    let path = events_path(home);
-    let write = || -> std::io::Result<()> {
-        if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(f, "{}", serde_json::to_string(ev).unwrap_or_default())
-    };
-    let _ = write();
+    let _ = crate::learn::append_jsonl(&events_path(home), ev);
 }
 
 /// Records one event in the store `home` now; `fill` adds the details. The engineer defaults to the
@@ -561,16 +553,19 @@ pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
     out
 }
 
-/// The latest version of every bucket in `stats.jsonl` (every node's, after the mesh merged them).
+/// The latest version of every bucket in `stats.jsonl` (every node's, after the mesh merged them). Two
+/// lines of one version (two rollups at once) are ranked as borg-mesh lines.rs `settle` ranks them, by
+/// the line's blake3 hash, so every node shows the same one whatever order the lines arrived in.
 pub fn rollups(home: &Path) -> BTreeMap<String, Bucket> {
-    let mut out: BTreeMap<String, Bucket> = BTreeMap::new();
+    let mut out: BTreeMap<String, (Bucket, [u8; 32])> = BTreeMap::new();
     for l in std::fs::read_to_string(rollups_path(home)).unwrap_or_default().lines() {
         let Ok(b) = serde_json::from_str::<Bucket>(l) else { continue };
-        if out.get(&b.id).is_none_or(|old| b.version > old.version) {
-            out.insert(b.id.clone(), b);
+        let h = *blake3::hash(l.as_bytes()).as_bytes();
+        if out.get(&b.id).is_none_or(|(old, oh)| (b.version, h) > (old.version, *oh)) {
+            out.insert(b.id.clone(), (b, h));
         }
     }
-    out
+    out.into_iter().map(|(id, (b, _))| (id, b)).collect()
 }
 
 /// Publishes this node's buckets whose counts changed since their last line in `stats.jsonl`, each
@@ -715,6 +710,24 @@ mod tests {
         assert_eq!(cur.len(), 2);
         let mine = cur.iter().find(|b| b.engineer == "a@x").unwrap();
         assert_eq!(mine.counts[TURN_END], 2, "own counts are folded fresh, not the stale rollup");
+    }
+
+    /// Two v+1 lines of one bucket (two rollups at once) reach peers in either order: every node shows
+    /// the same one, the one mesh `settle` makes last (higher hash).
+    #[test]
+    fn rollups_break_version_ties_by_hash_whatever_the_order() {
+        let bucket = |n: u64| {
+            let mut b = Bucket { id: "stat:n:a@x:1970-01-01".into(), version: 2, ..Default::default() };
+            b.counts.insert(TURN_END.into(), n);
+            serde_json::to_string(&b).unwrap()
+        };
+        let (a, b) = (bucket(1), bucket(2));
+        let shown = |name: &str, first: &str, second: &str| {
+            let home = tmp(name);
+            std::fs::write(rollups_path(&home), format!("{first}\n{second}\n")).unwrap();
+            rollups(&home).into_values().next().unwrap().counts[TURN_END]
+        };
+        assert_eq!(shown("ties-ab", &a, &b), shown("ties-ba", &b, &a));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use tower::ServiceExt;
 
 /// GET `uri` from the page's router: (status, JSON body).
 async fn get(app: Arc<App>, uri: &str) -> (StatusCode, Value) {
-    let res = router(app).oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+    let res = router(app).oneshot(Request::get(uri).header("host", "127.0.0.1:7979").body(Body::empty()).unwrap()).await.unwrap();
     let status = res.status();
     let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))

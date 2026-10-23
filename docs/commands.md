@@ -74,9 +74,9 @@ $ borg hive board
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
 | `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]` | Headless drones in worktrees, see [Running drones](#running-drones) |
 | `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again]` | An engineer opens a task; `--again` reopens a blocked one |
-| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it, exit 1 when another drone holds it (the message names the holder and tells the drone not to work on it). A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below); exit 1 when that work does not apply there |
+| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it, exit 1 when another drone holds it (the message names the holder and tells the drone not to work on it). A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below). When that work does not apply there, `claim TASK` exits 1, and `claim` alone skips the task and takes the next one; a skipped task is not offered to that session again. A board it cannot write exits 1 with the error, never as a lost race |
 | `borg hive progress "<note>"` · `release` · `block "<why>"` | Report on, give back or block the drone's claim |
-| `borg hive done [--note N]` | Run the task's checks with their own timeouts (no hook time limit); on a pass publish done and open its verify task |
+| `borg hive done [--note N]` | Run the task's checks with their own timeouts (no hook time limit), renewing the claim while they run; on a pass publish done and open its verify task. Exit 3 when the claim passed to another drone meanwhile: the board ignores that done, and the message names the holder |
 | `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the verifier's turn with the line `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note. The work's diff is checked first, see [Guardrails](#guardrails-and-the-hidden-oracle) |
 | `borg hive score <goal>` | The goal's hidden oracle scores every judged task not scored yet (`borg hive run` does this when its drones end). The engineer's: refused to a drone of a hive goal. Exit 1 when an attempt could not be checked out (run it from the goal's repo) |
 | `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts and run the goal's oracle and every task's checks on the combined tree, as `borg hive run` does itself (see [Running drones](#running-drones)). Exit 0 when it passed (the goal is finished), 1 when it was rejected (a fix task is open) or blocked, 2 when no integration is due. Needs git 2.40+. The engineer's: refused to a drone of a hive goal |
@@ -113,7 +113,8 @@ it), the board's changes since its last prompt and the contracts in its claim's 
 once. After an edit it sees contracts the edit lands in, and files outside its claim's scope (advice,
 never a refusal). At the stop the task's checks run: while they fail the stop blocks, at most 3 times per
 claim, then the task is published blocked. When they pass, done is published, a verify task opens (its
-author may not claim it), and the drone is handed the next open task. A suite slower than the stop hook
+author may not claim it), and the drone is handed the next open task; a done the board did not take (the
+claim passed to another drone meanwhile) is reported instead, and nothing is handed over. A suite slower than the stop hook
 (Claude Code 90 s, omp 30 s) needs `borg hive done`. A harness without prompt context gets this text at
 the stop. A paused drone is never blocked by its oracle.
 
@@ -140,7 +141,9 @@ useless (docs/design/hive-learning.md, step 8):
     `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`, `Jenkinsfile`, `azure-pipelines.yml`);
   - outside them, adds or changes a test runner's config (`conftest.py`, `pytest.ini`, `tox.ini`,
     `jest.config.*`, `vitest.config.*`, `.mocharc*`, `spec_helper.rb`, ...: it changes how the existing
-    tests run; `pyproject.toml` and `package.json` are not counted);
+    tests run), or the test runner's part of `pyproject.toml` (`[tool.pytest*]`, `[tool.coverage*]`,
+    `[tool.tox*]`), `setup.cfg` (`[tool:pytest]`, `[pytest]`, `[coverage:*]`) or `package.json` (`jest`,
+    `mocha`, `vitest`, `ava`, `nyc`, `c8`, the `test` scripts); their other parts are not counted;
   - outside them, deletes or renames a test (a file under `test/`, `tests/`, `spec/`, `specs/`,
     `__tests__/`, or named `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`, `*_spec.rb`), or weakens one: a
     removed line that no added line of the same hunk matches in shape (its tokens, with names, strings
@@ -148,8 +151,13 @@ useless (docs/design/hive-learning.md, step 8):
     making two different names one (`assert got == want` turned `assert got == got`), fewer test
     declarations than before (`#[test]` turned `#[inline]`, `@Test` turned `@Deprecated`, `def test_x(`
     renamed `def x(`), an added skip, disable or focus marker (`@Disabled`, `@pytest.mark.skip`,
-    `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, a bare `return`), or any binary change. Blank and comment lines do not count. A test
-    whose content diff git cannot give counts as weakened;
+    `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, a bare `return`, an `if False:` or `if (false) {`), or
+    any binary change. Blank and comment lines do not count. Added lines are judged too: a kept line
+    moved to another indentation (an assertion put under a new block), a hunk that opens or closes a
+    block comment or triple-quoted string around lines it leaves as they are, and, in a Python test,
+    a name bound again in the same scope (a second `def test_parse`, `parse = lambda s: s`, `from q
+    import parse`: the earlier one no longer runs) each weaken the test. A test whose content diff git
+    cannot give counts as weakened;
 
   or when the drone opened the hidden oracle's files. The work reopens with each path to restore and
   why (`tests/test_parse.py (line 4 removed or reshaped: assert parse('a') == 'a')`). Appended test
@@ -224,8 +232,8 @@ and runs headless sessions of the harness one after another, launched with
 and gate its stop on the oracle. Claude Code runs as `claude -p --permission-mode bypassPermissions`
 with your settings (so borg's hooks run) and `--max-budget-usd` set to the drone's dollars left, so it
 stops itself; codex, omp and opencode 1.x get no budget and are checked between sessions, so they can
-overshoot by one session; a session cut off at `--iter-timeout` without naming its cost is charged the
-drone's dearest session so far (or the rest of its share). Drones run with every permission inside their worktree: run it on a repo you
+overshoot by one session; a session cut off at `--iter-timeout`, or one that failed, without naming its
+cost is charged the drone's dearest session so far (or the rest of its share). Drones run with every permission inside their worktree: run it on a repo you
 are willing to let them change. Every session is cut off at `--iter-timeout` (default 1800 s).
 
 A drone stops when the board is finished (every task verified and integrated), its share is spent, a session ended
@@ -238,7 +246,10 @@ is finished, 1 when it is not, 2 when a precondition fails: an unknown goal, `--
 goal without a budget, a repo outside the goal's, a harness that cannot run headless, or another run of
 the goal still going (one at a time).
 
-A re-run shares what `spend.jsonl` says is left, whatever the drone count. `borg top` and the web page's Hive tab show
+A re-run shares what `spend.jsonl` says is left, whatever the drone count. A run killed mid-session
+(Ctrl-C, a closed terminal) takes its sessions with it; the next run of the goal charges each of them
+as a cut-off one (`exit: "killed"`) and releases their claims before it starts. Superseding a contract
+of your own drone (any of its sessions) needs no answer through `borg queen`. `borg top` and the web page's Hive tab show
 each goal's board, its spend per drone and its newest contracts.
 
 Not yet: mesh sync of hive lines, goal signatures, the queen approving a plan before `run`, multi-repo

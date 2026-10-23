@@ -10,7 +10,10 @@
 //! blocked, the claim still held); `hang`: once it holds a claim it sleeps past any iteration cap; `edit_tests`: it also
 //! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
 //! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
-//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait). A fix
+//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait);
+//! `own_session`: it ignores the runner's session id and names none at its end (omp and opencode keep
+//! their own); `crash`: once it holds a claim it exits 1 printing nothing (a harness that died after
+//! spending, without its cost). A fix
 //! task (`from`, hive/integrate.rs) is resolved by script: the conflict marker lines are dropped from its
 //! scoped files and from every other file holding them, both sides kept.
 
@@ -55,6 +58,10 @@ struct Plan {
     grow_tests: bool,
     #[serde(default)]
     work_s: u64,
+    #[serde(default)]
+    own_session: bool,
+    #[serde(default)]
+    crash: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -125,18 +132,19 @@ fn resolve_markers(dir: &Path, files: &[String]) {
 pub fn main(here: &Here) -> i32 {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     let (goal_id, name) = (var(super::ENV), var(super::DRONE_ENV));
-    let session = match var(sim::SESSION_ENV) {
-        s if !s.is_empty() => s,
-        _ => format!("sim-{name}-{}", learn::now_ms()),
-    };
     let script: Script = std::fs::read(var(SCRIPT_ENV))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Script { usd_per_iter: default_usd(), ..Script::default() });
     let plan = script.drones.get(&name).cloned().unwrap_or_default();
+    let session = match var(sim::SESSION_ENV) {
+        s if !s.is_empty() && !plan.own_session => s,
+        _ => format!("sim-{name}-{}", learn::now_ms()),
+    };
     let d = Drone { cwd: &here.cwd, session: &session };
+    let named = if plan.own_session { "" } else { session.as_str() };
     let answer = |text: &str, error: bool| {
-        println!("{}", json!({"usd": script.usd_per_iter, "session": session, "text": text, "error": error}));
+        println!("{}", json!({"usd": script.usd_per_iter, "session": named, "text": text, "error": error}));
         0
     };
     let text = d.hook("prompt", json!({"prompt": var(sim::PROMPT_ENV)})).map(|v| v.to_string()).unwrap_or_default();
@@ -151,6 +159,9 @@ pub fn main(here: &Here) -> i32 {
             b = board::fold(&board::read(&path));
         }
         let Some(held) = board::holding(&b, &session, learn::now_ms()).cloned() else { break };
+        if plan.crash {
+            return 1;
+        }
         if plan.hang {
             // Holding the claim, past any iteration cap.
             std::thread::sleep(Duration::from_secs(3600));

@@ -10,6 +10,13 @@
 //! each command is bounded by the goal's `timeout_s`. `borg hive run` scores what its drones left when
 //! they end, `borg hive score <goal>` any time (an engineer's command: a drone is refused); one attempt
 //! is never scored twice, and one the oracle could not run on (a failed checkout) is not scored yet.
+//!
+//! Held out from drones, not from the code under test: the commands run the work's own code (a check
+//! imports it) as the same user with `BORG_HIDDEN` set, so code an earlier attempt planted can copy the
+//! checks while they run, and the guard flags only a drone's tool calls that name them. Only commands
+//! run sandboxed (another user, or a mount namespace that shows the held-out directory read-only and
+//! nothing writable outside the scratch worktree) would close that; until then a score proves the most
+//! against a drone that does not plan across attempts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,10 +65,11 @@ fn tail(out: &[u8], n: usize) -> String {
     text[start..].to_string()
 }
 
-/// `git -C repo args`, a hook a drone planted in the repo never run (a checkout runs `post-checkout`).
+/// `git -C repo args` (git.rs: a hook a drone planted in the repo never runs, and a checkout runs
+/// `post-checkout`).
 fn git(repo: &Path, args: &[&str]) -> bool {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).args(["-c", "core.hooksPath=/dev/null"]).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let mut cmd = super::git::command(repo);
+    cmd.args(args);
     runner::run_capped_status(cmd, None, GIT_TIMEOUT).is_some_and(|(s, _)| s.success())
 }
 
@@ -114,7 +122,9 @@ fn run_within(goal_dir: &Path, h: &Hidden, repo: &Path, head: &str, key: &str, c
 
 /// `f` on a scratch worktree of `repo` checked out (detached) at `head`, `<parent>/<key>`, removed and
 /// unregistered afterwards whatever `f` did: a checkout outside every drone's worktree (the hidden
-/// oracle's, an integration's oracle run).
+/// oracle's, an integration's oracle run). One left at that path by a run that was killed (an
+/// integration's key is its task, which the next runner reclaims) is removed first: `worktree add`
+/// refuses a path that exists.
 ///
 /// # Errors
 /// A checkout that fails (`repo` is not the goal's, another filesystem, a commit gone): `f` never ran.
@@ -122,15 +132,21 @@ pub(crate) fn with_checkout<T>(parent: &Path, repo: &Path, head: &str, key: &str
     let scratch = parent.join(key.replace(['/', '\\'], "_"));
     let _ = std::fs::create_dir_all(parent);
     let s = scratch.display().to_string();
+    let remove = || {
+        if !git(repo, &["worktree", "remove", "--force", "--force", &s]) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = git(repo, &["worktree", "prune"]);
+        }
+    };
+    if std::fs::symlink_metadata(&scratch).is_ok() {
+        remove();
+    }
     if !git(repo, &["worktree", "add", "--detach", "--force", &s, head]) {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err(format!("could not check out {head} from {}", repo.display()));
     }
     let out = f(&scratch);
-    if !git(repo, &["worktree", "remove", "--force", &s]) {
-        let _ = std::fs::remove_dir_all(&scratch);
-        let _ = git(repo, &["worktree", "prune"]);
-    }
+    remove();
     Ok(out)
 }
 
@@ -237,6 +253,32 @@ mod tests {
         assert!(why.contains("could not check out"), "{why}");
         let left: Vec<_> = std::fs::read_dir(goal_dir.join(SCRATCH)).unwrap().flatten().collect();
         assert!(left.is_empty(), "every scratch worktree is removed: {left:?}");
+        let list = Command::new("git").arg("-C").arg(&repo).args(["worktree", "list"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 1, "and unregistered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_checkout_left_by_a_runner_that_died_is_replaced() {
+        let root = std::env::temp_dir().join(format!("borg-hive-hidden-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, parent) = (root.join("app"), root.join("store/hive/g/integrate"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("answer.txt"), "42\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        let head = verdict::snapshot(&repo, verdict::SNAPSHOT_TIMEOUT).unwrap();
+        // A registered worktree, half-changed, and a bare directory: what a killed run leaves.
+        let stale = parent.join("integrate.1");
+        git_ok(&repo, &["worktree", "add", "-q", "--detach", stale.to_str().unwrap(), &head]);
+        std::fs::write(stale.join("answer.txt"), "41\n").unwrap();
+        std::fs::create_dir_all(parent.join("integrate.2/junk")).unwrap();
+        for key in ["integrate.1", "integrate.2"] {
+            let got = with_checkout(&parent, &repo, &head, key, |wt| std::fs::read_to_string(wt.join("answer.txt")).unwrap());
+            assert_eq!(got.as_deref(), Ok("42\n"), "{key}: a fresh checkout at the head");
+        }
+        assert!(std::fs::read_dir(&parent).unwrap().next().is_none(), "removed afterwards");
         let list = Command::new("git").arg("-C").arg(&repo).args(["worktree", "list"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 1, "and unregistered");
         let _ = std::fs::remove_dir_all(&root);

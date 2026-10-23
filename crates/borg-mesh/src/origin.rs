@@ -256,9 +256,7 @@ mod tests {
                 lessons: vec!["L1".into()],
                 ms: 5,
                 node: "n".into(),
-                p: vec![],
-                channel: String::new(),
-                r: String::new(),
+                ..Default::default()
             };
             serde_json::to_string(&x).unwrap()
         };

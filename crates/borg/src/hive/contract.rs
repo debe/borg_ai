@@ -4,7 +4,8 @@
 //! per session: at a prompt when it is in the scope of the drone's claim, after a tool call when the
 //! edit lands in its scope.
 //!
-//! A drone may supersede its own contract. Superseding another drone's goes through the queen
+//! A drone may supersede its own contract (one of its sessions wrote it: `own`). Superseding another
+//! drone's goes through the queen
 //! (`Kind::Contract`): nothing is written until an engineer answers "supersede" (`ratify`).
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,10 @@ pub struct Contract {
     /// The queen entry that let it supersede another drone's contract.
     #[serde(default)]
     pub ok_by: Option<String>,
+    /// The drone `by` is an iteration of (`borg hive run` names it, hive/run.rs); empty for a session
+    /// of its own. Each iteration is a new session: the drone is the contract's author.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub drone: String,
 }
 
 impl Contract {
@@ -48,7 +53,24 @@ impl Contract {
             h.update(b"\0");
         }
         let id = format!("c{}", &h.finalize().to_hex()[..12]);
-        Contract { v: 1, id, task: task.into(), by: by.into(), node: String::new(), ms, scope, text: text.into(), supersedes, ok_by: None }
+        Contract {
+            v: 1,
+            id,
+            task: task.into(),
+            by: by.into(),
+            node: String::new(),
+            ms,
+            scope,
+            text: text.into(),
+            supersedes,
+            ok_by: None,
+            drone: String::new(),
+        }
+    }
+
+    pub fn with_drone(mut self, drone: &str) -> Contract {
+        self.drone = drone.into();
+        self
     }
 }
 
@@ -76,12 +98,18 @@ pub fn read(path: &Path) -> Vec<Contract> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Contract>(l).ok()).filter(|c| c.v <= 1).collect()
 }
 
+/// Whether `new` is by the author of `old`: the same session, or another session (a later iteration)
+/// of the same drone on the same node.
+fn own(old: &Contract, new: &Contract) -> bool {
+    old.by == new.by || (!old.drone.is_empty() && old.drone == new.drone && old.node == new.node)
+}
+
 /// The contracts in force: all but those a valid later line supersedes. A supersede is valid when its
-/// author wrote the contract it replaces, or the queen let it (`ok_by`).
+/// author wrote the contract it replaces (`own`), or the queen let it (`ok_by`).
 pub fn current(all: &[Contract]) -> Vec<&Contract> {
-    let author: HashMap<&str, &str> = all.iter().map(|c| (c.id.as_str(), c.by.as_str())).collect();
+    let by_id: HashMap<&str, &Contract> = all.iter().map(|c| (c.id.as_str(), c)).collect();
     let superseded: HashSet<&str> =
-        all.iter().filter_map(|c| c.supersedes.as_deref().filter(|old| c.ok_by.is_some() || author.get(old) == Some(&c.by.as_str()))).collect();
+        all.iter().filter_map(|c| c.supersedes.as_deref().filter(|old| c.ok_by.is_some() || by_id.get(old).is_some_and(|o| own(o, c)))).collect();
     all.iter().filter(|c| !superseded.contains(c.id.as_str())).collect()
 }
 
@@ -103,7 +131,7 @@ pub fn publish(home: &Path, goal: &str, c: &Contract, repo: &str) -> Result<Publ
     if let Some(old_id) = &c.supersedes {
         let all = read(&path);
         let old = all.iter().find(|x| &x.id == old_id).ok_or_else(|| format!("no contract {old_id} in goal {goal}"))?;
-        if old.by != c.by && c.ok_by.is_none() {
+        if !own(old, c) && c.ok_by.is_none() {
             return propose(home, goal, old, c, repo).map(Publish::Proposed);
         }
     }
@@ -258,6 +286,23 @@ mod tests {
         assert_eq!(ids(current(&[a.clone(), theirs.clone()])), [a.id.clone(), theirs.id.clone()], "another drone's supersede needs the queen");
         let ok = Contract { ok_by: Some("q1".into()), ..theirs };
         assert_eq!(ids(current(&[a, ok.clone()])), [ok.id]);
+    }
+
+    #[test]
+    fn a_later_session_of_the_same_drone_supersedes_its_own_contract() {
+        // Each iteration of a `borg hive run` drone is a new session.
+        let home = std::env::temp_dir().join(format!("borg-hive-contract-drone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let a = c("sa", 1, &["repo:app"], "fn parse() -> Item", None).with_drone("d1");
+        assert_eq!(publish(&home, "g", &a, "app").unwrap(), Publish::Written);
+        let later = c("sa2", 2, &["repo:app"], "fn parse() -> Result<Item>", Some(&a.id)).with_drone("d1");
+        assert_eq!(publish(&home, "g", &later, "app").unwrap(), Publish::Written, "no queen question");
+        let all = read(&super::super::contracts_path(&home, "g"));
+        assert_eq!(current(&all).iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["fn parse() -> Result<Item>"]);
+        let other = c("sb", 3, &["repo:app"], "fn parse() -> Option<Item>", Some(&later.id)).with_drone("d2");
+        assert!(matches!(publish(&home, "g", &other, "app").unwrap(), Publish::Proposed(_)), "another drone's still asks");
+        assert_eq!(current(&[a.clone(), Contract { drone: "d2".into(), ..later.clone() }]).len(), 2, "a supersede by another drone needs ok_by");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

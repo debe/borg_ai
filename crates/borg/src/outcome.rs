@@ -47,8 +47,8 @@
 //! **Team outcomes.** The raw log stays on this machine (it holds session ids and repos). `publish`
 //! appends a redacted, deterministic projection of the results the team may see (`SHARED_KINDS`) to
 //! `outcomes-team.jsonl` (`TEAM_FILE`), which the mesh syncs (borg-mesh lines.rs `SYNCED`): kind,
-//! lesson ids, time, propensity, channel, the hashed session and repo (`tag`) and the node, never raw
-//! sessions, repos, groups, grades or text. Only the belief readers opt in to the team view
+//! lesson ids, time, propensity, channel, the hashed session and repo (`tag`), a regret's hashed cause
+//! and credit, and the node, never raw sessions, repos, causes, groups, grades or text. Only the belief readers opt in to the team view
 //! (`read_team`): memory and trust in the conscience (conscience.rs `load_as`), `borg trust`, `borg
 //! memory` and borg-web's lessons. learn.rs (it would settle remote sessions), attention.rs (labels and
 //! the explore counter are this node's policy), stats.rs (rollups sync their own counts), install.rs and
@@ -170,8 +170,21 @@ pub const TEAM_FILE: &str = "outcomes-team.jsonl";
 /// Beside `TEAM_FILE`, never synced: the length of `outcomes.jsonl` at the last `publish`.
 pub const PUBLISHED: &str = "outcomes-team.published";
 
-/// The kinds `publish` shares. A whitelist: `graded`, `vetoed`, `regretted` and any later kind stay
-/// local until deliberately added here.
+/// The kinds `publish` shares. A whitelist: `graded` and any later kind stay local until deliberately
+/// added here.
+///
+/// Closed under memory.rs `derive`: every kind that changes a lesson's result for a session, or its
+/// belief, travels, so a peer folds the same memory. `vetoed` outranks the session's `changed` (shared
+/// alone, a lesson vetoed here would gain a use and spread there); `regretted` carries its `credit` and
+/// its hashed `cause` (`Shared::c`), the key derive dedupes regrets by. `graded` is the asking policy's
+/// denominator, not a result, and never moves the activity clock (`memory::Clock` counts shared kinds).
+///
+/// Unguarded: any member can write a line under any session tag (tags are public in this file), so a
+/// forged `asked_then_corrected` or `vetoed` overrides a teammate's session on every node but that
+/// teammate's, and a few forged `asked_then_changed` with fresh tags and two repo tags consolidate a
+/// lesson. `node` is self-declared. The mesh admits only members' signed lines (borg-mesh origin.rs),
+/// so this is the trusted-member model; the deferred guards (a session tag bound to its first signer,
+/// consolidation from at least two signers) would close it.
 ///
 /// The hive verdicts (`verified`, `rejected`, `hacked`) stay out until hive lines go on the mesh
 /// (collective step 4), and come in then with a `c: tag(cause)` field: the hive spike is local and
@@ -180,7 +193,7 @@ pub const PUBLISHED: &str = "outcomes-team.published";
 /// poisoning guards (k distinct nodes, a trust-weighted median) a forged `verified` stream would
 /// inflate lessons and a forged `hacked` one sink them (`team_view` drops unshared kinds, so a forged
 /// line is ignored today); and hidden-oracle results are private to their goal.
-pub const SHARED_KINDS: [&str; 6] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED];
+pub const SHARED_KINDS: [&str; 8] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED, VETOED, REGRETTED];
 
 /// A session or repo as the team sees it: the first 32 hex digits of blake3("borg-outcome-v1\0" + s).
 /// Unsalted on purpose: the same session hashes to the same tag on every node, so a node can drop its
@@ -199,7 +212,7 @@ fn tag_repo(repo: &str) -> String {
 
 /// One line of `TEAM_FILE`. Never carries `id` and `version` together (the mesh would settle it as a
 /// versioned record).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Shared {
     pub kind: String,
     /// `tag` of the session.
@@ -215,6 +228,12 @@ pub struct Shared {
     /// `tag` of the repo: memory.rs counts distinct repos to consolidate a lesson.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub r: String,
+    /// `tag` of a `regretted` record's cause (the regret episode): memory.rs counts each regret once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub c: String,
+    /// A `regretted` record's share of the blame.
+    #[serde(default, skip_serializing_if = "is_zero_f")]
+    pub credit: f64,
 }
 
 /// `o` as the team sees it, or None for a kind not in `SHARED_KINDS`.
@@ -228,6 +247,8 @@ pub fn share(o: &Outcome, node: &str) -> Option<Shared> {
         p: o.p.clone(),
         channel: o.channel.clone(),
         r: tag_repo(&o.repo),
+        c: tag_repo(&o.cause),
+        credit: o.credit,
     })
 }
 
@@ -293,7 +314,7 @@ pub fn read_team(lessons: &Path) -> Vec<Outcome> {
 /// repos for distinctness, so beliefs are the same and comparable with the team's), then every
 /// `TEAM_FILE` line of a shared kind whose session is not one of this machine's (that drops this node's
 /// own published copies, whatever its node id), once per (kind, session, lessons, ms). A kind this
-/// binary does not share (a newer node's, or a forged `vetoed`) is ignored. A remote session then counts
+/// binary does not share (a newer node's, or a forged `verified`) is ignored. A remote session then counts
 /// once per lesson like a local one (memory.rs `derive`, `sessions`).
 pub fn team_view(lessons: &Path, on: bool) -> Vec<Outcome> {
     let mut out = read(&path_beside(lessons));
@@ -305,12 +326,25 @@ pub fn team_view(lessons: &Path, on: bool) -> Vec<Outcome> {
         o.repo = tag_repo(&o.repo);
     }
     let text = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
-    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String)> = std::collections::HashSet::new();
     for x in text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()) {
-        if !SHARED_KINDS.contains(&x.kind.as_str()) || mine.contains(&x.s) || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms)) {
+        if !SHARED_KINDS.contains(&x.kind.as_str()) || mine.contains(&x.s) || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone()))
+        {
             continue;
         }
-        out.push(Outcome { kind: x.kind, session: x.s, lessons: x.lessons, ms: x.ms, repo: x.r, p: x.p, channel: x.channel, ..Default::default() });
+        let o = Outcome {
+            kind: x.kind,
+            session: x.s,
+            lessons: x.lessons,
+            ms: x.ms,
+            repo: x.r,
+            p: x.p,
+            channel: x.channel,
+            cause: x.c,
+            credit: x.credit,
+            ..Default::default()
+        };
+        out.push(o);
     }
     out
 }
@@ -319,13 +353,9 @@ pub fn read(path: &Path) -> Vec<Outcome> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
+/// Appends `o` in one write (learn.rs `append_line`: concurrent writers never tear a record).
 pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{}", serde_json::to_string(o).unwrap())?;
+    crate::learn::append_jsonl(path, o)?;
     // The results count in the usage statistics; `asked` is already counted as the Stop's block, a
     // `vetoed` result as the `veto` that credited it (veto.rs), and a hive verdict's as the one
     // `task_*` event of its verdict (hive/verdict.rs).
@@ -473,12 +503,14 @@ pub fn verdicts(outcomes: &[Outcome], kind: &str, author: &str, lessons: &[Strin
 /// At session end: every lesson asked in `session` that has no result yet was not corrected. A
 /// vetoed lesson already has its result.
 /// Sorted by lesson id so the appended lines are deterministic.
+/// One pass over the log, whatever the number of asks.
 pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
-    let mut asked: Vec<(&str, &str)> = outcomes
-        .iter()
-        .filter(|o| o.kind == ASKED && o.session == session)
+    let mine = outcomes.iter().filter(|o| o.session == session);
+    let resolved: std::collections::HashSet<&str> = mine.clone().filter(|o| resolves(&o.kind)).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
+    let mut asked: Vec<(&str, &str)> = mine
+        .filter(|o| o.kind == ASKED)
         .flat_map(|o| o.lessons.iter().map(move |l| (l.as_str(), o.repo.as_str())))
-        .filter(|(l, _)| !has(outcomes, CORRECTED, session, l) && !has(outcomes, NOT_CORRECTED, session, l) && !has(outcomes, VETOED, session, l))
+        .filter(|(l, _)| !resolved.contains(l))
         .collect();
     asked.sort();
     asked.dedup_by_key(|(l, _)| *l);
@@ -488,16 +520,36 @@ pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
         .collect()
 }
 
+/// Does a `kind` record end an ask's wait for its result (`settle`)?
+fn resolves(kind: &str) -> bool {
+    matches!(kind, CORRECTED | NOT_CORRECTED | VETOED)
+}
+
 /// Sessions with asks that are idle at `now`: their newest ask and newest episode
-/// (`last_episode`, newest episode ms per session) are at least `IDLE_MS` old. Sorted.
+/// (`last_episode`, newest episode ms per session) are at least `IDLE_MS` old. Sorted. Only sessions
+/// with an ask still without its result, so `borg learn` (under the store lock) settles what is new,
+/// not every session it ever settled: one pass over the log.
 pub fn idle_sessions<'a>(outcomes: &'a [Outcome], last_episode: &HashMap<String, i64>, now: i64) -> Vec<&'a str> {
     let mut newest: HashMap<&str, i64> = HashMap::new();
-    for o in outcomes.iter().filter(|o| o.kind == ASKED) {
-        let m = newest.entry(o.session.as_str()).or_insert(o.ms);
-        *m = (*m).max(o.ms);
+    let (mut asked, mut resolved) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for o in outcomes {
+        let into = match o.kind.as_str() {
+            ASKED => &mut asked,
+            k if resolves(k) => &mut resolved,
+            _ => continue,
+        };
+        into.extend(o.lessons.iter().map(|l| (o.session.as_str(), l.as_str())));
+        if o.kind == ASKED {
+            let m = newest.entry(o.session.as_str()).or_insert(o.ms);
+            *m = (*m).max(o.ms);
+        }
     }
-    let mut idle: Vec<&str> =
-        newest.into_iter().filter(|&(s, ms)| ms.max(last_episode.get(s).copied().unwrap_or(i64::MIN)) <= now - IDLE_MS).map(|(s, _)| s).collect();
+    let open: std::collections::HashSet<&str> = asked.difference(&resolved).map(|(s, _)| *s).collect();
+    let mut idle: Vec<&str> = newest
+        .into_iter()
+        .filter(|&(s, ms)| open.contains(s) && ms.max(last_episode.get(s).copied().unwrap_or(i64::MIN)) <= now - IDLE_MS)
+        .map(|(s, _)| s)
+        .collect();
     idle.sort();
     idle
 }
@@ -676,6 +728,20 @@ mod tests {
     }
 
     #[test]
+    fn idle_sessions_skip_settled_ones() {
+        let all = vec![
+            o(ASKED, "done", &["A", "B"], 0),
+            o(NOT_CORRECTED, "done", &["A"], 1),
+            o(CORRECTED, "done", &["B"], 1),
+            o(ASKED, "vetoed", &["A"], 0),
+            o(VETOED, "vetoed", &["A"], 1),
+            o(ASKED, "half", &["A", "B"], 0),
+            o(NOT_CORRECTED, "half", &["A"], 1),
+        ];
+        assert_eq!(idle_sessions(&all, &HashMap::new(), IDLE_MS + 10), ["half"], "every ask of the others has its result");
+    }
+
+    #[test]
     fn regretted_blames_asks_before_the_decision_shared_or_by_target() {
         let mut graded = o(GRADED, "s", &["G"], 5);
         graded.chosen = vec![];
@@ -743,16 +809,7 @@ mod tests {
     #[test]
     fn a_forged_team_verdict_is_ignored_and_a_local_one_counts_no_stat() {
         let home = tmp("verdict-team");
-        let forged = Shared {
-            kind: HACKED.into(),
-            s: "x".into(),
-            lessons: vec!["L1".into()],
-            ms: 5,
-            node: "n2".into(),
-            p: vec![],
-            channel: String::new(),
-            r: String::new(),
-        };
+        let forged = Shared { kind: HACKED.into(), s: "x".into(), lessons: vec!["L1".into()], ms: 5, node: "n2".into(), ..Default::default() };
         lines(&home.join(TEAM_FILE), &[serde_json::to_string(&forged).unwrap()]);
         assert!(team_view(&home.join("lessons.jsonl"), true).is_empty(), "an unshared kind from the team file is dropped");
         let p = home.join("outcomes.jsonl");
@@ -803,9 +860,12 @@ mod tests {
         }
         assert_eq!((x.s, x.r, x.p, x.node), (tag("session-raw"), tag("secret-repo"), vec![0.5], "n1".to_string()));
         assert_eq!(tag("s").len(), 32);
-        for kind in [GRADED, VETOED, REGRETTED, "veto"] {
+        for kind in [GRADED, HACKED, "veto"] {
             assert!(share(&o(kind, "s", &["A"], 1), "n1").is_none(), "{kind} is not shared");
         }
+        let regret = share(&Outcome { cause: "episode-raw".into(), credit: 0.25, ..o(REGRETTED, "s", &["A"], 1) }, "n1").unwrap();
+        let line = serde_json::to_string(&regret).unwrap();
+        assert!(!line.contains("episode-raw") && line.contains(&tag("episode-raw")) && line.contains(r#""credit":0.25"#), "{line}");
     }
 
     #[test]
@@ -850,9 +910,8 @@ mod tests {
                 lessons: vec!["L1".into()],
                 ms: 20,
                 node: node.into(),
-                p: vec![],
-                channel: String::new(),
                 r: tag("web"),
+                ..Default::default()
             })
             .unwrap()
         };
@@ -860,7 +919,7 @@ mod tests {
             serde_json::to_string(&share(&local, "me").unwrap()).unwrap(),
             remote(CHANGED, "x", "n2"),
             remote(CHANGED, "x", "n3"),
-            remote(VETOED, "y", "n2"),
+            remote(HACKED, "y", "n2"),
             remote("veto", "z", "n2"),
         ];
         if shuffle {
@@ -877,7 +936,7 @@ mod tests {
         let team = team_view(&home.join("lessons.jsonl"), true);
         assert_eq!(changed(&team, "L1"), 2, "{team:?}");
         assert_eq!(team.iter().filter(|o| o.session == "x").count(), 1, "one remote line per (kind, session, lessons, ms)");
-        assert!(team.iter().all(|o| o.kind != VETOED && o.kind != "veto"), "unshared kinds are ignored");
+        assert!(team.iter().all(|o| o.kind != HACKED && o.kind != "veto"), "unshared kinds are ignored");
         assert!(team.iter().all(|o| o.repo != "app"), "local repos compare as tags");
         let _ = std::fs::remove_dir_all(home);
     }
@@ -892,12 +951,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(b);
     }
 
+    /// A node's whole fold reaches its peers: a veto that outranks the session's change, a regret's
+    /// credit, and a session that only graded (no tick on either node). A peer holding only the team file
+    /// derives the same memory as the node that recorded it.
+    #[test]
+    fn a_peer_derives_the_same_memory_from_the_team_file() {
+        let (a, b) = (tmp("fold-a"), tmp("fold-b"));
+        let regret = Outcome { cause: "episode-1".into(), credit: 0.5, ..o(REGRETTED, "s2", &["L1"], 40) };
+        let log = [
+            o(GRADED, "s0", &["L1"], 5),
+            o(ASKED, "s1", &["L1"], 10),
+            o(CHANGED, "s1", &["L1"], 20),
+            o(VETOED, "s1", &["L1"], 30),
+            o(ASKED, "s2", &["L1"], 35),
+            regret,
+        ];
+        lines(&a.join("outcomes.jsonl"), &log.map(|x| serde_json::to_string(&x).unwrap()));
+        publish(&a);
+        std::fs::copy(a.join(TEAM_FILE), b.join(TEAM_FILE)).unwrap();
+        let ls = [crate::conscience::Challenge { id: "L1".into(), origin_ms: 1, ..Default::default() }];
+        let m = |h: &Path| crate::memory::derive(&team_view(&h.join("lessons.jsonl"), true), &ls, None);
+        let (here, there) = (m(&a), m(&b));
+        assert_eq!((here["L1"].vetoed, here["L1"].changed, here["L1"].regretted), (1, 0, 0.5), "{here:?}");
+        assert_eq!(here, there);
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    /// The unguarded surface `SHARED_KINDS` documents, pinned until the deferred guards land: a remote
+    /// line under one of this node's session tags is dropped here, whatever its kind, while a peer
+    /// without that session takes it, and the stronger result wins there.
+    #[test]
+    fn a_remote_line_under_a_local_tag_counts_on_peers_only() {
+        let (victim, peer) = (tmp("forged-victim"), tmp("forged-peer"));
+        let own = o(CHANGED, "s1", &["L1"], 10);
+        let forged = Shared { kind: CORRECTED.into(), s: tag("s1"), lessons: vec!["L1".into()], ms: 11, node: "n2".into(), ..Default::default() };
+        let team = [serde_json::to_string(&share(&own, "me").unwrap()).unwrap(), serde_json::to_string(&forged).unwrap()];
+        lines(&victim.join("outcomes.jsonl"), &[serde_json::to_string(&own).unwrap()]);
+        lines(&victim.join(TEAM_FILE), &team);
+        lines(&peer.join(TEAM_FILE), &team);
+        let ls = [crate::conscience::Challenge { id: "L1".into(), ..Default::default() }];
+        let m = |h: &Path| crate::memory::derive(&team_view(&h.join("lessons.jsonl"), true), &ls, None).remove("L1").unwrap();
+        assert_eq!((m(&victim).changed, m(&victim).corrected), (1, 0), "the victim never sees the override");
+        assert_eq!((m(&peer).changed, m(&peer).corrected), (0, 1), "a peer counts the forged correction");
+        let _ = std::fs::remove_dir_all(victim);
+        let _ = std::fs::remove_dir_all(peer);
+    }
+
     #[test]
     fn off_keeps_beliefs_local() {
         let home = team_store("off", false);
         let local = team_view(&home.join("lessons.jsonl"), false);
         assert_eq!(local, read(&home.join("outcomes.jsonl")));
         assert_eq!(changed(&local, "L1"), 1);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Several writers appending to one log at once (a hive's drones on one store): every record
+    /// reads back, none torn into `{A}{B}\n\n`.
+    #[test]
+    fn concurrent_appends_keep_every_record() {
+        let home = tmp("concurrent");
+        let p = home.join("outcomes.jsonl");
+        let (writers, each) = (8, 2000);
+        std::thread::scope(|scope| {
+            for w in 0..writers {
+                let p = &p;
+                scope.spawn(move || (0..each).for_each(|i| append(p, &o(ASKED, &format!("s{w}"), &["A"], i)).unwrap()));
+            }
+        });
+        assert_eq!(read(&p).len(), writers * each as usize);
         let _ = std::fs::remove_dir_all(home);
     }
 

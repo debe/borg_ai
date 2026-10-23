@@ -114,6 +114,19 @@ pub struct SubAgent {
     pub output: Option<Value>,
 }
 
+impl SubAgent {
+    /// A tool call's input, part of its work.
+    pub fn called(&mut self, input: &Value) {
+        self.work.push_str(&format!("{input}\n"));
+    }
+
+    /// A text it said: part of its work, and its final text until it says another.
+    pub fn said(&mut self, t: &str) {
+        self.work.push_str(&format!("{t}\n"));
+        self.final_text = t.to_string();
+    }
+}
+
 /// The sub-agents one session ran together: a Claude Code workflow run, an omp session's task agents,
 /// an opencode session's subagents.
 #[derive(Debug, Clone, Default)]

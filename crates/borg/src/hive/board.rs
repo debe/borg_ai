@@ -300,9 +300,11 @@ pub struct Board {
 }
 
 impl Board {
-    /// Whether `t` is barred to `session`: by its id, or by the drone it claims as.
-    pub fn barred(&self, t: &Task, session: &str) -> bool {
-        t.not_by.iter().any(|n| n == session || self.drones.get(session).is_some_and(|d| d == n))
+    /// Whether `t` is barred to `session` of `drone` (empty: none named): by its id, by `drone`, or by
+    /// the drone the session claimed as before. The caller names the drone: a new iteration's session
+    /// has no line on the board yet.
+    pub fn barred(&self, t: &Task, session: &str, drone: &str) -> bool {
+        t.not_by.iter().any(|n| n == session || (!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n))
     }
 
     /// The goal is reached: there are tasks, every one is verified (a work task by its verify task, a
@@ -415,11 +417,11 @@ pub fn by_engineer(by: &str) -> bool {
 
 /// The board the events say, the same in any arrival order (see the module doc).
 pub fn fold(events: &[Event]) -> Board {
-    // Within one ms an open goes first (a task opened and claimed at once is claimed open), except a
-    // verify task's open, which goes after the `done` written with it: it takes effect only on a done
-    // the fold took.
+    // Within one ms an open goes first (a task opened and claimed at once is claimed open), except the
+    // open of a verify or fix task, which goes after the line written with it: it takes effect only on
+    // a `done` or `rejected` the fold took.
     type Key = (i64, u8, [u8; 32], [u8; 32]);
-    let order = |e: &Event| match (e.ev, e.def.as_ref().and_then(|d| d.of.as_ref())) {
+    let order = |e: &Event| match (e.ev, e.def.as_ref().and_then(written_with)) {
         (Ev::Open, None) => 0,
         (Ev::Open, Some(_)) => 2,
         _ => 1,
@@ -469,6 +471,12 @@ pub fn closure(b: &Board, t: &Task) -> Vec<TaskId> {
     seen
 }
 
+/// The task whose line an open is written with: a verify task's work (its `done`), a fix task's
+/// integrate task (its `rejected`, hive/integrate.rs).
+fn written_with(t: &Task) -> Option<&str> {
+    t.of.as_deref().or_else(|| t.from.as_ref().and(t.id.strip_suffix(".fix")))
+}
+
 /// The holder of a claimed task, whatever its lease.
 fn holder(s: &TaskState) -> Option<&str> {
     match &s.status {
@@ -481,13 +489,19 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
     match e.ev {
         Ev::Open => {
             let Some(def) = e.def.as_ref().filter(|d| d.id == e.task) else { return };
-            // A verify task's open is part of its work's `done` (same session, same ms): a done the
-            // fold ignored (the lease had passed to another drone) opens nothing, so the verify task
-            // and its bar are those of the done that took effect.
-            if let Some(w) = def.of.as_ref()
-                && !matches!(b.tasks.get(w).map(|s| &s.status), Some(Status::Done { by, ms }) if *by == e.by && *ms == e.ms)
-            {
-                return;
+            // A verify task's open is part of its work's `done`, a fix task's of its integration's
+            // `rejected` (same session, same ms): a line the fold ignored (the lease had passed to
+            // another drone or runner) opens nothing, so the task and its bar are those of the line
+            // that took effect.
+            if let Some(w) = written_with(def) {
+                let took = match b.tasks.get(w).map(|s| &s.status) {
+                    Some(Status::Done { by, ms }) if def.of.is_some() => *by == e.by && *ms == e.ms,
+                    Some(Status::Verified { by, ms }) if def.of.is_none() => *by == e.by && *ms == e.ms,
+                    _ => false,
+                };
+                if !took {
+                    return;
+                }
             }
             match b.tasks.get_mut(&e.task) {
                 None => {
@@ -523,7 +537,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 }
                 return;
             }
-            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(&s.task, &e.by) {
+            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(&s.task, &e.by, &e.drone) {
                 b.lost.push((e.by.clone(), e.task.clone(), e.ms));
                 return;
             }
@@ -625,18 +639,18 @@ pub fn lost_since(b: &Board, session: &str, ms: i64) -> Vec<TaskId> {
     out
 }
 
-/// Whether `session` may claim `s` at `now` (the fold's rules a-c: open or expired, dependencies
-/// verified, not barred).
-pub fn claimable_by(b: &Board, s: &TaskState, session: &str, now: i64) -> bool {
-    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(&s.task, session)
+/// Whether `session` of `drone` may claim `s` at `now` (the fold's rules a-c: open or expired,
+/// dependencies verified, not barred).
+pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, now: i64) -> bool {
+    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(&s.task, session, drone)
 }
 
-/// The task `session` in `repo` should take next at `now`, among those `allowed` lets it claim: its
-/// own repo's first, then by role (verify, integrate, work, plan), then the oldest, then by id.
-pub fn next_for<'a>(b: &'a Board, session: &str, repo: &str, now: i64, allowed: impl Fn(&Task) -> bool) -> Option<&'a TaskState> {
+/// The task `session` of `drone` in `repo` should take next at `now`, among those `allowed` lets it
+/// claim: its own repo's first, then by role (verify, integrate, work, plan), then the oldest, then by id.
+pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, repo: &str, now: i64, allowed: impl Fn(&Task) -> bool) -> Option<&'a TaskState> {
     b.tasks
         .values()
-        .filter(|s| claimable_by(b, s, session, now) && allowed(&s.task))
+        .filter(|s| claimable_by(b, s, session, drone, now) && allowed(&s.task))
         .min_by_key(|s| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency(), s.opened_ms, s.task.id.clone()))
 }
 
@@ -873,7 +887,7 @@ mod tests {
     fn the_author_cannot_claim_its_verify_task() {
         let b = fold(&[done_t1(), vec![ev(Ev::Claim, "t1.v1", "sa", 3)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", 3));
+        assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", "", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", "", 3));
         assert_eq!(b.tasks["t1"].author.as_deref(), Some("sa"));
     }
 
@@ -886,7 +900,10 @@ mod tests {
         // A later iteration of d1 (a new session) claims the verify task: it does not take effect.
         let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa2", 3).with_drone("d1")]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(b.barred(&b.tasks["t1.v1"].task, "sa2") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", 3));
+        assert!(b.barred(&b.tasks["t1.v1"].task, "sa2", "") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", "", 3));
+        assert!(b.barred(&b.tasks["t1.v1"].task, "sa3", "d1") && !b.barred(&b.tasks["t1.v1"].task, "sa3", "d2"));
+        // A fresh iteration of d1 that wrote no line yet is not offered it either.
+        assert_eq!(next_for(&b, "sa3", "d1", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "its own verify task is not offered to d1");
         let b = fold(&[base, vec![ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d2"), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
         assert!(!b.finished() && integration_due(&b), "every task verified: the combined tree is checked next");
@@ -984,11 +1001,11 @@ mod tests {
             Event::open(v, "sx", 2),
         ];
         let b = fold(&events);
-        assert_eq!(next_for(&b, "me", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"), "verify before work in the same repo");
-        assert_eq!(next_for(&b, "sx", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
-        assert_eq!(next_for(&b, "me", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
-        assert_eq!(next_for(&b, "me", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
-        assert_eq!(next_for(&b, "me", "other", 3, |t| t.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(next_for(&b, "me", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"), "verify before work in the same repo");
+        assert_eq!(next_for(&b, "sx", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
+        assert_eq!(next_for(&b, "me", "", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(next_for(&b, "me", "", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
+        assert_eq!(next_for(&b, "me", "", "other", 3, |t| t.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
     }
 
     fn integrate(id: &str) -> Task {
@@ -1058,6 +1075,26 @@ mod tests {
         let b = fold(&[rejected, fixed, claimed_integrate("integrate.2", 11), vec![verdict(Ev::Verified, "integrate.2", "si", 12, "m2")]].concat());
         assert!(b.finished(), "{:?}", b.integrated);
         assert_eq!(b.integrated.map(|i| i.head).as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn a_stale_integrators_rejection_opens_no_fix_task() {
+        // si's lease on integrate.1 ran out and sj's integration passed; si then writes its rejection and
+        // the fix task with it. Neither takes effect, in any order.
+        let mut fix = task("integrate.1.fix");
+        fix.from = Some("m1".into());
+        let late = 5 + LEASE_MS + 1;
+        let tail = vec![
+            ev(Ev::Claim, "integrate.1", "sj", late),
+            verdict(Ev::Verified, "integrate.1", "sj", late + 1, "m2"),
+            verdict(Ev::Rejected, "integrate.1", "si", late + 2, "m1").with_note("visible fails"),
+            Event::open(fix, "si", late + 2).with_note("visible fails"),
+        ];
+        for p in permutations(&tail) {
+            let b = fold(&[verified_t1(), claimed_integrate("integrate.1", 5), p].concat());
+            assert!(!b.tasks.contains_key("integrate.1.fix"), "no orphan fix task");
+            assert!(b.finished(), "{:?}", b.integrated);
+        }
     }
 
     #[test]

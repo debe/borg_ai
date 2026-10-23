@@ -128,8 +128,9 @@ version wins everywhere. Cost grows with what changed: a laptop back from three 
 downloads three weeks of lessons.
 
 **What travels.** Lessons, each line signed by the machine that wrote it. Raw episodes stay where they
-were captured, so each is learned exactly once. Outcome lines say which lesson was asked, what followed,
-when, and the probability it was asked, with the session and repo hashed. They are signed and
+were captured, so each is learned exactly once. Outcome lines say which lesson was asked, what followed
+(including a veto, and a later regret's share of the blame), when, and the probability it was asked,
+with the session, repo and regret hashed, so every member derives the same lesson usefulness. They are signed and
 quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
 (`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Peers on `borg/mesh/5` and earlier do not
 sync with this version: upgrade every member. Reasoning excerpts go to two peers chosen by hash, so

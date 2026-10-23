@@ -176,6 +176,19 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
     cmd.arg("--die-with-parent");
     cmd.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
     cmd.arg("--tmpfs").arg(&home);
+    // The host's Unix sockets live under /run (/var/run links there, or is masked too): a read-only
+    // bind does not stop `connect()`, and the Docker daemon (root on the host: it mounts the real
+    // HOME), ssh-agent, gpg-agent and the session bus all answer there, network namespace or not.
+    // Only the resolver file comes back where resolv.conf points into /run (systemd-resolved).
+    // Abstract sockets (X11's @/tmp/.X11-unix) are per network namespace: closed to the scorer
+    // (`unshare_net`), not to an agent, which needs the API.
+    cmd.args(["--tmpfs", "/run"]);
+    if fs::symlink_metadata("/var/run").is_ok_and(|m| m.is_dir()) {
+        cmd.args(["--tmpfs", "/var/run"]);
+    }
+    if let Some(resolv) = fs::canonicalize("/etc/resolv.conf").ok().filter(|p| p.starts_with("/run") || p.starts_with("/var/run")) {
+        cmd.arg("--ro-bind").arg(&resolv).arg(&resolv);
+    }
     for ro in [home.join(".local/share/claude"), home.join(".local/bin")] {
         cmd.arg("--ro-bind").arg(&ro).arg(&ro);
     }

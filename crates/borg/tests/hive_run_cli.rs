@@ -339,7 +339,10 @@ fn a_drone_that_grows_an_existing_test_is_not_hacked() {
 #[test]
 fn a_conflicting_integration_opens_a_fix_task_and_the_hive_finishes() {
     // Both tasks write shared.txt from the same base: each passes alone, their attempts conflict.
-    let root = setup_files("conflict", &["shared.txt", "shared.txt"], "4", json!({"usd_per_iter": 0.10}));
+    // Each drone holds its work claim 2 s, so t2 goes to another drone while t1 is held: one drone
+    // doing both in its own tree builds t2 on t1 (no conflict, the scenario under test is gone).
+    let slow = json!({"work_s": 2});
+    let root = setup_files("conflict", &["shared.txt", "shared.txt"], "4", json!({"usd_per_iter": 0.10, "drones": {"d1": slow, "d2": slow, "d3": slow}}));
     let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
     assert_eq!(code, 0, "{out}{err}");
     let b = fold(&root);
@@ -411,17 +414,104 @@ fn a_harness_without_headless_is_refused() {
 
 #[test]
 fn a_hanging_drone_is_cut_off() {
-    let root = setup("hang", 1, "1", json!({"drones": {"d1": {"hang": true}}}));
-    let t0 = Instant::now();
-    let (out, err, code) = run(&root, &["--drones", "1", "--harness", "sim", "--iter-timeout", "2"]);
-    assert!(t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
+    // Also on a harness that keeps its own session ids and names none (omp, opencode): the runner
+    // finds the cut-off session by the drone its claim carries.
+    for own in [false, true] {
+        let root = setup(&format!("hang-{own}"), 1, "1", json!({"drones": {"d1": {"hang": true, "own_session": own}}}));
+        let t0 = Instant::now();
+        let (out, err, code) = run(&root, &["--drones", "1", "--harness", "sim", "--iter-timeout", "6"]);
+        assert!(t0.elapsed() < Duration::from_secs(40), "{:?}", t0.elapsed());
+        assert_eq!(code, 1, "{out}{err}");
+        let lines = spend(&root);
+        // Cut off without naming its cost, it is charged the rest of the share (no dearer iteration yet).
+        assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("timeout", Some(1.0))]);
+        assert!(out.contains("end: budget"), "{out}");
+        let notes: Vec<String> = events(&root).iter().filter(|e| e.ev == board::Ev::Released).map(|e| e.note.clone()).collect();
+        assert_eq!(notes, ["budget"], "own session {own}: the cut-off session's claim is released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn drones_of_a_harness_with_its_own_session_ids_are_tracked_by_drone() {
+    // omp and opencode ignore the runner's session id and name none at their end: each iteration's
+    // board lines are found by the drone their claims carry, so progress counts and nothing stalls.
+    let own = json!({"own_session": true});
+    let root = setup("own-session", 3, "3", json!({"usd_per_iter": 0.10, "drones": {"d1": own, "d2": own, "d3": own}}));
+    let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(fold(&root).finished() && !out.contains("end: stalled"), "{out}");
+    let done: Vec<&str> = out.lines().filter_map(|l| l.split("tasks done: ").nth(1)).flat_map(|d| d.split([' ', ','])).collect();
+    for t in ["t1", "t2", "t3"] {
+        assert!(done.contains(&t), "{t} is in some drone's tasks done: {out}");
+    }
+    let sessions: Vec<String> = spend(&root).iter().map(|l| l["session"].as_str().unwrap().to_string()).collect();
+    assert!(sessions.iter().any(|s| s.contains("sim-d")), "the spend lines name the harness's own sessions: {sessions:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_failed_iteration_that_names_no_cost_is_charged() {
+    // The harness dies holding a claim and prints no cost: what it spent is estimated, as a timeout's.
+    let root = setup("crash", 1, "1", json!({"drones": {"d1": {"crash": true}}}));
+    let (out, err, code) = run(&root, &["--drones", "1", "--harness", "sim"]);
     assert_eq!(code, 1, "{out}{err}");
     let lines = spend(&root);
-    // Cut off without naming its cost, it is charged the rest of the share (no dearer iteration yet).
-    assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("timeout", Some(1.0))]);
+    assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("error", Some(1.0))]);
     assert!(out.contains("end: budget"), "{out}");
     let notes: Vec<String> = events(&root).iter().filter(|e| e.ev == board::Ev::Released).map(|e| e.note.clone()).collect();
-    assert_eq!(notes, ["budget"], "the cut-off session's claim is released");
+    assert_eq!(notes, ["budget"], "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_run() {
+    let root = setup("killed", 1, "2", json!({"drones": {"d1": {"hang": true}}}));
+    let w = work(&root).display().to_string();
+    let mut child = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--dir", &w], &[]).spawn().unwrap();
+    let t0 = Instant::now();
+    while !events(&root).iter().any(|e| e.ev == board::Ev::Claim) {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no claim");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Killed mid-iteration (Ctrl-C, a closed terminal): nothing of its own is written any more.
+    child.kill().unwrap();
+    let _ = child.wait();
+    std::fs::write(root.join("script.json"), json!({}).to_string()).unwrap();
+    let mut rerun = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--dir", &w], &[]).spawn().unwrap();
+    let t0 = Instant::now();
+    while rerun.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(60) {
+            let _ = rerun.kill();
+            panic!("the rerun waits on the dead session's claim");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = String::from_utf8_lossy(&rerun.wait_with_output().unwrap().stdout).to_string();
+    // The dead iteration is charged its estimate (the rest of its share): nothing is left to spend.
+    let lines = spend(&root);
+    assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("killed", Some(2.0))], "{out}");
+    assert!(out.contains("end: budget"), "{out}");
+    let b = fold(&root);
+    assert_eq!(b.tasks["t1"].status, Status::Open, "the dead session's claim is released: {out}");
+    assert!(events(&root).iter().any(|e| e.ev == board::Ev::Released && e.note == "its run ended"), "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_hook_planted_in_the_shared_git_dir_never_runs_in_the_runner() {
+    // A drone's worktree shares the repo's .git/hooks: the runner's own git calls run none of them.
+    let root = setup("hooks", 1, "1", json!({"usd_per_iter": 0.10}));
+    let hook = work(&root).join(".git/hooks/post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, format!("#!/bin/sh\necho \"$1\" >> {}\n", root.join("ran").display())).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, err, _) = run(&root, &["--drones", "2", "--harness", "sim"]);
+    assert!(work(&root).join(".worktrees/hive-g-2").is_dir(), "{out}{err}");
+    // `worktree add` runs post-checkout with the null ref as the previous HEAD.
+    let ran = std::fs::read_to_string(root.join("ran")).unwrap_or_default();
+    assert!(!ran.lines().any(|l| !l.is_empty() && l.chars().all(|c| c == '0')), "worktree add ran the planted hook: {ran}");
     let _ = std::fs::remove_dir_all(root);
 }
 

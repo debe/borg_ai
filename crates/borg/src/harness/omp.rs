@@ -158,31 +158,7 @@ fn sub_agent(path: &Path) -> SubAgent {
                 a.prompt = v["task"].as_str().unwrap_or_default().to_string();
                 a.started = ts(&v["timestamp"]).max(a.started);
             }
-            Some("message") => {
-                let m = &v["message"];
-                match m["role"].as_str() {
-                    Some("assistant") => {
-                        for b in m["content"].as_array().into_iter().flatten() {
-                            match b["type"].as_str() {
-                                Some("toolCall") if b["name"] == "yield" => called.push(b["arguments"].clone()),
-                                Some("toolCall") => a.work.push_str(&format!("{}\n", b["arguments"])),
-                                Some("text") => {
-                                    let t = b["text"].as_str().unwrap_or_default();
-                                    a.work.push_str(&format!("{t}\n"));
-                                    a.final_text = t.to_string();
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    // What omp accepted: a call that failed its schema is retried, and only the
-                    // retry counts.
-                    Some("toolResult") if m["toolName"] == "yield" && m["isError"] != true && m["details"]["status"] == "success" => {
-                        accepted.extend(m["details"].as_object().map(|d| Value::Object(d.clone())));
-                    }
-                    _ => {}
-                }
-            }
+            Some("message") => message(&mut a, &mut called, &mut accepted, &v["message"]),
             _ => {}
         }
     }
@@ -193,6 +169,28 @@ fn sub_agent(path: &Path) -> SubAgent {
     };
     a.output = yielded(if accepted.is_empty() { called.into_iter().map(unwrap).collect() } else { accepted });
     a
+}
+
+/// One message of a sub-agent's session: an assistant's tool calls and texts are its work (its
+/// `yield` calls kept in `called`), a `yield` result omp accepted goes to `accepted` (a call that
+/// failed its schema is retried, and only the retry counts).
+fn message(a: &mut SubAgent, called: &mut Vec<Value>, accepted: &mut Vec<Value>, m: &Value) {
+    match m["role"].as_str() {
+        Some("assistant") => {
+            for b in m["content"].as_array().into_iter().flatten() {
+                match b["type"].as_str() {
+                    Some("toolCall") if b["name"] == "yield" => called.push(b["arguments"].clone()),
+                    Some("toolCall") => a.called(&b["arguments"]),
+                    Some("text") => a.said(b["text"].as_str().unwrap_or_default()),
+                    _ => {}
+                }
+            }
+        }
+        Some("toolResult") if m["toolName"] == "yield" && m["isError"] != true && m["details"]["status"] == "success" => {
+            accepted.extend(m["details"].as_object().map(|d| Value::Object(d.clone())));
+        }
+        _ => {}
+    }
 }
 
 /// One output from an agent's yields (`{type?, data}` each): a reviewer yields its findings one call

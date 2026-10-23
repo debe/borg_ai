@@ -335,3 +335,116 @@ fn a_drone_outside_the_goal_or_without_a_session_is_refused() {
     assert!(code == 1 && err.contains("no hive goal nope"), "{err}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Appends `lines` (JSON events) to g1's board.
+fn append_board(root: &Path, lines: &[Value]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(store(root).join("hive/g1/tasks.jsonl")).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+/// A goal `g1` (t1, t2) whose oracle passes, and while it runs hands t1 to `s2`: an engineer releases
+/// it and s2 claims it, the way a rival takes a claim whose lease ran out during a long suite.
+fn init_with_a_rival(root: &Path) {
+    let script = root.join("rival.sh");
+    let line = |ev: &str, by: &str, at: &str| format!(r#"{{"v":1,"ev":"{ev}","task":"t1","ms":{at},"by":"{by}"}}"#);
+    let body = format!(
+        "ms=$(date +%s%3N)\nprintf '%s\\n%s\\n' '{}' '{}' | sed \"s/MS1/$((ms-2))/;s/MS2/$((ms-1))/\" >> {}\n",
+        line("released", "engineer:e@x", "MS1"),
+        line("claim", "s2", "MS2"),
+        store(root).join("hive/g1/tasks.jsonl").display()
+    );
+    std::fs::write(&script, body).unwrap();
+    let check = format!("ok=sh {}", script.display());
+    ok(
+        root,
+        &["init", "g1", "--spec", "Ship the parser", "--oracle", &check, "--budget", "5", "--task", "t1|work|Add the parser", "--task", "t2|work|Document it"],
+    );
+}
+
+#[test]
+fn a_done_after_the_claim_passed_to_a_rival_is_not_a_done() {
+    let root = common::setup("hive-done-lost");
+    init_with_a_rival(&root);
+    join(&root, "s1");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    let (out, err, code) = hive(&root, &["done", "--session", "s1"]);
+    assert_eq!(code, 3, "the claim was lost while the oracle ran: {out}{err}");
+    assert!(!out.contains("done: the oracle passed") && out.contains("claimed by s2") && out.contains("It is not yours"), "{out}");
+    let b = board(&root);
+    assert_eq!(b["t1"], ("claimed".into(), "s2".into()));
+    assert!(!b.contains_key("t1.v1"), "no verify task for a done the board ignored");
+    // The stop's done: the same read-back, no handover announced for work the board did not take.
+    let root2 = common::setup("hive-stop-done-lost");
+    init_with_a_rival(&root2);
+    join(&root2, "s1");
+    ok(&root2, &["claim", "t1", "--session", "s1"]);
+    let r = reason(&stop(&root2, "s1", false));
+    assert!(!r.contains("t1 done") && r.contains("claimed by s2") && r.contains("It is not yours"), "{r}");
+    let b = board(&root2);
+    assert_eq!((&b["t1"], b["t2"].0.as_str()), (&("claimed".to_string(), "s2".to_string()), "open"));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(root2);
+}
+
+#[test]
+fn a_task_whose_deps_cannot_be_brought_in_is_passed_over_for_the_next() {
+    let root = common::setup("hive-deps-skip");
+    init(&root, &["t1|work|Add the parser", "t2|work|Use it||t1", "t3|work|Document it", "t4|work|Benchmark it"]);
+    // t1 verified, with no snapshot of its work to bring into a tree (a claim made outside git).
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let ev = |ev: &str, task: &str, by: &str, at: i64| json!({"v": 1, "ev": ev, "task": task, "ms": ms + at, "by": by});
+    let mut open = ev("open", "t1.v1", "sx", 2);
+    open["def"] = json!({"id": "t1.v1", "role": "verify", "title": "verify t1", "of": "t1"});
+    append_board(&root, &[ev("claim", "t1", "sx", 1), ev("done", "t1", "sx", 2), open, ev("claim", "t1.v1", "sy", 3), ev("verified", "t1.v1", "sy", 4)]);
+    assert_eq!(board(&root)["t1"].0, "verified");
+    join(&root, "s3");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let (out, err, code) = hive(&root, &["claim", "--session", "s3"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("skipped t2: t1 has no verified work to bring into this tree") && out.contains("claimed t3 for s3"), "{out}");
+    // Offered no more in this session, and passed over again by the stop's handover.
+    std::fs::write(work(&root).join("ok"), "").unwrap();
+    let r = reason(&stop(&root, "s3", false));
+    assert!(r.contains("t3 done") && r.contains("Next: Your claim: t4"), "{r}");
+    let b = board(&root);
+    assert_eq!((b["t2"].0.as_str(), &b["t4"]), ("open", &("claimed".to_string(), "s3".to_string())));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_board_that_cannot_be_written_is_no_lost_race() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = common::setup("hive-board-ro");
+    init(&root, &["t1|work|Add the parser"]);
+    join(&root, "s1");
+    let tasks = store(&root).join("hive/g1/tasks.jsonl");
+    std::fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let (out, err, code) = hive(&root, &["claim", "--session", "s1"]);
+    std::fs::set_permissions(&tasks, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(!out.contains("another drone claimed it first") && err.contains("could not write the board"), "{out}{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_session_in_a_subdirectory_is_scoped_by_repo_paths_and_its_end_releases_the_claim() {
+    let root = common::setup("hive-subdir");
+    init(&root, &["t1|work|Add the parser|crates/x/src/*"]);
+    std::fs::create_dir_all(work(&root).join(".git")).unwrap();
+    let sub = work(&root).join("crates/x");
+    std::fs::create_dir_all(sub.join("src")).unwrap();
+    join(&root, "s1");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    let edit = |f: &str| {
+        let input = json!({"cwd": sub, "tool_name": "Edit", "tool_input": {"file_path": sub.join(f), "old_string": "a", "new_string": "b"}});
+        hook(&root, "post_tool", "s1", input, &[]).map(|v| common::context(&v.to_string())).unwrap_or_default()
+    };
+    assert!(!edit("src/a.rs").contains("outside"), "its own file, seen from a subdirectory, is inside the scope");
+    assert!(edit("README.md").contains("crates/x/README.md is outside t1's scope"), "repo-relative in the warning too");
+    hook(&root, "end", "s1", json!({}), &[]);
+    assert_eq!(board(&root)["t1"].0, "open", "the session's end releases its claim");
+    let _ = std::fs::remove_dir_all(root);
+}

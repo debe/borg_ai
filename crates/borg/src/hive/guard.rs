@@ -83,12 +83,65 @@ pub fn guarded(home: &Path, g: &Goal) -> Vec<PathBuf> {
 
 /// A test runner's config, wherever it lies: it decides how the existing tests run (a `conftest.py`
 /// hook that deselects them, `addopts = -k ...`), so adding one is changing the tests. `pyproject.toml`
-/// and `package.json` are not counted: most of their changes are not about tests.
+/// and `package.json` are not counted: most of their changes are not about tests ([`shared_config`]:
+/// only their runner's part is).
 pub fn runner_config(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     ["conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "karma.conf.js", "phpunit.xml", "phpunit.xml.dist", ".rspec", "spec_helper.rb", "rails_helper.rb"]
         .contains(&name)
         || ["jest.config.", "jest.setup.", "vitest.config.", "vitest.workspace.", "setupTests.", ".mocharc"].iter().any(|p| name.starts_with(p))
+}
+
+/// A config file shared by a test runner and the rest of the project: only its runner's part (see
+/// [`runner_part`]) decides how the existing tests run.
+pub fn shared_config(rel: &str) -> bool {
+    ["pyproject.toml", "setup.cfg", "package.json"].contains(&rel.rsplit('/').next().unwrap_or(rel))
+}
+
+/// The test runner's part of a [`shared_config`] file (`rel`, its lines), as text two versions compare
+/// by: in pyproject.toml the `[tool.pytest*]`, `[tool.coverage*]`, `[tool.tox*]` tables and `tool.pytest`
+/// keys outside them; in setup.cfg the `[tool:pytest]`, `[pytest]`, `[coverage:*]` sections; in
+/// package.json the `jest`, `mocha`, `vitest`, `ava`, `nyc`, `c8` keys and the `test`, `pretest`,
+/// `posttest`, `test:*` scripts. A package.json that does not parse is all the runner's; an empty file
+/// (one not there) has none.
+pub fn runner_part(rel: &str, lines: &[String]) -> String {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if name == "package.json" {
+        return package_runner_part(&lines.join("\n"));
+    }
+    let runner = |table: &str| match name {
+        "pyproject.toml" => ["tool.pytest", "tool.coverage", "tool.tox"].iter().any(|p| table.starts_with(p)),
+        _ => table == "tool:pytest" || table == "pytest" || table.starts_with("coverage:"),
+    };
+    let (mut table, mut out) = (String::new(), String::new());
+    for l in lines {
+        let t = l.trim();
+        if t.starts_with('[') {
+            table = t.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+        }
+        if runner(&table) || (table.is_empty() && name == "pyproject.toml" && t.starts_with("tool.pytest")) {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// [`runner_part`] of a package.json's `text`.
+fn package_runner_part(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new(); // none, before it was added or after it was deleted
+    }
+    let Ok(Value::Object(v)) = serde_json::from_str::<Value>(text) else { return text.to_string() };
+    let mut part = serde_json::Map::new();
+    for k in ["jest", "mocha", "vitest", "ava", "nyc", "c8"] {
+        part.extend(v.get(k).map(|x| (k.to_string(), x.clone())));
+    }
+    if let Some(Value::Object(scripts)) = v.get("scripts") {
+        let test = |k: &str| ["test", "pretest", "posttest"].contains(&k) || k.starts_with("test:");
+        part.extend(scripts.iter().filter(|(k, _)| test(k)).map(|(k, x)| (format!("scripts.{k}"), x.clone())));
+    }
+    if part.is_empty() { String::new() } else { Value::Object(part).to_string() }
 }
 
 /// The repo files the goal's visible checks run (a `grade.sh`): a command word that is a file under
@@ -214,6 +267,99 @@ fn tokens(line: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
+/// What a line does to the comments and strings around it: the block comments it opens less those it
+/// closes (`/*`, `*/` outside its quoted strings; a quote in a comment, `it's`, opens none), and its triple quotes (`'''`, `"""`), each of
+/// which opens or closes a string. A test edit whose hunk changes either from what it removed turns
+/// unchanged lines into a comment or a string ([`weakens`](super::verdict::weakens)).
+pub fn delimiters(line: &str) -> (i32, usize) {
+    let triple = line.matches("'''").count() + line.matches("\"\"\"").count();
+    let c: Vec<char> = line.chars().collect();
+    let (mut depth, mut i, comment) = (0, 0, comment_only(line));
+    while i + 1 < c.len() {
+        match (c[i], c[i + 1]) {
+            ('/', '*') => (depth, i) = (depth + 1, i + 2),
+            ('*', '/') => (depth, i) = (depth - 1, i + 2),
+            ('/', '/') if depth == 0 => break,
+            (q @ ('\'' | '"' | '`'), _) if depth == 0 && !comment => {
+                i += 1;
+                while i < c.len() && c[i] != q {
+                    i += if c[i] == '\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (depth, triple)
+}
+
+static PY_DEF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:async\s+)?(def|class)\s+(\w+)").unwrap());
+static PY_IMPORT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:from\s+(\S+)\s+)?import\s+([^#]*)").unwrap());
+static PY_ASSIGN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\w+)\s*(?::[^=]*)?=[^=]").unwrap());
+
+/// What a Python file binds outside its functions: (scope, name) -> how many different bindings,
+/// where the scope is the enclosing classes (`""` for the module) by indentation. A `def`, a `class`
+/// and an assignment each bind a name anew; an import binds it to what it imports (`a.b` binds `a`,
+/// `x as y` binds `y`), so the same import twice is one binding. A triple-quoted string's lines bind
+/// nothing. A second binding of a name replaces the first: a second `def test_parse` is the only one
+/// pytest collects, and a `parse = lambda s: s` replaces the function under test.
+pub fn python_bindings(lines: &[String]) -> std::collections::HashMap<(String, String), usize> {
+    let mut seen: std::collections::HashMap<(String, String), std::collections::HashSet<String>> = std::collections::HashMap::new();
+    // The enclosing `def`s and `class`es: (indent, name, a def).
+    let mut scope: Vec<(usize, String, bool)> = Vec::new();
+    // Inside a triple-quoted string; inside an import's parentheses: (scope, module).
+    let (mut in_string, mut import): (bool, Option<(String, String)>) = (false, None);
+    let mut bind = |at: &str, name: &str, to: String| {
+        seen.entry((at.to_string(), name.to_string())).or_default().insert(to);
+    };
+    for (i, l) in lines.iter().enumerate() {
+        let odd = (l.matches("\"\"\"").count() + l.matches("'''").count()) % 2 == 1;
+        let t = l.trim_start();
+        if in_string || t.is_empty() || t.starts_with('#') {
+            in_string ^= in_string && odd;
+            continue;
+        }
+        if let Some((at, from)) = import.take() {
+            imported(&from, t).into_iter().for_each(|(n, to)| bind(&at, &n, to));
+            import = (!t.contains(')')).then_some((at, from));
+            continue;
+        }
+        in_string = odd;
+        let indent = l.len() - t.len();
+        while scope.last().is_some_and(|s| s.0 >= indent) {
+            scope.pop();
+        }
+        if scope.iter().any(|s| s.2) {
+            continue; // a function's locals
+        }
+        let at = scope.iter().map(|s| s.1.as_str()).collect::<Vec<_>>().join(".");
+        if let Some(c) = PY_DEF.captures(t) {
+            bind(&at, &c[2], format!("line {i}"));
+            scope.push((indent, c[2].to_string(), &c[1] == "def"));
+        } else if let Some(c) = PY_IMPORT.captures(t) {
+            let from = c.get(1).map_or("", |m| m.as_str());
+            imported(from, &c[2]).into_iter().for_each(|(n, to)| bind(&at, &n, to));
+            import = (c[2].contains('(') && !c[2].contains(')')).then(|| (at, from.to_string()));
+        } else if let Some(c) = PY_ASSIGN.captures(t) {
+            bind(&at, &c[1], format!("line {i}"));
+        }
+    }
+    seen.into_iter().map(|(k, v)| (k, v.len())).collect()
+}
+
+/// An import's names (`name`, `name as alias`; parentheses, a comment, a continuation aside), each with
+/// what it binds to: `import a.b` binds `a`, `from m import x as y` binds `y`.
+fn imported(from: &str, names: &str) -> Vec<(String, String)> {
+    let names = names.split(['(', ')', ',']).map(|n| n.split('#').next().unwrap_or(n).trim()).filter(|n| !n.is_empty() && *n != "*" && *n != "\\");
+    names
+        .map(|n| {
+            let (what, alias) = n.split_once(" as ").map_or((n, None), |(w, a)| (w.trim(), Some(a.trim())));
+            let name = alias.unwrap_or_else(|| if from.is_empty() { what.split('.').next().unwrap_or(what) } else { what });
+            (name.to_string(), format!("import {from}:{what}"))
+        })
+        .collect()
+}
+
 /// A line no test depends on: blank, or a comment only (`//`, `/*`, `*`, `*/`, `--`, `#` but not a
 /// Rust attribute `#[..]` or `#!`).
 pub fn comment_only(line: &str) -> bool {
@@ -231,8 +377,9 @@ static SILENCER: LazyLock<Regex> = LazyLock::new(|| {
         r"|(^|[^.\w$])(xit|xdescribe|xtest|xcontext|fit|fdescribe)\s*\(|\b(it|test|describe|context)\.(skip|only|todo|failing)\b",
         // Rust, Go, C#.
         r"|#\[ignore\b|\bt\.Skip(Now|f)?\s*\(|\[Ignore\b|\bSkip\s*=",
-        // Any language: an exit, or a bare return that ends a test early.
+        // Any language: an exit, a bare return that ends a test early, a block that never runs.
         r"|\b(sys\.exit|os\._exit|process\.exit|System\.exit)\s*\(|^\s*return\s*;?\s*$",
+        r"|^\s*(if|while)\s*\(?\s*(False|false|0|None|null|nil|undefined)\s*\)?\s*[:{]?\s*$",
     ))
     .unwrap()
 });
@@ -256,7 +403,7 @@ pub fn declares_test(line: &str) -> bool {
 }
 
 /// A line that skips, disables, focuses or cuts short tests: a `@Disabled`, `@pytest.mark.skip`,
-/// `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, an exit or a bare `return`. Annotation and call forms
+/// `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, an exit, a bare `return` or an `if False:`. Annotation and call forms
 /// only: a `skipsEmptyLines()` test is no silencer.
 pub fn silencer(line: &str) -> bool {
     SILENCER.is_match(line)
@@ -357,9 +504,12 @@ pub fn paths(tool: &str, input: &Value) -> (Vec<String>, Vec<String>) {
 pub fn flags_for(tool: &str, input: &Value, cwd: &Path, guard: &[PathBuf], oracle_files: &[String]) -> Vec<(Class, String)> {
     let (writes, reads) = paths(tool, input);
     let mut out: Vec<(Class, String)> = Vec::new();
+    // Relative to the repo, as a task's files and the verdict's diff are: `cwd` may be a subdirectory.
+    let root = lexical(cwd);
+    let top = super::repo_top(&root);
     let classed = |p: &str| {
         let abs = if Path::new(p).is_absolute() { lexical(Path::new(p)) } else { lexical(&cwd.join(p)) };
-        let rel = abs.strip_prefix(lexical(cwd)).map_or_else(|_| abs.display().to_string(), |r| r.display().to_string());
+        let rel = abs.strip_prefix(top).map_or_else(|_| abs.display().to_string(), |r| r.display().to_string());
         class_of(&rel, &abs, guard, oracle_files).map(|c| (c, rel))
     };
     for p in &writes {

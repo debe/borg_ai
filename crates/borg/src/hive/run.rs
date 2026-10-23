@@ -17,8 +17,16 @@
 //! cut off at `--iter-timeout` without naming its cost is charged an estimate (`Spend::est`: the
 //! drone's dearest iteration so far, else the rest of its share). A harness that stops itself at a
 //! budget (`Caps::headless_budget`) gets the drone's dollars left; any other overshoots by at most one
-//! iteration, which `--iter-timeout` bounds. Whatever an ended iteration's session still holds is
-//! released: the session is gone, and its lease would otherwise keep the task for `LEASE_MS`.
+//! iteration, which `--iter-timeout` bounds. One that failed without naming its cost is charged the
+//! same estimate: it may have spent up to the cap. Whatever an ended iteration's session still holds is
+//! released: the session is gone, and its lease would otherwise keep the task for `LEASE_MS`. An
+//! iteration's sessions are the one the runner named, the one the harness reported, and every one
+//! whose claim carries the drone since the iteration started: omp and opencode keep ids of their own
+//! and report none.
+//!
+//! A run killed mid-iteration (Ctrl-C, a closed terminal) writes nothing more, and its sessions die
+//! with it (runner.rs `run_bounded`). The next run of the goal makes that good under the lock, before
+//! it counts what is spent ([`recover`]).
 //!
 //! Lines, under `<store>/hive/<goal>/`: `spend.jsonl` (one per iteration, also what a re-run counts
 //! as spent), `runs.jsonl` (one per run), `joins.jsonl` (each iteration's session and worktree, and a
@@ -77,7 +85,7 @@ fn logs_dir(home: &Path, goal: &str) -> PathBuf {
 }
 
 /// One iteration of one drone: what it cost (None: the harness reported nothing) and how it ended
-/// (`ok`, `timeout`, `error`).
+/// (`ok`, `timeout`, `error`, or `killed`: its run died, written by the next run, [`recover`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Spend {
     pub v: u8,
@@ -86,7 +94,8 @@ pub struct Spend {
     pub iter: u32,
     pub harness: String,
     pub usd: Option<f64>,
-    /// What a timed-out iteration that named no cost is charged instead (see the module doc).
+    /// What a timed-out, failed or killed iteration that named no cost is charged instead (see the
+    /// module doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub est: Option<f64>,
     #[serde(default)]
@@ -217,7 +226,7 @@ fn fold(home: &Path, goal: &str) -> Board {
 
 /// A task is open to `drone` at `now`: one of its new sessions could claim it.
 fn open_to(g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> bool {
-    board::next_for(b, "", repo, now, |t| super::may_claim(g, t, repo) && !t.not_by.iter().any(|n| n == drone)).is_some()
+    board::next_for(b, "", drone, repo, now, |t| super::may_claim(g, t, repo)).is_some()
 }
 
 /// A fresh UUID-shaped session id (Claude Code's `--session-id` takes only a UUID).
@@ -231,9 +240,12 @@ fn session_id(goal: &str, drone: &str, iter: u32) -> String {
     format!("{}-{}-4{}-a{}-{}", &x[0..8], &x[8..12], &x[13..16], &x[17..20], &x[20..32])
 }
 
+/// git in `dir`, running no hook: a drone can plant one in the shared `.git/hooks` (`worktree add`
+/// runs post-checkout), and the runner runs as the engineer, outside any iteration's cap (as
+/// integrate.rs `git`).
 fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    cmd.arg("-C").arg(dir).args(["-c", "core.hooksPath=/dev/null"]).args(args).env("GIT_TERMINAL_PROMPT", "0");
     match runner::run_capped_status(cmd, None, timeout)? {
         (status, out) if status.success() => Some(String::from_utf8_lossy(&out).trim().to_string()),
         _ => None,
@@ -295,6 +307,66 @@ fn release_held(home: &Path, goal: &str, b: &Board, sessions: &[String], note: &
     }
 }
 
+/// The sessions of `drone`'s iteration that started at `started`: those named (`known`, empty ones
+/// skipped) and every one whose claim carries the drone since. A harness may ignore the session id the
+/// runner chose and report none (omp, opencode); its hooks still claim as the drone (`DRONE_ENV`).
+fn sessions_of(events: &[board::Event], drone: &str, started: i64, known: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = known.iter().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    for e in events.iter().filter(|e| e.ev == Ev::Claim && e.drone == drone && e.node.is_empty() && e.ms >= started) {
+        if !out.contains(&e.by) {
+            out.push(e.by.clone());
+        }
+    }
+    out
+}
+
+/// What an iteration that named no cost is charged: the drone's dearest iteration so far, else the
+/// rest of its share (it may have spent up to the cap).
+fn estimate(dearest: f64, share: f64, spent: f64) -> f64 {
+    if dearest > 0.0 { dearest } else { (share - spent).max(0.0) }
+}
+
+/// Makes good what the goal's last run, killed mid-iteration, never wrote; under the run lock, so no
+/// drone of the goal runs now. Each iteration it started (a `run` join naming its session) that no
+/// spend line names is charged its estimate (`exit: "killed"`), and every claim a runner drone's
+/// session still holds on this node is released: the session is dead, and its lease would keep the
+/// task for `LEASE_MS`.
+fn recover(home: &Path, goal: &str, now: i64) {
+    let mut lines: Vec<Spend> = super::read_lines(&spend_path(home, goal));
+    let run = super::read_lines::<RunLine>(&runs_path(home, goal)).pop();
+    let (since, share) = run.map_or((i64::MAX, 0.0), |r| (r.ms, r.share_usd));
+    let named: std::collections::HashSet<String> = lines.iter().flat_map(|s| s.session.split(',').map(String::from)).collect();
+    let joins = super::read_lines::<Join>(&super::joins_path(home, goal));
+    for j in joins.iter().filter(|j| j.by == "run" && j.ms >= since && !j.session.is_empty() && !named.contains(&j.session)) {
+        let (iter, dearest) = spent_before(&lines, &j.drone);
+        let spent: f64 = lines.iter().filter(|s| s.drone == j.drone && s.ms >= since).map(Spend::charged).sum();
+        let line = Spend {
+            v: 1,
+            ms: now,
+            drone: j.drone.clone(),
+            iter: iter + 1,
+            harness: j.harness.clone(),
+            usd: None,
+            est: Some(estimate(dearest, share, spent)),
+            session: j.session.clone(),
+            exit: "killed".into(),
+        };
+        if super::append_line(&spend_path(home, goal), &line).is_ok() {
+            lines.push(line);
+        }
+    }
+    let b = fold(home, goal);
+    let runner = |d: &str| (1..=MAX_DRONES).any(|n| drone_name(n) == d);
+    let held: Vec<String> = b
+        .tasks
+        .values()
+        .filter_map(|s| s.live(now))
+        .filter(|(by, node, _)| node.is_empty() && b.drones.get(*by).is_some_and(|d| runner(d)))
+        .map(|(by, _, _)| by.to_string())
+        .collect();
+    release_held(home, goal, &b, &held, "its run ended", now);
+}
+
 /// Up to `LOG_CAP` of an iteration's output, in `logs/<drone>-<iter>.out`.
 fn log(home: &Path, goal: &str, drone: &str, iter: u32, out: &[u8]) {
     let dir = logs_dir(home, goal);
@@ -342,10 +414,6 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         iter += 1;
         end.iters += 1;
         let session = session_id(goal, &name, iter);
-        let dir = wt.display().to_string();
-        let join =
-            Join { v: 1, ms: now, goal: goal.into(), dir, drone: name.clone(), session: session.clone(), harness: ctx.h.name().into(), by: "run".into() };
-        let _ = super::append_join(ctx.home, goal, &join);
         let left = (ctx.share - t.spent).max(0.0);
         let run = Headless {
             prompt: &text,
@@ -360,6 +428,12 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             end.spent = t.spent;
             return end;
         };
+        // Written before the session starts (its hooks route by it), and only for one that starts: a
+        // run join no spend line names is an iteration a killed run started (`recover`).
+        let dir = wt.display().to_string();
+        let join =
+            Join { v: 1, ms: now, goal: goal.into(), dir, drone: name.clone(), session: session.clone(), harness: ctx.h.name().into(), by: "run".into() };
+        let _ = super::append_join(ctx.home, goal, &join);
         let started = learn::now_ms();
         let ran = runner::run_bounded(cmd, None, ctx.iter_timeout);
         let out = ran.as_ref().map(|b| b.out.as_slice()).unwrap_or_default();
@@ -370,12 +444,11 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             Some(b) if !said.error && b.status.is_some_and(|s| s.success()) => "ok",
             _ => "error",
         };
-        let mut sessions = vec![session.clone()];
-        if !said.session.is_empty() && said.session != session {
-            sessions.push(said.session.clone());
-        }
-        // One cut off at the cap spent up to `iter_timeout` of model calls without saying what.
-        let est = (said.usd.is_none() && exit == "timeout").then(|| if t.dearest > 0.0 { t.dearest } else { (ctx.share - t.spent).max(0.0) });
+        let events = board::read(&super::tasks_path(ctx.home, goal));
+        let sessions = sessions_of(&events, &name, started, &[&session, &said.session]);
+        // One cut off at the cap, or one that failed, spent up to `iter_timeout` of model calls
+        // without saying what.
+        let est = (said.usd.is_none() && exit != "ok").then(|| estimate(t.dearest, ctx.share, t.spent));
         let line = Spend {
             v: 1,
             ms: learn::now_ms(),
@@ -398,7 +471,6 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         }
         t.errors = if exit == "ok" { 0 } else { t.errors + 1 };
         // Board progress: any line of this iteration's sessions (a claim, a done, a verdict).
-        let events = board::read(&super::tasks_path(ctx.home, goal));
         let mine: Vec<&board::Event> = events.iter().filter(|e| e.ms >= started && sessions.contains(&e.by) && e.ev != Ev::Heartbeat).collect();
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         t.stalls = if mine.is_empty() { t.stalls + 1 } else { 0 };
@@ -480,6 +552,22 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     let Some(sample) = o.harness.headless(&probe) else {
         return usage(format!("{} cannot run headless drones (Harness::headless); use one of: {}", o.harness.name(), headless_names(&probe)));
     };
+    // The lock before the spend is read: a run ending now has written all of its own.
+    let _lock = if o.dry_run {
+        None
+    } else {
+        match run_lock(home, &g.id) {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => return usage(format!("another `borg hive run {}` is running: one run of a goal at a time", g.id)),
+            Err(e) => {
+                eprintln!("borg hive run: {e}");
+                return 1;
+            }
+        }
+    };
+    if !o.dry_run {
+        recover(home, &g.id, learn::now_ms());
+    }
     let before: Vec<Spend> = super::read_lines(&spend_path(home, &g.id));
     let spent: f64 = before.iter().map(Spend::charged).sum();
     // What is left of the goal's budget, after every earlier run's spend, shared by this run's drones.
@@ -501,14 +589,6 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         println!("prompt ({}):\n{}", drone_name(1), prompt(&g, &drone_name(1), &super::joins_path(home, &g.id)));
         return 0;
     }
-    let _lock = match run_lock(home, &g.id) {
-        Ok(Some(l)) => l,
-        Ok(None) => return usage(format!("another `borg hive run {}` is running: one run of a goal at a time", g.id)),
-        Err(e) => {
-            eprintln!("borg hive run: {e}");
-            return 1;
-        }
-    };
     if let Err(e) = exclude_worktrees(&repo) {
         eprintln!("borg hive run: {e}");
         return 1;

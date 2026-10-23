@@ -24,14 +24,13 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::collective::{self, Config, Route};
+use crate::harness::opencode;
 use crate::learn::{self, Episode, Lesson};
 use crate::runner;
 
@@ -536,54 +535,8 @@ pub fn opencode_session(export: &Value) -> Vec<Found> {
     r.out
 }
 
-/// One opencode CLI call: (arguments, the directory it runs in) -> stdout. `opencode_cli` in production.
+/// One opencode CLI call: (arguments, the directory it runs in) -> stdout. `opencode::cli` in production.
 pub type Exec<'a> = &'a dyn Fn(&[String], &Path) -> Option<Vec<u8>>;
-
-/// How long one opencode CLI call (the query, a listing, one export) may take.
-const CLI_CAP: Duration = Duration::from_secs(30);
-
-/// `opencode <args>` in `dir`, the `opencode` on `path` (None: this process's PATH), capped like a
-/// model call (a hung CLI never stalls the run). PWD names the dir too: opencode takes the project
-/// from it, not from the process cwd. 2.x (`v2`) gets a model call's env (`runner::standalone_env`):
-/// its private server would otherwise load every plugin and the project's own config in the
-/// engineer's repos. The output goes to a file in a private scratch dir: opencode exits before a
-/// full pipe drains, so a large export read through a pipe arrives cut off (seen on 1.19 at 72 KiB),
-/// while a file gets all of it.
-fn opencode_cli(v2: bool, path: Option<&OsStr>, args: &[String], dir: &Path) -> Option<Vec<u8>> {
-    let scratch = runner::Scratch::new("opencode-out")?;
-    let out = scratch.0.join("out.json");
-    let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", r#"umask 077; out="$1"; shift; exec opencode "$@" > "$out""#, "sh"]).arg(&out).args(args);
-    cmd.current_dir(dir).env("PWD", dir).env("OPENCODE_DISABLE_AUTOUPDATE", "1");
-    if v2 {
-        let empty = scratch.0.join("config");
-        std::fs::create_dir(&empty).ok()?;
-        runner::standalone_env(&mut cmd, Some(&empty), runner::engineers_config());
-    }
-    if let Some(p) = path {
-        cmd.env("PATH", p);
-    }
-    runner::run_capped(cmd, None, CLI_CAP)?;
-    std::fs::read(&out).ok()
-}
-
-/// One session's export through this machine's opencode CLI, run in `dir` (the opencode harness's
-/// subagents, harness/opencode.rs).
-pub(crate) fn opencode_export(id: &str, dir: &Path) -> Option<Value> {
-    let v2 = runner::opencode() == runner::Opencode::V2;
-    opencode_cli(v2, None, &export_args(v2, id), dir).and_then(|o| serde_json::from_slice(&o).ok())
-}
-
-/// The rows of a read-only query of opencode 1.x's database; None on 2.x, which has no such query,
-/// or when the call fails.
-pub(crate) fn opencode_db(sql: &str) -> Option<Vec<Value>> {
-    if runner::opencode() == runner::Opencode::V2 {
-        return None;
-    }
-    let mut a = strings(&["db", "--pure", "--format", "json"]);
-    a.push(sql.to_string());
-    opencode_cli(false, None, &a, &std::env::temp_dir()).and_then(|o| serde_json::from_slice(&o).ok())
-}
 
 fn strings(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|x| x.to_string()).collect()
@@ -603,12 +556,6 @@ fn db_args(since: Option<i64>) -> Vec<String> {
 /// so the engineer's background service is never started or asked.
 fn list_args(v2: bool) -> Vec<String> {
     strings(&["session", "list", if v2 { "--standalone" } else { "--pure" }, "--format", "json", "-n", "100000"])
-}
-
-fn export_args(v2: bool, id: &str) -> Vec<String> {
-    let mut a = strings(if v2 { &["session", "export", "--standalone"] } else { &["export", "--pure"] });
-    a.push(id.to_string());
-    a
 }
 
 /// The session ids in a JSON array of rows (`opencode db`, `opencode session list`), without borg's
@@ -691,7 +638,7 @@ fn cli_sessions(v2: bool, since: Option<i64>, known: &BTreeSet<PathBuf>, exec: E
         eprintln!("borg assimilate: exporting {} opencode sessions", listed.len());
     }
     for (id, dir) in listed {
-        if let Some(v) = exec(&export_args(v2, &id), &dir).and_then(|o| serde_json::from_slice::<Value>(&o).ok()) {
+        if let Some(v) = exec(&opencode::export_args(v2, &id), &dir).and_then(|o| serde_json::from_slice::<Value>(&o).ok()) {
             each(&v);
         }
     }
@@ -794,7 +741,7 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
             OpencodeFrom::Dir(d) => dir_sessions(d, &mut each),
             OpencodeFrom::Cli => {
                 let v2 = runner::opencode() == runner::Opencode::V2;
-                cli_sessions(v2, opts.since, &known, &|a, d| opencode_cli(v2, None, a, d), &mut each)
+                cli_sessions(v2, opts.since, &known, &|a, d| opencode::cli(v2, None, a, d), &mut each)
             }
         }
         report.opencode = Some(n);
@@ -1526,8 +1473,8 @@ mod tests {
         assert!(!db_args(None)[4].contains("time_updated"));
         assert_eq!(list_args(true), ["session", "list", "--standalone", "--format", "json", "-n", "100000"]);
         assert_eq!(list_args(false), ["session", "list", "--pure", "--format", "json", "-n", "100000"]);
-        assert_eq!(export_args(true, "ses_a"), ["session", "export", "--standalone", "ses_a"]);
-        assert_eq!(export_args(false, "ses_a"), ["export", "--pure", "ses_a"]);
+        assert_eq!(opencode::export_args(true, "ses_a"), ["session", "export", "--standalone", "ses_a"]);
+        assert_eq!(opencode::export_args(false, "ses_a"), ["export", "--pure", "ses_a"]);
         let listed = include_str!("../tests/fixtures/opencode/v2/session-list.json").as_bytes();
         assert_eq!(ids_of(listed, None).unwrap().len(), 3);
         assert_eq!(ids_of(listed, Some(1791977900000)).unwrap(), ["ses_ec5bbe808ffe4C17dEwmu9aHAe", "ses_ec5caa71cffeRc4s7USxbim6zn"]);
@@ -1576,7 +1523,7 @@ mod tests {
         let path = std::env::join_paths(std::iter::once(fake).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap();
         let dir = temp("cli-wrapper");
         let args = db_args(Some(1));
-        let out = opencode_cli(true, Some(&path), &args, &dir).unwrap();
+        let out = opencode::cli(true, Some(&path), &args, &dir).unwrap();
         assert!(out.len() > 64 * 1024, "the fake answers more than a pipe holds");
         let ids = ids_of(&out, None).unwrap();
         assert_eq!((ids.len(), ids.last().map(String::as_str)), (3001, Some("ses_last")));

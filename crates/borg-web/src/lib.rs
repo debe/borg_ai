@@ -344,7 +344,32 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/queen", get(queen))
         .route("/api/hive", get(hive))
         .route("/api/events", get(events))
+        .layer(axum::middleware::from_fn(loopback_only))
         .with_state(app)
+}
+
+/// Answers only a request whose Host names this machine's loopback. The 127.0.0.1 bind keeps other
+/// machines out but not a page in the engineer's browser whose name re-resolves to 127.0.0.1 (DNS
+/// rebinding): to the browser the port is then that page's own origin, CORS does not apply, and its
+/// script could read the goals, contracts, spend and lessons. Such a request carries that name.
+async fn loopback_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(loopback) {
+        true => next.run(req).await,
+        false => (StatusCode::FORBIDDEN, "borg web: served to a loopback Host only (127.0.0.1, localhost, [::1])\n").into_response(),
+    }
+}
+
+/// `127.0.0.1`, `localhost` or `[::1]`, with a numeric port or none.
+fn loopback(host: &str) -> bool {
+    let (name, port) = match host.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some(("::1", port)) => ("::1", port),
+            _ => return false,
+        },
+        None => host.find(':').map_or((host, ""), |i| host.split_at(i)),
+    };
+    let port = port.is_empty() || port.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port && (name == "::1" || name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost"))
 }
 
 /// Publishes this node's rollups and redacted outcomes of every collective once a minute (stats.rs

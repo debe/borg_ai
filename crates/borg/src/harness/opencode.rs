@@ -2,10 +2,13 @@
 //! `~/.config/opencode/plugins/borg.ts` (`$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`). The plugin
 //! translates both ways, sends opencode's pid, emulates the stop's second round and sets its budget.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use crate::runner;
 
 use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
@@ -85,8 +88,61 @@ impl Harness for Opencode {
             return Vec::new();
         }
         let here = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        session_runs(session, since, &|id, dir| crate::assimilate::opencode_export(id, dir.unwrap_or(&here)), &crate::assimilate::opencode_db)
+        session_runs(session, since, &|id, dir| export(id, dir.unwrap_or(&here)), &db)
     }
+}
+
+// ---------------------------------------------------------------- the CLI
+
+/// How long one opencode CLI call (the query, a listing, one export) may take.
+const CLI_CAP: Duration = Duration::from_secs(30);
+
+/// `opencode <args>` in `dir`, the `opencode` on `path` (None: this process's PATH), capped like a
+/// model call (a hung CLI never stalls the run). PWD names the dir too: opencode takes the project
+/// from it, not from the process cwd. 2.x (`v2`) gets a model call's env (`runner::standalone_env`):
+/// its private server would otherwise load every plugin and the project's own config in the
+/// engineer's repos. The output goes to a file in a private scratch dir: opencode exits before a
+/// full pipe drains, so a large export read through a pipe arrives cut off (seen on 1.19 at 72 KiB),
+/// while a file gets all of it. Here, beside the harness, so `borg assimilate` and the subagent reader
+/// share it without harness/ depending on assimilate.rs (arch.sh M5).
+pub(crate) fn cli(v2: bool, path: Option<&OsStr>, args: &[String], dir: &Path) -> Option<Vec<u8>> {
+    let scratch = runner::Scratch::new("opencode-out")?;
+    let out = scratch.0.join("out.json");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", r#"umask 077; out="$1"; shift; exec opencode "$@" > "$out""#, "sh"]).arg(&out).args(args);
+    cmd.current_dir(dir).env("PWD", dir).env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+    if v2 {
+        let empty = scratch.0.join("config");
+        std::fs::create_dir(&empty).ok()?;
+        runner::standalone_env(&mut cmd, Some(&empty), runner::engineers_config());
+    }
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    runner::run_capped(cmd, None, CLI_CAP)?;
+    std::fs::read(&out).ok()
+}
+
+/// The arguments that export session `id` (2.x always `--standalone`: a private server).
+pub(crate) fn export_args(v2: bool, id: &str) -> Vec<String> {
+    let head: &[&str] = if v2 { &["session", "export", "--standalone"] } else { &["export", "--pure"] };
+    head.iter().map(|a| a.to_string()).chain(std::iter::once(id.to_string())).collect()
+}
+
+/// One session's export through this machine's opencode CLI, run in `dir`.
+fn export(id: &str, dir: &Path) -> Option<Value> {
+    let v2 = runner::opencode() == runner::Opencode::V2;
+    cli(v2, None, &export_args(v2, id), dir).and_then(|o| serde_json::from_slice(&o).ok())
+}
+
+/// The rows of a read-only query of opencode 1.x's database; None on 2.x, which has no such query,
+/// or when the call fails.
+fn db(sql: &str) -> Option<Vec<Value>> {
+    if runner::opencode() == runner::Opencode::V2 {
+        return None;
+    }
+    let args: Vec<String> = ["db", "--pure", "--format", "json", sql].iter().map(|a| a.to_string()).collect();
+    cli(false, None, &args, &std::env::temp_dir()).and_then(|o| serde_json::from_slice(&o).ok())
 }
 
 // ---------------------------------------------------------------- subagents
@@ -176,23 +232,7 @@ fn run_of(root: &Value, export: Export, until: Instant) -> Option<Run> {
             let read = session_id(child) && exported < CHILDREN && Instant::now() < until;
             exported += usize::from(read);
             match read.then(|| export(child, (!dir.is_empty()).then_some(Path::new(dir)))).flatten() {
-                Some(c) => {
-                    let ci = &c["info"];
-                    if let Some(d) = ci["directory"].as_str().or(ci["location"]["directory"].as_str()) {
-                        a.cwd = d.to_string();
-                    }
-                    for p in c["messages"].as_array().into_iter().flatten().filter(|m| assistant(m)).flat_map(parts) {
-                        match p["type"].as_str() {
-                            Some("tool") => a.work.push_str(&format!("{}\n", p["state"]["input"])),
-                            Some("text") => {
-                                let t = p["text"].as_str().unwrap_or_default();
-                                a.work.push_str(&format!("{t}\n"));
-                                a.final_text = t.to_string();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                Some(c) => from_export(&mut a, &c),
                 // Without its export (or not read), its final text as the parent saw it.
                 None => {
                     a.work = state["output"].as_str().map_or_else(|| text(&state["content"]), String::from);
@@ -209,6 +249,21 @@ fn run_of(root: &Value, export: Export, until: Instant) -> Option<Run> {
     let id = info["id"].as_str().unwrap_or_default().to_string();
     let started = info["time"]["created"].as_i64().unwrap_or(agents[0].started);
     Some(Run { session: id.clone(), id, name: info["title"].as_str().unwrap_or_default().to_string(), started, agents })
+}
+
+/// A child's work from its export `c`: its cwd when the export names one, and its assistant parts.
+fn from_export(a: &mut SubAgent, c: &Value) {
+    let ci = &c["info"];
+    if let Some(d) = ci["directory"].as_str().or(ci["location"]["directory"].as_str()) {
+        a.cwd = d.to_string();
+    }
+    for p in c["messages"].as_array().into_iter().flatten().filter(|m| assistant(m)).flat_map(parts) {
+        match p["type"].as_str() {
+            Some("tool") => a.called(&p["state"]["input"]),
+            Some("text") => a.said(p["text"].as_str().unwrap_or_default()),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

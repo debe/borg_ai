@@ -15,7 +15,16 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 async fn get(app: Arc<App>, uri: &str) -> (StatusCode, Value) {
-    let res = router(app).oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+    get_as(app, uri, Some("127.0.0.1:7979")).await
+}
+
+/// GET `uri` with `host` as its Host header (none when None).
+async fn get_as(app: Arc<App>, uri: &str, host: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::get(uri);
+    if let Some(h) = host {
+        req = req.header("host", h);
+    }
+    let res = router(app).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
     let status = res.status();
     let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
@@ -91,5 +100,26 @@ async fn a_goal_shows_its_counts_holder_and_spend() {
     assert_eq!((status, v["goals"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "no hive, no goals");
     let (status, _) = get(app, "/api/hive?c=nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// DNS rebinding: a page whose name re-resolves to 127.0.0.1 reads the port as its own origin, so the
+/// loopback bind alone does not keep the goals, contracts and spend in. Only a loopback Host is served.
+#[tokio::test]
+async fn a_page_on_another_host_name_is_refused() {
+    let base = std::env::temp_dir().join(format!("borg-web-host-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    seed(&base.join("corp"), learn::now_ms());
+    let app = app(vec![("corp", base.join("corp"))]);
+    for host in [Some("evil.example:7979"), Some("evil.example"), Some("127.0.0.1.evil.example:7979"), Some("localhost@evil.example"), None] {
+        for uri in ["/api/hive?c=corp", "/api/lessons", "/"] {
+            let (status, _) = get_as(app.clone(), uri, host).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{host:?} {uri}");
+        }
+    }
+    for host in ["127.0.0.1:7979", "localhost:7979", "LOCALHOST:1", "[::1]:7979", "localhost"] {
+        let (status, v) = get_as(app.clone(), "/api/hive?c=corp", Some(host)).await;
+        assert_eq!((status, v["collective"].as_str()), (StatusCode::OK, Some("corp")), "{host}");
+    }
     let _ = std::fs::remove_dir_all(&base);
 }

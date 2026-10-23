@@ -427,8 +427,8 @@ corrections), transcripts, source code, `collectives.json`, per-session state.
 - steering instructions and the signed member list;
 - daily usage counts per engineer: checks, questions, outcomes, corrections, cost, lesson ids
   ([Statistics](https://github.com/debe/borg_ai/blob/main/docs/statistics.md#privacy));
-- outcomes: which lesson was asked, what followed, when, and how likely it was to be asked, with the
-  session and repo hashed, so lesson usefulness and trust are the team's (`BORG_SHARE_OUTCOMES=off`
+- outcomes: which lesson was asked, what followed (a veto and a regret's share of the blame
+  included), when, and how likely it was to be asked, with the session, repo and regret hashed, so lesson usefulness and trust are the team's (`BORG_SHARE_OUTCOMES=off`
   keeps them local).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content. Run your own relay to

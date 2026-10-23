@@ -18,7 +18,9 @@ borg web                  # http://127.0.0.1:7979/, the collective of the curren
 borg web --port 8080 --dir ~/work/some-repo
 ```
 
-The page listens on 127.0.0.1 only and updates live: within about a second of a store file changing,
+The page listens on 127.0.0.1 only and answers only requests addressed to `127.0.0.1`, `localhost` or
+`[::1]`: any other Host gets a 403, so a web page whose name re-resolves to 127.0.0.1 (DNS rebinding)
+cannot read it. It updates live: within about a second of a store file changing,
 it fetches the views that changed. It reads the same files as `borg top`, so it needs no
 `borg mesh serve` and also shows private collectives. Install it with
 `cargo install borg-web --locked` (or `--path crates/borg-web` from a checkout).
