@@ -285,9 +285,23 @@ pub fn joined(home: &Path, cwd: &str) -> Option<Join> {
     if cwd.is_empty() {
         return None;
     }
+    let all = joins(home);
+    if all.is_empty() {
+        return None;
+    }
     let path = collective::normal(Path::new(cwd));
-    let best =
-        joins(home).into_iter().filter_map(|j| collective::inside(&path, &j.dir).map(|depth| (j.ms, depth, j))).max_by_key(|(ms, depth, _)| (*ms, *depth))?;
+    // A symlinked path and its target are one directory (macOS's /var is /private/var; `--here`
+    // records the resolved cwd, a harness may report the link): resolved only when the text misses.
+    let real = std::cell::OnceCell::new();
+    let resolved = |dir: &str| -> Option<usize> {
+        let real = real.get_or_init(|| std::fs::canonicalize(cwd).ok().map(|p| collective::normal(&p)));
+        let dir = std::fs::canonicalize(collective::expand(dir)).ok()?;
+        collective::inside(real.as_ref()?, &dir.to_string_lossy())
+    };
+    let best = all
+        .into_iter()
+        .filter_map(|j| collective::inside(&path, &j.dir).or_else(|| resolved(&j.dir)).map(|depth| (j.ms, depth, j)))
+        .max_by_key(|(ms, depth, _)| (*ms, *depth))?;
     Some(best.2).filter(|j| !j.goal.is_empty())
 }
 

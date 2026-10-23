@@ -379,12 +379,19 @@ pub fn route(cfg: Option<&Config>, cwd: &str, base: &Path) -> Route {
     if cwd.trim().is_empty() {
         return Route::Off; // unknown location: never guess
     }
-    let path = normal(&expand(cwd));
-    if cfg.off.iter().any(|p| inside(&path, p).is_some()) {
+    // A path and the one its symlinks resolve to are one place (macOS's /tmp is /private/tmp; a harness
+    // may report either), on both sides: an `off` path written through a link must still win.
+    let lexical = expand(cwd);
+    let paths: Vec<Vec<String>> = std::iter::once(normal(&lexical)).chain(lexical.canonicalize().ok().map(|p| normal(&p))).collect();
+    let within = |prefix: &str| -> Option<usize> {
+        let real = expand(prefix).canonicalize().ok().map(|p| p.to_string_lossy().into_owned());
+        let prefixes = std::iter::once(prefix.to_string()).chain(real);
+        prefixes.flat_map(|pre| paths.iter().filter_map(move |p| inside(p, &pre))).max()
+    };
+    if cfg.off.iter().any(|p| within(p).is_some()) {
         return Route::Off;
     }
-    let best =
-        cfg.collectives.iter().filter_map(|c| c.paths.iter().filter_map(|p| inside(&path, p)).max().map(|n| (n, c))).max_by_key(|(n, _)| *n).map(|(_, c)| c);
+    let best = cfg.collectives.iter().filter_map(|c| c.paths.iter().filter_map(|p| within(p)).max().map(|n| (n, c))).max_by_key(|(n, _)| *n).map(|(_, c)| c);
     let chosen = best.or_else(|| cfg.collectives.iter().find(|c| c.name == cfg.default && cfg.default != "off"));
     match chosen {
         Some(c) => Route::Collective { name: c.name.clone(), home: store(base, &c.name), share: c.share },
@@ -430,6 +437,25 @@ mod tests {
         assert_eq!(name(&route(Some(&c), "/home/u/work-repos-old/x", base)), "off", "work-repos-old is not work-repos");
         assert_eq!(name(&route(Some(&c), "/home/u/private/finances", base)), "private");
         assert_eq!(name(&route(Some(&c), "/home/u/work-repos/../private/x", base)), "private", "normalised before matching");
+    }
+
+    #[test]
+    fn a_symlink_and_its_target_route_alike() {
+        // The engineer writes paths through a link (macOS's /tmp, a symlinked home), the harness reports
+        // the resolved cwd, or the other way round: `off` still wins, and the collective still routes.
+        let root = std::env::temp_dir().join(format!("borg-route-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/work/secret/x")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let (real, link) = (root.join("real").display().to_string(), root.join("link").display().to_string());
+        let c = cfg(&format!(
+            r#"{{ "default": "off", "off": ["{link}/work/secret"], "collectives": [ {{ "name": "work", "paths": ["{real}/work"], "share": "team" }} ] }}"#
+        ));
+        let base = Path::new("/b");
+        assert_eq!(route(Some(&c), &format!("{real}/work/secret/x"), base), Route::Off, "an off path written through the link");
+        assert_eq!(route(Some(&c), &format!("{link}/work/secret/x"), base), Route::Off);
+        assert_eq!(name(&route(Some(&c), &format!("{link}/work"), base)), "work", "a cwd reported through the link");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
