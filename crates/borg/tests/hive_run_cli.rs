@@ -419,8 +419,10 @@ fn a_hanging_drone_is_cut_off() {
     for own in [false, true] {
         let root = setup(&format!("hang-{own}"), 1, "1", json!({"drones": {"d1": {"hang": true, "own_session": own}}}));
         let t0 = Instant::now();
-        let (out, err, code) = run(&root, &["--drones", "1", "--harness", "sim", "--iter-timeout", "6"]);
-        assert!(t0.elapsed() < Duration::from_secs(40), "{:?}", t0.elapsed());
+        // The cap must outlast the drone's first claim, which takes seconds when the suites run in
+        // parallel: cut off before it claims, there is nothing to release and the test proves nothing.
+        let (out, err, code) = run(&root, &["--drones", "1", "--harness", "sim", "--iter-timeout", "15"]);
+        assert!(t0.elapsed() < Duration::from_secs(60), "{:?}", t0.elapsed());
         assert_eq!(code, 1, "{out}{err}");
         let lines = spend(&root);
         // Cut off without naming its cost, it is charged the rest of the share (no dearer iteration yet).

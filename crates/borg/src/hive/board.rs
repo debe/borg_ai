@@ -427,7 +427,7 @@ pub fn fold(events: &[Event]) -> Board {
         _ => 1,
     };
     let mut keyed: Vec<(Key, &Event)> = events.iter().map(|e| ((e.ms, order(e), rank(e), line_hash(e)), e)).collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.sort_by_key(|a| a.0);
     let mut b = Board { drones: events.iter().filter(|e| !e.drone.is_empty()).map(|e| (e.by.clone(), e.drone.clone())).collect(), ..Board::default() };
     // The open span of each task's holder, by task: an index into `b.spans`.
     let mut open_span: BTreeMap<TaskId, usize> = BTreeMap::new();
