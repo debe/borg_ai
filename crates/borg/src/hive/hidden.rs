@@ -58,9 +58,10 @@ fn tail(out: &[u8], n: usize) -> String {
     text[start..].to_string()
 }
 
+/// `git -C repo args`, a hook a drone planted in the repo never run (a checkout runs `post-checkout`).
 fn git(repo: &Path, args: &[&str]) -> bool {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    cmd.arg("-C").arg(repo).args(["-c", "core.hooksPath=/dev/null"]).args(args).env("GIT_TERMINAL_PROMPT", "0");
     runner::run_capped_status(cmd, None, GIT_TIMEOUT).is_some_and(|(s, _)| s.success())
 }
 
@@ -78,44 +79,59 @@ pub fn run_hidden(goal_dir: &Path, h: &Hidden, repo: &Path, head: &str, key: &st
 /// `run_hidden`, each command within `cap`.
 fn run_within(goal_dir: &Path, h: &Hidden, repo: &Path, head: &str, key: &str, cap: Duration) -> Result<(bool, bool, u64, String), String> {
     let t0 = Instant::now();
-    let scratch = goal_dir.join(SCRATCH).join(key.replace(['/', '\\'], "_"));
-    let _ = std::fs::create_dir_all(goal_dir.join(SCRATCH));
+    let ran = with_checkout(&goal_dir.join(SCRATCH), repo, head, key, |scratch| {
+        let (mut pass, mut timeout, mut out) = (true, false, Vec::new());
+        for c in h.commands.iter().filter(|c| !c.trim().is_empty()) {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("exec 2>&1\n{c}"))
+                .current_dir(scratch)
+                .env("BORG_HIDDEN", &h.dir)
+                .env("BORG_WORK", scratch)
+                .env("BORG_LEARN", "off")
+                .env(super::ENV, "")
+                .env_remove(super::DRONE_ENV);
+            match runner::run_bounded(cmd, None, cap) {
+                Some(b) => {
+                    out.extend_from_slice(&b.out);
+                    timeout = b.timed_out();
+                    pass = b.status.is_some_and(|s| s.success());
+                }
+                None => {
+                    out.extend_from_slice(format!("(could not run `{c}`)").as_bytes());
+                    pass = false;
+                }
+            }
+            if !pass {
+                break;
+            }
+        }
+        (pass, timeout, out)
+    });
+    let (pass, timeout, out) = ran.map_err(|why| format!("{why} for the hidden oracle"))?;
+    Ok((pass, timeout, t0.elapsed().as_millis() as u64, tail(&out, TAIL_BYTES)))
+}
+
+/// `f` on a scratch worktree of `repo` checked out (detached) at `head`, `<parent>/<key>`, removed and
+/// unregistered afterwards whatever `f` did: a checkout outside every drone's worktree (the hidden
+/// oracle's, an integration's oracle run).
+///
+/// # Errors
+/// A checkout that fails (`repo` is not the goal's, another filesystem, a commit gone): `f` never ran.
+pub(crate) fn with_checkout<T>(parent: &Path, repo: &Path, head: &str, key: &str, f: impl FnOnce(&Path) -> T) -> Result<T, String> {
+    let scratch = parent.join(key.replace(['/', '\\'], "_"));
+    let _ = std::fs::create_dir_all(parent);
     let s = scratch.display().to_string();
     if !git(repo, &["worktree", "add", "--detach", "--force", &s, head]) {
         let _ = std::fs::remove_dir_all(&scratch);
-        return Err(format!("could not check out {head} from {} for the hidden oracle", repo.display()));
+        return Err(format!("could not check out {head} from {}", repo.display()));
     }
-    let (mut pass, mut timeout, mut out) = (true, false, Vec::new());
-    for c in h.commands.iter().filter(|c| !c.trim().is_empty()) {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!("exec 2>&1\n{c}"))
-            .current_dir(&scratch)
-            .env("BORG_HIDDEN", &h.dir)
-            .env("BORG_WORK", &scratch)
-            .env("BORG_LEARN", "off")
-            .env(super::ENV, "")
-            .env_remove(super::DRONE_ENV);
-        match runner::run_bounded(cmd, None, cap) {
-            Some(b) => {
-                out.extend_from_slice(&b.out);
-                timeout = b.timed_out();
-                pass = b.status.is_some_and(|s| s.success());
-            }
-            None => {
-                out.extend_from_slice(format!("(could not run `{c}`)").as_bytes());
-                pass = false;
-            }
-        }
-        if !pass {
-            break;
-        }
-    }
+    let out = f(&scratch);
     if !git(repo, &["worktree", "remove", "--force", &s]) {
         let _ = std::fs::remove_dir_all(&scratch);
         let _ = git(repo, &["worktree", "prune"]);
     }
-    Ok((pass, timeout, t0.elapsed().as_millis() as u64, tail(&out, TAIL_BYTES)))
+    Ok(out)
 }
 
 /// What one scoring did: the attempts scored, and those the oracle could not run on (`task: why`),
@@ -129,8 +145,8 @@ pub struct Scored {
 /// Scores up to `limit` judged attempts of `g` that have no score yet, oldest first, in `repo` (where
 /// the done's snapshots are): each a `Score` line, then its credit (`verified` on a pass, else
 /// `rejected`). A judged attempt is a verify task's valid `verified`, or its `rejected` that was not
-/// hacked (a hacked verdict credited at once) and whose work has both snapshots (one without them was
-/// final at once, verdict.rs `decide`). An attempt whose checkout fails gets no score and no credit:
+/// hacked (a hacked verdict credited at once) and whose work has both snapshots and started from its
+/// deps' verified work (one without was final at once, verdict.rs `decide`). An attempt whose checkout fails gets no score and no credit:
 /// an infrastructure failure is not the work's. One scoring at a time per goal (a lock on
 /// oracle.jsonl), so two never score one attempt. Nothing without a hidden oracle.
 pub fn score_pending(home: &Path, g: &Goal, repo: &Path, limit: usize, now: i64) -> Scored {
@@ -157,7 +173,10 @@ fn score_locked(home: &Path, g: &Goal, repo: &Path, limit: usize, now: i64) -> S
     judged.dedup_by(|a, b| a.task == b.task);
     let dir = super::dir(home, &g.id);
     let mut out = Scored::default();
-    let attempts = judged.into_iter().filter_map(|e| Some((e, verdict::attempt(&events, &b, &e.task)?))).filter(|(_, a)| !a.base.is_empty() && !a.head.is_empty());
+    let attempts =
+        judged.into_iter().filter_map(|e| Some((e, verdict::attempt(&events, &b, &e.task)?))).filter(|(_, a)| !a.base.is_empty() && !a.head.is_empty());
+    // Work that started without a dep's verified work was never checked with it (an unchecked reject).
+    let attempts = attempts.filter(|(_, a)| verdict::missing_deps(&events, &b, a).is_empty());
     for (e, a) in attempts.take(limit) {
         let (pass, timeout, dur_ms, tail) = match run_hidden(&dir, h, repo, &a.head, &format!("{}-{}", e.task, now)) {
             Ok(r) => r,

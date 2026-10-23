@@ -52,6 +52,7 @@ fn seed(home: &Path, now: i64) {
         of: None,
         not_by: vec![],
         flags: vec![],
+        from: None,
     };
     let tasks = hive::tasks_path(home, "g");
     board::append(&tasks, &[Event::open(t("t1"), "engineer:e", now - 10), Event::open(t("t2"), "engineer:e", now - 10)]).unwrap();

@@ -27,7 +27,7 @@
 | `borg notes attach [<commit>]` | Write the redacted reasoning note for a session's commits, then link them to the earlier decisions they fixed (normally at session end) |
 | `borg notes fetch [<commit>...]` | Get reasoning notes and decision → fix links from team members over the mesh: for the named commits, or the last 200 on HEAD; a link comes with either of its commits |
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked, on this machine and the team's |
-| `borg hive init\|board\|join\|leave\|open\|claim\|progress\|release\|block\|done\|verify\|score\|contract` | Many drones, one goal: a board of tasks with leased claims, contracts between drones, done gated by the goal's oracle, and verdicts guarded against gaming it; see [below](#hive) |
+| `borg hive init\|board\|join\|leave\|open\|claim\|progress\|release\|block\|done\|verify\|score\|integrate\|contract` | Many drones, one goal: a board of tasks with leased claims, contracts between drones, done gated by the goal's oracle, and verdicts guarded against gaming it; see [below](#hive) |
 | `borg hive run <goal> --drones N [--harness H] [--dry-run]` | N headless drones, each in a git worktree of the repo with an equal share of what is left of the goal's budget, until the board is finished; see [Running drones](#running-drones) |
 | `borg hive join <goal> --here` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join` (`--paths DIR...` names your repos), `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
@@ -74,11 +74,12 @@ $ borg hive board
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
 | `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]` | Headless drones in worktrees, see [Running drones](#running-drones) |
 | `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again]` | An engineer opens a task; `--again` reopens a blocked one |
-| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it |
+| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it. A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below); exit 1 when that work does not apply there |
 | `borg hive progress "<note>"` · `release` · `block "<why>"` | Report on, give back or block the drone's claim |
 | `borg hive done [--note N]` | Run the task's checks with their own timeouts (no hook time limit); on a pass publish done and open its verify task |
 | `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the verifier's turn with the line `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note. The work's diff is checked first, see [Guardrails](#guardrails-and-the-hidden-oracle) |
 | `borg hive score <goal>` | The goal's hidden oracle scores every judged task not scored yet (`borg hive run` does this when its drones end). The engineer's: refused to a drone of a hive goal. Exit 1 when an attempt could not be checked out (run it from the goal's repo) |
+| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts and run the goal's oracle and every task's checks on the combined tree, as `borg hive run` does itself (see [Running drones](#running-drones)). Exit 0 when it passed (the goal is finished), 1 when it was rejected (a fix task is open) or blocked, 2 when no integration is due. Needs git 2.40+. The engineer's: refused to a drone of a hive goal |
 | `borg hive contract "<text>" --scope a,b [--supersedes ID]` | Publish a contract scoped to files (globs), `id:NAME` or `repo:NAME`. Superseding another drone's contract asks the engineer through `borg queen` |
 
 Drone commands take `--session ID` (needed when the repo has more than one drone; the hook's context
@@ -90,7 +91,17 @@ progress, done, verified, rejected, released, blocked), `contracts.jsonl`, and `
 `spend.jsonl` and `runs.jsonl` (each iteration's cost and each `borg hive run`, below), and
 `logs/<drone>-<iter>.out` (an iteration's output, at most 1 MiB, local only). `flags.jsonl` (what
 drones did to tests, CI or oracle files), `oracle.jsonl` (the hidden oracle's scores) and `scratch/`
-(its checkouts while it runs), below. Membership is `<state>/<session>.hive`.
+(its checkouts while it runs), below; `integrate/` (an integration's checkout while its checks run).
+Membership is `<state>/<session>.hive`.
+
+**Dependencies.** `--deps` (or the fifth field of `--task`) names tasks of the goal; `init` and `open`
+refuse one that names no task, and `init` refuses a cycle. A task is claimable once every dep is
+verified. Each drone works in its own worktree, so the claim applies each dep's verified change to the
+claimant's working tree first (without touching its index or HEAD; a change already there is skipped)
+and records it in the claim (`deps_in`). The work's diff then starts after the deps. When a dep's
+change does not apply (the tree's own changes overlap it), the claim is refused and the tree stays as
+it was; a drone with a clean tree can take the task. A pass on work whose claim lacks a dep's work is
+not verified: the task reopens.
 
 **Claims are leases.** A claim lasts while its drone's hooks renew it (every 10 minutes) and expires
 after 30 minutes without one. When two drones claim the same open task, the claim with the lowest
@@ -120,15 +131,31 @@ useless (docs/design/hive-learning.md, step 8):
   shows in the diff. Work without a snapshot (git failed or timed out) cannot be checked: a pass on it
   rejects the work with a note and credits nothing; a verifier whose directory cannot diff the snapshots
   (another repo) gets no verdict recorded.
-- **Hacked.** When that diff modifies, deletes or renames a test (a file under `test/`, `tests/`, `spec/`,
-  `specs/`, `__tests__/`, or named `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`, `*_spec.rb`) or CI config
-  (`.github/workflows/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`, `Jenkinsfile`,
-  `azure-pipelines.yml`, or a file the goal's oracle runs, such as `grade.sh`) outside the task's own
-  `--files`, or when the drone opened the hidden oracle's files, the verdict is `rejected` with
-  `hacked`, whatever the verifier said. The work reopens with the paths to restore. Adding tests is fine;
-  adding or changing a test runner's config is not (`conftest.py`, `pytest.ini`, `tox.ini`, `jest.config.*`,
-  `vitest.config.*`, `.mocharc*`, `spec_helper.rb`, ...: it changes how the existing tests run).
-  `pyproject.toml` and `package.json` are not counted.
+- **Hacked.** Tests may grow, never shrink: outside your task's files you may add tests and change
+  names and values in existing ones, but you may not remove, skip or reshape a test or an assertion.
+  The verdict is `rejected` with `hacked`, whatever the verifier said, when the diff
+  - changes a file the goal's oracle runs (such as `grade.sh`) in any way. That file is the oracle, so
+    not even the task's own `--files` exempt it;
+  - outside the task's own `--files`, modifies, deletes or renames CI config (`.github/workflows/`,
+    `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`, `Jenkinsfile`, `azure-pipelines.yml`);
+  - outside them, adds or changes a test runner's config (`conftest.py`, `pytest.ini`, `tox.ini`,
+    `jest.config.*`, `vitest.config.*`, `.mocharc*`, `spec_helper.rb`, ...: it changes how the existing
+    tests run; `pyproject.toml` and `package.json` are not counted);
+  - outside them, deletes or renames a test (a file under `test/`, `tests/`, `spec/`, `specs/`,
+    `__tests__/`, or named `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`, `*_spec.rb`), or weakens one: a
+    removed line that no added line of the same hunk matches in shape (its tokens, with names, strings
+    and numbers as holes; assertion words such as `assert*`, `expect*`, `return`, `true` kept) without
+    making two different names one (`assert got == want` turned `assert got == got`), fewer test
+    declarations than before (`#[test]` turned `#[inline]`, `@Test` turned `@Deprecated`, `def test_x(`
+    renamed `def x(`), an added skip, disable or focus marker (`@Disabled`, `@pytest.mark.skip`,
+    `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, a bare `return`), or any binary change. Blank and comment lines do not count. A test
+    whose content diff git cannot give counts as weakened;
+
+  or when the drone opened the hidden oracle's files. The work reopens with each path to restore and
+  why (`tests/test_parse.py (line 4 removed or reshaped: assert parse('a') == 'a')`). Appended test
+  methods and imports, a renamed key literal or accessor and an updated expected value all pass. A
+  swapped value in an assertion of the same shape does not show in the diff: the hidden oracle is
+  the backstop for that.
 - **Flags.** At every tool call a drone in a goal makes, the paths it writes (edit tools; a shell
   command's redirects, `sed -i`, `rm`, `mv`, `cp`, `tee`, ...) are checked against those classes, and the
   paths it reads against the hidden oracle's (its directory, and `goal.json`, which names its commands).
@@ -160,9 +187,11 @@ without crediting lessons (an eval's frozen arm).
 ```console
 $ borg hive run parser --drones 3 --dry-run     # the worktrees, the harness command, the share, the prompt
 $ borg hive run parser --drones 3               # --harness: the calling session's harness, else claude
+d1  integrate.1  integrated 3f2a9c1b07de: the oracle passes
 d1  hive-parser-1  $1.84/$6.67  4 iter  tasks done: t1,t3.v1  end: goal finished
 ...
-board: 6 task(s) (6 verified); the goal is finished
+board: 7 task(s) (7 verified); the goal is finished
+integrated 3f2a9c1b07de… (integrate.1, refs/heads/hive/parser/integrated)
 ```
 
 `borg hive run` makes one git worktree per drone, `<repo>/.worktrees/hive-<goal>-<n>` on branch
@@ -170,8 +199,24 @@ board: 6 task(s) (6 verified); the goal is finished
 checked out as it is (a removed worktree's commits are kept, never reset to `--base`). The path is one component
 under `.worktrees/`, so borg records it as the same repo, and the same collective takes it. It adds
 `/.worktrees/` to the repo's local `.git/info/exclude` (never committed) so `git status` stays clean.
-Merging the branches is the engineer's. When the drones end, the run writes a leave for each worktree,
+When the drones end, the run writes a leave for each worktree,
 so a session you start there to review joins no goal.
+
+**Integration.** Once every task is verified, one drone thread integrates, in process and with no
+model call, while the others wait. It claims the board's `integrate.<n>` task and merges the
+accepted attempts: for each verified task, the diff from its claim's snapshot to its done's, onto the
+commit every claim started from. It never merges a drone's branch, so changes a drone made without
+holding the claim, or committed there, are left out. A conflict counts as resolved only by a fix
+task built on the tree with its markers. The merge
+uses `git merge-tree --merge-base`, so it needs git 2.40+; an older git blocks the integration with
+that reason. The result is a commit at `refs/heads/hive/<goal>/integrated`, which is the hive's result
+for you to review or merge. A conflict rejects it. Otherwise the goal's oracle and every task's own
+checks run on it in a scratch checkout, and a failure rejects it. A rejection opens the fix task
+`integrate.<n>.fix`, whose claim resets that drone's worktree to the combined tree; a joined session
+claims it in a checkout of that tree instead (`git worktree add <dir> <commit>`, as `borg hive
+integrate` prints). Once the fix is verified, the next integration includes it. The goal is finished only when an integration passes after the last
+task was verified. A model session never claims an integrate task; `borg hive integrate <goal>` runs
+one for a goal worked without `borg hive run`.
 
 Each drone gets an equal share of what is left of the goal's budget (every earlier run's spend counted)
 and runs headless sessions of the harness one after another, launched with
@@ -183,7 +228,7 @@ overshoot by one session; a session cut off at `--iter-timeout` without naming i
 drone's dearest session so far (or the rest of its share). Drones run with every permission inside their worktree: run it on a repo you
 are willing to let them change. Every session is cut off at `--iter-timeout` (default 1800 s).
 
-A drone stops when the board is finished (every task verified), its share is spent, a session ended
+A drone stops when the board is finished (every task verified and integrated), its share is spent, a session ended
 without naming its cost or at $0 (codex reports tokens only and a subscription model $0, so such a
 drone gets one session), two sessions
 in a row failed or timed out, two made no board progress, or nothing was open to it for three polls.
@@ -197,7 +242,7 @@ A re-run shares what `spend.jsonl` says is left, whatever the drone count. `borg
 each goal's board, its spend per drone and its newest contracts.
 
 Not yet: mesh sync of hive lines, goal signatures, the queen approving a plan before `run`, multi-repo
-goals (`run` takes the repo it is started in), merging the worktrees, stopping an unmetered session
+goals (`run` takes the repo it is started in), stopping an unmetered session
 mid-way at its budget, crediting verifiers by whether the hidden oracle agreed with them, a model
 that monitors drones for gaming, and messages between drones.
 

@@ -171,6 +171,7 @@ mod tests {
             of: None,
             not_by: vec![],
             flags: vec![],
+            from: None,
         }
     }
 

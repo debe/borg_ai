@@ -1,6 +1,6 @@
 //! The hive as `borg top` and borg-web show it: per goal, the board's tasks (status, holder, lease
-//! left), the budget and what each drone of `borg hive run` spent of its share, and the newest
-//! contracts. One fold of the board and one pass over each of spend.jsonl, runs.jsonl and
+//! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
+//! combined tree's commit, or why the last one failed), and the newest contracts. One fold of the board and one pass over each of spend.jsonl, runs.jsonl and
 //! contracts.jsonl per goal; nothing at all for a store without a hive.
 
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::run::{RunLine, Spend};
-use super::{Contract, LEASE_MS, Status, board, contract, goal};
+use super::{Contract, LEASE_MS, Role, Status, board, contract, goal};
 
 /// Contracts a view carries (the newest).
 const CONTRACTS: usize = 20;
@@ -55,6 +55,9 @@ pub struct HiveView {
     /// Tasks by status.
     pub counts: BTreeMap<String, usize>,
     pub finished: bool,
+    /// The integration: `integrated <commit>` once the combined tree passed, else the newest
+    /// integration's failure (`integrate.N rejected: …`, `… blocked: …`); empty before any.
+    pub integration: String,
 }
 
 /// The goals of the store `home`, sorted; empty without a hive (one failed read_dir).
@@ -113,6 +116,16 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let mut drones: Vec<DroneSpend> = drones.into_values().collect();
     // d2 before d10.
     drones.sort_by_key(|d| (d.drone.len(), d.drone.clone()));
+    let newest = b.tasks.values().filter(|s| s.task.role == Role::Integrate).max_by_key(|s| (s.opened_ms, s.task.id.clone()));
+    let integration = match (&b.integrated, newest) {
+        (Some(i), _) if b.finished() => format!("integrated {}", i.head),
+        (_, Some(s)) => match &s.status {
+            Status::Blocked { note, .. } => format!("{} blocked: {note}", s.task.id),
+            Status::Verified { .. } if !s.last_progress.is_empty() => format!("{} {}", s.task.id, s.last_progress),
+            st => format!("{} {}", s.task.id, st.name()),
+        },
+        _ => String::new(),
+    };
     let all = contract::read(&super::contracts_path(home, id));
     let contracts = all[all.len().saturating_sub(CONTRACTS)..].to_vec();
     Some(HiveView {
@@ -126,6 +139,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         drones,
         counts,
         finished: b.finished(),
+        integration,
     })
 }
 
@@ -174,6 +188,9 @@ pub fn render(v: &HiveView) -> String {
             s.push_str(line.trim_end());
             s.push('\n');
         }
+    }
+    if !v.integration.is_empty() {
+        s.push_str(&format!("  {}\n", cut(&v.integration, 160)));
     }
     if !v.drones.is_empty() {
         s.push_str(&format!("  {:<10} {:<15} {:>5}  {}\n", "DRONE", "SPENT/SHARE", "ITERS", "LAST"));
@@ -233,6 +250,7 @@ mod tests {
             of: None,
             not_by: vec![],
             flags: vec![],
+            from: None,
         };
         let path = super::super::tasks_path(home, "g");
         board::append(&path, &[Event::open(t("t1", "a.rs"), "engineer:e", 10), Event::open(t("t2", "b.rs"), "engineer:e", 10)]).unwrap();
@@ -272,6 +290,25 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
         assert_eq!(j["tasks"][0]["holder"], "sess-one-1234");
         assert_eq!(j["drones"][1]["unmetered"], true);
         assert_eq!(files(&home).len(), 6);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn the_newest_integration_shows_why_it_failed() {
+        let home = temp("integration");
+        seed(&home);
+        assert_eq!(of(&home, "g", 61_000).unwrap().integration, "", "before any");
+        let path = super::super::tasks_path(&home, "g");
+        let t1 = board::fold(&board::read(&path)).tasks["t1"].task.clone();
+        let it = |id: &str| Task { id: id.into(), role: Role::Integrate, title: "integrate".into(), files: vec![], ..t1.clone() };
+        board::append(&path, &[Event::open(it("integrate.1"), "integrate-d1-1", 20), Event::new(Ev::Claim, "integrate.1", "integrate-d1-1", 21)]).unwrap();
+        board::append(&path, &[Event::new(Ev::Rejected, "integrate.1", "integrate-d1-1", 22).with_note("unit fails: found 2 X")]).unwrap();
+        let v = of(&home, "g", 61_000).unwrap();
+        assert_eq!(v.integration, "integrate.1 rejected: unit fails: found 2 X");
+        assert!(render(&v).contains("\n  integrate.1 rejected: unit fails: found 2 X\n"), "{}", render(&v));
+        board::append(&path, &[Event::open(it("integrate.2"), "integrate-d1-2", 30), Event::new(Ev::Claim, "integrate.2", "integrate-d1-2", 31)]).unwrap();
+        board::append(&path, &[Event::new(Ev::Blocked, "integrate.2", "integrate-d1-2", 32).with_note("t2 has no snapshot")]).unwrap();
+        assert_eq!(of(&home, "g", 61_000).unwrap().integration, "integrate.2 blocked: t2 has no snapshot");
         let _ = std::fs::remove_dir_all(home);
     }
 

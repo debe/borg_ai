@@ -1254,6 +1254,7 @@ mod tests {
             of: None,
             not_by: vec![],
             flags: vec![],
+            from: None,
         };
         let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s-dec".into()], ..t1.clone() };
         let ev = |kind, task: &str, by: &str, ms| Event::new(kind, task, by, ms);

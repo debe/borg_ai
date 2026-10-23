@@ -1,5 +1,5 @@
-//! Hive: the collective's hive goals (`borg hive`): each goal's board by status, what each drone of
-//! `borg hive run` spent of its share, and the newest contracts between drones.
+//! Hive: the collective's hive goals (`borg hive`): each goal's board by status, its integration, what
+//! each drone of `borg hive run` spent of its share, and the newest contracts between drones.
 
 use leptos::prelude::*;
 
@@ -19,6 +19,7 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
             </div>
             <p class="feed-meta">{trunc(&g.spec, 200)}</p>
             <div class="bar" title="budget spent"><div style=format!("width:{spent:.0}%;height:6px;background:currentColor;opacity:.6")></div></div>
+            {(!g.integration.is_empty()).then(|| view! { <p class="feed-meta mono" title="the combined tree of the accepted work">{trunc(&g.integration, 200)}</p> })}
             {GROUPS.iter().filter_map(|grp| {
                 let rows: Vec<_> = g.tasks.iter().filter(|t| t.status == *grp).cloned().collect();
                 (!rows.is_empty()).then(|| view! {

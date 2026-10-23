@@ -5,6 +5,11 @@
 //! (`Harness::headless`), each launched with `BORG_HIVE=<goal>` and `BORG_HIVE_DRONE=d<n>`: the hooks
 //! join it to the goal, show it its claim and the board, and gate its stop on the oracle (mod.rs).
 //!
+//! Once every task is verified, the drone thread that sees it first integrates (integrate.rs): it
+//! claims the board's integrate task, merges the accepted attempts and runs the oracle on the combined
+//! tree, in process and at no model cost, while the other drones wait on its lease. The goal is
+//! finished only when that passes; a failure opens a fix task the drones take like any work.
+//!
 //! Between iterations the runner reads the board once (`board::fold`) and decides ([`step`]): the
 //! board is finished, the share is spent, a session ended well without naming its cost or at $0 (fail
 //! closed: an unmetered harness, or one on a subscription, gets one iteration), two iterations in a row
@@ -196,6 +201,8 @@ struct Ctx<'a> {
     home: &'a Path,
     g: &'a Goal,
     h: &'static dyn Harness,
+    /// The repo (its git toplevel), where the snapshots are; `repo` is its name.
+    root: &'a Path,
     repo: &'a str,
     model: Option<&'a str>,
     share: f64,
@@ -308,6 +315,14 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
     loop {
         let now = learn::now_ms();
         let b = fold(ctx.home, goal);
+        if let Some(o) = super::integrate::run(ctx.home, ctx.g, ctx.root, &name, now) {
+            let head = o.head.as_deref().map_or("-", |h| &h[..h.len().min(12)]);
+            match &o.verdict {
+                Ok(()) => println!("{name}  {}  integrated {head}: the oracle passes", o.task),
+                Err(why) => println!("{name}  {}  {head}: {why}", o.task),
+            }
+            continue;
+        }
         match step(&t, ctx.share, b.finished(), open_to(ctx.g, &b, &name, ctx.repo, now)) {
             Next::End(r) => {
                 end.reason = r;
@@ -475,7 +490,12 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         for (n, p) in paths.iter().enumerate() {
             println!("  {}  {}  branch {} from {}", drone_name(n + 1), p.display(), branch(&g.id, n + 1), o.base);
         }
-        println!("  each drone: ${share:.2} of ${:.2} left of ${:.2}; every iteration within {}s", (g.budget_usd - spent).max(0.0), g.budget_usd, o.iter_timeout.as_secs());
+        println!(
+            "  each drone: ${share:.2} of ${:.2} left of ${:.2}; every iteration within {}s",
+            (g.budget_usd - spent).max(0.0),
+            g.budget_usd,
+            o.iter_timeout.as_secs()
+        );
         println!("  harness {}: {sample:?}", o.harness.name());
         println!("  writes /.worktrees/ to the repo's local .git/info/exclude (never committed)");
         println!("prompt ({}):\n{}", drone_name(1), prompt(&g, &drone_name(1), &super::joins_path(home, &g.id)));
@@ -508,7 +528,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         eprintln!("borg hive run: {e}");
         return 1;
     }
-    let ctx = Ctx { home, g: &g, h: o.harness, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before };
+    let ctx = Ctx { home, g: &g, h: o.harness, root: &repo, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before };
     let ends: Vec<DroneEnd> = std::thread::scope(|s| {
         let handles: Vec<_> = wts
             .iter()
@@ -537,6 +557,9 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     }
     let counts: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
     println!("board: {} task(s) ({}){}", b.tasks.len(), counts.join(", "), if b.finished() { "; the goal is finished" } else { "" });
+    if let Some(i) = b.integrated.as_ref().filter(|_| b.finished()) {
+        println!("integrated {} ({}, refs/heads/hive/{}/integrated)", i.head, i.task, g.id);
+    }
     if b.finished() { 0 } else { 1 }
 }
 
@@ -599,12 +622,24 @@ mod tests {
         assert!(p.len() < 700, "{} chars", p.len());
         g.hidden = Some(goal::Hidden { dir: "/held".into(), commands: vec!["true".into()], timeout_s: 60 });
         let p = prompt(&g, "d3", Path::new("/s/hive/parser/joins.jsonl"));
-        assert!(p.ends_with("Gaming the oracle (editing tests, CI or oracle files) is visible, allowed to happen and useless: held-out checks you cannot see decide."));
+        assert!(p.ends_with(
+            "Gaming the oracle (editing tests, CI or oracle files) is visible, allowed to happen and useless: held-out checks you cannot see decide."
+        ));
     }
 
     #[test]
     fn a_timeout_without_a_cost_is_charged_and_a_zero_cost_is_unmetered() {
-        let line = |usd: Option<f64>, est: Option<f64>| Spend { v: 1, ms: 1, drone: "d1".into(), iter: 1, harness: "x".into(), usd, est, session: String::new(), exit: "ok".into() };
+        let line = |usd: Option<f64>, est: Option<f64>| Spend {
+            v: 1,
+            ms: 1,
+            drone: "d1".into(),
+            iter: 1,
+            harness: "x".into(),
+            usd,
+            est,
+            session: String::new(),
+            exit: "ok".into(),
+        };
         assert_eq!((line(Some(0.4), Some(9.0)).charged(), line(None, Some(0.4)).charged(), line(None, None).charged()), (0.4, 0.4, 0.0));
         assert_eq!(spent_before(&[line(Some(0.2), None), line(None, Some(0.7)), line(Some(0.1), None)], "d1"), (1, 0.7));
     }

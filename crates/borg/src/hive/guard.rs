@@ -11,10 +11,14 @@
 //! file open; nothing is read or created.
 //!
 //! Best-effort by design: `python -c` writes, generated paths and `cd`-relative paths escape it. The
-//! verdict's diff of the claim's snapshots (verdict.rs) is the ground truth on every harness; a flag
-//! is an early sign, and only an `oracle` flag decides a verdict.
+//! verdict's diff of the claim's snapshots (verdict.rs) is the ground truth on every harness, and it
+//! judges a test edit by its lines ([`shape`], [`comment_only`], [`silencer`]: tests may grow, never
+//! shrink); a flag is an early sign, and only an `oracle` flag decides a verdict.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -141,6 +145,121 @@ pub fn class_of(rel: &str, abs: &Path, guard: &[PathBuf], oracle_files: &[String
         None => false,
     };
     (test_dir || test_name || runner_config(rel)).then_some(Class::Test)
+}
+
+/// The words a line's [`shape`] keeps as they are: assertion and control words. Any other identifier,
+/// string or number is a hole.
+const VERBATIM: &[&str] = &["return", "throw", "raise", "not", "true", "false", "True", "False", "null", "None", "nil"];
+/// The prefixes of the identifiers a [`shape`] keeps (an `assertEquals`, an `expect`, a `checkThat`).
+const VERBATIM_PREFIX: &[&str] = &["assert", "expect", "verify", "should", "require", "fail", "check"];
+/// What a [`shape`] puts for an identifier, a string or a number.
+const HOLE: &str = "_";
+
+/// The shape of a source line: its tokens (identifiers `[A-Za-z_$][\w$]*`, numbers, strings in `'..'`,
+/// `".."` or `` `..` ``, single punctuation characters; whitespace dropped), each identifier, string
+/// and number a hole except the assertion and control words (`VERBATIM`, `VERBATIM_PREFIX`). A
+/// renamed key or accessor, an updated value keep a line's shape; a swapped assertion, `assert x`
+/// turned `assert True`, does not. An unterminated quote runs to the end of the line.
+pub fn shape(line: &str) -> Vec<String> {
+    tokens(line).into_iter().map(|(t, _)| t).collect()
+}
+
+/// Whether the line `added` keeps the line `removed` ([`weakens`](super::verdict::weakens)): the same
+/// [`shape`], and no two identifiers that differ in `removed` made one in `added`. A rename keeps a
+/// line; `assert got == want` turned `assert got == got` makes it a tautology.
+pub fn keeps(removed: &str, added: &str) -> bool {
+    let (r, a) = (tokens(removed), tokens(added));
+    let names = |t: &[(String, Option<String>)]| t.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>();
+    let (rn, an) = (names(&r), names(&a));
+    r.len() == a.len()
+        && r.iter().zip(&a).all(|(x, y)| x.0 == y.0)
+        && (0..rn.len()).all(|i| (i + 1..rn.len()).all(|j| rn[i].is_none() || rn[j].is_none() || rn[i] == rn[j] || an[i] != an[j]))
+}
+
+/// A line's tokens for [`shape`]: each with the identifier it holes (None for any other token).
+fn tokens(line: &str) -> Vec<(String, Option<String>)> {
+    let c: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch.is_alphabetic() || ch == '_' || ch == '$' {
+            let from = i;
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '$') {
+                i += 1;
+            }
+            let w: String = c[from..i].iter().collect();
+            let lower = w.to_ascii_lowercase();
+            let keep = VERBATIM.contains(&w.as_str()) || VERBATIM_PREFIX.iter().any(|p| lower.starts_with(p));
+            out.push(if keep { (w, None) } else { (HOLE.into(), Some(w)) });
+        } else if ch.is_ascii_digit() {
+            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '.' || c[i] == '_') {
+                i += 1;
+            }
+            out.push((HOLE.into(), None));
+        } else if matches!(ch, '\'' | '"' | '`') {
+            i += 1;
+            while i < c.len() && c[i] != ch {
+                i += if c[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            out.push((HOLE.into(), None));
+        } else {
+            out.push((ch.to_string(), None));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A line no test depends on: blank, or a comment only (`//`, `/*`, `*`, `*/`, `--`, `#` but not a
+/// Rust attribute `#[..]` or `#!`).
+pub fn comment_only(line: &str) -> bool {
+    let t = line.trim_start();
+    t.is_empty() || ["//", "/*", "*", "--"].iter().any(|p| t.starts_with(p)) || (t.starts_with('#') && !t[1..].starts_with('[') && !t[1..].starts_with('!'))
+}
+
+static SILENCER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        // Java, Kotlin (JUnit, TestNG).
+        r"@(Disabled|Ignore)\w*|@(Enabled|Disabled)(If|On)\w*|\bassume(True|False|That)\s*\(|\bAssumptions?\.\w+\s*\(",
+        // Python (pytest, unittest).
+        r"|@pytest\.mark\.(skip|skipif|xfail)\b|\bpytest\.(skip|xfail|importorskip)\s*\(|@unittest\.(skip\w*|expectedFailure)|\.skipTest\s*\(",
+        // JavaScript, TypeScript (Jest, Mocha, Vitest): not a method call (`model.fit(`).
+        r"|(^|[^.\w$])(xit|xdescribe|xtest|xcontext|fit|fdescribe)\s*\(|\b(it|test|describe|context)\.(skip|only|todo|failing)\b",
+        // Rust, Go, C#.
+        r"|#\[ignore\b|\bt\.Skip(Now|f)?\s*\(|\[Ignore\b|\bSkip\s*=",
+        // Any language: an exit, or a bare return that ends a test early.
+        r"|\b(sys\.exit|os\._exit|process\.exit|System\.exit)\s*\(|^\s*return\s*;?\s*$",
+    ))
+    .unwrap()
+});
+
+static TEST_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        // Rust (`#[test]`, `#[tokio::test]`), Java, Kotlin (JUnit, TestNG), C# (xUnit, NUnit, MSTest).
+        r"#\[(\w+::)*test\b|@(\w*Test|TestFactory|TestTemplate)\b|\[(Test|Fact|Theory|TestMethod|TestCase)\b",
+        // Python, Go, JUnit 3, Kotlin: a function named as a test; a Python test class.
+        r"|^\s*(async\s+)?def\s+test\w*\s*\(|^\s*class\s+Test\w*|\bfunc\s+(Test|Benchmark|Fuzz)\w*\s*\(|\b(void|fun)\s+test\w*\s*\(",
+        // JavaScript, TypeScript (Jest, Mocha, Vitest): not a method call.
+        r"|(^|[^.\w$])(it|test|describe|context)\s*\(",
+    ))
+    .unwrap()
+});
+
+/// A line that declares a test: `#[test]`, `@Test`, `[Fact]`, `def test_x(`, `func TestX(`, `it(`. A
+/// test edit that declares fewer than it removes drops a test from the run, however its lines look.
+pub fn declares_test(line: &str) -> bool {
+    TEST_DECL.is_match(line)
+}
+
+/// A line that skips, disables, focuses or cuts short tests: a `@Disabled`, `@pytest.mark.skip`,
+/// `it.only(`, `xit(`, `t.Skip()`, `#[ignore]`, an exit or a bare `return`. Annotation and call forms
+/// only: a `skipsEmptyLines()` test is no silencer.
+pub fn silencer(line: &str) -> bool {
+    SILENCER.is_match(line)
 }
 
 /// The words of a shell command that may be paths, in order: split at whitespace and shell
@@ -395,6 +514,105 @@ mod tests {
         assert_eq!(w, ["src/a.rs", "tests/b.py"], "an omp patch of several files");
         let (w, r) = paths("Grep", &json!({"pattern": "fn", "path": "/held/out"}));
         assert!(w.is_empty() && r == ["/held/out"]);
+    }
+
+    #[test]
+    fn a_shape_keeps_assertions_and_holes_names_and_values() {
+        let eq = |a: &str, b: &str| shape(a) == shape(b);
+        assert!(eq(r#"assertEquals("colorName", m.get("colorName"));"#, r#"assertEquals("color_name", m.get("color_name"));"#), "a renamed key");
+        assert!(eq("assertEquals(3, r.colorName());", "assertEquals(4, r.color_name());"), "an accessor and a value");
+        assert!(eq("assert parse('a') == 'a'", "assert parse(\"b\") == \"bb\""));
+        assert!(!eq("assertEquals(a, b);", "assertTrue(a, b);"));
+        assert!(!eq("assert x", "return x"));
+        assert!(!eq("assert parse('a') == 'a'", "assert True"));
+        assert!(!eq("assertTrue(x.ok());", "assertTrue(true);"));
+        assert_eq!(shape("s = 'it\\'s"), ["_", "=", "_"], "an unterminated string runs to the end");
+        assert_eq!(shape("f(`a ${b}`, 1.5e3)"), ["_", "(", "_", ",", "_", ")"]);
+        assert!(shape("").is_empty());
+    }
+
+    #[test]
+    fn a_line_is_kept_by_a_rename_but_not_by_a_tautology() {
+        assert!(keeps("assert got == want", "assert out == wanted"), "a rename");
+        assert!(keeps("assertEquals(3, r.colorName());", "assertEquals(4, r.color_name());"));
+        assert!(keeps("assert f(x) == g(x)", "assert f(x) == g(y)"), "one name made two");
+        assert!(!keeps("assert got == want", "assert got == got"));
+        assert!(!keeps("assertEquals(expected, actual);", "assertEquals(actual, actual);"));
+        assert!(!keeps("assertEquals(a, b);", "assertTrue(a, b);"), "a reshape");
+    }
+
+    #[test]
+    fn test_declarations() {
+        for d in [
+            "#[test]",
+            "    #[tokio::test]",
+            "@Test",
+            "  @ParameterizedTest",
+            "[Fact]",
+            "[TestMethod]",
+            "def test_parse():",
+            "    async def test_x(self):",
+            "class TestParser:",
+            "func TestParse(t *testing.T) {",
+            "public void testParse() {",
+            "fun testParse() {",
+            "it('parses', () => {",
+            "  test(\"x\", () => {})",
+            "describe('p', () => {",
+        ] {
+            assert!(declares_test(d), "{d:?}");
+        }
+        for n in [
+            "#[inline]",
+            "@Deprecated",
+            "def parse_case():",
+            "latest = test_data",
+            "testValue = 3",
+            "model.test(x)",
+            "@TestInstance(PER_CLASS)",
+            "fn helper() {",
+        ] {
+            assert!(!declares_test(n), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn comments_and_blank_lines_and_silencers() {
+        for c in ["", "   ", "// x", "  /* x", " * x", "*/", "-- x", "# x", "#"] {
+            assert!(comment_only(c), "{c:?}");
+        }
+        for n in ["#[test]", "#!/bin/sh", "x = 1 # y", "@Test"] {
+            assert!(!comment_only(n), "{n:?}");
+        }
+        for s in [
+            "@Disabled(\"flaky\")",
+            "  @Ignore",
+            "@EnabledOnOs(OS.LINUX)",
+            "assumeTrue(false);",
+            "Assumptions.assumeTrue(x);",
+            "@pytest.mark.skip(reason='x')",
+            "@pytest.mark.xfail",
+            "    pytest.skip('later')",
+            "@unittest.skipIf(True, 'x')",
+            "self.skipTest('x')",
+            "it.only('works', () => {})",
+            "xit('works', () => {})",
+            "fdescribe('x', () => {})",
+            "test.skip('x', () => {})",
+            "#[ignore]",
+            "\tt.Skip()",
+            "t.Skipf(\"x %d\", 1)",
+            "[Ignore(\"x\")]",
+            "[Fact(Skip = \"x\")]",
+            "sys.exit(0)",
+            "  return;",
+            "    return",
+        ] {
+            assert!(silencer(s), "{s:?}");
+        }
+        for n in ["void skipsEmptyLines() {", "ignoresCase()", "assertEquals(1, x);", "return x;", "model.fit(x)", "@Test", "describe('x', () => {})"] {
+            assert!(!silencer(n), "{n:?}");
+        }
     }
 
     #[test]

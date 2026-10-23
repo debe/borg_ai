@@ -8,6 +8,12 @@
 //! (ms, blake3(node, by, task)) wins on every node: the design's winner rule. The loser's claim never
 //! took effect (`Board::lost`), so it needs no `released`.
 //!
+//! The goal is reached when every task is verified and an integration passed after the last of them
+//! ([`Board::finished`]): an `integrate` task (hive/integrate.rs, run by `borg hive run` or `borg hive
+//! integrate`, never by a model session) merges the accepted attempts and runs the oracle on the
+//! combined tree; its `verified` or `rejected` carries that tree's commit (`head`). A rejected one
+//! opens a fix task that starts `from` the combined tree.
+//!
 //! Lines are plain JSON with no `id` + `version` pair, so the mesh's `settle` (borg-mesh lines.rs) never
 //! folds them, and they can sync as they are once the hive goes on the mesh.
 
@@ -81,6 +87,10 @@ pub struct Task {
     /// held the claim (hive/guard.rs `render`), shown to the verifier.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
+    /// A fix task's start: the commit a claimant's worktree is reset to at its claim (the combined tree
+    /// a failed integration left, hive/integrate.rs), and the base its diff is judged from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,14 +140,19 @@ pub struct Event {
     /// A progress, rejection, block or done summary.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// On `rejected`: the work changed protected files (tests or CI it was not scoped to) or touched
-    /// the oracle's (hive/verdict.rs `decide`), whatever the verifier said.
+    /// On `rejected`: the work weakened tests or changed CI it was not scoped to, changed the visible
+    /// check's files, or touched the oracle's (hive/verdict.rs `decide`), whatever the verifier said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hacked: Option<bool>,
     /// On a claim of a work task: a commit of the claimant's working tree then (hive/verdict.rs
     /// `snapshot`); on its `done`, `head`, the same at the done. The verdict diffs the two.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
+    /// On a claim of a work task with deps: `task@head` for each of its transitive deps (`closure`),
+    /// whose verified work was in the claimant's tree before `base` was taken (brought in at the claim,
+    /// hive/verdict.rs `bring_in`, or there already). A pass on work whose claim lacks one is rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps_in: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub head: String,
     /// On a claim: the drone the session is one iteration of (`borg hive run` names it, hive/run.rs);
@@ -161,6 +176,7 @@ impl Event {
             hacked: None,
             drone: String::new(),
             base: String::new(),
+            deps_in: Vec::new(),
             head: String::new(),
         }
     }
@@ -213,6 +229,9 @@ pub struct TaskState {
     pub last_progress: String,
     /// The session whose `done` was accepted last.
     pub author: Option<String>,
+    /// The verify task whose `verified` made this work task verified: its attempt is what an
+    /// integration merges.
+    pub accepted: Option<TaskId>,
 }
 
 /// Verifier notes kept per task.
@@ -260,6 +279,14 @@ pub struct Span {
     pub end: Option<Ev>,
 }
 
+/// An integration that passed: its integrate task, the combined tree's commit and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Integration {
+    pub task: TaskId,
+    pub head: String,
+    pub ms: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Board {
     pub tasks: BTreeMap<TaskId, TaskState>,
@@ -268,6 +295,8 @@ pub struct Board {
     pub spans: Vec<Span>,
     /// The drone each session claimed as (`Event::drone`): session -> drone.
     pub drones: BTreeMap<String, String>,
+    /// The newest integration that passed.
+    pub integrated: Option<Integration>,
 }
 
 impl Board {
@@ -276,10 +305,16 @@ impl Board {
         t.not_by.iter().any(|n| n == session || self.drones.get(session).is_some_and(|d| d == n))
     }
 
-    /// The goal is reached: there are tasks, and every one is verified (a work task by its verify task,
-    /// a verify task by its verdict).
+    /// The goal is reached: there are tasks, every one is verified (a work task by its verify task, a
+    /// verify or integrate task by its verdict), and an integration passed no earlier than the last
+    /// verification: work verified after it (a fix task's) is not in the combined tree yet.
     pub fn finished(&self) -> bool {
-        !self.tasks.is_empty() && self.tasks.values().all(|s| matches!(s.status, Status::Verified { .. }))
+        let Some(i) = &self.integrated else { return false };
+        !self.tasks.is_empty()
+            && self.tasks.values().all(|s| match &s.status {
+                Status::Verified { ms, .. } => s.task.role == Role::Integrate || *ms <= i.ms,
+                _ => false,
+            })
     }
 
     /// Some task is held under a live lease at `now`: its done will open a verify task, its release
@@ -287,6 +322,22 @@ impl Board {
     pub fn in_flight(&self, now: i64) -> bool {
         self.tasks.values().any(|s| s.live(now).is_some())
     }
+}
+
+/// An integration is due: every task is verified (integrate tasks included: none open, held or blocked)
+/// and the goal is not finished, so the combined tree of what was accepted has not been checked yet.
+pub fn integration_due(b: &Board) -> bool {
+    !b.tasks.is_empty() && b.tasks.values().all(|s| matches!(s.status, Status::Verified { .. })) && !b.finished()
+}
+
+/// The id of the next integrate task: `integrate.<n>`, one more than the integrate tasks so far (the
+/// same on every node, so two runners racing open the same task).
+pub fn integrate_id(b: &Board) -> TaskId {
+    let mut n = b.tasks.values().filter(|s| s.task.role == Role::Integrate).count() + 1;
+    while b.tasks.contains_key(&format!("integrate.{n}")) {
+        n += 1;
+    }
+    format!("integrate.{n}")
 }
 
 /// Appends `events` in one write(2) with O_APPEND: lines written together (a done and its verify
@@ -397,6 +448,27 @@ fn deps_met(tasks: &BTreeMap<TaskId, TaskState>, t: &Task) -> bool {
     of_done && t.deps.iter().all(|d| matches!(tasks.get(d).map(|s| &s.status), Some(Status::Verified { .. })))
 }
 
+/// The transitive deps of `t`, each once, ordered by when they were verified (then by id; one not
+/// verified last): a dep is verified before its dependent can be claimed, so this order is
+/// topological, and each dep's work is brought into a tree after the deps it was built on.
+pub fn closure(b: &Board, t: &Task) -> Vec<TaskId> {
+    let mut seen: Vec<TaskId> = Vec::new();
+    let mut todo: Vec<TaskId> = t.deps.clone();
+    while let Some(d) = todo.pop() {
+        if d == t.id || seen.contains(&d) {
+            continue;
+        }
+        todo.extend(b.tasks.get(&d).map(|s| s.task.deps.clone()).unwrap_or_default());
+        seen.push(d);
+    }
+    let verified = |d: &TaskId| match b.tasks.get(d).map(|s| &s.status) {
+        Some(Status::Verified { ms, .. }) => *ms,
+        _ => i64::MAX,
+    };
+    seen.sort_by_key(|d| (verified(d), d.clone()));
+    seen
+}
+
 /// The holder of a claimed task, whatever its lease.
 fn holder(s: &TaskState) -> Option<&str> {
     match &s.status {
@@ -419,14 +491,16 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
             }
             match b.tasks.get_mut(&e.task) {
                 None => {
+                    // An open's note is the task's first note (a fix task's: why the integration failed).
                     let s = TaskState {
                         task: def.clone(),
                         status: Status::Open,
                         opened_ms: e.ms,
                         rework: 0,
-                        notes: Vec::new(),
+                        notes: if e.note.is_empty() { Vec::new() } else { vec![e.note.clone()] },
                         last_progress: String::new(),
                         author: None,
+                        accepted: None,
                     };
                     b.tasks.insert(e.task.clone(), s);
                 }
@@ -487,21 +561,30 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
         }
         Ev::Verified | Ev::Rejected => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            if s.task.role != Role::Verify || holder(s) != Some(e.by.as_str()) {
+            if !matches!(s.task.role, Role::Verify | Role::Integrate) || holder(s) != Some(e.by.as_str()) {
                 return;
             }
             s.status = Status::Verified { by: e.by.clone(), ms: e.ms };
             if e.ev == Ev::Rejected {
                 s.last_progress = format!("rejected: {}", e.note);
             }
-            let of = s.task.of.clone();
+            let (role, of) = (s.task.role, s.task.of.clone());
             close(b, open_span, &e.task, e.ms, Some(e.ev));
+            // An integration's verdict is on the combined tree, no one task's: a rejected one touches
+            // no other task (its fix task's open is written with it).
+            if role == Role::Integrate {
+                if e.ev == Ev::Verified {
+                    b.integrated = Some(Integration { task: e.task.clone(), head: e.head.clone(), ms: e.ms });
+                }
+                return;
+            }
             let Some(w) = of.and_then(|w| b.tasks.get_mut(&w)) else { return };
             if !matches!(w.status, Status::Done { .. }) {
                 return;
             }
             if e.ev == Ev::Verified {
                 w.status = Status::Verified { by: e.by.clone(), ms: e.ms };
+                w.accepted = Some(e.task.clone());
             } else {
                 w.status = Status::Open;
                 w.rework += 1;
@@ -653,6 +736,7 @@ mod tests {
             of: None,
             not_by: vec![],
             flags: vec![],
+            from: None,
         }
     }
 
@@ -748,6 +832,30 @@ mod tests {
         assert_eq!(holder_of(&b, "t2").as_deref(), Some("sc"));
     }
 
+    #[test]
+    fn closure_is_transitive_and_in_verified_order() {
+        // t3 after t2 after t1, and after t0 directly; t0 verified last of them, t1 first.
+        let dep = |id: &str, deps: &[&str]| Task { deps: deps.iter().map(|d| d.to_string()).collect(), ..task(id) };
+        let mut lines = vec![
+            Event::open(dep("t0", &[]), "engineer:e", 0),
+            Event::open(dep("t1", &[]), "engineer:e", 0),
+            Event::open(dep("t2", &["t1"]), "engineer:e", 0),
+            Event::open(dep("t3", &["t0", "t2", "t1"]), "engineer:e", 0),
+        ];
+        for (n, t) in ["t1", "t2", "t0"].iter().enumerate() {
+            let ms = 10 * (n as i64 + 1);
+            lines.extend([ev(Ev::Claim, t, "sa", ms), ev(Ev::Done, t, "sa", ms + 1), Event::open(verify(t, "sa", 0), "sa", ms + 1)]);
+            lines.extend([ev(Ev::Claim, &format!("{t}.v1"), "sb", ms + 2), ev(Ev::Verified, &format!("{t}.v1"), "sb", ms + 3)]);
+        }
+        let b = fold(&lines);
+        assert_eq!(closure(&b, &b.tasks["t3"].task), ["t1", "t2", "t0"], "each dep once, by when it was verified");
+        assert_eq!(closure(&b, &b.tasks["t2"].task), ["t1"]);
+        assert!(closure(&b, &b.tasks["t1"].task).is_empty());
+        // A cycle (a board from before init refused them) ends: nothing twice, never the task itself.
+        let b = fold(&[Event::open(dep("a", &["b"]), "engineer:e", 0), Event::open(dep("b", &["a"]), "engineer:e", 0)]);
+        assert_eq!(closure(&b, &b.tasks["a"].task), ["b"]);
+    }
+
     fn verify(of: &str, author: &str, _ms: i64) -> Task {
         Task { id: format!("{of}.v1"), role: Role::Verify, of: Some(of.into()), not_by: vec![author.into()], ..task("x") }
     }
@@ -781,8 +889,8 @@ mod tests {
         assert!(b.barred(&b.tasks["t1.v1"].task, "sa2") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", 3));
         let b = fold(&[base, vec![ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d2"), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(b.finished(), "every task verified");
-        assert!(!Board::default().finished(), "an empty board is not a reached goal");
+        assert!(!b.finished() && integration_due(&b), "every task verified: the combined tree is checked next");
+        assert!(!Board::default().finished() && !integration_due(&Board::default()), "an empty board is not a reached goal");
     }
 
     #[test]
@@ -881,5 +989,95 @@ mod tests {
         assert_eq!(next_for(&b, "me", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
         assert_eq!(next_for(&b, "me", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
         assert_eq!(next_for(&b, "me", "other", 3, |t| t.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
+    }
+
+    fn integrate(id: &str) -> Task {
+        Task { role: Role::Integrate, title: "integrate".into(), ..task(id) }
+    }
+
+    fn verdict(kind: Ev, t: &str, by: &str, ms: i64, head: &str) -> Event {
+        Event { head: head.into(), ..ev(kind, t, by, ms) }
+    }
+
+    /// t1 done and verified (at 4), integrate.1 opened and claimed by `si` at 5.
+    fn verified_t1() -> Vec<Event> {
+        [done_t1(), vec![ev(Ev::Claim, "t1.v1", "sb", 3), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat()
+    }
+
+    fn claimed_integrate(id: &str, ms: i64) -> Vec<Event> {
+        vec![Event::open(integrate(id), "si", ms), ev(Ev::Claim, id, "si", ms)]
+    }
+
+    #[test]
+    fn finished_needs_an_integration_that_passed_after_every_verification() {
+        let b = fold(&verified_t1());
+        assert_eq!(b.tasks["t1"].accepted.as_deref(), Some("t1.v1"), "the passing verify task is the accepted attempt's");
+        assert_eq!(integrate_id(&b), "integrate.1");
+        let pass = [verified_t1(), claimed_integrate("integrate.1", 5), vec![verdict(Ev::Verified, "integrate.1", "si", 6, "m1")]].concat();
+        let b = fold(&pass);
+        assert!(b.finished() && !integration_due(&b), "{:?}", b.integrated);
+        assert_eq!(b.integrated, Some(Integration { task: "integrate.1".into(), head: "m1".into(), ms: 6 }));
+        assert_eq!(integrate_id(&b), "integrate.2");
+        // While it is held, nothing is due and the goal is not reached.
+        let b = fold(&[verified_t1(), claimed_integrate("integrate.1", 5)].concat());
+        assert!(!b.finished() && !integration_due(&b) && b.in_flight(6));
+        // A verdict from someone not holding it changes nothing.
+        let b = fold(&[verified_t1(), claimed_integrate("integrate.1", 5), vec![verdict(Ev::Verified, "integrate.1", "sx", 6, "m1")]].concat());
+        assert!(!b.finished() && b.integrated.is_none() && holder_of(&b, "integrate.1").as_deref() == Some("si"));
+    }
+
+    #[test]
+    fn a_rejected_integration_opens_a_fix_and_the_next_integration_finishes() {
+        let mut fix = task("integrate.1.fix");
+        fix.from = Some("m1".into());
+        let rejected = [
+            verified_t1(),
+            claimed_integrate("integrate.1", 5),
+            vec![verdict(Ev::Rejected, "integrate.1", "si", 6, "m1").with_note("visible fails"), Event::open(fix, "si", 6).with_note("visible fails")],
+        ]
+        .concat();
+        let b = fold(&rejected);
+        assert!(!b.finished() && b.integrated.is_none(), "a rejected integration does not finish the board");
+        assert!(matches!(b.tasks["integrate.1"].status, Status::Verified { .. }) && b.tasks["integrate.1"].last_progress == "rejected: visible fails");
+        assert!(matches!(b.tasks["t1"].status, Status::Verified { .. }), "it touches no work task");
+        let f = &b.tasks["integrate.1.fix"];
+        assert_eq!((f.status.clone(), f.task.from.as_deref(), f.notes.as_slice()), (Status::Open, Some("m1"), ["visible fails".to_string()].as_slice()));
+        assert!(!integration_due(&b), "the fix is open");
+        let mut fv = verify("integrate.1.fix", "sa", 0);
+        fv.id = "integrate.1.fix.v1".into();
+        let fixed = vec![
+            ev(Ev::Claim, "integrate.1.fix", "sa", 7),
+            ev(Ev::Done, "integrate.1.fix", "sa", 8),
+            Event::open(fv, "sa", 8),
+            ev(Ev::Claim, "integrate.1.fix.v1", "sb", 9),
+            ev(Ev::Verified, "integrate.1.fix.v1", "sb", 10),
+        ];
+        let b = fold(&[rejected.clone(), fixed.clone()].concat());
+        assert!(integration_due(&b) && !b.finished(), "the fix is verified after the last integration");
+        assert_eq!(integrate_id(&b), "integrate.2");
+        let b = fold(&[rejected, fixed, claimed_integrate("integrate.2", 11), vec![verdict(Ev::Verified, "integrate.2", "si", 12, "m2")]].concat());
+        assert!(b.finished(), "{:?}", b.integrated);
+        assert_eq!(b.integrated.map(|i| i.head).as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn two_runners_racing_open_one_integrate_task_and_one_claim_wins() {
+        let race = [
+            verified_t1(),
+            vec![Event::open(integrate("integrate.1"), "ra", 5), ev(Ev::Claim, "integrate.1", "ra", 5)],
+            vec![Event::open(integrate("integrate.1"), "rb", 5), ev(Ev::Claim, "integrate.1", "rb", 5)],
+        ]
+        .concat();
+        let winners: std::collections::BTreeSet<Option<String>> = permutations(&race[race.len() - 4..])
+            .into_iter()
+            .map(|tail| {
+                let b = fold(&[race[..race.len() - 4].to_vec(), tail].concat());
+                assert_eq!(b.tasks.values().filter(|s| s.task.role == Role::Integrate).count(), 1);
+                assert_eq!(b.lost.len(), 1);
+                holder_of(&b, "integrate.1")
+            })
+            .collect();
+        assert_eq!(winners.len(), 1, "the same winner in every order: {winners:?}");
+        assert!(winners.iter().all(Option::is_some));
     }
 }

@@ -9,15 +9,18 @@
 //! - `oracle/` (oracle.rs): the tails of failed oracle runs.
 //! - `flags.jsonl` (guard.rs): what drones did to tests, CI or the oracle's files, flagged at each tool
 //!   call; `oracle.jsonl` (hidden.rs): the hidden oracle's score of each judged attempt (runner only).
-//!   verdict.rs turns a verifier's verdict into the reward: a diff of the claim's snapshots that changed
-//!   protected files makes it `hacked`, and the lessons shown during the claim are credited.
+//!   verdict.rs turns a verifier's verdict into the reward: a diff of the claim's snapshots that
+//!   weakened tests or changed CI or check files makes it `hacked`, and the lessons shown during the
+//!   claim are credited.
 //! - `joins.jsonl`: directories whose sessions join the goal (`borg hive join --here`, and each
 //!   worktree `borg hive run` makes, with the session of each iteration, left when the run ends).
 //! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost, each `borg hive run`.
 //! - `logs/` (run.rs): each iteration's output, local only: it never syncs.
 //!
 //! `borg hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
-//! board is finished or their budget share spent; view.rs is the hive in `borg top` and borg-web.
+//! board is finished or their budget share spent; its drone threads integrate the accepted work and run
+//! the oracle on the combined tree (integrate.rs, also `borg hive integrate`); view.rs is the hive in
+//! `borg top` and borg-web.
 //!
 //! A session joins a goal by `borg hive join`, by `BORG_HIVE=<goal>` at its first hook, or by a join
 //! record of the directory it starts in; the membership is `<BORG_STATE>/<session>.hive` (`HiveSession`). The hook's [`around`] then adds the
@@ -31,6 +34,7 @@ pub mod contract;
 pub mod goal;
 pub mod guard;
 pub mod hidden;
+pub mod integrate;
 pub mod oracle;
 pub mod run;
 mod sim_drone;
@@ -81,7 +85,9 @@ pub const CONSCIENCE_RESERVE: Duration = Duration::from_secs(20);
 const MIN_ORACLE: Duration = Duration::from_secs(2);
 /// How long a claimant waits before reading the board back: a rival's line written at nearly the same
 /// moment has landed by then, so the answer is the fold's.
-const CLAIM_SETTLE: Duration = Duration::from_millis(150);
+pub(crate) const CLAIM_SETTLE: Duration = Duration::from_millis(150);
+/// Each git call of a fix task's worktree reset.
+const RESET_TIMEOUT: Duration = Duration::from_secs(60);
 /// Claims `borg hive claim` without a task tries before it gives up on a busy board.
 const CLAIM_TRIES: usize = 5;
 
@@ -97,7 +103,8 @@ const REPO_MARKER: &str = "#borg-hive-repo";
 /// Said once, at a drone's first hive prompt (docs/design/hive-learning.md, inoculation framing).
 pub const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
 Every change to tests, CI config or oracle files is recorded and shown to the verifier; gaming a check is visible, allowed to happen, and useless: \
-the task counts as failed. If a check looks wrong, say so in your done note instead of changing it.";
+the task counts as failed. Adding tests, also inside an existing test file, is fine; outside your task's files an existing test may change only in names and values, \
+never lose a line, an assertion or gain a skip. If a check looks wrong, say so in your done note instead of changing it.";
 /// Added for a goal with a hidden oracle.
 pub const INOCULATION_HIDDEN: &str = "This goal is also scored by held-out checks you cannot see.";
 
@@ -273,10 +280,41 @@ pub fn joined(home: &Path, cwd: &str) -> Option<Join> {
     Some(best.2).filter(|j| !j.goal.is_empty())
 }
 
-/// Whether a drone in `repo` may claim `t`: a drone outside the goal's repos only claims tasks of its
-/// own repo (or of none).
+/// Whether a drone in `repo` may claim `t`: never an integrate task (the runner integrates,
+/// integrate.rs), and a drone outside the goal's repos only claims tasks of its own repo (or of none).
 pub fn may_claim(g: &Goal, t: &Task, repo: &str) -> bool {
-    goal::in_scope(g, repo) || t.repo.is_empty() || t.repo.eq_ignore_ascii_case(repo)
+    t.role != Role::Integrate && (goal::in_scope(g, repo) || t.repo.is_empty() || t.repo.eq_ignore_ascii_case(repo))
+}
+
+/// Why integrate tasks are refused to a drone's claim.
+const INTEGRATE_REFUSED: &str = "integrate tasks are run by `borg hive run` or `borg hive integrate`";
+
+/// Whether `session` in `cwd` may take `t` (`may_claim`, and a fix task only in a runner worktree or
+/// a checkout of its `from`).
+fn may_take(g: &Goal, t: &Task, repo: &str, session: &str, cwd: &str) -> bool {
+    may_claim(g, t, repo) && t.from.as_deref().is_none_or(|from| runner_worktree(g, session, cwd) || checkout_of(cwd, from))
+}
+
+/// Whether `cwd` is a checkout of the commit `from` (its HEAD): where any session claims a fix task,
+/// its tree already the combined one (`git worktree add <dir> <from>`), with no reset.
+fn checkout_of(cwd: &str, from: &str) -> bool {
+    if cwd.is_empty() {
+        return false;
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-C", cwd, "rev-parse", "--verify", "-q", "HEAD"]).env("GIT_TERMINAL_PROMPT", "0");
+    crate::runner::run_capped_status(cmd, None, Duration::from_secs(5)).is_some_and(|(st, out)| st.success() && String::from_utf8_lossy(&out).trim() == from)
+}
+
+/// Whether `cwd` is the worktree `borg hive run` made for the drone `session` is an iteration of
+/// (`d<n>` in `.worktrees/hive-<goal>-<n>`): the only place a fix task's claim may reset to its `from`.
+/// An engineer's checkout, or a session of its own, never is.
+fn runner_worktree(g: &Goal, session: &str, cwd: &str) -> bool {
+    let Some(n) = bound(session).and_then(|hs| hs.drone.strip_prefix('d').and_then(|n| n.parse::<usize>().ok())) else { return false };
+    let cwd = Path::new(cwd);
+    let repo = PathBuf::from(borg_trace::repo_key(&cwd.display().to_string()));
+    let same = |a: &Path, b: &Path| a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b));
+    n >= 1 && same(cwd, &run::worktree(&repo, &g.id, n))
 }
 
 /// A shell word that runs this borg (the hook's own executable), so a printed command works in any
@@ -310,8 +348,8 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
     if !t.files.is_empty() {
         out.push_str(&format!("; files {}", t.files.join(", ")));
     }
-    if !t.deps.is_empty() {
-        out.push_str(&format!("; after {}", t.deps.join(", ")));
+    if !t.deps.is_empty() && t.role != Role::Verify {
+        out.push_str(&format!("; after {} (its verified work is in your tree)", t.deps.join(", ")));
     }
     let checks: Vec<&str> = oracle::checks(g, t).iter().map(|c| c.name.as_str()).collect();
     match t.role {
@@ -324,6 +362,13 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
                 command("verify --pass", session, cwd),
                 command("verify --reject", session, cwd)
             ));
+            if !t.deps.is_empty() {
+                out.push_str(&format!(
+                    " Its tree includes the verified work of {}: check {} together with it.",
+                    t.deps.join(", "),
+                    t.of.as_deref().unwrap_or("the work")
+                ));
+            }
             if !t.flags.is_empty() {
                 out.push_str(&format!(" Flagged while the work was done: {}.", t.flags.join("; ")));
             }
@@ -335,7 +380,12 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
             command("block", session, cwd)
         )),
     }
-    if !s.notes.is_empty() {
+    // A fix task's first note is why the integration failed: shown before any rework.
+    if let Some(from) = &t.from {
+        let start = if runner_worktree(g, session, cwd) { "Your worktree was reset to" } else { "You work on" };
+        out.push_str(&format!(" {start} the integrated tree {from}; the integration failed: {}.", s.notes.first().map_or("", String::as_str)));
+    }
+    if s.rework > 0 && !s.notes.is_empty() {
         out.push_str(&format!(" Rework {} — the verifier's notes: {}", s.rework, s.notes.join(" | ")));
     }
     out
@@ -343,7 +393,7 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
 
 /// What a drone without a claim is told: the next open task and the exact claim command.
 fn offer(g: &Goal, b: &Board, session: &str, repo: &str, cwd: &str, now: i64) -> String {
-    match board::next_for(b, session, repo, now, |t| may_claim(g, t, repo)) {
+    match board::next_for(b, session, repo, now, |t| may_take(g, t, repo, session, cwd)) {
         Some(s) => format!(
             "No claim. Next open: {} ({}) {}. Claim it: `{}`",
             s.task.id,
@@ -758,16 +808,16 @@ impl Ctx<'_> {
     }
 
     /// Claims the next open task for this drone (its snapshot within `left`): what it is told of it.
-    /// None when no task is open, or less than `MIN_ORACLE` of the hook's time is left: the next
-    /// prompt offers the task instead.
+    /// None when no task is open, the claim was lost or refused, or less than `MIN_ORACLE` of the
+    /// hook's time is left: the next prompt offers the task instead.
     fn hand_next(&self, path: &Path, left: Duration) -> Option<String> {
         if left < MIN_ORACLE {
             return None;
         }
         let now = self.clock();
         let b = board::fold(&board::read(path));
-        let next = board::next_for(&b, self.session, self.repo, now, |t| may_claim(self.g, t, self.repo))?;
-        let won = claim(self.home, self.g, self.session, &next.task, self.cwd, now, left)?;
+        let next = board::next_for(&b, self.session, self.repo, now, |t| may_take(self.g, t, self.repo, self.session, self.cwd))?;
+        let won = claim(self.home, self.g, self.session, &next.task, self.cwd, now, left).ok()?;
         count(self.home, stats::HIVE_CLAIM, self.session, &self.g.id, &won.task.id, self.repo);
         let now = self.clock();
         hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2)));
@@ -789,8 +839,8 @@ fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Pat
     (done, check)
 }
 
-/// The verify task a `done` of `t` opens: the same scope and checks, never claimable by its author
-/// (the session, and the drone it is an iteration of).
+/// The verify task a `done` of `t` opens: the same scope, deps and checks, never claimable by its
+/// author (the session, and the drone it is an iteration of).
 pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
     let drone = bound(author).map(|hs| hs.drone).filter(|d| !d.is_empty());
     Task {
@@ -799,12 +849,22 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
         title: format!("verify {}: {}", t.id, t.title),
         repo: t.repo.clone(),
         files: t.files.clone(),
-        deps: Vec::new(),
+        deps: t.deps.clone(),
         accept: t.accept.clone(),
         of: Some(t.id.clone()),
         not_by: std::iter::once(author.to_string()).chain(drone).collect(),
         flags: Vec::new(),
+        from: None,
     }
+}
+
+/// Why a claim took nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refused {
+    /// Another drone won it, it was not open to this one, or the board could not be written.
+    Lost,
+    /// A dep's verified work cannot be brought into this tree: why.
+    Deps(String),
 }
 
 /// Claims `task` for `session` in `cwd` (a claim and a heartbeat in one write), waits for rivals' lines
@@ -813,29 +873,134 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
 /// drone's (or, without a drone, this session's) first claim of the task when it had one (a tree that
 /// an earlier attempt already changed, say a test it weakened, is no base: the rework's diff must
 /// show it), else a snapshot taken now, `within` that time. The claim is stamped after the snapshot
-/// (`now` moved on by it), so it lands at its ms and never wins a race it reached late.
-fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64, within: Duration) -> Option<TaskState> {
+/// (`now` moved on by it), so it lands at its ms and never wins a race it reached late. A fix task
+/// (`from`, integrate.rs) starts from the combined tree: a runner drone in its own worktree claims it
+/// with `from` as its base, and once the claim won the worktree is reset to it (`reset_to`); any
+/// other session only in a checkout of `from` (`checkout_of`), never reset, its base a snapshot.
+///
+/// Work with deps starts from their verified work: before the base is taken, each dep's accepted
+/// attempt (board.rs `closure` order) is brought into the tree (verdict.rs `bring_in`), and the claim
+/// names them (`deps_in`). The base then holds them, so the work's diff is its own. A dep that cannot
+/// be brought in (this tree's own changes overlap it) refuses the claim, and a lost claim takes out
+/// what it brought in: either way the tree is as it was.
+fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64, within: Duration) -> Result<TaskState, Refused> {
     let path = tasks_path(home, &g.id);
     let drone = bound(session).map(|hs| hs.drone).unwrap_or_default();
+    let reset = task.from.is_some() && runner_worktree(g, session, cwd);
+    if task.from.as_deref().is_some_and(|from| !reset && !checkout_of(cwd, from)) {
+        return Err(Refused::Lost);
+    }
     let t0 = Instant::now();
-    let base = match task.role != Role::Verify && !cwd.is_empty() {
-        true => first_base(&board::read(&path), &task.id, session, &drone).or_else(|| verdict::snapshot(Path::new(cwd), within)).unwrap_or_default(),
-        false => String::new(),
+    let (deps_in, brought) = bring_deps(&path, task, cwd, within)?;
+    let take_out = || take_out_all(cwd, &brought, within.saturating_sub(t0.elapsed()));
+    let rest = within.saturating_sub(t0.elapsed());
+    // A fix task's claim keeps a snapshot of what the reset will discard in its note: recoverable.
+    let (base, note) = match (&task.from, task.role != Role::Verify && !cwd.is_empty()) {
+        (Some(from), _) if reset => {
+            (from.clone(), verdict::snapshot(Path::new(cwd), rest).map(|s| format!("worktree before the reset: {s}")).unwrap_or_default())
+        }
+        (_, true) => {
+            (first_base(&board::read(&path), &task.id, session, &drone).or_else(|| verdict::snapshot(Path::new(cwd), rest)).unwrap_or_default(), String::new())
+        }
+        (_, false) => (String::new(), String::new()),
     };
+    let left = within.saturating_sub(t0.elapsed());
     let now = now + t0.elapsed().as_millis() as i64;
-    let mut c = Event::new(Ev::Claim, &task.id, session, now).with_drone(&drone);
+    let mut c = Event::new(Ev::Claim, &task.id, session, now).with_drone(&drone).with_note(&note);
     c.base = base;
-    let task = task.id.as_str();
-    board::append(&path, &[c, Event::new(Ev::Heartbeat, task, session, now)]).ok()?;
+    c.deps_in = deps_in;
+    let id = task.id.as_str();
+    if board::append(&path, &[c, Event::new(Ev::Heartbeat, id, session, now)]).is_err() {
+        take_out();
+        return Err(Refused::Lost);
+    }
     std::thread::sleep(CLAIM_SETTLE);
     let b = board::fold(&board::read(&path));
-    let s = b.tasks.get(task)?;
-    let won = s.live(now).is_some_and(|(by, _, _)| by == session);
-    if won && let Some(mut hs) = bound(session) {
+    let Some(s) = b.tasks.get(id).filter(|s| s.live(now).is_some_and(|(by, _, _)| by == session)) else {
+        take_out();
+        return Err(Refused::Lost);
+    };
+    if let Some(from) = task.from.as_ref().filter(|_| reset)
+        && let Err(why) = reset_to(Path::new(cwd), from, left)
+    {
+        let _ = board::append(&path, &[Event::new(Ev::Released, id, session, learn::now_ms()).with_note(&why)]);
+        return Err(Refused::Lost);
+    }
+    if let Some(mut hs) = bound(session) {
         hs.beat_ms = now;
         save(session, &hs);
     }
-    won.then(|| s.clone())
+    Ok(s.clone())
+}
+
+/// A dep's change a claim brought into its tree: the (base, head) of its accepted attempt.
+type Brought = (String, String);
+
+/// Brings the verified work of `task`'s deps into `cwd` for its claim (see `claim`), `within` that
+/// time: the claim's `deps_in`, and the (base, head) of each change it applied, to take out if the
+/// claim is lost. Nothing for a verify or fix task, a task without deps, or no directory.
+fn bring_deps(path: &Path, task: &Task, cwd: &str, within: Duration) -> Result<(Vec<String>, Vec<Brought>), Refused> {
+    if task.role == Role::Verify || task.from.is_some() || task.deps.is_empty() || cwd.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let t0 = Instant::now();
+    let events = board::read(path);
+    let b = board::fold(&events);
+    let (mut deps_in, mut brought): (Vec<String>, Vec<Brought>) = (Vec::new(), Vec::new());
+    let refuse = |brought: &[Brought], why: String| {
+        take_out_all(cwd, brought, within.saturating_sub(t0.elapsed()));
+        Refused::Deps(why)
+    };
+    for d in board::closure(&b, task) {
+        let Some(a) = verdict::accepted(&events, &b, &d).filter(|a| !a.base.is_empty() && !a.head.is_empty()) else {
+            return Err(refuse(&brought, format!("{d} has no verified work to bring into this tree")));
+        };
+        match verdict::bring_in(Path::new(cwd), &a.base, &a.head, within.saturating_sub(t0.elapsed())) {
+            Ok(applied) => {
+                if applied {
+                    brought.push((a.base.clone(), a.head.clone()));
+                }
+                deps_in.push(format!("{d}@{}", a.head));
+            }
+            Err(tail) => {
+                let why = format!("cannot bring {d}'s verified work into this tree: {tail} (a drone whose tree does not overlap it can claim {})", task.id);
+                return Err(refuse(&brought, why));
+            }
+        }
+    }
+    Ok((deps_in, brought))
+}
+
+/// Takes the changes `bring_deps` applied out of `cwd` again, the last first, all `within` what is
+/// left of the claim's time (at least `MIN_ORACLE`, as `reset_to`: the undo comes first).
+fn take_out_all(cwd: &str, brought: &[Brought], within: Duration) {
+    let deadline = Instant::now() + within.max(MIN_ORACLE);
+    for (base, head) in brought.iter().rev() {
+        let _ = verdict::take_out(Path::new(cwd), base, head, deadline.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// Resets the runner worktree `dir` to `from` (a fix task's start): `checkout -f --detach`, then
+/// `clean -fd` (ignored files, build output, stay), each within `RESET_TIMEOUT` and both `within`.
+/// What it discards was in no accepted attempt: every one is inside `from`.
+///
+/// # Errors
+/// A git call that fails or runs out of time: the claim is released with the reason.
+fn reset_to(dir: &Path, from: &str, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within.max(MIN_ORACLE);
+    let git = |args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+        let left = deadline.saturating_duration_since(Instant::now()).min(RESET_TIMEOUT);
+        !left.is_zero() && crate::runner::run_capped_status(cmd, None, left).is_some_and(|(s, _)| s.success())
+    };
+    if !git(&["checkout", "-q", "-f", "--detach", from]) {
+        return Err(format!("could not reset the worktree to the integrated tree {from}"));
+    }
+    if !git(&["clean", "-fdq"]) {
+        return Err(format!("could not clean the worktree after the reset to {from}"));
+    }
+    Ok(())
 }
 
 /// The base of the first claim of `task` by `drone` (by `session` when it has none) that has one.
@@ -897,6 +1062,7 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
        [--task \"ID|role|title|files,..|deps,..\"]...       a goal, its oracle and its first tasks
        [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  held-out checks outside the repo, run after verdicts
   score <goal>                                              the hidden oracle scores the judged tasks not scored yet
+  integrate <goal>                                          merge the accepted work and run the oracle on it (git 2.40+)
   board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
   join <goal> [--session ID|DRONE]                          a running drone joins the goal
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
@@ -986,7 +1152,42 @@ fn new_task(id: &str, role: Role, title: &str, repo: &str, files: Vec<String>, d
     if title.trim().is_empty() {
         return Err(format!("task {id} needs a title"));
     }
-    Ok(Task { id: id.into(), role, title: title.trim().into(), repo: repo.into(), files, deps, accept, of: None, not_by: Vec::new(), flags: Vec::new() })
+    Ok(Task {
+        id: id.into(),
+        role,
+        title: title.trim().into(),
+        repo: repo.into(),
+        files,
+        deps,
+        accept,
+        of: None,
+        not_by: Vec::new(),
+        flags: Vec::new(),
+        from: None,
+    })
+}
+
+/// Why `tasks` cannot be opened together: a dep that names no task (of the batch, or one `known`), or a
+/// cycle among them (a after b after a). The board would never finish either.
+fn check_deps(tasks: &[Task], known: impl Fn(&str) -> bool) -> Result<(), String> {
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    for t in tasks {
+        if let Some(d) = t.deps.iter().find(|d| !ids.contains(&d.as_str()) && !known(d)) {
+            return Err(format!("task {}: its dep {d} names no task", t.id));
+        }
+    }
+    // A task whose deps in the batch are all placed is placed next; what is never placed is on a cycle.
+    let mut placed: Vec<&str> = Vec::new();
+    while let Some(t) =
+        tasks.iter().find(|t| !placed.contains(&t.id.as_str()) && t.deps.iter().all(|d| placed.contains(&d.as_str()) || !ids.contains(&d.as_str())))
+    {
+        placed.push(&t.id);
+    }
+    let cycle: Vec<&str> = ids.into_iter().filter(|i| !placed.contains(i)).collect();
+    match cycle.is_empty() {
+        true => Ok(()),
+        false => Err(format!("tasks {} depend on each other in a cycle", cycle.join(", "))),
+    }
 }
 
 /// Where the command runs: the store the directory routes to, and the directory.
@@ -1107,6 +1308,7 @@ pub fn main(args: &[&str]) -> i32 {
         ("release", []) => held_event(&here, session, Ev::Released, ""),
         ("done", []) => done_cmd(&here, session, a.value("--note").unwrap_or_default()),
         ("score", [id]) => score_cmd(&here, id),
+        ("integrate", [id]) => integrate_cmd(&here, id),
         ("verify", []) => match (a.on("--pass"), a.value("--reject")) {
             (true, None) => verdict_cmd(&here, session, verdict::Said::Pass),
             (false, Some(note)) if !note.trim().is_empty() => verdict_cmd(&here, session, verdict::Said::Reject(note.trim().into())),
@@ -1158,7 +1360,7 @@ fn init(here: &Here, a: &Args, id: &str) -> i32 {
         })
         .collect();
     let tasks: Result<Vec<Task>, String> = a.all("--task").into_iter().map(parse_task).collect();
-    let tasks = match tasks {
+    let tasks = match tasks.and_then(|t| check_deps(&t, |_| false).map(|()| t)) {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
@@ -1343,8 +1545,9 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
         let made = accept.and_then(|acc| {
             new_task(id, role, a.value("--title").unwrap_or_default(), a.value("--repo").unwrap_or_default(), a.list("--files"), a.list("--deps"), acc)
         });
-        match made {
-            Ok(t) if here.board(&g).tasks.contains_key(&t.id) => return fail(format!("task {} exists already (reopen a blocked one with --again)", t.id)),
+        let b = here.board(&g);
+        match made.and_then(|t| check_deps(std::slice::from_ref(&t), |d| b.tasks.contains_key(d)).map(|()| t)) {
+            Ok(t) if b.tasks.contains_key(&t.id) => return fail(format!("task {} exists already (reopen a blocked one with --again)", t.id)),
             Ok(t) => t,
             Err(e) => return fail(e),
         }
@@ -1375,6 +1578,10 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
         let pick = match task {
             Some(t) => match b.tasks.get(t) {
                 None => return fail(format!("no task {t} in goal {}", g.id)),
+                Some(s) if s.task.role == Role::Integrate => return fail(format!("{t}: {INTEGRATE_REFUSED}")),
+                Some(s) if s.task.from.as_deref().is_some_and(|f| !runner_worktree(&g, &session, &here.cwd) && !checkout_of(&here.cwd, f)) => {
+                    return fail(fix_where(t, s.task.from.as_deref().unwrap_or_default()));
+                }
                 Some(s) if !may_claim(&g, &s.task, &repo) => {
                     return fail(format!("{t} belongs to repo {}, and {repo} is outside the goal's repos", s.task.repo));
                 }
@@ -1383,7 +1590,7 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
                 }
                 Some(s) => s,
             },
-            None => match board::next_for(&b, &session, &repo, now, |t| may_claim(&g, t, &repo)) {
+            None => match board::next_for(&b, &session, &repo, now, |t| may_take(&g, t, &repo, &session, &here.cwd)) {
                 Some(s) => s,
                 None => {
                     println!("no task is open to {} now", short(&session));
@@ -1392,13 +1599,16 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
             },
         };
         let id = pick.task.id.clone();
-        if let Some(won) = claim(&here.home, &g, &session, &pick.task.clone(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
-            count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
-            hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
-            println!("claimed {id} for {}. {}", short(&session), describe(&g, &won, &session, &here.cwd));
-            return 0;
+        match claim(&here.home, &g, &session, &pick.task.clone(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
+            Ok(won) => {
+                count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
+                hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
+                println!("claimed {id} for {}. {}", short(&session), describe(&g, &won, &session, &here.cwd));
+                return 0;
+            }
+            Err(Refused::Deps(why)) => return fail(why),
+            Err(Refused::Lost) => println!("lost {id}: another drone claimed it first"),
         }
-        println!("lost {id}: another drone claimed it first");
     }
     3
 }
@@ -1530,6 +1740,48 @@ fn score_cmd(here: &Here, id: &str) -> i32 {
     i32::from(!scored.skipped.is_empty())
 }
 
+/// Where the fix task `t` (from the combined tree `from`) is claimed.
+fn fix_where(t: &str, from: &str) -> String {
+    format!(
+        "{t} starts from the integrated tree {from}: claim it in a checkout of it (`git worktree add <dir> {from}`, then `borg hive claim {t}` there), or a drone of `borg hive run` takes it in its own worktree"
+    )
+}
+
+/// `borg hive integrate <goal>`: what `borg hive run` does once every task is verified (integrate.rs),
+/// from the goal's repo. Exit 0 when the combined tree passed, 1 when it failed (a fix task is open) or
+/// is blocked, 2 when no integration is due. The engineer's: a drone's session never integrates.
+fn integrate_cmd(here: &Here, id: &str) -> i32 {
+    if drone_here(here) {
+        return fail(INTEGRATE_REFUSED);
+    }
+    let g = match goal::load(&here.home, id) {
+        Ok(g) => g,
+        Err(e) => return fail(e),
+    };
+    let Some(repo) = run::repo_of(Path::new(&here.cwd)) else { return fail(format!("{} is not in the goal's git repo", here.cwd)) };
+    match integrate::run(&here.home, &g, &repo, "cli", here.now) {
+        Some(integrate::Outcome { task, head, verdict: Ok(()) }) => {
+            println!("{task}: integrated {}; the goal is finished", head.unwrap_or_default());
+            0
+        }
+        Some(integrate::Outcome { task, head, verdict: Err(why) }) => {
+            println!("{task}: {}{why}", head.as_ref().map_or_else(String::new, |h| format!("{h}: ")));
+            if let Some(h) = head {
+                println!("{}", fix_where(&format!("{task}.fix"), &h));
+            }
+            1
+        }
+        None => {
+            let b = here.board(&g);
+            match b.tasks.values().find(|s| s.task.from.is_some() && !matches!(s.status, Status::Verified { .. })) {
+                Some(s) => println!("no integration of {id} is due: {}", fix_where(&s.task.id, s.task.from.as_deref().unwrap_or_default())),
+                None => println!("no integration of {id} is due: a task is not verified yet, or the goal is finished"),
+            }
+            2
+        }
+    }
+}
+
 fn contract_cmd(here: &Here, named: Option<&str>, text: &str, scope: Vec<String>, supersedes: Option<&str>) -> i32 {
     let (session, hs) = match here.drone(named) {
         Ok(x) => x,
@@ -1576,6 +1828,23 @@ mod tests {
     }
 
     #[test]
+    fn init_and_open_refuse_unknown_deps_and_cycles() {
+        let t = |line: &str| parse_task(line).unwrap();
+        let none = |_: &str| false;
+        // init: deps within the batch, in any order.
+        assert_eq!(check_deps(&[t("b|work|B||a"), t("a|work|A")], none), Ok(()));
+        assert_eq!(check_deps(&[t("a|work|A"), t("b|work|B||a,x")], none).unwrap_err(), "task b: its dep x names no task");
+        assert_eq!(
+            check_deps(&[t("a|work|A||c"), t("b|work|B||a"), t("c|work|C||b"), t("d|work|D")], none).unwrap_err(),
+            "tasks a, b, c depend on each other in a cycle"
+        );
+        assert!(check_deps(&[t("a|work|A||a")], none).is_err(), "a task after itself");
+        // open: a dep must be on the board already (so no new cycle can form).
+        assert_eq!(check_deps(&[t("c|work|C||a")], |d| d == "a"), Ok(()));
+        assert!(check_deps(&[t("c|work|C||z")], |d| d == "a").unwrap_err().contains("its dep z names no task"));
+    }
+
+    #[test]
     fn a_join_record_holds_the_directories_inside_it_and_a_leave_shadows_it() {
         let home = std::env::temp_dir().join(format!("borg-hive-joins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -1605,6 +1874,128 @@ mod tests {
         append_join(&home, "g", &j(3, "g", "/w/repo/.worktrees/hive-g-1")).unwrap();
         assert!(joined(&home, "/w/repo/.worktrees/hive-g-1/src").is_some() && joined(&home, "/w/repo/src").is_none());
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=e@x", "-c", "user.name=e"]).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn goal_g() -> Goal {
+        Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+        }
+    }
+
+    #[test]
+    fn a_model_session_is_never_offered_an_integrate_task() {
+        let g = goal_g();
+        let it = Task { role: Role::Integrate, ..new_task("integrate.1", Role::Work, "integrate", "", vec![], vec![], vec![]).unwrap() };
+        assert!(!may_claim(&g, &it, "app"), "whatever the repo");
+        let b = board::fold(&[Event::open(it, "integrate-d1-1", 1)]);
+        assert_eq!(offer(&g, &b, "s", "app", "/w", 2), "No claim, and no task is open to you now (`borg hive board`).");
+        let w = new_task("t1", Role::Work, "work", "", vec![], vec![], vec![]).unwrap();
+        assert!(may_claim(&g, &w, "app"));
+    }
+
+    #[test]
+    fn a_fix_task_claim_resets_a_runner_worktree_or_takes_a_checkout_of_its_tree() {
+        let root = std::env::temp_dir().join(format!("borg-hive-fix-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, home) = (root.join("app"), root.join("store"));
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "base"]);
+        // The combined tree a failed integration left: another commit.
+        git_ok(&repo, &["checkout", "-q", "-b", "m"]);
+        std::fs::write(repo.join("m.txt"), "merged\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "m"]);
+        let m = git_ok(&repo, &["rev-parse", "HEAD"]);
+        git_ok(&repo, &["checkout", "-q", "main"]);
+        let wt = run::worktree(&repo, "g", 1);
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "hive/g/1", wt.to_str().unwrap()]);
+        let g = goal_g();
+        goal::create(&home, &g).unwrap();
+        let fix = Task { from: Some(m.clone()), ..new_task("integrate.1.fix", Role::Work, "fix the integrated tree", "", vec![], vec![], vec![]).unwrap() };
+        board::append(&tasks_path(&home, "g"), &[Event::open(fix.clone(), "integrate-d2-1", 1)]).unwrap();
+        let pid = std::process::id();
+        let (runner_s, own_s) = (format!("fix-runner-{pid}"), format!("fix-own-{pid}"));
+        bind_as(&home, &runner_s, "g", "d1").unwrap();
+        bind_as(&home, &own_s, "g", "").unwrap();
+        let (w, r) = (wt.display().to_string(), repo.display().to_string());
+        // An engineer's checkout, or a session of its own: refused, nothing written.
+        assert_eq!(claim(&home, &g, &runner_s, &fix, &r, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        assert_eq!(claim(&home, &g, &own_s, &fix, &w, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        assert_eq!(board::read(&tasks_path(&home, "g")).len(), 1);
+        let b = board::fold(&board::read(&tasks_path(&home, "g")));
+        assert!(offer(&g, &b, &own_s, "app", &w, 2).starts_with("No claim, and no task"), "not offered where it cannot be claimed");
+        assert!(offer(&g, &b, &runner_s, "app", &w, 2).contains("integrate.1.fix"));
+        // The runner drone in its own worktree: claimed from `from`, the worktree reset to it.
+        std::fs::write(wt.join("README"), "stray edit\n").unwrap();
+        std::fs::write(wt.join("stray.txt"), "x\n").unwrap();
+        let now = learn::now_ms();
+        let won = claim(&home, &g, &runner_s, &fix, &w, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed");
+        assert!(won.live(now + 1).is_some_and(|(by, _, _)| by == runner_s));
+        assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), m);
+        assert_eq!(std::fs::read_to_string(wt.join("README")).unwrap(), "base\n");
+        assert!(wt.join("m.txt").exists() && !wt.join("stray.txt").exists());
+        let c = board::read(&tasks_path(&home, "g")).into_iter().find(|e| e.ev == Ev::Claim).unwrap();
+        assert_eq!(c.base, m, "the diff is judged from the combined tree");
+        let kept = c.note.strip_prefix("worktree before the reset: ").expect("the discarded tree is kept");
+        assert_eq!(git_ok(&repo, &["show", &format!("{kept}:stray.txt")]), "x");
+        assert!(describe(&g, &won, &runner_s, &w).contains(&format!("reset to the integrated tree {m}")));
+        // Any session in a checkout of `from` (a goal worked by joined sessions): offered and claimed
+        // there, never reset, its base a snapshot of that checkout.
+        board::append(&tasks_path(&home, "g"), &[Event::new(Ev::Released, "integrate.1.fix", &runner_s, learn::now_ms())]).unwrap();
+        let co = root.join("fix");
+        git_ok(&repo, &["worktree", "add", "-q", "--detach", co.to_str().unwrap(), &m]);
+        std::fs::write(co.join("notes.txt"), "mine\n").unwrap();
+        let c = co.display().to_string();
+        let now = learn::now_ms();
+        let b = board::fold(&board::read(&tasks_path(&home, "g")));
+        assert!(offer(&g, &b, &own_s, "app", &c, now).contains("integrate.1.fix"));
+        let won = claim(&home, &g, &own_s, &fix, &c, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed in a checkout of from");
+        assert!(co.join("notes.txt").exists(), "no reset");
+        let c = board::read(&tasks_path(&home, "g")).into_iter().rfind(|e| e.ev == Ev::Claim).unwrap();
+        assert_eq!(git_ok(&repo, &["rev-parse", &format!("{}^", c.base)]), m, "a snapshot on the combined tree");
+        assert!(describe(&g, &won, &own_s, &co.display().to_string()).contains(&format!("You work on the integrated tree {m}")));
+        unbind(&runner_s);
+        unbind(&own_s);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_lost_claim_takes_its_deps_out_even_when_its_time_is_up() {
+        let root = std::env::temp_dir().join(format!("borg-hive-take-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_ok(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "base"]);
+        let base = verdict::snapshot(&root, verdict::SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::write(root.join("a.txt"), "dep\n").unwrap();
+        let head = verdict::snapshot(&root, verdict::SNAPSHOT_TIMEOUT).unwrap();
+        git_ok(&root, &["checkout", "-q", "--", "a.txt"]);
+        assert!(verdict::bring_in(&root, &base, &head, verdict::SNAPSHOT_TIMEOUT).unwrap());
+        let t0 = Instant::now();
+        take_out_all(&root.display().to_string(), &[(base, head)], Duration::ZERO);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n", "the undo gets its floor");
+        assert!(t0.elapsed() < MIN_ORACLE + Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

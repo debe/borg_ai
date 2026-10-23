@@ -378,8 +378,15 @@ time at the same dollars as one session with subagents) is still to be measured 
 ([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)); until
 then it is preparation, not a claimed win. `borg hive run <goal> --drones N` starts N headless drones,
 each in a git worktree with an equal share of the goal's budget, until the board is finished (try
-`--dry-run` first); `borg top` and the web page show the board and the spend. Guardrails make gaming
-the oracle useless: a verdict on work whose diff changed tests or CI outside its scope is logged as
+`--dry-run` first). Once every task is verified, the runner merges the accepted work. It never merges
+a drone's whole branch. It runs the oracle on the combined tree, which ends up at
+`refs/heads/hive/<goal>/integrated` (`borg hive integrate` does the same for a goal worked
+interactively; it needs git 2.40+). A conflict or a failing check opens a fix task (a joined session
+takes it in a checkout of the combined tree), and the goal is
+finished only when the combined tree passes. A task that depends on another starts from its verified
+work: the claim brings that work into the drone's worktree. `borg top` and the web page show the board, the
+integration and the spend. Guardrails make gaming
+the oracle useless: a verdict on work whose diff weakened tests or changed CI outside its scope is logged as
 hacked and the task reopens, every tool call that writes a test or peeks at the oracle is flagged for
 the verifier, and an optional hidden oracle (held-out checks outside the repo) decides what a verdict
 credits. Each verdict credits the lessons shown during the task; the web page shows the hacked rate. A

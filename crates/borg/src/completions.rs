@@ -23,7 +23,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("no", &[], crate::veto::FLAGS, false),
     (
         "hive",
-        &["init", "run", "board", "join", "leave", "open", "claim", "progress", "release", "block", "done", "verify", "score", "contract"],
+        &["init", "run", "board", "join", "leave", "open", "claim", "progress", "release", "block", "done", "verify", "score", "integrate", "contract"],
         crate::hive::FLAGS,
         false,
     ),

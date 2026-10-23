@@ -6,10 +6,13 @@
 //!
 //! The script (`BORG_SIM_SCRIPT`, JSON, every field optional): `{"usd_per_iter": 0.10, "drones": {"d2":
 //! {"fail_first": true, "contract": {"scope": ["api.rs"], "text": "fn f() -> u8"}, "hang": false,
-//! "edit_tests": false, "work_s": 0}}}`. `fail_first`: the drone's first work ends at a failing oracle (its stop
+//! "edit_tests": false, "grow_tests": false, "work_s": 0}}}`. `fail_first`: the drone's first work ends at a failing oracle (its stop
 //! blocked, the claim still held); `hang`: once it holds a claim it sleeps past any iteration cap; `edit_tests`: it also
-//! writes `tests/sim_edit.txt` (a fixture for the reward step's guardrails); `contract`: it publishes it;
-//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait).
+//! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
+//! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
+//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait). A fix
+//! task (`from`, hive/integrate.rs) is resolved by script: the conflict marker lines are dropped from its
+//! scoped files and from every other file holding them, both sides kept.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +51,8 @@ struct Plan {
     hang: bool,
     #[serde(default)]
     edit_tests: bool,
+    #[serde(default)]
+    grow_tests: bool,
     #[serde(default)]
     work_s: u64,
 }
@@ -91,6 +96,29 @@ impl Drone<'_> {
 fn worktree_of(home: &Path, author: Option<&str>, cwd: &str) -> PathBuf {
     let dir = author.and_then(|a| super::joins(home).into_iter().rev().find(|j| j.session == a)).map(|j| j.dir);
     PathBuf::from(dir.unwrap_or_else(|| cwd.to_string()))
+}
+
+/// Whether `line` is a conflict marker git writes (`<<<<<<< x`, `=======`, `>>>>>>> x`, `||||||| x`).
+fn marker(line: &str) -> bool {
+    ["<<<<<<<", "|||||||", ">>>>>>>"].iter().any(|m| line.starts_with(m)) || line == "======="
+}
+
+/// Drops the conflict marker lines of `files` under `dir` and of every other file holding them (a
+/// conflict outside the tasks' scopes, a test file both appended to), keeping both sides: the scripted
+/// resolution of a fix task.
+fn resolve_markers(dir: &Path, files: &[String]) {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(["grep", "-l", "-e", "^<<<<<<< "]);
+    let out = runner::run_capped(cmd, None, CALL).unwrap_or_default();
+    let mut paths: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).collect();
+    paths.extend(String::from_utf8_lossy(&out).lines().map(|l| dir.join(l)));
+    paths.sort();
+    paths.dedup();
+    for p in paths {
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let kept: String = text.lines().filter(|l| !marker(l)).map(|l| format!("{l}\n")).collect();
+        let _ = std::fs::write(&p, kept);
+    }
 }
 
 /// One iteration; prints `{"usd", "session", "text", "error"}` and exits 0.
@@ -138,6 +166,13 @@ pub fn main(here: &Here) -> i32 {
             d.stop(false);
             break;
         }
+        if task.from.is_some() {
+            resolve_markers(Path::new(&here.cwd), &task.files);
+            if !d.stop(false).contains("done, verify task") {
+                break;
+            }
+            continue;
+        }
         std::thread::sleep(Duration::from_secs(plan.work_s));
         let file = task.files.first().cloned().unwrap_or_else(|| format!("{}.txt", task.id));
         let failed_once = hook::state_file(&format!("sim-{}-{name}", g.id)).with_extension("failed");
@@ -154,6 +189,11 @@ pub fn main(here: &Here) -> i32 {
             let t = Path::new(&here.cwd).join("tests/sim_edit.txt");
             let _ = std::fs::create_dir_all(t.parent().unwrap_or(Path::new(".")));
             let _ = std::fs::write(t, format!("edited by {name}\n"));
+        } else if plan.grow_tests {
+            let t = Path::new(&here.cwd).join("tests/sim_edit.txt");
+            let body = std::fs::read_to_string(&t).unwrap_or_default();
+            let _ = std::fs::create_dir_all(t.parent().unwrap_or(Path::new(".")));
+            let _ = std::fs::write(t, format!("{body}grown by {name}\n"));
         }
         if let Some(c) = &plan.contract {
             d.hive(&["contract", &c.text, "--scope", &c.scope.join(",")]);

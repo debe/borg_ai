@@ -5,10 +5,14 @@
 //! itself, whatever the verifier said:
 //! - the author never judges its own work (its session, or any session of its drone);
 //! - the work's diff, from a snapshot of the claimant's tree at the claim (`base`) to one at the done
-//!   (`head`, [`snapshot`]), may not modify, delete or rename tests or CI outside the task's own
-//!   `files` ([`protected`]; adding tests is fine), and the drone may not have touched the oracle's
-//!   files (guard.rs flags). Either makes the verdict `rejected` with `hacked`, a done that passed the
-//!   visible oracle by changing it; the work reopens with the paths to restore.
+//!   (`head`, [`snapshot`], [`diff`]), may not weaken tests or change CI outside the task's own
+//!   `files`, nor change the visible check's own files at all ([`protected`]: tests may grow, never
+//!   shrink), and the drone may not have touched the oracle's files (guard.rs flags). Either makes the
+//!   verdict `rejected` with `hacked`, a done that passed the visible oracle by changing it; the work
+//!   reopens with the paths to restore and why.
+//! - work with deps must have started from a tree holding each dep's verified work: its claim's
+//!   `deps_in` names every transitive dep's accepted head ([`accepted`], brought in by [`bring_in`] at
+//!   the claim), or a pass is an unchecked reject ([`NO_DEPS`]).
 //!
 //! The reward: every lesson shown to the author's session while it held the claim
 //! (veto.rs `shown_between`) gets the verdict as an outcome (outcome.rs `verified`, `rejected`,
@@ -17,6 +21,7 @@
 //! final at once. Each final verdict counts one `task_*` stat. BORG_HIVE_CREDIT=off (the frozen arm of
 //! an eval) credits nothing; the board and the stats still record.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -34,6 +39,10 @@ use crate::{learn, queen, runner, stats, veto};
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A whole snapshot outside the stop hook (the CLI): its four git calls.
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(40);
+/// A whole [`diff`]: its two git calls (inside the stop hook's 60 s default budget).
+pub const DIFF_TIMEOUT: Duration = Duration::from_secs(2 * GIT_TIMEOUT.as_secs());
+/// What a reason quotes of a line.
+const EXCERPT: usize = 80;
 /// A reject's reason, at least.
 const MIN_NOTE: usize = 4;
 
@@ -72,10 +81,6 @@ fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) ->
     }
 }
 
-fn git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Option<String> {
-    git_by(dir, args, env, Instant::now() + GIT_TIMEOUT)
-}
-
 /// A commit of `dir`'s working tree as it is (tracked and untracked files, `.gitignore` respected),
 /// written without touching the index, HEAD or any ref: a scratch index copied from the real one (so
 /// unchanged files are not hashed again), `add -A`, `write-tree`, `commit-tree`, all `within` (each
@@ -87,7 +92,10 @@ pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     let index = dir.join(git(dir, &["rev-parse", "--git-path", "index"], &[])?);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let tmp = std::env::temp_dir().join(format!("borg-hive-index-{}-{nanos}", std::process::id()));
-    if index.is_file() && std::fs::copy(&index, &tmp).is_err() {
+    // The copy keeps the index's mtime: git re-reads an entry as old as its index (racy git), and a
+    // fresh mtime would make it trust a same-size edit made in the second the index was written.
+    if index.is_file() && copy_keeping_mtime(&index, &tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return None;
     }
     let tmp_s = tmp.display().to_string();
@@ -104,6 +112,92 @@ pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     git(dir, &args, &who).filter(|c| !c.is_empty())
 }
 
+/// `from` copied to `to` with `from`'s mtime.
+fn copy_keeping_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to)?;
+    let mtime = std::fs::metadata(from)?.modified()?;
+    std::fs::File::options().write(true).open(to)?.set_modified(mtime)
+}
+
+/// `git -C dir args` (fed `input`) within `GIT_TIMEOUT` and before `deadline`, its stderr merged into
+/// its stdout: (success, untrimmed output). None when it did not run or finish.
+fn git_out(dir: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -> Option<(bool, String)> {
+    let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
+    if left.is_zero() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "exec 2>&1; exec git \"$@\"", "git", "-C"]).arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    runner::run_capped_status(cmd, input, left).map(|(s, out)| (s.success(), String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// What a refusal quotes of git's output: its last lines.
+fn git_tail(out: &str) -> String {
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(3)..].join("; ")
+}
+
+/// The change from `base` to `head` (commits of `dir`'s repo) as a binary patch, and `dir`'s toplevel,
+/// where it applies: from a subdirectory `git apply` would skip every path outside it.
+fn patch_of(dir: &Path, base: &str, head: &str, deadline: Instant) -> Result<(String, Vec<u8>), String> {
+    let top = git_by(dir, &["rev-parse", "--show-toplevel"], &[], deadline).ok_or_else(|| format!("{} is in no git worktree", dir.display()))?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(&top).args(["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).env("GIT_TERMINAL_PROMPT", "0");
+    let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
+    match (!left.is_zero()).then(|| runner::run_capped_status(cmd, None, left)).flatten() {
+        Some((s, out)) if s.success() => Ok((top, out)),
+        _ => Err(format!("git cannot diff {base}..{head} here (not this repo's snapshots, or out of time)")),
+    }
+}
+
+/// Puts a dependency's own change (`base..head`, the snapshots of its accepted attempt) into `dir`'s
+/// working tree, all `within`, without touching the index, HEAD or any ref: `git apply --check`, then
+/// `git apply`, at the toplevel. `Ok(true)` when it applied, `Ok(false)` when the change is in already
+/// (its reverse applies: the dep's author drone claims the dependent in its own tree, or a rework in a
+/// tree it was brought into before) or empty.
+///
+/// # Errors
+/// Neither applies (the tree's own changes overlap it), or git failed or ran out of time: the tree is
+/// as it was, and the reason ends with git's last lines.
+pub fn bring_in(dir: &Path, base: &str, head: &str, within: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + within;
+    let (top, patch) = patch_of(dir, base, head, deadline)?;
+    if patch.is_empty() {
+        return Ok(false);
+    }
+    let top = Path::new(&top);
+    let apply = |args: &[&str]| git_out(top, &[&["apply", "--whitespace=nowarn"], args].concat(), Some(&patch), deadline);
+    match apply(&["--check"]) {
+        Some((true, _)) => match apply(&[]) {
+            Some((true, _)) => Ok(true),
+            Some((false, out)) => Err(git_tail(&out)),
+            None => Err("git apply did not finish".into()),
+        },
+        Some((false, out)) => match apply(&["-R", "--check"]) {
+            Some((true, _)) => Ok(false),
+            _ => Err(git_tail(&out)),
+        },
+        None => Err("git apply --check did not finish".into()),
+    }
+}
+
+/// Undoes a [`bring_in`] that applied (`git apply -R` of the same change), `within` that time.
+///
+/// # Errors
+/// The reverse does not apply, or git failed or ran out of time.
+pub fn take_out(dir: &Path, base: &str, head: &str, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    let (top, patch) = patch_of(dir, base, head, deadline)?;
+    if patch.is_empty() {
+        return Ok(());
+    }
+    match git_out(Path::new(&top), &["apply", "--whitespace=nowarn", "-R"], Some(&patch), deadline) {
+        Some((true, _)) => Ok(()),
+        Some((false, out)) => Err(git_tail(&out)),
+        None => Err("git apply -R did not finish".into()),
+    }
+}
+
 /// One changed path of a diff: `status` is git's letter (M, A, D, R, T, C); a rename names its old path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -114,8 +208,150 @@ pub struct Change {
 /// The paths changed from `base` to `head` (commits of the repo at `dir`); None when git cannot say.
 /// Read NUL-separated (`-z`): paths come unquoted whatever their bytes (`core.quotePath`).
 pub fn changes(dir: &Path, base: &str, head: &str) -> Option<Vec<Change>> {
-    let out = git(dir, &["diff", "--name-status", "-z", "-M", "--no-color", base, head], &[])?;
+    changes_by(dir, base, head, Instant::now() + GIT_TIMEOUT)
+}
+
+fn changes_by(dir: &Path, base: &str, head: &str, deadline: Instant) -> Option<Vec<Change>> {
+    let out = git_by(dir, &["diff", "--name-status", "-z", "-M", "--no-color", base, head], &[], deadline)?;
     Some(parse_changes(&out))
+}
+
+/// One hunk of a test file's `-U0` diff: the old file's line it starts at, its removed and added lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hunk {
+    pub line: usize,
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
+}
+
+/// The content diff of a modified test file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestEdit {
+    pub hunks: Vec<Hunk>,
+    pub binary: bool,
+}
+
+/// A line git writes for a conflict (`<<<<<<< x`, `=======`, `>>>>>>> x`, `||||||| x`): no test's line;
+/// a fix task that drops one resolves the merge (hive/integrate.rs).
+fn conflict_marker(line: &str) -> bool {
+    ["<<<<<<< ", "||||||| ", ">>>>>>> "].iter().any(|m| line.starts_with(m)) || line == "======="
+}
+
+fn excerpt(line: &str) -> String {
+    let t = line.trim();
+    match t.chars().count() > EXCERPT {
+        true => format!("{}...", t.chars().take(EXCERPT).collect::<String>()),
+        false => t.to_string(),
+    }
+}
+
+/// Why a test edit weakens the file; None when it preserves it: in each hunk every removed line that
+/// is not blank, a comment or a conflict marker is kept by one of the hunk's added lines, in order
+/// (guard.rs `keeps`: the same shape, no two names made one), the edit declares no fewer tests
+/// (guard.rs `declares_test`) and adds no more silencers (guard.rs `silencer`) than it removes. A
+/// renamed key, accessor or an updated value keep a line; a deleted, reshaped or tautological
+/// assertion, a test no longer declared (`#[test]` turned `#[inline]`), an added skip do not, nor
+/// does any binary edit.
+pub fn weakens(e: &TestEdit) -> Option<String> {
+    if e.binary {
+        return Some("binary".into());
+    }
+    for h in &e.hunks {
+        let mut added = h.added.iter();
+        for (i, r) in h.removed.iter().enumerate() {
+            if guard::comment_only(r) || conflict_marker(r) {
+                continue;
+            }
+            if !added.any(|a| guard::keeps(r, a)) {
+                return Some(format!("line {} removed or reshaped: {}", h.line + i, excerpt(r)));
+            }
+        }
+    }
+    let count = |lines: &mut dyn Iterator<Item = &String>, f: fn(&str) -> bool| lines.filter(|l| f(l)).count();
+    let (removed, added) = (|| e.hunks.iter().flat_map(|h| &h.removed), || e.hunks.iter().flat_map(|h| &h.added));
+    if count(&mut added(), guard::declares_test) < count(&mut removed(), guard::declares_test) {
+        let first = removed().find(|l| guard::declares_test(l)).map_or_else(String::new, |l| excerpt(l));
+        return Some(format!("drops a test: {first}"));
+    }
+    if count(&mut added(), guard::silencer) > count(&mut removed(), guard::silencer) {
+        let first = added().find(|l| guard::silencer(l)).map_or_else(String::new, |l| excerpt(l));
+        return Some(format!("adds a skip: {first}"));
+    }
+    None
+}
+
+/// A diff from `base` to `head`: its changed paths, and the content diff of each modified test file
+/// (keyed by path; one missing could not be read).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Diff {
+    pub changes: Vec<Change>,
+    pub edits: HashMap<String, TestEdit>,
+}
+
+/// The diff of `dir` from `base` to `head`, within `DIFF_TIMEOUT`: the changed paths, then, when a
+/// test file (not a runner's config) was modified, one `-U0` diff of those files, read as literal
+/// pathspecs. None when git cannot list the paths; a content diff that fails leaves `edits` without
+/// them, and [`protected`] fails closed.
+pub fn diff(dir: &Path, base: &str, head: &str) -> Option<Diff> {
+    let deadline = Instant::now() + DIFF_TIMEOUT;
+    let changes = changes_by(dir, base, head, deadline)?;
+    let tests: Vec<String> = changes
+        .iter()
+        .filter(|c| c.status == 'M' && !guard::runner_config(&c.path))
+        .filter(|c| guard::class_of(&c.path, Path::new("/"), &[], &[]) == Some(Class::Test))
+        .map(|c| format!(":(literal){}", c.path))
+        .collect();
+    let mut edits = HashMap::new();
+    if !tests.is_empty() {
+        let mut args = vec!["-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
+        args.extend([base, head, "--"]);
+        args.extend(tests.iter().map(String::as_str));
+        if let Some(out) = git_by(dir, &args, &[], deadline) {
+            edits = parse_test_edits(&out);
+        }
+    }
+    Some(Diff { changes, edits })
+}
+
+/// `git diff -U0`'s file sections (each from a `diff --git ` line): the path from `+++ b/<path>` before
+/// the first hunk (or, for a binary file, the `diff --git a/<p> b/<p>` line), then each hunk's `-`
+/// and `+` lines (a removed `-- x` is content, never a header); `\ No newline` lines are skipped. A
+/// path git quoted matches no change and so fails closed.
+fn parse_test_edits(out: &str) -> HashMap<String, TestEdit> {
+    let mut got = HashMap::new();
+    let mut put = |path: Option<String>, e: TestEdit| {
+        if let Some(p) = path {
+            got.insert(p, e);
+        }
+    };
+    let (mut path, mut e, mut in_hunks): (Option<String>, TestEdit, bool) = (None, TestEdit::default(), false);
+    for l in out.lines() {
+        if let Some(rest) = l.strip_prefix("diff --git ") {
+            put(path.take(), std::mem::take(&mut e));
+            in_hunks = false;
+            // `a/<p> b/<p>`, the same path twice: what a binary file is known by.
+            let n = rest.len().saturating_sub(5) / 2;
+            path = rest.get(2..2 + n).filter(|p| rest == format!("a/{p} b/{p}")).map(String::from);
+        } else if let Some(h) = l.strip_prefix("@@ -") {
+            in_hunks = true;
+            let line = h.split([',', ' ']).next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            e.hunks.push(Hunk { line, ..Hunk::default() });
+        } else if in_hunks {
+            let hunk = e.hunks.last_mut();
+            match (l.chars().next(), hunk) {
+                (Some('-'), Some(h)) => h.removed.push(l[1..].to_string()),
+                (Some('+'), Some(h)) => h.added.push(l[1..].to_string()),
+                _ => {}
+            }
+        } else if let Some(p) = l.strip_prefix("+++ ") {
+            // Git ends a path holding a space with a tab here.
+            path = p.strip_prefix("b/").map(|p| p.strip_suffix('\t').unwrap_or(p).to_string());
+        } else if l.starts_with("Binary files ") {
+            e.binary = true;
+        }
+    }
+    put(path, e);
+    got
 }
 
 /// `git diff --name-status -z`: a status field, then one path (two for a rename or copy: the old one
@@ -133,19 +369,53 @@ fn parse_changes(out: &str) -> Vec<Change> {
     got
 }
 
-/// The protected changes: tests or CI (guard.rs `class_of`) modified, deleted, renamed or retyped,
-/// outside the task's own `files` scope. Adding a test is allowed; adding a test runner's config
-/// (guard.rs `runner_config`: a `conftest.py`, a `pytest.ini`) is not, as it changes how the existing
-/// tests run.
-pub fn protected(changes: &[Change], files: &[String], oracle_files: &[String]) -> Vec<Change> {
+/// A protected change: its path and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Protected {
+    pub path: String,
+    pub why: String,
+}
+
+/// The protected changes of a diff ("tests may grow, never shrink"): any change to a file the visible
+/// check runs (`oracle_files`; the oracle itself, so even in the task's scope); outside the task's own
+/// `files`: CI config (guard.rs `class_of`) modified, deleted, renamed or retyped; a test runner's
+/// config (guard.rs `runner_config`) added or changed, as it changes how the existing tests run; a test
+/// deleted, renamed or retyped; a test modified so that it weakens ([`weakens`]), or whose content diff
+/// could not be read. Adding a test is allowed, and so is adding to one, renaming in it or updating a
+/// value: outside your task's files you may add tests and change names and values in existing ones,
+/// but you may not remove, skip or reshape a test or an assertion.
+pub fn protected(d: &Diff, files: &[String], oracle_files: &[String]) -> Vec<Protected> {
     let globs: Vec<Regex> = files.iter().map(|f| crate::assimilate_dir::glob(f)).collect();
-    changes
-        .iter()
-        .filter(|c| matches!(c.status, 'M' | 'D' | 'R' | 'T') || (c.status == 'A' && guard::runner_config(&c.path)))
-        .filter(|c| matches!(guard::class_of(&c.path, Path::new("/"), &[], oracle_files), Some(Class::Test | Class::Ci)))
-        .filter(|c| !globs.iter().any(|g| g.is_match(&c.path)))
-        .cloned()
-        .collect()
+    let verb = |status: char| match status {
+        'A' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        'T' => "retyped",
+        _ => "modified",
+    };
+    let mut out = Vec::new();
+    for c in &d.changes {
+        let why = if oracle_files.contains(&c.path) {
+            Some(format!("the visible check's file, {}", verb(c.status)))
+        } else if globs.iter().any(|g| g.is_match(&c.path)) {
+            None
+        } else {
+            match guard::class_of(&c.path, Path::new("/"), &[], &[]) {
+                Some(Class::Ci) if matches!(c.status, 'M' | 'D' | 'R' | 'T') => Some(format!("CI config {}", verb(c.status))),
+                Some(Class::Test) if guard::runner_config(&c.path) && matches!(c.status, 'A' | 'M' | 'D' | 'R' | 'T') => {
+                    Some(format!("test runner config {}", verb(c.status)))
+                }
+                Some(Class::Test) if matches!(c.status, 'D' | 'R' | 'T') => Some(verb(c.status).to_string()),
+                Some(Class::Test) if c.status == 'M' => match d.edits.get(&c.path) {
+                    Some(e) => weakens(e),
+                    None => Some("its content diff could not be read (git failed or timed out)".into()),
+                },
+                _ => None,
+            }
+        };
+        out.extend(why.map(|why| Protected { path: c.path.clone(), why }));
+    }
+    out
 }
 
 /// What a verdict credits: a final verdict, or (with a hidden oracle) one deferred to its score, with
@@ -156,8 +426,9 @@ pub enum Kind {
     Rejected,
     Hacked,
     Deferred(bool),
-    /// A pass on work whose diff could not be checked (no snapshot at its claim or done): the board
-    /// rejects it, nothing is credited and the hidden oracle never scores it.
+    /// A pass on work whose diff could not be checked (no snapshot at its claim or done), or that
+    /// started without a dep's verified work: the board rejects it, nothing is credited and the hidden
+    /// oracle never scores it.
     Unchecked,
 }
 
@@ -184,16 +455,19 @@ pub struct Decision {
 
 /// Why a pass cannot verify work whose diff was not checked.
 pub const UNCHECKED: &str = "the work has no snapshot at its claim or its done (git failed or timed out), so its diff cannot be checked; publish done again";
+/// Why a pass cannot verify work that started without its dependencies' verified work (the ids follow).
+pub const NO_DEPS: &str = "the work started from a tree without its dependencies' verified work";
 
 /// The truth table: any `oracle` flag or protected change makes a hacked reject, whatever was said;
 /// else a pass on work whose diff was not `checked` is an `Unchecked` reject (fail closed: a drone
-/// that makes its snapshot fail does not pass unseen); else a pass verifies and a reject rejects with
-/// its note, both deferred to the hidden oracle when the goal has one.
-pub fn decide(said: &Said, protected: &[Change], oracle_flags: &[String], checked: bool, has_hidden: bool) -> Decision {
+/// that makes its snapshot fail does not pass unseen), and so is a pass on work whose claim lacks a
+/// dep's verified work (`missing_deps`: it was built and checked on a tree without it); else a pass
+/// verifies and a reject rejects with its note, both deferred to the hidden oracle when the goal has one.
+pub fn decide(said: &Said, protected: &[Protected], oracle_flags: &[String], checked: bool, missing_deps: &[String], has_hidden: bool) -> Decision {
     if !protected.is_empty() || !oracle_flags.is_empty() {
         let mut parts = Vec::new();
         if !protected.is_empty() {
-            let paths: Vec<&str> = protected.iter().map(|c| c.path.as_str()).collect();
+            let paths: Vec<String> = protected.iter().map(|p| format!("{} ({})", p.path, p.why)).collect();
             parts.push(format!("protected files changed: {}; restore them", paths.join(", ")));
         }
         if !oracle_flags.is_empty() {
@@ -206,9 +480,15 @@ pub fn decide(said: &Said, protected: &[Change], oracle_flags: &[String], checke
     }
     match said {
         Said::Pass if !checked => Decision { ev: Ev::Rejected, hacked: false, note: UNCHECKED.into(), kind: Kind::Unchecked },
+        Said::Pass if !missing_deps.is_empty() => {
+            Decision { ev: Ev::Rejected, hacked: false, note: format!("{NO_DEPS} ({}); claim it again", missing_deps.join(", ")), kind: Kind::Unchecked }
+        }
         Said::Pass => Decision { ev: Ev::Verified, hacked: false, note: String::new(), kind: if has_hidden { Kind::Deferred(true) } else { Kind::Verified } },
-        // Unchecked, the hidden oracle has no snapshot to score either: the reject is final.
-        Said::Reject(n) => Decision { ev: Ev::Rejected, hacked: false, note: n.clone(), kind: if has_hidden && checked { Kind::Deferred(false) } else { Kind::Rejected } },
+        // Unchecked or without its deps, the hidden oracle has no tree to score either: the reject is final.
+        Said::Reject(n) => {
+            let scored = has_hidden && checked && missing_deps.is_empty();
+            Decision { ev: Ev::Rejected, hacked: false, note: n.clone(), kind: if scored { Kind::Deferred(false) } else { Kind::Rejected } }
+        }
     }
 }
 
@@ -223,6 +503,8 @@ pub struct Attempt {
     pub done_ms: i64,
     pub base: String,
     pub head: String,
+    /// The claim's `deps_in` (board.rs `Event`): `task@head` of each dep's work its tree held.
+    pub deps_in: Vec<String>,
 }
 
 /// The attempt of the verify task `verify` on the board `b` folded from `events` (one pass): its open
@@ -237,8 +519,24 @@ pub fn attempt(events: &[Event], b: &Board, verify: &str) -> Option<Attempt> {
     })?;
     let (work, author, done_ms, claim_ms) = (span.task.clone(), open.by.clone(), open.ms, span.from_ms);
     let done = events.iter().find(|e| e.ev == Ev::Done && e.task == work && e.by == author && e.ms == done_ms)?;
-    let base = events.iter().find(|e| e.ev == Ev::Claim && e.task == work && e.by == author && e.ms == claim_ms).map(|e| e.base.clone()).unwrap_or_default();
-    Some(Attempt { drone: b.drones.get(&author).cloned().unwrap_or_default(), author, work, claim_ms, done_ms, base, head: done.head.clone() })
+    let claim = events.iter().find(|e| e.ev == Ev::Claim && e.task == work && e.by == author && e.ms == claim_ms);
+    let (base, deps_in) = claim.map(|e| (e.base.clone(), e.deps_in.clone())).unwrap_or_default();
+    Some(Attempt { drone: b.drones.get(&author).cloned().unwrap_or_default(), author, work, claim_ms, done_ms, base, head: done.head.clone(), deps_in })
+}
+
+/// The accepted attempt of the work task `work`: that of the verify task whose `verified` made it
+/// verified (board.rs `TaskState::accepted`; a rejected `.vN` never counts, though the fold closes it
+/// as verified too). It has a base and a head: `decide` rejects a pass on work without them. What a
+/// dependent's claim brings in, and what an integration merges.
+pub fn accepted(events: &[Event], b: &Board, work: &str) -> Option<Attempt> {
+    attempt(events, b, b.tasks.get(work)?.accepted.as_deref()?)
+}
+
+/// The transitive deps of the attempt's work whose accepted head its claim's tree did not hold (not
+/// in its `deps_in` as `task@head`), in `closure` order.
+pub fn missing_deps(events: &[Event], b: &Board, a: &Attempt) -> Vec<String> {
+    let Some(w) = b.tasks.get(&a.work) else { return Vec::new() };
+    board::closure(b, &w.task).into_iter().filter(|d| accepted(events, b, d).is_none_or(|x| !a.deps_in.contains(&format!("{d}@{}", x.head)))).collect()
 }
 
 /// The idempotence key of a verdict's credit.
@@ -333,14 +631,14 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     // verifier outside the goal's repo): no verdict, never one that skipped the check.
     let checked = !a.base.is_empty() && !a.head.is_empty();
     let changed = match checked {
-        true => changes(root, &a.base, &a.head)
+        true => diff(root, &a.base, &a.head)
             .ok_or_else(|| format!("cannot diff the work of {} from {cwd}: give the verdict from a worktree of the goal's repo", a.work))?,
-        false => Vec::new(),
+        false => Diff::default(),
     };
     let prot = protected(&changed, work.map_or(&[][..], |w| &w.files), &guard::oracle_files(g, root));
     let oracle_flags: Vec<String> =
         guard::flags_of(home, &g.id, &a.author, a.claim_ms, a.done_ms).into_iter().filter(|f| f.class == Class::Oracle).map(|f| f.path).collect();
-    let d = decide(said, &prot, &oracle_flags, checked, g.hidden.is_some());
+    let d = decide(said, &prot, &oracle_flags, checked, &missing_deps(&events, &b, &a), g.hidden.is_some());
     let mut e = Event::new(d.ev, verify, session, now).with_note(&d.note);
     e.hacked = d.hacked.then_some(true);
     board::append(&path, &[e]).map_err(|e| e.to_string())?;
@@ -419,39 +717,165 @@ mod tests {
         Change { path: path.into(), status }
     }
 
+    /// A diff of `changes` with no content diffs.
+    fn only(changes: &[Change]) -> Diff {
+        Diff { changes: changes.to_vec(), edits: HashMap::new() }
+    }
+
+    /// A diff modifying the test `path` by one hunk at line 1 (`removed` and `added`, one line each).
+    fn edit(path: &str, removed: &str, added: &str) -> Diff {
+        let lines = |t: &str| t.lines().map(String::from).collect::<Vec<_>>();
+        let e = TestEdit { hunks: vec![Hunk { line: 1, removed: lines(removed), added: lines(added) }], binary: false };
+        Diff { changes: vec![ch(path, 'M')], edits: HashMap::from([(path.to_string(), e)]) }
+    }
+
+    fn paths(p: &[Protected]) -> Vec<&str> {
+        p.iter().map(|p| p.path.as_str()).collect()
+    }
+
     #[test]
     fn the_truth_table() {
         let flags: Vec<String> = Vec::new();
-        let edited = protected(&[ch("tests/a.py", 'M')], &[], &[]);
+        let edited = protected(&edit("tests/a.py", "assert parse('a') == 'a'", "assert True"), &[], &[]);
         // 1. A pass whose diff edited a test: hacked.
-        let d = decide(&Said::Pass, &edited, &flags, true, false);
+        let d = decide(&Said::Pass, &edited, &flags, true, &[], false);
         assert_eq!((d.ev, d.hacked, d.kind), (Ev::Rejected, true, Kind::Hacked));
-        assert!(d.note.contains("tests/a.py") && d.note.contains("restore"), "{}", d.note);
-        // 2. A test in the task's own scope is not protected.
-        assert!(protected(&[ch("tests/a.py", 'M')], &["tests/*.py".into()], &[]).is_empty());
+        assert!(d.note.contains("tests/a.py (line 1 removed or reshaped: assert parse('a') == 'a')") && d.note.contains("restore"), "{}", d.note);
+        // 2. A test in the task's own scope is not protected, whatever the edit.
+        assert!(protected(&only(&[ch("tests/a.py", 'M')]), &["tests/*.py".into()], &[]).is_empty());
         // 3. An added test is allowed; a deleted or renamed one, or CI, is not.
-        assert!(protected(&[ch("tests/new.py", 'A'), ch("src/x.rs", 'M')], &[], &[]).is_empty());
-        assert_eq!(protected(&[ch("tests/a.py", 'D'), ch("spec/b_spec.rb", 'R'), ch("grade.sh", 'M')], &[], &["grade.sh".into()]).len(), 3);
+        assert!(protected(&only(&[ch("tests/new.py", 'A'), ch("src/x.rs", 'M')]), &[], &[]).is_empty());
+        assert_eq!(protected(&only(&[ch("tests/a.py", 'D'), ch("spec/b_spec.rb", 'R'), ch("grade.sh", 'M')]), &[], &["grade.sh".into()]).len(), 3);
         // 4. An oracle flag makes even a reject hacked.
-        let d = decide(&Said::Reject("wrong output".into()), &[], &["/held/t.py".into()], true, true);
+        let d = decide(&Said::Reject("wrong output".into()), &[], &["/held/t.py".into()], true, &[], true);
         assert_eq!((d.ev, d.hacked, d.kind), (Ev::Rejected, true, Kind::Hacked));
         assert!(d.note.contains("/held/t.py") && d.note.contains("verifier: wrong output"));
         // 5. Clean: a pass verifies, a reject rejects with its note.
-        assert_eq!(decide(&Said::Pass, &[], &flags, true, false), Decision { ev: Ev::Verified, hacked: false, note: String::new(), kind: Kind::Verified });
-        let d = decide(&Said::Reject("misses tabs".into()), &[], &flags, true, false);
+        assert_eq!(decide(&Said::Pass, &[], &flags, true, &[], false), Decision { ev: Ev::Verified, hacked: false, note: String::new(), kind: Kind::Verified });
+        let d = decide(&Said::Reject("misses tabs".into()), &[], &flags, true, &[], false);
         assert_eq!((d.ev, d.hacked, d.note.as_str(), d.kind), (Ev::Rejected, false, "misses tabs", Kind::Rejected));
         // 6. With a hidden oracle both wait for its score; a hack does not.
-        assert_eq!(decide(&Said::Pass, &[], &flags, true, true).kind, Kind::Deferred(true));
-        assert_eq!(decide(&Said::Reject("misses tabs".into()), &[], &flags, true, true).kind, Kind::Deferred(false));
-        assert_eq!(decide(&Said::Pass, &edited, &flags, true, true).kind, Kind::Hacked);
+        assert_eq!(decide(&Said::Pass, &[], &flags, true, &[], true).kind, Kind::Deferred(true));
+        assert_eq!(decide(&Said::Reject("misses tabs".into()), &[], &flags, true, &[], true).kind, Kind::Deferred(false));
+        assert_eq!(decide(&Said::Pass, &edited, &flags, true, &[], true).kind, Kind::Hacked);
         assert_eq!((Kind::Hacked.outcome(), Kind::Deferred(true).outcome()), (Some(outcome::HACKED), None));
         // 7. Unchecked (no snapshot): a pass rejects and credits nothing, a reject is final; a hack still shows.
-        let d = decide(&Said::Pass, &[], &flags, false, true);
+        let d = decide(&Said::Pass, &[], &flags, false, &[], true);
         assert_eq!((d.ev, d.hacked, d.kind, d.kind.outcome()), (Ev::Rejected, false, Kind::Unchecked, None));
-        assert_eq!(decide(&Said::Reject("misses tabs".into()), &[], &flags, false, true).kind, Kind::Rejected);
-        assert_eq!(decide(&Said::Pass, &[], &["/held/t.py".into()], false, false).kind, Kind::Hacked);
-        // 8. An added test runner config changes how the existing tests run: protected, added or not.
-        assert_eq!(protected(&[ch("tests/conftest.py", 'A'), ch("pytest.ini", 'A'), ch("tests/test_new.py", 'A')], &[], &[]).len(), 2);
+        assert_eq!(decide(&Said::Reject("misses tabs".into()), &[], &flags, false, &[], true).kind, Kind::Rejected);
+        assert_eq!(decide(&Said::Pass, &[], &["/held/t.py".into()], false, &[], false).kind, Kind::Hacked);
+        // 8. A pass on work whose claim lacked a dep's verified work: an unchecked reject naming it; a
+        //    reject is final (the hidden oracle has no tree with the dep to score); a hack still shows.
+        let missing = ["t1".to_string()];
+        let d = decide(&Said::Pass, &[], &flags, true, &missing, true);
+        assert_eq!((d.ev, d.hacked, d.kind, d.kind.outcome()), (Ev::Rejected, false, Kind::Unchecked, None));
+        assert_eq!(d.note, format!("{NO_DEPS} (t1); claim it again"));
+        assert_eq!(decide(&Said::Reject("misses tabs".into()), &[], &flags, true, &missing, true).kind, Kind::Rejected);
+        assert_eq!(decide(&Said::Pass, &edited, &flags, true, &missing, true).kind, Kind::Hacked);
+        // 9. An added test runner config changes how the existing tests run: protected, added or not.
+        assert_eq!(protected(&only(&[ch("tests/conftest.py", 'A'), ch("pytest.ini", 'A'), ch("tests/test_new.py", 'A')]), &[], &[]).len(), 2);
+    }
+
+    #[test]
+    fn tests_may_grow_never_shrink() {
+        let none = |d: &Diff| protected(d, &["src/*.py".into()], &["grade.sh".into()]);
+        // 1. A new test method and an import appended to an existing test class.
+        let grown = Diff {
+            changes: vec![ch("src/test/java/x/FooTest.java", 'M')],
+            edits: HashMap::from([(
+                "src/test/java/x/FooTest.java".to_string(),
+                TestEdit {
+                    hunks: vec![
+                        Hunk { line: 3, removed: vec![], added: vec!["import java.util.List;".into()] },
+                        Hunk {
+                            line: 20,
+                            removed: vec![],
+                            added: ["", "    @Test", "    void parsesTwo() {", "        assertEquals(2, Foo.parse(\"2\"));", "    }"]
+                                .map(String::from)
+                                .to_vec(),
+                        },
+                    ],
+                    binary: false,
+                },
+            )]),
+        };
+        assert!(none(&grown).is_empty());
+        // 2. A key literal and an accessor renamed in place, a value updated.
+        let renamed = edit(
+            "src/test/java/x/FooTest.java",
+            "        assertEquals(\"x\", json.get(\"colorName\"));\n        assertEquals(3, r.colorName().size());",
+            "        assertEquals(\"x\", json.get(\"color_name\"));\n        assertEquals(4, r.color_name().size());",
+        );
+        assert!(none(&renamed).is_empty());
+        // 3. An assertion turned trivial: protected, the line named.
+        let p = none(&edit("tests/test_parse.py", "assert parse('a') == 'a'", "assert True"));
+        assert_eq!((paths(&p), p[0].why.as_str()), (vec!["tests/test_parse.py"], "line 1 removed or reshaped: assert parse('a') == 'a'"));
+        assert_eq!(none(&edit("tests/A.java", "assertTrue(x.ok());", "assertTrue(true);")).len(), 1);
+        assert_eq!(none(&edit("tests/A.java", "assertEquals(1, f());", "assertTrue(f() > 0);")).len(), 1);
+        // 4. A deleted assertion, a deleted test method.
+        assert_eq!(none(&edit("tests/test_parse.py", "    assert parse('a') == 'a'", "")).len(), 1);
+        assert_eq!(none(&edit("tests/test_parse.py", "def test_a():\n    assert parse('a') == 'a'\n", "\n")).len(), 1);
+        // 5. An added skip, disable, focus or early return.
+        for skip in ["    @Disabled", "@pytest.mark.skip(reason='later')", "it.only('x', () => {})", "xit('x', () => {})", "\tt.Skip()", "        return;"] {
+            let p = none(&edit("tests/a_test.go", "", skip));
+            assert_eq!(p.len(), 1, "{skip:?}");
+            assert!(p[0].why.starts_with("adds a skip: "), "{}", p[0].why);
+        }
+        // 5b. A tautology, a test no longer declared or collected: each keeps its line's shape.
+        for (file, removed, added) in [
+            ("tests/test_p.py", "    assert result == expected", "    assert result == result"),
+            ("tests/FooTest.java", "        assertEquals(expected, actual);", "        assertEquals(actual, actual);"),
+            ("tests/p.rs", "    #[test]", "    #[inline]"),
+            ("tests/FooTest.java", "    @Test", "    @Deprecated"),
+            ("tests/test_p.py", "def test_parse():", "def parse_case():"),
+        ] {
+            let p = none(&edit(file, removed, added));
+            assert_eq!(p.len(), 1, "{added:?}");
+        }
+        assert_eq!(none(&edit("tests/p.rs", "    #[test]", "    #[inline]"))[0].why, "drops a test: #[test]");
+        assert!(none(&edit("tests/test_p.py", "def test_parse():", "def test_parse_v2():")).is_empty(), "a renamed test is kept");
+        // 6. An already disabled test's annotation reworded: no more silencers than before.
+        assert!(none(&edit("tests/ATest.java", "    @Disabled(\"flaky\")", "    @Disabled(\"flaky on CI, see #12\")")).is_empty());
+        // 7. A removed comment or blank line, a removed conflict marker.
+        assert!(none(&edit("tests/test_parse.py", "# old note\n\n<<<<<<< ours\n=======", "")).is_empty());
+        // 8. An appended line in a runner config.
+        let p = none(&edit("tests/conftest.py", "", "collect_ignore = ['test_parse.py']"));
+        assert_eq!((paths(&p), p[0].why.as_str()), (vec!["tests/conftest.py"], "test runner config modified"));
+        // 9. The visible check's file, even in the task's scope.
+        let p = protected(&only(&[ch("grade.sh", 'M')]), &["*.sh".into()], &["grade.sh".into()]);
+        assert_eq!(paths(&p), ["grade.sh"]);
+        // 10. A CI workflow in scope is allowed; outside it, not.
+        let ci = only(&[ch(".github/workflows/ci.yml", 'M')]);
+        assert!(protected(&ci, &[".github/workflows/*".into()], &[]).is_empty());
+        assert_eq!(protected(&ci, &[], &[])[0].why, "CI config modified");
+        // 11. A deleted or renamed test: protected outside the scope, allowed in it.
+        let gone = only(&[ch("tests/test_a.py", 'D'), ch("tests/test_b.py", 'R')]);
+        assert_eq!(paths(&protected(&gone, &[], &[])), ["tests/test_a.py", "tests/test_b.py"]);
+        assert!(protected(&gone, &["tests/*".into()], &[]).is_empty());
+        // 12. A binary test.
+        let mut bin = edit("tests/fixture_test.bin", "", "");
+        bin.edits.values_mut().for_each(|e| e.binary = true);
+        assert_eq!(none(&bin)[0].why, "binary");
+        // 13. A modified test whose content diff could not be read: fail closed.
+        let p = none(&only(&[ch("tests/test_parse.py", 'M')]));
+        assert!(p.len() == 1 && p[0].why.contains("could not be read"), "{p:?}");
+    }
+
+    #[test]
+    fn a_zero_context_diff_reads_hunks_binaries_and_odd_lines() {
+        let out = "diff --git a/tests/t.sql b/tests/t.sql\nindex 1..2 100644\n--- a/tests/t.sql\n+++ b/tests/t.sql\n@@ -3 +2,0 @@\n--- x\n\
+                   @@ -9,2 +8,2 @@ def f():\n-a\n-b\n+++c\n+d\n\\ No newline at end of file\n\
+                   diff --git a/tests/pic.png b/tests/pic.png\nindex 1..2 100644\nBinary files a/tests/pic.png and b/tests/pic.png differ\n\
+                   diff --git \"a/tests/q\\tx.py\" \"b/tests/q\\tx.py\"\n--- \"a/tests/q\\tx.py\"\n+++ \"b/tests/q\\tx.py\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let got = parse_test_edits(out);
+        let t = &got["tests/t.sql"];
+        assert_eq!(t.hunks.len(), 2);
+        assert_eq!(t.hunks[0], Hunk { line: 3, removed: vec!["-- x".into()], added: vec![] }, "a removed `-- x` is content");
+        assert_eq!(t.hunks[1], Hunk { line: 9, removed: vec!["a".into(), "b".into()], added: vec!["++c".into(), "d".into()] });
+        assert!(got["tests/pic.png"].binary);
+        assert_eq!(got.len(), 2, "a quoted path is kept under no change's name: {:?}", got.keys());
+        let quoted = Diff { changes: vec![ch("tests/q\tx.py", 'M')], edits: got };
+        assert!(protected(&quoted, &[], &[])[0].why.contains("could not be read"), "fails closed");
     }
 
     #[test]
@@ -459,7 +883,7 @@ mod tests {
         let out = "M\0tests/donn\u{e9}es.py\0R087\0tests/old \"q\".py\0src/new.py\0A\0a\tb.txt\0";
         assert_eq!(parse_changes(out), [ch("tests/donn\u{e9}es.py", 'M'), ch("tests/old \"q\".py", 'R'), ch("a\tb.txt", 'A')]);
         assert!(parse_changes("").is_empty());
-        assert_eq!(protected(&parse_changes(out), &[], &[]).len(), 2, "both tests, unquoted");
+        assert_eq!(protected(&only(&parse_changes(out)), &[], &[]).len(), 2, "both tests, unquoted");
     }
 
     #[test]
@@ -490,6 +914,7 @@ mod tests {
             of: None,
             not_by: vec![],
             flags: vec![],
+            from: None,
         };
         // A verify task barred to the author's session only (a line from before drones were barred).
         let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s1".into()], ..t1.clone() };
@@ -503,7 +928,16 @@ mod tests {
         let events = board::read(&path);
         let b = board::fold(&events);
         let a = attempt(&events, &b, "t1.v1").unwrap();
-        let want = Attempt { work: "t1".into(), author: "s1".into(), drone: "d1".into(), claim_ms: 10, done_ms: 20, base: "b".into(), head: "h".into() };
+        let want = Attempt {
+            work: "t1".into(),
+            author: "s1".into(),
+            drone: "d1".into(),
+            claim_ms: 10,
+            done_ms: 20,
+            base: "b".into(),
+            head: "h".into(),
+            deps_in: vec![],
+        };
         assert_eq!(a, want);
         assert!(matches!(&b.tasks["t1.v1"].status, board::Status::Claimed { by, .. } if by == "s2"), "the board let s2 claim it");
         let got = record(&home, &g, "t1.v1", &Said::Pass, "s2", "/nonexistent", 31);
@@ -516,7 +950,19 @@ mod tests {
     #[test]
     fn a_done_the_fold_ignored_opens_nothing_and_is_never_judged() {
         use super::super::LEASE_MS;
-        let t1 = Task { id: "t1".into(), role: Role::Work, title: "t".into(), repo: String::new(), files: vec![], deps: vec![], accept: vec![], of: None, not_by: vec![], flags: vec![] };
+        let t1 = Task {
+            id: "t1".into(),
+            role: Role::Work,
+            title: "t".into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+        };
         let v1 = |author: &str| Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec![author.into()], ..t1.clone() };
         let (a_done, b_claim, b_done) = (LEASE_MS + 50, LEASE_MS + 20, LEASE_MS + 90);
         let mut lines = vec![Event::open(t1.clone(), "engineer:e", 1), Event::new(Ev::Claim, "t1", "A", 10)];
@@ -560,8 +1006,190 @@ mod tests {
         assert_eq!(got, [ch("keep.txt", 'D'), ch("tests/a.py", 'M'), ch("tests/new.py", 'A')]);
         let status = std::process::Command::new("git").arg("-C").arg(&dir).args(["status", "--porcelain"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&status.stdout), " D keep.txt\n M tests/a.py\n?? tests/new.py\n", "the index is untouched");
+        let p = protected(&diff(&dir, &base, &head).unwrap(), &[], &[]);
+        assert_eq!((paths(&p), p[0].why.as_str()), (vec!["tests/a.py"], "line 1 removed or reshaped: assert 1"));
         let log = std::process::Command::new("git").arg("-C").arg(&dir).args(["rev-list", "--all", "--count"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "1", "no ref points at a snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_sees_an_edit_git_finds_only_because_its_index_is_racy() {
+        // git trusts an entry whose stat (to the second) matches unless the index is no newer than it
+        // (racy git): a scratch index with a fresh mtime would hide this edit, and a drone's work with it.
+        let dir = std::env::temp_dir().join(format!("borg-hive-snap-racy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        git_ok(&dir, &["config", "core.trustctime", "false"]);
+        std::fs::write(dir.join("f.txt"), "1\n2\n3\n").unwrap();
+        git_ok(&dir, &["add", "-A"]);
+        git_ok(&dir, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        let base = snapshot(&dir, SNAPSHOT_TIMEOUT).unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let set = |p: &Path| std::fs::File::options().write(true).open(p).unwrap().set_modified(old).unwrap();
+        set(&dir.join("f.txt"));
+        git_ok(&dir, &["update-index", "-q", "--refresh"]);
+        std::fs::write(dir.join("f.txt"), "1\nb\n3\n").unwrap();
+        set(&dir.join("f.txt"));
+        set(&dir.join(".git/index"));
+        let head = snapshot(&dir, SNAPSHOT_TIMEOUT).unwrap();
+        assert_eq!(changes(&dir, &base, &head).unwrap(), [ch("f.txt", 'M')]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repo at `name` with `a.txt` and `sub/b.txt` committed, and a dep's change (base, head) made in
+    /// a second worktree of it: `a.txt` edited, `sub/new.bin` added (binary), `gone.txt` deleted.
+    fn dep_fixture(name: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("borg-hive-bring-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (repo, other) = (dir.join("repo"), dir.join("other"));
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        std::fs::write(repo.join("sub/b.txt"), "b\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "x\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        git_ok(&repo, &["worktree", "add", "-q", "--detach", other.to_str().unwrap()]);
+        let base = snapshot(&other, SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::write(other.join("a.txt"), "1\ndep\n3\n").unwrap();
+        std::fs::write(other.join("sub/new.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
+        std::fs::remove_file(other.join("gone.txt")).unwrap();
+        let head = snapshot(&other, SNAPSHOT_TIMEOUT).unwrap();
+        (dir, base, head)
+    }
+
+    fn porcelain(dir: &Path) -> String {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(["status", "--porcelain"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into()
+    }
+
+    fn rev(dir: &Path, what: &str) -> String {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(["rev-parse", what]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().into()
+    }
+
+    #[test]
+    fn bring_in_applies_a_deps_change_to_a_dirty_tree_and_leaves_index_and_head_alone() {
+        let (dir, base, head) = dep_fixture("apply");
+        let repo = dir.join("repo");
+        // The claimant's own unrelated change, and its shell in a subdirectory.
+        std::fs::write(repo.join("sub/b.txt"), "b\nmine\n").unwrap();
+        let (head_before, index_before) = (rev(&repo, "HEAD"), std::fs::read(repo.join(".git/index")).unwrap());
+        assert_eq!(bring_in(&repo.join("sub"), &base, &head, SNAPSHOT_TIMEOUT), Ok(true));
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "1\ndep\n3\n", "a path outside the subdirectory too");
+        assert_eq!(std::fs::read(repo.join("sub/new.bin")).unwrap(), [0u8, 159, 146, 150, 0, 1], "binary");
+        assert!(!repo.join("gone.txt").exists());
+        assert_eq!(std::fs::read_to_string(repo.join("sub/b.txt")).unwrap(), "b\nmine\n", "its own change kept");
+        assert_eq!(porcelain(&repo), " M a.txt\n D gone.txt\n M sub/b.txt\n?? sub/new.bin\n", "nothing staged");
+        assert_eq!((rev(&repo, "HEAD"), std::fs::read(repo.join(".git/index")).unwrap()), (head_before, index_before));
+        assert!(bring_in(&repo, &base, &head, Duration::ZERO).is_err(), "no time left: nothing done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bring_in_of_a_change_already_in_is_a_no_op() {
+        let (dir, base, head) = dep_fixture("again");
+        let repo = dir.join("repo");
+        assert_eq!(bring_in(&repo, &base, &head, SNAPSHOT_TIMEOUT), Ok(true));
+        let before = porcelain(&repo);
+        assert_eq!(bring_in(&repo, &base, &head, SNAPSHOT_TIMEOUT), Ok(false), "its reverse applies: in already");
+        assert_eq!(porcelain(&repo), before);
+        // The dep's author's own tree holds it as well.
+        assert_eq!(bring_in(&dir.join("other"), &base, &head, SNAPSHOT_TIMEOUT), Ok(false));
+        assert_eq!(bring_in(&repo, &base, &base, SNAPSHOT_TIMEOUT), Ok(false), "an empty change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conflicting_tree_refuses_bring_in_and_stays_as_it_was() {
+        let (dir, base, head) = dep_fixture("conflict");
+        let repo = dir.join("repo");
+        std::fs::write(repo.join("a.txt"), "1\nmine\n3\n").unwrap();
+        let err = bring_in(&repo, &base, &head, SNAPSHOT_TIMEOUT).unwrap_err();
+        assert!(err.contains("a.txt"), "git's reason names the path: {err}");
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "1\nmine\n3\n");
+        assert!(repo.join("gone.txt").exists() && !repo.join("sub/new.bin").exists(), "no part of it applied");
+        assert_eq!(porcelain(&repo), " M a.txt\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn take_out_restores_the_tree() {
+        let (dir, base, head) = dep_fixture("out");
+        let repo = dir.join("repo");
+        std::fs::write(repo.join("sub/b.txt"), "b\nmine\n").unwrap();
+        let before = porcelain(&repo);
+        assert_eq!(bring_in(&repo, &base, &head, SNAPSHOT_TIMEOUT), Ok(true));
+        assert_eq!(take_out(&repo.join("sub"), &base, &head, SNAPSHOT_TIMEOUT), Ok(()));
+        assert_eq!(porcelain(&repo), before);
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "1\n2\n3\n");
+        assert!(take_out(&repo, &base, &head, SNAPSHOT_TIMEOUT).is_err(), "not in: nothing to take out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_is_the_verified_attempt_not_a_rejected_one() {
+        let t1 = Task {
+            id: "t1".into(),
+            role: Role::Work,
+            title: "t".into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+        };
+        let v = |n: u32| Task { id: format!("t1.v{n}"), role: Role::Verify, of: Some("t1".into()), not_by: vec!["A".into()], ..t1.clone() };
+        let attempt_lines = |ms: i64, n: &str| {
+            let mut c = Event::new(Ev::Claim, "t1", "A", ms);
+            c.base = format!("b{n}");
+            let mut d = Event::new(Ev::Done, "t1", "A", ms + 1);
+            d.head = format!("h{n}");
+            [c, d]
+        };
+        let mut lines = vec![Event::open(t1.clone(), "engineer:e", 1)];
+        lines.extend(attempt_lines(10, "1"));
+        lines.extend([Event::open(v(1), "A", 11), Event::new(Ev::Claim, "t1.v1", "B", 12), Event::new(Ev::Rejected, "t1.v1", "B", 13).with_note("wrong")]);
+        let b = board::fold(&lines);
+        assert!(accepted(&lines, &b, "t1").is_none(), "a rejected attempt is never accepted, though its verify task is closed");
+        lines.extend(attempt_lines(20, "2"));
+        lines.extend([Event::open(v(2), "A", 21), Event::new(Ev::Claim, "t1.v2", "B", 22), Event::new(Ev::Verified, "t1.v2", "B", 23)]);
+        let b = board::fold(&lines);
+        let a = accepted(&lines, &b, "t1").unwrap();
+        assert_eq!((a.base.as_str(), a.head.as_str()), ("b2", "h2"));
+        assert!(accepted(&lines, &b, "t9").is_none());
+        // A dependent's attempt misses t1 unless its claim names t1's accepted head.
+        let t2 = Task { id: "t2".into(), deps: vec!["t1".into()], ..t1.clone() };
+        lines.push(Event::open(t2, "engineer:e", 30));
+        let b = board::fold(&lines);
+        let mut dep = Attempt { work: "t2".into(), deps_in: vec!["t1@h1".into()], ..a.clone() };
+        assert_eq!(missing_deps(&lines, &b, &dep), ["t1"], "an older head of t1 is no dep");
+        dep.deps_in = vec!["t1@h2".into()];
+        assert!(missing_deps(&lines, &b, &dep).is_empty());
+    }
+
+    #[test]
+    fn a_real_diff_lets_an_appended_test_through_and_catches_a_weakened_one() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        let a = "from p import parse\n\ndef test_a():\n    assert parse('a') == 'a'\n";
+        std::fs::write(dir.join("tests/test_grow.py"), a).unwrap();
+        std::fs::write(dir.join("tests/test_weak [1].py"), a).unwrap();
+        let base = snapshot(&dir, SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::write(dir.join("tests/test_grow.py"), format!("{a}\ndef test_b():\n    assert parse('b') == 'b'\n")).unwrap();
+        std::fs::write(dir.join("tests/test_weak [1].py"), a.replace("assert parse('a') == 'a'", "assert True")).unwrap();
+        let head = snapshot(&dir, SNAPSHOT_TIMEOUT).unwrap();
+        let got = diff(&dir, &base, &head).unwrap();
+        assert_eq!(got.edits.len(), 2, "both read, a glob-like name literally: {:?}", got.edits.keys());
+        let p = protected(&got, &[], &[]);
+        assert_eq!((paths(&p), p[0].why.as_str()), (vec!["tests/test_weak [1].py"], "line 4 removed or reshaped: assert parse('a') == 'a'"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

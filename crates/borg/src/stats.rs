@@ -82,9 +82,13 @@ pub const HIVE_DONE: &str = "hive_done";
 pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
 pub const HIVE_RELEASED: &str = "hive_released";
 pub const HIVE_SHOWN: &str = "hive_shown";
+/// An integration of a hive goal (hive/integrate.rs; `why`: the goal, `text`: the integrate task and its
+/// note): the accepted attempts merged and the oracle run on the combined tree, `n` 1 on a pass, 0 on a
+/// failure.
+pub const HIVE_INTEGRATE: &str = "hive_integrate";
 /// A hive task's verdict, once per attempt (hive/verdict.rs; `why`: the goal, `text`: the task and an
 /// excerpt of the note, `lessons`: the lessons credited with it, `n` their number): verified, rejected
-/// (by its verifier or the hidden oracle), or hacked (protected tests or CI changed, or the oracle
+/// (by its verifier or the hidden oracle), or hacked (weakened tests or changed CI, or the oracle
 /// touched). With a hidden oracle, counted when it scored. `task_hacked` over all three is the hacked
 /// rate (borg-web's overview).
 pub const TASK_VERIFIED: &str = "task_verified";

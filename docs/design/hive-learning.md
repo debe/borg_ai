@@ -143,11 +143,15 @@ A single session can't do this because it has no group to compare. Subagents mak
 
 These come from the research, and each is cheap to build:
 - **Hidden oracle files** live outside the drone's worktree. `pre_tool` flags edits to test files, CI config or oracle paths in a claimed task's scope, and sends them to the verifier.
-- **Checks that fail hacks:** the verifier runs the hidden tests and diffs the test files. A pass that came with edited tests is rejected and logged as `hacked`, which carries a large negative reward.
+- **Checks that fail hacks:** the verifier runs the hidden tests and diffs the test files. A pass that came with weakened tests (removed, reshaped, made tautological, no longer declared or skipped; additions, renames and value updates are fine) is rejected as `hacked`, which carries a large negative reward; the hidden oracle backs it up.
 - **Monitor without optimizing:** a cheap model reads transcripts for hack intent ("make the test pass by…") and only flags them. Its verdict never enters the reward, so we don't train drones to hide intent.
 - **Inoculation framing:** the drone prompt says plainly that gaming the oracle is visible, allowed to happen, and useless to the task. This is the closest in-context analogue of Anthropic's finding.
 - **Promotion gate:** L1 and L2 changes are promoted only after beating the current version on a held-out goal set at the same budget. The queen shows each promotion to a human with its eval delta. Everything is versioned, and rollback is one line.
 - **Erosion check:** playbooks are edited by small deltas, never rewritten (ACE). A length and coverage check catches brevity bias.
+- **Dependent work is checked with its deps** (built, `hive/verdict.rs`). A claim of a task with deps brings each dep's verified work into the tree first and names it in `deps_in`. A pass on work whose claim lacks a dep's verified head is rejected as unchecked: it was built and checked on a tree without that dep. Nothing is credited, and the hidden oracle does not score it.
+- **The combined tree is checked** (built, `hive/integrate.rs`). Each verifier judges one attempt in its author's worktree. Two attempts can each pass alone and still break together: in the W2 probe, two drones added the same annotation at different spots and git merged them cleanly. Before the goal counts as finished, the accepted attempts are merged and the goal's oracle, plus every task's own checks, runs on the result. Only the board's accepted attempts are merged, so work a drone did without a claim never reaches the result.
+  - An integration credits no lessons: it is a verdict on no single attempt.
+  - The fix task a failed integration opens is judged like any work. Its diff runs from the combined tree to its done, and the same `protected` rule applies with the fix task's scope.
 
 ## Proof: a learning curve, not a single number
 

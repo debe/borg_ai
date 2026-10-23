@@ -31,7 +31,7 @@
 //!
 //! - `verified`, `rejected`, `hacked` (a hive verdict, hive/verdict.rs, 0 tokens): a drone's task in a
 //!   hive goal was judged, by its verifier or, when the goal has one, by the hidden oracle
-//!   (hive/hidden.rs); `hacked` is a done whose diff changed protected tests or CI, or whose drone
+//!   (hive/hidden.rs); `hacked` is a done whose diff weakened tests or changed CI, or whose drone
 //!   touched the oracle's files. Every lesson shown to the author's session while it held the claim is
 //!   credited, once per `cause` (`<goal>/<verify task>`). memory.rs weighs them; like `regretted` they
 //!   are deliberately not read by trust.rs (`sessions`), `weight` or attention.rs: a verdict is about

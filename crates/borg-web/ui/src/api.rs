@@ -421,6 +421,8 @@ pub struct HiveGoal {
     pub budget_usd: f64,
     pub spent_usd: f64,
     pub finished: bool,
+    /// `integrated <commit>`, or why the newest integration failed; empty before any.
+    pub integration: String,
     pub tasks: Vec<HiveTask>,
     pub drones: Vec<HiveDrone>,
     /// (task, text, scope) of the newest contracts, newest last.
@@ -438,6 +440,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
             budget_usd: f(&g["budget_usd"]),
             spent_usd: f(&g["spent_usd"]),
             finished: g["finished"].as_bool().unwrap_or(false),
+            integration: s(&g["integration"]),
             tasks: g["tasks"]
                 .as_array()
                 .into_iter()

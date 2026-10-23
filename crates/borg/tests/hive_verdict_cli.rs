@@ -121,15 +121,27 @@ fn board_lines(root: &Path, goal: &str) -> Vec<Value> {
     lines(&store(root).join(format!("hive/{goal}/tasks.jsonl")))
 }
 
-/// `sa` claims t1 of `goal`, is shown `Mdrain`, edits `edit` and publishes done; `sb` claims the verify task.
-fn work_done(root: &Path, goal: &str, edit: &str) {
+/// An edit of src: a comment appended.
+fn comment(body: &str) -> String {
+    format!("{body}# changed by sa\n")
+}
+
+/// An edit that weakens the test: its assertion made trivial.
+fn weaken(body: &str) -> String {
+    body.replace("assert parse('a') == 'a'", "assert True")
+}
+
+/// `sa` claims t1 of `goal`, is shown `Mdrain`, edits `edit` by `change` (an Edit its pre_tool hook
+/// sees) and publishes done; `sb` claims the verify task.
+fn work_done(root: &Path, goal: &str, edit: &str, change: fn(&str) -> String) {
     join(root, "sa", goal);
     join(root, "sb", goal);
     ok(root, &["claim", "t1", "--session", "sa"]);
     asked(root, "sa", "Mdrain");
     let p = work(root).join(edit);
+    hook(root, "claude", "pre_tool", "sa", json!({"tool_name": "Edit", "tool_input": {"file_path": p, "new_string": "x"}}), &[]);
     let body = std::fs::read_to_string(&p).unwrap_or_default();
-    std::fs::write(&p, format!("{body}# changed by sa\n")).unwrap();
+    std::fs::write(&p, change(&body)).unwrap();
     ok(root, &["done", "--session", "sa"]);
     asked(root, "sa", "Pbeacon");
     ok(root, &["claim", "t1.v1", "--session", "sb"]);
@@ -169,7 +181,7 @@ fn pre_tool_flags_a_test_edit_only_for_a_drone_in_a_goal_and_answers_nothing() {
 fn a_hacked_attempt_reworked_in_the_same_tree_is_still_hacked() {
     let root = setup("verdict-rework");
     ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
-    work_done(&root, "g1", "tests/test_parse.py");
+    work_done(&root, "g1", "tests/test_parse.py", weaken);
     // A verifier in another repo cannot diff the work's snapshots: no verdict, never an unchecked pass.
     let other = work(&root).join("other");
     std::fs::create_dir_all(&other).unwrap();
@@ -197,7 +209,7 @@ fn a_hacked_attempt_reworked_in_the_same_tree_is_still_hacked() {
 fn a_verdict_on_a_diff_that_edited_tests_is_hacked_and_credits_the_claims_lessons_once() {
     let root = setup("verdict-hacked");
     ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
-    work_done(&root, "g1", "tests/test_parse.py");
+    work_done(&root, "g1", "tests/test_parse.py", weaken);
     // The author cannot even claim its own verify task, so it cannot give a verdict on it.
     let before = board_lines(&root, "g1").len();
     let (_, err, code) = hive(&root, &["verify", "--pass", "--session", "sa"]);
@@ -208,7 +220,13 @@ fn a_verdict_on_a_diff_that_edited_tests_is_hacked_and_credits_the_claims_lesson
     let verdict = board_lines(&root, "g1").into_iter().find(|e| e["ev"] == "rejected").unwrap();
     assert_eq!((verdict["hacked"].as_bool(), verdict["by"].as_str()), (Some(true), Some("sb")));
     let hacked = outcomes(&root, "hacked");
-    assert_eq!(hacked.len(), 1, "Mdrain was shown during the claim, Pbeacon after the done: {hacked:?}\nboard: {:?}\noutcomes: {}", board_lines(&root, "g1"), std::fs::read_to_string(store(&root).join("outcomes.jsonl")).unwrap_or_default());
+    assert_eq!(
+        hacked.len(),
+        1,
+        "Mdrain was shown during the claim, Pbeacon after the done: {hacked:?}\nboard: {:?}\noutcomes: {}",
+        board_lines(&root, "g1"),
+        std::fs::read_to_string(store(&root).join("outcomes.jsonl")).unwrap_or_default()
+    );
     assert_eq!((hacked[0]["lessons"][0].as_str(), hacked[0]["session"].as_str(), hacked[0]["cause"].as_str()), (Some("Mdrain"), Some("sa"), Some("g1/t1.v1")));
     let stat = stats(&root, "task_hacked");
     assert_eq!((stat.len(), stat[0]["n"].as_u64()), (1, Some(1)));
@@ -229,10 +247,30 @@ fn a_verdict_on_a_diff_that_edited_tests_is_hacked_and_credits_the_claims_lesson
 }
 
 #[test]
+fn a_verdict_on_work_that_only_adds_tests_verifies() {
+    let root = setup("verdict-grow");
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
+    work_done(&root, "g1", "tests/test_parse.py", |body| format!("{body}\ndef test_more():\n    assert parse('b') == 'b'\n"));
+    let out = ok(&root, &["verify", "--pass", "--session", "sb"]);
+    assert!(out.contains("t1.v1 verified"), "tests may grow outside the task's files: {out}");
+    let board = board_lines(&root, "g1");
+    assert!(board.iter().all(|e| e.get("hacked").is_none()), "{board:?}");
+    let v = outcomes(&root, "verified");
+    assert_eq!((v.len(), v[0]["lessons"][0].as_str()), (1, Some("Mdrain")));
+    let flags = lines(&store(&root).join("hive/g1/flags.jsonl"));
+    assert_eq!(
+        (flags.len(), flags[0]["class"].as_str(), flags[0]["path"].as_str()),
+        (1, Some("test"), Some("tests/test_parse.py")),
+        "the verifier still sees the write"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_clean_pass_given_at_the_stop_verifies_and_credits_at_once() {
     let root = setup("verdict-stop");
     ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
-    work_done(&root, "g1", "src/parse.py");
+    work_done(&root, "g1", "src/parse.py", comment);
     let out = hook(&root, "claude", "stop", "sb", json!({"last_assistant_message": "Ran the tests.\nVERDICT: pass", "stop_hook_active": false}), &[]);
     let reason = serde_json::from_str::<Value>(out.trim()).map(|v| v["reason"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
     assert!(reason.contains("t1.v1 verified"), "{out}");
@@ -293,7 +331,7 @@ fn the_hidden_oracle_decides_the_credit_once() {
     );
     assert_eq!(code, 1, "a hidden dir inside the repo is refused");
     assert!(err.contains("inside the repo"), "{err}");
-    work_done(&root, "g2", "src/parse.py");
+    work_done(&root, "g2", "src/parse.py", comment);
     let out = ok(&root, &["verify", "--pass", "--session", "sb"]);
     assert!(out.contains("hidden oracle scores it next"), "{out}");
     assert!(outcomes(&root, "verified").is_empty() && stats(&root, "task_verified").is_empty(), "deferred to the score");
@@ -324,7 +362,7 @@ fn the_hidden_oracle_decides_the_credit_once() {
     for s in ["sa", "sb"] {
         ok(&root, &["leave", "--session", s]);
     }
-    work_done(&root, "g3", "src/parse.py");
+    work_done(&root, "g3", "src/parse.py", comment);
     ok(&root, &["verify", "--pass", "--session", "sb"]);
     ok(&root, &["score", "g3"]);
     let scores = lines(&store(&root).join("hive/g3/oracle.jsonl"));
@@ -344,5 +382,54 @@ fn no_hook_of_a_drone_outside_any_goal_creates_a_hive() {
     hook(&root, "claude", "stop", "s1", json!({"last_assistant_message": "VERDICT: pass", "stop_hook_active": false}), &[]);
     hook(&root, "claude", "end", "s1", json!({}), &[]);
     assert!(!store(&root).join("hive").exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `borg hive <args> --dir <dir>` with `env`: (stdout, stderr, exit code).
+fn hive_at(root: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let all: Vec<&str> = ["hive"].iter().copied().chain(args.iter().copied()).chain(["--dir", dir.to_str().unwrap()]).collect();
+    let out = command(root, &all).envs(env.iter().copied()).stdin(Stdio::null()).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn a_goal_of_joined_sessions_integrates_fixes_and_finishes_through_the_cli() {
+    // No `borg hive run`: the engineer integrates, and a joined session fixes the combined tree in a
+    // checkout of it.
+    let root = setup("verdict-integrate");
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=grep -rq fixed src", "--budget", "5"]);
+    ok(&root, &["open", "g1", "--id", "t1", "--title", "Fix the parser", "--files", "src/*.py", "--accept", "own=true"]);
+    let (out, _, code) = hive(&root, &["integrate", "g1"]);
+    assert_eq!((code, out.contains("no integration of g1 is due")), (2, true), "{out}");
+    work_done(&root, "g1", "src/parse.py", comment);
+    ok(&root, &["verify", "--pass", "--session", "sb"]);
+    let (_, err, code) = hive_at(&root, &work(&root), &["integrate", "g1"], &[("BORG_HIVE", "g1")]);
+    assert!(code != 0 && err.contains("borg hive integrate"), "a drone never integrates: {err}");
+    // The combined tree fails the oracle: exit 1, and where the fix is claimed.
+    let (out, _, code) = hive(&root, &["integrate", "g1"]);
+    assert!(code == 1 && out.contains("integrate.1: ") && out.contains("ok fails"), "{out}");
+    let b = board_lines(&root, "g1");
+    let m = b.iter().find(|e| e["ev"] == "open" && e["task"] == "integrate.1.fix").unwrap()["def"]["from"].as_str().unwrap().to_string();
+    assert!(out.contains(&format!("git worktree add <dir> {m}")), "{out}");
+    let (out, _, code) = hive(&root, &["integrate", "g1"]);
+    assert!(code == 2 && out.contains("integrate.1.fix starts from the integrated tree"), "{out}");
+    // Not in the engineer's checkout; in a checkout of the combined tree, yes.
+    let (_, err, code) = hive(&root, &["claim", "integrate.1.fix", "--session", "sa"]);
+    assert!(code != 0 && err.contains("git worktree add"), "{err}");
+    let fix = work(&root).join(".worktrees/fix");
+    git(&work(&root), &["worktree", "add", "-q", "--detach", fix.to_str().unwrap(), &m]);
+    let (out, err, code) = hive_at(&root, &fix, &["claim", "integrate.1.fix", "--session", "sa"], &[]);
+    assert!(code == 0 && out.contains(&format!("You work on the integrated tree {m}")), "{out}{err}");
+    std::fs::write(fix.join("src/parse.py"), "def parse(s): return s  # fixed\n").unwrap();
+    let (out, err, code) = hive_at(&root, &fix, &["done", "--session", "sa"], &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (out, err, code) = hive_at(&root, &fix, &["claim", "integrate.1.fix.v1", "--session", "sb"], &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (out, err, code) = hive_at(&root, &fix, &["verify", "--pass", "--session", "sb"], &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (out, err, code) = hive(&root, &["integrate", "g1"]);
+    assert!(code == 0 && out.starts_with("integrate.2: integrated ") && out.contains("the goal is finished"), "{out}{err}");
+    let (out, _, code) = hive(&root, &["integrate", "g1"]);
+    assert_eq!((code, out.contains("the goal is finished")), (2, true), "{out}");
     let _ = std::fs::remove_dir_all(root);
 }
