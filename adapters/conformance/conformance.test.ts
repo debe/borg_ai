@@ -305,7 +305,7 @@ for (const p of PROFILES) {
     assert.match(w.cli("doctor", "--home", w.home), new RegExp(`ok   ${p.harness}: adapter installed at`))
     w.cli("uninstall", p.harness, "--apply", "--home", w.home)
     assert.equal(existsSync(file), false, "uninstall removes borg's own adapter")
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   test(`${p.name}: the hooks record the turn, block the stop once and end the drone`, async () => {
@@ -346,7 +346,7 @@ for (const p of PROFILES) {
     d = top(w, s)
     assert.equal(d.state, "ended")
     await h.close()
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   test(`${p.name}: a wordless denial and the next prompt become an episode`, async () => {
@@ -364,7 +364,7 @@ for (const p of PROFILES) {
     } catch {}
     if (caps(p.harness).deny_capture) assert.ok(episodes.includes("drain it with an explicit consumer") && episodes.includes("rm -rf target"), episodes)
     else assert.ok(!episodes.includes("rm -rf target"), `the host's denials are ignored: ${episodes}`)
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   test(`${p.name}: a gone host process reads as ended`, async () => {
@@ -381,7 +381,7 @@ for (const p of PROFILES) {
     }
     assert.equal(top(w, s).state, caps(p.harness).sends_pid ? "ended" : "working")
     await h.close()
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   test(`${p.name}: a paused drone has its tools refused`, async () => {
@@ -395,7 +395,7 @@ for (const p of PROFILES) {
     writeFileSync(inbox, JSON.stringify(d) + "\n")
     assert.match(await h.refused({ kind: "bash", command: "ls" }, "c1"), /paused/)
     await h.close()
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   test(`${p.name}: a change is checked live and its ask arrives with the next tool call`, async () => {
@@ -423,6 +423,6 @@ for (const p of PROFILES) {
     assert.match(w.state(s, "ctx"), /#borg-skip live_covered/)
     await h.end()
     await h.close()
-    rmSync(w.root, { recursive: true, force: true })
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 }

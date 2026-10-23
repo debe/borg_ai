@@ -504,7 +504,9 @@ mod tests {
         assert_eq!((show(&repo, &head, "a.txt"), show(&repo, &head, "b.txt")), ("a".into(), "b".into()));
         assert_eq!(sh(&repo, &["rev-parse", "refs/heads/hive/g/integrated"]), head, "the ref keeps the combined tree");
         let ran_in = std::fs::read_to_string(&where_).unwrap();
-        assert!(ran_in.trim().starts_with(&super::super::dir(&home, "g").join(DIR).display().to_string()), "{ran_in}");
+        // `pwd` names the real path: macOS's temp dir is a symlink into /private.
+        let scratch = std::fs::canonicalize(super::super::dir(&home, "g").join(DIR)).unwrap();
+        assert!(ran_in.trim().starts_with(&scratch.display().to_string()), "{ran_in}");
         assert!(own.exists(), "a task's own checks run on the combined tree too");
         assert_eq!(std::fs::read_dir(super::super::dir(&home, "g").join(DIR)).unwrap().count(), 0, "the scratch checkout is removed");
         assert!(!root.join("hook-ran").exists(), "a hook planted in the repo never runs");

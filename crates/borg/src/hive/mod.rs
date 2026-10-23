@@ -2070,13 +2070,18 @@ mod tests {
         let t = new_task("t1", Role::Work, "work", "", vec![], vec![], vec![]).unwrap();
         let now = learn::now_ms();
         board::append(&path, &[Event::open(t, "engineer:e", now), Event::new(Ev::Claim, "t1", "s1", now)]).unwrap();
+        // The work lasts until three beats landed (a slow runner beats late, never not at all).
+        let beats = |p: &Path| board::read(p).iter().filter(|e| e.ev == Ev::Heartbeat).count();
         let out = renewing(&path, "t1", "s1", Duration::from_millis(20), || {
-            std::thread::sleep(Duration::from_millis(150));
+            let until = Instant::now() + Duration::from_secs(10);
+            while beats(&path) < 3 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             7
         });
         assert_eq!(out, 7);
-        let beats = board::read(&path).iter().filter(|e| e.ev == Ev::Heartbeat).count();
-        assert!(beats >= 3, "{beats} beats");
+        let n = beats(&path);
+        assert!(n >= 3, "{n} beats");
         let renewed = match board::fold(&board::read(&path)).tasks["t1"].status {
             Status::Claimed { renewed, .. } => renewed,
             ref s => panic!("{s:?}"),
