@@ -351,7 +351,7 @@ fn init_with_a_rival(root: &Path) {
     let script = root.join("rival.sh");
     let line = |ev: &str, by: &str, at: &str| format!(r#"{{"v":1,"ev":"{ev}","task":"t1","ms":{at},"by":"{by}"}}"#);
     let body = format!(
-        "ms=$(date +%s%3N)\nprintf '%s\\n%s\\n' '{}' '{}' | sed \"s/MS1/$((ms-2))/;s/MS2/$((ms-1))/\" >> {}\n",
+        "ms=$(perl -MTime::HiRes=time -e 'printf \"%d\", time*1000')\nprintf '%s\\n%s\\n' '{}' '{}' | sed \"s/MS1/$((ms-2))/;s/MS2/$((ms-1))/\" >> {}\n",
         line("released", "engineer:e@x", "MS1"),
         line("claim", "s2", "MS2"),
         store(root).join("hive/g1/tasks.jsonl").display()
