@@ -48,7 +48,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use borg::hive::{board, goal, guard, run as hive_run, verdict};
 use serde::Deserialize;
@@ -482,20 +482,22 @@ fn q(s: impl AsRef<str>) -> String {
 
 /// `sh -c cmd` in `dir` under `timeout`, with the eval git identity: (success, exit code, output).
 fn run_t(dir: &Path, cmd: &str, timeout_s: u32) -> (bool, i32, String) {
-    let out = Command::new("timeout")
-        .args(["-k", "10", &timeout_s.to_string(), "sh", "-c", cmd])
+    // Bounded in-process, not by coreutils' `timeout` (macOS has none): the whole process group is
+    // killed at the cap, and a cut-off run reports 124 as `timeout` did.
+    let mut c = Command::new("sh");
+    c.args(["-c", &format!("exec 2>&1\n{cmd}")])
         .current_dir(dir)
         .envs([("GIT_AUTHOR_NAME", "eval"), ("GIT_AUTHOR_EMAIL", "eval@borg"), ("GIT_COMMITTER_NAME", "eval"), ("GIT_COMMITTER_EMAIL", "eval@borg")])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output();
-    match out {
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            (o.status.success(), o.status.code().unwrap_or(-1), text)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match borg::runner::run_bounded(c, None, Duration::from_secs(u64::from(timeout_s))) {
+        Some(b) => {
+            let text = String::from_utf8_lossy(&b.out).into_owned();
+            match b.status {
+                Some(s) => (s.success(), s.code().unwrap_or(-1), text),
+                None => (false, 124, text),
+            }
         }
-        Err(e) => (false, -1, e.to_string()),
+        None => (false, -1, "sh could not start".into()),
     }
 }
 
@@ -1965,7 +1967,9 @@ fn report_text(rows: &[Value]) -> String {
 
 // ------------------------------------------------------------------------------------- tests
 
-#[cfg(test)]
+// The pilot runs on Linux only: its sandboxes are bwrap, and the scoring scripts bound each check with
+// coreutils' `timeout` inside the scorer sandbox.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
