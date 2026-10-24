@@ -457,9 +457,9 @@ impl Bounded {
 /// hive/run.rs).
 ///
 /// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
-/// `cmd` exits (nothing it started, such as an MCP server, outlives it). On Linux it also dies with
-/// this process: a harness that kills `borg` (its own hook timeout) never leaves a model call running
-/// and spending.
+/// `cmd` exits (nothing it started, such as an MCP server, outlives it). The group also dies with this
+/// process, on every platform ([`Watchdog`]): a harness that kills `borg` (its own hook timeout) never
+/// leaves a model call running and spending, and a killed `borg hive run` leaves no drone at work.
 pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Bounded> {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
@@ -480,8 +480,15 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
     let mut child = cmd.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let group = child.id() as libc::pid_t;
+    let watchdog = Watchdog::start(group);
     // SAFETY: kill(2) on the child's own process group (a negative pid), which this process created.
-    let kill_group = || unsafe { libc::kill(-group, libc::SIGKILL) };
+    // The watchdog goes first: it must never outlive the group and later hit a reused id.
+    let kill_group = || {
+        if let Some(w) = &watchdog {
+            w.stop();
+        }
+        unsafe { libc::kill(-group, libc::SIGKILL) }
+    };
     if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
         // Written on a thread: a child that reads slowly must not block the deadline below.
         let data = data.to_vec();
@@ -517,6 +524,43 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     }
 }
 
+/// Kills a process group once this process is gone, however it went (SIGKILL included): a `sh` in a
+/// group of its own, deaf to the terminal's signals, blocks reading a pipe whose only writer is this
+/// process (close-on-exec, so no other child holds it). The kernel closes it when this process dies,
+/// the read returns, and the group is killed. Linux's `PR_SET_PDEATHSIG` reaches only the direct
+/// child; this reaches the whole group, and works where that does not exist (macOS).
+struct Watchdog {
+    pid: libc::pid_t,
+    _writer: std::io::PipeWriter,
+}
+
+impl Watchdog {
+    /// None when the pipe or the `sh` cannot be made: the group then dies with `borg` only on Linux.
+    fn start(group: libc::pid_t) -> Option<Watchdog> {
+        use std::os::unix::process::CommandExt as _;
+        let (reader, writer) = std::io::pipe().ok()?;
+        let child = Command::new("/bin/sh")
+            .args(["-c", "trap '' HUP INT QUIT TERM; read -r _; kill -9 \"-$1\"", "sh", &group.to_string()])
+            .process_group(0)
+            .stdin(reader)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(Watchdog { pid: child.id() as libc::pid_t, _writer: writer })
+    }
+
+    /// Ends the watchdog without its kill, and reaps it.
+    fn stop(&self) {
+        // SAFETY: kill(2) and waitpid(2) on the watchdog this process started and has not reaped.
+        unsafe {
+            if libc::kill(self.pid, libc::SIGKILL) == 0 {
+                libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+}
+
 /// How long the output of a command that ended is still read: its group is gone, so the pipe closes
 /// at once, unless a process that left the group (`setsid`, a daemon) holds it open.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
@@ -536,6 +580,33 @@ fn drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `sleep` in a process group of its own, and whether it is still running after `wait`.
+    fn group_alive_after(stop_first: bool) -> bool {
+        use std::os::unix::process::CommandExt as _;
+        let mut sleeper = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let w = Watchdog::start(sleeper.id() as libc::pid_t).expect("a watchdog");
+        if stop_first {
+            w.stop();
+        }
+        drop(w); // closes the pipe, as the kernel does when borg dies
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if sleeper.try_wait().unwrap().is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        true
+    }
+
+    #[test]
+    fn the_watchdog_kills_the_group_once_its_writer_is_gone_and_never_after_a_stop() {
+        assert!(!group_alive_after(false), "borg gone: the group dies with it");
+        assert!(group_alive_after(true), "a stopped watchdog kills nothing");
+    }
 
     fn only(cli: &'static [&'static str]) -> impl Fn(&str) -> bool {
         move |c| cli.contains(&c)
