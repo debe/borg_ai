@@ -448,7 +448,13 @@ struct Gate {
     escaped: (f64, f64),
     usd: (f64, f64),
     holds: bool,
+    /// Frozen's mean mistakes per goal reach `FLOOR`: there are mistakes for learning to remove.
+    informative: bool,
 }
+
+/// The least mean mistakes per goal frozen must make over positions 5-8 for the gate to say anything
+/// (tasks/todo.md H5 amendment 3): below it, "not informative", never a pass.
+const FLOOR: f64 = 0.5;
 
 /// H5 holds iff l01's mean mistakes per goal <= 0.75 x frozen's AND l01's escaped mistakes <= frozen's
 /// AND l01's charged $ <= 2 x frozen's (inclusive); None without a pair.
@@ -463,7 +469,7 @@ fn gate(cs: &[Cell]) -> Option<Gate> {
     let escaped = (sum(&|(a, _)| a.escaped), sum(&|(_, b)| b.escaped));
     let usd = (sum(&|(a, _)| a.usd), sum(&|(_, b)| b.usd));
     let holds = mistakes.0 <= 0.75 * mistakes.1 + EPS && escaped.0 <= escaped.1 + EPS && usd.0 <= 2.0 * usd.1 + EPS;
-    Some(Gate { pairs: p.len(), mistakes, escaped, usd, holds })
+    Some(Gate { pairs: p.len(), mistakes, escaped, usd, holds, informative: mistakes.1 + EPS >= FLOOR })
 }
 
 /// A value of l01 and of frozen.
@@ -633,7 +639,13 @@ pub(crate) fn h5_report(rows: &[Value]) -> String {
             g.usd.0,
             g.usd.1,
             2.0 * g.usd.1,
-            if g.holds { "HOLDS" } else { "FAILS (kill: stop at L0, write up why)" }
+            if !g.informative {
+                "NOT INFORMATIVE (frozen makes fewer than 0.5 mistakes per goal: no headroom on mistakes)"
+            } else if g.holds {
+                "HOLDS"
+            } else {
+                "FAILS (kill: stop at L0, write up why)"
+            }
         )),
         None => out.push_str("H5: no position 5-8 goal that both l01 and frozen have yet -> not decided\n"),
     }
@@ -890,6 +902,11 @@ mod tests {
             let t = h5_report(&grid(|arm, pos| if arm == "l01" && pos > 4 { (m, e, u) } else { (1.0, 0.5, 2.0) }));
             assert!(t.contains("-> FAILS"), "({m}, {e}, {u}): {t}");
         }
+        // Frozen below the floor (0.5 mistakes per goal late): never a pass, whatever l01 does.
+        let flat = h5_report(&grid(|_, _| (0.0, 0.0, 2.0)));
+        assert!(flat.contains("-> NOT INFORMATIVE") && !flat.contains("HOLDS"), "{flat}");
+        let floor = h5_report(&grid(|arm, pos| if arm == "l01" && pos > 4 { (0.25, 0.0, 2.0) } else { (0.5, 0.0, 2.0) }));
+        assert!(floor.contains("-> HOLDS"), "at the floor the gate decides: {floor}");
         // A $/solve ratio that would have passed the superseded gate decides nothing: mistakes do.
         let cheap = h5_report(&grid(|arm, pos| if arm == "l01" && pos > 4 { (1.0, 0.0, 0.5) } else { (1.0, 0.0, 2.0) }));
         assert!(cheap.contains("-> FAILS") && cheap.contains("l01 0.250"), "{cheap}");
