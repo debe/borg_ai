@@ -170,7 +170,7 @@ pub fn main(here: &Here) -> i32 {
         if task.role == Role::Verify {
             let author = task.of.as_ref().and_then(|w| b.tasks.get(w)).and_then(|w| w.author.clone());
             let dir = worktree_of(&here.home, author.as_deref(), &here.cwd);
-            match oracle::run(&g, task, &dir, Some(Duration::from_secs(60))) {
+            match oracle::run(&here.home, &g, task, &dir, Some(Duration::from_secs(60))) {
                 oracle::Verdict::Pass => d.hive(&["verify", "--pass"]),
                 _ => d.hive(&["verify", "--reject", "its oracle fails in the author's worktree"]),
             };

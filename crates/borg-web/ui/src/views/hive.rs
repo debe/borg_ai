@@ -1,5 +1,7 @@
-//! Hive: the collective's hive goals (`borg hive`): each goal's board by status, its integration, what
-//! each drone of `borg hive run` spent of its share, and the newest contracts between drones.
+//! Hive: the collective's hive goals (`borg hive`): each goal's board by status (a holder on another
+//! node named with it), what stops it here (conflicting definitions, checks awaiting `borg hive
+//! approve`), its integration, what each drone of `borg hive run` spent of its share, and the newest
+//! contracts and messages between drones.
 
 use leptos::prelude::*;
 
@@ -15,9 +17,16 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
     view! {
         <article class="panel">
             <div class="kn-bar">
-                <h2>{format!("Goal {}", g.goal)}<small>{format!("${:.2} of ${:.2}{}", g.spent_usd, g.budget_usd, if g.finished { " · finished" } else { "" })}</small></h2>
+                <h2>{format!("Goal {}", g.goal)}<small>{format!(
+                    "${:.2} of ${:.2}{}{}",
+                    g.spent_usd,
+                    g.budget_usd,
+                    if g.nodes > 0.0 { format!(" · {} other node(s)", g.nodes) } else { String::new() },
+                    if g.finished { " · finished" } else { "" }
+                )}</small></h2>
             </div>
             <p class="feed-meta">{trunc(&g.spec, 200)}</p>
+            {g.alerts.iter().map(|a| view! { <p class="feed-meta mono" title="stops this goal on this node">{format!("! {}", trunc(a, 300))}</p> }).collect_view()}
             <div class="bar" title="budget spent"><div style=format!("width:{spent:.0}%;height:6px;background:currentColor;opacity:.6")></div></div>
             {(!g.integration.is_empty()).then(|| view! { <p class="feed-meta mono" title="the combined tree of the accepted work">{trunc(&g.integration, 200)}</p> })}
             {GROUPS.iter().filter_map(|grp| {
@@ -28,7 +37,10 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                         {rows.into_iter().map(|t| view! {
                             <tr>
                                 <td>{t.id}</td><td>{t.role}</td><td>{trunc(&t.title, 60)}</td>
-                                <td>{t.holder.chars().take(8).collect::<String>()}</td>
+                                <td title=if t.node.is_empty() { "on this node".to_string() } else { format!("on node {}", t.node) }>
+                                    {t.holder.chars().take(8).collect::<String>()}
+                                    {(!t.node.is_empty()).then(|| view! { <small>{format!(" @{}", t.node)}</small> })}
+                                </td>
                                 <td>{if t.lease_left_ms > 0.0 { format!("{}m", (t.lease_left_ms / 60_000.0).floor()) } else { String::new() }}</td>
                                 <td>{t.files.join(", ")}</td>
                             </tr>
@@ -53,6 +65,18 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                 <ul>
                     {g.contracts.iter().rev().map(|(task, text, scope)| view! {
                         <li><span class="mono">{format!("{task} [{}]", scope.join(", "))}</span>" "{trunc(text, 160)}</li>
+                    }).collect_view()}
+                </ul>
+            })}
+            {(!g.messages.is_empty()).then(|| view! {
+                <h3>"Messages"</h3>
+                <ul>
+                    {g.messages.iter().rev().map(|(kind, who, node, to, text)| {
+                        let to = if to.is_empty() { "all".to_string() } else { to.clone() };
+                        let at = if node.is_empty() { String::new() } else { format!(" @{}", node.chars().take(8).collect::<String>()) };
+                        view! {
+                            <li><span class="mono">{format!("{who}{at} {kind} → {to}")}</span>" "{trunc(text, 160)}</li>
+                        }
                     }).collect_view()}
                 </ul>
             })}

@@ -1262,6 +1262,7 @@ mod tests {
             created_ms: 0,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         };
         goal::create(home, &g).unwrap();
         let t1 = Task {

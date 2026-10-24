@@ -128,6 +128,10 @@ pub enum Publish {
 /// An unknown superseded contract, or a write failure.
 pub fn publish(home: &Path, goal: &str, c: &Contract, repo: &str) -> Result<Publish, String> {
     let path = super::contracts_path(home, goal);
+    // The writer's node, as every hive line this node writes (hive/mod.rs `write`): a drone of the same
+    // name on another node is another drone (`own`).
+    let stamped = Contract { node: if c.node.is_empty() { super::node(home) } else { c.node.clone() }, ..c.clone() };
+    let c = &stamped;
     if let Some(old_id) = &c.supersedes {
         let all = read(&path);
         let old = all.iter().find(|x| &x.id == old_id).ok_or_else(|| format!("no contract {old_id} in goal {goal}"))?;
@@ -140,12 +144,7 @@ pub fn publish(home: &Path, goal: &str, c: &Contract, repo: &str) -> Result<Publ
 }
 
 fn append(path: &Path, c: &Contract) -> Result<(), String> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
-    let line = serde_json::to_string(c).map_err(|e| e.to_string())? + "\n";
-    use std::io::Write;
-    std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(line.as_bytes())).map_err(|e| e.to_string())
+    super::append_line(path, c).map_err(|e| e.to_string())
 }
 
 /// Queues the change of `old` to `new` as a `Kind::Contract` queen question; returns its id (an equal
@@ -209,6 +208,9 @@ pub fn ratify(store: &Path, e: &queen::Entry, answer: &str, _author: &str, _now:
     let goal = p["goal"].as_str().filter(|g| super::goal::valid_id(g)).ok_or_else(|| format!("{}: no valid goal in its proposal", e.id))?;
     let mut c: Contract = serde_json::from_value(p["contract"].clone()).map_err(|err| format!("{}: unreadable proposed contract ({err})", e.id))?;
     c.ok_by = Some(e.id.clone());
+    if c.node.is_empty() {
+        c.node = super::node(store);
+    }
     append(&super::contracts_path(store, goal), &c)?;
     Ok(true)
 }

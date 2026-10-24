@@ -48,6 +48,7 @@ fn seed(home: &Path, now: i64) {
         created_ms: 1,
         sig: String::new(),
         hidden: None,
+        held_out: false,
     };
     goal::create(home, &g).unwrap();
     let t = |id: &str| Task {

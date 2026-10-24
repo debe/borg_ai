@@ -82,6 +82,9 @@ pub const HIVE_DONE: &str = "hive_done";
 pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
 pub const HIVE_RELEASED: &str = "hive_released";
 pub const HIVE_SHOWN: &str = "hive_shown";
+/// A message between hive drones sent (`borg hive ask|tell`, hive/message.rs; `why`: the goal, `text`:
+/// the kind, recipient and an excerpt).
+pub const HIVE_MESSAGE: &str = "hive_message";
 /// An integration of a hive goal (hive/integrate.rs; `why`: the goal, `text`: the integrate task and its
 /// note): the accepted attempts merged and the oracle run on the combined tree, `n` 1 on a pass, 0 on a
 /// failure.

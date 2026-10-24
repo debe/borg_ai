@@ -106,6 +106,9 @@ pub struct Stats {
     pub days: Vec<Day>,
     pub engineers: Vec<Engineer>,
     pub nodes: u64,
+    /// `borg ope`'s support: logged Thompson decisions with a pool, asked lessons without p, asked
+    /// records with p but no pool.
+    pub ope: (u64, u64, u64),
 }
 
 impl Stats {
@@ -151,7 +154,15 @@ pub fn parse_stats(v: &Value) -> Stats {
         .flatten()
         .map(|e| Engineer { name: s(&e["engineer"]), t: Totals::parse(&e["totals"]), days: days(&e["days"]) })
         .collect();
-    Stats { totals: Totals::parse(&v["totals"]), days: days(&v["days"]), engineers, nodes: v["nodes"].as_u64().unwrap_or(0) }
+    let ope = &v["ope"];
+    let n = |k: &str| ope[k].as_u64().unwrap_or(0);
+    Stats {
+        totals: Totals::parse(&v["totals"]),
+        days: days(&v["days"]),
+        engineers,
+        nodes: v["nodes"].as_u64().unwrap_or(0),
+        ope: (n("decisions"), n("no_p"), n("no_pool")),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -401,6 +412,8 @@ pub struct HiveTask {
     pub holder: String,
     pub lease_left_ms: f64,
     pub files: Vec<String>,
+    /// The holder's node: empty on this node.
+    pub node: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -427,6 +440,13 @@ pub struct HiveGoal {
     pub drones: Vec<HiveDrone>,
     /// (task, text, scope) of the newest contracts, newest last.
     pub contracts: Vec<(String, String, Vec<String>)>,
+    /// (kind, sender drone or session, its node, to, text) of the newest messages between drones,
+    /// newest last.
+    pub messages: Vec<(String, String, String, String, String)>,
+    /// Other nodes whose lines are on the board.
+    pub nodes: f64,
+    /// What stops the goal on this node: conflicting definitions, checks waiting for `borg hive approve`.
+    pub alerts: Vec<String>,
 }
 
 pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
@@ -453,6 +473,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                     holder: s(&t["holder"]),
                     lease_left_ms: f(&t["lease_left_ms"]),
                     files: strs(&t["files"]),
+                    node: s(&t["node"]),
                 })
                 .collect(),
             drones: g["drones"]
@@ -469,6 +490,17 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                 })
                 .collect(),
             contracts: g["contracts"].as_array().into_iter().flatten().map(|c| (s(&c["task"]), s(&c["text"]), strs(&c["scope"]))).collect(),
+            messages: g["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|m| {
+                    let who = if s(&m["drone"]).is_empty() { s(&m["by"]).chars().take(8).collect() } else { s(&m["drone"]) };
+                    (s(&m["kind"]), who, s(&m["node"]), s(&m["to"]), s(&m["text"]))
+                })
+                .collect(),
+            nodes: f(&g["nodes"]),
+            alerts: strs(&g["alerts"]),
         })
         .collect()
 }

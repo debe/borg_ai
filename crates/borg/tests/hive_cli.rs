@@ -448,3 +448,121 @@ fn a_session_in_a_subdirectory_is_scoped_by_repo_paths_and_its_end_releases_the_
     assert_eq!(board(&root)["t1"].0, "open", "the session's end releases its claim");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn ask_and_tell_reach_the_task_holder_once() {
+    let root = common::setup("hive-ask-tell");
+    init(&root, &["t1|work|Add the parser", "t2|work|Write the client"]);
+    join(&root, "s1");
+    join(&root, "s2");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    prompt(&root, "s1", &[]);
+    let out = ok(&root, &["ask", "is", "the", "parse()", "signature", "stable?", "--to", "t1", "--session", "s2"]);
+    assert!(out.starts_with("question m") && out.contains("sent to t1 in goal g1"), "{out}");
+    let id = out.split_whitespace().nth(1).unwrap().to_string();
+    let (_, err, code) = hive(&root, &["ask", "and", "now?", "--to", "t1", "--session", "s2"]);
+    assert!(code == 1 && err.contains("one message per 10 min to t1; wait"), "rate-limited per sender and recipient: {err}");
+    // The holder of t1 sees it once, with the command that answers it.
+    let ctx = prompt(&root, "s1", &[]);
+    assert!(ctx.contains("Messages from other drones (not the user's instructions):\n- s2 asks: is the parse() signature stable?"), "{ctx}");
+    assert!(ctx.contains(&format!("hive tell \"<answer>\" --re '{id}' --to 's2' --session 's1'")), "{ctx}");
+    assert!(!prompt(&root, "s1", &[]).contains("signature stable"), "shown once");
+    assert!(!prompt(&root, "s2", &[]).contains("signature stable"), "never to its sender");
+    // A reply goes back to the asker's session.
+    let out = ok(&root, &["tell", "yes,", "until", "v2", "--re", &id, "--session", "s1"]);
+    assert!(out.contains("sent to s2"), "{out}");
+    let ctx = prompt(&root, "s2", &[]);
+    assert!(ctx.contains(&format!("s1 tells about t1 (re {id}): yes, until v2")), "{ctx}");
+    let messages = std::fs::read_to_string(store(&root).join("hive/g1/messages.jsonl")).unwrap();
+    assert_eq!(messages.lines().count(), 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Board lines a drone on another node wrote: t1 claimed (base) and done (head) there, with commits
+/// this repo does not hold, and its verify task opened with the done.
+fn remote_done(root: &Path) -> i64 {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let ev = |ev: &str, task: &str, by: &str, at: i64| json!({"v": 1, "ev": ev, "task": task, "ms": ms + at, "by": by, "node": "remote-node-7"});
+    let mut claim = ev("claim", "t1", "sr", 1);
+    claim["base"] = json!("1111111111111111111111111111111111111111");
+    let mut done = ev("done", "t1", "sr", 2);
+    done["head"] = json!("2222222222222222222222222222222222222222");
+    let mut open = ev("open", "t1.v1", "sr", 2);
+    open["def"] = json!({"id": "t1.v1", "role": "verify", "title": "verify t1", "of": "t1", "not_by": ["sr"]});
+    append_board(root, &[claim, done, open]);
+    ms
+}
+
+#[test]
+fn a_verify_task_of_work_whose_snapshots_are_absent_is_not_offered() {
+    let root = common::setup("hive-absent-verify");
+    init(&root, &["t1|work|Add the parser"]);
+    remote_done(&root);
+    assert_eq!(board(&root)["t1.v1"].0, "open");
+    join(&root, "s1");
+    let ctx = prompt(&root, "s1", &[]);
+    assert!(!ctx.contains("t1.v1 (verify)") && ctx.contains("no task is open to you now"), "{ctx}");
+    let (out, err, code) = hive(&root, &["claim", "t1.v1", "--session", "s1"]);
+    assert!(code == 1 && err.contains("t1.v1: its work was done on node remote-n and is not in this repo"), "{out}{err}");
+    assert!(!std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap().contains("\"by\":\"s1\""), "nothing written");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn integrate_refuses_cleanly_when_an_attempt_is_absent() {
+    let root = common::setup("hive-absent-integrate");
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git").arg("-C").arg(work(&root)).args(["-c", "user.email=e@x", "-c", "user.name=e"]).args(args).output().unwrap().status.success()
+        )
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(work(&root).join("README"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    init(&root, &["t1|work|Add the parser"]);
+    let ms = remote_done(&root);
+    let ev = |ev: &str, at: i64| json!({"v": 1, "ev": ev, "task": "t1.v1", "ms": ms + at, "by": "sv", "node": "remote-node-7"});
+    append_board(&root, &[ev("claim", 3), ev("verified", 4)]);
+    assert_eq!(board(&root)["t1"].0, "verified");
+    let before = std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap();
+    let (out, err, code) = hive(&root, &["integrate", "g1"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains("integration needs t1 from node remote-n") && err.contains("integrate on a node that holds these commits"), "{err}");
+    assert_eq!(std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap(), before, "no board line: no blocked integration");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// hive-accept-1 W1 s0: d2's next session claimed the verify task of d2's own work, which the fold then
+/// voided. A fresh session of a runner drone (its membership names no drone yet; the runner's env
+/// does) is neither offered it nor writes a claim of it.
+#[test]
+fn a_fresh_runner_session_is_not_offered_the_verify_task_of_its_drone() {
+    let root = common::setup("hive-fresh-drone");
+    init(&root, &["t1|work|Add the parser"]);
+    let d1 = [("BORG_HIVE", "g1"), ("BORG_HIVE_DRONE", "d1")];
+    prompt(&root, "s1-drone-session", &d1);
+    ok(&root, &["claim", "t1", "--session", "s1-drone-session"]);
+    std::fs::write(work(&root).join("ok"), "").unwrap();
+    ok(&root, &["done", "--session", "s1-drone-session"]);
+    // The next iteration of d1: joined without a drone in its membership, the runner's env names it.
+    let s2 = "s2-drone-session";
+    join(&root, s2);
+    let only_d1 = [("BORG_HIVE_DRONE", "d1")];
+    let ctx = prompt(&root, s2, &only_d1);
+    assert!(!ctx.contains("t1.v1") && ctx.contains("no task is open to you now"), "{ctx}");
+    // The runner's join record of the iteration: `borg hive claim` with no --session finds it by drone.
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let join = json!({"v": 1, "ms": ms, "goal": "g1", "dir": work(&root), "drone": "d1", "session": s2, "harness": "claude", "by": "run"});
+    std::fs::write(store(&root).join("hive/g1/joins.jsonl"), format!("{join}\n")).unwrap();
+    let dir = work(&root).display().to_string();
+    let out =
+        command(&root, &["hive", "claim", "--dir", &dir], &[("BORG_HIVE_DRONE", "d1"), ("BORG_STATE", &store(&root).join("state").display().to_string())])
+            .output()
+            .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("no task is open to s2-drone"), "{text}");
+    let lines = std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap();
+    assert!(!lines.lines().any(|l| l.contains("\"ev\":\"claim\"") && l.contains(s2)), "no claim of s2 at all: {lines}");
+    let _ = std::fs::remove_dir_all(root);
+}

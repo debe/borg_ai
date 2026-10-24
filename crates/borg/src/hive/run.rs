@@ -137,7 +137,7 @@ pub fn drone_name(n: usize) -> String {
 
 /// The prompt of `drone`'s every iteration of `g`.
 pub fn prompt(g: &Goal, drone: &str, joins: &Path) -> String {
-    let decides = if g.hidden.is_some() { DECIDES_HIDDEN } else { DECIDES };
+    let decides = if goal::has_hidden(g) { DECIDES_HIDDEN } else { DECIDES };
     PROMPT.replace("{goal}", &g.id).replace("{drone}", drone).replace("{joins}", &joins.display().to_string()).replace("{decides}", decides)
 }
 
@@ -224,9 +224,11 @@ fn fold(home: &Path, goal: &str) -> Board {
     board::fold(&board::read(&super::tasks_path(home, goal)))
 }
 
-/// A task is open to `drone` at `now`: one of its new sessions could claim it.
-fn open_to(g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> bool {
-    board::next_for(b, "", drone, repo, now, |t| super::may_claim(g, t, repo)).is_some()
+/// A task is open to `drone` of this node (`home`) at `now`: one of its new sessions could claim it (its
+/// checks approved here, oracle.rs `Approvals`).
+fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> bool {
+    let approvals = super::oracle::Approvals::load(home, &g.id);
+    board::next_for(b, "", drone, &super::node(home), repo, now, |s| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty()).is_some()
 }
 
 /// A fresh UUID-shaped session id (Claude Code's `--session-id` takes only a UUID).
@@ -303,16 +305,17 @@ fn release_held(home: &Path, goal: &str, b: &Board, sessions: &[String], note: &
     let held: Vec<board::Event> =
         sessions.iter().filter_map(|s| board::holding(b, s, now).map(|t| board::Event::new(Ev::Released, &t.task.id, s, now).with_note(note))).collect();
     if !held.is_empty() {
-        let _ = board::append(&super::tasks_path(home, goal), &held);
+        let _ = super::write(home, goal, held);
     }
 }
 
 /// The sessions of `drone`'s iteration that started at `started`: those named (`known`, empty ones
-/// skipped) and every one whose claim carries the drone since. A harness may ignore the session id the
-/// runner chose and report none (omp, opencode); its hooks still claim as the drone (`DRONE_ENV`).
-fn sessions_of(events: &[board::Event], drone: &str, started: i64, known: &[&str]) -> Vec<String> {
+/// skipped) and every one whose claim on this node (`home`) carries the drone since. A harness may
+/// ignore the session id the runner chose and report none (omp, opencode); its hooks still claim as the
+/// drone (`DRONE_ENV`). Another node's d1 is another drone: its sessions are never this runner's.
+fn sessions_of(home: &Path, events: &[board::Event], drone: &str, started: i64, known: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = known.iter().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    for e in events.iter().filter(|e| e.ev == Ev::Claim && e.drone == drone && e.node.is_empty() && e.ms >= started) {
+    for e in events.iter().filter(|e| e.ev == Ev::Claim && e.drone == drone && super::is_local(home, &e.node) && e.ms >= started) {
         if !out.contains(&e.by) {
             out.push(e.by.clone());
         }
@@ -330,7 +333,7 @@ fn estimate(dearest: f64, share: f64, spent: f64) -> f64 {
 /// drone of the goal runs now. Each iteration it started (a `run` join naming its session) that no
 /// spend line names is charged its estimate (`exit: "killed"`), and every claim a runner drone's
 /// session still holds on this node is released: the session is dead, and its lease would keep the
-/// task for `LEASE_MS`.
+/// task for `LEASE_MS`. A claim made on another node (a peer's d1) is live there and never released.
 fn recover(home: &Path, goal: &str, now: i64) {
     let mut lines: Vec<Spend> = super::read_lines(&spend_path(home, goal));
     let run = super::read_lines::<RunLine>(&runs_path(home, goal)).pop();
@@ -361,7 +364,7 @@ fn recover(home: &Path, goal: &str, now: i64) {
         .tasks
         .values()
         .filter_map(|s| s.live(now))
-        .filter(|(by, node, _)| node.is_empty() && b.drones.get(*by).is_some_and(|d| runner(d)))
+        .filter(|(by, node, _)| super::is_local(home, node) && b.drones.get(*by).is_some_and(|d| runner(d)))
         .map(|(by, _, _)| by.to_string())
         .collect();
     release_held(home, goal, &b, &held, "its run ended", now);
@@ -395,7 +398,15 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             }
             continue;
         }
-        match step(&t, ctx.share, b.finished(), open_to(ctx.g, &b, &name, ctx.repo, now)) {
+        // Accepted work whose commits are on another node only: this node cannot integrate it, and
+        // writes no board line for it (integrate.rs `absent`).
+        if let Some(why) = super::integrate::elsewhere(ctx.home, ctx.g, ctx.root, now) {
+            println!("{name}  {why}");
+            end.reason = "integration needs another node's commits";
+            end.spent = t.spent;
+            return end;
+        }
+        match step(&t, ctx.share, b.finished(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now)) {
             Next::End(r) => {
                 end.reason = r;
                 end.spent = t.spent;
@@ -445,7 +456,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             _ => "error",
         };
         let events = board::read(&super::tasks_path(ctx.home, goal));
-        let sessions = sessions_of(&events, &name, started, &[&session, &said.session]);
+        let sessions = sessions_of(ctx.home, &events, &name, started, &[&session, &said.session]);
         // One cut off at the cap, or one that failed, spent up to `iter_timeout` of model calls
         // without saying what.
         let est = (said.usd.is_none() && exit != "ok").then(|| estimate(t.dearest, ctx.share, t.spent));
@@ -693,6 +704,7 @@ mod tests {
             created_ms: 0,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         };
         let p = prompt(&g, "d3", Path::new("/s/hive/parser/joins.jsonl"));
         assert!(p.contains("drone d3 of hive goal parser") && p.contains("`borg hive board parser`") && p.contains("/s/hive/parser/joins.jsonl"));
@@ -743,5 +755,43 @@ mod tests {
         let re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$").unwrap();
         assert!(re.is_match(&a), "{a}");
         assert_ne!(a, session_id("g", "d1", 2));
+    }
+
+    #[test]
+    fn a_runner_never_releases_a_remote_claim() {
+        let home = std::env::temp_dir().join(format!("borg-hive-remote-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let now = learn::now_ms();
+        let t = |id: &str| board::Task {
+            id: id.into(),
+            role: board::Role::Work,
+            title: id.into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+        };
+        let remote = board::Event { node: "remote".into(), ..board::Event::new(Ev::Claim, "t1", "x", now).with_drone("d1") };
+        let local = board::Event::new(Ev::Claim, "t2", "y", now).with_drone("d1");
+        super::super::write(
+            &home,
+            "g",
+            vec![board::Event::open(t("t1"), "engineer:e", now - 1), board::Event::open(t("t2"), "engineer:e", now - 1), remote.clone(), local],
+        )
+        .unwrap();
+        let events = board::read(&super::super::tasks_path(&home, "g"));
+        assert_eq!(sessions_of(&home, &events, "d1", now, &[]), ["y"], "another node's d1 is another drone");
+        // The killed-run cleanup: this node's runner drone's claim is released, the remote one stays held.
+        recover(&home, "g", now + 1);
+        let b = fold(&home, "g");
+        assert_eq!(b.tasks["t1"].live(now + 2).map(|(by, node, _)| (by.to_string(), node.to_string())), Some(("x".into(), "remote".into())));
+        assert!(b.tasks["t2"].live(now + 2).is_none(), "the local claim is released");
+        let released: Vec<String> = board::read(&super::super::tasks_path(&home, "g")).into_iter().filter(|e| e.ev == Ev::Released).map(|e| e.by).collect();
+        assert_eq!(released, ["y"]);
+        let _ = std::fs::remove_dir_all(home);
     }
 }

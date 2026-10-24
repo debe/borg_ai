@@ -763,6 +763,7 @@ fn visible_files(wl: &Workload, root: &Path) -> Vec<String> {
         created_ms: 0,
         sig: String::new(),
         hidden: None,
+        held_out: false,
     };
     guard::oracle_files(&g, root)
 }

@@ -18,6 +18,14 @@
 //!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
 //!    and the membership admits its origin key at its stamp time.
+//!
+//!    3b. The hive (borg hive/mod.rs `SYNCED`): `Goals` swaps the ids of the goals each side holds an
+//!    admitted hive line of, both sides keep the valid ids (an id names a directory) and take the
+//!    sorted union, then reconcile each goal's goal.jsonl, tasks.jsonl, contracts.jsonl,
+//!    messages.jsonl and flags.jsonl in that order, exactly as the logs above. Receiving a goal writes
+//!    its logs only, never goal.json (the hidden oracle stays on the node that made the goal). Before
+//!    each session the node credits the verdicts that arrived on work done here and publishes its goals'
+//!    projections (`Node::stamp`).
 //! 4. `reasoning.jsonl` (git-note excerpts, notes in the borg crate): not reconciled with everyone.
 //!    Each author offers its own excerpts to the k = 2 members that rendezvous hashing assigns to
 //!    each excerpt (`replicas`), so the reasoning survives the author being offline without every
@@ -60,7 +68,7 @@ use crate::{live, steer};
 
 mod vectors;
 
-pub const ALPN: &[u8] = b"borg/mesh/6";
+pub const ALPN: &[u8] = b"borg/mesh/7";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
@@ -219,6 +227,10 @@ enum Msg {
     },
     Lines {
         lines: Vec<Signed>,
+    },
+    /// The hive goals a side holds an admitted line of (3b).
+    Goals {
+        ids: Vec<String>,
     },
     Offer {
         hashes: Vec<String>,
@@ -395,7 +407,12 @@ impl Node {
     /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
     pub fn stamp(&self) -> Result<usize, String> {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        // Fresh outcomes ship with every sync, stamped in the same step.
+        // Verdicts that arrived on this node's work are credited first, so their outcomes publish in the
+        // same step; then the goals made here, then fresh outcomes, all stamped in the same step. The
+        // work is this node's only where no other member stamped its claim or done line.
+        let (origins, me) = (origin::load(&self.home), self.me.public());
+        borg::hive::verdict::credit_synced(&self.home, |line| origins.get(&lines::hash(line)).is_none_or(|o| o.key == me));
+        borg::hive::publish(&self.home);
         borg::outcome::publish(&self.home);
         origin::stamp(&self.home, &self.me, &logs(&self.home), borg::learn::now_ms())
     }
@@ -586,27 +603,19 @@ impl Node {
 
         // Lessons: reconcile with everyone.
         for file in SYNCED {
-            let path = home.join(file);
-            let set = origin::admitted(lines::read(&path), &origins, &mine);
-            self.gate()?; // read first, then gate: a line written after a switch to local is never sent
-            let mut r = Recon::new(&set);
-            loop {
-                let m = r.message();
-                let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else {
-                    return Err("protocol: expected a reconciliation round".into());
-                };
-                if r.absorb(&m, round)? {
-                    break;
-                }
+            self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
+        }
+
+        // The hive: every goal either side holds, each of its logs in turn (3b).
+        let held: Vec<String> = goal_ids(home, &origins, &mine);
+        self.gate()?;
+        let Msg::Goals { ids } = swap(dialler, tx, rx, Msg::Goals { ids: held.clone() }).await? else {
+            return Err("protocol: expected goals".into());
+        };
+        for id in &goals_to_sync(held, ids) {
+            for path in lines::hive_files(home, id) {
+                self.reconcile(dialler, tx, rx, &path, &origins, &mine, &mut report).await?;
             }
-            (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
-            let give = signed(&set, &origins, r.give.iter());
-            report.sent += give.len();
-            self.gate()?; // again just before lines leave
-            let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
-                return Err("protocol: expected lines".into());
-            };
-            self.store_lines(&path, got, &r.want, &mine, None, &mut report)?;
         }
 
         // Reasoning: each author hands its excerpts to their replicas.
@@ -665,6 +674,41 @@ impl Node {
         Ok(report)
     }
 
+    /// One log reconciled with the peer (step 3): the admitted set, recon rounds, then the lines each
+    /// side lacks, signed, stored when their origin verifies and is admitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile(
+        &self,
+        dialler: bool,
+        tx: &mut SendStream,
+        rx: &mut RecvStream,
+        path: &Path,
+        origins: &HashMap<Hash, Origin>,
+        mine: &Membership,
+        report: &mut Report,
+    ) -> Result<(), String> {
+        let set = origin::admitted(lines::read(path), origins, mine);
+        self.gate()?; // read first, then gate: a line written after a switch to local is never sent
+        let mut r = Recon::new(&set);
+        loop {
+            let m = r.message();
+            let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else {
+                return Err("protocol: expected a reconciliation round".into());
+            };
+            if r.absorb(&m, round)? {
+                break;
+            }
+        }
+        (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
+        let give = signed(&set, origins, r.give.iter());
+        report.sent += give.len();
+        self.gate()?; // again just before lines leave
+        let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
+            return Err("protocol: expected lines".into());
+        };
+        self.store_lines(path, got, &r.want, mine, None, report)
+    }
+
     /// Stores the lines that were asked for, whose origin verifies and is admitted (and, for
     /// replicas, is the peer itself): origin records first, so a line is never re-stamped as ours.
     fn store_lines(
@@ -692,6 +736,25 @@ impl Node {
         report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
         Ok(())
     }
+}
+
+/// The goals both sides reconcile, the same list on both: the union of the ids each offered, sorted,
+/// keeping only valid goal ids (an id names a directory: "../x" or "A B" never becomes one).
+fn goals_to_sync(mine: Vec<String>, theirs: Vec<String>) -> BTreeSet<String> {
+    mine.into_iter().chain(theirs).filter(|id| borg::hive::goal::valid_id(id)).collect()
+}
+
+/// The hive goals of `home` with at least one admitted line in a synced hive log, sorted: what a node
+/// offers in `Goals`. A goal only made here and not yet stamped is offered at the next session.
+fn goal_ids(home: &Path, origins: &HashMap<Hash, Origin>, m: &Membership) -> Vec<String> {
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for path in lines::hive_logs(home) {
+        let id = path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        if !ids.contains(&id) && !origin::admitted(lines::read(&path), origins, m).is_empty() {
+            ids.insert(id);
+        }
+    }
+    ids.into_iter().collect()
 }
 
 /// Where a dialler that announced `listen` can be reached: the IP its packets came from (what
@@ -1238,6 +1301,55 @@ mod tests {
         for n in [alice, bob, carol] {
             n.close().await;
         }
+    }
+
+    /// A board line carol wrote after her revocation reaches bob before he hears of it; his next sync
+    /// with alice quarantines it before any data moves, and his fold drops it. Her earlier line stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hive_lines_of_a_revoked_member_are_quarantined() {
+        let p = crew("hive-revoke", &["alice", "bob", "carol"]);
+        let (a, b, c) = (home(&p[0]), home(&p[1]), home(&p[2]));
+        let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
+        let carol = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
+        let (ta, tb) = (alice.ticket(), bob.ticket());
+        std::fs::create_dir_all(c.join("hive/g1")).unwrap();
+        let open = json!({"v": 1, "ev": "open", "task": "t1", "ms": 1, "by": "engineer:carol@x",
+            "def": {"id": "t1", "role": "work", "title": "do t1"}})
+        .to_string();
+        write(&c.join("hive/g1"), "tasks.jsonl", std::slice::from_ref(&open));
+        let (s, r) = tokio::join!(bob.accept(), carol.sync(&tb));
+        assert_eq!((s.unwrap().received, r.unwrap().sent), (1, 1), "a goal bob never held arrives whole");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut m = Membership::load(&a).unwrap().unwrap();
+        m.revoke(&Identity::load_or_create(&a).unwrap(), &carol.public(), borg::learn::now_ms()).unwrap();
+        m.save(&a).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let claim = json!({"v": 1, "ev": "claim", "task": "t1", "ms": 2, "by": "carol-session"}).to_string();
+        append_lines(&c.join("hive/g1"), "tasks.jsonl", std::slice::from_ref(&claim));
+        let (s, r) = tokio::join!(bob.accept(), carol.sync(&tb));
+        assert_eq!((s.unwrap().received, r.unwrap().sent), (1, 1), "bob has not heard of the revocation yet");
+        let board = |h: &Path| borg::hive::board::fold(&borg::hive::board::read(&h.join("hive/g1/tasks.jsonl")));
+        assert!(matches!(board(&b).tasks["t1"].status, borg::hive::Status::Claimed { .. }));
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ta));
+        let (served, synced) = (served.unwrap(), synced.unwrap());
+        assert_eq!(synced.quarantined, 1, "carol's late claim is set aside before any data moves");
+        assert!(holds(&b.join("mesh"), "quarantine.jsonl", &claim) && !holds(&b.join("hive/g1"), "tasks.jsonl", &claim));
+        assert_eq!(board(&b).tasks["t1"].status, borg::hive::Status::Open, "the fold drops it");
+        assert_eq!(served.received, 1, "alice gets carol's earlier open only");
+        assert_eq!(board(&a), board(&b));
+        for n in [alice, bob, carol] {
+            n.close().await;
+        }
+    }
+
+    /// Goal ids name directories: what a peer offers is kept only as a valid id, so "../evil" or "A B"
+    /// never becomes a path (both sides compute the same list, so the session stays in lockstep).
+    #[test]
+    fn goal_ids_are_path_checked() {
+        let got = goals_to_sync(vec!["g1".into(), "../evil".into()], vec!["A B".into(), "g0".into(), "g1".into(), "/abs".into(), String::new()]);
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), ["g0", "g1"]);
+        assert_eq!(goals_to_sync(vec!["b".into()], vec!["a".into()]), goals_to_sync(vec!["a".into()], vec!["b".into()]), "the same on both sides");
     }
 
     /// After days apart, two nodes holding 2000 common lessons and 5 new ones between them move

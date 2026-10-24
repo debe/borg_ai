@@ -253,8 +253,9 @@ test("session_stop: borg's questions block once, then stop_hook_active lets the 
 	await h.before_agent_start({ type: "before_agent_start", prompt: out.reason, systemPrompt: [] }, ctx);
 	assert.equal(await h.session_stop({ ...stop, stop_hook_active: true }, ctx), undefined);
 	// L2 shares no word with the work, so word matching (BORG_MATCH=bm25) does not ask it.
-	// The ask carries its propensity (#borg-p, hive-learning step 1): 1 under the fixed graded rule.
-	assert.equal(ctxFile(), "make the relay delivery lock-free\n#borg-p L1=1\n#borg-asked L1\n");
+	// The ask carries its propensity (#borg-p, hive-learning step 1) and, from this Thompson draw, the pool
+	// it was over (#borg-pool), both tagged with the check that drew it.
+	assert.match(ctxFile(), /^make the relay delivery lock-free\n#borg-p L1=1 @([0-9a-f]{12})\n#borg-pool L1=[0-9.]+ @\1\n#borg-asked L1\n$/);
 });
 
 test("tool_result hands borg's context (a live check's questions) to omp as additionalContext; nothing else", async () => {

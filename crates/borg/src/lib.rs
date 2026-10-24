@@ -20,6 +20,7 @@ pub mod live;
 pub mod memory;
 pub mod notes;
 pub mod notify;
+pub mod ope;
 pub mod outcome;
 pub mod predict;
 pub mod prefilter;

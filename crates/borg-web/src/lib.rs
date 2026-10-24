@@ -133,7 +133,11 @@ async fn stats_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
         })
         .collect();
     let nodes = buckets.iter().map(|b| b.node.as_str()).collect::<std::collections::BTreeSet<_>>().len();
-    Json(json!({"collective": m.name, "totals": totals(&all), "days": days, "engineers": engineers, "nodes": nodes})).into_response()
+    // `borg ope`'s support, one pass over this machine's log (pools are never shared); the estimate itself
+    // derives beliefs per decision, too heavy to poll.
+    let (ds, skipped) = borg::ope::decisions(&outcome::read(&m.home.join("outcomes.jsonl")));
+    let ope = json!({"decisions": ds.len(), "no_p": skipped.no_p, "no_pool": skipped.no_pool});
+    Json(json!({"collective": m.name, "totals": totals(&all), "days": days, "engineers": engineers, "nodes": nodes, "ope": ope})).into_response()
 }
 
 async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {

@@ -15,10 +15,17 @@
 //! opens a fix task that starts `from` the combined tree.
 //!
 //! Lines are plain JSON with no `id` + `version` pair, so the mesh's `settle` (borg-mesh lines.rs) never
-//! folds them, and they can sync as they are once the hive goes on the mesh.
+//! folds them. The board syncs over the mesh as a signed log (collective step 4): each line carries the
+//! node that wrote it (`node`, stamped by hive/mod.rs `write`; empty in a line from before), lines from
+//! another node fold the same as local ones, and leases travel with the heartbeats that renew them.
+//! Across nodes a claim is provisional until the next sync round: the loser learns at its next hook
+//! (mod.rs `lost_news`), its done and its verify task's open are ignored by the fold, so a loser wastes
+//! at most one sync latency of work. The winner rule compares the writers' clocks, so the skew between
+//! nodes must stay well below `LEASE_MS`. Drone names (`d1`..) repeat on every node: a drone name bars
+//! a verify task only on the node its work was done on (`Board::barred`); a session id bars everywhere.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -93,7 +100,7 @@ pub struct Task {
     pub from: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ev {
     Open,
@@ -160,6 +167,11 @@ pub struct Event {
     /// sessions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub drone: String,
+    /// On a verify task's `verified` or `rejected`: the outcome kind the verdict credits (`verified`,
+    /// `rejected`, `hacked`; hive/verdict.rs `Kind::outcome`), empty while it waits for a hidden score.
+    /// The node holding the author's shown records credits it (`verdict::credit_synced`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credit: String,
 }
 
 impl Event {
@@ -178,6 +190,7 @@ impl Event {
             base: String::new(),
             deps_in: Vec::new(),
             head: String::new(),
+            credit: String::new(),
         }
     }
 
@@ -232,6 +245,15 @@ pub struct TaskState {
     /// The verify task whose `verified` made this work task verified: its attempt is what an
     /// integration merges.
     pub accepted: Option<TaskId>,
+    /// The node its `open` was written on (empty: this one, or a line from before nodes were stamped).
+    /// A verify task's open is written with its work's `done`: the work's node.
+    pub node: String,
+}
+
+/// Whether two lines' nodes are one machine: equal, or either unknown (a line from before nodes were
+/// stamped), which bars conservatively.
+pub fn same_node(a: &str, b: &str) -> bool {
+    a == b || a.is_empty() || b.is_empty()
 }
 
 /// Verifier notes kept per task.
@@ -300,11 +322,13 @@ pub struct Board {
 }
 
 impl Board {
-    /// Whether `t` is barred to `session` of `drone` (empty: none named): by its id, by `drone`, or by
-    /// the drone the session claimed as before. The caller names the drone: a new iteration's session
-    /// has no line on the board yet.
-    pub fn barred(&self, t: &Task, session: &str, drone: &str) -> bool {
-        t.not_by.iter().any(|n| n == session || (!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n))
+    /// Whether `s` is barred to `session` of `drone` (empty: none named) on `node`: by its id always;
+    /// by `drone`, or by the drone the session claimed as before, only when the work was done on the
+    /// same node (`same_node`: every runner names its drones d1..dN). The caller names the drone: a new
+    /// iteration's session has no line on the board yet.
+    pub fn barred(&self, s: &TaskState, session: &str, drone: &str, node: &str) -> bool {
+        let here = same_node(&s.node, node);
+        s.task.not_by.iter().any(|n| n == session || (here && ((!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n))))
     }
 
     /// The goal is reached: there are tasks, every one is verified (a work task by its verify task, a
@@ -342,21 +366,19 @@ pub fn integrate_id(b: &Board) -> TaskId {
     format!("integrate.{n}")
 }
 
-/// Appends `events` in one write(2) with O_APPEND: lines written together (a done and its verify
-/// task's open, a claim and its heartbeat) never interleave with another writer's.
+/// Appends `events` in one write(2) with O_APPEND (hive/mod.rs `append_bytes`, under the file's lock):
+/// lines written together (a done and its verify task's open, a claim and its heartbeat) never
+/// interleave with another writer's.
 ///
 /// # Errors
 /// When the directory or the file cannot be written.
 pub fn append(path: &Path, events: &[Event]) -> std::io::Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
     let mut body = String::new();
     for e in events {
         body.push_str(&serde_json::to_string(e).map_err(std::io::Error::other)?);
         body.push('\n');
     }
-    std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(body.as_bytes())
+    super::append_bytes(path, body.as_bytes())
 }
 
 /// An event of a line, None for anything unparsable, incomplete (no newline yet) or of a newer
@@ -515,6 +537,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                         last_progress: String::new(),
                         author: None,
                         accepted: None,
+                        node: e.node.clone(),
                     };
                     b.tasks.insert(e.task.clone(), s);
                 }
@@ -537,7 +560,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 }
                 return;
             }
-            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(&s.task, &e.by, &e.drone) {
+            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(s, &e.by, &e.drone, &e.node) {
                 b.lost.push((e.by.clone(), e.task.clone(), e.ms));
                 return;
             }
@@ -639,18 +662,19 @@ pub fn lost_since(b: &Board, session: &str, ms: i64) -> Vec<TaskId> {
     out
 }
 
-/// Whether `session` of `drone` may claim `s` at `now` (the fold's rules a-c: open or expired,
-/// dependencies verified, not barred).
-pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, now: i64) -> bool {
-    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(&s.task, session, drone)
+/// Whether `session` of `drone` on `node` may claim `s` at `now` (the fold's rules a-c: open or
+/// expired, dependencies verified, not barred).
+pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, node: &str, now: i64) -> bool {
+    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(s, session, drone, node)
 }
 
-/// The task `session` of `drone` in `repo` should take next at `now`, among those `allowed` lets it
-/// claim: its own repo's first, then by role (verify, integrate, work, plan), then the oldest, then by id.
-pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, repo: &str, now: i64, allowed: impl Fn(&Task) -> bool) -> Option<&'a TaskState> {
+/// The task `session` of `drone` on `node` in `repo` should take next at `now`, among those `allowed`
+/// lets it claim: its own repo's first, then by role (verify, integrate, work, plan), then the oldest,
+/// then by id.
+pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
     b.tasks
         .values()
-        .filter(|s| claimable_by(b, s, session, drone, now) && allowed(&s.task))
+        .filter(|s| claimable_by(b, s, session, drone, node, now) && allowed(s))
         .min_by_key(|s| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency(), s.opened_ms, s.task.id.clone()))
 }
 
@@ -887,7 +911,7 @@ mod tests {
     fn the_author_cannot_claim_its_verify_task() {
         let b = fold(&[done_t1(), vec![ev(Ev::Claim, "t1.v1", "sa", 3)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", "", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", "", 3));
+        assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", "", "", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", "", "", 3));
         assert_eq!(b.tasks["t1"].author.as_deref(), Some("sa"));
     }
 
@@ -900,10 +924,10 @@ mod tests {
         // A later iteration of d1 (a new session) claims the verify task: it does not take effect.
         let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa2", 3).with_drone("d1")]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(b.barred(&b.tasks["t1.v1"].task, "sa2", "") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", "", 3));
-        assert!(b.barred(&b.tasks["t1.v1"].task, "sa3", "d1") && !b.barred(&b.tasks["t1.v1"].task, "sa3", "d2"));
+        assert!(b.barred(&b.tasks["t1.v1"], "sa2", "", "") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", "", "", 3));
+        assert!(b.barred(&b.tasks["t1.v1"], "sa3", "d1", "") && !b.barred(&b.tasks["t1.v1"], "sa3", "d2", ""));
         // A fresh iteration of d1 that wrote no line yet is not offered it either.
-        assert_eq!(next_for(&b, "sa3", "d1", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "its own verify task is not offered to d1");
+        assert_eq!(next_for(&b, "sa3", "d1", "", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "its own verify task is not offered to d1");
         let b = fold(&[base, vec![ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d2"), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
         assert!(!b.finished() && integration_due(&b), "every task verified: the combined tree is checked next");
@@ -1001,11 +1025,11 @@ mod tests {
             Event::open(v, "sx", 2),
         ];
         let b = fold(&events);
-        assert_eq!(next_for(&b, "me", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"), "verify before work in the same repo");
-        assert_eq!(next_for(&b, "sx", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
-        assert_eq!(next_for(&b, "me", "", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
-        assert_eq!(next_for(&b, "me", "", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
-        assert_eq!(next_for(&b, "me", "", "other", 3, |t| t.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(next_for(&b, "me", "", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"), "verify before work in the same repo");
+        assert_eq!(next_for(&b, "sx", "", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
+        assert_eq!(next_for(&b, "me", "", "", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(next_for(&b, "me", "", "", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
+        assert_eq!(next_for(&b, "me", "", "", "other", 3, |s| s.task.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
     }
 
     fn integrate(id: &str) -> Task {
@@ -1116,5 +1140,75 @@ mod tests {
             .collect();
         assert_eq!(winners.len(), 1, "the same winner in every order: {winners:?}");
         assert!(winners.iter().all(Option::is_some));
+    }
+
+    fn on(mut e: Event, node: &str) -> Event {
+        e.node = node.into();
+        e
+    }
+
+    /// t1 done by session sa of drone d1 on node `node`, its verify task barred to [sa, d1].
+    fn done_by_d1_on(node: &str) -> Vec<Event> {
+        let mut v = verify("t1", "sa", 2);
+        v.not_by.push("d1".into());
+        vec![
+            Event::open(task("t1"), "engineer:e", 0),
+            on(ev(Ev::Claim, "t1", "sa", 1).with_drone("d1"), node),
+            on(ev(Ev::Done, "t1", "sa", 2), node),
+            on(Event::open(v, "sa", 2), node),
+        ]
+    }
+
+    #[test]
+    fn a_fresh_session_of_the_author_drone_is_not_offered_its_verify_task() {
+        let b = fold(&done_by_d1_on(""));
+        assert!(b.spans.iter().all(|s| s.by != "fresh") && !b.drones.contains_key("fresh"), "the board has no line of the fresh session");
+        assert_eq!(b.tasks["t1.v1"].task.not_by, ["sa", "d1"]);
+        assert_eq!(next_for(&b, "fresh", "d1", "", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "the runner's drone name bars it");
+        assert_eq!(next_for(&b, "fresh", "d2", "", "", 3, |_| true).map(|s| s.task.id.as_str()), Some("t1.v1"));
+    }
+
+    #[test]
+    fn a_drone_name_bars_only_on_its_own_node() {
+        let base = done_by_d1_on("A");
+        assert_eq!(fold(&base).tasks["t1.v1"].node, "A", "a verify task's node is its work's");
+        // B's d1 is another drone: its claim takes effect. A's d1 (a later session) is voided.
+        let b = fold(&[base.clone(), vec![on(ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d1"), "B")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1").as_deref(), Some("sb"));
+        let b = fold(&[base.clone(), vec![on(ev(Ev::Claim, "t1.v1", "sa2", 3).with_drone("d1"), "A")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1"), None);
+        // A claimant line without a node (from before nodes were stamped) bars conservatively.
+        let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa3", 3).with_drone("d1")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1"), None);
+        // The author's session bars on every node.
+        let b = fold(&[base, vec![on(ev(Ev::Claim, "t1.v1", "sa", 3), "B")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1"), None);
+        assert!(same_node("A", "A") && same_node("", "B") && !same_node("A", "B"));
+    }
+
+    #[test]
+    fn remote_lines_fold_the_same_and_one_claim_wins_across_nodes() {
+        let lines = vec![
+            Event::open(task("t1"), "engineer:e", 0),
+            on(ev(Ev::Claim, "t1", "sa", 100), "A"),
+            on(ev(Ev::Claim, "t1", "sb", 90), "B"),
+            on(ev(Ev::Done, "t1", "sa", 120), "A"),
+            on(ev(Ev::Heartbeat, "t1", "sb", 110), "B"),
+        ];
+        let all = permutations(&lines);
+        let first = fold(&all[0]);
+        for p in &all {
+            let b = fold(p);
+            assert_eq!(b, first, "the same board in every arrival order");
+            assert_eq!(holder_of(&b, "t1").as_deref(), Some("sb"), "the earlier claim, on B, holds");
+            assert_eq!(lost_since(&b, "sa", 0), ["t1"], "A's claim lost; its later done is ignored");
+            // No two tenures of one task overlap.
+            let spans: Vec<&Span> = b.spans.iter().filter(|s| s.task == "t1").collect();
+            for (i, x) in spans.iter().enumerate() {
+                for y in &spans[i + 1..] {
+                    assert!(x.to_ms.is_some_and(|t| t <= y.from_ms) || y.to_ms.is_some_and(|t| t <= x.from_ms), "{x:?} overlaps {y:?}");
+                }
+            }
+        }
     }
 }

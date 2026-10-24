@@ -373,7 +373,7 @@ Borg runs on its own. These commands show what it does:
 
 **Hive (spike, preparation).** `borg hive` lets many drones work on one goal: a board of tasks with
 leased claims, contracts between drones, and done gated by the goal's oracle (shell checks run at the
-stop). It is a local, file-backed spike with no mesh sync. What is shown is that it works, not that it is
+stop). It is file-backed; on one machine, what is shown is that it works, not that it is
 better: on two private production codebases (six injected bugs in one service; a field rename across a
 service and its consumer, the consumer depending on the producer), three drones finished the board,
 integrated, and passed the visible suite and every held-out check in all 6 runs (3 seeds each, $8.48
@@ -394,6 +394,17 @@ hacked and the task reopens, every tool call that writes a test or peeks at the 
 the verifier, and an optional hidden oracle (held-out checks outside the repo) decides what a verdict
 credits. Each verdict credits the lessons shown during the task; the web page shows the hacked rate. A
 session that never joins a goal sees no change.
+
+**The hive across machines (built, not measured).** In a collective shared over the mesh, a goal, its
+board, contracts, messages between drones (`borg hive ask`, `tell`) and guard flags sync to every member
+as signed lines, so drones on several machines claim from one board: the earlier of two claims wins on
+both machines after a sync round, leases renew through synced heartbeats, a drone name bars only on its
+own machine, and the author's machine credits a verdict given elsewhere, once. A check another machine
+wrote is a shell command from that machine: it runs only after the engineer's `borg hive approve <goal>`
+there, and the board lists what waits. Two machines that make one goal id before a sync stop that goal
+on both and say why. It is proven on two
+loopback nodes with scripted drones, not measured across real machines (that is a later paid run).
+Commits do not travel: work is verified, and the goal integrated, on a machine that holds the commits.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive).
 
 All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).

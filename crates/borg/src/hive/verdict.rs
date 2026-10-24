@@ -20,6 +20,12 @@
 //! pass or a reject waits for its score, which then decides `verified` or `rejected`; `hacked` is
 //! final at once. Each final verdict counts one `task_*` stat. BORG_HIVE_CREDIT=off (the frozen arm of
 //! an eval) credits nothing; the board and the stats still record.
+//!
+//! Across machines (the board syncs, collective step 4): the verdict line carries the kind it credits
+//! (`Event::credit`), and the node holding the author's shown records, the author's, credits it when the
+//! line arrives ([`credit_synced`], at each mesh round); every other node has no such records and
+//! credits nothing. A verifier gives the verdict only where the work's snapshots are ([`present`]):
+//! commits do not travel with the board.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,7 +35,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 use super::TaskId;
-use super::board::{Board, Ev, Event, Role, Task};
+use super::board::{Board, Ev, Event, Role, Task, same_node};
 use super::guard::{self, Class};
 use super::{Goal, board};
 use crate::outcome::{self, Outcome};
@@ -579,6 +585,8 @@ pub struct Attempt {
     pub head: String,
     /// The claim's `deps_in` (board.rs `Event`): `task@head` of each dep's work its tree held.
     pub deps_in: Vec<String>,
+    /// The node the work was done on (its tenure's; empty: this one, or a line from before nodes).
+    pub node: String,
 }
 
 /// The attempt of the verify task `verify` on the board `b` folded from `events` (one pass): its open
@@ -586,16 +594,73 @@ pub struct Attempt {
 /// ended a tenure, board.rs `Span`): a done the fold ignored (its lease had passed to another drone)
 /// opens nothing (board.rs `apply`) and is never judged. The claim is the tenure that done ended.
 pub fn attempt(events: &[Event], b: &Board, verify: &str) -> Option<Attempt> {
-    let (open, span) = events.iter().filter(|e| e.ev == Ev::Open && e.task == verify).find_map(|e| {
-        let work = e.def.as_ref()?.of.as_ref()?;
-        let span = b.spans.iter().rev().find(|s| &s.task == work && s.by == e.by && s.to_ms == Some(e.ms) && s.end == Some(Ev::Done))?;
-        Some((e, span))
-    })?;
-    let (work, author, done_ms, claim_ms) = (span.task.clone(), open.by.clone(), open.ms, span.from_ms);
-    let done = events.iter().find(|e| e.ev == Ev::Done && e.task == work && e.by == author && e.ms == done_ms)?;
-    let claim = events.iter().find(|e| e.ev == Ev::Claim && e.task == work && e.by == author && e.ms == claim_ms);
-    let (base, deps_in) = claim.map(|e| (e.base.clone(), e.deps_in.clone())).unwrap_or_default();
-    Some(Attempt { drone: b.drones.get(&author).cloned().unwrap_or_default(), author, work, claim_ms, done_ms, base, head: done.head.clone(), deps_in })
+    Index::new(events, b).attempt(verify)
+}
+
+/// What `attempt` looks up, by key, in one pass over a board's events and spans: many attempts then
+/// cost one pass, not one each (`judged_events`).
+struct Index<'a> {
+    b: &'a Board,
+    /// The open events of each task, in file order.
+    opens: HashMap<&'a str, Vec<&'a Event>>,
+    /// The latest tenure that ended with a done, by (task, holder, its end ms).
+    done_spans: HashMap<(&'a str, &'a str, i64), &'a board::Span>,
+    /// Every tenure's end: (task, holder, ms, how).
+    ends: std::collections::HashSet<(&'a str, &'a str, i64, Ev)>,
+    /// The first claim and done line of each (task, by, ms).
+    claims: HashMap<(&'a str, &'a str, i64), &'a Event>,
+    dones: HashMap<(&'a str, &'a str, i64), &'a Event>,
+}
+
+impl<'a> Index<'a> {
+    fn new(events: &'a [Event], b: &'a Board) -> Index<'a> {
+        let mut x = Index { b, opens: HashMap::new(), done_spans: HashMap::new(), ends: Default::default(), claims: HashMap::new(), dones: HashMap::new() };
+        for e in events {
+            let key = (e.task.as_str(), e.by.as_str(), e.ms);
+            match e.ev {
+                Ev::Open => x.opens.entry(e.task.as_str()).or_default().push(e),
+                Ev::Claim => {
+                    x.claims.entry(key).or_insert(e);
+                }
+                Ev::Done => {
+                    x.dones.entry(key).or_insert(e);
+                }
+                _ => {}
+            }
+        }
+        for s in &b.spans {
+            let (Some(to), Some(end)) = (s.to_ms, s.end) else { continue };
+            x.ends.insert((s.task.as_str(), s.by.as_str(), to, end));
+            if end == Ev::Done {
+                x.done_spans.insert((s.task.as_str(), s.by.as_str(), to), s);
+            }
+        }
+        x
+    }
+
+    fn attempt(&self, verify: &str) -> Option<Attempt> {
+        let (open, span) = self.opens.get(verify)?.iter().find_map(|e| {
+            let work = e.def.as_ref()?.of.as_ref()?;
+            Some((*e, *self.done_spans.get(&(work.as_str(), e.by.as_str(), e.ms))?))
+        })?;
+        let (done_ms, claim_ms) = (open.ms, span.from_ms);
+        let done = self.dones.get(&(span.task.as_str(), open.by.as_str(), done_ms))?;
+        let claim = self.claims.get(&(span.task.as_str(), open.by.as_str(), claim_ms));
+        let (base, deps_in) = claim.map(|e| (e.base.clone(), e.deps_in.clone())).unwrap_or_default();
+        let (work, author) = (span.task.clone(), open.by.clone());
+        let node = span.node.clone();
+        Some(Attempt {
+            drone: self.b.drones.get(&author).cloned().unwrap_or_default(),
+            author,
+            work,
+            claim_ms,
+            done_ms,
+            base,
+            head: done.head.clone(),
+            deps_in,
+            node,
+        })
+    }
 }
 
 /// The accepted attempt of the work task `work`: that of the verify task whose `verified` made it
@@ -619,18 +684,27 @@ pub fn cause(goal: &str, verify: &str) -> String {
 }
 
 /// Credits `kind` (an outcome verdict kind) to every lesson shown in the attempt's claim, once per
-/// lesson and attempt, and counts the verdict's `task_*` stat; returns the lessons credited now.
+/// lesson and attempt; returns the lessons credited now. Nothing where the author's shown records are
+/// not (another node's work), nor with crediting off.
+pub fn credit(home: &Path, goal: &str, verify: &str, a: &Attempt, kind: &str, repo: &str, now: i64) -> Vec<String> {
+    if !credit_on() {
+        return Vec::new();
+    }
+    // Half-open [claim, done): a lesson asked in the done's own millisecond is taken as after the work.
+    let lessons = veto::shown_between(home, &a.author, a.claim_ms, a.done_ms - 1);
+    if lessons.is_empty() {
+        return Vec::new();
+    }
+    let path = home.join("outcomes.jsonl");
+    let records: Vec<Outcome> = outcome::verdicts(&outcome::read(&path), kind, &a.author, &lessons, &cause(goal, verify), now, repo);
+    records.iter().filter(|o| outcome::append(&path, o).is_ok()).flat_map(|o| o.lessons.clone()).collect()
+}
+
+/// [`credit`], then the verdict's `task_*` stat, counted once by the node that judged (or scored) it;
+/// returns the lessons credited now.
 #[allow(clippy::too_many_arguments)]
 pub fn settle(home: &Path, goal: &str, verify: &str, a: &Attempt, kind: &str, note: &str, repo: &str, now: i64) -> Vec<String> {
-    let credited = if credit_on() {
-        // Half-open [claim, done): a lesson asked in the done's own millisecond is taken as after the work.
-        let lessons = veto::shown_between(home, &a.author, a.claim_ms, a.done_ms - 1);
-        let path = home.join("outcomes.jsonl");
-        let records: Vec<Outcome> = outcome::verdicts(&outcome::read(&path), kind, &a.author, &lessons, &cause(goal, verify), now, repo);
-        records.iter().filter(|o| outcome::append(&path, o).is_ok()).flat_map(|o| o.lessons.clone()).collect()
-    } else {
-        Vec::new()
-    };
+    let credited = credit(home, goal, verify, a, kind, repo, now);
     let stat = match kind {
         outcome::VERIFIED => stats::TASK_VERIFIED,
         outcome::REJECTED => stats::TASK_REJECTED,
@@ -695,8 +769,9 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
         return Err(format!("{verify} is not claimed by this session"));
     }
     let a = attempt(&events, &b, verify).ok_or_else(|| format!("{verify}: no done of its work to judge"))?;
-    let drone = b.drones.get(session).cloned().or_else(|| super::bound(session).map(|hs| hs.drone)).unwrap_or_default();
-    if a.author == session || (!a.drone.is_empty() && a.drone == drone) {
+    let drone = b.drones.get(session).cloned().unwrap_or_else(|| super::drone_of(session));
+    // A drone name is the author's only on the author's node: every runner names its drones d1..dN.
+    if a.author == session || (!a.drone.is_empty() && a.drone == drone && same_node(&a.node, &super::node(home))) {
         return Err("the author cannot verify its own work".into());
     }
     let work: Option<&Task> = b.tasks.get(&a.work).map(|w| &w.task);
@@ -707,22 +782,239 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     // verifier outside the goal's repo): no verdict, never one that skipped the check.
     let checked = !a.base.is_empty() && !a.head.is_empty();
     let changed = match checked {
-        true => diff(root, &a.base, &a.head)
-            .ok_or_else(|| format!("cannot diff the work of {} from {cwd}: give the verdict from a worktree of the goal's repo", a.work))?,
+        true => diff(root, &a.base, &a.head).ok_or_else(|| match super::is_local(home, &a.node) {
+            true => format!("cannot diff the work of {} from {cwd}: give the verdict from a worktree of the goal's repo", a.work),
+            false => format!(
+                "the work of {} was done on node {} and its snapshots are not in this repo: verify from a node that holds them",
+                a.work,
+                a.node.chars().take(8).collect::<String>()
+            ),
+        })?,
         false => Diff::default(),
     };
     let prot = protected(&changed, work.map_or(&[][..], |w| &w.files), &guard::oracle_files(g, root));
     let oracle_flags: Vec<String> =
         guard::flags_of(home, &g.id, &a.author, a.claim_ms, a.done_ms).into_iter().filter(|f| f.class == Class::Oracle).map(|f| f.path).collect();
-    let d = decide(said, &prot, &oracle_flags, checked, &missing_deps(&events, &b, &a), g.hidden.is_some());
+    let d = decide(said, &prot, &oracle_flags, checked, &missing_deps(&events, &b, &a), super::goal::has_hidden(g));
     let mut e = Event::new(d.ev, verify, session, now).with_note(&d.note);
     e.hacked = d.hacked.then_some(true);
-    board::append(&path, &[e]).map_err(|e| e.to_string())?;
+    e.credit = d.kind.outcome().unwrap_or_default().into();
+    super::write(home, &g.id, vec![e]).map_err(|e| e.to_string())?;
     let credited = match d.kind.outcome() {
         Some(kind) => settle(home, &g.id, verify, &a, kind, &d.note, &queen::repo_name(cwd), now),
         None => Vec::new(),
     };
     Ok(Recorded { work: a.work, decision: d, credited })
+}
+
+/// Whether every one of `commits` is a commit in the repo at `dir` (`git cat-file -e <c>^{commit}`, each
+/// within `GIT_TIMEOUT` and all `within`, no hook run): a node verifies, fixes or integrates only work
+/// whose commits it holds.
+pub fn present(dir: &Path, commits: &[&str], within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    !dir.as_os_str().is_empty()
+        && commits.iter().all(|c| !c.is_empty() && git_by(dir, &["cat-file", "-e", &format!("{c}^{{commit}}")], &[], deadline).is_some())
+}
+
+/// Whether a verdict line's `credit` is the kind its event and `hacked` say: none (deferred to a hidden
+/// score, or nothing to credit), `verified` on a clean pass, `hacked` on a hacked reject, `rejected` on
+/// another reject. A line claiming another credit was not written by `record`.
+pub fn consistent(e: &Event) -> bool {
+    let hacked = e.hacked == Some(true);
+    match e.credit.as_str() {
+        "" => true,
+        outcome::VERIFIED => e.ev == Ev::Verified && !hacked,
+        outcome::HACKED => e.ev == Ev::Rejected && hacked,
+        outcome::REJECTED => e.ev == Ev::Rejected && !hacked,
+        _ => false,
+    }
+}
+
+/// The verdict events of `events` the fold took (they closed their verify task's tenure) and whose
+/// credit is `consistent`: (event, its verify task's attempt). One pass (`Index`).
+fn judged_events<'a>(events: &'a [Event], b: &Board) -> Vec<(&'a Event, Attempt)> {
+    let x = Index::new(events, b);
+    events
+        .iter()
+        .filter(|e| matches!(e.ev, Ev::Verified | Ev::Rejected) && consistent(e) && b.tasks.get(&e.task).is_some_and(|s| s.task.role == Role::Verify))
+        .filter(|e| x.ends.contains(&(e.task.as_str(), e.by.as_str(), e.ms, e.ev)))
+        .filter_map(|e| Some((e, x.attempt(&e.task)?)))
+        .collect()
+}
+
+/// The local cursor of `credit_synced` in a goal's board (never synced): the tasks.jsonl offset up to
+/// which its verdicts were credited, the blake3 of the board's bytes up to it, and the board's mtime.
+fn credit_cursor(home: &Path, goal: &str) -> std::path::PathBuf {
+    super::dir(home, goal).join("credit.cursor")
+}
+
+/// A file's length and modification time (ns), the key of the local caches over a board.
+fn stamp(path: &Path) -> Option<(u64, u128)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos()))
+}
+
+/// Credits the verdicts that arrived from other nodes on work done on this one (the author's shown
+/// records are here only), once each: a verdict line with a `consistent` credit kind that took effect,
+/// whose goal has no hidden oracle (its runner's score credits those, hive/hidden.rs). The work is this
+/// node's when its node is (`is_local`) and `local` says this node wrote both its claim and its done
+/// line: borg-mesh passes "no other member's origin", since a line's `node` is only self-declared and a
+/// member could name this node on a forged claim and done of a real local session. Called before each
+/// mesh round (borg-mesh `Node::stamp`). No stat: the verifier's node counted it, and stats rollups sync.
+/// Reads each board from the offset it reached last time (`credit.cursor`), when the bytes before it
+/// are still the same (a quarantine rewrite changes them: then from its start; `outcome::verdicts`
+/// writes a credited attempt never twice). Returns how many lessons it credited.
+pub fn credit_synced(home: &Path, local: impl Fn(&str) -> bool) -> usize {
+    if std::fs::metadata(home.join("hive")).is_err() || !credit_on() {
+        return 0;
+    }
+    let mut n = 0;
+    for id in super::goal::list(home) {
+        let Ok(g) = super::goal::load(home, &id) else { continue };
+        let path = super::tasks_path(home, &id);
+        let saved = std::fs::read_to_string(credit_cursor(home, &id)).unwrap_or_default();
+        let mut f = saved.split_whitespace();
+        let (cursor, prefix, mtime): (u64, &str, u128) =
+            (f.next().and_then(|x| x.parse().ok()).unwrap_or(0), f.next().unwrap_or_default(), f.next().and_then(|x| x.parse().ok()).unwrap_or(0));
+        // Unchanged since the last call (one stat): nothing arrived.
+        let Some((len, now_mtime)) = stamp(&path) else { continue };
+        if len == cursor && now_mtime == mtime {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let (lines, end) = board::read_from(&path, 0);
+        let hash_to = |at: u64| blake3::hash(&bytes[..(at as usize).min(bytes.len())]).to_hex().to_string();
+        let start = if cursor <= end && !prefix.is_empty() && hash_to(cursor) == prefix { cursor } else { 0 };
+        let events: Vec<Event> = lines.iter().map(|(_, e)| e.clone()).collect();
+        let new: std::collections::HashSet<(i64, &str, &str)> = lines
+            .iter()
+            .filter(|(at, e)| *at > start && matches!(e.ev, Ev::Verified | Ev::Rejected))
+            .map(|(_, e)| (e.ms, e.task.as_str(), e.by.as_str()))
+            .collect();
+        if !super::goal::has_hidden(&g) && !new.is_empty() {
+            // Each claim and done line's raw text, for `local`.
+            let raw = |at: u64| {
+                let stop = (at as usize).saturating_sub(1).min(bytes.len());
+                let from = bytes[..stop].iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                String::from_utf8_lossy(&bytes[from..stop]).into_owned()
+            };
+            let mut text: HashMap<(Ev, &str, &str, i64), u64> = HashMap::new();
+            for (at, e) in lines.iter().filter(|(_, e)| matches!(e.ev, Ev::Claim | Ev::Done)) {
+                text.entry((e.ev, e.task.as_str(), e.by.as_str(), e.ms)).or_insert(*at);
+            }
+            let wrote = |ev: Ev, a: &Attempt, ms: i64| text.get(&(ev, a.work.as_str(), a.author.as_str(), ms)).is_some_and(|at| local(&raw(*at)));
+            let b = board::fold(&events);
+            for (e, a) in judged_events(&events, &b) {
+                if !new.contains(&(e.ms, e.task.as_str(), e.by.as_str())) || !outcome::is_verdict(&e.credit) || !super::is_local(home, &a.node) {
+                    continue;
+                }
+                if !wrote(Ev::Claim, &a, a.claim_ms) || !wrote(Ev::Done, &a, a.done_ms) {
+                    continue;
+                }
+                let repo = b.tasks.get(&a.work).map(|w| w.task.repo.clone()).unwrap_or_default();
+                n += credit(home, &id, &e.task, &a, &e.credit, &repo, e.ms).len();
+            }
+        }
+        let _ = std::fs::write(credit_cursor(home, &id), format!("{end} {} {now_mtime}", hash_to(end)));
+    }
+    n
+}
+
+/// What a team verdict line may claim of an attempt this node's board judged (outcome.rs `team_view`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Allowed {
+    /// The board's verdict was `hacked`.
+    pub hacked: bool,
+    /// The kind it credits (`Event::credit`), empty while a hidden score decides.
+    pub credit: String,
+    /// The goal has a hidden oracle: its score decides `verified` or `rejected`.
+    pub held_out: bool,
+    /// The team tag (`outcome::tag`) of the attempt's author session: a verdict credits the lessons
+    /// shown to it, so the line's session must be it.
+    pub author: String,
+    /// The claim the work was done in, [claim_ms, done_ms): the lessons a line names must have been
+    /// asked of the author then.
+    pub claim_ms: i64,
+    pub done_ms: i64,
+    /// The node the work was done on: with a hidden oracle, the only one whose score is published.
+    pub node: String,
+}
+
+impl Allowed {
+    pub fn allows(&self, kind: &str) -> bool {
+        match (self.hacked, self.held_out) {
+            (true, _) => kind == outcome::HACKED,
+            (false, true) => kind == outcome::VERIFIED || kind == outcome::REJECTED,
+            (false, false) => !self.credit.is_empty() && kind == self.credit,
+        }
+    }
+}
+
+/// `<goal>/judged.json`: `judged`'s entries of one goal and the stamps of the board, goal.jsonl and
+/// goal.json they were derived from (local, never synced): the conscience reads the team view at every
+/// prompt and stop, and a goal unchanged since costs three stats.
+fn judged_cache(home: &Path, goal: &str) -> std::path::PathBuf {
+    super::dir(home, goal).join("judged.json")
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct JudgedCache {
+    board: Option<(u64, u128)>,
+    goal: Option<(u64, u128)>,
+    local: Option<(u64, u128)>,
+    entries: Vec<(String, Allowed)>,
+}
+
+/// One goal's judged attempts (`judged`), from its cache when the board and goal.jsonl are unchanged.
+fn judged_goal(home: &Path, id: &str) -> Vec<(String, Allowed)> {
+    let at = (stamp(&super::tasks_path(home, id)), stamp(&super::goal_jsonl_path(home, id)), stamp(&super::goal_path(home, id)));
+    let cache = judged_cache(home, id);
+    if let Ok(c) = serde_json::from_slice::<JudgedCache>(&std::fs::read(&cache).unwrap_or_default())
+        && (c.board, c.goal, c.local) == at
+    {
+        return c.entries;
+    }
+    // A conflicting goal (goal.rs `conflict`) admits no team verdict until one definition is left.
+    let entries: Vec<(String, Allowed)> = match super::goal::load(home, id) {
+        Err(_) => Vec::new(),
+        Ok(g) => {
+            let held_out = super::goal::has_hidden(&g);
+            let events = board::read(&super::tasks_path(home, id));
+            let b = board::fold(&events);
+            judged_events(&events, &b)
+                .into_iter()
+                .map(|(e, a)| {
+                    let allowed = Allowed {
+                        hacked: e.hacked == Some(true),
+                        credit: e.credit.clone(),
+                        held_out,
+                        author: outcome::tag(&a.author),
+                        claim_ms: a.claim_ms,
+                        done_ms: a.done_ms,
+                        node: a.node,
+                    };
+                    (outcome::tag(&cause(id, &e.task)), allowed)
+                })
+                .collect()
+        }
+    };
+    let c = JudgedCache { board: at.0, goal: at.1, local: at.2, entries };
+    if let Ok(body) = serde_json::to_vec(&c) {
+        let tmp = cache.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache);
+        }
+    }
+    c.entries
+}
+
+/// Every attempt the store's boards judged, by the team tag of its cause (`outcome::tag` of `cause`),
+/// and what a verdict on it may be: the board-binding guard on the team's verdict lines.
+pub fn judged(home: &Path) -> HashMap<String, Allowed> {
+    if std::fs::metadata(home.join("hive")).is_err() {
+        return HashMap::new();
+    }
+    super::goal::list(home).iter().flat_map(|id| judged_goal(home, id)).collect()
 }
 
 /// A verified verify task: whose work (`author`, in its claim `work_from..=work_to`), by whom
@@ -985,6 +1277,7 @@ mod tests {
             created_ms: 0,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         };
         super::super::goal::create(&home, &g).unwrap();
         let t1 = Task {
@@ -1021,6 +1314,7 @@ mod tests {
             base: "b".into(),
             head: "h".into(),
             deps_in: vec![],
+            node: String::new(),
         };
         assert_eq!(a, want);
         assert!(matches!(&b.tasks["t1.v1"].status, board::Status::Claimed { by, .. } if by == "s2"), "the board let s2 claim it");
@@ -1029,6 +1323,210 @@ mod tests {
         assert_eq!(board::read(&path).len(), lines.len(), "nothing appended");
         assert!(record(&home, &g, "t1.v1", &Said::Pass, "s9", "/nonexistent", 31).unwrap_err().contains("not claimed by this session"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A verdict from another node on work done here: this node holds the author's shown records and
+    /// credits it once, at the next mesh round's call; no stat (the verifier's node counted it).
+    #[test]
+    fn credit_synced_credits_the_author_node_once() {
+        let home = std::env::temp_dir().join(format!("borg-hive-verdict-synced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let g = Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+            held_out: false,
+        };
+        super::super::goal::create(&home, &g).unwrap();
+        let t1 = Task {
+            id: "t1".into(),
+            role: Role::Work,
+            title: "t".into(),
+            repo: "app".into(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+        };
+        let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s1".into()], ..t1.clone() };
+        let remote = |e: Event| Event { node: "remote".into(), ..e };
+        let verdict = Event { credit: outcome::VERIFIED.into(), ..Event::new(Ev::Verified, "t1.v1", "sv", 40) };
+        // The author's lines through `write` (this node's), the verifier's from the remote node.
+        super::super::write(
+            &home,
+            "g",
+            vec![Event::open(t1, "engineer:e", 1), Event::new(Ev::Claim, "t1", "s1", 10), Event::new(Ev::Done, "t1", "s1", 20), Event::open(v1, "s1", 20)],
+        )
+        .unwrap();
+        board::append(&super::super::tasks_path(&home, "g"), &[remote(Event::new(Ev::Claim, "t1.v1", "sv", 30)), remote(verdict)]).unwrap();
+        outcome::append(
+            &home.join("outcomes.jsonl"),
+            &Outcome { kind: outcome::ASKED.into(), session: "s1".into(), lessons: vec!["L1".into()], ms: 15, ..Default::default() },
+        )
+        .unwrap();
+        let stats_before = crate::stats::events(&home).len();
+        assert_eq!(credit_synced(&home, |_| true), 1);
+        let credited: Vec<Outcome> = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| o.kind == outcome::VERIFIED).collect();
+        assert_eq!(credited.len(), 1);
+        assert_eq!((credited[0].lessons.as_slice(), credited[0].cause.as_str(), credited[0].ms), (["L1".to_string()].as_slice(), "g/t1.v1", 40));
+        assert_eq!(credit_synced(&home, |_| true), 0, "once");
+        // A board read anew (a quarantine rewrote it) credits nothing twice either.
+        let _ = std::fs::remove_file(credit_cursor(&home, "g"));
+        assert_eq!(credit_synced(&home, |_| true), 0);
+        assert_eq!(outcome::read(&home.join("outcomes.jsonl")).iter().filter(|o| o.kind == outcome::VERIFIED).count(), 1);
+        assert_eq!(crate::stats::events(&home).len(), stats_before, "no stat: the verifier's node counted it");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The goal, the work task `id` and its verify task of the credit_synced tests.
+    fn synced_board(home: &Path, ids: &[&str]) -> Vec<(Task, Task)> {
+        let g = Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+            held_out: false,
+        };
+        super::super::goal::create(home, &g).unwrap();
+        ids.iter()
+            .map(|id| {
+                let t = Task {
+                    id: id.to_string(),
+                    role: Role::Work,
+                    title: "t".into(),
+                    repo: "app".into(),
+                    files: vec![],
+                    deps: vec![],
+                    accept: vec![],
+                    of: None,
+                    not_by: vec![],
+                    flags: vec![],
+                    from: None,
+                };
+                let v = Task { id: format!("{id}.v1"), role: Role::Verify, of: Some(id.to_string()), ..t.clone() };
+                (t, v)
+            })
+            .collect()
+    }
+
+    /// A line's `node` is self-declared: a member that writes a claim and a done naming this node, for
+    /// a real local session that was shown lessons, and then a verdict, credits nothing here when the
+    /// mesh says another member wrote those lines; nor does a verdict whose credit its event does not say.
+    #[test]
+    fn credit_synced_credits_only_work_this_node_wrote_with_a_consistent_credit() {
+        let home = std::env::temp_dir().join(format!("borg-hive-verdict-forged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let tasks = synced_board(&home, &["t1", "t2", "t3"]);
+        let here = super::super::node(&home);
+        let path = super::super::tasks_path(&home, "g");
+        let opens: Vec<Event> = tasks.iter().map(|(t, _)| Event::open(t.clone(), "engineer:e", 1)).collect();
+        super::super::write(&home, "g", opens).unwrap();
+        let remote = |e: Event| Event { node: "remote".into(), ..e };
+        let mut lines = Vec::new();
+        for (i, (t, v)) in tasks.iter().enumerate() {
+            let at = 10 + 100 * i as i64;
+            // Every line names this node and session s1: t1's and t3's are real, t2's were forged by a member.
+            let by = "s1";
+            lines.extend([
+                Event { node: here.clone(), ..Event::new(Ev::Claim, &t.id, by, at) },
+                Event { node: here.clone(), ..Event::new(Ev::Done, &t.id, by, at + 10) },
+                Event { node: here.clone(), ..Event::open(v.clone(), by, at + 10) },
+                remote(Event::new(Ev::Claim, &v.id, "sv", at + 20)),
+            ]);
+            let credit = if t.id == "t3" { outcome::HACKED } else { outcome::VERIFIED };
+            lines.push(remote(Event { credit: credit.into(), ..Event::new(Ev::Verified, &v.id, "sv", at + 30) }));
+        }
+        board::append(&path, &lines).unwrap();
+        for ms in [15, 115, 215] {
+            let asked = Outcome { kind: outcome::ASKED.into(), session: "s1".into(), lessons: vec![format!("L{ms}")], ms, ..Default::default() };
+            outcome::append(&home.join("outcomes.jsonl"), &asked).unwrap();
+        }
+        let forged = |l: &str| l.contains("\"task\":\"t2\"") && (l.contains("\"ev\":\"claim\"") || l.contains("\"ev\":\"done\""));
+        assert_eq!(credit_synced(&home, |l| !forged(l)), 1, "t1 only");
+        let credited: Vec<Outcome> = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| outcome::is_verdict(&o.kind)).collect();
+        assert_eq!(credited.iter().map(|o| (o.kind.as_str(), o.cause.as_str())).collect::<Vec<_>>(), [(outcome::VERIFIED, "g/t1.v1")]);
+        let judged = super::judged(&home);
+        assert!(judged.contains_key(&outcome::tag("g/t1.v1")) && !judged.contains_key(&outcome::tag("g/t3.v1")), "an inconsistent credit is never judged");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The team view runs `judged` at every prompt and stop: an unchanged goal is read from its local
+    /// cache (two stats and one small file, however long the board), a changed board is folded again.
+    #[test]
+    fn judged_is_cached_per_goal_until_its_board_changes() {
+        let home = std::env::temp_dir().join(format!("borg-hive-verdict-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (t1, v1) = synced_board(&home, &["t1"]).remove(0);
+        let path = super::super::tasks_path(&home, "g");
+        let verdict = Event { credit: outcome::VERIFIED.into(), ..Event::new(Ev::Verified, "t1.v1", "sv", 40) };
+        let lines = [
+            Event::open(t1, "engineer:e", 1),
+            Event::new(Ev::Claim, "t1", "s1", 10),
+            Event::new(Ev::Done, "t1", "s1", 20),
+            Event::open(v1, "s1", 20),
+            Event::new(Ev::Claim, "t1.v1", "sv", 30),
+        ];
+        board::append(&path, &lines).unwrap();
+        assert!(super::judged(&home).is_empty());
+        let cache = judged_cache(&home, "g");
+        assert!(cache.is_file());
+        // A planted entry is what an unchanged goal reads back: the board is not folded again.
+        let mut c: JudgedCache = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        c.entries.push(("planted".into(), Allowed::default()));
+        std::fs::write(&cache, serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(super::judged(&home).contains_key("planted"));
+        board::append(&path, &[verdict]).unwrap();
+        let now = super::judged(&home);
+        assert!(!now.contains_key("planted") && now[&outcome::tag("g/t1.v1")].author == outcome::tag("s1"), "{now:?}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A quarantine removes a long line before the cursor, then a short verdict and a long line arrive:
+    /// the board ends past the cursor while the verdict ends before it. The cursor's prefix hash no
+    /// longer matches, so the board is read from its start and the verdict is credited.
+    #[test]
+    fn credit_synced_rereads_a_board_a_quarantine_rewrote() {
+        let home = std::env::temp_dir().join(format!("borg-hive-verdict-rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (t1, v1) = synced_board(&home, &["t1"]).remove(0);
+        let path = super::super::tasks_path(&home, "g");
+        super::super::write(&home, "g", vec![Event::open(t1, "engineer:e", 1), Event::new(Ev::Claim, "t1", "s1", 10)]).unwrap();
+        let revoked = Event { node: "gone".into(), ..Event::new(Ev::Progress, "t1", "x", 11).with_note(&"r".repeat(400)) };
+        board::append(&path, std::slice::from_ref(&revoked)).unwrap();
+        super::super::write(&home, "g", vec![Event::new(Ev::Done, "t1", "s1", 20), Event::open(v1, "s1", 20)]).unwrap();
+        let asked = Outcome { kind: outcome::ASKED.into(), session: "s1".into(), lessons: vec!["L1".into()], ms: 15, ..Default::default() };
+        outcome::append(&home.join("outcomes.jsonl"), &asked).unwrap();
+        assert_eq!(credit_synced(&home, |_| true), 0, "no verdict yet");
+        let cursor = std::fs::metadata(&path).unwrap().len();
+        // The quarantine's rewrite, then a remote verifier's lines.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let removed = serde_json::to_string(&revoked).unwrap();
+        std::fs::write(&path, text.replace(&format!("{removed}\n"), "")).unwrap();
+        let remote = |e: Event| Event { node: "remote".into(), ..e };
+        let verdict = remote(Event { credit: outcome::VERIFIED.into(), ..Event::new(Ev::Verified, "t1.v1", "sv", 40) });
+        board::append(&path, &[remote(Event::new(Ev::Claim, "t1.v1", "sv", 30)), verdict]).unwrap();
+        let ends_before = std::fs::metadata(&path).unwrap().len();
+        assert!(ends_before < cursor, "the verdict ends before the old cursor");
+        board::append(&path, &[remote(Event::new(Ev::Progress, "t1.v1", "sv", 41).with_note(&"p".repeat(400)))]).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > cursor, "the board ends past it");
+        assert_eq!(credit_synced(&home, |_| true), 1);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

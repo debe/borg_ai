@@ -19,7 +19,7 @@
 //!   same number massed early; with a fixed d that comes from the later last use (a decay that depends
 //!   on the activation at each use, Pavlik and Anderson's spacing model, is a possible refinement).
 //! - **Usefulness belief** `Beta(1 + changed + verified, 1 + ignored + 2·corrected + 3·vetoed +
-//!   regretted + rejected + 3·hacked)`, one result
+//!   regretted + rejected + 3·hacked)` (the veto's 3 is `VETOED_W`), one result
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
 //!   learn`) without a change is ignored. A correction counts twice, as in outcome.rs; a veto (`borg no`,
 //!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
@@ -30,7 +30,9 @@
 //!   (hive/verdict.rs), one per (lesson, attempt), the worst of duplicates (hacked > rejected >
 //!   verified): additive to the session's result (a verdict is about the task, a session result about
 //!   the engineer's reaction), never a use, and never a tick of the activity clock. Weights in
-//!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`.
+//!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`. A fractional α (a candidate weight) is rounded the same way
+//!   (`draw`). `Weights` holds the hand-set weights so that `borg ope` (ope.rs, hive-learning.md step 6)
+//!   can replay the belief under other values offline; the counts `derive` returns are constant-free.
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
 //!   (session, lesson) so a session sees one stable ranking, or the belief's mean without a session.
 //!   `squash(A) = 2 / (1 + e^(−A/2))` lies in (0, 2) and is 1 at A = 0, a lesson created this session;
@@ -64,6 +66,23 @@ pub const REGRET: f64 = 1.0;
 pub const VERIFIED_W: u32 = 1;
 pub const REJECTED_W: u32 = 1;
 pub const HACKED_W: u32 = 3;
+/// What one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
+/// (design-chosen, no eval behind it yet; hive-learning.md step 6).
+pub const VETOED_W: u32 = 3;
+
+/// The belief's hand-set weights (design-chosen; `borg ope` estimates others offline, never applies them).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Weights {
+    pub vetoed: f64,
+    pub verified: f64,
+    pub rejected: f64,
+    pub hacked: f64,
+    pub regret: f64,
+}
+
+/// The weights in force.
+pub const WEIGHTS: Weights =
+    Weights { vetoed: VETOED_W as f64, verified: VERIFIED_W as f64, rejected: REJECTED_W as f64, hacked: HACKED_W as f64, regret: REGRET };
 pub const D_CONSOLIDATED: f64 = 0.3;
 pub const CONSOLIDATE_SESSIONS: usize = 3;
 pub const DORMANT_BELOW: f64 = -2.0;
@@ -71,8 +90,8 @@ pub const DORMANT_BELOW: f64 = -2.0;
 /// The collective's activity clock: its sessions in the order they first appear in the outcome log
 /// (by first ms, then id: independent of line order). Only the kinds the team shares
 /// (outcome.rs `SHARED_KINDS`) tick it, so every node counts the same sessions from the same first
-/// ms: a session that only graded, or a hive verdict (about a task, never a session of the
-/// collective), never moves it.
+/// ms: a session that only graded never moves it, and neither does a hive verdict (shared with `c`, but
+/// about a task, never a session of the collective).
 #[derive(Debug, Default)]
 pub struct Clock {
     first: Vec<(i64, String)>,
@@ -82,7 +101,7 @@ pub struct Clock {
 impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
-        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str())) {
+        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && !outcome::is_verdict(&o.kind)) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
         }
@@ -140,22 +159,36 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub fn alpha(&self) -> u32 {
-        1 + self.changed + VERIFIED_W * self.verified
+    /// α under weights `w`: the counts are constant-free, so one `derive` serves every candidate.
+    pub fn alpha_with(&self, w: &Weights) -> f64 {
+        1.0 + self.changed as f64 + w.verified * self.verified as f64
+    }
+
+    /// β under weights `w`.
+    pub fn beta_with(&self, w: &Weights) -> f64 {
+        (1 + self.ignored + 2 * self.corrected) as f64
+            + w.vetoed * self.vetoed as f64
+            + w.rejected * self.rejected as f64
+            + w.hacked * self.hacked as f64
+            + w.regret * self.regretted
+    }
+
+    pub fn alpha(&self) -> f64 {
+        self.alpha_with(&WEIGHTS)
     }
 
     pub fn beta(&self) -> f64 {
-        (1 + self.ignored + 2 * self.corrected + 3 * self.vetoed + REJECTED_W * self.rejected + HACKED_W * self.hacked) as f64 + REGRET * self.regretted
+        self.beta_with(&WEIGHTS)
     }
 
     pub fn mean(&self) -> f64 {
-        self.alpha() as f64 / (self.alpha() as f64 + self.beta())
+        self.alpha() / (self.alpha() + self.beta())
     }
 
     /// `squash(A) × (0.5 + x)`: x the Thompson sample for (`session`, `id`), or the mean without a session.
     pub fn weight(&self, id: &str, session: Option<&str>) -> f64 {
         let x = match session {
-            Some(s) => sample_beta(self.alpha(), round_seeded(self.beta(), seed(s, id) ^ 0x5265_6772), seed(s, id)),
+            Some(s) => draw(self.alpha(), self.beta(), seed(s, id)),
             None => self.mean(),
         };
         squash(self.activation) * (0.5 + x)
@@ -298,6 +331,12 @@ pub fn round_seeded(x: f64, seed: u64) -> u32 {
         true => whole as u32,
         false => whole as u32 + 1,
     }
+}
+
+/// A Thompson draw from Beta(alpha, beta), both randomised-rounded (`round_seeded`); integer
+/// parameters draw exactly as before.
+pub fn draw(alpha: f64, beta: f64, seed: u64) -> f64 {
+    sample_beta(round_seeded(alpha, seed ^ 0x416c_7068), round_seeded(beta, seed ^ 0x5265_6772), seed)
 }
 
 /// A Beta(a, b) draw for integer a, b ≥ 1: X / (X + Y) with X ~ Gamma(a), Y ~ Gamma(b), each a sum of
@@ -461,7 +500,7 @@ mod tests {
         ];
         let m = &derive(&log, &[l], None)["L"];
         assert_eq!((m.changed, m.ignored, m.corrected), (1, 2, 1));
-        assert_eq!((m.alpha(), m.beta()), (2, 5.0));
+        assert_eq!((m.alpha(), m.beta()), (2.0, 5.0));
     }
 
     #[test]
@@ -470,7 +509,7 @@ mod tests {
         let log = vec![o(CHANGED, "a", "L", 1, "r"), o(CORRECTED, "a", "L", 2, "r"), o(outcome::VETOED, "a", "L", 3, "r"), o(CORRECTED, "b", "L", 4, "r")];
         let m = &derive(&log, std::slice::from_ref(&l), None)["L"];
         assert_eq!((m.changed, m.ignored, m.corrected, m.vetoed), (0, 0, 1, 1));
-        assert_eq!((m.alpha(), m.beta()), (1, (1 + 2 + 3) as f64));
+        assert_eq!((m.alpha(), m.beta()), (1.0, (1 + 2 + 3) as f64));
         // The veto's change still deposited a use: activation counts it.
         let without = derive(&log[1..], std::slice::from_ref(&l), None)["L"].activation;
         assert!(m.activation > without, "{} {without}", m.activation);
@@ -532,9 +571,11 @@ mod tests {
         let lone = derive(&[verdict(outcome::VERIFIED, "z", "L", 9, "g/t1.v1")], std::slice::from_ref(&l), None);
         assert_eq!(lone["L"].activation, 0.0, "a verdict of a session with no other line adds no tick");
         assert_eq!(Clock::of(&[verdict(outcome::HACKED, "z", "L", 9, "c")]).now(None), 0);
+        // A peer's shared verdict (cause as its tag) neither: verdicts are shared, never ticks.
+        assert_eq!(Clock::of(&[verdict(outcome::VERIFIED, &outcome::tag("z"), "L", 9, &outcome::tag("g/t1.v1"))]).now(None), 0);
         // Additive to the session's result.
         let both = mem(&[asked.clone(), o(CHANGED, "a", "L", 5, "r"), verdict(outcome::HACKED, "a", "L", 9, "g/t1.v1")]);
-        assert_eq!((both.changed, both.hacked, both.alpha(), both.beta()), (1, 1, 2, 4.0));
+        assert_eq!((both.changed, both.hacked, both.alpha(), both.beta()), (1, 1, 2.0, 4.0));
         // Per attempt the worst of duplicates, in any line order; two attempts count twice.
         let log = vec![
             asked.clone(),
@@ -572,6 +613,21 @@ mod tests {
         };
         assert_eq!(m.weight("L", Some("s")), squash(0.0) * (0.5 + sample_beta(3, 4, seed("s", "L"))));
         assert_eq!(m.weight("L", Some("s")), 1.0618369485259265);
+    }
+
+    #[test]
+    fn fractional_alpha_draws_unbiased_and_integer_unchanged() {
+        // Integer parameters: `draw` is the draw `weight` made before fractional α existed.
+        assert!((0..200).all(|i| draw(3.0, 4.0, i) == sample_beta(3, 4, i)));
+        assert!((0..200).all(|i| draw(2.0, 2.5, i) == sample_beta(2, round_seeded(2.5, i ^ 0x5265_6772), i)));
+        // A fractional α rounds unbiased: Beta(1.5, 1) draws average between Beta(1, 1)'s and Beta(2, 1)'s.
+        let n = 20_000;
+        let mean = |a: f64| (0..n).map(|i| draw(a, 1.0, seed(&format!("s{i}"), "L"))).sum::<f64>() / n as f64;
+        let (lo, mid, hi) = (mean(1.0), mean(1.5), mean(2.0));
+        assert!((mid - (lo + hi) / 2.0).abs() < 0.01, "{lo} {mid} {hi}");
+        let m = Memory { verified: 2, ..derive(&[], &[lesson("L", 0)], None)["L"].clone() };
+        let half = Weights { verified: 0.5, ..WEIGHTS };
+        assert_eq!((m.alpha_with(&half), m.alpha(), m.beta_with(&half)), (2.0, 3.0, 1.0));
     }
 
     #[test]

@@ -24,6 +24,11 @@
 //! checkout of it, `git worktree add <dir> <commit>`); its accepted attempt is merged last
 //! next round. A missing snapshot or a git that cannot merge is `blocked`, for the engineer. Nothing is
 //! credited to lessons: an integration is no verdict on any one attempt.
+//!
+//! Cross-machine integration of commits is out of scope: the board syncs, the commits do not. A goal
+//! integrates on a node whose repo holds every accepted attempt's snapshots ([`absent`]); elsewhere
+//! nothing is opened, claimed or written, and the caller says which work is on which node. A snapshot
+//! missing on the node that made it is still `blocked`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -206,37 +211,75 @@ fn tail(text: &str, n: usize) -> String {
     text.chars().skip(count.saturating_sub(n)).collect()
 }
 
-/// Integrates goal `g` when it is due (board.rs `integration_due`) or an integrate task is open to a
-/// claim (its integrator died, an engineer opened or reopened one), as `drone` (session
-/// `integrate-<drone>-<ms>`), in `repo` (where the snapshots are): the claim, the merge, the oracle on
-/// the combined tree, the verdict. None when nothing is due or another runner won the claim.
+/// The accepted attempts of `g` whose snapshots `repo` lacks, work done on another node: (work task,
+/// its node, its head). Empty when every one is here (the git call runs only for another node's work).
+pub fn absent(home: &Path, g: &Goal, repo: &Path) -> Vec<(TaskId, String, String)> {
+    let events = board::read(&super::tasks_path(home, &g.id));
+    let b = board::fold(&events);
+    b.tasks
+        .values()
+        .filter(|s| s.task.role != Role::Integrate && s.accepted.is_some())
+        .filter_map(|s| verdict::accepted(&events, &b, &s.task.id))
+        .filter(|a| !super::is_local(home, &a.node) && !a.base.is_empty() && !a.head.is_empty())
+        .filter(|a| !verdict::present(repo, &[&a.base, &a.head], verdict::DIFF_TIMEOUT))
+        .map(|a| (a.work, a.node, a.head))
+        .collect()
+}
+
+/// Why `absent` work stops an integration here, for the engineer or the runner.
+pub fn absent_reason(absent: &[(TaskId, String, String)]) -> String {
+    let parts: Vec<String> = absent.iter().map(|(t, node, _)| format!("{t} from node {}", node.chars().take(8).collect::<String>())).collect();
+    format!("integration needs {}: integrate on a node that holds these commits (or fetch them)", parts.join(", "))
+}
+
+/// The integrate task an integration of `b` would take at `now`: one open to a claim while every work
+/// task is verified and the goal is not finished (its integrator died, an engineer opened or reopened
+/// one), else, when an integration is due (board.rs `integration_due`), a new one (`true`: to open).
+fn due(b: &Board, now: i64) -> Option<(TaskId, bool)> {
+    let works_verified = b.tasks.values().filter(|s| s.task.role != Role::Integrate).all(|s| matches!(s.status, Status::Verified { .. }));
+    let pending = b.tasks.values().find(|s| s.task.role == Role::Integrate && s.claimable(now)).map(|s| s.task.id.clone());
+    match pending {
+        Some(id) if works_verified && !b.finished() => Some((id, false)),
+        _ if board::integration_due(b) => Some((board::integrate_id(b), true)),
+        _ => None,
+    }
+}
+
+/// Why `g` cannot integrate in `repo` at `now` although an integration is due: an accepted attempt's
+/// commits are on another node only (`absent`). None when none is due or every commit is here.
+pub fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<String> {
+    due(&board::fold(&board::read(&super::tasks_path(home, &g.id))), now)?;
+    let a = absent(home, g, repo);
+    (!a.is_empty()).then(|| absent_reason(&a))
+}
+
+/// Integrates goal `g` when it is due (`due`), as `drone` (session `integrate-<drone>-<ms>`), in `repo`
+/// (where the snapshots are): the claim, the merge, the oracle on the combined tree, the verdict. None
+/// when nothing is due, another runner won the claim, or an accepted attempt's commits are on another
+/// node only (`elsewhere` says so; nothing is written).
 pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<Outcome> {
     let path = super::tasks_path(home, &g.id);
     let b = board::fold(&board::read(&path));
-    let works_verified = b.tasks.values().filter(|s| s.task.role != Role::Integrate).all(|s| matches!(s.status, Status::Verified { .. }));
-    let pending = b.tasks.values().find(|s| s.task.role == Role::Integrate && s.claimable(now)).map(|s| s.task.id.clone());
     let accepted = b.tasks.values().filter(|s| s.task.role != Role::Integrate && s.accepted.is_some()).count();
     let session = format!("integrate-{drone}-{now}");
+    let (id, new) = due(&b, now)?;
     let mut lines = Vec::new();
-    let id = match pending {
-        Some(id) if works_verified && !b.finished() => id,
-        _ if board::integration_due(&b) => {
-            let id = board::integrate_id(&b);
-            lines.push(Event::open(Task { title: format!("integrate {accepted} verified task(s)"), ..board_task(&id) }, &session, now));
-            id
-        }
-        _ => return None,
-    };
+    if new {
+        lines.push(Event::open(Task { title: format!("integrate {accepted} verified task(s)"), ..board_task(&id) }, &session, now));
+    }
+    if !absent(home, g, repo).is_empty() {
+        return None;
+    }
     // Two runners racing write the same open (the fold keeps the first) and a claim each: one wins.
     lines.extend([Event::new(Ev::Claim, &id, &session, now).with_drone(drone), Event::new(Ev::Heartbeat, &id, &session, now)]);
-    board::append(&path, &lines).ok()?;
+    super::write(home, &g.id, lines).ok()?;
     std::thread::sleep(super::CLAIM_SETTLE);
     let events = board::read(&path);
     let b = board::fold(&events);
     if b.tasks.get(&id).and_then(|s| s.live(now)).is_none_or(|(by, _, _)| by != session) {
         return None;
     }
-    let i = Integrator { home, g, path: &path, id: &id, session: &session };
+    let i = Integrator { home, g, id: &id, session: &session };
     Some(i.integrate(repo, &events, &b))
 }
 
@@ -244,7 +287,6 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
 struct Integrator<'a> {
     home: &'a Path,
     g: &'a Goal,
-    path: &'a Path,
     id: &'a str,
     session: &'a str,
 }
@@ -276,6 +318,13 @@ impl Integrator<'_> {
         let ids: Vec<&str> = works.iter().map(|w| w.task.id.as_str()).collect();
         let tasks: Vec<&Task> = works.iter().map(|w| &w.task).collect();
         let checks = checks_of(self.g, &tasks);
+        // Checks another node wrote run only once approved here; a fix task carrying them would approve
+        // them by being opened here (hive/mod.rs `write`).
+        let approvals = oracle::Approvals::load(self.home, &self.g.id);
+        let pending: Vec<&Check> = checks.iter().filter(|c| !approvals.allows(c)).collect();
+        if !pending.is_empty() {
+            return self.blocked(repo, &oracle::refusal(&self.g.id, &pending));
+        }
         if !m.conflicts.is_empty() {
             let parts: Vec<String> = m
                 .conflicts
@@ -291,8 +340,8 @@ impl Integrator<'_> {
         }
         let probe = Task { accept: checks.clone(), ..board_task(self.id) };
         // The checks run for minutes: the lease is renewed until they return.
-        let ran = super::renewing(self.path, self.id, self.session, super::HEARTBEAT, || {
-            hidden::with_checkout(&super::dir(self.home, &self.g.id).join(DIR), repo, &m.head, self.id, |wt| oracle::run(self.g, &probe, wt, None))
+        let ran = super::renewing(self.home, &self.g.id, self.id, self.session, super::HEARTBEAT, || {
+            hidden::with_checkout(&super::dir(self.home, &self.g.id).join(DIR), repo, &m.head, self.id, |wt| oracle::run(self.home, self.g, &probe, wt, None))
         });
         let v = match ran {
             Ok(v) => v,
@@ -304,7 +353,7 @@ impl Integrator<'_> {
                 let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
                 let note = format!("merged {}; {} pass", ids.join(", "), if names.is_empty() { "no checks".into() } else { names.join(", ") });
                 let e = Event { head: m.head.clone(), ..Event::new(Ev::Verified, self.id, self.session, ms).with_note(&note) };
-                if let Err(e) = board::append(self.path, &[e]) {
+                if let Err(e) = super::write(self.home, &self.g.id, vec![e]) {
                     return Outcome { task: self.id.into(), head: Some(m.head), verdict: Err(e.to_string()) };
                 }
                 self.count(repo, &note, true);
@@ -340,7 +389,7 @@ impl Integrator<'_> {
             ..board_task(&format!("{}.fix", self.id))
         };
         let e = Event { head: head.to_string(), ..Event::new(Ev::Rejected, self.id, self.session, ms).with_note(note) };
-        let why = match board::append(self.path, &[e, Event::open(fix, self.session, ms).with_note(note)]) {
+        let why = match super::write(self.home, &self.g.id, vec![e, Event::open(fix, self.session, ms).with_note(note)]) {
             Ok(()) => note.to_string(),
             Err(e) => e.to_string(),
         };
@@ -350,7 +399,7 @@ impl Integrator<'_> {
 
     /// `blocked` with `why`: what an engineer has to fix (a snapshot, git) before it is reopened.
     fn blocked(&self, repo: &Path, why: &str) -> Outcome {
-        let _ = board::append(self.path, &[Event::new(Ev::Blocked, self.id, self.session, learn::now_ms()).with_note(why)]);
+        let _ = super::write(self.home, &self.g.id, vec![Event::new(Ev::Blocked, self.id, self.session, learn::now_ms()).with_note(why)]);
         self.count(repo, why, false);
         Outcome { task: self.id.into(), head: None, verdict: Err(why.into()) }
     }
@@ -411,6 +460,36 @@ mod tests {
         (root, repo, home)
     }
 
+    /// `super::run` with every check of the goal and its board approved here, as the engineer's `borg
+    /// hive approve` does: these tests write the board raw, as another node's lines would arrive.
+    fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<Outcome> {
+        let b = board::fold(&board::read(&super::super::tasks_path(home, &g.id)));
+        let all: Vec<Check> = oracle::unapproved(home, g, &b).into_iter().map(|(_, c)| c.clone()).collect();
+        oracle::approve(home, &g.id, &all, 0).unwrap();
+        super::run(home, g, repo, drone, now)
+    }
+
+    /// A task's check another node wrote and nobody approved here: the integration is blocked before
+    /// any merge result is checked, nothing runs, and no fix task carries the check (it would be
+    /// approved by being opened here).
+    #[test]
+    fn an_unapproved_check_blocks_the_integration_and_never_runs() {
+        let (root, repo, home) = setup("unapproved");
+        let ran = root.join("ran");
+        let g = goal(&["unit=true"]);
+        oracle::approve(&home, "g", &g.oracle, 0).unwrap();
+        accepted(&home, work("t1", &["a.txt"], &[&format!("remote=touch {}", ran.display())]), &wt(&repo, 1), "s1", write("a.txt", "a\n"));
+        let o = super::run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        let b = fold(&home);
+        assert!(
+            matches!(&b.tasks["integrate.1"].status, Status::Blocked { note, .. } if note.contains("not approved") && note.contains("borg hive approve g")),
+            "{o:?}"
+        );
+        assert!(!ran.exists(), "nothing ran");
+        assert!(!b.tasks.values().any(|s| s.task.from.is_some()), "no fix task");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn wt(repo: &Path, n: usize) -> PathBuf {
         super::super::run::worktree(repo, "g", n)
     }
@@ -427,6 +506,7 @@ mod tests {
             created_ms: 0,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         }
     }
 

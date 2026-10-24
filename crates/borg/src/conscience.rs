@@ -76,7 +76,7 @@ pub struct Challenge {
     /// The usefulness belief behind `explore` (memory.rs `Memory::alpha`, `beta`): Beta(α, β), (1, 1)
     /// without outcomes. For the propensity of a slot (`propensity`).
     #[serde(skip, default = "uniform")]
-    pub belief: (u32, f64),
+    pub belief: (f64, f64),
     /// Mean trust of the lesson's authors in its area (trust.rs), 0.5 without evidence.
     #[serde(skip, default = "neutral")]
     pub trust: f64,
@@ -86,8 +86,8 @@ fn one() -> f64 {
     1.0
 }
 
-fn uniform() -> (u32, f64) {
-    (1, 1.0)
+fn uniform() -> (f64, f64) {
+    (1.0, 1.0)
 }
 
 fn neutral() -> f64 {
@@ -602,9 +602,8 @@ pub fn propensity(pool: &[(f64, &Challenge)], session: &str) -> std::collections
     }
     let draw = |c: &Challenge, i: usize| {
         let (a, b) = c.belief;
-        let seed = crate::memory::seed(&format!("{session}#p{i}"), &c.id);
-        let x = crate::memory::sample_beta(a, crate::memory::round_seeded(b, seed ^ 0x5265_6772), seed);
-        (0.5 + x) / (0.5 + a as f64 / (a as f64 + b))
+        let x = crate::memory::draw(a, b, crate::memory::seed(&format!("{session}#p{i}"), &c.id));
+        (0.5 + x) / (0.5 + a / (a + b))
     };
     let mut kept: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for i in 0..P_DRAWS {
@@ -615,6 +614,15 @@ pub fn propensity(pool: &[(f64, &Challenge)], session: &str) -> std::collections
         }
     }
     pool.iter().map(|(_, c)| (c.id.clone(), kept.get(c.id.as_str()).copied().unwrap_or(0) as f64 / P_DRAWS as f64)).collect()
+}
+
+/// A pooled lesson's score without its usefulness factor: s / (0.5 + mean belief) = relevance ×
+/// squash(A) × trust / NEUTRAL (`rank`, memory.rs `Memory::weight`). Under another belief the score is
+/// base × (0.5 + its mean), and `propensity` orders by base × (0.5 + draw), so `borg ope` (ope.rs) can
+/// replay a slot under other weights.
+pub fn pool_base(s: f64, c: &Challenge) -> f64 {
+    let (a, b) = c.belief;
+    s / (0.5 + a / (a + b))
 }
 
 /// At most this many lessons per early delivery (`early`).
@@ -1210,7 +1218,7 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
 
     #[test]
     fn a_pool_that_fits_has_propensity_one() {
-        let sc = |id: &str| Challenge { scope: vec!["Beacon".into()], belief: (1, 40.0), ..ch(id, "") };
+        let sc = |id: &str| Challenge { scope: vec!["Beacon".into()], belief: (1.0, 40.0), ..ch(id, "") };
         let ls: Vec<Challenge> = (0..7).map(|i| sc(&format!("s{i}"))).chain((0..3).map(|i| ch(&format!("g{i}"), ""))).collect();
         let pool: Vec<(f64, &Challenge)> = ls.iter().enumerate().map(|(i, c)| (10.0 - i as f64, c)).collect();
         let p = propensity(&pool, "s");
@@ -1234,10 +1242,10 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
 
     #[test]
     fn a_proven_lesson_outdraws_an_uncertain_one() {
-        let sc = |id: &str, belief: (u32, f64)| Challenge { scope: vec!["Beacon".into()], belief, ..ch(id, "") };
-        let mut ls: Vec<Challenge> = (0..10).map(|i| sc(&format!("a{i}"), (1, 1.0))).collect();
-        ls.push(sc("proven", (40, 2.0)));
-        ls.push(sc("harmful", (1, 40.0)));
+        let sc = |id: &str, belief: (f64, f64)| Challenge { scope: vec!["Beacon".into()], belief, ..ch(id, "") };
+        let mut ls: Vec<Challenge> = (0..10).map(|i| sc(&format!("a{i}"), (1.0, 1.0))).collect();
+        ls.push(sc("proven", (40.0, 2.0)));
+        ls.push(sc("harmful", (1.0, 40.0)));
         let pool: Vec<(f64, &Challenge)> = ls.iter().map(|c| (5.0, c)).collect();
         let p = propensity(&pool, "s");
         assert!(p["proven"] > p["harmful"], "{p:?}");
@@ -1245,7 +1253,8 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
 
     #[test]
     fn propensity_is_deterministic() {
-        let ls: Vec<Challenge> = (0..12).map(|i| Challenge { scope: vec!["Beacon".into()], belief: (1 + i, 2.5), ..ch(&format!("a{i}"), "") }).collect();
+        let ls: Vec<Challenge> =
+            (0..12).map(|i| Challenge { scope: vec!["Beacon".into()], belief: (1.0 + i as f64, 2.5), ..ch(&format!("a{i}"), "") }).collect();
         let pool: Vec<(f64, &Challenge)> = ls.iter().enumerate().map(|(i, c)| (5.0 + i as f64 / 10.0, c)).collect();
         assert_eq!(propensity(&pool, "s"), propensity(&pool, "s"));
         assert_ne!(propensity(&pool, "s"), propensity(&pool, "t"), "another session draws again");

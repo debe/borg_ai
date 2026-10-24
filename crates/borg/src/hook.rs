@@ -640,6 +640,7 @@ fn ask_live(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, fir
         let lessons: Vec<String> = firm.iter().map(|c| c.id.clone()).collect();
         let (grades, ranks, applied) = graded_of(session, &lessons);
         let p = propensity_of(session, &lessons);
+        let (pool, base, scoped) = pool_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
@@ -652,6 +653,9 @@ fn ask_live(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, fir
             ranks,
             applied,
             p,
+            pool,
+            base,
+            scoped,
             ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
@@ -837,7 +841,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
         // free at the next prompt or touch (conscience.rs `graded`).
         let (ask, free, learned, p) = crate::attention::graded(&applied, &learn::home());
         append(session, &graded_line(&applied));
-        append_p(session, applied.iter().zip(&p).filter(|((c, _), _)| ask.iter().any(|a| a.id == c.id)).map(|((c, _), p)| (c.id.as_str(), *p)));
+        append_p(session, applied.iter().zip(&p).filter(|((c, _), _)| ask.iter().any(|a| a.id == c.id)).map(|((c, _), p)| (c.id.as_str(), *p)), None);
         if learning() && !applied.is_empty() {
             let graded = outcome::Outcome {
                 kind: outcome::GRADED.into(),
@@ -1262,24 +1266,94 @@ fn graded_line(applied: &[(&conscience::Challenge, u8)]) -> String {
     format!("#borg-graded n={} {}", applied.len(), items.join(","))
 }
 
-/// `#borg-p <id>=<p>,…`: the propensity (outcome.rs `p`) of each lesson a check chose to ask, so every
-/// entry is above 0 and the latest entry per id is the check that asked it; the `asked` outcome carries
-/// them (`propensity_of`). Nothing when no lesson was chosen.
-fn append_p<'a>(session: &str, chosen: impl IntoIterator<Item = (&'a str, f64)>) {
+/// `#borg-p <id>=<p>,…[ @<check>]`: the propensity (outcome.rs `p`) of each lesson a check chose to ask,
+/// so every entry is above 0 and the latest entry per id is the check that asked it; the `asked`
+/// outcome carries them (`propensity_of`). `check` names the pool line the draw was over (`append_p_of`);
+/// none for a graded or learned-cut check. Nothing when no lesson was chosen.
+fn append_p<'a>(session: &str, chosen: impl IntoIterator<Item = (&'a str, f64)>, check: Option<&str>) {
     let items: Vec<String> = chosen.into_iter().map(|(id, p)| format!("{id}={}", outcome::round_p(p))).collect();
     if !items.is_empty() {
-        append(session, &format!("#borg-p {}", items.join(",")));
+        let tag = check.map_or_else(String::new, |c| format!(" @{c}"));
+        append(session, &format!("#borg-p {}{tag}", items.join(",")));
     }
 }
 
 /// `append_p` for lessons `budget`/`widen` asked from `pool`: their chance of a slot under the
-/// session's posterior (conscience.rs `propensity`).
+/// session's posterior (conscience.rs `propensity`). Then the pool itself, `#borg-pool
+/// <id>=<base>[:s],… @<check>` in ranking order (`:s` a scoped lesson, base conscience.rs `pool_base`,
+/// unrounded), so the `asked` record can carry it (`pool_of`) and `borg ope` can replay the draw. Both
+/// lines carry the same `check` (a hash of the pool line and its p line), which ties the p of an asked
+/// lesson to the pool its draw was over.
 fn append_p_of(session: &str, pool: &[(f64, &conscience::Challenge)], asked: &[&conscience::Challenge]) {
     if asked.is_empty() {
         return;
     }
     let p = conscience::propensity(pool, session);
-    append_p(session, asked.iter().filter_map(|c| p.get(&c.id).map(|p| (c.id.as_str(), *p))));
+    let chosen: Vec<(&str, f64)> = asked.iter().filter_map(|c| p.get(&c.id).map(|p| (c.id.as_str(), *p))).collect();
+    let items: Vec<String> =
+        pool.iter().map(|(s, c)| format!("{}={}{}", c.id, conscience::pool_base(*s, c), if c.scope.is_empty() { "" } else { ":s" })).collect();
+    let items = items.join(",");
+    let mut h = blake3::Hasher::new();
+    h.update(items.as_bytes());
+    for (id, p) in &chosen {
+        h.update(format!("\0{id}={}", outcome::round_p(*p)).as_bytes());
+    }
+    let check = h.finalize().to_hex()[..12].to_string();
+    append_p(session, chosen, Some(&check));
+    append(session, &format!("#borg-pool {items} @{check}"));
+}
+
+/// Splits `line` into its items and its ` @<check>` tag (None without one).
+fn tagged(line: &str) -> (&str, Option<&str>) {
+    match line.rsplit_once(" @") {
+        Some((items, check)) if !check.is_empty() && check.bytes().all(|b| b.is_ascii_hexdigit()) => (items, Some(check)),
+        _ => (line, None),
+    }
+}
+
+/// The pool behind `ids` (`append_p_of`): the `#borg-pool` line of the check that wrote the latest
+/// `#borg-p` entry of every one of them, as (ids, bases, scoped); empty when their latest entries come
+/// from different checks, from a check without a pool, or from a line before checks were tagged (never
+/// a guess: the p of one draw is never paired with another draw's pool).
+fn pool_of(session: &str, ids: &[String]) -> (Vec<String>, Vec<f64>, Vec<bool>) {
+    pool_in(&std::fs::read_to_string(state_file(session)).unwrap_or_default(), ids)
+}
+
+fn pool_in(state: &str, ids: &[String]) -> (Vec<String>, Vec<f64>, Vec<bool>) {
+    let parse = |line: &str| -> Option<(Vec<String>, Vec<f64>, Vec<bool>)> {
+        let mut out = (Vec::new(), Vec::new(), Vec::new());
+        for item in line.split(',') {
+            let (id, rest) = item.rsplit_once('=')?;
+            let (base, scoped) = match rest.strip_suffix(":s") {
+                Some(b) => (b, true),
+                None => (rest, false),
+            };
+            out.0.push(id.trim().to_string());
+            out.1.push(base.trim().parse::<f64>().ok()?);
+            out.2.push(scoped);
+        }
+        Some(out)
+    };
+    // The check of each id's latest p entry.
+    let mut check: std::collections::HashMap<&str, Option<&str>> = std::collections::HashMap::new();
+    for line in state.lines().filter_map(|l| l.strip_prefix("#borg-p ")) {
+        let (items, tag) = tagged(line);
+        for (id, _) in items.split(',').filter_map(|it| it.rsplit_once('=')) {
+            check.insert(id.trim(), tag);
+        }
+    }
+    let Some(Some(tag)) = ids.first().and_then(|i| check.get(i.as_str())).copied() else { return Default::default() };
+    if !ids.iter().all(|i| check.get(i.as_str()).copied().flatten() == Some(tag)) {
+        return Default::default();
+    }
+    state
+        .lines()
+        .rev()
+        .filter_map(|l| l.strip_prefix("#borg-pool "))
+        .map(tagged)
+        .filter(|(_, t)| *t == Some(tag))
+        .find_map(|(items, _)| parse(items).filter(|(pool, _, _)| ids.iter().all(|i| pool.contains(i))))
+        .unwrap_or_default()
 }
 
 /// For each of `ids`, its propensity in the session's latest `#borg-p` entry for it; empty when any of
@@ -1291,7 +1365,7 @@ fn propensity_of(session: &str, ids: &[String]) -> Vec<f64> {
 fn propensity_in(state: &str, ids: &[String]) -> Vec<f64> {
     let mut seen: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
     for line in state.lines().filter_map(|l| l.strip_prefix("#borg-p ")) {
-        for (id, p) in line.split(',').filter_map(|it| it.rsplit_once('=')) {
+        for (id, p) in tagged(line).0.split(',').filter_map(|it| it.rsplit_once('=')) {
             if let Ok(p) = p.trim().parse::<f64>() {
                 seen.insert(id.trim(), p);
             }
@@ -1344,6 +1418,7 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
         let lessons: Vec<String> = selected.iter().map(|c| c.id.clone()).collect();
         let (grades, ranks, applied) = graded_of(session, &lessons);
         let p = propensity_of(session, &lessons);
+        let (pool, base, scoped) = pool_of(session, &lessons);
         let asked = outcome::Outcome {
             kind: outcome::ASKED.into(),
             session: session.into(),
@@ -1356,6 +1431,9 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
             ranks,
             applied,
             p,
+            pool,
+            base,
+            scoped,
             ..Default::default()
         };
         let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
@@ -1460,5 +1538,43 @@ mod tests {
         assert_eq!(propensity_in(state, &ids(&["C"])), [0.1]);
         assert!(propensity_in(state, &ids(&["A", "D"])).is_empty(), "D unknown: no guess");
         assert!(propensity_in("", &ids(&["A"])).is_empty());
+    }
+
+    #[test]
+    fn pool_of_takes_the_pool_of_the_check_that_logged_each_p() {
+        let state = "#borg-p A=0.6,B=0.4 @c1\n#borg-pool A=1.5:s,B=0.25,C=2 @c1\n#borg-asked A,B\n#borg-p B=0.5 @c2\n#borg-pool B=0.5,D=0.125:s @c2\n";
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(pool_in(state, &ids(&["B"])), (ids(&["B", "D"]), vec![0.5, 0.125], vec![false, true]), "B's latest p is check 2's");
+        assert_eq!(pool_in(state, &ids(&["A"])), (ids(&["A", "B", "C"]), vec![1.5, 0.25, 2.0], vec![true, false, false]));
+        assert_eq!(pool_in(state, &ids(&["A", "B"])), Default::default(), "A's p from check 1, B's from check 2: no pairing");
+        assert_eq!(pool_in("", &ids(&["A"])), Default::default());
+        assert_eq!(pool_in(state, &[]), Default::default());
+        // A graded check's p has no pool: a later pool that happens to hold the lesson is not its.
+        let graded = "#borg-p A=1\n#borg-p B=0.5 @c3\n#borg-pool A=1,B=1 @c3\n";
+        assert_eq!(pool_in(graded, &ids(&["A"])), Default::default());
+        assert_eq!(pool_in(graded, &ids(&["B"])).0, ids(&["A", "B"]));
+        // A state file from before checks were tagged: no pool.
+        assert_eq!(pool_in("#borg-p A=1\n#borg-pool A=1,B=2\n", &ids(&["A"])), Default::default());
+    }
+
+    /// Track R's merged ask: a live check drew A and B from one pool, a stop check drew A again from
+    /// another; the stop merges the waiting B into its ask of A. Their p come from two draws, so the
+    /// record carries no pool (counted as no_pool by `borg ope`), never one draw's pool with both p.
+    #[test]
+    fn a_merged_ask_of_two_draws_carries_no_pool() {
+        let session = format!("pool-merge-{}", std::process::id());
+        let _ = std::fs::remove_file(state_file(&session));
+        let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
+        let (a, b, cc, d, e, f) = (c("A"), c("B"), c("C"), c("D"), c("E"), c("F"));
+        let live: Vec<(f64, &conscience::Challenge)> = vec![(1.0, &a), (0.9, &b), (0.8, &cc), (0.7, &d)];
+        append_p_of(&session, &live, &[&a, &b]);
+        let stop: Vec<(f64, &conscience::Challenge)> = vec![(1.0, &a), (0.9, &e), (0.8, &f)];
+        append_p_of(&session, &stop, &[&a]);
+        let merged = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(propensity_of(&session, &merged).len(), 2, "each id has its latest p");
+        assert_eq!(pool_of(&session, &merged), Default::default());
+        assert_eq!(pool_of(&session, &["A".to_string()]).0, ["A", "E", "F"], "A alone: the stop check's pool");
+        assert_eq!(pool_of(&session, &["B".to_string()]).0, ["A", "B", "C", "D"], "B alone: the live check's");
+        let _ = std::fs::remove_file(state_file(&session));
     }
 }

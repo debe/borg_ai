@@ -163,13 +163,14 @@ pub struct Scored {
 /// `rejected`). A judged attempt is a verify task's valid `verified`, or its `rejected` that was not
 /// hacked (a hacked verdict credited at once) and whose work has both snapshots and started from its
 /// deps' verified work (one without was final at once, verdict.rs `decide`). An attempt whose checkout fails gets no score and no credit:
-/// an infrastructure failure is not the work's. One scoring at a time per goal (a lock on
-/// oracle.jsonl), so two never score one attempt. Nothing without a hidden oracle.
+/// an infrastructure failure is not the work's. One scoring at a time per goal (a lock of its own,
+/// `oracle.scoring.lock`: each append to oracle.jsonl takes that file's lock, hive/mod.rs
+/// `append_bytes`), so two never score one attempt. Nothing without a hidden oracle.
 pub fn score_pending(home: &Path, g: &Goal, repo: &Path, limit: usize, now: i64) -> Scored {
     if g.hidden.is_none() {
         return Scored::default();
     }
-    crate::live::locked(&scores_path(home, &g.id), || score_locked(home, g, repo, limit, now))
+    crate::live::locked(&scores_path(home, &g.id).with_extension("scoring"), || score_locked(home, g, repo, limit, now))
 }
 
 fn score_locked(home: &Path, g: &Goal, repo: &Path, limit: usize, now: i64) -> Scored {

@@ -101,22 +101,29 @@ pub fn admitted(set: BTreeMap<Hash, String>, origins: &HashMap<Hash, Origin>, m:
 /// how many moved.
 pub fn quarantine(home: &Path, log: &Path, m: &Membership) -> Result<usize, String> {
     let origins = load(home);
-    let text = std::fs::read_to_string(log).unwrap_or_default();
     let refused = |l: &str| origins.get(&lines::hash(l)).is_some_and(|o| !m.admits(&o.key, o.ms));
-    let (out, keep): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| refused(l));
-    if out.is_empty() {
-        return Ok(0);
+    // Read to rename under the log's lock, which its writers take for each append (borg live.rs
+    // `locked`: the hive's `append_bytes`, the lessons' learn): a line appended meanwhile is never lost.
+    let moved = borg::live::locked(log, || -> Result<usize, String> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let (out, keep): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| refused(l));
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let q = identity::dir(home).join("quarantine.jsonl");
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&q).map_err(|e| format!("{}: {e}", q.display()))?;
+        f.write_all(out.iter().map(|l| format!("{l}\n")).collect::<String>().as_bytes()).map_err(|e| e.to_string())?;
+        let tmp = log.with_extension("jsonl.quarantine-tmp");
+        std::fs::write(&tmp, keep.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, log).map_err(|e| format!("{}: {e}", log.display()))?;
+        Ok(out.len())
+    })?;
+    if moved > 0 {
+        // A removed line may have been the winning version of a lesson: make the winner among the
+        // remaining lines the last one again, or the conscience would ask an older version.
+        lines::settle(log)?;
     }
-    let q = identity::dir(home).join("quarantine.jsonl");
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&q).map_err(|e| format!("{}: {e}", q.display()))?;
-    f.write_all(out.iter().map(|l| format!("{l}\n")).collect::<String>().as_bytes()).map_err(|e| e.to_string())?;
-    let tmp = log.with_extension("jsonl.quarantine-tmp");
-    std::fs::write(&tmp, keep.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, log).map_err(|e| format!("{}: {e}", log.display()))?;
-    // A removed line may have been the winning version of a lesson: make the winner among the
-    // remaining lines the last one again, or the conscience would ask an older version.
-    lines::settle(log)?;
-    Ok(out.len())
+    Ok(moved)
 }
 
 /// `<store>/mesh/quarantined-at`: which membership (`fingerprint`) the logs were last checked against.
@@ -236,6 +243,55 @@ mod tests {
         assert_eq!(apply(&home, &m).unwrap(), 1);
         assert_eq!(asked(), vec!["three".to_string()], "the highest remaining version, not the last line");
         assert_eq!(apply_if_new(&home, &m).unwrap(), 0, "checked against this membership already");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A quarantine rewrites a hive log while drones append to it: both take the log's lock, so the
+    /// rewrite waits for a writer and a writer for the rewrite, and the line appended is kept.
+    #[test]
+    fn quarantine_and_hive_appends_share_the_log_lock() {
+        let home = std::env::temp_dir().join(format!("borg-mesh-origin-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let (admin, carol) = (Identity::load_or_create(&home).unwrap(), Identity::load_or_create(&home.join("carol")).unwrap());
+        let mut m = Membership::found("work", &admin);
+        m.invite(&admin, &carol.public(), "member").unwrap();
+        let log = home.join("hive/g1/tasks.jsonl");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let bad = r#"{"v":1,"ev":"claim","task":"t1","ms":2,"by":"carol"}"#;
+        std::fs::write(&log, format!("{bad}\n")).unwrap();
+        append(&home, &[Origin::new(&carol, &lines::hash(bad), 50)]).unwrap();
+        m.revoke(&admin, &carol.public(), 10).unwrap();
+        let wait = std::time::Duration::from_millis(300);
+        // A writer holds the lock: the quarantine waits for it.
+        let moved = borg::live::locked(&log, || {
+            let (h, l, m) = (home.clone(), log.clone(), m.clone());
+            let t = std::thread::spawn(move || quarantine(&h, &l, &m).unwrap());
+            std::thread::sleep(wait);
+            assert!(!t.is_finished(), "the rewrite waits for the writer");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .unwrap()
+                .write_all(b"{\"v\":1,\"ev\":\"progress\",\"task\":\"t1\",\"ms\":3,\"by\":\"s\"}\n")
+                .unwrap();
+            t
+        })
+        .join()
+        .unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(), [r#"{"v":1,"ev":"progress","task":"t1","ms":3,"by":"s"}"#]);
+        // The hive's appends take the same lock.
+        borg::live::locked(&log, || {
+            let l = log.clone();
+            let t = std::thread::spawn(move || borg::hive::board::append(&l, &[borg::hive::Event::new(borg::hive::Ev::Progress, "t1", "s", 4)]).unwrap());
+            std::thread::sleep(wait);
+            assert!(!t.is_finished(), "an append waits for a rewrite in progress");
+            t
+        })
+        .join()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 

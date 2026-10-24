@@ -39,9 +39,35 @@ pub const REASONING: &str = "reasoning.jsonl";
 
 pub type Hash = [u8; 32];
 
-/// The logs whose lines carry origins (lessons and reasoning), in `home`.
+/// The logs whose lines carry origins, in `home`: the synced ones, every hive goal's (`hive_logs`) and
+/// reasoning. Stamping (origin.rs `stamp`), quarantine (`origin::apply`) and the daemon's change
+/// fingerprint all cover what this lists. A quarantine rewrites a file: a hive session's board cursor
+/// past the new end reads from 0 (borg hive/board.rs `read_from`), so it may be shown changes again once.
 pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
-    SYNCED.iter().chain([&REASONING]).map(|f| home.join(f)).collect()
+    let mut out: Vec<std::path::PathBuf> = SYNCED.iter().map(|f| home.join(f)).collect();
+    out.extend(hive_logs(home));
+    out.push(home.join(REASONING));
+    out
+}
+
+/// The hive's synced logs in `home` (borg hive/mod.rs `SYNCED`: goal projection, board, contracts,
+/// messages, guard flags): each existing one of every goal directory whose name is a valid goal id
+/// (`goal::valid_id`), never a goal's local files (goal.json, oracle.jsonl, joins, spend, runs).
+pub fn hive_logs(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut ids: Vec<String> = std::fs::read_dir(home.join("hive"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|id| borg::hive::goal::valid_id(id))
+        .collect();
+    ids.sort();
+    ids.iter().flat_map(|id| hive_files(home, id)).filter(|p| p.is_file()).collect()
+}
+
+/// Where goal `id`'s synced logs live in `home`, in `SYNCED` order (existing or not).
+pub fn hive_files(home: &Path, id: &str) -> Vec<std::path::PathBuf> {
+    borg::hive::SYNCED.iter().map(|f| borg::hive::dir(home, id).join(f)).collect()
 }
 
 pub fn hash(line: &str) -> Hash {
@@ -127,6 +153,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn hive_logs_list_each_goals_synced_files_and_skip_invalid_ids() {
+        let d = tmp("hive-logs");
+        for (dir, files) in [
+            ("g1", &["goal.json", "goal.jsonl", "tasks.jsonl", "oracle.jsonl", "joins.jsonl", "flags.jsonl"][..]),
+            ("A", &["tasks.jsonl"][..]),
+            ("g2", &["messages.jsonl"][..]),
+        ] {
+            std::fs::create_dir_all(d.join("hive").join(dir)).unwrap();
+            for f in files {
+                std::fs::write(d.join("hive").join(dir).join(f), "{}\n").unwrap();
+            }
+        }
+        // A directory named like a path escape never lists (it cannot be created under hive/ anyway).
+        std::fs::create_dir_all(d.join("hive/..x")).unwrap();
+        std::fs::write(d.join("hive/..x/tasks.jsonl"), "{}\n").unwrap();
+        let got: Vec<String> = hive_logs(&d).iter().map(|p| p.strip_prefix(&d).unwrap().display().to_string()).collect();
+        assert_eq!(got, ["hive/g1/goal.jsonl", "hive/g1/tasks.jsonl", "hive/g1/flags.jsonl", "hive/g2/messages.jsonl"]);
+        let all = logs(&d);
+        assert!(all.iter().any(|p| p.ends_with("hive/g1/tasks.jsonl")) && all.last().unwrap().ends_with(REASONING));
+        assert!(!all.iter().any(|p| p.ends_with("oracle.jsonl") || p.ends_with("joins.jsonl") || p.ends_with("goal.json")));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

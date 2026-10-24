@@ -6,7 +6,8 @@
 //! are classed ([`class_of`]): `test`, `ci` or `oracle`; the paths it only reads count when they are
 //! the oracle's (the hidden checks, oracle.jsonl, the scratch checkouts). Each flag is one line of
 //! `<goal>/flags.jsonl`, once per (session, claim, class, path) (`.ctx` marker `#borg-hive-flag`: each
-//! claim's verdict sees its own flags), and the
+//! claim's verdict sees its own flags; a hidden oracle's path is recorded as [`HIDDEN_PATH`], since the
+//! file syncs), and the
 //! verify task its done opens lists them for the verifier. A session in no hive goal costs one failed
 //! file open; nothing is read or created.
 //!
@@ -523,6 +524,17 @@ pub fn flags_for(tool: &str, input: &Value, cwd: &Path, guard: &[PathBuf], oracl
     out
 }
 
+/// What flags.jsonl names for a hidden oracle's file: its path would tell every node the held-out
+/// tests' directory and names, which goal.rs `projection` keeps on the runner.
+pub const HIDDEN_PATH: &str = "<hidden oracle>";
+
+/// `path` as a flag of `class` records it in flags.jsonl, which syncs: an oracle flag under goal `g`'s
+/// hidden directory as [`HIDDEN_PATH`], anything else as it is (the `.ctx` marker keeps the path).
+pub fn synced_path(g: &Goal, class: Class, path: &str) -> String {
+    let hidden = g.hidden.as_ref().is_some_and(|h| lexical(Path::new(path)).starts_with(lexical(Path::new(&h.dir))));
+    if class == Class::Oracle && hidden { HIDDEN_PATH.into() } else { path.into() }
+}
+
 /// The hook's pre_tool step: flags what this tool call does to tests, CI or the oracle's files. Never
 /// a decision. A session in no hive goal returns after one failed file open.
 pub fn pre_tool(home: &Path, input: &Value, now: i64) {
@@ -559,7 +571,7 @@ pub fn pre_tool(home: &Path, input: &Value, now: i64) {
             drone: hs.drone.clone(),
             task: held.map(|s| s.task.id.clone()).unwrap_or_default(),
             class,
-            path: path.clone(),
+            path: synced_path(&g, class, &path),
             tool: tool.into(),
             scoped: globs.iter().any(|g| g.is_match(&path)),
         };
@@ -639,6 +651,7 @@ mod tests {
             created_ms: 0,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         };
         let goal_json = super::super::goal_path(home, "g");
         assert!(!guarded(home, &g).contains(&goal_json), "without a hidden oracle goal.json names nothing held out");
@@ -664,6 +677,32 @@ mod tests {
         assert_eq!(w, ["src/a.rs", "tests/b.py"], "an omp patch of several files");
         let (w, r) = paths("Grep", &json!({"pattern": "fn", "path": "/held/out"}));
         assert!(w.is_empty() && r == ["/held/out"]);
+    }
+
+    /// flags.jsonl syncs to every node: a hidden oracle's path is recorded as a marker, never the
+    /// held-out directory and test names; other paths, and a goal without a hidden oracle, as they are.
+    #[test]
+    fn a_hidden_oracles_path_never_reaches_the_synced_flags() {
+        let mut g = Goal {
+            v: 1,
+            id: "g".into(),
+            spec: String::new(),
+            oracle: vec![],
+            budget_usd: 0.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: Some(goal::Hidden { dir: "/held/out".into(), commands: vec!["true".into()], timeout_s: 30 }),
+            held_out: false,
+        };
+        assert_eq!(synced_path(&g, Class::Oracle, "/held/out/tests/test_edge_case_42.py"), HIDDEN_PATH);
+        assert_eq!(synced_path(&g, Class::Oracle, "/held/out/../out/x.py"), HIDDEN_PATH, "lexically under it");
+        assert_eq!(synced_path(&g, Class::Oracle, "/s/hive/g/oracle.jsonl"), "/s/hive/g/oracle.jsonl");
+        assert_eq!(synced_path(&g, Class::Test, "tests/a.py"), "tests/a.py");
+        assert_eq!(synced_path(&g, Class::Oracle, "/held/outside.py"), "/held/outside.py", "a sibling is not inside");
+        g.hidden = None;
+        assert_eq!(synced_path(&g, Class::Oracle, "/held/out/t.py"), "/held/out/t.py");
     }
 
     #[test]

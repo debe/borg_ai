@@ -69,15 +69,20 @@ Anthropic's source-control team found what we see too: engineers mostly add judg
 
 ## Primitives
 
-Each is a log of lines under `<store>/hive/<goal>/`, synced like `lessons.jsonl` (union, signed `Origin`, revoked keys quarantined).
+Each is a log of lines under `<store>/hive/<goal>/`, synced like `lessons.jsonl` (union, signed `Origin`, revoked keys quarantined): `goal.jsonl`, `tasks.jsonl`, `contracts.jsonl`, `messages.jsonl` and `flags.jsonl` (built in step 4, `borg/mesh/7`). The hidden oracle, its scores, joins, spend, runs and logs stay on their node.
 
 ### Goal
 
-`goal.json`, signed by an admin, holds:
+`goal.json` holds:
 - the spec
 - the oracle command(s)
 - the dollar budget
 - the repos in scope, and the node expected to hold each repo
+
+It syncs as its projection, one compact line in `goal.jsonl`: the hidden oracle stripped, `held_out: true` saying one exists (a verdict elsewhere then waits for the runner node's score). A node without `goal.json` loads the goal from that log (the lowest `(created_ms, line hash)` line naming the id). `sig` stays empty: every line is signed by the member that first stamped it, the trusted-member model. Whether only an admin's goal should sync is open.
+
+- **One definition per id.** Two nodes can `init` one id before a sync round, and a member can append a line naming a goal it did not make. When `goal.jsonl` (with this node's `goal.json`) holds two different projections of one id, every node refuses the goal, the one holding `goal.json` too (`goal::conflict`), and `borg hive board`, `borg top` and the Hive tab say why. It stays stopped until one definition is left: make the goal again under another id, or revoke the member whose line it was.
+- **Checks run only where approved.** An oracle check is a shell command, and the board and `goal.jsonl` sync from every member. A node runs its own `goal.json` oracle and the checks of tasks it opened (`hive::write` records them in the local `approved.jsonl`); any other check (a synced goal's oracle, a remote task's `accept`) waits for the engineer's `borg hive approve <goal>`, which prints each one it approves. Until then its task is not offered or claimable there, an integration that needs it is blocked, and the board and the Hive tab list the commands waiting.
 
 The goal's plan (its task list) goes through the queen, and the human approves it before workers start.
 
@@ -86,8 +91,9 @@ The goal's plan (its task list) goes through the queen, and the human approves i
 `tasks.jsonl` records events: `open`, `claim`, `heartbeat`, `progress`, `done`, `verified`, `rejected`, `released`, `blocked`.
 
 - **Task fields:** id, role tag (`plan`, `work`, `verify`, `integrate`), the repo and files in scope, its dependencies, and acceptance criteria phrased as oracle checks.
-- **Claims are leases.** Presence heartbeats renew them, and a claim expires when its drone goes idle.
-- **Claim races:** when two claims arrive for the same task, the lowest `(ms, blake3(key))` wins. Every node computes the same winner without coordinating, and the losing drone learns on its next hook call and releases the task.
+- **Claims are leases.** Heartbeat lines on the board renew them, and a claim expires when its drone goes idle. Heartbeats sync with the board, so a lease held on node B is renewed on node A too; nothing else (presence, live channel) is needed.
+- **Nodes** (step 4): every line a node writes carries its node id (`hive::write`; empty in older lines, which count as this node's). A runner releases only its own node's claims. Drone names (`d1`..) repeat on every node, so a verify task is barred to the author's session everywhere and to the author's drone name only on the work's node.
+- **Claim races:** when two claims arrive for the same task, the lowest `(ms, blake3(key))` wins. Every node computes the same winner without coordinating, and the losing drone learns on its next hook call and releases the task. Across machines a claim is provisional until the next sync round: the loser's done and verify-task open are ignored by the fold, so a loser wastes at most one sync latency, and the clocks of the nodes must stay well within a lease.
 - **Verification:** a `verify` task is created for every `done`, and the drone that did the work can't claim it. A `rejected` reopens the work task with the verifier's note attached.
 - **Dependencies carry their work** (built). A task can be claimed only once each of its deps is verified. Each drone works in its own worktree, so the claim also brings the deps' work in:
   - Before the claim's `base` is taken, each transitive dep's accepted attempt (its claim's `base` to its done's `head`) is applied to the claimant's working tree, in the order the deps were verified. `git apply` runs at the toplevel and leaves the index, HEAD and refs alone. A change that is already there (the dep's author claims the dependent in its own tree) is skipped.
@@ -111,11 +117,12 @@ The goal's plan (its task list) goes through the queen, and the human approves i
 
 ### Messages between drones
 
-Extend `steer` with `ask` and `tell`, which any member can send, not only admin and steer roles.
+`borg hive ask` and `tell` append to the goal's `messages.jsonl` (`hive/message.rs`, built in step 4), a hive log synced like the board, not a mesh steer kind: steer is ephemeral (a TTL), gated to the admin and steer roles (letting `member` send would widen who can pause), and addresses nodes or sessions, not tasks or drones. A hive log gets signed origins, quarantine, offline catch-up and per-goal scope for free, and works on one machine with no mesh.
 
-- Messages are rate-limited per drone and per task, against the status-noise failure Anthropic saw.
-- Delivery reuses the `steer/seen` exclusive-create claim so each message is shown once.
-- `pause` and `resume` stay limited to admin and steer.
+- A message goes to everyone, a task (its holder), a drone (that name on the sender's node) or a session; `tell --re` answers one.
+- Rate-limited per sender (drone, else session) and recipient: one per `HEARTBEAT_MS`, against the status-noise failure Anthropic saw.
+- Shown once per session at a prompt (a `#borg-hive-msg` marker, like contracts), never to its sender, only while it is fresh (a lease).
+- `pause` and `resume` stay steer's, limited to admin and steer.
 
 ### Roles
 
@@ -223,7 +230,8 @@ Each workload is labelled by its structure and drawn from company repos.
    - **The probe before it** (D3 solved 2/5 on W2) found the bugs fixed for this run: idle drones quit while work was in flight; the combined tree was never integrated, so stray work of a drone that had lost its claim was merged; required test additions were flagged as hacked; dependent work started without its dependency; a snapshot missed a same-size edit made within the index's own second; a refused claim read as the drone's own.
    - **Not measured:** superiority over one session with subagents (B). The workloads were too easy to tell the arms apart, so H1–H4b have no data.
    - **Not exercised on a real repo:** the fix-task loop after a failing integration. The sim and CLI tests cover it.
-4. **Decide.** The gate is acceptance, not H1: a hive feature ships once it works without serious bugs on real repos. On one machine that held (step 3), so the next step is to add the hive lines to mesh sync, `ask`/`tell` to mesh steer, and arm E across machines, gated by the same acceptance run across machines. Whether the hive beats B stays open until a workload hard enough to tell them apart exists.
+4. **Decide.** The gate is acceptance, not H1: a hive feature ships once it works without serious bugs on real repos. On one machine that held (step 3), so the next step is to add the hive lines to mesh sync, `ask`/`tell` between drones, and arm E across machines, gated by the same acceptance run across machines. Whether the hive beats B stays open until a workload hard enough to tell them apart exists.
+   *Built (preparation for arm E):* the hive's logs sync over the mesh (`borg/mesh/7`): `goal.jsonl` (the goal's projection, `hive::publish`, without the hidden oracle), `tasks.jsonl`, `contracts.jsonl`, `messages.jsonl` and `flags.jsonl` of every goal (borg-mesh lines.rs `hive_logs`, a `Goals` swap of path-checked ids), signed, quarantined on revocation and covered by the daemon's change fingerprint, so a claim or heartbeat travels within a round. Every line names its node; runners release only their node's claims; drone names bar only on their node. Verdict lines carry the kind they credit, and the author's node credits a verdict given elsewhere at its next round, once (`verdict::credit_synced`); verdicts join `SHARED_KINDS` with `c`, bound to the local board's verdict (hive-learning.md step 2). `borg hive ask|tell` (Messages above). A verify or fix task whose commits this repo lacks is not offered, and an integration runs only on a node holding every accepted attempt, else writes nothing and says which work is where. `borg top` and the Hive tab name a holder's node and list messages. Also fixed: a runner drone's fresh session was offered the verify task barred to its drone (the hive-accept-1 build barred by session and the board's session→drone map only, so a session with no board line passed the pre-claim check and its claim was voided by the fold); the drone now comes from the runner's `BORG_HIVE_DRONE` when the membership names none, and `borg hive claim` without `--session` resolves the drone's own session. Proof, 0 tokens: two loopback nodes in one process with drones run as the real `borg` binary (crates/borg-mesh/tests/hive_mesh.rs): a task opened on A is claimed on both nodes before a sync, one claim wins on both, the work is done on B and verified on A by another node's `d1`, both boards fold identically, no task has two holders at once, the lesson shown during the claim is credited once on B and counted once in both nodes' memory, a message reaches the verifier once, and a further round moves only digests. *Not measured:* arm E and the acceptance run across real machines (a paid run with its own cost estimate). *Known limits:* claims are provisional until a round; the winner rule compares clocks (skew must stay well within a lease), and a member that backdates a claim line wins its race whenever it arrives, voiding a holder's finished tenure (bounding a line's `ms` by its origin stamp would refuse honest lines of a node that was offline; deferred, revocation quarantines it); board lines carry raw session ids, so a team outcome line's unsalted session tag (outcome.rs `tag`) links it to a hive session, its task and node: hive sessions are visible to the team (a per-node salted alias on board lines is deferred); commits do not travel (both test nodes share one object store); a goal with a hidden oracle credits a remote author's attempt not yet; the trusted-member model (any member's goal syncs, `sig` stays empty; a member can forge a board verdict and its team line, though a team verdict counts only under the attempt author's session tag, for lessons the team's records show it was given, and with a hidden oracle only from the work's node; credits already made from a verdict a revocation later quarantines stay); every goal ever made syncs (about five fingerprints per goal per round; compaction deferred); a quarantine rewrites a board, so a session may be shown changes again once.
 
 ### Tests
 
@@ -232,11 +240,12 @@ Each workload is labelled by its structure and drawn from company repos.
 - Matching contracts to scope.
 - The stop hook blocks while the oracle fails.
 - A `sim` harness run with 3 simulated drones on one board: `borg hive run` finishes it, no task has two holders at once, every verdict comes from another drone, and the spend stays within the shares (crates/borg/tests/hive_run_cli.rs).
+- Across machines (step 4): two loopback mesh nodes with drones as the real `borg` binary (crates/borg-mesh/tests/hive_mesh.rs); the fold of remote lines in every arrival order, a drone name barred only on its node, and a runner that never releases another node's claim (board.rs, run.rs); a revoked member's board line quarantined and goal ids path-checked (borg-mesh sync.rs), a quarantine and the hive's appends sharing the log's lock (borg-mesh origin.rs); two definitions of one goal stopping it on every node (goal.rs), a check another node wrote running only once approved (oracle.rs), a forged message line dropped (message.rs), a forged claim and done naming this node credited nothing and a board a quarantine rewrote read again (verdict.rs), a hidden oracle's path never in the synced flags (guard.rs); a verify task or an integration whose commits are absent refused cleanly, ask/tell once to the holder, and a fresh runner session not offered its drone's verify task (crates/borg/tests/hive_cli.rs).
 - Integration and dependencies (crates/borg/tests/hive_run_cli.rs): a conflicting integration opens a fix task and the hive still finishes; a dependent task starts from its dependency's verified work; idle drones wait for work in flight; a drone that grows an existing test is not hacked; a killed run is charged and released by the next.
 - The reward (crates/borg/tests/hive_verdict_cli.rs): `pre_tool` flags a test edit only for a drone in a goal and answers nothing; a verdict on a diff that weakened a test is `hacked` and credits the lessons shown during the claim once, one on work that only adds tests verifies; the author's session cannot give the verdict; a pass at the stop (`VERDICT: pass`) verifies and credits; with a hidden oracle the score decides the credit, once; no hook of a drone outside every goal creates a hive.
 
 ## Open questions
 
 - **Budget enforcement:** each drone could stop itself when it reaches its share, or a runner could kill it. Probably both. *H2: both; a harness that cannot stop itself overshoots by at most one session.*
-- **Merges:** on one machine the integrator merges the accepted attempts (built, and exercised on real repos). Across machines each drone owns its repo, so no two drones edit the same repo; integration then needs every attempt's commits on the integrating node, which the mesh lines do not carry yet.
+- **Merges:** on one machine the integrator merges the accepted attempts (built, and exercised on real repos). Across machines each drone owns its repo, so no two drones edit the same repo; integration then needs every attempt's commits on the integrating node, which the mesh lines do not carry (step 4: such a node integrates nothing and says which work is where).
 - **Secrecy:** contracts and task text sync to every member. Do they need the same redaction applied to presence prompts?

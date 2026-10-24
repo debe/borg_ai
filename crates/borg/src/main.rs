@@ -49,6 +49,8 @@
 //!        borg hive join <goal> --here [--drone NAME] | leave --here
 //!                                                     (every new session in this repo or worktree joins the goal)
 //!        borg trust [--dir DIR]                      (trust per engineer x area in the collective DIR routes to; trust.rs)
+//!        borg ope [--dir DIR | --file FILE] [--json]  (off-policy estimates of the belief's hand-set weights from
+//!                                                      logged asks with their propensity; never changes them; ope.rs)
 //!        borg top [--dir DIR] [--watch] [--json]      (the drones of each collective, local and remote; top.rs)
 //!        borg steer <drone|session|all> "<text>" | --pause | --resume [--dir DIR]
 //!                                                     (signed steering of a running drone; runs borg-mesh; steer.rs)
@@ -209,6 +211,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Debugging and evaluation",
         &[
             ("memory <lessons.jsonl> [--session ID]", "each lesson's activation and usefulness"),
+            ("ope [--dir DIR | --file FILE] [--json]", "off-policy estimates of the belief's hand-set weights"),
             ("recall <lessons.jsonl> [before_ms]", "rank lessons for text on stdin"),
             ("prefilter <state> [before_ms]", "the free gate's score for a turn on stdin"),
             ("facets [--apply] [--store FILE] [--jobs N]", "search facets for lessons"),
@@ -420,6 +423,7 @@ fn main() {
             std::process::exit(borg::review_fix::main(rest, &learn::ask_claude))
         }
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
+        ["ope", rest @ ..] => std::process::exit(borg::ope::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
         ["hive", rest @ ..] => std::process::exit(borg::hive::main(rest)),

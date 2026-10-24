@@ -1,17 +1,20 @@
 //! The hive as `borg top` and borg-web show it: per goal, the board's tasks (status, holder, lease
 //! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
-//! combined tree's commit, or why the last one failed), and the newest contracts. One fold of the board and one pass over each of spend.jsonl, runs.jsonl and
-//! contracts.jsonl per goal; nothing at all for a store without a hive.
+//! combined tree's commit, or why the last one failed), the newest contracts and messages between
+//! drones, and which holders are on other nodes (the board syncs over the mesh). One fold of the board
+//! and one pass over each of spend.jsonl, runs.jsonl, contracts.jsonl and messages.jsonl per goal;
+//! nothing at all for a store without a hive.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::message::{self, Message};
 use super::run::{RunLine, Spend};
 use super::{Contract, LEASE_MS, Role, Status, board, contract, goal};
 
-/// Contracts a view carries (the newest).
+/// Contracts a view carries (the newest), and as many messages.
 const CONTRACTS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -27,6 +30,8 @@ pub struct TaskRow {
     pub lease_left_ms: i64,
     pub files: Vec<String>,
     pub rework: u32,
+    /// The holder's node: empty on this node, else its first 8 characters.
+    pub node: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -51,6 +56,10 @@ pub struct HiveView {
     /// Live claims.
     pub claims: usize,
     pub contracts: Vec<Contract>,
+    /// The newest messages between drones (`borg hive ask|tell`), newest last.
+    pub messages: Vec<Message>,
+    /// Distinct other nodes whose lines are on the board.
+    pub nodes: usize,
     pub drones: Vec<DroneSpend>,
     /// Tasks by status.
     pub counts: BTreeMap<String, usize>,
@@ -58,6 +67,20 @@ pub struct HiveView {
     /// The integration: `integrated <commit>` once the combined tree passed, else the newest
     /// integration's failure (`integrate.N rejected: …`, `… blocked: …`); empty before any.
     pub integration: String,
+    /// What stops the goal on this node: conflicting definitions (goal.rs `conflict`), checks other
+    /// nodes wrote waiting for `borg hive approve` (oracle.rs `Approvals`).
+    pub alerts: Vec<String>,
+}
+
+/// What stops goal `g` (board `b`) on this node, as the board and borg-web say it.
+pub fn alerts(home: &Path, g: &goal::Goal, b: &board::Board) -> Vec<String> {
+    let mut out: Vec<String> = goal::conflict(home, &g.id).into_iter().collect();
+    let pending = super::oracle::unapproved(home, g, b);
+    if !pending.is_empty() {
+        let what: Vec<String> = pending.iter().map(|(at, c)| format!("{at} {}: {}", c.name, c.cmd)).collect();
+        out.push(format!("checks from another node wait for `borg hive approve {}`: {}", g.id, what.join("; ")));
+    }
+    out
 }
 
 /// The goals of the store `home`, sorted; empty without a hive (one failed read_dir).
@@ -65,10 +88,14 @@ pub fn goals(home: &Path) -> Vec<String> {
     goal::list(home)
 }
 
-/// Goal `id`'s view at `now`; None when it has no readable goal.json.
+/// Goal `id`'s view at `now`; None when it has no readable goal (made here or synced). A conflicting
+/// goal is shown with its `alerts`.
 pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
-    let g = goal::load(home, id).ok()?;
-    let b = board::fold(&board::read(&super::tasks_path(home, id)));
+    let g = goal::read(home, id).ok()?;
+    let events = board::read(&super::tasks_path(home, id));
+    let b = board::fold(&events);
+    let here = super::node(home);
+    let shown = |node: &str| if super::is_local(home, node) { String::new() } else { node.chars().take(8).collect() };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let tasks: Vec<TaskRow> = b
         .tasks
@@ -81,6 +108,11 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
                 Status::Done { by, .. } | Status::Verified { by, .. } | Status::Blocked { by, .. } => (by.clone(), 0),
                 Status::Open => (String::new(), 0),
             };
+            // The holder's node: its claim's, or the tenure it ended (a done, a verdict, a block).
+            let node = match &s.status {
+                Status::Claimed { node, .. } => node.clone(),
+                _ => b.spans.iter().rev().find(|x| x.task == s.task.id && x.by == holder).map(|x| x.node.clone()).unwrap_or_default(),
+            };
             TaskRow {
                 id: s.task.id.clone(),
                 role: s.task.role.name().into(),
@@ -90,6 +122,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
                 lease_left_ms,
                 files: s.task.files.clone(),
                 rework: s.rework,
+                node: shown(&node),
             }
         })
         .collect();
@@ -128,6 +161,11 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     };
     let all = contract::read(&super::contracts_path(home, id));
     let contracts = all[all.len().saturating_sub(CONTRACTS)..].to_vec();
+    let mut msgs = message::read(&super::messages_path(home, id));
+    msgs.sort_by_key(|m| (m.ms, m.id.clone()));
+    let messages = msgs[msgs.len().saturating_sub(CONTRACTS)..].to_vec();
+    let nodes = events.iter().map(|e| e.node.as_str()).filter(|n| !n.is_empty() && *n != here).collect::<std::collections::BTreeSet<_>>().len();
+    let alerts = alerts(home, &g, &b);
     Some(HiveView {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
@@ -136,10 +174,13 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         tasks,
         claims,
         contracts,
+        messages,
+        nodes,
         drones,
         counts,
         finished: b.finished(),
         integration,
+        alerts,
     })
 }
 
@@ -164,27 +205,25 @@ fn lease(ms: i64) -> String {
 pub fn render(v: &HiveView) -> String {
     let counts: Vec<String> = v.counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
     let mut s = format!(
-        "hive {}: ${:.2} of ${:.2} · {} task(s) ({}) · {} contract(s){}\n",
+        "hive {}: ${:.2} of ${:.2} · {} task(s) ({}) · {} contract(s){}{}{}\n",
         v.goal,
         v.spent_usd,
         v.budget_usd,
         v.tasks.len(),
         counts.join(", "),
         v.contracts.len(),
+        if v.messages.is_empty() { String::new() } else { format!(" · {} message(s)", v.messages.len()) },
+        if v.nodes == 0 { String::new() } else { format!(" · {} other node(s)", v.nodes) },
         if v.finished { " · finished" } else { "" }
     );
+    for a in &v.alerts {
+        s.push_str(&format!("  ! {}\n", cut(a, 240)));
+    }
     if !v.tasks.is_empty() {
         s.push_str(&format!("  {:<10} {:<9} {:<9} {:<10} {:>5}  {}\n", "TASK", "ROLE", "STATUS", "HOLDER", "LEASE", "FILES"));
         for t in &v.tasks {
-            let line = format!(
-                "  {:<10} {:<9} {:<9} {:<10} {:>5}  {}",
-                cut(&t.id, 10),
-                t.role,
-                t.status,
-                cut(&t.holder, 8),
-                lease(t.lease_left_ms),
-                t.files.join(", ")
-            );
+            let holder = if t.node.is_empty() { cut(&t.holder, 8) } else { format!("{}@{}", cut(&t.holder, 8), t.node.chars().take(4).collect::<String>()) };
+            let line = format!("  {:<10} {:<9} {:<9} {:<10} {:>5}  {}", cut(&t.id, 10), t.role, t.status, holder, lease(t.lease_left_ms), t.files.join(", "));
             s.push_str(line.trim_end());
             s.push('\n');
         }
@@ -209,7 +248,8 @@ pub fn files(home: &Path) -> Vec<PathBuf> {
         .iter()
         .flat_map(|g| {
             let d = super::dir(home, g);
-            ["goal.json", "tasks.jsonl", "contracts.jsonl", "spend.jsonl", "joins.jsonl", "runs.jsonl"].map(|f| d.join(f))
+            ["goal.json", "goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "spend.jsonl", "joins.jsonl", "runs.jsonl", "approved.jsonl"]
+                .map(|f| d.join(f))
         })
         .collect()
 }
@@ -237,6 +277,7 @@ mod tests {
             created_ms: 1,
             sig: String::new(),
             hidden: None,
+            held_out: false,
         };
         goal::create(home, &g).unwrap();
         let t = |id: &str, f: &str| Task {
@@ -284,12 +325,62 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
         );
         assert_eq!(render(&v), expected, "\n{}", render(&v));
         let j = serde_json::to_value(&v).unwrap();
-        for k in ["goal", "budget_usd", "spent_usd", "tasks", "claims", "contracts", "drones", "counts", "finished"] {
+        for k in ["goal", "budget_usd", "spent_usd", "tasks", "claims", "contracts", "messages", "nodes", "drones", "counts", "finished"] {
             assert!(j.get(k).is_some(), "{k}");
         }
         assert_eq!(j["tasks"][0]["holder"], "sess-one-1234");
+        assert_eq!((j["tasks"][0]["node"].as_str(), j["nodes"].as_u64()), (Some(""), Some(0)), "every line is this node's");
         assert_eq!(j["drones"][1]["unmetered"], true);
-        assert_eq!(files(&home).len(), 6);
+        assert_eq!(files(&home).len(), 9);
+        assert!(v.alerts.is_empty(), "{:?}", v.alerts);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// What stops a goal on this node shows in `borg top`, the board and borg-web: a check another node
+    /// wrote, waiting for approval, and two definitions of the goal (still shown, not hidden).
+    #[test]
+    fn a_goal_shows_what_stops_it_here() {
+        let home = temp("alerts");
+        seed(&home);
+        let remote = Task {
+            id: "t9".into(),
+            role: Role::Work,
+            title: "do t9".into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![goal::Check::parse("fetch=curl https://example.invalid/x", 60).unwrap()],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+        };
+        board::append(&super::super::tasks_path(&home, "g"), &[Event { node: "remote".into(), ..Event::open(remote, "engineer:peer", 5) }]).unwrap();
+        let v = of(&home, "g", 61_000).unwrap();
+        assert_eq!(v.alerts.len(), 1, "{:?}", v.alerts);
+        assert!(v.alerts[0].contains("borg hive approve g") && v.alerts[0].contains("t9 fetch: curl https://example.invalid/x"), "{:?}", v.alerts);
+        assert!(render(&v).contains("  ! checks from another node wait for `borg hive approve g`"), "{}", render(&v));
+        let other = goal::projection(&Goal { spec: "another".into(), created_ms: 0, ..goal::load(&home, "g").unwrap() });
+        std::fs::write(super::super::goal_jsonl_path(&home, "g"), format!("{other}\n")).unwrap();
+        let v = of(&home, "g", 61_000).expect("a conflicting goal is still shown");
+        assert!(v.alerts[0].contains("2 conflicting definitions"), "{:?}", v.alerts);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_holder_on_another_node_and_messages_show() {
+        let home = temp("remote");
+        seed(&home);
+        let path = super::super::tasks_path(&home, "g");
+        board::append(&path, &[Event { node: "remote-abcdef12".into(), ..Event::new(Ev::Claim, "t2", "sess-two-5678", 2_000) }]).unwrap();
+        let m = message::Message::new(message::ASK, "sess-two-5678", "d1", "remote-abcdef12", "t2", "t1", None, 3_000, "which format?");
+        super::super::append_line(&super::super::messages_path(&home, "g"), &m).unwrap();
+        let v = of(&home, "g", 61_000).unwrap();
+        let t2 = v.tasks.iter().find(|t| t.id == "t2").unwrap();
+        assert_eq!((t2.node.as_str(), v.nodes, v.messages.len()), ("remote-a", 1, 1));
+        assert_eq!(v.tasks.iter().find(|t| t.id == "t1").unwrap().node, "", "a local holder names no node");
+        let text = render(&v);
+        assert!(text.contains("sess-tw…@remo") && text.contains("1 message(s) · 1 other node(s)"), "{text}");
         let _ = std::fs::remove_dir_all(home);
     }
 

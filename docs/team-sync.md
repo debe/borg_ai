@@ -132,9 +132,15 @@ were captured, so each is learned exactly once. Outcome lines say which lesson w
 (including a veto, and a later regret's share of the blame), when, and the probability it was asked,
 with the session, repo and regret hashed, so every member derives the same lesson usefulness. They are signed and
 quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
-(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Peers on `borg/mesh/5` and earlier do not
-sync with this version: upgrade every member. Reasoning excerpts go to two peers chosen by hash, so
-the "why" survives its author going offline.
+(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Hive goals travel too (without their
+hidden checks), with their boards, contracts, messages between drones and guard flags, signed and
+quarantined the same way, so drones on several machines work one board; the commits they make do not
+travel, and a hive verdict counts on a peer only for an attempt its own synced board judged
+([commands: Across machines](commands.md#across-machines)). A goal's or task's checks written on
+another machine never run on yours until you approve them (`borg hive approve <goal>`). The hive across machines is built and
+proven on two loopback nodes, not measured across real machines yet. Peers on `borg/mesh/6` and earlier
+do not sync with this version: upgrade every member. Reasoning excerpts go to two peers chosen by hash,
+so the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key
 and drops lines it stamped after the revocation; earlier contributions stay. Steering directives are
