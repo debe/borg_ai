@@ -479,10 +479,20 @@ pub fn node(home: &Path) -> String {
     {
         return id.trim().to_string();
     }
+    // Created whole and only once: the id is written to a file of its own, then hard-linked into
+    // place, which fails when another process got there first; its id wins. A plain write could hand
+    // two first callers two ids, and a reader an empty file between its truncate and write.
     let id = fresh_id();
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(home));
-    let _ = std::fs::write(&path, &id);
-    id
+    let tmp = path.with_extension(format!("{id}.tmp"));
+    let linked = std::fs::write(&tmp, &id).and_then(|()| std::fs::hard_link(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::read_to_string(&path).map(|s| s.trim().to_string()).ok().filter(|s| !s.is_empty()).unwrap_or(id)
+        }
+        _ => id,
+    }
 }
 
 fn fresh_id() -> String {
@@ -615,6 +625,23 @@ pub fn current(home: &Path) -> Vec<Bucket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_first_calls_agree_on_one_node() {
+        // Board lines are stamped with the node and only this node's claims are released after a
+        // killed run: a runner and a drone's hook creating the id at once must not get two.
+        for round in 0..20 {
+            let home = std::env::temp_dir().join(format!("borg-stats-node-{}-{round}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            let ids: Vec<String> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..16).map(|_| s.spawn(|| node(&home))).collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(ids.iter().all(|id| *id == ids[0] && id.len() == 16), "{ids:?}");
+            assert_eq!(node(&home), ids[0]);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-stats-{tag}-{}", std::process::id()));
