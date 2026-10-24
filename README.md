@@ -410,6 +410,17 @@ nothing. Whether such lessons change behaviour more than lessons from single att
 paid run. `borg top` and the Hive tab show each group's winners, losers, the integrated attempt and
 the reflection. [Groups](https://github.com/debe/borg_ai/blob/main/docs/commands.md#groups-of-attempts).
 
+**Reworks (built, preparation: no value metric yet).** When the verifier rejects a hive task's attempt
+and a later attempt of the same task is verified (not hacked; with a hidden oracle, the held-out tests
+decide), the pair is one lesson source: the task, the verifier's why, the rejected change and what the
+rework changed relative to it. `borg learn` (at any session's end) asks the model once what mistake the
+verifier caught and writes it as a lesson that prevents it next time (source `rework`, provenance
+`rework-<goal>.<task>`), once per task, on the node whose verdict verified it (with a hidden oracle, on
+the goal's node, which holds the held-out scores). A task verified at its
+first attempt, a hacked or unchecked rejection, and a rejection the hidden oracle passed write nothing.
+`BORG_REWORK_REFLECT=off` turns it off for an eval arm. `borg top` and the Hive tab show each reworked
+task and its reflection. [Reworks](https://github.com/debe/borg_ai/blob/main/docs/commands.md#reworks).
+
 **Playbooks (built, preparation: no value metric yet).** A playbook is the team's short list of steps for
 a kind of task ("fix the parser", "add a migration with backfill"), learned from verified hive work.
 After an attempt wins (verified and not hacked, or passed by the hidden oracle; of a group, the

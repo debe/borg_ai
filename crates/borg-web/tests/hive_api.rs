@@ -114,6 +114,7 @@ async fn a_group_of_attempts_shows_with_its_reflection() {
     seed(&corp, now);
     let (_, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
     assert_eq!(v["goals"][0]["groups"], serde_json::json!([]), "no group, no rows");
+    assert_eq!(v["goals"][0]["reworks"], serde_json::json!([]), "no rework, no rows");
     let member = |n: usize| Task {
         id: hive::group::member_id("t3", n),
         role: Role::Work,

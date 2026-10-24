@@ -806,6 +806,11 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
     // R1: the same call judges what the drone did with lessons asked earlier this session.
     let pend = if w.judge { pending(session, w.state, w.all, w.message, live) } else { Vec::new() };
+    // Nothing to ask and nothing to judge (no lesson in the pool, none pending): no model call. A live
+    // check has no free gate, so without this every change of a session with no lessons paid for one.
+    if shortlist.is_empty() && pend.is_empty() {
+        return Verdict::Skip("empty".into());
+    }
     let extra = predict::judge_section(&pend).len();
     let graded = crate::whole::graded();
     let timeout = live::call_limit(w.budget, w.started.elapsed());

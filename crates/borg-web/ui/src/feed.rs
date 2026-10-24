@@ -20,6 +20,8 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
             "review" => "Borg learned a new lesson from a review finding".into(),
             "regret" => "Borg learned a new lesson from a later fix".into(),
             "veto" => "Borg learned a new lesson from a veto".into(),
+            "group" => "Borg learned a new lesson from a group of hive attempts".into(),
+            "rework" => "Borg learned a new lesson from a hive task the verifier rejected, then passed".into(),
             _ => "Borg learned a new lesson from a correction".into(),
         },
         "lesson_merged" => "A new correction sharpened a lesson".into(),

@@ -410,6 +410,50 @@ fn a_group_of_three_drones_integrates_the_winner_and_reflection_learns_what_it_d
 }
 
 #[test]
+fn a_rejected_attempt_and_its_verified_rework_become_one_lesson_once() {
+    // The first verdict rejects; the rework names its check and is verified.
+    let root = setup("rework", 1, "2", json!({"usd_per_iter": 0.10, "reject_first": true}));
+    let (out, err, code) = run(&root, &["--drones", "2", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let b = fold(&root);
+    assert!(b.finished() && b.tasks["t1"].rework == 1, "{out}");
+    assert_eq!(b.tasks["t1"].accepted.as_deref(), Some("t1.v2"));
+    let dir = work(&root).display().to_string();
+    let top = String::from_utf8_lossy(&command(&root, &["top", "--dir", &dir], &[]).output().unwrap().stdout).into_owned();
+    assert!(top.contains("rework t1: rejected 1 time(s), then verified · ") && top.contains("· to reflect"), "{top}");
+
+    std::fs::write(
+        root.join("answer.json"),
+        json!({"structured_output": {"is_lesson": true, "question": "Does the change say which check passed it?", "situations": ["finishing work a verifier reviews"],
+            "consequence": "the verifier rejects it", "same_as": "", "area": "verification", "supersedes": [], "reach": "team"}, "total_cost_usd": 0})
+        .to_string(),
+    )
+    .unwrap();
+    let rework_prompts = || -> Vec<String> {
+        std::fs::read_dir(root.join("prompts"))
+            .map(|d| d.flatten().map(|e| std::fs::read_to_string(e.path()).unwrap()).filter(|p| p.starts_with(borg::hive::rework::HEAD)).collect())
+            .unwrap_or_default()
+    };
+    let (out, err, code) = learn(&root, &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let asked = rework_prompts();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let p = &asked[0];
+    assert!(p.contains("## The rejection\nrework g/t1: rejected 1 time(s)") && p.contains("the file does not say which check passed it"), "{p}");
+    assert!(p.contains("What it changed relative to the rejected attempt (excerpt):") && p.contains("+checked by: ok"), "{p}");
+    let lessons: Vec<Value> = std::fs::read_to_string(store(&root).join("lessons.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let learned: Vec<&Value> = lessons.iter().filter(|l| l["episodes"] == json!(["rework-g.t1"])).collect();
+    assert_eq!(learned.len(), 1, "{lessons:?}");
+    assert_eq!(learned[0]["id"], "Lrework-g.t1");
+    // Once per task: the next run asks nothing again.
+    let (_, _, code) = learn(&root, &[]);
+    assert_eq!((code, rework_prompts().len()), (0, 1));
+    let top = String::from_utf8_lossy(&command(&root, &["top", "--dir", &dir], &[]).output().unwrap().stdout).into_owned();
+    assert!(top.contains("· lesson Lrework-g.t1"), "{top}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_group_of_one_is_a_plain_task_and_reflects_nothing() {
     let root = setup("group-one", 0, "1", json!({"usd_per_iter": 0.10}));
     let opened =

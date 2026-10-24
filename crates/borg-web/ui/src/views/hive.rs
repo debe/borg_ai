@@ -1,6 +1,6 @@
 //! Hive: the collective's hive goals (`borg hive`): each goal's board by status (a holder on another
 //! node named with it), what stops it here (conflicting definitions, checks awaiting `borg hive
-//! approve`), its integration, its groups of attempts (winners, losers, the one integrated, what
+//! approve`), its integration, its reworks, its groups of attempts (winners, losers, the one integrated, what
 //! reflection learned), what each drone of `borg hive run` spent of its share, and the newest contracts
 //! and messages between drones. Above them, the collective's L1 playbooks: their steps, the belief of
 //! each version drones were shown, and the edits waiting for an engineer (a playbook's first included).
@@ -75,6 +75,20 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                             <td>{if r.won.is_empty() { "-".to_string() } else { r.won.join(", ") }}</td>
                             <td>{if r.lost.is_empty() { "-".to_string() } else { r.lost.join(", ") }}</td>
                             <td>{r.integrates.clone()}</td>
+                            <td>{r.reflection.clone()}</td>
+                        </tr>
+                    }).collect_view()}
+                </table>
+            })}
+            {(!g.reworks.is_empty()).then(|| view! {
+                <h3>"Reworks"</h3>
+                <table class="mono">
+                    <tr><th>"task"</th><th>"rejected"</th><th>"drones"</th><th>"reflection"</th></tr>
+                    {g.reworks.iter().map(|r| view! {
+                        <tr title="rejected by the verifier, then verified: a lesson source">
+                            <td>{r.task.clone()}</td>
+                            <td>{format!("{}×", r.rejections)}</td>
+                            <td>{r.drones.join(" → ")}</td>
                             <td>{r.reflection.clone()}</td>
                         </tr>
                     }).collect_view()}

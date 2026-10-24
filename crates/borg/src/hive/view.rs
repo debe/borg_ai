@@ -2,7 +2,8 @@
 //! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
 //! combined tree's commit, or why the last one failed), the newest contracts and messages between
 //! drones, which holders are on other nodes (the board syncs over the mesh), and each group of attempts
-//! (hive/group.rs) with its winners, losers and reflection. One fold of the board
+//! (hive/group.rs) with its winners, losers and reflection, and each task verified after a rejection
+//! (hive/rework.rs) with its reflection. One fold of the board
 //! and one pass over each of spend.jsonl, runs.jsonl, contracts.jsonl and messages.jsonl per goal;
 //! nothing at all for a store without a hive.
 
@@ -73,6 +74,8 @@ pub struct HiveView {
     pub alerts: Vec<String>,
     /// Its groups (hive/group.rs): attempts, winners and losers, the member integrated, the reflection.
     pub groups: Vec<super::group::Row>,
+    /// Its tasks verified after a rejection (hive/rework.rs): rejections, drones, the reflection.
+    pub reworks: Vec<super::rework::Row>,
 }
 
 /// What stops goal `g` (board `b`) on this node, as the board and borg-web say it.
@@ -170,6 +173,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let nodes = events.iter().map(|e| e.node.as_str()).filter(|n| !n.is_empty() && *n != here).collect::<std::collections::BTreeSet<_>>().len();
     let alerts = alerts(home, &g, &b);
     let groups = super::group::rows(home, &g, &events, &b);
+    let reworks = super::rework::rows(home, &g, &events, &b);
     Some(HiveView {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
@@ -186,6 +190,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         integration,
         alerts,
         groups,
+        reworks,
     })
 }
 
@@ -248,6 +253,11 @@ pub fn render(v: &HiveView) -> String {
             gr.decided_by,
             gr.reflection
         );
+        s.push_str(&cut(&line, 200));
+        s.push('\n');
+    }
+    for r in &v.reworks {
+        let line = format!("  rework {}: rejected {} time(s), then verified · {} · {}", r.task, r.rejections, r.drones.join(" → "), r.reflection);
         s.push_str(&cut(&line, 200));
         s.push('\n');
     }

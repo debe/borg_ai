@@ -305,6 +305,33 @@ Known limits: a task cannot depend on a group, nor on one of its members (`hive 
 a member: only the best one is integrated); and a rejected member is reworked like any task, not
 dropped once another member won.
 
+### Reworks
+
+A work task whose attempt the verifier rejected and whose later attempt was verified is the hive's own
+lesson source: the verifier caught a mistake and the rework fixed it. Every `borg learn`, the one at
+each session's end included, first records each such task as one episode, `rework-<goal>.<task>`: the
+task, every rejection's note (the verifier's why), each rejected attempt's account and change, what the
+accepted rework changed relative to the last rejected attempt (redacted and cut), and the drones. It
+then asks the model once, with its own prompt, what mistake the first attempt made that the verifier
+caught, and writes it as a lesson that prevents it (source `rework`), or merges it into a lesson that
+says it already. Once per task, on one node: for a goal with a hidden oracle the node that holds it
+(the goal's own node, the only one with the held-out scores), else the one the verifying verdict was
+written on.
+
+What counts: the accepted attempt is the board's, verified and not hacked; with a hidden oracle its
+held-out score must pass, and the episode waits until the goal's node has scored it (`borg hive score`);
+another node, which never sees the scores, shows the task as `waiting`. A
+rejection counts when the verifier rejected the work on its merits: a hacked verdict (a guardrail), an
+unchecked one (no snapshot, a dependency's work missing) and one the held-out tests pass (the verifier
+was wrong) do not. Several rejections before the pass make one episode with all their notes. A task
+verified at its first attempt writes nothing. A fix task after a failed integration counts like any
+work task: its own rejection and verified rework. A group's member counts too (its group's reflection
+compares drones; a rework compares one task's attempts over time).
+
+`BORG_REWORK_REFLECT=off` stops it (an eval arm without it); `BORG_LEARN=off` stops it too. `borg top`
+and the Hive tab show each reworked task: how often it was rejected, the drones, and its reflection
+(`waiting` for a hidden score, `to reflect`, `learning`, `lesson <id>`, `not a lesson`).
+
 ### Playbooks
 
 ```console

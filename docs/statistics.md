@@ -102,7 +102,9 @@ questions led to per channel; the Cost page shows check cost by mode per day.
 
 The session state file (`<store>/state/<session>.ctx`) marks live mode too: `#borg-asked <ids>`
 followed by `#borg-live <ids> ms=<epoch ms>` when a live check's lessons were delivered, and
-`#borg-live-skip <score>` when a live check's free gate skipped the model. A live check's model call is
+`#borg-live-skip <score>` when a live check's free gate skipped the model, or `#borg-live-skip empty`
+when it had no lesson to ask and none to judge (a check with nothing in its pool, live or at the turn
+end, makes no model call; the turn end logs `#borg-skip empty`). A live check's model call is
 logged as `#borg-predict-cost`, like a turn end's, and as `live usd=… lessons=…` in the `.cost` file,
 so `borg status` counts it apart.
 

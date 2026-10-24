@@ -481,6 +481,19 @@ pub struct HiveGoal {
     pub alerts: Vec<String>,
     /// Its groups of attempts (borg hive/group.rs `Row`).
     pub groups: Vec<HiveGroup>,
+    /// Its tasks verified after a rejection (borg hive/rework.rs `Row`).
+    pub reworks: Vec<HiveRework>,
+}
+
+/// A task the verifier rejected and a later attempt passed, and what reflection made of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveRework {
+    pub task: String,
+    pub rejections: f64,
+    /// The rejected drones, then the accepted one's.
+    pub drones: Vec<String>,
+    /// `lesson <id>`, `not a lesson`, `learning`, `to reflect` or `waiting`.
+    pub reflection: String,
 }
 
 /// One group of K attempts at a task by different drones, and what reflection made of it.
@@ -564,6 +577,12 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                     integrates: s(&r["integrates"]),
                     reflection: s(&r["reflection"]),
                 })
+                .collect(),
+            reworks: g["reworks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| HiveRework { task: s(&r["task"]), rejections: f(&r["rejections"]), drones: strs(&r["drones"]), reflection: s(&r["reflection"]) })
                 .collect(),
         })
         .collect()

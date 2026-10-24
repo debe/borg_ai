@@ -43,6 +43,7 @@ pub mod hidden;
 pub mod integrate;
 pub mod message;
 pub mod oracle;
+pub mod rework;
 pub mod run;
 mod sim_drone;
 pub mod verdict;

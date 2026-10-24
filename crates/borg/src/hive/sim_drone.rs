@@ -11,6 +11,8 @@
 //! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
 //! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
 //! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait);
+//! `reject_first` (top level): the goal's first verdict is a reject whoever gives it, and a reworked task's
+//! file then also names its check (a rework, for hive/rework.rs);
 //! `own_session`: it ignores the runner's session id and names none at its end (omp and opencode keep
 //! their own); `crash`: once it holds a claim it exits 1 printing nothing (a harness that died after
 //! spending, without its cost). A fix
@@ -38,7 +40,13 @@ struct Script {
     usd_per_iter: f64,
     #[serde(default)]
     drones: BTreeMap<String, Plan>,
+    /// The goal's first verdict, whichever drone gives it, is a reject (`REJECT_NOTE`): a rework.
+    #[serde(default)]
+    reject_first: bool,
 }
+
+/// The note of the scripted first reject.
+const REJECT_NOTE: &str = "the file does not say which check passed it";
 
 fn default_usd() -> f64 {
     0.10
@@ -170,7 +178,12 @@ pub fn main(here: &Here) -> i32 {
         if task.role == Role::Verify {
             let author = task.of.as_ref().and_then(|w| b.tasks.get(w)).and_then(|w| w.author.clone());
             let dir = worktree_of(&here.home, author.as_deref(), &here.cwd);
+            let rejected_once = hook::state_file(&format!("sim-{}", g.id)).with_extension("rejected");
             match oracle::run(&here.home, &g, task, &dir, Some(Duration::from_secs(60))) {
+                oracle::Verdict::Pass if script.reject_first && !rejected_once.exists() => {
+                    let _ = std::fs::write(&rejected_once, "");
+                    d.hive(&["verify", "--reject", REJECT_NOTE])
+                }
                 oracle::Verdict::Pass => d.hive(&["verify", "--pass"]),
                 _ => d.hive(&["verify", "--reject", "its oracle fails in the author's worktree"]),
             };
@@ -195,7 +208,9 @@ pub fn main(here: &Here) -> i32 {
             }
             let _ = std::fs::write(p, body);
         };
-        write(if fail { format!("wip {}\n", task.id) } else { format!("done {} by {name}\n", task.id) });
+        // A rework says which check passed it: what the scripted reject asked for.
+        let checked = if held.rework > 0 { "checked by: ok\n" } else { "" };
+        write(if fail { format!("wip {}\n", task.id) } else { format!("done {} by {name}\n{checked}", task.id) });
         if plan.edit_tests {
             let t = Path::new(&here.cwd).join("tests/sim_edit.txt");
             let _ = std::fs::create_dir_all(t.parent().unwrap_or(Path::new(".")));
@@ -216,7 +231,7 @@ pub fn main(here: &Here) -> i32 {
                 let _ = std::fs::write(&failed_once, "");
                 break;
             }
-            write(format!("done {} by {name}\n", task.id));
+            write(format!("done {} by {name}\n{checked}", task.id));
             reason = d.stop(true);
         }
         // A finished task hands over the next one in the same turn; anything else ends it.

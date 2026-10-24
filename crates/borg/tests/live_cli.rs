@@ -323,3 +323,26 @@ fn a_live_ask_at_the_next_prompt_keeps_the_last_turns_work_as_evidence_on_omp() 
     assert_eq!(state(&root, "e1", "turn"), "", "the new turn starts empty");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn a_check_with_no_lesson_to_ask_and_none_to_judge_makes_no_model_call() {
+    let root = setup("live-empty");
+    let cwd = root.join("harbor_orion");
+    std::fs::write(root.join("store/collectives/corp/lessons.jsonl"), "").unwrap();
+    let lines = [
+        json!({"type": "user", "message": {"role": "user", "content": "Tidy the budget handling"}}),
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "/x/net.rs"}}]}}),
+    ];
+    std::fs::write(root.join("transcript.jsonl"), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    borg(&root, "prompt", &json!({"session_id": "n1", "cwd": cwd, "prompt": "Tidy the budget handling"}), &ENV);
+    // A change starts a live check; with no lesson in its pool it asks no model.
+    tool(&root, "n1", "Edit", json!({"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}));
+    let ctx = wait_for(&root, "n1", "ctx", |c| c.contains("#borg-live-skip"));
+    assert!(ctx.contains("#borg-live-skip empty") && !ctx.contains("#borg-predict-cost"), "{ctx}");
+    // Nor does the stop.
+    let out = borg(&root, "stop", &json!({"session_id": "n1", "cwd": cwd, "last_assistant_message": "Done.", "stop_hook_active": false}), &ENV);
+    assert!(!out.contains("block"), "{out}");
+    assert!(prompts(&root).is_empty(), "no model call: {:?}", prompts(&root));
+    let _ = std::fs::remove_dir_all(root);
+}
