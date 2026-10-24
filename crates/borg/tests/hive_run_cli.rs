@@ -495,8 +495,15 @@ fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_ru
     assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("killed", Some(2.0))], "{out}");
     assert!(out.contains("end: budget"), "{out}");
     let b = fold(&root);
-    assert_eq!(b.tasks["t1"].status, Status::Open, "the dead session's claim is released: {out}");
-    assert!(events(&root).iter().any(|e| e.ev == board::Ev::Released && e.note == "its run ended"), "{out}");
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let why = format!(
+        "{out}\nboard:\n{}\njoins:\n{}\nnode: {}",
+        read(goal_dir(&root).join("tasks.jsonl")),
+        read(goal_dir(&root).join("joins.jsonl")),
+        read(store(&root).join("stats/node"))
+    );
+    assert_eq!(b.tasks["t1"].status, Status::Open, "the dead session's claim is released: {why}");
+    assert!(events(&root).iter().any(|e| e.ev == board::Ev::Released && e.note == "its run ended"), "{why}");
     let _ = std::fs::remove_dir_all(root);
 }
 
