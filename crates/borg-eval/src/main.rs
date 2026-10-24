@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 mod dogfood;
 mod hive;
+mod hive_seq;
 // Replay evals over private data: optional, see build.rs. rustfmt cannot resolve absent module files, so
 // `cargo fmt` skips these; scripts/check.sh checks them with rustfmt directly when they are present.
 #[cfg(replay_evals)]
