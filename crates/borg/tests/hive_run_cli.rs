@@ -476,9 +476,13 @@ fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_ru
         assert!(t0.elapsed() < Duration::from_secs(30), "no claim");
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Killed mid-iteration (Ctrl-C, a closed terminal): nothing of its own is written any more.
-    child.kill().unwrap();
-    let _ = child.wait();
+    // Stopped mid-iteration the way an engineer stops it, Ctrl-C: nothing of its own is written any
+    // more, and its drone (a process group of its own, which the terminal's signal never reaches) dies
+    // with it (runner.rs `Watchdog`).
+    // SAFETY: kill(2) with SIGINT on the runner this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) }, 0);
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "Ctrl-C ends the run: {status:?}");
     std::fs::write(root.join("script.json"), json!({}).to_string()).unwrap();
     let mut rerun = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--dir", &w], &[]).spawn().unwrap();
     let t0 = Instant::now();
