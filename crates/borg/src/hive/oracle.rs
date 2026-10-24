@@ -285,11 +285,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("borg-hive-oracle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cap = Some(Duration::from_millis(200));
-        assert_eq!(exec(&goal(&["true", "true"]), &task(), &dir, cap), Verdict::Pass);
-        let v = exec(&goal(&["true", "echo boom >&2; false", "true"]), &task(), &dir, cap);
+        // Pass and fail get room to spawn on a loaded runner; only the timeout case is tight.
+        let roomy = Some(Duration::from_secs(30));
+        assert_eq!(exec(&goal(&["true", "true"]), &task(), &dir, roomy), Verdict::Pass);
+        let v = exec(&goal(&["true", "echo boom >&2; false", "true"]), &task(), &dir, roomy);
         assert_eq!(v, Verdict::Fail { check: "c1".into(), tail: "boom\n".into() }, "stderr is in the tail; the first failure decides");
         let pid_file = dir.join("pid");
+        let cap = Some(Duration::from_millis(200));
         let started = Instant::now();
         let v = exec(&goal(&[&format!("sleep 5 & echo $! > {}; wait", pid_file.display())]), &task(), &dir, cap);
         assert!(matches!(v, Verdict::Timeout { ref check, .. } if check == "c0"), "{v:?}");
