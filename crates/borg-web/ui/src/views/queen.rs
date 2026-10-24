@@ -44,6 +44,37 @@ fn card(q: QueenEntry) -> impl IntoView {
     }
 }
 
+/// The queen's attention reward: did its escalations spend the engineer's minutes well?
+fn attention(d: crate::api::Data) -> impl IntoView {
+    let a = move || d.attention.get();
+    let parts = Signal::derive(move || {
+        let a = a();
+        vec![
+            ("ended in no".to_string(), a.no, "var(--c-good)".to_string()),
+            ("yes, fine".into(), a.stamps, "var(--c-amber)".into()),
+            ("missed".into(), a.missed, "var(--c-heat)".into()),
+        ]
+    });
+    let share = Signal::derive(move || a().share.map_or_else(|| "–".to_string(), |s| format!("{:.0}%", s * 100.0)));
+    let reward = Signal::derive(move || format!("{:+}", a().reward));
+    let weights = Signal::derive(move || {
+        let a = a();
+        format!("no − {}·stamp − {}·missed", a.alpha, a.beta)
+    });
+    view! {
+        <section class="panel">
+            <h2>"The queen's attention"<small>"the team's escalations, scored; logged and shown, never optimised"</small></h2>
+            <section class="tiles">
+                <Tile label="Reward" value=reward sub=weights color="var(--c-violet)" />
+                <Tile label="Escalation yield" value=share sub=Signal::derive(|| "answered escalations that ended in a no".to_string()) color="var(--c-good)" />
+                <Tile label="Rubber stamps" value=Signal::derive(move || format!("{}", a().stamps)) sub=Signal::derive(|| "answered \"yes, fine\"".to_string()) color="var(--c-amber)" />
+                <Tile label="Missed escalations" value=Signal::derive(move || format!("{}", a().missed)) sub=Signal::derive(|| "a no after merge, never escalated".to_string()) color="var(--c-heat)" />
+            </section>
+            <Donut parts=parts center=Signal::derive(move || { let a = a(); format!("{}", a.answered + a.missed) }) caption="scored" />
+        </section>
+    }
+}
+
 #[component]
 pub fn Queen() -> impl IntoView {
     let d = data();
@@ -79,6 +110,7 @@ pub fn Queen() -> impl IntoView {
             <Tile label="Dismissed" value=Signal::derive(move || format!("{}", by("dismissed"))) color="var(--c-slate)" />
             <Tile label="Median answer time" value=latency />
         </section>
+        {move || d.attention.with(|a| a.known).then(|| attention(d))}
         <section class="two">
             <div class="panel">
                 <h2>"Decisions"</h2>

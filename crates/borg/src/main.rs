@@ -4,7 +4,8 @@
 //!        Every harness speaks one canonical, Claude-shaped event (session_id, cwd, prompt, tool_name,
 //!        tool_input, error, last_assistant_message, transcript_path, stop_hook_active) and gets
 //!        Claude-shaped output ({"decision":"block","reason"} at stop); adapters translate both ways.
-//!        borg learn [--session ID]                   (generalise captured corrections into lessons)
+//!        borg learn [--session ID | --group <goal>/<task>] (generalise captured corrections into lessons;
+//!                                                     --group: a hive group's winners vs losers, hive/group.rs)
 //!        borg no [--session ID|DRONE] [--dir DIR] [--json] <reason>
 //!                                                     (the engineer's veto: shown lessons lose credit, the reason
 //!                                                      becomes a lesson or a proposed constraint; veto.rs)
@@ -52,7 +53,7 @@
 //!        borg ope [--dir DIR | --file FILE] [--json]  (off-policy estimates of the belief's hand-set weights from
 //!                                                      logged asks with their propensity; never changes them; ope.rs)
 //!        borg top [--dir DIR] [--watch] [--json]      (the drones of each collective, local and remote; top.rs)
-//!        borg steer <drone|session|all> "<text>" | --pause | --resume [--dir DIR]
+//!        borg steer <drone|session|all> "<text>" | --pause | --resume | --veto <reason> [--dir DIR]
 //!                                                     (signed steering of a running drone; runs borg-mesh; steer.rs)
 //!        borg why <path>[:<line>[-<line>]] | <commit> [--full] [--json] [--dir DIR]
 //!                                                     (the reasoning behind code: blame, borg notes, linked lessons;
@@ -188,7 +189,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Knowledge",
         &[
-            ("learn [--session ID]", "turn waiting corrections into lessons now"),
+            ("learn [--session ID | --group GOAL/TASK]", "turn waiting corrections (or a hive group's winners vs losers) into lessons now"),
             ("assimilate [--apply] [--since DATE] [--limit N]", "import corrections from past sessions"),
             ("assimilate --from-dir DIR [--plan FILE] [--apply]", "import lessons from team documents"),
             ("reach [--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal"),
@@ -278,10 +279,29 @@ fn challenges_and_stdin(path: &str, rest: &[&str]) -> (Vec<conscience::Challenge
     (challenges, context)
 }
 
-/// `borg learn [--session ID]`.
+/// `borg learn [--session ID | --group <goal>/<task>]`.
 fn learn_cmd(rest: &[&str]) {
     borg::stats::set_purpose("learn");
     let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
+    // A hive group's reflection (hive/group.rs): its episode first, then learned like any waiting one.
+    if let Some(i) = rest.iter().position(|a| *a == "--group") {
+        let Some(spec) = rest.get(i + 1) else {
+            eprintln!("borg learn: --group needs <goal>/<task>");
+            std::process::exit(2);
+        };
+        match borg::hive::group::reflect(&learn::home(), spec) {
+            Ok(borg::hive::group::Reflected::Recorded(id)) => println!("group {spec}: reflection {id} recorded"),
+            Ok(borg::hive::group::Reflected::Already(id)) => println!("group {spec}: reflected before ({id})"),
+            Ok(borg::hive::group::Reflected::Nothing(why)) => {
+                println!("group {spec}: nothing to reflect: {why}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("borg learn: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // Unless BORG_REVIEW_FIX=off: the ended session's review → fix findings (its harness's sub-agent
     // runs) become episodes first, each in the store its repo routes to; a store other than this one
     // is learned here too, for this session.

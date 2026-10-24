@@ -83,7 +83,12 @@ system, Borg also proposes it as a constraint in `borg queen`; only you can rati
 enforces constraints yet. In the session, the drone is told to stop and not argue the veto back. The
 measure is the *repeat-veto rate*: vetoes that repeat an earlier one, which should fall toward zero.
 `borg web` shows it. The weight of a veto (three, against two for a correction) is a design choice
-with no eval behind it yet. See [Saying no](https://github.com/debe/borg_ai/blob/main/docs/commands.md#saying-no).
+with no eval behind it yet. Name a drone on a teammate's machine with `--session` and the veto travels
+as a signed steering directive (steer role needed): their machine records it once, where the drone's
+lessons and session are. A veto of work that already merged, from a session the queen never asked
+you about, counts as a missed escalation in the queen's attention score: escalations you answered by
+changing course count for the queen, "yes, fine" answers and missed ones against it. The queen view of
+`borg web` shows the score; nothing optimises it. See [Saying no](https://github.com/debe/borg_ai/blob/main/docs/commands.md#saying-no).
 
 **Delivery.** Borg spends tokens only where a lesson is likely to matter:
 
@@ -394,6 +399,28 @@ hacked and the task reopens, every tool call that writes a test or peeks at the 
 the verifier, and an optional hidden oracle (held-out checks outside the repo) decides what a verdict
 credits. Each verdict credits the lessons shown during the task; the web page shows the hacked rate. A
 session that never joins a goal sees no change.
+
+**Groups of attempts (built, preparation: no value metric yet).** `borg hive open <goal> --id T --group K`
+runs one task as K attempts by K different drones (best-of-N). Each attempt is verified like any task,
+and only the best one is integrated: the one the hidden oracle passed, else the cleanest. Once every
+attempt has its reward, `borg learn` (at any session's end, or `borg learn --group <goal>/T`) compares
+the winners with the losers, one model call, and writes what the winners did as a lesson whose
+provenance names the group. A group of one, or one whose attempts all won or all lost, writes
+nothing. Whether such lessons change behaviour more than lessons from single attempts (H6) is a later
+paid run. `borg top` and the Hive tab show each group's winners, losers, the integrated attempt and
+the reflection. [Groups](https://github.com/debe/borg_ai/blob/main/docs/commands.md#groups-of-attempts).
+
+**Playbooks (built, preparation: no value metric yet).** A playbook is the team's short list of steps for
+a kind of task ("fix the parser", "add a migration with backfill"), learned from verified hive work.
+After an attempt wins (verified and not hacked, or passed by the hidden oracle; of a group, the
+integrated one), `borg learn` asks the model once for at most one small edit: add, change or remove a
+step, never a rewrite. Learning never applies it: the edit waits in `borg queen` until an engineer
+answers "promote". A drone whose claimed task names the playbook's shape gets its steps in its hook
+context, once per version; a normal session gets them when its prompt names the whole shape. The
+version shown is logged, so verdicts, vetoes and regrets credit it as they credit lessons, and the Hive
+tab shows each playbook with its steps, the belief of each version and the edits waiting. Playbooks sync
+over the mesh like lessons. Whether they lower dollars per solve (H5) is a later paid run.
+`BORG_PLAYBOOKS=off` turns them off. [Playbooks](https://github.com/debe/borg_ai/blob/main/docs/commands.md#playbooks).
 
 **The hive across machines (built, not measured).** In a collective shared over the mesh, a goal, its
 board, contracts, messages between drones (`borg hive ask`, `tell`) and guard flags sync to every member

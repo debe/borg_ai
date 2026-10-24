@@ -23,6 +23,14 @@
 //! session, not only its own (a terminal veto may name an ended session). A veto merged into a lesson
 //! an earlier veto made counts as `veto_repeat`; an invariant of a lesson placed in this store becomes
 //! a proposed constraint in the queen's queue (`veto::propose`), never a constraint.
+//!
+//! **Groups** (hive/group.rs): a settled hive group of K attempts with a winner and a loser is an
+//! episode of kind `group`, recorded first by every run (once per group, on the node that opened it) or
+//! by `borg learn --group`, asked with its own prompt (`group::HEAD`): what the winners did that the
+//! losers did not. Learned at the end of any session, never counted against one.
+//!
+//! **Playbooks** (playbook.rs): every run with `track` then reflects once on each verified hive attempt
+//! of this node that won, and queues at most one playbook edit per attempt for the engineer to promote.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -272,7 +280,8 @@ If this correction contradicts or replaces a listed lesson (in the same situatio
 opposite, e.g. the engineer reversed an earlier correction), list that lesson's id in supersedes; never the same_as lesson. \
 Otherwise supersedes is empty.";
 
-/// The prompt for one episode: a correction's, a veto's (veto.rs) or a regret's (regret.rs).
+/// The prompt for one episode: a correction's, a veto's (veto.rs), a regret's (regret.rs) or a hive
+/// group's reflection (hive/group.rs).
 fn episode_prompt(e: &Episode, listed: &[String]) -> String {
     let existing = if listed.is_empty() { "(none)".into() } else { listed.join("\n") };
     if e.kind == crate::veto::KIND {
@@ -283,6 +292,16 @@ fn episode_prompt(e: &Episode, listed: &[String]) -> String {
             crate::veto::INVARIANT,
             e.task.chars().take(1500).collect::<String>(),
             e.correction,
+        );
+    }
+    if e.kind == crate::hive::group::KIND {
+        use crate::hive::group::{FIELDS, HEAD};
+        let (reach, merge) = (regret::neutral(REACH_RULES), regret::neutral(MERGE_RULES));
+        return format!(
+            "{HEAD}\n\n{reach}\n\n{FIELDS}\n{AREA}\n\n{merge}\n\n## The task every attempt had\n{}\n\n## The result\n{}\n\n## The attempts, winners first\n{}\n\n## Existing lessons\n{existing}\n",
+            e.task.chars().take(regret::CAP).collect::<String>(),
+            e.correction,
+            e.agent,
         );
     }
     if let Some(r) = e.regret.as_ref().filter(|_| e.kind == regret::KIND) {
@@ -320,9 +339,15 @@ fn veto_schema() -> Value {
 }
 
 /// The answer schema for `prompt`: a veto's prompt (it starts with `veto::OPENING`) gets the invariant
-/// field; correction and regret calls stay as they were.
+/// field, a playbook reflection (`playbook::OPENING`) its edit; correction and regret calls stay as they were.
 pub fn schema_for(prompt: &str) -> Value {
-    if prompt.starts_with(crate::veto::OPENING) { veto_schema() } else { schema() }
+    if prompt.starts_with(crate::veto::OPENING) {
+        veto_schema()
+    } else if prompt.starts_with(crate::playbook::OPENING) {
+        crate::playbook::schema()
+    } else {
+        schema()
+    }
 }
 
 /// The model call failed (quota, rate limit, not logged in, network, malformed answer): unlike a
@@ -659,6 +684,10 @@ fn learn_unlocked(
     report: &mut dyn FnMut(Step),
 ) -> (usize, usize, usize) {
     let (ep_path, lessons_path) = (home.join("episodes.jsonl"), home.join("lessons.jsonl"));
+    // Settled hive groups opened here become reflection episodes first (hive/group.rs), once each.
+    if track && crate::hive::group::on() {
+        crate::hive::group::record_pending(home);
+    }
     let outcomes_path = outcome::path_beside(&lessons_path);
     let mut outcomes = if track { outcome::read(&outcomes_path) } else { Vec::new() };
     let mut library = lessons(&lessons_path);
@@ -672,7 +701,8 @@ fn learn_unlocked(
     let episodes = read_jsonl::<Episode>(&ep_path);
     let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
     // A veto is learned at the end of any session (veto.rs): a terminal veto may name one already ended.
-    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND;
+    // So is a group's reflection: no session of its own ends.
+    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND || e.kind == crate::hive::group::KIND;
     let vetoes: HashSet<String> = episodes.iter().filter(|e| e.kind == crate::veto::KIND).map(|e| e.id.clone()).collect();
     let total = episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && mine(e)).count();
     let mut asked = 0;
@@ -720,6 +750,7 @@ fn learn_unlocked(
                     Some(r) if regret::is_review(r) => "review",
                     Some(_) => "regret",
                     None if e.kind == crate::veto::KIND => "veto",
+                    None if e.kind == crate::hive::group::KIND => "group",
                     None => "session",
                 };
                 let (kind, why, counted_in) = match &placed {
@@ -753,8 +784,9 @@ fn learn_unlocked(
                 }
                 let target = (l.version > 1).then_some(l.id.as_str());
                 // A veto credited the lessons shown before it already (veto.rs): it never doubles as a
-                // correction, nor as a missed question (`applied_then_corrected`).
-                let track_results = track && e.kind != crate::veto::KIND;
+                // correction, nor as a missed question (`applied_then_corrected`). A group's reflection
+                // is no correction of any session: its verdicts credited the lessons shown (verdict.rs).
+                let track_results = track && e.kind != crate::veto::KIND && e.kind != crate::hive::group::KIND;
                 let contradicted = match track_results {
                     true => outcome::contradicted(&outcomes, &e.session, e.ms, target, &l.supersedes),
                     false => Vec::new(),
@@ -795,6 +827,10 @@ fn learn_unlocked(
                 crate::stats::count(home, crate::stats::NOT_A_LESSON, &e.session, |ev| ev.engineer = e.engineer.clone());
             }
         }
+    }
+    // Verified hive work that won proposes playbook edits to the engineer (playbook.rs), once per attempt.
+    if track {
+        crate::playbook::reflect_pending(home, ask, now);
     }
     if track {
         if regret_credit() {
@@ -917,6 +953,50 @@ mod tests {
         assert_eq!((l.id.as_str(), inv.as_str()), ("Lno-s-3", "lookups go through the review API"));
         let (_, none) = generalise_with(&ep("e2", "no, the lock merge:x"), &[], &fake_ask).unwrap().unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_groups_reflection_is_asked_with_its_own_prompt_at_any_sessions_end_and_keeps_its_provenance() {
+        let home = temp_home("group");
+        let e = Episode {
+            id: "group-g.t".into(),
+            ms: 5,
+            session: "group-g.t".into(),
+            task: "write x.txt\n(goal: the spec)".into(),
+            agent: "### WON: the held-out tests pass (drone d2, attempt t.g2, verdict verified)\n\n### LOST: the held-out tests fail (drone d1, attempt t.g1, verdict verified)".into(),
+            correction: "group g/t: 2 attempt(s) by 2 drone(s); won: d2; lost: d1; decided by the hidden oracle".into(),
+            kind: crate::hive::group::KIND.into(),
+            ..Episode::default()
+        };
+        let p = episode_prompt(&e, &[]);
+        assert!(p.starts_with(crate::hive::group::HEAD), "{p}");
+        for part in
+            [crate::hive::group::FIELDS, "## The task every attempt had\nwrite x.txt", "## The result\ngroup g/t", "## The attempts, winners first\n### WON"]
+        {
+            assert!(p.contains(part), "{part}: {p}");
+        }
+        assert!(!p.contains(OPENING) && !p.contains("## Engineer's correction"));
+        assert_eq!(schema_for(&p), schema());
+        append_jsonl(&home.join("episodes.jsonl"), &e).unwrap();
+        // Another session's end learns it: the group has no session of its own to end.
+        asked(&home, "s1", 1, &["L0"]);
+        let seen = std::cell::RefCell::new(String::new());
+        let ask = |p: &str| {
+            *seen.borrow_mut() = p.to_string();
+            Some(json!({"is_lesson": true, "question": "Did you run the held-out cases before done?", "situations": [], "consequence": "c",
+                "same_as": "", "supersedes": [], "area": "verification", "reach": "team"}))
+        };
+        assert_eq!(learn_in(&home, Some("s1"), &ask, true, 10), (1, 0, 0));
+        assert!(seen.borrow().starts_with(crate::hive::group::HEAD));
+        let l = &lessons(&home.join("lessons.jsonl"))[0];
+        assert_eq!((l.id.as_str(), l.episodes.as_slice()), ("Lgroup-g.t", &["group-g.t".to_string()][..]), "provenance names the group");
+        assert!(l.engineers.is_empty(), "no engineer said it: the reward did");
+        // No correction of any session, and the feed names its source.
+        let kinds: Vec<String> = outcome::read(&home.join("outcomes.jsonl")).into_iter().map(|o| o.kind).collect();
+        assert!(!kinds.iter().any(|k| k == outcome::CORRECTED || k == outcome::MISSED), "{kinds:?}");
+        assert!(crate::stats::events(&home).iter().any(|e| e.kind == crate::stats::LESSON_NEW && e.why == "group"));
+        assert_eq!(learn_in(&home, None, &ask, true, 11), (0, 0, 0), "learned once");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1277,6 +1357,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s-dec".into()], ..t1.clone() };
         let ev = |kind, task: &str, by: &str, ms| Event::new(kind, task, by, ms);

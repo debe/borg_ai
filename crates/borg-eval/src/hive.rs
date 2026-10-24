@@ -2405,6 +2405,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let verdict_of = |ev: board::Ev, t: &str, by: &str, ms: i64, head: &str, note: &str| board::Event {
             head: head.into(),
@@ -2688,6 +2689,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let mut ev = vec![board::Event::open(task("t1"), "e", 1), board::Event::open(task("t2"), "e", 1)];
         let mut verify = task("t1.v1");

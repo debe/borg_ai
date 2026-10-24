@@ -14,6 +14,18 @@
 //!   as a queen question (`Kind::Constraint`). Only an engineer's answer ratifies it into
 //!   `<store>/constraints.jsonl`; learning never applies a constraint, and nothing enforces them yet.
 //!
+//! - **A missed escalation**, when the vetoed work had already merged and the queen never escalated
+//!   from that session (escalation.rs, the queen's attention reward; logged and shown, never optimised).
+//!
+//! **Across the mesh.** A drone on another node is vetoed by naming it (`--session`, a designation or a
+//! session id, as `borg steer` takes it): `borg no` then signs a `veto` steering directive with this
+//! node's member key (borg-mesh steer.rs; the signer needs a steering role, as for any directive to
+//! another engineer's drone). The drone's node records it once when it arrives (`apply`): the credit,
+//! the episode and the stat land where the shown lessons and the session are, and its drone is told at
+//! its next hook, labelled with the signer. The issuing node records nothing but `steer_issued`; the
+//! `vetoed` outcomes reach it as team outcomes (outcome.rs `SHARED_KINDS`), so both nodes' beliefs
+//! count the veto once.
+//!
 //! In the session the drone is told to stop the vetoed approach and not argue it back. A veto prompt is
 //! never the session's task and never doubles as a correction. BORG_VETO=off makes such a prompt an
 //! ordinary one (the command still works).
@@ -26,7 +38,7 @@ use serde_json::json;
 
 use crate::outcome::{self, Outcome};
 use crate::presence::State;
-use crate::{collective, learn, presence, queen, stats, top};
+use crate::{collective, escalation, learn, presence, queen, stats, steer, top};
 
 /// `Episode::kind` of a veto.
 pub const KIND: &str = "veto";
@@ -60,7 +72,8 @@ pub fn reason_in(prompt: &str) -> Option<String> {
 }
 
 /// The lessons the drone was shown in `session` so far, sorted and unique: its `asked` outcomes (stop
-/// or live) and its stats events of the delivering kinds (early, queued, live asks, blocks).
+/// or live), the playbook versions shown to it (`outcome::PLAYBOOK`, playbook.rs), and its stats events
+/// of the delivering kinds (early, queued, live asks, blocks).
 pub fn shown(home: &Path, session: &str) -> Vec<String> {
     shown_between(home, session, i64::MIN, i64::MAX)
 }
@@ -72,7 +85,7 @@ pub fn shown_between(home: &Path, session: &str, from_ms: i64, to_ms: i64) -> Ve
     let within = |ms: i64| (from_ms..=to_ms).contains(&ms);
     let asked = outcome::read(&home.join("outcomes.jsonl"))
         .into_iter()
-        .filter(|o| o.kind == outcome::ASKED && o.session == session && within(o.ms))
+        .filter(|o| outcome::shows(&o.kind) && o.session == session && within(o.ms))
         .flat_map(|o| o.lessons);
     let delivered =
         stats::events(home).into_iter().filter(|e| e.session == session && within(e.ms) && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
@@ -93,21 +106,24 @@ pub struct Said<'a> {
     pub agent: &'a str,
     pub reason: &'a str,
     pub ms: i64,
-    /// `cli` or `prompt`.
+    /// `cli`, `prompt` or `mesh` (a signed directive from another node, `apply`).
     pub via: &'static str,
 }
 
-/// What `record` wrote: the episode's id and the lessons credited `vetoed` now.
+/// What `record` wrote: the episode's id, the lessons credited `vetoed` now, and whether the veto
+/// counted as a missed escalation (escalation.rs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Veto {
     pub episode: String,
     pub credited: Vec<String>,
+    pub missed: bool,
 }
 
 /// Records one veto in `home`: the episode, a `vetoed` outcome per shown lesson not yet credited in
 /// the session (one per lesson keeps `outcome::has` idempotent; nothing when none, so a session with
-/// nothing shown adds no clock tick), and one `veto` stat for every call. The caller checks
-/// `learn::learning()` first.
+/// nothing shown adds no clock tick), and one `veto` stat for every call. A veto of work that had
+/// already merged, from a session the queen never escalated, is also a missed escalation
+/// (escalation.rs `missed`). The caller checks `learn::learning()` first.
 ///
 /// # Errors
 /// When the episode or an outcome cannot be appended.
@@ -143,7 +159,64 @@ pub fn record(home: &Path, s: &Said) -> std::io::Result<Veto> {
         ev.why = s.via.into();
         ev.text = stats::excerpt(s.reason, 160);
     });
-    Ok(Veto { episode: e.id, credited })
+    let missed = escalation::merged(home, &crate::notes::state_dir(), s.session, s.ms) && escalation::missed(home, s.session, KIND, &e.id, s.repo, s.ms);
+    Ok(Veto { episode: e.id, credited, missed })
+}
+
+/// The session's task as the hooks kept it (`<state>/<session>.task`), else `fallback` (its last prompt).
+fn task_of(home: &Path, session: &str, fallback: &str) -> String {
+    let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), PathBuf::from);
+    std::fs::read_to_string(state.join(format!("{}.task", presence::safe(session))))
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Records the veto a signed directive carries (steer.rs `VETO`), once, on the node whose drone it
+/// names: `borg no` for a drone on another machine signs it there (borg-mesh steer.rs `issue`), the
+/// mesh carries it here like any steering directive, and this node holds what the veto credits (the
+/// lessons the session was shown) and learns its episode, so its beliefs and its repeat-veto count see
+/// it. The issuing node records nothing but its `steer_issued` stat; the `vetoed` outcomes reach it as
+/// team outcomes. Once: `<store>/steer/vetoed/<id>` is created exclusively first (removed again if
+/// recording fails, so the next round retries). None for any other directive, or one already recorded.
+///
+/// # Errors
+/// When the marker or the veto cannot be written.
+pub fn apply(home: &Path, a: &steer::Accepted) -> std::io::Result<Option<Veto>> {
+    let session = a.d.target.session.as_str();
+    if a.d.kind != steer::VETO || a.d.target.node.is_empty() || session.is_empty() || a.d.text.trim().is_empty() {
+        return Ok(None);
+    }
+    // Only the node whose drone it names holds the session (borg-mesh steer.rs `check` refuses a veto
+    // without one): a session unknown here is another node's, or none.
+    let p = presence::read(home, session);
+    if p.is_none() && !outcome::read(&home.join("outcomes.jsonl")).iter().any(|o| o.session == session) {
+        return Ok(None);
+    }
+    let dir = steer::dir(home).join("vetoed");
+    std::fs::create_dir_all(&dir)?;
+    let marker = dir.join(presence::safe(&a.d.id));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let repo = p.as_ref().map(|p| p.repo.clone()).unwrap_or_default();
+    let task = task_of(home, session, p.as_ref().map_or("", |p| p.prompt.as_str()));
+    let reason: String = a.d.text.trim().chars().take(1500).collect();
+    let said = Said { session, repo: &repo, engineer: &a.d.engineer, task: &task, agent: "", reason: &reason, ms: a.d.ms, via: "mesh" };
+    record(home, &said).map(Some).inspect_err(|_| {
+        let _ = std::fs::remove_file(&marker);
+    })
+}
+
+/// Records every veto directive in this store's inbox not recorded yet (`apply`); the mesh calls it
+/// after each round's steering. Nothing with learning off. Returns how many it recorded.
+pub fn apply_inbox(home: &Path) -> usize {
+    if !learn::learning() {
+        return 0;
+    }
+    steer::read_inbox(home).iter().filter(|a| a.d.kind == steer::VETO).filter_map(|a| apply(home, a).ok().flatten()).count()
 }
 
 /// What the drone is told when the engineer vetoes in the session.
@@ -158,9 +231,10 @@ fn short(session: &str) -> String {
 }
 
 /// The drone a terminal veto names (pure). `named`: a designation, number or session id (prefix), as
-/// `borg steer` takes it, of a local drone. Otherwise the local drone working in `repo`: the one not
-/// ended, else the most recently seen ended one (a veto right after the session ended); several active
-/// ones are an error, never a guess. A remote drone is never picked.
+/// `borg steer` takes it, of a local drone or one on another node (`main` then sends it as a signed
+/// directive). Otherwise the local drone working in `repo`: the one not ended, else the most recently
+/// seen ended one (a veto right after the session ended); several active ones are an error, never a
+/// guess. A remote drone is never picked unnamed.
 ///
 /// # Errors
 /// What to name instead.
@@ -168,7 +242,6 @@ pub fn target<'a>(drones: &'a [top::Drone], repo: &str, named: Option<&str>) -> 
     if let Some(n) = named {
         return match top::resolve(drones, n)? {
             None => Err("a veto names one drone, not all".into()),
-            Some(d) if !d.node.is_empty() => Err(format!("{} runs on another machine: a veto reaches local drones only", d.designation)),
             Some(d) => Ok(d),
         };
     }
@@ -244,6 +317,22 @@ pub const FLAGS: &[&str] = &["--session", "--dir", "--json"];
 const USAGE: &str = "usage: borg no [--session ID|DRONE] [--dir DIR] [--json] <reason…>
   says no to a drone's work: the lessons it was shown lose credit, and the reason becomes a lesson";
 
+/// A veto of a drone on another node: `borg steer <session> --veto <reason>` (the mesh binary signs it
+/// with this node's member key; the drone's node records it, `apply`). Its output is this command's.
+fn remote(session: &str, cwd: &str, reason: &str) -> i32 {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("borg no: cannot find the borg binary to sign the veto with");
+        return 1;
+    };
+    match std::process::Command::new(exe).args(["steer", session, "--veto", "--dir", cwd, reason]).status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("borg no: cannot sign the veto: {e}");
+            1
+        }
+    }
+}
+
 /// `borg no [--session ID|DRONE] [--dir DIR] [--json] <reason…>`.
 pub fn main(args: &[&str]) -> i32 {
     let value = |f: &str| args.iter().position(|a| *a == f).and_then(|i| args.get(i + 1)).copied();
@@ -293,11 +382,10 @@ pub fn main(args: &[&str]) -> i32 {
         }
     };
     let session = d.p.session.as_str();
-    let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), PathBuf::from);
-    let task = std::fs::read_to_string(state.join(format!("{}.task", presence::safe(session))))
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| d.p.prompt.clone());
+    if !d.node.is_empty() {
+        return remote(session, &cwd, &reason);
+    }
+    let task = task_of(home, session, &d.p.prompt);
     let engineer = learn::engineer(&cwd);
     let said = Said { session, repo: &d.p.repo, engineer: &engineer, task: &task, agent: "", reason: &reason, ms: now, via: "cli" };
     let v = match record(home, &said) {
@@ -400,10 +488,10 @@ mod tests {
         // Only ended ones: the most recently seen (a veto right after the session ended).
         let ended = vec![drone("aaaa1111", "app", State::Ended, 50, "", 1), drone("cccc3333", "app", State::Ended, 40, "", 2)];
         assert_eq!(target(&ended, "app", None).unwrap().p.session, "aaaa1111");
-        // A remote drone is never picked, not even by name.
+        // A remote drone is never picked unnamed; named, it is (`main` signs the veto for its node).
         let remote = vec![drone("dddd4444", "app", State::Working, 10, "beef", 1)];
         assert!(target(&remote, "app", None).is_err());
-        assert!(target(&remote, "app", Some("dddd")).unwrap_err().contains("another machine"));
+        assert_eq!(target(&remote, "app", Some("dddd")).unwrap().node, "beef");
     }
 
     fn asked(home: &Path, session: &str, lessons: &[&str]) {
@@ -447,7 +535,7 @@ mod tests {
         asked(&home, "s1", &["A"]);
         event(&home, stats::EARLY, "s1", &["B"]);
         let v = record(&home, &said("s1", "never read the commit log for merges", 100)).unwrap();
-        assert_eq!(v, Veto { episode: "no-s1-100".into(), credited: vec!["A".into(), "B".into()] });
+        assert_eq!(v, Veto { episode: "no-s1-100".into(), credited: vec!["A".into(), "B".into()], missed: false });
         let eps: Vec<learn::Episode> =
             std::fs::read_to_string(home.join("episodes.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!((eps.len(), eps[0].kind.as_str(), eps[0].correction.as_str()), (1, KIND, "never read the commit log for merges"));
@@ -466,6 +554,105 @@ mod tests {
         let before = std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap();
         record(&home, &said("s9", "never deploy on fridays", 300)).unwrap();
         assert_eq!(std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap(), before);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn directive(id: &str, kind: &str, session: &str, text: &str, ms: i64) -> steer::Accepted {
+        steer::Accepted {
+            d: steer::Directive {
+                id: id.into(),
+                collective: "corp".into(),
+                key: "ab".repeat(32),
+                engineer: "lead@x".into(),
+                target: steer::Target { node: "me".into(), session: session.into() },
+                kind: kind.into(),
+                text: text.into(),
+                ms,
+                sig: String::new(),
+            },
+            role: "steer".into(),
+        }
+    }
+
+    #[test]
+    fn a_signed_veto_from_another_node_is_recorded_once_where_its_drone_runs() {
+        let home = temp("apply");
+        asked(&home, "s1", &["A"]);
+        let v = directive("v1", steer::VETO, "s1", "never read the commit log for merges", 100);
+        let got = apply(&home, &v).unwrap().unwrap();
+        assert_eq!((got.episode.as_str(), got.credited.clone(), got.missed), ("no-s1-100", vec!["A".to_string()], false));
+        assert_eq!(apply(&home, &v).unwrap(), None, "the same directive is recorded once");
+        // Through the inbox (the mesh's way in): already recorded, and a say or an untargeted veto never records.
+        steer::accept_all(
+            &home,
+            &[v.clone(), directive("s9", steer::SAY, "s1", "run the tests", 110), directive("v2", steer::VETO, "", "no target", 120)],
+            120,
+        )
+        .unwrap();
+        assert_eq!(apply_inbox(&home), 0);
+        let eps = std::fs::read_to_string(home.join("episodes.jsonl")).unwrap();
+        assert_eq!(eps.lines().count(), 1);
+        let e: learn::Episode = serde_json::from_str(eps.lines().next().unwrap()).unwrap();
+        assert_eq!((e.kind.as_str(), e.engineer.as_str(), e.session.as_str()), (KIND, "lead@x", "s1"), "the signer's veto, of its session");
+        let vetoes: Vec<stats::Event> = stats::events(&home).into_iter().filter(|e| e.kind == stats::VETO).collect();
+        assert_eq!((vetoes.len(), vetoes[0].why.as_str()), (1, "mesh"));
+        assert_eq!(outcome::read(&home.join("outcomes.jsonl")).iter().filter(|o| o.kind == outcome::VETOED).count(), 1);
+        // A new one through the inbox is recorded there.
+        steer::accept(&home, &directive("v3", steer::VETO, "s1", "and not the reflog either", 130), 130).unwrap();
+        assert_eq!(apply_inbox(&home), 1);
+        assert_eq!(apply_inbox(&home), 0);
+        // A veto of a session this node never held, or naming no node, is not this node's to learn.
+        assert_eq!(apply(&home, &directive("v4", steer::VETO, "zz", "not here", 140)).unwrap(), None);
+        let mut nodeless = directive("v5", steer::VETO, "s1", "everywhere", 150);
+        nodeless.d.target.node.clear();
+        assert_eq!(apply(&home, &nodeless).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(home.join("episodes.jsonl")).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_veto_of_integrated_hive_work_never_escalated_is_a_missed_escalation() {
+        use crate::hive::board::{self, Ev, Event, Role, Task};
+        let home = temp("missed");
+        let task = |id: &str, role: Role, of: Option<&str>| Task {
+            id: id.into(),
+            role,
+            title: id.into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: of.map(String::from),
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+            group: None,
+        };
+        let goal = crate::hive::dir(&home, "g");
+        std::fs::create_dir_all(&goal).unwrap();
+        std::fs::write(goal.join("goal.jsonl"), "").unwrap();
+        let events = [
+            Event::open(task("w", Role::Work, None), "engineer:a@x", 1),
+            Event::new(Ev::Claim, "w", "s1", 2),
+            Event::new(Ev::Done, "w", "s1", 3),
+            Event::open(task("w.v1", Role::Verify, Some("w")), "s1", 3),
+            Event::new(Ev::Claim, "w.v1", "s2", 4),
+            Event::new(Ev::Verified, "w.v1", "s2", 5),
+            Event::open(task("integrate.1", Role::Integrate, None), "s2", 5),
+            Event::new(Ev::Claim, "integrate.1", "i", 6),
+            Event::new(Ev::Verified, "integrate.1", "i", 7),
+        ];
+        board::append(&crate::hive::tasks_path(&home, "g"), &events).unwrap();
+        let state = home.join("state");
+        assert!(!escalation::merged(&home, &state, "s1", 6), "not integrated yet at 6");
+        assert!(escalation::merged(&home, &state, "s1", 7));
+        assert!(!escalation::merged(&home, &state, "s2", 7), "the verifier authored nothing");
+        let v = record(&home, &said("s1", "this broke the public schema", 50)).unwrap();
+        assert!(v.missed, "merged and never escalated");
+        let during = record(&home, &said("s2", "never skip the migration", 50)).unwrap();
+        assert!(!during.missed, "work that never merged: the veto caught it in time");
+        let y = escalation::team(&home);
+        assert_eq!((y.missed, y.reward), (1, -escalation::MISSED_W));
         let _ = std::fs::remove_dir_all(home);
     }
 

@@ -19,7 +19,7 @@ pub const KIND: &str = "regret";
 pub const REVIEW: &str = "review";
 
 /// Each excerpt in the prompt is cut to this many characters.
-const CAP: usize = 1500;
+pub const CAP: usize = 1500;
 
 /// The decision and the fix that changed its lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

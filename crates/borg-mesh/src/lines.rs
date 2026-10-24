@@ -31,7 +31,11 @@ use serde_json::Value;
 /// lesson ids, time, asking propensity, hashed session and repo, and the node; never raw sessions,
 /// repos or text. Plain lines (no `id` + `version`), so `settle` leaves them alone; signed and
 /// quarantined like every synced log.
-pub const SYNCED: [&str; 3] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE];
+///
+/// And the team's L1 playbooks (borg playbook.rs): promoted edits, each a delta to one step, folded
+/// order-independently by every reader, so a union is all a merge needs. Plain lines too (`pb` +
+/// `edit`, no `id` + `version`).
+pub const SYNCED: [&str; 4] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).

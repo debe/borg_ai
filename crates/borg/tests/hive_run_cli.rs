@@ -312,6 +312,126 @@ fn three_sim_drones_finish_a_board() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `borg learn <args>` on the collective's store, learning on, its model the fake `claude` (common.rs):
+/// (stdout, stderr, exit code).
+fn learn(root: &Path, args: &[&str]) -> (String, String, i32) {
+    let all: Vec<&str> = ["learn"].iter().copied().chain(args.iter().copied()).collect();
+    let store = store(root).display().to_string();
+    let env = [("BORG_HOME", store.as_str()), ("BORG_LEARN", "on"), ("BORG_LEARN_MODEL", "claude:fake")];
+    let out = command(root, &all, &env).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn a_group_of_three_drones_integrates_the_winner_and_reflection_learns_what_it_did_once() {
+    let root = common::setup("hive-run-group");
+    let repo = work(&root);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README"), "orion\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "start"]);
+    std::fs::write(root.join("script.json"), json!({"usd_per_iter": 0.10}).to_string()).unwrap();
+    // The held-out check passes only the attempt of t1.g2, whichever drone made it: a reward spread of
+    // one winner and two losers.
+    let held = root.join("held");
+    std::fs::create_dir_all(&held).unwrap();
+    let held = held.display().to_string();
+    ok(
+        &root,
+        &["init", "g", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "3", "--hidden-dir", &held, "--hidden", "grep -q 'done t1.g2 by' f1.txt"],
+    );
+    let opened =
+        ok(&root, &["open", "g", "--id", "t1", "--title", "write f1.txt", "--files", "f1.txt", "--accept", "ok=grep -q 'done t1' f1.txt", "--group", "3"]);
+    assert!(opened.contains("opened t1.g3") && opened.contains("group t1: 3 attempts"), "{opened}");
+    // Three drones cannot make three attempts that are each another drone's and have them verified by
+    // a drone that made none.
+    let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(err.contains("group t1 has 3 attempts") && err.contains("at least 4 drones") && spend(&root).is_empty(), "{err}");
+
+    let (out, err, code) = run(&root, &["--drones", "4", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let b = fold(&root);
+    assert!(b.finished(), "{out}");
+    // Each attempt is another drone's, and none of them verified a rival's.
+    let drone = |t: &str| b.drones[b.tasks[t].author.as_ref().unwrap()].clone();
+    let mut authors: Vec<String> = (1..=3).map(|n| drone(&format!("t1.g{n}"))).collect();
+    authors.sort();
+    authors.dedup();
+    assert_eq!(authors.len(), 3, "{authors:?}");
+    for n in 1..=3 {
+        let judges: Vec<String> = b.spans.iter().filter(|sp| sp.task.starts_with(&format!("t1.g{n}.v"))).map(|sp| b.drones[&sp.by].clone()).collect();
+        assert!(!judges.is_empty() && judges.iter().all(|j| !authors.contains(j)), "t1.g{n} judged by {judges:?}, attempts by {authors:?}");
+    }
+    let w = drone("t1.g2");
+    // Every attempt was scored before the integration, which merged only the winner's.
+    let scores: Vec<Value> = std::fs::read_to_string(goal_dir(&root).join("oracle.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!((scores.len(), scores.iter().filter(|s| s["pass"] == true).count()), (3, 1));
+    let head = git(&repo, &["rev-parse", "refs/heads/hive/g/integrated"]);
+    assert!(git(&repo, &["show", &format!("{head}:f1.txt")]).ends_with(&format!("done t1.g2 by {w}")), "the integrated tree holds the winner's attempt");
+    let winner = "t1.g2";
+    let dir = repo.display().to_string();
+    let top = String::from_utf8_lossy(&command(&root, &["top", "--dir", &dir], &[]).output().unwrap().stdout).into_owned();
+    let shown = format!("group t1: 3 attempt(s) of 3 · won {w} · lost ");
+    assert!(top.contains(&shown) && top.contains(&format!("integrates {winner} · to reflect")), "{top}");
+
+    // `borg learn` (as at any session's end) reflects on the settled group: one model call, the group's
+    // prompt, winners first; the lesson keeps the group as its provenance.
+    std::fs::write(
+        root.join("answer.json"),
+        json!({"structured_output": {"is_lesson": true, "question": "Does the file name the drone the held-out check expects?", "situations": ["writing a file a held-out check reads"],
+            "consequence": "the held-out check fails", "same_as": "", "area": "verification", "supersedes": [], "reach": "team"}, "total_cost_usd": 0})
+        .to_string(),
+    )
+    .unwrap();
+    let (out, err, code) = learn(&root, &[]);
+    assert_eq!(code, 0, "{out}{err}");
+    let prompts: Vec<String> = std::fs::read_dir(root.join("prompts")).unwrap().flatten().map(|e| std::fs::read_to_string(e.path()).unwrap()).collect();
+    let asked: Vec<&String> = prompts.iter().filter(|p| p.starts_with("Several coding agents attempted the same task")).collect();
+    assert_eq!(asked.len(), 1, "{prompts:?}");
+    let p = asked[0];
+    let (won, lost) = (p.find(&format!("### WON: the held-out tests pass (drone {w}")).unwrap(), p.find("### LOST: the held-out tests fail").unwrap());
+    assert!(won < lost && p.contains("decided by the hidden oracle") && p.contains(&format!("by {w}")), "{p}");
+    let lessons: Vec<Value> = std::fs::read_to_string(store(&root).join("lessons.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let learned: Vec<&Value> = lessons.iter().filter(|l| l["episodes"] == json!(["group-g.t1"])).collect();
+    assert_eq!(learned.len(), 1, "{lessons:?}");
+    assert_eq!(learned[0]["id"], "Lgroup-g.t1");
+    // Once per group: neither the next run nor an explicit reflection asks again.
+    let (_, _, code) = learn(&root, &[]);
+    assert_eq!(code, 0);
+    let (out, _, code) = learn(&root, &["--group", "g/t1"]);
+    assert!(code == 0 && out.contains("reflected before (group-g.t1)"), "{out}");
+    let again =
+        std::fs::read_dir(root.join("prompts")).unwrap().flatten().filter(|e| std::fs::read_to_string(e.path()).unwrap().starts_with("Several coding")).count();
+    assert_eq!(again, 1);
+    let top = String::from_utf8_lossy(&command(&root, &["top", "--dir", &dir], &[]).output().unwrap().stdout).into_owned();
+    assert!(top.contains("· lesson Lgroup-g.t1"), "{top}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_group_of_one_is_a_plain_task_and_reflects_nothing() {
+    let root = setup("group-one", 0, "1", json!({"usd_per_iter": 0.10}));
+    let opened =
+        ok(&root, &["open", "g", "--id", "t1", "--title", "write f1.txt", "--files", "f1.txt", "--accept", "ok=grep -q 'done t1' f1.txt", "--group", "1"]);
+    assert!(opened.contains("opened t1 (work)") && !opened.contains("group"), "{opened}");
+    let b = fold(&root);
+    assert_eq!((b.tasks.len(), b.tasks["t1"].task.group.clone()), (1, None));
+    let (out, _, code) = learn(&root, &["--group", "g/t1"]);
+    assert!(code == 0 && out.contains("nothing to reflect: t1 is no group of goal g"), "{out}");
+    assert!(!store(&root).join("episodes.jsonl").exists());
+    // A group of a plan task, or with --again, is refused.
+    let (_, err, code) = hive(&root, &["open", "g", "--id", "p", "--role", "plan", "--title", "plan it", "--group", "2"], &[]);
+    assert!(code == 1 && err.contains("only a work task"), "{err}");
+    let (_, _, code) = hive(&root, &["open", "g", "--id", "t1", "--again", "--group", "2"], &[]);
+    assert_eq!(code, 2);
+    // Work built on one attempt of a group is refused: only the group's best attempt is integrated.
+    ok(&root, &["open", "g", "--id", "t2", "--title", "write f2.txt", "--files", "f2.txt", "--group", "2"]);
+    let (_, err, code) = hive(&root, &["open", "g", "--id", "u", "--title", "use f2.txt", "--deps", "t2.g1"], &[]);
+    assert!(code == 1 && err.contains("its dep t2.g1 is an attempt of a group"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn a_drone_that_grows_an_existing_test_is_not_hacked() {
     // Every drone appends to one test file in its worktree: the attempts may conflict there, and the fix

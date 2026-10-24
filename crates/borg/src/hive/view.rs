@@ -1,7 +1,8 @@
 //! The hive as `borg top` and borg-web show it: per goal, the board's tasks (status, holder, lease
 //! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
 //! combined tree's commit, or why the last one failed), the newest contracts and messages between
-//! drones, and which holders are on other nodes (the board syncs over the mesh). One fold of the board
+//! drones, which holders are on other nodes (the board syncs over the mesh), and each group of attempts
+//! (hive/group.rs) with its winners, losers and reflection. One fold of the board
 //! and one pass over each of spend.jsonl, runs.jsonl, contracts.jsonl and messages.jsonl per goal;
 //! nothing at all for a store without a hive.
 
@@ -70,6 +71,8 @@ pub struct HiveView {
     /// What stops the goal on this node: conflicting definitions (goal.rs `conflict`), checks other
     /// nodes wrote waiting for `borg hive approve` (oracle.rs `Approvals`).
     pub alerts: Vec<String>,
+    /// Its groups (hive/group.rs): attempts, winners and losers, the member integrated, the reflection.
+    pub groups: Vec<super::group::Row>,
 }
 
 /// What stops goal `g` (board `b`) on this node, as the board and borg-web say it.
@@ -166,6 +169,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let messages = msgs[msgs.len().saturating_sub(CONTRACTS)..].to_vec();
     let nodes = events.iter().map(|e| e.node.as_str()).filter(|n| !n.is_empty() && *n != here).collect::<std::collections::BTreeSet<_>>().len();
     let alerts = alerts(home, &g, &b);
+    let groups = super::group::rows(home, &g, &events, &b);
     Some(HiveView {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
@@ -181,6 +185,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         finished: b.finished(),
         integration,
         alerts,
+        groups,
     })
 }
 
@@ -230,6 +235,21 @@ pub fn render(v: &HiveView) -> String {
     }
     if !v.integration.is_empty() {
         s.push_str(&format!("  {}\n", cut(&v.integration, 160)));
+    }
+    for gr in &v.groups {
+        let integrates = if gr.integrates.is_empty() { String::new() } else { format!(" · integrates {}", gr.integrates) };
+        let line = format!(
+            "  group {}: {} attempt(s) of {} · won {} · lost {} ({}){integrates} · {}",
+            gr.group,
+            gr.attempts,
+            gr.members,
+            if gr.won.is_empty() { "-".into() } else { gr.won.join(",") },
+            if gr.lost.is_empty() { "-".into() } else { gr.lost.join(",") },
+            gr.decided_by,
+            gr.reflection
+        );
+        s.push_str(&cut(&line, 200));
+        s.push('\n');
     }
     if !v.drones.is_empty() {
         s.push_str(&format!("  {:<10} {:<15} {:>5}  {}\n", "DRONE", "SPENT/SHARE", "ITERS", "LAST"));
@@ -292,6 +312,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let path = super::super::tasks_path(home, "g");
         board::append(&path, &[Event::open(t("t1", "a.rs"), "engineer:e", 10), Event::open(t("t2", "b.rs"), "engineer:e", 10)]).unwrap();
@@ -354,6 +375,7 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         board::append(&super::super::tasks_path(&home, "g"), &[Event { node: "remote".into(), ..Event::open(remote, "engineer:peer", 5) }]).unwrap();
         let v = of(&home, "g", 61_000).unwrap();

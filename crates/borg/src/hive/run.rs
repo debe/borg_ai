@@ -553,6 +553,14 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     if g.budget_usd <= 0.0 || !g.budget_usd.is_finite() {
         return usage(format!("goal {} has no budget: drones spend money", g.id));
     }
+    // A group's attempts are different drones', and none of them may judge a rival's (board.rs
+    // `Board::rival`): K attempts need K drones and one more to verify them.
+    let b = fold(home, &g.id);
+    let short =
+        super::group::groups(&b).into_iter().find(|(_, m)| m.len() >= o.drones && m.iter().any(|s| !matches!(s.status, super::Status::Verified { .. })));
+    if let Some((gr, m)) = short {
+        return usage(format!("group {gr} has {} attempts, each another drone's, verified by none of them: run at least {} drones", m.len(), m.len() + 1));
+    }
     let Some(repo) = repo_of(Path::new(dir)) else { return usage(format!("{dir} is not in a git repo: drones work in its worktrees")) };
     let repo_name = queen::repo_name(&repo.display().to_string());
     if !goal::in_scope(&g, &repo_name) {
@@ -745,7 +753,13 @@ mod tests {
         assert!(held.is_some());
         assert!(run_lock(&home, "g").unwrap().is_none(), "a second run is refused while the first holds it");
         drop(held);
-        assert!(run_lock(&home, "g").unwrap().is_some(), "free again once the first ended");
+        // A child another test forks right now holds a copy of every open file, this lock's too, until
+        // its exec closes it (close-on-exec): free again within moments, not necessarily at once.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while run_lock(&home, "g").unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "free again once the first ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -774,6 +788,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let remote = board::Event { node: "remote".into(), ..board::Event::new(Ev::Claim, "t1", "x", now).with_drone("d1") };
         let local = board::Event::new(Ev::Claim, "t2", "y", now).with_drone("d1");

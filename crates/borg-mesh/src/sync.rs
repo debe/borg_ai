@@ -13,7 +13,7 @@
 //!    same way everywhere). The peer must still be a member under the result, and revocations are
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
-//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl` (lines.rs `SYNCED`), each in turn:
+//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl` (lines.rs `SYNCED`), each in turn:
 //!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
 //!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
@@ -68,7 +68,7 @@ use crate::{live, steer};
 
 mod vectors;
 
-pub const ALPN: &[u8] = b"borg/mesh/7";
+pub const ALPN: &[u8] = b"borg/mesh/8";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
@@ -671,6 +671,7 @@ impl Node {
         report.presence += live::receive(home, &mine, &me, presence, now)?;
         let (new, dropped) = steer::receive(home, &mine, &me, &directives, now);
         (report.steered, report.dropped) = (report.steered + new, report.dropped + dropped);
+        borg::veto::apply_inbox(home); // a veto for a drone of this node: its credit and episode, once
         Ok(report)
     }
 
@@ -944,6 +945,41 @@ mod tests {
             assert_eq!(r["stat:na:dev@x:2026-10-12"].counts["turn_end"], 5, "the newest version of alice's bucket");
             assert_eq!(r["stat:nb:dev@x:2026-10-12"].counts["turn_end"], 7);
         }
+    }
+
+    /// Each node promoted an edit to the same playbook; after a round both fold the same steps, in the
+    /// same order, under the same version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn playbook_edits_sync_and_fold_the_same_on_both_nodes() {
+        let (pa, pb) = team("playbooks");
+        let (a, b) = (home(&pa), home(&pb));
+        let edit = |step: &str, text: &str, ms: i64, ok: &str| {
+            let mut e = borg::playbook::Edit {
+                pb: borg::playbook::playbook_id("", "fix the parser"),
+                step: step.into(),
+                text: text.into(),
+                shape: "fix the parser".into(),
+                ms,
+                ok_by: ok.into(),
+                ..Default::default()
+            };
+            e.edit = borg::playbook::edit_id(&e);
+            serde_json::to_string(&e).unwrap()
+        };
+        write(&a, borg::playbook::FILE, &[edit("s1", "run the parser tests", 1, "q1")]);
+        write(&b, borg::playbook::FILE, &[edit("s2", "add a failing test first", 2, "q2")]);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        served.unwrap();
+        synced.unwrap();
+        let (fa, fb) = (borg::playbook::read(&a), borg::playbook::read(&b));
+        assert_eq!(fa, fb);
+        assert_eq!(fa[0].steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2"]);
+        assert_eq!(fa[0].key(), fb[0].key());
+        alice.close().await;
+        bob.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1625,6 +1661,60 @@ mod tests {
         alice.enforce().unwrap();
         assert!(borg::steer::read_inbox(&a).is_empty(), "the revoked signer's directives are gone");
         assert_eq!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 6, || None), None, "and the pause no longer holds");
+        alice.close().await;
+        bob.close().await;
+    }
+
+    /// `borg no` on bob's node for alice's drone: signed, carried by the round's steering, recorded once on
+    /// alice's node (credit, episode, stat), shown to her drone once, and back on bob's node as a team
+    /// outcome, so both nodes' beliefs count the veto once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_veto_on_one_node_reaches_the_drones_node_once() {
+        let (pa, pb) = team("veto");
+        let (a, b) = (home(&pa), home(&pb));
+        let (alice_id, bob_id) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&b).unwrap());
+        let mut m = Membership::load(&a).unwrap().unwrap();
+        m.invite(&alice_id, &bob_id.public(), "steer").unwrap();
+        m.save(&a).unwrap();
+        let now = borg::learn::now_ms();
+        let ev = json!({"session_id": "alice-s1", "cwd": pa.dir, "prompt": "look merges up"});
+        borg::presence::write(&a, &borg::presence::update(None, "work", "claude", "prompt", &ev, now, |_| ("alice@x".into(), "repo".into()))).unwrap();
+        write(&a, "lessons.jsonl", &[lesson("L1", 1, "how are merges found?")]);
+        let asked = json!({"kind": "asked", "session": "alice-s1", "lessons": ["L1"], "ms": now - 10, "repo": "repo"}).to_string();
+        write(&a, "outcomes.jsonl", &[asked]);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        let _ = (served.unwrap(), synced.unwrap());
+
+        let said = crate::steer::issue(&b, "work", true, "bob@x", "One", borg::steer::VETO, "never look merges up in the commit log", now).unwrap();
+        assert!(said.starts_with("vetoed One of One (session alice-s1, alice@x)"), "{said}");
+        assert!(crate::steer::issue(&b, "work", true, "bob@x", "all", borg::steer::VETO, "no", now).is_err(), "a veto names one drone");
+        assert!(!b.join("episodes.jsonl").exists(), "the issuing node records no veto of its own");
+        for _ in 0..2 {
+            let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+            let _ = (served.unwrap(), synced.unwrap());
+        }
+        let vetoed =
+            |h: &Path| borg::outcome::read(&h.join("outcomes.jsonl")).into_iter().filter(|o| o.kind == borg::outcome::VETOED && o.lessons == ["L1"]).count();
+        assert_eq!(vetoed(&a), 1, "credited once on the drone's node, over two rounds");
+        let eps = std::fs::read_to_string(a.join("episodes.jsonl")).unwrap();
+        assert_eq!(eps.lines().count(), 1);
+        assert!(eps.contains("\"kind\":\"veto\"") && eps.contains("bob@x") && eps.contains("never look merges up"), "{eps}");
+        let stats: Vec<_> = borg::stats::events(&a).into_iter().filter(|e| e.kind == borg::stats::VETO).collect();
+        assert_eq!((stats.len(), stats[0].why.as_str()), (1, "mesh"));
+        // Alice's drone is told once, labelled with bob's key.
+        let prompt = json!({"session_id": "alice-s1", "cwd": pa.dir});
+        let out = borg::steer::around(&a, true, "prompt", &prompt, Some(now - 10), now + 1, || None).unwrap();
+        let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(ctx.starts_with(&format!("[borg] Veto from bob@x [key {}] (signed, role steer): The engineer said no", &bob_id.public()[..12])), "{ctx}");
+        assert_eq!(borg::steer::around(&a, true, "prompt", &prompt, Some(now - 10), now + 2, || None), None);
+        // Both nodes' beliefs count it once: alice's from her own record, bob's from the team outcome.
+        let l1 = [borg::conscience::Challenge { id: "L1".into(), ..Default::default() }];
+        let belief = |h: &Path| borg::memory::derive(&borg::outcome::read_team(&h.join("lessons.jsonl")), &l1, None)["L1"].vetoed;
+        assert_eq!((belief(&a), belief(&b)), (1, 1));
+        assert!(!b.join("outcomes.jsonl").exists() && !b.join("episodes.jsonl").exists(), "bob's node holds only the team copy");
         alice.close().await;
         bob.close().await;
     }

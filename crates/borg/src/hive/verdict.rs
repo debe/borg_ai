@@ -832,7 +832,7 @@ pub fn consistent(e: &Event) -> bool {
 
 /// The verdict events of `events` the fold took (they closed their verify task's tenure) and whose
 /// credit is `consistent`: (event, its verify task's attempt). One pass (`Index`).
-fn judged_events<'a>(events: &'a [Event], b: &Board) -> Vec<(&'a Event, Attempt)> {
+pub(crate) fn judged_events<'a>(events: &'a [Event], b: &Board) -> Vec<(&'a Event, Attempt)> {
     let x = Index::new(events, b);
     events
         .iter()
@@ -1292,6 +1292,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         // A verify task barred to the author's session only (a line from before drones were barred).
         let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s1".into()], ..t1.clone() };
@@ -1357,6 +1358,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s1".into()], ..t1.clone() };
         let remote = |e: Event| Event { node: "remote".into(), ..e };
@@ -1418,6 +1420,7 @@ mod tests {
                     not_by: vec![],
                     flags: vec![],
                     from: None,
+                    group: None,
                 };
                 let v = Task { id: format!("{id}.v1"), role: Role::Verify, of: Some(id.to_string()), ..t.clone() };
                 (t, v)
@@ -1544,6 +1547,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let v1 = |author: &str| Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec![author.into()], ..t1.clone() };
         let (a_done, b_claim, b_done) = (LEASE_MS + 50, LEASE_MS + 20, LEASE_MS + 90);
@@ -1725,6 +1729,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         };
         let v = |n: u32| Task { id: format!("t1.v{n}"), role: Role::Verify, of: Some("t1".into()), not_by: vec!["A".into()], ..t1.clone() };
         let attempt_lines = |ms: i64, n: &str| {

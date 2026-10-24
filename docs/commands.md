@@ -13,7 +13,8 @@
 | `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks or adapter and the `borg` skill; a dry run without `--apply` ([details](configuration.md#what-borg-install-writes)) |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions (opencode 2: known projects only, not the sessions it migrated from 1.x), or team documents ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
-| `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end); also counts each learned regret against the lessons asked before its decision (`regretted`) |
+| `borg learn [--session ID]` | Turn waiting episodes into lessons now (normally at session end); also counts each learned regret against the lessons asked before its decision (`regretted`), and first turns each settled hive group opened on this node into a reflection episode, once (see [Groups](#groups-of-attempts)) |
+| `borg learn --group <goal>/<task>` | Reflect on one hive group now: compare its winning and losing attempts and learn what the winners did, then learn like `borg learn`. Prints why nothing was written for a group of one, one not settled yet, or one whose attempts all won or all lost |
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness (with its `regretted` share of later fixes), weight, and long-term or dormant state, from this machine's outcomes and the team's synced ones |
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
@@ -77,7 +78,7 @@ $ borg hive board
 | `borg hive join <goal> [--session ID\|DRONE]` · `borg hive leave` | A running drone joins the goal, or leaves it (its claim is released). A drone started with `BORG_HIVE=<goal>` joins at its first hook |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
 | `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]` | Headless drones in worktrees, see [Running drones](#running-drones) |
-| `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again]` | An engineer opens a task; `--again` reopens a blocked one |
+| `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task; `--again` reopens a blocked one. `--group K` (2 to 19) opens K attempts `ID.g1`..`ID.gK` of one work task, each another drone's; see [Groups](#groups-of-attempts) |
 | `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it, exit 1 when another drone holds it (the message names the holder and tells the drone not to work on it). A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below). When that work does not apply there, `claim TASK` exits 1, and `claim` alone skips the task and takes the next one; a skipped task is not offered to that session again. A verify task of work done on another node whose snapshots this repo lacks (or a fix task whose tree it lacks) is not offered, and `claim TASK` exits 1 with "its work was done on node X and is not in this repo". A board it cannot write exits 1 with the error, never as a lost race. Inside a drone of `borg hive run` without `--session`, the session is the drone's (`BORG_HIVE_DRONE`), not whichever drone of the repo was seen last |
 | `borg hive progress "<note>"` · `release` · `block "<why>"` | Report on, give back or block the drone's claim |
 | `borg hive done [--note N]` | Run the task's checks with their own timeouts (no hook time limit), renewing the claim while they run; on a pass publish done and open its verify task. Exit 3 when the claim passed to another drone meanwhile: the board ignores that done, and the message names the holder |
@@ -250,14 +251,103 @@ in a row failed or timed out, two made no board progress, or nothing was open to
 Whatever an ended session still held is released (the note names why), so no claim waits for its
 lease. A verify task is never claimed by a session of the drone that did the work. Exit 0 when the board
 is finished, 1 when it is not, 2 when a precondition fails: an unknown goal, `--drones` outside 1–20, a
-goal without a budget, a repo outside the goal's, a harness that cannot run headless, or another run of
-the goal still going (one at a time).
+goal without a budget, a repo outside the goal's, a harness that cannot run headless, a group with more
+attempts than `--drones` (see [Groups](#groups-of-attempts)), or another run of the goal still going (one
+at a time).
 
 A re-run shares what `spend.jsonl` says is left, whatever the drone count. A run killed mid-session
 (Ctrl-C, a closed terminal) takes its sessions with it; the next run of the goal charges each of them
 as a cut-off one (`exit: "killed"`) and releases their claims before it starts. Superseding a contract
 of your own drone (any of its sessions) needs no answer through `borg queen`. `borg top` and the web page's Hive tab show
 each goal's board, its spend per drone and its newest contracts.
+
+### Groups of attempts
+
+```console
+$ borg hive open parser --id lexer --title "Write the lexer" --files src/lexer.rs --group 3
+opened lexer.g1 (work) Write the lexer in goal parser
+opened lexer.g2 (work) Write the lexer in goal parser
+opened lexer.g3 (work) Write the lexer in goal parser
+group lexer: 3 attempts, each another drone's (`borg hive run` needs one drone more, to verify them); the best is integrated
+$ borg hive run parser --drones 4
+$ borg learn --group parser/lexer
+group parser/lexer: reflection group-parser.lexer recorded
+1 new lessons, 0 merged into existing ones
+```
+
+A group runs one work task as K independent attempts (docs/design/hive-learning.md, step 4; best-of-N).
+Each member `<id>.gN` is an ordinary task: claimed, done, verified, reworked on a rejection. A session
+or drone that held or verified one member is never offered or allowed another, and one that held a
+member never verifies another, so the K attempts are K drones', independent, and none is judged by a
+rival (a run needs at least K+1 drones; one verifier may judge every member). The drones of one run share a harness and a model, so they differ by
+sampling only. Every member must be verified for the goal to finish. The integration merges only
+the group's best accepted attempt: the one the hidden oracle passed (a goal with one scores the group's
+attempts before it merges), else the one with the fewest rejections, then the earliest verified.
+
+Once every member is verified and every attempt has its reward, the group is settled. Each attempt
+won or lost: by the hidden oracle's score where this node has one, else by the verdict (verified and
+not hacked wins; a rejected attempt that was reworked lost, its rework is a new attempt). A settled
+group with a winner and a loser becomes one episode, `group-<goal>.<id>`: the task, which drones won
+and lost and by what, and each attempt's account, the verifier's note and its change, redacted and
+cut, winners first. `borg learn` asks the model once with its own prompt what the winners did that the
+losers did not, and writes that as a lesson whose `episodes` name the group (or merges it into a
+lesson that says it already). Every `borg learn`, the one at each session's end included, records
+the settled groups opened on this node first, once each: one node learns each group. `borg learn
+--group` reflects on a group from any node. A group of one, or one whose attempts all won or all
+lost, writes nothing. `BORG_GROUP_REFLECT=off` stops the automatic reflection (an eval arm without
+it); `BORG_LEARN=off` stops it too.
+
+`borg top` and the Hive tab show each group: its attempts, who won and who lost and by what, the
+member the integration takes, and its reflection (`waiting` until settled, `to reflect`, `learning`,
+`lesson <id>`, `not a lesson`, or `no spread`).
+
+Known limits: a task cannot depend on a group, nor on one of its members (`hive open` refuses a dep on
+a member: only the best one is integrated); and a rejected member is reworked like any task, not
+dropped once another member won.
+
+### Playbooks
+
+```console
+$ borg learn
+$ borg queen
+app (1)
+  1  Add to the team's playbook: "Run the parser's tests before calling it done"?
+$ borg queen answer 1 b
+q3f2a91c0 answered: the edit is promoted into ~/.local/share/borg/collectives/corp/playbooks.jsonl
+```
+
+A playbook is the team's procedure for a kind of task: its shape ("fix the parser") and a short list
+of steps (docs/design/hive-learning.md, step 5, L1). `playbooks.jsonl` holds edits, never whole
+playbooks: each adds a step, changes one, or removes one. Every reader folds the same set of edits
+into the same playbooks in any order (the edits replay by time: a removed step can be added again, a
+step's text is its latest add or change, and a change promoted on a machine whose clock is behind the
+step's add still lands), so the file syncs over the mesh like lessons. A line whose ids its content
+does not derive is ignored, so no synced line can rewrite a promoted step under the same version. A playbook's id comes from its repo and its
+shape's words; its version (`P…@<edits>.<hash>`) names the exact set of edits.
+
+After a hive attempt wins, `borg learn` asks the model once, shown the playbooks of that task's shape
+with their step ids, for at most one edit. An attempt wins when it was verified and not hacked, or,
+with a hidden oracle, passed by it; of a group, only the integrated member's attempt, and the attempts
+it beat are in the prompt. Only work done on this node is reflected, once per attempt
+(`playbooks-reflected.txt`, local). The edit is never applied by learning: it is queued as a queen
+question whose default keeps the playbook as it is, and only an engineer's `promote` answer appends it,
+stamped with the question and the engineer. An edit asked once is never asked again. A step is one
+line of at most 300 characters, and the question shows it whole: what you promote is what drones read.
+
+A drone with a claim sees the playbooks whose shape its task's title and files name (at least 60% of
+the shape's significant words, the queen's bar for a text stating something), of the task's repo or
+of none, once per version, after its contracts. A session outside the hive sees them only when its
+prompt names every word of the shape. Each version shown is logged (`playbook` in `outcomes.jsonl`), so
+the verdict on the drone's attempt, a `borg no` and a later regret credit that version as they credit
+the lessons shown, and its usefulness belief is the lessons' (memory.rs). The Hive tab lists each
+playbook with its steps, the belief of every version shown and the edits waiting for an answer (a
+playbook with nothing promoted yet shows with its waiting edits); the feed shows playbooks shown,
+edits proposed and edits promoted. `BORG_PLAYBOOKS=off` shows and proposes nothing.
+
+Known limits: promotion is the engineer's answer only, not yet a held-out eval win at the same budget;
+a low belief does not yet hide a version; there is no length or coverage check against brevity bias
+beyond the one-edit rule; the group reflection itself still writes an L0 lesson, while the playbook
+edit comes from the integrated attempt.
 
 ### Across machines
 
@@ -324,8 +414,18 @@ to stop it now: borg steer 3f9c2a1b --pause
 - several running: an error that lists them; name one with `--session` (a designation as `borg top`
   shows it, its number, a session id or a prefix of at least 4 characters).
 
-A drone on another member's machine is never vetoed from here. Presence keeps only a repo's name, so two
-checkouts of repos with the same name count as one repo; use `--session` there.
+A drone on another member's machine is never picked without `--session`. Presence keeps only a repo's
+name, so two checkouts of repos with the same name count as one repo; use `--session` there.
+
+**Across machines.** Name a drone on another member's machine with `--session` (as `borg top` lists
+it) and `borg no` sends the veto as a signed steering directive (`borg steer <drone> --veto
+"<reason>"` does the same). It needs what any directive to another engineer's drone needs: a team
+collective and the `admin` or `steer` role. It travels with the next mesh round. The drone's machine
+records it once, as if it had been said there: the lessons that session was shown lose credit, the
+reason becomes a veto episode that machine's `borg learn` turns into a lesson (and counts
+`veto_repeat`), and the drone is told at its next hook, labelled with your name and key. Your machine
+counts only the directive it sent; the credit reaches its beliefs through the team's outcomes, so each
+machine counts the veto once.
 
 **Inside the session.** A prompt that starts with `borg no` is the same veto for that session:
 
@@ -353,6 +453,11 @@ question. The prompt never becomes the session's task and is never also counted 
    question: keep it a lesson only (the default) or ratify it as a constraint. Only an engineer's
    answer ratifies it, and a personal lesson never proposes one. A ratified constraint is appended to
    `<store>/constraints.jsonl`. Nothing enforces constraints yet, and the mesh does not sync that file.
+
+4. **A missed escalation.** When the vetoed work had already merged (the session landed a commit of
+   its own that is still on HEAD, or its hive task was verified and integrated) and the queen never
+   escalated anything from that session, the veto also counts against the queen's attention (see
+   [Answering the queen](#answering-the-queen)).
 
 With `BORG_LEARN=off` the command records nothing and says so. The page (`borg web`) shows vetoes and
 the share of them that repeated an earlier one; the goal is zero.
@@ -395,3 +500,18 @@ of the reply. Pick an option, answer in your own words or skip. The drone record
 - A question belongs to its git repo, whichever subdirectory or worktree raised it.
 - A skipped question waits 3 days; an unanswered one returns after 3 more sessions.
 - `BORG_QUEEN_ASK=off` or `BORG_LEARN=off` turns this off.
+
+**The queen's attention.** Every escalation costs you minutes, so Borg scores how well the queen
+spends them. Only the questions the queen chooses to raise count (an external mutation, an irreversible
+change, a public API or schema change, a cross-repo decision); proposals you must answer anyway
+(constraints, contracts, playbooks, reach, open decisions) do not.
+
+| Event | Counts |
+|---|---|
+| An escalation you answered by changing course (any option but the one that lets the plan go ahead, or your own words) | +1 (`queen_no`) |
+| An escalation you answered "yes, fine" (the plan's own option, or a bare yes) | −1 (`queen_stamp`) |
+| A veto of merged work, or a later fix of a committed decision, from a session the queen never escalated | −3, a veto's weight (`queen_missed`) |
+
+The page's queen view shows the reward, the share of answered escalations that ended in a "no", and
+each count, for the whole team. The weights are design choices, not tuned. Nothing optimises this
+score: it is for you to watch, and for a later, evaluated escalation policy to be judged by.

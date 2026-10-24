@@ -37,6 +37,7 @@ pub mod board;
 pub mod contract;
 mod git;
 pub mod goal;
+pub mod group;
 pub mod guard;
 pub mod hidden;
 pub mod integrate;
@@ -530,6 +531,9 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
     if !t.deps.is_empty() && t.role != Role::Verify {
         out.push_str(&format!("; after {} (its verified work is in your tree)", t.deps.join(", ")));
     }
+    if let Some(gr) = &t.group {
+        out.push_str(&format!("; one of several independent attempts at {gr} by other drones: solve it your own way in your worktree"));
+    }
     let checks: Vec<&str> = oracle::checks(g, t).iter().map(|c| c.name.as_str()).collect();
     match t.role {
         Role::Verify => {
@@ -717,7 +721,8 @@ impl Ctx<'_> {
     }
 
     /// The prompt's hive context: the claim (in full when it is new to the drone), lost claims, the
-    /// board's changes since the last prompt, and contracts in the claim's scope not shown yet.
+    /// board's changes since the last prompt, and contracts and playbooks in the claim's scope not shown
+    /// yet.
     fn prompt(&self, hs: &mut HiveSession, b: &Board, events: &[(u64, Event)], end: u64) -> String {
         let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
         let mut parts: Vec<String> = Vec::new();
@@ -796,6 +801,14 @@ impl Ctx<'_> {
                 parts.push(format!("Contracts in your claim's scope:\n{}\n{}", lines.join("\n"), contract::LABEL));
                 shown = fresh.iter().map(|c| c.id.clone()).collect();
                 marks.push(format!("{CONTRACT_MARKER}{}", shown.join(",")));
+            }
+            // The team's playbooks for the claim's task shape (playbook.rs), each version once, logged so
+            // the verdict on this attempt credits the version shown.
+            let text = format!("{} {}", s.task.title, s.task.files.join(" "));
+            if let Some((pb, keys)) = crate::playbook::fresh(self.home, &state, repo, &text, queen::STATED) {
+                parts.push(pb);
+                marks.push(format!("{}{}", crate::playbook::MARKER, keys.join(",")));
+                crate::playbook::record_shown(self.home, self.session, repo, &keys, self.clock());
             }
         }
         if !marks.is_empty() {
@@ -1129,6 +1142,7 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
         not_by: std::iter::once(author.to_string()).chain(drone).collect(),
         flags: Vec::new(),
         from: None,
+        group: None,
     }
 }
 
@@ -1343,6 +1357,7 @@ pub const FLAGS: &[&str] = &[
     "--hidden-timeout",
     "--to",
     "--re",
+    "--group",
 ];
 
 /// The flags that take no value.
@@ -1363,7 +1378,9 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]
                                                             N headless drones in worktrees until done or the budget is spent
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
-       [--accept NAME=CMD]... [--again]                     an engineer opens a task (--again reopens a blocked one)
+       [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one;
+                                                            --group K: K attempts ID.g1.. by different drones, the
+                                                            best integrated, `borg learn --group <goal>/ID` compares them)
   drone commands (the goal is the session's):
   claim [TASK] | progress \"note\" | release | block \"why\" | done [--note N]
   verify --pass | --reject \"why\" (or end the turn with `VERDICT: pass|reject <why>`) | contract \"text\" --scope a,b [--supersedes ID]
@@ -1457,6 +1474,7 @@ fn new_task(id: &str, role: Role, title: &str, repo: &str, files: Vec<String>, d
         not_by: Vec::new(),
         flags: Vec::new(),
         from: None,
+        group: None,
     })
 }
 
@@ -1866,6 +1884,10 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
         eprintln!("borg hive open: give --id ID");
         return 2;
     };
+    if a.on("--again") && a.value("--group").is_some() {
+        eprintln!("borg hive open: --again reopens one blocked task (a group's member by its id), never a group");
+        return 2;
+    }
     let task = if a.on("--again") {
         match here.board(&g).tasks.get(id) {
             Some(s) if matches!(s.status, Status::Blocked { .. }) => s.task.clone(),
@@ -1884,15 +1906,60 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
         let b = here.board(&g);
         match made.and_then(|t| check_deps(std::slice::from_ref(&t), |d| b.tasks.contains_key(d)).map(|()| t)) {
             Ok(t) if b.tasks.contains_key(&t.id) => return fail(format!("task {} exists already (reopen a blocked one with --again)", t.id)),
+            Ok(t) if b.tasks.values().any(|s| s.task.group.as_ref() == Some(&t.id)) => return fail(format!("group {} exists already", t.id)),
+            // Only a group's best member is integrated (group.rs `merged`): work built on another member
+            // would be merged onto a tree without it.
+            Ok(t) if t.deps.iter().any(|d| b.tasks.get(d).is_some_and(|s| s.task.group.is_some())) => {
+                let d = t.deps.iter().find(|d| b.tasks.get(*d).is_some_and(|s| s.task.group.is_some())).cloned().unwrap_or_default();
+                return fail(format!("task {}: its dep {d} is an attempt of a group, and only a group's best attempt is integrated: depend on none", t.id));
+            }
             Ok(t) => t,
             Err(e) => return fail(e),
         }
     };
-    if let Err(e) = write(&here.home, goal_id, vec![Event::open(task.clone(), &here.engineer(), here.now)]) {
+    let tasks = match a.value("--group").map(str::parse::<usize>) {
+        None | Some(Ok(0 | 1)) => vec![task],
+        Some(Ok(k)) => match group_of(&here.board(&g), &task, k) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        },
+        Some(Err(_)) => {
+            eprintln!("borg hive open: --group is the number of attempts, 2 to {}", run::MAX_DRONES - 1);
+            return 2;
+        }
+    };
+    let opens: Vec<Event> = tasks.iter().map(|t| Event::open(t.clone(), &here.engineer(), here.now)).collect();
+    if let Err(e) = write(&here.home, goal_id, opens) {
         return fail(e);
     }
-    println!("opened {} ({}) {} in goal {goal_id}", task.id, task.role.name(), task.title);
+    for task in &tasks {
+        println!("opened {} ({}) {} in goal {goal_id}", task.id, task.role.name(), task.title);
+    }
+    if let [first, ..] = tasks.as_slice()
+        && let Some(gr) = &first.group
+    {
+        println!("group {gr}: {} attempts, each another drone's (`borg hive run` needs one drone more, to verify them); the best is integrated", tasks.len());
+    }
     0
+}
+
+/// The `k` members of a group opened as `t` (hive/group.rs): `<id>.g1`.. copies of the work task `t`.
+/// A group needs a drone per attempt and one more to verify them, so `k` is below `run::MAX_DRONES`.
+fn group_of(b: &Board, t: &Task, k: usize) -> Result<Vec<Task>, String> {
+    if t.role != Role::Work {
+        return Err(format!("--group: only a work task is attempted by a group, not a {} task", t.role.name()));
+    }
+    if k >= run::MAX_DRONES {
+        return Err(format!("--group {k}: a group needs a drone per attempt and one more to verify them, at most {}", run::MAX_DRONES - 1));
+    }
+    let members: Vec<Task> = (1..=k).map(|n| Task { id: group::member_id(&t.id, n), group: Some(t.id.clone()), ..t.clone() }).collect();
+    if let Some(m) = members.iter().find(|m| !valid_task_id(&m.id)) {
+        return Err(format!("invalid task id {:?}: the group's id must leave room for its members' `.gN`", m.id));
+    }
+    if let Some(m) = members.iter().find(|m| b.tasks.contains_key(&m.id)) {
+        return Err(format!("task {} exists already", m.id));
+    }
+    Ok(members)
 }
 
 fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {

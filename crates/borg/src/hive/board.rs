@@ -98,6 +98,12 @@ pub struct Task {
     /// a failed integration left, hive/integrate.rs), and the base its diff is judged from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// A work task that is one attempt of a group (hive/group.rs): the group's id, which its K members
+    /// (`<group>.g1`..) share. A session or drone that held one member is barred from the others
+    /// (`Board::barred`), so each attempt is another drone's; only the group's best accepted attempt is
+    /// integrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -319,6 +325,8 @@ pub struct Board {
     pub drones: BTreeMap<String, String>,
     /// The newest integration that passed.
     pub integrated: Option<Integration>,
+    /// Every integration that passed, oldest first.
+    pub integrations: Vec<Integration>,
 }
 
 impl Board {
@@ -328,7 +336,38 @@ impl Board {
     /// iteration's session has no line on the board yet.
     pub fn barred(&self, s: &TaskState, session: &str, drone: &str, node: &str) -> bool {
         let here = same_node(&s.node, node);
-        s.task.not_by.iter().any(|n| n == session || (here && ((!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n))))
+        let named = |n: &str| (!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n);
+        s.task.not_by.iter().any(|n| n == session || (here && named(n))) || self.rival(s, session, node, named)
+    }
+
+    /// The group member `t` belongs to: itself when it is one, the member it verifies when it is that
+    /// member's verify task; with the group's id.
+    fn member_of<'a>(&'a self, t: &'a Task) -> Option<(&'a str, &'a str)> {
+        let m = match t.role {
+            Role::Verify => &self.tasks.get(t.of.as_deref()?)?.task,
+            _ => t,
+        };
+        Some((m.id.as_str(), m.group.as_deref()?))
+    }
+
+    /// Whether `session` (or the drone `named` matches, on the same node) held a task of another member
+    /// of the group `s` belongs to (`member_of`), so its claim of `s` is not independent: a group's
+    /// attempts are different drones' (hive/group.rs), a drone that verified one member has read a rival
+    /// solution and may not attempt another, and one that attempted a member may not judge a rival's.
+    /// Verifying several members is no rivalry: one verifier may judge them all.
+    fn rival(&self, s: &TaskState, session: &str, node: &str, named: impl Fn(&str) -> bool) -> bool {
+        let Some((mine, g)) = self.member_of(&s.task) else { return false };
+        let verifying = s.task.role == Role::Verify;
+        let rivals = |t: &str| {
+            self.tasks
+                .get(t)
+                .and_then(|o| Some((o.task.role, self.member_of(&o.task)?)))
+                .is_some_and(|(role, (m, og))| og == g && m != mine && !(verifying && role == Role::Verify))
+        };
+        self.spans
+            .iter()
+            .filter(|sp| rivals(&sp.task))
+            .any(|sp| sp.by == session || (same_node(&sp.node, node) && self.drones.get(&sp.by).is_some_and(|d| named(d))))
     }
 
     /// The goal is reached: there are tasks, every one is verified (a work task by its verify task, a
@@ -611,7 +650,9 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
             // no other task (its fix task's open is written with it).
             if role == Role::Integrate {
                 if e.ev == Ev::Verified {
-                    b.integrated = Some(Integration { task: e.task.clone(), head: e.head.clone(), ms: e.ms });
+                    let i = Integration { task: e.task.clone(), head: e.head.clone(), ms: e.ms };
+                    b.integrations.push(i.clone());
+                    b.integrated = Some(i);
                 }
                 return;
             }
@@ -775,6 +816,7 @@ mod tests {
             not_by: vec![],
             flags: vec![],
             from: None,
+            group: None,
         }
     }
 

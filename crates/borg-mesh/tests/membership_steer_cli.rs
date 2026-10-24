@@ -92,3 +92,37 @@ fn revoke_demote_and_join_lift_the_steerers_pause_without_a_daemon() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&peer);
 }
+
+/// `borg steer <drone> --veto "<reason>"` (what `borg no` runs for a drone on another machine) for a
+/// drone of this machine: signed, filed and recorded as this machine's veto at once, without a daemon;
+/// a veto without a reason, or for every drone, is refused.
+#[test]
+fn a_signed_veto_of_a_local_drone_is_recorded_at_once() {
+    let root = tmp("veto");
+    mesh(&root, &["init"]);
+    let home = store(&root);
+    let ev = json!({"session_id": "s1", "cwd": root.join("work/app"), "prompt": "look merges up"});
+    borg::presence::write(&home, &borg::presence::update(None, "corp", "claude", "prompt", &ev, now(), |_| ("ann@x".into(), "app".into()))).unwrap();
+    let said = mesh(&root, &["steer", "s1", "--veto", "never", "read", "the", "commit", "log"]);
+    assert!(said.starts_with("vetoed One of One (session s1, ann@x): signed"), "{said}");
+    let eps = std::fs::read_to_string(home.join("episodes.jsonl")).unwrap();
+    assert_eq!(eps.lines().count(), 1);
+    assert!(eps.contains("\"kind\":\"veto\"") && eps.contains("never read the commit log"), "{eps}");
+    let stats = std::fs::read_to_string(home.join("stats/events.jsonl")).unwrap();
+    assert_eq!(stats.lines().filter(|l| l.contains("\"kind\":\"veto\"") && l.contains("\"why\":\"mesh\"")).count(), 1);
+    for args in [&["steer", "s1", "--veto"][..], &["steer", "all", "--veto", "no"][..]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_borg-mesh"))
+            .args(args)
+            .args(["--dir", &root.join("work/app").display().to_string()])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("BORG_HOME", root.join("base"))
+            .env("BORG_CONFIG", root.join("collectives.json"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} is refused");
+    }
+    assert_eq!(std::fs::read_to_string(home.join("episodes.jsonl")).unwrap().lines().count(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}

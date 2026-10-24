@@ -171,6 +171,9 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "assimilated" => ("imports", "var(--c-sky)", "⇣"),
         "vectors" => ("vector lookups", "var(--c-slate)", "≈"),
         "sync" => ("mesh syncs", "var(--c-sky)", "⇄"),
+        "playbook_shown" => ("playbooks shown", "var(--c-teal)", "☰"),
+        "playbook_proposed" => ("playbook edits proposed", "var(--c-violet)", "☰"),
+        "playbook_promoted" => ("playbook edits promoted", "var(--c-good)", "☰"),
         _ => ("other", "var(--c-muted)", "•"),
     }
 }

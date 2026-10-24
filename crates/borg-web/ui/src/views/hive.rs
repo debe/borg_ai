@@ -1,12 +1,47 @@
 //! Hive: the collective's hive goals (`borg hive`): each goal's board by status (a holder on another
 //! node named with it), what stops it here (conflicting definitions, checks awaiting `borg hive
-//! approve`), its integration, what each drone of `borg hive run` spent of its share, and the newest
-//! contracts and messages between drones.
+//! approve`), its integration, its groups of attempts (winners, losers, the one integrated, what
+//! reflection learned), what each drone of `borg hive run` spent of its share, and the newest contracts
+//! and messages between drones. Above them, the collective's L1 playbooks: their steps, the belief of
+//! each version drones were shown, and the edits waiting for an engineer (a playbook's first included).
 
 use leptos::prelude::*;
 
-use crate::api::{HiveGoal, data};
-use crate::util::trunc;
+use crate::api::{HiveGoal, Playbook, data};
+use crate::util::{ago, pct, trunc};
+
+fn playbook_view(p: Playbook) -> impl IntoView {
+    // A playbook no edit was promoted to yet shows with its waiting edits alone.
+    let meta = format!(
+        "{}{}{}{}",
+        if p.edits > 0.0 { format!("v{} · ", p.edits) } else { String::new() },
+        if p.repo.is_empty() { String::new() } else { format!("{} · ", p.repo) },
+        if p.edits > 0.0 { format!("promoted {}", ago(p.promoted_ms)) } else { "nothing promoted yet".into() },
+        if p.proposed > 0.0 { format!(" · {} edit(s) waiting in the queen's queue", p.proposed) } else { String::new() }
+    );
+    view! {
+        <div>
+            <h3 title=p.key.clone()>{format!("“{}”", p.shape)}<small>{format!(" {} · {meta}", p.id)}</small></h3>
+            <ol>{p.steps.iter().map(|(id, text)| view! { <li title=id.clone()>{trunc(text, 240)}</li> }).collect_view()}</ol>
+            {(!p.waiting.is_empty()).then(|| view! {
+                <ul class="feed-meta" title="proposed edits an engineer has not answered yet (borg queen)">
+                    {p.waiting.iter().map(|(op, text)| view! { <li>{format!("waiting: {op} “{}”", trunc(text, 240))}</li> }).collect_view()}
+                </ul>
+            })}
+            {(!p.versions.is_empty()).then(|| view! {
+                <table class="mono">
+                    <tr><th>"version shown"</th><th>"useful"</th><th>"verified"</th><th>"rejected"</th><th>"hacked"</th><th>"vetoed"</th><th>"regretted"</th></tr>
+                    {p.versions.iter().map(|v| view! {
+                        <tr>
+                            <td>{v.key.clone()}</td><td>{pct(v.mean, 1.0)}</td><td>{v.verified}</td><td>{v.rejected}</td>
+                            <td>{v.hacked}</td><td>{v.vetoed}</td><td>{format!("{:.2}", v.regretted)}</td>
+                        </tr>
+                    }).collect_view()}
+                </table>
+            })}
+        </div>
+    }
+}
 
 /// Board groups in the order a reader scans them: what moves first.
 const GROUPS: [&str; 6] = ["claimed", "open", "expired", "blocked", "done", "verified"];
@@ -29,6 +64,22 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
             {g.alerts.iter().map(|a| view! { <p class="feed-meta mono" title="stops this goal on this node">{format!("! {}", trunc(a, 300))}</p> }).collect_view()}
             <div class="bar" title="budget spent"><div style=format!("width:{spent:.0}%;height:6px;background:currentColor;opacity:.6")></div></div>
             {(!g.integration.is_empty()).then(|| view! { <p class="feed-meta mono" title="the combined tree of the accepted work">{trunc(&g.integration, 200)}</p> })}
+            {(!g.groups.is_empty()).then(|| view! {
+                <h3>"Groups"</h3>
+                <table class="mono">
+                    <tr><th>"group"</th><th>"attempts"</th><th>"won"</th><th>"lost"</th><th>"integrates"</th><th>"reflection"</th></tr>
+                    {g.groups.iter().map(|r| view! {
+                        <tr title=format!("decided by {}", r.decided_by)>
+                            <td>{r.group.clone()}</td>
+                            <td>{format!("{} of {}", r.attempts, r.members)}</td>
+                            <td>{if r.won.is_empty() { "-".to_string() } else { r.won.join(", ") }}</td>
+                            <td>{if r.lost.is_empty() { "-".to_string() } else { r.lost.join(", ") }}</td>
+                            <td>{r.integrates.clone()}</td>
+                            <td>{r.reflection.clone()}</td>
+                        </tr>
+                    }).collect_view()}
+                </table>
+            })}
             {GROUPS.iter().filter_map(|grp| {
                 let rows: Vec<_> = g.tasks.iter().filter(|t| t.status == *grp).cloned().collect();
                 (!rows.is_empty()).then(|| view! {
@@ -89,6 +140,15 @@ pub fn Hive() -> impl IntoView {
     let d = data();
     view! {
         <section>
+            {move || {
+                let pbs = d.playbooks.get();
+                (!pbs.is_empty()).then(|| view! {
+                    <article class="panel">
+                        <div class="kn-bar"><h2>"Playbooks"<small>"procedures learned from verified work, promoted by engineers"</small></h2></div>
+                        {pbs.into_iter().map(playbook_view).collect_view()}
+                    </article>
+                })
+            }}
             {move || {
                 let goals = d.hive.get();
                 if goals.is_empty() {

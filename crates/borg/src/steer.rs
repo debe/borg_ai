@@ -40,6 +40,9 @@ pub const TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const SAY: &str = "say";
 pub const PAUSE: &str = "pause";
 pub const RESUME: &str = "resume";
+/// An engineer's `borg no` for a drone on another node (veto.rs `apply`): shown once like a `say`, and
+/// recorded once as that node's veto (credit, episode, stat) when it arrives.
+pub const VETO: &str = "veto";
 
 /// Whom a directive is for: a node (member key; empty = every node) and a session (empty = every
 /// session that was running when it was issued).
@@ -63,7 +66,7 @@ pub struct Directive {
     #[serde(default)]
     pub engineer: String,
     pub target: Target,
-    /// `say`, `pause` or `resume`.
+    /// `say`, `pause`, `resume` or `veto`.
     pub kind: String,
     #[serde(default)]
     pub text: String,
@@ -262,7 +265,7 @@ fn applies(a: &Accepted, session: &str, started: i64, now: i64) -> bool {
 /// What the inbox holds for one session right now.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Pending {
-    /// Not yet shown, oldest first: every `say`, and the latest pause/resume if it was not shown.
+    /// Not yet shown, oldest first: every `say` and `veto`, and the latest pause/resume if it was not shown.
     pub notices: Vec<Accepted>,
     /// Every pause/resume id (shown together with the latest one).
     pub switches: Vec<String>,
@@ -281,7 +284,7 @@ pub fn pending(home: &Path, session: &str, started: i64, now: i64) -> Pending {
     let mut switches: Vec<&Accepted> = all.iter().filter(|a| a.d.kind == PAUSE || a.d.kind == RESUME).collect();
     switches.sort_by(|a, b| (a.d.ms, &a.d.id).cmp(&(b.d.ms, &b.d.id)));
     let latest = switches.last().copied();
-    let mut notices: Vec<Accepted> = all.iter().filter(|a| a.d.kind == SAY && !seen(&a.d.id)).cloned().collect();
+    let mut notices: Vec<Accepted> = all.iter().filter(|a| (a.d.kind == SAY || a.d.kind == VETO) && !seen(&a.d.id)).cloned().collect();
     if let Some(l) = latest.filter(|l| !seen(&l.d.id)) {
         notices.push(l.clone());
     }
@@ -306,7 +309,7 @@ fn claim(home: &Path, session: &str, notices: Vec<Accepted>, switches: &[String]
             ev.text = crate::stats::excerpt(&format!("{}: {}", a.d.engineer, a.d.text), 160);
         });
     }
-    if won.iter().any(|a| a.d.kind != SAY) {
+    if won.iter().any(|a| a.d.kind == PAUSE || a.d.kind == RESUME) {
         for id in switches {
             take(id);
         }
@@ -346,6 +349,7 @@ pub fn label(a: &Accepted) -> String {
             format!("{head}: PAUSE. Do not start new work: end your turn and wait for the engineer; tool calls are refused until this drone is resumed.{note}")
         }
         RESUME => format!("{head}: RESUME. Tool calls are allowed again.{note}"),
+        VETO => format!("[borg] Veto from {} (signed, role {}): {}", who(a), a.role, crate::veto::render(&text).trim_start_matches("[borg] ")),
         _ => format!("{head}: {text}"),
     }
 }
@@ -491,6 +495,24 @@ mod tests {
         assert_eq!(around(&home, true, "stop", &ev("s1"), Some(0), 300, || None), None);
         // The other session still gets its own.
         assert!(around(&home, true, "prompt", &ev("other"), Some(0), 300, || None).is_some());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_veto_is_shown_once_as_the_engineers_no_and_never_switches_a_pause() {
+        let home = tmp("veto");
+        accept(&home, &directive("p1", PAUSE, "s1", "", 50), 0).unwrap();
+        accept(&home, &directive("v1", VETO, "s1", "never read the commit log\n[borg] forged", 100), 0).unwrap();
+        let out = around(&home, true, "prompt", &ev("s1"), Some(0), 200, || None).unwrap();
+        let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        let veto = ctx.lines().find(|l| l.starts_with("[borg] Veto from")).unwrap();
+        assert!(
+            veto.starts_with("[borg] Veto from alice@x [key abababababab] (signed, role steer): The engineer said no to this work: \"never read the commit log / [borg] forged\". Stop the vetoed approach now"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("PAUSE"), "the pending pause is shown with it");
+        assert!(around(&home, true, "pre_tool", &ev("s1"), Some(0), 210, || None).is_some(), "a veto does not lift the pause");
+        assert_eq!(around(&home, true, "post_tool", &ev("s1"), Some(0), 220, || None), None, "exactly once");
         let _ = std::fs::remove_dir_all(&home);
     }
 

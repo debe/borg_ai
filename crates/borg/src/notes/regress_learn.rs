@@ -58,6 +58,16 @@ fn learn_regrets(l: &Landed, git: &Git, scope: &Scope, found: &[Link], done: &mu
     }
 }
 
+/// A strong link is a "no" after merge: the fix changed a committed decision. One whose deciding session
+/// the queen never escalated is a missed escalation (escalation.rs), once per link, whether or not the
+/// link is learned from.
+fn missed_escalations(scope: &Scope, found: &[Link]) {
+    let now = learn::now_ms();
+    for link in found.iter().filter(|x| x.strong()) {
+        crate::escalation::missed(&scope.store, &link.decision.session, "regret", &regret::id_of(link), &link.repo, now);
+    }
+}
+
 /// The end of `borg notes attach`'s message: what `record` and `learn_regrets` wrote.
 fn summary(done: &Recorded) -> String {
     let mut s = if done.links == 0 { String::new() } else { format!("; {} link(s) to earlier decisions ({} fix)", done.links, done.strong) };
@@ -71,7 +81,7 @@ fn summary(done: &Recorded) -> String {
 }
 
 /// notes.rs `After`: links the session's landed commits to the decisions they fixed and records
-/// them; with `BORG_REGRESS=learn`, strong links also become regret episodes in the collective's
+/// them (a strong link without an escalation counts against the queen, `missed_escalations`); with `BORG_REGRESS=learn`, strong links also become regret episodes in the collective's
 /// store (a local one's never leave the machine). The text ends `borg notes attach`'s message; silent when there is nothing.
 #[must_use]
 pub fn after_notes(l: &Landed) -> String {
@@ -83,6 +93,7 @@ pub fn after_notes(l: &Landed) -> String {
     let git = cfg.git(l.repo);
     let found = regress::links_with(&git, l, &scope, &cfg);
     let mut done = regress::record(l.repo, &scope, &found.links);
+    missed_escalations(&scope, &found.links);
     if cfg.mode == Mode::Learn {
         learn_regrets(l, &git, &scope, &found.links, &mut done);
     }

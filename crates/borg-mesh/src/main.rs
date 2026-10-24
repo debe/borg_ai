@@ -21,7 +21,7 @@
 //!                                              every known peer each interval and on local change;
 //!                                              default 0.0.0.0:7878, 60 s)
 //!        borg-mesh sync <key>[@<hints>]       (reconcile with one member, once)
-//!        borg-mesh steer <drone|session|all> "<text>" | <drone> --pause | --resume
+//!        borg-mesh steer <drone|session|all> "<text>" | <drone> --pause | --resume | --veto "<reason>"
 //!                                             (signed steering, steer.rs; `borg steer` runs this)
 //!        borg-mesh fetch [<commit>...]        (ask every known member for the reasoning excerpts of these
 //!                                              commits, default: recent commits without a note, and
@@ -312,7 +312,8 @@ async fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `steer <drone|session|all> "<text>" | --pause [text] | --resume [text]`: works for a local
+/// `steer <drone|session|all> "<text>" | --pause [text] | --resume [text] | --veto <reason>` (`borg no`
+/// for another node's drone runs the last): works for a local
 /// collective too (signed with this machine's key, never leaves it); never for an off repo.
 fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String> {
     let (name, home) = store(r)?;
@@ -321,7 +322,7 @@ fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String
     while i < args.len() {
         match args[i].as_str() {
             "--dir" => i += 1,
-            "--pause" | "--resume" => {}
+            "--pause" | "--resume" | "--veto" => {}
             w => words.push(w.to_string()),
         }
         i += 1;
@@ -330,13 +331,15 @@ fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String
         borg::steer::PAUSE
     } else if args.iter().any(|a| a == "--resume") {
         borg::steer::RESUME
+    } else if args.iter().any(|a| a == "--veto") {
+        borg::steer::VETO
     } else {
         borg::steer::SAY
     };
-    let usage = "usage: borg steer <drone|session|all> \"<text>\" | <drone> --pause | <drone> --resume [--dir DIR]";
+    let usage = "usage: borg steer <drone|session|all> \"<text>\" | <drone> --pause | <drone> --resume | <drone> --veto \"<reason>\" [--dir DIR]";
     let target = words.first().ok_or(usage)?;
     let text = words[1..].join(" ");
-    if kind == borg::steer::SAY && text.trim().is_empty() {
+    if (kind == borg::steer::SAY || kind == borg::steer::VETO) && text.trim().is_empty() {
         return Err(usage.into());
     }
     let engineer = borg::learn::engineer(&place.dir);

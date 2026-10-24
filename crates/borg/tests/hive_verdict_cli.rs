@@ -445,3 +445,85 @@ fn a_goal_of_joined_sessions_integrates_fixes_and_finishes_through_the_cli() {
     assert_eq!((code, out.contains("the goal is finished")), (2, true), "{out}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The context a hook's output hands the drone.
+fn context(out: &str) -> String {
+    serde_json::from_str::<Value>(out.trim()).ok().and_then(|v| v["hookSpecificOutput"]["additionalContext"].as_str().map(String::from)).unwrap_or_default()
+}
+
+/// `borg <args>` on the collective's store with the learn model the fake `claude` (common.rs): its stdout.
+fn with_fake_model(root: &Path, args: &[&str]) -> String {
+    let out = command(root, args).env("BORG_HOME", store(root)).env("BORG_LEARN_MODEL", "claude:fake").stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "borg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into()
+}
+
+#[test]
+fn a_verified_task_proposes_a_playbook_edit_and_once_promoted_it_reaches_the_next_matching_task_only() {
+    let root = setup("playbook");
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
+    work_done(&root, "g1", "src/parse.py", comment);
+    ok(&root, &["verify", "--pass", "--session", "sb"]);
+    // `borg learn` reflects on the verified attempt once and queues the model's edit for the engineer.
+    let answer = json!({"shape": "fix the parser", "op": "add", "step": "", "text": "Run the parser's tests before calling it done"});
+    std::fs::write(root.join("answer.json"), json!({"structured_output": answer, "total_cost_usd": 0}).to_string()).unwrap();
+    with_fake_model(&root, &["learn"]);
+    let reflections = || common::prompts(&root).into_iter().filter(|p| p.starts_with(borg::playbook::OPENING)).collect::<Vec<_>>();
+    let asked = reflections();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].contains("## The task\nFix the parser") && asked[0].contains("An independent verifier passed it.") && asked[0].contains("(none)"),
+        "{}",
+        asked[0]
+    );
+    assert!(!store(&root).join(borg::playbook::FILE).exists(), "learning never applies an edit");
+    let q = borg::queen::open(&store(&root)).into_iter().find(|e| e.kind == borg::queen::Kind::Playbook).unwrap();
+    assert!(q.question.contains("Run the parser's tests"), "{}", q.question);
+    with_fake_model(&root, &["learn"]);
+    assert_eq!(reflections().len(), 1, "once per attempt");
+    let out = command(&root, &["queen", "answer", &q.id, "b", "--dir", work(&root).to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("the edit is promoted"),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pbs = borg::playbook::read(&store(&root));
+    assert_eq!(pbs.len(), 1);
+    let key = pbs[0].key();
+
+    // A task of the playbook's shape is shown it once; a task of another shape is not.
+    ok(&root, &["open", "g1", "--id", "t2", "--title", "Fix the parser for empty input", "--files", "src/parse.py"]);
+    ok(&root, &["open", "g1", "--id", "t3", "--title", "Write the release notes", "--files", "docs/notes.md"]);
+    for s in ["sc", "sd", "se"] {
+        join(&root, s, "g1");
+    }
+    ok(&root, &["claim", "t2", "--session", "sc"]);
+    ok(&root, &["claim", "t3", "--session", "sd"]);
+    let prompt = |s: &str, text: &str| context(&hook(&root, "claude", "prompt", s, json!({"prompt": text}), &[]));
+    let shown = prompt("sc", "go on");
+    assert!(shown.contains(&format!("playbook {} v1 for \"fix the parser\"", pbs[0].id)) && shown.contains("Run the parser's tests"), "{shown}");
+    assert!(!prompt("sc", "go on").contains("playbook"), "each version once");
+    assert!(!prompt("sd", "go on").contains("playbook"), "another task's shape");
+    let logged = outcomes(&root, "playbook");
+    assert_eq!((logged.len(), logged[0]["session"].as_str(), logged[0]["lessons"][0].as_str()), (1, Some("sc"), Some(key.as_str())));
+    // The verdict on that attempt credits the version shown, as it credits the lessons shown.
+    let p = work(&root).join("src/parse.py");
+    std::fs::write(&p, comment(&std::fs::read_to_string(&p).unwrap())).unwrap();
+    ok(&root, &["done", "--session", "sc"]);
+    ok(&root, &["claim", "t2.v1", "--session", "se"]);
+    ok(&root, &["verify", "--pass", "--session", "se"]);
+    let v: Vec<Value> = outcomes(&root, "verified").into_iter().filter(|o| o["session"] == "sc").collect();
+    assert_eq!((v.len(), v[0]["lessons"][0].as_str()), (1, Some(key.as_str())));
+    // So does the engineer's no.
+    hook(&root, "claude", "prompt", "sc", json!({"prompt": "borg no: never patch the parser without a failing test first"}), &[]);
+    let vetoed = outcomes(&root, "vetoed");
+    assert!(vetoed.iter().any(|o| o["session"] == "sc" && o["lessons"][0] == key.as_str()), "{vetoed:?}");
+    let belief = &borg::playbook::beliefs(&store(&root))[&key];
+    assert_eq!((belief.verified, belief.vetoed), (1, 1));
+    // A session outside the hive sees it only when its prompt names the whole shape.
+    assert!(!prompt("sn", "tidy the docs").contains("playbook"));
+    let plain = prompt("sn", "please fix the parser, it breaks on tabs");
+    assert!(plain.contains("the team's playbook") && plain.contains("Run the parser's tests"), "{plain}");
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -1028,8 +1028,11 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     // An adapter that will not wait for the answer (`"context": false`), or a harness whose model never
     // sees a prompt's context, gets none: what is handed over here is marked delivered and would be lost.
     let out = (h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false))).then(|| {
-        let ask = queen_ask(h, session, input.get("cwd").and_then(Value::as_str).unwrap_or_default());
-        let extra: Vec<String> = [ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
+        let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        let ask = queen_ask(h, session, cwd);
+        let playbook =
+            learning().then(|| crate::playbook::for_prompt(&learn::home(), session, &crate::queen::repo_name(cwd), prompt, learn::now_ms())).flatten();
+        let extra: Vec<String> = [playbook, ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
         free_context_with(h, "UserPromptSubmit", session, input, prompt, (!extra.is_empty()).then(|| extra.join("\n\n")))
     });
     // A new turn's work starts, after a live ask handed over here took the last turn's as its evidence.

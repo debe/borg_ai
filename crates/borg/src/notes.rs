@@ -331,6 +331,13 @@ pub fn landed(repo: &Path, start: &Start, windows: &[(i64, i64)]) -> Vec<String>
     out
 }
 
+/// The commits `session` landed so far (`landed`, from its start recorded in `dir`); empty when it
+/// started outside git or left no record here.
+pub fn landed_by(dir: &Path, session: &str) -> Vec<String> {
+    let start = std::fs::read_to_string(state(dir, session, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok());
+    start.map(|s| landed(Path::new(&s.repo), &s, &windows(dir, session, &s))).unwrap_or_default()
+}
+
 /// The top level of the git repo `dir` is in.
 pub fn toplevel(dir: &str) -> Option<PathBuf> {
     git(Path::new(dir), &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
@@ -700,6 +707,20 @@ mod tests {
 
         // Idempotent: a second run (another `end`) adds nothing.
         assert_eq!(attach(&l, false).unwrap(), Attached::default());
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// The veto's "after merge" (escalation.rs `merged`): a session that landed a commit of its own.
+    #[test]
+    fn landed_by_reads_the_sessions_recorded_start() {
+        let (repo, dir, store) = repo("landed-by");
+        assert!(landed_by(&dir, "s-3").is_empty(), "no start recorded");
+        remember_start(&dir, "s-3", &repo.display().to_string());
+        assert!(landed_by(&dir, "s-3").is_empty(), "nothing landed yet");
+        assert!(!crate::escalation::merged(&store, &dir, "s-3", i64::MAX));
+        sh(&repo, &["commit", "-q", "--allow-empty", "-m", "landed"]);
+        assert_eq!(landed_by(&dir, "s-3"), vec![sh(&repo, &["rev-parse", "HEAD"])]);
+        assert!(crate::escalation::merged(&store, &dir, "s-3", i64::MAX));
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
 

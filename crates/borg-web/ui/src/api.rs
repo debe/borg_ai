@@ -367,6 +367,38 @@ pub fn parse_queen(v: &Value) -> Vec<QueenEntry> {
         .collect()
 }
 
+/// The queen's attention reward (borg escalation.rs), the team's: escalations answered "no" (+1),
+/// rubber-stamped (−alpha), and "no"s after merge never escalated (−beta).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Attention {
+    pub answered: f64,
+    pub no: f64,
+    pub stamps: f64,
+    pub missed: f64,
+    /// The share of answered escalations that ended in a "no"; None before any answer.
+    pub share: Option<f64>,
+    pub reward: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    /// The server sent it (an older one does not).
+    pub known: bool,
+}
+
+pub fn parse_attention(v: &Value) -> Attention {
+    let a = &v["attention"];
+    Attention {
+        answered: f(&a["answered"]),
+        no: f(&a["no"]),
+        stamps: f(&a["stamps"]),
+        missed: f(&a["missed"]),
+        share: a["share"].as_f64(),
+        reward: f(&a["reward"]),
+        alpha: f(&a["alpha"]),
+        beta: f(&a["beta"]),
+        known: a.is_object(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drone {
     pub designation: String,
@@ -447,6 +479,23 @@ pub struct HiveGoal {
     pub nodes: f64,
     /// What stops the goal on this node: conflicting definitions, checks waiting for `borg hive approve`.
     pub alerts: Vec<String>,
+    /// Its groups of attempts (borg hive/group.rs `Row`).
+    pub groups: Vec<HiveGroup>,
+}
+
+/// One group of K attempts at a task by different drones, and what reflection made of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveGroup {
+    pub group: String,
+    pub members: f64,
+    pub attempts: f64,
+    pub won: Vec<String>,
+    pub lost: Vec<String>,
+    pub decided_by: String,
+    /// The member an integration merges; empty before one is accepted.
+    pub integrates: String,
+    /// `lesson <id>`, `not a lesson`, `learning`, `to reflect`, `no spread` or `waiting`.
+    pub reflection: String,
 }
 
 pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
@@ -501,6 +550,83 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                 .collect(),
             nodes: f(&g["nodes"]),
             alerts: strs(&g["alerts"]),
+            groups: g["groups"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| HiveGroup {
+                    group: s(&r["group"]),
+                    members: f(&r["members"]),
+                    attempts: f(&r["attempts"]),
+                    won: strs(&r["won"]),
+                    lost: strs(&r["lost"]),
+                    decided_by: s(&r["decided_by"]),
+                    integrates: s(&r["integrates"]),
+                    reflection: s(&r["reflection"]),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// One version of a playbook that was shown, with its usefulness belief (borg memory.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybookVersion {
+    pub key: String,
+    pub mean: f64,
+    pub verified: f64,
+    pub rejected: f64,
+    pub hacked: f64,
+    pub vetoed: f64,
+    pub regretted: f64,
+}
+
+/// An L1 playbook (borg playbook.rs `view`): the steps for a kind of task, promoted by engineers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playbook {
+    pub id: String,
+    pub key: String,
+    pub shape: String,
+    pub repo: String,
+    pub edits: f64,
+    pub promoted_ms: f64,
+    /// (step id, text), in order.
+    pub steps: Vec<(String, String)>,
+    pub versions: Vec<PlaybookVersion>,
+    /// Edits waiting for an engineer's answer in the queen's queue, and each one's (op, text).
+    pub proposed: f64,
+    pub waiting: Vec<(String, String)>,
+}
+
+pub fn parse_playbooks(v: &Value) -> Vec<Playbook> {
+    v["playbooks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| Playbook {
+            id: s(&p["id"]),
+            key: s(&p["key"]),
+            shape: s(&p["shape"]),
+            repo: s(&p["repo"]),
+            edits: f(&p["edits"]),
+            promoted_ms: f(&p["promoted_ms"]),
+            steps: p["steps"].as_array().into_iter().flatten().map(|x| (s(&x["id"]), s(&x["text"]))).collect(),
+            versions: p["versions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|x| PlaybookVersion {
+                    key: s(&x["key"]),
+                    mean: f(&x["mean"]),
+                    verified: f(&x["verified"]),
+                    rejected: f(&x["rejected"]),
+                    hacked: f(&x["hacked"]),
+                    vetoed: f(&x["vetoed"]),
+                    regretted: f(&x["regretted"]),
+                })
+                .collect(),
+            proposed: f(&p["proposed"]),
+            waiting: p["waiting"].as_array().into_iter().flatten().map(|x| (s(&x["op"]), s(&x["text"]))).collect(),
         })
         .collect()
 }
@@ -549,9 +675,13 @@ pub struct Data {
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
     pub queen: Memo<Vec<QueenEntry>>,
+    /// The queen's attention reward (served with the queue).
+    pub attention: Memo<Attention>,
     pub drones: Memo<Vec<Drone>>,
     /// The collective's hive goals; empty without a hive (or on a server without `/api/hive`).
     pub hive: Memo<Vec<HiveGoal>>,
+    /// The collective's L1 playbooks (served with the hive).
+    pub playbooks: Memo<Vec<Playbook>>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -591,8 +721,10 @@ pub fn provide() -> Data {
         lessons: Memo::new(move |_| parse_lessons(&le.raw.get())),
         feed: Memo::new(move |_| parse_feed(&fe.raw.get())),
         queen: Memo::new(move |_| parse_queen(&qu.raw.get())),
+        attention: Memo::new(move |_| parse_attention(&qu.raw.get())),
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
         hive: Memo::new(move |_| parse_hive(&hi.raw.get())),
+        playbooks: Memo::new(move |_| parse_playbooks(&hi.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

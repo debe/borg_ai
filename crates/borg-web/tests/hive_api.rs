@@ -63,6 +63,7 @@ fn seed(home: &Path, now: i64) {
         not_by: vec![],
         flags: vec![],
         from: None,
+        group: None,
     };
     let tasks = hive::tasks_path(home, "g");
     board::append(&tasks, &[Event::open(t("t1"), "engineer:e", now - 10), Event::open(t("t2"), "engineer:e", now - 10)]).unwrap();
@@ -101,6 +102,83 @@ async fn a_goal_shows_its_counts_holder_and_spend() {
     assert_eq!((status, v["goals"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "no hive, no goals");
     let (status, _) = get(app, "/api/hive?c=nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn a_group_of_attempts_shows_with_its_reflection() {
+    let base = std::env::temp_dir().join(format!("borg-web-group-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let corp = base.join("corp");
+    let now = learn::now_ms();
+    seed(&corp, now);
+    let (_, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
+    assert_eq!(v["goals"][0]["groups"], serde_json::json!([]), "no group, no rows");
+    let member = |n: usize| Task {
+        id: hive::group::member_id("t3", n),
+        role: Role::Work,
+        title: "write t3.txt".into(),
+        repo: String::new(),
+        files: vec!["t3.txt".into()],
+        deps: vec![],
+        accept: vec![],
+        of: None,
+        not_by: vec![],
+        flags: vec![],
+        from: None,
+        group: Some("t3".into()),
+    };
+    board::append(&hive::tasks_path(&corp, "g"), &[Event::open(member(1), "engineer:e", now - 3), Event::open(member(2), "engineer:e", now - 3)]).unwrap();
+    let (_, v) = get(app(vec![("corp", corp)]), "/api/hive?c=corp").await;
+    let row = &v["goals"][0]["groups"][0];
+    assert_eq!((row["group"].as_str(), row["members"].as_u64(), row["attempts"].as_u64()), (Some("t3"), Some(2), Some(0)), "{v}");
+    assert_eq!((row["reflection"].as_str(), row["integrates"].as_str()), (Some("waiting"), Some("")));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A promoted playbook shows with its steps, the belief of each version shown and the edits waiting
+/// for the engineer.
+#[tokio::test]
+async fn a_playbook_shows_its_steps_belief_and_waiting_edits() {
+    let base = std::env::temp_dir().join(format!("borg-web-playbook-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let corp = base.join("corp");
+    seed(&corp, learn::now_ms());
+    let (_, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
+    assert_eq!(v["playbooks"], serde_json::json!([]));
+    let pb = borg::playbook::playbook_id("app", "fix the parser");
+    let edit = |text: &str, ms: i64| borg::playbook::Edit {
+        pb: pb.clone(),
+        op: borg::playbook::Op::Add,
+        step: borg::playbook::bullet_id(&pb, text),
+        text: text.into(),
+        shape: "fix the parser".into(),
+        repo: "app".into(),
+        ms,
+        ..Default::default()
+    };
+    // One edit promoted through the queen, one still waiting for an answer.
+    assert!(borg::playbook::propose(&corp, &edit("run the parser tests", 1), None, "s1", "", &[]).unwrap());
+    // Before the first promotion the playbook shows with its waiting edit alone.
+    let (_, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
+    let p = &v["playbooks"][0];
+    assert_eq!((p["id"].as_str(), p["edits"].as_u64(), p["proposed"].as_u64()), (Some(pb.as_str()), Some(0), Some(1)), "{v}");
+    assert_eq!((p["waiting"][0]["op"].as_str(), p["waiting"][0]["text"].as_str()), (Some("add"), Some("run the parser tests")));
+    let q = borg::queen::open(&corp).remove(0);
+    borg::queen::answer(&corp, &q.id, borg::playbook::PROMOTE_OPTION, "ann@x", 5).unwrap();
+    assert!(borg::playbook::propose(&corp, &edit("add a failing test first", 6), None, "s1", "", &[]).unwrap());
+    let key = borg::playbook::read(&corp)[0].key();
+    borg::playbook::record_shown(&corp, "s2", "app", std::slice::from_ref(&key), 10);
+    let vetoed = borg::outcome::Outcome { kind: borg::outcome::VETOED.into(), session: "s2".into(), lessons: vec![key.clone()], ms: 20, ..Default::default() };
+    borg::outcome::append(&corp.join("outcomes.jsonl"), &vetoed).unwrap();
+    let (_, v) = get(app(vec![("corp", corp)]), "/api/hive?c=corp").await;
+    let p = &v["playbooks"][0];
+    assert_eq!((p["shape"].as_str(), p["edits"].as_u64(), p["proposed"].as_u64()), (Some("fix the parser"), Some(1), Some(1)), "{v}");
+    assert_eq!(p["steps"][0]["text"], "run the parser tests");
+    assert_eq!(p["waiting"][0]["text"], "add a failing test first");
+    let version = &p["versions"][0];
+    assert_eq!((version["key"].as_str(), version["vetoed"].as_u64()), (Some(key.as_str()), Some(1)));
+    assert!(version["mean"].as_f64().unwrap() < 0.5);
     let _ = std::fs::remove_dir_all(&base);
 }
 

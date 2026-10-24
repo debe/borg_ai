@@ -55,7 +55,7 @@ Anthropic's source-control team found what we see too: engineers mostly add judg
   - **Drone contracts are soft.** They are shown when relevant; a conflict goes to the queen.
   - **Constraints are hard.** `pre_tool` and `on_stop` block an edit or completion that a constraint's check rejects. A check can be a command, a grep, an import rule, or for now a model-graded question.
   - **Where they live:** constraints are kept in `constraints.jsonl` for each collective, not each goal, so they outlive the run.
-- **"No" is one cheap line.** `borg no <task|change|plan> "<why>"` and the queen's answer both send a signed `veto` directive. The vetoed task reopens with the reason attached, and the reason becomes a lesson, or a proposed constraint when it names an invariant. A drone may not argue a veto back in. It may ask one clarifying question through the queen.
+- **"No" is one cheap line.** `borg no <task|change|plan> "<why>"` and the queen's answer both send a signed `veto` directive. The vetoed task reopens with the reason attached, and the reason becomes a lesson, or a proposed constraint when it names an invariant. A drone may not argue a veto back in. It may ask one clarifying question through the queen. *Built (hive-learning.md 7b):* `borg no` of a drone on another node sends a signed `veto` directive, recorded once on the drone's node; a veto names a drone, not a task, change or plan, and neither reopens a hive task nor comes from a queen answer yet.
 - **Review intent, not lines.** Every `done` task publishes an intent card:
   - what changed and why, in a few lines
   - the contracts and constraints it touched
@@ -65,7 +65,7 @@ Anthropic's source-control team found what we see too: engineers mostly add judg
   Semantic approval rules choose the risk class: docs, comments and tests in scope are auto-approved, ordinary logic gets sampled review, and anything touching a constraint's scope, security or data migrations needs an engineer. The queen orders intent cards by risk, not by arrival time.
 - **The verifier is scoped against over-engineering.** It checks the work against the task, the contracts and the constraints. It doesn't invent hypothetical threats. Verifier suggestions that add scope go to the queen as proposals, not rejections.
 - **Superfan drones.** A drone can own one component for a long time and watch its logs and telemetry (context ownership, thesis 1). Its findings become `open` tasks the engineer can approve or veto.
-- **Engineer attention is a budget.** Every escalation costs minutes. The hive tracks engineer minutes per goal, the share of escalations answered "yes, fine" (wasted attention) and the share of "no" answers that arrived only after merge (missed escalation).
+- **Engineer attention is a budget.** Every escalation costs minutes. The hive tracks engineer minutes per goal, the share of escalations answered "yes, fine" (wasted attention) and the share of "no" answers that arrived only after merge (missed escalation). *Built (hive-learning.md 7b, escalation.rs):* the queen's attention reward counts both, team-wide, on borg-web's queen view; engineer minutes per goal are not tracked yet.
 
 ## Primitives
 

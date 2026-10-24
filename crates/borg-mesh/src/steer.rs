@@ -13,6 +13,9 @@
 //!   `<store>/mesh/directives.jsonl`, which the daemon offers every member each round (sync.rs,
 //!   live step); members relay what they hold, so it reaches a drone's node through any path.
 //!   A local collective never writes that file, and the sync gate refuses it anyway.
+//! - **Veto**: a `veto` directive is `borg no` for a drone on another node (borg veto.rs). It travels
+//!   and is checked like any directive; where it lands, `borg::veto::apply_inbox` records it once
+//!   (after each round's steering, sync.rs, and at once when it names a drone of this node).
 //! - **Drop and log**: every refused directive (unsigned, bad signature, unknown or revoked signer,
 //!   wrong role, stale) is appended to `<store>/steer/dropped.jsonl` with the reason.
 
@@ -64,8 +67,13 @@ pub fn check(d: &Directive, collective: &str, auth: &Authority, now: i64) -> Res
     if now - d.ms > TTL_MS || d.ms > now + 60_000 {
         return Err("stale or from the future".into());
     }
-    if !matches!(d.kind.as_str(), borg::steer::SAY | borg::steer::PAUSE | borg::steer::RESUME) {
+    if !matches!(d.kind.as_str(), borg::steer::SAY | borg::steer::PAUSE | borg::steer::RESUME | borg::steer::VETO) {
         return Err(format!("unknown kind {:?}", d.kind));
+    }
+    // A veto is one engineer's no to one drone's work (`issue`): one sent to every node would be
+    // learned once per node.
+    if d.kind == borg::steer::VETO && (d.target.node.is_empty() || d.target.session.is_empty()) {
+        return Err("a veto names one drone: its node and session".into());
     }
     match auth {
         Authority::Local { me } if d.key == *me => Ok("local".into()),
@@ -202,6 +210,7 @@ pub fn issue(home: &Path, collective: &str, may_sync: bool, engineer: &str, targ
     let drones = borg::top::drones(home, may_sync, now);
     let drone = borg::top::resolve(&drones, target)?;
     let to = match drone {
+        None if kind == borg::steer::VETO => return Err("a veto names one drone, not all".into()),
         None => Target::default(),
         Some(d) => Target { node: if d.node.is_empty() { key.clone() } else { d.node.clone() }, session: d.p.session.clone() },
     };
@@ -214,6 +223,9 @@ pub fn issue(home: &Path, collective: &str, may_sync: bool, engineer: &str, targ
         None => Authority::Local { me: &key },
     };
     file(home, collective, &auth, &key, membership.is_some(), &d, now)?;
+    if kind == borg::steer::VETO {
+        borg::veto::apply_inbox(home); // a drone of this node: recorded now, not at a mesh round
+    }
     borg::stats::count(home, borg::stats::STEER_ISSUED, "", |ev| {
         ev.engineer = engineer.into();
         ev.why = kind.into();
@@ -238,6 +250,7 @@ pub fn issue(home: &Path, collective: &str, may_sync: bool, engineer: &str, targ
     let what = match kind {
         borg::steer::PAUSE => "paused",
         borg::steer::RESUME => "resumed",
+        borg::steer::VETO => "vetoed",
         _ => "told",
     };
     Ok(format!("{what} {whom}: signed {}, delivered once {how}", &d.id[..12]))
@@ -261,7 +274,7 @@ pub fn new(collective: &str, engineer: &str, target: Target, kind: &str, text: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg::steer::{PAUSE, SAY};
+    use borg::steer::{PAUSE, SAY, VETO};
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-mesh-steer-{tag}-{}", std::process::id()));
@@ -309,6 +322,17 @@ mod tests {
         assert_eq!(check(&unsigned, "corp", &Authority::Team { m: &t.m, me: "nobody" }, 1000).unwrap_err(), "unsigned");
         assert!(check(&d, "private", &Authority::Team { m: &t.m, me: "nobody" }, 1000).is_err(), "another collective");
         assert!(check(&d, "corp", &Authority::Team { m: &t.m, me: "nobody" }, 1000 + TTL_MS + 1).is_err(), "stale");
+    }
+
+    #[test]
+    fn a_veto_that_names_no_drone_is_refused() {
+        let t = team("veto");
+        let auth = Authority::Team { m: &t.m, me: "nobody" };
+        let veto = |node: &str, session: &str| sign(&t.steerer, new("corp", "s@x", Target { node: node.into(), session: session.into() }, VETO, "no", 1000));
+        for (node, session) in [("", "abc"), ("n1", ""), ("", "")] {
+            assert_eq!(check(&veto(node, session), "corp", &auth, 1000).unwrap_err(), "a veto names one drone: its node and session", "{node:?} {session:?}");
+        }
+        assert_eq!(check(&veto("n1", "abc"), "corp", &auth, 1000), Ok("steer".into()));
     }
 
     #[test]

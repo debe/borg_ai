@@ -182,7 +182,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 28] = [
+const NOTABLE: [&str; 31] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -211,6 +211,9 @@ const NOTABLE: [&str; 28] = [
     stats::EARLY,
     stats::QUEUED_FREE,
     stats::MODEL_CALL,
+    stats::PLAYBOOK_SHOWN,
+    stats::PLAYBOOK_PROPOSED,
+    stats::PLAYBOOK_PROMOTED,
 ];
 
 #[derive(Deserialize)]
@@ -241,7 +244,9 @@ async fn queen(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let mut entries = borg::queen::entries(&m.home);
     entries.sort_by_key(|e| std::cmp::Reverse(e.ms));
-    Json(json!({"collective": m.name, "entries": entries})).into_response()
+    // The queen's attention reward (escalation.rs), the team's: folded from every stats bucket.
+    let attention = borg::escalation::team(&m.home);
+    Json(json!({"collective": m.name, "entries": entries, "attention": attention})).into_response()
 }
 
 async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
@@ -255,11 +260,13 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
 }
 
 /// The collective's hive goals (hive/view.rs): board, budget and spend per drone, newest contracts;
-/// `goals` is empty for a store without a hive.
+/// `goals` is empty for a store without a hive. And its L1 playbooks (playbook.rs `view`): steps, each
+/// shown version's belief, edits waiting for the engineer.
 async fn hive(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let goals = borg::hive::view::all(&m.home, learn::now_ms());
-    Json(json!({"collective": m.name, "goals": goals})).into_response()
+    let playbooks = borg::playbook::view(&m.home);
+    Json(json!({"collective": m.name, "goals": goals, "playbooks": playbooks})).into_response()
 }
 
 /// Size and modification time of `path`, or of every file directly in it.
@@ -289,9 +296,17 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("stats", vec![home.join("stats.jsonl"), stats::events_path(home)]),
         ("drones", vec![home.join("presence"), presence::remote_path(home)]),
         ("feed", vec![stats::events_path(home)]),
-        ("queen", vec![home.join("queen")]),
+        ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
         // The goal dirs are nested: their files by name, and the hive dir for a new goal.
-        ("hive", [vec![home.join("hive")], borg::hive::view::files(home)].concat()),
+        // Playbooks show with the hive: their edits, the queue that proposes them, the outcomes that credit them.
+        (
+            "hive",
+            [
+                vec![home.join("hive"), home.join(borg::playbook::FILE), home.join("queen"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE)],
+                borg::hive::view::files(home),
+            ]
+            .concat(),
+        ),
     ]
 }
 

@@ -45,7 +45,7 @@ pub const REGRETTED: &str = "regretted";
 /// The engineer corrected the drone (an episode): `why` is `rejected_tool` or `pushback`, `text` a snippet.
 pub const CORRECTION: &str = "correction";
 /// The engineer said no (`borg no`, veto.rs): `lessons` the lessons shown so far (credited `vetoed`),
-/// `n` their number, `why` `cli` or `prompt`, `text` the reason.
+/// `n` their number, `why` `cli`, `prompt` or `mesh`, `text` the reason.
 pub const VETO: &str = "veto";
 /// `borg learn` merged a veto into a lesson an earlier veto made: the same "no" said twice.
 pub const VETO_REPEAT: &str = "veto_repeat";
@@ -72,12 +72,24 @@ pub const QUEEN_DELIVERED: &str = "queen_delivered";
 pub const QUEEN_ANSWERED: &str = "queen_answered";
 pub const QUEEN_SKIPPED: &str = "queen_skipped";
 pub const QUEEN_DISMISSED: &str = "queen_dismissed";
+/// The queen's attention reward (escalation.rs), once per event: an escalation answered by changing
+/// course, one answered "yes, fine", and a "no" after merge from a session never escalated (`why`: the
+/// kind, or `veto`/`regret`; `text` starts with the question, episode or link id).
+pub const QUEEN_NO: &str = "queen_no";
+pub const QUEEN_STAMP: &str = "queen_stamp";
+pub const QUEEN_MISSED: &str = "queen_missed";
 /// One imported chunk of team documents (`n`: lessons, `usd`).
 pub const ASSIMILATED: &str = "assimilated";
 /// The hive (hive/mod.rs; `why`: the goal, `text`: the task): a claim taken, a task's oracle passed and
 /// its `done` published, a stop blocked because the oracle failed, a claim released at the session's
 /// end, and board context shown to a drone (`lessons`: the contract ids shown).
 pub const HIVE_CLAIM: &str = "hive_claim";
+/// L1 playbooks (playbook.rs): versions shown to a drone (`lessons`: their keys, `n`), an edit proposed
+/// to the engineer from verified work, and one promoted by an engineer's answer (`lessons`: the
+/// playbook, `why`: add/modify/remove, `text`: the step).
+pub const PLAYBOOK_SHOWN: &str = "playbook_shown";
+pub const PLAYBOOK_PROPOSED: &str = "playbook_proposed";
+pub const PLAYBOOK_PROMOTED: &str = "playbook_promoted";
 pub const HIVE_DONE: &str = "hive_done";
 pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
 pub const HIVE_RELEASED: &str = "hive_released";

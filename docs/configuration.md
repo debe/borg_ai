@@ -437,6 +437,8 @@ project.
 | `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored). Unset: a join record of the session's directory decides (`borg hive join --here`, `borg hive run`'s worktrees). Empty: no goal at all |
 | `BORG_HIVE_DRONE` | unset | Set by `borg hive run`: the drone a session is an iteration of. A verify task is barred to every session of the drone that did the work |
 | `BORG_HIVE_CREDIT` | on | `off`: hive verdicts credit no lessons (`verified`, `rejected`, `hacked` outcomes); the board, the flags and the `task_*` statistics still record. For an eval's frozen arm. Also off with `BORG_LEARN=off` |
+| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a drone or a session, and `borg learn` proposes no playbook edit from verified hive work ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
+| `BORG_GROUP_REFLECT` | on | `off`: `borg learn` no longer turns settled hive groups into reflection episodes ([Groups](commands.md#groups-of-attempts)); `borg learn --group` still does. For an eval arm without group reflection. Also off with `BORG_LEARN=off` |
 
 **Experimental**, off by default. Most failed a pre-registered test and stay for further experiments.
 

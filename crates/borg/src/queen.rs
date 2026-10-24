@@ -48,7 +48,7 @@ pub const BUDGET_SESSIONS: usize = 5;
 pub const MAX_QUESTIONS: usize = 2;
 /// Of a decision's significant words, this share already in the engineer's prompts means the inputs
 /// state the decision (criterion 3).
-const STATED: f64 = 0.6;
+pub(crate) const STATED: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,9 +72,31 @@ pub enum Kind {
     /// drone's `borg hive contract --supersedes`, not a checkpoint; only an engineer's answer lets it
     /// supersede, and the default keeps the current contract.
     Contract,
+    /// An edit to an L1 playbook learned from verified hive work (playbook.rs `propose`). Queued by `borg
+    /// learn`, not a checkpoint; only an engineer's answer promotes it, and the default keeps the
+    /// playbook as it is.
+    Playbook,
 }
 
 impl Kind {
+    /// Whether the queen chose to raise it: the four kinds a checkpoint escalates (`classify`). The
+    /// others are proposals or gates every engineer answers whatever the queen thinks, so the queen's
+    /// attention reward (escalation.rs) leaves them out.
+    pub fn escalates(self) -> bool {
+        matches!(self, Kind::ExternalMutation | Kind::Irreversible | Kind::PublicApi | Kind::CrossRepo)
+    }
+
+    /// The option that lets the drone's plan go ahead: the "yes, fine" of an escalation. An external
+    /// mutation's default holds it, so its alternative is the plan; every other escalation proceeds by
+    /// default. Empty for a kind that does not escalate.
+    pub fn proceeds(self) -> &'static str {
+        match self {
+            Kind::ExternalMutation => self.options().1,
+            k if k.escalates() => k.options().0,
+            _ => "",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::ExternalMutation => "an external mutation",
@@ -85,12 +107,13 @@ impl Kind {
             Kind::Reach => "who should hear a lesson",
             Kind::Constraint => "an invariant proposed as a constraint",
             Kind::Contract => "a change to another drone's contract",
+            Kind::Playbook => "an edit to a team playbook",
         }
     }
 
     /// (the drone's default, the alternative). External mutations stay approval-gated: their default
     /// is to hold, everything else proceeds as planned.
-    fn options(self) -> (&'static str, &'static str) {
+    pub(crate) fn options(self) -> (&'static str, &'static str) {
         match self {
             Kind::ExternalMutation => ("hold: prepare it, but do not run it until the engineer approves", "run it as planned"),
             Kind::Irreversible => ("proceed as planned", "make it reversible first (backup, soft delete, a revert path)"),
@@ -100,6 +123,7 @@ impl Kind {
             Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
             Kind::Constraint => (crate::veto::KEEP_OPTION, crate::veto::RATIFY_OPTION),
             Kind::Contract => (crate::hive::contract::KEEP_OPTION, crate::hive::contract::SUPERSEDE_OPTION),
+            Kind::Playbook => (crate::playbook::KEEP_OPTION, crate::playbook::PROMOTE_OPTION),
         }
     }
 }
@@ -204,7 +228,7 @@ pub struct Decision {
 }
 
 /// Significant words of `text`: tokens of 3+ characters minus filler, sorted and unique.
-fn words(text: &str) -> Vec<String> {
+pub(crate) fn words(text: &str) -> Vec<String> {
     let mut w: Vec<String> = conscience::tokens(text).into_iter().filter(|t| !STOP.contains(&t.as_str())).collect();
     w.sort();
     w.dedup();
@@ -212,7 +236,7 @@ fn words(text: &str) -> Vec<String> {
 }
 
 /// Share of `need`'s words that `have` contains; 0 for fewer than `min` words.
-fn overlap(need: &[String], have: &HashSet<String>, min: usize) -> f64 {
+pub(crate) fn overlap(need: &[String], have: &HashSet<String>, min: usize) -> f64 {
     match need.len() >= min {
         true => need.iter().filter(|w| have.contains(*w)).count() as f64 / need.len() as f64,
         false => 0.0,
@@ -506,7 +530,7 @@ pub fn within_budget(store: &Path, engineer: &str, session: &str) -> bool {
 /// questions and proposed constraints use none.
 pub fn budget_allows(asked: &[Entry], seen: &[Seen], engineer: &str, session: &str, aliases: &collective::Aliases) -> bool {
     let me = aliases.canon(engineer);
-    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract));
+    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook));
     let Some(last) = sent.filter(|e| aliases.canon(&e.engineer) == me).max_by_key(|e| e.ms) else { return true };
     if last.session == session {
         return false; // one message per session at most
@@ -791,6 +815,8 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         crate::veto::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Contract {
         crate::hive::contract::ratify(store, &e, text, author, now)?;
+    } else if e.kind == Kind::Playbook {
+        crate::playbook::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Reach {
         crate::reach::answer(store, &e, text)?;
     } else {
@@ -806,7 +832,8 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
         ev.text = crate::stats::excerpt(text, 160);
     });
-    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Contract) {
+    crate::escalation::answered(store, &e, text, author, now);
+    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook) {
         counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
             ev.engineer = author.into();
             ev.why = "queen".into();
@@ -1168,13 +1195,14 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
     // Queued in an earlier session (or imported from a document): the drone must not take a checkpoint
     // question's quoted plan for its own.
     let (question, origin) = match q.question.strip_prefix("The drone's plan says: ") {
-        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract) => {
+        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook) => {
             (format!("An earlier session's plan said: {rest}"), "queued by an earlier session")
         }
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
         _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
         _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
         _ if q.kind == Kind::Contract => (q.question.clone(), "proposed by a drone of a hive goal"),
+        _ if q.kind == Kind::Playbook => (q.question.clone(), "learned from verified hive work"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1518,6 +1546,13 @@ pub fn main(args: &[&str]) -> i32 {
                     }
                     0
                 }
+                Ok(e) if e.kind == Kind::Playbook => {
+                    match e.answer.as_deref().is_some_and(crate::playbook::promotes) {
+                        true => println!("{} answered: the edit is promoted into {}", e.id, store.join(crate::playbook::FILE).display()),
+                        false => println!("{} answered: the playbook stays as it is", e.id),
+                    }
+                    0
+                }
                 Ok(e) if e.kind == Kind::Contract => {
                     match e.answer.as_deref().is_some_and(crate::hive::contract::supersedes_answer) {
                         true => println!("{} answered: the drone's contract supersedes the other one", e.id),
@@ -1845,6 +1880,13 @@ mod tests {
             assert!(consider(&cp(&store, &s, PUSH, TASK)).unwrap().is_empty(), "asked again in {s}");
         }
         answer(&store, &asked[0].id, "Never force-push main; open a new branch.", "lead@x", 9).unwrap();
+        // The engineer changed course: the escalation earned the queen its "no" (escalation.rs), once.
+        let rewarded: Vec<String> = crate::stats::events(&store)
+            .into_iter()
+            .filter(|e| e.kind.starts_with("queen_") && e.kind != crate::stats::QUEEN_ANSWERED && e.kind != crate::stats::QUEEN_QUEUED)
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(rewarded, [crate::stats::QUEEN_NO]);
         // The answer's lesson would be filtered by the conscience first; even without it, the key is spent.
         std::fs::remove_file(store.join("lessons.jsonl")).unwrap();
         assert!(consider(&cp(&store, "s9", PUSH, TASK)).unwrap().is_empty());
@@ -1915,6 +1957,7 @@ mod tests {
         assert_eq!(kept.answer.as_deref(), Some(crate::veto::KEEP_OPTION));
         assert!(!store.join("lessons.jsonl").exists() && !crate::veto::constraints_path(&store).exists());
         assert!(!crate::stats::events(&store).iter().any(|ev| ev.kind == crate::stats::LESSON_NEW));
+        assert_eq!(crate::escalation::team(&store).answered, 0, "a proposal is no escalation: the queen's reward ignores it");
         // Ratified (option b): one constraint, still no lesson.
         let e2 = crate::learn::Episode { session: "s2".into(), ..e };
         assert!(crate::veto::propose(&store, &l, "the public schema changes only additively", &e2, 10).unwrap());

@@ -4,7 +4,9 @@
 //! integrate`, never by a model session (mod.rs `may_claim`): the work is mechanical, a suite outlasts
 //! any stop hook, and a model would judge a tree it did not build.
 //!
-//! What is merged is the accepted attempts, never a drone's branch: for each verified work task the diff
+//! What is merged is the accepted attempts, never a drone's branch (of a group, hive/group.rs, only its
+//! best: the K attempts are one task's, scored by the hidden oracle first when the goal has one): for
+//! each verified work task the diff
 //! from its accepted claim's `base` to its done's `head` (verdict.rs `accepted`), in order (by `deps`,
 //! then by when it was verified, then by id), each applied with `git merge-tree --merge-base` (git 2.40+)
 //! onto the tree before it, from the goal's origin: the newest common ancestor of the HEADs every work
@@ -36,7 +38,7 @@ use std::time::{Duration, Instant};
 use super::board::{Board, Ev, Event, Role, Status, Task, TaskState};
 use super::goal::Check;
 use super::verdict::{self, Attempt};
-use super::{Goal, TaskId, board, hidden, oracle};
+use super::{Goal, TaskId, board, group, hidden, oracle};
 use crate::{learn, queen, runner, stats};
 
 /// Each git call of a merge.
@@ -216,9 +218,9 @@ fn tail(text: &str, n: usize) -> String {
 pub fn absent(home: &Path, g: &Goal, repo: &Path) -> Vec<(TaskId, String, String)> {
     let events = board::read(&super::tasks_path(home, &g.id));
     let b = board::fold(&events);
-    b.tasks
-        .values()
-        .filter(|s| s.task.role != Role::Integrate && s.accepted.is_some())
+    let scores = group::scores(home, &g.id);
+    group::merged(&b, |v| scores.get(v).copied())
+        .into_iter()
         .filter_map(|s| verdict::accepted(&events, &b, &s.task.id))
         .filter(|a| !super::is_local(home, &a.node) && !a.base.is_empty() && !a.head.is_empty())
         .filter(|a| !verdict::present(repo, &[&a.base, &a.head], verdict::DIFF_TIMEOUT))
@@ -260,7 +262,8 @@ pub fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<String>
 pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<Outcome> {
     let path = super::tasks_path(home, &g.id);
     let b = board::fold(&board::read(&path));
-    let accepted = b.tasks.values().filter(|s| s.task.role != Role::Integrate && s.accepted.is_some()).count();
+    let scores = group::scores(home, &g.id);
+    let accepted = group::merged(&b, |v| scores.get(v).copied()).len();
     let session = format!("integrate-{drone}-{now}");
     let (id, new) = due(&b, now)?;
     let mut lines = Vec::new();
@@ -293,8 +296,15 @@ struct Integrator<'a> {
 
 impl Integrator<'_> {
     fn integrate(&self, repo: &Path, events: &[Event], b: &Board) -> Outcome {
-        let works: Vec<&TaskState> = b.tasks.values().filter(|s| s.task.role != Role::Integrate && s.accepted.is_some()).collect();
-        let works = ordered(&works);
+        // A group's best attempt is the one the hidden oracle passed: its accepted attempts are scored
+        // first (hidden.rs; each attempt once), while the lease is renewed.
+        if self.g.hidden.is_some() && group::contested(b) {
+            super::renewing(self.home, &self.g.id, self.id, self.session, super::HEARTBEAT, || {
+                hidden::score_pending(self.home, self.g, repo, usize::MAX, learn::now_ms())
+            });
+        }
+        let scores = group::scores(self.home, &self.g.id);
+        let works = ordered(&group::merged(b, |v| scores.get(v).copied()));
         let mut attempts: Vec<Attempt> = Vec::new();
         for w in &works {
             match verdict::accepted(events, b, &w.task.id) {
@@ -428,6 +438,7 @@ fn board_task(id: &str) -> Task {
         not_by: Vec::new(),
         flags: Vec::new(),
         from: None,
+        group: None,
     }
 }
 
