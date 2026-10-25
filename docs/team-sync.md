@@ -134,12 +134,13 @@ with the session, repo and regret hashed, so every member derives the same lesso
 quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
 (`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Hive goals travel too (without their
 hidden checks), with their boards, contracts, messages between drones and guard flags, signed and
-quarantined the same way, so drones on several machines work one board; the commits they make do not
-travel, and a hive verdict counts on a peer only for an attempt its own synced board judged
+quarantined the same way, so drones on several machines work one board; the commits they make travel as git bundles
+beside the board (at most 1 MiB per attempt, refused unless they hold exactly the attempt's commits),
+and a hive verdict counts on a peer only for an attempt its own synced board judged
 ([commands: Across machines](commands.md#across-machines)). A goal's or task's checks written on
 another machine never run on yours until you approve them (`borg hive approve <goal>`). The hive across machines is built and
-proven on two loopback nodes, not measured across real machines yet. Peers on `borg/mesh/6` and earlier
-do not sync with this version: upgrade every member. Reasoning excerpts go to two peers chosen by hash,
+proven on two loopback nodes, not measured across real machines yet. Peers on `borg/mesh/8` and earlier
+do not sync with this version (`borg/mesh/9` adds the bundles): upgrade every member. Reasoning excerpts go to two peers chosen by hash,
 so the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key

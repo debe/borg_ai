@@ -405,16 +405,32 @@ pub fn integrate_id(b: &Board) -> TaskId {
     format!("integrate.{n}")
 }
 
+/// `e` with the secrets in its text replaced (notes.rs `redact`, what presence prompts get): a task's
+/// title and flags, a note. Ids, commits, scopes and checks stay as they are (the fold, the matching and
+/// the oracle read them), and a check's command must run the same on every node: a secret belongs in
+/// the environment, never in a check.
+pub fn redacted(e: &Event) -> Event {
+    let mut e = e.clone();
+    if !e.note.is_empty() {
+        e.note = crate::notes::redact(&e.note);
+    }
+    if let Some(t) = e.def.as_mut() {
+        t.title = crate::notes::redact(&t.title);
+        t.flags = t.flags.iter().map(|f| crate::notes::redact(f)).collect();
+    }
+    e
+}
+
 /// Appends `events` in one write(2) with O_APPEND (hive/mod.rs `append_bytes`, under the file's lock):
 /// lines written together (a done and its verify task's open, a claim and its heartbeat) never
-/// interleave with another writer's.
+/// interleave with another writer's. Their text is [`redacted`] first: the board syncs to every member.
 ///
 /// # Errors
 /// When the directory or the file cannot be written.
 pub fn append(path: &Path, events: &[Event]) -> std::io::Result<()> {
     let mut body = String::new();
     for e in events {
-        body.push_str(&serde_json::to_string(e).map_err(std::io::Error::other)?);
+        body.push_str(&serde_json::to_string(&redacted(e)).map_err(std::io::Error::other)?);
         body.push('\n');
     }
     super::append_bytes(path, body.as_bytes())
@@ -822,6 +838,26 @@ mod tests {
 
     fn ev(kind: Ev, t: &str, by: &str, ms: i64) -> Event {
         Event::new(kind, t, by, ms)
+    }
+
+    #[test]
+    fn a_secret_in_a_title_or_note_never_reaches_the_board() {
+        let path = std::env::temp_dir().join(format!("borg-hive-board-redact-{}/tasks.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let head = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+        let t = Task { title: format!("rotate the CI token {secret} in deploy.yml"), files: vec!["deploy.yml".into()], ..task("t1") };
+        let mut done = ev(Ev::Done, "t1", "s1", 3).with_note(&format!("used password=hunter2 then {head}"));
+        done.head = head.into();
+        append(&path, &[Event::open(t, "engineer:e", 1), ev(Ev::Claim, "t1", "s1", 2), done]).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(secret) && !raw.contains("hunter2"), "{raw}");
+        let b = fold(&read(&path));
+        assert_eq!(b.tasks["t1"].task.title, "rotate the CI token [REDACTED] in deploy.yml");
+        assert_eq!(b.tasks["t1"].task.files, ["deploy.yml"], "the scope is kept");
+        assert!(matches!(b.tasks["t1"].status, Status::Done { .. }), "the fold still works");
+        assert!(raw.contains(&format!("\"head\":\"{head}\"")) && raw.contains(&format!("then {head}")), "commit ids are kept");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     fn holder_of(b: &Board, t: &str) -> Option<String> {

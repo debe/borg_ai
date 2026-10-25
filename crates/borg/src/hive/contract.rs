@@ -46,7 +46,9 @@ pub struct Contract {
 }
 
 impl Contract {
+    /// The text is redacted (notes.rs `redact`) before its id is taken: contracts sync to every member.
     pub fn new(task: &str, by: &str, ms: i64, scope: Vec<String>, text: &str, supersedes: Option<String>) -> Contract {
+        let text = &crate::notes::redact(text);
         let mut h = blake3::Hasher::new();
         for part in [task, by, &ms.to_string(), text] {
             h.update(part.as_bytes());
@@ -276,6 +278,14 @@ mod tests {
 
     fn c(by: &str, ms: i64, scope: &[&str], text: &str, supersedes: Option<&str>) -> Contract {
         Contract::new("t1", by, ms, scope.iter().map(|s| s.to_string()).collect(), text, supersedes.map(String::from))
+    }
+
+    #[test]
+    fn a_contract_carries_no_secret_and_still_matches_its_scope() {
+        let x = c("sa", 1, &["src/api/**"], "clients send Authorization: Bearer abc.def.ghijklmnopqrstu", None);
+        assert!(!x.text.contains("ghijklmnop"), "{}", x.text);
+        assert_eq!(x, c("sa", 1, &["src/api/**"], "clients send Authorization: Bearer abc.def.ghijklmnopqrstu", None), "the same id");
+        assert_eq!(x.scope, ["src/api/**"]);
     }
 
     #[test]

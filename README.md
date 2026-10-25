@@ -386,7 +386,14 @@ in total, 7–11 minutes per run), with no false hacked verdict. Whether a hive 
 subagents is not measured: these workloads were too easy to tell
 ([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)). `borg hive run <goal> --drones N` starts N headless drones,
 each in a git worktree with an equal share of the goal's budget, until the board is finished (try
-`--dry-run` first). Once every task is verified, the runner merges the accepted work. It never merges
+`--dry-run` first). Before the first drone starts, it shows the plan as one intent card per task
+(intent, files, deps, checks and a risk class from the queen's classifier) and waits for you to approve
+it once: `y` at its terminal or `borg queen answer <id> a`. A no stops the run with nothing claimed, and
+a no with a reason is learned like `borg no`. `--yes` approves on the command line, for scripts and evals.
+A high-risk task (an irreversible change, an external mutation, a public API change or a cross-repo
+decision in its title) asks the queen once more when it is first claimed (once for all attempts of a
+`--group`), and its drone goes on with
+that kind's default meanwhile ([details](docs/commands.md#running-drones)). Once every task is verified, the runner merges the accepted work. It never merges
 a drone's whole branch. It runs the oracle on the combined tree, which ends up at
 `refs/heads/hive/<goal>/integrated` (`borg hive integrate` does the same for a goal worked
 interactively; it needs git 2.40+). A conflict or a failing check opens a fix task (a joined session
@@ -442,7 +449,11 @@ wrote is a shell command from that machine: it runs only after the engineer's `b
 there, and the board lists what waits. Two machines that make one goal id before a sync stop that goal
 on both and say why. It is proven on two
 loopback nodes with scripted drones, not measured across real machines (that is a later paid run).
-Commits do not travel: work is verified, and the goal integrated, on a machine that holds the commits.
+Commits travel with the board: each attempt's commits go as a signed git bundle of at most 1 MiB
+(cut against the remote both clones share), and a machine verifying, building on or integrating the
+work takes them only when they are exactly the commits the board names; `borg top` and the Hive tab
+show each bundle and what this machine did with it. Task text, contracts, messages and the goal's spec
+are redacted (tokens, keys, passwords) before they reach a synced log, as presence prompts are.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive).
 
 All commands: [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md). Every switch: [Environment variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables).

@@ -33,6 +33,8 @@ regex.workspace = true
 libc = "0.2"
 # hashed session and repo ids in the outcomes the team sees (outcome.rs `tag`); the mesh uses it already
 blake3 = "1.8"
+# an attempt's commits as a git bundle in a synced hive line (hive/commits.rs)
+base64 = "0.22"
 # Vector recall at the Stop step (vectors.rs, internal evaluation "vectors", not published): embedded SeekStorm, and a Model2Vec
 # embedder that maps the model file instead of reading it.
 seekstorm = { version = "=3.3.13", default-features = false, optional = true }

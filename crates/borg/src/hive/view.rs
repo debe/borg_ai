@@ -2,8 +2,10 @@
 //! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
 //! combined tree's commit, or why the last one failed), the newest contracts and messages between
 //! drones, which holders are on other nodes (the board syncs over the mesh), and each group of attempts
-//! (hive/group.rs) with its winners, losers and reflection, and each task verified after a rejection
-//! (hive/rework.rs) with its reflection. One fold of the board
+//! (hive/group.rs) with its winners, losers and reflection, each task verified after a rejection
+//! (hive/rework.rs) with its reflection, the bundles of commits that travel (hive/commits.rs), and the
+//! plan's intent cards with the engineer's decision (hive/plan.rs). One
+//! fold of the board
 //! and one pass over each of spend.jsonl, runs.jsonl, contracts.jsonl and messages.jsonl per goal;
 //! nothing at all for a store without a hive.
 
@@ -76,6 +78,12 @@ pub struct HiveView {
     pub groups: Vec<super::group::Row>,
     /// Its tasks verified after a rejection (hive/rework.rs): rejections, drones, the reflection.
     pub reworks: Vec<super::rework::Row>,
+    /// The newest bundles of attempts' commits (hive/commits.rs): from which node, their size, and
+    /// whether this node made, unbundled or refused each.
+    pub commits: Vec<super::commits::Row>,
+    /// The plan (hive/plan.rs): its intent cards and whether the engineer approved, refused or has yet
+    /// to answer it; None without a work task.
+    pub plan: Option<super::plan::Row>,
 }
 
 /// What stops goal `g` (board `b`) on this node, as the board and borg-web say it.
@@ -174,6 +182,8 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let alerts = alerts(home, &g, &b);
     let groups = super::group::rows(home, &g, &events, &b);
     let reworks = super::rework::rows(home, &g, &events, &b);
+    let commits = super::commits::rows(home, id);
+    let plan = super::plan::row(home, id, &b);
     Some(HiveView {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
@@ -191,6 +201,8 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         alerts,
         groups,
         reworks,
+        commits,
+        plan,
     })
 }
 
@@ -238,6 +250,19 @@ pub fn render(v: &HiveView) -> String {
             s.push('\n');
         }
     }
+    if let Some(p) = &v.plan {
+        let high: Vec<&super::plan::Card> = p.cards.iter().filter(|c| c.risk == super::plan::Risk::High).collect();
+        let by = if p.by.is_empty() { String::new() } else { format!(" by {}", p.by) };
+        let how = match p.state.as_str() {
+            "approved" | "refused" => format!("{by} ({})", if p.via == "yes" { "--yes" } else { p.question.as_str() }),
+            "waiting" => format!(" for the engineer (borg queen answer {})", p.question),
+            _ => String::new(),
+        };
+        s.push_str(&format!("  plan {}{how} · {} card(s), {} high-risk\n", p.state, p.cards.len(), high.len()));
+        for c in high {
+            s.push_str(&format!("  {}\n", cut(&format!("card {}", super::plan::render_card(c)), 200)));
+        }
+    }
     if !v.integration.is_empty() {
         s.push_str(&format!("  {}\n", cut(&v.integration, 160)));
     }
@@ -261,6 +286,12 @@ pub fn render(v: &HiveView) -> String {
         s.push_str(&cut(&line, 200));
         s.push('\n');
     }
+    for c in &v.commits {
+        let from = if c.node.is_empty() { String::new() } else { format!(" from node {}", c.node) };
+        let line = format!("  commits {} {}{from} ({} KiB): {}", c.task, c.head, c.bytes.div_ceil(1024), c.state);
+        s.push_str(&cut(&line, 200));
+        s.push('\n');
+    }
     if !v.drones.is_empty() {
         s.push_str(&format!("  {:<10} {:<15} {:>5}  {}\n", "DRONE", "SPENT/SHARE", "ITERS", "LAST"));
         for d in &v.drones {
@@ -278,8 +309,21 @@ pub fn files(home: &Path) -> Vec<PathBuf> {
         .iter()
         .flat_map(|g| {
             let d = super::dir(home, g);
-            ["goal.json", "goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "spend.jsonl", "joins.jsonl", "runs.jsonl", "approved.jsonl"]
-                .map(|f| d.join(f))
+            [
+                "goal.json",
+                "goal.jsonl",
+                "tasks.jsonl",
+                "contracts.jsonl",
+                "messages.jsonl",
+                "spend.jsonl",
+                "joins.jsonl",
+                "runs.jsonl",
+                "approved.jsonl",
+                "bundles.jsonl",
+                "unbundled.jsonl",
+                "plan.jsonl",
+            ]
+            .map(|f| d.join(f))
         })
         .collect()
 }
@@ -348,6 +392,7 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
   TASK       ROLE      STATUS    HOLDER     LEASE  FILES
   t1         work      claimed   sess-on…     {}m  a.rs
   t2         work      open                     -  b.rs
+  plan not asked · 2 card(s), 0 high-risk
   DRONE      SPENT/SHARE     ITERS  LAST
   d1         $0.75/$1.50         2  timeout
   d2         $0.00/$1.50+        1  error
@@ -356,13 +401,42 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
         );
         assert_eq!(render(&v), expected, "\n{}", render(&v));
         let j = serde_json::to_value(&v).unwrap();
-        for k in ["goal", "budget_usd", "spent_usd", "tasks", "claims", "contracts", "messages", "nodes", "drones", "counts", "finished"] {
+        for k in ["goal", "budget_usd", "spent_usd", "tasks", "claims", "contracts", "messages", "nodes", "drones", "counts", "finished", "commits", "plan"] {
             assert!(j.get(k).is_some(), "{k}");
         }
         assert_eq!(j["tasks"][0]["holder"], "sess-one-1234");
         assert_eq!((j["tasks"][0]["node"].as_str(), j["nodes"].as_u64()), (Some(""), Some(0)), "every line is this node's");
         assert_eq!(j["drones"][1]["unmetered"], true);
-        assert_eq!(files(&home).len(), 9);
+        assert_eq!(files(&home).len(), 12);
+        assert_eq!((j["plan"]["state"].as_str(), j["plan"]["cards"][0]["risk"].as_str()), (Some("not asked"), Some("normal")));
+        // An approval shows who gave it; a high-risk card is listed.
+        let b = board::fold(&board::read(&super::super::tasks_path(&home, "g")));
+        let mut risky = b.tasks["t2"].task.clone();
+        risky.id = "t3".into();
+        risky.title = "drop the users table".into();
+        board::append(&super::super::tasks_path(&home, "g"), &[Event::open(risky, "engineer:e", 11)]).unwrap();
+        let b = board::fold(&board::read(&super::super::tasks_path(&home, "g")));
+        let key = super::super::plan::key("g", &super::super::plan::cards(&b));
+        let d = super::super::plan::Decision {
+            v: 1,
+            ms: 5,
+            key,
+            approved: true,
+            by: "e@x".into(),
+            via: "queen".into(),
+            answer: "y".into(),
+            question: "q1".into(),
+            tasks: 3,
+            high: 1,
+        };
+        super::super::append_line(&super::super::plan::path(&home, "g"), &d).unwrap();
+        let text = render(&of(&home, "g", 61_000).unwrap());
+        assert!(
+            text.contains(
+                "\n  plan approved by e@x (q1) · 3 card(s), 1 high-risk\n  card t3  drop the users table · files b.rs · risk high (an irreversible change)\n"
+            ),
+            "{text}"
+        );
         assert!(v.alerts.is_empty(), "{:?}", v.alerts);
         let _ = std::fs::remove_dir_all(home);
     }

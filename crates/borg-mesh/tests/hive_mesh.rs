@@ -5,9 +5,14 @@
 //! node, and the boards fold identically on both. A message (`borg hive tell`) reaches the verifier on
 //! the other node once. No model call: every model CLI on the drones' PATH is a stub that fails.
 //!
-//! Both nodes hold the repo: A's checkout is `a/app`, B's a `git worktree` of it at `b/app`. The stores
-//! are separate, the git objects shared, which is what "both nodes hold the repo" means for a verdict
-//! (it diffs the author's snapshots). Commits never travel over the mesh.
+//! In the first test both nodes hold the repo: A's checkout is `a/app`, B's a `git worktree` of it at
+//! `b/app`. The stores are separate, the git objects shared, which is what "both nodes hold the repo"
+//! means for a verdict (it diffs the author's snapshots).
+//!
+//! In the second each node has a clone of one remote with an object store of its own: B's attempt
+//! travels as a bundle (borg hive/commits.rs), A verifies and integrates it, its combined tree holds
+//! B's commit; a forged bundle and one over the cap are refused; no secret in a task title, a contract
+//! or a message reaches either store.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -270,6 +275,147 @@ async fn a_task_opened_on_a_is_claimed_done_and_verified_across_two_nodes() {
     }
     assert_eq!(verified_of(&sb_store, "L1"), 1);
     assert_eq!((team_verified(&sa_store, "L1"), team_verified(&sb_store, "L1")), (1, 1));
+    na.close().await;
+    nb.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The secrets the second test hands the hive: a task title's, a contract's and a message's.
+const SECRETS: [&str; 3] = ["ghp_abcdefghijklmnopqrstuvwxyz0123456789", "hunter2hunter2", "sk-ant-api03-abcdefghijklmnopqrstuvwx"];
+
+/// Every file under `dir` that holds `needle`.
+fn holding(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(holding(&p, needle));
+        } else if std::fs::read(&p).is_ok_and(|b| String::from_utf8_lossy(&b).contains(needle)) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn work_done_on_b_is_verified_and_integrated_on_a_with_its_own_object_store() {
+    let root = std::env::temp_dir().join(format!("borg-hive-mesh-commits-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    stub_models(&root);
+    let (ma, mb) = (Machine::new(&root, "a"), Machine::new(&root, "b"));
+    // One remote, two clones with object stores of their own: nothing B commits is in A's repo.
+    let origin = root.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("README"), "app\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-qm", "base"]);
+    for m in [&ma, &mb] {
+        git(&root, &["clone", "-q", "--no-local", origin.to_str().unwrap(), m.app.to_str().unwrap()]);
+    }
+    let (sa_store, sb_store) = (ma.store(), mb.store());
+    let alice = Identity::load_or_create(&sa_store).unwrap();
+    let bob = Identity::load_or_create(&sb_store).unwrap();
+    let mut m = Membership::found("work", &alice);
+    m.invite(&alice, &bob.public(), "member").unwrap();
+    m.save(&sa_store).unwrap();
+    m.save(&sb_store).unwrap();
+    let na = Node::bind(&ma.place(), LOCAL.parse().unwrap()).await.unwrap();
+    let nb = Node::bind(&mb.place(), LOCAL.parse().unwrap()).await.unwrap();
+
+    // 1. A opens the goal, its task's title holding a token; B approves A's check and d1 claims t1.
+    let task = format!("t1|work|Write f1, the deploy token {} expired|f1.txt|", SECRETS[0]);
+    ma.ok(&root, &["init", "g1", "--spec", "Write f1", "--oracle", "t=test -f f1.txt", "--budget", "1", "--task", &task], &[]);
+    round(&na, &nb).await;
+    mb.ok(&root, &["approve", "g1"], &[]);
+    let (sb, sa) = ("sb-session-0001", "sa-session-0001");
+    let d1 = [("BORG_HIVE", "g1"), ("BORG_HIVE_DRONE", "d1")];
+    mb.prompt(&root, sb, &d1);
+    assert!(mb.ok(&root, &["claim", "t1", "--session", sb], &d1).starts_with("claimed t1"));
+    assert!(mb.board().tasks["t1"].task.title.contains("the deploy token [REDACTED] expired"), "the fold reads the redacted title");
+    mb.ok(&root, &["contract", &format!("f1.txt is read with password={}", SECRETS[1]), "--scope", "f1.txt", "--session", sb], &d1);
+    std::fs::write(mb.app.join("f1.txt"), "one\n").unwrap();
+    assert!(mb.ok(&root, &["done", "--session", sb], &d1).contains("verify task t1.v1 opened"));
+    mb.ok(&root, &["tell", &format!("the staging key {} works", SECRETS[2]), "--to", "t1.v1", "--session", sb], &d1);
+    let events = board::read(&hive::tasks_path(&sb_store, "g1"));
+    let attempt = borg::hive::verdict::attempt(&events, &mb.board(), "t1.v1").unwrap();
+    let present = |c: &str| {
+        Command::new("git").arg("-C").arg(&ma.app).args(["cat-file", "-e", &format!("{c}^{{commit}}")]).stderr(Stdio::null()).status().unwrap().success()
+    };
+    assert!(!present(&attempt.head), "separate object stores");
+
+    // 2. B's done bundled the attempt. Before it is stamped, B's log holds a forged bundle instead (another
+    //    commit under the attempt's names) and one over the cap: A refuses the first and never gets the other.
+    let bundles = borg::hive::commits::path(&sb_store, "g1");
+    let genuine = std::fs::read_to_string(&bundles).unwrap();
+    assert_eq!(genuine.lines().count(), 1, "one bundle per attempt");
+    std::fs::write(mb.app.join("f2.txt"), "two\n").unwrap();
+    let other = borg::hive::verdict::snapshot(&mb.app, borg::hive::verdict::SNAPSHOT_TIMEOUT).unwrap();
+    let forged_ref = "refs/borg/forged";
+    git(&mb.app, &["update-ref", forged_ref, &other]);
+    let f = root.join("forged.bundle");
+    git(&mb.app, &["bundle", "create", "-q", f.to_str().unwrap(), forged_ref, "--not", "--remotes"]);
+    let line = |bundle: String| {
+        let b = borg::hive::commits::Bundle {
+            v: 1,
+            task: "t1".into(),
+            node: hive::node(&sb_store),
+            ms: 1,
+            base: attempt.base.clone(),
+            head: attempt.head.clone(),
+            bundle,
+        };
+        serde_json::to_string(&b).unwrap()
+    };
+    use base64::Engine as _;
+    let forged = line(base64::engine::general_purpose::STANDARD.encode(std::fs::read(&f).unwrap()));
+    let oversized = line("A".repeat(borg::hive::commits::MAX_LINE));
+    std::fs::write(&bundles, format!("{forged}\n{oversized}\n")).unwrap();
+    round(&na, &nb).await;
+    let at_a = std::fs::read_to_string(borg::hive::commits::path(&sa_store, "g1")).unwrap();
+    assert_eq!(at_a.lines().collect::<Vec<_>>(), [forged.as_str()], "the oversized line never leaves B");
+    ma.prompt(&root, sa, &d1);
+    let (out, code) = ma.hive(&root, &["claim", "t1.v1", "--session", sa], &d1);
+    assert!(code != 0 && out.contains("its work was done on node") && out.contains("not in this repo"), "{out}");
+    assert!(!present(&attempt.head) && !present(&other), "nothing of the forged bundle lands in A's repo");
+    let view = borg::hive::view::of(&sa_store, "g1", borg::learn::now_ms()).unwrap();
+    assert!(view.commits.iter().any(|c| c.state.starts_with("refused: its commits are")), "{:?}", view.commits);
+
+    // 3. The genuine line arrives after the forged one: A's verifier claims t1.v1 and passes it.
+    std::fs::write(&bundles, format!("{forged}\n{oversized}\n{genuine}")).unwrap();
+    round(&na, &nb).await;
+    assert!(ma.ok(&root, &["claim", "t1.v1", "--session", sa], &d1).starts_with("claimed t1.v1"));
+    assert!(present(&attempt.base) && present(&attempt.head) && !present(&other));
+    let ctx = ma.prompt(&root, sa, &d1);
+    assert!(ctx.contains("tells: the staging key [REDACTED] works"), "{ctx}");
+    assert!(ma.ok(&root, &["verify", "--pass", "--session", sa], &d1).contains("t1.v1 verified"));
+    let top = ma.borg(&root, &["top"], &[]).output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    assert!(top.contains("commits t1") && top.contains(": unbundled") && top.contains(": refused: its commits are"), "{top}");
+
+    // 4. A integrates: its combined tree holds B's commit, and both boards fold identically.
+    round(&na, &nb).await;
+    let out = ma.ok(&root, &["integrate", "g1"], &[]);
+    assert!(out.contains("integrated") && out.contains("the goal is finished"), "{out}");
+    let integrated = git(&ma.app, &["rev-parse", "refs/heads/hive/g1/integrated"]);
+    git(&ma.app, &["merge-base", "--is-ancestor", &attempt.head, &integrated]);
+    assert_eq!(git(&ma.app, &["show", &format!("{integrated}:f1.txt")]), "one");
+    round(&na, &nb).await;
+    let (ba, bb) = (ma.board(), mb.board());
+    assert_eq!(ba, bb, "the same board on both nodes");
+    assert!(ba.finished() && matches!(ba.tasks["t1"].status, Status::Verified { .. }));
+    one_holder_at_a_time(&ba);
+
+    // 5. No secret is in any byte either store holds, the synced logs included.
+    for s in SECRETS {
+        for store in [&sa_store, &sb_store] {
+            assert!(holding(store, s).is_empty(), "{s} in {:?}", holding(store, s));
+        }
+    }
+    let (served, synced) = round(&na, &nb).await;
+    for r in [served, synced] {
+        assert_eq!((r.sent, r.received, r.rejected), (0, 0, 0), "a further round moves only digests: {r:?}");
+    }
     na.close().await;
     nb.close().await;
     let _ = std::fs::remove_dir_all(&root);

@@ -22,10 +22,16 @@
 //!    3b. The hive (borg hive/mod.rs `SYNCED`): `Goals` swaps the ids of the goals each side holds an
 //!    admitted hive line of, both sides keep the valid ids (an id names a directory) and take the
 //!    sorted union, then reconcile each goal's goal.jsonl, tasks.jsonl, contracts.jsonl,
-//!    messages.jsonl and flags.jsonl in that order, exactly as the logs above. Receiving a goal writes
-//!    its logs only, never goal.json (the hidden oracle stays on the node that made the goal). Before
-//!    each session the node credits the verdicts that arrived on work done here and publishes its goals'
+//!    messages.jsonl, flags.jsonl and bundles.jsonl in that order, exactly as the logs above. Receiving a
+//!    goal writes its logs only, never goal.json (the hidden oracle stays on the node that made the goal).
+//!    bundles.jsonl carries each attempt's commits as a git bundle (borg hive/commits.rs): a line over its
+//!    cap (lines.rs `cap`) is neither offered nor stored, and the receiving node unbundles a line only
+//!    once its board needs those commits and they are exactly the attempt the board names. Before each
+//!    session the node credits the verdicts that arrived on work done here and publishes its goals'
 //!    projections (`Node::stamp`).
+//!
+//! One `Lines` frame carries at most `MAX_GIVE` bytes of lines; the rest go at the next session (the
+//! sets still differ, so its reconciliation finds them again).
 //! 4. `reasoning.jsonl` (git-note excerpts, notes in the borg crate): not reconciled with everyone.
 //!    Each author offers its own excerpts to the k = 2 members that rendezvous hashing assigns to
 //!    each excerpt (`replicas`), so the reasoning survives the author being offline without every
@@ -68,11 +74,14 @@ use crate::{live, steer};
 
 mod vectors;
 
-pub const ALPN: &[u8] = b"borg/mesh/8";
+pub const ALPN: &[u8] = b"borg/mesh/9";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
 const MAX_FRAME: usize = 256 << 20;
+/// Most bytes of lines one `Lines` frame gives (well within `MAX_FRAME`): a goal's many bundles go over
+/// several sessions, never in a frame the peer refuses.
+const MAX_GIVE: usize = 64 << 20;
 /// How many members hold a replica of each reasoning excerpt besides its author.
 pub const REPLICAS: usize = 2;
 /// Most commits one `Ask` names, and most excerpts one answer carries.
@@ -701,7 +710,7 @@ impl Node {
             }
         }
         (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
-        let give = signed(&set, origins, r.give.iter());
+        let give = within_budget(signed(&set, origins, r.give.iter()));
         report.sent += give.len();
         self.gate()?; // again just before lines leave
         let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
@@ -724,7 +733,11 @@ impl Node {
         let mut keep: BTreeMap<Hash, Signed> = BTreeMap::new();
         for s in got {
             let h = lines::hash(&s.line);
-            let ok = want.contains(&h) && s.origin.verify(&s.line).is_ok() && m.admits(&s.origin.key, s.origin.ms) && author.is_none_or(|a| a == s.origin.key);
+            let ok = want.contains(&h)
+                && s.line.len() <= lines::cap(path)
+                && s.origin.verify(&s.line).is_ok()
+                && m.admits(&s.origin.key, s.origin.ms)
+                && author.is_none_or(|a| a == s.origin.key);
             if ok {
                 keep.insert(h, s);
             } else {
@@ -788,6 +801,20 @@ fn about(commits: &[String], line: &str) -> bool {
 /// Whether `commit` is one of `asked` (full ids, or abbreviations of at least 7 characters).
 fn asked(asked: &[String], commit: &str) -> bool {
     asked.iter().any(|a| a == commit || (a.len() >= 7 && commit.starts_with(a.as_str())))
+}
+
+/// The first of `lines` whose sizes add up to at most `MAX_GIVE` (at least one).
+fn within_budget(lines: Vec<Signed>) -> Vec<Signed> {
+    let mut used = 0;
+    lines
+        .into_iter()
+        .enumerate()
+        .take_while(|(i, s)| {
+            used += s.line.len();
+            *i == 0 || used <= MAX_GIVE
+        })
+        .map(|(_, s)| s)
+        .collect()
 }
 
 fn signed<'a>(set: &BTreeMap<Hash, String>, origins: &HashMap<Hash, Origin>, hashes: impl Iterator<Item = &'a Hash>) -> Vec<Signed> {
@@ -873,6 +900,20 @@ mod tests {
         let link = |c: &str, f: &str| json!({"kind": "regress", "commit": c, "fix": f}).to_string();
         assert!(about(&ask, &excerpt) && about(&ask, &link("aaaaaaaaaa", "f1f1f1f1f1")) && about(&ask, &link("d0d0d0d0d0", "bbbbbbbbbb")));
         assert!(!about(&ask, &link("aaaaaaaaaa", "bbbbbbbbbb")) && !about(&ask, "not json"));
+    }
+
+    /// A frame of lines stays within `MAX_GIVE`: the rest wait for the next session; one line always goes.
+    #[test]
+    fn a_frame_gives_lines_up_to_its_budget() {
+        let me = Identity::load_or_create(&std::env::temp_dir().join(format!("borg-mesh-budget-{}", std::process::id()))).unwrap();
+        let line = |n: usize| {
+            let l = "x".repeat(n);
+            Signed { origin: Origin::new(&me, &lines::hash(&l), 1), line: l }
+        };
+        let give = within_budget(vec![line(MAX_GIVE / 2), line(MAX_GIVE / 2), line(1)]);
+        assert_eq!(give.len(), 2);
+        assert_eq!(within_budget(vec![line(MAX_GIVE + 1), line(1)]).len(), 1);
+        assert!(within_budget(Vec::new()).is_empty());
     }
 
     /// One node's machine: a root store (`BORG_HOME`), a config (`BORG_CONFIG`) and a repo that

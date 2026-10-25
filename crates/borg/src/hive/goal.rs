@@ -52,11 +52,16 @@ pub fn has_hidden(g: &Goal) -> bool {
     g.hidden.is_some() || g.held_out
 }
 
-/// The goal as it syncs: no hidden oracle, `held_out` when it has one; one compact line, the same for
-/// the same goal (so `publish` appends it once).
+/// The goal as it syncs: no hidden oracle, `held_out` when it has one, its spec redacted (notes.rs
+/// `redact`, as presence prompts); one compact line, the same for the same goal (so `publish` appends
+/// it once).
 pub fn projection(g: &Goal) -> String {
-    let p = Goal { hidden: None, held_out: has_hidden(g), ..g.clone() };
-    serde_json::to_string(&p).unwrap_or_default()
+    serde_json::to_string(&shared(g)).unwrap_or_default()
+}
+
+/// `g` as other nodes hold it: what `projection` writes.
+fn shared(g: &Goal) -> Goal {
+    Goal { hidden: None, held_out: has_hidden(g), spec: crate::notes::redact(&g.spec), ..g.clone() }
 }
 
 /// A goal's hidden oracle: `commands` run by `sh -c` in a scratch checkout of the work, with
@@ -185,7 +190,7 @@ pub fn local(home: &Path, id: &str) -> Option<Goal> {
 /// lines are quarantined), and the board and borg-web say why.
 pub fn conflict(home: &Path, id: &str) -> Option<String> {
     let text = std::fs::read_to_string(super::goal_jsonl_path(home, id)).unwrap_or_default();
-    let shown = |g: &Goal| Goal { hidden: None, held_out: has_hidden(g), sig: String::new(), ..g.clone() };
+    let shown = |g: &Goal| Goal { sig: String::new(), ..shared(g) };
     let mut defs: Vec<Goal> = local(home, id).iter().map(shown).collect();
     for g in text.lines().filter_map(|l| serde_json::from_str::<Goal>(l).ok()).filter(|g| g.v <= 1 && g.id == id) {
         let g = shown(&g);
@@ -315,6 +320,19 @@ mod tests {
         for d in [home, peer, held] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn a_secret_in_the_spec_stays_on_the_node_that_made_the_goal() {
+        let home = temp("secret");
+        let g = Goal { spec: "Fix the deploy\nDATABASE_URL=postgres://admin:hunter2@db/app".into(), ..goal("g-p") };
+        create(&home, &g).unwrap();
+        crate::hive::publish(&home);
+        let line = std::fs::read_to_string(crate::hive::goal_jsonl_path(&home, "g-p")).unwrap();
+        assert!(!line.contains("hunter2"), "{line}");
+        assert_eq!(local(&home, "g-p").unwrap().spec, g.spec, "this node's goal.json keeps it");
+        assert!(conflict(&home, "g-p").is_none(), "its own projection is one definition");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// Two nodes that made one id before a sync round, or a member's line naming a goal it did not make

@@ -196,7 +196,9 @@ fn exec(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Verdi
             Some((status, _)) if status.success() => {}
             Some((status, out)) => {
                 let text = String::from_utf8_lossy(&out);
-                let mut t = tail(&text, TAIL_CHARS);
+                // Redacted whole, before the cut: a tail that starts past a secret's key would keep its
+                // value (a failure's tail reaches the synced board, integrate.rs and verdict.rs).
+                let mut t = tail(&crate::notes::redact(&text), TAIL_CHARS);
                 if t.trim().is_empty() {
                     t = format!("(no output; exit {})", status.code().map_or("by signal".into(), |c| c.to_string()));
                 }
@@ -302,6 +304,10 @@ mod tests {
         assert_eq!(exec(&goal(&["true", "true"]), &task(), &dir, roomy), Verdict::Pass);
         let v = exec(&goal(&["true", "echo boom >&2; false", "true"]), &task(), &dir, roomy);
         assert_eq!(v, Verdict::Fail { check: "c1".into(), tail: "boom\n".into() }, "stderr is in the tail; the first failure decides");
+        // A tail cut just past a secret's key would keep its value: the output is redacted before the cut.
+        let v = exec(&goal(&[&format!("printf 'password=hunter2 %0{}d' 0; false", TAIL_CHARS - 8)]), &task(), &dir, roomy);
+        let Verdict::Fail { tail: t, .. } = v else { panic!("{v:?}") };
+        assert!(!t.contains("hunter2") && t.contains("DACTED]"), "{}", &t[..40]);
         let pid_file = dir.join("pid");
         let cap = Some(Duration::from_millis(200));
         let started = Instant::now();

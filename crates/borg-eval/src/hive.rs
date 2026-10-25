@@ -1306,8 +1306,10 @@ fn d3_init_args(wl: &Workload, spec_file: &Path, cap: f64, goal: &str) -> Vec<St
     a
 }
 
+/// `borg hive run` of D3's goal. `--yes`: the eval approves the plan itself (hive/plan.rs), so the run
+/// never waits for an engineer the sandbox does not have.
 fn d3_run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &str) -> Vec<String> {
-    let mut a: Vec<String> = ["borg", "hive", "run", goal, "--drones"].map(String::from).to_vec();
+    let mut a: Vec<String> = ["borg", "hive", "run", goal, "--yes", "--drones"].map(String::from).to_vec();
     a.extend([DRONES.to_string(), "--model".into(), model.into(), "--base".into(), base.into(), "--iter-timeout".into(), iter_timeout_s.to_string()]);
     if sim {
         a.extend(["--harness".into(), "sim".into()]);
@@ -2345,6 +2347,7 @@ mod tests {
         assert_eq!(at(&run, "--iter-timeout").as_deref(), Some("3600"));
         assert_eq!(at(&run, "--model").as_deref(), Some("sonnet"));
         assert!(!run.contains(&"--harness".to_string()));
+        assert!(run.contains(&"--yes".to_string()), "an eval run never waits for the plan's approval");
         assert!(d3_run_args("sonnet", "abc", 1, true, "pilot").ends_with(&s(&["--harness", "sim"])));
         assert!(wl.prompt().ends_with("Visible check: run `true` from the workspace root."));
         let _ = fs::remove_dir_all(root);

@@ -483,6 +483,48 @@ pub struct HiveGoal {
     pub groups: Vec<HiveGroup>,
     /// Its tasks verified after a rejection (borg hive/rework.rs `Row`).
     pub reworks: Vec<HiveRework>,
+    /// The newest bundles of attempts' commits (borg hive/commits.rs `Row`).
+    pub commits: Vec<HiveCommit>,
+    /// The plan's intent cards and the engineer's decision (borg hive/plan.rs `Row`); None without a
+    /// work task.
+    pub plan: Option<HivePlan>,
+}
+
+/// A goal's plan as the engineer approves it before `borg hive run` starts its drones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HivePlan {
+    /// `approved`, `refused`, `waiting` or `not asked`.
+    pub state: String,
+    pub by: String,
+    /// `queen` or `yes` (`--yes`).
+    pub via: String,
+    pub question: String,
+    pub answer: String,
+    pub cards: Vec<HiveCard>,
+}
+
+/// One task's intent card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveCard {
+    pub task: String,
+    pub intent: String,
+    pub files: Vec<String>,
+    pub deps: Vec<String>,
+    /// `low`, `normal` or `high`.
+    pub risk: String,
+    pub why: String,
+}
+
+/// One attempt's commits carried as a bundle between nodes, and what this node did with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveCommit {
+    pub task: String,
+    pub head: String,
+    /// The node it came from: empty for this one.
+    pub node: String,
+    pub bytes: f64,
+    /// `made here`, `carried`, `unbundled`, `refused: …` or `waiting: …`.
+    pub state: String,
 }
 
 /// A task the verifier rejected and a later attempt passed, and what reflection made of it.
@@ -584,6 +626,32 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                 .flatten()
                 .map(|r| HiveRework { task: s(&r["task"]), rejections: f(&r["rejections"]), drones: strs(&r["drones"]), reflection: s(&r["reflection"]) })
                 .collect(),
+            commits: g["commits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| HiveCommit { task: s(&c["task"]), head: s(&c["head"]), node: s(&c["node"]), bytes: f(&c["bytes"]), state: s(&c["state"]) })
+                .collect(),
+            plan: g["plan"].is_object().then(|| HivePlan {
+                state: s(&g["plan"]["state"]),
+                by: s(&g["plan"]["by"]),
+                via: s(&g["plan"]["via"]),
+                question: s(&g["plan"]["question"]),
+                answer: s(&g["plan"]["answer"]),
+                cards: g["plan"]["cards"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|c| HiveCard {
+                        task: s(&c["task"]),
+                        intent: s(&c["intent"]),
+                        files: strs(&c["files"]),
+                        deps: strs(&c["deps"]),
+                        risk: s(&c["risk"]),
+                        why: s(&c["why"]),
+                    })
+                    .collect(),
+            }),
         })
         .collect()
 }

@@ -57,7 +57,13 @@ fn norm(text: &str) -> String {
 pub fn stamp(e: &Entry, answer: &str) -> bool {
     let a = norm(answer);
     let plan = norm(e.kind.proceeds());
-    (!plan.is_empty() && a.starts_with(&plan)) || (!a.is_empty() && a.split(' ').all(|w| YES.contains(&w)))
+    (!plan.is_empty() && a.starts_with(&plan)) || yes(answer)
+}
+
+/// Whether `answer` says only yes: every word of it is a plain yes (hive/plan.rs approves a plan by it too).
+pub fn yes(answer: &str) -> bool {
+    let a = norm(answer);
+    !a.is_empty() && a.split(' ').all(|w| YES.contains(&w))
 }
 
 /// Logs the reward of an answer to `e` (queen.rs `answer`, after it was recorded): `queen_no` or
@@ -235,7 +241,7 @@ mod tests {
         let mut e = entry("q1", Kind::PublicApi, "s1");
         assert_eq!(answered(&store, &e, "keep the old contract working", "ann@x", 10), Some(stats::QUEEN_NO));
         assert_eq!(answered(&store, &e, "proceed as planned", "ann@x", 11), Some(stats::QUEEN_STAMP));
-        for k in [Kind::Constraint, Kind::Contract, Kind::Playbook, Kind::Reach, Kind::OpenDecision] {
+        for k in [Kind::Constraint, Kind::Contract, Kind::Playbook, Kind::Reach, Kind::OpenDecision, Kind::Plan] {
             e.kind = k;
             assert_eq!(answered(&store, &e, "anything", "ann@x", 12), None, "{k:?} is a gate, not the queen's choice");
         }

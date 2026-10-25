@@ -10,6 +10,8 @@
 //!   this runner's to release.
 //! - `contracts.jsonl` (contract.rs): what drones promise each other, shown once per session.
 //! - `messages.jsonl` (message.rs): `borg hive ask` and `tell` between drones, shown once per session.
+//! - `bundles.jsonl` (commits.rs): each attempt's commits as a git bundle, from a store in a mesh, so a
+//!   node on another machine verifies, builds on and integrates work it did not do.
 //! - `oracle/` (oracle.rs): the tails of failed oracle runs.
 //! - `flags.jsonl` (guard.rs): what drones did to tests, CI or the oracle's files, flagged at each tool
 //!   call; `oracle.jsonl` (hidden.rs): the hidden oracle's score of each judged attempt (runner only).
@@ -34,6 +36,7 @@
 //! the drone the next open task. A session in no goal costs one failed file open and sees no change.
 
 pub mod board;
+pub mod commits;
 pub mod contract;
 mod git;
 pub mod goal;
@@ -43,6 +46,7 @@ pub mod hidden;
 pub mod integrate;
 pub mod message;
 pub mod oracle;
+pub mod plan;
 pub mod rework;
 pub mod run;
 mod sim_drone;
@@ -137,8 +141,9 @@ pub fn inoculation(g: &Goal) -> String {
 /// projection), oracle.jsonl (the hidden scores), joins.jsonl, spend.jsonl, runs.jsonl (this node's
 /// worktrees and spend), logs/ and scratch/. flags.jsonl does: a verifier on another node reads the
 /// author's oracle-file flags from it (verdict.rs `record`), or a hack that touched the oracle's files
-/// would pass there.
-pub const SYNCED: [&str; 5] = ["goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "flags.jsonl"];
+/// would pass there. bundles.jsonl (commits.rs) carries each attempt's commits to the nodes that verify,
+/// build on or integrate it elsewhere.
+pub const SYNCED: [&str; 6] = ["goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "flags.jsonl", commits::FILE];
 
 /// This store's node id: the self-declared id outcomes and the stats rollups carry (stats.rs `node`),
 /// stamped on every hive line this node writes. Not the member key: lines are bound to a key by their
@@ -427,29 +432,29 @@ fn next_open<'a>(home: &Path, g: &Goal, b: &'a Board, session: &str, drone: &str
         !refused.contains(s.task.id.as_str())
             && may_take(g, &s.task, repo, session, cwd)
             && approvals.pending(g, &s.task).is_empty()
-            && absent_from(home, b, || events.get_or_init(|| board::read(&tasks_path(home, &g.id))).as_slice(), s, cwd).is_none()
+            && absent_from(home, &g.id, b, || events.get_or_init(|| board::read(&tasks_path(home, &g.id))).as_slice(), s, cwd).is_none()
     })
 }
 
 /// The node holding commits `s` starts from that `cwd`'s repo lacks: a verify task of work done on
 /// another node whose snapshots are not here, a fix task of another node's integration whose `from`
 /// is not. None for anything opened on this node (the git call runs only for another node's), or when
-/// the commits are here (both nodes hold one repo). Cross-machine integration of commits is out of
-/// scope: the work is verified where its commits are (docs/design/collective.md step 4).
-fn absent_from<'e>(home: &Path, b: &Board, events: impl FnOnce() -> &'e [Event], s: &TaskState, cwd: &str) -> Option<String> {
+/// the commits are here: both nodes hold one repo, or the work's bundle brought them (commits.rs
+/// `fetch`). A fix task's `from` does not travel yet: it is claimed where its integration ran.
+fn absent_from<'e>(home: &Path, goal: &str, b: &Board, events: impl FnOnce() -> &'e [Event], s: &TaskState, cwd: &str) -> Option<String> {
     if is_local(home, &s.node) {
         return None;
     }
-    let commits: Vec<String> = match (&s.task.from, s.task.role) {
-        (Some(from), _) => vec![from.clone()],
+    let here = match (&s.task.from, s.task.role) {
+        (Some(from), _) => verdict::present(Path::new(cwd), &[from], verdict::DIFF_TIMEOUT),
+        // The work's commits, from its bundle when this repo lacks them (commits.rs).
         (None, Role::Verify) => match verdict::attempt(events(), b, &s.task.id) {
-            Some(a) if !a.base.is_empty() && !a.head.is_empty() => vec![a.base, a.head],
+            Some(a) if !a.base.is_empty() && !a.head.is_empty() => commits::fetch(home, goal, &a, Path::new(cwd)),
             _ => return None,
         },
         _ => return None,
     };
-    let refs: Vec<&str> = commits.iter().map(String::as_str).collect();
-    (!verdict::present(Path::new(cwd), &refs, verdict::DIFF_TIMEOUT)).then(|| s.node.clone())
+    (!here).then(|| s.node.clone())
 }
 
 /// What a drone is told of a task whose commits are on another node.
@@ -1047,7 +1052,8 @@ impl Ctx<'_> {
         count(self.home, stats::HIVE_CLAIM, self.session, &self.g.id, &won.task.id, self.repo);
         let now = self.clock();
         hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2)));
-        Some(describe(self.g, &won, self.session, self.cwd))
+        let risk = plan::escalate(self.home, self.g, &won.task, self.session, self.cwd, now).map(|t| format!("\n{t}")).unwrap_or_default();
+        Some(format!("{}{risk}", describe(self.g, &won, self.session, self.cwd)))
     }
 }
 
@@ -1088,8 +1094,10 @@ fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, no
     };
     let (done, check) = done_events(home, g, held, session, dir, since, within);
     let (vid, ms) = (check.id.clone(), done.ms);
-    write(home, &g.id, vec![done.with_note(&hook::one_line(note, 200)), Event::open(check, session, ms)]).map_err(|e| Unfinished::Io(e.to_string()))?;
-    let b = board::fold(&board::read(&path));
+    write(home, &g.id, vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)])
+        .map_err(|e| Unfinished::Io(e.to_string()))?;
+    let events = board::read(&path);
+    let b = board::fold(&events);
     match b.tasks.get(id) {
         Some(s) if s.status == (Status::Done { by: session.to_string(), ms }) => {}
         s => {
@@ -1097,6 +1105,12 @@ fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, no
             let held = s.map_or_else(|| "gone".to_string(), |s| held_by(s, now));
             return Err(Unfinished::Lost(format!("{id}'s done did not take effect: the task is {held} now. {NOT_YOURS}")));
         }
+    }
+    // The attempt's commits, for a verifier or an integrator on another machine (a store in a mesh only).
+    if let Some(a) = verdict::attempt(&events, &b, &vid)
+        && let Err(e) = commits::publish(home, &g.id, &a, dir)
+    {
+        eprintln!("borg hive: {e}");
     }
     count(home, stats::HIVE_DONE, session, &g.id, id, &queen::repo_name(&dir.display().to_string()));
     Ok(vid)
@@ -1194,7 +1208,7 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64,
         return Err(Refused::NotHere(fix_where(&task.id, from)));
     }
     let t0 = Instant::now();
-    let (deps_in, brought) = bring_deps(&path, task, cwd, within)?;
+    let (deps_in, brought) = bring_deps(home, &g.id, task, cwd, within)?;
     let take_out = || take_out_all(cwd, &brought, within.saturating_sub(t0.elapsed()));
     let rest = within.saturating_sub(t0.elapsed());
     // A fix task's claim keeps a snapshot of what the reset will discard in its note: recoverable.
@@ -1243,12 +1257,12 @@ type Brought = (String, String);
 /// Brings the verified work of `task`'s deps into `cwd` for its claim (see `claim`), `within` that
 /// time: the claim's `deps_in`, and the (base, head) of each change it applied, to take out if the
 /// claim is lost. Nothing for a verify or fix task, a task without deps, or no directory.
-fn bring_deps(path: &Path, task: &Task, cwd: &str, within: Duration) -> Result<(Vec<String>, Vec<Brought>), Refused> {
+fn bring_deps(home: &Path, goal: &str, task: &Task, cwd: &str, within: Duration) -> Result<(Vec<String>, Vec<Brought>), Refused> {
     if task.role == Role::Verify || task.from.is_some() || task.deps.is_empty() || cwd.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
     let t0 = Instant::now();
-    let events = board::read(path);
+    let events = board::read(&tasks_path(home, goal));
     let b = board::fold(&events);
     let (mut deps_in, mut brought): (Vec<String>, Vec<Brought>) = (Vec::new(), Vec::new());
     let refuse = |brought: &[Brought], why: String| {
@@ -1259,6 +1273,8 @@ fn bring_deps(path: &Path, task: &Task, cwd: &str, within: Duration) -> Result<(
         let Some(a) = verdict::accepted(&events, &b, &d).filter(|a| !a.base.is_empty() && !a.head.is_empty()) else {
             return Err(refuse(&brought, format!("{d} has no verified work to bring into this tree")));
         };
+        // A dep done on another machine: its commits from its bundle (commits.rs), else git says why below.
+        commits::fetch(home, goal, &a, Path::new(cwd));
         match verdict::bring_in(Path::new(cwd), &a.base, &a.head, within.saturating_sub(t0.elapsed())) {
             Ok(applied) => {
                 if applied {
@@ -1364,7 +1380,7 @@ pub const FLAGS: &[&str] = &[
 ];
 
 /// The flags that take no value.
-const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here"];
+const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here", "--yes"];
 
 const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   init <goal> --spec TEXT|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]...
@@ -1378,8 +1394,9 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
   leave [--here]                                            the drone leaves (its claim is released); --here: new
                                                             sessions here join no more (joined ones stay)
-  run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]
-                                                            N headless drones in worktrees until done or the budget is spent
+  run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]
+                                                            N headless drones in worktrees until done or the budget is spent,
+                                                            once the engineer approved the plan (--yes: approved here)
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
        [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one;
                                                             --group K: K attempts ID.g1.. by different drones, the
@@ -1873,8 +1890,16 @@ fn run_cmd(here: &Here, a: &Args, id: &str) -> i32 {
             return 2;
         }
     };
-    let o =
-        run::Opts { goal: id, drones, harness, model: a.value("--model"), base: a.value("--base").unwrap_or("HEAD"), iter_timeout, dry_run: a.on("--dry-run") };
+    let o = run::Opts {
+        goal: id,
+        drones,
+        harness,
+        model: a.value("--model"),
+        base: a.value("--base").unwrap_or("HEAD"),
+        iter_timeout,
+        dry_run: a.on("--dry-run"),
+        yes: a.on("--yes"),
+    };
     run::main(&here.home, &here.cwd, &o)
 }
 
@@ -2001,7 +2026,8 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
                 }
                 Some(s) => {
                     let events = std::cell::OnceCell::new();
-                    if let Some(n) = absent_from(&here.home, &b, || events.get_or_init(|| board::read(&tasks_path(&here.home, &g.id))).as_slice(), s, &here.cwd)
+                    if let Some(n) =
+                        absent_from(&here.home, &g.id, &b, || events.get_or_init(|| board::read(&tasks_path(&here.home, &g.id))).as_slice(), s, &here.cwd)
                     {
                         return fail(elsewhere(t, &n));
                     }
@@ -2022,6 +2048,9 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
                 count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
                 hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
                 println!("claimed {id} for {}. {}", short(&session), describe(&g, &won, &session, &here.cwd));
+                if let Some(told) = plan::escalate(&here.home, &g, &won.task, &session, &here.cwd, learn::now_ms()) {
+                    println!("{told}");
+                }
                 return 0;
             }
             // Never offered to this session again; without a task named, the next one is tried.
@@ -2129,11 +2158,18 @@ fn verdict_cmd(here: &Here, named: Option<&str>, said: verdict::Said) -> i32 {
     }
 }
 
-/// Whether this command runs for a drone: launched into a goal (`BORG_HIVE`, `BORG_HIVE_DRONE`), or in
-/// a worktree `borg hive run` made and has not left (a harness that drops the env).
+/// Whether this command runs for a drone ([`drone`]).
 fn drone_here(here: &Here) -> bool {
+    drone(&here.home, &here.cwd)
+}
+
+/// Whether a process in `cwd` runs for a drone: launched into a goal (`BORG_HIVE`, `BORG_HIVE_DRONE`),
+/// or in a worktree `borg hive run` made and has not left (a harness that drops the env). What the
+/// engineer-only commands and the queen's questions about a hive's plan and tasks are never run,
+/// answered or delivered by (queen.rs).
+pub fn drone(home: &Path, cwd: &str) -> bool {
     let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
-    set(ENV) || set(DRONE_ENV) || joined(&here.home, &here.cwd).is_some_and(|j| j.by == "run")
+    set(ENV) || set(DRONE_ENV) || joined(home, cwd).is_some_and(|j| j.by == "run")
 }
 
 /// `borg hive approve <goal>`: the engineer approves the checks of goal `id` that other nodes wrote (the

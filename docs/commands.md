@@ -30,7 +30,7 @@
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked, on this machine and the team's |
 | `borg ope [--dir DIR \| --file FILE] [--json]` | Off-policy estimates of the belief's hand-set weights (veto, hive verdicts, regret) from logged asks with their propensity; reports and never changes them |
 | `borg hive init\|board\|join\|leave\|open\|claim\|progress\|release\|block\|done\|verify\|score\|integrate\|approve\|contract\|ask\|tell` | Many drones, one goal: a board of tasks with leased claims, contracts and messages between drones, done gated by the goal's oracle, and verdicts guarded against gaming it; see [below](#hive) |
-| `borg hive run <goal> --drones N [--harness H] [--dry-run]` | N headless drones, each in a git worktree of the repo with an equal share of what is left of the goal's budget, until the board is finished; see [Running drones](#running-drones) |
+| `borg hive run <goal> --drones N [--harness H] [--dry-run] [--yes]` | N headless drones, each in a git worktree of the repo with an equal share of what is left of the goal's budget, until the board is finished, once you approved the goal's plan (`--yes`: approved on the command line); see [Running drones](#running-drones) |
 | `borg hive join <goal> --here` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join` (`--paths DIR...` names your repos), `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
 
@@ -77,14 +77,14 @@ $ borg hive board
 | `borg hive board [<goal>] [--json] [--watch]` | The tasks by status, with holders, age, rework and dependencies |
 | `borg hive join <goal> [--session ID\|DRONE]` · `borg hive leave` | A running drone joins the goal, or leaves it (its claim is released). A drone started with `BORG_HIVE=<goal>` joins at its first hook |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
-| `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run]` | Headless drones in worktrees, see [Running drones](#running-drones) |
+| `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]` | Headless drones in worktrees, once the plan is approved, see [Running drones](#running-drones). Exit 1 when you said no to the plan (nothing was started or claimed) |
 | `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task; `--again` reopens a blocked one. `--group K` (2 to 19) opens K attempts `ID.g1`..`ID.gK` of one work task, each another drone's; see [Groups](#groups-of-attempts) |
-| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it, exit 1 when another drone holds it (the message names the holder and tells the drone not to work on it). A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below). When that work does not apply there, `claim TASK` exits 1, and `claim` alone skips the task and takes the next one; a skipped task is not offered to that session again. A verify task of work done on another node whose snapshots this repo lacks (or a fix task whose tree it lacks) is not offered, and `claim TASK` exits 1 with "its work was done on node X and is not in this repo". A board it cannot write exits 1 with the error, never as a lost race. Inside a drone of `borg hive run` without `--session`, the session is the drone's (`BORG_HIVE_DRONE`), not whichever drone of the repo was seen last |
+| `borg hive claim [TASK]` | The drone claims a task (the next open one without TASK); exit 3 when another drone won it, exit 1 when another drone holds it (the message names the holder and tells the drone not to work on it). A task with deps is open once they are verified, and its claim first brings their verified work into the drone's tree (see below). When that work does not apply there, `claim TASK` exits 1, and `claim` alone skips the task and takes the next one; a skipped task is not offered to that session again. A verify task of work done on another node whose snapshots this repo lacks and no bundle brings (or a fix task whose tree it lacks) is not offered, and `claim TASK` exits 1 with "its work was done on node X and is not in this repo" ([across machines](#across-machines)). A board it cannot write exits 1 with the error, never as a lost race. Inside a drone of `borg hive run` without `--session`, the session is the drone's (`BORG_HIVE_DRONE`), not whichever drone of the repo was seen last |
 | `borg hive progress "<note>"` · `release` · `block "<why>"` | Report on, give back or block the drone's claim |
 | `borg hive done [--note N]` | Run the task's checks with their own timeouts (no hook time limit), renewing the claim while they run; on a pass publish done and open its verify task. Exit 3 when the claim passed to another drone meanwhile: the board ignores that done, and the message names the holder |
 | `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the verifier's turn with the line `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note. The work's diff is checked first, see [Guardrails](#guardrails-and-the-hidden-oracle) |
 | `borg hive score <goal>` | The goal's hidden oracle scores every judged task not scored yet (`borg hive run` does this when its drones end). The engineer's: refused to a drone of a hive goal. Exit 1 when an attempt could not be checked out (run it from the goal's repo) |
-| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts and run the goal's oracle and every task's checks on the combined tree, as `borg hive run` does itself (see [Running drones](#running-drones)). Exit 0 when it passed (the goal is finished), 1 when it was rejected (a fix task is open) or blocked, or when an accepted attempt's commits are on another node only ("integrate on a node that holds these commits", nothing written), 2 when no integration is due. Needs git 2.40+. The engineer's: refused to a drone of a hive goal |
+| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts and run the goal's oracle and every task's checks on the combined tree, as `borg hive run` does itself (see [Running drones](#running-drones)). Exit 0 when it passed (the goal is finished), 1 when it was rejected (a fix task is open) or blocked, or when an accepted attempt's commits are on another node only and no bundle brings them ("integrate on a node that holds these commits", nothing written), 2 when no integration is due. Needs git 2.40+. The engineer's: refused to a drone of a hive goal |
 | `borg hive approve <goal>` | Run the checks of goal `<goal>` that another node wrote (a synced goal's oracle, a task another node opened with `--accept`) on this machine: prints each command and approves it here (the local `approved.jsonl`). Until then such a task is not offered or claimable here, its checks never run, and `borg hive board`, `borg top` and the Hive tab list them. The goal's own `goal.json` oracle and the checks of tasks opened here need no approval. The engineer's: refused to a drone of a hive goal |
 | `borg hive contract "<text>" --scope a,b [--supersedes ID]` | Publish a contract scoped to files (globs), `id:NAME` or `repo:NAME`. Superseding another drone's contract asks the engineer through `borg queen` |
 | `borg hive ask "<text>" [--to TASK\|DRONE\|SESSION]` · `borg hive tell "<text>" [--to …] [--re ID]` | A message to the goal's drones: everyone, whoever holds a task, a drone (that name on the sender's node) or a session. Each recipient's next prompt shows it once, with the command that answers it, while it is fresh (30 min, a lease); never to its sender. One message per sender and recipient per 10 min (the heartbeat). `tell --re ID` without `--to` answers the asker's session |
@@ -203,12 +203,41 @@ without crediting lessons (an eval's frozen arm).
 ```console
 $ borg hive run parser --drones 3 --dry-run     # the worktrees, the harness command, the share, the prompt
 $ borg hive run parser --drones 3               # --harness: the calling session's harness, else claude
+hive run parser: the plan waits for the engineer's approval (queen question q3c1d09aa); no drone starts before it
+  t1  add the lexer · files src/lexer.rs · checks unit=cargo test lexer · risk normal (ordinary work)
+  t2  document the grammar · files docs/grammar.md · risk low (docs and tests only)
+  t3  drop the legacy tokens table · files migrations/ · after t1 · risk high (an irreversible change)
+  answer: y here, or `borg queen answer q3c1d09aa a` to approve, `borg queen answer q3c1d09aa "<why not>"` to stop the run
+approve the plan? [y/N, or why not] y
+hive run parser: plan approved by ann@example.com (queen question q3c1d09aa): 3 task(s), 1 high-risk
 d1  integrate.1  integrated 3f2a9c1b07de: the oracle passes
 d1  hive-parser-1  $1.84/$6.67  4 iter  tasks done: t1,t3.v1  end: goal finished
 ...
 board: 7 task(s) (7 verified); the goal is finished
 integrated 3f2a9c1b07de… (integrate.1, refs/heads/hive/parser/integrated)
 ```
+
+**Plan approval.** Before any drone starts, `borg hive run` shows the goal's plan as one intent card
+per task (its intent, files, deps, checks and a risk class) and asks you to approve it, once, as a
+queen question. Answer at the run's terminal (`y`; Enter or `n` is no; or say why not), or from anywhere
+with `borg queen answer <id> a` (approve) or `borg queen answer <id> "<why not>"`. The run waits, under
+its lock, with no worktree made and nothing claimed, and a no (or a dismissal) stops it with exit 1. A
+no in your own words is recorded like `borg no`: `borg learn` can turn it into a lesson. The risk class
+is `high` when the queen's classifier finds an irreversible change, an external mutation, a public API
+or schema change or a cross-repo decision in the task's title, `low` when every file in scope is docs or
+tests, and `normal` otherwise. The decision is kept in `<store>/hive/<goal>/plan.jsonl`: a rerun of the
+same plan does not ask again, and a new or changed task does, also one opened while the run waits
+(after your approval the run asks again for the changed plan before any drone starts). `--yes` approves the plan on the command
+line without a question or a wait, for scripts and evals (borg-eval's runs pass it); without a terminal
+and without `--yes` the run waits for an answer through the queue. When a high-risk task is claimed the
+first time, the queen asks you about it once (a question of its kind, which the queen's attention reward
+counts), and the drone is told to go on with that kind's default meanwhile (an external mutation is held
+until you approve). The attempts of a `--group K` task are one task: one question, and each attempt's
+drone is told. A drone can neither answer these questions nor be shown them, also in a worktree
+`borg hive run` made when its harness drops the environment, and `borg queen dedupe` never dismisses
+them. `borg top`, `/api/hive`
+and the Hive tab show the plan's state (`approved`, `refused`, `waiting`, `not asked`) and its cards. The
+queue is this node's: on another node of the mesh, that node's run asks its own engineer.
 
 `borg hive run` makes one git worktree per drone, `<repo>/.worktrees/hive-<goal>-<n>` on branch
 `hive/<goal>/<n>` from `--base` (default `HEAD`); an existing one is reused, and an existing branch is
@@ -391,11 +420,27 @@ not this one.
   lease. A runner releases only its own node's claims.
 - **Drone names** (`d1`, `d2`) repeat on every machine: a verify task is barred to the author's session
   everywhere, and to the author's drone name only on the author's node.
-- **Commits do not travel.** A verdict diffs the author's snapshots, so a verify task is offered only
-  where they are (a repo with that node's objects: a clone that fetched them, a shared object store);
-  elsewhere it is not offered, and `borg hive verify` says which node holds the work. An integration
-  runs only on a node that holds every accepted attempt; `borg hive run` and `borg hive integrate`
-  elsewhere write nothing and say which work is on which node.
+- **Commits travel as bundles.** A verdict diffs the author's snapshots. At each `done` in a store
+  that is a mesh member, the attempt's two snapshots (claim and done) are pinned at
+  `refs/borg/hive/<goal>/<sha>` and bundled `--not --remotes` into the goal's synced `bundles.jsonl`
+  (at most 1 MiB; a bigger attempt carries nothing and stays where it was done). A node whose repo
+  lacks an attempt's commits unbundles them when a verify offer, a dependency's bring-in or an
+  integration needs them, and pins them at the same refs. A bundle is refused unless its commits are
+  exactly the claim and done snapshots the board names and every object they reach arrives (it is
+  unbundled into a quarantine first, so a refused bundle leaves nothing in the repo); the repo must
+  hold the remote's history it was cut from (`git fetch` first, the line is tried again, as after a
+  local failure such as a git call that did not finish). The goal's node fetches an attempt's commits
+  for its hidden oracle too, so work done elsewhere is scored there, accepted or rejected. Without
+  a usable bundle the verify task is not offered there, `borg hive claim` says which node holds the
+  work, and `borg hive run` and `borg hive integrate` write nothing and say which work is on which
+  node. `borg top` and the Hive tab list each bundle: made here, carried, unbundled, waiting or refused
+  and why. A fix task's start (a failed integration's tree) does not travel yet: claim it where that
+  integration ran.
+- **Secrets stay home.** Task titles and notes, contracts, messages and the synced goal's spec are
+  redacted before they are written to the synced logs (the redaction presence prompts get: tokens,
+  keys, passwords, `.env` values). Ids, commits, scopes and check commands are kept, so the board folds
+  and contracts match as before; keep secrets out of check commands (use the environment). The goal's
+  own `goal.json` keeps its spec as written.
 - **Checks are shell commands from another machine.** A node runs its own goal's oracle and the
   checks of tasks it opened; any other check (a goal made elsewhere, a task opened elsewhere with
   `--accept`) runs only after `borg hive approve <goal>` there, which prints each command. Until then
@@ -415,12 +460,12 @@ not this one.
   session tag can be linked to its hive session. A goal with a hidden
   oracle is scored and credited on the node that made it only; a remote author of such a goal's
   attempt is not credited yet.
-- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/6` or
-  earlier do not sync with this version.
+- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/8` or
+  earlier do not sync with this version (`borg/mesh/9` carries the bundles): upgrade every member.
 
-Not yet: goal signatures (any member's goal syncs, signed by its origin), the queen approving a plan
-before `run`, multi-repo goals (`run` takes the repo it is started in), moving commits between
-machines, stopping an unmetered session mid-way at its budget, crediting verifiers by whether the
+Not yet: goal signatures (any member's goal syncs, signed by its origin), approving a plan once for
+every node (each node's run asks its own engineer), multi-repo goals (`run` takes the repo it is started in), moving a failed
+integration's tree between machines, stopping an unmetered session mid-way at its budget, crediting verifiers by whether the
 hidden oracle agreed with them, and a model that monitors drones for gaming.
 
 ## Saying no
@@ -510,7 +555,7 @@ $ borg queen answer 1 b
 |---|---|
 | `borg queen` | Open questions, numbered and grouped by repo |
 | `borg queen ask` | Answer them one by one |
-| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson (a reach question moves its lesson instead; a proposed constraint is ratified with `b`, see [Saying no](#saying-no); a drone's change to another drone's hive contract is let through with `b`, see [Hive](#hive)). A letter or number picks an option; one that names no option is refused |
+| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson (a reach question moves its lesson instead; a proposed constraint is ratified with `b`, see [Saying no](#saying-no); a drone's change to another drone's hive contract is let through with `b`, see [Hive](#hive); a hive plan is approved with `a`, see [Running drones](#running-drones)). A letter or number picks an option; one that names no option is refused |
 | `borg queen show <n\|id>` | One question with its evidence |
 | `borg queen skip <n\|id>` | Ask again in 3 days |
 | `borg queen dismiss <n\|id> [reason]` | Drop it without a lesson |

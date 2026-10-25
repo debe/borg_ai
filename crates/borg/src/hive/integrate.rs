@@ -27,9 +27,10 @@
 //! next round. A missing snapshot or a git that cannot merge is `blocked`, for the engineer. Nothing is
 //! credited to lessons: an integration is no verdict on any one attempt.
 //!
-//! Cross-machine integration of commits is out of scope: the board syncs, the commits do not. A goal
-//! integrates on a node whose repo holds every accepted attempt's snapshots ([`absent`]); elsewhere
-//! nothing is opened, claimed or written, and the caller says which work is on which node. A snapshot
+//! Across machines the commits travel as bundles beside the board (commits.rs): a goal integrates on a
+//! node whose repo holds every accepted attempt's snapshots, or takes them from their bundles
+//! ([`absent`]); elsewhere nothing is opened, claimed or written, and the caller says which work is on
+//! which node. A snapshot
 //! missing on the node that made it is still `blocked`.
 
 use std::path::Path;
@@ -214,7 +215,8 @@ fn tail(text: &str, n: usize) -> String {
 }
 
 /// The accepted attempts of `g` whose snapshots `repo` lacks, work done on another node: (work task,
-/// its node, its head). Empty when every one is here (the git call runs only for another node's work).
+/// its node, its head). Empty when every one is here (the git call runs only for another node's work),
+/// one its bundle brought here included (commits.rs `fetch`).
 pub fn absent(home: &Path, g: &Goal, repo: &Path) -> Vec<(TaskId, String, String)> {
     let events = board::read(&super::tasks_path(home, &g.id));
     let b = board::fold(&events);
@@ -223,7 +225,7 @@ pub fn absent(home: &Path, g: &Goal, repo: &Path) -> Vec<(TaskId, String, String
         .into_iter()
         .filter_map(|s| verdict::accepted(&events, &b, &s.task.id))
         .filter(|a| !super::is_local(home, &a.node) && !a.base.is_empty() && !a.head.is_empty())
-        .filter(|a| !verdict::present(repo, &[&a.base, &a.head], verdict::DIFF_TIMEOUT))
+        .filter(|a| !super::commits::fetch(home, &g.id, a, repo))
         .map(|a| (a.work, a.node, a.head))
         .collect()
 }
@@ -312,11 +314,13 @@ impl Integrator<'_> {
                 _ => return self.blocked(repo, &format!("{} has no snapshot of its accepted attempt", w.task.id)),
             }
         }
-        // Every work claim's base, a rejected attempt's too: the origin is before all of them.
+        // Every work claim's base, a rejected attempt's too: the origin is before all of them. Another
+        // node's claim whose tree never came here (no accepted attempt of it, no bundle) is left out.
         let claims: Vec<&str> = events
             .iter()
             .filter(|e| e.ev == Ev::Claim && !e.base.is_empty())
             .filter(|e| b.tasks.get(&e.task).is_some_and(|s| !matches!(s.task.role, Role::Verify | Role::Integrate)))
+            .filter(|e| super::is_local(self.home, &e.node) || verdict::present(repo, &[&e.base], verdict::DIFF_TIMEOUT))
             .map(|e| e.base.as_str())
             .collect();
         let m = match merge(repo, &claims, &attempts, MERGE_TIMEOUT) {

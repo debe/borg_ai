@@ -55,8 +55,9 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// The hive's synced logs in `home` (borg hive/mod.rs `SYNCED`: goal projection, board, contracts,
-/// messages, guard flags): each existing one of every goal directory whose name is a valid goal id
-/// (`goal::valid_id`), never a goal's local files (goal.json, oracle.jsonl, joins, spend, runs).
+/// messages, guard flags, bundles of commits): each existing one of every goal directory whose name is
+/// a valid goal id (`goal::valid_id`), never a goal's local files (goal.json, oracle.jsonl, joins,
+/// spend, runs, unbundled.jsonl).
 pub fn hive_logs(home: &Path) -> Vec<std::path::PathBuf> {
     let mut ids: Vec<String> = std::fs::read_dir(home.join("hive"))
         .into_iter()
@@ -82,10 +83,20 @@ fn complete(line: &str) -> bool {
     !line.trim().is_empty() && serde_json::from_str::<Value>(line).is_ok()
 }
 
-/// The distinct complete lines of `path` by hash (empty if the file does not exist).
+/// The longest line of `path` that counts: a hive goal's bundles (borg hive/commits.rs `MAX_LINE`), else
+/// any. A longer line is treated as a torn one: never stamped, offered, sent or stored.
+pub fn cap(path: &Path) -> usize {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(borg::hive::commits::FILE) => borg::hive::commits::MAX_LINE,
+        _ => usize::MAX,
+    }
+}
+
+/// The distinct complete lines of `path` by hash (empty if the file does not exist), none over its `cap`.
 pub fn read(path: &Path) -> BTreeMap<Hash, String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    text.lines().filter(|l| complete(l)).map(|l| (hash(l), l.to_string())).collect()
+    let max = cap(path);
+    text.lines().filter(|l| l.len() <= max && complete(l)).map(|l| (hash(l), l.to_string())).collect()
 }
 
 /// One hash for the whole set: equal digests mean there is nothing to exchange.
@@ -97,11 +108,12 @@ pub fn digest(set: &BTreeMap<Hash, String>) -> Hash {
     *h.finalize().as_bytes()
 }
 
-/// Appends the `incoming` lines `path` lacks, then settles lesson versions. Returns how many
-/// lines were new.
+/// Appends the `incoming` lines `path` lacks (none over its `cap`), then settles lesson versions.
+/// Returns how many lines were new.
 pub fn merge(path: &Path, incoming: &[String]) -> Result<usize, String> {
     let mut known = read(path);
-    let new: Vec<&String> = incoming.iter().filter(|l| complete(l) && known.insert(hash(l), (*l).clone()).is_none()).collect();
+    let max = cap(path);
+    let new: Vec<&String> = incoming.iter().filter(|l| l.len() <= max && complete(l) && known.insert(hash(l), (*l).clone()).is_none()).collect();
     append(path, &new)?;
     settle(path)?;
     Ok(new.len())
@@ -163,7 +175,7 @@ mod tests {
     fn hive_logs_list_each_goals_synced_files_and_skip_invalid_ids() {
         let d = tmp("hive-logs");
         for (dir, files) in [
-            ("g1", &["goal.json", "goal.jsonl", "tasks.jsonl", "oracle.jsonl", "joins.jsonl", "flags.jsonl"][..]),
+            ("g1", &["goal.json", "goal.jsonl", "tasks.jsonl", "oracle.jsonl", "joins.jsonl", "flags.jsonl", "bundles.jsonl", "unbundled.jsonl"][..]),
             ("A", &["tasks.jsonl"][..]),
             ("g2", &["messages.jsonl"][..]),
         ] {
@@ -176,10 +188,10 @@ mod tests {
         std::fs::create_dir_all(d.join("hive/..x")).unwrap();
         std::fs::write(d.join("hive/..x/tasks.jsonl"), "{}\n").unwrap();
         let got: Vec<String> = hive_logs(&d).iter().map(|p| p.strip_prefix(&d).unwrap().display().to_string()).collect();
-        assert_eq!(got, ["hive/g1/goal.jsonl", "hive/g1/tasks.jsonl", "hive/g1/flags.jsonl", "hive/g2/messages.jsonl"]);
+        assert_eq!(got, ["hive/g1/goal.jsonl", "hive/g1/tasks.jsonl", "hive/g1/flags.jsonl", "hive/g1/bundles.jsonl", "hive/g2/messages.jsonl"]);
         let all = logs(&d);
         assert!(all.iter().any(|p| p.ends_with("hive/g1/tasks.jsonl")) && all.last().unwrap().ends_with(REASONING));
-        assert!(!all.iter().any(|p| p.ends_with("oracle.jsonl") || p.ends_with("joins.jsonl") || p.ends_with("goal.json")));
+        assert!(!all.iter().any(|p| p.ends_with("oracle.jsonl") || p.ends_with("joins.jsonl") || p.ends_with("goal.json") || p.ends_with("unbundled.jsonl")));
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -192,6 +204,19 @@ mod tests {
         let n = merge(&p, &[lesson("L1", 1, "a"), lesson("L3", 1, "c"), "garbage".into()]).unwrap();
         assert_eq!(n, 1, "only the unknown complete line is new");
         assert_eq!(merge(&p, &[lesson("L3", 1, "c")]).unwrap(), 0, "idempotent");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_bundle_line_over_its_cap_counts_nowhere() {
+        let d = tmp("cap");
+        let p = d.join("hive/g/bundles.jsonl");
+        let big = serde_json::json!({"v": 1, "bundle": "A".repeat(borg::hive::commits::MAX_LINE)}).to_string();
+        let small = serde_json::json!({"v": 1, "bundle": "AAAA"}).to_string();
+        assert_eq!(merge(&p, &[big.clone(), small.clone()]).unwrap(), 1, "only the line within the cap is stored");
+        std::fs::write(&p, format!("{big}\n{small}\n")).unwrap();
+        assert_eq!(read(&p).into_values().collect::<Vec<_>>(), [small], "a line written over the cap is never offered");
+        assert_eq!(cap(&d.join("lessons.jsonl")), usize::MAX);
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -101,6 +101,9 @@ pub const HIVE_MESSAGE: &str = "hive_message";
 /// note): the accepted attempts merged and the oracle run on the combined tree, `n` 1 on a pass, 0 on a
 /// failure.
 pub const HIVE_INTEGRATE: &str = "hive_integrate";
+/// A hive goal's plan decided (hive/plan.rs; `why`: the goal, `n` 1 approved or 0 refused, `text` how
+/// and the answer): by the engineer's answer to its queen question, or `--yes`.
+pub const HIVE_PLAN: &str = "hive_plan";
 /// A hive task's verdict, once per attempt (hive/verdict.rs; `why`: the goal, `text`: the task and an
 /// excerpt of the note, `lessons`: the lessons credited with it, `n` their number): verified, rejected
 /// (by its verifier or the hidden oracle), or hacked (weakened tests or changed CI, or the oracle

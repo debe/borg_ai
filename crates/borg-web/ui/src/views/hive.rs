@@ -1,8 +1,9 @@
 //! Hive: the collective's hive goals (`borg hive`): each goal's board by status (a holder on another
 //! node named with it), what stops it here (conflicting definitions, checks awaiting `borg hive
 //! approve`), its integration, its reworks, its groups of attempts (winners, losers, the one integrated, what
-//! reflection learned), what each drone of `borg hive run` spent of its share, and the newest contracts
-//! and messages between drones. Above them, the collective's L1 playbooks: their steps, the belief of
+//! reflection learned), the attempts' commits carried between nodes, the plan's intent cards and the
+//! engineer's approval of them, what each drone of `borg hive run`
+//! spent of its share, and the newest contracts and messages between drones. Above them, the collective's L1 playbooks: their steps, the belief of
 //! each version drones were shown, and the edits waiting for an engineer (a playbook's first included).
 
 use leptos::prelude::*;
@@ -64,6 +65,33 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
             {g.alerts.iter().map(|a| view! { <p class="feed-meta mono" title="stops this goal on this node">{format!("! {}", trunc(a, 300))}</p> }).collect_view()}
             <div class="bar" title="budget spent"><div style=format!("width:{spent:.0}%;height:6px;background:currentColor;opacity:.6")></div></div>
             {(!g.integration.is_empty()).then(|| view! { <p class="feed-meta mono" title="the combined tree of the accepted work">{trunc(&g.integration, 200)}</p> })}
+            {g.plan.clone().map(|p| {
+                let how = match p.state.as_str() {
+                    "approved" | "refused" => format!(
+                        "{}{}",
+                        if p.by.is_empty() { String::new() } else { format!(" by {}", p.by) },
+                        if p.via == "yes" { " (--yes)".to_string() } else { format!(" ({})", p.question) }
+                    ),
+                    "waiting" => format!(" for the engineer: borg queen answer {} a", p.question),
+                    _ => String::new(),
+                };
+                view! {
+                    <h3 title="the engineer approves the plan before borg hive run starts a drone">{format!("Plan {}{how}", p.state)}</h3>
+                    {(!p.answer.is_empty()).then(|| view! { <p class="feed-meta">{format!("“{}”", trunc(&p.answer, 200))}</p> })}
+                    <table class="mono">
+                        <tr><th>"task"</th><th>"intent"</th><th>"files"</th><th>"after"</th><th>"risk"</th></tr>
+                        {p.cards.iter().map(|c| view! {
+                            <tr title=c.why.clone()>
+                                <td>{c.task.clone()}</td>
+                                <td>{trunc(&c.intent, 80)}</td>
+                                <td>{c.files.join(", ")}</td>
+                                <td>{c.deps.join(", ")}</td>
+                                <td>{if c.risk == "high" { format!("high: {}", c.why) } else { c.risk.clone() }}</td>
+                            </tr>
+                        }).collect_view()}
+                    </table>
+                }
+            })}
             {(!g.groups.is_empty()).then(|| view! {
                 <h3>"Groups"</h3>
                 <table class="mono">
@@ -90,6 +118,21 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                             <td>{format!("{}×", r.rejections)}</td>
                             <td>{r.drones.join(" → ")}</td>
                             <td>{r.reflection.clone()}</td>
+                        </tr>
+                    }).collect_view()}
+                </table>
+            })}
+            {(!g.commits.is_empty()).then(|| view! {
+                <h3>"Commits"</h3>
+                <table class="mono">
+                    <tr><th>"task"</th><th>"head"</th><th>"from"</th><th>"size"</th><th>"here"</th></tr>
+                    {g.commits.iter().map(|c| view! {
+                        <tr title="an attempt's commits, carried between nodes as a git bundle">
+                            <td>{c.task.clone()}</td>
+                            <td>{c.head.clone()}</td>
+                            <td>{if c.node.is_empty() { "this node".to_string() } else { format!("node {}", c.node) }}</td>
+                            <td>{format!("{:.0} KiB", (c.bytes / 1024.0).ceil())}</td>
+                            <td>{trunc(&c.state, 160)}</td>
                         </tr>
                     }).collect_view()}
                 </table>

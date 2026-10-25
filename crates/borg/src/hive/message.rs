@@ -73,7 +73,8 @@ fn token(s: &str) -> bool {
 impl Message {
     #[allow(clippy::too_many_arguments)]
     pub fn new(kind: &str, by: &str, drone: &str, node: &str, task: &str, to: &str, re: Option<String>, ms: i64, text: &str) -> Message {
-        let text = stats::excerpt(text.trim(), TEXT);
+        // Redacted (notes.rs `redact`) before it is cut and hashed: messages sync to every member.
+        let text = stats::excerpt(&crate::notes::redact(text.trim()), TEXT);
         Message {
             v: 1,
             id: id_of(by, ms, &text),
@@ -191,6 +192,13 @@ mod tests {
 
     fn m(by: &str, drone: &str, node: &str, to: &str, ms: i64) -> Message {
         Message::new(ASK, by, drone, node, "t1", to, None, ms, "is the API stable?")
+    }
+
+    #[test]
+    fn a_secret_is_redacted_before_the_id_is_taken() {
+        let x = Message::new(TELL, "s1", "d1", "n1", "t1", "", None, 5, "the staging key: sk-ant-api03-abcdefghijklmnopqrstuvwx works");
+        assert!(!x.text.contains("sk-ant") && x.text.contains("[REDACTED]"), "{}", x.text);
+        assert!(x.well_formed(), "every reader keeps it");
     }
 
     #[test]

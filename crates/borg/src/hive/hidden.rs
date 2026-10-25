@@ -159,7 +159,7 @@ pub struct Scored {
 }
 
 /// Scores up to `limit` judged attempts of `g` that have no score yet, oldest first, in `repo` (where
-/// the done's snapshots are): each a `Score` line, then its credit (`verified` on a pass, else
+/// the done's snapshots are, or arrive as a bundle from the node the work was done on): each a `Score` line, then its credit (`verified` on a pass, else
 /// `rejected`). A judged attempt is a verify task's valid `verified`, or its `rejected` that was not
 /// hacked (a hacked verdict credited at once) and whose work has both snapshots and started from its
 /// deps' verified work (one without was final at once, verdict.rs `decide`). An attempt whose checkout fails gets no score and no credit:
@@ -195,6 +195,8 @@ fn score_locked(home: &Path, g: &Goal, repo: &Path, limit: usize, now: i64) -> S
     // Work that started without a dep's verified work was never checked with it (an unchecked reject).
     let attempts = attempts.filter(|(_, a)| verdict::missing_deps(&events, &b, a).is_empty());
     for (e, a) in attempts.take(limit) {
+        // Work done on another machine: its commits come with the board (commits.rs), accepted or not.
+        super::commits::fetch(home, &g.id, &a, repo);
         let (pass, timeout, dur_ms, tail) = match run_hidden(&dir, h, repo, &a.head, &format!("{}-{}", e.task, now)) {
             Ok(r) => r,
             Err(why) => {

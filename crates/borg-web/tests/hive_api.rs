@@ -97,6 +97,10 @@ async fn a_goal_shows_its_counts_holder_and_spend() {
     assert!((g["spent_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9, "{g}");
     assert_eq!(g["drones"][0]["drone"], "d1");
     assert_eq!(g["contracts"][0]["text"], "t1.txt holds one line");
+    // The plan: a card per work task, not asked yet (no run raised it).
+    assert_eq!(g["plan"]["state"], "not asked", "{g}");
+    assert_eq!(g["plan"]["cards"].as_array().map(Vec::len), Some(g["tasks"].as_array().unwrap().iter().filter(|t| t["role"] == "work").count()));
+    assert!(g["plan"]["cards"].as_array().unwrap().iter().all(|c| c["risk"].is_string() && c["intent"].is_string()), "{g}");
 
     let (status, v) = get(app.clone(), "/api/hive?c=plain").await;
     assert_eq!((status, v["goals"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "no hive, no goals");
@@ -115,6 +119,7 @@ async fn a_group_of_attempts_shows_with_its_reflection() {
     let (_, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
     assert_eq!(v["goals"][0]["groups"], serde_json::json!([]), "no group, no rows");
     assert_eq!(v["goals"][0]["reworks"], serde_json::json!([]), "no rework, no rows");
+    assert_eq!(v["goals"][0]["commits"], serde_json::json!([]), "no bundle, no rows");
     let member = |n: usize| Task {
         id: hive::group::member_id("t3", n),
         role: Role::Work,

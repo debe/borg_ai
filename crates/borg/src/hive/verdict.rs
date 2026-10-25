@@ -24,8 +24,8 @@
 //! Across machines (the board syncs, collective step 4): the verdict line carries the kind it credits
 //! (`Event::credit`), and the node holding the author's shown records, the author's, credits it when the
 //! line arrives ([`credit_synced`], at each mesh round); every other node has no such records and
-//! credits nothing. A verifier gives the verdict only where the work's snapshots are ([`present`]):
-//! commits do not travel with the board.
+//! credits nothing. A verifier gives the verdict only where the work's snapshots are ([`present`]),
+//! which a bundle of the work's node brings (commits.rs `fetch`).
 
 use std::collections::HashMap;
 use std::path::Path;

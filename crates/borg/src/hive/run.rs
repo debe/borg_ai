@@ -5,6 +5,10 @@
 //! (`Harness::headless`), each launched with `BORG_HIVE=<goal>` and `BORG_HIVE_DRONE=d<n>`: the hooks
 //! join it to the goal, show it its claim and the board, and gate its stop on the oracle (mod.rs).
 //!
+//! Before the first drone starts, the engineer approves the goal's plan (plan.rs `gate`): an intent card
+//! per task in one queen question, waited for under the run lock, so a "no" stops the run with no
+//! worktree made and nothing claimed. `--yes` approves it at the command line (borg-eval's runs).
+//!
 //! Once every task is verified, the drone thread that sees it first integrates (integrate.rs): it
 //! claims the board's integrate task, merges the accepted attempts and runs the oracle on the combined
 //! tree, in process and at no model cost, while the other drones wait on its lease. The goal is
@@ -203,6 +207,8 @@ pub struct Opts<'a> {
     pub base: &'a str,
     pub iter_timeout: Duration,
     pub dry_run: bool,
+    /// The engineer approves the plan on the command line (`--yes`): no question, no wait (plan.rs).
+    pub yes: bool,
 }
 
 /// One run: what every drone shares.
@@ -586,6 +592,35 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     };
     if !o.dry_run {
         recover(home, &g.id, learn::now_ms());
+        // The engineer's approval of the plan before any drone starts (plan.rs): no worktree, run line
+        // or claim before it. A task opened while it waited (another shell, a peer's line) was on no
+        // approved card: the changed plan is asked again.
+        loop {
+            match super::plan::gate(home, &g, &fold(home, &g.id), &repo, o.yes) {
+                Ok(super::plan::Gate::Refused(d)) => {
+                    let by = if d.by.is_empty() { String::new() } else { format!(" ({})", d.by) };
+                    let why = if d.answer.is_empty() { String::new() } else { format!(": {}", d.answer) };
+                    println!("hive run {}: the engineer said no to the plan{by}{why}; nothing was started or claimed", g.id);
+                    println!("  change the plan (borg hive open) and run again, or approve this one with --yes");
+                    return 1;
+                }
+                Ok(super::plan::Gate::Approved(d)) => {
+                    if super::plan::key(&g.id, &super::plan::cards(&fold(home, &g.id))) != d.key {
+                        println!("hive run {}: the plan changed while it waited for approval; the new plan is asked again", g.id);
+                        continue;
+                    }
+                    let by = if d.by.is_empty() { String::new() } else { format!(" by {}", d.by) };
+                    let via = if d.via == "yes" { "--yes".to_string() } else { format!("queen question {}", d.question) };
+                    println!("hive run {}: plan approved{by} ({via}): {} task(s), {} high-risk", g.id, d.tasks, d.high);
+                }
+                Ok(super::plan::Gate::Nothing) => {}
+                Err(e) => {
+                    eprintln!("borg hive run: {e}");
+                    return 1;
+                }
+            }
+            break;
+        }
     }
     let before: Vec<Spend> = super::read_lines(&spend_path(home, &g.id));
     let spent: f64 = before.iter().map(Spend::charged).sum();
@@ -605,6 +640,13 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         );
         println!("  harness {}: {sample:?}", o.harness.name());
         println!("  writes /.worktrees/ to the repo's local .git/info/exclude (never committed)");
+        let cards = super::plan::cards(&b);
+        if !cards.is_empty() {
+            println!("  the plan the engineer approves first ({}):", if o.yes { "--yes approves it" } else { "a queen question, waited for" });
+            for c in &cards {
+                println!("    {}", super::plan::render_card(c));
+            }
+        }
         println!("prompt ({}):\n{}", drone_name(1), prompt(&g, &drone_name(1), &super::joins_path(home, &g.id)));
         return 0;
     }

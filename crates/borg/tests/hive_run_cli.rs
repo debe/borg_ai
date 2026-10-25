@@ -105,8 +105,10 @@ fn setup_files(name: &str, files: &[&str], budget: &str, script: Value) -> PathB
     root
 }
 
+/// `borg hive run g <args> --yes`: the engineer approved the plan on the command line (plan.rs), as
+/// every suite here but the approval's own does.
 fn run(root: &Path, args: &[&str]) -> (String, String, i32) {
-    let all: Vec<&str> = ["run", "g"].iter().copied().chain(args.iter().copied()).collect();
+    let all: Vec<&str> = ["run", "g"].iter().copied().chain(args.iter().copied()).chain(["--yes"]).collect();
     hive(root, &all, &[])
 }
 
@@ -634,7 +636,7 @@ fn a_failed_iteration_that_names_no_cost_is_charged() {
 fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_run() {
     let root = setup("killed", 1, "2", json!({"drones": {"d1": {"hang": true}}}));
     let w = work(&root).display().to_string();
-    let mut child = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--dir", &w], &[]).spawn().unwrap();
+    let mut child = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]).spawn().unwrap();
     let t0 = Instant::now();
     while !events(&root).iter().any(|e| e.ev == board::Ev::Claim) {
         assert!(t0.elapsed() < Duration::from_secs(30), "no claim");
@@ -648,7 +650,7 @@ fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_ru
     let status = child.wait().unwrap();
     assert!(!status.success(), "Ctrl-C ends the run: {status:?}");
     std::fs::write(root.join("script.json"), json!({}).to_string()).unwrap();
-    let mut rerun = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--dir", &w], &[]).spawn().unwrap();
+    let mut rerun = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]).spawn().unwrap();
     let t0 = Instant::now();
     while rerun.try_wait().unwrap().is_none() {
         if t0.elapsed() > Duration::from_secs(60) {
@@ -772,4 +774,198 @@ fn non_hive_hook_output_is_unchanged() {
     assert_eq!(a, b);
     let _ = std::fs::remove_dir_all(plain);
     let _ = std::fs::remove_dir_all(with_goal);
+}
+
+/// `borg queen <args>` in the work repo: (stdout, stderr, exit code).
+fn queen(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let all: Vec<&str> = ["queen"].iter().copied().chain(args.iter().copied()).collect();
+    let out = command(root, &all, env).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
+/// `borg hive run g --drones <n> --harness sim` without `--yes`, started in the background.
+fn spawn_run(root: &Path, drones: &str) -> std::process::Child {
+    let w = work(root).display().to_string();
+    command(root, &["hive", "run", "g", "--drones", drones, "--harness", "sim", "--dir", &w], &[]).spawn().unwrap()
+}
+
+/// The open plan question of the waiting run `child`, once it is queued (within 30 s).
+fn plan_question(root: &Path, child: &mut std::process::Child) -> borg::queen::Entry {
+    let t0 = Instant::now();
+    loop {
+        if let Some(e) = borg::queen::open(&store(root)).into_iter().find(|e| e.kind == borg::queen::Kind::Plan) {
+            return e;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "the run ended without asking");
+        assert!(t0.elapsed() < Duration::from_secs(30), "no plan question");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The run's exit code and stdout once it ends (within `secs`); past that it is stopped as an engineer
+/// stops it, Ctrl-C, and the test fails.
+fn ended(child: std::process::Child, secs: u64) -> (i32, String) {
+    let t0 = Instant::now();
+    let mut child = child;
+    while child.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(secs) {
+            // SAFETY: kill(2) with SIGINT on the runner this test spawned and has not reaped.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+            let _ = child.wait();
+            panic!("the run did not end within {secs}s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into())
+}
+
+#[test]
+fn a_run_waits_for_the_plan_and_a_no_stops_it_with_nothing_claimed() {
+    let root = setup("plan-no", 2, "1", json!({"usd_per_iter": 0.10}));
+    let mut child = spawn_run(&root, "2");
+    let q = plan_question(&root, &mut child);
+    assert!(q.question.starts_with("Hive goal g: approve its plan before drones start? 2 task(s): t1 \"write f1.txt\" (normal)"), "{}", q.question);
+    assert_eq!(
+        q.evidence,
+        [
+            "t1  write f1.txt · files f1.txt · checks ok=grep -q 'done t1' f1.txt · risk normal (ordinary work)",
+            "t2  write f2.txt · files f2.txt · checks ok=grep -q 'done t2' f2.txt · risk normal (ordinary work)"
+        ]
+    );
+    // It waits: no drone, no worktree, no run line, no claim.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(child.try_wait().unwrap().is_none(), "the run waits for the engineer");
+    assert!(!work(&root).join(".worktrees").exists() && !goal_dir(&root).join("runs.jsonl").exists());
+    assert!(!events(&root).iter().any(|e| e.ev == board::Ev::Claim));
+    let top = command(&root, &["top", "--dir", &work(&root).display().to_string()], &[]).output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    assert!(top.contains(&format!("plan waiting for the engineer (borg queen answer {})", q.id)), "{top}");
+    // A drone never answers it.
+    let (_, err, code) = queen(&root, &["answer", &q.id, "a"], &[("BORG_HIVE", "g")]);
+    assert!(code == 1 && err.contains("never a hive drone's"), "{err}");
+    // Nor a drone whose harness dropped the env, in a worktree `borg hive run` joined.
+    let wt = work(&root).join(".git/wt-drone");
+    std::fs::create_dir_all(&wt).unwrap();
+    let join = json!({"v": 1, "ms": 1, "goal": "g", "dir": wt.display().to_string(), "drone": "d9", "by": "run"});
+    let mut joins = std::fs::OpenOptions::new().create(true).append(true).open(goal_dir(&root).join("joins.jsonl")).unwrap();
+    std::io::Write::write_all(&mut joins, format!("{join}\n").as_bytes()).unwrap();
+    let (_, err, code) = queen(&root, &["answer", &q.id, "a", "--dir", &wt.display().to_string()], &[]);
+    assert!(code == 1 && err.contains("never a hive drone's"), "{err}");
+    // The engineer says no, with a reason: the run stops, nothing claimed, and the "no" is a veto.
+    let (out, err, code) = queen(&root, &["answer", &q.id, "no: t2 must come before t1"], &[("BORG_LEARN", "on")]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("the plan is refused"), "{out}");
+    let (code, out) = ended(child, 30);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("the engineer said no to the plan") && out.contains("t2 must come before t1") && out.contains("nothing was started or claimed"),
+        "{out}"
+    );
+    assert!(!work(&root).join(".worktrees").exists() && !goal_dir(&root).join("runs.jsonl").exists() && spend(&root).is_empty());
+    assert!(!events(&root).iter().any(|e| e.ev == board::Ev::Claim));
+    let episodes = std::fs::read_to_string(store(&root).join("episodes.jsonl")).unwrap_or_default();
+    assert!(episodes.contains("\"kind\":\"veto\"") && episodes.contains("t2 must come before t1"), "{episodes}");
+    // The same plan again: refused at once, not asked again.
+    let (out, _, code) = hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
+    assert!(code == 1 && out.contains("the engineer said no to the plan"), "{out}");
+    assert_eq!(borg::queen::entries(&store(&root)).len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_approved_plan_runs_to_the_end_and_a_high_risk_claim_escalates_once() {
+    let root = setup("plan-yes", 1, "3", json!({"usd_per_iter": 0.10}));
+    let accept = "ok=grep -q 'done t2' f2.txt";
+    ok(&root, &["open", "g", "--id", "t2", "--title", "drop the users table from f2.txt", "--files", "f2.txt", "--accept", accept]);
+    let mut child = spawn_run(&root, "2");
+    let q = plan_question(&root, &mut child);
+    assert!(q.question.contains("2 task(s), 1 high-risk") && q.evidence[1].ends_with("risk high (an irreversible change)"), "{q:?}");
+    let (out, err, code) = queen(&root, &["answer", &q.id, "a"], &[]);
+    assert!(code == 0 && out.contains("the plan is approved"), "{out}{err}");
+    let (code, out) = ended(child, 240);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("plan approved (queen question {}): 2 task(s), 1 high-risk", q.id)), "{out}");
+    let b = fold(&root);
+    assert!(b.finished(), "{out}");
+    // t2 was claimed by its worker and by its verifier, and escalated once, naming the worker's session.
+    let asked: Vec<borg::queen::Entry> = borg::queen::entries(&store(&root)).into_iter().filter(|e| e.kind != borg::queen::Kind::Plan).collect();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!((asked[0].kind, asked[0].payload.as_ref().map(|p| p["task"].clone())), (borg::queen::Kind::Irreversible, Some(json!("t2"))));
+    assert_eq!(Some(&asked[0].session), b.tasks["t2"].author.as_ref(), "the claiming session is the escalation's");
+    let w = work(&root).display().to_string();
+    let top = command(&root, &["top", "--dir", &w], &[]).output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    assert!(top.contains(&format!("plan approved ({}) · 2 card(s), 1 high-risk", q.id)) && top.contains("card t2  drop the users table"), "{top}");
+    // A rerun of the approved plan asks nothing.
+    let (out, _, code) = hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
+    assert!(code == 0 && out.contains("plan approved"), "{out}");
+    assert_eq!(borg::queen::entries(&store(&root)).iter().filter(|e| e.kind == borg::queen::Kind::Plan).count(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_task_opened_while_the_plan_waits_is_asked_about_before_any_drone_starts() {
+    let root = setup("plan-changed", 1, "3", json!({"usd_per_iter": 0.10}));
+    let mut child = spawn_run(&root, "2");
+    let first = plan_question(&root, &mut child);
+    assert!(first.question.contains("1 task(s)"), "{}", first.question);
+    // Another shell opens a task while the run waits, then the engineer approves the plan they saw.
+    ok(&root, &["open", "g", "--id", "t2", "--title", "write f2.txt", "--files", "f2.txt", "--accept", "ok=grep -q 'done t2' f2.txt"]);
+    let (out, err, code) = queen(&root, &["answer", &first.id, "a"], &[]);
+    assert!(code == 0 && out.contains("the plan is approved"), "{out}{err}");
+    // The run asks again for the plan with t2 on it, and nothing is claimed before that answer.
+    let t0 = Instant::now();
+    let second = loop {
+        if let Some(e) = borg::queen::open(&store(&root)).into_iter().find(|e| e.kind == borg::queen::Kind::Plan && e.id != first.id) {
+            break e;
+        }
+        assert!(child.try_wait().unwrap().is_none(), "the run ended without asking again");
+        assert!(t0.elapsed() < Duration::from_secs(30), "no second plan question");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(second.question.contains("2 task(s)"), "{}", second.question);
+    assert!(!events(&root).iter().any(|e| e.ev == board::Ev::Claim), "no claim before the changed plan is approved");
+    let (out, err, code) = queen(&root, &["answer", &second.id, "a"], &[]);
+    assert!(code == 0, "{out}{err}");
+    let (code, out) = ended(child, 240);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("the plan changed while it waited for approval") && out.contains(&format!("plan approved (queen question {}): 2 task(s)", second.id)),
+        "{out}"
+    );
+    assert!(fold(&root).finished(), "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn yes_approves_the_plan_without_a_question_or_a_wait() {
+    let root = setup("plan-flag", 1, "1", json!({"usd_per_iter": 0.10}));
+    let t0 = Instant::now();
+    let (out, err, code) = run(&root, &["--drones", "2", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("plan approved (--yes): 1 task(s), 0 high-risk") && fold(&root).finished(), "{out}");
+    assert!(t0.elapsed() < Duration::from_secs(120));
+    assert!(borg::queen::entries(&store(&root)).is_empty(), "nothing asked");
+    let plan: Vec<Value> = std::fs::read_to_string(goal_dir(&root).join("plan.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!((plan.len(), plan[0]["approved"].as_bool(), plan[0]["via"].as_str()), (1, Some(true), Some("yes")));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_claimant_of_a_high_risk_task_is_told_once() {
+    let root = setup("plan-claim", 0, "1", json!({}));
+    let accept = "ok=grep -q 'done t1' f1.txt";
+    ok(&root, &["open", "g", "--id", "t1", "--title", "deploy to production from f1.txt", "--files", "f1.txt", "--accept", accept]);
+    for s in ["sess-risk-a", "sess-risk-b"] {
+        ok(&root, &["join", "g", "--session", s]);
+    }
+    let out = ok(&root, &["claim", "t1", "--session", "sess-risk-a"]);
+    assert!(out.contains("t1 is high-risk (an external mutation)") && out.contains("Until they answer: hold: prepare it, but do not run it"), "{out}");
+    ok(&root, &["release", "--session", "sess-risk-a"]);
+    let out = ok(&root, &["claim", "t1", "--session", "sess-risk-b"]);
+    assert!(!out.contains("high-risk"), "asked once per task: {out}");
+    let asked = borg::queen::entries(&store(&root));
+    assert_eq!(asked.iter().map(|e| (e.kind, e.session.as_str())).collect::<Vec<_>>(), [(borg::queen::Kind::ExternalMutation, "sess-risk-a")]);
+    let _ = std::fs::remove_dir_all(root);
 }

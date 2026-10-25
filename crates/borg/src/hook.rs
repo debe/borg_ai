@@ -704,7 +704,7 @@ fn queen_ask(h: &dyn Harness, session: &str, cwd: &str) -> Option<String> {
         repos
     };
     let scope = if cwd.is_empty() { String::new() } else { format!(" --dir {}", crate::queen::sh_quote(cwd)) };
-    let mut q = crate::queen::deliver(&learn::home(), session, repos, &scope, learn::now_ms())?;
+    let mut q = crate::queen::deliver(&learn::home(), session, cwd, repos, &scope, learn::now_ms())?;
     if let Ok(exe) = std::env::current_exe() {
         q = q.run_by(&crate::queen::sh_quote(&exe.display().to_string()));
     }
