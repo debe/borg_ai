@@ -575,6 +575,16 @@ impl Jail {
         }
     }
 
+    /// The roots a call's checks may leave reports in besides the tree: the sandbox's own `/tmp`
+    /// (a fresh tmpfs per call, so nothing of another call's). Plain shares the host's: none.
+    fn scratch(&self) -> Vec<PathBuf> {
+        match self {
+            Jail::Sandbox { .. } => vec![PathBuf::from("/tmp")],
+            #[cfg(all(test, target_os = "linux"))]
+            Jail::Plain => Vec::new(),
+        }
+    }
+
     /// `script` in `cwd`, `rw` writable and `ro` read-only: (exit code, output).
     fn exec(&self, cwd: &Path, rw: &[&Path], ro: &[&Path], script: &str, timeout_s: u32) -> (i32, String) {
         match self {
@@ -752,15 +762,37 @@ fn clone_script(ws: &Path, head: &str, out: &Path) -> String {
 /// The checks script, on the clone in `<out>/tree`: each check from its own file under `checks`
 /// (bound read-only: code the result's build runs during one check cannot rewrite a later one), from
 /// the tree's root, with `BORG_HIDDEN` and `BORG_WORK`; per check `<id>.rc`, `<id>.ms` and
-/// `<id>.log` in `out`.
-fn checks_script(out: &Path, checks_dir: &Path, hidden_dir: &Path, checks: &[(String, u32)]) -> String {
+/// `<id>.log` in `out`. Right after the last hidden check (`h-*`), before the visible one can add
+/// its own, every JUnit XML report under `tree` and the `scratch` roots (a JUnit test-results
+/// directory's `*.xml`, or a `TEST-*.xml`) is copied to `<out>/junit/<root name>/<path in it>`.
+fn checks_script(out: &Path, checks_dir: &Path, hidden_dir: &Path, checks: &[(String, u32)], scratch: &[PathBuf]) -> String {
     let (d, t, c) = (q(out.display().to_string()), q(out.join("tree").display().to_string()), q(checks_dir.display().to_string()));
     let mut s = format!(
         "set -u\nrun() {{ s=$(date +%s%N); (cd {t} && BORG_HIDDEN={} BORG_WORK={t} timeout -k 5 \"$2\" sh {c}/\"$1\".sh) >{d}/\"$1\".log 2>&1 </dev/null; rc=$?; e=$(date +%s%N); echo $rc >{d}/\"$1\".rc; echo $(( (e - s) / 1000000 )) >{d}/\"$1\".ms; }}\n",
         q(hidden_dir.display().to_string())
     );
-    for (id, timeout) in checks {
+    let last_hidden = checks.iter().rposition(|(id, _)| id.starts_with("h-"));
+    for (i, (id, timeout)) in checks.iter().enumerate() {
         s.push_str(&format!("run {} {timeout}\n", q(id)));
+        if Some(i) == last_hidden {
+            s.push_str(&junit_script(out, scratch));
+        }
+    }
+    s
+}
+
+/// The step of `checks_script` that keeps the hidden checks' JUnit XML (see there). A report is
+/// small next to a build; a root that is gone or has none adds nothing.
+fn junit_script(out: &Path, scratch: &[PathBuf]) -> String {
+    let dst = q(out.join("junit").display().to_string());
+    let roots = std::iter::once(("tree".to_string(), out.join("tree")))
+        .chain(scratch.iter().map(|r| (r.file_name().map_or_else(|| "scratch".into(), |n| n.to_string_lossy().into_owned()), r.clone())));
+    let mut s = String::new();
+    for (name, root) in roots {
+        let (r, d) = (q(root.display().to_string()), q(name));
+        s.push_str(&format!(
+            "[ -d {r} ] && (cd {r} && find . -name .git -prune -o -type f -name '*.xml' \\( -path '*/test-results/*' -o -name 'TEST-*.xml' \\) -print) 2>/dev/null | while IFS= read -r f; do f=${{f#./}}; mkdir -p {dst}/{d}/\"$(dirname \"$f\")\" && cp {r}/\"$f\" {dst}/{d}/\"$f\"; done\n"
+        ));
     }
     s
 }
@@ -804,9 +836,26 @@ enum Which {
     Both,
 }
 
+/// The diff `base..head` of the scored clone `tree` (git's own config), binary and all, in `to`: what
+/// was scored, kept beside its score (for D3 the integrated tree).
+fn keep_diff(tree: &Path, base: &str, head: &str, to: &Path) -> Result<(), String> {
+    let cmd = format!(
+        "{GIT} -C {} diff --binary --no-color --no-ext-diff --no-textconv --no-renames {} {} >{}",
+        q(tree.display().to_string()),
+        q(base),
+        q(head),
+        q(to.display().to_string())
+    );
+    match run_t(tree, &cmd, 600) {
+        (true, _, _) => Ok(()),
+        (false, _, out) => Err(format!("git cannot diff {base}..{head} in the scored tree: {}", out.trim())),
+    }
+}
+
 /// Scores `head` of `ws` in `dir` inside `bx`: the hidden checks and/or the visible check (`which`),
 /// and the test/CI paths changed from `base` (on the fresh clone, whose .git config
-/// is git's own).
+/// is git's own). `dir` keeps `diff.patch` (`keep_diff`) and, after hidden checks, `junit/`
+/// (`checks_script`).
 fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path, which: Which) -> Result<Score, String> {
     let (hidden, visible) = (which != Which::Visible, which != Which::Hidden);
     let _ = fs::remove_dir_all(dir);
@@ -835,11 +884,14 @@ fn score(bx: &Jail, wl: &Workload, ws: &Path, base: &str, head: &str, dir: &Path
     let tree = out_dir.join("tree");
     let oracle_files = visible_files(wl, &tree);
     let d = verdict::diff(&tree, base, head).ok_or_else(|| format!("hacked: git cannot diff {base}..{head} in the scored tree"))?;
+    keep_diff(&tree, base, head, &dir.join("diff.patch"))?;
     let mut s = Score::default();
     (s.hacked_paths, s.hacked_why) = verdict::protected(&d, &wl.scope(), &oracle_files).into_iter().map(|p| (p.path, p.why)).unzip();
     let total: u32 = list.iter().map(|(_, t)| t + 10).sum::<u32>() + 60;
-    let (_, out) = bx.exec(&out_dir, &[&out_dir], &[&wl.hidden_dir, &checks_dir], &checks_script(&out_dir, &checks_dir, &wl.hidden_dir, &list), total);
+    let script = checks_script(&out_dir, &checks_dir, &wl.hidden_dir, &list, &bx.scratch());
+    let (_, out) = bx.exec(&out_dir, &[&out_dir], &[&wl.hidden_dir, &checks_dir], &script, total);
     fs::write(dir.join("score.log"), format!("{cloned}{out}")).map_err(|e| e.to_string())?;
+    let _ = fs::rename(out_dir.join("junit"), dir.join("junit"));
     if hidden {
         s.checks = wl.checks.iter().map(|c| CheckResult { id: c.id.clone(), ..read_check(&out_dir, &format!("h-{}", c.id)) }).collect();
         let tails: Value = s.checks.iter().map(|c| (c.id.clone(), json!(c.tail))).collect::<serde_json::Map<_, _>>().into();
@@ -2703,6 +2755,48 @@ mod tests {
         assert_eq!(out.lines().collect::<Vec<_>>(), ["-p", "reflect", "--json-schema", "{}", "--model", "sonnet"]);
         let a = session_args(Arm::A, "P", "sonnet", 1.0);
         assert_eq!(a[a.iter().position(|x| x == "--append-system-prompt").unwrap() + 1], crate::SYSTEM, "the same text");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A cell keeps what it scored and why: the diff base..head (the integrated tree for D3) and the
+    /// hidden checks' JUnit XML, from the tree and the sandbox's scratch, not the visible check's.
+    #[test]
+    fn a_scored_cell_keeps_its_diff_and_the_hidden_checks_junit_xml() {
+        let root = tmp("keep");
+        let scratch = root.join("scratch");
+        let (wd, _, runs) = workload(&root, |v| {
+            v["visible"] = json!("mkdir -p r/build/test-results/test && echo '<testsuite name=\"Visible\"/>' > r/build/test-results/test/TEST-Visible.xml");
+            v["hidden"]["checks"] = json!([
+                {"id": "c1", "cmd": "mkdir -p r/build/test-results/test && echo '<testsuite name=\"Held\"/>' > r/build/test-results/test/TEST-Held.xml && echo '<x/>' > r/notes.xml && grep -q fixed r/a.txt", "timeout_s": 30}
+            ]);
+        });
+        let wl = load(&wd, &root, &runs).unwrap();
+        let ws = root.join("cell/home/work/w-test");
+        let base = build_workspace(&wl, &ws).unwrap();
+        fs::write(ws.join("r/a.txt"), "fixed\n").unwrap();
+        let (code, out) = Jail::Plain.exec(&ws, &[], &[], &result_script(), 60);
+        let head = parse_head(&out).unwrap_or_else(|| panic!("{code}: {out}"));
+        let dir = root.join("cell/score");
+        let s = score(&Jail::Plain, &wl, &ws, &base, &head, &dir, Which::Both).unwrap();
+        assert!(s.checks[0].pass && s.visible_pass == Some(true), "{s:?}");
+        let patch = fs::read_to_string(dir.join("diff.patch")).unwrap();
+        assert!(patch.contains("--- a/r/a.txt") && patch.contains("-broken\n+fixed\n"), "{patch}");
+        let kept = |p: &str| dir.join("junit").join(p);
+        assert_eq!(fs::read_to_string(kept("tree/r/build/test-results/test/TEST-Held.xml")).unwrap(), "<testsuite name=\"Held\"/>\n");
+        assert!(!kept("tree/r/build/test-results/test/TEST-Visible.xml").exists(), "the visible check's reports are not the hidden tests'");
+        assert!(!kept("tree/r/notes.xml").exists(), "only JUnit reports");
+        // The visible check alone (F's selection) keeps no reports; the diff it does.
+        let sel = root.join("cell/select");
+        score(&Jail::Plain, &wl, &ws, &base, &head, &sel, Which::Visible).unwrap();
+        assert!(sel.join("diff.patch").is_file() && !sel.join("junit").exists());
+        // A scratch root (the sandbox's /tmp) is kept under its own name.
+        fs::create_dir_all(scratch.join("copy/build/test-results/test")).unwrap();
+        fs::write(scratch.join("copy/build/test-results/test/TEST-Tmp.xml"), "<t/>").unwrap();
+        let out = root.join("cell/raw");
+        fs::create_dir_all(out.join("tree")).unwrap();
+        let (ok, _, log) = run_t(&out, &junit_script(&out, std::slice::from_ref(&scratch)), 30);
+        assert!(ok, "{log}");
+        assert_eq!(fs::read_to_string(out.join("junit/scratch/copy/build/test-results/test/TEST-Tmp.xml")).unwrap(), "<t/>");
         let _ = fs::remove_dir_all(root);
     }
 
