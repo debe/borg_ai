@@ -44,6 +44,10 @@
 //!    latest per member and session, a day at most) and signed steering directives (steer.rs:
 //!    checked against the membership on receipt; refused ones are dropped and logged).
 //!
+//! A completed session, dialled or served, is recorded on each side by when it started, per member
+//! (`mesh/synced.json`, borg presence.rs `synced_path`): a hive claim made before that ms has reached
+//! the member, and so have the member's own claims up to its reading of the logs.
+//!
 //! Addressing is by key (addr.rs): a peer is dialled at its node id, with direct addresses and
 //! relay URLs as optional hints. How the endpoint reaches it across NAT is the collective's relay
 //! setting: n0's relays and address lookup (default), a self-hosted relay, or direct only.
@@ -430,6 +434,20 @@ impl Node {
         origin::stamp(&self.home, &self.me, &logs(&self.home), borg::learn::now_ms())
     }
 
+    /// Records a completed session with `remote` that started at `started` (borg presence.rs
+    /// `synced_path`): a claim written before it reached the peer, and the peer's earlier claims came back.
+    fn synced(&self, remote: &str, started: i64) {
+        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = borg::presence::note_synced(&self.home, remote, started);
+    }
+
+    /// Forgets `remote`'s last completed session (presence.rs `forget_synced`): a dial to it failed, so
+    /// no hive claim here waits on it until a session with it completes again.
+    pub(crate) fn unreachable(&self, remote: &str) {
+        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = borg::presence::forget_synced(&self.home, remote);
+    }
+
     /// The home relay this node tells peers about (not for a one-shot dial, nor with relays off).
     fn announced(&self) -> Option<String> {
         self.announce.then(|| self.home_relay()).flatten()
@@ -450,6 +468,7 @@ impl Node {
         if membership.role_of(&t.key).is_none() {
             return Err(format!("{} is not a member of {name}: refusing to connect", t.key));
         }
+        let started = borg::learn::now_ms();
         let conn = self.endpoint.connect(t.endpoint_addr(&self.relay)?, ALPN).await.map_err(|e| format!("connect {target}: {e}"))?;
         let result = async {
             let remote = authorise(&conn, &membership, name)?;
@@ -463,6 +482,7 @@ impl Node {
             }
             let report = self.exchange(true, &mut tx, &mut rx, membership, &remote, commits).await?;
             let _ = tx.finish();
+            self.synced(&remote, started);
             Ok(report)
         }
         .await;
@@ -555,6 +575,7 @@ impl Node {
             IncomingAddr::Ip(a) => Some(a),
             _ => None,
         };
+        let started = borg::learn::now_ms();
         let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
         let session = async {
             let (name, home) = self.gate()?;
@@ -573,6 +594,7 @@ impl Node {
             let report = self.exchange(false, &mut tx, &mut rx, membership, &remote, &[]).await?;
             let _ = tx.finish();
             conn.closed().await; // the dialler closes once it has read everything
+            self.synced(&remote, started);
             Ok(report)
         };
         let result = if conn.alpn() == JOIN_ALPN { self.admit(&conn, observed).await } else { session.await };
@@ -1287,6 +1309,7 @@ mod tests {
         let opts = Options {
             interval: Duration::from_millis(300),
             poll: Duration::from_millis(50),
+            hive_poll: Duration::from_millis(50),
             backoff_max: Duration::from_millis(600),
             timeout: Duration::from_secs(5),
             grace: Duration::from_secs(1),
@@ -1335,6 +1358,227 @@ mod tests {
         for l in loops {
             tokio::time::timeout(Duration::from_secs(5), l).await.expect("serve stops within its grace").unwrap();
         }
+    }
+
+    /// `serve` loops for `nodes`, each stopped by its sender; the failures they report, with who and when.
+    struct Serving {
+        stops: Vec<tokio::sync::oneshot::Sender<()>>,
+        loops: Vec<tokio::task::JoinHandle<()>>,
+        failed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    fn serving(nodes: Vec<(&'static str, std::sync::Arc<Node>)>, opts: crate::daemon::Options) -> Serving {
+        let s = Serving { stops: Vec::new(), loops: Vec::new(), failed: Default::default() };
+        nodes.into_iter().fold(s, |mut s, (who, n)| {
+            s.add(who, n, opts);
+            s
+        })
+    }
+
+    impl Serving {
+        fn add(&mut self, who: &'static str, n: std::sync::Arc<Node>, opts: crate::daemon::Options) {
+            use crate::daemon::{self, Event};
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            self.stops.push(tx);
+            let failed = self.failed.clone();
+            self.loops.push(tokio::spawn(daemon::serve(
+                n,
+                opts,
+                async move {
+                    let _ = rx.await;
+                },
+                move |e| {
+                    if matches!(e, Event::Served(Err(_)) | Event::Synced { result: Err(_), .. } | Event::Gate(Err(_))) {
+                        failed.lock().unwrap().push(format!("{who} at {}: {e:?}", borg::learn::now_ms()));
+                    }
+                },
+            )));
+        }
+
+        async fn stop(self) {
+            for s in self.stops {
+                let _ = s.send(());
+            }
+            for l in self.loops {
+                tokio::time::timeout(std::time::Duration::from_secs(10), l).await.expect("serve stops within its grace").unwrap();
+            }
+        }
+    }
+
+    /// Goal g1 with task t0 open, in alice's hive: the line, and where the goal lives at alice and bob.
+    fn hive_goal(a: &Path, b: &Path) -> (String, PathBuf, PathBuf) {
+        let (ga, gb) = (a.join("hive/g1"), b.join("hive/g1"));
+        std::fs::create_dir_all(&ga).unwrap();
+        let open = json!({"v": 1, "ev": "open", "task": "t0", "ms": 1, "by": "engineer:alice@x",
+            "def": {"id": "t0", "role": "work", "title": "do t0"}})
+        .to_string();
+        write(&ga, "tasks.jsonl", std::slice::from_ref(&open));
+        (open, ga, gb)
+    }
+
+    /// Appends claim `i` to alice's board (`ga`) and waits for it in bob's (`gb`): how long it took, in ms.
+    async fn claim_trip(ga: &Path, gb: &Path, i: u64, failed: &std::sync::Mutex<Vec<String>>) -> f64 {
+        let claim = json!({"v": 1, "ev": "claim", "task": "t0", "ms": borg::learn::now_ms(), "by": format!("s{i}")}).to_string();
+        let at = std::time::Instant::now();
+        append_lines(ga, "tasks.jsonl", std::slice::from_ref(&claim));
+        while !holds(gb, "tasks.jsonl", &claim) {
+            assert!(
+                at.elapsed() < std::time::Duration::from_secs(10),
+                "timed out waiting for alice's claim {i} at bob; failures: {:?}",
+                failed.lock().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        at.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Two `serve` loops with `opts`: 24 claims appended to alice's board, each timed until it is in
+    /// bob's (sorted, ms); each side records when its last completed session with the other started.
+    async fn claim_trips(tag: &str, opts: crate::daemon::Options) -> Vec<f64> {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let p = crew(tag, &["alice", "bob"]);
+        let (a, b) = (home(&p[0]), home(&p[1]));
+        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
+        let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
+        assert!(peers::remember(&b, &alice.public(), &addr_of(&alice)).unwrap());
+        let (open, ga, gb) = hive_goal(&a, &b);
+        let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
+        // Bob dials at start: the goal reaches him and alice learns where he is.
+        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
+        eventually("bob's address at alice", Duration::from_secs(10), || peers::load(&a).contains_key(&bob.public())).await;
+        let mut took = Vec::new();
+        for i in 1..=24u64 {
+            // Off any beat of the loops' ticks.
+            tokio::time::sleep(Duration::from_millis(40 + (i * 37) % 160)).await;
+            let ms = borg::learn::now_ms();
+            took.push(claim_trip(&ga, &gb, i, &serve.failed).await);
+            // Bob's served session wrote it, so it started after the claim; alice's dial reports a moment later.
+            eventually("alice's session recorded at bob", Duration::from_secs(5), || borg::presence::synced(&b).get(&alice.public()).is_some_and(|&s| s >= ms))
+                .await;
+            eventually("bob's session recorded at alice", Duration::from_secs(5), || borg::presence::synced(&a).get(&bob.public()).is_some_and(|&s| s >= ms))
+                .await;
+        }
+        took.sort_by(f64::total_cmp);
+        println!(
+            "claim at the peer: p50 {:.0} ms, p95 {:.0} ms, max {:.0} ms over {} trials",
+            took[took.len() / 2],
+            p95(&took),
+            took[took.len() - 1],
+            took.len()
+        );
+        serve.stop().await;
+        took
+    }
+
+    fn p95(took: &[f64]) -> f64 {
+        took[(took.len() * 95).div_ceil(100) - 1]
+    }
+
+    /// Two `serve` loops with the shipped options: a claim appended to alice's board is in bob's well
+    /// before the 2 s poll of the whole store (p95 under 1 s here, on any machine running the suite;
+    /// before E3 the median alone was 1.9 s), and each side records its sessions with the other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_carries_a_claim_to_the_peer_at_once() {
+        use std::time::Duration;
+        let opts = crate::daemon::Options { timeout: Duration::from_secs(5), grace: Duration::from_secs(1), ..Default::default() };
+        let took = claim_trips("claim", opts).await;
+        assert!(p95(&took) < 1000.0, "a claim reaches the peer within 1 s at p95, took {took:?}");
+    }
+
+    /// Phase e E3's pre-registered bar, p95 under 300 ms over 24 trials: a timing measured on an idle
+    /// machine (`cargo test -p borg-mesh -- --ignored a_claim_reaches`), not in the default suite.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "timing bar for an idle machine"]
+    async fn a_claim_reaches_the_peer_within_300_ms_at_p95() {
+        use std::time::Duration;
+        let opts = crate::daemon::Options { timeout: Duration::from_secs(5), grace: Duration::from_secs(1), ..Default::default() };
+        let took = claim_trips("claim-bar", opts).await;
+        assert!(p95(&took) < 300.0, "a claim reaches the peer within 300 ms at p95, took {took:?}");
+    }
+
+    /// Carol is a member alice dials, but her endpoint is gone: her dials wait out their `timeout`
+    /// (and come back after the first retry), and alice's claims still reach bob at once. Carol's
+    /// session record from before goes with her first failed dial, so no claim waits on her.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_does_not_answer_holds_no_claim_back() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let p = crew("deaf", &["alice", "bob", "carol"]);
+        let (a, b) = (home(&p[0]), home(&p[1]));
+        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
+        let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
+        let carol = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
+        let (key, at) = (carol.public(), addr_of(&carol));
+        carol.close().await;
+        assert!(peers::remember(&a, &key, &at).unwrap());
+        assert!(peers::remember(&b, &alice.public(), &addr_of(&alice)).unwrap());
+        borg::presence::note_synced(&a, &key, borg::learn::now_ms()).unwrap();
+        let (open, ga, gb) = hive_goal(&a, &b);
+        let opts = crate::daemon::Options { timeout: Duration::from_secs(3), grace: Duration::from_secs(1), ..Default::default() };
+        let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
+        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
+        eventually("bob's address at alice", Duration::from_secs(10), || peers::load(&a).contains_key(&bob.public())).await;
+        // Over 6 s: carol's first dial, its retry a `poll` after it failed, and the one after.
+        let mut took = Vec::new();
+        for i in 1..=15u64 {
+            took.push(claim_trip(&ga, &gb, i, &serve.failed).await);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        let failed = serve.failed.lock().unwrap().clone();
+        assert!(failed.iter().any(|f| f.contains(&key)), "carol's dials failed: {failed:?}");
+        assert!(!borg::presence::synced(&a).contains_key(&key), "a failed dial drops carol's record");
+        serve.stop().await;
+        assert!(took.iter().all(|&t| t < 1000.0), "every claim reaches bob within 1 s, took {took:?}");
+    }
+
+    /// Alice's first dial to bob fails (his node runs no `serve` yet); the claim it was to carry reaches
+    /// him a `poll` later, with no new change and bob never dialling in: not after a 2-minute backoff.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_dial_is_retried_soon_with_what_it_missed() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let p = crew("retry", &["alice", "bob"]);
+        let (a, b) = (home(&p[0]), home(&p[1]));
+        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
+        let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
+        assert!(peers::remember(&a, &bob.public(), &addr_of(&bob)).unwrap());
+        let (open, _, gb) = hive_goal(&a, &b);
+        let opts = crate::daemon::Options { timeout: Duration::from_secs(1), grace: Duration::from_secs(1), ..Default::default() };
+        let mut serve = serving(vec![("alice", alice.clone())], opts);
+        eventually("alice's dial to bob failed", Duration::from_secs(10), || !serve.failed.lock().unwrap().is_empty()).await;
+        serve.add("bob", bob.clone(), opts);
+        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
+        serve.stop().await;
+    }
+
+    /// One idle node holding 2000 goals nobody works on: the hive's 25 ms look stats none of them, so
+    /// the loop costs a small part of a core (it took a whole one when it statted every goal's logs).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_node_with_many_old_goals_stays_idle() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        // This thread's CPU time (user + system), in clock ticks: the runtime and `serve` run on it.
+        fn cpu() -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+            let f: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+            f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+        }
+        let p = crew("idle", &["alice"]);
+        let a = home(&p[0]);
+        for i in 0..2000 {
+            std::fs::create_dir_all(a.join(format!("hive/g{i}"))).unwrap();
+        }
+        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
+        let serve = serving(vec![("alice", alice)], crate::daemon::Options { grace: Duration::from_secs(1), ..Default::default() });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (t0, c0) = (Instant::now(), cpu());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let share = (cpu() - c0) as f64 / 100.0 / t0.elapsed().as_secs_f64();
+        serve.stop().await;
+        println!("idle serve with 2000 goals: {:.0}% of a core", share * 100.0);
+        assert!(share < 0.25, "an idle serve took {:.0}% of a core", share * 100.0);
     }
 
     /// A revokes C; B, which has not heard yet, still takes a lesson C wrote after its revocation.

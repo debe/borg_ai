@@ -380,7 +380,7 @@ mod tests {
             let line = Spend { v: 1, ms: 2, drone: d.into(), iter: 1, harness: "x".into(), usd, exit: exit.into(), ..Spend::default() };
             super::super::append_line(&spend, &line).unwrap();
         }
-        let run = RunLine { v: 1, ms: 1, drones: 2, harness: "x".into(), share_usd: 1.5, base: "HEAD".into() };
+        let run = RunLine { v: 1, ms: 1, drones: 2, harness: "x".into(), share_usd: 1.5, base: "HEAD".into(), peers: 0, waited_ms: 0 };
         super::super::append_line(&super::super::run::runs_path(home, "g"), &run).unwrap();
     }
 

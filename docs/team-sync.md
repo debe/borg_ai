@@ -112,8 +112,17 @@ the three model files of the pinned revision ([Vectors](configuration.md#vectors
 
 ![One sync session between two peers in six steps](img/mesh-sync.svg)
 
-Each peer dials the members it knows every 60 seconds, and at once after a local change. Whatever B
-learned from A reaches C in B's next round.
+Each peer dials the members it knows every 60 seconds, and at once after a local change: the logs of
+a hive goal being worked on (a drone's claim, done or message; a goal with a change in the last 30
+minutes) are looked at every 25 ms, the rest of the store every 2 s. Between two nodes on loopback a
+claim was at the peer within 50 ms (p95); the 2 s poll took 2.4 s. Each member is dialled on its own, so
+one that does not answer (a laptop asleep) holds up no other. A failed dial is tried again 2 s later,
+then after 2, 4, 8 … minutes (at most 30), and carries what the failed one missed. Whatever B learned
+from A reaches C in B's next round. After each session that completed, dialled or
+answered, a peer notes when it started in `mesh/synced.json` (per member key, local only): what it held
+then has reached that member; a failed dial removes the member from it. A hive claim beside another
+machine's drones, and `borg hive run` at its start, wait on this file for a round with each member
+synced in the last 2 minutes (at most 1 s and 3 s).
 
 **Membership.** Each machine holds one ed25519 key per collective; the key is also its network address,
 so a connection proves who is on the other end. The member list is a JSON document signed by an admin.

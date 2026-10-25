@@ -3778,6 +3778,19 @@ echo '{"type":"result","total_cost_usd":0.5,"num_turns":2,"result":"ok","modelUs
                 arm_e::quantile(&waste, 0.5),
                 arm_e::quantile(&waste, 1.0)
             );
+            // The added claim latency (E4's confirm windows) and the runs' start waits (E2b), in ms.
+            let confirm: Vec<f64> = rows.iter().flat_map(|r| r["e"]["confirm_ms"].as_array().cloned().unwrap_or_default()).filter_map(|w| w.as_f64()).collect();
+            let start: Vec<f64> =
+                rows.iter().flat_map(|r| r["e"]["start_wait_ms"].as_object().cloned().unwrap_or_default().into_values()).filter_map(|w| w.as_f64()).collect();
+            let outcomes: Vec<&Value> = rows.iter().map(|r| &r["e"]["confirm_outcomes"]).collect();
+            eprintln!(
+                "{side}: {} confirm windows, median {:?} max {:?} ms, outcomes per cell {outcomes:?}; run start waits median {:?} max {:?} ms",
+                confirm.len(),
+                arm_e::quantile(&confirm, 0.5),
+                arm_e::quantile(&confirm, 1.0),
+                arm_e::quantile(&start, 0.5),
+                arm_e::quantile(&start, 1.0)
+            );
             p95.push(q);
             forget_validation(&format!("e2e-{tag}"));
             let _ = fs::remove_dir_all(wd);

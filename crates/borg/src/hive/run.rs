@@ -9,6 +9,11 @@
 //! per task in one queen question, waited for under the run lock, so a "no" stops the run with no
 //! worktree made and nothing claimed. `--yes` approves it at the command line (borg-eval's runs).
 //!
+//! Once the worktrees are made, the runner announces its node on the board (mod.rs `announce`) and,
+//! with mesh peers reachable, waits for one sync round with each, a few seconds at most: the drones of
+//! every node then start knowing each node's share (board.rs `next_for`), instead of racing for one task
+//! until their first lines sync. On one node there is no wait.
+//!
 //! Once every task is verified, the drone thread that sees it first integrates (integrate.rs): it
 //! claims the board's integrate task, merges the accepted attempts and runs the oracle on the combined
 //! tree, in process and at no model cost, while the other drones wait on its lease. The goal is
@@ -179,6 +184,12 @@ pub struct RunLine {
     pub harness: String,
     pub share_usd: f64,
     pub base: String,
+    /// The mesh peers its start waited on (mod.rs `announce`; 0: none reachable, no wait) and for how
+    /// long.
+    #[serde(default)]
+    pub peers: usize,
+    #[serde(default)]
+    pub waited_ms: u64,
 }
 
 /// Drone `n`'s worktree: one path component under `.worktrees/`, so borg-trace's `repo_key` folds it
@@ -756,21 +767,51 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
             }
         }
     }
-    let run = RunLine { v: 1, ms: learn::now_ms(), drones: o.drones, harness: o.harness.name().into(), share_usd: share, base: o.base.into() };
+    // This node live on the board before its drones claim, and that heard by the peers (phase e E2b).
+    let names: Vec<String> = (1..=wts.len()).map(drone_name).collect();
+    let (peers, heard, waited) = match super::announce(home, &g.id, &names) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("borg hive run: {e}");
+            return 1;
+        }
+    };
+    if peers > 0 {
+        let how = if heard { "heard back" } else { "not all heard back" };
+        println!("hive run {}: announced to {peers} mesh peer(s), {how} in {} ms", g.id, waited.as_millis());
+    }
+    let run = RunLine {
+        v: 1,
+        ms: learn::now_ms(),
+        drones: o.drones,
+        harness: o.harness.name().into(),
+        share_usd: share,
+        base: o.base.into(),
+        peers,
+        waited_ms: waited.as_millis() as u64,
+    };
     if let Err(e) = super::append_line(&runs_path(home, &g.id), &run) {
         eprintln!("borg hive run: {e}");
         return 1;
     }
     let ctx =
         Ctx { home, g: &g, h: o.harness, root: &repo, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before, here: &here };
+    // The drones still running, named on the board at each one's end (mod.rs `roster`).
+    let running = std::sync::Mutex::new(names);
     let ends: Vec<DroneEnd> = std::thread::scope(|s| {
         let handles: Vec<_> = wts
             .iter()
             .enumerate()
             .map(|(i, wt)| {
                 s.spawn({
-                    let ctx = &ctx;
-                    move || drone(ctx, i + 1, wt)
+                    let (ctx, running) = (&ctx, &running);
+                    move || {
+                        let end = drone(ctx, i + 1, wt);
+                        let mut r = running.lock().unwrap_or_else(|e| e.into_inner());
+                        r.retain(|d| *d != end.drone);
+                        let _ = super::roster(ctx.home, &ctx.g.id, &r);
+                        end
+                    }
                 })
             })
             .collect();

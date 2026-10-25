@@ -453,10 +453,15 @@ the team's numbers (synced logs) or this machine's. [The page](https://github.co
 board, contracts, messages between drones (`borg hive ask`, `tell`), guard flags and spend sync to every member
 as signed lines, so drones on several machines claim from one board and spend one budget (every drone stops
 once the goal's total over all machines reaches it, passed at most by the sessions then in flight): each machine's drones take the tasks it owns first
-(rendezvous hashing over the machines whose drones are active on the board), so two machines rarely claim one task, the earlier of two claims wins on
+(rendezvous hashing over the machines whose drones are active on the board, and a run announces its machine on the board before its
+drones start), drones of one machine start on different tasks, so two drones rarely claim one task; with drones active on another machine a claim
+waits for a sync round with each reachable peer (at most 1 s, about 0 ms in the sim) before work starts, and the earlier of two claims wins on
 both machines after a sync round (the loser hears so at its next tool call, its edits are refused, and when its turn ends or it claims again its
 worktree goes back to the claim's start with its changes kept in a pinned snapshot commit), leases renew through synced heartbeats, a drone name bars only on its
-own machine, and the author's machine credits a verdict given elsewhere, once. A check another machine
+own machine, and the author's machine credits a verdict given elsewhere, once. `borg mesh serve` sends a claim, a done or
+a message to the other machines as soon as a drone writes it (it looks at the boards of goals being worked on every 25 ms; the rest of the store
+every 2 s): a claim was at the peer within 50 ms (p95, two nodes on loopback), not after a 2 s poll, and a machine that does not answer
+holds up no other. A check another machine
 wrote is a shell command from that machine: it runs only after the engineer's `borg hive approve <goal>`
 there, and the board lists what waits. Two machines that make one goal id before a sync stop that goal
 on both and say why. It is proven on two

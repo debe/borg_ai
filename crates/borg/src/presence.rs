@@ -243,6 +243,50 @@ pub fn remote(home: &Path, now: i64) -> Vec<Remote> {
     v
 }
 
+/// `<store>/mesh/synced.json`, `{"<member key>": ms}`: when the last session with each member that
+/// completed started (this node's clock), written by the mesh daemon (borg-mesh sync.rs), dialled or
+/// served. Every line this node held before that ms was offered to the member in it, and the member's
+/// lines up to its own reading of the logs came back. Local, never synced.
+pub fn synced_path(home: &Path) -> PathBuf {
+    home.join("mesh").join("synced.json")
+}
+
+/// The members' last completed sessions (`synced_path`); empty when none completed yet.
+pub fn synced(home: &Path) -> std::collections::BTreeMap<String, i64> {
+    std::fs::read_to_string(synced_path(home)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Records a completed session with `key` that started at `ms` (an older one never moves it back, but a
+/// record later than the clock now goes: the clock stepped back since, and it would stay ahead of
+/// every claim for as long). One small write to a temp file, then a rename: a reader never sees half
+/// of it. `serve` and a one-shot `borg mesh sync` take no lock between them: one may drop the other's
+/// newer entry, which only makes a claim wait for the next session.
+pub fn note_synced(home: &Path, key: &str, ms: i64) -> std::io::Result<()> {
+    let mut all = synced(home);
+    if all.get(key).is_some_and(|&held| held >= ms && held <= crate::learn::now_ms()) {
+        return Ok(());
+    }
+    all.insert(key.into(), ms);
+    write_synced(home, &all)
+}
+
+/// Drops `key`'s record (its last dial failed): no claim waits on it until a session completes again.
+pub fn forget_synced(home: &Path, key: &str) -> std::io::Result<()> {
+    let mut all = synced(home);
+    if all.remove(key).is_none() {
+        return Ok(());
+    }
+    write_synced(home, &all)
+}
+
+fn write_synced(home: &Path, all: &std::collections::BTreeMap<String, i64>) -> std::io::Result<()> {
+    let p = synced_path(home);
+    std::fs::create_dir_all(home.join("mesh"))?;
+    let tmp = p.with_extension(format!("{}.tmp", std::process::id())); // a one-shot `borg mesh sync` beside `serve`
+    std::fs::write(&tmp, serde_json::to_string(all).unwrap_or_default())?;
+    std::fs::rename(&tmp, &p)
+}
+
 /// The session's state at `now`; `alive` says whether a pid the harness gave still runs.
 pub fn state(p: &Presence, now: i64, alive: impl Fn(u32) -> bool) -> State {
     if p.event == "end" || p.pid.is_some_and(|pid| !alive(pid)) {
@@ -274,6 +318,34 @@ mod tests {
 
     fn who(_: &str) -> (String, String) {
         ("alice@x".into(), "app".into())
+    }
+
+    /// Two sessions with one member can complete out of order (a served one beside a dialled one): the
+    /// later start stays.
+    #[test]
+    fn a_members_last_session_never_moves_back() {
+        let h = tmp("synced");
+        assert!(synced(&h).is_empty());
+        note_synced(&h, "k1", 200).unwrap();
+        note_synced(&h, "k1", 100).unwrap();
+        note_synced(&h, "k2", 50).unwrap();
+        assert_eq!(synced(&h).into_iter().collect::<Vec<_>>(), [("k1".to_string(), 200), ("k2".to_string(), 50)]);
+        note_synced(&h, "k1", 300).unwrap();
+        assert_eq!(synced(&h)["k1"], 300);
+        forget_synced(&h, "k1").unwrap();
+        assert_eq!(synced(&h).into_keys().collect::<Vec<_>>(), ["k2"], "a failed dial drops the member");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn a_record_ahead_of_the_clock_gives_way() {
+        // The clock stepped back an hour after a session: the next session's start replaces it.
+        let h = tmp("synced-skew");
+        let now = crate::learn::now_ms();
+        note_synced(&h, "k1", now + 3_600_000).unwrap();
+        note_synced(&h, "k1", now).unwrap();
+        assert_eq!(synced(&h)["k1"], now);
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     #[test]

@@ -18,9 +18,11 @@
 //! folds them. The board syncs over the mesh as a signed log (hive.md C4): each line carries the
 //! node that wrote it (`node`, stamped by hive/mod.rs `write`; empty in a line from before), lines from
 //! another node fold the same as local ones, and leases travel with the heartbeats that renew them.
-//! Across nodes a claim is provisional until the next sync round: the loser learns at its next hook
-//! (mod.rs `lost_news`), its done and its verify task's open are ignored by the fold, so a loser wastes
-//! at most one sync latency of work. The winner rule compares the writers' clocks, so the skew between
+//! Across nodes a claim is provisional until the next sync round: with drones live on other nodes,
+//! `claim` (mod.rs) waits for a round with each reachable peer before work starts, so a loser mostly
+//! learns before it began; past that window's cap it learns at its next hook (mod.rs `lost_news`), its
+//! done and its verify task's open are ignored by the fold, so a loser wastes at most one sync latency
+//! of work. The winner rule compares the writers' clocks, so the skew between
 //! nodes must stay well below `LEASE_MS`. Drone names (`d1`..) repeat on every node: a drone name bars
 //! a verify task only on the node its work was done on (`Board::barred`); a session id bars everywhere.
 
@@ -331,6 +333,14 @@ pub struct Board {
     /// The newest line a session of each node wrote (its ms), any line the fold took or not, an
     /// engineer's not (`by_engineer`): the nodes taking part (`Board::live_nodes`).
     pub nodes: BTreeMap<String, i64>,
+    /// The drones each node's runner runs, from its newest line naming them (`roster_note`; mod.rs
+    /// `announce` at the run's start, then one at each drone's end): node -> (ms, drone names).
+    pub rosters: BTreeMap<String, (i64, BTreeSet<String>)>,
+}
+
+/// The note of a runner's line naming the drones it runs (`Board::rosters`): `drones d1 d2 ...`.
+pub fn roster_note(drones: &[String]) -> String {
+    std::iter::once("drones").chain(drones.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
 }
 
 impl Board {
@@ -396,8 +406,9 @@ impl Board {
     /// `LEASE_MS` (a claim, heartbeat, done or a verify task's open; a working drone renews its lease
     /// well within it). An engineer's lines (opens, releases, verdicts from the terminal) do not count:
     /// a node that only opened the goal may run no drone, and a share of its own would wait last on
-    /// every other node, which then race for it. A node whose drones wrote nothing yet is not among them
-    /// until its first line syncs.
+    /// every other node, which then race for it. A runner's start writes a line of its own (mod.rs
+    /// `announce`, a heartbeat of no task by `runner`), so its node is among them before any of its
+    /// drones claims, once that line synced.
     pub fn live_nodes<'a>(&'a self, node: &'a str, now: i64) -> BTreeSet<&'a str> {
         self.nodes.iter().filter(|(n, ms)| !n.is_empty() && now - **ms <= LEASE_MS).map(|(n, _)| n.as_str()).chain([node]).collect()
     }
@@ -523,6 +534,11 @@ pub fn fold(events: &[Event]) -> Board {
     for e in events.iter().filter(|e| !e.node.is_empty() && !by_engineer(&e.by)) {
         let ms = b.nodes.entry(e.node.clone()).or_insert(e.ms);
         *ms = (*ms).max(e.ms);
+        if let Some(names) = (e.ev == Ev::Heartbeat && e.task.is_empty() && e.by == "runner").then(|| e.note.strip_prefix("drones")).flatten()
+            && b.rosters.get(&e.node).is_none_or(|(at, _)| *at <= e.ms)
+        {
+            b.rosters.insert(e.node.clone(), (e.ms, names.split_whitespace().map(String::from).collect()));
+        }
     }
     // The open span of each task's holder, by task: an index into `b.spans`.
     let mut open_span: BTreeMap<TaskId, usize> = BTreeMap::new();
@@ -750,17 +766,58 @@ pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, node: 
 /// nodes start apart instead of racing for one task; a node whose share ran out takes another's from
 /// the far end, which its owner reaches last (two nodes overlap only where k + k drones exceed the
 /// tasks). On one node it owns them all, the order of before (oldest, then id).
+///
+/// Drones of one node start apart too (`idle_slot`): drone dN takes the first task it may claim from
+/// its place among the node's idle running drones on, counted over the tasks of the class still open,
+/// so two drones reading one board pick different tasks while there are enough, and a drone that sees
+/// another's claim picks as if it had not: the claimed task left the order and its drone left the
+/// places before it. A drone whose place is past
+/// the share walks on into the others' far end. A session without a runner's drone name starts at the
+/// first place.
 pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
     let live = b.live_nodes(node, now);
-    b.tasks.values().filter(|s| claimable_by(b, s, session, drone, node, now) && allowed(s)).min_by_key(|s| {
-        let class = (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency());
-        let within = if owner(&live, &s.task.id) == Some(node) {
-            (false, s.opened_ms, Reverse([0; 32]))
-        } else {
-            (true, -s.opened_ms, Reverse(affinity(node, &s.task.id)))
-        };
-        (class, within, s.task.id.clone())
-    })
+    let class = |s: &TaskState| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency());
+    let mine = |s: &TaskState| owner(&live, &s.task.id) == Some(node);
+    let fits = |s: &TaskState| claimable_by(b, s, session, drone, node, now) && allowed(s);
+    let best = b.tasks.values().filter(|s| fits(s)).min_by_key(|s| (class(s), !mine(s)))?;
+    let (c, m) = (class(best), mine(best));
+    let mut order: Vec<&TaskState> = b.tasks.values().filter(|s| class(s) == c && s.claimable(now) && deps_met(&b.tasks, &s.task)).collect();
+    order.sort_by_key(|s| match mine(s) {
+        true => (false, s.opened_ms, Reverse([0; 32]), s.task.id.clone()),
+        false => (true, -s.opened_ms, Reverse(affinity(node, &s.task.id)), s.task.id.clone()),
+    });
+    // A drone whose place is within the share walks the share; one past it (more drones than the share
+    // has tasks), or with nothing of the share left to it, walks on from that place into the others'
+    // far end, so the drones the share cannot hold spill one after another, as one drone would.
+    let (share, n) = (order.iter().filter(|s| mine(s)).count(), idle_slot(b, drone, node, now));
+    if m && n < share {
+        order.truncate(share);
+    }
+    // The walk finds a task: `best` fits, and it is in `order` (in the share when `m`).
+    let first = order.iter().cycle().skip(n % order.len()).take(order.len()).copied().find(|s| fits(s));
+    first.or(Some(best))
+}
+
+/// Where drone `dN` of a runner starts in `next_for`'s order: N - 1; 0 for any other name.
+fn slot(drone: &str) -> usize {
+    drone.strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
+}
+
+/// `drone`'s place among the drones of `node` not holding a task at `now`: its `slot`, less the drones
+/// before it that hold one or that ended (not in the node's newest `rosters` entry; without one, every
+/// drone before it runs). A busy or ended drone takes no place, so the running idle ones fill the share
+/// first, oldest task first.
+fn idle_slot(b: &Board, drone: &str, node: &str, now: i64) -> usize {
+    let n = slot(drone);
+    let ended = |i: usize| b.rosters.get(node).is_some_and(|(_, r)| !r.iter().any(|d| slot(d) == i));
+    let busy: BTreeSet<usize> = b
+        .tasks
+        .values()
+        .filter_map(|s| s.live(now).filter(|(_, at, _)| same_node(at, node)))
+        .filter_map(|(by, _, _)| b.drones.get(by).filter(|d| d.as_str() != drone))
+        .map(|d| slot(d))
+        .collect();
+    (0..n).filter(|&i| !busy.contains(&i) && !ended(i)).count()
 }
 
 /// The node of `live` that owns `task`: the highest `affinity` (rendezvous hashing, as borg-mesh
@@ -1397,6 +1454,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn drones_of_one_node_reading_one_board_pick_apart() {
+        // Phase e E2b: k drones of one node read the same board at once (none sees another's claim
+        // yet): each picks another task while there are enough, and the same one it would pick
+        // seeing the others' claims first. On two live nodes they stay within their node's share.
+        for nodes in [vec!["A"], vec!["A", "B"]] {
+            for m in [2, 3, 6, 12] {
+                for trial in 0..50 {
+                    let id = |i: usize| blake3::hash(format!("{trial}/{m}/{i}").as_bytes()).to_hex()[..8].to_string();
+                    let mut lines: Vec<Event> = (0..m).map(|i| on(Event::open(task(&id(i)), "engineer:e", i as i64), "A")).collect();
+                    lines.extend(nodes.iter().map(|n| on(ev(Ev::Progress, "warm", &format!("s{n}"), 0), n)));
+                    let live: BTreeSet<&str> = nodes.iter().copied().collect();
+                    let share = (0..m).filter(|&i| owner(&live, &id(i)) == Some("A")).count();
+                    let b = fold(&lines);
+                    let at_once: Vec<TaskId> =
+                        (1..=3).map_while(|d| next_for(&b, &format!("A{d}"), &format!("d{d}"), "A", "", 100, |_| true).map(|s| s.task.id.clone())).collect();
+                    let distinct: BTreeSet<&TaskId> = at_once.iter().collect();
+                    // Past the share they spill one after another into the far end: apart while there are tasks.
+                    assert!(distinct.len() >= 3.min(m), "{nodes:?} m={m} share={share} trial {trial}: {at_once:?}");
+                    let mut seen = Vec::new();
+                    for d in 1..=3 {
+                        let Some(t) = next_for(&fold(&lines), &format!("A{d}"), &format!("d{d}"), "A", "", 100, |_| true).map(|s| s.task.id.clone()) else {
+                            break;
+                        };
+                        lines.push(on(ev(Ev::Claim, &t, &format!("A{d}"), 100).with_drone(&format!("d{d}")), "A"));
+                        seen.push(t);
+                    }
+                    if share >= 3 {
+                        assert!(at_once.iter().all(|t| owner(&live, t) == Some("A")), "{nodes:?} m={m} trial {trial}: {at_once:?} leaves A's share");
+                        assert_eq!(at_once, seen, "{nodes:?} m={m} trial {trial}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_busy_drone_takes_no_place_in_its_nodes_share() {
+        // A owns one work task; d1 holds a plan task (another class). d2 is the only idle drone: it
+        // takes A's task, not B's far end, which B's own drones take.
+        let live = BTreeSet::from(["A", "B"]);
+        let a = (0..).map(|i| format!("a{i}")).find(|t| owner(&live, t) == Some("A")).unwrap();
+        let bs: Vec<String> = (0..).map(|i| format!("b{i}")).filter(|t| owner(&live, t) == Some("B")).take(2).collect();
+        let plan = Task { role: Role::Plan, ..task("p") };
+        let mut lines = vec![on(Event::open(plan, "engineer:e", 0), "A"), on(Event::open(task(&a), "engineer:e", 0), "A")];
+        lines.extend(bs.iter().map(|t| on(Event::open(task(t), "engineer:e", 0), "A")));
+        lines.extend([on(ev(Ev::Claim, "p", "A1", 1).with_drone("d1"), "A"), on(ev(Ev::Progress, "warm", "sB", 1), "B")]);
+        assert_eq!(next_for(&fold(&lines), "A2", "d2", "A", "", 2, |_| true).map(|s| s.task.id.clone()), Some(a));
+    }
+
+    #[test]
+    fn a_busy_drone_of_the_same_class_is_counted_once() {
+        // One node, t1..t5 open, d1 holds t1. d2 and d3 pick from the same board, or d2 before d1's claim
+        // reached it: each time two different tasks, the same ones either way.
+        let opens: Vec<Event> = (1..=5).map(|i| on(Event::open(task(&format!("t{i}")), "engineer:e", i), "A")).collect();
+        let claim = on(ev(Ev::Claim, "t1", "A1", 10).with_drone("d1"), "A");
+        let pick = |lines: &[Event], d: usize| next_for(&fold(lines), &format!("A{d}"), &format!("d{d}"), "A", "", 20, |_| true).map(|s| s.task.id.clone());
+        let seen: Vec<Event> = opens.iter().cloned().chain([claim]).collect();
+        assert_eq!((pick(&seen, 2), pick(&seen, 3)), (Some("t2".into()), Some("t3".into())), "both see d1's claim");
+        assert_eq!((pick(&opens, 2), pick(&seen, 3)), (Some("t2".into()), Some("t3".into())), "d2 does not see it yet, d3 does");
+    }
+
+    #[test]
+    fn an_ended_drone_takes_no_place() {
+        // The runner's newest line names d2 alone (d1 and d3 ended): d2 takes the oldest task, not the
+        // second; with no such line every drone before it counts.
+        let mut lines: Vec<Event> = (1..=3).map(|i| on(Event::open(task(&format!("t{i}")), "engineer:e", i), "A")).collect();
+        let pick = |lines: &[Event]| next_for(&fold(lines), "A2", "d2", "A", "", 20, |_| true).map(|s| s.task.id.clone());
+        assert_eq!(pick(&lines), Some("t2".into()));
+        let all = ["d1", "d2", "d3"].map(String::from);
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 5).with_note(&roster_note(&all)), "A"));
+        assert_eq!(pick(&lines), Some("t2".into()), "all three run");
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 8).with_note(&roster_note(&all[1..2])), "A"));
+        assert_eq!(pick(&lines), Some("t1".into()), "d1 and d3 ended");
+        assert_eq!(fold(&lines).rosters["A"], (8, BTreeSet::from(["d2".to_string()])));
     }
 
     #[test]

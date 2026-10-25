@@ -299,17 +299,31 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
     if !absent(home, g, repo).is_empty() {
         return None;
     }
+    let (events, b) = claim_due(home, &g.id, &session, drone, now, (id.clone(), new), lines)?;
+    let i = Integrator { home, g, id: &id, session: &session };
+    Some(i.integrate(repo, &events, &b))
+}
+
+/// Claims the integration `found` due (`due`) with `lines` (its open, when new) as `session` of
+/// `drone`, and reads the board back: its events and fold when the claim won. Nothing is written when
+/// the board moved on since it was found due (another drone thread's integration landed while `absent`
+/// asked git): this claim would only lose.
+fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, found: (TaskId, bool), mut lines: Vec<Event>) -> Option<(Vec<Event>, Board)> {
+    let path = super::tasks_path(home, goal);
+    if due(&board::fold(&board::read(&path)), now).as_ref() != Some(&found) {
+        return None;
+    }
     // Two runners racing write the same open (the fold keeps the first) and a claim each: one wins.
-    lines.extend([Event::new(Ev::Claim, &id, &session, now).with_drone(drone), Event::new(Ev::Heartbeat, &id, &session, now)]);
-    super::write(home, &g.id, lines).ok()?;
+    let id = found.0;
+    lines.extend([Event::new(Ev::Claim, &id, session, now).with_drone(drone), Event::new(Ev::Heartbeat, &id, session, now)]);
+    super::write(home, goal, lines).ok()?;
     std::thread::sleep(super::CLAIM_SETTLE);
     let events = board::read(&path);
     let b = board::fold(&events);
     if b.tasks.get(&id).and_then(|s| s.live(now)).is_none_or(|(by, _, _)| by != session) {
         return None;
     }
-    let i = Integrator { home, g, id: &id, session: &session };
-    Some(i.integrate(repo, &events, &b))
+    Some((events, b))
 }
 
 /// One claimed integration.
@@ -957,5 +971,24 @@ mod tests {
         assert!(matches!(&b.tasks["integrate.1"].status, Status::Claimed { by, .. } if by == "rival"));
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(root2);
+    }
+
+    #[test]
+    fn an_integration_that_landed_since_it_was_found_due_is_not_claimed_again() {
+        // Drone thread d1 finds integrate.1 due; while it asks git whether the work is here, d2 opens
+        // and claims it. d1 writes nothing: no second open, no lost claim.
+        let (root, repo, home) = setup("landed");
+        accepted(&home, work("t1", &["a.txt"], &[]), &wt(&repo, 1), "s1", write("a.txt", "a\n"));
+        let now = learn::now_ms();
+        let found = due(&fold(&home), now).unwrap();
+        assert_eq!(found, ("integrate.1".to_string(), true));
+        let open = |by: &str| Event::open(Task { title: "integrate".into(), ..board_task(&found.0) }, by, now);
+        board::append(&super::super::tasks_path(&home, "g"), &[open("integrate-d2-1"), Event::new(Ev::Claim, "integrate.1", "integrate-d2-1", now)]).unwrap();
+        let before = board::read(&super::super::tasks_path(&home, "g")).len();
+        let mine = open("integrate-d1-1");
+        assert!(claim_due(&home, "g", "integrate-d1-1", "d1", now, found, vec![mine]).is_none());
+        assert_eq!(board::read(&super::super::tasks_path(&home, "g")).len(), before, "nothing written");
+        assert!(fold(&home).lost.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

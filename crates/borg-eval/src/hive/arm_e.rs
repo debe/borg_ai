@@ -3,10 +3,11 @@
 //! (its own node id and mesh key), both members of one team collective; each node's workspace is a
 //! `--no-local` clone of one bare remote, so their object stores are separate and an attempt's commits
 //! reach the other node only as a bundle (borg hive/commits.rs). A sync pump in this process runs
-//! borg-mesh's own sync sessions between the two stores ([`Pump`]) every [`SYNC_EVERY`] for the whole
-//! run, and [`FINAL_ROUNDS`] more once both runs ended. Its transport is borg-mesh's `Node`, an iroh
-//! QUIC endpoint, bound on loopback with relays off and no address lookup: iroh carries the bytes, but
-//! no network beyond this machine is involved (the spec's "no iroh" means no relay or discovery). The
+//! borg-mesh's own sync sessions between the two stores ([`Pump`]) as soon as a hive log changes on
+//! either (as `borg mesh serve` dials), at least every [`SYNC_EVERY`], for the whole run, and
+//! [`FINAL_ROUNDS`] more once both runs ended. Its transport is borg-mesh's `Node`, an iroh QUIC endpoint, bound on
+//! loopback with relays off and no address lookup: iroh carries the bytes, but no network beyond this
+//! machine is involved (the spec's "no iroh" means no relay or discovery). The
 //! pump runs borg's session code in this process, with the nodes' switches ([`PUMP_ENV`], set by
 //! `hive::main`; a test calling the cell directly runs it with the test's, the row's `sync.credit`).
 //!
@@ -31,13 +32,14 @@
 //! Budget: `spend.jsonl` syncs (borg hive/run.rs `ledger`, `borg/mesh/10`), each line naming its node, so
 //! both runners read the goal's one total and every drone stops once it reaches the cap. The bound: the
 //! cap plus the iterations in flight when the total reached it, at most one per drone (three here),
-//! each at most its drone's share left, while the pump syncs faster than an iteration lasts (every
-//! [`SYNC_EVERY`]). Both runs start at once and each splits the whole cap (neither has seen the
-//! other's spend yet), so in the worst case those in-flight iterations still sum to a cap per node:
+//! each at most its drone's share left, while the pump syncs faster than an iteration lasts (a spend
+//! line is a hive log: at once, and every [`SYNC_EVERY`] at the latest). Both runs start at once and
+//! each splits the whole cap (neither has seen the other's spend yet), so in the worst case those in-flight iterations still sum to a cap per node:
 //! `--stop-at-usd` keeps reserving twice the cap for the cell (`Arm::reserve`). The row counts both
 //! nodes' dollars against the cap (`over_cap`), each node's from its own lines of the synced file.
 
 use super::*;
+use borg_mesh::daemon;
 use borg_mesh::identity::Identity;
 use borg_mesh::membership::Membership;
 use borg_mesh::sync::{Node, Place};
@@ -47,7 +49,8 @@ pub(super) const NODES: [(&str, usize); 2] = [("a", 2), ("b", 1)];
 /// Each node's collectives config: the workspace routes to collective `pilot`, shared with the team
 /// (a local collective never syncs), relays off (loopback only).
 const TEAM: &str = r#"{"default":"off","collectives":[{"name":"pilot","paths":["~/work"],"share":"team","relay":"disabled"}]}"#;
-/// How often the pump runs a sync session while the runs go.
+/// How often the pump runs a sync session while the runs go, at the latest: a change to a hive log
+/// starts one at once, looked for at `serve`'s pace (daemon.rs `hive_poll`; phase e E3).
 const SYNC_EVERY: Duration = Duration::from_secs(2);
 /// Sessions after both runs ended: a verdict that arrived is credited at the next session's stamp,
 /// and the one after carries that back (hive_mesh.rs).
@@ -84,7 +87,8 @@ impl Synced {
 
     fn json(&self) -> Value {
         json!({"rounds": self.rounds, "failed": self.failed, "sent": self.sent, "received": self.received, "rejected": self.rejected,
-               "quarantined": self.quarantined, "errors": self.errors, "every_s": SYNC_EVERY.as_secs(), "final_rounds": FINAL_ROUNDS,
+               "quarantined": self.quarantined, "errors": self.errors, "every_s": SYNC_EVERY.as_secs(),
+               "hive_poll_ms": daemon::Options::default().hive_poll.as_millis() as u64, "final_rounds": FINAL_ROUNDS,
                "credit": pump_credits()})
     }
 }
@@ -99,8 +103,8 @@ fn pump_credits() -> bool {
 }
 
 /// The sync pump: a thread with a tokio runtime holding two mesh nodes bound on loopback, one per
-/// store, running a session (B dials A) every `every` until stopped, then [`FINAL_ROUNDS`] more, then
-/// closing both endpoints. Stopped by [`Pump::stop`], or when dropped (an early return of the cell).
+/// store, running a session (B dials A) once a hive log changed on either and at least every `every`
+/// until stopped, then [`FINAL_ROUNDS`] more, then closing both endpoints. Stopped by [`Pump::stop`], or when dropped (an early return of the cell).
 struct Pump {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<Synced>>,
@@ -140,12 +144,19 @@ impl Pump {
                         }
                     };
                     let _ = ready_tx.send(Ok(()));
-                    loop {
+                    let (hive, poll) = (|n: &Node| daemon::hive_state(n.home()), daemon::Options::default().hive_poll);
+                    'pump: loop {
+                        let seen = (hive(&na), hive(&nb));
                         round(&na, &nb, &mut s).await;
-                        // A dropped sender (the pump dropped) stops it as a stop does.
-                        tokio::select! {
-                            _ = &mut stop_rx => break,
-                            () = tokio::time::sleep(every) => {}
+                        // The next session at `every`, or as soon as a hive log changed on either node (a claim,
+                        // a done: what `serve` dials for at once, daemon.rs `hive_poll`), including during this one.
+                        let next = tokio::time::Instant::now() + every;
+                        while tokio::time::Instant::now() < next && seen == (hive(&na), hive(&nb)) {
+                            // A dropped sender (the pump dropped) stops it as a stop does.
+                            tokio::select! {
+                                _ = &mut stop_rx => break 'pump,
+                                () = tokio::time::sleep(poll) => {}
+                            }
                         }
                     }
                     for _ in 0..FINAL_ROUNDS {
@@ -429,6 +440,11 @@ fn digest(b: &board::Board) -> String {
     blake3::hash(format!("{b:?}").as_bytes()).to_hex()[..16].to_string()
 }
 
+/// Every parsable line of a JSONL file (none when it does not exist).
+fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
+    fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
 /// Arm E (module doc).
 pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json::Map<String, Value>) -> Result<(), String> {
     // The shared remote: the workload's workspace, bare.
@@ -596,6 +612,15 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let spend: Vec<hive_run::Spend> = sides.iter().flat_map(|s| spend_of(&s.gdir(&o.goal).join("spend.jsonl"), None)).collect();
     let waste = loser_waste(&folds[0], &events[0], &spend);
     let known: Vec<f64> = waste.iter().flatten().copied().collect();
+    // The added claim latency (phase e E4: each confirm window, both nodes') and each run's start wait (E2b).
+    let confirms: Vec<borg::hive::Confirm> = sides.iter().flat_map(|s| read_jsonl(&borg::hive::confirms_path(&s.store, &o.goal))).collect();
+    let confirm_ms: Vec<f64> = confirms.iter().map(|c| c.waited_ms as f64).collect();
+    let mut confirm_outcomes: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &confirms {
+        *confirm_outcomes.entry(c.outcome.clone()).or_default() += 1;
+    }
+    let start_wait_ms: BTreeMap<&str, Option<u64>> =
+        sides.iter().map(|s| (s.name, read_jsonl::<hive_run::RunLine>(&hive_run::runs_path(&s.store, &o.goal)).last().map(|r| r.waited_ms))).collect();
     let name_of = |id: &str| sides.iter().find(|s| s.id == id).map(|s| s.name);
     for (s, (b, ev)) in sides.iter().zip(folds.iter().zip(&events)) {
         let mut v = node_stats(b, ev, s, &o.goal);
@@ -629,6 +654,7 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
                "max_holders": holders.values().copied().max().unwrap_or(0), "max_holders_by_task": holders,
                "lost_claims": lost, "lost_then_done": lost_worked.len(), "lost_then_done_tasks": lost_worked,
                "loser_waste_s": waste, "loser_waste_p95_s": quantile(&known, 0.95), "loser_waste_max_s": quantile(&known, 1.0),
+               "confirm_ms": confirm_ms, "confirm_outcomes": confirm_outcomes, "start_wait_ms": start_wait_ms,
                "cross_node": {"verified": cross.verified, "integrated": cross.integrated,
                               "by_node": cross.by_node.iter().filter_map(|(id, (v, i))| Some((name_of(id)?, json!({"verified": v, "integrated": i})))).collect::<BTreeMap<_, _>>(),
                               "on_board": {"verified": cross.on_board.0, "integrated": cross.on_board.1}},

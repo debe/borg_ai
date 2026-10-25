@@ -433,7 +433,14 @@ not this one.
 - **Claims and leases.** A claim is provisional until the next sync round: of two claims made on two
   machines, the earlier one wins on both once they sync, and the loser's drone hears so at its next
   hook after that sync, a tool call included, with its edits refused and its worktree set aside from
-  then on (see "Claims are leases" under [Hive](#hive); its done is ignored). Heartbeats are board lines, so a lease held on one machine is renewed on
+  then on (see "Claims are leases" under [Hive](#hive); its done is ignored). With drones active on
+  another machine, a claim that won its own read-back waits for one sync round with each peer the mesh
+  daemon synced with in the last 2 minutes and whose last dial did not fail (at most 1 s), then reads
+  the board again: a rival's earlier claim that had reached that peer is there by then, and the claim
+  exits 3 before any work starts (one stamped earlier that reached its own machine later still wins,
+  heard at the next tool call). Each wait is a line in the
+  goal's local `confirms.jsonl` (task, peers, ms waited, `won`, `lost` or `cap`). A claim of a task
+  another drone took since it was picked writes nothing and exits 3. Heartbeats are board lines, so a lease held on one machine is renewed on
   every other one. The winner rule compares clocks: keep the machines' clocks well within the 30 min
   lease. A runner releases only its own node's claims.
 - **Which task a drone takes.** The next open task is from the drone's own repo first, then by role
@@ -442,9 +449,16 @@ not this one.
   a board line within the lease (rendezvous hashing; an engineer's lines, such as opening the goal, do
   not count), so drones on two machines start on different tasks instead of racing for one. A machine
   whose own tasks are taken takes the others newest first, the end their owner reaches last. On one
-  machine the order is the oldest task first, as before. Each machine judges liveness from what it has
-  seen: a machine whose drones were quiet for the lease, or just started, can still race until its
-  next line syncs.
+  machine the order is the oldest task first, as before. Drones of one machine start apart: `dN` takes
+  the first task it may claim from its place among the machine's idle drones still running on (the
+  runner names them on the board at its start and at each drone's end), so two drones reading one board
+  take different tasks, and those the machine's share cannot hold take the others' far end one
+  after another. `borg hive run` announces its machine on the board before its drones start (a
+  heartbeat of no task by `runner`) and, with mesh peers synced in the last 2 minutes, waits for one
+  round with each (at most 3 s; `announced to 1 mesh peer(s), heard back in 40 ms`, and `peers` and
+  `waited_ms` in `runs.jsonl`), so every machine's drones start knowing each other's share. On one
+  machine nothing is waited for. Each machine still judges liveness from what it has seen: a machine
+  whose drones were quiet for the lease can race until its next line syncs.
 - **Drone names** (`d1`, `d2`) repeat on every machine: a verify task is barred to the author's session
   everywhere, and to the author's drone name only on the author's node.
 - **Commits travel as bundles.** A verdict diffs the author's snapshots. At each `done` in a store
@@ -492,7 +506,7 @@ not this one.
   once the goal's total reaches the budget, whoever spent it. Runs started at once each split the whole
   budget (neither has seen the other's spend), so together they can pass the budget by the sessions in
   flight when the total reached it, one per drone, each at most its drone's dollars left, while the
-  mesh syncs faster than a session lasts (the daemon syncs a change within seconds: it polls every 2 s); a machine that lags longer
+  mesh syncs faster than a session lasts (the daemon dials as soon as a hive log changes, looked at every 25 ms); a machine that lags longer
   lets each of its drones start one more session per sync it missed.
 - **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/9` or
   earlier do not sync with this version (`borg/mesh/10` carries the goal's spend, 9 the bundles): upgrade every member.
