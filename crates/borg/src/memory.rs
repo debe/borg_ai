@@ -31,7 +31,7 @@
 //!   verified): additive to the session's result (a verdict is about the task, a session result about
 //!   the engineer's reaction), never a use, and never a tick of the activity clock. Weights in
 //!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`. A fractional α (a candidate weight) is rounded the same way
-//!   (`draw`). `Weights` holds the hand-set weights so that `borg ope` (ope.rs, hive-learning.md step 6)
+//!   (`draw`). `Weights` holds the hand-set weights so that `borg ope` (ope.rs, hive.md L6)
 //!   can replay the belief under other values offline; the counts `derive` returns are constant-free.
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
 //!   (session, lesson) so a session sees one stable ranking, or the belief's mean without a session.
@@ -59,15 +59,15 @@ pub const D: f64 = 0.5;
 /// same-session, same-concern evidence; a regret is delayed and shared among the lessons asked). A veto
 /// weighs more than a correction, so regret < corrected < vetoed.
 pub const REGRET: f64 = 1.0;
-/// What one hive verdict adds to a lesson's belief (design-chosen, to be tuned by hive-learning.md
-/// step 6, like the veto's 3): a verified task adds one to α, like a change; a rejected one one to β,
+/// What one hive verdict adds to a lesson's belief (design-chosen, to be tuned by hive.md
+/// L6, like the veto's 3): a verified task adds one to α, like a change; a rejected one one to β,
 /// like an ignore (the verifier can be wrong); a hacked one three to β, as heavy as a veto and not
 /// above it: the hack test is a heuristic over a diff's lines that can be wrong, a veto is an engineer.
 pub const VERIFIED_W: u32 = 1;
 pub const REJECTED_W: u32 = 1;
 pub const HACKED_W: u32 = 3;
 /// What one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
-/// (design-chosen, no eval behind it yet; hive-learning.md step 6).
+/// (design-chosen, no eval behind it yet; hive.md L6).
 pub const VETOED_W: u32 = 3;
 
 /// The belief's hand-set weights (design-chosen; `borg ope` estimates others offline, never applies them).

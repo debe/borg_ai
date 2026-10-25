@@ -2,13 +2,13 @@
 //! rewritten. It holds the spec, the oracle checks that gate `done`, the dollar budget (recorded and
 //! shown, not enforced yet) and the repos in scope.
 //!
-//! Goals sync over the mesh as `goal.jsonl` (collective step 4): one compact line per goal, its
+//! Goals sync over the mesh as `goal.jsonl` (hive.md C4): one compact line per goal, its
 //! projection (`projection`: the hidden oracle stripped, `held_out` saying one exists), appended by
 //! `publish` (hive/mod.rs) on the node that made it. A node without goal.json loads the goal from that
 //! log ([`load`]). `sig` stays empty: every line is signed by the member that first stamped it (borg-mesh
 //! origin.rs), the trusted-member model. Two definitions of one id stop the goal on every node
 //! ([`conflict`]), and a synced goal's oracle runs only once this node's engineer approved it (oracle.rs
-//! `Approvals`). Whether only an admin's goal should sync is an open question (docs/design/collective.md
+//! `Approvals`). Whether only an admin's goal should sync is an open question (docs/design/hive.md
 //! "Goal").
 
 use std::path::Path;

@@ -1,4 +1,4 @@
-//! Commits travel with the board (docs/design/collective.md step 4, "Merges"): the node that did a
+//! Commits travel with the board (docs/design/hive.md C4, "Commits travel"): the node that did a
 //! task's work publishes the attempt's two snapshots (its claim's `base`, its done's `head`) as one git
 //! bundle in `bundles.jsonl`, a synced log of the goal (hive/mod.rs `SYNCED`), so a node on another
 //! machine verifies, builds on and integrates the work as the author's node does.

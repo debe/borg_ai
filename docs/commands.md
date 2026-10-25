@@ -18,7 +18,7 @@
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness (with its `regretted` share of later fixes), weight, and long-term or dormant state, from this machine's outcomes and the team's synced ones |
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
-| `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1 ([details](statistics.md)) |
+| `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1, with a Learning tab that shows week by week whether learning works ([details](statistics.md)) |
 | `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
 | `borg steer <drone\|session\|all> "<text>"` | Send a signed instruction to running drones; `--pause`, `--resume` |
 | `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson; see [below](#saying-no) |
@@ -56,12 +56,12 @@ is not listed in `borg help`.
 
 ## Hive
 
-A local spike, before the pilot (docs/design/collective.md): many drones work on one goal. The goal
+A local spike, before the pilot (docs/design/hive.md): many drones work on one goal. The goal
 has an oracle (shell checks) that decides when a task is done. Drones claim tasks from a shared board,
 publish contracts for each other, and finish a task only when its checks pass. Everything is in files
 under `<store>/hive/<goal>/`. In a collective shared over the mesh ([team sync](team-sync.md)) the goal,
-its board, contracts, messages and guard flags sync to every member as signed lines, so drones on
-several machines work one board; the hidden oracle, its scores, joins, spend and logs stay on the node
+its board, contracts, messages, guard flags and spend sync to every member as signed lines, so drones on
+several machines work one board and one budget; the hidden oracle, its scores, joins, runs and logs stay on the node
 that has them, and so do the commits (see [Across machines](#across-machines)).
 
 ```console
@@ -96,7 +96,8 @@ prints the exact command) and `--dir DIR`.
 `tasks.jsonl` (the board's events: open, claim, heartbeat, progress, done, verified, rejected, released,
 blocked; each line names the node that wrote it), `contracts.jsonl`, `messages.jsonl`, and `oracle/<task>.<ms>.log`
 (the last 8 KiB of a failed run, the newest 20 kept). `joins.jsonl` (directories whose sessions join),
-`spend.jsonl` and `runs.jsonl` (each iteration's cost and each `borg hive run`, below), and
+`spend.jsonl` (each iteration's cost, naming the node that spent it; synced) and `runs.jsonl` (each
+`borg hive run`, local), below, and
 `logs/<drone>-<iter>.out` (an iteration's output, at most 1 MiB, local only). `flags.jsonl` (what
 drones did to tests, CI or oracle files), `oracle.jsonl` (the hidden oracle's scores) and `scratch/`
 (its checkouts while it runs), below; `integrate/` (an integration's checkout while its checks run).
@@ -131,7 +132,7 @@ Nothing changes for a session that never joined a goal.
 ### Guardrails and the hidden oracle
 
 A drone can pass a visible oracle by changing it. The hive lets that happen, records it, and makes it
-useless (docs/design/hive-learning.md, step 8):
+useless (docs/design/hive.md, L8):
 
 - **Snapshots.** A claim of work records a commit of the drone's working tree (tracked and untracked
   files, written to the object store without touching the index, HEAD or any ref), and its done records
@@ -252,19 +253,25 @@ model call, while the others wait. It claims the board's `integrate.<n>` task an
 accepted attempts: for each verified task, the diff from its claim's snapshot to its done's, onto the
 commit every claim started from. It never merges a drone's branch, so changes a drone made without
 holding the claim, or committed there, are left out. A conflict counts as resolved only by a fix
-task built on the tree with its markers. The merge
+task built on the tree with its markers, which changes the path or leaves it without markers (a
+modify/delete or binary conflict has none: the fix's verified tree is the resolution). The merge
 uses `git merge-tree --merge-base`, so it needs git 2.40+; an older git blocks the integration with
 that reason. The result is a commit at `refs/heads/hive/<goal>/integrated`, which is the hive's result
 for you to review or merge. A conflict rejects it. Otherwise the goal's oracle and every task's own
 checks run on it in a scratch checkout, and a failure rejects it. A rejection opens the fix task
 `integrate.<n>.fix`, whose claim resets that drone's worktree to the combined tree; a joined session
 claims it in a checkout of that tree instead (`git worktree add <dir> <commit>`, as `borg hive
-integrate` prints). Once the fix is verified, the next integration includes it. The goal is finished only when an integration passes after the last
+integrate` prints). Once the fix is verified, the next integration includes it, built on the same
+commits as before with the fix last. If that integration fails for the same reason (the same
+conflicted paths, the same failing or timed-out check) and it merges no attempt the rejected tree
+did not already hold, it is blocked instead of opening another fix: the next fix would start from the same tree. The runner
+prints why, with the fix's id and `borg hive open <goal> --id integrate.<n> --again` to retry once you
+changed something (a new task, a corrected check). The goal is finished only when an integration passes after the last
 task was verified. A model session never claims an integrate task; `borg hive integrate <goal>` runs
 one for a goal worked without `borg hive run`.
 
-Each drone gets an equal share of what is left of the goal's budget (every earlier run's spend counted)
-and runs headless sessions of the harness one after another, launched with
+Each drone gets an equal share of what is left of the goal's budget (every earlier run's spend counted,
+on every node of the mesh) and runs headless sessions of the harness one after another, launched with
 `BORG_HIVE=<goal>` and `BORG_HIVE_DRONE=d<n>`: borg's own hooks join each to the goal, show it the board
 and gate its stop on the oracle. Claude Code runs as `claude -p --permission-mode bypassPermissions`
 with your settings (so borg's hooks run) and `--max-budget-usd` set to the drone's dollars left, so it
@@ -273,7 +280,8 @@ overshoot by one session; a session cut off at `--iter-timeout`, or one that fai
 cost is charged the drone's dearest session so far (or the rest of its share). Drones run with every permission inside their worktree: run it on a repo you
 are willing to let them change. Every session is cut off at `--iter-timeout` (default 1800 s).
 
-A drone stops when the board is finished (every task verified and integrated), its share is spent, a session ended
+A drone stops when the board is finished (every task verified and integrated), its share is spent, the
+goal's budget is spent (by any node's drones: see [Across machines](#across-machines)), a session ended
 without naming its cost or at $0 (codex reports tokens only and a subscription model $0, so such a
 drone gets one session), two sessions
 in a row failed or timed out, two made no board progress, or nothing was open to it for three polls.
@@ -284,11 +292,13 @@ goal without a budget, a repo outside the goal's, a harness that cannot run head
 attempts than `--drones` (see [Groups](#groups-of-attempts)), or another run of the goal still going (one
 at a time).
 
-A re-run shares what `spend.jsonl` says is left, whatever the drone count. A run killed mid-session
+A re-run shares what `spend.jsonl` says is left, whatever the drone count. The run's last lines say the
+goal's total by node (`goal g: $1.25 of $1.00 spent (here $0.75, 1a2b3c4d $0.50)`); `--dry-run` says it too. A run killed mid-session
 (Ctrl-C, a closed terminal) takes its sessions with it; the next run of the goal charges each of them
 as a cut-off one (`exit: "killed"`) and releases their claims before it starts. Superseding a contract
 of your own drone (any of its sessions) needs no answer through `borg queen`. `borg top` and the web page's Hive tab show
-each goal's board, its spend per drone and its newest contracts.
+each goal's board, its spend (the goal's total over every node, and per drone: another node's drone as
+`d1@<its node>`) and its newest contracts.
 
 ### Groups of attempts
 
@@ -304,7 +314,7 @@ group parser/lexer: reflection group-parser.lexer recorded
 1 new lessons, 0 merged into existing ones
 ```
 
-A group runs one work task as K independent attempts (docs/design/hive-learning.md, step 4; best-of-N).
+A group runs one work task as K independent attempts (docs/design/hive.md, L4; best-of-N).
 Each member `<id>.gN` is an ordinary task: claimed, done, verified, reworked on a rejection. A session
 or drone that held or verified one member is never offered or allowed another, and one that held a
 member never verifies another, so the K attempts are K drones', independent, and none is judged by a
@@ -373,7 +383,7 @@ q3f2a91c0 answered: the edit is promoted into ~/.local/share/borg/collectives/co
 ```
 
 A playbook is the team's procedure for a kind of task: its shape ("fix the parser") and a short list
-of steps (docs/design/hive-learning.md, step 5, L1). `playbooks.jsonl` holds edits, never whole
+of steps (docs/design/hive.md, L5, the playbook layer). `playbooks.jsonl` holds edits, never whole
 playbooks: each adds a step, changes one, or removes one. Every reader folds the same set of edits
 into the same playbooks in any order (the edits replay by time: a removed step can be added again, a
 step's text is its latest add or change, and a change promoted on a machine whose clock is behind the
@@ -460,8 +470,15 @@ not this one.
   session tag can be linked to its hive session. A goal with a hidden
   oracle is scored and credited on the node that made it only; a remote author of such a goal's
   attempt is not credited yet.
-- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/8` or
-  earlier do not sync with this version (`borg/mesh/9` carries the bundles): upgrade every member.
+- **One budget.** A goal's `spend.jsonl` syncs, each line naming its node, so runs on several machines
+  split and stop on one budget: a run's share is what every node's drones left, and every drone stops
+  once the goal's total reaches the budget, whoever spent it. Runs started at once each split the whole
+  budget (neither has seen the other's spend), so together they can pass the budget by the sessions in
+  flight when the total reached it, one per drone, each at most its drone's dollars left, while the
+  mesh syncs faster than a session lasts (the daemon syncs a change within seconds: it polls every 2 s); a machine that lags longer
+  lets each of its drones start one more session per sync it missed.
+- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/9` or
+  earlier do not sync with this version (`borg/mesh/10` carries the goal's spend, 9 the bundles): upgrade every member.
 
 Not yet: goal signatures (any member's goal syncs, signed by its origin), approving a plan once for
 every node (each node's run asks its own engineer), multi-repo goals (`run` takes the repo it is started in), moving a failed

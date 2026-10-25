@@ -1,4 +1,4 @@
-//! The hive across machines (docs/design/collective.md step 4), proven on two loopback mesh nodes in
+//! The hive across machines (docs/design/hive.md C4), proven on two loopback mesh nodes in
 //! one process with drones run as the real `borg` binary (its hooks and `borg hive` CLI, what a sim
 //! drone does): a task opened on A is claimed on both nodes before they sync, one claim wins on both,
 //! the work is done on B, verified on A by a drone of the same name, credited once on the author's
@@ -51,11 +51,13 @@ impl Machine {
         Place { config: self.base.join("collectives.json"), base: self.base.clone(), dir: self.app.display().to_string(), collective: None }
     }
 
-    /// The `borg` binary with this machine's environment and `env`, in its checkout.
+    /// The `borg` binary with this machine's environment and `env`, in its checkout. Its hook state is
+    /// its own (`BORG_STATE`): tests running at once reuse session ids.
     fn borg(&self, root: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(borg_bin());
         c.args(args)
             .env_clear()
+            .env("BORG_STATE", self.base.join("state"))
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", root.join("bin").display()))
             .env("HOME", self.base.join("home"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -416,6 +418,130 @@ async fn work_done_on_b_is_verified_and_integrated_on_a_with_its_own_object_stor
     for r in [served, synced] {
         assert_eq!((r.sent, r.received, r.rejected), (0, 0, 0), "a further round moves only digests: {r:?}");
     }
+    na.close().await;
+    nb.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Each iteration's cost in the budget test; the goal's budget is four of them.
+const ITER_USD: f64 = 0.25;
+const BUDGET_USD: f64 = 1.0;
+
+/// `borg hive run g1 --drones <n> --harness sim --yes` on machine `m`, its scripted drones signing as
+/// `node`, each doing one task per iteration at `ITER_USD`; its output in `<root>/run-<node>.out`.
+fn spawn_run(root: &Path, m: &Machine, node: &str, drones: usize) -> std::process::Child {
+    let plan = json!({"one_task": true, "work_s": 3});
+    let names: serde_json::Map<String, Value> = (1..=drones).map(|n| (format!("d{n}"), plan.clone())).collect();
+    let script = m.base.join("script.json");
+    std::fs::write(&script, json!({"usd_per_iter": ITER_USD, "node": node, "drones": names}).to_string()).unwrap();
+    let out = std::fs::File::create(root.join(format!("run-{node}.out"))).unwrap();
+    let (n, dir, script) = (drones.to_string(), m.app.display().to_string(), script.display().to_string());
+    let env = [("BORG_TEST_HARNESS", "1"), ("BORG_SIM_CAPS", "prompt,tool,deny,headless"), ("BORG_SIM_SCRIPT", script.as_str()), ("BORG_LEARN", "off")];
+    let mut c = m.borg(root, &["hive", "run", "g1", "--drones", &n, "--harness", "sim", "--yes", "--dir", &dir], &env);
+    c.stdin(Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out);
+    c.spawn().unwrap()
+}
+
+fn spend_lines(store: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(hive::run::spend_path(store, "g1")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+/// A goal's budget across nodes (tasks/todo.md D1): runs start at once on A (2 drones) and B (1), each
+/// splitting the whole budget (neither has seen the other's spend), while the mesh syncs every 50 ms.
+/// The goal's spend lines sync, so every drone stops once the goal's total over both nodes reaches the
+/// budget: the total is at most the budget plus the iterations in flight then, one per drone (run.rs
+/// `ledger`), where each node's own split would have let them spend the budget each.
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_on_two_nodes_spend_one_goal_budget() {
+    let root = std::env::temp_dir().join(format!("borg-hive-mesh-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    stub_models(&root);
+    let (ma, mb) = (Machine::new(&root, "a"), Machine::new(&root, "b"));
+    let origin = root.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("README"), "app\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-qm", "base"]);
+    for m in [&ma, &mb] {
+        git(&root, &["clone", "-q", "--no-local", origin.to_str().unwrap(), m.app.to_str().unwrap()]);
+    }
+    let (sa_store, sb_store) = (ma.store(), mb.store());
+    let alice = Identity::load_or_create(&sa_store).unwrap();
+    let bob = Identity::load_or_create(&sb_store).unwrap();
+    let mut m = Membership::found("work", &alice);
+    m.invite(&alice, &bob.public(), "member").unwrap();
+    m.save(&sa_store).unwrap();
+    m.save(&sb_store).unwrap();
+    let na = Node::bind(&ma.place(), LOCAL.parse().unwrap()).await.unwrap();
+    let nb = Node::bind(&mb.place(), LOCAL.parse().unwrap()).await.unwrap();
+
+    // A opens the goal with more tasks than the budget pays for; B approves A's checks.
+    ma.ok(&root, &["init", "g1", "--spec", "Write the files", "--oracle", "ok=true", "--budget", &BUDGET_USD.to_string()], &[]);
+    for i in 1..=12 {
+        let (id, file) = (format!("t{i}"), format!("f{i}.txt"));
+        let accept = format!("ok=grep -q 'done {id}' {file}");
+        ma.ok(&root, &["open", "g1", "--id", &id, "--title", &format!("write {file}"), "--files", &file, "--accept", &accept], &[]);
+    }
+    round(&na, &nb).await;
+    mb.ok(&root, &["approve", "g1"], &[]);
+
+    let mut runs = [spawn_run(&root, &ma, "a", 2), spawn_run(&root, &mb, "b", 1)];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut codes: [Option<i32>; 2] = [None, None];
+    while codes.iter().any(Option::is_none) {
+        for (c, code) in runs.iter_mut().zip(codes.iter_mut()) {
+            if code.is_none() {
+                *code = c.try_wait().unwrap().map(|s| s.code().unwrap_or(-1));
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            // Stopped as an engineer stops a run (Ctrl-C), then waited for.
+            for c in runs.iter_mut() {
+                let _ = Command::new("kill").args(["-INT", &c.id().to_string()]).status();
+                let _ = c.wait();
+            }
+            panic!("the runs did not end within 600 s");
+        }
+        round(&na, &nb).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    round(&na, &nb).await;
+    round(&na, &nb).await;
+    let out: Vec<String> = ["a", "b"].iter().map(|n| std::fs::read_to_string(root.join(format!("run-{n}.out"))).unwrap()).collect();
+
+    // Each run split what it saw left (the whole budget, unless a peer's first lines had arrived): their
+    // splits together promised more than the budget, so the goal's stop rule is what bounds them.
+    let share = |store: &Path| {
+        let text = std::fs::read_to_string(hive::run::runs_path(store, "g1")).unwrap();
+        serde_json::from_str::<Value>(text.lines().last().unwrap()).unwrap()["share_usd"].as_f64().unwrap()
+    };
+    let (share_a, share_b) = (share(&sa_store), share(&sb_store));
+    assert!(2.0 * share_a + share_b >= BUDGET_USD + 2.0 * ITER_USD, "shares {share_a} on A, {share_b} on B\n{out:?}");
+
+    // Both nodes hold every node's spend lines, each naming its node.
+    let (la, lb) = (spend_lines(&sa_store), spend_lines(&sb_store));
+    assert_eq!(la, lb, "the goal's spend synced");
+    let lines: Vec<hive::run::Spend> = la.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let (ida, idb) = (hive::node(&sa_store), hive::node(&sb_store));
+    assert!(lines.iter().all(|s| s.node == ida || s.node == idb), "{lines:?}");
+    assert!(lines.iter().any(|s| s.node == ida) && lines.iter().any(|s| s.node == idb), "both nodes spent: {lines:?}");
+    let total = hive::run::ledger(&lines, &ida);
+    assert_eq!(total, hive::run::ledger(&lines, &idb), "both nodes fold one ledger");
+    assert_eq!(hive::run::goal_spent(&sa_store, "g1"), hive::run::goal_spent(&sb_store, "g1"));
+
+    // The bound: the budget was reached, and passed by at most one in-flight iteration per drone.
+    let drones = 3.0;
+    assert!(total.total >= BUDGET_USD, "the drones spent the budget: {total:?}\n{out:?}");
+    assert!(total.total <= BUDGET_USD + drones * ITER_USD + 1e-9, "at most one iteration per drone over the budget: {total:?}\n{out:?}");
+    assert!(total.total < 2.0 * BUDGET_USD, "less than each node's own split would have let them spend: {total:?}");
+    let ends: Vec<&str> = out.iter().flat_map(|o| o.lines()).filter(|l| l.starts_with('d') && l.contains(" end: ")).collect();
+    assert_eq!(ends.len(), 3, "{out:?}");
+    assert!(ends.iter().all(|l| l.ends_with("end: budget")), "every drone stopped on the goal's budget: {ends:?}");
+    assert!(out[1].contains("goal g1: $") && out[1].contains("spent (here $"), "the run says the goal's total by node: {}", out[1]);
+    let view = borg::hive::view::of(&sb_store, "g1", borg::learn::now_ms()).unwrap();
+    assert!((view.spent_usd - total.total).abs() < 1e-9, "monitoring shows the goal's total: {}", view.spent_usd);
+    assert!(view.drones.iter().any(|d| d.drone.starts_with("d2@")), "A's drones under their node on B: {:?}", view.drones);
     na.close().await;
     nb.close().await;
     let _ = std::fs::remove_dir_all(&root);

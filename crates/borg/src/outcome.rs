@@ -158,7 +158,7 @@ pub struct Outcome {
     /// cut (attention.rs `propensities`), the share of Thompson draws that give it a slot in
     /// `budget`/`widen` (conscience.rs `propensity`). Rounded to 4 decimals (`round_p`). Empty in records
     /// from before propensities and when unknown (BORG_ONLY, a state file from an older binary). For
-    /// off-policy evaluation (hive-learning.md "Credit assignment").
+    /// off-policy evaluation (hive.md "Credit assignment").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub p: Vec<f64>,
     /// `asked` from a Thompson slot draw only (conscience.rs `budget_pool`/`widen_pool`, hook.rs
@@ -213,8 +213,8 @@ pub const PUBLISHED: &str = "outcomes-team.published";
 /// so this is the trusted-member model; the deferred guards (a session tag bound to its first signer,
 /// consolidation from at least two signers) would close it.
 ///
-/// The hive verdicts (`verified`, `rejected`, `hacked`) are shared since the hive lines sync (collective
-/// step 4), with `c` = the tag of their cause (`<goal>/<verify task>`), so memory derives one verdict per
+/// The hive verdicts (`verified`, `rejected`, `hacked`) are shared since the hive lines sync (hive.md
+/// C4), with `c` = the tag of their cause (`<goal>/<verify task>`), so memory derives one verdict per
 /// (lesson, attempt) from a local record and a peer's copy alike. A verdict is a self-reported reward,
 /// so `team_view` binds a peer's verdict line to the signed board: it counts only for an attempt whose
 /// board verdict took effect on this node (hive/verdict.rs `judged`), and only of a kind that verdict

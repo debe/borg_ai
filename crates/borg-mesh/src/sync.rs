@@ -22,7 +22,8 @@
 //!    3b. The hive (borg hive/mod.rs `SYNCED`): `Goals` swaps the ids of the goals each side holds an
 //!    admitted hive line of, both sides keep the valid ids (an id names a directory) and take the
 //!    sorted union, then reconcile each goal's goal.jsonl, tasks.jsonl, contracts.jsonl,
-//!    messages.jsonl, flags.jsonl and bundles.jsonl in that order, exactly as the logs above. Receiving a
+//!    messages.jsonl, flags.jsonl, bundles.jsonl and spend.jsonl in that order, exactly as the logs
+//!    above (a spend line that names no node stays on its node: lines.rs `local`). Receiving a
 //!    goal writes its logs only, never goal.json (the hidden oracle stays on the node that made the goal).
 //!    bundles.jsonl carries each attempt's commits as a git bundle (borg hive/commits.rs): a line over its
 //!    cap (lines.rs `cap`) is neither offered nor stored, and the receiving node unbundles a line only
@@ -74,7 +75,10 @@ use crate::{live, steer};
 
 mod vectors;
 
-pub const ALPN: &[u8] = b"borg/mesh/9";
+/// The session protocol. 10: a goal's `spend.jsonl` is a seventh synced hive log (borg hive/run.rs
+/// `ledger`); the hive logs reconcile in a fixed list, so a peer on 9 would reconcile another file at
+/// the same step and is refused at the handshake instead.
+pub const ALPN: &[u8] = b"borg/mesh/10";
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.

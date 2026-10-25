@@ -757,7 +757,8 @@ pub struct Data {
     /// Name, share and delivery mode (`hook` or `live`) of each collective.
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
-    pub sources: [Source; 6],
+    /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source.
+    pub sources: [Source; 7],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -797,8 +798,16 @@ pub fn data() -> Data {
 
 /// Creates the shared data, loads it for the shown collective and follows the change stream.
 pub fn provide() -> Data {
-    let sources = [Source::new("stats"), Source::new("lessons"), Source::new("feed"), Source::new("queen"), Source::new("drones"), Source::new("hive")];
-    let [st, le, fe, qu, dr, hi] = sources;
+    let sources = [
+        Source::new("stats"),
+        Source::new("lessons"),
+        Source::new("feed"),
+        Source::new("queen"),
+        Source::new("drones"),
+        Source::new("hive"),
+        Source::new("learning"),
+    ];
+    let [st, le, fe, qu, dr, hi, _] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),

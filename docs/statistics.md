@@ -33,7 +33,26 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `/api/feed?c=&limit=` | This machine's notable events, newest first |
 | `/api/queen?c=` | The queen's questions and answers |
 | `/api/drones?c=` | The drones, as in `borg top` |
+| `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts, per hive goal the mistakes caught and its rework lessons, the playbook versions with their beliefs; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/events?c=` | A server-sent event stream naming the views whose files changed |
+
+**Is learning working?** The Learning tab answers it per collective, week by week, from the logs
+Borg keeps anyway (no state of its own, so the history is there from the first view): lessons written
+per source (session, review, regret, veto, group, rework, queen, import) and the team's lessons written
+and merged; the share of asked lessons that changed the work (should rise) and of vetoes that repeated
+an earlier "no" (should fall); per hive goal, the mistakes its guards caught (verifier rejections,
+failed integrations, hacked attempts) next to verified work, and the rework lessons learned from them
+(click a goal, then a lesson); and each playbook version shown to a drone with its belief. Each panel
+is labelled `team` when it folds synced logs (rollups, lessons, boards, playbooks) of a team collective,
+or `this machine` when it folds the local event log, the only place a lesson's source is kept.
+The weeks run up to the current one, marked "so far", so an idle month shows as idle weeks. The team's
+new lessons are counted from the lessons themselves, each once in the week it was learned. Hive
+verdicts count only the lines the board took (a late verifier's line, a duplicate or a line without a
+claim is ignored). The history derived before live counting began holds no lesson sources, merges or
+repeated vetoes: those series start at the week live counting began on this machine (the API's
+`live_from`; earlier weeks are `null`), and a repeated veto is dated when it was said, in its veto's
+week. A "verdict on an asked lesson" is a Stop's changed or ignored, or a later correction anyway, which
+one lesson can get on top of either, as on the Conscience tab.
 
 ## How counting works
 
@@ -64,7 +83,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `regretted` | `borg learn` counted a later fix, or a review finding, against a lesson asked before the decision (`lessons`: that lesson). Its share of the blame is the `credit` of the `regretted` record in `outcomes.jsonl`, keyed by the regret episode (`cause`) |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
 | `veto` | An engineer said no to a drone's work (`borg no`, or a prompt starting "borg no"); `lessons` the lessons shown in the session so far, `n` their number, `why` `cli` or `prompt` |
-| `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned, so the latest days can lag |
+| `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned and dated when the veto was said, so the latest days can still grow |
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |

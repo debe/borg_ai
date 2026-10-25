@@ -23,6 +23,8 @@ use axum::routing::get;
 use borg::collective::{self, Route, Share};
 use borg::{conscience, install, learn, memory, outcome, presence, stats, top};
 use futures_util::{Stream, StreamExt};
+
+pub mod learning;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -269,6 +271,12 @@ async fn hive(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     Json(json!({"collective": m.name, "goals": goals, "playbooks": playbooks})).into_response()
 }
 
+/// Whether learning works in the collective, week by week (learning.rs), backfilled from its logs.
+async fn learning_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    Json(learning::view(&m.name, &m.home, m.share)).into_response()
+}
+
 /// Size and modification time of `path`, or of every file directly in it.
 fn stamp(path: &Path) -> Vec<(u64, u128)> {
     let one = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), mtime(&m)));
@@ -303,6 +311,16 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
             "hive",
             [
                 vec![home.join("hive"), home.join(borg::playbook::FILE), home.join("queen"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE)],
+                borg::hive::view::files(home),
+            ]
+            .concat(),
+        ),
+        // Learning health folds the lessons, the rollups, the local events, the boards and the playbooks.
+        (
+            "learning",
+            [
+                vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home), home.join("hive"), home.join(borg::playbook::FILE)],
+                vec![home.join(outcome::TEAM_FILE), home.join("outcomes.jsonl")],
                 borg::hive::view::files(home),
             ]
             .concat(),
@@ -362,6 +380,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
         .route("/api/hive", get(hive))
+        .route("/api/learning", get(learning_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))
         .with_state(app)

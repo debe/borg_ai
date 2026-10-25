@@ -139,8 +139,10 @@ beside the board (at most 1 MiB per attempt, refused unless they hold exactly th
 and a hive verdict counts on a peer only for an attempt its own synced board judged
 ([commands: Across machines](commands.md#across-machines)). A goal's or task's checks written on
 another machine never run on yours until you approve them (`borg hive approve <goal>`). The hive across machines is built and
-proven on two loopback nodes, not measured across real machines yet. Peers on `borg/mesh/8` and earlier
-do not sync with this version (`borg/mesh/9` adds the bundles): upgrade every member. Reasoning excerpts go to two peers chosen by hash,
+proven on two loopback nodes, not measured across real machines yet. A goal's spend syncs too, so the
+drones of every machine split and stop on the goal's one budget (spend recorded before this version
+names no machine and stays on the machine that spent it). Peers on `borg/mesh/9` and earlier
+do not sync with this version (`borg/mesh/10` adds the goal's spend, 9 the bundles): upgrade every member. Reasoning excerpts go to two peers chosen by hash,
 so the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key

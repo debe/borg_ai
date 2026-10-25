@@ -15,7 +15,7 @@
 //! finished only when that passes; a failure opens a fix task the drones take like any work.
 //!
 //! Between iterations the runner reads the board once (`board::fold`) and decides ([`step`]): the
-//! board is finished, the share is spent, a session ended well without naming its cost or at $0 (fail
+//! board is finished, the share is spent or the goal's budget is (every node's spend, [`ledger`]), a session ended well without naming its cost or at $0 (fail
 //! closed: an unmetered harness, or one on a subscription, gets one iteration), two iterations in a row
 //! failed or timed out, two made no board progress, or nothing was open for three polls. An iteration
 //! cut off at `--iter-timeout` without naming its cost is charged an estimate (`Spend::est`: the
@@ -32,14 +32,27 @@
 //! with it (runner.rs `run_bounded`). The next run of the goal makes that good under the lock, before
 //! it counts what is spent ([`recover`]).
 //!
+//! Budget across nodes: `spend.jsonl` syncs over the mesh (mod.rs `SYNCED`), each line naming its node,
+//! so every runner of a goal, on any node, reads the goal's one total ([`ledger`]): a run's share is
+//! what is left of the budget after every node's spend, split over its drones, and every drone stops
+//! once the goal's total reaches the budget, whoever spent it. Runs started at once on two nodes each
+//! split the whole budget (neither saw the other's spend yet); the stop rule bounds what they spend
+//! together: at most the budget plus the iterations in flight when the total reached it, one per drone
+//! (each at most its drone's dollars left, the harness's own cap when it has one, else `--iter-timeout`),
+//! provided each node sees the others' lines before its drones start another iteration (the mesh syncs
+//! more often than an iteration lasts). Each sync period a node lags behind lets each of its drones
+//! start at most one more iteration. A drone name (`d1`) is per node: a drone's own tally and its
+//! earlier iterations are its node's lines only.
+//!
 //! Lines, under `<store>/hive/<goal>/`: `spend.jsonl` (one per iteration, also what a re-run counts
-//! as spent), `runs.jsonl` (one per run), `joins.jsonl` (each iteration's session and worktree, and a
+//! as spent; synced), `runs.jsonl` (one per run), `joins.jsonl` (each iteration's session and worktree, and a
 //! leave of each worktree when the run ends: a later session there, an engineer's review, joins
 //! nothing). `logs/<drone>-<iter>.out` keeps each iteration's output (at most `LOG_CAP`): local
 //! only, never synced. When the drones end, the goal's hidden oracle scores every attempt they had
 //! judged ([`after_run`], hidden.rs) in scratch checkouts under the goal's directory: no oracle file
 //! is ever put into a drone's worktree.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -65,7 +78,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 const LOG_CAP: usize = 1 << 20;
 
 /// What each drone is told (the hooks add its claim and the exact commands); the last sentence is the
-/// inoculation framing (docs/design/hive-learning.md), and names held-out checks only for a goal that
+/// inoculation framing (docs/design/hive.md, L8), and names held-out checks only for a goal that
 /// has them ({decides}, as mod.rs `inoculation`).
 const PROMPT: &str = "You are drone {drone} of hive goal {goal}. Work in this worktree only. \
 borg's hooks show your claim or the next open task with the exact commands: claim one task \
@@ -76,8 +89,11 @@ oracle files) is visible, allowed to happen and useless: {decides}.";
 const DECIDES_HIDDEN: &str = "held-out checks you cannot see decide";
 const DECIDES: &str = "the verifier sees every such change and the task counts as failed";
 
+/// Each iteration's cost, every node's (mod.rs `SYNCED`).
+pub const SPEND_FILE: &str = "spend.jsonl";
+
 pub fn spend_path(home: &Path, goal: &str) -> PathBuf {
-    super::dir(home, goal).join("spend.jsonl")
+    super::dir(home, goal).join(SPEND_FILE)
 }
 
 pub fn runs_path(home: &Path, goal: &str) -> PathBuf {
@@ -90,11 +106,16 @@ fn logs_dir(home: &Path, goal: &str) -> PathBuf {
 
 /// One iteration of one drone: what it cost (None: the harness reported nothing) and how it ended
 /// (`ok`, `timeout`, `error`, or `killed`: its run died, written by the next run, [`recover`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Spend {
     pub v: u8,
     pub ms: i64,
     pub drone: String,
+    /// The node whose runner wrote it (mod.rs `node`): `d1` on two nodes is two drones. Empty on a line
+    /// from before lines named their node, which is this node's: spend did not sync then, and such a
+    /// line never leaves the node (borg-mesh lines.rs `local`: it is never stamped, so never offered).
+    #[serde(default)]
+    pub node: String,
     pub iter: u32,
     pub harness: String,
     pub usd: Option<f64>,
@@ -112,6 +133,41 @@ impl Spend {
     pub fn charged(&self) -> f64 {
         self.usd.or(self.est).unwrap_or(0.0).max(0.0)
     }
+}
+
+impl Spend {
+    /// The node that spent it: its `node`, else `here` (a line from before lines named their node,
+    /// which stays on the node that wrote it).
+    pub fn owner<'a>(&'a self, here: &'a str) -> &'a str {
+        if self.node.is_empty() { here } else { &self.node }
+    }
+}
+
+/// A goal's spend over every node (spend.jsonl syncs): the fold every runner's share and stop rule read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ledger {
+    /// Every node's charges (`Spend::charged`).
+    pub total: f64,
+    /// By node.
+    pub nodes: BTreeMap<String, f64>,
+}
+
+/// The ledger of `lines` read on node `here`: each distinct line once, summed in one fixed order, so
+/// the fold is the same whatever order the mesh delivered the lines in, and a line delivered twice
+/// counts once.
+pub fn ledger(lines: &[Spend], here: &str) -> Ledger {
+    let distinct: BTreeMap<String, &Spend> = lines.iter().map(|s| (serde_json::to_string(s).unwrap_or_default(), s)).collect();
+    let mut l = Ledger::default();
+    for s in distinct.values() {
+        l.total += s.charged();
+        *l.nodes.entry(s.owner(here).to_string()).or_default() += s.charged();
+    }
+    l
+}
+
+/// The ledger of `goal` in `home`.
+pub fn goal_spent(home: &Path, goal: &str) -> Ledger {
+    ledger(&super::read_lines(&spend_path(home, goal)), &super::node(home))
 }
 
 /// One `borg hive run`.
@@ -167,11 +223,12 @@ pub enum Next {
     End(&'static str),
 }
 
-/// What a drone does next: the stop reasons in order, then whether a task is open to it.
-pub fn step(t: &Tally, share: f64, finished: bool, open: bool) -> Next {
+/// What a drone does next: the stop reasons in order, then whether a task is open to it. `left` is what
+/// is left of the goal's budget after every node's spend ([`ledger`]).
+pub fn step(t: &Tally, share: f64, left: f64, finished: bool, open: bool) -> Next {
     if finished {
         Next::End("goal finished")
-    } else if t.spent >= share {
+    } else if t.spent >= share || left <= 0.0 {
         Next::End("budget")
     } else if t.unmetered {
         Next::End("cost not reported")
@@ -224,6 +281,8 @@ struct Ctx<'a> {
     iter_timeout: Duration,
     /// spend.jsonl as the run found it.
     before: &'a [Spend],
+    /// This node's id (mod.rs `node`).
+    here: &'a str,
 }
 
 fn fold(home: &Path, goal: &str) -> Board {
@@ -300,10 +359,10 @@ fn exclude_worktrees(repo: &Path) -> Result<(), String> {
     std::fs::write(&path, format!("{text}{sep}/.worktrees/\n")).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Of the iterations before this run (`lines`), `drone`'s last number and its dearest one's charge (a
-/// timed-out iteration's estimate starts from it).
-fn spent_before(lines: &[Spend], drone: &str) -> (u32, f64) {
-    lines.iter().filter(|s| s.drone == drone).fold((0, 0.0), |(n, dear), s| (n.max(s.iter), dear.max(s.charged())))
+/// Of the iterations before this run (`lines`), the last number and the dearest one's charge of `drone`
+/// of node `here` (a timed-out iteration's estimate starts from it). Another node's d1 is another drone.
+fn spent_before(lines: &[Spend], here: &str, drone: &str) -> (u32, f64) {
+    lines.iter().filter(|s| s.drone == drone && s.owner(here) == here).fold((0, 0.0), |(n, dear), s| (n.max(s.iter), dear.max(s.charged())))
 }
 
 /// Releases what `sessions` still hold on `b` at `now`, with `note`.
@@ -341,18 +400,20 @@ fn estimate(dearest: f64, share: f64, spent: f64) -> f64 {
 /// session still holds on this node is released: the session is dead, and its lease would keep the
 /// task for `LEASE_MS`. A claim made on another node (a peer's d1) is live there and never released.
 fn recover(home: &Path, goal: &str, now: i64) {
+    let here = super::node(home);
     let mut lines: Vec<Spend> = super::read_lines(&spend_path(home, goal));
     let run = super::read_lines::<RunLine>(&runs_path(home, goal)).pop();
     let (since, share) = run.map_or((i64::MAX, 0.0), |r| (r.ms, r.share_usd));
     let named: std::collections::HashSet<String> = lines.iter().flat_map(|s| s.session.split(',').map(String::from)).collect();
     let joins = super::read_lines::<Join>(&super::joins_path(home, goal));
     for j in joins.iter().filter(|j| j.by == "run" && j.ms >= since && !j.session.is_empty() && !named.contains(&j.session)) {
-        let (iter, dearest) = spent_before(&lines, &j.drone);
-        let spent: f64 = lines.iter().filter(|s| s.drone == j.drone && s.ms >= since).map(Spend::charged).sum();
+        let (iter, dearest) = spent_before(&lines, &here, &j.drone);
+        let spent: f64 = lines.iter().filter(|s| s.drone == j.drone && s.owner(&here) == here && s.ms >= since).map(Spend::charged).sum();
         let line = Spend {
             v: 1,
             ms: now,
             drone: j.drone.clone(),
+            node: here.clone(),
             iter: iter + 1,
             harness: j.harness.clone(),
             usd: None,
@@ -388,7 +449,7 @@ fn log(home: &Path, goal: &str, drone: &str, iter: u32, out: &[u8]) {
 fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
     let name = drone_name(n);
     let goal = ctx.g.id.as_str();
-    let (mut iter, dearest) = spent_before(ctx.before, &name);
+    let (mut iter, dearest) = spent_before(ctx.before, ctx.here, &name);
     let mut t = Tally { dearest, ..Tally::default() };
     let mut end = DroneEnd { drone: name.clone(), worktree: wt.to_path_buf(), spent: 0.0, iters: 0, done: Vec::new(), reason: "" };
     let text = prompt(ctx.g, &name, &super::joins_path(ctx.home, goal));
@@ -412,7 +473,10 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             end.spent = t.spent;
             return end;
         }
-        match step(&t, ctx.share, b.finished(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now)) {
+        // The goal's budget left after every node's spend, read before each decision: a peer's lines
+        // arrive between iterations.
+        let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
+        match step(&t, ctx.share, left, b.finished(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now)) {
             Next::End(r) => {
                 end.reason = r;
                 end.spent = t.spent;
@@ -431,7 +495,8 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         iter += 1;
         end.iters += 1;
         let session = session_id(goal, &name, iter);
-        let left = (ctx.share - t.spent).max(0.0);
+        // The harness's own cap: the drone's dollars left, never more than the goal has left.
+        let left = (ctx.share - t.spent).min(left).max(0.0);
         let run = Headless {
             prompt: &text,
             cwd: wt,
@@ -470,6 +535,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             v: 1,
             ms: learn::now_ms(),
             drone: name.clone(),
+            node: ctx.here.to_string(),
             iter,
             harness: ctx.h.name().into(),
             usd: said.usd,
@@ -492,7 +558,8 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         t.stalls = if mine.is_empty() { t.stalls + 1 } else { 0 };
         let b = board::fold(&events);
-        let note = match step(&t, ctx.share, b.finished(), true) {
+        let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
+        let note = match step(&t, ctx.share, left, b.finished(), true) {
             Next::End(r) => r,
             _ => "iteration ended",
         };
@@ -500,7 +567,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
     }
 }
 
-/// The reward (docs/design/hive-learning.md "Reward"): the hidden oracle scores every judged attempt
+/// The reward (docs/design/hive.md "Reward"): the hidden oracle scores every judged attempt
 /// not scored yet, outside every worktree, once the drones ended (scoring between iterations would
 /// have the drones' threads race for one attempt). Nothing without a hidden oracle.
 fn after_run(home: &Path, g: &Goal, repo: &Path) {
@@ -524,6 +591,14 @@ fn run_lock(home: &Path, goal: &str) -> Result<Option<std::fs::File>, String> {
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// The ledger by node, this node first as `here`, each other by its id's first 8 characters
+/// (`here $0.40, 1a2b3c4d $0.35`); `nothing` when no line was written.
+fn spent_by(l: &Ledger, here: &str) -> String {
+    let mut parts: Vec<String> = l.nodes.get(here).map(|u| format!("here ${u:.2}")).into_iter().collect();
+    parts.extend(l.nodes.iter().filter(|(n, _)| n.as_str() != here).map(|(n, u)| format!("{} ${u:.2}", &n[..n.len().min(8)])));
+    if parts.is_empty() { "nothing".into() } else { parts.join(", ") }
 }
 
 /// Leaves of the run's worktrees, once its drones ended: a later session there (an engineer reviewing
@@ -623,8 +698,11 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         }
     }
     let before: Vec<Spend> = super::read_lines(&spend_path(home, &g.id));
-    let spent: f64 = before.iter().map(Spend::charged).sum();
-    // What is left of the goal's budget, after every earlier run's spend, shared by this run's drones.
+    let here = super::node(home);
+    let book = ledger(&before, &here);
+    let spent = book.total;
+    // What is left of the goal's budget, after every earlier run's spend on every node, shared by this
+    // run's drones.
     let share = (g.budget_usd - spent).max(0.0) / o.drones as f64;
     let paths: Vec<PathBuf> = (1..=o.drones).map(|n| worktree(&repo, &g.id, n)).collect();
     if o.dry_run {
@@ -633,9 +711,11 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
             println!("  {}  {}  branch {} from {}", drone_name(n + 1), p.display(), branch(&g.id, n + 1), o.base);
         }
         println!(
-            "  each drone: ${share:.2} of ${:.2} left of ${:.2}; every iteration within {}s",
+            "  each drone: ${share:.2} of ${:.2} left of ${:.2} ({} spent on {} node(s)); every iteration within {}s",
             (g.budget_usd - spent).max(0.0),
             g.budget_usd,
+            spent_by(&book, &here),
+            book.nodes.len(),
             o.iter_timeout.as_secs()
         );
         println!("  harness {}: {sample:?}", o.harness.name());
@@ -669,7 +749,8 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         eprintln!("borg hive run: {e}");
         return 1;
     }
-    let ctx = Ctx { home, g: &g, h: o.harness, root: &repo, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before };
+    let ctx =
+        Ctx { home, g: &g, h: o.harness, root: &repo, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before, here: &here };
     let ends: Vec<DroneEnd> = std::thread::scope(|s| {
         let handles: Vec<_> = wts
             .iter()
@@ -690,6 +771,8 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         let done = if e.done.is_empty() { "-".to_string() } else { e.done.join(",") };
         println!("{}  {name}  ${:.2}/${share:.2}  {} iter  tasks done: {done}  end: {}", e.drone, e.spent, e.iters, e.reason);
     }
+    let total = goal_spent(home, &g.id);
+    println!("goal {}: ${:.2} of ${:.2} spent ({})", g.id, total.total, g.budget_usd, spent_by(&total, &here));
     let b = fold(home, &g.id);
     let now = learn::now_ms();
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -727,18 +810,64 @@ mod tests {
     #[test]
     fn every_stop_reason_comes_from_the_tally() {
         let t = |spent: f64, idle: u32, errors: u32, stalls: u32, unmetered: bool| Tally { spent, idle, errors, stalls, unmetered, dearest: 0.0 };
-        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, false, true), Next::Go);
-        assert_eq!(step(&t(0.5, 0, 0, 0, false), 1.0, true, true), Next::End("goal finished"), "finished first");
-        assert_eq!(step(&t(1.0, 0, 0, 0, false), 1.0, false, true), Next::End("budget"));
-        assert_eq!(step(&t(1.2, 0, 2, 2, true), 1.0, false, true), Next::End("budget"), "budget before the guards");
-        assert_eq!(step(&t(0.0, 0, 0, 0, true), 1.0, false, true), Next::End("cost not reported"));
-        assert_eq!(step(&t(0.0, 0, 1, 0, false), 1.0, false, true), Next::Go, "one failure is retried");
-        assert_eq!(step(&t(0.0, 0, 2, 0, false), 1.0, false, true), Next::End("errors"));
-        assert_eq!(step(&t(0.0, 0, 0, 2, false), 1.0, false, true), Next::End("stalled"));
-        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, false, false), Next::Wait);
-        assert_eq!(step(&t(0.0, 2, 0, 0, false), 1.0, false, false), Next::Wait);
-        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, false, false), Next::End("nothing to do"));
-        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, false, true), Next::Go, "an open task resets the wait");
+        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, 1.0, false, true), Next::Go);
+        assert_eq!(step(&t(0.5, 0, 0, 0, false), 1.0, 1.0, true, true), Next::End("goal finished"), "finished first");
+        assert_eq!(step(&t(1.0, 0, 0, 0, false), 1.0, 1.0, false, true), Next::End("budget"));
+        assert_eq!(step(&t(1.2, 0, 2, 2, true), 1.0, 1.0, false, true), Next::End("budget"), "budget before the guards");
+        assert_eq!(step(&t(0.0, 0, 0, 0, true), 1.0, 1.0, false, true), Next::End("cost not reported"));
+        assert_eq!(step(&t(0.0, 0, 1, 0, false), 1.0, 1.0, false, true), Next::Go, "one failure is retried");
+        assert_eq!(step(&t(0.0, 0, 2, 0, false), 1.0, 1.0, false, true), Next::End("errors"));
+        assert_eq!(step(&t(0.0, 0, 0, 2, false), 1.0, 1.0, false, true), Next::End("stalled"));
+        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, 1.0, false, false), Next::Wait);
+        assert_eq!(step(&t(0.0, 2, 0, 0, false), 1.0, 1.0, false, false), Next::Wait);
+        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, 1.0, false, false), Next::End("nothing to do"));
+        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, 1.0, false, true), Next::Go, "an open task resets the wait");
+        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, 0.0, false, true), Next::End("budget"), "another node spent the rest of the goal's budget");
+        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, -0.3, false, true), Next::End("budget"));
+        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, 0.01, false, true), Next::Go);
+    }
+
+    fn spend(node: &str, drone: &str, iter: u32, usd: f64) -> Spend {
+        Spend {
+            v: 1,
+            ms: iter as i64,
+            drone: drone.into(),
+            node: node.into(),
+            iter,
+            harness: "x".into(),
+            usd: Some(usd),
+            exit: "ok".into(),
+            ..Spend::default()
+        }
+    }
+
+    #[test]
+    fn the_ledger_folds_every_nodes_lines_once_in_any_order() {
+        let lines = vec![spend("a", "d1", 1, 0.1), spend("b", "d1", 1, 0.2), spend("", "d2", 1, 0.3), spend("a", "d1", 2, 0.7), spend("b", "d1", 2, 1e-17)];
+        let l = ledger(&lines, "a");
+        assert_eq!(l.nodes.keys().collect::<Vec<_>>(), ["a", "b"], "a line without a node is this node's");
+        assert!((l.total - 1.3).abs() < 1e-12 && (l.nodes["a"] - 1.1).abs() < 1e-12 && (l.nodes["b"] - 0.2).abs() < 1e-12, "{l:?}");
+        // Order-independent to the bit, and a line delivered twice counts once.
+        let mut rev = lines.clone();
+        rev.reverse();
+        assert_eq!(ledger(&rev, "a"), l);
+        let mut rot = lines.clone();
+        rot.rotate_left(2);
+        rot.extend(lines.iter().take(3).cloned());
+        assert_eq!(ledger(&rot, "a"), l);
+        // Read on b, the old line without a node is b's.
+        assert!((ledger(&lines, "b").nodes["b"] - 0.5).abs() < 1e-12);
+        assert_eq!(ledger(&[], "a"), Ledger::default());
+        assert_eq!(spent_by(&l, "a"), "here $1.10, b $0.20");
+        assert_eq!(spent_by(&ledger(&[spend("0123456789ab", "d1", 1, 0.25)], "a"), "a"), "01234567 $0.25");
+        assert_eq!(spent_by(&Ledger::default(), "a"), "nothing");
+    }
+
+    #[test]
+    fn a_drones_earlier_iterations_are_its_nodes_only() {
+        let lines = vec![spend("a", "d1", 1, 0.1), spend("b", "d1", 5, 0.9), spend("", "d1", 2, 0.2)];
+        assert_eq!(spent_before(&lines, "a", "d1"), (2, 0.2), "b's d1 is another drone");
+        assert_eq!(spent_before(&lines, "b", "d1"), (5, 0.9));
     }
 
     #[test]
@@ -775,6 +904,7 @@ mod tests {
             v: 1,
             ms: 1,
             drone: "d1".into(),
+            node: String::new(),
             iter: 1,
             harness: "x".into(),
             usd,
@@ -783,7 +913,7 @@ mod tests {
             exit: "ok".into(),
         };
         assert_eq!((line(Some(0.4), Some(9.0)).charged(), line(None, Some(0.4)).charged(), line(None, None).charged()), (0.4, 0.4, 0.0));
-        assert_eq!(spent_before(&[line(Some(0.2), None), line(None, Some(0.7)), line(Some(0.1), None)], "d1"), (1, 0.7));
+        assert_eq!(spent_before(&[line(Some(0.2), None), line(None, Some(0.7)), line(Some(0.1), None)], "n", "d1"), (1, 0.7));
     }
 
     #[test]

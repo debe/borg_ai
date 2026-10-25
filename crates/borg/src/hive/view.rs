@@ -145,12 +145,16 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let runs: Vec<RunLine> = super::read_lines(&super::run::runs_path(home, id));
     let (share, since) = runs.last().map_or((0.0, i64::MIN), |r| (r.share_usd, r.ms));
     let mut drones: BTreeMap<String, DroneSpend> = BTreeMap::new();
-    // A drone's row is its latest run's: its share is of what that run found left.
-    for s in spend.iter().filter(|s| s.ms >= since) {
-        let d = drones.entry(s.drone.clone()).or_insert_with(|| DroneSpend {
-            drone: s.drone.clone(),
+    // A drone's row is its latest run's: its share is of what that run found left. spend.jsonl syncs
+    // (run.rs `ledger`): another node's drone is named `d1@<its node>`, with all of its lines and no
+    // share (its runs stay on its node).
+    for s in spend.iter().filter(|s| s.owner(&here) != here || s.ms >= since) {
+        let local = s.owner(&here) == here;
+        let name = if local { s.drone.clone() } else { format!("{}@{}", s.drone, shown(&s.node)) };
+        let d = drones.entry(name.clone()).or_insert_with(|| DroneSpend {
+            drone: name,
             usd: 0.0,
-            share,
+            share: if local { share } else { 0.0 },
             iters: 0,
             last_exit: String::new(),
             unmetered: false,
@@ -188,7 +192,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
         budget_usd: g.budget_usd,
-        spent_usd: spend.iter().map(Spend::charged).sum(),
+        spent_usd: super::run::ledger(&spend, &here).total,
         tasks,
         claims,
         contracts,
@@ -373,11 +377,39 @@ mod tests {
         board::append(&path, &[Event::new(Ev::Claim, "t1", "sess-one-1234", 1_000).with_drone("d1")]).unwrap();
         let spend = super::super::run::spend_path(home, "g");
         for (d, usd, exit) in [("d1", Some(0.5), "ok"), ("d2", None, "error"), ("d1", Some(0.25), "timeout")] {
-            let line = Spend { v: 1, ms: 2, drone: d.into(), iter: 1, harness: "x".into(), usd, est: None, session: String::new(), exit: exit.into() };
+            let line = Spend { v: 1, ms: 2, drone: d.into(), iter: 1, harness: "x".into(), usd, exit: exit.into(), ..Spend::default() };
             super::super::append_line(&spend, &line).unwrap();
         }
         let run = RunLine { v: 1, ms: 1, drones: 2, harness: "x".into(), share_usd: 1.5, base: "HEAD".into() };
         super::super::append_line(&super::super::run::runs_path(home, "g"), &run).unwrap();
+    }
+
+    #[test]
+    fn another_nodes_drones_count_against_the_goal_under_their_node() {
+        let home = temp("remote-spend");
+        seed(&home);
+        let here = super::super::node(&home);
+        let spend = super::super::run::spend_path(&home, "g");
+        // Another node's d1, synced, with an older ms than this node's run: all its lines count.
+        let remote = Spend {
+            v: 1,
+            ms: 0,
+            drone: "d1".into(),
+            node: "0123456789abcdef".into(),
+            iter: 1,
+            harness: "x".into(),
+            usd: Some(1.0),
+            exit: "ok".into(),
+            ..Spend::default()
+        };
+        super::super::append_line(&spend, &remote).unwrap();
+        let mine = Spend { node: here, ms: 3, iter: 2, usd: Some(0.25), ..remote.clone() };
+        super::super::append_line(&spend, &mine).unwrap();
+        let v = of(&home, "g", 61_000).unwrap();
+        assert!((v.spent_usd - 2.0).abs() < 1e-12, "{}", v.spent_usd);
+        let rows: Vec<(&str, f64, f64, u32)> = v.drones.iter().map(|d| (d.drone.as_str(), d.usd, d.share, d.iters)).collect();
+        assert_eq!(rows, [("d1", 1.0, 1.5, 3), ("d2", 0.0, 1.5, 1), ("d1@01234567", 1.0, 0.0, 1)]);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

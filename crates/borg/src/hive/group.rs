@@ -1,5 +1,5 @@
 //! Groups: one task attempted K times by different drones, the hive's group of rollouts
-//! (docs/design/hive-learning.md "Group-relative advantage", step 4; arm F's best-of-N).
+//! (docs/design/hive.md "Group-relative advantage", L4; arm F's best-of-N).
 //!
 //! `borg hive open <goal> --id T --group K` opens K work tasks `T.g1`..`T.gK`, each a copy of T with
 //! `group: T` (board.rs `Task::group`). Each is an ordinary task (claim, done, verify, rework), with

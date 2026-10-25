@@ -77,12 +77,13 @@ pub fn append(home: &Path, records: &[Origin]) -> Result<(), String> {
 }
 
 /// Stamps every line of `logs` that has no record yet as this node's, at `now`; returns how many.
+/// A line that stays on this node (`lines::local`) is never stamped, so never offered.
 pub fn stamp(home: &Path, me: &Identity, logs: &[PathBuf], now: i64) -> Result<usize, String> {
     let mut known: std::collections::HashSet<Hash> = load(home).into_keys().collect();
     let mut new = Vec::new();
     for log in logs {
-        for h in lines::read(log).into_keys() {
-            if known.insert(h) {
+        for (h, line) in lines::read(log) {
+            if !lines::local(log, &line) && known.insert(h) {
                 new.push(Origin::new(me, &h, now));
             }
         }
@@ -207,6 +208,15 @@ mod tests {
         std::fs::write(&log, "{\"a\":1}\n{\"b\":2}\n").unwrap();
         assert_eq!(stamp(&home, &me, std::slice::from_ref(&log), 7).unwrap(), 2);
         assert_eq!(stamp(&home, &me, &[log], 8).unwrap(), 0, "stamped once");
+        // A goal's spend line that names no node is from before spend synced: it stays here.
+        let spend = home.join("hive/g/spend.jsonl");
+        std::fs::create_dir_all(spend.parent().unwrap()).unwrap();
+        std::fs::write(
+            &spend,
+            "{\"drone\":\"d1\",\"usd\":1.0}\n{\"drone\":\"d1\",\"node\":\"\",\"usd\":2.0}\n{\"drone\":\"d1\",\"node\":\"n1\",\"usd\":3.0}\n",
+        )
+        .unwrap();
+        assert_eq!(stamp(&home, &me, &[spend], 9).unwrap(), 1, "only the line that names its node");
         let _ = std::fs::remove_dir_all(&home);
     }
 

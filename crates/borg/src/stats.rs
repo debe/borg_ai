@@ -47,7 +47,8 @@ pub const CORRECTION: &str = "correction";
 /// The engineer said no (`borg no`, veto.rs): `lessons` the lessons shown so far (credited `vetoed`),
 /// `n` their number, `why` `cli`, `prompt` or `mesh`, `text` the reason.
 pub const VETO: &str = "veto";
-/// `borg learn` merged a veto into a lesson an earlier veto made: the same "no" said twice.
+/// `borg learn` merged a veto into a lesson an earlier veto made: the same "no" said twice, dated when
+/// that veto was said (its episode's ms), so it falls in the week of its own `veto`.
 pub const VETO_REPEAT: &str = "veto_repeat";
 /// A lesson written (`why`: its source, session/import/queen/veto) or merged into an existing one.
 pub const LESSON_NEW: &str = "lesson_new";
@@ -282,6 +283,18 @@ pub fn events(home: &Path) -> Vec<Event> {
     all
 }
 
+/// The live events only (stats/events.jsonl), without the derived history.
+pub fn live(home: &Path) -> Vec<Event> {
+    read_events(&events_path(home))
+}
+
+/// When live counting began in `home`: its first live event (None: none yet). A repeated veto is
+/// dated when it was said, earlier than its line, so it never marks the start. What `backfill`
+/// derives is before it; a series backfill cannot derive (merges, repeated vetoes) is unknown there.
+pub fn live_since(home: &Path) -> Option<i64> {
+    live(home).iter().filter(|e| e.kind != VETO_REPEAT).map(|e| e.ms).min()
+}
+
 pub fn backfill_path(home: &Path) -> PathBuf {
     home.join("stats").join("backfill.jsonl")
 }
@@ -300,7 +313,7 @@ pub fn backfill(home: &Path) -> usize {
     if path.exists() {
         return 0;
     }
-    let cutoff = read_events(&events_path(home)).iter().map(|e| e.ms).min().unwrap_or_else(crate::learn::now_ms);
+    let cutoff = live_since(home).unwrap_or_else(crate::learn::now_ms);
     let mut out = derive_history(home);
     out.retain(|e| e.ms > 0 && e.ms < cutoff);
     out.sort_by_key(|e| e.ms);

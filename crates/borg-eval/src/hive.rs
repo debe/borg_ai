@@ -1,5 +1,5 @@
-//! `borg-eval hive`: the hive pilot's harness (docs/design/collective.md "Proof protocol" and steps
-//! 2–3; the pre-registered rule is in tasks/todo.md "Hive pilot"). It measures the rule, it does not
+//! `borg-eval hive`: the hive pilot's harness (docs/design/hive.md "The hive against one session" and
+//! C2–C3; the pre-registered rule is in tasks/todo.md "Hive pilot"). It measures the rule, it does not
 //! change it: arms A, B, D3 and F, 3 seeds per cell; H1 holds on a workload iff D3's median wall-clock
 //! ≤ 0.8 × B's AND D3's mean hidden solve share ≥ B's − 1/K.
 //!
@@ -1058,12 +1058,20 @@ fn session_cost(result: Option<&Value>, stream: &str, budget: f64) -> Cost {
     Cost { usd, complete: usd.is_some(), reported: usd.unwrap_or(0.0), charged: usd.unwrap_or(budget), tokens, turns, models }
 }
 
+/// The lines of a goal's `spend.jsonl`, of node `node` only when one is named: the file syncs (borg
+/// hive/run.rs `ledger`), so each node of arm E holds every node's lines (a line naming no node is the
+/// reading node's).
+fn spend_of(path: &Path, node: Option<&str>) -> Vec<hive_run::Spend> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let all = text.lines().filter_map(|l| serde_json::from_str::<hive_run::Spend>(l).ok());
+    all.filter(|s| node.is_none_or(|n| s.node.is_empty() || s.node == n)).collect()
+}
+
 /// D3: the dollars `spend.jsonl` charges (`Spend::charged`: the cost, else a timed-out iteration's
 /// estimate), the dollars its lines reported, whether every line named its cost, and the number of
-/// iterations.
-fn d3_spend(path: &Path) -> (f64, f64, bool, usize) {
-    let lines: Vec<hive_run::Spend> =
-        fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<hive_run::Spend>(l).ok()).collect();
+/// iterations; of node `node`'s lines only when one is named (`spend_lines`).
+fn d3_spend(path: &Path, node: Option<&str>) -> (f64, f64, bool, usize) {
+    let lines = spend_of(path, node);
     (lines.iter().map(hive_run::Spend::charged).sum(), lines.iter().filter_map(|s| s.usd).sum(), lines.iter().all(|s| s.usd.is_some()), lines.len())
 }
 
@@ -1089,10 +1097,10 @@ fn d3_tokens(logs: &Path) -> (Tokens, Vec<String>) {
 /// got a spend.jsonl line: each iteration the runner started (a `by: "run"` line in joins.jsonl) whose
 /// session no spend line names. Each was launched with its drone's dollars left (`--max-budget-usd`),
 /// so it is charged that: the run's share (runs.jsonl, else `share`) less what the drone's lines
-/// charge. Returns (dollars, the drones cut off).
-fn d3_unreported(gdir: &Path, share: f64) -> (f64, Vec<String>) {
-    let lines: Vec<hive_run::Spend> =
-        fs::read_to_string(gdir.join("spend.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+/// charge. Joins and runs are node `node`'s (they never sync), and so are the drones' lines counted
+/// (another node's d1 is another drone). Returns (dollars, the drones cut off).
+fn d3_unreported(gdir: &Path, share: f64, node: Option<&str>) -> (f64, Vec<String>) {
+    let lines = spend_of(&gdir.join("spend.jsonl"), node);
     let seen: BTreeSet<&str> = lines.iter().flat_map(|s| s.session.split(',')).filter(|s| !s.is_empty()).collect();
     let values =
         |f: &str| -> Vec<Value> { fs::read_to_string(gdir.join(f)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
@@ -1178,8 +1186,11 @@ impl Arm {
     }
 
     /// The dollars a cell of this arm may spend at most, which `--stop-at-usd` reserves before it starts:
-    /// its cap, and for arm E each node's: every node's runner splits the goal's budget from its own
-    /// spend (borg hive/run.rs; spend.jsonl does not sync), so the two may spend the cap each.
+    /// its cap, and for arm E each node's. spend.jsonl syncs and every drone stops once the goal's total
+    /// over both nodes reaches the cap (borg hive/run.rs `ledger`), so a cell spends at most the cap plus
+    /// the iterations in flight then, one per drone, each at most its drone's share left. The two runs
+    /// start at once and each splits the whole cap (neither has seen the other's spend), so those shares
+    /// sum to the cap per node: the worst case is still each node's cap.
     fn reserve(self, cap: f64) -> f64 {
         match self {
             Arm::E => cap * arm_e::NODES.len() as f64,
@@ -1788,8 +1799,8 @@ fn arm_d3(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json:
     // Dollars, tokens and wall first: known now, and nothing below may lose them.
     let gdir = borg::collective::store(&root, hive_seq::COLLECTIVE).join("hive").join(&o.goal);
     let timed_out = code == 124 || code == 137;
-    let (charged, reported, all_named, iterations) = d3_spend(&gdir.join("spend.jsonl"));
-    let (cut_usd, cut) = d3_unreported(&gdir, o.cap / DRONES as f64);
+    let (charged, reported, all_named, iterations) = d3_spend(&gdir.join("spend.jsonl"), None);
+    let (cut_usd, cut) = d3_unreported(&gdir, o.cap / DRONES as f64, None);
     let (tokens, models) = d3_tokens(&gdir.join("logs"));
     let complete = all_named && cut.is_empty() && !timed_out;
     let total = charged + cut_usd;
@@ -3010,8 +3021,15 @@ mod tests {
             json!({"v": 1, "ms": 1, "drone": "d1", "iter": 1, "harness": "claude", "usd": usd, "est": est, "session": "s", "exit": exit}).to_string()
         };
         fs::write(root.join("spend.jsonl"), [line(Some(0.5), None, "ok"), line(None, Some(0.7), "timeout"), line(Some(0.25), None, "ok")].join("\n")).unwrap();
-        let (charged, reported, all_named, n) = d3_spend(&root.join("spend.jsonl"));
+        let (charged, reported, all_named, n) = d3_spend(&root.join("spend.jsonl"), None);
         assert!((charged - 1.45).abs() < 1e-12 && (reported - 0.75).abs() < 1e-12 && !all_named && n == 3);
+        // Arm E: the synced file holds both nodes' lines; each node's dollars are its own lines only.
+        let on = |node: &str, usd: f64| {
+            json!({"v": 1, "ms": 1, "drone": "d1", "node": node, "iter": 1, "harness": "sim", "usd": usd, "session": node, "exit": "ok"}).to_string()
+        };
+        fs::write(root.join("both.jsonl"), [on("na", 0.5), on("nb", 0.25), line(Some(0.125), None, "ok")].join("\n")).unwrap();
+        let both = root.join("both.jsonl");
+        assert_eq!((d3_spend(&both, Some("na")).0, d3_spend(&both, Some("nb")).0, d3_spend(&both, None).0), (0.625, 0.375, 0.875));
         fs::create_dir_all(root.join("logs")).unwrap();
         fs::write(root.join("logs/d1-1.out"), r.to_string()).unwrap();
         fs::write(root.join("logs/d2-1.out"), json!({"total_cost_usd": 0.1, "usage": {"input_tokens": 100, "output_tokens": 1}}).to_string()).unwrap();
@@ -3132,11 +3150,11 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("runs.jsonl"), json!({"v": 1, "ms": 1, "drones": 3, "harness": "claude", "share_usd": 2.0, "base": "b"}).to_string()).unwrap();
-        let (usd, cut) = d3_unreported(&root, 9.0);
+        let (usd, cut) = d3_unreported(&root, 9.0, None);
         assert_eq!(cut, ["d1", "d2"]);
         assert!((usd - (0.6 + 2.0)).abs() < 1e-9, "each at its drone's dollars left: {usd}");
         let _ = fs::remove_file(root.join("runs.jsonl"));
-        assert!((d3_unreported(&root, 1.0).0 - 1.0).abs() < 1e-9, "no runs line: the cap's share, d1 past it");
+        assert!((d3_unreported(&root, 1.0, None).0 - 1.0).abs() < 1e-9, "no runs line: the cap's share, d1 past it");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3371,8 +3389,8 @@ mod tests {
         let _ = fs::remove_dir_all(run.parent().unwrap());
     }
 
-    /// Arm E may spend its cap on each node: `--stop-at-usd` reserves twice the cap for it, and a cell of
-    /// it that died before its row counts that reserve.
+    /// Arm E may spend its cap on each node in the worst case (its runs' in-flight iterations): `--stop-at-usd`
+    /// reserves twice the cap for it, and a cell of it that died before its row counts that reserve.
     #[test]
     fn an_arm_e_cell_reserves_each_nodes_cap_under_stop_at() {
         assert_eq!((Arm::E.reserve(15.0), Arm::D3.reserve(15.0)), (30.0, 15.0));

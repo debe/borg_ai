@@ -1,5 +1,5 @@
 //! The hidden oracle: held-out checks no drone sees (goal.json `hidden`, kept outside every repo and
-//! worktree), run after a verdict on the work as it was at its `done` (docs/design/hive-learning.md
+//! worktree), run after a verdict on the work as it was at its `done` (docs/design/hive.md
 //! "Reward"). Its score decides what a pass or a reject credits (verdict.rs `settle`): a pass of the
 //! hidden checks is `verified`, a failure `rejected`, whatever the verifier said; `agree` logs whether
 //! the verifier said the same (for crediting verifiers later, deferred).

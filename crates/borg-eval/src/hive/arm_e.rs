@@ -1,4 +1,4 @@
-//! Arm E on one machine (tasks/todo.md "Arm E on one machine", docs/design/collective.md step 4): the
+//! Arm E on one machine (tasks/todo.md "Arm E on one machine", docs/design/hive.md C4): the
 //! hive across two nodes, without a second machine. Two sandbox HOMEs A and B, each a store of its own
 //! (its own node id and mesh key), both members of one team collective; each node's workspace is a
 //! `--no-local` clone of one bare remote, so their object stores are separate and an attempt's commits
@@ -28,10 +28,14 @@
 //! those whose session still wrote its done (double work a lost race hides from the holder count);
 //! the pump's rounds, failed rounds and lines moved.
 //!
-//! Budget: a goal's budget is split over the drones of each run from that node's own `spend.jsonl`,
-//! which does not sync; each node's runner may spend the whole budget, so a cell may spend twice its
-//! cap. The row counts both nodes' dollars against the cap (`over_cap`), and `--stop-at-usd` reserves
-//! twice the cap for the cell (`Arm::reserve`).
+//! Budget: `spend.jsonl` syncs (borg hive/run.rs `ledger`, `borg/mesh/10`), each line naming its node, so
+//! both runners read the goal's one total and every drone stops once it reaches the cap. The bound: the
+//! cap plus the iterations in flight when the total reached it, at most one per drone (three here),
+//! each at most its drone's share left, while the pump syncs faster than an iteration lasts (every
+//! [`SYNC_EVERY`]). Both runs start at once and each splits the whole cap (neither has seen the
+//! other's spend yet), so in the worst case those in-flight iterations still sum to a cap per node:
+//! `--stop-at-usd` keeps reserving twice the cap for the cell (`Arm::reserve`). The row counts both
+//! nodes' dollars against the cap (`over_cap`), each node's from its own lines of the synced file.
 
 use super::*;
 use borg_mesh::identity::Identity;
@@ -516,8 +520,8 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let (mut cut_all, mut ends_all, mut spend_lines) = (serde_json::Map::new(), serde_json::Map::new(), 0usize);
     for (s, r) in sides.iter().zip(&ran) {
         let gdir = s.gdir(&o.goal);
-        let (c, rep, named, iters) = d3_spend(&gdir.join("spend.jsonl"));
-        let (cu, cut) = d3_unreported(&gdir, o.cap / s.drones as f64);
+        let (c, rep, named, iters) = d3_spend(&gdir.join("spend.jsonl"), Some(&s.id));
+        let (cu, cut) = d3_unreported(&gdir, o.cap / s.drones as f64, Some(&s.id));
         let (tk, ms) = d3_tokens(&gdir.join("logs"));
         charged += c;
         reported += rep;
@@ -526,7 +530,7 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
         cut_usd += cu;
         tokens.add(tk);
         models.extend(ms);
-        spend_lines += fs::read_to_string(gdir.join("spend.jsonl")).unwrap_or_default().lines().count();
+        spend_lines += iters;
         let ends: Vec<&str> = r.out.lines().filter(|l| l.starts_with('d') && l.contains(" end: ")).collect();
         ends_all.insert(s.name.into(), json!(ends));
         per_node.insert(s.name.into(), json!({"exit": r.code, "wall_s": r.wall, "charged_usd": c + cu, "iterations": iters, "cut_off_drones": cut}));

@@ -1,4 +1,4 @@
-//! Rework episodes: the hive's own lesson source (docs/design/hive-learning.md step 4, "Rework").
+//! Rework episodes: the hive's own lesson source (docs/design/hive.md L4, "rework episodes").
 //!
 //! A work task whose attempt the verifier rejected and whose later attempt was verified holds a
 //! mistake a verifier caught and the fix that passed. That pair becomes one episode of kind [`KIND`]

@@ -1,5 +1,5 @@
-//! L1 playbooks: the team's procedure for a kind of task (docs/design/hive-learning.md "Learning in
-//! four layers", step 5). Where a lesson is one question, a playbook is a short list of steps for a task
+//! L1 playbooks: the team's procedure for a kind of task (docs/design/hive.md "Learning in
+//! four layers", L5). Where a lesson is one question, a playbook is a short list of steps for a task
 //! shape ("add a database migration with a backfill"), learned from verified hive work.
 //!
 //! **Store.** `playbooks.jsonl` (`FILE`) in the collective's store holds edits, never whole playbooks

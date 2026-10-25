@@ -1,5 +1,5 @@
 //! The guard: what a hive drone does to tests, CI and the oracle's files, flagged as it happens
-//! (docs/design/hive-learning.md "Guardrails against reward hacking"). Flag only: measure, don't block.
+//! (docs/design/hive.md "Guardrails against reward hacking"). Flag only: measure, don't block.
 //!
 //! At every tool call of a session in a hive goal ([`pre_tool`]), the paths the call writes (an edit
 //! tool's files; the targets of a shell command's redirects, `sed -i`, `rm`, `mv`, `cp`, `tee`, ...)

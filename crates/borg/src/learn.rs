@@ -670,7 +670,7 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
 }
 
 /// The share of a regret's strength that reaches the drone that verified the regretted work
-/// (design-chosen, to be tuned by hive-learning.md step 6): it passed the work, it did not decide it.
+/// (design-chosen, to be tuned by hive.md L6): it passed the work, it did not decide it.
 pub const VERIFIER_REGRET: f64 = 0.5;
 
 /// An episode the hive made, a group's reflection or a rework: no session of its own, no correction.
@@ -796,7 +796,10 @@ fn learn_unlocked(
                     // The same "no" said twice: merged into a lesson an earlier veto made (H5b's numerator).
                     let earlier = library.iter().find(|x| x.id == l.id);
                     if l.version > 1 && earlier.is_some_and(|o| o.episodes.iter().any(|id| id != &e.id && vetoes.contains(id))) {
+                        // Dated when the engineer said it, the week of its own `veto`, not when it was
+                        // learned: a weekly share of repeated vetoes pairs counts of the same no's.
                         crate::stats::count(&counted_in, crate::stats::VETO_REPEAT, &e.session, |ev| {
+                            ev.ms = if e.ms > 0 { e.ms } else { ev.ms };
                             ev.engineer = e.engineer.clone();
                             ev.repo = e.repo.clone();
                             ev.lessons = vec![l.id.clone()];
@@ -1100,6 +1103,7 @@ mod tests {
         assert_eq!(repeats(&home), 1);
         let r = crate::stats::events(&home).into_iter().find(|e| e.kind == crate::stats::VETO_REPEAT).unwrap();
         assert_eq!((r.session.as_str(), r.lessons.clone()), ("s2", vec!["Le0".to_string()]));
+        assert_eq!(r.ms, 4, "dated when the veto was said, the week of its own veto");
         let _ = std::fs::remove_dir_all(home);
     }
 

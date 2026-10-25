@@ -1,12 +1,12 @@
-//! Plan approval and intent cards (docs/design/collective.md "The engineer's role", step 1;
-//! hive-learning.md 7b): the engineer approves a goal's plan once, through the queen, before
+//! Plan approval and intent cards (docs/design/hive.md "The engineer's role", C1;
+//! L7b): the engineer approves a goal's plan once, through the queen, before
 //! `borg hive run` starts a drone, and a task the plan marks high-risk escalates once when it is claimed.
 //!
 //! - **Intent cards** ([`cards`]): one per work or plan task (a fix task an integration opened is the
 //!   approved scope's, never a card): its intent (the title, redacted when it was written), files,
 //!   deps, checks and a risk class. `high` when the queen's classifier (queen.rs `classify`, the four
 //!   checkpoint kinds, deterministic, 0 tokens) finds a high-consequence move in the title: the card
-//!   names the kind. `low` when every file in scope is docs or tests (collective.md's auto-approved
+//!   names the kind. `low` when every file in scope is docs or tests (hive.md's auto-approved
 //!   class). `normal` otherwise. Only `high` routes anything; `low` and `normal` are shown.
 //! - **The plan question** ([`gate`]): `borg hive run` raises one `Kind::Plan` queen question whose
 //!   payload holds the cards, keyed by the goal and the cards ([`key`]), and waits: the engineer answers

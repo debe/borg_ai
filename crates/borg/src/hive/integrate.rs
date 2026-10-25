@@ -1,5 +1,5 @@
 //! Integration: the combined tree of a goal's accepted work, checked by the oracle before the goal counts
-//! as reached (docs/design/collective.md "Board", "Roles"). An `integrate` task is an ordinary board task
+//! as reached (docs/design/hive.md "Board", "Roles"). An `integrate` task is an ordinary board task
 //! (open, claim, lease, verdict), run in process by `borg hive run`'s drone threads or by `borg hive
 //! integrate`, never by a model session (mod.rs `may_claim`): the work is mechanical, a suite outlasts
 //! any stop hook, and a model would judge a tree it did not build.
@@ -18,13 +18,15 @@
 //! a hook: a drone can plant one in the shared `.git/hooks`.
 //!
 //! The verdict: a conflict no later attempt resolves (one built on the tree with its markers, a fix
-//! task's, that changes the path) is `rejected` at once; else the goal's oracle and
+//! task's, that changes the path or holds it without markers) is `rejected` at once; else the goal's oracle and
 //! every integrated task's own checks run in a scratch worktree (`<goal>/integrate/<task>`, hidden.rs
 //! `with_checkout`) while a thread renews the lease: all pass, `verified`; one fails, `rejected`. A
 //! rejection opens the fix task `<integrate task>.fix` in the same write, which starts `from` the
 //! combined tree (mod.rs `claim` resets a runner worktree to it; any other session claims it in a
 //! checkout of it, `git worktree add <dir> <commit>`); its accepted attempt is merged last
-//! next round. A missing snapshot or a git that cannot merge is `blocked`, for the engineer. Nothing is
+//! next round. The same failure again right after that fix was verified, with no attempt merged that
+//! the rejected tree did not hold, is `blocked` (`repeated`): one fix per reason, never a loop until the budget is gone. A missing
+//! snapshot or a git that cannot merge is `blocked`, for the engineer. Nothing is
 //! credited to lessons: an integration is no verdict on any one attempt.
 //!
 //! Across machines the commits travel as bundles beside the board (commits.rs): a goal integrates on a
@@ -119,8 +121,10 @@ fn origin(repo: &Path, bases: &[&str], deadline: Instant) -> Result<String, Stri
 /// attempts' own, each step a commit (parents: the tree so far and the attempt's head) with borg's
 /// identity and the attempt's done time as its date, all `within`. A step that conflicts commits the
 /// tree with conflict markers; a path of it counts as resolved when a later attempt built on that
-/// step (its base descends from the step's commit: a fix task's) changes it. An attempt from a tree
-/// without the markers merges around them and leaves them in.
+/// step (its base descends from the step's commit: a fix task's) changes it, or holds it without a
+/// marker line (a modify/delete, rename or binary conflict writes none: the fix's verified tree,
+/// which the next step merges cleanly, is the resolution). An attempt from a tree without the
+/// markers merges around them and leaves them in.
 ///
 /// # Errors
 /// No attempts, a git call that fails or runs out of time, or a git without `merge-tree --merge-base`.
@@ -170,6 +174,13 @@ pub(crate) fn merge(repo: &Path, claims: &[&str], attempts: &[Attempt], within: 
             }
             let changed = verdict::changes(repo, &a.base, &a.head).ok_or_else(|| format!("cannot diff the attempt of {}", a.work))?;
             later.extend(changed.into_iter().map(|c| c.path));
+            // A path it left as it was counts when its tree holds no markers there: a modify/delete,
+            // rename or binary conflict writes none, and the verified fix's tree is the resolution.
+            let kept: Vec<&str> = paths.iter().filter(|p| !later.contains(p)).map(String::as_str).collect();
+            if !kept.is_empty() {
+                let marked = with_markers(repo, &a.head, &kept, deadline)?;
+                later.extend(kept.iter().filter(|p| !marked.iter().any(|m| m == *p)).map(|p| p.to_string()));
+            }
         }
         let open: Vec<String> = paths.into_iter().filter(|p| !later.contains(p)).collect();
         if !open.is_empty() {
@@ -177,6 +188,19 @@ pub(crate) fn merge(repo: &Path, claims: &[&str], attempts: &[Attempt], within: 
         }
     }
     Ok(Merged { head: t, conflicts })
+}
+
+/// The `paths` that hold a conflict marker line (`<<<<<<< ` or `>>>>>>> ` at a line's start) in the
+/// commit `head`; a path it deleted holds none.
+fn with_markers(repo: &Path, head: &str, paths: &[&str], deadline: Instant) -> Result<Vec<String>, String> {
+    let specs: Vec<String> = paths.iter().map(|p| format!(":(literal){p}")).collect();
+    let args: Vec<&str> =
+        ["grep", "-l", "--color=never", "-I", "-E", "-e", "^(<<<<<<<|>>>>>>>)( |$)", head, "--"].into_iter().chain(specs.iter().map(String::as_str)).collect();
+    match git(repo, &args, &[], deadline)? {
+        (0, out) => Ok(out.lines().filter_map(|l| l.strip_prefix(&format!("{head}:"))).map(String::from).collect()),
+        (1, _) => Ok(Vec::new()),
+        (code, _) => Err(format!("git grep failed on {head} (exit {code})")),
+    }
 }
 
 /// The accepted work tasks in merge order: a task after its dependencies, else by when it was verified,
@@ -350,7 +374,7 @@ impl Integrator<'_> {
                 .collect();
             let paths: Vec<&str> = m.conflicts.iter().flat_map(|(_, p)| p.iter().map(String::as_str)).collect();
             let note = format!("conflict: {}", parts.join("; "));
-            return self.rejected(repo, &m.head, &note, &format!("conflict in {}", paths.join(", ")), &tasks, checks);
+            return self.rejected(repo, b, &m.head, &note, &format!("conflict in {}", paths.join(", ")), &attempts, &tasks, checks);
         }
         let probe = Task { accept: checks.clone(), ..board_task(self.id) };
         // The checks run for minutes: the lease is renewed until they return.
@@ -376,32 +400,40 @@ impl Integrator<'_> {
             oracle::Verdict::Fail { check, tail: t } => {
                 let _ = oracle::log(self.home, &self.g.id, self.id, &v, ms);
                 let note = format!("{check} fails: {}", tail(t.trim_end(), NOTE_TAIL));
-                self.rejected(repo, &m.head, &note, &format!("{check} fails"), &tasks, checks)
+                self.rejected(repo, b, &m.head, &note, &format!("{check} fails"), &attempts, &tasks, checks)
             }
             oracle::Verdict::Timeout { check, after } => {
                 let _ = oracle::log(self.home, &self.g.id, self.id, &v, ms);
                 let note = format!("{check} timed out after {} s", after.as_secs());
-                self.rejected(repo, &m.head, &note, &format!("{check} times out"), &tasks, checks)
+                self.rejected(repo, b, &m.head, &note, &format!("{check} times out"), &attempts, &tasks, checks)
             }
         }
     }
 
     /// `rejected` on the combined tree `head`, with the fix task it opens in the same write: from
     /// `head`, scoped to the union of the tasks' scopes (none when one has none), the same `checks`.
-    fn rejected(&self, repo: &Path, head: &str, note: &str, what: &str, tasks: &[&Task], checks: Vec<Check>) -> Outcome {
+    /// The same failure (`what`) right after the fix of the last rejection was verified, with no
+    /// attempt merged that the rejected tree did not hold, is `blocked` instead (`repeated`,
+    /// `new_work`): another fix would start from this tree.
+    #[allow(clippy::too_many_arguments)]
+    fn rejected(&self, repo: &Path, b: &Board, head: &str, note: &str, what: &str, attempts: &[Attempt], tasks: &[&Task], checks: Vec<Check>) -> Outcome {
+        if let Some(fix) = repeated(b, self.id, what).filter(|(fix, from)| !new_work(repo, attempts, fix, from)).map(|(fix, _)| fix) {
+            let why = format!(
+                "{note}: the same failure again after its fix {fix} was verified, so another fix would start from this same tree; \
+                 the hive stops here instead of spending its budget on it. The tree is {head} (refs/heads/hive/{g}/integrated): \
+                 open a task that changes what fails, or correct the check, then reopen this one (`borg hive open {g} --id {id} --again`)",
+                g = self.g.id,
+                id = self.id,
+            );
+            return self.blocked(repo, &why);
+        }
         let ms = learn::now_ms();
         let scoped = tasks.iter().all(|t| !t.files.is_empty());
         let mut files: Vec<String> = if scoped { tasks.iter().flat_map(|t| t.files.iter().cloned()).collect() } else { Vec::new() };
         files.sort();
         files.dedup();
-        let fix = Task {
-            title: format!("fix the integrated tree: {what}"),
-            role: Role::Work,
-            files,
-            accept: checks,
-            from: Some(head.to_string()),
-            ..board_task(&format!("{}.fix", self.id))
-        };
+        let fix =
+            Task { title: fix_title(what), role: Role::Work, files, accept: checks, from: Some(head.to_string()), ..board_task(&format!("{}.fix", self.id)) };
         let e = Event { head: head.to_string(), ..Event::new(Ev::Rejected, self.id, self.session, ms).with_note(note) };
         let why = match super::write(self.home, &self.g.id, vec![e, Event::open(fix, self.session, ms).with_note(note)]) {
             Ok(()) => note.to_string(),
@@ -426,6 +458,42 @@ impl Integrator<'_> {
             ev.text = stats::excerpt(&format!("{}: {note}", self.id), 160);
         });
     }
+}
+
+/// The verified fix task of the last rejected integration before `id`, and the tree it started from
+/// (that integration's combined tree), when `id` fails for the same reason `what` (the fix's title
+/// names it): the bound on an integration loop, unless `new_work` says this round merged an attempt
+/// that tree did not hold. A verified fix passed the combined checks on its own tree, and the replay
+/// merges the same attempts commit for commit with the fix last, so with no new attempt the next
+/// integration's tree is the fix's: failing again the same way, a third round would meet the same
+/// tree, and each round costs a fix and its verify (two drone iterations). One fix per reason, then
+/// the engineer. What the rejected tree held is read from git, not from when work was verified: the
+/// checks of that integration run for minutes, work verified meanwhile (here or on a peer whose
+/// clock runs early) was not in it.
+fn repeated(b: &Board, id: &str, what: &str) -> Option<(TaskId, String)> {
+    let fix = b
+        .tasks
+        .values()
+        .filter(|s| {
+            s.task.from.is_some() && s.task.id.strip_suffix(".fix").is_some_and(|i| i != id && b.tasks.get(i).is_some_and(|t| t.task.role == Role::Integrate))
+        })
+        .max_by_key(|s| s.opened_ms)?;
+    let same = fix.task.title == fix_title(what) && matches!(fix.status, Status::Verified { .. });
+    same.then(|| (fix.task.id.clone(), fix.task.from.clone().unwrap_or_default()))
+}
+
+/// Whether `attempts` (this round's, in merge order) hold one the tree `from` (the rejected
+/// integration's) did not: an attempt's head that is no ancestor of it, the fix `fix`'s own aside
+/// (it is built on `from`). Every step of a merge has its attempt's head as a parent, so each attempt that
+/// tree merged is in its history. A git call that fails counts as none: the bound holds.
+fn new_work(repo: &Path, attempts: &[Attempt], fix: &str, from: &str) -> bool {
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    attempts.iter().filter(|a| a.work != fix).any(|a| matches!(git(repo, &["merge-base", "--is-ancestor", &a.head, from], &[], deadline), Ok((1, _))))
+}
+
+/// The title of the fix task of an integration that failed with `what`.
+fn fix_title(what: &str) -> String {
+    format!("fix the integrated tree: {what}")
 }
 
 /// A task named `id` with nothing else set.
@@ -538,8 +606,12 @@ mod tests {
     /// `t` opened, claimed in `dir` by `author` (its base: a snapshot then, or `from`), changed by `edit`,
     /// done (its head: a snapshot then), and verified by `verifier`: the board lines, at real times.
     fn accepted(home: &Path, t: Task, dir: &Path, author: &str, edit: impl FnOnce(&Path)) {
+        accepted_at(home, t, dir, author, learn::now_ms(), edit);
+    }
+
+    /// `accepted` with its lines stamped from `ms` on.
+    fn accepted_at(home: &Path, t: Task, dir: &Path, author: &str, ms: i64, edit: impl FnOnce(&Path)) {
         let path = super::super::tasks_path(home, "g");
-        let ms = learn::now_ms();
         let mut claim = Event::new(Ev::Claim, &t.id, author, ms + 1);
         claim.base = t.from.clone().unwrap_or_else(|| verdict::snapshot(dir, verdict::SNAPSHOT_TIMEOUT).unwrap());
         edit(dir);
@@ -704,6 +776,92 @@ mod tests {
         assert!(m3.conflicts.is_empty(), "{:?}", m3.conflicts);
         assert_eq!(show(&repo, &m3.head, "s.txt"), "both");
         assert!(merge(&repo, &[], &[], MERGE_TIMEOUT).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_verified_fix_of_a_conflict_without_markers_resolves_it() {
+        // The 2026-10-25 gate run: t1's first claim got no snapshot (git timed out under load), so its
+        // rework's base already held f1.txt (its own first attempt) and its diff only changes that
+        // file. Merged after t2 (from the clean base), it is a modify/delete conflict: git writes the
+        // file without markers, the fix finds nothing to change, and a rule that wants the fix to
+        // change the path rejects every integration again (11 in a row, until the budget was gone).
+        let (root, repo, home) = setup("no-markers");
+        let g = goal(&["unit=grep -q 'done t1' f1.txt && grep -q 'done t2' f2.txt"]);
+        let w1 = wt(&repo, 1);
+        std::fs::write(w1.join("f1.txt"), "done t1\n").unwrap();
+        accepted(&home, work("t2", &["f2.txt"], &[]), &wt(&repo, 2), "s2", write("f2.txt", "done t2\n"));
+        accepted(&home, work("t1", &["f1.txt"], &[]), &w1, "s1", write("f1.txt", "done t1\nchecked by: ok\n"));
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        assert_eq!(o.verdict, Err("conflict: t1 onto t2 in f1.txt".to_string()));
+        let m = o.head.unwrap();
+        assert!(!show(&repo, &m, "f1.txt").contains("<<<<<<<"), "a modify/delete conflict has no markers");
+        // The fix: its worktree reset to the combined tree, nothing to change; verified.
+        let fix = fold(&home).tasks["integrate.1.fix"].task.clone();
+        let w3 = wt(&repo, 3);
+        sh(&w3, &["checkout", "-q", "-f", "--detach", &m]);
+        accepted(&home, fix, &w3, "s3", |_| {});
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        assert_eq!((o.task.as_str(), o.verdict.clone()), ("integrate.2", Ok(())));
+        let head = o.head.unwrap();
+        assert_eq!(sh(&repo, &["rev-parse", &format!("{head}^1")]), m, "the next integration builds on the tree the fix verified");
+        assert_eq!(show(&repo, &head, "f1.txt"), "done t1\nchecked by: ok");
+        assert!(fold(&home).finished());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_same_failure_after_its_verified_fix_blocks_instead_of_looping() {
+        let (root, repo, home) = setup("repeat");
+        // The combined tree fails the goal's oracle whatever a fix does there.
+        let g = goal(&["unit=test -f never.txt"]);
+        let fix_of = |home: &Path, n: usize, dir: &Path, author: &str| {
+            let fix = fold(home).tasks[&format!("integrate.{n}.fix")].task.clone();
+            sh(dir, &["checkout", "-q", "-f", "--detach", fix.from.as_deref().unwrap()]);
+            accepted(home, fix, dir, author, |_| {});
+        };
+        accepted(&home, work("t1", &["a.txt"], &[]), &wt(&repo, 1), "s1", write("a.txt", "a\n"));
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        assert!(o.verdict.unwrap_err().starts_with("unit fails"));
+        fix_of(&home, 1, &wt(&repo, 3), "s3");
+        // New work verified since the fix: another reason to integrate, so another fix.
+        accepted(&home, work("t2", &["b.txt"], &[]), &wt(&repo, 2), "s2", write("b.txt", "b\n"));
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        assert!(o.verdict.unwrap_err().starts_with("unit fails"));
+        assert!(fold(&home).tasks.contains_key("integrate.2.fix"));
+        // Its fix verified and nothing else: the same failure blocks, with no third fix.
+        fix_of(&home, 2, &wt(&repo, 3), "s4");
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        let why = o.verdict.unwrap_err();
+        assert!(why.starts_with("unit fails") && why.contains("the same failure again after its fix integrate.2.fix was verified"), "{why}");
+        assert!(why.contains("borg hive open g --id integrate.3 --again"), "{why}");
+        let b = fold(&home);
+        assert!(matches!(&b.tasks["integrate.3"].status, Status::Blocked { .. }) && !b.tasks.contains_key("integrate.3.fix"));
+        assert!(run(&home, &g, &repo, "d1", learn::now_ms()).is_none(), "blocked: nothing is due, nothing loops");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Work verified while the rejected integration's checks ran (its lines dated before the fix was
+    /// opened, as a peer's with an early clock are) was not in the rejected tree: the same failure
+    /// with it merged opens a fix for it, never the bound's block.
+    #[test]
+    fn work_the_rejected_tree_did_not_hold_gets_a_fix_whatever_its_dates() {
+        let (root, repo, home) = setup("dated");
+        let g = goal(&["unit=test ! -f bad_a && test ! -f bad_b"]);
+        accepted(&home, work("t1", &["bad_a"], &[]), &wt(&repo, 1), "s1", write("bad_a", "a\n"));
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        assert!(o.verdict.unwrap_err().starts_with("unit fails"));
+        let fix = fold(&home).tasks["integrate.1.fix"].clone();
+        accepted_at(&home, work("t2", &["bad_b"], &[]), &wt(&repo, 2), "s2", fix.opened_ms - 50, write("bad_b", "b\n"));
+        let dir = wt(&repo, 3);
+        sh(&dir, &["checkout", "-q", "-f", "--detach", fix.task.from.as_deref().unwrap()]);
+        accepted(&home, fix.task, &dir, "s3", |d| std::fs::remove_file(d.join("bad_a")).unwrap());
+        let o = run(&home, &g, &repo, "d1", learn::now_ms()).unwrap();
+        let why = o.verdict.unwrap_err();
+        assert!(why.starts_with("unit fails") && !why.contains("the same failure again"), "{why}");
+        let b = fold(&home);
+        assert!(!matches!(&b.tasks["integrate.2"].status, Status::Blocked { .. }), "{:?}", b.tasks["integrate.2"].status);
+        assert!(b.tasks.contains_key("integrate.2.fix"));
         let _ = std::fs::remove_dir_all(root);
     }
 

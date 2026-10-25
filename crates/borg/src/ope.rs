@@ -1,5 +1,5 @@
-//! `borg ope`: off-policy estimates of the usefulness belief's hand-set weights (hive-learning.md
-//! step 6), from the outcome log alone. Reports, never applies: no constant changes.
+//! `borg ope`: off-policy estimates of the usefulness belief's hand-set weights (hive.md
+//! L6), from the outcome log alone. Reports, never applies: no constant changes.
 //!
 //! **What is estimated.** The per-ask change rate under a candidate policy: of the lessons a check
 //! asks, the share the drone then changed its work on. The candidates differ from the policy in force

@@ -12,12 +12,13 @@ mod views;
 use leptos::prelude::*;
 
 use crate::drawer::Drawer;
-use crate::views::{conscience::Conscience, cost::Cost, drones::Drones, hive::Hive, knowledge::Knowledge, overview::Overview, queen::Queen, steering::Steering};
+use crate::views::{conscience::Conscience, cost::Cost, drones::Drones, hive::Hive, knowledge::Knowledge, learning::Learning, overview::Overview, queen::Queen, steering::Steering};
 
-const TABS: [(&str, &str); 8] = [
+const TABS: [(&str, &str); 9] = [
     ("overview", "Overview"),
     ("knowledge", "Knowledge"),
     ("conscience", "Conscience"),
+    ("learning", "Learning"),
     ("steering", "Steering"),
     ("queen", "Queen"),
     ("cost", "Cost"),
@@ -77,6 +78,7 @@ fn App() -> impl IntoView {
             {move || match tab.get().as_str() {
                 "knowledge" => view! { <Knowledge /> }.into_any(),
                 "conscience" => view! { <Conscience /> }.into_any(),
+                "learning" => view! { <Learning /> }.into_any(),
                 "steering" => view! { <Steering /> }.into_any(),
                 "queen" => view! { <Queen /> }.into_any(),
                 "cost" => view! { <Cost /> }.into_any(),

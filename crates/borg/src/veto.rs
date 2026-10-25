@@ -1,5 +1,5 @@
-//! `borg no`: the engineer's veto, the strongest negative signal (docs/design/hive-learning.md "The
-//! engineer's \"no\"", step 7b).
+//! `borg no`: the engineer's veto, the strongest negative signal (docs/design/hive.md "The
+//! engineer's role", L7b).
 //!
 //! An engineer says no to a drone's work, with a reason: `borg no <reason>` from a terminal (the drone
 //! of the current repo, or the one `--session` names), or a prompt that starts with "borg no" inside the

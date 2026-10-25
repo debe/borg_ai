@@ -1,6 +1,6 @@
-//! The hive: many drones, one goal (docs/design/collective.md). File-backed under `<store>/hive/<goal>/`;
+//! The hive: many drones, one goal (docs/design/hive.md). File-backed under `<store>/hive/<goal>/`;
 //! the logs in [`SYNCED`] travel over the mesh as signed lines like lessons (borg-mesh lines.rs
-//! `hive_logs`), so drones on several machines work one board (collective step 4).
+//! `hive_logs`), so drones on several machines work one board (hive.md C4).
 //!
 //! - `goal.json` (goal.rs): the spec, the oracle checks that gate `done`, the budget, the repos; it
 //!   syncs as its projection in `goal.jsonl` (`publish`), without the hidden oracle.
@@ -20,7 +20,8 @@
 //!   claim are credited.
 //! - `joins.jsonl`: directories whose sessions join the goal (`borg hive join --here`, and each
 //!   worktree `borg hive run` makes, with the session of each iteration, left when the run ends).
-//! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost, each `borg hive run`.
+//! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost (synced, naming its node:
+//!   every node's runner reads the goal's one budget), each `borg hive run` (local).
 //! - `logs/` (run.rs): each iteration's output, local only: it never syncs.
 //!
 //! `borg hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
@@ -120,7 +121,7 @@ const TASK_MARKER: &str = "#borg-hive-task ";
 const REFUSED_MARKER: &str = "#borg-hive-refused ";
 const REPO_MARKER: &str = "#borg-hive-repo";
 
-/// Said once, at a drone's first hive prompt (docs/design/hive-learning.md, inoculation framing).
+/// Said once, at a drone's first hive prompt (docs/design/hive.md, inoculation framing).
 pub const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
 Every change to tests, CI config or oracle files is recorded and shown to the verifier; gaming a check is visible, allowed to happen, and useless: \
 the task counts as failed. Adding tests, also inside an existing test file, is fine; outside your task's files an existing test may change only in names and values, \
@@ -138,12 +139,13 @@ pub fn inoculation(g: &Goal) -> String {
 
 /// A goal's logs that sync over the mesh (borg-mesh lines.rs `hive_logs`), in the order a session
 /// reconciles them. Never synced: goal.json (it may hold the hidden oracle; `goal.jsonl` is its
-/// projection), oracle.jsonl (the hidden scores), joins.jsonl, spend.jsonl, runs.jsonl (this node's
-/// worktrees and spend), logs/ and scratch/. flags.jsonl does: a verifier on another node reads the
-/// author's oracle-file flags from it (verdict.rs `record`), or a hack that touched the oracle's files
-/// would pass there. bundles.jsonl (commits.rs) carries each attempt's commits to the nodes that verify,
-/// build on or integrate it elsewhere.
-pub const SYNCED: [&str; 6] = ["goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "flags.jsonl", commits::FILE];
+/// projection), oracle.jsonl (the hidden scores), joins.jsonl, runs.jsonl (this node's worktrees and
+/// runs), logs/ and scratch/. flags.jsonl does: a verifier on another node reads the author's
+/// oracle-file flags from it (verdict.rs `record`), or a hack that touched the oracle's files would
+/// pass there. bundles.jsonl (commits.rs) carries each attempt's commits to the nodes that verify,
+/// build on or integrate it elsewhere. spend.jsonl (run.rs `ledger`, `borg/mesh/10`), each line naming
+/// its node: every node's runner splits and stops on the goal's one budget.
+pub const SYNCED: [&str; 7] = ["goal.jsonl", "tasks.jsonl", "contracts.jsonl", "messages.jsonl", "flags.jsonl", commits::FILE, run::SPEND_FILE];
 
 /// This store's node id: the self-declared id outcomes and the stats rollups carry (stats.rs `node`),
 /// stamped on every hive line this node writes. Not the member key: lines are bound to a key by their

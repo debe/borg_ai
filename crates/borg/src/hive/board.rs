@@ -15,7 +15,7 @@
 //! opens a fix task that starts `from` the combined tree.
 //!
 //! Lines are plain JSON with no `id` + `version` pair, so the mesh's `settle` (borg-mesh lines.rs) never
-//! folds them. The board syncs over the mesh as a signed log (collective step 4): each line carries the
+//! folds them. The board syncs over the mesh as a signed log (hive.md C4): each line carries the
 //! node that wrote it (`node`, stamped by hive/mod.rs `write`; empty in a line from before), lines from
 //! another node fold the same as local ones, and leases travel with the heartbeats that renew them.
 //! Across nodes a claim is provisional until the next sync round: the loser learns at its next hook

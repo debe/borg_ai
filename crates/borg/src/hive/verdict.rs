@@ -1,4 +1,4 @@
-//! The verdict on a hive task and its reward (docs/design/hive-learning.md "Reward", steps 2 and 8).
+//! The verdict on a hive task and its reward (docs/design/hive.md "Reward", L2 and L8).
 //!
 //! A verifier drone ends its verify task with `VERDICT: pass` or `VERDICT: reject <why>` (its last
 //! message, read at the stop) or `borg hive verify --pass|--reject`. [`record`] then checks the work
@@ -21,7 +21,7 @@
 //! final at once. Each final verdict counts one `task_*` stat. BORG_HIVE_CREDIT=off (the frozen arm of
 //! an eval) credits nothing; the board and the stats still record.
 //!
-//! Across machines (the board syncs, collective step 4): the verdict line carries the kind it credits
+//! Across machines (the board syncs, hive.md C4): the verdict line carries the kind it credits
 //! (`Event::credit`), and the node holding the author's shown records, the author's, credits it when the
 //! line arrives ([`credit_synced`], at each mesh round); every other node has no such records and
 //! credits nothing. A verifier gives the verdict only where the work's snapshots are ([`present`]),

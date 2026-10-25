@@ -55,9 +55,9 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// The hive's synced logs in `home` (borg hive/mod.rs `SYNCED`: goal projection, board, contracts,
-/// messages, guard flags, bundles of commits): each existing one of every goal directory whose name is
-/// a valid goal id (`goal::valid_id`), never a goal's local files (goal.json, oracle.jsonl, joins,
-/// spend, runs, unbundled.jsonl).
+/// messages, guard flags, bundles of commits, spend): each existing one of every goal directory whose
+/// name is a valid goal id (`goal::valid_id`), never a goal's local files (goal.json, oracle.jsonl,
+/// joins, runs, unbundled.jsonl).
 pub fn hive_logs(home: &Path) -> Vec<std::path::PathBuf> {
     let mut ids: Vec<String> = std::fs::read_dir(home.join("hive"))
         .into_iter()
@@ -73,6 +73,15 @@ pub fn hive_logs(home: &Path) -> Vec<std::path::PathBuf> {
 /// Where goal `id`'s synced logs live in `home`, in `SYNCED` order (existing or not).
 pub fn hive_files(home: &Path, id: &str) -> Vec<std::path::PathBuf> {
     borg::hive::SYNCED.iter().map(|f| borg::hive::dir(home, id).join(f)).collect()
+}
+
+/// Whether `line` of `path` stays on this node: a hive goal's spend line that names no node (borg
+/// hive/run.rs `Spend::owner`: one from before spend lines named their node, which only this node
+/// can have written, since spend did not sync then). Never stamped (origin.rs `stamp`), so never
+/// offered: on a peer it would read as the peer's own spend.
+pub fn local(path: &Path, line: &str) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some(borg::hive::run::SPEND_FILE)
+        && serde_json::from_str::<Value>(line).ok().is_none_or(|v| v.get("node").and_then(Value::as_str).is_none_or(str::is_empty))
 }
 
 pub fn hash(line: &str) -> Hash {
@@ -175,7 +184,21 @@ mod tests {
     fn hive_logs_list_each_goals_synced_files_and_skip_invalid_ids() {
         let d = tmp("hive-logs");
         for (dir, files) in [
-            ("g1", &["goal.json", "goal.jsonl", "tasks.jsonl", "oracle.jsonl", "joins.jsonl", "flags.jsonl", "bundles.jsonl", "unbundled.jsonl"][..]),
+            (
+                "g1",
+                &[
+                    "goal.json",
+                    "goal.jsonl",
+                    "tasks.jsonl",
+                    "oracle.jsonl",
+                    "joins.jsonl",
+                    "flags.jsonl",
+                    "bundles.jsonl",
+                    "unbundled.jsonl",
+                    "spend.jsonl",
+                    "runs.jsonl",
+                ][..],
+            ),
             ("A", &["tasks.jsonl"][..]),
             ("g2", &["messages.jsonl"][..]),
         ] {
@@ -188,10 +211,17 @@ mod tests {
         std::fs::create_dir_all(d.join("hive/..x")).unwrap();
         std::fs::write(d.join("hive/..x/tasks.jsonl"), "{}\n").unwrap();
         let got: Vec<String> = hive_logs(&d).iter().map(|p| p.strip_prefix(&d).unwrap().display().to_string()).collect();
-        assert_eq!(got, ["hive/g1/goal.jsonl", "hive/g1/tasks.jsonl", "hive/g1/flags.jsonl", "hive/g1/bundles.jsonl", "hive/g2/messages.jsonl"]);
+        assert_eq!(
+            got,
+            ["hive/g1/goal.jsonl", "hive/g1/tasks.jsonl", "hive/g1/flags.jsonl", "hive/g1/bundles.jsonl", "hive/g1/spend.jsonl", "hive/g2/messages.jsonl"]
+        );
         let all = logs(&d);
         assert!(all.iter().any(|p| p.ends_with("hive/g1/tasks.jsonl")) && all.last().unwrap().ends_with(REASONING));
-        assert!(!all.iter().any(|p| p.ends_with("oracle.jsonl") || p.ends_with("joins.jsonl") || p.ends_with("goal.json") || p.ends_with("unbundled.jsonl")));
+        assert!(!all.iter().any(|p| p.ends_with("oracle.jsonl")
+            || p.ends_with("joins.jsonl")
+            || p.ends_with("goal.json")
+            || p.ends_with("unbundled.jsonl")
+            || p.ends_with("runs.jsonl")));
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -1,5 +1,5 @@
 //! A hive goal sequence for `borg-eval hive` (tasks/todo.md "H5: does the hive learn?", the pre-registered
-//! rule; docs/design/hive-learning.md "Proof"): learning arms, a store that persists across the goals of a
+//! rule; docs/design/hive.md "The learning curve"): learning arms, a store that persists across the goals of a
 //! chain, the simulated engineer who promotes queued playbook edits between goals, and the H5 report.
 //!
 //! - Arms (`--learn`): `frozen` (every learning switch off), `l0` (lessons on, playbooks off), `l01` (lessons

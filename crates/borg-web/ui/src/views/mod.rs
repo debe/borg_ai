@@ -3,6 +3,7 @@ pub mod cost;
 pub mod drones;
 pub mod hive;
 pub mod knowledge;
+pub mod learning;
 pub mod overview;
 pub mod queen;
 pub mod steering;

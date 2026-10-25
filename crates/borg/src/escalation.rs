@@ -1,4 +1,4 @@
-//! The queen's attention reward (docs/design/hive-learning.md "The engineer's \"no\"", step 7b): did
+//! The queen's attention reward (docs/design/hive.md "The engineer's role", L7b): did
 //! an escalation spend the engineer's minutes well?
 //!
 //! ```text

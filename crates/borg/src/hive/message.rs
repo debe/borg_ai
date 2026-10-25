@@ -1,5 +1,5 @@
 //! Messages between drones: `<store>/hive/<goal>/messages.jsonl`, append-only, one line per `borg hive
-//! ask` or `tell` (docs/design/collective.md "Messages between drones"). A hive log like the board, so
+//! ask` or `tell` (docs/design/hive.md "Messages between drones"). A hive log like the board, so
 //! it syncs over the mesh with signed origins, quarantine and offline catch-up (borg-mesh lines.rs
 //! `hive_logs`), works on one machine with no mesh, and is scoped to its goal. Mesh steer stays the
 //! engineer's channel to drones (pause, resume, say): it is ephemeral, gated to the admin and steer

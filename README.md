@@ -384,7 +384,7 @@ service and its consumer, the consumer depending on the producer), three drones 
 integrated, and passed the visible suite and every held-out check in all 6 runs (3 seeds each, $8.48
 in total, 7–11 minutes per run), with no false hacked verdict. Whether a hive beats one session with
 subagents is not measured: these workloads were too easy to tell
-([design](https://github.com/debe/borg_ai/blob/main/docs/design/collective.md#proof-protocol)). `borg hive run <goal> --drones N` starts N headless drones,
+([design](https://github.com/debe/borg_ai/blob/main/docs/design/hive.md#the-hive-against-one-session)). `borg hive run <goal> --drones N` starts N headless drones,
 each in a git worktree with an equal share of the goal's budget, until the board is finished (try
 `--dry-run` first). Before the first drone starts, it shows the plan as one intent card per task
 (intent, files, deps, checks and a risk class from the queen's classifier) and waits for you to approve
@@ -398,7 +398,8 @@ a drone's whole branch. It runs the oracle on the combined tree, which ends up a
 `refs/heads/hive/<goal>/integrated` (`borg hive integrate` does the same for a goal worked
 interactively; it needs git 2.40+). A conflict or a failing check opens a fix task (a joined session
 takes it in a checkout of the combined tree), and the goal is
-finished only when the combined tree passes. A task that depends on another starts from its verified
+finished only when the combined tree passes. An integration that fails the same way again after its
+fix was verified stops there, blocked with the reason, instead of looping until the budget is gone. A task that depends on another starts from its verified
 work: the claim brings that work into the drone's worktree. `borg top` and the web page show the board, the
 integration and the spend. Guardrails make gaming
 the oracle useless: a verdict on work whose diff weakened tests or changed CI outside its scope is logged as
@@ -440,9 +441,18 @@ tab shows each playbook with its steps, the belief of each version and the edits
 over the mesh like lessons. Whether they lower dollars per solve (H5) is a later paid run.
 `BORG_PLAYBOOKS=off` turns them off. [Playbooks](https://github.com/debe/borg_ai/blob/main/docs/commands.md#playbooks).
 
+**Is learning working? (built).** Learning is judged in production: `borg web`'s Learning tab shows per
+collective, week by week and backfilled from the existing logs, the lessons written per source, the
+share of asked lessons that changed the work, the share of vetoes that repeated an earlier "no" (the series
+the backfill cannot derive start when live counting began, never a fake 0), per
+hive goal the mistakes caught (verifier rejections, failed integrations, hacked attempts) with the
+rework lessons they taught, and the playbook versions with their beliefs. Each panel says whether it is
+the team's numbers (synced logs) or this machine's. [The page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md#the-page).
+
 **The hive across machines (built, not measured).** In a collective shared over the mesh, a goal, its
-board, contracts, messages between drones (`borg hive ask`, `tell`) and guard flags sync to every member
-as signed lines, so drones on several machines claim from one board: the earlier of two claims wins on
+board, contracts, messages between drones (`borg hive ask`, `tell`), guard flags and spend sync to every member
+as signed lines, so drones on several machines claim from one board and spend one budget (every drone stops
+once the goal's total over all machines reaches it, passed at most by the sessions then in flight): the earlier of two claims wins on
 both machines after a sync round, leases renew through synced heartbeats, a drone name bars only on its
 own machine, and the author's machine credits a verdict given elsewhere, once. A check another machine
 wrote is a shell command from that machine: it runs only after the engineer's `borg hive approve <goal>`

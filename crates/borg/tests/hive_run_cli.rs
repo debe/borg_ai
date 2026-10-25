@@ -969,3 +969,96 @@ fn the_claimant_of_a_high_risk_task_is_told_once() {
     assert_eq!(asked.iter().map(|e| (e.kind, e.session.as_str())).collect::<Vec<_>>(), [(borg::queen::Kind::ExternalMutation, "sess-risk-a")]);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The real git on the test's PATH (the wrapper on the drones' PATH execs it).
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(|d| d.join("git")).find(|p| p.is_file()).expect("git on PATH")
+}
+
+/// A `git` on the drones' PATH that makes a snapshot fail (its `write-tree` under a scratch index,
+/// verdict.rs `snapshot`) as a git cut off at its 10 s bound under load does: every one while
+/// `<root>/fail-snapshot` exists, and the first one in a tree whose HEAD is an integration step (a
+/// fix task's done) while `<root>/fail-fix` exists, which it then removes.
+fn failing_git(root: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+real='{git}'
+case "$GIT_INDEX_FILE" in *borg-hive-index*)
+  dir=.; prev=; tree=no
+  for a in "$@"; do [ "$prev" = -C ] && dir=$a; [ "$a" = write-tree ] && tree=yes; prev=$a; done
+  if [ $tree = yes ]; then
+    [ -f '{r}/fail-snapshot' ] && exit 1
+    if [ -f '{r}/fail-fix' ] && "$real" -C "$dir" log -1 --format=%s HEAD 2>/dev/null | grep -q '^integrate '; then
+      rm -f '{r}/fail-fix'; exit 1
+    fi
+  fi;;
+esac
+exec "$real" "$@"
+"#,
+        git = real_git().display(),
+        r = root.display()
+    );
+    let path = root.join("bin/git");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_verified_fix_ends_the_conflict_its_integration_found_and_a_missing_snapshot_is_retried() {
+    // The 2026-10-25 gate run, reproduced: t1's claim got no snapshot (git timed out under load), its
+    // drone went on to t2 in the same tree, then reworked t1 from a base that held its first attempt.
+    // Integrated after t2, t1's change is a modify/delete conflict in f1.txt (no markers), which every
+    // verified fix left as it was: 11 integrations, each rejected the same way, until the budget ran out.
+    let root = setup("conflict-loop", 2, "2", json!({"usd_per_iter": 0.10}));
+    failing_git(&root);
+    let w = work(&root);
+    std::fs::write(w.join(".git/info/exclude"), "/.worktrees/\n").unwrap();
+    let (a, b) = (w.join(".worktrees/a"), w.join(".worktrees/b"));
+    for (d, n) in [(&a, "a"), (&b, "b")] {
+        git(&w, &["worktree", "add", "-q", "-b", &format!("wt-{n}"), d.to_str().unwrap()]);
+    }
+    let (sa, sb) = ("sess-a-loop", "sess-b-loop");
+    for s in [sa, sb] {
+        ok(&root, &["join", "g", "--session", s]);
+    }
+    let fail = root.join("fail-snapshot");
+    std::fs::write(&fail, "").unwrap();
+    ok_in(&root, &a, &["claim", "t1", "--session", sa]);
+    std::fs::remove_file(&fail).unwrap();
+    assert!(events(&root).iter().any(|e| e.ev == board::Ev::Claim && e.task == "t1" && e.by == sa && e.base.is_empty()), "the claim has no snapshot");
+    std::fs::write(a.join("f1.txt"), "done t1\n").unwrap();
+    ok_in(&root, &a, &["done", "--session", sa]);
+    ok_in(&root, &b, &["claim", "t1.v1", "--session", sb]);
+    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t1 not verified (the work has no snapshot"));
+    ok_in(&root, &a, &["claim", "t2", "--session", sa]);
+    std::fs::write(a.join("f2.txt"), "done t2\n").unwrap();
+    ok_in(&root, &a, &["done", "--session", sa]);
+    ok_in(&root, &b, &["claim", "t2.v1", "--session", sb]);
+    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t2 is verified"));
+    ok_in(&root, &a, &["claim", "t1", "--session", sa]);
+    std::fs::write(a.join("f1.txt"), "done t1\nchecked by: ok\n").unwrap();
+    ok_in(&root, &a, &["done", "--session", sa]);
+    ok_in(&root, &b, &["claim", "t1.v2", "--session", sb]);
+    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t1 is verified"));
+    // The drones integrate, fix and verify; the fix's first done gets no snapshot either.
+    std::fs::write(root.join("fail-fix"), "").unwrap();
+    let (out, err, code) = run(&root, &["--drones", "2", "--harness", "sim"]);
+    let bd = fold(&root);
+    let integrations: Vec<(&str, &str)> =
+        bd.tasks.values().filter(|s| s.task.role == board::Role::Integrate).map(|s| (s.task.id.as_str(), s.status.name())).collect();
+    assert_eq!((code, integrations.as_slice()), (0, [("integrate.1", "verified"), ("integrate.2", "verified")].as_slice()), "{out}{err}");
+    assert!(out.contains("integrate.1") && out.contains("conflict: t1 onto t2 in f1.txt"), "{out}");
+    assert!(!root.join("fail-fix").exists(), "the fix's done lost its snapshot once");
+    // That fix was retried as what it was, a missing snapshot: its verify rejected it unchecked, and
+    // its rework was integrated; no second conflict, no second fix.
+    let ev = events(&root);
+    assert!(ev.iter().any(|e| e.ev == board::Ev::Rejected && e.task == "integrate.1.fix.v1" && e.note.contains("no snapshot")), "{out}");
+    assert_eq!(bd.tasks.keys().filter(|t| t.ends_with(".fix")).count(), 1);
+    let i1 = ev.iter().find(|e| e.ev == board::Ev::Rejected && e.task == "integrate.1").unwrap().head.clone();
+    let head = bd.integrated.clone().unwrap().head;
+    assert_eq!(git(&w, &["rev-parse", &format!("{head}^1")]), i1, "the passing integration builds on the tree the fix verified");
+    assert_eq!(git(&w, &["show", &format!("{head}:f1.txt")]), "done t1\nchecked by: ok");
+    assert!(git(&w, &["show", &format!("{head}:f2.txt")]).starts_with("done t2"));
+    let _ = std::fs::remove_dir_all(root);
+}

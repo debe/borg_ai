@@ -11,6 +11,7 @@
 //! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
 //! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
 //! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait);
+//! `one_task`: its turn ends after one finished task (one task per iteration, each costing `usd_per_iter`);
 //! `node` (top level): a label the drones sign their files with (`by d1@<node>`);
 //! `reject_first` (top level): the goal's first verdict is a reject whoever gives it, and a reworked task's
 //! file then also names its check (a rework, for hive/rework.rs);
@@ -75,6 +76,8 @@ struct Plan {
     grow_tests: bool,
     #[serde(default)]
     work_s: u64,
+    #[serde(default)]
+    one_task: bool,
     #[serde(default)]
     own_session: bool,
     #[serde(default)]
@@ -257,7 +260,7 @@ pub fn main(here: &Here) -> i32 {
             reason = d.stop(true);
         }
         // A finished task hands over the next one in the same turn; anything else ends it.
-        if !reason.contains("done, verify task") {
+        if plan.one_task || !reason.contains("done, verify task") {
             break;
         }
     }
