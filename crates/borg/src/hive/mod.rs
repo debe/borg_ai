@@ -120,6 +120,13 @@ const TASK_MARKER: &str = "#borg-hive-task ";
 /// offered or handed to it again; `borg hive claim <task>` still tries.
 const REFUSED_MARKER: &str = "#borg-hive-refused ";
 const REPO_MARKER: &str = "#borg-hive-repo";
+/// Each claim whose read-back saw it won, with a tree (`claim`): `task@ms sha top`, the tree it started
+/// from (its base; a rework's base is its first claim's, so a snapshot taken at this claim; `-` for a
+/// verify task) and the git top it works in. A lost claim is set aside to that tree (`set_aside`); one
+/// its own read-back saw lost has none: it took out what it brought in.
+const CLAIM_START_MARKER: &str = "#borg-hive-claim-start ";
+/// Lost claims (`task@ms`) set aside, each once.
+const SET_ASIDE_MARKER: &str = "#borg-hive-set-aside ";
 
 /// Said once, at a drone's first hive prompt (docs/design/hive.md, inoculation framing).
 pub const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
@@ -625,6 +632,140 @@ fn lost_news(b: &Board, session: &str, state: &str) -> (Vec<String>, Vec<String>
     (lines, fresh.iter().map(|(k, _)| k.clone()).collect())
 }
 
+/// The latest claim of `session` (`lines`, the board's), when the fold voided it (a race lost, across
+/// nodes perhaps only at a sync after the claim looked won, or a claim the board did not allow) or the
+/// session was told so (`LOST_MARKER`: a later line may hand the task back, `release_told_loss`), and
+/// the session holds nothing now: its edits are refused (`pre_tool`) and its worktree set aside
+/// (`set_aside_lost`). A session that claimed again since, or holds a task, has none.
+fn lost_claim<'a>(b: &Board, lines: impl IntoIterator<Item = &'a Event>, session: &str, state: &str, now: i64) -> Option<&'a Event> {
+    if board::holding(b, session, now).is_some() {
+        return None;
+    }
+    let last = lines.into_iter().filter(|e| e.ev == Ev::Claim && e.by == session).max_by_key(|e| e.ms)?;
+    let told = hook::listed(state, LOST_MARKER).contains(claim_key(last).as_str());
+    (told || b.lost.iter().any(|(by, t, ms)| by == session && *t == last.task && *ms == last.ms)).then_some(last)
+}
+
+fn claim_key(c: &Event) -> String {
+    format!("{}@{}", c.task, c.ms)
+}
+
+/// The tree claim `key` (`task@ms`) started from and the git top it works in, from `state`
+/// (`CLAIM_START_MARKER`); the tree is `-` for a claim without one.
+fn claim_start<'a>(state: &'a str, key: &str) -> Option<(&'a str, &'a str)> {
+    state.lines().rev().filter_map(|l| l.strip_prefix(CLAIM_START_MARKER)).find_map(|v| {
+        let mut it = v.splitn(3, ' ');
+        (it.next()? == key).then_some(())?;
+        Some((it.next()?, it.next()?))
+    })
+}
+
+/// The lost claim (`lost_claim`) whose tree is still to be set aside: it has a start
+/// (`CLAIM_START_MARKER`) and was not set aside yet.
+fn set_aside_due<'a>(b: &Board, lines: impl IntoIterator<Item = &'a Event>, session: &str, state: &str, now: i64) -> Option<&'a Event> {
+    lost_claim(b, lines, session, state, now).filter(|c| {
+        let key = claim_key(c);
+        claim_start(state, &key).is_some_and(|(sha, _)| sha != "-") && !hook::listed(state, SET_ASIDE_MARKER).contains(key.as_str())
+    })
+}
+
+/// Sets aside the worktree `cwd` of `session`'s lost claim when it is due (`set_aside_due`), once
+/// (marked before it starts), `within` that time: what the drone is told, None when nothing was due or
+/// nothing changed. Only at the stop (what is left of its time) or in `borg hive claim`, never in a tool
+/// call's or prompt's hook: opencode and omp give those 2 to 5 s and then kill borg.
+#[allow(clippy::too_many_arguments)]
+fn set_aside_lost<'a>(
+    g: &Goal,
+    b: &Board,
+    lines: impl IntoIterator<Item = &'a Event>,
+    session: &str,
+    state: &str,
+    cwd: &str,
+    now: i64,
+    within: Duration,
+) -> Option<String> {
+    let c = set_aside_due(b, lines, session, state, now)?;
+    let key = claim_key(c);
+    let (start, _) = claim_start(state, &key)?;
+    hook::append(session, &format!("{SET_ASIDE_MARKER}{key}"));
+    set_aside(g, b, &c.task, start, session, cwd, now, within)
+}
+
+/// The worktree `cwd` after a lost claim of `task` that started from the tree `start`, `within` that
+/// time: its changes
+/// since then kept in a snapshot commit, pinned (commits.rs `pin`, so gc keeps it), and taken out
+/// (verdict.rs `take_out` of start..snapshot: the index, HEAD and refs untouched, ignored files stay),
+/// so the tree is the claim's start and nothing of the lost work leaks into the next task; what the
+/// drone is told, None when nothing changed. Nothing is taken out without a pinned snapshot, or while
+/// another session of this node holds a task in the same git top (`CLAIM_START_MARKER` in its state):
+/// its work is in the same files.
+#[allow(clippy::too_many_arguments)]
+fn set_aside(g: &Goal, b: &Board, task: &str, start: &str, session: &str, cwd: &str, now: i64, within: Duration) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let (dir, top) = (Path::new(cwd), repo_top(Path::new(cwd)));
+    let t0 = Instant::now();
+    let Some(snap) = verdict::snapshot(dir, within) else {
+        return Some(format!("Your worktree still holds what you did for {task} (no snapshot could be taken): set it aside before your next task."));
+    };
+    if verdict::changes(dir, start, &snap).is_some_and(|ch| ch.is_empty()) {
+        return None;
+    }
+    if !commits::pin(dir, &g.id, &snap) {
+        return Some(format!(
+            "Your worktree still holds what you did for {task} (its snapshot {snap} could not be pinned): set it aside before your next task."
+        ));
+    }
+    let shared = b.tasks.values().any(|s| {
+        s.live(now).is_some_and(|(by, _, since)| {
+            by != session
+                && claim_start(&std::fs::read_to_string(hook::state_file(by)).unwrap_or_default(), &format!("{}@{since}", s.task.id))
+                    .is_some_and(|(_, t)| Path::new(t) == top)
+        })
+    });
+    if shared {
+        return Some(format!("What you did for {task} is kept in commit {snap}; your worktree is left as it is: another drone holds a task in it."));
+    }
+    Some(match verdict::take_out(dir, start, &snap, within.saturating_sub(t0.elapsed())) {
+        Ok(()) => format!(
+            "What you did for {task} is set aside in commit {snap} (`git diff {start} {snap}`) and your worktree is back at the claim's start: start your next task from there."
+        ),
+        Err(why) => format!("Your worktree could not be set back to the claim's start ({why}); what you did for {task} is kept in commit {snap}."),
+    })
+}
+
+/// Releases the task the fold gives `session` back after its loss was told (`LOST_MARKER`): a line
+/// that syncs later (the winner's release, written before this claim) can make a lost claim win. The
+/// drone was told to move on and its tree may be set aside, so it must not hold the task unawares,
+/// its heartbeats renewing it. Whether it released one.
+fn release_told_loss(home: &Path, g: &Goal, b: &Board, session: &str, repo: &str, state: &str, now: i64) -> bool {
+    let Some(s) = board::holding(b, session, now) else { return false };
+    let key = format!("{}@{}", s.task.id, s.live(now).map_or(0, |l| l.2));
+    if !hook::listed(state, LOST_MARKER).contains(key.as_str()) {
+        return false;
+    }
+    let done = write(home, &g.id, vec![Event::new(Ev::Released, &s.task.id, session, now).with_note("its claim was told lost")]).is_ok();
+    if done {
+        count(home, stats::HIVE_RELEASED, session, &g.id, &s.task.id, repo);
+    }
+    done
+}
+
+/// The board of goal `g` for `session` at `now` (its lines with their offsets, the end offset, the
+/// fold), after `release_told_loss`.
+fn board_for(home: &Path, g: &Goal, session: &str, repo: &str, now: i64) -> (Vec<(u64, Event)>, u64, Board) {
+    let path = tasks_path(home, &g.id);
+    let read = || {
+        let (events, end) = board::read_from(&path, 0);
+        let b = board::fold(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
+        (events, end, b)
+    };
+    let (events, end, b) = read();
+    let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
+    if release_told_loss(home, g, &b, session, repo, &state, now) { read() } else { (events, end, b) }
+}
+
 /// `out` (the inner answer) with `text` as the event's context, first; when the harness does not take
 /// context here (`allowed` false) the text waits for the stop.
 fn with_context(session: &str, hook_event: &str, text: String, allowed: bool, out: Option<Value>) -> Option<Value> {
@@ -674,9 +815,7 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
     let Ok(g) = goal::load(home, &hs.goal) else { return inner() };
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
     let repo = queen::repo_name(cwd);
-    let path = tasks_path(home, &g.id);
-    let (events, end) = board::read_from(&path, 0);
-    let b = board::fold(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
+    let (events, end, b) = board_for(home, &g, session, &repo, now);
     let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started };
     match event {
         "prompt" => {
@@ -690,10 +829,10 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
             if heartbeat(home, &mut hs, &b, session, now) {
                 save(session, &hs);
             }
-            let text = ctx.post_tool(&b, input);
+            let text = ctx.post_tool(&b, &events, input);
             with_context(session, "PostToolUse", text, h.caps().tool_context, inner())
         }
-        "stop" => ctx.stop(&mut hs, &b, input, started, inner),
+        "stop" => ctx.stop(&mut hs, &b, &events, input, started, inner),
         "end" => {
             let out = inner();
             if let Some(s) = board::holding(&b, session, now)
@@ -705,6 +844,31 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
         }
         _ => inner(),
     }
+}
+
+/// The hook's pre_tool step for an edit or write (hook.rs `edit_text`'s tools): denied while the
+/// session's latest claim was lost and it holds no task (`lost_claim`), with the lost claim's news
+/// when it is new (told once, as at any other hook) and `NOT_YOURS`. A claim lost across nodes is
+/// learnt at a sync, so the loser's next edit is its last attempt at the task, not its next turn. The
+/// worktree is not set aside here (a 2 s hook on opencode and omp): at the stop or the next claim. Any
+/// other tool gets None at once; an edit in no goal after one failed file open.
+pub fn pre_tool(h: &dyn Harness, home: &Path, input: &Value, now: i64) -> Option<Value> {
+    let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
+    hook::edit_text(tool, input.get("tool_input").unwrap_or(&Value::Null))?;
+    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+    let g = goal::load(home, &bound(session)?.goal).ok()?;
+    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    let repo = queen::repo_name(cwd);
+    let (events, _, b) = board_for(home, &g, session, &repo, now);
+    let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
+    let task = lost_claim(&b, events.iter().map(|(_, e)| e), session, &state, now)?.task.clone();
+    let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started: Instant::now() };
+    let mut news = ctx.lost_told(&b, &events, &state, false);
+    if news.is_empty() {
+        news.push(format!("Your claim on {task} did not take effect and you hold no task: this {tool} is refused."));
+    }
+    let reason = format!("{} {}\n{NOT_YOURS}", ctx.head(), news.join("\n"));
+    Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
 }
 
 /// One hook event of a hive drone.
@@ -728,6 +892,29 @@ impl Ctx<'_> {
 
     fn head(&self) -> String {
         format!("[borg hive {}]", self.g.id)
+    }
+
+    /// The lost claims not told yet (`lost_news`), marked told: told once, at whichever hook comes
+    /// first. At the stop (`settle`) the latest lost claim's worktree is set aside then
+    /// (`set_aside_lost`), by its own session, whose next claim may come from a fresh session that never
+    /// hears of this loss; never while it holds a task. At a shorter hook the news says when it will be.
+    fn lost_told(&self, b: &Board, lines: &[(u64, Event)], state: &str, settle: bool) -> Vec<String> {
+        let (mut news, keys) = lost_news(b, self.session, state);
+        if !keys.is_empty() {
+            hook::append(self.session, &format!("{LOST_MARKER}{}", keys.join(",")));
+        }
+        let lines = || lines.iter().map(|(_, e)| e);
+        if settle {
+            let total = crate::expert_route::stop_budget(self.h).unwrap_or(crate::expert_route::DEFAULT_STOP_BUDGET);
+            let left = total.saturating_sub(self.started.elapsed()).saturating_sub(crate::expert_route::STOP_MARGIN);
+            news.extend(set_aside_lost(self.g, b, lines(), self.session, state, self.cwd, self.now, left));
+        } else if let Some(c) = set_aside_due(b, lines(), self.session, state, self.now).filter(|c| keys.contains(&claim_key(c))) {
+            news.push(format!(
+                "What you did for {} is set aside when this turn ends or at your next claim (kept in a snapshot commit): build nothing more on it.",
+                c.task
+            ));
+        }
+        news
     }
 
     /// The prompt's hive context: the claim (in full when it is new to the drone), lost claims, the
@@ -756,11 +943,7 @@ impl Ctx<'_> {
         if last != Some(key.as_str()) {
             marks.push(format!("{TASK_MARKER}{key}"));
         }
-        let (lost, lost_keys) = lost_news(b, self.session, &state);
-        parts.extend(lost);
-        if !lost_keys.is_empty() {
-            marks.push(format!("{LOST_MARKER}{}", lost_keys.join(",")));
-        }
+        parts.extend(self.lost_told(b, events, &state, false));
         // What other drones and engineers did since the last prompt, newest last.
         let cursor = if hs.cursor > end { 0 } else { hs.cursor };
         let changes: Vec<&Event> = events.iter().filter(|(at, e)| *at > cursor && e.by != self.session && e.ev != Ev::Heartbeat).map(|(_, e)| e).collect();
@@ -835,12 +1018,30 @@ impl Ctx<'_> {
         format!("{} {}", self.head(), parts.join("\n"))
     }
 
-    /// After a tool call: contracts the edit lands in, and files outside the claim's scope (advice,
-    /// never a refusal), each once.
-    fn post_tool(&self, b: &Board, input: &Value) -> String {
+    /// After a tool call: a lost claim, after any tool (the loser hears of it at its next hook, not its
+    /// next turn); after an edit, contracts it lands in and files outside the claim's scope (advice,
+    /// never a refusal). Each once.
+    fn post_tool(&self, b: &Board, lines: &[(u64, Event)], input: &Value) -> String {
+        let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
+        let mut parts = self.lost_told(b, lines, &state, false);
+        let hits = self.edit_news(b, input, &state, &mut parts);
+        if parts.is_empty() {
+            return String::new();
+        }
+        stats::count(self.home, stats::HIVE_SHOWN, self.session, |ev| {
+            ev.lessons = hits;
+            ev.why = self.g.id.clone();
+            ev.repo = self.repo.into();
+        });
+        format!("{} {}", self.head(), parts.join("\n"))
+    }
+
+    /// An edit's contracts and out-of-scope files (`post_tool`) added to `parts`, marked shown: the
+    /// contracts' ids. Nothing for another tool.
+    fn edit_news(&self, b: &Board, input: &Value, state: &str, parts: &mut Vec<String>) -> Vec<String> {
         let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
         let tool_input = input.get("tool_input").unwrap_or(&Value::Null);
-        let Some(text) = hook::edit_text(tool, tool_input) else { return String::new() };
+        let Some(text) = hook::edit_text(tool, tool_input) else { return Vec::new() };
         let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
         let mut files: Vec<String> = [s(tool_input, "file_path"), s(tool_input, "notebook_path")].into_iter().collect();
         files.extend(tool_input.get("edits").and_then(Value::as_array).into_iter().flatten().map(|e| s(e, "file_path")));
@@ -849,12 +1050,10 @@ impl Ctx<'_> {
         let files: Vec<String> =
             files.into_iter().filter(|f| !f.is_empty()).map(|f| cwd.join(&f).strip_prefix(top).map(|p| p.display().to_string()).unwrap_or(f)).collect();
         let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-        let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
-        let mut parts = Vec::new();
         let mut marks = Vec::new();
         let all = contract::read(&contracts_path(self.home, &self.g.id));
         let current = contract::current(&all);
-        let told = hook::listed(&state, CONTRACT_MARKER);
+        let told = hook::listed(state, CONTRACT_MARKER);
         let hits: Vec<&Contract> =
             contract::matching(&current, self.repo, &refs, &text).into_iter().filter(|c| c.by != self.session && !told.contains(c.id.as_str())).collect();
         if !hits.is_empty() {
@@ -866,7 +1065,7 @@ impl Ctx<'_> {
         }
         if let Some(held) = board::holding(b, self.session, self.now).filter(|s| !s.task.files.is_empty()) {
             let globs: Vec<regex::Regex> = held.task.files.iter().map(|g| crate::assimilate_dir::glob(g)).collect();
-            let warned = hook::listed(&state, SCOPE_MARKER);
+            let warned = hook::listed(state, SCOPE_MARKER);
             let outside: Vec<&str> = refs.iter().copied().filter(|f| !globs.iter().any(|g| g.is_match(f)) && !warned.contains(f) && !f.contains(',')).collect();
             for f in &outside {
                 parts.push(format!(
@@ -882,30 +1081,27 @@ impl Ctx<'_> {
         if !marks.is_empty() {
             hook::append(self.session, &marks.join("\n"));
         }
-        if parts.is_empty() {
-            return String::new();
-        }
-        stats::count(self.home, stats::HIVE_SHOWN, self.session, |ev| {
-            ev.lessons = hits.iter().map(|c| c.id.clone()).collect();
-            ev.why = self.g.id.clone();
-            ev.repo = self.repo.into();
-        });
-        format!("{} {}", self.head(), parts.join("\n"))
+        hits.iter().map(|c| c.id.clone()).collect()
     }
 
     /// The stop: with a claim, its oracle decides (block, publish blocked, or publish done and hand
     /// over the next task); without one, `inner()` with any waiting hive text.
-    fn stop(&self, hs: &mut HiveSession, b: &Board, input: &Value, started: Instant, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
+    fn stop(
+        &self,
+        hs: &mut HiveSession,
+        b: &Board,
+        lines: &[(u64, Event)],
+        input: &Value,
+        started: Instant,
+        inner: impl FnOnce() -> Option<Value>,
+    ) -> Option<Value> {
         let first_round = input.get("stop_hook_active").and_then(Value::as_bool) != Some(true);
         let waiting = std::fs::read_to_string(wait_path(self.session)).unwrap_or_default();
         let _ = std::fs::remove_file(wait_path(self.session));
         let path = tasks_path(self.home, &self.g.id);
         let Some(held) = board::holding(b, self.session, self.now) else {
             let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
-            let (lost, keys) = lost_news(b, self.session, &state);
-            if !keys.is_empty() {
-                hook::append(self.session, &format!("{LOST_MARKER}{}", keys.join(",")));
-            }
+            let lost = self.lost_told(b, lines, &state, true);
             let mut text = waiting;
             if !lost.is_empty() {
                 text.push_str(&format!("{} {}", self.head(), lost.join("\n")));
@@ -1214,14 +1410,16 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64,
     let take_out = || take_out_all(cwd, &brought, within.saturating_sub(t0.elapsed()));
     let rest = within.saturating_sub(t0.elapsed());
     // A fix task's claim keeps a snapshot of what the reset will discard in its note: recoverable.
-    let (base, note) = match (&task.from, task.role != Role::Verify && !cwd.is_empty()) {
+    // The tree this claim starts from (`CLAIM_START_MARKER`): its base, but for a rework a snapshot now.
+    let (base, note, start) = match (&task.from, task.role != Role::Verify && !cwd.is_empty()) {
         (Some(from), _) if reset => {
-            (from.clone(), verdict::snapshot(Path::new(cwd), rest).map(|s| format!("worktree before the reset: {s}")).unwrap_or_default())
+            (from.clone(), verdict::snapshot(Path::new(cwd), rest).map(|s| format!("worktree before the reset: {s}")).unwrap_or_default(), from.clone())
         }
         (_, true) => {
-            (first_base(&board::read(&path), &task.id, session, &drone).or_else(|| verdict::snapshot(Path::new(cwd), rest)).unwrap_or_default(), String::new())
+            let now = verdict::snapshot(Path::new(cwd), rest).unwrap_or_default();
+            (first_base(&board::read(&path), &task.id, session, &drone).unwrap_or_else(|| now.clone()), String::new(), now)
         }
-        (_, false) => (String::new(), String::new()),
+        (_, false) => (String::new(), String::new(), String::new()),
     };
     let left = within.saturating_sub(t0.elapsed());
     let now = now + t0.elapsed().as_millis() as i64;
@@ -1245,6 +1443,10 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64,
         let _ = write(home, &g.id, vec![Event::new(Ev::Released, id, session, learn::now_ms()).with_note(&why)]);
         let kept = note.strip_prefix("worktree before the reset: ").map(|s| format!("; what the worktree held is kept in commit {s}")).unwrap_or_default();
         return Err(Refused::Reset(format!("{why}: the claim of {id} is released{kept}")));
+    }
+    if !cwd.is_empty() {
+        let start = if start.is_empty() { "-" } else { start.as_str() };
+        hook::append(session, &format!("{CLAIM_START_MARKER}{id}@{now} {start} {}", repo_top(Path::new(cwd)).display()));
     }
     if let Some(mut hs) = bound(session) {
         hs.beat_ms = now;
@@ -2002,6 +2204,12 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
         Err(e) => return fail(e),
     };
     let repo = queen::repo_name(&here.cwd);
+    // A lost claim's tree is set aside before this claim takes its base from it.
+    let (events, _, b) = board_for(&here.home, &g, &session, &repo, learn::now_ms());
+    let state = std::fs::read_to_string(hook::state_file(&session)).unwrap_or_default();
+    if let Some(told) = set_aside_lost(&g, &b, events.iter().map(|(_, e)| e), &session, &state, &here.cwd, learn::now_ms(), verdict::SNAPSHOT_TIMEOUT) {
+        println!("{told}");
+    }
     let mut lost = 0;
     while lost < if task.is_some() { 1 } else { CLAIM_TRIES } {
         let now = learn::now_ms();
@@ -2581,6 +2789,72 @@ mod tests {
         unbind(&runner_s);
         unbind(&own_s);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A loss the claim's own read-back saw took out the deps it brought in (`take_out_all`) and left no
+    /// start (`CLAIM_START_MARKER`): nothing is set aside, which would bring them back. A loss learnt
+    /// later sets the tree aside to this claim's start, never to its base: a rework's base is its first
+    /// claim's, older than another task's work done in the same tree since.
+    #[test]
+    fn a_lost_claim_is_set_aside_to_its_own_start_and_only_when_it_has_one() {
+        let root = std::env::temp_dir().join(format!("borg-hive-set-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (w, home) = (root.join("app"), root.join("store"));
+        std::fs::create_dir_all(&w).unwrap();
+        git_ok(&w, &["init", "-q", "-b", "main"]);
+        std::fs::write(w.join("a.txt"), "a\n").unwrap();
+        git_ok(&w, &["add", "-A"]);
+        git_ok(&w, &["commit", "-qm", "base"]);
+        let g = goal_g();
+        goal::create(&home, &g).unwrap();
+        // The base: the first claim's tree. The start: this claim's, with a dep's and t2's work since.
+        let base = verdict::snapshot(&w, verdict::SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::write(w.join("dep.txt"), "the dep's verified work\n").unwrap();
+        std::fs::write(w.join("t2.txt"), "t2's done work\n").unwrap();
+        let start = verdict::snapshot(&w, verdict::SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::write(w.join("mine.txt"), "lost work\n").unwrap();
+        let session = format!("set-aside-{}", std::process::id());
+        let t1 = new_task("t1", Role::Work, "work", "", vec![], vec![], vec![]).unwrap();
+        let mine = Event { base: base.clone(), ..Event::new(Ev::Claim, "t1", &session, 20) };
+        let lines: Vec<(u64, Event)> =
+            [Event::open(t1, "eng", 1), Event::new(Ev::Claim, "t1", "rival", 10), mine].into_iter().enumerate().map(|(i, e)| (i as u64, e)).collect();
+        let b = board::fold(&lines.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
+        let ctx = Ctx {
+            h: &crate::harness::sim::Sim,
+            home: &home,
+            g: &g,
+            session: &session,
+            cwd: w.to_str().unwrap(),
+            repo: "app",
+            now: 30,
+            started: Instant::now(),
+        };
+        let news = ctx.lost_told(&b, &lines, "", true);
+        assert_eq!(news.len(), 1, "told, nothing set aside: {news:?}");
+        assert!(w.join("mine.txt").exists());
+        let read = || std::fs::read_to_string(hook::state_file(&session)).unwrap_or_default();
+        let state = format!("{}{CLAIM_START_MARKER}t1@20 {start} {}\n", read(), w.display());
+        let news = ctx.lost_told(&b, &lines, &state, true);
+        assert!(news.len() == 1 && news[0].contains("set aside in commit") && news[0].contains(&format!("git diff {start} ")), "{news:?}");
+        assert!(w.join("dep.txt").exists() && w.join("t2.txt").exists() && !w.join("mine.txt").exists(), "only this claim's work is taken out");
+        let marked = format!("{}{CLAIM_START_MARKER}t1@20 {start} {}\n", read(), w.display());
+        assert!(ctx.lost_told(&b, &lines, &marked, true).is_empty(), "once");
+        let _ = std::fs::remove_file(hook::state_file(&session));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_session_holding_a_task_has_no_lost_claim_whatever_its_latest_claim() {
+        let t = |id: &str| Event::open(new_task(id, Role::Work, "work", "", vec![], vec![], vec![]).unwrap(), "eng", 1);
+        let mut lines =
+            vec![t("t1"), t("t2"), Event::new(Ev::Claim, "t2", "s", 5), Event::new(Ev::Claim, "t1", "rival", 8), Event::new(Ev::Claim, "t1", "s", 10)];
+        let b = board::fold(&lines);
+        assert_eq!(b.lost, vec![("s".to_string(), "t1".to_string(), 10)], "its latest claim, t1's, lost");
+        assert!(lost_claim(&b, &lines, "s", "", 11).is_none(), "it holds t2: its edits run and its tree stays");
+        assert!(lost_claim(&b, &lines, "s", "", 11 + LEASE_MS).is_some(), "once t2's lease is gone, t1's loss counts");
+        // A renewal of the held task is no loss either.
+        lines.push(Event::new(Ev::Claim, "t2", "s", 12));
+        assert!(lost_claim(&board::fold(&lines), &lines, "s", "", 13).is_none());
     }
 
     #[test]

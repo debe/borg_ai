@@ -114,7 +114,14 @@ not verified: the task reopens.
 
 **Claims are leases.** A claim lasts while its drone's hooks renew it (every 10 minutes) and expires
 after 30 minutes without one. When two drones claim the same open task, the claim with the lowest
-(ms, blake3 key) wins, on every machine alike; the loser is told at its next prompt and moves on. A drone
+(ms, blake3 key) wins, on every machine alike; the loser is told at its next hook (a prompt, any tool
+call or its stop) and moves on. While its latest claim is lost and it holds no task, its edits and
+writes are refused with the reason (a refused edit raises no guard flag). When its turn ends, or at
+its next `borg hive claim`, its worktree is set back to where the claim started: the changes since then
+are kept in a snapshot commit the message names, pinned at `refs/borg/hive/<goal>/<sha>` (`git diff
+<start> <snapshot>` shows them), so nothing of the lost work reaches its next task. This happens only
+while the session holds no task, and not in a tree another session holds a task in. Should a line that
+syncs later give the task back to the drone after it was told it lost, the drone releases it. A drone
 that works 30 minutes without any hook event (one long tool call) loses its claim too.
 
 **In the harness.** At a prompt the drone sees its claim (or the next open task and the command to claim
@@ -425,9 +432,19 @@ not this one.
 
 - **Claims and leases.** A claim is provisional until the next sync round: of two claims made on two
   machines, the earlier one wins on both once they sync, and the loser's drone hears so at its next
-  hook (its done is ignored). Heartbeats are board lines, so a lease held on one machine is renewed on
+  hook after that sync, a tool call included, with its edits refused and its worktree set aside from
+  then on (see "Claims are leases" under [Hive](#hive); its done is ignored). Heartbeats are board lines, so a lease held on one machine is renewed on
   every other one. The winner rule compares clocks: keep the machines' clocks well within the 30 min
   lease. A runner releases only its own node's claims.
+- **Which task a drone takes.** The next open task is from the drone's own repo first, then by role
+  (verify, integrate, work, plan). Within that, each machine takes the tasks it owns first, oldest
+  first: the owner is the machine with the highest `blake3(node, task)` among those whose drones wrote
+  a board line within the lease (rendezvous hashing; an engineer's lines, such as opening the goal, do
+  not count), so drones on two machines start on different tasks instead of racing for one. A machine
+  whose own tasks are taken takes the others newest first, the end their owner reaches last. On one
+  machine the order is the oldest task first, as before. Each machine judges liveness from what it has
+  seen: a machine whose drones were quiet for the lease, or just started, can still race until its
+  next line syncs.
 - **Drone names** (`d1`, `d2`) repeat on every machine: a verify task is barred to the author's session
   everywhere, and to the author's drone name only on the author's node.
 - **Commits travel as bundles.** A verdict diffs the author's snapshots. At each `done` in a store

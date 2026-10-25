@@ -1496,11 +1496,16 @@ pub fn main(name: &str, event: &str) {
     }
     // Who is working where (presence.rs, for `borg top`): one small atomic write per hook.
     let now = learn::now_ms();
-    // Not at pre_tool (every tool call): there only the hive's guard flags (hive/guard.rs: one failed
-    // open for a session in no goal) and steering reads, only once someone steered.
+    // Not at pre_tool (every tool call): there only the hive's refusal of a lost claim's edits
+    // (hive/mod.rs `pre_tool`), its guard flags (hive/guard.rs: one failed open for a session in no
+    // goal; a refused edit never runs, so it flags nothing) and steering reads, only once someone steered.
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let me = match event {
         "pre_tool" => {
+            if let Some(deny) = crate::hive::pre_tool(h, &home, &input, now) {
+                println!("{deny}");
+                return;
+            }
             crate::hive::guard::pre_tool(&home, &input, now);
             if !crate::steer::inbox(&home).exists() {
                 return;

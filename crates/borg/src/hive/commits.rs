@@ -97,6 +97,12 @@ pub fn reference(goal: &str, sha: &str) -> String {
     format!("refs/borg/hive/{goal}/{sha}")
 }
 
+/// Pins commit `sha` of the repo at `repo` at `reference(goal, sha)`, which keeps it from `gc`: whether
+/// it did. A lost claim's snapshot (hive/mod.rs `set_aside`) is pinned so, never bundled.
+pub fn pin(repo: &Path, goal: &str, sha: &str) -> bool {
+    git_ok(repo, &["update-ref", &reference(goal, sha), sha])
+}
+
 /// A full commit id: 40 (sha1) or 64 (sha256) lowercase hex.
 fn sha(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

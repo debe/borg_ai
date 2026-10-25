@@ -359,6 +359,35 @@ fn lost_claims(b: &board::Board, events: &[board::Event]) -> (usize, Vec<(String
     (b.lost.len(), worked)
 }
 
+/// Each lost claim's waste, in seconds: from the claim to the first of its session's next claim, a
+/// release, done or block of the task (the loser dropped it, or worked it to the end), and the end of
+/// its iteration (its `spend` line); None when none is known. Before a loser heard of its loss at its
+/// next hook (tasks/todo.md E1) it worked on until its turn ended.
+fn loser_waste(b: &board::Board, events: &[board::Event], spend: &[hive_run::Spend]) -> Vec<Option<f64>> {
+    use board::Ev;
+    b.lost
+        .iter()
+        .map(|(by, task, ms)| {
+            let next = events.iter().filter(|e| &e.by == by && e.ms > *ms).filter(|e| match e.ev {
+                Ev::Claim => true,
+                Ev::Released | Ev::Done | Ev::Blocked => &e.task == task,
+                _ => false,
+            });
+            // A spend line names its iteration's sessions, comma-separated.
+            let end = spend.iter().filter(|s| s.session.split(',').any(|x| x == by) && s.ms >= *ms).map(|s| s.ms);
+            next.map(|e| e.ms).chain(end).min().map(|end| (end - ms) as f64 / 1000.0)
+        })
+        .collect()
+}
+
+/// The `q` quantile (nearest rank) of `xs`; None when empty.
+pub(super) fn quantile(xs: &[f64], q: f64) -> Option<f64> {
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let i = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len().max(1)) - 1;
+    v.get(i).copied()
+}
+
 /// One node's stats: attempts done there, attempts authored there that were verified, verdicts given
 /// there, bundles made there, received from the other node, taken (unbundled), refused and still waiting
 /// here (a failure that may pass, not taken since), with the reasons.
@@ -563,6 +592,10 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let cross = cross_node(&folds[0], &events[0], &taken);
     let integrator = cross.integrator.clone();
     let (lost, lost_worked) = lost_claims(&folds[0], &events[0]);
+    // Both nodes' spend lines (the file syncs; a line on both counts once per session and ms).
+    let spend: Vec<hive_run::Spend> = sides.iter().flat_map(|s| spend_of(&s.gdir(&o.goal).join("spend.jsonl"), None)).collect();
+    let waste = loser_waste(&folds[0], &events[0], &spend);
+    let known: Vec<f64> = waste.iter().flatten().copied().collect();
     let name_of = |id: &str| sides.iter().find(|s| s.id == id).map(|s| s.name);
     for (s, (b, ev)) in sides.iter().zip(folds.iter().zip(&events)) {
         let mut v = node_stats(b, ev, s, &o.goal);
@@ -595,6 +628,7 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
                "integrated_on": integrator.as_deref().and_then(name_of), "scored_from": scored_from.map(|s| s.name),
                "max_holders": holders.values().copied().max().unwrap_or(0), "max_holders_by_task": holders,
                "lost_claims": lost, "lost_then_done": lost_worked.len(), "lost_then_done_tasks": lost_worked,
+               "loser_waste_s": waste, "loser_waste_p95_s": quantile(&known, 0.95), "loser_waste_max_s": quantile(&known, 1.0),
                "cross_node": {"verified": cross.verified, "integrated": cross.integrated,
                               "by_node": cross.by_node.iter().filter_map(|(id, (v, i))| Some((name_of(id)?, json!({"verified": v, "integrated": i})))).collect::<BTreeMap<_, _>>(),
                               "on_board": {"verified": cross.on_board.0, "integrated": cross.on_board.1}},
@@ -675,6 +709,27 @@ mod tests {
         let b = board::fold(&ev);
         assert_eq!(lost_claims(&b, &ev), (1, vec![("t1".to_string(), "sa".to_string())]), "{:?}", b.lost);
         assert_eq!(max_holders(&b)["t1"], 1, "a lost claim holds nothing");
+    }
+
+    /// A loser's waste ends at its next claim, a done of the lost task, or its iteration's end,
+    /// whichever comes first.
+    #[test]
+    fn a_losers_waste_runs_to_its_next_claim_done_or_iteration_end() {
+        let mut ev = vec![on(Event::open(task("t1", Role::Work, None), "eng", 1), "A"), on(Event::open(task("t2", Role::Work, None), "eng", 1), "A")];
+        ev.push(on(Event::new(Ev::Claim, "t1", "sb", 1_000).with_drone("d1"), "B"));
+        ev.push(on(Event::new(Ev::Claim, "t1", "sa", 1_010).with_drone("d1"), "A"));
+        ev.push(on(Event::new(Ev::Heartbeat, "t1", "sa", 2_000), "A"));
+        ev.push(on(Event::new(Ev::Claim, "t2", "sa", 4_010).with_drone("d1"), "A"));
+        let spend = |session: &str, ms: i64| hive_run::Spend { v: 1, ms, session: session.into(), ..hive_run::Spend::default() };
+        let b = board::fold(&ev);
+        assert_eq!(loser_waste(&b, &ev, &[spend("sa", 9_000)]), [Some(3.0)], "dropped for t2 after 3 s");
+        let mut done = ev[..4].to_vec();
+        done.push(on(Event::new(Ev::Done, "t1", "sa", 61_010), "A"));
+        assert_eq!(loser_waste(&board::fold(&done), &done, &[spend("sa", 70_000)]), [Some(60.0)], "worked to its done");
+        let quiet = ev[..4].to_vec();
+        assert_eq!(loser_waste(&board::fold(&quiet), &quiet, &[spend("sa,sa", 6_010), spend("sb", 9_000)]), [Some(5.0)], "its iteration ended");
+        assert_eq!(loser_waste(&board::fold(&quiet), &quiet, &[]), [None]);
+        assert_eq!((quantile(&[1.0, 5.0, 2.0], 0.95), quantile(&[], 0.95)), (Some(5.0), None));
     }
 
     #[test]

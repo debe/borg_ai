@@ -296,6 +296,17 @@ fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) 
     board::next_for(b, "", drone, &super::node(home), repo, now, |s| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty()).is_some()
 }
 
+/// The stall count after an iteration. One that wrote no board line is a stall only while work is
+/// still open to the drone: one beaten to its task (a race lost here or on another node) while that
+/// work is in hand left nothing to do, so the runner waits on the holder instead of ending.
+fn stalls(n: u32, wrote_nothing: bool, open: bool, in_flight: bool) -> u32 {
+    match (wrote_nothing, open || !in_flight) {
+        (false, _) => 0,
+        (true, false) => n,
+        (true, true) => n + 1,
+    }
+}
+
 /// A fresh UUID-shaped session id (Claude Code's `--session-id` takes only a UUID).
 fn session_id(goal: &str, drone: &str, iter: u32) -> String {
     let mut h = blake3::Hasher::new();
@@ -556,8 +567,9 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         // Board progress: any line of this iteration's sessions (a claim, a done, a verdict).
         let mine: Vec<&board::Event> = events.iter().filter(|e| e.ms >= started && sessions.contains(&e.by) && e.ev != Ev::Heartbeat).collect();
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
-        t.stalls = if mine.is_empty() { t.stalls + 1 } else { 0 };
         let b = board::fold(&events);
+        let now = learn::now_ms();
+        t.stalls = stalls(t.stalls, mine.is_empty(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now), b.in_flight(now));
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
         let note = match step(&t, ctx.share, left, b.finished(), true) {
             Next::End(r) => r,
@@ -805,6 +817,14 @@ mod tests {
         assert_eq!(queen::repo_name(&wt.join("src").display().to_string()), "app");
         assert_eq!(branch("g", 2), "hive/g/2");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_iteration_beaten_to_its_task_while_the_work_is_in_hand_is_no_stall() {
+        assert_eq!(stalls(1, false, true, true), 0, "a board line resets the count");
+        assert_eq!(stalls(1, true, true, true), 2, "work still open to it and it did nothing");
+        assert_eq!(stalls(1, true, false, false), 2, "nothing open and nothing in hand");
+        assert_eq!(stalls(1, true, false, true), 1, "beaten to the task: another drone holds the work");
     }
 
     #[test]

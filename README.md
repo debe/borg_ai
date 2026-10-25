@@ -452,8 +452,10 @@ the team's numbers (synced logs) or this machine's. [The page](https://github.co
 **The hive across machines (built, not measured).** In a collective shared over the mesh, a goal, its
 board, contracts, messages between drones (`borg hive ask`, `tell`), guard flags and spend sync to every member
 as signed lines, so drones on several machines claim from one board and spend one budget (every drone stops
-once the goal's total over all machines reaches it, passed at most by the sessions then in flight): the earlier of two claims wins on
-both machines after a sync round, leases renew through synced heartbeats, a drone name bars only on its
+once the goal's total over all machines reaches it, passed at most by the sessions then in flight): each machine's drones take the tasks it owns first
+(rendezvous hashing over the machines whose drones are active on the board), so two machines rarely claim one task, the earlier of two claims wins on
+both machines after a sync round (the loser hears so at its next tool call, its edits are refused, and when its turn ends or it claims again its
+worktree goes back to the claim's start with its changes kept in a pinned snapshot commit), leases renew through synced heartbeats, a drone name bars only on its
 own machine, and the author's machine credits a verdict given elsewhere, once. A check another machine
 wrote is a shell command from that machine: it runs only after the engineer's `borg hive approve <goal>`
 there, and the board lists what waits. Two machines that make one goal id before a sync stop that goal

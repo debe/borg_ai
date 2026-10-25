@@ -566,3 +566,233 @@ fn a_fresh_runner_session_is_not_offered_the_verify_task_of_its_drone() {
     assert!(!lines.lines().any(|l| l.contains("\"ev\":\"claim\"") && l.contains(s2)), "no claim of s2 at all: {lines}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A line of another node's drone `sr` that claims `task` 5 ms before `session`'s latest claim of it:
+/// the fold gives it the race, as a sync would deliver it after the local claim looked won.
+fn lose_to_remote(root: &Path, session: &str, task: &str) {
+    lose_to(root, "sr", session, task);
+}
+
+fn lose_to(root: &Path, rival: &str, session: &str, task: &str) {
+    let ms = claim_ms(root, session, task);
+    let ev = |ev: &str| json!({"v": 1, "ev": ev, "task": task, "ms": ms - 5, "by": rival, "node": "remote-node-7"});
+    append_board(root, &[ev("claim"), ev("heartbeat")]);
+}
+
+/// The ms of `session`'s latest claim of `task`.
+fn claim_ms(root: &Path, session: &str, task: &str) -> i64 {
+    let lines = std::fs::read_to_string(store(root).join("hive/g1/tasks.jsonl")).unwrap();
+    lines
+        .lines()
+        .rev()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["ev"] == "claim" && v["by"] == session && v["task"] == task)
+        .and_then(|v| v["ms"].as_i64())
+        .unwrap()
+}
+
+fn bash() -> Value {
+    json!({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+}
+
+fn edit(root: &Path) -> Value {
+    json!({"tool_name": "Edit", "tool_input": {"file_path": work(root).join("src/parse.rs"), "old_string": "a", "new_string": "b"}})
+}
+
+fn denied(v: &Option<Value>) -> Option<String> {
+    let spec = &v.as_ref()?["hookSpecificOutput"];
+    (spec["permissionDecision"] == "deny").then(|| spec["permissionDecisionReason"].as_str().unwrap_or_default().to_string())
+}
+
+#[test]
+fn a_claim_lost_to_another_node_is_told_at_the_next_tool_call_and_its_edits_are_refused() {
+    let root = common::setup("hive-lost-hook");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    join(&root, "s1");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    assert_eq!(denied(&hook(&root, "pre_tool", "s1", edit(&root), &[])), None, "its own claim: edits run");
+    lose_to_remote(&root, "s1", "t1");
+    let ctx = hook(&root, "post_tool", "s1", bash(), &[]).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(ctx.starts_with("[borg hive g1] Your claim on t1 did not take effect"), "after any tool, not only an edit: {ctx}");
+    let again = hook(&root, "post_tool", "s1", bash(), &[]).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(!again.contains("did not take effect"), "told once: {again}");
+    let why = denied(&hook(&root, "pre_tool", "s1", edit(&root), &[])).expect("an edit of a lost claim is refused");
+    assert!(why.contains("Your claim on t1 did not take effect") && why.contains("It is not yours"), "{why}");
+    assert_eq!(denied(&hook(&root, "pre_tool", "s1", bash(), &[])), None, "only edits and writes are refused");
+    assert_eq!(denied(&hook(&root, "pre_tool", "s2", edit(&root), &[])), None, "a session in no goal is untouched");
+    ok(&root, &["claim", "t2", "--session", "s1"]);
+    assert_eq!(denied(&hook(&root, "pre_tool", "s1", edit(&root), &[])), None, "a new claim lifts it");
+    assert_eq!(board(&root)["t1"], ("claimed".into(), "sr".into()));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The work dir as a git repo with `src/parse.rs` committed and an uncommitted `notes.md` (in every
+/// claim's base, so a reset to the base keeps it).
+fn git_work(root: &Path) -> PathBuf {
+    let w = work(root);
+    std::fs::create_dir_all(w.join("src")).unwrap();
+    std::fs::write(w.join("src/parse.rs"), "fn parse() {}\n").unwrap();
+    git(&w, &["init", "-q", "-b", "main"]);
+    git(&w, &["add", "-A"]);
+    git(&w, &["-c", "user.name=x", "-c", "user.email=x@y", "commit", "-q", "-m", "one"]);
+    std::fs::write(w.join("notes.md"), "mine, before any claim\n").unwrap();
+    w
+}
+
+fn tool_ctx(root: &Path, session: &str) -> String {
+    hook(root, "post_tool", session, bash(), &[]).map(|v| common::context(&v.to_string())).unwrap_or_default()
+}
+
+#[test]
+fn a_lost_claims_worktree_is_set_aside_at_its_stop_in_a_pinned_snapshot_and_reset_to_its_base() {
+    let root = common::setup("hive-lost-reset");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    let w = git_work(&root);
+    join(&root, "lr1");
+    ok(&root, &["claim", "t1", "--session", "lr1"]);
+    // The loser works on: a tracked file changed, a new file, before the sync tells it.
+    std::fs::write(w.join("src/parse.rs"), "fn parse() { todo!() }\n").unwrap();
+    std::fs::write(w.join("src/lost.rs"), "lost work\n").unwrap();
+    lose_to_remote(&root, "lr1", "t1");
+    // A tool call's hook tells it and leaves the tree: opencode and omp give such a hook 2 to 5 s.
+    let ctx = tool_ctx(&root, "lr1");
+    assert!(ctx.contains("did not take effect") && ctx.contains("set aside when this turn ends"), "{ctx}");
+    assert!(w.join("src/lost.rs").exists(), "nothing reset inside a tool call's hook");
+    let r = reason(&stop(&root, "lr1", false));
+    let snap = r.split("set aside in commit ").nth(1).and_then(|s| s.split_whitespace().next()).expect(&r).to_string();
+    assert!(r.contains("your worktree is back at the claim's start"), "{r}");
+    assert_eq!(std::fs::read_to_string(w.join("src/parse.rs")).unwrap(), "fn parse() {}\n", "the tracked file is as at the claim");
+    assert!(!w.join("src/lost.rs").exists(), "the new file is gone");
+    assert_eq!(std::fs::read_to_string(w.join("notes.md")).unwrap(), "mine, before any claim\n", "the base's own change stays");
+    assert_eq!(git(&w, &["show", &format!("{snap}:src/lost.rs")]), "lost work", "the snapshot holds the discarded work");
+    assert_eq!(git(&w, &["show", &format!("{snap}:src/parse.rs")]), "fn parse() { todo!() }");
+    assert_eq!(git(&w, &["rev-parse", &format!("refs/borg/hive/g1/{snap}")]), snap, "pinned: gc keeps it");
+    let lines = std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap();
+    let base = lines.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["ev"] == "claim" && v["by"] == "lr1").unwrap()["base"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(git(&w, &["diff", "--name-only", &base, &snap]), "src/lost.rs\nsrc/parse.rs", "the discarded diff, against the base");
+    assert_eq!(git(&w, &["status", "--porcelain"]), "?? notes.md", "the worktree equals the base: nothing else differs from HEAD");
+    // Once only: the next stop neither tells nor resets again.
+    std::fs::write(w.join("scratch.txt"), "after\n").unwrap();
+    let again = reason(&stop(&root, "lr1", false));
+    assert!(!again.contains("set aside") && w.join("scratch.txt").exists(), "{again}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_lost_claim_is_set_aside_at_the_next_claim_before_it_takes_its_base() {
+    let root = common::setup("hive-lost-next-claim");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    let w = git_work(&root);
+    join(&root, "ln1");
+    ok(&root, &["claim", "t1", "--session", "ln1"]);
+    std::fs::write(w.join("src/lost.rs"), "lost work\n").unwrap();
+    lose_to_remote(&root, "ln1", "t1");
+    tool_ctx(&root, "ln1");
+    let out = ok(&root, &["claim", "t2", "--session", "ln1"]);
+    assert!(out.contains("set aside in commit") && out.contains("claimed t2"), "{out}");
+    assert!(!w.join("src/lost.rs").exists(), "t1's work is not in t2's tree");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_second_loss_of_a_task_claimed_again_sets_aside_only_this_claims_work() {
+    let root = common::setup("hive-lost-twice");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    let w = git_work(&root);
+    join(&root, "lt1");
+    ok(&root, &["claim", "t1", "--session", "lt1"]);
+    lose_to_remote(&root, "lt1", "t1");
+    stop(&root, "lt1", false);
+    // t2's work, done in the same worktree.
+    ok(&root, &["claim", "t2", "--session", "lt1"]);
+    std::fs::write(w.join("t2.txt"), "t2's work\n").unwrap();
+    std::fs::write(w.join("ok"), "").unwrap();
+    ok(&root, &["done", "--session", "lt1"]);
+    // The rival lets t1 go; s1 claims it again (its base: its first claim's, from before t2) and loses
+    // once more.
+    let ms = claim_ms(&root, "lt1", "t1");
+    append_board(&root, &[json!({"v": 1, "ev": "released", "task": "t1", "ms": ms + 1, "by": "sr", "node": "remote-node-7"})]);
+    ok(&root, &["claim", "t1", "--session", "lt1"]);
+    std::fs::write(w.join("t1-again.txt"), "lost again\n").unwrap();
+    lose_to(&root, "sr2", "lt1", "t1");
+    let r = reason(&stop(&root, "lt1", false));
+    assert!(r.contains("set aside in commit"), "{r}");
+    assert!(!w.join("t1-again.txt").exists(), "this claim's work is set aside");
+    assert_eq!(std::fs::read_to_string(w.join("t2.txt")).unwrap(), "t2's work\n", "t2's done work stays");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_lost_claim_the_fold_gives_back_after_it_was_told_is_released() {
+    let root = common::setup("hive-lost-flip");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    join(&root, "lf1");
+    ok(&root, &["claim", "t1", "--session", "lf1"]);
+    lose_to_remote(&root, "lf1", "t1");
+    assert!(tool_ctx(&root, "lf1").contains("Your claim on t1 did not take effect"));
+    // The rival's release, written before s1's claim, syncs late: the fold now gives t1 to s1.
+    let ms = claim_ms(&root, "lf1", "t1");
+    append_board(&root, &[json!({"v": 1, "ev": "released", "task": "t1", "ms": ms - 4, "by": "sr", "node": "remote-node-7"})]);
+    tool_ctx(&root, "lf1");
+    assert_eq!(board(&root)["t1"].0, "open", "told it lost, the drone moved on: released, not renewed");
+    assert!(denied(&hook(&root, "pre_tool", "lf1", edit(&root), &[])).is_some(), "its edits stay refused");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_refused_edit_of_a_test_file_raises_no_flag() {
+    let root = common::setup("hive-lost-no-flag");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    join(&root, "lg1");
+    ok(&root, &["claim", "t1", "--session", "lg1"]);
+    lose_to_remote(&root, "lg1", "t1");
+    let test = json!({"tool_name": "Edit", "tool_input": {"file_path": work(&root).join("tests/test_parse.py"), "old_string": "a", "new_string": "b"}});
+    assert!(denied(&hook(&root, "pre_tool", "lg1", test, &[])).is_some());
+    let flags = store(&root).join("hive/g1/flags.jsonl");
+    assert_eq!(std::fs::read_to_string(&flags).unwrap_or_default(), "", "the edit never ran: nothing to flag");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_lost_claim_in_a_tree_another_session_holds_a_task_in_is_left_as_it_is() {
+    let root = common::setup("hive-lost-shared");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    let w = git_work(&root);
+    join(&root, "lh1");
+    join(&root, "lh2");
+    ok(&root, &["claim", "t1", "--session", "lh1"]);
+    ok(&root, &["claim", "t2", "--session", "lh2"]);
+    std::fs::write(w.join("t2.txt"), "s2's work on t2\n").unwrap();
+    lose_to_remote(&root, "lh1", "t1");
+    let r = reason(&stop(&root, "lh1", false));
+    assert!(r.contains("left as it is: another drone holds a task in it"), "{r}");
+    assert!(w.join("t2.txt").exists(), "s2's work is untouched");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_lost_claim_learnt_while_holding_the_next_task_resets_nothing() {
+    let root = common::setup("hive-lost-held");
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    let w = git_work(&root);
+    join(&root, "s1");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    lose_to_remote(&root, "s1", "t1");
+    // Before any hook told it, the session claimed t2 and works on it.
+    ok(&root, &["claim", "t2", "--session", "s1"]);
+    std::fs::write(w.join("src/parse.rs"), "t2's work\n").unwrap();
+    let ctx = hook(&root, "post_tool", "s1", bash(), &[]).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(ctx.contains("Your claim on t1 did not take effect") && !ctx.contains("set aside"), "told, nothing reset: {ctx}");
+    assert_eq!(std::fs::read_to_string(w.join("src/parse.rs")).unwrap(), "t2's work\n", "the held task's work is untouched");
+    assert_eq!(denied(&hook(&root, "pre_tool", "s1", edit(&root), &[])), None, "it holds t2: edits run");
+    let _ = std::fs::remove_dir_all(root);
+}

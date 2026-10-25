@@ -3725,6 +3725,70 @@ echo '{"type":"result","total_cost_usd":0.5,"num_turns":2,"result":"ok","modelUs
         let _ = fs::remove_dir_all(cell);
     }
 
+    /// Arm E's loser waste (tasks/todo.md E1), sim harness: `BORG_E_CELLS` cells (default 20) per side of
+    /// slow drones (each holds a claim 10 s), firing no hook while they work (before: a loser hears of
+    /// its loss at its turn's end) and the post_tool hook every 2 s (after). Prints each side's lost
+    /// claims and waste; the after side's p95 must stay within two sync rounds and a poll.
+    /// cargo build -p borg-ai && cargo test -p borg-eval hive_e2e_e_sim_loser -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn hive_e2e_e_sim_loser_waste_before_and_after_hook_news() {
+        let cells: u32 = std::env::var("BORG_E_CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        let mut p95 = Vec::new();
+        for (side, slow) in [("before", json!({"work_s": 10, "poll_s": 0})), ("after", json!({"work_s": 10}))] {
+            let tag = format!("waste{side}");
+            let (wd, root) =
+                e2e_workload_in(&tag, json!({"usd_per_iter": 0.10, "drones": {"d1": slow, "d2": slow}}), &["w/f1.txt", "w/f2.txt", "w/f3.txt", "w/f4.txt"]);
+            assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
+            let run = format!("hive-e2e-{tag}-{}", std::process::id());
+            let (wds, borg) = (wd.display().to_string(), built_borg().display().to_string());
+            for seed in 0..cells {
+                let seed_s = seed.to_string();
+                let args = [
+                    "--workload",
+                    &wds,
+                    "--arm",
+                    "e",
+                    "--seed",
+                    &seed_s,
+                    "--cap-usd",
+                    "6",
+                    "--timeout-s",
+                    "300",
+                    "--run",
+                    &run,
+                    "--harness",
+                    "sim",
+                    "--borg",
+                    &borg,
+                ];
+                let code = cell_cmd(&s(&args));
+                assert_eq!(code, 0, "{side} s{seed}: {:#}", rows_of(&run).last().unwrap());
+            }
+            let rows = rows_of(&run);
+            let waste: Vec<f64> =
+                rows.iter().flat_map(|r| r["e"]["loser_waste_s"].as_array().cloned().unwrap_or_default()).filter_map(|w| w.as_f64()).collect();
+            let unknown = rows.iter().flat_map(|r| r["e"]["loser_waste_s"].as_array().cloned().unwrap_or_default()).filter(Value::is_null).count();
+            let lost: u64 = rows.iter().filter_map(|r| r["e"]["lost_claims"].as_u64()).sum();
+            let done: u64 = rows.iter().filter_map(|r| r["e"]["lost_then_done"].as_u64()).sum();
+            let q = arm_e::quantile(&waste, 0.95);
+            eprintln!(
+                "{side}: {} cells, {lost} lost claims ({done} then done, {unknown} without an end), waste p50 {:?} p95 {q:?} max {:?} s: {waste:?}",
+                rows.len(),
+                arm_e::quantile(&waste, 0.5),
+                arm_e::quantile(&waste, 1.0)
+            );
+            p95.push(q);
+            forget_validation(&format!("e2e-{tag}"));
+            let _ = fs::remove_dir_all(wd);
+            let _ = fs::remove_dir_all(root);
+            let _ = fs::remove_dir_all(repo_root().join("target/eval-runs").join(&run));
+        }
+        if let [_, Some(after)] = p95[..] {
+            assert!(after <= 6.0, "after: a loser drops its task within two sync rounds and a poll: p95 {after} s");
+        }
+    }
+
     /// A chain goal of the sequence driver: `e2e_workload_in` in the workspace `toy` shared by the chain,
     /// its tasks titled in the words of the fake learner's playbook shape, an oracle that fails while a
     /// task's file holds `wip`, and d1 failing its first attempt (its next iteration starts holding the

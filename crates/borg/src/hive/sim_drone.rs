@@ -10,7 +10,9 @@
 //! blocked, the claim still held); `hang`: once it holds a claim it sleeps past any iteration cap; `edit_tests`: it also
 //! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
 //! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
-//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait);
+//! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait), firing
+//! the post_tool hook every `poll_s` (default 2; 0: never) meanwhile, as a real drone's tool calls do, and
+//! drops the task at once when the hook says the claim was lost;
 //! `one_task`: its turn ends after one finished task (one task per iteration, each costing `usd_per_iter`);
 //! `node` (top level): a label the drones sign their files with (`by d1@<node>`);
 //! `reject_first` (top level): the goal's first verdict is a reject whoever gives it, and a reworked task's
@@ -62,6 +64,10 @@ fn default_usd() -> f64 {
     0.10
 }
 
+fn default_poll() -> u64 {
+    2
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 struct Plan {
     #[serde(default)]
@@ -76,6 +82,8 @@ struct Plan {
     grow_tests: bool,
     #[serde(default)]
     work_s: u64,
+    #[serde(default = "default_poll")]
+    poll_s: u64,
     #[serde(default)]
     one_task: bool,
     #[serde(default)]
@@ -116,6 +124,27 @@ impl Drone<'_> {
         let mut cmd = Command::new(std::env::current_exe().ok()?);
         cmd.arg("hive").args(args).args(["--session", self.session, "--dir", self.cwd]).current_dir(self.cwd);
         runner::run_capped_status(cmd, None, cap).and_then(|(s, _)| s.code())
+    }
+
+    /// Works `plan.work_s` on a claim, firing the post_tool hook every `plan.poll_s` (a tool call):
+    /// false as soon as a hook says the claim on `task` was lost.
+    fn work(&self, plan: &Plan, task: &str) -> bool {
+        let end = std::time::Instant::now() + Duration::from_secs(plan.work_s);
+        let every = Duration::from_secs(if plan.poll_s == 0 { plan.work_s } else { plan.poll_s });
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::sleep(left.min(every));
+            if plan.poll_s == 0 {
+                continue;
+            }
+            let said = self.hook("post_tool", json!({"tool_name": "Bash", "tool_input": {"command": "true"}})).map(|v| v.to_string()).unwrap_or_default();
+            if said.contains(&format!("Your claim on {task} did not take effect")) {
+                return false;
+            }
+        }
     }
 
     fn stop(&self, again: bool) -> String {
@@ -215,7 +244,9 @@ pub fn main(here: &Here) -> i32 {
             }
             continue;
         }
-        std::thread::sleep(Duration::from_secs(plan.work_s));
+        if !d.work(&plan, &task.id) {
+            continue;
+        }
         let file = task.files.first().cloned().unwrap_or_else(|| format!("{}.txt", task.id));
         let failed_once = hook::state_file(&format!("sim-{}-{name}", g.id)).with_extension("failed");
         let fail = plan.fail_first && !failed_once.exists();
