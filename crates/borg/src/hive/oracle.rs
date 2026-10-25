@@ -1,5 +1,6 @@
 //! The oracle: what gates `done`. A task's `accept` checks (else the goal's oracle) run one after the
-//! other, each `sh -c` in its repo's directory, bounded by its own timeout and by what is left of the
+//! other, each `sh -c` in its repo's directory (the worktree root for an empty `repo`, whichever
+//! subdirectory the caller's shell is in), bounded by its own timeout and by what is left of the
 //! caller's budget (the stop hook's, or none for `borg hive done`); the first one that does not pass
 //! decides. A failed run's output tail is kept in `<goal>/oracle/<task>.<ms>.log` (the newest
 //! `KEEP_LOGS`), for the drone and its verifier.
@@ -47,18 +48,27 @@ pub fn checks<'a>(goal: &'a Goal, task: &'a Task) -> &'a [Check] {
     if task.accept.is_empty() { &goal.oracle } else { &task.accept }
 }
 
-/// Where a check runs: `cwd` for an empty `repo`; else `repo` as a directory under `cwd`, or beside
-/// the repo `cwd` is in (a sibling checkout), or as an absolute path.
-fn dir_of(check: &Check, cwd: &Path) -> PathBuf {
+/// The root of the worktree `cwd` is in, else `cwd` itself (outside git). A check is written against
+/// the root (`cd sub && make test`), and a drone's shell may have moved into a subdirectory.
+fn root_of(cwd: &Path) -> PathBuf {
+    crate::notes::toplevel(&cwd.display().to_string()).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Where a check runs, for `root` a worktree root (`root_of`): `root` for an empty `repo`; else `repo`
+/// as a directory under `root`, or beside the repo `root` is in (a sibling checkout), or as an
+/// absolute path.
+fn dir_of(check: &Check, root: &Path) -> PathBuf {
     if check.repo.is_empty() {
-        return cwd.to_path_buf();
+        return root.to_path_buf();
     }
     let p = Path::new(&check.repo);
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    let root = PathBuf::from(borg_trace::repo_key(&cwd.display().to_string()));
-    [cwd.join(p), root.parent().map(|r| r.join(p)).unwrap_or_default()].into_iter().find(|d| d.is_dir()).unwrap_or_else(|| cwd.join(p))
+    // Under the worktree itself first (a drone's `.worktrees/hive-…` checkout, never the main one
+    // `repo_key` folds it onto); the folded key only finds a sibling checkout.
+    let key = PathBuf::from(borg_trace::repo_key(&root.display().to_string()));
+    [root.join(p), key.parent().map(|r| r.join(p)).unwrap_or_default()].into_iter().find(|d| d.is_dir()).unwrap_or_else(|| root.join(p))
 }
 
 /// The last `n` characters of `text`.
@@ -158,11 +168,12 @@ pub fn run(home: &Path, goal: &Goal, task: &Task, cwd: &Path, budget: Option<Dur
     exec(goal, task, cwd, budget)
 }
 
-/// Runs the checks for `task` of `goal` in `cwd`, within `budget` in all (None: each check's own
+/// Runs the checks for `task` of `goal` from the root of the worktree `cwd` is in, within `budget` in all (None: each check's own
 /// timeout only). The children never re-enter the hive or learning: a test suite that runs borg's own
 /// hooks does not recurse.
 fn exec(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Verdict {
     let started = Instant::now();
+    let root = root_of(cwd);
     for c in checks(goal, task) {
         let own = Duration::from_secs(c.timeout_s.max(1));
         let cap = match budget {
@@ -176,7 +187,7 @@ fn exec(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Verdi
         // Stderr joins stdout, so the tail shows the failure.
         cmd.arg("-c")
             .arg(format!("exec 2>&1\n{}", c.cmd))
-            .current_dir(dir_of(c, cwd))
+            .current_dir(dir_of(c, &root))
             .env("BORG_LEARN", "off")
             .env(super::ENV, "")
             .env_remove(super::DRONE_ENV);
@@ -193,7 +204,7 @@ fn exec(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Verdi
             }
             // Killed at the cap, or it could not start (a missing directory) well before it.
             None if t0.elapsed() + Duration::from_millis(50) >= cap => return Verdict::Timeout { check: c.name.clone(), after: t0.elapsed() },
-            None => return Verdict::Fail { check: c.name.clone(), tail: format!("could not run `{}` in {}", c.cmd, dir_of(c, cwd).display()) },
+            None => return Verdict::Fail { check: c.name.clone(), tail: format!("could not run `{}` in {}", c.cmd, dir_of(c, &root).display()) },
         }
     }
     Verdict::Pass
@@ -347,6 +358,45 @@ mod tests {
         crate::hive::goal::create(&home, &g).unwrap();
         assert_eq!(run(&home, &g, &task(), &work, None), Verdict::Pass);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A check written against the worktree root (`cd sub && ...`, or `repo` = `sub`) passes from a
+    /// subdirectory too: a drone whose shell is already in `sub` runs `borg hive done` there.
+    #[test]
+    fn checks_run_from_the_worktree_root_whatever_the_callers_directory() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-oracle-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(sub.join("deep")).unwrap();
+        std::fs::write(sub.join("marker"), "").unwrap();
+        let st = std::process::Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap();
+        assert!(st.success());
+        let roomy = Some(Duration::from_secs(30));
+        let g = goal(&["cd sub && test -f marker", "test -d sub"]);
+        for cwd in [dir.clone(), sub.clone(), sub.join("deep")] {
+            assert_eq!(exec(&g, &task(), &cwd, roomy), Verdict::Pass, "from {}", cwd.display());
+        }
+        let mut in_repo = goal(&["test -f marker"]);
+        in_repo.oracle[0].repo = "sub".into();
+        assert_eq!(exec(&in_repo, &task(), &sub.join("deep"), roomy), Verdict::Pass, "a check's repo is under the root, not the caller");
+        // In a linked worktree (a drone's `.worktrees/hive-…`), `repo` resolves in that worktree, not
+        // in the main checkout `repo_key` folds it onto.
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["worktree", "add", "-q", ".worktrees/hive-g-1"]);
+        let wt = dir.join(".worktrees/hive-g-1");
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::write(wt.join("sub/drone-only"), "").unwrap();
+        let mut drone = goal(&["test -f drone-only"]);
+        drone.oracle[0].repo = "sub".into();
+        assert_eq!(exec(&drone, &task(), &wt.join("sub"), roomy), Verdict::Pass, "a check's repo is in the drone's worktree, not the main checkout");
+        // Outside git the caller's directory is the root.
+        let plain = std::env::temp_dir().join(format!("borg-hive-oracle-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(plain.join("sub")).unwrap();
+        assert_eq!(exec(&goal(&["test -d sub"]), &task(), &plain, roomy), Verdict::Pass);
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

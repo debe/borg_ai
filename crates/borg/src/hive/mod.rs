@@ -94,6 +94,8 @@ pub const SHOW_CHANGES: usize = 12;
 pub const CONSCIENCE_RESERVE: Duration = Duration::from_secs(20);
 /// Less stop budget than this left: the oracle does not start (it reports a timeout).
 const MIN_ORACLE: Duration = Duration::from_secs(2);
+/// What the stop hook says of a check its time ran out on (the drone is told to run `borg hive done`).
+pub(crate) const HOOK_TIMED_OUT: &str = "did not finish within the stop hook's time";
 /// How long a claimant waits before reading the board back: a rival's line written at nearly the same
 /// moment has landed by then, so the answer is the fold's.
 pub(crate) const CLAIM_SETTLE: Duration = Duration::from_millis(150);
@@ -959,7 +961,7 @@ impl Ctx<'_> {
             let what = match &verdict {
                 oracle::Verdict::Fail { check, tail } => format!("{check} failed (attempt {} of {MAX_ORACLE_BLOCKS}).\n{}", hs.oracle_blocks, tail.trim_end()),
                 oracle::Verdict::Timeout { check, .. } => format!(
-                    "{check} did not finish within the stop hook's time (attempt {} of {MAX_ORACLE_BLOCKS}): run the checks with `{}`, which has no hook time limit.",
+                    "{check} {HOOK_TIMED_OUT} (attempt {} of {MAX_ORACLE_BLOCKS}): run the checks with `{}`, which has no hook time limit.",
                     hs.oracle_blocks,
                     command("done", self.session, self.cwd)
                 ),

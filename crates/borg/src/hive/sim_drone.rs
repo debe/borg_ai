@@ -17,7 +17,9 @@
 //! their own); `crash`: once it holds a claim it exits 1 printing nothing (a harness that died after
 //! spending, without its cost). A fix
 //! task (`from`, hive/integrate.rs) is resolved by script: the conflict marker lines are dropped from its
-//! scoped files and from every other file holding them, both sides kept.
+//! scoped files and from every other file holding them, both sides kept. A check slower than the stop
+//! hook's time (a real suite) is run as a real drone is told to, with `borg hive done`; a verifier runs
+//! the checks without a hook limit, each within its own timeout.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +35,8 @@ use crate::{hook, learn, runner};
 
 pub const SCRIPT_ENV: &str = "BORG_SIM_SCRIPT";
 const CALL: Duration = Duration::from_secs(120);
+/// The cap on `borg hive done`, which runs the checks within their own timeouts.
+const DONE_CALL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Default, Deserialize)]
 struct Script {
@@ -96,9 +100,14 @@ impl Drone<'_> {
 
     /// `borg hive <args> --session S --dir CWD`: its exit code.
     fn hive(&self, args: &[&str]) -> Option<i32> {
+        self.hive_within(args, CALL)
+    }
+
+    /// `hive`, capped at `cap`.
+    fn hive_within(&self, args: &[&str], cap: Duration) -> Option<i32> {
         let mut cmd = Command::new(std::env::current_exe().ok()?);
         cmd.arg("hive").args(args).args(["--session", self.session, "--dir", self.cwd]).current_dir(self.cwd);
-        runner::run_capped_status(cmd, None, CALL).and_then(|(s, _)| s.code())
+        runner::run_capped_status(cmd, None, cap).and_then(|(s, _)| s.code())
     }
 
     fn stop(&self, again: bool) -> String {
@@ -179,7 +188,7 @@ pub fn main(here: &Here) -> i32 {
             let author = task.of.as_ref().and_then(|w| b.tasks.get(w)).and_then(|w| w.author.clone());
             let dir = worktree_of(&here.home, author.as_deref(), &here.cwd);
             let rejected_once = hook::state_file(&format!("sim-{}", g.id)).with_extension("rejected");
-            match oracle::run(&here.home, &g, task, &dir, Some(Duration::from_secs(60))) {
+            match oracle::run(&here.home, &g, task, &dir, None) {
                 oracle::Verdict::Pass if script.reject_first && !rejected_once.exists() => {
                     let _ = std::fs::write(&rejected_once, "");
                     d.hive(&["verify", "--reject", REJECT_NOTE])
@@ -225,6 +234,13 @@ pub fn main(here: &Here) -> i32 {
             d.hive(&["contract", &c.text, "--scope", &c.scope.join(",")]);
         }
         let mut reason = d.stop(false);
+        if reason.contains(super::HOOK_TIMED_OUT) && !fail {
+            // A suite slower than the hook's time: `borg hive done`, as the hook tells a drone.
+            if d.hive_within(&["done"], DONE_CALL) == Some(0) {
+                continue;
+            }
+            break;
+        }
         if reason.contains("is not done") {
             if fail {
                 // The drone's turn ends here, its oracle failing and its claim held.
