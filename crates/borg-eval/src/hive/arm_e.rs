@@ -399,9 +399,10 @@ pub(super) fn quantile(xs: &[f64], q: f64) -> Option<f64> {
     v.get(i).copied()
 }
 
-/// One node's stats: attempts done there, attempts authored there that were verified, verdicts given
+/// One node's stats: attempts done there, attempts authored there that were verified, verdicts given (and how many passed)
 /// there, bundles made there, received from the other node, taken (unbundled), refused and still waiting
-/// here (a failure that may pass, not taken since), with the reasons.
+/// here (a failure that may pass, not taken since), with the reasons, and its claims refused before
+/// their write (a rival's had landed: a race no board shows).
 fn node_stats(b: &board::Board, events: &[board::Event], side: &Side, goal: &str) -> Value {
     let id = side.id.as_str();
     let role = |t: &str| b.tasks.get(t).map(|s| s.task.role);
@@ -416,6 +417,7 @@ fn node_stats(b: &board::Board, events: &[board::Event], side: &Side, goal: &str
         .iter()
         .filter(|s| s.node == id && matches!(s.end, Some(board::Ev::Verified | board::Ev::Rejected)) && role(&s.task) == Some(board::Role::Verify))
         .count();
+    let passes = b.spans.iter().filter(|s| s.node == id && matches!(s.end, Some(board::Ev::Verified)) && role(&s.task) == Some(board::Role::Verify)).count();
     let integrations = b
         .spans
         .iter()
@@ -432,7 +434,9 @@ fn node_stats(b: &board::Board, events: &[board::Event], side: &Side, goal: &str
     let waiting: BTreeSet<String> =
         outcomes.iter().filter(|o| o["ok"] == false).filter_map(line_of).filter(|l| !taken.contains(l) && !refused.contains(l)).collect();
     let why: BTreeSet<&str> = outcomes.iter().filter(|o| o["ok"] == false).filter_map(|o| o["why"].as_str()).collect();
-    json!({"id": id, "drones": side.drones, "attempts_done": done, "attempts_verified": verified, "verdicts": verdicts, "integrations": integrations,
+    let confirms: Vec<borg::hive::Confirm> = read_jsonl(&borg::hive::confirms_path(&side.store, goal));
+    let refused_claims = confirms.iter().filter(|c| c.outcome == borg::hive::REFUSED).count();
+    json!({"id": id, "drones": side.drones, "refused_claims": refused_claims, "attempts_done": done, "attempts_verified": verified, "verdicts": verdicts, "verdicts_passed": passes, "integrations": integrations,
            "bundles": {"made": made, "received": lines.len() - made, "taken": taken.len(), "refused": refused.len(), "waiting": waiting.len(), "why_not": why}})
 }
 
@@ -614,7 +618,7 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let known: Vec<f64> = waste.iter().flatten().copied().collect();
     // The added claim latency (phase e E4: each confirm window, both nodes') and each run's start wait (E2b).
     let confirms: Vec<borg::hive::Confirm> = sides.iter().flat_map(|s| read_jsonl(&borg::hive::confirms_path(&s.store, &o.goal))).collect();
-    let confirm_ms: Vec<f64> = confirms.iter().map(|c| c.waited_ms as f64).collect();
+    let confirm_ms: Vec<f64> = confirms.iter().filter(|c| c.outcome != borg::hive::REFUSED).map(|c| c.waited_ms as f64).collect();
     let mut confirm_outcomes: BTreeMap<String, usize> = BTreeMap::new();
     for c in &confirms {
         *confirm_outcomes.entry(c.outcome.clone()).or_default() += 1;

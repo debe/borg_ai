@@ -60,7 +60,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +75,11 @@ pub const DEFAULT_ITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Guards, not tuned defaults: polls of a board with nothing open to the drone before it ends, failed
 /// iterations and iterations without board progress in a row.
 const IDLE_POLLS: u32 = 3;
-const IDLE_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const IDLE_WAIT: Duration = Duration::from_secs(3);
+/// How often an idle drone looks at the board's file within `IDLE_WAIT` (`idle_wait`): as often as the
+/// mesh daemon looks at the hive's logs (borg-mesh daemon.rs `hive_poll`), so a peer's line that lands
+/// wakes it within a tick, not a blind wait.
+const IDLE_TICK: Duration = Duration::from_millis(25);
 const MAX_ERRORS: u32 = 2;
 const MAX_STALLS: u32 = 2;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -88,8 +92,8 @@ const LOG_CAP: usize = 1 << 20;
 const PROMPT: &str = "You are drone {drone} of hive goal {goal}. Work in this worktree only. \
 borg's hooks show your claim or the next open task with the exact commands: claim one task \
 (the board: `borg hive board {goal}`), publish every interface you create or change as a contract, \
-and finish when its oracle passes (ending your turn runs it). A verify task's work is in its \
-author's worktree: {joins} maps sessions to worktrees. Gaming the oracle (editing tests, CI or \
+and finish when its oracle passes (ending your turn runs it). A verify task's work is the \
+commits its claim names, in this repo whatever node did it, not your tree. Gaming the oracle (editing tests, CI or \
 oracle files) is visible, allowed to happen and useless: {decides}.";
 const DECIDES_HIDDEN: &str = "held-out checks you cannot see decide";
 const DECIDES: &str = "the verifier sees every such change and the task counts as failed";
@@ -207,9 +211,9 @@ pub fn drone_name(n: usize) -> String {
 }
 
 /// The prompt of `drone`'s every iteration of `g`.
-pub fn prompt(g: &Goal, drone: &str, joins: &Path) -> String {
+pub fn prompt(g: &Goal, drone: &str) -> String {
     let decides = if goal::has_hidden(g) { DECIDES_HIDDEN } else { DECIDES };
-    PROMPT.replace("{goal}", &g.id).replace("{drone}", drone).replace("{joins}", &joins.display().to_string()).replace("{decides}", decides)
+    PROMPT.replace("{goal}", &g.id).replace("{drone}", drone).replace("{decides}", decides)
 }
 
 /// A drone's tally between iterations.
@@ -300,18 +304,56 @@ fn fold(home: &Path, goal: &str) -> Board {
     board::fold(&board::read(&super::tasks_path(home, goal)))
 }
 
-/// A task is open to `drone` of this node (`home`) at `now`: one of its new sessions could claim it (its
-/// checks approved here, oracle.rs `Approvals`).
-fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> bool {
+/// What the board offers `drone` of this node (`home`) at `now`: when the task open to it became
+/// claimable (board.rs `claimable_since`), if one is: one of its new sessions could claim it (its checks
+/// approved here, oracle.rs `Approvals`) and no idle drone of this node before it takes it (board.rs
+/// `free_for`); and whether the work is in hand instead: a task is held, or one it could claim is such
+/// a drone's, which a session of this one would only race.
+fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> (Option<i64>, bool) {
     let approvals = super::oracle::Approvals::load(home, &g.id);
-    board::next_for(b, "", drone, &super::node(home), repo, now, |s| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty()).is_some()
+    let allowed = |s: &board::TaskState| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty();
+    let node = super::node(home);
+    let open = board::free_for(b, "", drone, &node, repo, now, allowed).map(|s| board::claimable_since(b, s));
+    (open, b.in_flight(now) || (open.is_none() && board::taken_before(b, drone, &node, repo, now, allowed)))
+}
+
+/// Runs `cmd`, a session of `drone` on `goal` for a task claimable since `since` (`open_to`), within
+/// `timeout`. Another node leaves this node's task to its idle drones for `OWNER_GRACE_MS` after it
+/// became claimable (board.rs `left_to_owner`): `IDLE_WAIT` for the runner to start a session, then a
+/// line's way to the peers. A session that claims within that time needs no line of its own; one that
+/// has not claimed by then says on the board that it started (`session`, stamped with its start), so
+/// the peers keep leaving the task to it until it claims, and that it ended once it ends unsettled.
+/// A line only then: each line starts sync rounds, and a claim that lands during one waits for the
+/// next (mod.rs `heard_back`).
+fn run_session(home: &Path, goal: &str, drone: &str, cmd: Command, timeout: Duration, since: i64) -> Option<runner::Bounded> {
+    let started = learn::now_ms();
+    let notice = Duration::from_millis(u64::try_from(since.saturating_add(IDLE_WAIT.as_millis() as i64) - started).unwrap_or(0));
+    let unsettled = || {
+        let b = fold(home, goal);
+        let node = super::node(home);
+        !b.sessions.get(&(node, drone.to_string())).is_some_and(|(_, settled)| *settled > started)
+    };
+    let (ended, ending) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let said = scope.spawn(move || {
+            let timed_out = matches!(ending.recv_timeout(notice), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+            timed_out && unsettled() && super::session(home, goal, drone, true, started).is_ok()
+        });
+        let ran = runner::run_bounded(cmd, None, timeout);
+        drop(ended);
+        if said.join().unwrap_or(false) && unsettled() {
+            let _ = super::session(home, goal, drone, false, learn::now_ms());
+        }
+        ran
+    })
 }
 
 /// The stall count after an iteration. One that wrote no board line is a stall only while work is
 /// still open to the drone: one beaten to its task (a race lost here or on another node) while that
-/// work is in hand left nothing to do, so the runner waits on the holder instead of ending.
-fn stalls(n: u32, wrote_nothing: bool, open: bool, in_flight: bool) -> u32 {
-    match (wrote_nothing, open || !in_flight) {
+/// work is in hand (`open_to`: held, or left to an idle drone of this node before it) left nothing to
+/// do, so the runner waits on the holder instead of ending.
+fn stalls(n: u32, wrote_nothing: bool, open: bool, in_hand: bool) -> u32 {
+    match (wrote_nothing, open || !in_hand) {
         (false, _) => 0,
         (true, false) => n,
         (true, true) => n + 1,
@@ -459,6 +501,29 @@ fn recover(home: &Path, goal: &str, now: i64) {
     release_held(home, goal, &b, &held, "its run ended", now);
 }
 
+/// The board file's length and mtime (`idle_wait`), None while it does not exist.
+type Mark = Option<(u64, Option<std::time::SystemTime>)>;
+
+fn mark(path: &Path) -> Mark {
+    std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+}
+
+/// Waits until the board file at `path` differs from `seen`, at most `cap`, looking every `IDLE_TICK`:
+/// whether it changed.
+fn idle_wait(path: &Path, seen: Mark, cap: Duration) -> bool {
+    let t0 = Instant::now();
+    loop {
+        if mark(path) != seen {
+            return true;
+        }
+        let left = cap.saturating_sub(t0.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(IDLE_TICK.min(left));
+    }
+}
+
 /// Up to `LOG_CAP` of an iteration's output, in `logs/<drone>-<iter>.out`.
 fn log(home: &Path, goal: &str, drone: &str, iter: u32, out: &[u8]) {
     let dir = logs_dir(home, goal);
@@ -474,10 +539,12 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
     let (mut iter, dearest) = spent_before(ctx.before, ctx.here, &name);
     let mut t = Tally { dearest, ..Tally::default() };
     let mut end = DroneEnd { drone: name.clone(), worktree: wt.to_path_buf(), spent: 0.0, iters: 0, done: Vec::new(), reason: "" };
-    let text = prompt(ctx.g, &name, &super::joins_path(ctx.home, goal));
+    let text = prompt(ctx.g, &name);
     let env = [(super::ENV, goal.to_string()), (super::DRONE_ENV, name.clone())];
+    let tasks = super::tasks_path(ctx.home, goal);
     loop {
         let now = learn::now_ms();
+        let seen = mark(&tasks);
         let b = fold(ctx.home, goal);
         if let Some(o) = super::integrate::run(ctx.home, ctx.g, ctx.root, &name, now) {
             let head = o.head.as_deref().map_or("-", |h| &h[..h.len().min(12)]);
@@ -498,18 +565,21 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         // The goal's budget left after every node's spend, read before each decision: a peer's lines
         // arrive between iterations.
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
-        match step(&t, ctx.share, left, b.finished(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now)) {
+        let (open, in_hand) = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
+        match step(&t, ctx.share, left, b.finished(), open.is_some()) {
             Next::End(r) => {
                 end.reason = r;
                 end.spent = t.spent;
                 return end;
             }
             Next::Wait => {
-                // Work held by another drone may still open a verify task this drone can take.
-                if !b.in_flight(now) {
+                // Work held by another drone, or left to an idle drone of this node before this one,
+                // may still open a verify task this drone can take; a wait the board's change ended
+                // early is no idle poll.
+                let changed = idle_wait(&tasks, seen, IDLE_WAIT);
+                if !in_hand && !changed {
                     t.idle += 1;
                 }
-                std::thread::sleep(IDLE_WAIT);
                 continue;
             }
             Next::Go => t.idle = 0,
@@ -539,7 +609,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             Join { v: 1, ms: now, goal: goal.into(), dir, drone: name.clone(), session: session.clone(), harness: ctx.h.name().into(), by: "run".into() };
         let _ = super::append_join(ctx.home, goal, &join);
         let started = learn::now_ms();
-        let ran = runner::run_bounded(cmd, None, ctx.iter_timeout);
+        let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, open.unwrap_or(started));
         let out = ran.as_ref().map(|b| b.out.as_slice()).unwrap_or_default();
         let said = ctx.h.headless_end(out);
         log(ctx.home, goal, &name, iter, out);
@@ -580,7 +650,8 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         let b = board::fold(&events);
         let now = learn::now_ms();
-        t.stalls = stalls(t.stalls, mine.is_empty(), open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now), b.in_flight(now));
+        let (open, in_hand) = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
+        t.stalls = stalls(t.stalls, mine.is_empty(), open.is_some(), in_hand);
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
         let note = match step(&t, ctx.share, left, b.finished(), true) {
             Next::End(r) => r,
@@ -750,7 +821,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
                 println!("    {}", super::plan::render_card(c));
             }
         }
-        println!("prompt ({}):\n{}", drone_name(1), prompt(&g, &drone_name(1), &super::joins_path(home, &g.id)));
+        println!("prompt ({}):\n{}", drone_name(1), prompt(&g, &drone_name(1)));
         return 0;
     }
     if let Err(e) = exclude_worktrees(&repo) {
@@ -824,6 +895,12 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         let done = if e.done.is_empty() { "-".to_string() } else { e.done.join(",") };
         println!("{}  {name}  ${:.2}/${share:.2}  {} iter  tasks done: {done}  end: {}", e.drone, e.spent, e.iters, e.reason);
     }
+    // Races no board shows: claims a rival's beat to the write, each a session's start spent for nothing.
+    let refused =
+        super::read_lines::<super::Confirm>(&super::confirms_path(home, &g.id)).iter().filter(|c| c.ms >= run.ms && c.outcome == super::REFUSED).count();
+    if refused > 0 {
+        println!("claims refused here (a rival's landed first): {refused}");
+    }
     let total = goal_spent(home, &g.id);
     println!("goal {}: ${:.2} of ${:.2} spent ({})", g.id, total.total, g.budget_usd, spent_by(&total, &here));
     let b = fold(home, &g.id);
@@ -858,6 +935,67 @@ mod tests {
         assert_eq!(queen::repo_name(&wt.join("src").display().to_string()), "app");
         assert_eq!(branch("g", 2), "hive/g/2");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_session_says_it_started_only_once_unclaimed_past_its_tasks_notice_time() {
+        // Another node leaves this node's task to its idle drones for the grace: a session that claims
+        // within the notice time writes nothing (each line starts sync rounds a claim then waits on);
+        // one past it says it started, stamped with its start, and that it ended unsettled; one that
+        // claims after saying so is settled by its claim.
+        let home = std::env::temp_dir().join(format!("borg-hive-run-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let path = super::super::tasks_path(&home, "g");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let notes = || board::read(&path).into_iter().filter(|e| e.by == "runner").map(|e| (e.note, e.ms)).collect::<Vec<_>>();
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let cap = Duration::from_secs(10);
+        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, learn::now_ms());
+        assert_eq!(notes(), [], "within the notice time");
+        let t0 = learn::now_ms();
+        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, t0 - IDLE_WAIT.as_millis() as i64);
+        let n = notes();
+        assert_eq!(n.iter().map(|(note, _)| note.as_str()).collect::<Vec<_>>(), ["session-start d1", "session-end d1"]);
+        assert!(n[0].1 >= t0 && n[0].1 < t0 + 200 && n[1].1 >= n[0].1 + 200, "{n:?}");
+        let claim = board::Event { node: super::super::node(&home), ..board::Event::new(Ev::Claim, "t1", "s1", 0).with_drone("d1") };
+        let line = serde_json::to_string(&claim).unwrap().replace("\"ms\":0", &format!("\"ms\":{}", learn::now_ms() + 100));
+        run_session(&home, "g", "d1", sh(&format!("sleep 0.2 && printf '%s\\n' '{line}' >> '{}'", path.display())), cap, 0);
+        assert_eq!(notes().len(), 3, "a start, no end: {:?}", notes());
+        let b = fold(&home, "g");
+        let (started, settled) = b.sessions[&(super::super::node(&home), "d1".to_string())];
+        assert!(settled > started, "{:?}", b.sessions);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_idle_drone_wakes_when_the_board_changes() {
+        // A peer's line lands 100 ms into the wait: the drone looks again then, not after a blind
+        // IDLE_WAIT; a quiet board waits the cap out.
+        let dir = std::env::temp_dir().join(format!("borg-hive-idle-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let seen = mark(&path);
+        let lands = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                board::append(&path, &[board::Event::new(Ev::Claim, "t1", "sb", 1)]).unwrap();
+            }
+        });
+        let t0 = Instant::now();
+        assert!(idle_wait(&path, seen, IDLE_WAIT), "the board changed");
+        assert!(t0.elapsed() < IDLE_WAIT / 2, "{:?}", t0.elapsed());
+        lands.join().unwrap();
+        let t0 = Instant::now();
+        assert!(!idle_wait(&path, mark(&path), Duration::from_millis(150)), "nothing changed");
+        assert!(t0.elapsed() >= Duration::from_millis(150), "{:?}", t0.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -946,14 +1084,14 @@ mod tests {
             hidden: None,
             held_out: false,
         };
-        let p = prompt(&g, "d3", Path::new("/s/hive/parser/joins.jsonl"));
-        assert!(p.contains("drone d3 of hive goal parser") && p.contains("`borg hive board parser`") && p.contains("/s/hive/parser/joins.jsonl"));
+        let p = prompt(&g, "d3");
+        assert!(p.contains("drone d3 of hive goal parser") && p.contains("`borg hive board parser`") && p.contains("the commits its claim names"));
         assert!(p.ends_with("useless: the verifier sees every such change and the task counts as failed."), "no hidden oracle is named: {p}");
         assert!(!p.contains("hidden") && !p.contains("held-out"), "{p}");
         assert!(!p.contains('{'), "every placeholder filled: {p}");
         assert!(p.len() < 700, "{} chars", p.len());
         g.hidden = Some(goal::Hidden { dir: "/held".into(), commands: vec!["true".into()], timeout_s: 60 });
-        let p = prompt(&g, "d3", Path::new("/s/hive/parser/joins.jsonl"));
+        let p = prompt(&g, "d3");
         assert!(p.ends_with(
             "Gaming the oracle (editing tests, CI or oracle files) is visible, allowed to happen and useless: held-out checks you cannot see decide."
         ));
@@ -988,9 +1126,9 @@ mod tests {
         drop(held);
         // A child another test forks right now holds a copy of every open file, this lock's too, until
         // its exec closes it (close-on-exec): free again within moments, not necessarily at once.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while run_lock(&home, "g").unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline, "free again once the first ended");
+            assert!(Instant::now() < deadline, "free again once the first ended");
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(home);

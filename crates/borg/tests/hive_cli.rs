@@ -508,6 +508,46 @@ fn a_verify_task_of_work_whose_snapshots_are_absent_is_not_offered() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// d3-accept2: verifiers of another node's work, sent to a joins.jsonl that holds only this node's
+/// worktrees, found "no change". Its commits here, the claim names them and how to check them out.
+#[test]
+fn a_verify_claim_of_another_nodes_work_names_its_commits() {
+    let root = common::setup("hive-verify-names");
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(work(&root)).args(["-c", "user.email=e@x", "-c", "user.name=e"]).args(args).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(work(&root).join("README"), "x\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    std::fs::write(work(&root).join("parser.rs"), "fn parse() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "the remote drone's work"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["reset", "-q", "--hard", &base]);
+    init(&root, &["t1|work|Add the parser"]);
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let ev = |ev: &str, task: &str, at: i64| json!({"v": 1, "ev": ev, "task": task, "ms": ms + at, "by": "sr", "node": "remote-node-7"});
+    let (mut claim, mut done, mut open) = (ev("claim", "t1", 1), ev("done", "t1", 2), ev("open", "t1.v1", 2));
+    claim["base"] = json!(base);
+    done["head"] = json!(head);
+    open["def"] = json!({"id": "t1.v1", "role": "verify", "title": "verify t1", "of": "t1", "not_by": ["sr"]});
+    append_board(&root, &[claim, done, open]);
+    join(&root, "s1");
+    let out = ok(&root, &["claim", "t1.v1", "--session", "s1"]);
+    assert!(out.contains(&format!("Its change is `git diff {base} {head}`")) && !out.contains("joins.jsonl"), "{out}");
+    // The printed copy holds the work; the verifier's own tree does not.
+    let make = out.split("apart from your tree, `").nth(1).and_then(|s| s.split('`').next()).expect(&out);
+    assert!(Command::new("sh").arg("-c").arg(make).current_dir(work(&root)).status().unwrap().success(), "{make}");
+    let dir = make.rsplit("tar -x -C ").next().unwrap().trim_matches('\'');
+    assert!(Path::new(dir).join("parser.rs").exists() && !work(&root).join("parser.rs").exists());
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn integrate_refuses_cleanly_when_an_attempt_is_absent() {
     let root = common::setup("hive-absent-integrate");

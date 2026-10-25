@@ -286,6 +286,12 @@ fn three_sim_drones_finish_a_board() {
         let mine: f64 = lines.iter().filter(|l| l["drone"] == d).map(|l| l["usd"].as_f64().unwrap()).sum();
         assert!(mine <= 1.0 + 0.10 + 1e-9, "{d} spent {mine}");
     }
+    // A session that had not claimed by the end of its task's notice time said so on the board (another
+    // node leaves this node's task to it until it claims), at most once per iteration, and ended with a
+    // claim or a line of its end: every session of the finished run is settled.
+    let marks = |note: &str| events(&root).iter().filter(|e| e.by == "runner" && e.note.starts_with(note)).count();
+    assert!(marks("session-start") <= lines.len() && marks("session-end") <= marks("session-start"), "{} {}", marks("session-start"), marks("session-end"));
+    assert!(b.sessions.values().all(|(started, settled)| started <= settled), "{:?}", b.sessions);
     let sim_sessions = std::fs::read_dir(store(&root).join("presence"))
         .unwrap()
         .flatten()

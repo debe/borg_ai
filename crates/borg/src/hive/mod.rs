@@ -22,7 +22,8 @@
 //!   worktree `borg hive run` makes, with the session of each iteration, left when the run ends).
 //! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost (synced, naming its node:
 //!   every node's runner reads the goal's one budget), each `borg hive run` (local).
-//! - `confirms.jsonl` (`claim`): each claim's confirm window across nodes, its wait and outcome (local).
+//! - `confirms.jsonl` (`claim`): each claim's confirm window across nodes, its wait and outcome, and each
+//!   claim refused before its write (local).
 //! - `logs/` (run.rs): each iteration's output, local only: it never syncs.
 //!
 //! `borg hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
@@ -112,6 +113,14 @@ const ROUND: Duration = Duration::from_millis(500);
 /// A claim's confirm window across nodes (`claim`): two rounds, as one may be running when the claim
 /// lands and the next carries it.
 pub(crate) const CONFIRM_CAP: Duration = ROUND.saturating_mul(2);
+/// How long another node's task is left to its owner's idle drones that started no session (board.rs
+/// `left_to_owner`) after it became claimable: the owner's idle runner looks at the board within
+/// `IDLE_WAIT` (run.rs; at once on a change of the board) and starts a session, which by the end of
+/// that time has claimed or says on the board that it started (`session`, run.rs `run_session`), a line
+/// that reaches here within `CONFIRM_CAP` and one more round. From then the task is left while that
+/// session has not claimed; without a start by then, the owner is not taking it: an idle drone of this
+/// node may.
+pub(crate) const OWNER_GRACE_MS: i64 = (run::IDLE_WAIT.as_millis() + CONFIRM_CAP.as_millis() + ROUND.as_millis()) as i64;
 /// A run's wait for its announcement to reach the peers (`announce`): its first round may carry more
 /// than a claim (the goal's bundles), and it is spent once per run.
 const START_CAP: Duration = ROUND.saturating_mul(6);
@@ -554,7 +563,7 @@ fn count(home: &Path, kind: &str, session: &str, goal: &str, task: &str, repo: &
 }
 
 /// What a drone is told about its claim `s`.
-fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
+fn describe(home: &Path, g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
     let t = &s.task;
     let mut out = format!("Your claim: {} ({}) {}", t.id, t.role.name(), t.title);
     if !t.files.is_empty() {
@@ -577,6 +586,9 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
                 command("verify --pass", session, cwd),
                 command("verify --reject", session, cwd)
             ));
+            if let Some(a) = under_review(home, g, &t.id) {
+                out.push_str(&review_of(&t.id, &a.base, &a.head, session));
+            }
             if !t.deps.is_empty() {
                 out.push_str(&format!(
                     " Its tree includes the verified work of {}: check {} together with it.",
@@ -604,6 +616,29 @@ fn describe(g: &Goal, s: &TaskState, session: &str, cwd: &str) -> String {
         out.push_str(&format!(" Rework {} — the verifier's notes: {}", s.rework, s.notes.join(" | ")));
     }
     out
+}
+
+/// The attempt the verify task `verify` judges, when it has both snapshots.
+fn under_review(home: &Path, g: &Goal, verify: &str) -> Option<verdict::Attempt> {
+    let events = board::read(&tasks_path(home, &g.id));
+    verdict::attempt(&events, &board::fold(&events), verify).filter(|a| !a.base.is_empty() && !a.head.is_empty())
+}
+
+/// Where the work a verifier judges is: its snapshots, by commit. The author's worktree may be on
+/// another node (d3-accept2: 9 of 10 cross-node rejects found "no change" in the verifier's own tree);
+/// its commits are in this repo either way (worktrees share it, a bundle brought another node's:
+/// `absent_from`). Exported apart, so the verifier's own tree, where its next work starts, keeps no
+/// unaccepted change: `git archive` only reads the repo (a sandboxed drone, codex's `workspace-write`,
+/// may not write its `.git`, which `worktree add` does) and registers nothing, and the directory is the
+/// claim's own (two nodes on one machine share the temp dir) and cleared first (a claim released
+/// without a verdict, then taken again by its session).
+fn review_of(verify: &str, base: &str, head: &str, session: &str) -> String {
+    let own: String = session.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    let dir = queen::sh_quote(&std::env::temp_dir().join(format!("borg-verify-{verify}-{}-{own}", short(head))).display().to_string());
+    format!(
+        " Its change is `git diff {base} {head}` (its commits are in this repo, whichever node did the work; your worktree does not hold it): \
+run its checks on a copy of it apart from your tree, `rm -rf {dir} && mkdir -p {dir} && git archive {head} | tar -x -C {dir}`, and remove it after: `rm -rf {dir}`."
+    )
 }
 
 /// What a drone without a claim is told: the next open task and the exact claim command.
@@ -951,7 +986,7 @@ impl Ctx<'_> {
         let holding = board::holding(b, self.session, self.now);
         let key = holding.map_or_else(|| "-".to_string(), |s| format!("{}@{}", s.task.id, s.live(self.now).map_or(0, |l| l.2)));
         match holding {
-            Some(s) if last != Some(key.as_str()) => parts.push(describe(self.g, s, self.session, self.cwd)),
+            Some(s) if last != Some(key.as_str()) => parts.push(describe(self.home, self.g, s, self.session, self.cwd)),
             Some(s) => parts.push(format!("Your claim: {} ({}) {}.", s.task.id, s.task.role.name(), s.task.title)),
             None => parts.push(offer(self.home, self.g, b, self.session, self.repo, self.cwd, self.now)),
         }
@@ -1255,7 +1290,7 @@ impl Ctx<'_> {
             let now = self.clock();
             let b = board::fold(&board::read(path));
             let next = next_open(self.home, self.g, &b, self.session, &drone_of(self.session), self.repo, self.cwd, now)?;
-            match claim(self.home, self.g, self.session, &next.task, self.cwd, now, left) {
+            match claim(self.home, self.g, self.session, &next.task, true, self.cwd, now, left) {
                 Ok(won) => break won,
                 // Passed over, as `borg hive claim` does: `next_open` picks another.
                 Err(Refused::Deps(_)) => refuse(self.session, &next.task.id),
@@ -1266,7 +1301,7 @@ impl Ctx<'_> {
         let now = self.clock();
         hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2)));
         let risk = plan::escalate(self.home, self.g, &won.task, self.session, self.cwd, now).map(|t| format!("\n{t}")).unwrap_or_default();
-        Some(format!("{}{risk}", describe(self.g, &won, self.session, self.cwd)))
+        Some(format!("{}{risk}", describe(self.home, self.g, &won, self.session, self.cwd)))
     }
 }
 
@@ -1376,7 +1411,11 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
     }
 }
 
-/// `<goal>/confirms.jsonl`: each claim's confirm window across nodes (`claim`), local, never synced.
+/// A `Confirm` line's outcome for a claim refused before its write.
+pub const REFUSED: &str = "refused";
+
+/// `<goal>/confirms.jsonl`: each claim's confirm window across nodes, and each claim refused before its
+/// write (`claim`), local, never synced.
 pub fn confirms_path(home: &Path, goal: &str) -> PathBuf {
     dir(home, goal).join("confirms.jsonl")
 }
@@ -1384,6 +1423,8 @@ pub fn confirms_path(home: &Path, goal: &str) -> PathBuf {
 /// One confirm window: a claim that won its read-back on a board with live drones on other nodes
 /// waited `waited_ms` for a sync round with each of its `peers` (`heard_back`), then folded the board
 /// again: `won`, `lost`, or `cap` (it kept the claim though a peer's round did not complete in time).
+/// A claim not written because a rival's had landed since the pick (`claim`'s pre-write check) is a
+/// line too, `refused`, with no peers and no wait: a race no board shows, which cost the session it ran in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirm {
     pub v: u8,
@@ -1446,6 +1487,14 @@ pub(crate) fn roster(home: &Path, goal: &str, drones: &[String]) -> std::io::Res
     write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(&board::roster_note(drones))])
 }
 
+/// `drone`'s session on `goal` started (`start`) or ended at `ms` (board.rs `Board::sessions`; run.rs
+/// `run_session` writes them only for a session that has not claimed within its task's grace): another
+/// node leaves this node's task to a drone whose session started and has not claimed yet, and an ended
+/// session that claimed nothing holds nothing back. A heartbeat of no task, as `roster`'s.
+pub(crate) fn session(home: &Path, goal: &str, drone: &str, start: bool, ms: i64) -> std::io::Result<()> {
+    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", ms).with_note(&board::session_note(drone, start))])
+}
+
 /// The state of `id` on `b` while `session` holds it at `now`.
 fn holding(b: &Board, id: &str, session: &str, now: i64) -> Option<TaskState> {
     b.tasks.get(id).filter(|s| s.live(now).is_some_and(|(by, _, _)| by == session)).cloned()
@@ -1499,7 +1548,7 @@ fn refuse(session: &str, task: &str) {
 /// clocks' skew plus the rival's stamp-to-write time longer than this claim's write-to-round time) is
 /// not: it still wins later, and this drone hears it at its next hook (`lost_news`). A claim of work carries the tree it
 /// starts from (`base`, verdict.rs), which the verdict diffs against the done's: the base of this
-/// drone's (or, without a drone, this session's) first claim of the task when it had one (a tree that
+/// drone's on this node (or, without a drone, this session's) first claim of the task when it had one (a tree that
 /// an earlier attempt already changed, say a test it weakened, is no base: the rework's diff must
 /// show it), else a snapshot taken now, `within` that time. The claim is stamped after the snapshot
 /// (`now` moved on by it), so it lands at its ms and never wins a race it reached late. A fix task
@@ -1512,7 +1561,8 @@ fn refuse(session: &str, task: &str) {
 /// names them (`deps_in`). The base then holds them, so the work's diff is its own. A dep that cannot
 /// be brought in (this tree's own changes overlap it) refuses the claim, and a lost claim takes out
 /// what it brought in: either way the tree is as it was.
-fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64, within: Duration) -> Result<TaskState, Refused> {
+#[allow(clippy::too_many_arguments)]
+fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &str, now: i64, within: Duration) -> Result<TaskState, Refused> {
     let path = tasks_path(home, &g.id);
     let drone = drone_of(session);
     let reset = task.from.is_some() && runner_worktree(g, session, cwd);
@@ -1531,7 +1581,7 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64,
         }
         (_, true) => {
             let now = verdict::snapshot(Path::new(cwd), rest).unwrap_or_default();
-            (first_base(&board::read(&path), &task.id, session, &drone).unwrap_or_else(|| now.clone()), String::new(), now)
+            (first_base(&board::read(&path), &task.id, session, &drone, &node(home)).unwrap_or_else(|| now.clone()), String::new(), now)
         }
         (_, false) => (String::new(), String::new(), String::new()),
     };
@@ -1540,11 +1590,17 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, cwd: &str, now: i64,
     // this one would only lose, so it is not written, and the caller tries the next task. The claim is
     // stamped after this fold, just before its append: the time a rival's line could land unseen
     // between its stamp and its write stays the append's.
+    // A task `picked` for the session (`next_open`) that another node's idle drones now take is no pick
+    // either: that node's line, which made it the owner's (`left_to_owner`), arrived since (a runner
+    // that started a moment before its peer picked from a board without it).
     let before = board::fold(&board::read(&path));
     let now = now + t0.elapsed().as_millis() as i64;
     let rival = |s: &TaskState| !s.claimable(now) && s.live(now).is_none_or(|(by, _, _)| by != session);
-    if before.tasks.get(&task.id).is_none_or(rival) {
+    let theirs = |s: &TaskState| picked && board::left_to_another(&before, s, &node(home), now);
+    if before.tasks.get(&task.id).is_none_or(|s| rival(s) || theirs(s)) {
         take_out();
+        let line = Confirm { v: 1, ms: now, task: task.id.clone(), session: session.into(), peers: 0, waited_ms: 0, outcome: REFUSED.into() };
+        let _ = append_line(&confirms_path(home, &g.id), &line);
         return Err(Refused::Lost);
     }
     let mut c = Event::new(Ev::Claim, &task.id, session, now).with_drone(&drone).with_note(&note);
@@ -1671,12 +1727,13 @@ fn reset_to(dir: &Path, from: &str, within: Duration) -> Result<(), String> {
     Ok(())
 }
 
-/// The base of the first claim of `task` by `drone` (by `session` when it has none) that has one.
-fn first_base(events: &[Event], task: &str, session: &str, drone: &str) -> Option<String> {
+/// The base of the first claim of `task` by `drone` on `node` (by `session` when it has none) that has
+/// one. Another node's d1 is another drone: its base holds that node's tree, never this drone's.
+fn first_base(events: &[Event], task: &str, session: &str, drone: &str, node: &str) -> Option<String> {
     events
         .iter()
         .filter(|e| e.ev == Ev::Claim && e.task == task && !e.base.is_empty())
-        .filter(|e| if drone.is_empty() { e.by == session } else { e.drone == drone })
+        .filter(|e| if drone.is_empty() { e.by == session } else { e.drone == drone && board::same_node(&e.node, node) })
         .min_by_key(|e| e.ms)
         .map(|e| e.base.clone())
 }
@@ -2395,11 +2452,11 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
             },
         };
         let id = pick.task.id.clone();
-        match claim(&here.home, &g, &session, &pick.task.clone(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
+        match claim(&here.home, &g, &session, &pick.task.clone(), task.is_none(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
             Ok(won) => {
                 count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
                 hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
-                println!("claimed {id} for {}. {}", short(&session), describe(&g, &won, &session, &here.cwd));
+                println!("claimed {id} for {}. {}", short(&session), describe(&here.home, &g, &won, &session, &here.cwd));
                 if let Some(told) = plan::escalate(&here.home, &g, &won.task, &session, &here.cwd, learn::now_ms()) {
                     println!("{told}");
                 }
@@ -2850,6 +2907,24 @@ mod tests {
     }
 
     #[test]
+    fn a_rework_takes_the_base_of_its_own_nodes_drone_never_another_nodes() {
+        // Node A's d1 claimed t1 first, from a tree that held another task's fix; node B's d1 then
+        // claimed it from its own. A rework by B's d1 starts from B's base: A's would make its diff
+        // revert that fix.
+        let claim = |by: &str, node: &str, base: &str, ms: i64| Event {
+            node: node.into(),
+            drone: "d1".into(),
+            base: base.into(),
+            ..Event::new(Ev::Claim, "t1", by, ms)
+        };
+        let lines = [claim("sa", "A", "base-a", 10), claim("sb", "B", "base-b", 20)];
+        assert_eq!(first_base(&lines, "t1", "sb2", "d1", "B").as_deref(), Some("base-b"));
+        assert_eq!(first_base(&lines, "t1", "sa2", "d1", "A").as_deref(), Some("base-a"));
+        assert_eq!(first_base(&lines[..1], "t1", "sb2", "d1", "B"), None, "only A's d1 claimed: no base of B's");
+        assert_eq!(first_base(&lines, "t1", "sb", "", "B").as_deref(), Some("base-b"), "a session of its own: by its id");
+    }
+
+    #[test]
     fn a_claim_beside_another_nodes_drones_waits_for_a_round_with_each_peer() {
         // Phase e E4. Node B is live (its runner announced). This node's claim of t1 won its read-back;
         // B's earlier claim reaches it only with the round after: the window loses the claim before any
@@ -2867,7 +2942,7 @@ mod tests {
         // No rival, through `claim`: won once the round completed, within the cap.
         let t2 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t2"].task.clone();
         let round = peer_round(&home, CLAIM_SETTLE * 2, Vec::new());
-        assert!(claim(&home, &g, "sa", &t2, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
         round.join().unwrap();
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str(), c.peers)).collect::<Vec<_>>(), [("t1", "lost", 1), ("t2", "won", 1)]);
@@ -2893,7 +2968,7 @@ mod tests {
         let filler: Vec<Event> = (0..20_000).map(|i| Event::new(Ev::Heartbeat, &format!("x{i}"), "sx", 1)).collect();
         board::append(&tasks_path(&home, "g"), &filler).unwrap();
         let t1 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t1"].task.clone();
-        assert!(claim(&home, &g, "sa", &t1, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t1, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
         let ms = board::read(&tasks_path(&home, "g")).iter().find(|e| e.ev == Ev::Claim && e.by == "sa").unwrap().ms;
         let landed = std::fs::metadata(tasks_path(&home, "g")).unwrap().modified().unwrap();
         let landed = landed.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -2909,12 +2984,12 @@ mod tests {
         let (t1, t2) = (b.tasks["t1"].task.clone(), b.tasks["t2"].task.clone());
         // No other node live: no wait, no confirm line, the peer reachable or not.
         let t0 = Instant::now();
-        assert!(claim(&home, &g, "sa", &t1, "", now, verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t1, false, "", now, verdict::SNAPSHOT_TIMEOUT).is_ok());
         assert!(t0.elapsed() < CLAIM_SETTLE + CONFIRM_CAP / 2, "{:?}", t0.elapsed());
         assert!(read_lines::<Confirm>(&confirms_path(&home, "g")).is_empty());
         board::append(&tasks_path(&home, "g"), &[on_b(Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()))]).unwrap();
         let t0 = Instant::now();
-        assert!(claim(&home, &g, "sa2", &t2, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa2", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
         assert!(t0.elapsed() >= CONFIRM_CAP && t0.elapsed() < CONFIRM_CAP * 2, "{:?}", t0.elapsed());
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [("t2", "cap")]);
@@ -2922,15 +2997,42 @@ mod tests {
     }
 
     #[test]
+    fn a_picked_task_another_nodes_idle_drone_now_takes_is_not_written() {
+        // A run that started a moment before its peer's picked from a board without the peer's runner
+        // line; that line arrived before the claim's write and makes the task the peer's, whose idle d1
+        // takes it: the pick is refused (the next one is tried), never written to lose.
+        let (home, g, now) = two_node_store("prewrite-owner");
+        let here = node(&home);
+        let live = std::collections::BTreeSet::from([here.as_str(), "B"]);
+        let id = (0..).map(|i| format!("b{i}")).find(|t| board::owner(&live, t) == Some("B")).unwrap();
+        let t = new_task(&id, Role::Work, "work", "", vec![], vec![], vec![]).unwrap();
+        board::append(&tasks_path(&home, "g"), &[Event::open(t.clone(), "engineer:e", now - 10)]).unwrap();
+        board::append(&tasks_path(&home, "g"), &[on_b(Event::new(Ev::Heartbeat, "", "runner", now).with_note(&board::roster_note(&["d1".to_string()])))])
+            .unwrap();
+        assert_eq!(claim(&home, &g, "sa", &t, true, "", now + 1, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        let b = board::fold(&board::read(&tasks_path(&home, "g")));
+        assert!(b.tasks[&id].claimable(now + 1) && b.lost.is_empty());
+        let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
+        assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [(id.as_str(), REFUSED)]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn a_claim_of_a_task_a_rival_took_since_the_pick_is_not_written() {
         // The pick read t1 open; another drone's claim landed before this one was written: it would only
-        // lose, so nothing is written and no lost claim shows on the board.
+        // lose, so nothing is written and no lost claim shows on the board; the refusal is counted on
+        // this node (`confirms.jsonl`), so the empty race is visible.
         let (home, g, now) = two_node_store("prewrite");
         let t1 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t1"].task.clone();
         write(&home, "g", vec![Event::new(Ev::Claim, "t1", "s-rival", now)]).unwrap();
-        assert_eq!(claim(&home, &g, "sa", &t1, "", now + 1, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        assert_eq!(claim(&home, &g, "sa", &t1, false, "", now + 1, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(b.lost.is_empty(), "{:?}", b.lost);
+        let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
+        assert_eq!(
+            lines.iter().map(|c| (c.task.as_str(), c.session.as_str(), c.outcome.as_str(), c.waited_ms)).collect::<Vec<_>>(),
+            [("t1", "sa", REFUSED, 0)]
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -2996,6 +3098,71 @@ mod tests {
     }
 
     #[test]
+    fn a_verify_claim_of_another_nodes_attempt_names_its_commits() {
+        // d3-accept2: verifiers told only of joins.jsonl (this node's) found "no change" in their own
+        // tree. The claim names the attempt's base and head, which are in this repo.
+        let home = std::env::temp_dir().join(format!("borg-hive-verify-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let g = goal_g();
+        goal::create(&home, &g).unwrap();
+        let (base, head) = ("1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222");
+        let w = new_task("t1", Role::Work, "work", "", vec![], vec![], vec![]).unwrap();
+        let on_b = |e: Event| Event { node: "B".into(), ..e };
+        let lines = [
+            on_b(Event::open(w.clone(), "sr", 0)),
+            on_b(Event { base: base.into(), ..Event::new(Ev::Claim, "t1", "sr", 1) }),
+            on_b(Event { head: head.into(), ..Event::new(Ev::Done, "t1", "sr", 2) }),
+            on_b(Event::open(verify_task(&w, 0, "sr"), "sr", 2)),
+            Event::new(Ev::Claim, "t1.v1", "sv", 3),
+        ];
+        board::append(&tasks_path(&home, "g"), &lines).unwrap();
+        let b = board::fold(&board::read(&tasks_path(&home, "g")));
+        let said = describe(&home, &g, &b.tasks["t1.v1"], "sv", "/w");
+        assert!(said.contains(&format!("`git diff {base} {head}`")) && said.contains(&format!("git archive {head} |")), "{said}");
+        assert!(!said.contains("joins.jsonl"), "{said}");
+        // Work without snapshots names none: a pass on it rejects as unchecked.
+        std::fs::remove_file(tasks_path(&home, "g")).unwrap();
+        let bare = lines.map(|e| Event { base: String::new(), head: String::new(), ..e });
+        board::append(&tasks_path(&home, "g"), &bare).unwrap();
+        let b = board::fold(&board::read(&tasks_path(&home, "g")));
+        assert!(!describe(&home, &g, &b.tasks["t1.v1"], "sv", "/w").contains("git diff"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_verifiers_copy_of_the_work_can_be_made_again_and_registers_nothing() {
+        // A verify claim released without a verdict (MAX_ORACLE_BLOCKS stops, a lost lease) and taken
+        // again names the same copy: making it twice works, holds the head's tree, writes nothing in
+        // the repo's .git (a sandboxed drone may not), and one claim's copy is not another session's.
+        let root = std::env::temp_dir().join(format!("borg-hive-review-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "base"]);
+        let base = git_ok(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("parser.rs"), "fn parse() {}\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "work"]);
+        let head = git_ok(&repo, &["rev-parse", "HEAD"]);
+        git_ok(&repo, &["reset", "-q", "--hard", &base]);
+        let told = review_of("t1.v1", &base, &head, "sv");
+        let make = told.split("apart from your tree, `").nth(1).and_then(|s| s.split('`').next()).expect(&told);
+        let run = || std::process::Command::new("sh").arg("-c").arg(make).current_dir(&repo).status().unwrap().success();
+        assert!(run(), "{make}");
+        assert!(run(), "the same claim's copy made again: {make}");
+        let dir = make.rsplit("tar -x -C ").next().unwrap().trim_matches('\'');
+        assert!(Path::new(dir).join("parser.rs").exists() && !repo.join("parser.rs").exists());
+        assert!(!repo.join(".git/worktrees").exists(), "nothing registered in the repo");
+        assert!(told.ends_with(&format!("remove it after: `rm -rf {}`.", queen::sh_quote(dir))), "{told}");
+        assert_ne!(make, review_of("t1.v1", &base, &head, "sw").split("apart from your tree, `").nth(1).unwrap().split('`').next().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_fix_task_claim_resets_a_runner_worktree_or_takes_a_checkout_of_its_tree() {
         let root = std::env::temp_dir().join(format!("borg-hive-fix-claim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3029,8 +3196,8 @@ mod tests {
         bind_as(&home, &own_s, "g", "").unwrap();
         let (w, r) = (wt.display().to_string(), repo.display().to_string());
         // An engineer's checkout, or a session of its own: refused, nothing written.
-        assert!(matches!(claim(&home, &g, &runner_s, &fix, &r, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
-        assert!(matches!(claim(&home, &g, &own_s, &fix, &w, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
+        assert!(matches!(claim(&home, &g, &runner_s, &fix, false, &r, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
+        assert!(matches!(claim(&home, &g, &own_s, &fix, false, &w, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
         assert_eq!(board::read(&tasks_path(&home, "g")).len(), 4);
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(offer(&home, &g, &b, &own_s, "app", &w, 2).starts_with("No claim, and no task"), "not offered where it cannot be claimed");
@@ -3039,7 +3206,7 @@ mod tests {
         std::fs::write(wt.join("README"), "stray edit\n").unwrap();
         std::fs::write(wt.join("stray.txt"), "x\n").unwrap();
         let now = learn::now_ms();
-        let won = claim(&home, &g, &runner_s, &fix, &w, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed");
+        let won = claim(&home, &g, &runner_s, &fix, false, &w, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed");
         assert!(won.live(now + 1).is_some_and(|(by, _, _)| by == runner_s));
         assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), m);
         assert_eq!(std::fs::read_to_string(wt.join("README")).unwrap(), "base\n");
@@ -3048,7 +3215,7 @@ mod tests {
         assert_eq!(c.base, m, "the diff is judged from the combined tree");
         let kept = c.note.strip_prefix("worktree before the reset: ").expect("the discarded tree is kept");
         assert_eq!(git_ok(&repo, &["show", &format!("{kept}:stray.txt")]), "x");
-        assert!(describe(&g, &won, &runner_s, &w).contains(&format!("reset to the integrated tree {m}")));
+        assert!(describe(&home, &g, &won, &runner_s, &w).contains(&format!("reset to the integrated tree {m}")));
         // Any session in a checkout of `from` (a goal worked by joined sessions): offered and claimed
         // there, never reset, its base a snapshot of that checkout.
         board::append(&tasks_path(&home, "g"), &[Event::new(Ev::Released, "integrate.1.fix", &runner_s, learn::now_ms())]).unwrap();
@@ -3059,11 +3226,11 @@ mod tests {
         let now = learn::now_ms();
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(offer(&home, &g, &b, &own_s, "app", &c, now).contains("integrate.1.fix"));
-        let won = claim(&home, &g, &own_s, &fix, &c, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed in a checkout of from");
+        let won = claim(&home, &g, &own_s, &fix, false, &c, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed in a checkout of from");
         assert!(co.join("notes.txt").exists(), "no reset");
         let c = board::read(&tasks_path(&home, "g")).into_iter().rfind(|e| e.ev == Ev::Claim).unwrap();
         assert_eq!(git_ok(&repo, &["rev-parse", &format!("{}^", c.base)]), m, "a snapshot on the combined tree");
-        assert!(describe(&g, &won, &own_s, &co.display().to_string()).contains(&format!("You work on the integrated tree {m}")));
+        assert!(describe(&home, &g, &won, &own_s, &co.display().to_string()).contains(&format!("You work on the integrated tree {m}")));
         unbind(&runner_s);
         unbind(&own_s);
         let _ = std::fs::remove_dir_all(root);

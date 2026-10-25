@@ -34,7 +34,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::goal::Check;
-use super::{LEASE_MS, TaskId};
+use super::{LEASE_MS, OWNER_GRACE_MS, TaskId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -336,7 +336,20 @@ pub struct Board {
     /// The drones each node's runner runs, from its newest line naming them (`roster_note`; mod.rs
     /// `announce` at the run's start, then one at each drone's end): node -> (ms, drone names).
     pub rosters: BTreeMap<String, (i64, BTreeSet<String>)>,
+    /// Each runner drone's newest session start (`session_note`, run.rs `run_session`, stamped with the start)
+    /// and its newest claim or session end: (node, drone) -> (start ms, settled ms). A start newer than
+    /// what settled it is a session that has not claimed yet (`left_to_owner`).
+    pub sessions: BTreeMap<(String, String), (i64, i64)>,
 }
+
+/// The note of a runner's line saying `drone`'s session starts or ended (`Board::sessions`):
+/// `session-start d1`, `session-end d1`.
+pub fn session_note(drone: &str, start: bool) -> String {
+    format!("{} {drone}", if start { SESSION_START } else { SESSION_END })
+}
+
+const SESSION_START: &str = "session-start";
+const SESSION_END: &str = "session-end";
 
 /// The note of a runner's line naming the drones it runs (`Board::rosters`): `drones d1 d2 ...`.
 pub fn roster_note(drones: &[String]) -> String {
@@ -538,6 +551,17 @@ pub fn fold(events: &[Event]) -> Board {
             && b.rosters.get(&e.node).is_none_or(|(at, _)| *at <= e.ms)
         {
             b.rosters.insert(e.node.clone(), (e.ms, names.split_whitespace().map(String::from).collect()));
+        }
+        let mark = match (e.ev, e.by.as_str(), e.note.split_once(' ')) {
+            (Ev::Claim, _, _) if !e.drone.is_empty() => Some((e.drone.as_str(), false)),
+            (Ev::Heartbeat, "runner", Some((SESSION_START, d))) if e.task.is_empty() => Some((d, true)),
+            (Ev::Heartbeat, "runner", Some((SESSION_END, d))) if e.task.is_empty() => Some((d, false)),
+            _ => None,
+        };
+        if let Some((d, start)) = mark {
+            let (started, settled) = b.sessions.entry((e.node.clone(), d.to_string())).or_insert((i64::MIN, i64::MIN));
+            let at = if start { started } else { settled };
+            *at = (*at).max(e.ms);
         }
     }
     // The open span of each task's holder, by task: an index into `b.spans`.
@@ -767,48 +791,78 @@ pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, node: 
 /// the far end, which its owner reaches last (two nodes overlap only where k + k drones exceed the
 /// tasks). On one node it owns them all, the order of before (oldest, then id).
 ///
-/// Drones of one node start apart too (`idle_slot`): drone dN takes the first task it may claim from
-/// its place among the node's idle running drones on, counted over the tasks of the class still open,
-/// so two drones reading one board pick different tasks while there are enough, and a drone that sees
-/// another's claim picks as if it had not: the claimed task left the order and its drone left the
-/// places before it. A drone whose place is past
-/// the share walks on into the others' far end. A session without a runner's drone name starts at the
-/// first place.
+/// Drones of one node start apart too: the node's idle running drones before `drone` (`idle_before`,
+/// in their order d1, d2, ...) each take, in turn, the first task in this order that they may claim
+/// and no drone before them took, and `drone` takes the first one left (`free_for`). Two drones
+/// reading one board pick different tasks while there are enough, also when one of them may not claim
+/// some (its own work's verify task, another node's task left to its owner), and a drone that sees
+/// another's claim picks as if it had not: the claimed task left the board's open tasks and its drone
+/// the idle ones. Past its node's share a drone walks on into the others' far end. With every task it
+/// may claim taken by a drone before it, it gets the first of them anyway: a session that runs takes
+/// what is there (a runner starts none for it, `free_for`). A session without a runner's drone name
+/// has no drone before it.
+///
+/// Another node's task is left to its owner while one of the owner's idle drones will take it
+/// (`left_to_owner`), so an idle drone here does not race the owner's for it (d3-accept2: node b's
+/// tasks all went to node a's drones, and b's sessions ran empty); a busy owner's tasks still spill.
 pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
-    let live = b.live_nodes(node, now);
-    let class = |s: &TaskState| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency());
-    let mine = |s: &TaskState| owner(&live, &s.task.id) == Some(node);
-    let fits = |s: &TaskState| claimable_by(b, s, session, drone, node, now) && allowed(s);
-    let best = b.tasks.values().filter(|s| fits(s)).min_by_key(|s| (class(s), !mine(s)))?;
-    let (c, m) = (class(best), mine(best));
-    let mut order: Vec<&TaskState> = b.tasks.values().filter(|s| class(s) == c && s.claimable(now) && deps_met(&b.tasks, &s.task)).collect();
-    order.sort_by_key(|s| match mine(s) {
-        true => (false, s.opened_ms, Reverse([0; 32]), s.task.id.clone()),
-        false => (true, -s.opened_ms, Reverse(affinity(node, &s.task.id)), s.task.id.clone()),
-    });
-    // A drone whose place is within the share walks the share; one past it (more drones than the share
-    // has tasks), or with nothing of the share left to it, walks on from that place into the others'
-    // far end, so the drones the share cannot hold spill one after another, as one drone would.
-    let (share, n) = (order.iter().filter(|s| mine(s)).count(), idle_slot(b, drone, node, now));
-    if m && n < share {
-        order.truncate(share);
-    }
-    // The walk finds a task: `best` fits, and it is in `order` (in the share when `m`).
-    let first = order.iter().cycle().skip(n % order.len()).take(order.len()).copied().find(|s| fits(s));
-    first.or(Some(best))
+    pick(b, session, drone, node, repo, now, allowed).map(|p| p.free.unwrap_or(p.first))
 }
 
-/// Where drone `dN` of a runner starts in `next_for`'s order: N - 1; 0 for any other name.
+/// `next_for` without its last resort: None when every task `drone` may claim is one an idle drone of
+/// its node before it takes, so a runner leaves it to that drone instead of starting a session that
+/// would race it (two drones woken by one change of the board, run.rs `idle_wait`); `taken_before`
+/// says whether that is so.
+pub fn free_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
+    pick(b, session, drone, node, repo, now, allowed).and_then(|p| p.free)
+}
+
+/// Whether a task `drone` may claim is taken by an idle drone of its node before it (`free_for`): one
+/// that drone will claim, so there is work in hand on the board.
+pub fn taken_before(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> bool {
+    pick(b, "", drone, node, repo, now, allowed).is_some_and(|p| p.free.is_none())
+}
+
+/// What `next_for` found: the first task the drone may claim that no idle drone before it takes, and
+/// the first it may claim at all.
+struct Pick<'a> {
+    free: Option<&'a TaskState>,
+    first: &'a TaskState,
+}
+
+fn pick<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<Pick<'a>> {
+    let live = b.live_nodes(node, now);
+    let class = |s: &TaskState| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency());
+    let key = |s: &TaskState| {
+        let place = match owner(&live, &s.task.id) == Some(node) {
+            true => (false, s.opened_ms, Reverse([0; 32])),
+            false => (true, -s.opened_ms, Reverse(affinity(node, &s.task.id))),
+        };
+        (class(s), place, s.task.id.clone())
+    };
+    let open = |s: &TaskState, sess: &str, d: &str| claimable_by(b, s, sess, d, node, now) && allowed(s) && !left_to_owner(b, &live, s, node, now);
+    let mut order: Vec<&TaskState> = b.tasks.values().collect();
+    order.sort_by_cached_key(|s| key(s));
+    let first = *order.iter().find(|s| open(s, session, drone))?;
+    let mut taken: BTreeSet<&str> = BTreeSet::new();
+    for d in idle_before(b, drone, node, now) {
+        if let Some(t) = order.iter().find(|s| !taken.contains(s.task.id.as_str()) && open(s, "", &d)) {
+            taken.insert(&t.task.id);
+        }
+    }
+    let free = order.iter().copied().find(|s| !taken.contains(s.task.id.as_str()) && open(s, session, drone));
+    Some(Pick { free, first })
+}
+
+/// Where drone `dN` of a runner stands in `next_for`'s turn: N - 1; 0 for any other name.
 fn slot(drone: &str) -> usize {
     drone.strip_prefix('d').and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
 }
 
-/// `drone`'s place among the drones of `node` not holding a task at `now`: its `slot`, less the drones
-/// before it that hold one or that ended (not in the node's newest `rosters` entry; without one, every
-/// drone before it runs). A busy or ended drone takes no place, so the running idle ones fill the share
-/// first, oldest task first.
-fn idle_slot(b: &Board, drone: &str, node: &str, now: i64) -> usize {
-    let n = slot(drone);
+/// The drones of `node` before `drone` (by `slot`) that run and hold no task at `now`, in that order:
+/// not holding a live claim there, and not ended (named in the node's newest `rosters` entry; without
+/// one, every drone before it runs).
+fn idle_before(b: &Board, drone: &str, node: &str, now: i64) -> Vec<String> {
     let ended = |i: usize| b.rosters.get(node).is_some_and(|(_, r)| !r.iter().any(|d| slot(d) == i));
     let busy: BTreeSet<usize> = b
         .tasks
@@ -817,7 +871,58 @@ fn idle_slot(b: &Board, drone: &str, node: &str, now: i64) -> usize {
         .filter_map(|(by, _, _)| b.drones.get(by).filter(|d| d.as_str() != drone))
         .map(|d| slot(d))
         .collect();
-    (0..n).filter(|&i| !busy.contains(&i) && !ended(i)).count()
+    (0..slot(drone)).filter(|&i| !busy.contains(&i) && !ended(i)).map(|i| format!("d{}", i + 1)).collect()
+}
+
+/// Whether `s` is another node's task left to its owner's idle drones at `now` (`left_to_owner`), as a
+/// drone of `node` reads `b`.
+pub fn left_to_another(b: &Board, s: &TaskState, node: &str, now: i64) -> bool {
+    left_to_owner(b, &b.live_nodes(node, now), s, node, now)
+}
+
+/// Whether `s`, owned by another node of `live` than `node`, is left to its owner at `now`: the owner's
+/// runner names idle drones that may claim it (in its newest roster, holding no live claim there), more
+/// of them than the owner's claimable tasks before it in the order its drones walk (role, then oldest)
+/// that one of those drones may claim. An idle drone whose session started and has not claimed yet
+/// (`Board::sessions`) is taking one: the model claims inside the session, after reading its prompt and
+/// hooks, which takes seconds to tens of them. One that started none counts while `s` became claimable
+/// less than `OWNER_GRACE_MS` ago, the time for its runner to notice and its start to reach here. The
+/// tasks past the owner's idle drones spill at once, and an owner that did not take one (its drones
+/// barred, slow to start, or its session went for something else and claimed it or ended) loses no
+/// work: the task goes to whoever is idle. A node without a roster (no runner) keeps nothing back.
+fn left_to_owner(b: &Board, live: &BTreeSet<&str>, s: &TaskState, node: &str, now: i64) -> bool {
+    let Some(o) = owner(live, &s.task.id).filter(|o| *o != node) else { return false };
+    let Some((_, roster)) = b.rosters.get(o) else { return false };
+    let busy: BTreeSet<&str> =
+        b.tasks.values().filter_map(|t| t.live(now).filter(|(_, at, _)| *at == o)).filter_map(|(by, _, _)| b.drones.get(by).map(String::as_str)).collect();
+    let starting = |d: &str| b.sessions.get(&(o.to_string(), d.to_string())).is_some_and(|(started, settled)| started > settled);
+    let fresh = now - claimable_since(b, s) < OWNER_GRACE_MS;
+    let idle: Vec<&str> =
+        roster.iter().map(String::as_str).filter(|d| !busy.contains(d) && (fresh || starting(d)) && claimable_by(b, s, "", d, o, now)).collect();
+    let key = |t: &TaskState| (t.task.role.urgency(), t.opened_ms, t.task.id.clone());
+    let ahead =
+        b.tasks.values().filter(|t| owner(live, &t.task.id) == Some(o) && key(t) < key(s) && idle.iter().any(|d| claimable_by(b, t, "", d, o, now))).count();
+    ahead < idle.len()
+}
+
+/// When `s` last became claimable, as far as the board says: its open, the end of its last tenure (an
+/// expired lease at its expiry), its work's done (a verify task), its deps' verification, its last
+/// verdict (a rework). A blocked task the engineer reopened reads as of its block: earlier, a shorter
+/// grace.
+pub fn claimable_since(b: &Board, s: &TaskState) -> i64 {
+    let id = s.task.id.as_str();
+    let at = |t: &str| match b.tasks.get(t).map(|t| &t.status) {
+        Some(Status::Done { ms, .. } | Status::Verified { ms, .. }) => *ms,
+        _ => i64::MIN,
+    };
+    let expired = match &s.status {
+        Status::Claimed { renewed, .. } => renewed + LEASE_MS,
+        _ => i64::MIN,
+    };
+    let ended = b.spans.iter().filter(|sp| sp.task == id).filter_map(|sp| sp.to_ms).max().unwrap_or(i64::MIN);
+    let verdict = b.tasks.values().filter(|v| v.task.of.as_deref() == Some(id)).map(|v| at(&v.task.id)).max().unwrap_or(i64::MIN);
+    let deps = s.task.deps.iter().chain(&s.task.of).map(|d| at(d)).max().unwrap_or(i64::MIN);
+    [s.opened_ms, expired, ended, verdict, deps].into_iter().max().unwrap_or(s.opened_ms)
 }
 
 /// The node of `live` that owns `task`: the highest `affinity` (rendezvous hashing, as borg-mesh
@@ -1077,6 +1182,13 @@ mod tests {
 
     fn verify(of: &str, author: &str, _ms: i64) -> Task {
         Task { id: format!("{of}.v1"), role: Role::Verify, of: Some(of.into()), not_by: vec![author.into()], ..task("x") }
+    }
+
+    /// Work `t` done at `ms` by `session` (of `drone`, when named), its verify task barred to both.
+    fn worked(t: &str, session: &str, drone: &str, ms: i64) -> Vec<Event> {
+        let mut v = verify(t, session, ms);
+        v.not_by.extend((!drone.is_empty()).then(|| drone.to_string()));
+        vec![Event::open(task(t), "engineer:e", 0), ev(Ev::Claim, t, session, 0).with_drone(drone), ev(Ev::Done, t, session, ms), Event::open(v, session, ms)]
     }
 
     fn done_t1() -> Vec<Event> {
@@ -1493,6 +1605,38 @@ mod tests {
     }
 
     #[test]
+    fn a_drone_before_that_may_not_claim_a_task_leaves_it_to_the_next() {
+        // One node, both drones idle at once (their works done in one instant): t1.v1 judges d1's work,
+        // barred to d1; t2.v1 is newer. d1 takes t2.v1, the first it may claim, so d2 takes t1.v1, not
+        // t2.v1 too (a walk from d2's place landed on it: a lost claim). Seeing d1's claim first, d2
+        // picks the same.
+        let lines = [worked("t1", "sa", "d1", 1), worked("t2", "sb", "", 2)].concat();
+        let pick = |lines: &[Event], d: usize| next_for(&fold(lines), &format!("A{d}"), &format!("d{d}"), "", "", 5, |_| true).map(|s| s.task.id.clone());
+        assert_eq!((pick(&lines, 1), pick(&lines, 2)), (Some("t2.v1".into()), Some("t1.v1".into())));
+        let seen = [lines.clone(), vec![ev(Ev::Claim, "t2.v1", "A1", 3).with_drone("d1")]].concat();
+        assert_eq!(pick(&seen, 2), Some("t1.v1".into()));
+    }
+
+    #[test]
+    fn a_runner_leaves_the_task_an_idle_drone_before_it_takes() {
+        // One task, d1 and d2 idle, woken by one change of the board: d2's runner starts no session to
+        // race d1's for it, the work is in hand; a session of d2 that runs still gets it; once d1 holds
+        // something else, d2 may take it.
+        let lines = vec![Event::open(task("t1"), "engineer:e", 1)];
+        let b = fold(&lines);
+        assert_eq!(free_for(&b, "", "d1", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        assert!(!taken_before(&b, "d1", "", "", 5, |_| true));
+        assert_eq!(free_for(&b, "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), None);
+        assert!(taken_before(&b, "d2", "", "", 5, |_| true));
+        assert_eq!(next_for(&b, "A2", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        let busy = [lines.clone(), vec![Event::open(task("t0"), "engineer:e", 0), ev(Ev::Claim, "t0", "A1", 2).with_drone("d1")]].concat();
+        assert_eq!(free_for(&fold(&busy), "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        // A task d1 may not claim is d2's at once.
+        let b = fold(&worked("w", "sx", "d1", 1));
+        assert_eq!(free_for(&b, "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("w.v1"));
+    }
+
+    #[test]
     fn a_busy_drone_takes_no_place_in_its_nodes_share() {
         // A owns one work task; d1 holds a plan task (another class). d2 is the only idle drone: it
         // takes A's task, not B's far end, which B's own drones take.
@@ -1531,6 +1675,66 @@ mod tests {
         lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 8).with_note(&roster_note(&all[1..2])), "A"));
         assert_eq!(pick(&lines), Some("t1".into()), "d1 and d3 ended");
         assert_eq!(fold(&lines).rosters["A"], (8, BTreeSet::from(["d2".to_string()])));
+    }
+
+    #[test]
+    fn another_nodes_task_waits_for_its_idle_owner_then_spills() {
+        // d3-accept2 w2-s2: B's runner runs d1, idle; B owns b1 and b2. A's idle d1 is not offered the
+        // oldest, which B's d1 takes, but the one past B's idle drones; with B's d1 busy, both; and
+        // after the grace, whatever B's drones did.
+        let live = BTreeSet::from(["A", "B"]);
+        let bs: Vec<String> = (0..).map(|i| format!("b{i}")).filter(|t| owner(&live, t) == Some("B")).take(2).collect();
+        let mut lines = vec![on(Event::open(task(&bs[0]), "engineer:e", 0), "A"), on(Event::open(task(&bs[1]), "engineer:e", 1), "A")];
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 1).with_note(&roster_note(&["d1".to_string()])), "B"));
+        let pick = |lines: &[Event], now: i64| next_for(&fold(lines), "A1", "d1", "A", "", now, |_| true).map(|s| s.task.id.clone());
+        assert_eq!(pick(&lines[..1].iter().chain(&lines[2..]).cloned().collect::<Vec<_>>(), 5), None, "B's idle d1 takes its one task");
+        assert_eq!(pick(&lines, 5), Some(bs[1].clone()), "B has one idle drone for two tasks: the second spills");
+        // A's d2 took the second: the oldest is left to B's d1 within the grace, after it whoever is idle.
+        let taken = [lines.clone(), vec![on(ev(Ev::Claim, &bs[1], "A2", 2).with_drone("d2"), "A")]].concat();
+        assert_eq!(pick(&taken, OWNER_GRACE_MS - 1), None, "within the grace");
+        assert_eq!(pick(&taken, OWNER_GRACE_MS), Some(bs[0].clone()), "B did not take it");
+        // B's d1 started a session that has not claimed yet: the model claims inside it, seconds to tens
+        // of them later, so the task is still B's past the grace; its claim of another task or its end
+        // without one hands it on.
+        let solo: Vec<Event> = lines[..1].iter().chain(&lines[2..]).cloned().collect();
+        let started = [solo.clone(), vec![on(Event::new(Ev::Heartbeat, "", "runner", 2).with_note(&session_note("d1", true)), "B")]].concat();
+        assert_eq!(pick(&started, 10 * OWNER_GRACE_MS), None, "B's session is on its way to it");
+        let ended = [started.clone(), vec![on(Event::new(Ev::Heartbeat, "", "runner", 9).with_note(&session_note("d1", false)), "B")]].concat();
+        assert_eq!(pick(&ended, 10 * OWNER_GRACE_MS), Some(bs[0].clone()), "it ended without a claim");
+        let lost = [started, vec![on(ev(Ev::Claim, "elsewhere", "B9", 9).with_drone("d1"), "B")]].concat();
+        assert_eq!(pick(&lost, 10 * OWNER_GRACE_MS), Some(bs[0].clone()), "it claimed something else");
+        assert_eq!(fold(&lost).sessions[&("B".to_string(), "d1".to_string())], (2, 9));
+        // B's d1 busy on a plan task: B has no idle drone, both spill.
+        let plan = Task { role: Role::Plan, ..task("p") };
+        lines.extend([on(Event::open(plan, "engineer:e", 0), "B"), on(ev(Ev::Claim, "p", "B1", 2).with_drone("d1"), "B")]);
+        assert_eq!(pick(&lines, 5), Some(bs[1].clone()));
+        lines.push(on(ev(Ev::Claim, &bs[1], "A2", 3).with_drone("d2"), "A"));
+        assert_eq!(pick(&lines, 5), Some(bs[0].clone()), "the owner's oldest too while its drones are busy");
+        // A node without a runner's roster keeps nothing back.
+        let bare = [on(Event::open(task(&bs[0]), "engineer:e", 0), "A"), on(ev(Ev::Progress, "warm", "sB", 1), "B")];
+        assert_eq!(pick(&bare, 5), Some(bs[0].clone()));
+    }
+
+    #[test]
+    fn a_task_the_owners_idle_drones_may_not_claim_does_not_count_ahead() {
+        // B's only drone d1 authored w: B owns w.v1, barred to d1, and the work task b. A's d1 takes
+        // w.v1; b is left to B's d1, which it may claim, not raced for by another of A's drones.
+        let live = BTreeSet::from(["A", "B"]);
+        let w = (0..).map(|i| format!("w{i}")).find(|t| owner(&live, &format!("{t}.v1")) == Some("B")).unwrap();
+        let b = (0..).map(|i| format!("b{i}")).find(|t| owner(&live, t) == Some("B")).unwrap();
+        let mut v = verify(&w, "sB", 2);
+        v.not_by.push("d1".into());
+        let lines = vec![
+            on(Event::open(task(&w), "engineer:e", 0), "A"),
+            on(Event::open(task(&b), "engineer:e", 0), "A"),
+            on(Event::new(Ev::Heartbeat, "", "runner", 0).with_note(&roster_note(&["d1".to_string()])), "B"),
+            on(ev(Ev::Claim, &w, "sB", 1).with_drone("d1"), "B"),
+            on(ev(Ev::Done, &w, "sB", 2), "B"),
+            on(Event::open(v, "sB", 2), "B"),
+        ];
+        let pick = |allowed: fn(&TaskState) -> bool| next_for(&fold(&lines), "A1", "d1", "A", "", 5, allowed).map(|s| s.task.id.clone());
+        assert_eq!(pick(|_| true), Some(format!("{w}.v1")), "B's d1 may not verify its own work");
+        assert_eq!(pick(|s| s.task.role != Role::Verify), None, "b is B's d1's");
     }
 
     #[test]

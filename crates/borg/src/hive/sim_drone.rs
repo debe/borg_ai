@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Here, Role, board, goal, oracle};
+use super::{Here, Role, board, goal, oracle, verdict};
 use crate::harness::{Harness, sim};
 use crate::{hook, learn, runner};
 
@@ -159,6 +159,22 @@ fn worktree_of(home: &Path, author: Option<&str>, cwd: &str) -> PathBuf {
     PathBuf::from(dir.unwrap_or_else(|| cwd.to_string()))
 }
 
+/// The verify task `task`'s verdict: on a checkout of its attempt's `head` apart from `cwd`'s tree,
+/// as a drone is told (mod.rs `review_of`: the author's worktree may be another node's); on
+/// `author_dir` only when the attempt has no snapshots (no git). A checkout that fails is an error,
+/// never the author's worktree: a sim run must not pass on it once verifying from the commits broke.
+fn verdict_of(here: &Here, g: &goal::Goal, task: &super::Task, head: Option<&str>, author_dir: impl FnOnce() -> PathBuf) -> Result<oracle::Verdict, String> {
+    match head {
+        Some(h) => {
+            let key = format!("{}-{}", task.id, std::process::id());
+            super::hidden::with_checkout(&std::env::temp_dir().join("borg-sim-verify"), Path::new(&here.cwd), h, &key, |dir| {
+                oracle::run(&here.home, g, task, dir, None)
+            })
+        }
+        None => Ok(oracle::run(&here.home, g, task, &author_dir(), None)),
+    }
+}
+
 /// Whether `line` is a conflict marker git writes (`<<<<<<< x`, `=======`, `>>>>>>> x`, `||||||| x`).
 fn marker(line: &str) -> bool {
     ["<<<<<<<", "|||||||", ">>>>>>>"].iter().any(|m| line.starts_with(m)) || line == "======="
@@ -223,16 +239,19 @@ pub fn main(here: &Here) -> i32 {
         }
         let task = &held.task;
         if task.role == Role::Verify {
+            let events = board::read(&super::tasks_path(&here.home, &g.id));
+            let head = verdict::attempt(&events, &board::fold(&events), &task.id).map(|a| a.head).filter(|h| !h.is_empty());
             let author = task.of.as_ref().and_then(|w| b.tasks.get(w)).and_then(|w| w.author.clone());
-            let dir = worktree_of(&here.home, author.as_deref(), &here.cwd);
+            let verdict = verdict_of(here, &g, task, head.as_deref(), || worktree_of(&here.home, author.as_deref(), &here.cwd));
             let rejected_once = hook::state_file(&format!("sim-{}", g.id)).with_extension("rejected");
-            match oracle::run(&here.home, &g, task, &dir, None) {
-                oracle::Verdict::Pass if script.reject_first && !rejected_once.exists() => {
+            match verdict {
+                Err(why) => d.hive(&["verify", "--reject", &format!("its commits could not be checked out: {why}")]),
+                Ok(oracle::Verdict::Pass) if script.reject_first && !rejected_once.exists() => {
                     let _ = std::fs::write(&rejected_once, "");
                     d.hive(&["verify", "--reject", REJECT_NOTE])
                 }
-                oracle::Verdict::Pass => d.hive(&["verify", "--pass"]),
-                _ => d.hive(&["verify", "--reject", "its oracle fails in the author's worktree"]),
+                Ok(oracle::Verdict::Pass) => d.hive(&["verify", "--pass"]),
+                _ => d.hive(&["verify", "--reject", "its oracle fails on its commits"]),
             };
             d.stop(false);
             break;
@@ -296,4 +315,59 @@ pub fn main(here: &Here) -> i32 {
         }
     }
     answer(&text, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.email=e@x", "-c", "user.name=e"]).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_sim_verifier_judges_the_commits_and_never_falls_back_once_they_fail_to_check_out() {
+        let root = std::env::temp_dir().join(format!("borg-sim-verify-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, author) = (root.join("app"), root.join("author"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&author).unwrap();
+        std::fs::write(author.join("parser.rs"), "").unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("parser.rs"), "fn parse() {}\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "work"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["reset", "-q", "--hard", &base]);
+        let home = root.join("home");
+        let g = goal::Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![goal::Check::parse("has=test -f parser.rs", 60).unwrap()],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+            held_out: false,
+        };
+        goal::create(&home, &g).unwrap();
+        let task = super::super::new_task("t1.v1", Role::Verify, "verify t1", "", vec![], vec![], vec![]).unwrap();
+        let here = Here { home: home.clone(), cwd: repo.display().to_string(), now: 0 };
+        let mine = || repo.clone();
+        assert_eq!(verdict_of(&here, &g, &task, Some(&head), mine).unwrap(), oracle::Verdict::Pass, "on the head, not this tree");
+        assert!(!repo.join(".git/worktrees").read_dir().is_ok_and(|mut d| d.next().is_some()), "the checkout is removed");
+        let gone = "0123456789012345678901234567890123456789";
+        assert!(verdict_of(&here, &g, &task, Some(gone), || author.clone()).is_err(), "no fallback to the author's worktree");
+        assert_eq!(verdict_of(&here, &g, &task, None, || author.clone()).unwrap(), oracle::Verdict::Pass, "no snapshots: its worktree");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
