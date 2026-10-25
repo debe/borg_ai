@@ -426,11 +426,13 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "borg-ai",
+ "borg-mesh",
  "borg-trace",
  "libc",
  "regex",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

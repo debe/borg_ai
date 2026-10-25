@@ -309,8 +309,10 @@ fn take(repo: &Path, file: &Path, goal: &str, need: &[String]) -> Result<(), (St
         return Err(local("the repo lacks the bundle's prerequisite commits: `git fetch` its remote".into()));
     }
     let q = Quarantine::new(repo).map_err(local)?;
-    if !git_in(repo, Some(&q), &["bundle", "unbundle", &f]).is_some_and(|(ok, _)| ok) {
-        return Err(local("git bundle unbundle failed".into()));
+    match git_in(repo, Some(&q), &["bundle", "unbundle", &f]) {
+        Some((true, _)) => {}
+        Some((false, _)) => return Err(local("git bundle unbundle failed".into())),
+        None => return Err(local(format!("git bundle unbundle did not finish within {}s", GIT_TIMEOUT.as_secs()))),
     }
     // Every object the two commits reach is here (the bundle carried what the repo lacked), before any
     // of it reaches the repo's store or a ref names it.

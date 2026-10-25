@@ -15,6 +15,9 @@ publish = false
 [dependencies]
 borg-trace = { path = "../borg-trace", version = "0.1.0" }
 borg = { package = "borg-ai", path = "../borg", version = "0.1.0" }
+# arm E: two stores synced by the mesh's own protocol over loopback (hive/arm_e.rs)
+borg-mesh = { path = "../borg-mesh", version = "0.1.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true

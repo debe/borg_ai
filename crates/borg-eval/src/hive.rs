@@ -4,7 +4,7 @@
 //! ≤ 0.8 × B's AND D3's mean hidden solve share ≥ B's − 1/K.
 //!
 //! ```text
-//! borg-eval hive --workload DIR --arm a|b|d3|f --seed N --cap-usd X
+//! borg-eval hive --workload DIR --arm a|b|d3|e|f --seed N --cap-usd X
 //!                [--model sonnet] [--timeout-s 3600] [--run NAME] [--stop-at-usd Y]
 //!                [--borg BIN] [--claude BIN] [--harness claude|sim]
 //!                [--learn frozen|l0|l01] [--chain DIR] [--goal ID] [--position N]
@@ -33,6 +33,9 @@
 //!   prompt. The hive integrates (borg hive/integrate.rs: the accepted attempts merged, the oracle run
 //!   on the combined tree, a fix task on a failure); the harness scores `refs/heads/hive/pilot/integrated`
 //!   as the board names it (the base when no integration merged anything); wall = the run.
+//! - E: D3 across two nodes on this machine (hive/arm_e.rs; tasks/todo.md "Arm E on one machine"): two
+//!   stores of one collective, each node's workspace a clone of one bare remote with its own objects,
+//!   synced by borg-mesh over loopback while `borg hive run` runs on both (2 drones on A, 1 on B).
 //!
 //! Every agent sandbox and the scorer have a PID namespace of their own: nothing started inside (a
 //! Gradle daemon) outlives them; /run is masked in both (no Docker daemon, agent or bus socket). A
@@ -64,6 +67,8 @@ use serde_json::{Value, json};
 use crate::dogfood::{Secrets, prepare_home_bare, prepare_home_with};
 use crate::hive_seq::{self, Learn};
 use crate::{Extra, sandbox_with};
+
+mod arm_e;
 
 /// The default hive goal (`--goal`), and the dummy goal id `visible_files` builds.
 const GOAL: &str = "pilot";
@@ -659,6 +664,26 @@ fn build_workspace(wl: &Workload, dst: &Path) -> Result<String, String> {
     Ok(out.trim().lines().last().unwrap_or_default().to_string())
 }
 
+/// `dst`: a `--no-local` clone of the bare repo `remote` (objects copied, not linked). Returns its HEAD.
+fn clone_workspace(remote: &Path, dst: &Path) -> Result<String, String> {
+    if dst.exists() {
+        return Err(format!("{} exists", dst.display()));
+    }
+    let parent = dst.parent().unwrap_or(dst);
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let cmd = format!(
+        "{GIT} clone -q --no-local {} {} && {GIT} -C {} rev-parse HEAD",
+        q(remote.display().to_string()),
+        q(dst.display().to_string()),
+        q(dst.display().to_string())
+    );
+    let (ok, _, out) = run_t(parent, &cmd, ARCHIVE_TIMEOUT_S);
+    if !ok {
+        return Err(format!("clone {}: {}", remote.display(), out.trim()));
+    }
+    Ok(out.trim().lines().last().unwrap_or_default().to_string())
+}
+
 /// Index locks a session killed mid-`git` left (it is over: nothing else writes the repo now).
 const STALE_LOCKS: &str = "find .git -name index.lock -type f -delete 2>/dev/null\n";
 
@@ -1136,6 +1161,7 @@ enum Arm {
     A,
     B,
     D3,
+    E,
     F,
 }
 
@@ -1145,8 +1171,19 @@ impl Arm {
             "a" => Some(Arm::A),
             "b" => Some(Arm::B),
             "d3" => Some(Arm::D3),
+            "e" => Some(Arm::E),
             "f" => Some(Arm::F),
             _ => None,
+        }
+    }
+
+    /// The dollars a cell of this arm may spend at most, which `--stop-at-usd` reserves before it starts:
+    /// its cap, and for arm E each node's: every node's runner splits the goal's budget from its own
+    /// spend (borg hive/run.rs; spend.jsonl does not sync), so the two may spend the cap each.
+    fn reserve(self, cap: f64) -> f64 {
+        match self {
+            Arm::E => cap * arm_e::NODES.len() as f64,
+            _ => cap,
         }
     }
 
@@ -1155,6 +1192,7 @@ impl Arm {
             Arm::A => "a",
             Arm::B => "b",
             Arm::D3 => "d3",
+            Arm::E => "e",
             Arm::F => "f",
         }
     }
@@ -1216,7 +1254,7 @@ fn parse_opts(raw: &[String]) -> Result<Opts, String> {
             "--workload" => workload = Some(PathBuf::from(v()?)),
             "--arm" => {
                 let a = v()?;
-                arm = Some(Arm::parse(&a).ok_or_else(|| format!("--arm {a}: a, b, d3 or f"))?);
+                arm = Some(Arm::parse(&a).ok_or_else(|| format!("--arm {a}: a, b, d3, e or f"))?);
             }
             "--seed" => seed = Some(v()?.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
             "--cap-usd" => cap = Some(v()?.parse::<f64>().map_err(|e| format!("--cap-usd: {e}"))?),
@@ -1242,7 +1280,7 @@ fn parse_opts(raw: &[String]) -> Result<Opts, String> {
         }
     }
     o.workload = workload.ok_or("--workload DIR is required")?;
-    o.arm = arm.ok_or("--arm a|b|d3|f is required")?;
+    o.arm = arm.ok_or("--arm a|b|d3|e|f is required")?;
     o.seed = seed.ok_or("--seed N is required")?;
     o.cap = cap.ok_or("--cap-usd X is required (no default: fixed after the probe)")?;
     if !o.cap.is_finite() || o.cap <= 0.0 {
@@ -1254,8 +1292,8 @@ fn parse_opts(raw: &[String]) -> Result<Opts, String> {
     if o.stop_at.is_some_and(|y| !y.is_finite() || y <= 0.0) {
         return Err("--stop-at-usd: above 0".into());
     }
-    if o.sim && o.arm != Arm::D3 {
-        return Err("--harness sim runs the d3 arm only (A/B/F take --claude BIN for a fake)".into());
+    if o.sim && !matches!(o.arm, Arm::D3 | Arm::E) {
+        return Err("--harness sim runs the d3 and e arms only (A/B/F take --claude BIN for a fake)".into());
     }
     if (o.learn.is_some() || o.chain.is_some()) && o.arm != Arm::D3 {
         return Err("--learn and --chain are for the d3 arm".into());
@@ -1309,8 +1347,13 @@ fn d3_init_args(wl: &Workload, spec_file: &Path, cap: f64, goal: &str) -> Vec<St
 /// `borg hive run` of D3's goal. `--yes`: the eval approves the plan itself (hive/plan.rs), so the run
 /// never waits for an engineer the sandbox does not have.
 fn d3_run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &str) -> Vec<String> {
+    run_args(model, base, iter_timeout_s, sim, goal, DRONES)
+}
+
+/// `d3_run_args` with `drones` drones (arm E's runs, one per node).
+fn run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &str, drones: usize) -> Vec<String> {
     let mut a: Vec<String> = ["borg", "hive", "run", goal, "--yes", "--drones"].map(String::from).to_vec();
-    a.extend([DRONES.to_string(), "--model".into(), model.into(), "--base".into(), base.into(), "--iter-timeout".into(), iter_timeout_s.to_string()]);
+    a.extend([drones.to_string(), "--model".into(), model.into(), "--base".into(), base.into(), "--iter-timeout".into(), iter_timeout_s.to_string()]);
     if sim {
         a.extend(["--harness".into(), "sim".into()]);
     }
@@ -1399,16 +1442,32 @@ fn agent_home(dir: &Path, o: &Opts) -> PathBuf {
 }
 
 fn make_agent(dir: &Path, o: &Opts, wl: &Workload, env: &Env, sim_script: Option<&Path>) -> Result<Agent, String> {
+    make_agent_from(dir, o, wl, env, sim_script, COLLECTIVES, None)
+}
+
+/// `make_agent` with the HOME's collectives config `collectives`, and with `remote` the workspace a
+/// `--no-local` clone of that bare repo (an object store of its own, arm E's nodes) instead of a build
+/// of the workload; the remote is readable in the sandbox, as a shared remote is.
+fn make_agent_from(
+    dir: &Path,
+    o: &Opts,
+    wl: &Workload,
+    env: &Env,
+    sim_script: Option<&Path>,
+    collectives: &str,
+    remote: Option<&Path>,
+) -> Result<Agent, String> {
     let home = agent_home(dir, o);
     fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let secrets = if o.claude.is_some() || o.sim {
-        prepare_home_bare(&home, &env.borg, "{}", COLLECTIVES)?;
+        prepare_home_bare(&home, &env.borg, "{}", collectives)?;
         None
     } else {
-        Some(prepare_home_with(&home, &env.real_home, &env.borg, "{}", COLLECTIVES, f64::from(o.timeout_s) + 900.0)?)
+        Some(prepare_home_with(&home, &env.real_home, &env.borg, "{}", collectives, f64::from(o.timeout_s) + 900.0)?)
     };
     let mut ro = vec![env.borg.clone()];
-    if o.arm == Arm::D3 && !o.sim {
+    ro.extend(remote.map(Path::to_path_buf));
+    if matches!(o.arm, Arm::D3 | Arm::E) && !o.sim {
         // The drones' `claude` (the runner finds it on PATH, `<home>/bin` first): the real one, or the
         // fake, with the system prompt A, B and F get.
         let target = o.claude.clone().unwrap_or_else(|| env.real_home.join(".local/bin/claude"));
@@ -1424,7 +1483,10 @@ fn make_agent(dir: &Path, o: &Opts, wl: &Workload, env: &Env, sim_script: Option
         ro.push(c.clone());
     }
     let ws = home.join("work").join(&wl.ws);
-    let base = build_workspace(wl, &ws)?;
+    let base = match remote {
+        Some(r) => clone_workspace(r, &ws)?,
+        None => build_workspace(wl, &ws)?,
+    };
     Ok(Agent { env: agent_env(&home, wl, sim_script, o.learn, &o.model), home_binds: wl.home_binds(&env.real_home), home, ws, base, secrets, ro })
 }
 
@@ -1475,11 +1537,12 @@ fn base_row(o: &Opts, wl: &Workload, env: &Env) -> serde_json::Map<String, Value
         "timed_out": false, "cost_usd": null, "cost_complete": false, "over_cap": false, "tokens": Tokens::default().json(),
         "turns": null, "sessions": null, "hidden": {"checks": [], "passed": 0, "solve_share": 0.0}, "visible_pass": null,
         "rework": null, "merge_conflicts": 0, "integrated": false, "integrations": 0, "hacked": 0, "hacked_paths": [], "hacked_why": [], "hacked_verdicts": 0,
-        "verifier_rejects": null, "failed_integrations": null, "d3": null, "f": null, "store_lessons_before": null, "store_lessons_after": null,
+        "verifier_rejects": null, "failed_integrations": null, "d3": null, "e": null, "f": null, "store_lessons_before": null, "store_lessons_after": null,
         "borg_rev": git_rev(&env.root, "crates/borg crates/borg-trace"), "borg_eval_rev": git_rev(&env.root, "crates/borg-eval"),
         "mast": [], "error": null,
     });
     let mut row = v.as_object().cloned().unwrap_or_default();
+    row.insert("reserve_usd".into(), json!(o.arm.reserve(o.cap)));
     for k in ["reported_usd", "charged_usd", "error_stage", "cell", "attempt"] {
         row.insert(k.into(), Value::Null);
     }
@@ -1841,12 +1904,13 @@ pub(crate) fn charged_of(r: &Value) -> f64 {
         .or_else(|| r["charged_usd"].as_f64())
         .or_else(|| r["cost_usd"].as_f64())
         .or_else(|| (r["paid"] == false && !r["error"].is_null()).then_some(0.0))
+        .or_else(|| r["reserve_usd"].as_f64())
         .or_else(|| r["cap_usd"].as_f64())
         .unwrap_or(0.0)
 }
 
 /// The dollars a run already counts: each row's `charged_of`, and the cap of every cell attempt that
-/// started (`<cell>/cell.json`) but wrote no row (killed, crashed: its sessions may have spent it).
+/// started (`<cell>/cell.json`; its reserve, arm E's 2× cap) but wrote no row (killed, crashed: its sessions may have spent it).
 fn spent_in(run_dir: &Path) -> f64 {
     let rows: Vec<Value> =
         fs::read_to_string(run_dir.join("results.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
@@ -1857,25 +1921,26 @@ fn spent_in(run_dir: &Path) -> f64 {
         .flatten()
         .filter_map(|e| fs::read_to_string(e.path().join("cell.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()))
         .filter(|c| c["attempt"].as_str().is_some_and(|a| !attempts.contains(a)))
-        .map(|c| c["cap_usd"].as_f64().unwrap_or(0.0))
+        .map(|c| c["reserve_usd"].as_f64().or_else(|| c["cap_usd"].as_f64()).unwrap_or(0.0))
         .sum();
     rows.iter().map(charged_of).sum::<f64>() + lost
 }
 
 /// Starts a cell: its dir and `cell.json`, written before anything is spent (a cell killed before its
-/// row still counts its cap, `spent_in`), under the run's budget lock: without it, cells of one run
+/// row still counts its reserve, `spent_in`), under the run's budget lock: without it, cells of one run
 /// started at once would each read the total before the others' `cell.json` and all start past
-/// `stop_at`. (exit code, why) when the run's spend plus `cap` passes `stop_at` or the cell exists.
-fn start_cell(run_dir: &Path, cell: &Path, record: &Value, cap: f64, stop_at: Option<f64>) -> Result<(), (i32, String)> {
+/// `stop_at`. (exit code, why) when the run's spend plus `reserve` (the most the cell may spend,
+/// `Arm::reserve`) passes `stop_at` or the cell exists.
+fn start_cell(run_dir: &Path, cell: &Path, record: &Value, reserve: f64, stop_at: Option<f64>) -> Result<(), (i32, String)> {
     fs::create_dir_all(run_dir).map_err(|e| (1, e.to_string()))?;
     let lock = fs::File::create(run_dir.join(".budget.lock")).map_err(|e| (1, e.to_string()))?;
     // Released when `lock` closes, on return.
     lock.lock().map_err(|e| (1, format!("budget lock: {e}")))?;
     let spent = spent_in(run_dir);
-    if let Some(y) = stop_at.filter(|y| spent + cap > *y) {
+    if let Some(y) = stop_at.filter(|y| spent + reserve > *y) {
         return Err((
             2,
-            format!("${spent:.2} spent in run {} + cap ${cap:.2} > ${y:.2}: not started", run_dir.file_name().unwrap_or_default().to_string_lossy()),
+            format!("${spent:.2} spent in run {} + reserve ${reserve:.2} > ${y:.2}: not started", run_dir.file_name().unwrap_or_default().to_string_lossy()),
         ));
     }
     if cell.exists() {
@@ -1908,7 +1973,17 @@ pub fn main(raw: &[String]) {
         }
         Some("validate") => std::process::exit(validate_cmd(&raw[1..])),
         Some("promote") => std::process::exit(hive_seq::promote_cmd(&raw[1..])),
-        _ => std::process::exit(cell_cmd(raw)),
+        _ => {
+            if parse_opts(raw).is_ok_and(|o| o.arm == Arm::E) {
+                // Arm E's sync pump runs borg's session code in this process: with the nodes' switches,
+                // as each node's `borg mesh serve` would (arm_e.rs `PUMP_ENV`).
+                for (k, v) in arm_e::PUMP_ENV {
+                    // SAFETY: borg-eval's main thread, before any other thread is started.
+                    unsafe { std::env::set_var(k, v) };
+                }
+            }
+            std::process::exit(cell_cmd(raw))
+        }
     }
 }
 
@@ -1945,7 +2020,9 @@ fn cell_cmd(raw: &[String]) -> i32 {
     let cell = run_dir.join(format!("{}-{}-s{}", wl.id, o.arm_name(), o.seed));
     let name = cell.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let attempt = format!("{name}-{}", (now_s() * 1000.0) as u64);
-    if let Err((code, e)) = start_cell(&run_dir, &cell, &json!({"cell": name, "attempt": attempt, "cap_usd": o.cap}), o.cap, o.stop_at) {
+    let reserve = o.arm.reserve(o.cap);
+    let record = json!({"cell": name, "attempt": attempt, "cap_usd": o.cap, "reserve_usd": reserve});
+    if let Err((code, e)) = start_cell(&run_dir, &cell, &record, reserve, o.stop_at) {
         eprintln!("borg-eval hive: {e}");
         return code;
     }
@@ -1958,6 +2035,7 @@ fn cell_cmd(raw: &[String]) -> i32 {
         Arm::A | Arm::B => arm_single(&o, &wl, &env, &cell, &mut row),
         Arm::F => arm_f(&o, &wl, &env, &cell, &mut row),
         Arm::D3 => arm_d3(&o, &wl, &env, &cell, &mut row),
+        Arm::E => arm_e::run(&o, &wl, &env, &cell, &mut row),
     };
     if let Err(e) = &done {
         eprintln!("  error: {e}");
@@ -3157,11 +3235,11 @@ mod tests {
     /// A workload for the end-to-end runs: two work tasks writing f1.txt and f2.txt; hidden checks want
     /// `done t1` / `done t2` in them. Not under /tmp: the sandbox mounts a fresh tmpfs there.
     fn e2e_workload(tag: &str, sim: Value) -> (PathBuf, PathBuf) {
-        e2e_workload_in(tag, sim, ["w/f1.txt", "w/f2.txt"])
+        e2e_workload_in(tag, sim, &["w/f1.txt", "w/f2.txt"])
     }
 
-    /// `e2e_workload` with task tN scoped to `files[N-1]` (both the same file: their attempts conflict).
-    fn e2e_workload_in(tag: &str, sim: Value, files: [&str; 2]) -> (PathBuf, PathBuf) {
+    /// `e2e_workload` with task tN scoped to `files[N-1]` (two the same file: their attempts conflict).
+    fn e2e_workload_in(tag: &str, sim: Value, files: &[&str]) -> (PathBuf, PathBuf) {
         let root = repo_root().join("target/hive-test").join(format!("{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -3173,32 +3251,39 @@ mod tests {
         let wd = std::env::temp_dir().join(format!("borg-hive-e2e-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&wd);
         fs::create_dir_all(wd.join("hidden")).unwrap();
-        let [f1, f2] = files;
-        fs::write(wd.join("spec.md"), format!("Write `done t1` into {f1} and `done t2` into {f2}.\n")).unwrap();
+        let tasks: Vec<(String, &str)> = files.iter().enumerate().map(|(i, f)| (format!("t{}", i + 1), *f)).collect();
+        let spec: Vec<String> = tasks.iter().map(|(t, f)| format!("`done {t}` into {f}")).collect();
+        fs::write(wd.join("spec.md"), format!("Write {}.\n", spec.join(" and "))).unwrap();
         // At the workspace root, where the sim drone's `edit_tests` modifies it.
         fs::write(
             wd.join("inject.patch"),
             "diff --git a/tests/sim_edit.txt b/tests/sim_edit.txt\nnew file mode 100644\n--- /dev/null\n+++ b/tests/sim_edit.txt\n@@ -0,0 +1 @@\n+original\n",
         )
         .unwrap();
-        let reference = if f1 == f2 {
-            format!("diff --git a/{f1} b/{f1}\nnew file mode 100644\n--- /dev/null\n+++ b/{f1}\n@@ -0,0 +1,2 @@\n+done t1\n+done t2\n")
-        } else {
-            format!(
-                "diff --git a/{f1} b/{f1}\nnew file mode 100644\n--- /dev/null\n+++ b/{f1}\n@@ -0,0 +1 @@\n+done t1\n\
-diff --git a/{f2} b/{f2}\nnew file mode 100644\n--- /dev/null\n+++ b/{f2}\n@@ -0,0 +1 @@\n+done t2\n"
-            )
-        };
+        // Each file holds the lines of every task scoped to it.
+        let mut by_file: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (t, f) in &tasks {
+            by_file.entry(f).or_default().push(format!("done {t}"));
+        }
+        let reference: String = by_file
+            .iter()
+            .map(|(f, lines)| {
+                let body: String = lines.iter().map(|l| format!("+{l}\n")).collect();
+                format!("diff --git a/{f} b/{f}\nnew file mode 100644\n--- /dev/null\n+++ b/{f}\n@@ -0,0 +1,{} @@\n{body}", lines.len())
+            })
+            .collect();
         fs::write(wd.join("reference.patch"), reference).unwrap();
+        let checks: Vec<Value> = tasks
+            .iter()
+            .map(|(t, f)| json!({"id": t, "cmd": format!("grep -q 'done {t}' \"$BORG_WORK/{f}\" && ! grep -q '^<<<<<<<' \"$BORG_WORK/{f}\""), "timeout_s": 30}))
+            .collect();
         let v = json!({
             "id": format!("e2e-{tag}"), "shape": "parallel",
             "repos": [{"src": src.display().to_string(), "commit": commit, "dir": "w"}],
             "inject": "inject.patch", "spec": "spec.md", "visible": "true", "visible_timeout_s": 30,
-            "hidden": {"dir": "hidden", "checks": [
-                {"id": "t1", "cmd": format!("grep -q 'done t1' \"$BORG_WORK/{f1}\" && ! grep -q '^<<<<<<<' \"$BORG_WORK/{f1}\""), "timeout_s": 30},
-                {"id": "t2", "cmd": format!("grep -q 'done t2' \"$BORG_WORK/{f2}\" && ! grep -q '^<<<<<<<' \"$BORG_WORK/{f2}\""), "timeout_s": 30}]},
+            "hidden": {"dir": "hidden", "checks": checks},
             "reference": "reference.patch",
-            "hive": {"tasks": [format!("t1|work|write done t1 into {f1}|{f1}"), format!("t2|work|write done t2 into {f2}|{f2}")]},
+            "hive": {"tasks": tasks.iter().map(|(t, f)| format!("{t}|work|write done {t} into {f}|{f}")).collect::<Vec<_>>()},
             "sim": sim
         });
         fs::write(wd.join("workload.json"), v.to_string()).unwrap();
@@ -3286,6 +3371,23 @@ diff --git a/{f2} b/{f2}\nnew file mode 100644\n--- /dev/null\n+++ b/{f2}\n@@ -0
         let _ = fs::remove_dir_all(run.parent().unwrap());
     }
 
+    /// Arm E may spend its cap on each node: `--stop-at-usd` reserves twice the cap for it, and a cell of
+    /// it that died before its row counts that reserve.
+    #[test]
+    fn an_arm_e_cell_reserves_each_nodes_cap_under_stop_at() {
+        assert_eq!((Arm::E.reserve(15.0), Arm::D3.reserve(15.0)), (30.0, 15.0));
+        let run = tmp("reserve").join("run");
+        let rec = |i: u32, arm: Arm| json!({"cell": format!("c{i}"), "attempt": format!("c{i}-1"), "cap_usd": 15.0, "reserve_usd": arm.reserve(15.0)});
+        assert!(start_cell(&run, &run.join("c0"), &rec(0, Arm::E), Arm::E.reserve(15.0), Some(90.0)).is_ok());
+        assert!(start_cell(&run, &run.join("c1"), &rec(1, Arm::E), Arm::E.reserve(15.0), Some(90.0)).is_ok());
+        assert!((spent_in(&run) - 60.0).abs() < 1e-9, "two lost cells count their reserve: {}", spent_in(&run));
+        // $60 + $30 is the stop itself: a third starts; a fourth does not.
+        assert!(start_cell(&run, &run.join("c2"), &rec(2, Arm::E), Arm::E.reserve(15.0), Some(90.0)).is_ok());
+        assert_eq!(start_cell(&run, &run.join("c3"), &rec(3, Arm::E), Arm::E.reserve(15.0), Some(90.0)).map_err(|e| e.0), Err(2));
+        assert!((charged_of(&json!({"cap_usd": 15.0, "reserve_usd": 30.0})) - 30.0).abs() < 1e-9, "a row of unknown cost counts its reserve");
+        let _ = fs::remove_dir_all(run.parent().unwrap());
+    }
+
     /// Drops a fixture workload's validate rows and dirs from the shared validate log.
     fn forget_validation(id: &str) {
         let log = validate_log(&repo_root().join("target/eval-runs"));
@@ -3326,7 +3428,7 @@ diff --git a/{f2} b/{f2}\nnew file mode 100644\n--- /dev/null\n+++ b/{f2}\n@@ -0
     }
 
     fn e2e_d3_in(tag: &str, sim: Value, files: [&str; 2]) -> (Value, Option<String>) {
-        let (wd, root) = e2e_workload_in(tag, sim, files);
+        let (wd, root) = e2e_workload_in(tag, sim, &files);
         assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
         let run = format!("hive-e2e-{tag}-{}", std::process::id());
         let code = cell_cmd(&s(&[
@@ -3532,6 +3634,74 @@ echo '{"type":"result","total_cost_usd":0.5,"num_turns":2,"result":"ok","modelUs
         ]));
         assert_eq!((code, rows_of(&run).len()), (2, 3));
         forget_validation("e2e-fake");
+        let _ = fs::remove_dir_all(wd);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(cell);
+    }
+
+    /// Arm E on the sim harness: two stores synced over loopback, 2 drones on a and 1 on b, four tasks of
+    /// slow drones (each holds its claim 3 s) so b's drone gets work while a's hold theirs.
+    /// cargo build -p borg-ai && cargo test -p borg-eval hive_e2e_e -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn hive_e2e_e_sim_two_nodes_work_verify_across_and_fold_one_board() {
+        let slow = json!({"work_s": 3});
+        let (wd, root) =
+            e2e_workload_in("arme", json!({"usd_per_iter": 0.10, "drones": {"d1": slow, "d2": slow}}), &["w/f1.txt", "w/f2.txt", "w/f3.txt", "w/f4.txt"]);
+        assert_eq!(validate_cmd(&s(&["--workload", &wd.display().to_string()])), 0, "validate");
+        let run = format!("hive-e2e-arme-{}", std::process::id());
+        let code = cell_cmd(&s(&[
+            "--workload",
+            &wd.display().to_string(),
+            "--arm",
+            "e",
+            "--seed",
+            "0",
+            "--cap-usd",
+            "6",
+            "--timeout-s",
+            "300",
+            "--run",
+            &run,
+            "--harness",
+            "sim",
+            "--borg",
+            &built_borg().display().to_string(),
+        ]));
+        let rows = rows_of(&run);
+        forget_validation("e2e-arme");
+        assert_eq!(rows.len(), 1, "one row");
+        let r = &rows[0];
+        let e = &r["e"];
+        eprintln!("{}", serde_json::to_string_pretty(e).unwrap());
+        assert_eq!(code, 0, "{r:#}");
+        assert!(r["error"].is_null(), "{r:#}");
+        assert_eq!((e["finished"].as_bool(), e["boards_identical"].as_bool(), e["heads_agree"].as_bool()), (Some(true), Some(true), Some(true)), "{e:#}");
+        assert_eq!(e["board_digest"]["a"], e["board_digest"]["b"]);
+        assert_eq!((e["boards_finished"]["a"].as_bool(), e["boards_finished"]["b"].as_bool()), (Some(true), Some(true)), "{e:#}");
+        for n in ["a", "b"] {
+            assert!(e["nodes"][n]["attempts_verified"].as_u64() >= Some(1), "work on node {n}: {e:#}");
+        }
+        // Commits travelled: every judgement the board shows across nodes, either way, is one whose judging
+        // node took that attempt's bundle, and b's verified work reached a that way.
+        let x = &e["cross_node"];
+        assert!(x["verified"].as_u64().unwrap() + x["integrated"].as_u64().unwrap() >= 1, "{e:#}");
+        assert_eq!((&x["on_board"]["verified"], &x["on_board"]["integrated"]), (&x["verified"], &x["integrated"]), "{e:#}");
+        let used = |n: &str| x["by_node"][n]["verified"].as_u64().unwrap_or(0) + x["by_node"][n]["integrated"].as_u64().unwrap_or(0);
+        assert!(used("a") >= 1 && e["nodes"]["a"]["bundles"]["taken"].as_u64() >= Some(1), "b's work judged on a from its bundle: {e:#}");
+        assert_eq!(e["max_holders"], 1, "{e:#}");
+        let bundles = |k: &str| e["nodes"]["a"]["bundles"][k].as_u64().unwrap() + e["nodes"]["b"]["bundles"][k].as_u64().unwrap();
+        assert!(bundles("made") >= 1 && bundles("taken") >= 1 && bundles("refused") == 0, "{e:#}");
+        assert!(e["sync"]["rounds"].as_u64() >= Some(3) && e["sync"]["failed"] == 0, "{e:#}");
+        assert_eq!((r["integrated"].as_bool(), r["visible_pass"].as_bool(), r["hidden"]["solve_share"].as_f64()), (Some(true), Some(true), Some(1.0)), "{r:#}");
+        assert_eq!((r["hacked"].as_u64(), r["merge_conflicts"].as_u64(), r["over_cap"].as_bool()), (Some(0), Some(0), Some(false)), "{r:#}");
+        assert_ne!(r["result_head"], r["base"]);
+        let cell = repo_root().join("target/eval-runs").join(&run);
+        let diff = fs::read_to_string(cell.join("e2e-arme-e-s0/score/diff.patch")).unwrap_or_default();
+        eprintln!("integrated diff:\n{diff}");
+        for t in 1..=4 {
+            assert!(diff.contains(&format!("+done t{t}")), "{diff}");
+        }
         let _ = fs::remove_dir_all(wd);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(cell);

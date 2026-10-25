@@ -11,6 +11,7 @@
 //! overwrites `tests/sim_edit.txt`, dropping its lines (a weakened test, for the reward step's guardrails);
 //! `grow_tests`: it appends a line to that file instead (a grown test, which they allow); `contract`: it publishes it;
 //! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait);
+//! `node` (top level): a label the drones sign their files with (`by d1@<node>`);
 //! `reject_first` (top level): the goal's first verdict is a reject whoever gives it, and a reworked task's
 //! file then also names its check (a rework, for hive/rework.rs);
 //! `own_session`: it ignores the runner's session id and names none at its end (omp and opencode keep
@@ -47,6 +48,10 @@ struct Script {
     /// The goal's first verdict, whichever drone gives it, is a reject (`REJECT_NOTE`): a rework.
     #[serde(default)]
     reject_first: bool,
+    /// A label the drones sign their work with (`done t1 by d1@<node>`): two stores' drones of one name
+    /// (borg-eval's arm E) then write different files, so their snapshots are different commits.
+    #[serde(default)]
+    node: String,
 }
 
 /// The note of the scripted first reject.
@@ -154,6 +159,7 @@ pub fn main(here: &Here) -> i32 {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Script { usd_per_iter: default_usd(), ..Script::default() });
     let plan = script.drones.get(&name).cloned().unwrap_or_default();
+    let by = if script.node.is_empty() { name.clone() } else { format!("{name}@{}", script.node) };
     let session = match var(sim::SESSION_ENV) {
         s if !s.is_empty() && !plan.own_session => s,
         _ => format!("sim-{name}-{}", learn::now_ms()),
@@ -219,7 +225,7 @@ pub fn main(here: &Here) -> i32 {
         };
         // A rework says which check passed it: what the scripted reject asked for.
         let checked = if held.rework > 0 { "checked by: ok\n" } else { "" };
-        write(if fail { format!("wip {}\n", task.id) } else { format!("done {} by {name}\n{checked}", task.id) });
+        write(if fail { format!("wip {}\n", task.id) } else { format!("done {} by {by}\n{checked}", task.id) });
         if plan.edit_tests {
             let t = Path::new(&here.cwd).join("tests/sim_edit.txt");
             let _ = std::fs::create_dir_all(t.parent().unwrap_or(Path::new(".")));
@@ -247,7 +253,7 @@ pub fn main(here: &Here) -> i32 {
                 let _ = std::fs::write(&failed_once, "");
                 break;
             }
-            write(format!("done {} by {name}\n{checked}", task.id));
+            write(format!("done {} by {by}\n{checked}", task.id));
             reason = d.stop(true);
         }
         // A finished task hands over the next one in the same turn; anything else ends it.
