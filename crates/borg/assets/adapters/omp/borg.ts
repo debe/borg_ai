@@ -24,6 +24,9 @@ import { spawn } from "node:child_process";
 
 type Json = Record<string, unknown>;
 
+// How much of a shell call's output borg gets (its end, where a test run's summary is).
+const OUTPUT_TAIL = 4_000;
+
 /** The canonical event `borg hook` reads on stdin. */
 export interface Canonical {
 	session_id: string;
@@ -32,6 +35,7 @@ export interface Canonical {
 	prompt?: string;
 	tool_name?: string;
 	tool_input?: unknown;
+	tool_response?: string;
 	error?: string;
 	last_assistant_message?: string;
 	stop_hook_active?: boolean;
@@ -113,10 +117,13 @@ export function promptEvent(ctx: any, prompt: string): Canonical {
 	return { ...where(ctx), prompt };
 }
 
-/** A finished tool call: failures carry the result text as `error` (borg looks for rejections in it). */
+/** A finished tool call: failures carry the result text as `error` (borg looks for rejections in it), a
+ *  successful shell call the end of its output as `tool_response` (borg tells a test run's pass by it). */
 export function toolEvent(ctx: any, ev: Json): ["post_tool" | "post_tool_failure", Canonical] {
 	const base = { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: toolInput(String(ev.toolName ?? ""), ev.input) };
-	return ev.isError ? ["post_tool_failure", { ...base, error: text(ev.content) }] : ["post_tool", base];
+	if (ev.isError) return ["post_tool_failure", { ...base, error: text(ev.content) }];
+	const out = base.tool_name === "Bash" ? text(ev.content).slice(-OUTPUT_TAIL) : "";
+	return ["post_tool", out.trim() ? { ...base, tool_response: out } : base];
 }
 
 /** omp denies at its approval prompt before running the tool, so no tool_result follows; this is the

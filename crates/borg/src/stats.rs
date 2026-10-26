@@ -42,6 +42,9 @@ pub const NOT_CORRECTED: &str = "not_corrected";
 /// A later fix, or a review finding, counted against a lesson asked before the decision (outcome.rs
 /// `regretted`; `lessons`: the blamed lesson).
 pub const REGRETTED: &str = "regretted";
+/// `borg learn` credited a lesson asked before the session's own tests went green (outcome.rs `tested`;
+/// `lessons`: that lesson).
+pub const TESTED: &str = "tested";
 /// The engineer corrected the drone (an episode): `why` is `rejected_tool` or `pushback`, `text` a snippet.
 pub const CORRECTION: &str = "correction";
 /// The engineer said no (`borg no`, veto.rs): `lessons` the lessons shown so far (credited `vetoed`),
@@ -366,6 +369,8 @@ fn derive_history(home: &Path) -> Vec<Event> {
     for o in lines(&home.join("outcomes.jsonl")) {
         let live = o["channel"] == "live";
         let kind = match o["kind"].as_str().unwrap_or_default() {
+            // A free delivery counts once, as its own event (`early`, `queued_free`), never as a block.
+            crate::outcome::ASKED if o["channel"] == "early" || o["channel"] == "queued" => continue,
             crate::outcome::ASKED if live => LIVE_ASK,
             crate::outcome::ASKED => BLOCK,
             crate::outcome::CHANGED => CHANGED,
@@ -373,6 +378,7 @@ fn derive_history(home: &Path) -> Vec<Event> {
             crate::outcome::CORRECTED => CORRECTED,
             crate::outcome::NOT_CORRECTED => NOT_CORRECTED,
             crate::outcome::REGRETTED => REGRETTED,
+            crate::outcome::TESTED => TESTED,
             _ => continue,
         };
         let lessons = ids(&o, "lessons");
@@ -816,6 +822,9 @@ mod tests {
             "outcomes.jsonl",
             &[
                 json!({"kind":"asked","session":"s1","lessons":["L1","L2"],"ms":110,"repo":"app"}),
+                // Free deliveries are counted live as `early` and `queued_free`: never a block here.
+                json!({"kind":"asked","session":"s1","lessons":["L3"],"ms":112,"repo":"app","channel":"early"}),
+                json!({"kind":"asked","session":"s1","lessons":["L4"],"ms":114,"repo":"app","channel":"queued"}),
                 json!({"kind":"asked_then_changed","session":"s1","lessons":["L1"],"ms":120,"repo":"app"}),
             ],
         );

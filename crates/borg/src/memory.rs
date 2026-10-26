@@ -18,7 +18,7 @@
 //!   wall time: a holiday erases nothing. Uses spread over time keep a lesson active longer than the
 //!   same number massed early; with a fixed d that comes from the later last use (a decay that depends
 //!   on the activation at each use, Pavlik and Anderson's spacing model, is a possible refinement).
-//! - **Usefulness belief** `Beta(1 + changed + verified, 1 + ignored + 2·corrected + 3·vetoed +
+//! - **Usefulness belief** `Beta(1 + changed + verified + ½·tested, 1 + ignored + 2·corrected + 3·vetoed +
 //!   regretted + rejected + 3·hacked)` (the veto's 3 is `VETOED_W`), one result
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
 //!   learn`) without a change is ignored. A correction counts twice, as in outcome.rs; a veto (`borg no`,
@@ -30,7 +30,11 @@
 //!   (hive/verdict.rs), one per (lesson, attempt), the worst of duplicates (hacked > rejected >
 //!   verified): additive to the session's result (a verdict is about the task, a session result about
 //!   the engineer's reaction), never a use, and never a tick of the activity clock. Weights in
-//!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`. A fractional α (a candidate weight) is rounded the same way
+//!   `VERIFIED_W`, `REJECTED_W`, `HACKED_W`. `tested` (outcome.rs) is the session's own tests going
+//!   green after the ask, one per (lesson, session), weighed `TESTED_W`, half a verified task: the same
+//!   kind of evidence, read from a test runner's output rather than judged by a verifier. Additive like a
+//!   verdict, never a use, no tick, and nothing for a session whose result is a correction or a veto.
+//!   A fractional α (a candidate weight) is rounded the same way
 //!   (`draw`). `Weights` holds the hand-set weights so that `borg ope` (ope.rs, hive.md L6)
 //!   can replay the belief under other values offline; the counts `derive` returns are constant-free.
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
@@ -48,6 +52,20 @@
 //! - **Dormant**: not consolidated and `A < DORMANT_BELOW` (about 54 sessions of the collective
 //!   without a use). Never deleted: a dormant lesson is recalled only on a strong match (conscience.rs
 //!   `rank`), and one use reactivates it.
+//! - **Whose sessions count.** Disuse is measured where the lesson could have been used, by its reach,
+//!   on whichever node the sessions ran. ACT-R's decay stands for
+//!   the opportunities a memory had and missed; a session that could never have recalled the lesson is
+//!   no such opportunity. So a team lesson ages with every session of the collective, a teammate's
+//!   included: they all see it, and a lesson none of their drones acts on for ~54 sessions has stopped
+//!   mattering to the people it reaches, even when its own author's node is quiet. A repo convention ages
+//!   only with the sessions in its repo (`Clock::eligible`, by the repo of each session's lines), so
+//!   neither a teammate's busy week elsewhere nor an engineer's own work in another repo lets it fade.
+//!   This is coarser than reach.rs `deliverable`: a session's repo is its working directory's
+//!   (hook.rs `repo_of`), not every repo it touched, so a session started in one repo that edits
+//!   another is no tick for the other's conventions (a use there still counts: it ranks at the next
+//!   eligible tick). The system gate (systems.rs `gate`) is not applied, so a lesson scoped to other
+//!   systems ages with every session its reach allows. In the team view each repo is a case-sensitive
+//!   tag, so a clone whose directory name differs in case from the lesson's repo does not age it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +84,9 @@ pub const REGRET: f64 = 1.0;
 pub const VERIFIED_W: u32 = 1;
 pub const REJECTED_W: u32 = 1;
 pub const HACKED_W: u32 = 3;
+/// What one `tested` result (outcome.rs) adds to α: half a verified task (design-chosen, `borg ope`
+/// estimates others): the session's own runner, not a verifier, said the work passes.
+pub const TESTED_W: f64 = VERIFIED_W as f64 / 2.0;
 /// What one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
 /// (design-chosen, no eval behind it yet; hive.md L6).
 pub const VETOED_W: u32 = 3;
@@ -78,11 +99,12 @@ pub struct Weights {
     pub rejected: f64,
     pub hacked: f64,
     pub regret: f64,
+    pub tested: f64,
 }
 
 /// The weights in force.
 pub const WEIGHTS: Weights =
-    Weights { vetoed: VETOED_W as f64, verified: VERIFIED_W as f64, rejected: REJECTED_W as f64, hacked: HACKED_W as f64, regret: REGRET };
+    Weights { vetoed: VETOED_W as f64, verified: VERIFIED_W as f64, rejected: REJECTED_W as f64, hacked: HACKED_W as f64, regret: REGRET, tested: TESTED_W };
 pub const D_CONSOLIDATED: f64 = 0.3;
 pub const CONSOLIDATE_SESSIONS: usize = 3;
 pub const DORMANT_BELOW: f64 = -2.0;
@@ -91,24 +113,42 @@ pub const DORMANT_BELOW: f64 = -2.0;
 /// (by first ms, then id: independent of line order). Only the kinds the team shares
 /// (outcome.rs `SHARED_KINDS`) tick it, so every node counts the same sessions from the same first
 /// ms: a session that only graded never moves it, and neither does a hive verdict (shared with `c`, but
-/// about a task, never a session of the collective).
+/// about a task, never a session of the collective) or a `tested` result (about the session's work).
 #[derive(Debug, Default)]
 pub struct Clock {
     first: Vec<(i64, String)>,
     at: HashMap<String, u64>,
+    /// Per tick, the repos its session's ticking lines name (raw here, `tag`ged in the team view).
+    repos: Vec<HashSet<String>>,
 }
 
 impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
-        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && !outcome::is_verdict(&o.kind)) {
+        let mut repos: HashMap<&str, HashSet<String>> = HashMap::new();
+        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && !outcome::is_verdict(&o.kind) && o.kind != outcome::TESTED) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
+            if !o.repo.is_empty() {
+                repos.entry(o.session.as_str()).or_default().insert(o.repo.clone());
+            }
         }
         let mut first: Vec<(i64, String)> = first.into_iter().map(|(s, ms)| (ms, s.to_string())).collect();
         first.sort();
         let at = first.iter().enumerate().map(|(i, (_, s))| (s.clone(), i as u64)).collect();
-        Clock { first, at }
+        let repos = first.iter().map(|(_, s)| repos.remove(s.as_str()).unwrap_or_default()).collect();
+        Clock { first, at, repos }
+    }
+
+    /// The ticks of the sessions `c` counts its disuse in, ascending, or None for every tick: a repo
+    /// convention's are the sessions with a line in its repo, matched ignoring case as reach.rs
+    /// `deliverable` does or, in the team view, by its exact `tag`; any other reach's are all of them.
+    pub fn eligible(&self, c: &Challenge) -> Option<Vec<u64>> {
+        if c.reach != crate::reach::REPO || c.repo.is_empty() {
+            return None;
+        }
+        let tagged = outcome::tag(&c.repo);
+        Some((0..self.repos.len() as u64).filter(|t| self.repos[*t as usize].iter().any(|r| r.eq_ignore_ascii_case(&c.repo) || *r == tagged)).collect())
     }
 
     /// The tick of `session`: its place on the clock, or the next tick for a session not in the log
@@ -154,6 +194,8 @@ pub struct Memory {
     pub verified: u32,
     pub rejected: u32,
     pub hacked: u32,
+    /// Sessions whose own tests went green after it was asked (outcome.rs `tested`).
+    pub tested: u32,
     pub consolidated: bool,
     pub dormant: bool,
 }
@@ -161,7 +203,7 @@ pub struct Memory {
 impl Memory {
     /// α under weights `w`: the counts are constant-free, so one `derive` serves every candidate.
     pub fn alpha_with(&self, w: &Weights) -> f64 {
-        1.0 + self.changed as f64 + w.verified * self.verified as f64
+        1.0 + self.changed as f64 + w.verified * self.verified as f64 + w.tested * self.tested as f64
     }
 
     /// β under weights `w`.
@@ -208,7 +250,15 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
     let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
     // Per (lesson, attempt): its hive verdict, the worst of duplicates: 2 hacked > 1 rejected > 0 verified.
     let mut verdict: HashMap<(&str, &str), u8> = HashMap::new();
+    // Per lesson: the sessions whose own tests went green after it was asked.
+    let mut tested: HashMap<&str, HashSet<&str>> = HashMap::new();
     for o in outcomes {
+        if o.kind == outcome::TESTED {
+            for l in &o.lessons {
+                tested.entry(l.as_str()).or_default().insert(o.session.as_str());
+            }
+            continue;
+        }
         if outcome::is_verdict(&o.kind) {
             let r = match o.kind.as_str() {
                 outcome::HACKED => 2,
@@ -256,6 +306,8 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
     for ((l, _), r) in verdict {
         verdicts.entry(l).or_default()[r as usize] += 1;
     }
+    // Per (reach, repo): the ticks its lessons were eligible in (`Clock::eligible`).
+    let mut eligible: HashMap<(&str, &str), Option<Vec<u64>>> = HashMap::new();
     lessons
         .iter()
         .map(|c| {
@@ -269,10 +321,16 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             let consolidated = changed_sessions >= CONSOLIDATE_SESSIONS && (repos.get(c.id.as_str()).is_some_and(|r| r.len() >= 2) || c.engineers.len() >= 2);
             let d = if consolidated { D_CONSOLIDATED } else { D };
             let born = clock.at_ms(c.origin_ms);
-            let ages = used.into_iter().chain([born]).map(|t| now.saturating_sub(t) + 1);
+            // Δt in the sessions the lesson was eligible in: a tick's place among them (itself excluded).
+            let eligible = eligible.entry((c.reach.as_str(), c.repo.as_str())).or_insert_with(|| clock.eligible(c));
+            let rank = |t: u64| eligible.as_ref().map_or(t, |e| e.partition_point(|x| *x < t) as u64);
+            let now = rank(now);
+            let ages = used.into_iter().chain([born]).map(|t| now.saturating_sub(rank(t)) + 1);
             let a = activation(ages, d);
             let regretted = regretted.get(c.id.as_str()).copied().unwrap_or(0.0);
             let [verified, rejected, hacked] = verdicts.get(c.id.as_str()).copied().unwrap_or_default();
+            // A green run of a session the engineer corrected or vetoed on the lesson adds nothing.
+            let tested = tested.get(c.id.as_str()).map_or(0, |t| t.iter().filter(|s| per.and_then(|m| m.get(**s)).is_none_or(|r| *r < 2)).count() as u32);
             let m = Memory {
                 activation: a,
                 changed,
@@ -283,6 +341,7 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
                 verified,
                 rejected,
                 hacked,
+                tested,
                 consolidated,
                 dormant: !consolidated && a < DORMANT_BELOW,
             };
@@ -468,6 +527,38 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_convention_ages_only_with_the_sessions_of_its_repo_and_a_team_lesson_with_all() {
+        let conv = Challenge { reach: crate::reach::REPO.into(), repo: "a".into(), ..lesson("C", 0) };
+        let both = [lesson("T", 0), conv];
+        let in_repo = |log: Vec<Outcome>, repo: &dyn Fn(usize) -> String| -> Vec<Outcome> {
+            log.into_iter()
+                .enumerate()
+                .map(|(i, mut x)| {
+                    x.repo = repo(i);
+                    x
+                })
+                .collect()
+        };
+        // Sixty sessions elsewhere: the team lesson goes dormant, the convention had no chance to be used.
+        let m = derive(&in_repo(sessions(60), &|_| "b".into()), &both, None);
+        assert!(m["T"].dormant);
+        assert_eq!((m["C"].activation, m["C"].dormant), (0.0, false));
+        // Sixty in its repo, raw, in another case or as the team view's tag: it fades like the team lesson.
+        for repo in ["a".to_string(), "A".to_string(), outcome::tag("a")] {
+            let m = derive(&in_repo(sessions(60), &|_| repo.clone()), &both, None);
+            assert_eq!(m["C"].activation, m["T"].activation, "{repo}");
+            assert!(m["C"].dormant, "{repo}");
+        }
+        // Interleaved, every fourth session in its repo (ten of forty): born before the first (age 10 + 1),
+        // used in the second (nine sessions from it on, + 1).
+        let mut log = in_repo(sessions(40), &|i| if i % 4 == 0 { "a".into() } else { "b".into() });
+        log.push(o(CHANGED, "s004", "C", 501, "a"));
+        let m = derive(&log, &both, None);
+        let want = activation([11, 10], D);
+        assert!((m["C"].activation - want).abs() < 1e-12, "{} vs {want}", m["C"].activation);
+    }
+
+    #[test]
     fn activation_is_monotone_in_uses_and_spaced_uses_outlast_massed_ones() {
         let l = lesson("L", 0);
         let mut log = sessions(30);
@@ -592,6 +683,24 @@ mod tests {
     }
 
     #[test]
+    fn a_green_test_run_weighs_half_a_verified_task_and_never_ticks() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = o(outcome::ASKED, "a", "L", 1, "r");
+        let t = mem(&[asked.clone(), o(outcome::TESTED, "a", "L", 9, "r"), o(outcome::TESTED, "a", "L", 10, "r")]);
+        assert_eq!((t.tested, t.alpha(), t.changed), (1, 1.0 + TESTED_W, 0), "once per session, never a use");
+        assert_eq!(t.activation, mem(std::slice::from_ref(&asked)).activation);
+        assert_eq!(Clock::of(&[o(outcome::TESTED, "z", "L", 9, "r")]).now(None), 0, "no tick");
+        // The session's correction or veto of the lesson outranks it, in any line order.
+        for k in [outcome::CORRECTED, outcome::VETOED] {
+            let log = [o(outcome::TESTED, "a", "L", 9, "r"), asked.clone(), o(k, "a", "L", 5, "r")];
+            assert_eq!(mem(&log).tested, 0, "{k}");
+        }
+        assert_eq!(Weights { tested: 2.0, ..WEIGHTS }.tested, 2.0);
+        assert_eq!(t.alpha_with(&Weights { tested: 2.0, ..WEIGHTS }), 3.0);
+    }
+
+    #[test]
     fn fractional_beta_sampling_is_unbiased_and_integer_beta_unchanged() {
         let n = 20_000;
         let mean = (0..n).map(|i| round_seeded(2.5, seed(&format!("s{i}"), "L")) as f64).sum::<f64>() / n as f64;
@@ -608,6 +717,7 @@ mod tests {
             verified: 0,
             rejected: 0,
             hacked: 0,
+            tested: 0,
             consolidated: false,
             dormant: false,
         };
@@ -697,6 +807,7 @@ mod tests {
             verified: 0,
             rejected: 0,
             hacked: 0,
+            tested: 0,
             consolidated: false,
             dormant: false,
         };

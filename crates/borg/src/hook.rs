@@ -119,6 +119,12 @@ fn task_file(session: &str) -> PathBuf {
     state_file(session).with_extension("task")
 }
 
+/// The session's first task prompt, never overwritten: what a plain session's commits set out to do
+/// (playbook.rs `plain_win`), where its task file holds the latest prompt ("commit it", "thanks").
+fn first_task_file(session: &str) -> PathBuf {
+    state_file(session).with_extension("first-task")
+}
+
 /// A tool call refused without words, waiting for the engineer's next prompt (their reason).
 /// Pending only while the drone waits: a later successful tool call or the session's end clears it,
 /// because omp lets the model carry on after a denial and the next prompt may be about anything.
@@ -142,7 +148,11 @@ fn capture_prompt(h: &dyn Harness, session: &str, input: &Value, prompt: &str) {
         }
     }
     if !learn::is_correction(prompt) || task.is_empty() {
-        let _ = std::fs::write(task_file(session), prompt.chars().take(3000).collect::<String>());
+        let task: String = prompt.chars().take(3000).collect();
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(first_task_file(session)) {
+            let _ = f.write_all(task.as_bytes());
+        }
+        let _ = std::fs::write(task_file(session), task);
         return;
     }
     record(session, input, task, proposal(h, input), None, prompt.chars().take(1500).collect());
@@ -351,31 +361,49 @@ const MAX_PENDING: usize = 10;
 /// after that it waits for `borg learn` to settle it as `asked_not_corrected`.
 const MAX_JUDGE_TRIES: usize = 2;
 
-/// R1: lessons asked at an earlier Stop of this session that have no verdict yet, with the evidence for
-/// the consequence model (predict.rs `Pending`): the blocked message (before), and after it the drone's
-/// answer, its edits and later messages since, and this turn's message (`final_msg`), each part capped at
-/// `predict::JUDGE_PART` characters. `#borg-judged <id>=<label>` lines in the state file record verdicts.
+/// The markers of a delivery of lessons to the drone, in the state and .edits files: asked at a Stop or
+/// live (`#borg-asked`), delivered early, handed over free (`#borg-queued`).
+const DELIVERED: [&str; 3] = ["#borg-asked ", "#borg-early ", "#borg-queued "];
+
+/// R1: lessons delivered earlier in this session (asked at a Stop or live, delivered early, handed over
+/// free) that have no verdict yet, with the evidence for the consequence model (predict.rs `Pending`):
+/// the work before the delivery (at a Stop, the blocked message), and after it the drone's answer (a
+/// question's only: a free delivery asks nothing), its edits and later messages since, and this turn's
+/// message (`final_msg`), each part capped at `predict::JUDGE_PART` characters. `#borg-judged
+/// <id>=<label>` lines in the state file record verdicts, each for the lesson's latest delivery before
+/// it: a lesson delivered early, judged, then asked at a Stop is judged again on the question.
 /// `answered_only` (a live check, mid-turn): questions the drone has not answered yet (no `#borg-answer`
-/// after them, written at the stop) wait for the stop's judge, which sees the answer, as in hook mode.
-fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str, answered_only: bool) -> Vec<predict::Pending<'a>> {
+/// after them, written at the stop) wait for the stop's judge, which sees the answer, as in hook mode;
+/// free deliveries wait for it too. Of the `MAX_PENDING` slots, questions take theirs first (the newest),
+/// free deliveries what is left: a free hand-over never pushes a question out of its judge. The flag:
+/// whether a question is among them.
+fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str, answered_only: bool) -> (Vec<predict::Pending<'a>>, bool) {
     let mut tries: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut settled = std::collections::HashSet::new();
-    for l in state.lines().filter_map(|l| l.strip_prefix("#borg-judged ")) {
-        let (id, label) = l.split_once('=').unwrap_or((l, ""));
-        *tries.entry(id).or_default() += 1;
-        if label.trim() != "pending" {
-            settled.insert(id);
+    for l in state.lines() {
+        if let Some(l) = l.strip_prefix("#borg-judged ") {
+            let (id, label) = l.split_once('=').unwrap_or((l, ""));
+            *tries.entry(id).or_default() += 1;
+            if label.trim() != "pending" {
+                settled.insert(id);
+            }
+        } else if let Some(ids) = DELIVERED.iter().find_map(|m| l.strip_prefix(m)) {
+            for id in ids.split(',').map(str::trim) {
+                tries.remove(id);
+                settled.remove(id);
+            }
         }
     }
     let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
     let lines: Vec<&str> = edits.lines().collect();
     let part = predict::JUDGE_PART;
-    let mut out: Vec<predict::Pending> = Vec::new();
+    // Each with whether it was a question (`#borg-asked`), not a free delivery.
+    let mut out: Vec<(predict::Pending, bool)> = Vec::new();
     for (p, l) in lines.iter().enumerate() {
-        let Some(ids) = l.strip_prefix("#borg-asked ") else { continue };
+        let Some((marker, ids)) = DELIVERED.iter().find_map(|m| l.strip_prefix(m).map(|ids| (*m, ids))) else { continue };
         let before = p.checked_sub(1).map(|b| lines[b]).filter(|b| !b.starts_with("#borg-")).unwrap_or_default();
         let later = &lines[p + 1..];
-        let answers: Vec<&str> = later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect();
+        let answers: Vec<&str> = if marker == "#borg-asked " { later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect() } else { Vec::new() };
         if answered_only && answers.is_empty() {
             continue;
         }
@@ -388,16 +416,28 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
         );
         let said = answers.join("\n").to_lowercase();
         for id in ids.split(',').map(str::trim).filter(|i| !i.is_empty()) {
-            if settled.contains(id) || tries.get(id).copied().unwrap_or(0) >= MAX_JUDGE_TRIES || out.iter().any(|x| x.lesson.id == id) {
+            if settled.contains(id) || tries.get(id).copied().unwrap_or(0) >= MAX_JUDGE_TRIES {
                 continue;
             }
             let Some(c) = all.iter().find(|c| c.id == id) else { continue };
+            // A later delivery of the same lesson is the one judged: its evidence replaces the earlier one's.
+            out.retain(|x| x.0.lesson.id != id);
             let declared = crate::memory::declared(&said, &id.to_lowercase());
-            out.push(predict::Pending { lesson: c, before: before.to_string(), after: after.clone(), declared });
+            out.push((predict::Pending { lesson: c, before: before.to_string(), after: after.clone(), declared }, marker == "#borg-asked "));
         }
     }
-    let n = out.len();
-    out.split_off(n.saturating_sub(MAX_PENDING))
+    let questions = out.iter().filter(|x| x.1).count().min(MAX_PENDING);
+    let mut room = [MAX_PENDING - questions, questions];
+    let mut kept: Vec<(predict::Pending, bool)> = Vec::new();
+    for x in out.into_iter().rev() {
+        let r = &mut room[usize::from(x.1)];
+        if *r > 0 {
+            *r -= 1;
+            kept.push(x);
+        }
+    }
+    kept.reverse();
+    (kept.into_iter().map(|x| x.0).collect(), questions > 0)
 }
 
 /// R1: the consequence model's verdicts on the pending lessons it was shown (predict.rs `Judged`).
@@ -423,12 +463,12 @@ fn record_verdicts(session: &str, input: &Value, pending: &[predict::Pending], r
     log_cost(session, &format!("judge call={call} pending={} resolved={} chars={chars}", pending.len(), changed.len() + ignored.len()));
     if learning() {
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
-        // One record per channel: the statistics split what the questions led to by how they were asked.
+        // One record per channel: the statistics split what the deliveries led to by how they were made.
         let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
-        let live = live_asked(&edits);
+        let by = channels(&edits);
         for (kind, lessons) in [(outcome::CHANGED, changed), (outcome::IGNORED, ignored)] {
-            let (by_live, by_stop): (Vec<String>, Vec<String>) = lessons.into_iter().partition(|id| live.contains(id.as_str()));
-            for (channel, lessons) in [("live", by_live), ("stop", by_stop)] {
+            for channel in ["live", "stop", "early", "queued"] {
+                let lessons: Vec<String> = lessons.iter().filter(|id| by.get(id.as_str()).copied().unwrap_or("stop") == channel).cloned().collect();
                 if !lessons.is_empty() {
                     let o = outcome::Outcome {
                         kind: kind.into(),
@@ -446,14 +486,28 @@ fn record_verdicts(session: &str, input: &Value, pending: &[predict::Pending], r
     }
 }
 
-/// Lessons a live check asked (`#borg-live <ids> ms=<epoch ms>`, right after their `#borg-asked` line).
-fn live_asked(text: &str) -> std::collections::HashSet<&str> {
-    text.lines()
-        .filter_map(|l| l.strip_prefix("#borg-live "))
-        .filter_map(|rest| rest.split_whitespace().next())
-        .flat_map(|ids| ids.split(','))
-        .filter(|i| !i.is_empty())
-        .collect()
+/// The channel of each lesson's latest delivery in the .edits file `text`: `stop` (`#borg-asked`),
+/// `live` (a live check's, `#borg-live <ids> ms=<epoch ms>` right after its `#borg-asked` line), `early`
+/// or `queued`.
+fn channels(text: &str) -> std::collections::HashMap<&str, &'static str> {
+    let mut out = std::collections::HashMap::new();
+    for l in text.lines() {
+        let (ids, channel) = if let Some(ids) = l.strip_prefix("#borg-asked ") {
+            (ids, "stop")
+        } else if let Some(rest) = l.strip_prefix("#borg-live ") {
+            (rest.split_whitespace().next().unwrap_or_default(), "live")
+        } else if let Some(ids) = l.strip_prefix("#borg-early ") {
+            (ids, "early")
+        } else if let Some(ids) = l.strip_prefix("#borg-queued ") {
+            (ids, "queued")
+        } else {
+            continue;
+        };
+        for id in ids.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+            out.insert(id, channel);
+        }
+    }
+    out
 }
 
 /// Ids listed on the state file's `marker` lines (`#borg-asked a,b`).
@@ -465,18 +519,20 @@ pub(crate) fn listed<'a>(context: &'a str, marker: &str) -> std::collections::Ha
 /// (a topic) and that scope's lessons score on them, the top ones go to the drone at once, as context,
 /// instead of waiting for the Stop checkpoint: at the prompt or the first touch on the topic (`text` is
 /// this event's, already in the state file). Each lesson once per session (`#borg-early`; Stop does not
-/// ask it again). A topic is settled (`#borg-topic`) once a delivery covered it or none of its lessons is
+/// ask it again) and an `asked` outcome with channel early (`record_delivery`). A topic is settled (`#borg-topic`) once a delivery covered it or none of its lessons is
 /// left; until then each prompt or touch looks again. At most `MAX_EARLY_DELIVERIES` per session. Only
 /// where the harness takes it (`Caps::early_delivery`, Claude Code so far): omp and opencode take a prompt's
 /// and a tool call's context too (live mode), but early delivery to them waits for an evaluation, so for
-/// them the lessons stay with Stop. `BORG_EARLY=off` disables it;
-/// so do the eval modes BORG_ONLY and BORG_CRITIC.
+/// them the lessons stay with Stop. Standing lessons (ratified constraints, conscience.rs `standing_pool`)
+/// are no ranking guess and need no evaluation: they come on every harness that takes the context (a
+/// prompt's, or a tool call's for a named scope), whenever their scope is named (an unscoped one at a
+/// prompt), settled topic or not and past `MAX_EARLY_DELIVERIES`, until each came once. `BORG_EARLY=off`
+/// disables it; so do the eval modes BORG_ONLY and BORG_CRITIC.
 /// Early deliveries per session at most (each up to `conscience::render_early`'s lesson cap).
 const MAX_EARLY_DELIVERIES: usize = 3;
 
-fn early(h: &dyn Harness, hook_event: &str, session: &str, text: &str) -> Option<String> {
-    if !h.caps().early_delivery
-        || text.trim().is_empty()
+fn early(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, text: &str) -> Option<String> {
+    if text.trim().is_empty()
         || std::env::var("BORG_EARLY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
         || std::env::var_os("BORG_ONLY").is_some()
         || std::env::var_os("BORG_CRITIC").is_some()
@@ -484,37 +540,58 @@ fn early(h: &dyn Harness, hook_event: &str, session: &str, text: &str) -> Option
         return None;
     }
     let challenges = lessons(session);
-    if challenges.iter().all(|c| c.scope.is_empty() && !c.consolidated) {
-        return None;
-    }
     let context = std::fs::read_to_string(state_file(session)).unwrap_or_default();
     // Free, but not free of noise: a long session naming many systems would otherwise get a delivery
-    // at every touch until each topic's lessons ran out.
-    if context.lines().filter(|l| l.starts_with("#borg-early ")).count() >= MAX_EARLY_DELIVERIES {
+    // at every touch until each topic's lessons ran out. Standing lessons are exempt.
+    let plain = h.caps().early_delivery && context.lines().filter(|l| l.starts_with("#borg-early ")).count() < MAX_EARLY_DELIVERIES;
+    let standing = challenges.iter().any(conscience::Challenge::standing);
+    if !standing && (!plain || challenges.iter().all(|c| c.scope.is_empty() && !c.consolidated)) {
         return None;
     }
     let settled = listed(&context, "#borg-topic ");
-    let mut topics: Vec<String> = conscience::named_scopes(&challenges, &where_now(session)).into_iter().filter(|t| !settled.contains(t.as_str())).collect();
+    let named = conscience::named_scopes(&challenges, &where_now(session));
+    let mut topics: Vec<String> = if plain { named.iter().filter(|t| !settled.contains(t.as_str())).cloned().collect() } else { Vec::new() };
     // Consolidated lessons (memory.rs) need no scope: the first prompt is their topic (`ANY`).
-    if topics.is_empty() && hook_event == "UserPromptSubmit" && !settled.contains(conscience::ANY) && challenges.iter().any(|c| c.consolidated) {
+    if plain
+        && topics.is_empty()
+        && hook_event == "UserPromptSubmit"
+        && !settled.contains(conscience::ANY)
+        && challenges.iter().any(|c| c.consolidated && !c.standing())
+    {
         topics.push(conscience::ANY.into());
     }
-    if topics.is_empty() {
-        return None;
+    // A standing lesson's topic is every named scope, settled or not, and any prompt for an unscoped one.
+    let mut standing_topics = named;
+    if hook_event == "UserPromptSubmit" {
+        standing_topics.push(conscience::ANY.into());
     }
     let mut done = listed(&context, "#borg-asked ");
     done.extend(listed(&context, "#borg-early "));
     done.extend(listed(&context, "#borg-queued "));
-    let selected = conscience::early(&challenges, &context, &topics, &done);
-    let shown = conscience::render_early(&selected, &topics);
+    let mut pool = if standing { conscience::standing_pool(&challenges, &standing_topics, &done) } else { Vec::new() };
+    if !topics.is_empty() {
+        pool.extend(conscience::early_pool(&challenges, &conscience::work_text(&context), &topics, &done));
+    }
+    // The header names what came: the plain topics, and the scopes of the standing lessons beside them.
+    let mut shown_topics = topics.clone();
+    for t in standing_topics.into_iter().filter(|t| pool.iter().any(|(_, c)| c.standing() && c.scope.contains(t))) {
+        if !shown_topics.contains(&t) {
+            shown_topics.push(t);
+        }
+    }
+    let selected: Vec<&conscience::Challenge> = conscience::explored(pool.iter().copied()).into_iter().take(conscience::EARLY_CAP).collect();
+    let shown = conscience::render_early(&selected, &shown_topics);
     let delivered = &selected[..shown.as_ref().map_or(0, |(_, n)| *n)];
+    // Plain topics only: a standing lesson left over (past `EARLY_CAP` or `EARLY_CHARS`) comes at the next
+    // prompt or touch on its scope whatever is settled.
     let now_settled: Vec<&str> = topics
         .iter()
         .filter(|t| {
             // One delivery per topic: whatever was delivered now covers every topic looked at now.
             !delivered.is_empty()
                 || !challenges.iter().any(|c| {
-                    (c.scope.contains(t) || (t.as_str() == conscience::ANY && c.consolidated))
+                    !c.standing()
+                        && (c.scope.contains(t) || (t.as_str() == conscience::ANY && c.consolidated))
                         && !done.contains(c.id.as_str())
                         && !delivered.iter().any(|d| d.id == c.id)
                 })
@@ -530,6 +607,8 @@ fn early(h: &dyn Harness, hook_event: &str, session: &str, text: &str) -> Option
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
         let _ = writeln!(f, "#borg-early {ids}");
     }
+    let p = conscience::early_propensity(&pool, session, &shown_topics);
+    record_delivery(session, input, delivered, "early", delivered.iter().map(|c| p.get(&c.id).copied().unwrap_or(0.0)).collect());
     log_cost(session, &format!("free event={hook_event} lessons={} chars={}", delivered.len(), text.len()));
     crate::stats::count(&learn::home(), crate::stats::EARLY, session, |e| {
         e.n = delivered.len() as u64;
@@ -537,6 +616,33 @@ fn early(h: &dyn Harness, hook_event: &str, session: &str, text: &str) -> Option
         e.channel = "early".into();
     });
     Some(text)
+}
+
+/// The `asked` outcome of a free delivery (`channel` early or queued) of `delivered`, with each one's
+/// propensity `p`: delivered as context, the lessons wait for a result as a Stop's questions do. The
+/// next Stop's judge (`pending`) labels them changed or ignored, a merged correction corrected
+/// (outcome.rs `contradicted`), and `borg learn` settles the rest. Nothing with learning off.
+fn record_delivery(session: &str, input: &Value, delivered: &[&conscience::Challenge], channel: &str, p: Vec<f64>) {
+    if !learning() || delivered.is_empty() {
+        return;
+    }
+    let lessons: Vec<String> = delivered.iter().map(|c| c.id.clone()).collect();
+    let (grades, ranks, applied) = graded_of(session, &lessons);
+    let asked = outcome::Outcome {
+        kind: outcome::ASKED.into(),
+        session: session.into(),
+        lessons,
+        ms: learn::now_ms(),
+        repo: repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()),
+        groups: conscience::disagreement_ids(delivered),
+        channel: channel.into(),
+        grades,
+        ranks,
+        applied,
+        p: p.into_iter().map(outcome::round_p).collect(),
+        ..Default::default()
+    };
+    let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
 }
 
 /// Graded Stop (default): ids graded 2 or 1 at a turn end that did not block, one comma-separated line
@@ -580,7 +686,8 @@ fn take_live(session: &str) -> Vec<String> {
 /// The waiting graded lessons as free context, once: those not asked, delivered early or handed over
 /// since, as many as one early delivery fits (`conscience::render_early`); the rest are dropped. Marked
 /// `#borg-queued` in the state and .edits files, so neither this queue nor early delivery repeats them,
-/// and Stop treats them as early lessons (done once acted on). A live check's asks (`live` lines) come
+/// and Stop treats them as early lessons (done once acted on); an `asked` outcome with channel queued
+/// (`record_delivery`). A live check's asks (`live` lines) come
 /// first, as questions to answer (`ask_live`).
 fn queued(h: &dyn Harness, hook_event: &str, session: &str, input: &Value) -> Option<String> {
     let ids = take_queue(session)?;
@@ -611,6 +718,8 @@ fn queued(h: &dyn Harness, hook_event: &str, session: &str, input: &Value) -> Op
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
             let _ = writeln!(f, "#borg-queued {ids}");
         }
+        // Handed over as the graded check left them: no draw, so each was certain to come (p 1).
+        record_delivery(session, input, &wanted[..n], "queued", vec![1.0; n]);
         log_cost(session, &format!("free event={hook_event} lessons={n} chars={} graded dropped={}", text.len(), wanted.len() - n));
         crate::stats::count(&learn::home(), crate::stats::QUEUED_FREE, session, |e| {
             e.n = n as u64;
@@ -720,7 +829,7 @@ fn free_context(h: &dyn Harness, hook_event: &str, session: &str, input: &Value,
 
 /// `free_context` plus `extra` (a queen question) last.
 fn free_context_with(h: &dyn Harness, hook_event: &str, session: &str, input: &Value, text: &str, extra: Option<String>) -> Option<Value> {
-    let parts: Vec<String> = [queued(h, hook_event, session, input), early(h, hook_event, session, text), extra].into_iter().flatten().collect();
+    let parts: Vec<String> = [queued(h, hook_event, session, input), early(h, hook_event, session, input, text), extra].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| json!({"hookSpecificOutput": {"hookEventName": hook_event, "additionalContext": parts.join("\n\n")}}))
 }
 
@@ -743,7 +852,8 @@ struct Work<'a> {
     done: &'a std::collections::HashSet<&'a str>,
     /// The state file as read before the check.
     state: &'a str,
-    /// The state file plus the drone's work text: what the gate and the model read.
+    /// The state file plus the drone's work text: the gate finds the turn in it by its markers; the pool
+    /// and the model read it without them (`conscience::work_text`).
     context: &'a str,
     scope_text: &'a str,
     /// The drone's message for the judge (`pending`): its final message at the stop, the turn so far live.
@@ -778,12 +888,15 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     if let Some(score) = skip {
         return Verdict::Skip(score);
     }
+    // What the pool and the model read: the work, without the state file's bookkeeping lines.
+    let text = conscience::work_text(w.context);
+    let text = text.as_ref();
     // BM25's top 30, plus lessons the vector index finds that word matching missed (vectors.rs; here only,
     // where the model call dwarfs loading the embedder). Top 30 found as much as top 20 + vectors; both
     // together find the most (internal evaluation "vectors", not published).
     let started = std::time::Instant::now();
     let shortlist_now = || {
-        let (list, added) = crate::vectors::shortlist(&lessons_path(), w.challenges, w.context, w.scope_text, crate::vectors::SHORTLIST);
+        let (list, added) = crate::vectors::shortlist(&lessons_path(), w.challenges, text, w.scope_text, crate::vectors::SHORTLIST);
         if crate::vectors::enabled() {
             log_cost(session, &format!("vectors added={added} ms={}", started.elapsed().as_millis()));
         }
@@ -794,7 +907,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     // pool in the shortlist's layout (predict::prompt).
     let whole = crate::whole::on();
     let shortlist = if whole {
-        let ranked = conscience::rank_scoped(w.challenges, w.context, w.scope_text);
+        let ranked = conscience::rank_scoped(w.challenges, text, w.scope_text);
         let eligible = crate::whole::eligible(w.challenges, &ranked, w.scope_text);
         let n = eligible.len();
         let (shown, fell) = crate::whole::select(eligible, shortlist_now, &ranked, crate::whole::tokens());
@@ -805,10 +918,11 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     };
     let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
     // R1: the same call judges what the drone did with lessons asked earlier this session.
-    let pend = if w.judge { pending(session, w.state, w.all, w.message, live) } else { Vec::new() };
-    // Nothing to ask and nothing to judge (no lesson in the pool, none pending): no model call. A live
+    let (pend, question) = if w.judge { pending(session, w.state, w.all, w.message, live) } else { (Vec::new(), false) };
+    // Nothing to ask and no question to judge (no lesson in the pool, none pending): no model call. A live
     // check has no free gate, so without this every change of a session with no lessons paid for one.
-    if shortlist.is_empty() && pend.is_empty() {
+    // Free deliveries alone never pay for a call: they wait for the next one, or `borg learn` settles them.
+    if shortlist.is_empty() && !question {
         return Verdict::Skip("empty".into());
     }
     let extra = predict::judge_section(&pend).len();
@@ -816,9 +930,9 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     let timeout = live::call_limit(w.budget, w.started.elapsed());
     let called = std::time::Instant::now();
     let pred = if whole && !crate::whole::classic() {
-        predict::predict_whole(w.context, &shortlist, &pend, &model, graded, timeout)
+        predict::predict_whole(text, &shortlist, &pend, &model, graded, timeout)
     } else {
-        predict::predict(w.context, &shortlist, &pend, &model, graded, timeout)
+        predict::predict(text, &shortlist, &pend, &model, graded, timeout)
     };
     stat(session, input, if live { crate::stats::LIVE_CHECK } else { crate::stats::CHECK }, |e| {
         e.n = shortlist.len() as u64;
@@ -878,7 +992,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
         // R3b: the model decides whether to ask (at the stop, an extra round); once it does, the questions
         // also carry every other lesson over the low bar (conscience.rs `widen`).
         let predicted: Vec<&conscience::Challenge> = applied.iter().map(|(c, _)| *c).collect();
-        let pool = conscience::widen_pool(&conscience::rank_scoped(w.all, w.context, w.scope_text), &predicted, w.done);
+        let pool = conscience::widen_pool(&conscience::rank_scoped(w.all, text, w.scope_text), &predicted, w.done);
         let widened: Vec<&conscience::Challenge> =
             conscience::in_scope_first(conscience::explored(pool.iter().copied())).into_iter().filter(|c| w.challenges.iter().any(|x| x.id == c.id)).collect();
         append_p_of(session, &pool, &widened);
@@ -1048,7 +1162,9 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
 }
 
 /// A shell command that ran tests leaves `fail <ms>` or `pass <ms>` in `<state>/<session>.tests`: the
-/// regress `tests` signal (`notes/regress_signals.rs`), whether or not the harness reports denials.
+/// regress `tests` signal (`notes/regress_signals.rs`) and `borg learn`'s `tested` credit, whether or not
+/// the harness reports denials. A call that did not fail and shows no output (an adapter that sends
+/// none) leaves nothing: its result is unknown, not a pass.
 fn capture_test(session: &str, input: &Value, failed: bool) {
     if !learning() || input.get("tool_name").and_then(Value::as_str) != Some("Bash") {
         return;
@@ -1057,7 +1173,11 @@ fn capture_test(session: &str, input: &Value, failed: bool) {
     if !crate::notes::regress_signals::runs_tests(command) {
         return;
     }
-    if let Some(what) = crate::notes::regress_signals::test_outcome(command, &crate::notes::regress_signals::tool_output(input), failed)
+    let output = crate::notes::regress_signals::tool_output(input);
+    if !failed && output.trim().is_empty() {
+        return;
+    }
+    if let Some(what) = crate::notes::regress_signals::test_outcome(command, &output, failed)
         && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state_file(session).with_extension("tests"))
     {
         let _ = writeln!(f, "{what} {}", learn::now_ms());
@@ -1226,7 +1346,7 @@ fn stop_select<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, 
         // R3b (conscience.rs `budget`): block only for a lesson near the best match not yet done;
         // then ask everything over the low bar, in-scope first.
         Err(_) => {
-            let pool = conscience::budget_pool(&conscience::rank_scoped(w.all, w.context, w.scope_text), w.done);
+            let pool = conscience::budget_pool(&conscience::rank_scoped(w.all, &conscience::work_text(w.context), w.scope_text), w.done);
             let asked: Vec<&conscience::Challenge> = conscience::in_scope_first(conscience::explored(pool.iter().copied()))
                 .into_iter()
                 .filter_map(|c| w.challenges.iter().find(|x| x.id == c.id))

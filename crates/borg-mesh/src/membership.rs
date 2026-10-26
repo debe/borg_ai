@@ -321,6 +321,8 @@ impl Membership {
         let tmp = p.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap()).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &p).map_err(|e| format!("{}: {e}", p.display()))?;
+        // A key this version no longer lists never completes another session to clear its protocol record.
+        let _ = borg::presence::retain_mismatches(home, |k| self.role_of(k).is_some());
         self.record(home)
     }
 
@@ -368,6 +370,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let id = Identity::load_or_create(&home).unwrap();
         (home, id)
+    }
+
+    #[test]
+    fn a_member_that_leaves_takes_its_protocol_record_along() {
+        let ((ha, admin), (hb, bob), (hc, eve)) = (node("pa"), node("pb"), node("pc"));
+        let mut m = Membership::found("work", &admin);
+        m.invite(&admin, &bob.public(), "member").unwrap();
+        m.invite(&admin, &eve.public(), "member").unwrap();
+        m.save(&ha).unwrap();
+        let old = |ms| borg::presence::Mismatch { theirs: "borg/mesh/5".into(), ours: "borg/mesh/10".into(), ms };
+        borg::presence::note_mismatch(&ha, &bob.public(), old(1)).unwrap();
+        borg::presence::note_mismatch(&ha, &eve.public(), old(2)).unwrap();
+        m.revoke(&admin, &bob.public(), 3).unwrap();
+        m.save(&ha).unwrap();
+        let left: Vec<String> = borg::presence::mismatches(&ha).into_keys().collect();
+        assert_eq!(left, vec![eve.public()], "only the member still listed keeps its warning");
+        for h in [ha, hb, hc] {
+            let _ = std::fs::remove_dir_all(h);
+        }
     }
 
     #[test]

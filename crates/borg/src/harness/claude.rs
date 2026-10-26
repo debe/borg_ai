@@ -60,11 +60,12 @@ impl Harness for Claude {
         Probe { cli: "claude", tested: "" }
     }
 
-    /// Workflow runs: `<projects>/<slug>/<session>/workflows/wf_*.json` (`$CLAUDE_CONFIG_DIR/projects`,
-    /// else `home/.claude/projects`).
+    /// Workflow runs (`<projects>/<slug>/<session>/workflows/wf_*.json`) and each session's plain
+    /// sub-agents (the Agent tool, [`agent_runs`]), under `$CLAUDE_CONFIG_DIR/projects`, else
+    /// `home/.claude/projects`.
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
         let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".claude"), PathBuf::from);
-        workflow_runs(&config.join("projects"), session, since)
+        project_runs(&config.join("projects"), session, since)
     }
 
     /// `claude -p` with the engineer's settings (so borg's hooks run in the drone) and every permission
@@ -100,6 +101,28 @@ impl Harness for Claude {
 
 // ---------------------------------------------------------------- workflow runs
 
+/// The workflow runs and the plain sub-agents' runs under a projects directory, oldest first (see
+/// [`workflow_runs`], [`agent_runs`]).
+pub fn project_runs(projects: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+    let mut runs = workflow_runs(projects, session, since);
+    let mut loose = agent_runs(projects, session, since);
+    // An Agent-tool sub-agent that a workflow's agent started is part of that workflow's run.
+    for l in &mut loose {
+        for a in std::mem::take(&mut l.agents) {
+            match runs.iter_mut().find(|r| r.session == l.session && r.agents.iter().any(|w| !a.parent.is_empty() && w.id == a.parent)) {
+                Some(r) => r.agents.push(a),
+                None => l.agents.push(a),
+            }
+        }
+    }
+    for r in &mut runs {
+        r.agents.sort_by_key(|a| a.started);
+    }
+    runs.extend(loose.into_iter().filter(|l| !l.agents.is_empty()));
+    runs.sort_by_key(|r| r.started);
+    runs
+}
+
 /// Every workflow run under a projects directory, oldest first: of `session` only when given, from
 /// runs that started at or after `since`. Each run file lists its agents (label, phase, start); each
 /// agent's transcript is `<session>/subagents/workflows/<runId>/agent-<id>.jsonl`, its output the
@@ -118,8 +141,46 @@ pub fn workflow_runs(projects: &Path, session: Option<&str>, since: Option<i64>)
                 let started = run.get("startTime").map_or(0, num);
                 if since.is_none_or(|s| started >= s) {
                     let s = |k: &str| run.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-                    runs.push(Run { id: s("runId"), session: session.clone(), name: s("workflowName"), started, agents: agents(&dir, &run) });
+                    runs.push(Run { id: s("runId"), session: session.clone(), name: s("workflowName"), started, agents: agents(&dir, &run), loose: false });
                 }
+            }
+        }
+    }
+    runs.sort_by_key(|r| r.started);
+    runs
+}
+
+/// One run per session that ran plain sub-agents (the Agent tool, outside any workflow), oldest first:
+/// of `session` only when given, from runs whose first agent started at or after `since`. Each agent's
+/// transcript is `<session>/subagents/agent-<id>.jsonl`, its description, type, the agent that started
+/// it (`parentAgentId`, none when the session's own agent did) and the Agent call that did
+/// (`toolUseId`) in `agent-<id>.meta.json` beside it; it has no structured output, so its findings come
+/// from its text. The run's id is `agents-<session>`, and it is [`Run::loose`].
+pub fn agent_runs(projects: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+    let mut runs = Vec::new();
+    for slug in read_dir(projects) {
+        let dirs = match session {
+            Some(s) => vec![slug.join(s)],
+            None => read_dir(&slug),
+        };
+        for dir in dirs.into_iter().filter(|p| p.is_dir()) {
+            let session = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut agents: Vec<SubAgent> = read_dir(&dir.join("subagents"))
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+                .map(|f| {
+                    let meta = std::fs::read_to_string(f.with_extension("meta.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+                    let s = |k: &str| meta.as_ref().and_then(|m| m.get(k)).and_then(Value::as_str).unwrap_or_default().to_string();
+                    let id = f.file_stem().map(|n| n.to_string_lossy().trim_start_matches("agent-").to_string()).unwrap_or_default();
+                    let mut a = SubAgent { id, parent: s("parentAgentId"), label: s("description"), kind: s("agentType"), ..Default::default() };
+                    read_agent_from(&f, &s("toolUseId"), &mut a);
+                    a
+                })
+                .collect();
+            agents.sort_by_key(|a| a.started);
+            let Some(started) = agents.first().map(|a| a.started) else { continue };
+            if since.is_none_or(|s| started >= s) {
+                runs.push(Run { id: format!("agents-{session}"), session, name: String::new(), started, loose: true, agents });
             }
         }
     }
@@ -148,7 +209,8 @@ fn agents(session_dir: &Path, run: &Value) -> Vec<SubAgent> {
         .filter(|p| p.get("type").and_then(Value::as_str) == Some("workflow_agent"))
         .map(|p| {
             let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-            let mut a = SubAgent { label: s("label"), phase: s("phaseTitle"), started: p.get("startedAt").map_or(0, num), ..Default::default() };
+            let mut a =
+                SubAgent { id: s("agentId"), label: s("label"), phase: s("phaseTitle"), started: p.get("startedAt").map_or(0, num), ..Default::default() };
             read_agent(&session_dir.join("subagents/workflows").join(id).join(format!("agent-{}.jsonl", s("agentId"))), &mut a);
             a
         })
@@ -165,11 +227,21 @@ fn text_of(content: &Value) -> String {
     }
 }
 
-/// Read one agent transcript into `a`: its cwd, its first user message (the prompt), every tool input
-/// and text, and its last `StructuredOutput`.
+/// Read one agent transcript into `a`: its cwd, its start (where `a` has none), its first user message
+/// (the prompt), every tool input and text, and its last `StructuredOutput`.
 fn read_agent(path: &Path, a: &mut SubAgent) {
+    read_agent_from(path, "", a);
+}
+
+/// [`read_agent`] of an agent the Agent call `call` started. A fork's transcript opens with that call,
+/// copied from its parent, and a user message of fork boilerplate: the call's prompt is its prompt,
+/// and the call is not its work.
+fn read_agent_from(path: &Path, call: &str, a: &mut SubAgent) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
     for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        if a.started == 0 {
+            a.started = v.get("timestamp").and_then(Value::as_str).map_or(0, borg_trace::parse_ts);
+        }
         if a.cwd.is_empty()
             && let Some(c) = v.get("cwd").and_then(Value::as_str)
         {
@@ -178,26 +250,30 @@ fn read_agent(path: &Path, a: &mut SubAgent) {
         let Some(content) = v.get("message").and_then(|m| m.get("content")) else { continue };
         match v.get("type").and_then(Value::as_str) {
             Some("user") if a.prompt.is_empty() => a.prompt = text_of(content),
-            Some("assistant") => {
-                for b in content.as_array().into_iter().flatten() {
-                    match b.get("type").and_then(Value::as_str) {
-                        Some("tool_use") if b.get("name").and_then(Value::as_str) == Some("StructuredOutput") => a.output = b.get("input").cloned(),
-                        Some("tool_use") => {
-                            a.work.push_str(&b.get("input").map(Value::to_string).unwrap_or_default());
-                            a.work.push('\n');
-                        }
-                        Some("text") => {
-                            let t = b.get("text").and_then(Value::as_str).unwrap_or_default();
-                            a.work.push_str(t);
-                            a.work.push('\n');
-                            a.final_text = t.to_string();
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            Some("assistant") => content.as_array().into_iter().flatten().for_each(|b| read_block(b, call, a)),
             _ => {}
         }
+    }
+}
+
+/// One content block of an assistant message of [`read_agent_from`] into `a`.
+fn read_block(b: &Value, call: &str, a: &mut SubAgent) {
+    match b.get("type").and_then(Value::as_str) {
+        Some("tool_use") if b.get("name").and_then(Value::as_str) == Some("StructuredOutput") => a.output = b.get("input").cloned(),
+        Some("tool_use") if !call.is_empty() && b.get("id").and_then(Value::as_str) == Some(call) => {
+            a.prompt = b.get("input").and_then(|i| i.get("prompt")).and_then(Value::as_str).unwrap_or_default().to_string();
+        }
+        Some("tool_use") => {
+            a.work.push_str(&b.get("input").map(Value::to_string).unwrap_or_default());
+            a.work.push('\n');
+        }
+        Some("text") => {
+            let t = b.get("text").and_then(Value::as_str).unwrap_or_default();
+            a.work.push_str(t);
+            a.work.push('\n');
+            a.final_text = t.to_string();
+        }
+        _ => {}
     }
 }
 
@@ -284,6 +360,42 @@ mod tests {
         assert_eq!(turn_so_far(t, 4000), "I will replace the reset arc.\n[Read] /x/net.rs\n[Edit] /x/net.rs\n[Bash] cargo test -p net");
         assert_eq!(turn_so_far(t, 20), "[Bash] cargo test -p net".chars().skip(4).collect::<String>(), "the newest work is kept");
         assert_eq!(turn_so_far(Path::new("/nonexistent/t.jsonl"), 4000), "");
+    }
+
+    #[test]
+    fn a_workflow_agents_sub_agent_joins_its_run_and_a_fork_is_prompted_by_its_call() {
+        let projects = std::env::temp_dir().join(format!("borg-claude-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&projects);
+        let dir = projects.join("-w-app/s1");
+        std::fs::create_dir_all(dir.join("subagents/workflows/wf_1")).unwrap();
+        std::fs::create_dir_all(dir.join("workflows")).unwrap();
+        let line = |v: Value| format!("{v}\n");
+        let user = |ts: &str, content: Value| line(serde_json::json!({"type": "user", "timestamp": ts, "cwd": "/w/app", "message": {"content": content}}));
+        let progress = serde_json::json!([{"type": "workflow_agent", "label": "fix", "phaseTitle": "Fix", "agentId": "w1", "startedAt": "1000"}]);
+        let run = serde_json::json!({"runId": "wf_1", "workflowName": "build", "startTime": 1000, "workflowProgress": progress});
+        std::fs::write(dir.join("workflows/wf_1.json"), run.to_string()).unwrap();
+        std::fs::write(dir.join("subagents/workflows/wf_1/agent-w1.jsonl"), user("1970-01-01T00:00:01.000Z", "fix it".into())).unwrap();
+        let sub = dir.join("subagents");
+        let meta = |id: &str, m: Value| std::fs::write(sub.join(format!("agent-{id}.meta.json")), m.to_string()).unwrap();
+        meta("n1", serde_json::json!({"agentType": "general-purpose", "description": "Fix the arc", "parentAgentId": "w1"}));
+        std::fs::write(sub.join("agent-n1.jsonl"), user("1970-01-01T00:00:02.000Z", "edit src/net.rs".into())).unwrap();
+        meta("f1", serde_json::json!({"agentType": "fork", "isFork": true, "description": "Review the net", "toolUseId": "toolu_1"}));
+        let call = serde_json::json!({"type": "assistant", "timestamp": "1970-01-01T00:00:03.000Z", "cwd": "/w/app", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Agent", "input": {"subagent_type": "fork", "prompt": "review the net diff"}}
+        ]}});
+        let boilerplate =
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "toolu_1"}, {"type": "text", "text": "<fork-boilerplate>You are a worker fork."}]);
+        let fork = line(serde_json::json!({"type": "fork-context-ref", "agentId": "f1"})) + &line(call) + &user("1970-01-01T00:00:03.000Z", boilerplate);
+        std::fs::write(sub.join("agent-f1.jsonl"), fork).unwrap();
+        let runs = project_runs(&projects, None, None);
+        let agents = |r: &Run| r.agents.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            runs.iter().map(|r| (r.id.as_str(), r.loose, agents(r))).collect::<Vec<_>>(),
+            [("wf_1", false, vec!["w1".to_string(), "n1".into()]), ("agents-s1", true, vec!["f1".into()])]
+        );
+        let f = &runs[1].agents[0];
+        assert_eq!((f.prompt.as_str(), f.work.as_str()), ("review the net diff", ""), "the call is the parent's, not the fork's work");
+        let _ = std::fs::remove_dir_all(projects);
     }
 
     #[test]

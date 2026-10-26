@@ -38,7 +38,7 @@ pub fn turn(context: &str) -> &str {
 /// store's largest idf. 0 for an empty store or a turn that matches nothing.
 pub fn score(challenges: &[Challenge], context: &str) -> f64 {
     let n = challenges.len() as f64;
-    let top = conscience::rank(challenges, turn(context)).first().map(|(s, _)| *s).unwrap_or(0.0);
+    let top = conscience::rank(challenges, &conscience::work_text(turn(context))).first().map(|(s, _)| *s).unwrap_or(0.0);
     let idf_max = (1.0 + (n - 0.5) / 1.5).ln();
     if idf_max > 0.0 { top / idf_max } else { 0.0 }
 }
@@ -195,9 +195,10 @@ pub fn tally(state: &std::path::Path) -> Tally {
 
 /// The gate's score and what an eval needs beside it (eval/preempt/stop_prefilter.py).
 pub fn features(challenges: &[Challenge], context: &str) -> serde_json::Value {
-    let t = turn(context);
+    let t = conscience::work_text(turn(context));
+    let t = t.as_ref();
     let ranked = conscience::rank(challenges, t);
-    let shortlist = conscience::select(challenges, context, 20);
+    let shortlist = conscience::select(challenges, &conscience::work_text(context), 20);
     let q: std::collections::HashSet<String> = conscience::tokens(t).into_iter().collect();
     serde_json::json!({
         "score": score(challenges, context),
@@ -240,6 +241,19 @@ mod tests {
         assert_eq!(score(&ls, &earlier), score(&ls, "ok, thanks"), "earlier turns do not count");
         assert_eq!(score(&[], hit), 0.0);
         assert_eq!(score(&ls[..1], "nothing matches here"), 0.0, "a store of one has idf 0 or no match");
+    }
+
+    /// A bookkeeping line in the turn (`#borg-answer` carries the drone's last proposal, `#borg-p` lesson
+    /// ids) is not the turn's work: it scores nothing.
+    #[test]
+    fn bookkeeping_lines_score_nothing() {
+        let ls: Vec<Challenge> = (0..30)
+            .map(|i| lesson(&format!("L{i}"), &format!("unrelated filler words number{i} about gardening")))
+            .chain([lesson("lock", "Did I hold the websocket send lock across the await on the delivery queue?")])
+            .collect();
+        let marked = "ok, thanks\n#borg-answer hold the websocket send lock while awaiting the delivery queue\n#borg-p lock=0.9\n";
+        assert_eq!(score(&ls, marked), score(&ls, "ok, thanks\n"));
+        assert!(features(&ls, marked)["turn_ids"].as_array().unwrap().is_empty(), "{}", features(&ls, marked));
     }
 
     /// Why the held-out result was fixed in advance (internal evaluation "stop-prefilter", not published): query words are a set

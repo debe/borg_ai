@@ -104,7 +104,7 @@ pub fn session_runs(sessions: &Path, session: Option<&str>, since: Option<i64>) 
             let title = main.iter().find_map(|v| (v["type"] == "title").then(|| v["title"].as_str()).flatten()).unwrap_or_default().to_string();
             let started = main.iter().find(|v| v["type"] == "session").map_or(agents[0].started, |v| ts(&v["timestamp"]));
             if since.is_none_or(|s| started >= s) {
-                runs.push(Run { id: name, session: id, name: title, started, agents });
+                runs.push(Run { id: name, session: id, name: title, started, agents, loose: false });
             }
         }
     }

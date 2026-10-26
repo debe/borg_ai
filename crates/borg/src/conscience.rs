@@ -162,7 +162,70 @@ fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Opti
         }
         c.trust = trust.lesson(c);
     }
+    out.extend(constraints(path, before_ms, aliases, &out));
     out
+}
+
+/// `source` of a ratified constraint loaded as a lesson (`constraints`).
+pub const CONSTRAINT: &str = "constraint";
+
+impl Challenge {
+    /// A standing lesson: a constraint an engineer ratified (veto.rs `ratify`). Consolidated, never
+    /// dormant, its weight and trust fixed (no outcome or author moves them), and delivered early
+    /// whenever its scope is in play, whatever the match, on every harness that takes prompt context
+    /// (`standing_pool`, hook.rs `early`).
+    pub fn standing(&self) -> bool {
+        self.source == CONSTRAINT
+    }
+}
+
+/// The ratified constraints beside the lessons file `path` (veto.rs `constraints_path`) known before
+/// `before_ms`, as standing lessons: the invariant is the question, the scope and repo are those of the
+/// lesson it was proposed from (in `lessons`), its reach the narrower of the line's and the lesson's
+/// (reach.rs `narrower`): a lesson withdrawn or made a repo convention takes its constraint along. With
+/// the lesson unknown here (quarantined, not synced yet, after `before_ms`), the line's own scope and
+/// repo, bound to that repo; a line that names no repo either is left out, never delivered everywhere.
+/// One per id, the earliest ratification (by time, then author), so nodes that both ratified it read
+/// the same line after a sync, in whatever order it came.
+fn constraints(path: &Path, before_ms: Option<i64>, aliases: &Aliases, lessons: &[Challenge]) -> Vec<Challenge> {
+    let Some(dir) = path.parent() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(crate::veto::constraints_path(dir)) else { return Vec::new() };
+    let mut by: std::collections::BTreeMap<String, (i64, String, Challenge)> = std::collections::BTreeMap::new();
+    for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        let s = |k: &str| v[k].as_str().unwrap_or_default().trim().to_string();
+        let (id, question, ms) = (s("id"), s("text"), v["ms"].as_i64().unwrap_or(0));
+        if id.is_empty() || question.is_empty() || before_ms.is_some_and(|b| ms >= b) {
+            continue;
+        }
+        let author = aliases.canon(&s("by"));
+        if by.get(&id).is_some_and(|(m, a, _)| (*m, a.as_str()) <= (ms, author.as_str())) {
+            continue;
+        }
+        let line_scope: Vec<String> = v["scope"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(str::to_string).collect();
+        let (scope, repo, reach, area) = match lessons.iter().find(|l| l.id == s("lesson")) {
+            Some(l) => {
+                let repo = if l.repo.is_empty() { s("repo") } else { l.repo.clone() };
+                (l.scope.clone(), repo, crate::reach::narrower(&s("reach"), &l.reach).to_string(), l.area.clone())
+            }
+            None if s("repo").is_empty() => continue,
+            None => (line_scope, s("repo"), crate::reach::narrower(&s("reach"), crate::reach::REPO).to_string(), trust::OTHER.into()),
+        };
+        let c = Challenge {
+            id: id.clone(),
+            origin_ms: ms,
+            question,
+            source: CONSTRAINT.into(),
+            engineers: Some(author.clone()).filter(|a| !a.is_empty()).into_iter().collect(),
+            scope,
+            repo,
+            reach,
+            area,
+            consolidated: true,
+            ..Challenge::default()
+        };
+        by.insert(id, (ms, author, c));
+    }
+    by.into_values().map(|(_, _, c)| c).collect()
 }
 
 /// The lessons as stored (latest version per id, area normalised, engineers canonical), without
@@ -261,6 +324,16 @@ pub fn tokens(text: &str) -> Vec<String> {
 /// exactly as BM25 over the questions, and the prefilter's normalisation by the largest idf stays valid.
 pub fn rank<'a>(challenges: &'a [Challenge], context: &str) -> Vec<(f64, &'a Challenge)> {
     rank_scoped(challenges, context, context)
+}
+
+/// The drone's work in `context` (a session's state file plus its work text) as word matching, the
+/// vectors and the consequence model read it: without borg's own bookkeeping lines (`#borg-asked`,
+/// `#borg-p`, `#borg-pool`, every `#borg-` marker). They carry lesson ids, scores and costs, not work.
+pub fn work_text(context: &str) -> std::borrow::Cow<'_, str> {
+    if !context.contains("#borg-") {
+        return std::borrow::Cow::Borrowed(context);
+    }
+    std::borrow::Cow::Owned(context.split_inclusive('\n').filter(|l| !l.starts_with("#borg-")).collect())
 }
 
 /// `rank`, with scopes judged against `scope_text` (where the session works) instead of the whole
@@ -600,20 +673,26 @@ pub fn propensity(pool: &[(f64, &Challenge)], session: &str) -> std::collections
     if pool.iter().filter(|(_, c)| c.scope.is_empty()).count() <= GENERIC_CAP && pool.len() <= CAP {
         return pool.iter().map(|(_, c)| (c.id.clone(), 1.0)).collect();
     }
+    kept_share(pool, session, |order| in_scope_first(order).into_iter().map(|c| c.id.clone()).collect())
+}
+
+/// The share of `P_DRAWS` draws (`propensity`) in which `keep`, given the pool ordered by score × draw,
+/// keeps each pooled lesson.
+fn kept_share(pool: &[(f64, &Challenge)], session: &str, keep: impl Fn(Vec<&Challenge>) -> Vec<String>) -> std::collections::HashMap<String, f64> {
     let draw = |c: &Challenge, i: usize| {
         let (a, b) = c.belief;
         let x = crate::memory::draw(a, b, crate::memory::seed(&format!("{session}#p{i}"), &c.id));
         (0.5 + x) / (0.5 + a / (a + b))
     };
-    let mut kept: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut kept: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for i in 0..P_DRAWS {
         let mut v: Vec<(f64, &Challenge)> = pool.iter().map(|&(s, c)| (s * draw(c, i), c)).collect();
         v.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for c in in_scope_first(v.into_iter().map(|(_, c)| c)) {
-            *kept.entry(c.id.as_str()).or_default() += 1;
+        for id in keep(v.into_iter().map(|(_, c)| c).collect()) {
+            *kept.entry(id).or_default() += 1;
         }
     }
-    pool.iter().map(|(_, c)| (c.id.clone(), kept.get(c.id.as_str()).copied().unwrap_or(0) as f64 / P_DRAWS as f64)).collect()
+    pool.iter().map(|(_, c)| (c.id.clone(), kept.get(&c.id).copied().unwrap_or(0) as f64 / P_DRAWS as f64)).collect()
 }
 
 /// A pooled lesson's score without its usefulness factor: s / (0.5 + mean belief) = relevance ×
@@ -645,17 +724,53 @@ pub fn named_scopes(challenges: &[Challenge], text: &str) -> Vec<String> {
 /// Early delivery: the scoped lessons a context brings into scope through one of `topics` (scope names
 /// it just named for the first time), ranked over the whole `context`, scoring at least `RELATIVE` × the
 /// best of them (done or not), minus those already delivered or asked (`done`), at most `EARLY_CAP`. Unscoped lessons
-/// never come early: generic hygiene has no topic, and only a named system says the drone is on one.
+/// never come early: generic hygiene has no topic, and only a named system says the drone is on one. Standing
+/// lessons (ratified constraints, `Challenge::standing`) come first on their topic, matched or not (`standing_pool`).
 pub fn early<'a>(challenges: &'a [Challenge], context: &str, topics: &[String], done: &HashSet<&str>) -> Vec<&'a Challenge> {
+    let pool: Vec<(f64, &Challenge)> = standing_pool(challenges, topics, done).into_iter().chain(early_pool(challenges, context, topics, done)).collect();
+    explored(pool).into_iter().take(EARLY_CAP).collect()
+}
+
+/// `early`'s pool of plain lessons before the slots: every on-topic lesson not done over `RELATIVE` ×
+/// the best of them, with its score. Never a standing lesson: those need no match (`standing_pool`).
+pub fn early_pool<'a>(challenges: &'a [Challenge], context: &str, topics: &[String], done: &HashSet<&str>) -> Vec<(f64, &'a Challenge)> {
     let on_topic = Names::of_all(topics.iter().map(String::as_str));
     let any = topics.iter().any(|t| t == ANY);
     let ranked: Vec<(f64, &Challenge)> = rank(challenges, context)
         .into_iter()
-        .filter(|(_, c)| (!c.scope.is_empty() && c.scope.iter().any(|s| on_topic.contains(s))) || (any && c.consolidated))
+        .filter(|(_, c)| !c.standing() && ((!c.scope.is_empty() && c.scope.iter().any(|s| on_topic.contains(s))) || (any && c.consolidated)))
         .collect();
     // The best on-topic match, done or not, sets the bar (as in `budget`).
     let Some(&(top, _)) = ranked.first() else { return Vec::new() };
-    explored(ranked.into_iter().filter(|(s, c)| *s >= RELATIVE * top && !done.contains(c.id.as_str()))).into_iter().take(EARLY_CAP).collect()
+    ranked.into_iter().filter(|(s, c)| *s >= RELATIVE * top && !done.contains(c.id.as_str())).collect()
+}
+
+/// The standing lessons on `topics` not done (a named scope's; with `ANY`, the unscoped ones), each
+/// with an infinite score: it comes ahead of every match and of every draw, matched or not.
+pub fn standing_pool<'a>(challenges: &'a [Challenge], topics: &[String], done: &HashSet<&str>) -> Vec<(f64, &'a Challenge)> {
+    let on_topic = Names::of_all(topics.iter().map(String::as_str));
+    let any = topics.iter().any(|t| t == ANY);
+    challenges
+        .iter()
+        .filter(|c| c.standing() && !c.off_system && !done.contains(c.id.as_str()))
+        .filter(|c| c.scope.iter().any(|s| on_topic.contains(s)) || (any && c.scope.is_empty()))
+        .map(|c| (f64::INFINITY, c))
+        .collect()
+}
+
+/// Each pooled lesson's chance of being delivered early under the session's posterior (`early` over
+/// `early_pool`): `propensity`'s draws, keeping in each the first `EARLY_CAP` and of them what
+/// `render_early` shows for `topics`. Exactly 1 for every lesson when the whole pool always shows.
+pub fn early_propensity(pool: &[(f64, &Challenge)], session: &str, topics: &[String]) -> std::collections::HashMap<String, f64> {
+    let delivered = |order: Vec<&Challenge>| -> Vec<String> {
+        let first: Vec<&Challenge> = order.into_iter().take(EARLY_CAP).collect();
+        let n = render_early(&first, topics).map_or(0, |(_, n)| n);
+        first[..n].iter().map(|c| c.id.clone()).collect()
+    };
+    if delivered(pool.iter().map(|(_, c)| *c).collect()).len() == pool.len() {
+        return pool.iter().map(|(_, c)| (c.id.clone(), 1.0)).collect();
+    }
+    kept_share(pool, session, delivered)
 }
 
 /// The topic of consolidated lessons (memory.rs) in `early`: they need no scope, the session's first
@@ -689,6 +804,9 @@ instructions: where one applies to this task, check it against the code and keep
     let mut shown = 0;
     for c in selected {
         let mut line = format!("\n- {}", clip(&c.question, 300));
+        if c.standing() {
+            line.push_str(" (a constraint this collective ratified)");
+        }
         if !c.consequence.trim().is_empty() {
             line.push_str(&format!(" → {}", clip(&c.consequence, 200)));
         }
@@ -1238,6 +1356,61 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
         let gs: Vec<Challenge> = (0..6).map(|i| ch(&format!("g{i}"), "")).collect();
         let pool: Vec<(f64, &Challenge)> = gs.iter().map(|c| (5.0, c)).collect();
         assert!((propensity(&pool, "s").values().sum::<f64>() - GENERIC_CAP as f64).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_constraint_never_reaches_further_than_its_lesson() {
+        use serde_json::json;
+        let lessons = [
+            json!({"id": "Lrepo", "origin_ms": 1, "question": "q", "repo": "app", "reach": "repo", "scope": ["Orion"]}),
+            json!({"id": "Lgone", "origin_ms": 1, "question": "q", "repo": "app", "reach": "personal"}),
+            json!({"id": "Lteam", "origin_ms": 1, "question": "q", "repo": "app"}),
+        ];
+        let dir = store("constraint-reach", &lessons, &[]);
+        let line = |id: &str, lesson: &str, extra: serde_json::Value| {
+            let mut v = json!({"id": id, "text": format!("rule {id}"), "lesson": lesson, "by": "lead@x", "ms": 5});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            format!("{v}\n")
+        };
+        let text = [
+            line("c1", "Lrepo", json!({})),
+            line("c2", "Lgone", json!({"reach": ""})),
+            line("c3", "Lteam", json!({"reach": "repo", "repo": "app"})),
+            line("c4", "Lmissing", json!({"repo": "app", "scope": ["Beacon"]})),
+            line("c5", "Lmissing", json!({})),
+        ]
+        .concat();
+        std::fs::write(crate::veto::constraints_path(&dir), text).unwrap();
+        let all = load_with(&dir.join("lessons.jsonl"), None, &Aliases::default());
+        let c = |id: &str| all.iter().find(|c| c.id == id && c.standing());
+        let of = |id: &str| c(id).map(|c| (c.reach.as_str(), c.repo.as_str(), c.scope.clone()));
+        assert_eq!(of("c1"), Some(("repo", "app", vec!["Orion".to_string()])), "a repo convention's constraint stays in its repo");
+        assert_eq!(of("c2").map(|x| x.0), Some("personal"), "a withdrawn lesson takes its constraint along");
+        assert_eq!(of("c3").map(|x| x.0), Some("repo"), "the line's narrower reach holds over a team lesson");
+        assert_eq!(of("c4"), Some(("repo", "app", vec!["Beacon".to_string()])), "an unknown lesson: the line's scope, bound to its repo");
+        assert!(c("c5").is_none(), "an unknown lesson and no repo: never delivered everywhere");
+        let here = ["other".to_string()];
+        assert!(["c1", "c2", "c3", "c4"].iter().all(|id| !crate::reach::deliverable(c(id).unwrap(), &here)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn early_propensities_fill_its_slots_and_what_it_shows() {
+        let topics = vec!["Beacon".to_string()];
+        let ls: Vec<Challenge> = (0..8).map(|i| Challenge { scope: vec!["Beacon".into()], ..ch(&format!("a{i}"), "Is it short?") }).collect();
+        let pool: Vec<(f64, &Challenge)> = ls.iter().map(|c| (5.0, c)).collect();
+        assert!(early_propensity(&pool[..EARLY_CAP], "s", &topics).values().all(|&x| x == 1.0), "the whole pool shows");
+        let p = early_propensity(&pool, "s", &topics);
+        let sum: f64 = p.values().sum();
+        assert!((sum - EARLY_CAP as f64).abs() < 0.05, "{sum}");
+        assert!(p.values().all(|&x| x > 0.0 && x < 1.0), "{p:?}");
+        // Lines too long for `EARLY_CHARS` to hold all four: the slots are what it shows, whatever the cap.
+        let long: Vec<Challenge> =
+            (0..4).map(|i| Challenge { scope: vec!["Beacon".into()], consequence: "y".repeat(199), ..ch(&format!("l{i}"), &"x".repeat(299)) }).collect();
+        let pool: Vec<(f64, &Challenge)> = long.iter().map(|c| (5.0, c)).collect();
+        let shown = render_early(&pool.iter().map(|(_, c)| *c).collect::<Vec<_>>(), &topics).unwrap().1;
+        let sum: f64 = early_propensity(&pool, "s", &topics).values().sum();
+        assert!(shown < pool.len() && (sum - shown as f64).abs() < 1e-9, "{shown} {sum}");
     }
 
     #[test]

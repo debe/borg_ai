@@ -61,14 +61,22 @@ fn ope_reads_a_file_and_prints_a_table_per_weight() {
     assert!(text.starts_with("file "), "{text}");
     assert!(text.contains("decisions: 2 with a pool") && text.contains("1 lessons without p"), "{text}");
     assert!(text.contains("grid: each weight ×0.5, ×1, ×2 around its current value, the others held"), "{text}");
-    for knob in ["veto (current 3, evidence 1 records)", "verified (current 1", "rejected", "hacked", "regret (current 1", "verifier_regret (current 0.5"] {
+    for knob in [
+        "veto (current 3, evidence 1 records)",
+        "verified (current 1",
+        "rejected",
+        "hacked",
+        "regret (current 1",
+        "verifier_regret (current 0.5",
+        "tested (current 0.5",
+    ] {
         assert!(text.contains(knob), "{knob}: {text}");
     }
     assert!(text.contains("value") && text.contains("estimate") && text.contains("95% CI") && text.contains("ESS"), "{text}");
     assert!(text.trim_end().ends_with("constants unchanged"), "{text}");
     let out = borg(&["ope", "--file", file.to_str().unwrap(), "--json"], &root);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((v["report"]["decisions"].as_u64(), v["report"]["rows"].as_array().map(Vec::len)), (Some(2), Some(18)), "{v}");
+    assert_eq!((v["report"]["decisions"].as_u64(), v["report"]["rows"].as_array().map(Vec::len)), (Some(2), Some(21)), "{v}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -555,6 +555,7 @@ fn doctor(t: &Targets) -> i32 {
     if let Ok(c) = &cfg {
         let routes = collectives(c.as_ref(), &learn::home());
         checks.extend(crate::vectors::doctor::checks(&routes));
+        checks.extend(crate::presence::mesh_checks(&routes));
         let emails: BTreeSet<String> = routes
             .iter()
             .filter_map(|r| match r {

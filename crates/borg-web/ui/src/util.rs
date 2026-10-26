@@ -148,6 +148,7 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "corrected" => ("corrected anyway", "var(--c-heat)", "!"),
         "not_corrected" => ("not corrected", "var(--c-sky)", "✓"),
         "regretted" => ("regretted later", "var(--c-pink)", "↶"),
+        "tested" => ("tests green after", "var(--c-good)", "✓"),
         "task_verified" => ("verified tasks", "var(--c-good)", "✓"),
         "task_rejected" => ("rejected tasks", "var(--c-slate)", "⨯"),
         "task_hacked" => ("hacked tasks", "var(--c-heat)", "⚠"),

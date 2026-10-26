@@ -60,6 +60,13 @@ test("maps tool names, texts and failures", () => {
 	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
 	const [ev, p] = toolEvent(ctx, { toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true });
 	assert.deepEqual([ev, p], ["post_tool_failure", { session_id: "s", cwd: "/r", pid: process.pid, tool_name: "Bash", tool_input: { command: "ls" }, error: "boom" }]);
+	// A successful shell call carries the end of its output (a test run's summary); other tools nothing.
+	const long = "x".repeat(5_000) + "\ntest result: ok.";
+	const [ok, q] = toolEvent(ctx, { toolName: "bash", input: { command: "cargo test" }, content: [{ type: "text", text: long }] });
+	assert.equal(ok, "post_tool");
+	assert.equal(q.tool_response, long.slice(-4_000));
+	assert.equal(toolEvent(ctx, { toolName: "bash", input: { command: "true" }, content: [] })[1].tool_response, undefined);
+	assert.equal(toolEvent(ctx, { toolName: "read", input: { path: "a" }, content: [{ type: "text", text: "a" }] })[1].tool_response, undefined);
 });
 
 test("edit and write name their file as file_path, an edit's patch is its new_string", () => {

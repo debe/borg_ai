@@ -2,8 +2,9 @@
 //! anything was committed. Most bugs are caught there (a build → review → verify → fix workflow), and a
 //! commit-based signal (regress links: a later commit from another session) never sees them.
 //!
-//! Source: each harness's runs of sub-agents (`Harness::sub_runs`: a Claude Code workflow run, an omp
-//! session's task agents, an opencode session's subagents), each agent with its label, phase, kind,
+//! Source: each harness's runs of sub-agents (`Harness::sub_runs`: a Claude Code workflow run or a
+//! session's Agent-tool sub-agents, an omp session's task agents, an opencode session's subagents, a
+//! Codex session's spawned agents), each agent with its label, phase, kind,
 //! start, prompt, work and output. Workflow scripts and prompts are the engineer's own, so output
 //! shapes vary; this reads them tolerantly from each agent's output (Claude's last `StructuredOutput`,
 //! omp's yields, else a JSON object in its text, [`output_of`]):
@@ -16,13 +17,16 @@
 //!   calls or final text name the finding's file. Agents edit mostly through Bash, so tool inputs of
 //!   every kind count, not only Edit/Write.
 //!
+//! The builder (the episode's task and proposal) is the run's first agent that is none of these; a
+//! loose run (`Run::loose`: a plain session's own sub-agents) has none, since its session's own agent
+//! built.
+//!
 //! A finding is **strong** when it was fixed and no verifier rejected it. The negative control asks the
 //! same "fixed" question of a fix agent from another session's run: its rate is how often the file rule
 //! matches by chance.
 //!
 //! 0 tokens: nothing calls a model. Every finding is routed by its agent's cwd (`collective::route`); an
-//! off repo is only counted. Claude Code's plain sub-agents outside workflows (the Agent tool) are not
-//! read yet.
+//! off repo is only counted.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -321,8 +325,10 @@ fn run_findings(run: &Run) -> Vec<Finding> {
     let agents = &run.agents;
     let verdicts: Vec<(&SubAgent, Said)> = agents.iter().flat_map(|a| verdicts_of(a.output.as_ref()).into_iter().map(move |v| (a, v))).collect();
     let raws: Vec<(&SubAgent, Raw)> = agents.iter().flat_map(|a| findings_of(a.output.as_ref()).into_iter().map(move |r| (a, r))).collect();
-    // The builder: the first agent that produced neither findings nor verdicts and is no fix step.
-    let builder = agents.iter().find(|b| !is_fix(b) && findings_of(b.output.as_ref()).is_empty() && verdicts_of(b.output.as_ref()).is_empty());
+    // The builder: the first agent that produced neither findings nor verdicts and is no fix step; none
+    // in a loose run, where the session's own agent built and its sub-agents only searched or checked.
+    let builder =
+        agents.iter().filter(|_| !run.loose).find(|b| !is_fix(b) && findings_of(b.output.as_ref()).is_empty() && verdicts_of(b.output.as_ref()).is_empty());
     let n = DETAIL_CHARS * 2;
     let builder_repo = builder.map(|b| borg_trace::repo_key(&b.cwd));
     let (task, built) = builder.map_or_else(Default::default, |b| {
@@ -358,7 +364,13 @@ fn run_findings(run: &Run) -> Vec<Finding> {
         // the reviewer's, and another repo's text must not land in its collective.
         let same_repo = builder_repo.as_deref() == Some(borg_trace::repo_key(&a.cwd).as_str());
         out.push(Finding {
-            id: format!("{}#{k}", run.id),
+            // A loose run's agents finish in any order, so a finding there is named by its agent: a
+            // later finisher that started earlier must not renumber findings already recorded.
+            id: if run.loose {
+                format!("{}#{}.{}", run.id, a.id, raws[..k].iter().filter(|(b, _)| std::ptr::eq(*b, *a)).count())
+            } else {
+                format!("{}#{k}", run.id)
+            },
             session: run.session.clone(),
             run: run.id.clone(),
             workflow: run.name.clone(),
@@ -585,7 +597,7 @@ fn record<'a>(findings: impl Iterator<Item = &'a Finding>, cfg: Option<&Config>,
 }
 
 /// Session end records the session's strong review findings as episodes before `borg learn`
-/// generalises them: on by default (the value eval, README), `BORG_REVIEW_FIX=off` turns it off.
+/// generalises them: on by default (the value eval, docs/evidence.md), `BORG_REVIEW_FIX=off` turns it off.
 pub fn on() -> bool {
     std::env::var("BORG_REVIEW_FIX").as_deref() != Ok("off")
 }
@@ -948,7 +960,7 @@ mod tests {
     fn harnesses_without_sub_agent_transcripts_give_no_runs() {
         let home = fixture("omp");
         let none: Vec<&str> = harness::ALL.iter().filter(|h| h.sub_runs(&home, None, None).is_empty()).map(|h| h.name()).collect();
-        assert!(none.contains(&"codex") && none.contains(&"sim"), "{none:?}");
+        assert!(none.contains(&"sim"), "{none:?}");
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
         "corrected" => "Asked, and still corrected afterwards".into(),
         "not_corrected" => "Asked, and no correction followed".into(),
         "regretted" => "A later fix counted against a question asked before the decision".into(),
+        "tested" => "The session's tests went green after a question was asked".into(),
         "task_verified" => "A verifier passed a hive task".into(),
         "task_rejected" => "A hive task was rejected".into(),
         "task_hacked" => "A hive task changed protected tests or touched the oracle: logged as hacked".into(),

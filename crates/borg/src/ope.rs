@@ -52,15 +52,17 @@ pub struct Knob {
     pub set: fn(&mut Candidate, f64),
 }
 
-/// The six hand-set weights: the veto's (`VETOED_W`), the hive verdicts' (`VERIFIED_W`, `REJECTED_W`,
-/// `HACKED_W`), a regret's (`REGRET`) and the verifier's share of a regret (learn.rs `VERIFIER_REGRET`).
-pub const KNOBS: [Knob; 6] = [
+/// The seven hand-set weights: the veto's (`VETOED_W`), the hive verdicts' (`VERIFIED_W`, `REJECTED_W`,
+/// `HACKED_W`), a regret's (`REGRET`), the verifier's share of a regret (learn.rs `VERIFIER_REGRET`) and
+/// a green test run's (`TESTED_W`).
+pub const KNOBS: [Knob; 7] = [
     Knob { name: "veto", current: memory::VETOED_W as f64, kinds: &[outcome::VETOED], verify: false, set: |c, v| c.weights.vetoed = v },
     Knob { name: "verified", current: memory::VERIFIED_W as f64, kinds: &[outcome::VERIFIED], verify: false, set: |c, v| c.weights.verified = v },
     Knob { name: "rejected", current: memory::REJECTED_W as f64, kinds: &[outcome::REJECTED], verify: false, set: |c, v| c.weights.rejected = v },
     Knob { name: "hacked", current: memory::HACKED_W as f64, kinds: &[outcome::HACKED], verify: false, set: |c, v| c.weights.hacked = v },
     Knob { name: "regret", current: memory::REGRET, kinds: &[outcome::REGRETTED], verify: false, set: |c, v| c.weights.regret = v },
     Knob { name: "verifier_regret", current: learn::VERIFIER_REGRET, kinds: &[outcome::REGRETTED], verify: true, set: |c, v| c.verifier = v },
+    Knob { name: "tested", current: memory::TESTED_W, kinds: &[outcome::TESTED], verify: false, set: |c, v| c.weights.tested = v },
 ];
 
 /// Candidates around a weight: half, itself, double. Derived from the current value, never hand-picked;
@@ -137,7 +139,8 @@ pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
             skipped.graded += 1;
             continue;
         }
-        if o.kind != outcome::ASKED {
+        // A free delivery (early, queued) asks nothing and draws from no pool the weights move.
+        if o.kind != outcome::ASKED || outcome::free(o) {
             continue;
         }
         if o.p.is_empty() || o.p.len() != o.lessons.len() {
@@ -317,7 +320,7 @@ pub struct Pick {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
-    /// Records read, `asked` records among them.
+    /// Records read, `asked` records among them (free deliveries left out: they ask nothing).
     pub records: usize,
     pub asked: usize,
     pub decisions: usize,
@@ -432,7 +435,7 @@ pub fn evaluate(outcomes: &[Outcome]) -> Report {
         .collect();
     Report {
         records: outcomes.len(),
-        asked: outcomes.iter().filter(|o| o.kind == outcome::ASKED).count(),
+        asked: outcomes.iter().filter(|o| o.kind == outcome::ASKED && !outcome::free(o)).count(),
         decisions: ds.len(),
         units: n_units,
         skipped,
@@ -739,15 +742,17 @@ mod tests {
             Outcome { p: vec![0.5], ..o(ASKED, "c", &["C"], 3) },
             o(GRADED, "c", &["C", "Y"], 3),
             ask("d", &["D"], &[0.5], &["D", "Y"], 4),
+            Outcome { p: vec![1.0], channel: "queued".into(), ..o(ASKED, "e", &["E"], 4) },
+            Outcome { p: vec![0.5], channel: "early".into(), ..o(ASKED, "e", &["F"], 4) },
             o(CHANGED, "a", &["A"], 5),
             o(CHANGED, "b", &["B"], 5),
             o(CHANGED, "c", &["C"], 5),
         ];
         let (ds, skipped) = decisions(&log);
         assert!(ds.is_empty());
-        assert_eq!(skipped, Skipped { no_p: 1, zero_p: 1, no_pool: 1, pending: 1, graded: 1 });
+        assert_eq!(skipped, Skipped { no_p: 1, zero_p: 1, no_pool: 1, pending: 1, graded: 1 }, "free deliveries count nowhere");
         let r = evaluate(&log);
-        assert_eq!((r.units, r.current.value), (0, None));
+        assert_eq!((r.units, r.current.value, r.asked), (0, None, 4));
         assert!(render(&r).contains("too thin"), "{}", render(&r));
     }
 
@@ -785,7 +790,15 @@ mod tests {
         let current: Vec<f64> = KNOBS.iter().map(|k| k.current).collect();
         assert_eq!(
             current,
-            [memory::VETOED_W as f64, memory::VERIFIED_W as f64, memory::REJECTED_W as f64, memory::HACKED_W as f64, memory::REGRET, learn::VERIFIER_REGRET]
+            [
+                memory::VETOED_W as f64,
+                memory::VERIFIED_W as f64,
+                memory::REJECTED_W as f64,
+                memory::HACKED_W as f64,
+                memory::REGRET,
+                learn::VERIFIER_REGRET,
+                memory::TESTED_W
+            ]
         );
         // Each knob sets its own weight.
         for k in &KNOBS {

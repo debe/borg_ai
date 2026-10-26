@@ -280,11 +280,93 @@ pub fn forget_synced(home: &Path, key: &str) -> std::io::Result<()> {
 }
 
 fn write_synced(home: &Path, all: &std::collections::BTreeMap<String, i64>) -> std::io::Result<()> {
-    let p = synced_path(home);
+    write_mesh(home, &synced_path(home), all)
+}
+
+/// One small write to a temp file, then a rename: a reader never sees half of `p`.
+fn write_mesh<T: Serialize>(home: &Path, p: &Path, all: &T) -> std::io::Result<()> {
     std::fs::create_dir_all(home.join("mesh"))?;
     let tmp = p.with_extension(format!("{}.tmp", std::process::id())); // a one-shot `borg mesh sync` beside `serve`
     std::fs::write(&tmp, serde_json::to_string(all).unwrap_or_default())?;
-    std::fs::rename(&tmp, &p)
+    std::fs::rename(&tmp, p)
+}
+
+/// `<store>/mesh/protocols.json`, `{"<member key>": Mismatch}`: the members whose last session ended at
+/// the handshake because they speak another session protocol (borg-mesh sync.rs `ALPN`), so nothing
+/// syncs with them. Written by the mesh daemon; `borg doctor` names each one. A session with the member
+/// that completes drops its record, and so does a membership that no longer lists it. Local, never synced.
+pub fn protocols_path(home: &Path) -> PathBuf {
+    home.join("mesh").join("protocols.json")
+}
+
+/// A member's protocol beside this node's, both as their ALPN (`borg/mesh/<n>`), and when it was seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mismatch {
+    pub theirs: String,
+    pub ours: String,
+    pub ms: i64,
+}
+
+impl Mismatch {
+    /// What the mesh log and `borg doctor` say about member `key`: who has to upgrade.
+    pub fn line(&self, key: &str) -> String {
+        let n = |p: &str| p.rsplit('/').next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let who = if n(&self.theirs) < n(&self.ours) { "upgrade it" } else { "upgrade this node" };
+        format!("peer {} speaks {}, this node {}: nothing syncs with it; {who}", key.get(..12).unwrap_or(key), self.theirs, self.ours)
+    }
+
+    /// The same, as the member on the other end reads it about this node (`me`): the close reason sent to it.
+    pub fn told(&self, me: &str) -> String {
+        Mismatch { theirs: self.ours.clone(), ours: self.theirs.clone(), ms: self.ms }.line(me)
+    }
+}
+
+/// The members whose protocol differs (`protocols_path`); empty when none.
+pub fn mismatches(home: &Path) -> std::collections::BTreeMap<String, Mismatch> {
+    std::fs::read_to_string(protocols_path(home)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Records that `key` speaks another protocol (the newest sighting stays).
+pub fn note_mismatch(home: &Path, key: &str, m: Mismatch) -> std::io::Result<()> {
+    let mut all = mismatches(home);
+    all.insert(key.into(), m);
+    write_mesh(home, &protocols_path(home), &all)
+}
+
+/// Drops `key`'s record: a session with it completed, so it speaks this node's protocol now.
+pub fn forget_mismatch(home: &Path, key: &str) -> std::io::Result<()> {
+    let mut all = mismatches(home);
+    if all.remove(key).is_none() {
+        return Ok(());
+    }
+    write_mesh(home, &protocols_path(home), &all)
+}
+
+/// Keeps only the records of keys `keep` still allows (the mesh calls it when the membership it holds
+/// changes: a removed or revoked member never completes another session, so nothing else drops it).
+pub fn retain_mismatches(home: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<()> {
+    let mut all = mismatches(home);
+    let before = all.len();
+    all.retain(|k, _| keep(k));
+    if all.len() == before {
+        return Ok(());
+    }
+    write_mesh(home, &protocols_path(home), &all)
+}
+
+/// `borg doctor`'s line for each member the mesh cannot sync with because it speaks another session
+/// protocol (`mismatches`, recorded by `borg mesh serve` or `sync`), in the stores of `routes`
+/// (install.rs `collectives`): a handshake that fails otherwise says nothing.
+pub fn mesh_checks(routes: &[crate::collective::Route]) -> Vec<(crate::harness::Level, String)> {
+    use crate::collective::Route;
+    routes
+        .iter()
+        .filter_map(|r| match r {
+            Route::Collective { name, home, .. } => Some((name, home)),
+            Route::Off => None,
+        })
+        .flat_map(|(name, home)| mismatches(home).into_iter().map(move |(k, m)| (crate::harness::Level::Warn, format!("mesh {name}: {}", m.line(&k)))))
+        .collect()
 }
 
 /// The session's state at `now`; `alive` says whether a pid the harness gave still runs.
@@ -334,6 +416,40 @@ mod tests {
         assert_eq!(synced(&h)["k1"], 300);
         forget_synced(&h, "k1").unwrap();
         assert_eq!(synced(&h).into_keys().collect::<Vec<_>>(), ["k2"], "a failed dial drops the member");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn doctor_names_a_member_on_another_mesh_protocol() {
+        use crate::collective::Route;
+        use crate::harness::Level;
+        let home = tmp("protocols-doctor");
+        let route = Route::Collective { name: "team".into(), home: home.clone(), share: crate::collective::Share::Team };
+        assert!(mesh_checks(std::slice::from_ref(&route)).is_empty());
+        let m = Mismatch { theirs: "borg/mesh/5".into(), ours: "borg/mesh/10".into(), ms: 1 };
+        note_mismatch(&home, "abcdef0123456789", m).unwrap();
+        let checks = mesh_checks(&[route, Route::Off]);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].0, Level::Warn);
+        assert!(checks[0].1.starts_with("mesh team: peer abcdef012345 speaks borg/mesh/5") && checks[0].1.ends_with("upgrade it"), "{checks:?}");
+    }
+
+    /// A member on another protocol is recorded with who has to upgrade, until a session completes.
+    #[test]
+    fn a_protocol_mismatch_is_kept_until_a_session_completes() {
+        let h = tmp("protocols");
+        assert!(mismatches(&h).is_empty());
+        let old = Mismatch { theirs: "borg/mesh/5".into(), ours: "borg/mesh/10".into(), ms: 1 };
+        note_mismatch(&h, "abcdef0123456789", old.clone()).unwrap();
+        note_mismatch(&h, "k2", Mismatch { theirs: "borg/mesh/11".into(), ..old.clone() }).unwrap();
+        let all = mismatches(&h);
+        assert_eq!(
+            all["abcdef0123456789"].line("abcdef0123456789"),
+            "peer abcdef012345 speaks borg/mesh/5, this node borg/mesh/10: nothing syncs with it; upgrade it"
+        );
+        assert!(all["k2"].line("k2").ends_with("upgrade this node"), "a newer peer: this node is the old one");
+        forget_mismatch(&h, "abcdef0123456789").unwrap();
+        assert_eq!(mismatches(&h).into_keys().collect::<Vec<_>>(), ["k2"]);
         let _ = std::fs::remove_dir_all(&h);
     }
 

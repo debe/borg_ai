@@ -2,6 +2,7 @@
 
 [← README](../README.md)
 
+- [Install](#install)
 - [Collectives](#collectives)
 - [Who hears a lesson](#who-hears-a-lesson)
 - [Storage](#storage)
@@ -10,7 +11,79 @@
 - [Import what you already have](#import-what-you-already-have)
 - [Vectors](#vectors)
 - [Decision → fix links](#decision--fix-links)
+- [Review → fix findings](#review--fix-findings)
 - [Environment variables](#environment-variables)
+
+## Install
+
+**Requirements**
+
+- Linux (x86_64 or arm64) or macOS on Apple silicon; release binaries for all three. Intel Macs are not
+  covered by the release binaries (`cargo install borg-ai` may still build there).
+- For `cargo install` or a build from source: Rust 1.91 or newer (edition 2024), via
+  [rustup](https://rustup.rs). On macOS the vectors build needs the Xcode command line tools; if
+  `esaxx-rs` cannot find the C++ headers, set
+  `CXXFLAGS="-isystem $(xcrun --show-sdk-path)/usr/include/c++/v1"`.
+- A harness ([Harnesses](harnesses.md)) and one logged-in model CLI on `PATH` (see *Model runner* below).
+
+**Three ways to install.** The one-liner puts prebuilt `borg`, `borg-mesh` and `borg-web`, sha256-checked,
+into `~/.local/bin` and runs `borg setup`; options go after `sh -s --`
+([scripts/install.sh](../scripts/install.sh)):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.1.0 --dir ~/bin --no-setup
+```
+
+From crates.io (the package is `borg-ai`; the binary is `borg`), or from a checkout:
+
+```sh
+cargo install borg-ai --locked      # the CLI and hook binary, vectors included
+cargo install borg-mesh --locked    # only for team sync, borg top across machines, borg steer
+cargo install borg-web --locked     # only for borg web, the live page
+
+git clone https://github.com/debe/borg_ai borg && cd borg
+cargo install --path crates/borg --locked    # and crates/borg-mesh, crates/borg-web
+```
+
+`cargo install` puts them in `~/.cargo/bin`. The hooks call `borg` by absolute path, so keep it where
+you installed it. `--no-default-features` builds a lean `borg` without vectors.
+
+**`borg setup`** asks a few questions, shows everything it will change, and writes nothing until you
+confirm:
+
+- **Harnesses:** which agents to wire; the default is every one whose CLI is on `PATH`.
+- **Collectives:** a personal collective (`"share": "local"`), a team or company collective (found one
+  and become its admin, or join one with a `BORG1...` ticket), or both. Then the repo directories of
+  each, the repos no collective may ever see, and where every other repo goes (`off` is recommended).
+  An existing `collectives.json` is only ever added to, with a backup.
+- **Team:** for a team you found, the relay (n0's public relays, `disabled` for LAN or VPN only, or
+  your company's `iroh-relay`) and the [delivery mode](delivery.md#delivery-modes). Then it runs
+  `borg mesh init`, or `borg mesh join` with your ticket.
+- **Vectors:** fetches the model (~490 MB, once) and indexes every store with lessons. A failed
+  download asks for a mirror (`BORG_VECTOR_URL`) and never stops setup.
+- **Wiring:** the hooks or adapter of each harness, and the `borg` skill, which teaches the agent itself
+  to explain borg, edit `collectives.json` and run these commands for you.
+- **Import:** optionally learns the 50 newest corrections from your past sessions (model calls).
+
+It ends with `borg doctor`. A second run changes nothing. Its flags are in [Commands](commands.md#overview).
+
+**By hand.** Configure collectives first ([below](#collectives)): without a config, every repo joins one
+team collective named `default`, which a mesh would share. Check the routing with
+`borg collective ~/work/some-repo`. Then:
+
+```sh
+borg install all              # dry run: prints the diff for claude, omp, opencode and codex
+borg install all --apply      # each changed file gets a backup
+borg doctor                   # checks wiring, the skill, config, the model CLI, the stores and vectors
+borg vectors --fetch          # ~490 MB, once; then each store indexes itself as lessons arrive
+borg vectors --rebuild        # only for a store that already has lessons
+borg assimilate --apply --limit 50                                  # corrections from past sessions
+borg assimilate --from-dir ~/work/handbook --plan /tmp/plan.json    # team documents: writes a plan (model calls)
+borg assimilate --from-dir ~/work/handbook --apply --plan /tmp/plan.json
+```
+
+For a team, continue with [Team sync](team-sync.md).
 
 ## Collectives
 
@@ -43,7 +116,7 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `share` | `"team"` (default) syncs over the mesh; `"local"` never leaves the machine |
 | `engineers` | Optional. Merges one person's git emails into one author for trust, `borg status` and `borg top`. Never synced |
 | `relay` | Optional, per collective. How the mesh crosses NAT; see [Relays](team-sync.md#how-peers-find-each-other) |
-| `mode` | Optional, per collective. `"live"` (default): the conscience judges the work at the turn end and also during the turn, after state-changing tool calls (Claude Code, omp ≥18.4.4, opencode 1.x and 2.x). `"hook"`: at the turn end only, about a tenth of live's own cost. `BORG_MODE` overrides it. An unknown value is live, with a warning in `borg doctor`. See [Delivery modes](../README.md#delivery-modes) |
+| `mode` | Optional, per collective. `"live"` (default): the conscience judges the work at the turn end and also during the turn, after state-changing tool calls (Claude Code, omp ≥18.4.4, opencode 1.x and 2.x, Codex). `"hook"`: at the turn end only, about an eighth of live's own cost. `BORG_MODE` overrides it. An unknown value is live, with a warning in `borg doctor`. See [Delivery modes](delivery.md#delivery-modes) |
 | `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`) |
 | `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
 
@@ -68,6 +141,14 @@ borg collective ~/personal/notes   # -> private (Local, may sync: false) ...
 
 The model decides by asking: would a teammate working on the same code get this correction too?
 Imported team documents are always team; their repo conventions are scoped by system already.
+
+Reach also sets which sessions make an unused lesson fade ([Memory](learning.md#memory)). A team lesson ages with
+every session of its collective, a teammate's included: everyone hears it, so ~54 sessions in which no
+one's agent acts on it put it to sleep, even when its author is away. A repo lesson ages only with
+sessions in its repo, so work in other repos, yours or a teammate's, never makes it dormant. A
+session's repo is the one it started in: a session that edits another repo does not age that repo's
+conventions (a use there still counts). The system gate is not applied to aging, and in the team view a
+repo is a case-sensitive name, so a clone whose directory differs in case does not age its lessons.
 
 Personal lessons go to the `local` collective named by `personal`, or to your only `local` collective.
 A personal lesson already shared with the team is withdrawn there: a newer version replaces its text
@@ -297,10 +378,10 @@ from the sub-agents your harness ran, with 0 tokens:
 
 | Harness | A run is | Read from |
 |---|---|---|
-| Claude Code | a workflow run | `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`), `<repo>/<session>/workflows/wf_*.json` and each agent's transcript under `<session>/subagents/workflows/<run>/` |
+| Claude Code | a workflow run, or a session's Agent-tool sub-agents | `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR/projects`), `<repo>/<session>/workflows/wf_*.json` and each agent's transcript under `<session>/subagents/workflows/<run>/`; the Agent tool's under `<session>/subagents/agent-<id>.jsonl`, with its description and type in `agent-<id>.meta.json`; one that a workflow's agent started joins that workflow's run |
 | omp | a session's task agents | `~/.omp/agent/sessions/` (or `$PI_CODING_AGENT_DIR/sessions`), `<repo>/<ts>_<session>/<Task>.jsonl` beside the session's own file |
 | opencode | a session's subagents | the child sessions its task calls name, exported through `opencode` itself, read-only; only when `~/.local/share/opencode` (or `$XDG_DATA_HOME/opencode`) exists. Every session at once: 1.x only (2.x has no query that lists them); at session end, both |
-| Codex | none | nothing yet |
+| Codex | a session's spawned agents | `~/.codex/sessions/` (or `$CODEX_HOME/sessions`): every rollout whose `session_meta` names the thread that spawned it, grouped under the session that spawned the first; history a forked agent inherited is not its own work. Built from codex's serde names, not yet checked against a real spawned rollout |
 
 `--home DIR` reads under another home; the harnesses' own directory variables still win.
 
@@ -309,7 +390,8 @@ each agent's output tolerantly: Claude Code's last `StructuredOutput`; omp's acc
 every finding gathered whether it yielded them one per call, as one array or inside one object
 (`{overall_correctness, explanation, findings}`); otherwise the last JSON object in the agent's text
 with a `findings` or `issues` array, starting a line (a fenced `json` block counts). opencode has no
-structured output, so only reviewers told to answer in JSON yield findings there.
+structured output, nor do Claude Code's Agent-tool sub-agents or Codex's spawned agents, so only
+reviewers told to answer in JSON yield findings there.
 
 - A **finding** is an item of a `findings` or `issues` array that has a severity (or a `priority`: 0
   to 3 or `P0` to `P3` reads as `p0` to `p3`) and a text (`title`, `claim`, `problem`, `description`,
@@ -326,9 +408,11 @@ rate is how often the file rule matches by chance. Run `borg review-fix` to see 
 
 **Learning from it.** On by default, with nothing to set: at session end, `borg learn` first makes the
 session's strong findings episodes (from the runs of the drone's harness, `BORG_HARNESS`), of
-kind `regret` (id `V<run>#<n>`, written once). Each episode goes to the store its repo routes to; an
+kind `regret` (id `V<run>#<n>`, written once; `V<run>#<agent>.<n>` for a session's Agent-tool or
+spawned agents, which finish in any order). Each episode goes to the store its repo routes to; an
 off repo is skipped. Then it makes one model call per episode, with the builder's task and the end of
-its account of the build (only when the builder worked in the same repo as the reviewer), and the
+its account of the build (only when the builder worked in the same repo as the reviewer; a session's
+Agent-tool or spawned agents have no builder, since the session's own agent built), and the
 redacted finding. It words the lesson as a question for the moment of building: "Before <doing X>, has
 <risk Y> been considered?". `BORG_REVIEW_FIX=off` turns it off; `borg review-fix --apply` records past
 findings by hand.
@@ -342,8 +426,7 @@ Why on: in the value eval lessons from earlier findings raised the share of late
 by 6 points, never worse overall, and 89% of the lessons state their finding faithfully. The interval
 still reaches −5.1, just past the −5 bar set before the run; the engineer turned it on, since a user who
 never configures would otherwise never get it. `borg web` counts the findings learned, so you can
-watch it. Numbers in the README's *Evidence and limits*. Not read yet: Claude Code's plain Agent-tool
-reviews outside a workflow, and Codex (it has no sub-agent runs to read).
+watch it. Numbers in [Evidence and limits](evidence.md).
 
 ## Environment variables
 
@@ -371,6 +454,7 @@ All are optional.
 | `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
 | `BORG_REVIEW_FIX` | on | [Review → fix findings](#review--fix-findings): `off`: the ended session's sub-agent review findings are not learned from |
 | `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
+| `BORG_TEST_CREDIT` | on | `off`: a session's own tests going green after a lesson was asked no longer credit it (`tested` outcomes; [Green tests credit the question](learning.md#outcomes-and-the-usefulness-belief)). For an eval's frozen arm. Also off with `BORG_LEARN=off` |
 | `BORG_SHARE_OUTCOMES` | on | `off`: publish no outcomes for the team and read none (lesson usefulness and trust from this machine only); lines already synced stay |
 | `BORG_VETO` | on | `off`: a prompt starting "borg no" is an ordinary prompt (the `borg no` command still works; [Saying no](commands.md#saying-no)) |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
@@ -437,7 +521,7 @@ project.
 | `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored). Unset: a join record of the session's directory decides (`borg hive join --here`, `borg hive run`'s worktrees). Empty: no goal at all |
 | `BORG_HIVE_DRONE` | unset | Set by `borg hive run`: the drone a session is an iteration of. A verify task is barred to every session of the drone that did the work |
 | `BORG_HIVE_CREDIT` | on | `off`: hive verdicts credit no lessons (`verified`, `rejected`, `hacked` outcomes); the board, the flags and the `task_*` statistics still record. For an eval's frozen arm. Also off with `BORG_LEARN=off` |
-| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a drone or a session, and `borg learn` proposes no playbook edit from verified hive work ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
+| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a drone or a session, and `borg learn` proposes no playbook edit from verified hive work or a clean plain session ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
 | `BORG_GROUP_REFLECT` | on | `off`: `borg learn` no longer turns settled hive groups into reflection episodes ([Groups](commands.md#groups-of-attempts)); `borg learn --group` still does. For an eval arm without group reflection. Also off with `BORG_LEARN=off` |
 | `BORG_REWORK_REFLECT` | on | `off`: `borg learn` no longer turns hive tasks the verifier rejected and a rework passed into rework episodes ([Reworks](commands.md#reworks)). For an eval arm without them. Also off with `BORG_LEARN=off` |
 

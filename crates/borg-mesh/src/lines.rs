@@ -35,7 +35,12 @@ use serde_json::Value;
 /// And the team's L1 playbooks (borg playbook.rs): promoted edits, each a delta to one step, folded
 /// order-independently by every reader, so a union is all a merge needs. Plain lines too (`pb` +
 /// `edit`, no `id` + `version`).
-pub const SYNCED: [&str; 4] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE];
+///
+/// And the ratified constraints (borg veto.rs `ratify`): standing lessons every member's sessions get
+/// (conscience.rs `standing`), lines holding what a lesson does (the redacted invariant, its lesson,
+/// who ratified it). Plain lines (no `version`); the conscience keeps the earliest ratification per id,
+/// so arrival order does not matter.
+pub const SYNCED: [&str; 5] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE, borg::veto::FILE];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).
@@ -252,6 +257,35 @@ mod tests {
         std::fs::write(&p, format!("{big}\n{small}\n")).unwrap();
         assert_eq!(read(&p).into_values().collect::<Vec<_>>(), [small], "a line written over the cap is never offered");
         assert_eq!(cap(&d.join("lessons.jsonl")), usize::MAX);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn ratified_constraints_sync_and_load_as_the_same_standing_lesson_everywhere() {
+        let d = tmp("constraints");
+        assert!(logs(&d).contains(&d.join(borg::veto::FILE)), "stamped, signed and quarantined like the lessons");
+        let c = |by: &str, ms: i64| {
+            serde_json::json!({"id": "cabc", "text": "merge lookups go through the review API", "lesson": "L1", "by": by, "ms": ms, "source": "veto"})
+                .to_string()
+        };
+        let (a, b) = (d.join("a"), d.join("b"));
+        for (home, own) in [(&a, c("bob@x", 9)), (&b, c("ann@x", 5))] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("lessons.jsonl"), format!("{}\n", lesson("L1", 1, "lookup?"))).unwrap();
+            merge(&home.join(borg::veto::FILE), &[own]).unwrap();
+        }
+        merge(&a.join(borg::veto::FILE), &read(&b.join(borg::veto::FILE)).into_values().collect::<Vec<_>>()).unwrap();
+        merge(&b.join(borg::veto::FILE), &read(&a.join(borg::veto::FILE)).into_values().collect::<Vec<_>>()).unwrap();
+        let standing = |h: &Path| {
+            let v: Vec<_> = borg::conscience::load(&h.join("lessons.jsonl"), None)
+                .into_iter()
+                .filter(|c| c.standing())
+                .map(|c| (c.id, c.engineers, c.consolidated))
+                .collect();
+            v
+        };
+        assert_eq!(standing(&a), [("cabc".to_string(), vec!["ann@x".to_string()], true)], "the earliest ratification, whatever the order");
+        assert_eq!(standing(&a), standing(&b));
         let _ = std::fs::remove_dir_all(d);
     }
 

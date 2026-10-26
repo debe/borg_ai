@@ -64,6 +64,79 @@ fn write_omp(root: &Path, id: &str, repo: &str) {
     .unwrap();
 }
 
+/// The finding both plain-agent fixtures report, as a reviewer answers in its text: a fenced JSON block.
+fn reviewer_text() -> String {
+    let finding =
+        json!({"findings": [{"file": "src/net.rs", "severity": "high", "title": "The budget place is reset by an arc instead of drained by a consumer"}]});
+    format!("Reviewed the diff.\n```json\n{finding}\n```")
+}
+
+/// One Agent-tool sub-agent `id` of the plain Claude Code session `session` in `repo` (under root),
+/// started at `ts` with `prompt`, that answered `content`.
+fn write_agent(root: &Path, session: &str, repo: &str, (id, description, ts): (&str, &str, &str), prompt: &str, content: Value) {
+    let cwd = root.join(repo);
+    let dir = root.join("home/.claude/projects").join(format!("-{repo}")).join(session).join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("agent-{id}.meta.json")), json!({"agentType": "general-purpose", "description": description}).to_string()).unwrap();
+    let lines = [
+        json!({"type": "user", "isSidechain": true, "agentId": id, "sessionId": session, "timestamp": ts, "cwd": cwd, "message": {"role": "user", "content": prompt}}),
+        json!({"type": "assistant", "isSidechain": true, "agentId": id, "sessionId": session, "timestamp": ts, "cwd": cwd, "message": {"role": "assistant", "content": [content]}}),
+    ];
+    std::fs::write(dir.join(format!("agent-{id}.jsonl")), lines.iter().map(|v| format!("{v}\n")).collect::<String>()).unwrap();
+}
+
+/// A plain Claude Code session `session` in `repo` (under root) that ran two Agent-tool sub-agents, no
+/// workflow: a reviewer answering with a finding in its text, then a fixer editing its file.
+fn write_agents(root: &Path, session: &str, repo: &str) {
+    let review = json!({"type": "text", "text": reviewer_text()});
+    write_agent(root, session, repo, ("a1", "Review the net diff", "2026-09-14T13:15:00.000Z"), "review the diff", review);
+    let edit = json!({"type": "tool_use", "name": "Bash", "input": {"command": "sed -i 's/reset/drain/' src/net.rs src/arc.rs"}});
+    write_agent(root, session, repo, ("a2", "Fix the budget arc", "2026-09-14T13:16:00.000Z"), "apply the finding", edit);
+}
+
+/// A Codex session `id` in `repo` (under root) whose agent spawned two others: a reviewer answering with
+/// a finding in its text, then a fixer patching its file through code mode's `exec`.
+fn write_codex(root: &Path, id: &str, repo: &str) {
+    let cwd = root.join(repo);
+    let day = root.join("home/.codex/sessions/2026/09/14");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = |thread: &str, ts: &str, source: Value, items: &[Value]| {
+        let meta = json!({"timestamp": ts, "type": "session_meta", "payload": {"id": thread, "session_id": id, "timestamp": ts, "cwd": cwd, "originator": "codex-tui", "source": source}});
+        let mut lines = vec![meta];
+        lines.extend(items.iter().map(|p| json!({"timestamp": ts, "type": "response_item", "payload": p})));
+        let name = format!("rollout-{}-{thread}.jsonl", ts.replace(':', "-"));
+        std::fs::write(day.join(name), lines.iter().map(|v| format!("{v}\n")).collect::<String>()).unwrap();
+    };
+    let msg = |role: &str, kind: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]});
+    let spawned = |path: &str, role: &str| json!({"subagent": {"thread_spawn": {"parent_thread_id": id, "depth": 1, "agent_path": path, "agent_nickname": "Cedar", "agent_role": role}}});
+    rollout(id, "2026-09-14T13:14:05.691Z", json!("cli"), &[msg("user", "input_text", "build the net, review it, fix what the review finds")]);
+    rollout(
+        "01a0a00d-0000-7000-8000-0000000000a1",
+        "2026-09-14T13:15:00.000Z",
+        spawned("/root/review_net", "explorer"),
+        &[
+            msg("user", "input_text", "# AGENTS.md instructions\n\n<INSTRUCTIONS>…"),
+            msg("user", "input_text", "review the diff"),
+            msg("assistant", "output_text", &reviewer_text()),
+        ],
+    );
+    let patch = "*** Begin Patch\n*** Update File: src/net.rs\n-reset\n+drain\n*** End Patch";
+    rollout(
+        "01a0a00d-0000-7000-8000-0000000000a2",
+        "2026-09-14T13:16:00.000Z",
+        spawned("/root/fix_net", "worker"),
+        &[
+            msg("user", "input_text", "apply the finding"),
+            json!({"type": "custom_tool_call", "name": "exec", "input": format!("await tools.apply_patch({patch:?})")}),
+        ],
+    );
+}
+
+/// The review episodes in the corp store.
+fn review_episodes(root: &Path) -> Vec<Value> {
+    episodes(root).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["id"].as_str().is_some_and(|i| i.starts_with('V'))).collect()
+}
+
 fn learn(root: &Path, session: &str, env: &[(&str, &str)]) {
     let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let ok = Command::new(env!("CARGO_BIN_EXE_borg"))
@@ -168,4 +241,58 @@ fn an_omp_sessions_finding_is_recorded_at_its_end() {
     assert_eq!(review[0]["session"], id);
     assert!(common::prompts(&root).is_empty());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_plain_claude_sessions_agent_tool_review_is_recorded_at_its_end() {
+    let root = common::setup("review-fix-agents");
+    write_agents(&root, "s1", "harbor_orion");
+    learn(&root, "s1", &[("BORG_HARNESS", "claude")]);
+    let review = review_episodes(&root);
+    assert_eq!(review.len(), 1, "{}", episodes(&root));
+    assert_eq!(review[0]["id"], "Vagents-s1#a1.0");
+    assert_eq!(review[0]["session"], "s1");
+    assert!(review[0]["correction"].as_str().unwrap().contains("drained by a consumer"), "{}", review[0]);
+    assert!(common::prompts(&root).is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_reviewer_that_started_earlier_but_finished_later_neither_hides_nor_repeats_a_finding() {
+    let root = common::setup("review-fix-agents-late");
+    write_agents(&root, "s1", "harbor_orion");
+    let search = json!({"type": "text", "text": "The arcs are reset in src/net.rs."});
+    write_agent(&root, "s1", "harbor_orion", ("a9", "Find the arc code", "2026-09-14T13:13:00.000Z"), "find where arcs are reset", search);
+    learn(&root, "s1", &[("BORG_HARNESS", "claude")]);
+    // A background reviewer, started before the first, gives its finding after that Stop.
+    let late = json!({"findings": [{"file": "src/arc.rs", "severity": "medium", "title": "The arc's weight is read before the place is checked"}]});
+    let late = json!({"type": "text", "text": format!("```json\n{late}\n```")});
+    write_agent(&root, "s1", "harbor_orion", ("a0", "Review the arcs", "2026-09-14T13:14:00.000Z"), "review the arcs", late);
+    learn(&root, "s1", &[("BORG_HARNESS", "claude")]);
+    let mut ids: Vec<String> = review_episodes(&root).iter().map(|v| v["id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    assert_eq!(ids, ["Vagents-s1#a0.0", "Vagents-s1#a1.0"], "{}", episodes(&root));
+    // The session's own agent built: no sub-agent's prompt is the episode's task.
+    assert!(review_episodes(&root).iter().all(|v| v["task"].as_str().unwrap_or_default().is_empty()), "{}", episodes(&root));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_codex_sessions_spawned_review_is_recorded_at_its_end() {
+    let root = common::setup("review-fix-codex");
+    let id = "01a0a00d-0000-7000-8000-000000000001";
+    write_codex(&root, id, "harbor_orion");
+    learn(&root, id, &[("BORG_HARNESS", "codex")]);
+    let review = review_episodes(&root);
+    assert_eq!(review.len(), 1, "{}", episodes(&root));
+    assert_eq!(review[0]["id"], format!("V{id}#01a0a00d-0000-7000-8000-0000000000a1.0"));
+    assert_eq!(review[0]["session"], id);
+    assert!(common::prompts(&root).is_empty());
+    // A spawned thread's own id names no session of its own.
+    let other = common::setup("review-fix-codex-child");
+    write_codex(&other, id, "harbor_orion");
+    learn(&other, "01a0a00d-0000-7000-8000-0000000000a1", &[("BORG_HARNESS", "codex")]);
+    assert!(review_episodes(&other).is_empty(), "{}", episodes(&other));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(other);
 }

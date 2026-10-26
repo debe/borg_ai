@@ -2,7 +2,8 @@
 //! that are generic or do not help, and for trust per engineer × area (trust.rs).
 //!
 //! `$BORG_HOME/outcomes.jsonl` is append-only and deterministic, one record per line:
-//! - `asked`: the conscience asked these lessons at a stop (hook, 0 tokens);
+//! - `asked`: the conscience asked these lessons at a stop or live, or delivered them as context (early,
+//!   or a graded check's 2s and 1s handed over free; hook, 0 tokens);
 //! - `asked_then_corrected`: after lesson X was asked, the engineer still made a correction in the
 //!   same session that `borg learn` merged into X (same concern): asking did not prevent it;
 //! - `asked_not_corrected`: the session ended, or has been idle for `IDLE_MS`, and no later
@@ -37,6 +38,14 @@
 //!   are deliberately not read by trust.rs (`sessions`), `weight` or attention.rs: a verdict is about
 //!   the drone's task, not about an engineer following a lesson. Counted once per verdict as `task_*`
 //!   (stats.rs), shared with `c` = the tag of its cause since the hive syncs (`SHARED_KINDS`).
+//!
+//! - `tested` (`borg learn`, 0 tokens): the session's own test runs (hook.rs `capture_test`) ended green
+//!   after a lesson was asked as a question (a free delivery is none): a failed run after the ask, then a
+//!   pass, or a pass after the drone changed its work on the lesson's point (`asked_then_changed`); never
+//!   for a question the drone ignored (`asked_then_ignored`). A
+//!   weak, verified-like credit (memory.rs `TESTED_W`), once per (session, lesson) (`tested`). Like a
+//!   verdict it is about the work, not about an engineer following a lesson: never a use, and not read by
+//!   trust.rs, `weight` or attention.rs.
 //!
 //! An unclear verdict, or a session whose later turn ends never reach the model (the prefilter skipped
 //! them, or BORG_MATCH=bm25), leaves the lesson pending: `settle` turns it into `asked_not_corrected`.
@@ -95,6 +104,10 @@ pub const VERIFIED: &str = "verified";
 pub const REJECTED: &str = "rejected";
 pub const HACKED: &str = "hacked";
 
+/// The session's own tests went green after the lesson was asked (`tested`): red then green, or green
+/// after a change on the lesson's point. Once per (session, lesson), dated at that pass.
+pub const TESTED: &str = "tested";
+
 /// The playbook versions shown to a session (playbook.rs; `lessons`: each `Playbook::key`). Local, never
 /// shared, and no result: like `asked` it is what the session's later results credit, the veto
 /// (veto.rs `shown_between`), the regret (`regretted`) and a hive verdict, so a playbook version gets the
@@ -125,8 +138,9 @@ pub struct Outcome {
     /// `asked` only: the asked lessons rendered as one disagreement (conscience.rs `disagreements`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
-    /// How the lessons were asked (`asked` and the judge's results): `stop` (a turn-end block) or `live`
-    /// (a live check during the turn, live.rs). Empty in records from before delivery modes.
+    /// How the lessons were asked (`asked` and the judge's results): `stop` (a turn-end block), `live`
+    /// (a live check during the turn, live.rs), `early` (early delivery, conscience.rs `early`) or
+    /// `queued` (a graded check's 2s and 1s, handed over free). Empty in records from before delivery modes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
     /// `graded` and `asked`: each lesson's grade (3 certain, 2 likely, 1 worth a thought) and its rank in
@@ -156,16 +170,17 @@ pub struct Outcome {
     /// `asked` and `graded`: per lesson (aligned with `lessons`), the probability that the policy in force
     /// at that check asked it: 1 or 0 under the fixed graded rule, the explore mixture under the learned
     /// cut (attention.rs `propensities`), the share of Thompson draws that give it a slot in
-    /// `budget`/`widen` (conscience.rs `propensity`). Rounded to 4 decimals (`round_p`). Empty in records
-    /// from before propensities and when unknown (BORG_ONLY, a state file from an older binary). For
-    /// off-policy evaluation (hive.md "Credit assignment").
+    /// `budget`/`widen` (conscience.rs `propensity`), the share that delivers it early (conscience.rs
+    /// `early_propensity`), 1 for a free hand-over of a graded check's 2s and 1s. Rounded to 4 decimals
+    /// (`round_p`). Empty in records from before propensities and when unknown (BORG_ONLY, a state file
+    /// from an older binary). For off-policy evaluation (hive.md "Credit assignment").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub p: Vec<f64>,
     /// `asked` from a Thompson slot draw only (conscience.rs `budget_pool`/`widen_pool`, hook.rs
     /// `#borg-pool`): the pool the check drew from, in ranking order, the asked lessons included; each
     /// one's score without its usefulness factor (conscience.rs `pool_base`, unrounded so a replay is
     /// exact); and whether it is scoped. Aligned with each other, not with `lessons`. Empty for graded
-    /// and live asks. Local: never shared (`share`). For `borg ope` (ope.rs).
+    /// and live asks and free deliveries. Local: never shared (`share`). For `borg ope` (ope.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -227,7 +242,13 @@ pub const PUBLISHED: &str = "outcomes-team.published";
 /// the k-distinct-nodes rule and a trust-weighted median stay deferred. Hidden-oracle results stay
 /// private: a goal with one credits on its runner's node only, so a remote author of such a goal's
 /// attempt is not credited yet (deferred). They never move the activity clock (`memory::Clock`).
-pub const SHARED_KINDS: [&str; 11] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED, VETOED, REGRETTED, VERIFIED, REJECTED, HACKED];
+///
+/// `tested` is shared like `asked_then_changed`, the result it is weaker than: memory folds it, so a peer
+/// without it would hold another belief. Both are this node's own reading of its session (the judge's,
+/// the test runner's output), neither backed by a board, so the trusted-member model above is the same;
+/// `team_view` counts a peer's `tested` line only for lessons the team's records show its session was
+/// given. It never moves the activity clock either.
+pub const SHARED_KINDS: [&str; 12] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED, VETOED, REGRETTED, VERIFIED, REJECTED, HACKED, TESTED];
 
 /// A session or repo as the team sees it: the first 32 hex digits of blake3("borg-outcome-v1\0" + s).
 /// Unsalted on purpose: the same session hashes to the same tag on every node, so a node can drop its
@@ -380,7 +401,7 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
     let lines: Vec<Shared> = text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()).collect();
     // The lessons each team session's records name: a verdict credits only lessons its author was given.
     let mut given: std::collections::HashMap<&str, std::collections::HashSet<&str>> = std::collections::HashMap::new();
-    for x in lines.iter().filter(|x| !is_verdict(&x.kind)) {
+    for x in lines.iter().filter(|x| !is_verdict(&x.kind) && x.kind != TESTED) {
         given.entry(x.s.as_str()).or_default().extend(x.lessons.iter().map(String::as_str));
     }
     let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String)> = std::collections::HashSet::new();
@@ -401,6 +422,9 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
             continue;
         }
         if is_verdict(&x.kind) && !backed(x) {
+            continue;
+        }
+        if x.kind == TESTED && !x.lessons.iter().all(|l| given.get(x.s.as_str()).is_some_and(|g| g.contains(l.as_str()))) {
             continue;
         }
         team.push(Outcome {
@@ -435,6 +459,7 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
         CORRECTED => crate::stats::CORRECTED,
         NOT_CORRECTED => crate::stats::NOT_CORRECTED,
         REGRETTED => crate::stats::REGRETTED,
+        TESTED => crate::stats::TESTED,
         _ => return Ok(()),
     };
     if let Some(home) = path.parent() {
@@ -485,16 +510,23 @@ pub fn contradicted(outcomes: &[Outcome], session: &str, ms: i64, target: Option
     out
 }
 
+/// Was `o` a free delivery (channel `early` or `queued`): lessons handed over as context, no question?
+pub fn free(o: &Outcome) -> bool {
+    o.channel == "early" || o.channel == "queued"
+}
+
 /// The lessons a correction at `ms` in `session` shows were needed and not asked: of the lessons it
 /// `supersedes` and `target` (the lesson it was merged into), those a graded check of the session found
-/// applying before `ms` without choosing them, never asked in the session before `ms`, and not yet
-/// recorded as missed there. Sorted, unique.
+/// applying before `ms` without choosing them, never asked as a question in the session before `ms` (a
+/// free delivery asks nothing: a lesson only handed over as context stays a miss for the cut,
+/// attention.rs), and not yet recorded as missed there. Sorted, unique.
 pub fn missed(outcomes: &[Outcome], session: &str, ms: i64, target: Option<&str>, supersedes: &[String]) -> Vec<String> {
     let mut out: Vec<String> = supersedes.iter().cloned().chain(target.map(str::to_string)).collect();
     let applied_unchosen = |l: &str| {
         outcomes.iter().any(|o| o.kind == GRADED && o.session == session && o.ms < ms && o.lessons.iter().any(|x| x == l) && !o.chosen.iter().any(|x| x == l))
     };
-    out.retain(|l| applied_unchosen(l) && !asked_before(outcomes, session, l, ms) && !has(outcomes, MISSED, session, l));
+    let questioned = |l: &str| outcomes.iter().any(|o| o.kind == ASKED && !free(o) && o.session == session && o.ms < ms && o.lessons.iter().any(|x| x == l));
+    out.retain(|l| applied_unchosen(l) && !questioned(l) && !has(outcomes, MISSED, session, l));
     out.sort();
     out.dedup();
     out
@@ -556,6 +588,52 @@ fn blamed(outcomes: &[Outcome], kind: &str, session: &str, before_ms: i64, cause
             ..Default::default()
         })
         .collect()
+}
+
+/// The `tested` records a session's own test runs earn (`tests`: its `<state>/<session>.tests`, `fail <ms>`
+/// and `pass <ms>` lines, hook.rs `capture_test`): each lesson asked as a question in `session` (a free
+/// delivery asks nothing, `free`: handed over at every prompt of its scope, it would gain from every
+/// test-first session) whose last test result after its first ask passed, after a failed run since that ask (red, then green) or a change the drone
+/// made on the lesson's point (`asked_then_changed`), and that has no `tested` record there yet, nor a
+/// correction or a veto (the engineer's word outranks a green run), nor `asked_then_ignored` (red, then
+/// green is also how a feature is built: it does not make an ignored question useful). A pass before the ask says nothing
+/// of the lesson. One record per lesson, sorted, at that last pass. Every record's session has an
+/// earlier `asked` record, so it never moves memory.rs's `Clock`.
+pub fn tested(outcomes: &[Outcome], session: &str, tests: &str) -> Vec<Outcome> {
+    let mut runs: Vec<(i64, bool)> = tests
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(w, m)| Some((m.trim().parse::<i64>().ok()?, matches!(w, "pass" | "fail").then_some(w == "pass")?)))
+        .collect();
+    runs.sort_unstable();
+    // Each lesson's first ask in the session, and its repo.
+    let mut first: HashMap<&str, (i64, &str)> = HashMap::new();
+    for o in outcomes.iter().filter(|o| o.kind == ASKED && !free(o) && o.session == session) {
+        for l in &o.lessons {
+            let e = first.entry(l.as_str()).or_insert((o.ms, o.repo.as_str()));
+            if o.ms < e.0 {
+                *e = (o.ms, o.repo.as_str());
+            }
+        }
+    }
+    let mut out: Vec<Outcome> = first
+        .into_iter()
+        .filter(|(l, _)| ![TESTED, CORRECTED, VETOED, IGNORED].iter().any(|k| has(outcomes, k, session, l)))
+        .filter_map(|(l, (at, repo))| {
+            let after = &runs[runs.partition_point(|r| r.0 <= at)..];
+            let &(ms, pass) = after.last()?;
+            (pass && (after.iter().any(|r| !r.1) || has(outcomes, CHANGED, session, l))).then(|| Outcome {
+                kind: TESTED.into(),
+                session: session.into(),
+                lessons: vec![l.into()],
+                ms,
+                repo: repo.into(),
+                ..Default::default()
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.lessons.cmp(&b.lessons));
+    out
 }
 
 /// The verdict records a hive verdict (`kind`, one of `is_verdict`) on the attempt `cause` writes for
@@ -728,6 +806,10 @@ mod tests {
         let mut asked = log.clone();
         asked.push(o(ASKED, "s", &["A"], 15));
         assert!(missed(&asked, "s", 20, Some("A"), &none).is_empty(), "asked later in the session: not a miss");
+        let mut free = log.clone();
+        free.push(Outcome { channel: "queued".into(), ..o(ASKED, "s", &["A"], 15) });
+        free.push(Outcome { channel: "early".into(), ..o(ASKED, "s", &["A"], 16) });
+        assert_eq!(missed(&free, "s", 20, Some("A"), &none), ["A"], "handed over free, never asked: still a miss");
         let mut done = log.clone();
         done.push(o(MISSED, "s", &["A"], 18));
         assert!(missed(&done, "s", 20, Some("A"), &none).is_empty(), "recorded once");
@@ -756,6 +838,43 @@ mod tests {
         assert_eq!(w["A"], weight(1, 1));
         assert_eq!(w["B"], 1.0);
         assert!(!w.contains_key("C"));
+    }
+
+    #[test]
+    fn a_session_whose_tests_go_green_after_an_ask_credits_it_once() {
+        let mut log = vec![o(ASKED, "s", &["A", "B"], 10), o(ASKED, "t", &["A"], 10)];
+        // Red after the ask, then green: one credit per lesson asked, dated at the pass.
+        let got = tested(&log, "s", "fail 20\npass 30\n");
+        assert_eq!(got.iter().map(|x| (x.kind.as_str(), x.lessons[0].as_str(), x.ms)).collect::<Vec<_>>(), [(TESTED, "A", 30), (TESTED, "B", 30)]);
+        // Idempotent: a re-run with the records written writes nothing.
+        log.extend(got);
+        assert!(tested(&log, "s", "fail 20\npass 30\n").is_empty());
+        // Only the session's own asks: t ran no tests.
+        assert!(tested(&log, "t", "").is_empty(), "no tests file: nothing");
+    }
+
+    #[test]
+    fn a_green_run_credits_only_after_the_ask_and_with_a_reason() {
+        let log = vec![o(ASKED, "s", &["A"], 50)];
+        assert!(tested(&log, "s", "fail 20\npass 30\n").is_empty(), "red and green before the ask");
+        assert!(tested(&log, "s", "fail 20\npass 60\n").is_empty(), "the failure before the ask: green proves nothing new");
+        assert!(tested(&log, "s", "fail 60\npass 70\nfail 80\n").is_empty(), "last run red");
+        assert!(tested(&log, "s", "pass 60\n").is_empty(), "green alone, nothing changed");
+        assert!(tested(&log, "s", "pass 60\npass 70 \ngarbage\n").is_empty());
+        let early = [Outcome { channel: "early".into(), ..o(ASKED, "e", &["A"], 10) }];
+        assert!(tested(&early, "e", "fail 20\npass 30\n").is_empty(), "a free delivery asked nothing");
+        // Green after the drone changed its work on the lesson: a credit.
+        let changed = [log.clone(), vec![o(CHANGED, "s", &["A"], 55)]].concat();
+        assert_eq!(tested(&changed, "s", "pass 60\n").len(), 1);
+        // A correction or a veto of the lesson in the session outranks a green run; an ignored question
+        // gains nothing from the drone fixing its own failing test.
+        for k in [CORRECTED, VETOED, IGNORED] {
+            let worse = [log.clone(), vec![o(k, "s", &["A"], 55)]].concat();
+            assert!(tested(&worse, "s", "fail 60\npass 70\n").is_empty(), "{k}");
+        }
+        // Lines out of order still find the last run; the first ask decides what is after it.
+        let twice = [log.clone(), vec![o(ASKED, "s", &["A"], 65)]].concat();
+        assert_eq!(tested(&twice, "s", "pass 70\nfail 60\n")[0].ms, 70);
     }
 
     #[test]
@@ -1214,6 +1333,21 @@ mod tests {
         assert_eq!((m(&peer).changed, m(&peer).corrected), (0, 1), "a peer counts the forged correction");
         let _ = std::fs::remove_dir_all(victim);
         let _ = std::fs::remove_dir_all(peer);
+    }
+
+    /// A peer's `tested` line counts for a lesson its session was given, and for no other.
+    #[test]
+    fn a_peer_green_run_counts_only_for_lessons_its_session_was_given() {
+        let home = tmp("tested-team");
+        let asked = share(&o(ASKED, "p1", &["L1"], 10), "peer").unwrap();
+        let ok = share(&o(TESTED, "p1", &["L1"], 20), "peer").unwrap();
+        let stray = share(&o(TESTED, "p1", &["L2"], 20), "peer").unwrap();
+        let alone = share(&o(TESTED, "p2", &["L1"], 20), "peer").unwrap();
+        lines(&home.join(TEAM_FILE), &[&asked, &ok, &stray, &alone].map(|x| serde_json::to_string(x).unwrap()));
+        let ls = ["L1", "L2"].map(|id| crate::conscience::Challenge { id: id.into(), ..Default::default() });
+        let m = crate::memory::derive(&team_view(&home.join("lessons.jsonl"), true), &ls, None);
+        assert_eq!((m["L1"].tested, m["L2"].tested), (1, 0), "{m:?}");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

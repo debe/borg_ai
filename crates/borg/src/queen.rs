@@ -1139,8 +1139,9 @@ pub fn ask_on(value: Option<&str>) -> bool {
 /// The question to deliver in `session`, pure. None once `delivered` has one for this session (one per
 /// session). Else an open question of one of `repos` (never another repo's), not skipped within
 /// `SKIP_MS`, and, if delivered before, only once more than `REOFFER_SESSIONS` sessions of `visits`
-/// (first-seen order) began since. Never-delivered questions first, then asking order. The index is
-/// into `open`.
+/// (first-seen order) began since. The engineer's decisions about the work come first: a hive question
+/// (`about_hive`) only when none of them is eligible. Then never-delivered questions first, then asking
+/// order. The index is into `open`.
 pub fn eligible<'a>(
     open: &'a [Entry],
     skips: &[Mark],
@@ -1158,16 +1159,16 @@ pub fn eligible<'a>(
         .enumerate()
         .filter(|(_, e)| repos.iter().any(|r| same_repo(r, &repo(e))) && !skipped(skips, &e.id, now))
         .filter_map(|(i, e)| {
-            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((false, i, e)) };
+            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((about_hive(e), false, i, e)) };
             let since = match (at(&last.session), at(session)) {
                 (Some(t), Some(n)) => n.saturating_sub(t),
                 // The delivering session's record is gone: count sessions first seen after the delivery.
                 _ => visits.iter().filter(|v| v.ms > last.ms).count(),
             };
-            (since > REOFFER_SESSIONS).then_some((true, i, e))
+            (since > REOFFER_SESSIONS).then_some((about_hive(e), true, i, e))
         })
-        .min_by_key(|&(again, i, _)| (again, i))
-        .map(|(_, i, e)| (i, e))
+        .min_by_key(|&(hive, again, i, _)| (hive, again, i))
+        .map(|(_, _, i, e)| (i, e))
 }
 
 /// The prompt hook's call (0 model calls): the one question to ask in `session` (in `cwd`), whose work is in
@@ -1208,6 +1209,13 @@ pub fn deliver(store: &Path, session: &str, cwd: &str, repos: impl FnOnce() -> V
 /// A question about a hive goal's plan or one of its tasks (hive/plan.rs): the engineer's alone.
 fn hive_question(e: &Entry) -> bool {
     e.kind == Kind::Plan || (e.kind.escalates() && e.payload.as_ref().is_some_and(|p| p["goal"].is_string() && p["task"].is_string()))
+}
+
+/// A question the hive raised rather than a session's own work: a goal's plan or task (`hive_question`),
+/// a drone's contract change or a playbook edit learned from hive work. A plain session's one question
+/// goes to its own work first (`eligible`).
+fn about_hive(e: &Entry) -> bool {
+    hive_question(e) || matches!(e.kind, Kind::Contract | Kind::Playbook)
 }
 
 /// At most five words of an option, up to its first ':' or ',': its label in a dialog.

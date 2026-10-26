@@ -7,7 +7,7 @@
 | Command | Shows or does |
 |---|---|
 | `borg status` | Each collective's delivery mode and store (lessons, episodes, outcomes, turn-end and live checks), what is wired and whether the `borg` skill is current |
-| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode, or a pinned `codex:<model>`), `borg` on `PATH`, a missing or stale `borg` skill, the vector model and each store's index, and which of borg's hooks codex would skip as untrusted (asked of codex itself, `codex app-server`) |
+| `borg doctor` | What is broken: config (an unknown `mode` included), hooks, adapters, the model CLI (claude, omp or opencode, or a pinned `codex:<model>`), `borg` on `PATH`, a missing or stale `borg` skill, the vector model and each store's index, which of borg's hooks codex would skip as untrusted (asked of codex itself, `codex app-server`), and each mesh member on another protocol version, with who has to upgrade |
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
 | `borg setup [--yes] [--no-vectors] [--harness LIST] [--private DIR...] [--team NAME --paths DIR... [--relay URL\|disabled] \| --join TICKET [--paths DIR...]] [--home DIR]` | Guided setup: collectives (personal, team or company, off paths), the team's mesh, the vector model, wiring, an optional import, then `borg doctor`. Shows one plan and writes nothing until you confirm; `--yes` takes every default without asking. Flags answer their question. An existing `collectives.json` is only added to. A second run changes nothing ([Quick start](../README.md#quick-start)) |
 | `borg install\|uninstall <claude\|omp\|opencode\|codex\|all> [--apply]` | Wire or unwire the hooks or adapter and the `borg` skill; a dry run without `--apply` ([details](configuration.md#what-borg-install-writes)) |
@@ -24,11 +24,11 @@
 | `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson; see [below](#saying-no) |
 | `borg why <path>[:<line>[-<line>]] \| <commit> [--full] [--json]` | The reasoning behind code: blame, Borg notes, linked lessons, and both ends of a decision → fix link: "→ fixed in Y (task)" on the decision, "← decided in X (task) → fixed here" on the fix (three each, all with `--full`; `--json` adds `fixed_in` and `fixes`) |
 | `borg regress [--session ID] [--replay A..B] [--any-origin] [--explain] [--json] [--dir DIR]` | The decision → fix links Borg would make, as a dry run that writes nothing: for the latest session in this repo (or `--session`), or every commit of a range (`--replay`, at most 500). `--explain` lists each candidate left out and why (`format`, `move`, `too-large`, `no-reasoning`, `same-session`, `too-young`, `duplicate`, `cap`, ...); `--any-origin` also takes origins without Borg reasoning, to try the detector on a repo with no notes ([details](configuration.md#decision--fix-links)) |
-| `borg review-fix [--home DIR] [--since YYYY-MM-DD] [--json] [--apply [--only ID,…]]` | The bugs a sub-agent review found and a fix sub-agent fixed before any commit (Claude Code workflows, omp tasks, opencode subagents), per collective, with a chance-match control; 0 tokens. `--apply` records the strong ones as episodes and learns them ([details](configuration.md#review--fix-findings)) |
+| `borg review-fix [--home DIR] [--since YYYY-MM-DD] [--json] [--apply [--only ID,…]]` | The bugs a sub-agent review found and a fix sub-agent fixed before any commit (Claude Code workflows and Agent-tool sub-agents, omp tasks, opencode subagents, Codex spawned agents), per collective, with a chance-match control; 0 tokens. `--apply` records the strong ones as episodes and learns them ([details](configuration.md#review--fix-findings)) |
 | `borg notes attach [<commit>]` | Write the redacted reasoning note for a session's commits, then link them to the earlier decisions they fixed (normally at session end) |
 | `borg notes fetch [<commit>...]` | Get reasoning notes and decision → fix links from team members over the mesh: for the named commits, or the last 200 on HEAD; a link comes with either of its commits |
 | `borg trust [--dir DIR]` | Trust per engineer and area, from what happened after their lessons were asked, on this machine and the team's |
-| `borg ope [--dir DIR \| --file FILE] [--json]` | Off-policy estimates of the belief's hand-set weights (veto, hive verdicts, regret) from logged asks with their propensity; reports and never changes them |
+| `borg ope [--dir DIR \| --file FILE] [--json]` | Off-policy estimates of the belief's hand-set weights (veto, hive verdicts, regret, green tests) from logged asks with their propensity; reports and never changes them |
 | `borg hive init\|board\|join\|leave\|open\|claim\|progress\|release\|block\|done\|verify\|score\|integrate\|approve\|contract\|ask\|tell` | Many drones, one goal: a board of tasks with leased claims, contracts and messages between drones, done gated by the goal's oracle, and verdicts guarded against gaming it; see [below](#hive) |
 | `borg hive run <goal> --drones N [--harness H] [--dry-run] [--yes]` | N headless drones, each in a git worktree of the repo with an equal share of what is left of the goal's budget, until the board is finished, once you approved the goal's plan (`--yes`: approved on the command line); see [Running drones](#running-drones) |
 | `borg hive join <goal> --here` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
@@ -46,7 +46,7 @@ For debugging and evaluation: `borg recall`, `borg prefilter`, `borg resolve`, `
 `borg facets`. Their usage is in the header of [`crates/borg/src/main.rs`](../crates/borg/src/main.rs).
 
 **Internal:** `borg check --session ID [--transcript FILE] --cwd DIR` is live mode's check of the work
-so far ([Delivery modes](../README.md#delivery-modes)). Every harness's post-tool event (Claude Code and
+so far ([Delivery modes](delivery.md#delivery-modes)). Every harness's post-tool event (Claude Code and
 omp PostToolUse, opencode `tool.execute.after`) starts it detached after a state-changing tool call, with
 the hook's environment. Without a transcript (omp, opencode) the work so far is the turn's tool calls
 from `<state>/<session>.turn`. It takes the session's lock
@@ -405,19 +405,23 @@ step's add still lands), so the file syncs over the mesh like lessons. A line wh
 does not derive is ignored, so no synced line can rewrite a promoted step under the same version. A playbook's id comes from its repo and its
 shape's words; its version (`P…@<edits>.<hash>`) names the exact set of edits.
 
-After a hive attempt wins, `borg learn` asks the model once, shown the playbooks of that task's shape
-with their step ids, for at most one edit. An attempt wins when it was verified and not hacked, or,
-with a hidden oracle, passed by it; of a group, only the integrated member's attempt, and the attempts
-it beat are in the prompt. Only work done on this node is reflected, once per attempt
-(`playbooks-reflected.txt`, local). The edit is never applied by learning: it is queued as a queen
+After a hive attempt wins, or a plain session ends clean, `borg learn` asks the model once, shown the
+playbooks of that task's shape with their step ids, for at most one edit. An attempt wins when it was
+verified and not hacked, or, with a hidden oracle, passed by it; of a group, only the integrated
+member's attempt, and the attempts it beat are in the prompt. A plain session (no hive) ends clean when
+it landed commits, its own last test run passed, and you neither corrected nor vetoed it (`borg no`);
+its task is its first task prompt (not a later "commit it") and its change runs from where it started
+to its newest commit. It is reflected when it ends, never while idle; when the model does not answer,
+it waits for a later `borg learn` (`playbooks-plain.txt`, local). Only work done on this node is
+reflected, once per attempt or session (`playbooks-reflected.txt`, local). The edit is never applied by learning: it is queued as a queen
 question whose default keeps the playbook as it is, and only an engineer's `promote` answer appends it,
 stamped with the question and the engineer. An edit asked once is never asked again. A step is one
 line of at most 300 characters, and the question shows it whole: what you promote is what drones read.
 
 A drone with a claim sees the playbooks whose shape its task's title and files name (at least 60% of
 the shape's significant words, the queen's bar for a text stating something), of the task's repo or
-of none, once per version, after its contracts. A session outside the hive sees them only when its
-prompt names every word of the shape. Each version shown is logged (`playbook` in `outcomes.jsonl`), so
+of none, once per version, after its contracts. A session outside the hive sees them when its prompt
+names as much of the shape, the same bar: a prompt is how a plain session states its task. Each version shown is logged (`playbook` in `outcomes.jsonl`), so
 the verdict on the drone's attempt, a `borg no` and a later regret credit that version as they credit
 the lessons shown, and its usefulness belief is the lessons' (memory.rs). The Hive tab lists each
 playbook with its steps, the belief of every version shown and the edits waiting for an answer (a
@@ -515,8 +519,10 @@ not this one.
   flight when the total reached it, one per drone, each at most its drone's dollars left, while the
   mesh syncs faster than a session lasts (the daemon dials as soon as a hive log changes, looked at every 25 ms); a machine that lags longer
   lets each of its drones start one more session per sync it missed.
-- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/9` or
-  earlier do not sync with this version (`borg/mesh/10` carries the goal's spend, 9 the bundles): upgrade every member.
+- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/10` or
+  earlier do not sync with this version (`borg/mesh/11` carries the ratified constraints, 10 the goal's spend, 9 the
+  bundles): upgrade every member.
+  The mesh log and `borg doctor` name each member on another version and who has to upgrade.
 
 Not yet: goal signatures (any member's goal syncs, signed by its origin), approving a plan once for
 every node (each node's run asks its own engineer), multi-repo goals (`run` takes the repo it is started in), moving a failed
@@ -579,7 +585,11 @@ question. The prompt never becomes the session's task and is never also counted 
    through the review API, never the commit log"), `borg learn` queues it in `borg queen` as a
    question: keep it a lesson only (the default) or ratify it as a constraint. Only an engineer's
    answer ratifies it, and a personal lesson never proposes one. A ratified constraint is appended to
-   `<store>/constraints.jsonl`. Nothing enforces constraints yet, and the mesh does not sync that file.
+   `<store>/constraints.jsonl`, and the mesh syncs that file to the team. A ratified constraint is a
+   standing lesson: every session, on every harness, may be asked it like any lesson, and on every
+   harness that takes the context it comes early, before any match, at the first prompt (unscoped) or once the work names the
+   scope of the lesson it came from, marked as a ratified constraint. Nothing blocks an edit or a
+   stop on a constraint yet.
 
 4. **A missed escalation.** When the vetoed work had already merged (the session landed a commit of
    its own that is still on HEAD, or its hive task was verified and integrated) and the queen never

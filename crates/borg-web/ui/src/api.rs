@@ -191,6 +191,8 @@ pub struct Lesson {
     pub verified: f64,
     pub rejected: f64,
     pub hacked: f64,
+    /// Sessions whose own tests went green after it was asked.
+    pub tested: f64,
     pub dormant: bool,
     pub consolidated: bool,
     pub usage: BTreeMap<String, f64>,
@@ -208,10 +210,10 @@ impl Lesson {
         if self.area.is_empty() { "other".into() } else { self.area.clone() }
     }
 
-    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed + verified, 1 + ignored + 2 corrected
+    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed + verified + ½ tested, 1 + ignored + 2 corrected
     /// + 3 vetoed + regretted + rejected + 3 hacked)).
     pub fn usefulness(&self) -> f64 {
-        let a = 1.0 + self.changed + self.verified;
+        let a = 1.0 + self.changed + self.verified + 0.5 * self.tested;
         let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted + self.rejected + 3.0 * self.hacked;
         a / (a + b)
     }
@@ -262,6 +264,7 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             verified: f(&l["verified"]),
             rejected: f(&l["rejected"]),
             hacked: f(&l["hacked"]),
+            tested: f(&l["tested"]),
             dormant: l["dormant"].as_bool().unwrap_or(false),
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
             usage: map(&l["usage"]),

@@ -1,4 +1,4 @@
-//! Delivery modes: when the conscience judges the work (README "Delivery modes").
+//! Delivery modes: when the conscience judges the work (docs/delivery.md).
 //!
 //! - **hook**: early delivery and queued lessons are free word matching; one graded model
 //!   call runs at the turn end (main.rs `stop`), and only a grade 3 blocks the stop.
@@ -52,7 +52,7 @@ pub struct Resolved {
 }
 
 /// The mode when neither BORG_MODE nor the collective sets one: live, which passed the eval's fixed
-/// rule against hook (README "Delivery modes"). `"mode": "hook"` or `BORG_MODE=hook` switches back.
+/// rule against hook (docs/delivery.md, "Why live is the default"). `"mode": "hook"` or `BORG_MODE=hook` switches back.
 pub const DEFAULT: Mode = Mode::Live;
 
 /// `env` (BORG_MODE) wins over `configured` (the collective's `mode`), else `DEFAULT`. An unknown value

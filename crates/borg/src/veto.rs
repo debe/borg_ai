@@ -12,7 +12,10 @@
 //!   the rate the hive learns to bring to zero (H5b).
 //! - **A proposed constraint.** When the reason names an invariant of the system, `borg learn` queues it
 //!   as a queen question (`Kind::Constraint`). Only an engineer's answer ratifies it into
-//!   `<store>/constraints.jsonl`; learning never applies a constraint, and nothing enforces them yet.
+//!   `<store>/constraints.jsonl`; learning never applies a constraint. A ratified constraint is a
+//!   standing lesson (conscience.rs `standing`): every session gets it early once its scope is in play
+//!   (an unscoped one at the first prompt), whatever the match, and the mesh syncs the file signed like
+//!   the lessons. Nothing blocks an edit or a stop on a constraint yet.
 //!
 //! - **A missed escalation**, when the vetoed work had already merged and the queen never escalated
 //!   from that session (escalation.rs, the queen's attention reward; logged and shown, never optimised).
@@ -289,14 +292,22 @@ pub fn propose(home: &Path, lesson: &learn::Lesson, invariant: &str, e: &learn::
     queen::seed(home, &entry)
 }
 
-/// The constraints file of a store. Written on ratification; nothing reads it yet (enforcement at
-/// pre_tool and at the stop is a later hive step) and the mesh does not sync it.
+/// The ratified constraints of a store, beside its lessons (`constraints_path`).
+pub const FILE: &str = "constraints.jsonl";
+
+/// The constraints file of a store. Written on ratification, read with the lessons as standing ones
+/// (conscience.rs `load`) and synced by the mesh (borg-mesh lines.rs `SYNCED`); blocking on a
+/// constraint at pre_tool and at the stop is a later hive step.
 pub fn constraints_path(store: &Path) -> PathBuf {
-    store.join("constraints.jsonl")
+    store.join(FILE)
 }
 
 /// The answer to a constraint question (queen.rs `answer`): an answer starting with "ratify" (option
 /// b) appends the invariant to `constraints.jsonl` and returns true; anything else writes nothing.
+/// The line syncs to the team, so it carries what a lesson does and no more: the invariant (redacted,
+/// as a lesson is generalised), the lesson it came from and who ratified it, never the veto's raw words.
+/// It also carries who should hear it: the lesson's scope, repo and reach (reach.rs), or, the lesson
+/// unknown here, the question's repo with reach `repo`, so a node without the lesson never widens it.
 ///
 /// # Errors
 /// When the constraints file cannot be appended.
@@ -305,8 +316,14 @@ pub fn ratify(store: &Path, e: &queen::Entry, answer: &str, author: &str, now: i
         return Ok(false);
     }
     let field = |prefix: &str| e.evidence.iter().find_map(|x| x.strip_prefix(prefix)).unwrap_or_default().to_string();
-    let line = json!({"id": format!("c{}", &e.decision_key[..8.min(e.decision_key.len())]), "text": field("invariant: "), "lesson": field("lesson "),
-        "veto": field("veto: "), "by": author, "ms": now, "source": "veto", "check": ""});
+    let lesson = field("lesson ");
+    let from = crate::conscience::load_unweighted(&store.join("lessons.jsonl"), None).into_iter().find(|l| l.id == lesson);
+    let (scope, repo, reach) = match from {
+        Some(l) => (l.scope, if l.repo.is_empty() { e.repo.clone() } else { l.repo }, l.reach),
+        None => (Vec::new(), e.repo.clone(), crate::reach::REPO.to_string()),
+    };
+    let line = json!({"id": format!("c{}", &e.decision_key[..8.min(e.decision_key.len())]), "text": crate::notes::redact(&field("invariant: ")),
+        "lesson": lesson, "scope": scope, "repo": repo, "reach": reach, "by": author, "ms": now, "source": "veto", "check": ""});
     learn::append_jsonl(&constraints_path(store), &line).map_err(|err| err.to_string())?;
     Ok(true)
 }
@@ -685,6 +702,15 @@ mod tests {
             (c["text"].as_str(), c["lesson"].as_str(), c["by"].as_str(), c["source"].as_str()),
             (Some(rule), Some("Lno-s1-1"), Some("lead@x"), Some("veto"))
         );
+        // The lesson unknown here: bound to the question's repo, never everywhere.
+        assert_eq!((c["repo"].as_str(), c["reach"].as_str()), (Some("app"), Some(crate::reach::REPO)));
+        // The lesson known: its scope, repo and reach.
+        let lesson = serde_json::json!({"id": "Lno-s1-1", "origin_ms": 1, "question": "q", "repo": "app", "scope": ["Orion"]});
+        std::fs::write(home.join("lessons.jsonl"), format!("{lesson}\n")).unwrap();
+        std::fs::remove_file(constraints_path(&home)).unwrap();
+        assert!(ratify(&home, &q, RATIFY_OPTION, "lead@x", 9).unwrap());
+        let c: serde_json::Value = serde_json::from_str(std::fs::read_to_string(constraints_path(&home)).unwrap().trim()).unwrap();
+        assert_eq!((c["scope"].clone(), c["repo"].as_str(), c["reach"].as_str()), (serde_json::json!(["Orion"]), Some("app"), Some("")));
         let _ = std::fs::remove_dir_all(home);
     }
 }

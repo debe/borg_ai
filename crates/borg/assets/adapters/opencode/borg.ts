@@ -30,6 +30,8 @@
 // output (stored with the call: the TUI hides it for built-in tools, exports show it); opencode 2 sends
 // it as a steer synthetic input and leaves the tool result alone (the TUI shows that). opencode 1 runs
 // no after-hook for a failed call, so text waiting then comes with the next successful call or prompt.
+// A shell call's post_tool carries the end of its output and a non-zero exit as tool_response, Codex's
+// way: borg tells a test run's pass from its failure by it.
 // An answer later than POST_MS (a prompt's: PROMPT_MS) is kept for the next call or prompt: borg already
 // counts it delivered.
 //
@@ -74,6 +76,8 @@ const DECLINED = "The user declined this tool call"
 const AUTO_REJECTED = "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action."
 // Claude's plain rejection, which borg takes for a wordless denial: the engineer's next prompt is the reason.
 const DENIED = "The user doesn't want to proceed with this tool use."
+// How much of a shell call's output borg gets (its end, where a test run's summary is).
+const OUTPUT_TAIL = 4_000
 
 // opencode tool ids -> the Claude names borg matches on (borg reads Bash command, Grep/Glob pattern,
 // else file_path/path from tool_input). Unknown tools keep their id.
@@ -115,6 +119,24 @@ function canonicalError(error: string): string {
   if (m) return corrected(m[1])
   const bare = error.trim()
   return bare === REJECTED || bare === DECLINED ? DENIED : error
+}
+
+/** A shell call's tool_response for borg, which tells a test run's pass from its failure by it
+ *  (hook.rs `capture_test`): the end of its output, after Codex's "Exit code: N" line when it exited
+ *  non-zero (opencode's shell keeps such a call out of the error state). Undefined without output:
+ *  borg records no result it cannot see. */
+function shellResponse(output: string | undefined, exit: unknown): string | undefined {
+  const out = (output ?? "").slice(-OUTPUT_TAIL)
+  if (!out.trim()) return undefined
+  return typeof exit === "number" && exit !== 0 ? `Exit code: ${exit}\nOutput:\n${out}` : out
+}
+
+/** The text of an opencode 2 tool result: its `output`, or its content's text blocks. */
+function resultText(result: any): string {
+  if (typeof result === "string") return result
+  if (typeof result?.output === "string") return result.output
+  const content = Array.isArray(result?.content) ? result.content : []
+  return content.map((b: any) => (b?.type === "text" ? String(b.text ?? "") : "")).filter((t: string) => t).join("\n")
 }
 
 /** The engineer- or drone-visible text of message parts (no synthetic or ignored parts). */
@@ -341,12 +363,15 @@ function drones(io: Io) {
   }
 
   /** A finished tool call. Resolves to the text for the model's next step: context that came late
-   *  before, then borg's answer, if it came within POST_MS; a later answer waits in `late`. */
-  const postTool = async (id: string, callID: string, tool: string, args: any): Promise<string | undefined> => {
+   *  before, then borg's answer, if it came within POST_MS; a later answer waits in `late`. A shell
+   *  call's `output` and `exit` go along as its tool_response (`shellResponse`). */
+  const postTool = async (id: string, callID: string, tool: string, args: any, output?: string, exit?: unknown): Promise<string | undefined> => {
     const s = get(id)
     s.args.delete(callID)
     if (s.child) return
-    const answer = send(id, "post_tool", async () => ({ tool_name: TOOL_NAMES[tool] ?? tool, tool_input: toolInput(tool, args) })).then(contextOf)
+    const name = TOOL_NAMES[tool] ?? tool
+    const response = name === "Bash" ? shellResponse(output, exit) : undefined
+    const answer = send(id, "post_tool", async () => ({ tool_name: name, tool_input: toolInput(tool, args), ...(response ? { tool_response: response } : {}) })).then(contextOf)
     // Behind a stop still thinking (a model call) the answer can only come late: the call does not wait.
     return withLate(s, await within(id, answer, s.stopping ? 0 : POST_MS, "tool"))
   }
@@ -476,7 +501,7 @@ const server: Plugin = async ({ client, directory }) => {
 
     // Awaited before the next step; the output is what the model reads (and what opencode stores).
     "tool.execute.after": async (input, output) => {
-      const t = await d.postTool(input.sessionID, input.callID, input.tool, input.args)
+      const t = await d.postTool(input.sessionID, input.callID, input.tool, input.args, output.output, output.metadata?.exit)
       if (t) output.output = `${output.output}\n\n${t}`
     },
 
@@ -557,7 +582,7 @@ async function setup(ctx: any) {
   await ctx.tool.hook("execute.after", async (e: any) => {
     if (e.status !== "error") {
       // Awaited before the next step. A steer, not the tool result: the TUI shows the result.
-      const t = await d.postTool(e.sessionID, e.id, e.tool, e.input)
+      const t = await d.postTool(e.sessionID, e.id, e.tool, e.input, resultText(e.result), e.result?.metadata?.exit ?? e.metadata?.exit)
       if (!t) return
       try {
         await ctx.session.synthetic({ sessionID: e.sessionID, text: t, delivery: "steer", resume: false, metadata: MARK })

@@ -81,6 +81,7 @@ one lesson can get on top of either, as on the Conscience tab.
 | `early`, `queued_free` | Lessons handed over free at a prompt or touch |
 | `changed`, `ignored`, `corrected`, `not_corrected` | What happened after a lesson was asked: used, ignored, corrected anyway, or no correction followed |
 | `regretted` | `borg learn` counted a later fix, or a review finding, against a lesson asked before the decision (`lessons`: that lesson). Its share of the blame is the `credit` of the `regretted` record in `outcomes.jsonl`, keyed by the regret episode (`cause`) |
+| `tested` | `borg learn` credited a lesson asked before the session's own tests went green: a failed run after the question, then a pass, or a pass after the drone changed its work on it; never for a question it ignored (`lessons`: that lesson). Half a verified hive task in its usefulness, once per session and lesson |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
 | `veto` | An engineer said no to a drone's work (`borg no`, or a prompt starting "borg no"); `lessons` the lessons shown in the session so far, `n` their number, `why` `cli` or `prompt` |
 | `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned and dated when the veto was said, so the latest days can still grow |
@@ -102,13 +103,19 @@ counted once per verdict as the `task_*` event above, never per record, and are 
 (`outcomes-team.jsonl`) until hive lines sync over the mesh.
 
 **Mode and channel.** Events from a hook carry `mode`: the delivery mode it ran in (`hook` or `live`,
-[Delivery modes](../README.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson
+[Delivery modes](delivery.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson
 reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or `queued` (free). The
 `asked` outcome records and the judge's `asked_then_changed` and `asked_ignored` records in
-`outcomes.jsonl` carry the same `channel`. A veto adds a `vetoed` record per lesson shown in the session
+`outcomes.jsonl` carry the same `channel`. A free delivery's `asked` record counts as its `early` or
+`queued_free` event, never as a `block`, and the next turn end's model call judges it as it judges a
+question (questions keep their judge slots first; free deliveries alone pay for no model call). A
+correction `borg learn` merges into a lesson delivered free is `asked_then_corrected`; one a graded check
+left unchosen stays `applied_then_corrected` too, since a free delivery asks nothing, and `borg ope`
+leaves free deliveries out: they draw from no pool. A veto adds a `vetoed` record per lesson shown in the session
 before it (no channel; it is counted as the `veto` event, not as an outcome kind of its own). `asked`
 and `graded` records also carry `p`, each lesson's probability of being asked under the policy in force,
-for off-policy evaluation. `outcomes-team.jsonl` holds the redacted outcomes the mesh syncs (session and
+for off-policy evaluation (1 for a queued hand-over; for an early delivery, the share of the session's
+draws that deliver it). `outcomes-team.jsonl` holds the redacted outcomes the mesh syncs (session and
 repo hashed); the statistics never read it, since the rollups already sync their counts. Rollups keep two splits beside the counts:
 
 - `usd_mode`: the cost of `check` and `live_check` per mode. Checks from before modes existed count as

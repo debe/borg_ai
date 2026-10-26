@@ -86,12 +86,17 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
 
 /// One turn: a prompt, the given tool calls, then the Stop with `last`. Returns the Stop's output.
 pub fn turn(root: &Path, session: &str, prompt: &str, tools: &[(&str, Value)], last: &str, env: &[(&str, &str)]) -> String {
+    turn_as(root, "claude", session, prompt, tools, last, env)
+}
+
+/// `turn` through the hooks of `harness` (see `borg_as`).
+pub fn turn_as(root: &Path, harness: &str, session: &str, prompt: &str, tools: &[(&str, Value)], last: &str, env: &[(&str, &str)]) -> String {
     let cwd = root.join("harbor_orion");
-    borg(root, "prompt", &json!({"session_id": session, "cwd": cwd, "prompt": prompt}), env);
+    borg_as(root, harness, "prompt", &json!({"session_id": session, "cwd": cwd, "prompt": prompt}), env);
     for (tool, input) in tools {
-        borg(root, "post_tool", &json!({"session_id": session, "cwd": cwd, "tool_name": tool, "tool_input": input}), env);
+        borg_as(root, harness, "post_tool", &json!({"session_id": session, "cwd": cwd, "tool_name": tool, "tool_input": input}), env);
     }
-    borg(root, "stop", &json!({"session_id": session, "cwd": cwd, "last_assistant_message": last, "stop_hook_active": false}), env)
+    borg_as(root, harness, "stop", &json!({"session_id": session, "cwd": cwd, "last_assistant_message": last, "stop_hook_active": false}), env)
 }
 
 /// The prompts the fake model received, in order.

@@ -48,8 +48,8 @@ const GRADE: &str = "Grade each lesson you return: 3 = this work clearly runs in
 is followed; 2 = probably relevant; 1 = loosely related, worth a thought.";
 
 const JUDGE: &str = "## Questions asked earlier in this session\n\
-At an earlier turn end the agent was asked each question below; each group shows its work before the questions and \
-after them. Judge by meaning, not by shared words, comparing the two: did the agent change its work on the question's point (changed), keep \
+Earlier in this session the agent was given each question below, at a turn end or as context while it worked; each \
+group shows its work before the questions and after them. Judge by meaning, not by shared words, comparing the two: did the agent change its work on the question's point (changed), keep \
 it as it was (unchanged), or does the evidence not tell (unclear)? Set avoids_consequence true only if the work after \
 the question no longer leads to the consequence. A declaration (applies / skip) is the agent's claim, not proof: judge \
 the work. Put one verdict per id in `resolved`.";

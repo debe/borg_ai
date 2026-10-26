@@ -13,7 +13,7 @@
 //!    same way everywhere). The peer must still be a member under the result, and revocations are
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
-//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl` (lines.rs `SYNCED`), each in turn:
+//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl` (lines.rs `SYNCED`), each in turn:
 //!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
 //!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
@@ -63,7 +63,7 @@ use std::time::Duration;
 
 use borg::collective::{self, Config, Route};
 use iroh::Endpoint;
-use iroh::endpoint::{Builder, Connection, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::endpoint::{Builder, ConnectOptions, Connection, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
 use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
@@ -79,10 +79,23 @@ use crate::{live, steer};
 
 mod vectors;
 
-/// The session protocol. 10: a goal's `spend.jsonl` is a seventh synced hive log (borg hive/run.rs
-/// `ledger`); the hive logs reconcile in a fixed list, so a peer on 9 would reconcile another file at
-/// the same step and is refused at the handshake instead.
-pub const ALPN: &[u8] = b"borg/mesh/10";
+/// The session protocol. 11: `constraints.jsonl` is a fifth synced log (lines.rs `SYNCED`); the logs
+/// reconcile in a fixed list, so a peer on 10 would reconcile another file at the same step and is
+/// refused at the handshake instead. 10: a goal's `spend.jsonl` is a seventh synced hive log (borg
+/// hive/run.rs `ledger`).
+pub const ALPN: &[u8] = b"borg/mesh/11";
+/// The protocols of older nodes (`borg/mesh/10` down to `/1`), offered and accepted beside `ALPN` only to
+/// tell a mismatch: without them the handshake fails and nothing says why. A session on one is closed at
+/// once and the peer recorded (`mismatch`). A newer node does the same with this one's `ALPN`.
+fn older() -> Vec<Vec<u8>> {
+    let ours = version(ALPN).unwrap_or(0);
+    (1..ours).rev().map(|v| format!("borg/mesh/{v}").into_bytes()).collect()
+}
+
+/// The number of a session protocol (`borg/mesh/<n>`).
+fn version(alpn: &[u8]) -> Option<u32> {
+    std::str::from_utf8(alpn).ok()?.strip_prefix("borg/mesh/")?.parse().ok()
+}
 /// The join handshake: an invite for the membership history (`Node::join`, `Node::admit`).
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
@@ -321,7 +334,11 @@ impl Node {
             // Direct addresses only: no relay, no lookup, no probing of the LAN's router.
             Relay::Disabled => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()).portmapper_config(PortmapperConfig::Disabled),
         };
-        let mut builder = builder.secret_key(me.iroh_secret()).alpns(vec![ALPN.to_vec(), JOIN_ALPN.to_vec()]).clear_ip_transports().ca_tls_config(ca_trust());
+        let mut builder = builder
+            .secret_key(me.iroh_secret())
+            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec()], older()].concat())
+            .clear_ip_transports()
+            .ca_tls_config(ca_trust());
         if let Some(a) = addr {
             builder = builder.bind_addr(a).map_err(|e| e.to_string())?;
         }
@@ -439,6 +456,25 @@ impl Node {
     fn synced(&self, remote: &str, started: i64) {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let _ = borg::presence::note_synced(&self.home, remote, started);
+        let _ = borg::presence::forget_mismatch(&self.home, remote);
+    }
+
+    /// A session with member `remote` that came up on another protocol (`older`): recorded for `borg
+    /// doctor` (borg presence.rs `protocols_path`), closed, and the error says who has to upgrade; the
+    /// close reason says the same from the peer's side.
+    fn mismatch(&self, conn: &Connection, remote: &str) -> String {
+        let m = borg::presence::Mismatch {
+            theirs: String::from_utf8_lossy(conn.alpn()).into_owned(),
+            ours: String::from_utf8_lossy(ALPN).into_owned(),
+            ms: borg::learn::now_ms(),
+        };
+        let (line, told) = (m.line(remote), m.told(&self.me.public()));
+        {
+            let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = borg::presence::note_mismatch(&self.home, remote, m);
+        }
+        conn.close(2u32.into(), told.as_bytes());
+        line
     }
 
     /// Forgets `remote`'s last completed session (presence.rs `forget_synced`): a dial to it failed, so
@@ -469,7 +505,11 @@ impl Node {
             return Err(format!("{} is not a member of {name}: refusing to connect", t.key));
         }
         let started = borg::learn::now_ms();
-        let conn = self.endpoint.connect(t.endpoint_addr(&self.relay)?, ALPN).await.map_err(|e| format!("connect {target}: {e}"))?;
+        let connecting = self.endpoint.connect_with_opts(t.endpoint_addr(&self.relay)?, ALPN, ConnectOptions::new().with_additional_alpns(older()));
+        let conn = connecting.await.map_err(|e| format!("connect {target}: {e}"))?.await.map_err(|e| format!("connect {target}: {e}"))?;
+        if conn.alpn() != ALPN {
+            return Err(self.mismatch(&conn, &t.key));
+        }
         let result = async {
             let remote = authorise(&conn, &membership, name)?;
             let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
@@ -577,6 +617,11 @@ impl Node {
         };
         let started = borg::learn::now_ms();
         let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
+        if conn.alpn() != ALPN && conn.alpn() != JOIN_ALPN {
+            let (name, home) = self.gate()?;
+            let remote = authorise(&conn, &members(&home)?, &name)?;
+            return Err(self.mismatch(&conn, &remote));
+        }
         let session = async {
             let (name, home) = self.gate()?;
             let (name, home) = (name.as_str(), home.as_path());
@@ -1050,6 +1095,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_ratified_constraint_reaches_the_team_signed() {
+        let (pa, pb) = team("constraints");
+        let (a, b) = (home(&pa), home(&pb));
+        write(&a, "lessons.jsonl", &[lesson("L1", 1, "lock order?")]);
+        let c = json!({"id": "cabc", "text": "locks are taken in id order", "lesson": "L1", "by": "lead@x", "ms": 5, "source": "veto"}).to_string();
+        write(&a, borg::veto::FILE, std::slice::from_ref(&c));
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        served.unwrap();
+        assert!(synced.unwrap().received >= 2, "the lesson and the constraint");
+        assert_eq!(lines::read(&b.join(borg::veto::FILE)).into_values().collect::<Vec<_>>(), std::slice::from_ref(&c));
+        assert!(origin::load(&b).contains_key(&lines::hash(&c)), "it arrived with its signed origin");
+        let standing: Vec<String> = borg::conscience::load(&b.join("lessons.jsonl"), None).into_iter().filter(|c| c.standing()).map(|c| c.question).collect();
+        assert_eq!(standing, ["locks are taken in id order"], "bob's sessions get it as a standing lesson");
+        alice.close().await;
+        bob.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn team_outcomes_sync_and_count_once() {
         let (pa, pb) = team("outcomes");
         let (a, b) = (home(&pa), home(&pb));
@@ -1159,6 +1225,68 @@ mod tests {
         assert_eq!(calls.get(), 1, "and still learns nothing again");
         alice.close().await;
         bob.close().await;
+    }
+
+    /// A member on an older protocol (a node that only speaks `borg/mesh/5`) is told apart from a broken
+    /// network both ways: the session ends at once, the error and the record (for `borg doctor`) name
+    /// the peer and who has to upgrade, and the first session that completes drops the record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_on_an_older_protocol_is_named_both_ways() {
+        const OLD: &[u8] = b"borg/mesh/5";
+        let (pa, pb) = team("protocol");
+        let (a, b) = (home(&pa), home(&pb));
+        let bob_key = Identity::load_or_create(&b).unwrap().public();
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let old_bob = Node::open(&pb, Some(LOCAL.parse().unwrap()), true, |x| x.alpns(vec![OLD.to_vec()])).await.unwrap();
+
+        // Alice dials the old node.
+        let serve_old = async {
+            let conn = old_bob.incoming().await?.await.ok()?;
+            Some((conn.alpn().to_vec(), conn.closed().await.to_string()))
+        };
+        let old_ticket = old_bob.ticket();
+        let (seen, synced) = tokio::join!(serve_old, alice.sync(&old_ticket));
+        let err = synced.unwrap_err();
+        let ours = String::from_utf8_lossy(ALPN);
+        let line = format!("peer {} speaks borg/mesh/5, this node {ours}: nothing syncs with it; upgrade it", &bob_key[..12]);
+        assert_eq!(err, line);
+        let (alpn, closed) = seen.expect("the old node completed the handshake");
+        assert_eq!(alpn, OLD);
+        let alice_key = Identity::load_or_create(&a).unwrap().public();
+        let told = format!("peer {} speaks {ours}, this node borg/mesh/5: nothing syncs with it; upgrade this node", &alice_key[..12]);
+        assert!(closed.contains(&told), "the old node is told why, as it reads it: {closed}");
+        assert_eq!(borg::presence::mismatches(&a)[&bob_key].theirs, "borg/mesh/5");
+
+        // The old node dials alice.
+        let _ = std::fs::remove_file(borg::presence::protocols_path(&a));
+        let addr = Target::parse(&alice.ticket()).unwrap().endpoint_addr(&old_bob.relay).unwrap();
+        let dial_old = async {
+            let conn = old_bob.endpoint.connect(addr, OLD).await.map_err(|e| e.to_string())?;
+            Ok::<String, String>(conn.closed().await.to_string())
+        };
+        let (served, dialled) = tokio::join!(alice.accept(), dial_old);
+        assert_eq!(served.unwrap_err(), line);
+        assert!(dialled.unwrap().contains(&told));
+        assert_eq!(borg::presence::mismatches(&a)[&bob_key].ours, ours);
+        old_bob.close().await;
+
+        // Bob upgraded: the first session that completes drops the record.
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        served.unwrap();
+        synced.unwrap();
+        assert!(borg::presence::mismatches(&a).is_empty());
+        alice.close().await;
+        bob.close().await;
+    }
+
+    #[test]
+    fn older_protocols_are_every_version_below_this_one() {
+        let n = version(ALPN).expect("borg/mesh/<n>");
+        let o = older();
+        let below = format!("borg/mesh/{}", n - 1);
+        assert_eq!((o.len(), o[0].as_slice(), o[o.len() - 1].as_slice()), (n as usize - 1, below.as_bytes(), b"borg/mesh/1".as_slice()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

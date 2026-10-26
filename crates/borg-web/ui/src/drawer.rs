@@ -32,6 +32,7 @@ pub fn Drawer() -> impl IntoView {
             ("corrected anyway", l.corrected, "var(--c-heat)"),
             ("vetoed", l.vetoed, "var(--c-heat)"),
             ("regretted later", l.regretted, "var(--c-pink)"),
+            ("tests green after", l.tested, "var(--c-good)"),
             ("hive task verified", l.verified, "var(--c-good)"),
             ("hive task rejected", l.rejected, "var(--c-slate)"),
             ("hive task hacked", l.hacked, "var(--c-heat)"),

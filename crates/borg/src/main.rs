@@ -365,7 +365,7 @@ fn memory_cmd(path: &str, rest: &[&str]) {
         println!(
             "{}",
             json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
-                "vetoed": m.vetoed, "regretted": m.regretted, "verified": m.verified, "rejected": m.rejected, "hacked": m.hacked, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
+                "vetoed": m.vetoed, "regretted": m.regretted, "verified": m.verified, "rejected": m.rejected, "hacked": m.hacked, "tested": m.tested, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
                 "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
         );
     }
@@ -430,7 +430,7 @@ fn main() {
         ["resolve", path] => resolve_cmd(path),
         ["recall", path, rest @ ..] => {
             let (challenges, context) = challenges_and_stdin(path, rest);
-            for (score, c) in conscience::rank(&challenges, &context) {
+            for (score, c) in conscience::rank(&challenges, &conscience::work_text(&context)) {
                 println!("{} {score:.3}", c.id);
             }
         }

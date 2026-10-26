@@ -334,8 +334,12 @@ pub fn landed(repo: &Path, start: &Start, windows: &[(i64, i64)]) -> Vec<String>
 /// The commits `session` landed so far (`landed`, from its start recorded in `dir`); empty when it
 /// started outside git or left no record here.
 pub fn landed_by(dir: &Path, session: &str) -> Vec<String> {
-    let start = std::fs::read_to_string(state(dir, session, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok());
-    start.map(|s| landed(Path::new(&s.repo), &s, &windows(dir, session, &s))).unwrap_or_default()
+    start_of(dir, session).map(|s| landed(Path::new(&s.repo), &s, &windows(dir, session, &s))).unwrap_or_default()
+}
+
+/// Where `session` started (`remember_start`, recorded in `dir`); None outside git or without a record.
+pub fn start_of(dir: &Path, session: &str) -> Option<Start> {
+    std::fs::read_to_string(state(dir, session, "head")).ok().and_then(|t| serde_json::from_str::<Start>(&t).ok())
 }
 
 /// The top level of the git repo `dir` is in.

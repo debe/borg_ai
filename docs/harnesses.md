@@ -91,7 +91,9 @@ verifier.
 | Reads of the oracle | `Read`, `Grep`, `Glob` | as normalised | as normalised | shell only |
 
 omp and opencode already have channels for early delivery and steering in context. Both stay off until
-an evaluation shows they help.
+an evaluation shows they help. Standing lessons (ratified constraints) are exempt: they are no ranking
+guess, so they arrive early on every harness whose `prompt_context` or `tool_context` takes them
+(hook.rs `early`).
 
 With no budget at all, the expert drone keeps inside 60 s, Claude Code's own command-hook default, and
 the model call inside the model's own limit. Claude Code's Stop hook gets a 90 s `timeout` from

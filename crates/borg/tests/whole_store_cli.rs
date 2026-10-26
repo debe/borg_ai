@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{answer, borg, context, prompts, setup, state, turn};
+use common::{answer, borg, context, prompts, setup, state, turn, turn_as};
 use serde_json::{Value, json};
 
 /// The lesson ids in a prompt's lesson block (whole layout: between `## Lessons` and `## Current work`).
@@ -205,4 +205,31 @@ fn graded_blocks_only_for_a_three_and_hands_twos_and_ones_over_free_once() {
     assert!(last("g3").split(',').count() > 1 && last("g3").contains("New"), "{}", last("g3"));
     assert!(!prompts(&root).last().unwrap().contains("Grade each"));
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// What the model reads of the work is the drone's work alone: the state file's bookkeeping lines
+/// (`#borg-asked`, `#borg-p`, `#borg-pool`, `#borg-predict-cost`, ...) stay out of the prompt, in both
+/// layouts, though the second turn's state holds them; through every harness's hooks.
+#[test]
+fn the_models_prompt_holds_no_bookkeeping_line() {
+    for harness in ["claude", "omp", "opencode", "codex"] {
+        let root = setup(&format!("unmarked-{harness}"));
+        // Off Claude Code the model call is pinned to the fake `claude` (common.rs `borg_as`).
+        let pin = (harness != "claude").then_some(("BORG_PREDICT_MODEL", "claude:sonnet"));
+        let off: Vec<_> = [("BORG_PREFILTER", "off")].into_iter().chain(pin).collect();
+        let shortlist: Vec<_> = off.iter().copied().chain([("BORG_STOP_POOL", "shortlist")]).collect();
+        turn_as(&root, harness, "u1", "Tidy the budget handling of the net", &[], "Done: the budget place is drained.", &off);
+        turn_as(&root, harness, "u1", "and the budget tests", &[], "Tests added.", &off);
+        let marked = state(&root, "u1", "ctx");
+        assert!(marked.lines().any(|l| l.starts_with("#borg-asked")) && marked.lines().any(|l| l.starts_with("#borg-predict-cost")), "{harness}: {marked}");
+        turn_as(&root, harness, "u2", "Tidy the budget handling of the net", &[], "Done.", &shortlist);
+        turn_as(&root, harness, "u2", "and the budget tests", &[], "Tests added.", &shortlist);
+        let all = prompts(&root);
+        assert_eq!(all.len(), 4, "{harness}: every turn end asked the model");
+        for p in &all {
+            assert!(!p.lines().any(|l| l.starts_with("#borg-")), "{harness}: a bookkeeping line reached the model: {p}");
+            assert!(p.contains("Tidy the budget handling of the net"), "{harness}: the work itself still does: {p}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

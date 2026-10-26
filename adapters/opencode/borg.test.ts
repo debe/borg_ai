@@ -288,6 +288,35 @@ test("real borg: conscience asks once per session, corrections and rejections be
 
 // ---- opencode 2.x: the same contract through `setup(ctx)`.
 
+test("a shell call's post_tool carries its output's end and a non-zero exit, other tools none", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  const after = (callID: string, tool: string, args: object, output: string, metadata: object) =>
+    hooks["tool.execute.after"]!({ tool, sessionID: SESSION, callID, args }, { title: "", output, metadata })
+  await after("c1", "bash", { command: "cargo test" }, "test result: FAILED. 1 failed", { exit: 101 })
+  await after("c2", "bash", { command: "cargo test" }, "y".repeat(5_000) + "test result: ok.", { exit: 0 })
+  await after("c3", "bash", { command: "cargo test" }, "", { exit: 0 })
+  await after("c4", "read", { filePath: "/work/repo/a.rs" }, "fn a() {}", {})
+  const posts = recorded(rec).filter((c) => c[0] === "post_tool").map((c) => c[1].tool_response)
+  assert.deepEqual(posts, ["Exit code: 101\nOutput:\ntest result: FAILED. 1 failed", ("y".repeat(5_000) + "test result: ok.").slice(-4_000), undefined, undefined])
+})
+
+test("opencode 2: a shell call's post_tool carries its result's text and a non-zero exit", async () => {
+  const [bin, rec] = recorder()
+  process.env.BORG_BIN = bin
+  const { hooks, cleanup } = await setupV2()
+  const after = (id: string, result: object) =>
+    hooks["tool.execute.after"]({ tool: "shell", sessionID: SESSION, agent: "build", messageID: "msg_2", id, input: { command: "cargo test" }, status: "completed", result })
+  await after("c1", { content: [{ type: "text", text: "test result: FAILED." }], metadata: { exit: 101 } })
+  await after("c2", { output: "test result: ok." })
+  await settle()
+  const posts = recorded(rec).filter((c) => c[0] === "post_tool").map((c) => c[1].tool_response)
+  assert.deepEqual(posts, ["Exit code: 101\nOutput:\ntest result: FAILED.", "test result: ok."])
+  await cleanup()
+})
+
 test("one module serves both plugin APIs: opencode 2 reads id + setup, opencode 1 id + server", () => {
   assert.equal(plugin.id, "borg")
   assert.equal(typeof plugin.setup, "function")

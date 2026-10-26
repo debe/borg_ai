@@ -354,3 +354,44 @@ fn bm25_asks_log_slot_propensities() {
     assert!(store_file(&root, "state/s1.ctx").lines().any(|l| l.starts_with("#borg-p ")), "{}", store_file(&root, "state/s1.ctx"));
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn teammates_sessions_age_a_team_lesson_and_a_repo_convention_only_in_its_repo() {
+    // Disuse counts the sessions a lesson was deliverable in, on any node (memory.rs "Whose sessions
+    // count"): a teammate's sessions age the team lesson Lgit, and the repo convention Lconv only when
+    // they work in its repo. This node's own three sessions keep both active.
+    let root = setup("peer-clock");
+    let store = root.join("store/collectives/corp");
+    let mut lessons = store_file(&root, "lessons.jsonl");
+    lessons += &format!("{}\n", json!({"id": "Lconv", "origin_ms": 1, "question": "Is the deploy run through make ship?", "reach": "repo", "repo": "corp"}));
+    std::fs::write(store.join("lessons.jsonl"), lessons).unwrap();
+    let local: String =
+        (0..3).map(|i| format!("{}\n", json!({"kind": "asked", "session": format!("own{i}"), "lessons": ["Llock"], "ms": 10 + i, "repo": "corp"}))).collect();
+    std::fs::write(store.join("outcomes.jsonl"), local).unwrap();
+    let peers = |repo: &str| -> String {
+        (0..60)
+            .map(|i| format!("{}\n", json!({"kind": "asked", "s": borg::outcome::tag(&format!("peer{i}")), "lessons": ["Ldrain"], "ms": 100 + i, "node": "n2", "r": borg::outcome::tag(repo)})))
+            .collect()
+    };
+    let dormant = |root: &Path| -> std::collections::HashMap<String, bool> {
+        let path = store.join("lessons.jsonl");
+        borg(root, &["memory", path.to_str().unwrap()], "", false, &[])
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .map(|v| (v["id"].as_str().unwrap().to_string(), v["dormant"].as_bool().unwrap()))
+            .collect()
+    };
+    let alone = dormant(&root);
+    assert_eq!((alone["Lgit"], alone["Lconv"]), (false, false), "{alone:?}");
+    std::fs::write(store.join("outcomes-team.jsonl"), peers("elsewhere")).unwrap();
+    let busy_elsewhere = dormant(&root);
+    assert_eq!((busy_elsewhere["Lgit"], busy_elsewhere["Lconv"]), (true, false), "{busy_elsewhere:?}");
+    std::fs::write(store.join("outcomes-team.jsonl"), peers("corp")).unwrap();
+    let busy_here = dormant(&root);
+    assert_eq!((busy_here["Lgit"], busy_here["Lconv"]), (true, true), "{busy_here:?}");
+    // Kept to this machine's view, the teammates' sessions age nothing.
+    let path = store.join("lessons.jsonl");
+    let off = borg(&root, &["memory", path.to_str().unwrap()], "", false, &[("BORG_SHARE_OUTCOMES", "off")]);
+    assert!(off.lines().all(|l| l.contains("\"dormant\":false")), "{off}");
+    let _ = std::fs::remove_dir_all(root);
+}

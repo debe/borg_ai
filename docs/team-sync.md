@@ -150,8 +150,13 @@ and a hive verdict counts on a peer only for an attempt its own synced board jud
 another machine never run on yours until you approve them (`borg hive approve <goal>`). The hive across machines is built and
 proven on two loopback nodes, not measured across real machines yet. A goal's spend syncs too, so the
 drones of every machine split and stop on the goal's one budget (spend recorded before this version
-names no machine and stays on the machine that spent it). Peers on `borg/mesh/9` and earlier
-do not sync with this version (`borg/mesh/10` adds the goal's spend, 9 the bundles): upgrade every member. Reasoning excerpts go to two peers chosen by hash,
+names no machine and stays on the machine that spent it). Ratified constraints (`borg no`, `borg queen`) sync
+too, signed and quarantined like lessons, holding the invariant, its lesson and who ratified it, never the
+veto's words; every member's sessions get them as standing lessons. Peers on `borg/mesh/10` and earlier
+do not sync with this version (`borg/mesh/11` adds the constraints, 10 the goal's spend, 9 the bundles): upgrade every member. A session with a
+member on another version ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
+("peer <key> speaks borg/mesh/5, this node borg/mesh/11: nothing syncs with it; upgrade it") until a session with
+it completes or it leaves the member list; the old node's log gets the same line from its side ("… upgrade this node"). Reasoning excerpts go to two peers chosen by hash,
 so the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key

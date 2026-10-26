@@ -613,6 +613,12 @@ pub fn regret_credit() -> bool {
     std::env::var("BORG_REGRET_CREDIT").as_deref() != Ok("off")
 }
 
+/// Crediting a session's own green test runs on (`outcome::tested`): learning is, and BORG_TEST_CREDIT is
+/// not `off` (an eval's frozen arm).
+pub fn test_credit() -> bool {
+    learning() && std::env::var("BORG_TEST_CREDIT").as_deref() != Ok("off")
+}
+
 /// Each regret episode generalised into a lesson of this store (`library`, as stored: a lesson placed in
 /// a private store is not in it) blames the lessons asked in its deciding session before the decision
 /// (`outcome::regretted`). Runs over every such episode on every run, so regrets learned before this
@@ -856,10 +862,6 @@ fn learn_unlocked(
             }
         }
     }
-    // Verified hive work that won proposes playbook edits to the engineer (playbook.rs), once per attempt.
-    if track {
-        crate::playbook::reflect_pending(home, ask, now);
-    }
     if track {
         if regret_credit() {
             credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path);
@@ -869,7 +871,22 @@ fn learn_unlocked(
         if let Some(s) = session.filter(|s| !ended.iter().any(|x| x == s) && !pending.contains(*s)) {
             ended.push(s.to_string());
         }
+        let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
+        // Verified hive work that won, and the session that just ended (its end hook's `--session`, never
+        // an idle one: that may still be open) without a correction or veto (no episode) that ended
+        // clean, propose playbook edits to the engineer (playbook.rs), once each.
+        let clean: Vec<&str> = session.filter(|s| !last_episode.contains_key(*s)).into_iter().collect();
+        crate::playbook::reflect_pending(home, ask, now, &clean, &state, &outcomes);
         for s in &ended {
+            // The session's own tests that went green after an ask (hook.rs `capture_test`) credit the
+            // lessons asked, once each, as it settles.
+            if test_credit() {
+                let tests = std::fs::read_to_string(state.join(format!("{}.tests", crate::notes::safe(s)))).unwrap_or_default();
+                for o in outcome::tested(&outcomes, s, &tests) {
+                    let _ = outcome::append(&outcomes_path, &o);
+                    outcomes.push(o);
+                }
+            }
             for o in outcome::settle(&outcomes, s, now) {
                 let _ = outcome::append(&outcomes_path, &o);
                 outcomes.push(o);

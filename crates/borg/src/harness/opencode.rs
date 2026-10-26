@@ -248,7 +248,7 @@ fn run_of(root: &Value, export: Export, until: Instant) -> Option<Run> {
     agents.sort_by_key(|a| a.started);
     let id = info["id"].as_str().unwrap_or_default().to_string();
     let started = info["time"]["created"].as_i64().unwrap_or(agents[0].started);
-    Some(Run { session: id.clone(), id, name: info["title"].as_str().unwrap_or_default().to_string(), started, agents })
+    Some(Run { session: id.clone(), id, name: info["title"].as_str().unwrap_or_default().to_string(), started, agents, loose: false })
 }
 
 /// A child's work from its export `c`: its cwd when the export names one, and its assistant parts.

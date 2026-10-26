@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::wiring::Hooks;
-use super::{Caps, Harness, Headless, HeadlessEnd, Level, Probe, Transcript, Wiring};
+use super::{Caps, Harness, Headless, HeadlessEnd, Level, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
 /// tool call fires no PostToolUse at all), so denials are not captured.
@@ -117,6 +117,13 @@ impl Harness for Codex {
         raw
     }
 
+    /// Each session's spawned agents ([`spawn_runs`]) under `$CODEX_HOME/sessions`, else
+    /// `home/.codex/sessions`.
+    fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+        let codex = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()).map_or_else(|| home.join(".codex"), PathBuf::from);
+        spawn_runs(&codex.join("sessions"), session, since)
+    }
+
     fn install_notes(&self) -> Vec<String> {
         vec!["open codex and run /hooks to trust borg's hooks (codex skips untrusted hooks silently)".into()]
     }
@@ -161,6 +168,145 @@ pub fn patch_edit(patch: &str, cwd: &Path) -> Option<Value> {
         edit["edits"] = json!(rest);
     }
     Some(edit)
+}
+
+// ---------------------------------------------------------------- spawned agents
+
+/// One run per session whose agent spawned others (`spawn_agent`), oldest first: of `session` only when
+/// given, from sessions that started at or after `since`. Every thread keeps its own rollout
+/// (`<sessions>/YYYY/MM/DD/rollout-*.jsonl`), whose first line, `session_meta`, names a spawned
+/// thread's parent (`source.subagent.thread_spawn.parent_thread_id`, with its `agent_path`, nickname
+/// and role; checked against the serde names in codex 0.153.2). An agent spawned by a spawned agent
+/// belongs to its root session's run, which is [`Run::loose`]. Codex has no structured output, so
+/// findings come from an agent's text. This reader is built from codex's serde names and hand-made
+/// rollouts, not checked against a real spawned one yet.
+pub fn spawn_runs(sessions: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
+    let metas: Vec<(PathBuf, Value)> = rollouts(sessions).into_iter().filter_map(|f| Some((f.clone(), first_meta(&f)?))).collect();
+    let file: std::collections::HashMap<&str, &Path> = metas.iter().filter_map(|(f, m)| Some((m["id"].as_str()?, f.as_path()))).collect();
+    let parent = |m: &Value| m["source"]["subagent"]["thread_spawn"]["parent_thread_id"].as_str().map(String::from);
+    let parents: std::collections::HashMap<String, String> = metas.iter().filter_map(|(_, m)| Some((m["id"].as_str()?.to_string(), parent(m)?))).collect();
+    let mut runs: std::collections::BTreeMap<String, Run> = std::collections::BTreeMap::new();
+    for (f, m) in metas.iter().filter(|(_, m)| parent(m).is_some()) {
+        let id = root_of(&parents, m["id"].as_str().unwrap_or_default());
+        if session.is_some_and(|s| s != id) {
+            continue;
+        }
+        let from = parent(m).unwrap_or_default();
+        let mut a = spawned(m, &id, &from);
+        // A forked agent's rollout may open with the history it inherited (`fork_turns`): its parent's.
+        let inherited = m["forked_from_id"].as_str().unwrap_or(&from);
+        read_rollout(f, file.get(inherited).copied(), &mut a);
+        runs.entry(id.clone()).or_insert_with(|| Run { id: id.clone(), session: id, loose: true, ..Default::default() }).agents.push(a);
+    }
+    let started: std::collections::HashMap<&str, i64> = metas.iter().filter_map(|(_, m)| Some((m["id"].as_str()?, ts(&m["timestamp"])))).collect();
+    let mut out: Vec<Run> = runs
+        .into_values()
+        .map(|mut r| {
+            r.agents.sort_by_key(|a| a.started);
+            r.started = started.get(r.id.as_str()).copied().filter(|t| *t > 0).unwrap_or(r.agents[0].started);
+            r
+        })
+        .filter(|r| since.is_none_or(|s| r.started >= s))
+        .collect();
+    out.sort_by_key(|r| r.started);
+    out
+}
+
+/// The root of spawned thread `id`: its `parents` followed up to a thread nobody spawned.
+fn root_of(parents: &std::collections::HashMap<String, String>, id: &str) -> String {
+    let mut id = id.to_string();
+    for _ in 0..parents.len() {
+        match parents.get(&id) {
+            Some(p) => id = p.clone(),
+            None => break,
+        }
+    }
+    id
+}
+
+/// The spawned agent of `session_meta` payload `m`, in the run of root thread `root`, spawned by
+/// thread `from` (no parent agent when the root's own agent spawned it); its work not read yet.
+fn spawned(m: &Value, root: &str, from: &str) -> SubAgent {
+    let spawn = &m["source"]["subagent"]["thread_spawn"];
+    let s = |k: &str| spawn[k].as_str().or_else(|| m[k].as_str()).unwrap_or_default().to_string();
+    let path = s("agent_path");
+    let label = path.rsplit('/').next().filter(|l| !l.is_empty()).map_or_else(|| s("agent_nickname"), String::from);
+    SubAgent {
+        id: m["id"].as_str().unwrap_or_default().to_string(),
+        parent: if from == root { String::new() } else { from.to_string() },
+        label,
+        kind: s("agent_role"),
+        started: ts(&m["timestamp"]),
+        cwd: s("cwd"),
+        ..Default::default()
+    }
+}
+
+/// The `rollout-*.jsonl` files under `dir`, at any depth.
+fn rollouts(dir: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).collect();
+    entries.sort();
+    let mut out = Vec::new();
+    for p in entries {
+        if p.is_dir() {
+            out.extend(rollouts(&p));
+        } else if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rollout-")) && p.extension().is_some_and(|e| e == "jsonl") {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A rollout's `session_meta` payload, from its first line only.
+fn first_meta(f: &Path) -> Option<Value> {
+    let line = std::io::BufReader::new(std::fs::File::open(f).ok()?).lines().next()?.ok()?;
+    let v: Value = serde_json::from_str(&line).ok()?;
+    (v["type"] == "session_meta").then(|| v["payload"].clone())
+}
+
+fn ts(v: &Value) -> i64 {
+    v.as_str().map_or(0, borg_trace::parse_ts)
+}
+
+/// A rollout's response items, in order.
+fn items(f: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(f).unwrap_or_default();
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["type"] == "response_item").map(|v| v["payload"].clone()).collect()
+}
+
+/// Read one spawned agent's rollout into `a`: its task (its first user message that Codex did not
+/// inject: AGENTS.md, environment and other tagged context), every tool input and text it produced.
+/// The items it shares, from the start, with its parent's rollout (`parent`) are history it inherited,
+/// never its own task or work.
+fn read_rollout(f: &Path, parent: Option<&Path>, a: &mut SubAgent) {
+    let own = items(f);
+    let inherited = parent.map(items).unwrap_or_default();
+    let skip = own.iter().zip(&inherited).take_while(|(o, i)| o == i).count();
+    for p in &own[skip..] {
+        let said = || p["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
+        match (p["type"].as_str(), p["role"].as_str()) {
+            (Some("message"), Some("user")) if a.prompt.is_empty() => {
+                let t = said();
+                let t = t.trim_start();
+                if !t.starts_with('<') && !t.starts_with("# AGENTS.md") {
+                    a.prompt = t.to_string();
+                }
+            }
+            (Some("message"), Some("assistant")) => {
+                let t = said();
+                if !t.trim().is_empty() {
+                    a.said(&t);
+                }
+            }
+            (Some("function_call"), _) => {
+                let args = p["arguments"].as_str().unwrap_or_default();
+                a.called(&serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.into())));
+            }
+            (Some("custom_tool_call"), _) => a.called(&p["input"]),
+            (Some("local_shell_call"), _) => a.called(&p["action"]),
+            _ => {}
+        }
+    }
 }
 
 /// Codex's own list of its hooks for `cwd` (`codex app-server`, JSON-RPC over stdio: `initialize`,
@@ -249,6 +395,34 @@ mod tests {
     fn fixture(name: &str) -> Value {
         let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex").join(name);
         serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_forked_agents_inherited_history_is_neither_its_task_nor_its_work() {
+        let sessions = std::env::temp_dir().join(format!("borg-codex-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sessions);
+        let day = sessions.join("2026/09/14");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = |thread: &str, ts: &str, meta: Value, items: &[Value]| {
+            let mut lines = vec![json!({"timestamp": ts, "type": "session_meta", "payload": meta})];
+            lines.extend(items.iter().map(|p| json!({"timestamp": ts, "type": "response_item", "payload": p})));
+            std::fs::write(day.join(format!("rollout-{ts}-{thread}.jsonl")), lines.iter().map(|v| format!("{v}\n")).collect::<String>()).unwrap();
+        };
+        let msg = |role: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]});
+        let edit = json!({"type": "custom_tool_call", "name": "apply_patch", "input": "*** Update File: src/parent.rs"});
+        let parent = [msg("user", "build the net"), edit.clone(), msg("assistant", "Built.")];
+        rollout("p", "2026-09-14T13-14-00Z", json!({"id": "p", "timestamp": "2026-09-14T13:14:00Z", "source": "cli"}), &parent);
+        let source = json!({"subagent": {"thread_spawn": {"parent_thread_id": "p", "agent_path": "/root/fix_net", "agent_role": "worker"}}});
+        let meta = json!({"id": "c", "timestamp": "2026-09-14T13:15:00Z", "forked_from_id": "p", "source": source});
+        let mut own = parent.to_vec();
+        own.extend([msg("user", "fix the arc"), json!({"type": "custom_tool_call", "name": "apply_patch", "input": "*** Update File: src/arc.rs"})]);
+        rollout("c", "2026-09-14T13-15-00Z", meta, &own);
+        let runs = spawn_runs(&sessions, None, None);
+        assert_eq!(runs.len(), 1);
+        let a = &runs[0].agents[0];
+        assert_eq!((runs[0].id.as_str(), runs[0].loose, a.id.as_str(), a.prompt.as_str()), ("p", true, "c", "fix the arc"));
+        assert!(a.work.contains("src/arc.rs") && !a.work.contains("src/parent.rs"), "{}", a.work);
+        let _ = std::fs::remove_dir_all(sessions);
     }
 
     #[test]

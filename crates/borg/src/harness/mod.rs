@@ -95,6 +95,10 @@ pub struct HeadlessEnd {
 /// One sub-agent of a [`Run`], as its transcript shows it.
 #[derive(Debug, Clone, Default)]
 pub struct SubAgent {
+    /// Its own id (a Claude Code agent id, a Codex thread id); empty where the harness gives none.
+    pub id: String,
+    /// The id of the sub-agent that started it; empty when the session's own agent did.
+    pub parent: String,
     /// What the run calls it (`review:rust`, `MappingReview`, a task's description).
     pub label: String,
     /// Its workflow phase (`Review`, `Fix`); empty where the harness has none.
@@ -127,8 +131,9 @@ impl SubAgent {
     }
 }
 
-/// The sub-agents one session ran together: a Claude Code workflow run, an omp session's task agents,
-/// an opencode session's subagents.
+/// The sub-agents one session ran together: a Claude Code workflow run or a session's Agent-tool
+/// sub-agents, an omp session's task agents, an opencode session's subagents, a Codex session's
+/// spawned agents.
 #[derive(Debug, Clone, Default)]
 pub struct Run {
     pub id: String,
@@ -136,6 +141,10 @@ pub struct Run {
     /// The workflow's or the session's name; may be empty.
     pub name: String,
     pub started: i64,
+    /// Its agents are the ones a plain session started one by one (Claude Code's Agent tool, Codex's
+    /// spawns), not one orchestrated run: the session's own agent built, so no sub-agent is the
+    /// builder, and they finish in any order, so a finding is named by its agent.
+    pub loose: bool,
     /// In start order.
     pub agents: Vec<SubAgent>,
 }
