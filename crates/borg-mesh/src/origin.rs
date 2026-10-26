@@ -117,6 +117,11 @@ pub fn quarantine(home: &Path, log: &Path, m: &Membership) -> Result<usize, Stri
         let tmp = log.with_extension("jsonl.quarantine-tmp");
         std::fs::write(&tmp, keep.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, log).map_err(|e| format!("{}: {e}", log.display()))?;
+        // A hive board's receive index speaks of the file before (borg hive/board.rs `held_path`): it
+        // starts afresh, under this lock, its lines held from now, later than they arrived, never earlier.
+        if log.file_name().is_some_and(|f| f == "tasks.jsonl") {
+            borg::hive::board::reset_held(log);
+        }
         Ok(out.len())
     })?;
     if moved > 0 {

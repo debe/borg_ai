@@ -118,7 +118,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
             let status = s.shown_status(now).to_string();
             *counts.entry(status.clone()).or_default() += 1;
             let (holder, lease_left_ms) = match &s.status {
-                Status::Claimed { by, renewed, .. } => (by.clone(), if s.live(now).is_some() { LEASE_MS - (now - renewed) } else { 0 }),
+                Status::Claimed { by, .. } => (by.clone(), if s.live(now).is_some() { LEASE_MS - (now - s.local.renewed) } else { 0 }),
                 Status::Done { by, .. } | Status::Verified { by, .. } | Status::Blocked { by, .. } => (by.clone(), 0),
                 Status::Open => (String::new(), 0),
             };
@@ -375,6 +375,8 @@ mod tests {
         let path = super::super::tasks_path(home, "g");
         board::append(&path, &[Event::open(t("t1", "a.rs"), "engineer:e", 10), Event::open(t("t2", "b.rs"), "engineer:e", 10)]).unwrap();
         board::append(&path, &[Event::new(Ev::Claim, "t1", "sess-one-1234", 1_000).with_drone("d1")]).unwrap();
+        // Held here at 1 000 on the test's clock, the claim's stamp.
+        board::note_held_at(&path, || 1_000);
         let spend = super::super::run::spend_path(home, "g");
         for (d, usd, exit) in [("d1", Some(0.5), "ok"), ("d2", None, "error"), ("d1", Some(0.25), "timeout")] {
             let line = Spend { v: 1, ms: 2, drone: d.into(), iter: 1, harness: "x".into(), usd, exit: exit.into(), ..Spend::default() };

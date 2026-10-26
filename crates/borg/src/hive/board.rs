@@ -22,8 +22,12 @@
 //! `claim` (mod.rs) waits for a round with each reachable peer before work starts, so a loser mostly
 //! learns before it began; past that window's cap it learns at its next hook (mod.rs `lost_news`), its
 //! done and its verify task's open are ignored by the fold, so a loser wastes at most one sync latency
-//! of work. The winner rule compares the writers' clocks, so the skew between
-//! nodes must stay well below `LEASE_MS`. Drone names (`d1`..) repeat on every node: a drone name bars
+//! of work. Stamps are a hybrid logical clock taken under the board lock (`stamp`): a line written after
+//! another was folded on its node sorts after it everywhere, so the winner rule compares clocks only
+//! between claims neither writer had seen. Every age the scheduling reads (a lease, a node's liveness,
+//! the owner's grace) is timed on the reader's own clock from when it first held the line (`Local`,
+//! `held_path`), never `now` against another node's stamp: a skew between nodes moves none of them.
+//! Drone names (`d1`..) repeat on every node: a drone name bars
 //! a verify task only on the node its work was done on (`Board::barred`); a session id bars everywhere.
 
 use std::cmp::Reverse;
@@ -181,6 +185,22 @@ pub struct Event {
     /// The node holding the author's shown records credits it (`verdict::credit_synced`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credit: String,
+    /// When this node first held the line, on its own clock: local, never written or synced (`read`
+    /// fills it from the board's receive index, [`held_path`]).
+    #[serde(skip)]
+    pub seen: Seen,
+}
+
+/// When a node first held a line, on that node's clock (`Event::seen`); None for a line built in memory,
+/// whose stamp stands in for it (`read` gives one past the receive index the time of the read). Never part of a line's identity: two copies
+/// of one line are equal wherever and whenever they were seen.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Seen(pub Option<i64>);
+
+impl PartialEq for Seen {
+    fn eq(&self, _: &Seen) -> bool {
+        true
+    }
 }
 
 impl Event {
@@ -200,6 +220,7 @@ impl Event {
             deps_in: Vec::new(),
             head: String::new(),
             credit: String::new(),
+            seen: Seen(None),
         }
     }
 
@@ -257,6 +278,40 @@ pub struct TaskState {
     /// The node its `open` was written on (empty: this one, or a line from before nodes were stamped).
     /// A verify task's open is written with its work's `done`: the work's node.
     pub node: String,
+    /// When this node held the lines behind its stamps, on its own clock (`Local`).
+    pub local: Local,
+}
+
+/// When this node first held the lines behind a task's state, on its own clock (`Event::seen`): what
+/// every age the scheduling reads is measured on (`live`, `claimable`, `claimable_since`), never `now`
+/// against another node's stamp, so a peer's clock offset moves no lease, liveness or grace (Gray &
+/// Cheriton 1989: each party times a lease on its own clock; Kubernetes leader election: the local
+/// time at which the record was seen to change). Local, as `Board::nodes`: the fold's rules read the
+/// stamps alone, so every node holding the same lines folds the same tasks.
+#[derive(Debug, Clone, Copy)]
+pub struct Local {
+    /// Its open.
+    pub opened: i64,
+    /// The line that last renewed its holder's lease (its claim or a heartbeat).
+    pub renewed: i64,
+    /// Its done or verdict (`Status::Done` / `Verified`).
+    pub status: i64,
+    /// The end of its last tenure (an expired one at its last renewal).
+    pub ended: i64,
+}
+
+/// No part of what the lines say (`Board`'s equality): equal wherever and whenever they were held.
+impl PartialEq for Local {
+    fn eq(&self, _: &Local) -> bool {
+        true
+    }
+}
+
+/// Nothing held yet: every time before any other.
+impl Default for Local {
+    fn default() -> Local {
+        Local { opened: i64::MIN, renewed: i64::MIN, status: i64::MIN, ended: i64::MIN }
+    }
 }
 
 /// Whether two lines' nodes are one machine: equal, or either unknown (a line from before nodes were
@@ -269,20 +324,38 @@ pub fn same_node(a: &str, b: &str) -> bool {
 pub const MAX_NOTES: usize = 5;
 
 impl TaskState {
-    /// The live holder at `now`: (session, node, since), None when the task is not claimed or its
-    /// lease expired (then it is open to claim; the log is not rewritten).
+    /// The live holder at `now`, this node's clock: (session, node, since), None when the task is not
+    /// claimed or no renewal of its lease was seen here within `LEASE_MS` (then it is open to claim; the
+    /// log is not rewritten). The lease is timed from when this node held the renewal (`Local`), so a
+    /// holder's clock ahead or behind this one's neither stretches nor cuts it.
     pub fn live(&self, now: i64) -> Option<(&str, &str, i64)> {
         match &self.status {
-            Status::Claimed { by, node, since, renewed } if now - renewed <= LEASE_MS => Some((by, node, *since)),
+            Status::Claimed { by, node, since, .. } if now - self.local.renewed <= LEASE_MS => Some((by, node, *since)),
             _ => None,
         }
     }
 
-    /// Open to a claim at `now`: open, or claimed with an expired lease.
+    /// Open to a claim at `now`, this node's clock: open, or claimed with an expired lease (`live`).
     pub fn claimable(&self, now: i64) -> bool {
         match &self.status {
             Status::Open => true,
-            Status::Claimed { renewed, .. } => now - renewed > LEASE_MS,
+            Status::Claimed { .. } => now - self.local.renewed > LEASE_MS,
+            _ => false,
+        }
+    }
+
+    /// The fold's lease rule, on stamps: open, or a rival's claim stamped `ms` is more than `LEASE_MS`
+    /// past the holder's last renewal the fold took. Only a takeover reads a stamp gap; a holder's own
+    /// heartbeat or claim renews whatever the gap since its last (`apply`): a hybrid stamp jumps when its
+    /// node hears a peer's clock ahead (`stamp`, `claim_at`), so a gap between one holder's stamps says
+    /// nothing of how long it was silent, and the fold would otherwise end a live holder's lease on
+    /// every node for a peer's clock more than `LEASE_MS − HEARTBEAT_MS` ahead. The gap this rule reads,
+    /// a rival's stamp past the holder's, only grows when the holder's stamps jump: a jump never breaks
+    /// a lease, whatever `AHEAD_MS` is.
+    fn claimable_at(&self, ms: i64) -> bool {
+        match self.status {
+            Status::Open => true,
+            Status::Claimed { renewed, .. } => ms - renewed > LEASE_MS,
             _ => false,
         }
     }
@@ -318,7 +391,7 @@ pub struct Integration {
     pub ms: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Board {
     pub tasks: BTreeMap<TaskId, TaskState>,
     /// Claims that lost a race or were invalid: (by, task, ms).
@@ -330,8 +403,9 @@ pub struct Board {
     pub integrated: Option<Integration>,
     /// Every integration that passed, oldest first.
     pub integrations: Vec<Integration>,
-    /// The newest line a session of each node wrote (its ms), any line the fold took or not, an
-    /// engineer's not (`by_engineer`): the nodes taking part (`Board::live_nodes`).
+    /// When this node last held a new line a session of each node wrote, on its own clock (`Local`),
+    /// any line the fold took or not, an engineer's not (`by_engineer`): the nodes taking part
+    /// (`Board::live_nodes`). Local: a peer's stamp ahead of this clock keeps it live no longer.
     pub nodes: BTreeMap<String, i64>,
     /// The drones each node's runner runs, from its newest line naming them (`roster_note`; mod.rs
     /// `announce` at the run's start, then one at each drone's end): node -> (ms, drone names).
@@ -340,6 +414,16 @@ pub struct Board {
     /// and its newest claim or session end: (node, drone) -> (start ms, settled ms). A start newer than
     /// what settled it is a session that has not claimed yet (`left_to_owner`).
     pub sessions: BTreeMap<(String, String), (i64, i64)>,
+}
+
+/// Two boards are one when they say the same of the lines: this node's clock (`Board::nodes`, each
+/// task's `Local`) is no part of it, so two nodes holding the same lines fold equal boards (S1).
+impl PartialEq for Board {
+    fn eq(&self, o: &Board) -> bool {
+        let Board { tasks, lost, spans, drones, integrated, integrations, nodes: _, rosters, sessions } = self;
+        (tasks, lost, spans, drones, integrated, integrations, rosters, sessions)
+            == (&o.tasks, &o.lost, &o.spans, &o.drones, &o.integrated, &o.integrations, &o.rosters, &o.sessions)
+    }
 }
 
 /// The note of a runner's line saying `drone`'s session starts or ended (`Board::sessions`):
@@ -415,8 +499,8 @@ impl Board {
         self.tasks.values().any(|s| s.live(now).is_some())
     }
 
-    /// The nodes taking part at `now`: `node` (this one) and each whose sessions wrote a line within
-    /// `LEASE_MS` (a claim, heartbeat, done or a verify task's open; a working drone renews its lease
+    /// The nodes taking part at `now`: `node` (this one) and each whose sessions wrote a line this node
+    /// held within `LEASE_MS`, on its own clock (`Board::nodes`; a claim, heartbeat, done or a verify task's open; a working drone renews its lease
     /// well within it). An engineer's lines (opens, releases, verdicts from the terminal) do not count:
     /// a node that only opened the goal may run no drone, and a share of its own would wait last on
     /// every other node, which then race for it. A runner's start writes a line of its own (mod.rs
@@ -466,12 +550,140 @@ pub fn redacted(e: &Event) -> Event {
 /// # Errors
 /// When the directory or the file cannot be written.
 pub fn append(path: &Path, events: &[Event]) -> std::io::Result<()> {
+    super::append_bytes(path, lines(events)?.as_bytes())
+}
+
+/// `append` by a caller that holds the file's lock (hive/mod.rs `write_if`).
+pub(crate) fn append_held(path: &Path, events: &[Event]) -> std::io::Result<()> {
+    super::append_held(path, lines(events)?.as_bytes())
+}
+
+/// `events` as the board's lines, each [`redacted`].
+fn lines(events: &[Event]) -> std::io::Result<String> {
     let mut body = String::new();
     for e in events {
         body.push_str(&serde_json::to_string(&redacted(e)).map_err(std::io::Error::other)?);
         body.push('\n');
     }
-    super::append_bytes(path, body.as_bytes())
+    Ok(body)
+}
+
+/// How far past its own clock a node stamps a line to stay above the lines it holds (`stamp`): a peer's
+/// clock ahead by less is absorbed, one further ahead (a broken clock) does not drag this node's stamps
+/// along. No rule reads it for safety: at 0 a node's stamps are its clock's, monotone but blind to a
+/// peer's ahead (the order across nodes is the writers' clocks', as before hybrid clocks); unbounded it
+/// is Kulkarni et al.'s clock, which follows the fastest clock it heard of. Either way a jump it lets a
+/// holder's stamps make renews its lease all the same: the fold's renewal reads no gap between one
+/// holder's stamps (`TaskState::claimable_at`).
+pub const AHEAD_MS: i64 = LEASE_MS;
+
+/// The stamp of a line `node` writes at `wall` (its clock, or an earlier reading of it) onto a board
+/// holding `events`: a hybrid logical clock (Kulkarni et al. 2014), taken under the board file's lock
+/// (hive/mod.rs `write`), in ms with the logical step folded in as +1. It is above every line of
+/// `node`'s, so a node's stamps are strictly monotone in its file whatever its clock does, and above
+/// every other line it holds (up to `AHEAD_MS` past `wall`), so a line written after another was folded
+/// here sorts after it on every node. One `ms` field, no counter: the fold's order key, (ms, order,
+/// rank, line hash), reads it as it read the wall clock, and a log from before folds the same. Lines of
+/// one write share their stamp when they share their ms (a done and its verify task's open).
+pub fn stamp(events: &[Event], node: &str, wall: i64) -> i64 {
+    let (mut own, mut other) = (i64::MIN, i64::MIN);
+    for e in events {
+        let last = if e.node == node { &mut own } else { &mut other };
+        *last = (*last).max(e.ms);
+    }
+    own.saturating_add(1).max(wall.max(other.saturating_add(1)).min(wall.saturating_add(AHEAD_MS)))
+}
+
+/// The least stamp a claim of `s` at `now` (this node's clock) is written at (hive/mod.rs `claim`): past
+/// the fold's lease rule (`claimable_at`) when this node saw the holder's lease expire (`claimable`),
+/// so the fold, which compares the claim's stamp with the holder's, agrees with the expiry this node
+/// timed on its own clock (at most `AHEAD_MS` past it; a holder's clock further ahead keeps its lease
+/// until this one catches up). Otherwise `now`.
+pub fn claim_at(s: &TaskState, now: i64) -> i64 {
+    match s.status {
+        Status::Claimed { renewed, .. } if s.claimable(now) => now.max(renewed.saturating_add(LEASE_MS + 1).min(now.saturating_add(AHEAD_MS))),
+        _ => now,
+    }
+}
+
+/// The board's receive index, local and never synced: `<board>.held`, lines of `Held`, each saying the
+/// file's first `len` bytes were on this node by `ms` (its clock). `note_held` writes one after every
+/// append (this node's under the board lock, hive/mod.rs `write`; a peer's lines once the mesh merged
+/// them, borg-mesh lines.rs `merge`); `read` gives each line the earliest `ms` whose `len` covers it
+/// (`Event::seen`): when this node first held it, at most the record's lag late, never early. Every
+/// record is written under the board file's lock, and a quarantine's rewrite starts the index afresh
+/// (`reset_held`), so no record of a file before speaks of the file now.
+pub fn held_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("held")
+}
+
+/// One record of the receive index (`held_path`): the board file (`ino`, its inode: a quarantine
+/// rewrites the board by a rename, and offsets of the file before mean nothing in the new one), its
+/// length then and the time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct Held {
+    ino: u64,
+    len: u64,
+    ms: i64,
+}
+
+#[cfg(unix)]
+fn ino(m: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(m)
+}
+
+#[cfg(not(unix))]
+fn ino(_: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// Records that every line now in the board at `path` is on this node (`held_path`): its length, read
+/// before the clock, so the record never says a line was here before it was. Best effort: a record
+/// lost leaves the lines to the next one, later, so they read as seen later (younger), never earlier.
+pub fn note_held(path: &Path) {
+    note_held_at(path, crate::learn::now_ms);
+}
+
+/// `note_held` at the time `clock` gives, read after the length; a test's own clock.
+pub(crate) fn note_held_at(path: &Path, clock: impl FnOnce() -> i64) {
+    let Ok(m) = std::fs::metadata(path) else { return };
+    let h = Held { ino: ino(&m), len: m.len(), ms: clock() };
+    if let Ok(line) = serde_json::to_string(&h) {
+        let _ = super::append_bytes(&held_path(path), format!("{line}\n").as_bytes());
+    }
+}
+
+/// Starts the receive index of the board at `path` afresh, with one record of the file as it is now
+/// (`note_held`), by a rename: a quarantine (borg-mesh origin.rs) rewrote the board under its lock,
+/// and a record of the file before would date this one's lines early once a later rewrite's file got
+/// that file's inode again (a filesystem reuses a freed one). Its lines read as held from now, later
+/// than they arrived, never earlier. Under the board file's lock, as every record is written, so no
+/// record of the file before lands after it.
+pub fn reset_held(path: &Path) {
+    let held = held_path(path);
+    let Ok(m) = std::fs::metadata(path) else {
+        let _ = std::fs::remove_file(&held);
+        return;
+    };
+    let h = Held { ino: ino(&m), len: m.len(), ms: crate::learn::now_ms() };
+    let tmp = held.with_extension("held-tmp");
+    let fresh = serde_json::to_string(&h).ok().is_some_and(|line| std::fs::write(&tmp, format!("{line}\n")).is_ok());
+    if !fresh || std::fs::rename(&tmp, &held).is_err() {
+        // No fresh index: none at all, so every line reads as held at the read (`read_from`).
+        let _ = std::fs::remove_file(&held);
+    }
+}
+
+/// For the board file `ino`: (len, earliest ms of any record covering len) by len, from its receive
+/// index.
+fn held_index(path: &Path, ino: u64) -> Vec<(u64, i64)> {
+    let text = std::fs::read_to_string(held_path(path)).unwrap_or_default();
+    let mut out: Vec<(u64, i64)> = text.lines().filter_map(|l| serde_json::from_str::<Held>(l).ok()).filter(|h| h.ino == ino).map(|h| (h.len, h.ms)).collect();
+    out.sort_unstable();
+    for i in (0..out.len().saturating_sub(1)).rev() {
+        out[i].1 = out[i].1.min(out[i + 1].1);
+    }
+    out
 }
 
 /// An event of a line, None for anything unparsable, incomplete (no newline yet) or of a newer
@@ -486,16 +698,24 @@ pub fn read(path: &Path) -> Vec<Event> {
 }
 
 /// The events after byte `offset` (each with the offset its line ends at) and the offset to read from
-/// next: only complete lines count. An offset past the end (the file was replaced) reads from 0.
+/// next: only complete lines count. An offset past the end (the file was replaced) reads from 0. A line
+/// no record of the receive index covers (a board from before it, a record lost) reads as held now, the
+/// youngest it can be, never at its writer's stamp, another node's clock: a missing record only
+/// lengthens the ages read from it (a lease, a node's liveness), never cuts one.
 pub fn read_from(path: &Path, offset: u64) -> (Vec<(u64, Event)>, u64) {
     let Ok(mut f) = std::fs::File::open(path) else { return (Vec::new(), 0) };
-    let len = f.metadata().map_or(0, |m| m.len());
+    let meta = f.metadata().ok();
+    let len = meta.as_ref().map_or(0, |m| m.len());
+    let held = meta.as_ref().map(|m| held_index(path, ino(m))).unwrap_or_default();
+    let seen_at = |end: u64| held.get(held.partition_point(|(len, _)| *len < end)).map(|(_, ms)| *ms);
     let start = if offset > len { 0 } else { offset };
     if f.seek(std::io::SeekFrom::Start(start)).is_err() {
         return (Vec::new(), offset);
     }
     let mut raw = Vec::new();
     let _ = f.read_to_end(&mut raw);
+    // Read after the index and the lines: every line past the index was here by then.
+    let now = crate::learn::now_ms();
     let mut out = Vec::new();
     let mut pos = start;
     let mut rest = raw.as_slice();
@@ -503,7 +723,7 @@ pub fn read_from(path: &Path, offset: u64) -> (Vec<(u64, Event)>, u64) {
         let (line, tail) = rest.split_at(i + 1);
         pos += line.len() as u64;
         if let Some(e) = std::str::from_utf8(&line[..i]).ok().and_then(parse) {
-            out.push((pos, e));
+            out.push((pos, Event { seen: Seen(Some(seen_at(pos).unwrap_or(now))), ..e }));
         }
         rest = tail;
     }
@@ -531,6 +751,11 @@ pub fn by_engineer(by: &str) -> bool {
 }
 
 /// The board the events say, the same in any arrival order (see the module doc).
+///
+/// Every rule reads the lines in one order, the sort below, the pre-pass too: the board is a function of
+/// the set of lines alone (S1), never of the order they arrived in. Two lines of one key's prefix (two
+/// roster lines of a node in one ms, from before stamps were a hybrid logical clock, `stamp`) are
+/// ordered by their hash. `Local` and `Board::nodes` are this node's own clock, from `Event::seen`.
 pub fn fold(events: &[Event]) -> Board {
     // Within one ms an open goes first (a task opened and claimed at once is claimed open), except the
     // open of a verify or fix task, which goes after the line written with it: it takes effect only on
@@ -543,13 +768,17 @@ pub fn fold(events: &[Event]) -> Board {
     };
     let mut keyed: Vec<(Key, &Event)> = events.iter().map(|e| ((e.ms, order(e), rank(e), line_hash(e)), e)).collect();
     keyed.sort_by_key(|a| a.0);
-    let mut b = Board { drones: events.iter().filter(|e| !e.drone.is_empty()).map(|e| (e.by.clone(), e.drone.clone())).collect(), ..Board::default() };
-    for e in events.iter().filter(|e| !e.node.is_empty() && !by_engineer(&e.by)) {
-        let ms = b.nodes.entry(e.node.clone()).or_insert(e.ms);
-        *ms = (*ms).max(e.ms);
-        if let Some(names) = (e.ev == Ev::Heartbeat && e.task.is_empty() && e.by == "runner").then(|| e.note.strip_prefix("drones")).flatten()
-            && b.rosters.get(&e.node).is_none_or(|(at, _)| *at <= e.ms)
-        {
+    let mut b = Board::default();
+    for e in keyed.iter().map(|(_, e)| *e) {
+        if !e.drone.is_empty() {
+            b.drones.insert(e.by.clone(), e.drone.clone());
+        }
+        if e.node.is_empty() || by_engineer(&e.by) {
+            continue;
+        }
+        let held = b.nodes.entry(e.node.clone()).or_insert(i64::MIN);
+        *held = (*held).max(seen(e));
+        if let Some(names) = (e.ev == Ev::Heartbeat && e.task.is_empty() && e.by == "runner").then(|| e.note.strip_prefix("drones")).flatten() {
             b.rosters.insert(e.node.clone(), (e.ms, names.split_whitespace().map(String::from).collect()));
         }
         let mark = match (e.ev, e.by.as_str(), e.note.split_once(' ')) {
@@ -572,10 +801,20 @@ pub fn fold(events: &[Event]) -> Board {
     b
 }
 
-fn close(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, task: &str, to: i64, end: Option<Ev>) {
+/// When this node first held `e`, on its own clock: its receive time, or its stamp for a line built in
+/// memory (`Seen`).
+fn seen(e: &Event) -> i64 {
+    e.seen.0.unwrap_or(e.ms)
+}
+
+/// Ends `task`'s open span at stamp `to`, held here at `at` (`Local::ended`).
+fn close(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, task: &str, (to, at): (i64, i64), end: Option<Ev>) {
     if let Some(i) = open_span.remove(task) {
         b.spans[i].to_ms = Some(to);
         b.spans[i].end = end;
+        if let Some(s) = b.tasks.get_mut(task) {
+            s.local.ended = s.local.ended.max(at);
+        }
     }
 }
 
@@ -651,6 +890,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                         author: None,
                         accepted: None,
                         node: e.node.clone(),
+                        local: Local { opened: seen(e), ..Local::default() },
                     };
                     b.tasks.insert(e.task.clone(), s);
                 }
@@ -664,34 +904,39 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 b.lost.push((e.by.clone(), e.task.clone(), e.ms));
                 return;
             };
-            if holder(s) == Some(e.by.as_str()) && s.live(e.ms).is_some() {
-                // Claimed by itself already: a heartbeat.
+            if holder(s) == Some(e.by.as_str()) {
+                // Claimed by itself already, no rival's claim taken since: a heartbeat (`claimable_at`).
                 if let Some(s) = b.tasks.get_mut(&e.task)
                     && let Status::Claimed { renewed, .. } = &mut s.status
                 {
                     *renewed = e.ms;
+                    s.local.renewed = s.local.renewed.max(seen(e));
                 }
                 return;
             }
-            if !s.claimable(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(s, &e.by, &e.drone, &e.node) {
+            if !s.claimable_at(e.ms) || !deps_met(&b.tasks, &s.task) || b.barred(s, &e.by, &e.drone, &e.node) {
                 b.lost.push((e.by.clone(), e.task.clone(), e.ms));
                 return;
             }
             // The previous holder's lease expired: its tenure ends at its last sign of life.
             if let Status::Claimed { renewed, .. } = s.status {
-                close(b, open_span, &e.task, renewed, None);
+                let at = s.local.renewed;
+                close(b, open_span, &e.task, (renewed, at), None);
             }
             if let Some(s) = b.tasks.get_mut(&e.task) {
                 s.status = Status::Claimed { by: e.by.clone(), node: e.node.clone(), since: e.ms, renewed: e.ms };
+                s.local.renewed = seen(e);
             }
             open_span.insert(e.task.clone(), b.spans.len());
             b.spans.push(Span { task: e.task.clone(), by: e.by.clone(), node: e.node.clone(), from_ms: e.ms, to_ms: None, end: None });
         }
         Ev::Heartbeat | Ev::Progress => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            let live = s.live(e.ms).is_some_and(|(by, _, _)| by == e.by);
+            // The holder's, with no rival's claim taken since: it renews, whatever the gap (`claimable_at`).
+            let live = holder(s) == Some(e.by.as_str());
             if let (true, Status::Claimed { renewed, .. }) = (live, &mut s.status) {
                 *renewed = e.ms;
+                s.local.renewed = s.local.renewed.max(seen(e));
                 if e.ev == Ev::Progress {
                     s.last_progress = e.note.clone();
                 }
@@ -703,11 +948,12 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 return;
             }
             s.status = Status::Done { by: e.by.clone(), ms: e.ms };
+            s.local.status = seen(e);
             s.author = Some(e.by.clone());
             if !e.note.is_empty() {
                 s.last_progress = e.note.clone();
             }
-            close(b, open_span, &e.task, e.ms, Some(Ev::Done));
+            close(b, open_span, &e.task, (e.ms, seen(e)), Some(Ev::Done));
         }
         Ev::Verified | Ev::Rejected => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
@@ -715,11 +961,12 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
                 return;
             }
             s.status = Status::Verified { by: e.by.clone(), ms: e.ms };
+            s.local.status = seen(e);
             if e.ev == Ev::Rejected {
                 s.last_progress = format!("rejected: {}", e.note);
             }
             let (role, of) = (s.task.role, s.task.of.clone());
-            close(b, open_span, &e.task, e.ms, Some(e.ev));
+            close(b, open_span, &e.task, (e.ms, seen(e)), Some(e.ev));
             // An integration's verdict is on the combined tree, no one task's: a rejected one touches
             // no other task (its fix task's open is written with it).
             if role == Role::Integrate {
@@ -736,6 +983,7 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
             }
             if e.ev == Ev::Verified {
                 w.status = Status::Verified { by: e.by.clone(), ms: e.ms };
+                w.local.status = seen(e);
                 w.accepted = Some(e.task.clone());
             } else {
                 w.status = Status::Open;
@@ -752,14 +1000,14 @@ fn apply(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, e: &Event) {
             let engineer = by_engineer(&e.by) && matches!(s.status, Status::Claimed { .. } | Status::Blocked { .. });
             if mine || engineer {
                 s.status = Status::Open;
-                close(b, open_span, &e.task, e.ms, Some(Ev::Released));
+                close(b, open_span, &e.task, (e.ms, seen(e)), Some(Ev::Released));
             }
         }
         Ev::Blocked => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
             if holder(s) == Some(e.by.as_str()) {
                 s.status = Status::Blocked { by: e.by.clone(), note: e.note.clone() };
-                close(b, open_span, &e.task, e.ms, Some(Ev::Blocked));
+                close(b, open_span, &e.task, (e.ms, seen(e)), Some(Ev::Blocked));
             }
         }
     }
@@ -926,24 +1174,21 @@ fn left_to_owner(b: &Board, live: &BTreeSet<&str>, s: &TaskState, node: &str, no
     ahead < idle.len()
 }
 
-/// When `s` last became claimable, as far as the board says: its open, the end of its last tenure (an
-/// expired lease at its expiry), its work's done (a verify task), its deps' verification, its last
-/// verdict (a rework). A blocked task the engineer reopened reads as of its block: earlier, a shorter
-/// grace.
+/// When `s` last became claimable, as far as the board says, on this node's clock (`Local`: when it held
+/// the line that made it so): its open, the end of its last tenure (an expired lease at its expiry),
+/// its work's done (a verify task), its deps' verification, its last verdict (a rework). A blocked task
+/// the engineer reopened reads as of its block: earlier, a shorter grace. Every age of it (the owner's
+/// grace, run.rs `run_session`'s notice) is then this clock's alone.
 pub fn claimable_since(b: &Board, s: &TaskState) -> i64 {
     let id = s.task.id.as_str();
-    let at = |t: &str| match b.tasks.get(t).map(|t| &t.status) {
-        Some(Status::Done { ms, .. } | Status::Verified { ms, .. }) => *ms,
-        _ => i64::MIN,
-    };
+    let at = |t: &str| b.tasks.get(t).filter(|t| matches!(t.status, Status::Done { .. } | Status::Verified { .. })).map_or(i64::MIN, |t| t.local.status);
     let expired = match &s.status {
-        Status::Claimed { renewed, .. } => renewed + LEASE_MS,
+        Status::Claimed { .. } => s.local.renewed + LEASE_MS,
         _ => i64::MIN,
     };
-    let ended = b.spans.iter().filter(|sp| sp.task == id).filter_map(|sp| sp.to_ms).max().unwrap_or(i64::MIN);
     let verdict = b.tasks.values().filter(|v| v.task.of.as_deref() == Some(id)).map(|v| at(&v.task.id)).max().unwrap_or(i64::MIN);
     let deps = s.task.deps.iter().chain(&s.task.of).map(|d| at(d)).max().unwrap_or(i64::MIN);
-    [s.opened_ms, expired, ended, verdict, deps].into_iter().max().unwrap_or(s.opened_ms)
+    [s.local.opened, expired, s.local.ended, verdict, deps].into_iter().max().unwrap_or(s.local.opened)
 }
 
 /// The node of `live` that owns `task`: the highest `affinity` (rendezvous hashing, as borg-mesh
@@ -984,8 +1229,8 @@ fn short(session: &str) -> String {
 /// Who holds or held a task, as a board line names it.
 fn who(s: &TaskState, now: i64) -> String {
     match &s.status {
-        Status::Claimed { by, renewed, .. } => {
-            format!("{} {}", short(by), if s.live(now).is_some() { format!("renewed {} ago", ago(now - renewed)) } else { "lease expired".into() })
+        Status::Claimed { by, .. } => {
+            format!("{} {}", short(by), if s.live(now).is_some() { format!("renewed {} ago", ago(now - s.local.renewed)) } else { "lease expired".into() })
         }
         Status::Done { by, .. } | Status::Verified { by, .. } | Status::Blocked { by, .. } => short(by),
         Status::Open => String::new(),
@@ -1009,7 +1254,7 @@ pub fn render(b: &Board, now: i64, width: usize) -> String {
             if !who.is_empty() {
                 line.push_str(&format!("  [{who}]"));
             }
-            line.push_str(&format!("  opened {} ago", ago(now - s.opened_ms)));
+            line.push_str(&format!("  opened {} ago", ago(now - s.local.opened)));
             if s.rework > 0 {
                 line.push_str(&format!("  rework {}", s.rework));
             }
@@ -1157,6 +1402,95 @@ mod tests {
         assert!(b.in_flight(2 * LEASE_MS - 1) && !b.in_flight(2 * LEASE_MS), "in flight while the lease lives");
         let b = fold(&[Event::open(task("t2"), "engineer:e", 0), ev(Ev::Claim, "t2", "sa", 0), ev(Ev::Done, "t2", "sa", 1)]);
         assert!(!b.in_flight(2), "a done task is not in flight");
+    }
+
+    /// `e` written on `node`, first held here at `seen` (this node's clock).
+    fn held_on(node: &str, seen: i64, e: Event) -> Event {
+        Event { node: node.into(), seen: Seen(Some(seen)), ..e }
+    }
+
+    #[test]
+    fn leases_liveness_and_grace_are_timed_on_the_observers_clock() {
+        // Node B's clock is 10 s or 5 min ahead of or behind this one's (A's): its claim and its renewal
+        // reach A at A's 1000 and 2000 whatever their stamps. The lease lives, B is live and the task is
+        // claimable since exactly as long, on A's clock, as with one clock.
+        for skew in [0, 10_000, -10_000, 300_000, -300_000] {
+            let lines = b_lines(skew);
+            let b = fold(&lines);
+            let s = &b.tasks["t1"];
+            assert!(s.live(2000 + LEASE_MS).is_some() && s.live(2001 + LEASE_MS).is_none(), "skew {skew}: the lease, from A's 2000");
+            assert!(!s.claimable(2000 + LEASE_MS) && s.claimable(2001 + LEASE_MS), "skew {skew}");
+            assert_eq!(claimable_since(&b, s), 2000 + LEASE_MS, "skew {skew}: claimable once the lease A timed ran out");
+            assert_eq!(claimable_since(&b, &b.tasks["t2"]), 0, "skew {skew}");
+            assert!(b.live_nodes("A", 2000 + LEASE_MS).contains("B") && !b.live_nodes("A", 2001 + LEASE_MS).contains("B"), "skew {skew}: B's liveness");
+            // A's claim once it saw the lease run out is stamped where the fold, comparing it with B's
+            // stamp, agrees: it takes the task over.
+            let now = 2001 + LEASE_MS;
+            let at = stamp(&lines, "A", claim_at(s, now));
+            assert!(at >= now && at <= now + skew.max(0) + 1, "skew {skew}: {at}");
+            let mut lines = lines;
+            lines.push(held_on("A", now, ev(Ev::Claim, "t1", "sa", at)));
+            assert_eq!(holder_of(&fold(&lines), "t1").as_deref(), Some("sa"), "skew {skew}: the takeover took effect");
+        }
+    }
+
+    /// Two tasks opened on A; B, its clock `skew` off A's, claims t1 and renews it, each line reaching A
+    /// a second after the one before, B's stamps its hybrid clock (`stamp`).
+    fn b_lines(skew: i64) -> Vec<Event> {
+        let mut lines = vec![held_on("A", 0, Event::open(task("t1"), "engineer:e", 0)), held_on("A", 0, Event::open(task("t2"), "engineer:e", 0))];
+        for (at, e) in [(1000, Ev::Claim), (2000, Ev::Heartbeat)] {
+            let ms = stamp(&lines, "B", at + skew);
+            lines.push(held_on("B", at, ev(e, "t1", "sb", ms)));
+        }
+        lines
+    }
+
+    #[test]
+    fn a_hybrid_stamp_is_above_every_line_held_and_monotone_per_node() {
+        let lines = [held_on("A", 0, ev(Ev::Heartbeat, "", "runner", 50)), held_on("B", 0, ev(Ev::Heartbeat, "", "runner", 900))];
+        assert_eq!(stamp(&lines, "A", 100), 901, "above B's line it holds: a line written after it sorts after it");
+        assert_eq!(stamp(&lines, "A", 2000), 2000, "the wall clock when it is ahead");
+        assert_eq!(stamp(&lines, "B", 10), 901, "above its own last line whatever its clock");
+        assert_eq!(stamp(&lines[..1], "A", 50), 51, "two lines of one node never share a stamp");
+        let broken = [held_on("B", 0, ev(Ev::Heartbeat, "", "runner", 10 * AHEAD_MS))];
+        assert_eq!(stamp(&broken, "A", 100), 100 + AHEAD_MS, "a peer's clock far ahead drags this one at most AHEAD_MS");
+        assert_eq!(stamp(&[], "A", 7), 7);
+    }
+
+    #[test]
+    fn read_gives_each_line_when_this_node_first_held_it() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-board-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tasks.jsonl");
+        append(&path, &[ev(Ev::Heartbeat, "", "runner", 5)]).unwrap();
+        let t0 = crate::learn::now_ms();
+        assert!(read(&path)[0].seen.0.is_some_and(|ms| ms >= t0), "no record: held as of the read, never at its stamp");
+        note_held(&path);
+        let first = read(&path)[0].seen.0.expect("held");
+        append(&path, &[ev(Ev::Heartbeat, "t1", "s", 6)]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        note_held(&path);
+        note_held(&path);
+        let got = read(&path);
+        assert_eq!(got[0].seen.0, Some(first), "a later record never moves a line's time");
+        assert!(got[1].seen.0.is_some_and(|ms| ms > first), "{got:?}");
+        assert_eq!(got[0], ev(Ev::Heartbeat, "", "runner", 5), "where it was seen is no part of the line");
+        // A rewrite (a quarantine's rename) is a new file: the records of the old one say nothing of it.
+        let tmp = dir.join("tasks.jsonl.tmp");
+        std::fs::copy(&path, &tmp).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        let t1 = crate::learn::now_ms();
+        assert!(read(&path).iter().all(|e| e.seen.0.is_some_and(|ms| ms >= t1)), "held as of the read");
+        // A record of a file before that the rewrite's file shares an inode with (a reused one, here the
+        // same file's) would date its lines early: the rewrite starts the index afresh.
+        let ino = ino(&std::fs::metadata(&path).unwrap());
+        super::super::append_bytes(&held_path(&path), format!("{{\"ino\":{ino},\"len\":999999,\"ms\":1}}\n").as_bytes()).unwrap();
+        assert!(read(&path).iter().all(|e| e.seen.0 == Some(1)), "the stale record dates every line at 1");
+        reset_held(&path);
+        let got = read(&path);
+        assert!(got.iter().all(|e| e.seen.0.is_some_and(|ms| ms >= t1)), "{got:?}");
+        assert_eq!(std::fs::read_to_string(held_path(&path)).unwrap().lines().count(), 1, "one record, of the file now");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

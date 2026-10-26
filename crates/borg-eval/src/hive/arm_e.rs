@@ -777,6 +777,7 @@ mod tests {
                 author: None,
                 accepted: None,
                 node: String::new(),
+                local: board::Local::default(),
             },
         );
         let span = |from, to| board::Span { task: "t1".into(), by: "x".into(), node: String::new(), from_ms: from, to_ms: to, end: None };

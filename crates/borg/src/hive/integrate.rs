@@ -305,25 +305,46 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
 }
 
 /// Claims the integration `found` due (`due`) with `lines` (its open, when new) as `session` of
-/// `drone`, and reads the board back: its events and fold when the claim won. Nothing is written when
-/// the board moved on since it was found due (another drone thread's integration landed while `absent`
-/// asked git): this claim would only lose.
+/// `drone`, and reads the board back: its events and fold when the claim won. Written only while
+/// `found` is still the integration due on the board as it stands under the file's lock (hive/mod.rs
+/// `write_if`), the claim decided there on this node's clock and stamped under the lock (mod.rs
+/// `land`, past a lease it takes over, `board::claim_at`): when the board moved on since (another
+/// drone thread's integration landed while `absent` asked git) nothing is written, this claim would
+/// only lose. Of a node's drones one claims an integration, with no timing assumption, while its
+/// holder's lease is live (phase f F2). Across nodes two runners can write the same open (the fold
+/// keeps the first) and a claim each, and one wins: with another node live the claim waits as a work
+/// claim does (hive/mod.rs `across`) and reads the board again, so a rival's earlier claim that a
+/// peer's round brings loses this one before the merge. That is no exclusion either (F5's).
 fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, found: (TaskId, bool), mut lines: Vec<Event>) -> Option<(Vec<Event>, Board)> {
     let path = super::tasks_path(home, goal);
-    if due(&board::fold(&board::read(&path)), now).as_ref() != Some(&found) {
-        return None;
-    }
-    // Two runners racing write the same open (the fold keeps the first) and a claim each: one wins.
-    let id = found.0;
-    lines.extend([Event::new(Ev::Claim, &id, session, now).with_drone(drone), Event::new(Ev::Heartbeat, &id, session, now)]);
-    super::write(home, goal, lines).ok()?;
-    std::thread::sleep(super::CLAIM_SETTLE);
+    let id = found.0.clone();
+    let mut stamp = now;
+    let wrote = super::write_if(home, goal, |events| {
+        let b = board::fold(events);
+        (due(&b, now).as_ref() == Some(&found)).then(|| {
+            stamp = now.max(learn::now_ms());
+            let at = b.tasks.get(&id).map_or(stamp, |s| board::claim_at(s, stamp));
+            lines.extend([Event::new(Ev::Claim, &id, session, at).with_drone(drone), Event::new(Ev::Heartbeat, &id, session, at)]);
+            lines
+        })
+    });
+    wrote.ok()??;
+    let written = learn::now_ms();
+    let won = |b: &Board| b.tasks.get(&id).and_then(|s| s.live(stamp)).is_some_and(|(by, _, _)| by == session);
     let events = board::read(&path);
     let b = board::fold(&events);
-    if b.tasks.get(&id).and_then(|s| s.live(now)).is_none_or(|(by, _, _)| by != session) {
+    if !won(&b) {
         return None;
     }
-    Some((events, b))
+    match super::across(home, goal, &id, session, stamp, written, &b) {
+        None => Some((events, b)),
+        Some((None, _)) => None,
+        Some((Some(_), _)) => {
+            let events = board::read(&path);
+            let b = board::fold(&events);
+            won(&b).then_some((events, b))
+        }
+    }
 }
 
 /// One claimed integration.
@@ -450,7 +471,7 @@ impl Integrator<'_> {
             Task { title: fix_title(what), role: Role::Work, files, accept: checks, from: Some(head.to_string()), ..board_task(&format!("{}.fix", self.id)) };
         let e = Event { head: head.to_string(), ..Event::new(Ev::Rejected, self.id, self.session, ms).with_note(note) };
         let why = match super::write(self.home, &self.g.id, vec![e, Event::open(fix, self.session, ms).with_note(note)]) {
-            Ok(()) => note.to_string(),
+            Ok(_) => note.to_string(),
             Err(e) => e.to_string(),
         };
         self.count(repo, note, false);
@@ -989,6 +1010,38 @@ mod tests {
         assert!(claim_due(&home, "g", "integrate-d1-1", "d1", now, found, vec![mine]).is_none());
         assert_eq!(board::read(&super::super::tasks_path(&home, "g")).len(), before, "nothing written");
         assert!(fold(&home).lost.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_integrate_claim_beside_another_node_waits_for_its_peers_round() {
+        // Phase f F2 (cross-node behaviour kept until F5). Node B is live; its runner's earlier claim of
+        // integrate.1 reaches this node only with the peer's round 300 ms after this claim's read-back:
+        // the claim waits for that round (`across`) and loses before any merge. Fails with the wait
+        // left out of `claim_due` (the read-back alone sees this claim won).
+        let (root, repo, home) = setup("across");
+        accepted(&home, work("t1", &["a.txt"], &[]), &wt(&repo, 1), "s1", write("a.txt", "a\n"));
+        let now = learn::now_ms();
+        let tasks = super::super::tasks_path(&home, "g");
+        let on_b = |e: Event| Event { node: "B".into(), ..e };
+        board::append(&tasks, &[on_b(Event::new(Ev::Heartbeat, "", "runner", now - 5))]).unwrap();
+        crate::presence::note_synced(&home, "kb", now - 1000).unwrap();
+        let found = due(&fold(&home), now).unwrap();
+        let open = |by: &str| Event::open(Task { title: "integrate".into(), ..board_task(&found.0) }, by, now - 1);
+        let rival = vec![on_b(open("integrate-d1-b")), on_b(Event::new(Ev::Claim, &found.0, "integrate-d1-b", now - 1))];
+        let peer = {
+            let (home, tasks) = (home.clone(), tasks.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                board::append(&tasks, &rival).unwrap();
+                crate::presence::note_synced(&home, "kb", learn::now_ms()).unwrap();
+            })
+        };
+        assert!(claim_due(&home, "g", "integrate-d1-a", "d1", now, found.clone(), vec![open("integrate-d1-a")]).is_none());
+        peer.join().unwrap();
+        let confirms: Vec<super::super::Confirm> = super::super::read_lines(&super::super::confirms_path(&home, "g"));
+        assert_eq!(confirms.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [(found.0.as_str(), "lost")]);
+        assert_eq!(fold(&home).tasks[&found.0].live(learn::now_ms()).map(|(by, _, _)| by.to_string()).as_deref(), Some("integrate-d1-b"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

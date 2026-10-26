@@ -105,9 +105,11 @@ pub const CONSCIENCE_RESERVE: Duration = Duration::from_secs(20);
 const MIN_ORACLE: Duration = Duration::from_secs(2);
 /// What the stop hook says of a check its time ran out on (the drone is told to run `borg hive done`).
 pub(crate) const HOOK_TIMED_OUT: &str = "did not finish within the stop hook's time";
-/// How long a claimant waits before reading the board back: a rival's line written at nearly the same
-/// moment has landed by then, so the answer is the fold's.
-pub(crate) const CLAIM_SETTLE: Duration = Duration::from_millis(150);
+/// How long a claim beside another live node with no peer reachable waits before reading the board
+/// back (`across`): a line of a peer that dials in at nearly the same moment has landed by then. A
+/// timer, so no exclusion: at 0 two nodes' claims can both read back won, as they can past it (phase f
+/// F5 makes cross-node claims final without one).
+const CROSS_SETTLE: Duration = Duration::from_millis(150);
 /// One sync round with a peer on a busy machine: the mesh daemon's look at the hive's logs (borg-mesh
 /// daemon.rs `hive_poll`, 25 ms) and one session (phase e E3: p95 44 ms quiet, a few hundred under
 /// load). The waits for a round below are capped by it.
@@ -194,8 +196,56 @@ pub fn is_local(home: &Path, node: &str) -> bool {
 
 /// Appends `events` to `goal`'s board in one write, each without a node stamped with this store's
 /// (`node`): every line a drone, runner or engineer of this node writes. `board::append` stays raw.
-/// The checks of a task this node opens are approved here (oracle.rs `Approvals`): it wrote them.
-pub(crate) fn write(home: &Path, goal: &str, mut events: Vec<Event>) -> std::io::Result<()> {
+/// The checks of a task this node opens are approved here (oracle.rs `Approvals`): it wrote them. Each
+/// line is stamped under the board file's lock (`land`): the lines as they landed.
+pub(crate) fn write(home: &Path, goal: &str, events: Vec<Event>) -> std::io::Result<Vec<Event>> {
+    let path = tasks_path(home, goal);
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    crate::live::locked(&path, || land(home, goal, &path, &board::read(&path), events))
+}
+
+/// Appends what `decide` makes of `goal`'s board as it stands, as `write` does, with the board read,
+/// `decide` run and its lines appended under the board file's lock (`append_bytes`): a check-and-append.
+/// Every line this node writes lands through that lock, so none lands between what `decide` read and
+/// its lines, however long either takes: a decision it makes of the board (a task is claimable for
+/// this session) still holds when its lines land, a compare-and-swap with no timing assumption. The
+/// lines of other nodes the mesh merges (borg-mesh lines.rs) take no such lock: across nodes this is
+/// no exclusion (`across`). `decide` only reads: it runs under the lock (one fold, no git, network or
+/// write of this board). The lines as they landed, stamped (`land`; `decide` None: nothing written).
+/// When the lock cannot be taken nothing is decided or written and the error is returned (live.rs
+/// `try_locked`): a check without the lock would be the race this removes.
+pub(crate) fn write_if(home: &Path, goal: &str, decide: impl FnOnce(&[Event]) -> Option<Vec<Event>>) -> std::io::Result<Option<Vec<Event>>> {
+    let path = tasks_path(home, goal);
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    crate::live::try_locked(&path, || {
+        let file = board::read(&path);
+        let Some(events) = decide(&file) else { return Ok(None) };
+        land(home, goal, &path, &file, events).map(Some)
+    })?
+}
+
+/// Under the board file's lock, holding `file` (its lines): `events` stamped (`stamped`, and each its
+/// ms as a hybrid logical clock, `board::stamp`, its ms the wall-clock reading it was made at) and
+/// appended, then the receive index told (`board::note_held`). Stamped here, under the lock, no line of
+/// this node lands below one already in its file, and every one is above each line it was decided on:
+/// a heartbeat that lands after a claim written meanwhile sorts after it, and renews nothing.
+fn land(home: &Path, goal: &str, path: &Path, file: &[Event], events: Vec<Event>) -> std::io::Result<Vec<Event>> {
+    let mut events = stamped(home, goal, events)?;
+    for e in &mut events {
+        e.ms = board::stamp(file, &e.node, e.ms);
+    }
+    board::append_held(path, &events)?;
+    board::note_held(path);
+    Ok(events)
+}
+
+/// `events` with this store's node on each without one (`node`), the checks of the tasks they open
+/// approved here (`write`).
+fn stamped(home: &Path, goal: &str, mut events: Vec<Event>) -> std::io::Result<Vec<Event>> {
     let here = node(home);
     for e in events.iter_mut().filter(|e| e.node.is_empty()) {
         e.node = here.clone();
@@ -204,7 +254,7 @@ pub(crate) fn write(home: &Path, goal: &str, mut events: Vec<Event>) -> std::io:
     if !opened.is_empty() {
         oracle::approve(home, goal, &opened, learn::now_ms())?;
     }
-    board::append(&tasks_path(home, goal), &events)
+    Ok(events)
 }
 
 /// Appends to goal.jsonl the projection of every goal made here (with a goal.json) that it lacks:
@@ -230,13 +280,19 @@ fn append_raw(path: &Path, line: &str) -> std::io::Result<()> {
 /// Appends `body` to `path` in one O_APPEND write, under the file's lock (live.rs `locked`): a
 /// quarantine (borg-mesh origin.rs) rewrites a synced log by a rename under the same lock, so a line
 /// written meanwhile is never lost. Every hive log is written through here, so no caller may hold the
-/// same file's lock (a second lock in one process waits for itself).
+/// same file's lock (a second lock in one process waits for itself): one that does appends with
+/// `append_held` (`write_if`).
 pub(crate) fn append_bytes(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    crate::live::locked(path, || std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(body))
+    crate::live::locked(path, || append_held(path, body))
+}
+
+/// `append_bytes` by a caller that holds `path`'s lock.
+pub(crate) fn append_held(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(body)
 }
 
 pub fn dir(home: &Path, goal: &str) -> PathBuf {
@@ -1344,8 +1400,9 @@ fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, no
     };
     let (done, check) = done_events(home, g, held, session, dir, since, within);
     let (vid, ms) = (check.id.clone(), done.ms);
-    write(home, &g.id, vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)])
+    let landed = write(home, &g.id, vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)])
         .map_err(|e| Unfinished::Io(e.to_string()))?;
+    let ms = landed[0].ms;
     let events = board::read(&path);
     let b = board::fold(&events);
     match b.tasks.get(id) {
@@ -1486,20 +1543,49 @@ pub(crate) fn announce(home: &Path, goal: &str, drones: &[String]) -> std::io::R
 /// (`next_for`). A heartbeat of no task: the fold takes it for nothing else, a node from before reads
 /// it the same.
 pub(crate) fn roster(home: &Path, goal: &str, drones: &[String]) -> std::io::Result<()> {
-    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(&board::roster_note(drones))])
+    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(&board::roster_note(drones))]).map(drop)
 }
 
 /// `drone`'s session on `goal` started (`start`) or ended at `ms` (board.rs `Board::sessions`; run.rs
 /// `run_session` writes them only for a session that has not claimed within its task's grace): another
 /// node leaves this node's task to a drone whose session started and has not claimed yet, and an ended
-/// session that claimed nothing holds nothing back. A heartbeat of no task, as `roster`'s.
-pub(crate) fn session(home: &Path, goal: &str, drone: &str, start: bool, ms: i64) -> std::io::Result<()> {
-    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", ms).with_note(&board::session_note(drone, start))])
+/// session that claimed nothing holds nothing back. A heartbeat of no task, as `roster`'s. A start,
+/// `ms` the session's `clock`, is written only while the session is still unsettled on the board as it
+/// stands under the lock (`settled_since`): its stamp is above every line there, so one written after
+/// the session's claim would read on every node as a session that never claims. Whether it wrote.
+pub(crate) fn session(home: &Path, goal: &str, drone: &str, start: bool, ms: i64) -> std::io::Result<bool> {
+    let line = Event::new(Ev::Heartbeat, "", "runner", ms).with_note(&board::session_note(drone, start));
+    if !start {
+        return write(home, goal, vec![line]).map(|_| true);
+    }
+    let here = node(home);
+    write_if(home, goal, |events| (!settled_since(&board::fold(events), &here, drone, ms)).then(|| vec![line])).map(|w| w.is_some())
+}
+
+/// Whether `drone` of `node` claimed or ended a session on `b` since `at` (a `clock` reading at its
+/// session's start): every line this node writes after the reading is stamped at or above it.
+pub(crate) fn settled_since(b: &Board, node: &str, drone: &str, at: i64) -> bool {
+    b.sessions.get(&(node.to_string(), drone.to_string())).is_some_and(|(_, settled)| *settled >= at)
+}
+
+/// This node's hybrid clock on `goal`'s board now (`board::stamp`): every line it writes from here on
+/// is stamped at or above it, every line it holds below it (barring its wall clock stepping back).
+pub(crate) fn clock(home: &Path, goal: &str) -> i64 {
+    board::stamp(&board::read(&tasks_path(home, goal)), &node(home), learn::now_ms())
 }
 
 /// The state of `id` on `b` while `session` holds it at `now`.
 fn holding(b: &Board, id: &str, session: &str, now: i64) -> Option<TaskState> {
     b.tasks.get(id).filter(|s| s.live(now).is_some_and(|(by, _, _)| by == session)).cloned()
+}
+
+/// Whether `session` on node `here` may claim `id` on board `b` at `now`, as `claim` decides under the
+/// board file's lock: the task is there and no rival holds it (claimable, or held by this session), and
+/// a task `picked` for the session (`next_open`) is not one another node's idle drones now take
+/// (`left_to_another`: that node's line, which made it the owner's, arrived since the pick).
+pub(super) fn claimable_for(b: &Board, id: &str, session: &str, picked: bool, here: &str, now: i64) -> bool {
+    let rival = |s: &TaskState| !s.claimable(now) && s.live(now).is_none_or(|(by, _, _)| by != session);
+    b.tasks.get(id).is_some_and(|s| !rival(s) && !(picked && board::left_to_another(b, s, here, now)))
 }
 
 /// The confirm window (phase e E4) of `session`'s claim of `id` at `now`, written at `written`: waits
@@ -1518,6 +1604,24 @@ fn confirm(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: 
         Confirm { v: 1, ms: now, task: id.into(), session: session.into(), peers: peers.len(), waited_ms: waited.as_millis() as u64, outcome: outcome.into() };
     let _ = append_line(&confirms_path(home, goal), &line);
     (again, waited)
+}
+
+/// What `session`'s claim of `id`, stamped `now`, written at `written` and read back won on `b`, waits
+/// for from other nodes before any work on it: None with no other node live on `b` (nothing to wait
+/// for), else the task while the claim still holds after the wait, and the wait. With peers reachable
+/// that is the confirm window (`confirm`, phase e E4); with none, `CROSS_SETTLE` and a read-back. Both
+/// `claim` and the integrate claim (integrate.rs `claim_due`) take it. Neither is an exclusion: across
+/// nodes a claim is final only with phase f F5.
+pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: i64, b: &Board) -> Option<(Option<TaskState>, Duration)> {
+    if b.live_nodes(&node(home), learn::now_ms()).len() <= 1 {
+        return None;
+    }
+    let peers = reachable(home, learn::now_ms());
+    if !peers.is_empty() {
+        return Some(confirm(home, goal, id, session, now, written, &peers));
+    }
+    std::thread::sleep(CROSS_SETTLE);
+    Some((holding(&board::fold(&board::read(&tasks_path(home, goal))), id, session, now), CROSS_SETTLE))
 }
 
 /// Why a claim took nothing. Only `Lost` is a race worth another try.
@@ -1541,10 +1645,19 @@ fn refuse(session: &str, task: &str) {
     hook::append(session, &format!("{REFUSED_MARKER}{task}"));
 }
 
-/// Claims `task` for `session` in `cwd` (a claim and a heartbeat in one write), waits for rivals' lines
-/// to land, and reads the board back: the task when the claim won. With drones live on other nodes it
-/// then waits for a sync round with each reachable peer that started after the claim (`heard_back`, at
-/// most `CONFIRM_CAP`, written to `confirms.jsonl`) and reads the board again: a rival's earlier claim
+/// Claims `task` for `session` in `cwd` (a claim and a heartbeat in one write, appended only while the
+/// task is claimable for it on the board as it stands under the file's lock, `write_if`) and reads the
+/// board back: the task when the claim won. Same-node exclusion, with no timing assumption: no session
+/// writes a claim of a task another session of its node holds while that holder's lease is live, so two
+/// never both hold it, whatever the time between a fold, the lock and the append (phase f F2; before, a
+/// sleep and a read-back: Fischer's timed mutex, sound only while a write lands within the sleep). Every
+/// line is stamped under that lock (`land`, phase f F3), so a holder's heartbeat that lands after a
+/// claim written meanwhile sorts after it and renews nothing retroactively; the holder's lease is timed
+/// on this node's clock from when it held the renewal (board.rs `Local`), and a claim that takes over an
+/// expired one is stamped past it (`board::claim_at`). With drones live on other nodes it then waits
+/// (`across`): for a sync round with each reachable peer that started after the claim (`heard_back`, at
+/// most `CONFIRM_CAP`, written to `confirms.jsonl`), or with none reachable for `CROSS_SETTLE`, and
+/// reads the board again: a rival's earlier claim
 /// from another node that was on the peer's disk when that round read its logs is there by then, and
 /// the claim is lost before any work on it. One stamped earlier that landed after that read (the
 /// clocks' skew plus the rival's stamp-to-write time longer than this claim's write-to-round time) is
@@ -1588,33 +1701,42 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
         (_, false) => (String::new(), String::new(), String::new()),
     };
     let left = within.saturating_sub(t0.elapsed());
-    // A rival's claim that landed since the task was picked (the snapshot and the deps take a while):
-    // this one would only lose, so it is not written, and the caller tries the next task. The claim is
-    // stamped after this fold, just before its append: the time a rival's line could land unseen
-    // between its stamp and its write stays the append's.
-    // A task `picked` for the session (`next_open`) that another node's idle drones now take is no pick
-    // either: that node's line, which made it the owner's (`left_to_owner`), arrived since (a runner
-    // that started a moment before its peer picked from a board without it).
-    let before = board::fold(&board::read(&path));
-    let now = now + t0.elapsed().as_millis() as i64;
-    let rival = |s: &TaskState| !s.claimable(now) && s.live(now).is_none_or(|(by, _, _)| by != session);
-    let theirs = |s: &TaskState| picked && board::left_to_another(&before, s, &node(home), now);
-    if before.tasks.get(&task.id).is_none_or(|s| rival(s) || theirs(s)) {
-        take_out();
-        let line = Confirm { v: 1, ms: now, task: task.id.clone(), session: session.into(), peers: 0, waited_ms: 0, outcome: REFUSED.into() };
-        let _ = append_line(&confirms_path(home, &g.id), &line);
-        return Err(Refused::Lost);
-    }
-    let mut c = Event::new(Ev::Claim, &task.id, session, now).with_drone(&drone).with_note(&note);
+    // Decided under the board file's lock (`write_if`), on the board as it stands then: a rival's claim
+    // that landed since the task was picked (the snapshot and the deps take a while) makes this one
+    // refused, not written, and the caller tries the next task. Of two sessions of this node only the
+    // first to take the lock writes its claim, whatever stalls either (`claimable_for`). The claim is
+    // decided on this node's clock after the fold (`now` moved on, never back) and stamped under the
+    // lock (`land`: a hybrid clock above every line in the file, past the lease it takes over,
+    // `board::claim_at`), so this node's claims are in stamp order in its file and none sorts below a
+    // line it was decided on, however long the pick took.
+    let (here, id) = (node(home), task.id.as_str());
+    let mut c = Event::new(Ev::Claim, id, session, now).with_drone(&drone).with_note(&note);
     c.base = base;
     c.deps_in = deps_in;
-    let id = task.id.as_str();
-    if let Err(e) = write(home, &g.id, vec![c, Event::new(Ev::Heartbeat, id, session, now)]) {
-        take_out();
-        return Err(Refused::Io(format!("could not write the board {}: {e}", path.display())));
-    }
+    let mut at = now;
+    let wrote = write_if(home, &g.id, |events| {
+        let b = board::fold(events);
+        at = (now + t0.elapsed().as_millis() as i64).max(learn::now_ms());
+        c.ms = b.tasks.get(id).map_or(at, |s| board::claim_at(s, at));
+        let beat = Event::new(Ev::Heartbeat, id, session, c.ms);
+        claimable_for(&b, id, session, picked, &here, at).then(|| vec![c, beat])
+    });
+    let now = at;
+    let stamp = match wrote {
+        Err(e) => {
+            take_out();
+            return Err(Refused::Io(format!("could not write the board {}: {e}", path.display())));
+        }
+        Ok(None) => {
+            take_out();
+            let line = Confirm { v: 1, ms: now, task: task.id.clone(), session: session.into(), peers: 0, waited_ms: 0, outcome: REFUSED.into() };
+            let _ = append_line(&confirms_path(home, &g.id), &line);
+            return Err(Refused::Lost);
+        }
+        Ok(Some(landed)) => landed[0].ms,
+    };
     let written = learn::now_ms();
-    std::thread::sleep(CLAIM_SETTLE);
+    // Read back: a line of another node merged since can have won (the winner rule); none of this one.
     let b = board::fold(&board::read(&path));
     let Some(mut s) = holding(&b, id, session, now) else {
         take_out();
@@ -1622,13 +1744,10 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
     };
     // The confirm window (phase e E4): with drones live on other nodes, a rival's earlier claim may not
     // have synced yet. A round with each reachable peer after the claim brings it, so a lost claim is
-    // known before any work starts. On one node, or with no peer reachable, no wait.
+    // known before any work starts. On one node no wait (`across`).
     let mut waited = Duration::ZERO;
-    let here = node(home);
-    let peers = if b.live_nodes(&here, learn::now_ms()).len() > 1 { reachable(home, learn::now_ms()) } else { Vec::new() };
-    if !peers.is_empty() {
-        let again;
-        (again, waited) = confirm(home, &g.id, id, session, now, written, &peers);
+    if let Some((again, w)) = across(home, &g.id, id, session, now, written, &b) {
+        waited = w;
         match again {
             Some(again) => s = again,
             None => {
@@ -1646,7 +1765,7 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
     }
     if !cwd.is_empty() {
         let start = if start.is_empty() { "-" } else { start.as_str() };
-        hook::append(session, &format!("{CLAIM_START_MARKER}{id}@{now} {start} {}", repo_top(Path::new(cwd)).display()));
+        hook::append(session, &format!("{CLAIM_START_MARKER}{id}@{stamp} {start} {}", repo_top(Path::new(cwd)).display()));
     }
     if let Some(mut hs) = bound(session) {
         hs.beat_ms = now;
@@ -2494,7 +2613,7 @@ fn held(here: &Here, named: Option<&str>) -> Result<(String, Goal, TaskState), S
 fn held_event(here: &Here, named: Option<&str>, ev: Ev, note: &str) -> i32 {
     match held(here, named) {
         Ok((session, g, s)) => match write(&here.home, &g.id, vec![Event::new(ev, &s.task.id, &session, here.now).with_note(note.trim())]) {
-            Ok(()) => {
+            Ok(_) => {
                 if ev == Ev::Released {
                     count(&here.home, stats::HIVE_RELEASED, &session, &g.id, &s.task.id, &queen::repo_name(&here.cwd));
                 }
@@ -2943,7 +3062,7 @@ mod tests {
         assert!(waited < CONFIRM_CAP, "{waited:?}");
         // No rival, through `claim`: won once the round completed, within the cap.
         let t2 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t2"].task.clone();
-        let round = peer_round(&home, CLAIM_SETTLE * 2, Vec::new());
+        let round = peer_round(&home, Duration::from_millis(300), Vec::new());
         assert!(claim(&home, &g, "sa", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
         round.join().unwrap();
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
@@ -2987,7 +3106,7 @@ mod tests {
         // No other node live: no wait, no confirm line, the peer reachable or not.
         let t0 = Instant::now();
         assert!(claim(&home, &g, "sa", &t1, false, "", now, verdict::SNAPSHOT_TIMEOUT).is_ok());
-        assert!(t0.elapsed() < CLAIM_SETTLE + CONFIRM_CAP / 2, "{:?}", t0.elapsed());
+        assert!(t0.elapsed() < CONFIRM_CAP / 2, "{:?}", t0.elapsed());
         assert!(read_lines::<Confirm>(&confirms_path(&home, "g")).is_empty());
         board::append(&tasks_path(&home, "g"), &[on_b(Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()))]).unwrap();
         let t0 = Instant::now();
@@ -3020,6 +3139,34 @@ mod tests {
     }
 
     #[test]
+    fn sessions_of_one_node_racing_a_claim_never_both_hold_it() {
+        // Phase f F2. Eight sessions of this node, released at once by a barrier, claim one open task
+        // through `claim`, per trial a new task: one wins, every other is refused unwritten, with no
+        // sleep in the claim. Fails with the check made outside the lock (`write_if`).
+        let (home, g, now) = two_node_store("same-node-race");
+        let tasks: Vec<Task> = (0..30).map(|i| new_task(&format!("r{i}"), Role::Work, "work", "", vec![], vec![], vec![]).unwrap()).collect();
+        board::append(&tasks_path(&home, "g"), &tasks.iter().map(|t| Event::open(t.clone(), "engineer:e", now - 5)).collect::<Vec<_>>()).unwrap();
+        for t in &tasks {
+            let barrier = std::sync::Barrier::new(8);
+            let won: Vec<bool> = std::thread::scope(|sc| {
+                let racers: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (home, g, t, barrier) = (&home, &g, t, &barrier);
+                        sc.spawn(move || {
+                            barrier.wait();
+                            claim(home, g, &format!("{}-s{i}", t.id), t, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok()
+                        })
+                    })
+                    .collect();
+                racers.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            let claims = board::read(&tasks_path(&home, "g")).into_iter().filter(|e| e.ev == Ev::Claim && e.task == t.id).count();
+            assert_eq!((won.iter().filter(|w| **w).count(), claims), (1, 1), "{}: {won:?}", t.id);
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn a_claim_of_a_task_a_rival_took_since_the_pick_is_not_written() {
         // The pick read t1 open; another drone's claim landed before this one was written: it would only
         // lose, so nothing is written and no lost claim shows on the board; the refusal is counted on
@@ -3039,13 +3186,34 @@ mod tests {
     }
 
     #[test]
+    fn a_line_is_stamped_under_the_lock_above_every_line_its_node_holds() {
+        // Phase f F3. A heartbeat stamped from a clock read before a rival's claim landed (a stall
+        // between the reading and the append) lands above that claim: it sorts after it on every node,
+        // and the holder's lease it would have renewed retroactively stays lapsed. A peer's line stamped
+        // ahead of this clock lifts this node's stamps above it, and the receive index times both lines
+        // on this node's clock.
+        let (home, _, now) = two_node_store("hlc");
+        let path = tasks_path(&home, "g");
+        board::append(&path, &[Event { node: "B".into(), ..Event::new(Ev::Heartbeat, "", "runner", now + 60_000) }]).unwrap();
+        board::note_held(&path);
+        let rival = write(&home, "g", vec![Event::new(Ev::Claim, "t1", "s-rival", now)]).unwrap();
+        assert_eq!(rival[0].ms, now + 60_001, "above the peer's line it holds");
+        let beat = write(&home, "g", vec![Event::new(Ev::Heartbeat, "t1", "s-old", now - 5)]).unwrap();
+        assert_eq!(beat[0].ms, now + 60_002, "above this node's own last line");
+        let got = board::read(&path);
+        assert!(got.iter().all(|e| e.seen.0.is_some_and(|ms| ms >= now && ms < now + 60_000)), "held on this node's clock: {got:?}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn a_runs_start_makes_its_node_live_and_waits_for_the_peers_round() {
         // Phase e E2b. With a peer reachable: the announcement, then the wait for its round.
         let (home, _, _) = two_node_store("announce");
-        let round = peer_round(&home, CLAIM_SETTLE, Vec::new());
+        let after = Duration::from_millis(150);
+        let round = peer_round(&home, after, Vec::new());
         let (peers, heard, waited) = announce(&home, "g", &["d1".to_string()]).unwrap();
         round.join().unwrap();
-        assert!(peers == 1 && heard && waited >= CLAIM_SETTLE && waited < START_CAP, "{peers} {heard} {waited:?}");
+        assert!(peers == 1 && heard && waited >= after && waited < START_CAP, "{peers} {heard} {waited:?}");
         // Another node reads this one live before any of its drones wrote a line; the fold takes the
         // line for nothing else.
         let b = board::fold(&board::read(&tasks_path(&home, "g")));

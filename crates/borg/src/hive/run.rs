@@ -348,20 +348,20 @@ fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) 
 /// has not claimed by then says on the board that it started (`session`, stamped with its start), so
 /// the peers keep leaving the task to it until it claims, and that it ended once it ends unsettled.
 /// A line only then: each line starts sync rounds, and a claim that lands during one waits for the
-/// next (mod.rs `heard_back`).
-fn run_session(home: &Path, goal: &str, drone: &str, cmd: Command, timeout: Duration, since: i64) -> Option<runner::Bounded> {
+/// next (mod.rs `heard_back`). `at` is the board's clock at the iteration's start (mod.rs `clock`).
+fn run_session(home: &Path, goal: &str, drone: &str, cmd: Command, timeout: Duration, since: i64, at: i64) -> Option<runner::Bounded> {
+    // Two clocks: the notice is timed on this node's (`since` is when this node saw the task become
+    // claimable, board.rs `claimable_since`), what settled the session is read in board stamps from its
+    // start on (`at`, `settled_since`), so a stamp ahead of the wall clock (a peer's clock ahead,
+    // absorbed) never reads an earlier session's claim as this one's.
     let started = learn::now_ms();
     let notice = Duration::from_millis(u64::try_from(since.saturating_add(IDLE_WAIT.as_millis() as i64) - started).unwrap_or(0));
-    let unsettled = || {
-        let b = fold(home, goal);
-        let node = super::node(home);
-        !b.sessions.get(&(node, drone.to_string())).is_some_and(|(_, settled)| *settled > started)
-    };
+    let unsettled = || !super::settled_since(&fold(home, goal), &super::node(home), drone, at);
     let (ended, ending) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         let said = scope.spawn(move || {
             let timed_out = matches!(ending.recv_timeout(notice), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
-            timed_out && unsettled() && super::session(home, goal, drone, true, started).is_ok()
+            timed_out && super::session(home, goal, drone, true, at).is_ok_and(|w| w)
         });
         let ran = runner::run_bounded(cmd, None, timeout);
         drop(ended);
@@ -472,18 +472,26 @@ fn release_held(home: &Path, goal: &str, b: &Board, sessions: &[String], note: &
     }
 }
 
-/// The sessions of `drone`'s iteration that started at `started`: those named (`known`, empty ones
+/// The sessions of `drone`'s iteration that started at board clock `at` (mod.rs `clock`, a stamp at or
+/// below every line this node writes after it and above every one before, never the wall clock, which
+/// a stamp runs ahead of once this node heard a peer's clock ahead): those named (`known`, empty ones
 /// skipped) and every one whose claim on this node (`home`) carries the drone since. A harness may
 /// ignore the session id the runner chose and report none (omp, opencode); its hooks still claim as the
 /// drone (`DRONE_ENV`). Another node's d1 is another drone: its sessions are never this runner's.
-fn sessions_of(home: &Path, events: &[board::Event], drone: &str, started: i64, known: &[&str]) -> Vec<String> {
+fn sessions_of(home: &Path, events: &[board::Event], drone: &str, at: i64, known: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = known.iter().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    for e in events.iter().filter(|e| e.ev == Ev::Claim && e.drone == drone && super::is_local(home, &e.node) && e.ms >= started) {
+    for e in events.iter().filter(|e| e.ev == Ev::Claim && e.drone == drone && super::is_local(home, &e.node) && e.ms >= at) {
         if !out.contains(&e.by) {
             out.push(e.by.clone());
         }
     }
     out
+}
+
+/// An iteration's board progress: every line of its `sessions` but a heartbeat (a claim, a done, a
+/// verdict) stamped from its start at board clock `at` on (`sessions_of`).
+fn progress<'a>(events: &'a [board::Event], sessions: &[String], at: i64) -> Vec<&'a board::Event> {
+    events.iter().filter(|e| e.ms >= at && sessions.contains(&e.by) && e.ev != Ev::Heartbeat).collect()
 }
 
 /// What an iteration that named no cost is charged: the drone's dearest iteration so far, else the
@@ -642,8 +650,9 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         let join =
             Join { v: 1, ms: now, goal: goal.into(), dir, drone: name.clone(), session: session.clone(), harness: ctx.h.name().into(), by: "run".into() };
         let _ = super::append_join(ctx.home, goal, &join);
-        let started = learn::now_ms();
-        let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, offer.task.as_ref().map_or(started, |(_, since)| *since));
+        // The wall clock for the notice, the board's for which lines are this iteration's (`sessions_of`).
+        let (started, at) = (learn::now_ms(), super::clock(ctx.home, goal));
+        let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, offer.task.as_ref().map_or(started, |(_, since)| *since), at);
         let out = ran.as_ref().map(|b| b.out.as_slice()).unwrap_or_default();
         let said = ctx.h.headless_end(out);
         log(ctx.home, goal, &name, iter, out);
@@ -653,7 +662,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             _ => "error",
         };
         let events = board::read(&super::tasks_path(ctx.home, goal));
-        let sessions = sessions_of(ctx.home, &events, &name, started, &[&session, &said.session]);
+        let sessions = sessions_of(ctx.home, &events, &name, at, &[&session, &said.session]);
         // One cut off at the cap, or one that failed, spent up to `iter_timeout` of model calls
         // without saying what.
         let est = (said.usd.is_none() && exit != "ok").then(|| estimate(t.dearest, ctx.share, t.spent));
@@ -679,8 +688,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             t.unmetered = true;
         }
         t.errors = if exit == "ok" { 0 } else { t.errors + 1 };
-        // Board progress: any line of this iteration's sessions (a claim, a done, a verdict).
-        let mine: Vec<&board::Event> = events.iter().filter(|e| e.ms >= started && sessions.contains(&e.by) && e.ev != Ev::Heartbeat).collect();
+        let mine = progress(&events, &sessions, at);
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         let b = board::fold(&events);
         let now = learn::now_ms();
@@ -987,16 +995,16 @@ mod tests {
             c
         };
         let cap = Duration::from_secs(10);
-        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, learn::now_ms());
+        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, learn::now_ms(), super::super::clock(&home, "g"));
         assert_eq!(notes(), [], "within the notice time");
         let t0 = learn::now_ms();
-        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, t0 - IDLE_WAIT.as_millis() as i64);
+        run_session(&home, "g", "d1", sh("sleep 0.2"), cap, t0 - IDLE_WAIT.as_millis() as i64, super::super::clock(&home, "g"));
         let n = notes();
         assert_eq!(n.iter().map(|(note, _)| note.as_str()).collect::<Vec<_>>(), ["session-start d1", "session-end d1"]);
         assert!(n[0].1 >= t0 && n[0].1 < t0 + 200 && n[1].1 >= n[0].1 + 200, "{n:?}");
         let claim = board::Event { node: super::super::node(&home), ..board::Event::new(Ev::Claim, "t1", "s1", 0).with_drone("d1") };
         let line = serde_json::to_string(&claim).unwrap().replace("\"ms\":0", &format!("\"ms\":{}", learn::now_ms() + 100));
-        run_session(&home, "g", "d1", sh(&format!("sleep 0.2 && printf '%s\\n' '{line}' >> '{}'", path.display())), cap, 0);
+        run_session(&home, "g", "d1", sh(&format!("sleep 0.2 && printf '%s\\n' '{line}' >> '{}'", path.display())), cap, 0, super::super::clock(&home, "g"));
         assert_eq!(notes().len(), 3, "a start, no end: {:?}", notes());
         let b = fold(&home, "g");
         let (started, settled) = b.sessions[&(super::super::node(&home), "d1".to_string())];
@@ -1232,6 +1240,55 @@ mod tests {
         let re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$").unwrap();
         assert!(re.is_match(&a), "{a}");
         assert_ne!(a, session_id("g", "d1", 2));
+    }
+
+    /// Phase f F3, after review: this node holds a peer's line stamped 5 min ahead of its clock, so its
+    /// own stamps run 5 min ahead too (board.rs `stamp`). d1's first iteration claims and finishes t1;
+    /// its second starts a second later. Read against the wall clock at the second's start, the first's
+    /// claim and done (5 min ahead) were the second's: its sessions, its progress (the stall count reset
+    /// by work done before, `done` given an old task, `release_held` acting for the first). Read from the
+    /// board's clock at its start (mod.rs `clock`), they are the first's, and the second's own claim is
+    /// its.
+    #[test]
+    fn an_iteration_reads_its_own_lines_beside_a_peer_clock_ahead() {
+        let home = std::env::temp_dir().join(format!("borg-hive-iter-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let path = super::super::tasks_path(&home, "g");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wall = learn::now_ms();
+        let t = |id: &str| board::Task {
+            id: id.into(),
+            role: board::Role::Work,
+            title: id.into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+            group: None,
+        };
+        let peer = board::Event { node: "peer".into(), ..board::Event::new(Ev::Heartbeat, "", "runner", wall + 300_000) };
+        board::append(&path, &[peer]).unwrap();
+        super::super::write(&home, "g", vec![board::Event::open(t("t1"), "engineer:e", wall), board::Event::open(t("t2"), "engineer:e", wall)]).unwrap();
+        let first = super::super::clock(&home, "g");
+        let w = |e: board::Event| super::super::write(&home, "g", vec![e]).unwrap();
+        w(board::Event::new(Ev::Claim, "t1", "s1", learn::now_ms()).with_drone("d1"));
+        w(board::Event::new(Ev::Done, "t1", "s1", learn::now_ms()));
+        let (started, at) = (learn::now_ms(), super::super::clock(&home, "g"));
+        let events = board::read(&path);
+        assert!(events.iter().any(|e| e.by == "s1" && e.ms >= started), "the first's lines are stamped past the second's wall-clock start");
+        assert_eq!(sessions_of(&home, &events, "d1", at, &[]), Vec::<String>::new(), "no session of the second's yet");
+        assert_eq!(sessions_of(&home, &events, "d1", first, &[]), ["s1"], "the first's");
+        assert!(progress(&events, &["s1".to_string()], at).is_empty(), "the first's done is no progress of the second's");
+        w(board::Event::new(Ev::Claim, "t2", "s2", learn::now_ms()).with_drone("d1"));
+        let events = board::read(&path);
+        let sessions = sessions_of(&home, &events, "d1", at, &[]);
+        assert_eq!(sessions, ["s2"]);
+        assert_eq!(progress(&events, &sessions, at).iter().map(|e| e.task.as_str()).collect::<Vec<_>>(), ["t2"]);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

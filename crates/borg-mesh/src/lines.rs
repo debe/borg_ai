@@ -118,12 +118,17 @@ pub fn digest(set: &BTreeMap<Hash, String>) -> Hash {
 }
 
 /// Appends the `incoming` lines `path` lacks (none over its `cap`), then settles lesson versions.
-/// Returns how many lines were new.
+/// A hive board's new lines are noted as on this node from now (borg hive/board.rs `note_held`, under
+/// the board's lock, as a quarantine's fresh index is): the receive time its leases and liveness are
+/// timed from, on this node's clock. Returns how many lines were new.
 pub fn merge(path: &Path, incoming: &[String]) -> Result<usize, String> {
     let mut known = read(path);
     let max = cap(path);
     let new: Vec<&String> = incoming.iter().filter(|l| l.len() <= max && complete(l) && known.insert(hash(l), (*l).clone()).is_none()).collect();
     append(path, &new)?;
+    if !new.is_empty() && path.file_name().is_some_and(|f| f == "tasks.jsonl") {
+        borg::live::locked(path, || borg::hive::board::note_held(path));
+    }
     settle(path)?;
     Ok(new.len())
 }
