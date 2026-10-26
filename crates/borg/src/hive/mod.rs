@@ -105,17 +105,21 @@ pub const CONSCIENCE_RESERVE: Duration = Duration::from_secs(20);
 const MIN_ORACLE: Duration = Duration::from_secs(2);
 /// What the stop hook says of a check its time ran out on (the drone is told to run `borg hive done`).
 pub(crate) const HOOK_TIMED_OUT: &str = "did not finish within the stop hook's time";
-/// How long a claim beside another live node with no peer reachable waits before reading the board
-/// back (`across`): a line of a peer that dials in at nearly the same moment has landed by then. A
-/// timer, so no exclusion: at 0 two nodes' claims can both read back won, as they can past it (phase f
-/// F5 makes cross-node claims final without one).
+/// How long a claim beside a participant that writes no watermark (a node from before phase f F5), with
+/// no peer reachable, waits before reading the board back (`across`): a line of a peer that dials in at
+/// nearly the same moment has landed by then. A timer, so no exclusion: at 0 two nodes' claims can both
+/// read back won, as they can past it (a participant that writes watermarks makes claims final with
+/// none; the monotone results make either safe).
 const CROSS_SETTLE: Duration = Duration::from_millis(150);
 /// One sync round with a peer on a busy machine: the mesh daemon's look at the hive's logs (borg-mesh
 /// daemon.rs `hive_poll`, 25 ms) and one session (phase e E3: p95 44 ms quiet, a few hundred under
 /// load). The waits for a round below are capped by it.
 const ROUND: Duration = Duration::from_millis(500);
-/// A claim's confirm window across nodes (`claim`): two rounds, as one may be running when the claim
-/// lands and the next carries it.
+/// A claim's confirm window on a participant that writes no watermark (`across`, a node from before
+/// phase f F5): two rounds, as one may be running when the claim lands and the next carries it. A
+/// liveness bound only, where no failure detector reads that peer: no claim beside a participant that
+/// writes watermarks reads it (it waits until final or the peer is suspected). Also a round's way in the
+/// grace and suspicion windows below.
 pub(crate) const CONFIRM_CAP: Duration = ROUND.saturating_mul(2);
 /// How long another node's task is left to its owner's idle drones that started no session (board.rs
 /// `left_to_owner`) after it became claimable: the owner's idle runner looks at the board within
@@ -125,6 +129,26 @@ pub(crate) const CONFIRM_CAP: Duration = ROUND.saturating_mul(2);
 /// session has not claimed; without a start by then, the owner is not taking it: an idle drone of this
 /// node may.
 pub(crate) const OWNER_GRACE_MS: i64 = (run::IDLE_WAIT.as_millis() + CONFIRM_CAP.as_millis() + ROUND.as_millis()) as i64;
+/// How often a running runner says on the board that its node still takes part in the goal (a goal
+/// heartbeat, `beat`; phase f F4): as often as an idle drone of it looks at the board (`run::IDLE_WAIT`).
+/// A node's liveness is then known in seconds, apart from the work lease (`LEASE_MS`), which only a
+/// session's own hooks renew (Kafka KIP-62: the member's liveness apart from its work's timeout).
+pub(crate) const BEAT_MS: i64 = run::IDLE_WAIT.as_millis() as i64;
+/// A goal participant from which this node held no new line for longer, on its own clock, is suspected
+/// (board.rs `Board::participants`, `Local::gone`): three beats missed, and the last one's way here
+/// (`CONFIRM_CAP`). Safety reads no timer: at 0 every peer is suspected at once and its runner drones'
+/// leases may be taken over (a duplicate attempt, both dones kept since phase f F5), and every claim
+/// proceeds unconfirmed, unbounded no node is ever suspected and only the lease frees a task, as before F4.
+/// The window bounds a beat's way on a healthy mesh only, not the transport's stalls: a dial may take
+/// up to 30 s and a peer that failed two dials in a row is dialled again only 2 min later (borg-mesh
+/// daemon.rs `timeout`, `backoff_wait`), and on the observer's side a mesh daemon down or backing off,
+/// or a machine just resumed, holds nothing new of any peer. Each such stall past the window is a false
+/// suspicion: the peer's live claims taken over (a duplicate attempt, its done kept since F5) and, with
+/// every peer suspected, a claim that proceeds before it is final (`across`). Safe, as above; the cost is work done twice (scenario.rs
+/// `a_cut_on_the_observers_side_costs_at_most_a_duplicate_attempt`). Telling "the peer is silent" from
+/// "this node receives nothing" (suspecting only while this node's rounds with the mesh complete, as
+/// SWIM's indirect probes do) needs the transport's round records in the fold: left for later.
+pub(crate) const SUSPECT_MS: i64 = 3 * BEAT_MS + CONFIRM_CAP.as_millis() as i64;
 /// A run's wait for its announcement to reach the peers (`announce`): its first round may carry more
 /// than a claim (the goal's bundles), and it is spent once per run.
 const START_CAP: Duration = ROUND.saturating_mul(6);
@@ -228,16 +252,13 @@ pub(crate) fn write_if(home: &Path, goal: &str, decide: impl FnOnce(&[Event]) ->
     })?
 }
 
-/// Under the board file's lock, holding `file` (its lines): `events` stamped (`stamped`, and each its
-/// ms as a hybrid logical clock, `board::stamp`, its ms the wall-clock reading it was made at) and
-/// appended, then the receive index told (`board::note_held`). Stamped here, under the lock, no line of
+/// Under the board file's lock, holding `file` (its lines): `events` stamped (`stamped`, and one ms for
+/// the write as a hybrid logical clock, `board::landing`, each ms the wall-clock reading it was made at,
+/// with its `seq`, the watermark's count) and appended, then the receive index told (`board::note_held`). Stamped here, under the lock, no line of
 /// this node lands below one already in its file, and every one is above each line it was decided on:
 /// a heartbeat that lands after a claim written meanwhile sorts after it, and renews nothing.
 fn land(home: &Path, goal: &str, path: &Path, file: &[Event], events: Vec<Event>) -> std::io::Result<Vec<Event>> {
-    let mut events = stamped(home, goal, events)?;
-    for e in &mut events {
-        e.ms = board::stamp(file, &e.node, e.ms);
-    }
+    let events = board::landing(file, stamped(home, goal, events)?);
     board::append_held(path, &events)?;
     board::note_held(path);
     Ok(events)
@@ -731,7 +752,12 @@ fn heartbeat(home: &Path, hs: &mut HiveSession, b: &Board, session: &str, now: i
 /// Claims this session lost and was not told of yet: their lines, and the marker that tells them.
 fn lost_news(b: &Board, session: &str, state: &str) -> (Vec<String>, Vec<String>) {
     let told = hook::listed(state, LOST_MARKER);
-    let keys: Vec<(String, &str)> = b.lost.iter().filter(|(by, _, _)| by == session).map(|(_, t, ms)| (format!("{t}@{ms}"), t.as_str())).collect();
+    let keys: Vec<(String, &str)> = b
+        .lost
+        .iter()
+        .filter(|(by, t, ms)| by == session && !board::attempted(b, session, t, *ms))
+        .map(|(_, t, ms)| (format!("{t}@{ms}"), t.as_str()))
+        .collect();
     let fresh: Vec<&(String, &str)> = keys.iter().filter(|(k, _)| !told.contains(k.as_str())).collect();
     let lines = fresh
         .iter()
@@ -742,14 +768,19 @@ fn lost_news(b: &Board, session: &str, state: &str) -> (Vec<String>, Vec<String>
 
 /// The latest claim of `session` (`lines`, the board's), when the fold voided it (a race lost, across
 /// nodes perhaps only at a sync after the claim looked won, or a claim the board did not allow) or the
-/// session was told so (`LOST_MARKER`: a later line may hand the task back, `release_told_loss`), and
+/// session was told so (`LOST_MARKER`: a later line may hand the task back, `release_lost`), and
 /// the session holds nothing now: its edits are refused (`pre_tool`) and its worktree set aside
-/// (`set_aside_lost`). A session that claimed again since, or holds a task, has none.
+/// (`set_aside_lost`): the in-progress work of a claim that never became final. A session that claimed
+/// again since, or holds a task, has none, nor one whose done under that claim the fold keeps (phase f
+/// F5: an attempt for good, `board::attempted`).
 fn lost_claim<'a>(b: &Board, lines: impl IntoIterator<Item = &'a Event>, session: &str, state: &str, now: i64) -> Option<&'a Event> {
     if board::holding(b, session, now).is_some() {
         return None;
     }
     let last = lines.into_iter().filter(|e| e.ev == Ev::Claim && e.by == session).max_by_key(|e| e.ms)?;
+    if board::attempted(b, session, &last.task, last.ms) {
+        return None;
+    }
     let told = hook::listed(state, LOST_MARKER).contains(claim_key(last).as_str());
     (told || b.lost.iter().any(|(by, t, ms)| by == session && *t == last.task && *ms == last.ms)).then_some(last)
 }
@@ -843,35 +874,27 @@ fn set_aside(g: &Goal, b: &Board, task: &str, start: &str, session: &str, cwd: &
     })
 }
 
-/// Releases the task the fold gives `session` back after its loss was told (`LOST_MARKER`): a line
-/// that syncs later (the winner's release, written before this claim) can make a lost claim win. The
-/// drone was told to move on and its tree may be set aside, so it must not hold the task unawares,
-/// its heartbeats renewing it. Whether it released one.
-fn release_told_loss(home: &Path, g: &Goal, b: &Board, session: &str, repo: &str, state: &str, now: i64) -> bool {
-    let Some(s) = board::holding(b, session, now) else { return false };
-    let key = format!("{}@{}", s.task.id, s.live(now).map_or(0, |l| l.2));
-    if !hook::listed(state, LOST_MARKER).contains(key.as_str()) {
-        return false;
+/// Releases each of `lost` (`task@ms` claim keys) of `session` as it learns the loss (phase f F5, in
+/// place of a release once the fold flipped such a claim back to a win): a `released` stamped after the
+/// claim, which the fold ignores while the claim holds nothing and applies the moment a line that syncs
+/// later (the winner's release, written before this claim) makes it win. The drone was told to move on
+/// and its tree may be set aside, so it never holds such a task unawares, its heartbeats renewing it.
+fn release_lost(home: &Path, goal: &str, session: &str, lost: &[String]) {
+    let lines: Vec<Event> = lost
+        .iter()
+        .filter_map(|k| k.rsplit_once('@'))
+        .map(|(task, _)| Event::new(Ev::Released, task, session, learn::now_ms()).with_note("its claim was told lost"))
+        .collect();
+    if !lines.is_empty() {
+        let _ = write(home, goal, lines);
     }
-    let done = write(home, &g.id, vec![Event::new(Ev::Released, &s.task.id, session, now).with_note("its claim was told lost")]).is_ok();
-    if done {
-        count(home, stats::HIVE_RELEASED, session, &g.id, &s.task.id, repo);
-    }
-    done
 }
 
-/// The board of goal `g` for `session` at `now` (its lines with their offsets, the end offset, the
-/// fold), after `release_told_loss`.
-fn board_for(home: &Path, g: &Goal, session: &str, repo: &str, now: i64) -> (Vec<(u64, Event)>, u64, Board) {
-    let path = tasks_path(home, &g.id);
-    let read = || {
-        let (events, end) = board::read_from(&path, 0);
-        let b = board::fold(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
-        (events, end, b)
-    };
-    let (events, end, b) = read();
-    let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
-    if release_told_loss(home, g, &b, session, repo, &state, now) { read() } else { (events, end, b) }
+/// The board of goal `g` for `session` at `now`: its lines with their offsets, the end offset, the fold.
+fn board_for(home: &Path, g: &Goal) -> (Vec<(u64, Event)>, u64, Board) {
+    let (events, end) = board::read_from(&tasks_path(home, &g.id), 0);
+    let b = board::fold_on(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(), &node(home));
+    (events, end, b)
 }
 
 /// `out` (the inner answer) with `text` as the event's context, first; when the harness does not take
@@ -923,7 +946,7 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
     let Ok(g) = goal::load(home, &hs.goal) else { return inner() };
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
     let repo = queen::repo_name(cwd);
-    let (events, end, b) = board_for(home, &g, session, &repo, now);
+    let (events, end, b) = board_for(home, &g);
     let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started };
     match event {
         "prompt" => {
@@ -967,7 +990,7 @@ pub fn pre_tool(h: &dyn Harness, home: &Path, input: &Value, now: i64) -> Option
     let g = goal::load(home, &bound(session)?.goal).ok()?;
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
     let repo = queen::repo_name(cwd);
-    let (events, _, b) = board_for(home, &g, session, &repo, now);
+    let (events, _, b) = board_for(home, &g);
     let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
     let task = lost_claim(&b, events.iter().map(|(_, e)| e), session, &state, now)?.task.clone();
     let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started: Instant::now() };
@@ -1010,6 +1033,10 @@ impl Ctx<'_> {
         let (mut news, keys) = lost_news(b, self.session, state);
         if !keys.is_empty() {
             hook::append(self.session, &format!("{LOST_MARKER}{}", keys.join(",")));
+            // A task it holds again under a newer claim is not released.
+            let held = board::holding(b, self.session, self.now).map(|s| s.task.id.clone());
+            let stale: Vec<String> = keys.iter().filter(|k| k.rsplit_once('@').is_none_or(|(t, _)| Some(t) != held.as_deref())).cloned().collect();
+            release_lost(self.home, &self.g.id, self.session, &stale);
         }
         let lines = || lines.iter().map(|(_, e)| e);
         if settle {
@@ -1346,7 +1373,7 @@ impl Ctx<'_> {
         }
         let won = loop {
             let now = self.clock();
-            let b = board::fold(&board::read(path));
+            let b = board::fold_on(&board::read(path), &node(self.home));
             let next = next_open(self.home, self.g, &b, self.session, &drone_of(self.session), self.repo, self.cwd, now)?;
             match claim(self.home, self.g, self.session, &next.task, true, self.cwd, now, left) {
                 Ok(won) => break won,
@@ -1371,6 +1398,7 @@ fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Pat
     let now = learn::now_ms();
     let mut done = Event::new(Ev::Done, &held.task.id, session, now);
     done.head = head;
+    done.claim = Some(since);
     let flags: Vec<String> = guard::flags_of(home, &g.id, session, since, now).iter().map(guard::render).collect();
     let mut check = verify_task(&held.task, held.rework, session);
     check.flags = flags;
@@ -1381,16 +1409,17 @@ fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Pat
 enum Unfinished {
     /// The board could not be written.
     Io(String),
-    /// The board ignored it: the claim had passed to another drone (board.rs `apply`). What to tell
-    /// the drone.
+    /// Not written: the claim had passed to another drone. What to tell the drone.
     Lost(String),
 }
 
 /// Publishes the `done` of the claim `held` by `session` in `dir` (`done_events`, `within` that time)
-/// and the verify task it opens in one write, then reads the board back: the verify task's id when
-/// the board took the done. A done whose claim passed to another drone meanwhile (a suite that ran past
-/// the lease) is ignored by the fold, and the verify task's open with it: then nothing is counted and
-/// the drone is told who holds the task. `borg hive done` and the stop share it.
+/// and the verify task it opens in one write, written only while the board as it stands under the file's
+/// lock still gives the session that claim (`write_if`): the done names it (`Event::claim`) and is then
+/// an attempt for good (phase f F5, board.rs `Fold::permanent`), which no claim that arrives later voids.
+/// A claim that passed to another drone meanwhile (a suite that ran past the lease, a rival's earlier
+/// claim from a suspected node) writes nothing: nothing is counted and the drone is told who holds the
+/// task. The verify task's id when it took. `borg hive done` and the stop share it.
 fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, note: &str, within: Duration) -> Result<TaskId, Unfinished> {
     let path = tasks_path(home, &g.id);
     let id = &held.task.id;
@@ -1400,21 +1429,18 @@ fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, no
     };
     let (done, check) = done_events(home, g, held, session, dir, since, within);
     let (vid, ms) = (check.id.clone(), done.ms);
-    let landed = write(home, &g.id, vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)])
+    let here = node(home);
+    let lines = vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)];
+    let landed = write_if(home, &g.id, |events| holding(&board::fold_on(events, &here), id, session, learn::now_ms()).map(|_| lines))
         .map_err(|e| Unfinished::Io(e.to_string()))?;
-    let ms = landed[0].ms;
     let events = board::read(&path);
-    let b = board::fold(&events);
-    match b.tasks.get(id) {
-        Some(s) if s.status == (Status::Done { by: session.to_string(), ms }) => {}
-        s => {
-            let now = learn::now_ms();
-            let held = s.map_or_else(|| "gone".to_string(), |s| held_by(s, now));
-            return Err(Unfinished::Lost(format!("{id}'s done did not take effect: the task is {held} now. {NOT_YOURS}")));
-        }
-    }
+    let b = board::fold_on(&events, &here);
+    let Some(ms) = landed.map(|l| l[0].ms) else {
+        let held = b.tasks.get(id).map_or_else(|| "gone".to_string(), |s| held_by(s, learn::now_ms()));
+        return Err(Unfinished::Lost(format!("{id}'s done did not take effect: the task is {held} now. {NOT_YOURS}")));
+    };
     // The attempt's commits, for a verifier or an integrator on another machine (a store in a mesh only).
-    if let Some(a) = verdict::attempt(&events, &b, &vid)
+    if let Some(a) = verdict::attempt_of(&events, &b, id, session, ms)
         && let Err(e) = commits::publish(home, &g.id, &a, dir)
     {
         eprintln!("borg hive: {e}");
@@ -1521,14 +1547,17 @@ fn heard_back(home: &Path, peers: &[String], after: i64, cap: Duration) -> (bool
     }
 }
 
-/// A run's start on `goal` (run.rs, phase e E2b): a line that makes this node live on the board
-/// (`Board::live_nodes`) before any of its drones claims, a heartbeat of no task by `runner` naming the
-/// `drones` it runs (`roster`), then, with peers reachable, the wait until a round with each completed
-/// after it (`heard_back`, at most `START_CAP`). The peers' runners announced at their start too, so
-/// the drones start knowing every node's share. What it waited on: (peers, every one heard back, the
-/// wait).
+/// A run's start on `goal` (run.rs, phase e E2b): this node joins the goal (a `board::JOIN` line, phase
+/// f F4: a participant, `Board::participants`, before any of its drones claims) with the `drones` it
+/// runs (a roster line, `roster`), in one write, then, with peers reachable, the wait until a round with
+/// each completed after it (`heard_back`, at most `START_CAP`). The peers' runners announced at their
+/// start too, so the drones start knowing every node's share. The wait is on every reachable member,
+/// not the participants alone: a peer starting at this moment has not joined here yet, and it is spent
+/// once per run. What it waited on: (peers, every one heard back, the wait).
 pub(crate) fn announce(home: &Path, goal: &str, drones: &[String]) -> std::io::Result<(usize, bool, Duration)> {
-    roster(home, goal, drones)?;
+    let now = learn::now_ms();
+    let line = |note: &str| Event::new(Ev::Heartbeat, "", "runner", now).with_note(note);
+    write(home, goal, vec![line(board::JOIN), line(&board::roster_note(drones))])?;
     let written = learn::now_ms();
     let peers = reachable(home, written);
     if peers.is_empty() {
@@ -1546,6 +1575,13 @@ pub(crate) fn roster(home: &Path, goal: &str, drones: &[String]) -> std::io::Res
     write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(&board::roster_note(drones))]).map(drop)
 }
 
+/// This node's runner says on `goal`'s board that it is still in the goal (`board::BEAT`, every
+/// `BEAT_MS`, run.rs) or that it leaves it (`board::LEAVE`, at the run's end, also on SIGINT or SIGHUP):
+/// a heartbeat of no task, as `roster`'s (phase f F4).
+pub(crate) fn member(home: &Path, goal: &str, note: &str) -> std::io::Result<()> {
+    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(note)]).map(drop)
+}
+
 /// `drone`'s session on `goal` started (`start`) or ended at `ms` (board.rs `Board::sessions`; run.rs
 /// `run_session` writes them only for a session that has not claimed within its task's grace): another
 /// node leaves this node's task to a drone whose session started and has not claimed yet, and an ended
@@ -1559,7 +1595,7 @@ pub(crate) fn session(home: &Path, goal: &str, drone: &str, start: bool, ms: i64
         return write(home, goal, vec![line]).map(|_| true);
     }
     let here = node(home);
-    write_if(home, goal, |events| (!settled_since(&board::fold(events), &here, drone, ms)).then(|| vec![line])).map(|w| w.is_some())
+    write_if(home, goal, |events| (!settled_since(&board::fold_on(events, &here), &here, drone, ms)).then(|| vec![line])).map(|w| w.is_some())
 }
 
 /// Whether `drone` of `node` claimed or ended a session on `b` since `at` (a `clock` reading at its
@@ -1594,7 +1630,7 @@ pub(super) fn claimable_for(b: &Board, id: &str, session: &str, picked: bool, he
 /// holds it, and the wait.
 fn confirm(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: i64, peers: &[String]) -> (Option<TaskState>, Duration) {
     let (all, waited) = heard_back(home, peers, written, CONFIRM_CAP);
-    let again = holding(&board::fold(&board::read(&tasks_path(home, goal))), id, session, now);
+    let again = holding(&board::fold_on(&board::read(&tasks_path(home, goal)), &node(home)), id, session, now);
     let outcome = match (&again, all) {
         (None, _) => "lost",
         (Some(_), true) => "won",
@@ -1606,22 +1642,104 @@ fn confirm(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: 
     (again, waited)
 }
 
-/// What `session`'s claim of `id`, stamped `now`, written at `written` and read back won on `b`, waits
-/// for from other nodes before any work on it: None with no other node live on `b` (nothing to wait
-/// for), else the task while the claim still holds after the wait, and the wait. With peers reachable
-/// that is the confirm window (`confirm`, phase e E4); with none, `CROSS_SETTLE` and a read-back. Both
-/// `claim` and the integrate claim (integrate.rs `claim_due`) take it. Neither is an exclusion: across
-/// nodes a claim is final only with phase f F5.
+/// What `session`'s claim of `id`, written at `written` and read back won on `b`, waits for from other
+/// nodes before any work on it: None with no other goal participant on `b` (nothing to wait for), else
+/// the task while the claim still holds once it is final, and the wait. Final (phase f F5): every other
+/// participant's watermark is past the claim's stamp (board.rs `Board::unconfirmed`), so every line of
+/// theirs not here yet is stamped above it and no rival's claim that sorts before it can still arrive
+/// from them; the fold's winner then is the winner on every node for good. The wait has no cap: it ends
+/// when the claim is final, lost, or every participant it waits for is suspected (`SUSPECT_MS` without a
+/// new line of it here, the failure detector of F4; a healthy peer acks a claim a line's way after it
+/// holds it, run.rs `membership`, else at its next beat). Only then may a claim proceed unconfirmed, and
+/// a rival's claim from that node can still win later: its work is then at most a duplicate attempt, its
+/// done kept (board.rs `Fold::permanent`). A participant that writes no watermark (a runner from before
+/// F5, a node with no runner) is waited for as before F5: the confirm window on its mesh round (`confirm`,
+/// at most `CONFIRM_CAP`, a liveness bound where no failure detector reads it), or `CROSS_SETTLE` with none
+/// reachable. Both `claim` and the integrate claim (integrate.rs `claim_due`) take it; each wait is a line
+/// of `confirms.jsonl` (`final`, `suspected`, `lost`; `won`/`cap` for the window).
 pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: i64, b: &Board) -> Option<(Option<TaskState>, Duration)> {
-    if b.live_nodes(&node(home), learn::now_ms()).len() <= 1 {
+    let here = node(home);
+    if b.participants(&here, learn::now_ms()).len() <= 1 {
         return None;
     }
-    let peers = reachable(home, learn::now_ms());
-    if !peers.is_empty() {
-        return Some(confirm(home, goal, id, session, now, written, &peers));
+    let since = holding(b, id, session, now).and_then(|s| s.live(now).map(|(_, _, since)| since)).unwrap_or(now);
+    let path = tasks_path(home, goal);
+    let t0 = Instant::now();
+    let waited_on: Vec<String> = b.unconfirmed(&here, since, learn::now_ms()).0.into_iter().map(String::from).collect();
+    let (mut len, mut b) = (u64::MAX, b.clone());
+    let confirmed = loop {
+        let at = std::fs::metadata(&path).map_or(0, |m| m.len());
+        if at != len {
+            (len, b) = (at, board::fold_on(&board::read(&path), &here));
+        }
+        let t = learn::now_ms();
+        let Some(s) = holding(&b, id, session, t) else { break None };
+        let (waiting, mute) = b.unconfirmed(&here, since, t);
+        if waiting.is_empty() {
+            let mute: std::collections::BTreeSet<&str> = mute.into_iter().chain([here.as_str()]).collect();
+            if mute.len() > 1 {
+                // A participant with no watermark: its mesh round, as before F5.
+                let peers = participant_peers(home, goal, &mute, &here, reachable(home, t));
+                if !peers.is_empty() {
+                    let (again, w) = confirm(home, goal, id, session, now, written, &peers);
+                    return Some((again, t0.elapsed().max(w)));
+                }
+                std::thread::sleep(CROSS_SETTLE);
+                return Some((holding(&board::fold_on(&board::read(&path), &here), id, session, learn::now_ms()), t0.elapsed()));
+            }
+            break Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let waited = t0.elapsed();
+    let live = b.participants(&here, learn::now_ms());
+    let outcome = match &confirmed {
+        None => "lost",
+        Some(_) if waited_on.iter().any(|n| !live.contains(n.as_str())) => "suspected",
+        Some(_) => "final",
+    };
+    let line = Confirm {
+        v: 1,
+        ms: now,
+        task: id.into(),
+        session: session.into(),
+        peers: waited_on.len(),
+        waited_ms: waited.as_millis() as u64,
+        outcome: outcome.into(),
+    };
+    let _ = append_line(&confirms_path(home, goal), &line);
+    Some((confirmed, waited))
+}
+
+/// The mesh members of `reachable` a claim's confirm window waits for (phase f F4, G2): those whose key
+/// stamped a join line of a goal participant of `live` other than `here` (borg-mesh origin.rs: each
+/// synced line's record names the key that first stamped it). A mesh member that runs nothing on this
+/// goal is none of them. A participant whose key is not known here (a node from before F4, which wrote
+/// no join line, or whose line's record is not here) makes it wait for every reachable member, as
+/// before: a longer wait, never a peer left out.
+fn participant_peers(home: &Path, goal: &str, live: &std::collections::BTreeSet<&str>, here: &str, reachable: Vec<String>) -> Vec<String> {
+    let others: Vec<&str> = live.iter().copied().filter(|n| *n != here).collect();
+    let text = std::fs::read_to_string(tasks_path(home, goal)).unwrap_or_default();
+    // The hash of each participant's join lines, as the mesh hashes a line (borg-mesh lines.rs `hash`).
+    let mut joins: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    for l in text.lines() {
+        let Ok(e) = serde_json::from_str::<Event>(l) else { continue };
+        if let Some(n) = others.iter().find(|n| **n == e.node).filter(|_| e.by == "runner" && e.task.is_empty() && e.note == board::JOIN) {
+            joins.insert(blake3::hash(l.as_bytes()).to_hex().to_string(), n);
+        }
     }
-    std::thread::sleep(CROSS_SETTLE);
-    Some((holding(&board::fold(&board::read(&tasks_path(home, goal))), id, session, now), CROSS_SETTLE))
+    let mut keys: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+    let origins = std::fs::read_to_string(home.join("mesh").join("origins.jsonl")).unwrap_or_default();
+    for l in origins.lines().filter(|l| !joins.is_empty() && l.contains("\"h\"")) {
+        let Ok(o) = serde_json::from_str::<Value>(l) else { continue };
+        if let (Some(n), Some(k)) = (o["h"].as_str().and_then(|h| joins.get(h)), o["key"].as_str()) {
+            keys.entry(n).or_default().insert(k.to_string());
+        }
+    }
+    if others.iter().any(|n| !keys.contains_key(n)) {
+        return reachable;
+    }
+    reachable.into_iter().filter(|k| keys.values().any(|ks| ks.contains(k))).collect()
 }
 
 /// Why a claim took nothing. Only `Lost` is a race worth another try.
@@ -1654,14 +1772,12 @@ fn refuse(session: &str, task: &str) {
 /// line is stamped under that lock (`land`, phase f F3), so a holder's heartbeat that lands after a
 /// claim written meanwhile sorts after it and renews nothing retroactively; the holder's lease is timed
 /// on this node's clock from when it held the renewal (board.rs `Local`), and a claim that takes over an
-/// expired one is stamped past it (`board::claim_at`). With drones live on other nodes it then waits
-/// (`across`): for a sync round with each reachable peer that started after the claim (`heard_back`, at
-/// most `CONFIRM_CAP`, written to `confirms.jsonl`), or with none reachable for `CROSS_SETTLE`, and
-/// reads the board again: a rival's earlier claim
-/// from another node that was on the peer's disk when that round read its logs is there by then, and
-/// the claim is lost before any work on it. One stamped earlier that landed after that read (the
-/// clocks' skew plus the rival's stamp-to-write time longer than this claim's write-to-round time) is
-/// not: it still wins later, and this drone hears it at its next hook (`lost_news`). A claim of work carries the tree it
+/// expired one is stamped past it (`board::claim_at`). With other goal participants it then waits until
+/// it is final (`across`, phase f F5: each participant's watermark past its stamp, no cap): a rival's
+/// claim from another node that sorts before it is here by then, and the claim is lost before any work
+/// on it (released at once, `release_lost`). Only a participant that is suspected meanwhile is not
+/// waited for: a rival of its node can still win later, this drone hears it at its next hook
+/// (`lost_news`), and a done it wrote first stays an attempt for good. A claim of work carries the tree it
 /// starts from (`base`, verdict.rs), which the verdict diffs against the done's: the base of this
 /// drone's on this node (or, without a drone, this session's) first claim of the task when it had one (a tree that
 /// an earlier attempt already changed, say a test it weakened, is no base: the rework's diff must
@@ -1715,9 +1831,10 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
     c.deps_in = deps_in;
     let mut at = now;
     let wrote = write_if(home, &g.id, |events| {
-        let b = board::fold(events);
+        let b = board::fold_on(events, &here);
         at = (now + t0.elapsed().as_millis() as i64).max(learn::now_ms());
         c.ms = b.tasks.get(id).map_or(at, |s| board::claim_at(s, at));
+        c.takes = b.tasks.get(id).and_then(|s| board::takes(s, at));
         let beat = Event::new(Ev::Heartbeat, id, session, c.ms);
         claimable_for(&b, id, session, picked, &here, at).then(|| vec![c, beat])
     });
@@ -1737,9 +1854,13 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
     };
     let written = learn::now_ms();
     // Read back: a line of another node merged since can have won (the winner rule); none of this one.
-    let b = board::fold(&board::read(&path));
+    let b = board::fold_on(&board::read(&path), &here);
+    // Lost here or in the wait below: released at once (`release_lost`), so a line that arrives later
+    // and makes it win never hands the task to a session that moved on.
+    let lost = || release_lost(home, &g.id, session, &[format!("{id}@{stamp}")]);
     let Some(mut s) = holding(&b, id, session, now) else {
         take_out();
+        lost();
         return Err(Refused::Lost);
     };
     // The confirm window (phase e E4): with drones live on other nodes, a rival's earlier claim may not
@@ -1752,6 +1873,7 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
             Some(again) => s = again,
             None => {
                 take_out();
+                lost();
                 return Err(Refused::Lost);
             }
         }
@@ -2131,7 +2253,7 @@ impl Here {
     }
 
     fn board(&self, g: &Goal) -> Board {
-        board::fold(&board::read(&tasks_path(&self.home, &g.id)))
+        board::fold_on(&board::read(&tasks_path(&self.home, &g.id)), &node(&self.home))
     }
 }
 
@@ -2525,7 +2647,7 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
     };
     let repo = queen::repo_name(&here.cwd);
     // A lost claim's tree is set aside before this claim takes its base from it.
-    let (events, _, b) = board_for(&here.home, &g, &session, &repo, learn::now_ms());
+    let (events, _, b) = board_for(&here.home, &g);
     let state = std::fs::read_to_string(hook::state_file(&session)).unwrap_or_default();
     if let Some(told) = set_aside_lost(&g, &b, events.iter().map(|(_, e)| e), &session, &state, &here.cwd, learn::now_ms(), verdict::SNAPSHOT_TIMEOUT) {
         println!("{told}");
@@ -3218,13 +3340,97 @@ mod tests {
         // line for nothing else.
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         let here = node(&home);
-        assert_eq!(b.live_nodes("B", learn::now_ms()), std::collections::BTreeSet::from(["B", here.as_str()]));
+        assert_eq!(b.participants("B", learn::now_ms()), std::collections::BTreeSet::from(["B", here.as_str()]));
         assert!(b.tasks.values().all(|s| s.status == Status::Open) && b.lost.is_empty() && b.spans.is_empty());
         // One node, no peer ever synced: no wait at all.
         let solo = std::env::temp_dir().join(format!("borg-hive-announce-solo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&solo);
         assert_eq!(announce(&solo, "g", &[]).unwrap(), (0, true, Duration::ZERO));
         let _ = std::fs::remove_dir_all(solo);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_claim_beside_a_peer_that_marks_waits_until_it_is_final_with_no_cap() {
+        // Phase f F5. B joined and writes watermarks. This node's claim of t1 waits, past the old 1 s cap,
+        // until B's beat marks it (1.5 s later): final. Its claim of t2 meets B's rival claim stamped
+        // before it, which B's file held before its beat: lost before any work.
+        let (home, _, now) = two_node_store("final");
+        let path = tasks_path(&home, "g");
+        let land_b = |events: Vec<Event>| {
+            let landed = board::landing(&board::read(&path), events.into_iter().map(on_b).collect());
+            board::append(&path, &landed).unwrap();
+            board::note_held(&path);
+        };
+        land_b(vec![Event::new(Ev::Heartbeat, "", "runner", now - 5).with_note(board::JOIN)]);
+        let beat_after = |wait: Duration, rival: Option<Event>| {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(wait);
+                let path = tasks_path(&home, "g");
+                // B wrote its rival before this node's claim reached it: stamped on what it held then.
+                if let Some(r) = rival {
+                    let held: Vec<Event> = board::read(&path).into_iter().filter(|e| !(e.ev == Ev::Claim && e.task == r.task)).collect();
+                    board::append(&path, &board::landing(&held, vec![on_b(r)])).unwrap();
+                }
+                let beat = Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(board::BEAT);
+                board::append(&path, &board::landing(&board::read(&path), vec![on_b(beat)])).unwrap();
+                board::note_held(&path);
+            })
+        };
+        let claim = |task: &str, by: &str| {
+            let landed = write(&home, "g", vec![Event::new(Ev::Claim, task, by, learn::now_ms())]).unwrap();
+            (landed[0].ms, learn::now_ms())
+        };
+        let (at, written) = claim("t1", "sa");
+        let beat = beat_after(Duration::from_millis(1500), None);
+        let (again, waited) = across(&home, "g", "t1", "sa", at, written, &board::fold(&board::read(&path))).expect("B takes part");
+        beat.join().unwrap();
+        assert!(again.is_some() && waited >= Duration::from_millis(1500), "final on B's mark, past the old cap: {waited:?}");
+        let (at, written) = claim("t2", "sa2");
+        let beat = beat_after(Duration::from_millis(100), Some(Event::new(Ev::Claim, "t2", "sb", at - 50)));
+        let (again, _) = across(&home, "g", "t2", "sa2", at, written, &board::fold(&board::read(&path))).expect("B takes part");
+        beat.join().unwrap();
+        assert!(again.is_none(), "B's earlier claim, before its mark: lost");
+        let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
+        assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [("t1", "final"), ("t2", "lost")]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_mesh_member_that_is_not_a_goal_participant_delays_no_confirm() {
+        // Phase f F4 (G2). Mesh members kb and kc are both reachable; only kb's node, B, joined the goal
+        // (its join line's origin record names kb). A claim's confirm window waits for a round with kb
+        // alone: kc never syncs again, and a wait on it would run to the cap.
+        let (home, _, now) = two_node_store("g2");
+        let path = tasks_path(&home, "g");
+        let join = |note: &str, ms: i64| on_b(Event::new(Ev::Heartbeat, "", "runner", ms).with_note(note));
+        board::append(&path, &[join(board::JOIN, now - 5)]).unwrap();
+        board::note_held(&path);
+        presence::note_synced(&home, "kc", now - 1000).unwrap();
+        let line = std::fs::read_to_string(&path).unwrap().lines().find(|l| l.contains("\"join\"")).unwrap().to_string();
+        let origin = json!({"h": blake3::hash(line.as_bytes()).to_hex().to_string(), "key": "kb", "ms": now, "sig": ""});
+        std::fs::create_dir_all(home.join("mesh")).unwrap();
+        std::fs::write(home.join("mesh/origins.jsonl"), format!("{origin}\n")).unwrap();
+        let both = vec!["kb".to_string(), "kc".to_string()];
+        let b = board::fold(&board::read(&path));
+        let (here, at) = (node(&home), learn::now_ms());
+        assert_eq!(participant_peers(&home, "g", &b.participants(&here, at), &here, both.clone()), ["kb"]);
+        write(&home, "g", vec![Event::new(Ev::Claim, "t1", "sa", now)]).unwrap();
+        let written = learn::now_ms();
+        let round = peer_round(&home, Duration::from_millis(50), Vec::new());
+        let b = board::fold(&board::read(&path));
+        let (again, waited) = across(&home, "g", "t1", "sa", now, written, &b).expect("B takes part: a confirm window");
+        round.join().unwrap();
+        assert!(again.is_some() && waited < CONFIRM_CAP, "won on kb's round alone: {waited:?}");
+        // A participant whose key is not known here (no origin record): every reachable member, as before.
+        std::fs::remove_file(home.join("mesh/origins.jsonl")).unwrap();
+        assert_eq!(participant_peers(&home, "g", &b.participants(&here, at), &here, both), ["kb", "kc"]);
+        // B left the goal: no participant but this node, no wait at all.
+        board::append(&path, &[join(board::LEAVE, now - 4)]).unwrap();
+        board::note_held(&path);
+        let b = board::fold(&board::read(&path));
+        assert_eq!(across(&home, "g", "t1", "sa", now, written, &b), None);
         let _ = std::fs::remove_dir_all(home);
     }
 

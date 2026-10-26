@@ -85,6 +85,21 @@ fn git(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> R
     }
 }
 
+/// `git` with `input` on its stdin, that must succeed: its trimmed stdout.
+fn git_in(repo: &Path, args: &[&str], input: &str, deadline: Instant) -> Result<String, String> {
+    let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
+    if left.is_zero() {
+        return Err("the merge ran out of time".into());
+    }
+    let mut cmd = super::git::command(repo);
+    cmd.args(args);
+    match runner::run_capped_status(cmd, Some(input.as_bytes()), left) {
+        Some((s, out)) if s.success() => Ok(String::from_utf8_lossy(&out).trim().to_string()),
+        Some((s, _)) => Err(format!("git {} failed (exit {})", args.first().unwrap_or(&""), s.code().unwrap_or(-1))),
+        None => Err(format!("git {} did not finish", args.first().unwrap_or(&""))),
+    }
+}
+
 /// `git` that must succeed: its trimmed stdout.
 fn git_ok(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<String, String> {
     match git(repo, args, env, deadline)? {
@@ -276,7 +291,7 @@ pub(super) fn due(b: &Board, now: i64) -> Option<(TaskId, bool)> {
 /// Why `g` cannot integrate in `repo` at `now` although an integration is due: an accepted attempt's
 /// commits are on another node only (`absent`). None when none is due or every commit is here.
 pub fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<String> {
-    due(&board::fold(&board::read(&super::tasks_path(home, &g.id))), now)?;
+    due(&board::fold_on(&board::read(&super::tasks_path(home, &g.id)), &super::node(home)), now)?;
     let a = absent(home, g, repo);
     (!a.is_empty()).then(|| absent_reason(&a))
 }
@@ -287,7 +302,7 @@ pub fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<String>
 /// node only (`elsewhere` says so; nothing is written).
 pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<Outcome> {
     let path = super::tasks_path(home, &g.id);
-    let b = board::fold(&board::read(&path));
+    let b = board::fold_on(&board::read(&path), &super::node(home));
     let scores = group::scores(home, &g.id);
     let accepted = group::merged(&b, |v| scores.get(v).copied()).len();
     let session = format!("integrate-{drone}-{now}");
@@ -300,7 +315,8 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
         return None;
     }
     let (events, b) = claim_due(home, &g.id, &session, drone, now, (id.clone(), new), lines)?;
-    let i = Integrator { home, g, id: &id, session: &session };
+    let since = b.tasks.get(&id).and_then(|s| s.live(learn::now_ms())).map_or(now, |(_, _, since)| since);
+    let i = Integrator { home, g, id: &id, session: &session, since };
     Some(i.integrate(repo, &events, &b))
 }
 
@@ -312,19 +328,21 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
 /// drone thread's integration landed while `absent` asked git) nothing is written, this claim would
 /// only lose. Of a node's drones one claims an integration, with no timing assumption, while its
 /// holder's lease is live (phase f F2). Across nodes two runners can write the same open (the fold
-/// keeps the first) and a claim each, and one wins: with another node live the claim waits as a work
-/// claim does (hive/mod.rs `across`) and reads the board again, so a rival's earlier claim that a
-/// peer's round brings loses this one before the merge. That is no exclusion either (F5's).
+/// keeps the first) and a claim each, and one wins: with another node live the claim waits until it is
+/// final as a work claim does (hive/mod.rs `across`, phase f F5), so a rival's earlier claim loses this
+/// one before the merge unless the rival's node is suspected; the integrator folds again before its
+/// verdict (`Integrator::holds`) and moves the integrated ref only under its fencing token (`fence`).
 fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, found: (TaskId, bool), mut lines: Vec<Event>) -> Option<(Vec<Event>, Board)> {
     let path = super::tasks_path(home, goal);
     let id = found.0.clone();
     let mut stamp = now;
     let wrote = super::write_if(home, goal, |events| {
-        let b = board::fold(events);
+        let b = board::fold_on(events, &super::node(home));
         (due(&b, now).as_ref() == Some(&found)).then(|| {
             stamp = now.max(learn::now_ms());
             let at = b.tasks.get(&id).map_or(stamp, |s| board::claim_at(s, stamp));
-            lines.extend([Event::new(Ev::Claim, &id, session, at).with_drone(drone), Event::new(Ev::Heartbeat, &id, session, at)]);
+            let claim = Event { takes: b.tasks.get(&id).and_then(|s| board::takes(s, stamp)), ..Event::new(Ev::Claim, &id, session, at).with_drone(drone) };
+            lines.extend([claim, Event::new(Ev::Heartbeat, &id, session, at)]);
             lines
         })
     });
@@ -332,7 +350,7 @@ fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, foun
     let written = learn::now_ms();
     let won = |b: &Board| b.tasks.get(&id).and_then(|s| s.live(stamp)).is_some_and(|(by, _, _)| by == session);
     let events = board::read(&path);
-    let b = board::fold(&events);
+    let b = board::fold_on(&events, &super::node(home));
     if !won(&b) {
         return None;
     }
@@ -341,18 +359,77 @@ fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, foun
         Some((None, _)) => None,
         Some((Some(_), _)) => {
             let events = board::read(&path);
-            let b = board::fold(&events);
+            let b = board::fold_on(&events, &super::node(home));
             won(&b).then_some((events, b))
         }
     }
 }
 
-/// One claimed integration.
+/// The epoch of the integrate task `id`: `integrate.<n>`'s n (`board::integrate_id`), 0 for any other id.
+pub(super) fn epoch(id: &str) -> u32 {
+    id.strip_prefix("integrate.").and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+/// The ref that fences goal `goal`'s integrated ref (phase f F5): a blob naming the fencing token,
+/// `<epoch> <claim stamp>`, of the integration that last moved it.
+fn token_ref(goal: &str) -> String {
+    format!("refs/borg/hive/{goal}/integrated-token")
+}
+
+/// Moves `refs/heads/hive/<goal>/integrated` in `repo` to `head` under the fencing token `token`: the
+/// integrate task's epoch and its holder's claim stamp (phase f F5; Kleppmann, "How to do distributed
+/// locking", 2016: the resource checks the token). That ref is the integration's one side effect outside
+/// the board (no push: a clone or another node carries it only by fetching it); every runner and
+/// `borg hive integrate` sharing the repo writes it. It moves only to a token above the one it holds, in
+/// one ref transaction with the token's own ref (`git update-ref --stdin`, compare-and-swap on the token
+/// ref's old value), so an integrator whose claim was taken over, or one of an epoch past, never
+/// overwrites a newer one's tree, however long it stalled. Whether it moved: false when it holds `head`
+/// already at a token at or past this one (the same tree, a retry). No timer is read. Within one epoch
+/// the later claim stamp wins here, the earlier one in the fold (a takeover refused once the holder's
+/// renewal arrived): so it is called only while the board gives the caller its claim, and of two
+/// integrators sharing a repo whose claims both read held (a false suspicion) the one fenced out
+/// writes nothing and the epoch is integrated again: a liveness cost, never two verdicts.
+///
+/// # Errors
+/// The ref holds another tree at a token at or past `token` (this integration is stale), or git failed.
+pub(crate) fn fence(repo: &Path, goal: &str, token: (u32, i64), head: &str, deadline: Instant) -> Result<bool, String> {
+    let (reference, tref) = (format!("refs/heads/hive/{goal}/integrated"), token_ref(goal));
+    let zero = "0".repeat(40);
+    for _ in 0..3 {
+        let old = git(repo, &["rev-parse", "--verify", "-q", &tref], &[], deadline)?.1.trim().to_string();
+        let held = match old.is_empty() {
+            true => None,
+            false => {
+                let text = git_ok(repo, &["cat-file", "blob", &old], &[], deadline)?;
+                let mut it = text.split_whitespace().map(|p| p.parse::<i64>().unwrap_or(i64::MAX));
+                Some((it.next().unwrap_or(i64::MAX), it.next().unwrap_or(i64::MAX)))
+            }
+        };
+        if let Some(held) = held.filter(|h| *h >= (i64::from(token.0), token.1)) {
+            let now = git(repo, &["rev-parse", "--verify", "-q", &reference], &[], deadline)?.1.trim().to_string();
+            return match now == head {
+                true => Ok(false),
+                false => Err(format!("the integrated ref holds {now} at token {held:?}, past this integration's {token:?}: it is stale")),
+            };
+        }
+        let blob = git_in(repo, &["hash-object", "-w", "--stdin"], &format!("{} {}\n", token.0, token.1), deadline)?;
+        let expect = if old.is_empty() { zero.as_str() } else { old.as_str() };
+        let tx = format!("update {tref} {blob} {expect}\nupdate {reference} {head}\n");
+        if git_in(repo, &["update-ref", "--stdin"], &tx, deadline).is_ok() {
+            return Ok(true);
+        }
+        // Another integrator moved the token between the read and the transaction: read it again.
+    }
+    Err("the integrated ref's token kept moving".into())
+}
+
+/// One claimed integration: `since`, the stamp of its claim, is its fencing token's second part.
 struct Integrator<'a> {
     home: &'a Path,
     g: &'a Goal,
     id: &'a str,
     session: &'a str,
+    since: i64,
 }
 
 impl Integrator<'_> {
@@ -386,8 +463,14 @@ impl Integrator<'_> {
             Ok(m) => m,
             Err(e) => return self.blocked(repo, &e),
         };
-        let reference = format!("refs/heads/hive/{}/integrated", self.g.id);
-        let _ = git(repo, &["update-ref", &reference, &m.head], &[], Instant::now() + GIT_TIMEOUT);
+        // Fenced only while it holds its claim: an integrator whose claim the fold no longer gives it (a
+        // takeover refused once the holder's renewal arrived) neither moves the ref nor fences the holder.
+        if !self.holds() {
+            return self.fenced("its claim was taken before its merge");
+        }
+        if let Err(why) = fence(repo, &self.g.id, (epoch(self.id), self.since), &m.head, Instant::now() + GIT_TIMEOUT) {
+            return self.fenced(&why);
+        }
         let ids: Vec<&str> = works.iter().map(|w| w.task.id.as_str()).collect();
         let tasks: Vec<&Task> = works.iter().map(|w| &w.task).collect();
         let checks = checks_of(self.g, &tasks);
@@ -425,9 +508,17 @@ impl Integrator<'_> {
             oracle::Verdict::Pass => {
                 let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
                 let note = format!("merged {}; {} pass", ids.join(", "), if names.is_empty() { "no checks".into() } else { names.join(", ") });
-                let e = Event { head: m.head.clone(), ..Event::new(Ev::Verified, self.id, self.session, ms).with_note(&note) };
-                if let Err(e) = super::write(self.home, &self.g.id, vec![e]) {
-                    return Outcome { task: self.id.into(), head: Some(m.head), verdict: Err(e.to_string()) };
+                let merged: Vec<String> = attempts.iter().map(|a| format!("{}@{}", a.work, a.head)).collect();
+                let e = Event {
+                    head: m.head.clone(),
+                    claim: Some(self.since),
+                    deps_in: merged,
+                    ..Event::new(Ev::Verified, self.id, self.session, ms).with_note(&note)
+                };
+                match self.write_held(vec![e]) {
+                    Ok(true) => {}
+                    Ok(false) => return self.fenced("its claim was taken before its verdict"),
+                    Err(e) => return Outcome { task: self.id.into(), head: Some(m.head), verdict: Err(e.to_string()) },
                 }
                 self.count(repo, &note, true);
                 Outcome { task: self.id.into(), head: Some(m.head), verdict: Ok(()) }
@@ -469,13 +560,44 @@ impl Integrator<'_> {
         files.dedup();
         let fix =
             Task { title: fix_title(what), role: Role::Work, files, accept: checks, from: Some(head.to_string()), ..board_task(&format!("{}.fix", self.id)) };
-        let e = Event { head: head.to_string(), ..Event::new(Ev::Rejected, self.id, self.session, ms).with_note(note) };
-        let why = match super::write(self.home, &self.g.id, vec![e, Event::open(fix, self.session, ms).with_note(note)]) {
-            Ok(_) => note.to_string(),
+        let e = Event { head: head.to_string(), claim: Some(self.since), ..Event::new(Ev::Rejected, self.id, self.session, ms).with_note(note) };
+        let why = match self.write_held(vec![e, Event::open(fix, self.session, ms).with_note(note)]) {
+            Ok(true) => note.to_string(),
+            Ok(false) => return self.fenced("its claim was taken before its verdict"),
             Err(e) => e.to_string(),
         };
         self.count(repo, note, false);
         Outcome { task: self.id.into(), head: Some(head.into()), verdict: Err(why) }
+    }
+
+    /// Whether this integrator still holds its claim on the board read again now (phase f F5).
+    fn holds(&self) -> bool {
+        self.holds_on(&board::read(&super::tasks_path(self.home, &self.g.id)))
+    }
+
+    /// Whether the board of `events` gives this integrator its claim now.
+    fn holds_on(&self, events: &[Event]) -> bool {
+        let now = learn::now_ms();
+        board::fold_on(events, &super::node(self.home)).tasks.get(self.id).and_then(|s| s.live(now)).is_some_and(|(by, _, _)| by == self.session)
+    }
+
+    /// Writes this integrator's verdict `lines` (its fix task's open with a rejection) for good
+    /// (`Event::claim`, phase f F5) only while the board as it stands under the file's lock still gives
+    /// it the claim (mod.rs `write_if`, as verdict.rs `record` and mod.rs `finish`): no takeover lands
+    /// between the check and the append, whatever the lease, so a claim taken over never leaves a second
+    /// verdict on its integrate task. Whether they were written (false: fenced, nothing written).
+    fn write_held(&self, lines: Vec<Event>) -> std::io::Result<bool> {
+        super::write_if(self.home, &self.g.id, |events| self.holds_on(events).then_some(lines)).map(|w| w.is_some())
+    }
+
+    /// An integration that stops with nothing written (phase f F5): its ref's token is past its own (a
+    /// newer integrator moved it), or its claim was taken before its verdict. A claim it still holds is
+    /// released for the integrator that holds the newer token.
+    fn fenced(&self, why: &str) -> Outcome {
+        if self.holds() {
+            let _ = super::write(self.home, &self.g.id, vec![Event::new(Ev::Released, self.id, self.session, learn::now_ms()).with_note(why)]);
+        }
+        Outcome { task: self.id.into(), head: None, verdict: Err(format!("fenced: {why}")) }
     }
 
     /// `blocked` with `why`: what an engineer has to fix (a snapshot, git) before it is reopened.
@@ -681,6 +803,52 @@ mod tests {
 
     fn show(repo: &Path, head: &str, file: &str) -> String {
         sh(repo, &["show", &format!("{head}:{file}")])
+    }
+
+    #[test]
+    fn a_stale_integrator_never_moves_the_integrated_ref() {
+        // Phase f F5: the integrated ref moves only under a fencing token (epoch, claim stamp) above the
+        // one it holds. Two trees, c1 and c2, of integrate.1 claimed at 100, and later ones.
+        let (root, repo, _) = setup("fence");
+        let tree = sh(&repo, &["write-tree"]);
+        let (c1, c2) = (sh(&repo, &["commit-tree", &tree, "-m", "c1"]), sh(&repo, &["commit-tree", &tree, "-m", "c2"]));
+        let at = |token: (u32, i64), head: &str| fence(&repo, "g", token, head, Instant::now() + GIT_TIMEOUT);
+        let reference = || sh(&repo, &["rev-parse", "refs/heads/hive/g/integrated"]);
+        assert_eq!(at((1, 100), &c1), Ok(true));
+        assert!(at((1, 50), &c2).is_err_and(|e| e.contains("stale")), "a claim taken over before: never overwrites");
+        assert_eq!(reference(), c1);
+        assert_eq!(at((1, 100), &c1), Ok(false), "a retry of the same integration: its tree is there");
+        assert_eq!(at((1, 200), &c2), Ok(true), "the takeover's newer claim moves it");
+        assert_eq!(at((2, 10), &c1), Ok(true), "the next epoch moves it");
+        assert!(at((1, 999), &c2).is_err(), "an epoch past never moves it back");
+        assert_eq!(reference(), c1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_integrator_whose_claim_was_taken_writes_no_verdict() {
+        // Phase f F5, after review: the verdict is checked and appended under the board's lock (`write_held`,
+        // mod.rs `write_if`). si claimed integrate.1, an engineer released it and sj claimed it: si's
+        // pass is refused unwritten, sj's lands, and the board has one verdict and one integration.
+        let root = std::env::temp_dir().join(format!("borg-hive-integrate-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, g) = (root.join("store"), goal(&[]));
+        let w = |events: Vec<Event>| super::super::write(&home, "g", events).unwrap();
+        let now = learn::now_ms();
+        let claim = |by: &str| vec![Event::new(Ev::Claim, "integrate.1", by, now), Event::new(Ev::Heartbeat, "integrate.1", by, now)];
+        w(vec![Event::open(board_task("integrate.1"), "si", now)]);
+        let si = w(claim("si"))[0].ms;
+        w(vec![Event::new(Ev::Released, "integrate.1", "engineer:e", now)]);
+        let sj = w(claim("sj"))[0].ms;
+        let pass = |session: &str, since: i64| {
+            let i = Integrator { home: &home, g: &g, id: "integrate.1", session, since };
+            i.write_held(vec![Event { head: format!("m-{session}"), claim: Some(since), ..Event::new(Ev::Verified, "integrate.1", session, now) }]).unwrap()
+        };
+        assert!(!pass("si", si), "si's claim was taken: nothing written");
+        assert!(pass("sj", sj));
+        let b = fold(&home);
+        assert_eq!(b.integrations.iter().map(|i| i.head.as_str()).collect::<Vec<_>>(), ["m-sj"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1015,7 +1183,7 @@ mod tests {
 
     #[test]
     fn an_integrate_claim_beside_another_node_waits_for_its_peers_round() {
-        // Phase f F2 (cross-node behaviour kept until F5). Node B is live; its runner's earlier claim of
+        // Phase f F2; B writes no watermark (a node from before F5), so the claim waits for its round. Node B is live; its runner's earlier claim of
         // integrate.1 reaches this node only with the peer's round 300 ms after this claim's read-back:
         // the claim waits for that round (`across`) and loses before any merge. Fails with the wait
         // left out of `claim_due` (the read-back alone sees this claim won).

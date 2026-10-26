@@ -440,7 +440,14 @@ fn node_stats(b: &board::Board, events: &[board::Event], side: &Side, goal: &str
            "bundles": {"made": made, "received": lines.len() - made, "taken": taken.len(), "refused": refused.len(), "waiting": waiting.len(), "why_not": why}})
 }
 
+/// A digest of what the fold says of the lines: each node's own clock (when it held them, `Board::nodes`
+/// and each task's `Local`) is left out, as `Board`'s equality leaves it out.
 fn digest(b: &board::Board) -> String {
+    let mut b = b.clone();
+    b.nodes.clear();
+    for s in b.tasks.values_mut() {
+        s.local = board::Local::default();
+    }
     blake3::hash(format!("{b:?}").as_bytes()).to_hex()[..16].to_string()
 }
 
@@ -776,6 +783,9 @@ mod tests {
                 last_progress: String::new(),
                 author: None,
                 accepted: None,
+                attempts: Vec::new(),
+                accepted_attempt: None,
+                of_attempt: None,
                 node: String::new(),
                 local: board::Local::default(),
             },

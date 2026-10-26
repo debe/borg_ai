@@ -10,25 +10,28 @@
 //! (`integrate::due`, `board::free_for` / `in_hand`, `run::step`, `run::stalls`, the session-start and
 //! session-end lines, a roster line at each drone's end) and each session claims as mod.rs `claim_cmd`
 //! and `claim` do (`board::next_for`, the claim checked under its node's board lock, the read-back),
-//! writing real `Event` lines. A claim's lock is modelled as the code's (hive/mod.rs `write_if`): one
+//! writing real `Event` lines. Each runner joins the goal with its roster, beats every `BEAT_MS` (a
+//! line no trace shows) and leaves once its drones ended (phase f F4); a killed one just stops. A
+//! claim's lock is modelled as the code's (hive/mod.rs `write_if`): one
 //! node's appends are serialized, and a claim is appended only when its check (mod.rs `claimable_for`,
 //! integrate.rs `due`) holds on its node's file as it stands when it lands, after the lines its node
 //! wrote before it (earlier in its tick, or while a `Hold` kept it back); else it is refused unwritten. As in hivemc.py, one tick is one second; within a tick every drone reads
 //! its node's board as it stood at the tick's start and its lines land at the tick's end; a claim's
-//! read-back and its confirm window are read at the next tick, the work's hooks at every tick (a
+//! read-back is read at the next tick and it waits from there until it is final (phase f F5, mod.rs
+//! `across`: `Board::unconfirmed` empty on its node's fold; each runner acks a claim of another node in
+//! the tick it holds it, `board::to_ack`, as run.rs `membership` does), the work's hooks at every tick (a
 //! loser stops at its first tick after it learns), and a session takes one task.
 //!
 //! Where the harness is not the run: no git, oracle, approvals or harness process (an iteration costs
-//! 1 of a node's `share`; every check passes); `open_to`'s `allowed` is `may_claim` (no integrate task),
-//! a session's adds `absent_from` (a verify task of another node's work only with `bundles`); the
-//! confirm window is the next tick's fold, never its cap; an integrate claim's read-back is the next
-//! tick's fold too, where integrate.rs `claim_due` reads back at once with no confirm window, so a
-//! peer's integrate claim that takes up to a tick to arrive is always seen here (integrate-once holds
-//! at a delay of 1 on this abstraction, not on the code).
+//! 1 of a node's `share`; every check passes, a verifier of a verify task `reject` names rejects);
+//! `open_to`'s `allowed` is `may_claim` (no integrate task),
+//! a session's adds `absent_from` (a verify task of another node's work only with `bundles`); every
+//! node writes watermarks (F5), so no claim takes the confirm window's capped fallback; an integration's
+//! ref is a per-node token (integrate.rs `fence`), its git work none.
 //!
 //! Each test names the hivemc scenario it mirrors and the property it checks: S1 (one board for any
 //! order of the lines), S2' (a done, a verdict or an integration that took effect in a node's fold is in
-//! the converged board), integrate-once (one integration in full per integrate task), same-node
+//! the converged board), integrate-once (one merge per integrate task), same-node
 //! exclusion (one read-back win per node per task attempt), no premature end (every runner ended:
 //! finished, or a budget spent, a node killed or a task blocked) and stable-prefix exit (exit 0 only
 //! on a finished converged board). A property that does not hold yet is `#[ignore]`d with the step of
@@ -39,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::board::{self, Board, Ev, Event, Role, Status, Task, TaskState};
 use super::run::{self, Next, Offer, Tally};
-use super::{CLAIM_TRIES, LEASE_MS, START_CAP, TaskId, integrate};
+use super::{BEAT_MS, CLAIM_TRIES, LEASE_MS, START_CAP, SUSPECT_MS, TaskId, integrate};
 
 /// One tick, in ms.
 const TICK: i64 = 1000;
@@ -58,6 +61,9 @@ struct NodeCfg {
     share: u32,
     /// The tick its runner is killed: no line of it after that (its mesh daemon still syncs).
     stop: Option<i64>,
+    /// The tick its runner's beats stop while it and its drones run on (a suspend, a failed beat write,
+    /// a stalled beat thread).
+    mute: Option<i64>,
 }
 
 /// A line held back: the first `ev` line on `task` written on `node` lands in its own file `local` ticks
@@ -79,6 +85,8 @@ enum Guard {
     Claim { task: String, session: String, picked: bool, now: i64 },
     /// integrate.rs `claim_due`: the integration found is still the one `due`.
     Integrate { found: (TaskId, bool), now: i64 },
+    /// mod.rs `finish`, verdict.rs `record`, integrate.rs `write_held`: the session still holds the task.
+    Holds { task: String, session: String, now: i64 },
 }
 
 impl Guard {
@@ -86,6 +94,7 @@ impl Guard {
         match self {
             Guard::Claim { task, session, picked, now } => super::claimable_for(b, task, session, *picked, here, *now),
             Guard::Integrate { found, now } => integrate::due(b, *now).as_ref() == Some(found),
+            Guard::Holds { task, session, now } => super::holding(b, task, session, *now).is_some(),
         }
     }
 }
@@ -113,8 +122,17 @@ struct Cfg {
     integrate: i64,
     delay: i64,
     holds: Vec<Hold>,
+    /// Ticks [from, to) in which the network is cut: a line written then reaches the other nodes at
+    /// `to` at the earliest.
+    cuts: Vec<(i64, i64)>,
+    /// (node, from, to): ticks [from, to) in which `node` receives nothing (its mesh daemon down or
+    /// backing off, its machine just resumed): a line due there then lands at `to`. The others receive
+    /// its lines as ever.
+    deaf: Vec<(&'static str, i64, i64)>,
     /// A verify task's or an integration's commits reach the other nodes (commits.rs bundles).
     bundles: bool,
+    /// Verify tasks every verifier rejects (`t0.v1`): a rework round, its attempts judged again.
+    reject: Vec<String>,
     /// Sessions claim the task their prompt offered by name (mod.rs `offer`, `picked` false: G1).
     named: bool,
     horizon: i64,
@@ -131,7 +149,7 @@ impl Cfg {
     /// `tasks`: (its owner, the index of its dep). Work takes 3 ticks, a verdict and an integration 2,
     /// and a line one tick to reach the other node.
     fn new(tasks: &[(&str, Option<usize>)]) -> Cfg {
-        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None };
+        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None, mute: None };
         let mut ids: Vec<(String, Vec<String>)> = Vec::new();
         for (owner, dep) in tasks {
             let id = owned(owner, &ids);
@@ -147,7 +165,10 @@ impl Cfg {
             integrate: 2,
             delay: 1,
             holds: Vec::new(),
+            cuts: Vec::new(),
+            deaf: Vec::new(),
             bundles: true,
+            reject: Vec::new(),
             named: false,
             horizon: 90,
         }
@@ -177,12 +198,13 @@ impl Cfg {
 }
 
 /// What a node's fold showed taking effect at some tick: a done (task, session), a verdict (task,
-/// session), an integration (task, ms).
+/// session), an integration (task, ms), a rejection's reopen (work task, its rework round).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Seen {
     Done(String, String),
     Verdict(String, String),
     Integrated(String, i64),
+    Reopened(String, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +234,7 @@ struct Session {
 enum St {
     Off,
     Decide,
-    Wait { until: i64, seen: usize, in_hand: bool },
+    Wait { until: i64, seen: Box<Board>, in_hand: bool },
     Session(Box<Session>),
     Integrating { session: String, task: String, until: Option<i64> },
     Post { start: Box<Offer>, wrote: bool },
@@ -243,11 +265,22 @@ struct Sim {
     exits: BTreeMap<usize, (bool, i64)>,
     ends: Vec<(String, &'static str, i64)>,
     seen: BTreeSet<Seen>,
-    /// Integrators that merged and wrote their verdict: integrate task -> sessions.
+    /// Integrators that started the merge (their claim final, their ref moved): integrate task -> sessions.
     integrations: BTreeMap<String, Vec<String>>,
     /// Sessions whose read-back won: (node, task, rework) -> sessions.
     won: BTreeMap<(String, String, u32), Vec<String>>,
+    /// Per node, the newest claim stamp of another node its runner acked (`board::to_ack`).
+    acked: Vec<i64>,
+    /// Ticks each claim waited after its line landed until it was final (phase f F5), and each node's
+    /// integrated ref: its fencing token (epoch, claim stamp), and the integrators that moved it, by
+    /// (node, integrate task).
+    waits: Vec<i64>,
+    refs: BTreeMap<usize, (u32, i64)>,
+    ref_moves: BTreeMap<(String, String), Vec<String>>,
     log: Vec<String>,
+    /// Each node's last fold and how many lines it folded: a node's lines only grow, and between two
+    /// beats most ticks bring none.
+    folded: Vec<(usize, Board)>,
 }
 
 fn work_task(id: &str, role: Role, deps: &[String]) -> Task {
@@ -268,16 +301,30 @@ fn work_task(id: &str, role: Role, deps: &[String]) -> Task {
 }
 
 /// hive/mod.rs `land`: `events` of one write stamped under the lock onto a file holding `file` (a hybrid
-/// clock, `board::stamp`), a claim past the lease it takes over (`board::claim_at`, as mod.rs `claim`
+/// clock and the watermark's count, `board::landing`), a claim past the lease it takes over (`board::claim_at`, as mod.rs `claim`
 /// and integrate.rs `claim_due` propose it; a claim's ms is its node's clock when it was decided).
 fn stamped(file: &[Event], events: Vec<Event>) -> Vec<Event> {
-    let b = board::fold(file);
+    let here = events.first().map_or("", |e| e.node.as_str());
+    let b = if events.iter().any(|e| e.ev == Ev::Claim) { board::fold_on(file, here) } else { Board::default() };
     let at = |e: &Event| match (e.ev, b.tasks.get(&e.task)) {
         (Ev::Claim | Ev::Heartbeat, Some(s)) if events.iter().any(|c| c.ev == Ev::Claim && c.task == e.task) => board::claim_at(s, e.ms),
         _ => e.ms,
     };
-    let props: Vec<i64> = events.iter().map(at).collect();
-    events.into_iter().zip(props).map(|(e, p)| Event { ms: board::stamp(file, &e.node, p), ..e }).collect()
+    // A claim names the lease it takes over (`board::takes`), as mod.rs `claim` and integrate.rs do.
+    let takes = |e: &Event| b.tasks.get(&e.task).filter(|_| e.ev == Ev::Claim).and_then(|s| board::takes(s, e.ms));
+    let props: Vec<(i64, Option<i64>)> = events.iter().map(|e| (at(e), takes(e))).collect();
+    board::landing(file, events.into_iter().zip(props).map(|(e, (ms, takes))| Event { ms, takes, ..e }).collect())
+}
+
+/// The stamp of the claim its holder holds `t` under at `now`.
+fn since(t: &TaskState, now: i64) -> i64 {
+    t.live(now).map_or(i64::MIN, |(_, _, since)| since)
+}
+
+/// The head of the attempt the verify task `t` judges (its `of_attempt`), which its verdict names.
+fn judged_head(b: &Board, t: &TaskState) -> String {
+    let (Some(w), Some((by, done))) = (t.task.of.as_ref().and_then(|w| b.tasks.get(w)), t.of_attempt.as_ref()) else { return String::new() };
+    w.attempts.iter().find(|a| a.by == *by && a.done == *done).map_or_else(String::new, |a| a.head.clone())
 }
 
 /// run.rs `open_to` with every check approved.
@@ -313,7 +360,12 @@ impl Sim {
             seen: BTreeSet::new(),
             integrations: BTreeMap::new(),
             won: BTreeMap::new(),
+            acked: vec![i64::MIN; n],
+            waits: Vec::new(),
+            refs: BTreeMap::new(),
+            ref_moves: BTreeMap::new(),
             log: Vec::new(),
+            folded: vec![(usize::MAX, Board::default()); n],
             cfg,
         };
         while s.t < s.cfg.horizon && !(s.pending.is_empty() && s.landing.is_empty() && s.drones.iter().all(|d| matches!(d.st, St::Ended(_)))) {
@@ -327,7 +379,12 @@ impl Sim {
     }
 
     fn now(&self, node: usize) -> i64 {
-        self.t * TICK + self.cfg.nodes[node].skew + node as i64
+        self.clock(node, self.t)
+    }
+
+    /// `node`'s clock at tick `t`.
+    fn clock(&self, node: usize, t: i64) -> i64 {
+        t * TICK + self.cfg.nodes[node].skew + node as i64
     }
 
     fn note(&mut self, node: usize, what: String) {
@@ -361,7 +418,7 @@ impl Sim {
             if let Some(i) = hold {
                 self.held.insert(i);
             }
-            let remote = self.t + (local - 1).max(0) + self.cfg.delay + remote;
+            let remote = self.arrive(self.t + (local - 1).max(0) + self.cfg.delay + remote);
             if local > 0 {
                 for e in &events {
                     self.note(node, format!("{} {} {}@{} (held {local} ticks)", e.by, e.ev.name(), e.task, e.ms));
@@ -370,7 +427,7 @@ impl Sim {
                 return Some(self.t + local);
             }
             let file = self.file(node);
-            if !guard.holds(&board::fold(&file), self.name(node)) {
+            if !guard.holds(&board::fold_on(&file, self.name(node)), self.name(node)) {
                 self.note(node, format!("{guard:?} refused under the lock"));
                 return None;
             }
@@ -392,17 +449,31 @@ impl Sim {
                 self.held.insert(i);
             }
             lands = lands.max(self.t + local);
-            let what = format!("{} {} {}@{}{}", e.by, e.ev.name(), e.task, e.ms, if e.note.is_empty() { String::new() } else { format!(" ({})", e.note) });
-            self.note(node, what);
+            if e.note != board::BEAT {
+                let what = format!("{} {} {}@{}{}", e.by, e.ev.name(), e.task, e.ms, if e.note.is_empty() { String::new() } else { format!(" ({})", e.note) });
+                self.note(node, what);
+            }
+            let remote = self.arrive(self.t + (local - 1).max(0) + self.cfg.delay + remote);
             for to in 0..self.lines.len() {
                 match (to == node, local) {
                     (true, 0) => self.out[node].push(e.clone()),
                     (true, _) => self.pending.push((self.t + local, to, e.clone())),
-                    (false, _) => self.pending.push((self.t + (local - 1).max(0) + self.cfg.delay + remote, to, e.clone())),
+                    (false, _) => self.pending.push((remote, to, e.clone())),
                 }
             }
         }
         Some(lands)
+    }
+
+    /// When a line written now that would reach the other nodes at tick `at` does: not before a cut it is
+    /// written in heals (`Cfg::cuts`).
+    fn arrive(&self, at: i64) -> i64 {
+        self.cfg.cuts.iter().filter(|(from, to)| (*from..*to).contains(&self.t)).fold(at, |at, (_, to)| at.max(*to))
+    }
+
+    /// A runner line of `node` with `note` (a roster, a membership line) at its clock now.
+    fn runner(&self, node: usize, note: &str) -> Event {
+        Event::new(Ev::Heartbeat, "", "runner", self.now(node) + self.out[node].len() as i64).with_note(note)
     }
 
     /// What `node`'s board file holds now: its lines and its writes of this tick (each landed under
@@ -421,7 +492,7 @@ impl Sim {
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.landing).into_iter().partition(|l| l.at <= self.t);
         self.landing = later;
         for l in due {
-            if !l.guard.holds(&board::fold(&self.lines[l.node]), self.name(l.node)) {
+            if !l.guard.holds(&board::fold_on(&self.lines[l.node], self.name(l.node)), self.name(l.node)) {
                 self.note(l.node, format!("{:?} refused under the lock", l.guard));
                 continue;
             }
@@ -440,26 +511,52 @@ impl Sim {
         let t = self.t;
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|(at, _, _)| *at <= t);
         self.pending = later;
-        for (_, to, e) in due {
+        for (at, to, e) in due {
+            if let Some(&(_, _, until)) = self.cfg.deaf.iter().find(|(n, from, until)| *n == self.cfg.nodes[to].name && (*from..*until).contains(&t)) {
+                self.pending.push((at.max(until), to, e));
+                continue;
+            }
             let seen = board::Seen(Some(self.now(to)));
             self.lines[to].push(Event { seen, ..e });
         }
         self.land();
         for i in 0..self.cfg.nodes.len() {
-            if self.cfg.nodes[i].start == t {
+            let start = self.cfg.nodes[i].start;
+            if start == t {
+                // mod.rs `announce`: the join and the roster in one write.
                 let names: Vec<String> = (1..=self.cfg.nodes[i].drones).map(|k| format!("d{k}")).collect();
                 let now = self.now(i);
-                self.write(i, vec![Event::new(Ev::Heartbeat, "", "runner", now).with_note(&board::roster_note(&names))]);
+                let line = |note: &str| Event::new(Ev::Heartbeat, "", "runner", now).with_note(note);
+                self.write(i, vec![line(board::JOIN), line(&board::roster_note(&names))]);
+            }
+            // run.rs `membership`: a goal heartbeat every `BEAT_MS` while the runner runs.
+            let beats = |n: &NodeCfg| n.stop.into_iter().chain(n.mute).all(|stop| t < stop);
+            let running = t >= start && !self.exits.contains_key(&i) && beats(&self.cfg.nodes[i]);
+            if t > start && (t - start) % (BEAT_MS / TICK) == 0 && running {
+                let beat = self.runner(i, board::BEAT);
+                self.write(i, vec![beat]);
+            } else if let Some(m) = board::to_ack(&self.file(i), self.name(i)).filter(|m| running && *m > self.acked[i]) {
+                // run.rs `membership`: a claim of another node arrived, a beat now moves this node's
+                // watermark past it (phase f F5).
+                self.acked[i] = m;
+                let beat = self.runner(i, board::BEAT);
+                self.write(i, vec![beat]);
             }
             if self.cfg.nodes[i].stop == Some(t) {
                 self.note(i, "runner killed".into());
-                for d in self.drones.iter_mut().filter(|d| d.node == i) {
+                for d in self.drones.iter_mut().filter(|d| d.node == i && !matches!(d.st, St::Ended(_))) {
                     d.st = St::Ended("killed");
+                    self.ends.push((format!("{}.{}", self.cfg.nodes[i].name, d.name), "killed", t));
                 }
                 self.stopped.insert(i);
             }
         }
-        let folds: Vec<Board> = self.lines.iter().map(|l| board::fold(l)).collect();
+        for (i, l) in self.lines.iter().enumerate() {
+            if self.folded[i].0 != l.len() {
+                self.folded[i] = (l.len(), board::fold_on(l, self.cfg.nodes[i].name));
+            }
+        }
+        let folds: Vec<Board> = self.folded.iter().map(|(_, b)| b.clone()).collect();
         for b in &folds {
             self.observe(b);
         }
@@ -472,8 +569,13 @@ impl Sim {
                 self.note(node, format!("{} ends: {why}", self.drones[d].name));
                 // Its runner names the drones still running (each end its own ms, as the threads end apart).
                 let still: Vec<String> = self.drones.iter().filter(|x| x.node == node && !matches!(x.st, St::Ended(_))).map(|x| x.name.clone()).collect();
-                let ms = self.now(node) + self.out[node].len() as i64;
-                self.write(node, vec![Event::new(Ev::Heartbeat, "", "runner", ms).with_note(&board::roster_note(&still))]);
+                let roster = self.runner(node, &board::roster_note(&still));
+                self.write(node, vec![roster]);
+                // run.rs `main`: its drones ended, the runner leaves the goal (`Joined`).
+                if still.is_empty() && !self.stopped.contains(&node) {
+                    let leave = self.runner(node, board::LEAVE);
+                    self.write(node, vec![leave]);
+                }
             }
         }
         for i in 0..self.lines.len() {
@@ -501,6 +603,9 @@ impl Sim {
         for i in &b.integrations {
             self.seen.insert(Seen::Integrated(i.task.clone(), i.ms));
         }
+        for s in b.tasks.values().filter(|s| s.task.role == Role::Work) {
+            self.seen.extend((1..=s.rework).map(|r| Seen::Reopened(s.task.id.clone(), r)));
+        }
     }
 
     fn act(&mut self, d: usize, b: &Board) {
@@ -512,8 +617,9 @@ impl Sim {
                 St::Off if self.t >= ready => self.drones[d].st = St::Decide,
                 St::Off => return,
                 St::Wait { until, seen, in_hand } => {
-                    // run.rs `idle_wait`: a change of the board's file ends the wait early, no idle poll.
-                    let changed = self.lines[node].len() != seen;
+                    // run.rs `idle_wait`: a change of the board ends the wait early, no idle poll; a line
+                    // that changes no board (a beat) does not.
+                    let changed = *b != *seen;
                     if !changed && self.t < until {
                         return;
                     }
@@ -573,7 +679,7 @@ impl Sim {
         let x = &mut self.drones[d];
         match run::step(&x.tally, f64::from(self.cfg.nodes[node].share), 1.0, b.finished(), offer.task.is_some()) {
             Next::End(why) => x.st = St::Ended(why),
-            Next::Wait => x.st = St::Wait { until: self.t + IDLE_WAIT, seen: self.lines[node].len(), in_hand: offer.in_hand },
+            Next::Wait => x.st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()), in_hand: offer.in_hand },
             Next::Go => {
                 x.tally.idle = 0;
                 x.iters += 1;
@@ -657,9 +763,13 @@ impl Sim {
             }
             (Some(_), false) if self.t < s.lands => false,
             (Some(id), false) => match super::holding(b, &id, &s.id, now) {
+                // mod.rs `across`: the claim waits until it is final (phase f F5), every participant's
+                // watermark past its stamp, or the ones it waits for suspected.
+                Some(t) if !b.unconfirmed(here, since(&t, now), now).0.is_empty() => false,
                 Some(t) => {
                     let key = (here.to_string(), id.clone(), t.rework);
                     self.won.entry(key).or_default().push(s.id.clone());
+                    self.waits.push(self.t - s.lands);
                     s.won = true;
                     s.until = self.t + if t.task.role == Role::Verify { self.cfg.verify } else { self.cfg.work };
                     false
@@ -679,8 +789,14 @@ impl Sim {
                 }
                 Some(_) if self.t < s.until => false,
                 Some(t) => {
+                    // Written under the claim the fold gives it now, and only while its node's file under the
+                    // lock still gives it: for good (phase f F5).
+                    let claim = Some(since(&t, now));
                     let lines = match t.task.role {
-                        Role::Verify => vec![Event::new(Ev::Verified, &id, &s.id, now)],
+                        Role::Verify if self.cfg.reject.contains(&id) => {
+                            vec![Event { claim, head: judged_head(b, &t), ..Event::new(Ev::Rejected, &id, &s.id, now).with_note("rejected") }]
+                        }
+                        Role::Verify => vec![Event { claim, head: judged_head(b, &t), ..Event::new(Ev::Verified, &id, &s.id, now) }],
                         _ => {
                             // mod.rs `finish`: the done and its verify task's open (`verify_task`) at one ms.
                             let v = Task {
@@ -689,10 +805,12 @@ impl Sim {
                                 not_by: vec![s.id.clone(), drone.clone()],
                                 ..work_task("", Role::Verify, &t.task.deps)
                             };
-                            vec![Event { head: format!("head-{}", s.id), ..Event::new(Ev::Done, &id, &s.id, now) }, Event::open(v, &s.id, now)]
+                            vec![Event { head: format!("head-{}", s.id), claim, ..Event::new(Ev::Done, &id, &s.id, now) }, Event::open(v, &s.id, now)]
                         }
                     };
-                    self.write(node, lines);
+                    if self.write_if(node, lines, Guard::Holds { task: id.clone(), session: s.id.clone(), now }).is_none() {
+                        self.note(node, format!("{} no longer holds {id}: nothing written", s.id));
+                    }
                     true
                 }
             },
@@ -707,24 +825,55 @@ impl Sim {
         }
     }
 
-    /// integrate.rs after `claim_due`'s write: the read-back, then the merge and the oracle, and the
-    /// verdict, with no fold between. Whether the drone is done for this tick.
+    /// integrate.rs after `claim_due`'s write: the read-back and the wait until the claim is final (phase
+    /// f F5), the integrated ref moved under its fencing token (`integrate::fence`: refused to a token not
+    /// above the ref's), the merge and the oracle, then a fold again before the verdict (written only
+    /// while the claim still holds, for good, with the attempts merged). Whether the drone is done for
+    /// this tick.
     fn integrating(&mut self, d: usize, b: &Board, session: String, task: String, until: Option<i64>) -> bool {
         let (node, now) = (self.drones[d].node, self.now(self.drones[d].node));
-        let x = &mut self.drones[d];
-        match until {
-            None if b.tasks.get(&task).and_then(|s| s.live(now)).is_none_or(|(by, _, _)| by != session) => {
-                x.st = St::Decide;
+        let here = self.name(node);
+        let held = b.tasks.get(&task).and_then(|s| s.live(now)).filter(|(by, _, _)| *by == session).map(|(_, _, since)| since);
+        match (until, held) {
+            (None, None) => {
+                self.drones[d].st = St::Decide;
                 false
             }
-            None => {
-                x.st = St::Integrating { session, task, until: Some(self.t + self.cfg.integrate) };
+            (None, Some(since)) if !b.unconfirmed(here, since, now).0.is_empty() => true,
+            (None, Some(since)) => {
+                let token = (integrate::epoch(&task), since);
+                if self.refs.get(&node).is_some_and(|held| *held >= token) {
+                    self.note(node, format!("{session} fenced from the ref by {:?}", self.refs[&node]));
+                    self.drones[d].st = St::Decide;
+                    return false;
+                }
+                self.refs.insert(node, token);
+                self.integrations.entry(task.clone()).or_default().push(session.clone());
+                self.ref_moves.entry((here.to_string(), task.clone())).or_default().push(session.clone());
+                self.drones[d].st = St::Integrating { session, task, until: Some(self.t + self.cfg.integrate) };
                 true
             }
-            Some(at) if self.t < at => true,
-            Some(_) => {
-                self.integrations.entry(task.clone()).or_default().push(session.clone());
-                self.write(node, vec![Event { head: format!("merged-{session}"), ..Event::new(Ev::Verified, &task, &session, now) }]);
+            (Some(at), _) if self.t < at => true,
+            (Some(_), None) => {
+                self.note(node, format!("{session} no longer holds {task}: no verdict"));
+                self.drones[d].st = St::Decide;
+                true
+            }
+            (Some(_), Some(since)) => {
+                let merged = b.tasks.values().filter(|s| s.task.role == Role::Work).filter_map(|s| {
+                    let (by, done) = s.accepted_attempt.as_ref()?;
+                    s.attempts.iter().find(|a| a.by == *by && a.done == *done).map(|a| format!("{}@{}", s.task.id, a.head))
+                });
+                let e = Event {
+                    head: format!("merged-{session}"),
+                    claim: Some(since),
+                    deps_in: merged.collect(),
+                    ..Event::new(Ev::Verified, &task, &session, now)
+                };
+                // integrate.rs `write_held`: under the lock, only while its node's file still gives it the claim.
+                if self.write_if(node, vec![e], Guard::Holds { task: task.clone(), session: session.clone(), now }).is_none() {
+                    self.note(node, format!("{session} no longer holds {task}: no verdict"));
+                }
                 self.drones[d].st = St::Decide;
                 true
             }
@@ -782,15 +931,32 @@ impl Sim {
         let kept = |x: &Seen| match x {
             Seen::Done(t, by) => u.spans.iter().any(|sp| sp.task == *t && sp.by == *by && sp.end == Some(Ev::Done)),
             Seen::Verdict(t, by) => u.spans.iter().any(|sp| sp.task == *t && sp.by == *by && matches!(sp.end, Some(Ev::Verified | Ev::Rejected))),
-            Seen::Integrated(t, ms) => u.integrations.iter().any(|i| i.task == *t && i.ms == *ms),
+            // The epoch stays integrated; of two integrators that both passed under a suspicion, the
+            // verdict that closed the task is its one integration on every board, the other a verdict kept
+            // as its own (`Seen::Verdict`).
+            Seen::Integrated(t, _) => u.integrations.iter().any(|i| i.task == *t),
+            // A reopen stands until the task is verified (a pass of the round, sticky, may sort first).
+            Seen::Reopened(t, r) => u.tasks.get(t).is_some_and(|s| s.rework >= *r || matches!(s.status, Status::Verified { .. })),
         };
         let gone: Vec<&Seen> = self.seen.iter().filter(|x| !kept(x)).collect();
         (!gone.is_empty()).then(|| format!("took effect in a node's fold, void in the converged board: {gone:?}"))
     }
 
-    /// Integrate-once: one integrator merged and wrote its verdict per integrate task.
+    /// Integrate-once: one integrator merged per integrate task (and so ran the oracle; its verdict only
+    /// while it still holds the claim).
     fn integrated_twice(&self) -> Option<String> {
         self.integrations.iter().find(|(_, by)| by.len() > 1).map(|(t, by)| format!("{t} integrated in full by {by:?}"))
+    }
+
+    /// Integrate-once on the board: one integration per integrate task in the converged board, whatever
+    /// integrators ran (two under a suspicion, `integrated_twice`).
+    fn integrations_twice(&self) -> Option<String> {
+        let u = self.converged();
+        let mut per: BTreeMap<&str, usize> = BTreeMap::new();
+        for i in &u.integrations {
+            *per.entry(i.task.as_str()).or_default() += 1;
+        }
+        per.iter().find(|(_, n)| **n > 1).map(|(t, n)| format!("{t} integrated {n} times on the converged board: {:?}", u.integrations))
     }
 
     /// Same-node exclusion: one session of a node won its read-back per task attempt.
@@ -800,7 +966,7 @@ impl Sim {
 
     /// What the run did, read without a clock: its trace up to the first integration, each line's
     /// stamps left out (two nodes' integrators claim one integration in one tick, CE4, and the lower
-    /// stamp wins, a race only F5 makes final; who wins moves the ends after it), each drone's end and
+    /// stamp wins once both claims are final, phase f F5; who wins moves the ends after it), each drone's end and
     /// its iterations.
     fn outcome(&self) -> (Vec<String>, BTreeSet<(String, &'static str)>, Vec<u32>) {
         let unstamped = |l: &String| l.split(' ').map(|w| w.split_once('@').map_or(w, |(w, _)| w)).collect::<Vec<_>>().join(" ");
@@ -810,11 +976,12 @@ impl Sim {
 
     /// Every property but the ones `skip` names, with the trace.
     fn check(&self, skip: &[&str]) {
-        let props: [(&str, Option<String>); 5] = [
+        let props: [(&str, Option<String>); 6] = [
             ("end", self.premature_end()),
             ("exit", self.exit_unfinished()),
             ("S2'", self.retracted()),
             ("integrate", self.integrated_twice()),
+            ("integration", self.integrations_twice()),
             ("same-node", self.same_node_twice()),
         ];
         for (name, v) in props {
@@ -877,17 +1044,19 @@ fn c_two_drones_on_one_node() {
     }
 }
 
-/// A slow network (hivemc D): lines take 3 s. Every property but integrate-once (`d_integrates_once`).
+/// A slow network (hivemc D): lines take 3 s. Every property, integrate-once too since phase f F5
+/// (`d_integrates_once`).
 #[test]
 fn d_a_slow_network() {
     for cfg in Cfg::new(&[("a", None), ("b", None)]).sweep(&[1, 6]) {
-        Sim::run(Cfg { delay: 3, ..cfg }).check(&["integrate"]);
+        Sim::run(Cfg { delay: 3, ..cfg }).check(&[]);
     }
 }
 
-/// hivemc D's integration: with lines taking 3 s, both nodes see the last verdict and integrate (CE4).
+/// hivemc D's integration: with lines taking 3 s, both nodes see the last verdict and claim the
+/// integration (CE4); each claim waits until it is final (phase f F5: the other's watermark past its
+/// stamp), by then each node holds the other's claim, and only the one that sorts first integrates.
 #[test]
-#[ignore = "F5: integrate claims wait for every live participant, the integration is fenced by its epoch"]
 fn d_integrates_once() {
     for cfg in Cfg::new(&[("a", None), ("b", None)]).sweep(&[1, 6]) {
         let r = Sim::run(Cfg { delay: 3, ..cfg });
@@ -895,11 +1064,11 @@ fn d_integrates_once() {
     }
 }
 
-/// Clock skew (hivemc E): b's clock 2 s behind, lines take 2 s. Every property but integrate-once.
+/// Clock skew (hivemc E): b's clock 2 s behind, lines take 2 s. Every property.
 #[test]
 fn e_clock_skew() {
     for cfg in Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.skew = -2000).sweep(&[1, 6]) {
-        Sim::run(Cfg { delay: 2, ..cfg }).check(&["integrate"]);
+        Sim::run(Cfg { delay: 2, ..cfg }).check(&[]);
     }
 }
 
@@ -942,11 +1111,12 @@ fn g_a_peer_clock_ahead_hides_no_stall() {
     }
 }
 
-/// a's runner is killed at t=4 holding its task (hivemc H): b waits on the lease (`in_flight`) and never
-/// takes the task back; the lease is 30 min, and only a could verify b's work. The property: a node
-/// gone silent hands its tasks back within seconds.
+/// a's runner is killed at t=4 holding its task (hivemc H). Before phase f F4 b waited on the lease
+/// (`in_flight`), 30 min, and never took the task back. The property: a node gone silent hands its
+/// tasks back within seconds: a's runner beats no more, b suspects it `SUSPECT_MS` after the last line
+/// it held of a (`Board::participants`), and a's drone's lease counts as expired there (`Local::gone`):
+/// b's claim names a's last renewal (`board::takes`) and the fold takes it within the lease.
 #[test]
-#[ignore = "F4: a goal participant silent for seconds is suspected and its leases count as expired"]
 fn h_a_killed_holder_hands_its_task_back() {
     let cfg = Cfg { horizon: 120, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.stop = Some(4));
     let r = Sim::run(cfg);
@@ -955,11 +1125,12 @@ fn h_a_killed_holder_hands_its_task_back() {
     assert!(taken, "{t} still a's 2 minutes after a's runner died\n{}", r.trace());
 }
 
-/// a's lease wait (hivemc H) ends no runner early: b keeps waiting on a killed node's claim.
+/// hivemc H ends no runner early: b takes a's task back once a is suspected (phase f F4; before, b
+/// waited on a's lease), does it, and ends once nothing is left it may do: only a could verify either
+/// task, and a is gone (F6 makes that an explicit stuck; a node killed excuses it here).
 #[test]
 fn h_a_killed_holder_ends_no_runner_early() {
     let r = Sim::run(Cfg::new(&[("a", None), ("b", None)]).node("a", |n| n.stop = Some(4)));
-    assert!(matches!(r.drones[1].st, St::Wait { .. }), "{}", r.trace());
     r.check(&[]);
 }
 
@@ -972,43 +1143,43 @@ fn i_a_budget_of_one_iteration() {
 }
 
 /// Named claims (hivemc J; G1): the model claims the task its prompt offered, by name (`picked` false,
-/// no `left_to_another` refusal, no retry); b starts 2 s late. Every property but integrate-once.
+/// no `left_to_another` refusal, no retry); b starts 2 s late. Every property.
 #[test]
 fn j_named_claims() {
     for cfg in Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.start = 2).sweep(&[1, 6]) {
-        Sim::run(Cfg { named: true, ..cfg }).check(&["integrate"]);
+        Sim::run(Cfg { named: true, ..cfg }).check(&[]);
     }
 }
 
 /// The integration race (hivemc K; CE4): lines take 2 s, an integration 5. Both nodes' drones see the
 /// last verdicts within a tick of each other and claim the integrate task; neither read-back has the
-/// other's claim, and the integrator never folds again, so both merge, run the oracle and write their
-/// verdict. Integrate-once.
+/// other's claim, and the integrator never folded again, so both merged, ran the oracle and wrote their
+/// verdict. Integrate-once: each claim now waits until it is final (phase f F5), the loser learns before
+/// its merge, and the integrator folds again before its verdict.
 #[test]
-#[ignore = "F5: integrate claims wait for every live participant, the integration is fenced by its epoch"]
 fn k_ce4_two_nodes_integrate_once() {
     let r = Sim::run(Cfg { delay: 2, integrate: 5, ..Cfg::new(&[("a", None), ("b", None)]) });
     assert_eq!(r.integrated_twice(), None, "{}", r.trace());
 }
 
-/// hivemc K's other properties: the duplicate integration is ignored by the fold and costs no result.
+/// hivemc K's other properties: no result is lost (every property, integrate-once included).
 #[test]
 fn k_the_integration_race_loses_no_result() {
-    Sim::run(Cfg { delay: 2, integrate: 5, ..Cfg::new(&[("a", None), ("b", None)]) }).check(&["integrate"]);
+    Sim::run(Cfg { delay: 2, integrate: 5, ..Cfg::new(&[("a", None), ("b", None)]) }).check(&[]);
 }
 
 /// One task, a's; a starts 3 s late, b's clock is 2 s behind, lines take 2 s, work 5 (hivemc L):
-/// every property but integrate-once.
+/// every property.
 #[test]
 fn l_a_late_owner_with_skew() {
     let cfg = Cfg { delay: 2, work: 5, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.start = 3).node("b", |n| n.skew = -2000);
     for cfg in cfg.sweep(&[1, 2, 3]) {
-        Sim::run(cfg).check(&["integrate"]);
+        Sim::run(cfg).check(&[]);
     }
 }
 
 /// CE3 (hivemc L at HEAD): a session that finds its work only as it ends. a starts 1 s late, lines take
-/// 2 s, b's model 5 s to claim, work 1. b's first session starts on t0 (a's roster not here yet) and
+/// 2 s, b's model 8 s to claim (5 before phase f F5, whose final wait puts a's done 3 s later), work 1. b's first session starts on t0 (a's roster not here yet) and
 /// claims after a's claim landed, so it writes nothing, and as it ends a's done has opened t0.v1 to b.
 /// A task that became claimable during the session is no stall (run.rs `stalls` by the session's start
 /// view, the CE3 fix), so b verifies instead of counting it. No premature end. (At HEAD this needed b's
@@ -1016,24 +1187,69 @@ fn l_a_late_owner_with_skew() {
 /// skew no longer changes it: `skew_changes_nothing_a_node_does`.)
 #[test]
 fn ce3_work_that_opens_during_a_session_is_no_stall() {
-    let cfg = Cfg { delay: 2, work: 1, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.start = 1).lat("b", "d1", &[5]);
+    let cfg = Cfg { delay: 2, work: 1, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.start = 1).lat("b", "d1", &[8]);
     let r = Sim::run(cfg);
     let t = r.first("b", "d1 wrote nothing; t0.v1 became claimable during its session: no stall");
     assert!(t.is_some(), "b's empty session found a's work as it ended\n{}", r.trace());
     assert!(r.first("b", "verified t0.v1") > t, "b verifies a's work\n{}", r.trace());
-    r.check(&["integrate"]);
+    r.check(&[]);
 }
 
 /// CE5: b's clock is 2 s behind and lines take 5 s, work 2. b claims a's task in the tick a does,
 /// stamped 2 s earlier, before a's roster reached it; a's read-back and confirm window see nothing, a
 /// works and its done takes effect in a's fold, until b's claim lands and voids it (and its verify
-/// task). S2'.
+/// task). S2'. Since phase f F5 a's claim waits until it is final, b's watermark past it, which b's claim
+/// (earlier in b's file) reaches a before: a loses before any work, and a done would be for good anyway.
 #[test]
-#[ignore = "F5: dones are never voided; attempts are a G-set, the accepted one chosen at integration"]
 fn ce5_a_done_that_took_effect_is_never_voided() {
     let cfg = Cfg { delay: 5, work: 2, ..Cfg::new(&[("a", None)]) }.node("b", |n| n.skew = -2000);
     let r = Sim::run(cfg);
     assert_eq!(r.retracted(), None, "{}", r.trace());
+}
+
+/// CE5 with b suspected: as `ce5_a_done_that_took_effect_is_never_voided`, two drones a node (a node
+/// that did an attempt verifies none of its rival's), and every line written from t=1 until `heal` kept
+/// from the other node until then, so the joins arrive and the claims do not. Each node's claim waits
+/// on the other's watermark until it suspects the other (`SUSPECT_MS`), then proceeds: both work, and
+/// both dones take effect in their own folds. b's claim, stamped 2 s earlier, wins the converged fold.
+/// Healed at t=30, each node's verifier has judged its own node's attempt in the cut.
+fn ce5_suspected(heal: i64) -> Cfg {
+    let cfg = Cfg { delay: 5, work: 2, cuts: vec![(1, heal)], horizon: 120, ..Cfg::new(&[("a", None)]) };
+    cfg.node("a", |n| n.drones = 2).node("b", |n| (n.drones, n.skew) = (2, -2000))
+}
+
+/// Phase f F5, after review: `ce5_suspected`. The final wait no longer protects a's done, only the
+/// monotone results do: a's done is kept beside b's, b's the task's (S2'), and every property holds.
+/// Fails with `Fold::permanent` never true: a's done, which took effect in a's fold, is voided once
+/// b's earlier claim arrives.
+#[test]
+fn ce5_a_done_under_a_suspicion_is_never_voided() {
+    let r = Sim::run(ce5_suspected(20));
+    let t = &r.cfg.tasks[0].0;
+    let u = r.converged();
+    let done: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t && sp.end == Some(Ev::Done)).map(|sp| sp.node.as_str()).collect();
+    assert_eq!(done.len(), 2, "both did it: {done:?}\n{}", r.trace());
+    assert!(matches!(&u.tasks[t].status, Status::Verified { .. }), "{}", r.trace());
+    assert!(r.first("a", &format!("done {t}@")).is_some() && r.first("b", &format!("done {t}@")).is_some(), "both did it\n{}", r.trace());
+    assert_eq!(r.retracted(), None, "{}", r.trace());
+    r.check(&["integrate"]);
+}
+
+/// Phase f F5, after review: both nodes' integrators finish under a suspicion. Two drones a node, a task
+/// each; the network is cut from t=6 for a minute, so each node suspects the other, takes the other's
+/// task over, verifies and integrates on its own. Both merge (a duplicate, `integrated_twice`), and
+/// once the cut heals the converged board has one integration of the epoch (only the verdict that
+/// closed the integrate task integrates; the other is an attempt), every other property holding. Fails
+/// with every verdict for good integrating: two integrations of integrate.1, `integrated` moving to
+/// the later-arriving one.
+#[test]
+fn integrators_that_both_finish_under_a_suspicion_integrate_once_on_the_board() {
+    let cfg = Cfg { cuts: vec![(6, 66)], horizon: 160, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.drones = 2).node("b", |n| n.drones = 2);
+    let r = Sim::run(cfg);
+    let both: Vec<&String> = r.integrations.values().flatten().collect();
+    assert!(both.len() >= 2, "both nodes integrated in the cut: {both:?}\n{}", r.trace());
+    assert_eq!(r.integrations_twice(), None, "{}", r.trace());
+    r.check(&["integrate"]);
 }
 
 /// Not in hivemc (its read-back was always in time): a's d1 stamps its claim of t (a's) at t=2, and the
@@ -1064,11 +1280,13 @@ fn integrators_on_two_nodes_in_one_ms_are_two_sessions() {
 }
 
 /// Not in hivemc (spec G5): b's integrate claim is stamped before a's (b's clock 2 s behind) and reaches
-/// a only after a's integration passed; b's runner is killed before its own passes. a's runner exits 0
-/// on its fold, then b's claim lands and voids a's integration: the converged board is unfinished, b's
-/// lease on the integrate task live. Stable-prefix exit (and S2').
+/// a only after a's integration passed; b's runner is killed before its own passes. a's runner exited 0
+/// on its fold, then b's claim landed and voided a's integration: the converged board unfinished, b's
+/// lease on the integrate task live. Stable-prefix exit (and S2'), by phase f F5 alone: a's claim waits
+/// for b's watermark, which the held claim keeps short of it (`Event::seq`) until b is suspected, and a's
+/// verdict, written under its claim (`Event::claim`), is for good: the late claim takes no integration
+/// back. (F6's stable-prefix exit covers what F5 does not: a late line that opens a task.)
 #[test]
-#[ignore = "F5/F6: integrations are never voided, a runner exits 0 only on a finished stable prefix"]
 fn g5_a_runner_exits_0_only_on_a_stable_prefix() {
     let mut cfg = Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.skew = -2000);
     cfg.holds.push(Hold { node: "b", ev: Ev::Claim, task: "integrate.1".into(), local: 0, remote: 6 });
@@ -1079,8 +1297,8 @@ fn g5_a_runner_exits_0_only_on_a_stable_prefix() {
 
 /// hivemc's liveness sweep (tasks/soundness-model/sweep.py), reduced: task sets with dep chains within
 /// and across nodes, b starting at once or 2 s late with its clock 2 s either side of a's, lines in 1 or
-/// 2 s, each drone's claims after 1 or 12 s (or every drone's after 4), work and integrations 4. Every property but integrate-once
-/// (CE4, `k_ce4_two_nodes_integrate_once`).
+/// 2 s, each drone's claims after 1 or 12 s (or every drone's after 4), work and integrations 4. Every
+/// property, integrate-once too since phase f F5 (CE4, `k_ce4_two_nodes_integrate_once`).
 #[test]
 fn a_reduced_liveness_sweep() {
     let sets: [&[(&str, Option<usize>)]; 4] =
@@ -1091,7 +1309,7 @@ fn a_reduced_liveness_sweep() {
                 for delay in [1, 2] {
                     let cfg = Cfg { delay, work: 4, integrate: 4, ..Cfg::new(tasks) }.node("b", |n| (n.start, n.skew) = (start, skew));
                     for cfg in [cfg.sweep(&[1, 12]), cfg.sweep(&[4])].concat() {
-                        Sim::run(cfg).check(&["integrate"]);
+                        Sim::run(cfg).check(&[]);
                     }
                 }
             }
@@ -1154,42 +1372,169 @@ fn skew_changes_nothing_a_node_does() {
         Cfg::new(&[("a", None)]).lat("a", "d1", &[12]),
         Cfg::new(&[("a", None), ("a", Some(0))]).lat("b", "d1", &[12, 1]),
         Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.start = 6),
-        Cfg { delay: 2, work: 1, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.start = 1).lat("b", "d1", &[5]),
+        Cfg { delay: 2, work: 1, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.start = 1).lat("b", "d1", &[8]),
     ];
     for cfg in cfgs {
         let base = Sim::run(cfg.clone());
-        base.check(&["integrate"]);
+        base.check(&[]);
         for (node, skew) in ["a", "b"].into_iter().flat_map(|n| SKEWS.map(|s| (n, s))) {
             let r = Sim::run(cfg.clone().node(node, |n| n.skew = skew));
-            r.check(&["integrate"]);
+            r.check(&[]);
             assert_eq!(r.outcome(), base.outcome(), "{node}'s clock {skew} ms off\n{}\n---- one clock:\n{}", r.trace(), base.trace());
         }
     }
 }
 
-/// a's runner is killed at t=4 holding its task (hivemc H), its clock 10 s or 5 min off b's: b times
-/// a's lease from when it held a's last renewal, on its own clock, so it takes the task over at the
-/// same tick as with one clock (`LEASE_MS` after), its claim stamped past the lease (board.rs
-/// `claim_at`) so the fold agrees; and a leaves b's live set (`Board::live_nodes`) at the same tick.
-/// Before, the lease and the live set were `now` against a's stamps: a's clock 5 min ahead kept its
-/// task and its node 5 min longer, 5 min behind handed them over 5 min early.
+/// A session hung on a node that still beats keeps its claim for the whole lease (phase f F4: a node's
+/// liveness apart from the work lease), its clock 10 s or 5 min off b's (F3): a's only drone claims its
+/// task and its work never ends, no hook renews the lease, a's runner beats on. On b, a stays a
+/// participant and its task stays held until `LEASE_MS` after b held a's claim, then turns claimable at
+/// the same tick for every skew: b times the lease from when it held the renewal, on its own clock (a,
+/// the owner, takes it again within its grace). Before F3 the lease was `now` against a's stamps: a's
+/// clock 5 min ahead kept its task 5 min longer, 5 min behind handed it over 5 min early.
 #[test]
 fn a_dead_holders_lease_and_liveness_run_out_on_the_observers_clock() {
+    let horizon = LEASE_MS / TICK + 20;
     let run = |skew: i64| {
-        let horizon = LEASE_MS / TICK + 40;
-        let r = Sim::run(Cfg { horizon, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| (n.stop, n.skew) = (Some(4), skew)));
+        let r = Sim::run(Cfg { horizon, work: 3 * horizon, ..Cfg::new(&[("a", None)]) }.node("a", |n| n.skew = skew));
         let t = r.cfg.tasks[0].0.clone();
-        let took = r.first("b", &format!("claim {t}@"));
-        let b = board::fold(&r.lines[1]);
-        let gone = (0..horizon).find(|&t| !b.live_nodes("b", t * TICK + 1).contains("a"));
-        assert!(r.converged().spans.iter().any(|sp| sp.task == t && sp.node == "b"), "b holds {t} in the converged board\n{}", r.trace());
-        (took, gone)
+        // b's board as it stood at tick `at`, on b's clock.
+        let on_b = |at: i64| board::fold(&r.lines[1].iter().filter(|e| e.seen.0.is_some_and(|ms| ms <= r.clock(1, at))).cloned().collect::<Vec<_>>());
+        let freed = (LEASE_MS / TICK - 5..horizon).find(|&at| on_b(at).tasks[&t].claimable(r.clock(1, at)));
+        for at in (3..LEASE_MS / TICK - 5).step_by(97) {
+            let b = on_b(at);
+            assert!(b.tasks[&t].live(r.clock(1, at)).is_some() && b.participants("b", r.clock(1, at)).contains("a"), "a's at t={at}\n{}", r.trace());
+        }
+        freed
     };
-    let base = run(0);
-    assert!(base.0.is_some_and(|t| t >= LEASE_MS / TICK) && base.1.is_some_and(|t| t >= LEASE_MS / TICK), "{base:?}");
-    for skew in SKEWS {
-        assert_eq!(run(skew), base, "a's clock {skew} ms off");
+    // Half an hour of ticks per skew: the runs side by side.
+    let freed: Vec<Option<i64>> = std::thread::scope(|s| {
+        let runs: Vec<_> = [0].into_iter().chain(SKEWS).map(|skew| s.spawn(move || run(skew))).collect();
+        runs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let base = freed[0];
+    assert!(base.is_some_and(|t| t >= LEASE_MS / TICK), "{base:?}");
+    for (skew, at) in SKEWS.iter().zip(&freed[1..]) {
+        assert_eq!(*at, base, "a's clock {skew} ms off");
     }
+}
+
+/// Phase f F4: a node killed mid-claim hands its task to the other within the suspicion window, for
+/// every skew. a's runner is killed as its claim reaches b (t=3, before its confirm window's read), or
+/// holding it (t=4, t=6); b suspects a `SUSPECT_MS` after it last held a line of a, on its own clock
+/// (`Board::participants`), and takes the task at once (`Local::gone`, `board::takes`): the same ticks
+/// for each skew, the claim within an idle drone's look and a session's claim of the suspicion, or of b's
+/// drone's done of its own task: b's claim of it, made as a died, waits until it is final (phase f F5),
+/// which a dead a never acks, so until a is suspected. Before, 30 min.
+#[test]
+fn a_node_killed_mid_claim_hands_its_task_over_within_the_suspicion_window() {
+    let window = SUSPECT_MS / TICK;
+    for stop in [3, 4, 6] {
+        let run = |skew: i64| {
+            let r = Sim::run(Cfg { horizon: 60, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| (n.stop, n.skew) = (Some(stop), skew)));
+            let t = r.cfg.tasks[0].0.clone();
+            let took = r.first("b", &format!("claim {t}@"));
+            let free = r.first("b", "done ");
+            let b = board::fold(&r.lines[1]);
+            let away = (stop..60).find(|&t| !b.participants("b", t * TICK + 1).contains("a"));
+            assert!(r.converged().spans.iter().any(|sp| sp.task == t && sp.node == "b"), "b holds {t}\n{}", r.trace());
+            r.check(&[]);
+            (took, away, free, r.trace())
+        };
+        let (took, away, free, trace) = run(0);
+        // Suspected a window after the last line b held of a; claimed within an idle drone's look and a
+        // session's claim of that, or of b's drone's own done.
+        let ready = away.zip(free).map(|(a, f)| a.max(f));
+        let (away_ok, took_ok) = (away.is_some_and(|t| t <= stop + window + 1), took.zip(ready).is_some_and(|(t, a)| t <= a + IDLE_WAIT + 1));
+        assert!(away_ok && took_ok, "killed at t={stop}: claimed at {took:?}, suspected at {away:?}, b free at {free:?}\n{trace}");
+        for skew in SKEWS {
+            let (t, a, f, trace) = run(skew);
+            assert_eq!((t, a, f), (took, away, free), "killed at t={stop}, a's clock {skew} ms off\n{trace}");
+        }
+    }
+}
+
+/// Phase f F4: a node that is slow but beats keeps its claims. a's work takes 40 s, four suspicion
+/// windows, and no hook renews its lease in that time; its runner beats every `BEAT_MS`, so b never
+/// suspects it and never claims a's task, for every skew: one tenure, a's done, a finished board.
+#[test]
+fn a_slow_node_that_beats_keeps_its_claims() {
+    for skew in [0].into_iter().chain(SKEWS) {
+        let r = Sim::run(Cfg { work: 40, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.skew = skew));
+        let t = &r.cfg.tasks[0].0;
+        let u = r.converged();
+        let held: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t).map(|sp| sp.node.as_str()).collect();
+        assert_eq!(held, ["a"], "a's clock {skew} ms off\n{}", r.trace());
+        r.check(&[]);
+        assert!(u.finished(), "{}", r.trace());
+    }
+}
+
+/// Phase f F4: a false suspicion costs at most a duplicate attempt, never a lost task. The network is
+/// cut from t=5 to t=36, longer than the suspicion window, while a works on its task (16 s; its claim
+/// final at t=4, b's ack in before the cut): b suspects a, takes the task over (`board::takes` names
+/// a's claim, the last renewal it held; final at once, its only peer suspected) and does it again; a,
+/// cut off, finishes and its done takes effect in its own fold, and so does b's in b's. Once the cut
+/// heals both stay (phase f F5): a's done, written under its claim, is the task's done (b's tenure ends
+/// there), b's a duplicate attempt kept beside it. Two attempts, every runner's end excused or the
+/// board finished, one accepted result, every property (S2': `a_false_suspicion_voids_no_done`).
+#[test]
+fn a_false_suspicion_costs_at_most_a_duplicate_attempt() {
+    let r = Sim::run(Cfg { work: 16, cuts: vec![(5, 36)], ..Cfg::new(&[("a", None)]) });
+    let t = &r.cfg.tasks[0].0;
+    let u = r.converged();
+    let attempts: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t).map(|sp| sp.node.as_str()).collect();
+    assert_eq!(attempts, ["a", "b"], "b took a's task over in the cut\n{}", r.trace());
+    assert!(r.first("a", &format!("done {t}@")).is_some() && r.first("b", &format!("done {t}@")).is_some(), "both did it\n{}", r.trace());
+    assert!(u.finished(), "{}", r.trace());
+    r.check(&[]);
+}
+
+/// What phase f F5 adds to `a_false_suspicion_costs_at_most_a_duplicate_attempt`: a's done, which took
+/// effect in a's fold during the cut, is not voided by b's earlier takeover, nor b's by a's (S2').
+#[test]
+fn a_false_suspicion_voids_no_done() {
+    let r = Sim::run(Cfg { work: 16, cuts: vec![(5, 36)], ..Cfg::new(&[("a", None)]) });
+    assert_eq!(r.retracted(), None, "{}", r.trace());
+}
+
+/// Phase f F4, after review: a node never suspects itself. a runs alone with two drones; its runner's
+/// beats stop at t=2 (a suspend, a failed beat write, a stalled beat thread) while d1 works 40 s on its
+/// task, four suspicion windows, and no hook renews the lease meanwhile. Its idle d2 reads the board
+/// on a's own clock and never takes d1's live claim (F2's exclusion): one tenure, d1's, and the board
+/// finished. Fails with the sim's folds observed by no node (`board::fold` for `fold_on`): d2 takes the
+/// task over a window after a's last line.
+#[test]
+fn a_node_whose_own_beats_stop_keeps_its_drones_claims() {
+    let mut cfg = Cfg { work: 40, ..Cfg::new(&[("a", None)]) }.node("a", |n| (n.drones, n.mute) = (2, Some(2)));
+    cfg.nodes.truncate(1);
+    let r = Sim::run(cfg);
+    let t = &r.cfg.tasks[0].0;
+    let u = r.converged();
+    let held: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t).map(|sp| sp.by.as_str()).collect();
+    assert_eq!(held.len(), 1, "one tenure of {t}: {held:?}\n{}", r.trace());
+    r.check(&[]);
+    assert!(u.finished(), "{}", r.trace());
+}
+
+/// Phase f F4, after review: a cut on the observer's side (b's mesh daemon down or backing off after two
+/// failed dials, about 2 min; b just resumed) longer than the suspicion window. b receives nothing from
+/// t=5 to t=40 while its own lines reach a; a works 30 s on its task. b suspects a once `SUSPECT_MS`
+/// passed since the last line it held (it cannot tell its own deafness from a's silence; F5's final
+/// claims do not tell either: with a suspected, b's claim is final at once) and takes the task over,
+/// naming a's claim; a learns of the takeover at once and drops its attempt. What holds: at most a
+/// duplicate attempt, never a lost task, the board finished, every property. What it costs: the work
+/// done twice (a done of a's that landed after b's takeover would be kept since phase f F5,
+/// `a_false_suspicion_voids_no_done`).
+#[test]
+fn a_cut_on_the_observers_side_costs_at_most_a_duplicate_attempt() {
+    let r = Sim::run(Cfg { work: 30, deaf: vec![("b", 5, 40)], horizon: 120, ..Cfg::new(&[("a", None)]) });
+    let t = &r.cfg.tasks[0].0;
+    let u = r.converged();
+    let attempts: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t).map(|sp| sp.node.as_str()).collect();
+    assert_eq!(attempts, ["a", "b"], "b, deaf, took a's task over\n{}", r.trace());
+    assert!(u.finished(), "{}", r.trace());
+    r.check(&[]);
 }
 
 /// Phase f F3, after review: a live holder keeps its lease beside a peer whose clock is 25 min or 2 h
@@ -1251,5 +1596,137 @@ fn a_live_holder_keeps_its_lease_beside_a_peer_clock_far_ahead() {
         let u = board::fold(&files[0]);
         assert_eq!(u, board::fold(&files[1]), "skew {skew}: one board");
         assert!(u.lost.is_empty() && u.spans.len() == 1 && u.spans[0].to_ms.is_none(), "skew {skew}: one tenure, still held: {:?}", u.spans);
+    }
+}
+
+/// What a fold says took effect for good (phase f F5): every done and verdict (a tenure that ended so,
+/// by task and session), every verify task, every work task verified, every integrated epoch (which
+/// verdict integrated it is the fold's order's, `Sim::retracted`), every rework
+/// round a rejection opened (`reopened`, which stands until the task is verified).
+fn results(b: &Board) -> BTreeSet<String> {
+    let ends = b.spans.iter().filter_map(|sp| match sp.end {
+        Some(Ev::Done) => Some(format!("done {} {}", sp.task, sp.by)),
+        Some(Ev::Verified | Ev::Rejected) => Some(format!("verdict {} {}", sp.task, sp.by)),
+        _ => None,
+    });
+    let tasks = b.tasks.values().filter_map(|s| match (s.task.role, &s.status) {
+        (Role::Verify, _) => Some(format!("verify task {}", s.task.id)),
+        (Role::Work, Status::Verified { .. }) => Some(format!("verified {}", s.task.id)),
+        _ => None,
+    });
+    let rounds = b.tasks.values().filter(|s| s.task.role == Role::Work).flat_map(|s| (1..=s.rework).map(move |r| format!("reopened {} {r}", s.task.id)));
+    ends.chain(tasks).chain(b.integrations.iter().map(|i| format!("integrated {}", i.task))).chain(rounds).collect()
+}
+
+/// Whether `result` of an earlier fold is in `now` (`results`): a reopen also once its task is verified.
+fn kept(result: &str, now: &BTreeSet<String>, b: &Board) -> bool {
+    let verified = |t: &str| b.tasks.get(t).is_some_and(|s| matches!(s.status, Status::Verified { .. }));
+    now.contains(result) || result.strip_prefix("reopened ").and_then(|r| r.split(' ').next()).is_some_and(verified)
+}
+
+/// Phase f F5, S2': a result once in a fold is in every later fold, under every arrival order of the
+/// lines. The lines of runs where results race: two attempts of one task after a false suspicion (a cut,
+/// a deaf observer), a claim stamped earlier that arrives late (CE5), an integrate claim held back
+/// until after the other node's integration passed (G5), two nodes' integrators (CE4), and the false
+/// suspicions and CE5 again with every first verdict a rejection (two attempts of one round, a rework
+/// round, its attempts judged again; in CE5's, a's verifier rejects a's attempt in the cut, before b's
+/// attempt, stamped earlier and the task's done once it arrives). Each one's lines arrive at a node in 24 orders, its fold read at
+/// 40 points along the way: no result read at one point is gone at a later one. Fails with the fold's
+/// holder rule alone (a done or verdict counted only from the task's holder in the fold's order,
+/// `Fold::permanent` never true): a's done in the cut is voided once b's takeover arrives; and with a
+/// rejection that reopens only while the attempt it judged is the task's done: the reopen is
+/// retracted once the other attempt of the round, stamped earlier, arrives.
+#[test]
+fn s2_an_accepted_result_stays_in_every_later_fold_in_any_arrival_order() {
+    let mut g5 = Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.skew = -2000);
+    g5.holds.push(Hold { node: "b", ev: Ev::Claim, task: "integrate.1".into(), local: 0, remote: 6 });
+    let at = Sim::run(g5.clone()).first("b", "claim integrate.1").unwrap();
+    let reject = |c: Cfg| Cfg { reject: vec![format!("{}.v1", c.tasks[0].0)], horizon: 160, ..c }.node("a", |n| n.drones = 2).node("b", |n| n.drones = 2);
+    let cfgs = [
+        Cfg { work: 16, cuts: vec![(5, 36)], ..Cfg::new(&[("a", None)]) },
+        Cfg { work: 30, deaf: vec![("b", 5, 40)], horizon: 120, ..Cfg::new(&[("a", None)]) },
+        Cfg { delay: 5, work: 2, ..Cfg::new(&[("a", None)]) }.node("b", |n| n.skew = -2000),
+        g5.node("b", |n| n.stop = Some(at + 1)),
+        Cfg { delay: 2, integrate: 5, ..Cfg::new(&[("a", None), ("b", None)]) },
+        reject(Cfg { work: 16, cuts: vec![(5, 36)], ..Cfg::new(&[("a", None)]) }),
+        reject(Cfg { work: 30, deaf: vec![("b", 5, 40)], ..Cfg::new(&[("a", None)]) }),
+        reject(ce5_suspected(30)),
+    ];
+    for cfg in cfgs {
+        let r = Sim::run(cfg);
+        r.check(&["integrate"]);
+        let lines = r.union();
+        for seed in 0..24 {
+            let order = shuffled(&lines, seed);
+            let mut before: BTreeSet<String> = BTreeSet::new();
+            for k in 1..=40 {
+                let b = board::fold(&order[..order.len() * k / 40]);
+                let now = results(&b);
+                let gone: Vec<&String> = before.iter().filter(|x| !kept(x, &now, &b)).collect();
+                assert!(gone.is_empty(), "order {seed}, at {k}/40: {gone:?} retracted\n{}", r.trace());
+                before = now;
+            }
+        }
+    }
+}
+
+/// Phase f F5: integrate once under delays and skew. Two nodes, a task each, so both see the last verdict
+/// within a few ticks and claim the integration; lines take 1 to 5 s, b's clock is up to 10 s either way,
+/// an integration takes 2 or 5 s. One integrator merges and writes a verdict per integrate task, each
+/// node's integrated ref moves at most once per integrate task under its fencing token, and every other
+/// property holds. Before F5 (`k_ce4_two_nodes_integrate_once`): both nodes integrated in every run with
+/// lines in 2 s or more.
+#[test]
+fn integrate_once_under_delays_and_skew() {
+    for delay in [1, 2, 3, 5] {
+        for skew in [0, 2000, -2000, 10_000, -10_000] {
+            for integrate in [2, 5] {
+                let r = Sim::run(Cfg { delay, integrate, ..Cfg::new(&[("a", None), ("b", None)]) }.node("b", |n| n.skew = skew));
+                r.check(&[]);
+                let moved = r.ref_moves.iter().find(|(_, by)| by.len() > 1);
+                assert_eq!(moved, None, "delay {delay}, skew {skew}\n{}", r.trace());
+                let u = r.converged();
+                assert_eq!(u.integrations.len(), 1, "delay {delay}, skew {skew}: {:?}\n{}", u.integrations, r.trace());
+            }
+        }
+    }
+}
+
+/// Phase f F5: no claim proceeds to its work before it is final unless a participant it waits for is
+/// suspected. Without a fault (no node killed, cut, deaf or mute), over task sets with deps across
+/// nodes, lines in 1 to 5 s, b's clock 2 or 10 s either way, b starting late, claims after 1 to 12 s:
+/// no two sessions of any nodes worked on one task in one round, so no work is done twice, and every
+/// property holds. With a cut longer than the suspicion window (`a_false_suspicion_voids_no_done`) a
+/// claim proceeds on its suspicion and the work is done twice. Fails before F5 (the confirm window's
+/// next-tick fold): CE5, b's claim stamped 2 s earlier landing at a after a's read-back, has both work.
+/// The final waits, in ticks after a claim's line landed, are measured here too (`waits`).
+#[test]
+fn no_claim_works_before_it_is_final_without_a_suspicion() {
+    let sets: [&[(&str, Option<usize>)]; 3] = [&[("a", None)], &[("a", None), ("b", None)], &[("a", None), ("b", Some(0))]];
+    let mut waits: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for tasks in sets {
+        for delay in [1, 2, 3, 5] {
+            for (start, skew) in [(0, 0), (0, -2000), (2, 2000), (0, 10_000), (3, -10_000)] {
+                let cfg = Cfg { delay, work: 2, ..Cfg::new(tasks) }.node("b", |n| (n.start, n.skew) = (start, skew));
+                for cfg in cfg.sweep(&[1, 4, 12]) {
+                    let r = Sim::run(cfg);
+                    r.check(&[]);
+                    let mut by_round: BTreeMap<(&str, u32), Vec<&str>> = BTreeMap::new();
+                    for ((_, t, rework), by) in &r.won {
+                        by_round.entry((t, *rework)).or_default().extend(by.iter().map(String::as_str));
+                    }
+                    let twice = by_round.iter().find(|(_, by)| by.len() > 1);
+                    assert_eq!(twice, None, "delay {delay}, b start {start} skew {skew}\n{}", r.trace());
+                    waits.entry(delay).or_default().extend(&r.waits);
+                }
+            }
+        }
+    }
+    // A healthy peer acks a claim in the tick it holds it: final two line delays after the claim landed,
+    // at most a beat and a delay more when the ack waits on a line held back (none here).
+    for (delay, w) in &waits {
+        let (max, mean) = (w.iter().max().copied().unwrap_or(0), w.iter().sum::<i64>() as f64 / w.len().max(1) as f64);
+        eprintln!("final waits, lines in {delay} s: {} claims, mean {mean:.2} ticks, max {max}", w.len());
+        assert!(max <= 2 * delay + BEAT_MS / TICK, "lines in {delay} s: a final wait of {max} ticks");
     }
 }

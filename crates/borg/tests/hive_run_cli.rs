@@ -320,6 +320,85 @@ fn three_sim_drones_finish_a_board() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Phase f F4: SIGINT stops a run as a user stops it, not as a death. The runner joined the goal and
+/// beats; its one drone's session has said that it started and has not claimed (its model takes a
+/// minute). On SIGINT the runner says on the board that the session ended and that its node left the
+/// goal, then exits 130: a peer neither leaves a task to that session nor waits on its drones' leases.
+#[test]
+fn sigint_ends_the_unsettled_session_and_leaves_the_goal() {
+    let root = setup("sigint", 1, "3", json!({"usd_per_iter": 0.10, "drones": {"d1": {"claim_s": 60}}}));
+    let dir = work(&root).display().to_string();
+    let args = ["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", dir.as_str()];
+    let child = command(&root, &args, &[]).spawn().unwrap();
+    let notes = |root: &Path| events(root).into_iter().filter(|e| e.by == "runner" && e.task.is_empty()).map(|e| e.note).collect::<Vec<_>>();
+    let t0 = Instant::now();
+    while !(notes(&root).iter().any(|n| n == "session-start d1") && notes(&root).iter().any(|n| n == board::BEAT)) {
+        assert!(t0.elapsed() < Duration::from_secs(60), "the session never said it started: {:?}", notes(&root));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(130), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("stopped by SIGINT"), "{text}");
+    let notes = notes(&root);
+    let at = |note: &str| notes.iter().rposition(|n| n == note);
+    assert!(at(board::JOIN) < at("session-start d1") && at("session-start d1") < at("session-end d1"), "{notes:?}");
+    assert_eq!(notes.last().map(String::as_str), Some(board::LEAVE), "{notes:?}");
+    let b = fold(&root);
+    assert!(b.sessions.values().all(|(started, settled)| started <= settled), "{:?}", b.sessions);
+    assert!(b.members.values().all(|(join, leave)| join < leave), "{:?}", b.members);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Phase f F4, after review: once the drones ended and the node left the goal, Ctrl-C ends the run at
+/// once again, as before the run caught it: here during the hidden oracle's scoring of the verified
+/// attempt (`after_run`, an oracle that takes 30 s). Before, the handler kept noting the signal with no
+/// thread left to act on it, and the run went on to the end of the scoring and its summary.
+#[test]
+fn sigint_after_the_drones_ended_stops_the_run_at_once() {
+    let root = common::setup("hive-run-sigint-after");
+    let w = work(&root);
+    git(&w, &["init", "-q", "-b", "main"]);
+    std::fs::write(w.join("README"), "orion\n").unwrap();
+    git(&w, &["add", "."]);
+    git(&w, &["commit", "-q", "-m", "start"]);
+    std::fs::write(root.join("script.json"), json!({"usd_per_iter": 0.10}).to_string()).unwrap();
+    let held = root.join("held");
+    std::fs::create_dir_all(&held).unwrap();
+    let held = held.display().to_string();
+    ok(&root, &["init", "g", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "3", "--hidden-dir", &held, "--hidden", "sleep 30"]);
+    ok(&root, &["open", "g", "--id", "t1", "--title", "write f1.txt", "--files", "f1.txt", "--accept", "ok=grep -q 'done t1' f1.txt"]);
+    let dir = w.display().to_string();
+    let args = ["hive", "run", "g", "--drones", "2", "--harness", "sim", "--yes", "--dir", dir.as_str()];
+    let mut child = command(&root, &args, &[]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let left = |root: &Path| events(root).iter().any(|e| e.by == "runner" && e.task.is_empty() && e.note == board::LEAVE);
+    let t0 = Instant::now();
+    while !left(&root) {
+        assert!(t0.elapsed() < Duration::from_secs(120), "the run never left the goal");
+        assert!(child.try_wait().unwrap().is_none(), "the run ended before the scoring");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "the run is scoring");
+    assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            let _ = Command::new("kill").args(["-HUP", &child.id().to_string()]).status();
+            panic!("SIGINT did not stop the run during the scoring");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    use std::os::unix::process::ExitStatusExt;
+    assert!(status.code() == Some(130) || status.signal() == Some(2), "{status:?}");
+    assert!(fold(&root).finished(), "the run had finished the goal");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// `borg learn <args>` on the collective's store, learning on, its model the fake `claude` (common.rs):
 /// (stdout, stderr, exit code).
 fn learn(root: &Path, args: &[&str]) -> (String, String, i32) {

@@ -597,6 +597,12 @@ pub fn attempt(events: &[Event], b: &Board, verify: &str) -> Option<Attempt> {
     Index::new(events, b).attempt(verify)
 }
 
+/// The attempt of the work task `work` whose done `author` wrote at `done_ms` (phase f F5: every done the
+/// fold took is one, board.rs `TaskState::attempts`).
+pub fn attempt_of(events: &[Event], b: &Board, work: &str, author: &str, done_ms: i64) -> Option<Attempt> {
+    Index::new(events, b).attempt_of(work, author, done_ms)
+}
+
 /// What `attempt` looks up, by key, in one pass over a board's events and spans: many attempts then
 /// cost one pass, not one each (`judged_events`).
 struct Index<'a> {
@@ -638,16 +644,30 @@ impl<'a> Index<'a> {
         x
     }
 
+    /// The attempt the verify task `verify` judges: the one its open in the fold was written with
+    /// (`TaskState::of_attempt`; of two attempts of one round, the first in the fold's order).
     fn attempt(&self, verify: &str) -> Option<Attempt> {
-        let (open, span) = self.opens.get(verify)?.iter().find_map(|e| {
-            let work = e.def.as_ref()?.of.as_ref()?;
-            Some((*e, *self.done_spans.get(&(work.as_str(), e.by.as_str(), e.ms))?))
-        })?;
-        let (done_ms, claim_ms) = (open.ms, span.from_ms);
-        let done = self.dones.get(&(span.task.as_str(), open.by.as_str(), done_ms))?;
-        let claim = self.claims.get(&(span.task.as_str(), open.by.as_str(), claim_ms));
+        let v = self.b.tasks.get(verify)?;
+        let (author, done_ms) = v.of_attempt.as_ref()?;
+        self.attempt_of(v.task.of.as_deref()?, author, *done_ms)
+    }
+
+    /// The attempt a verdict judged: the one it names by its head (phase f F5), else its verify task's.
+    fn judged(&self, e: &Event) -> Option<Attempt> {
+        let named = self.b.tasks.get(&e.task).and_then(|v| self.b.tasks.get(v.task.of.as_deref()?)).and_then(|w| {
+            let a = w.attempts.iter().find(|a| !e.head.is_empty() && a.head == e.head)?;
+            self.attempt_of(&w.task.id, &a.by, a.done)
+        });
+        named.or_else(|| self.attempt(&e.task))
+    }
+
+    fn attempt_of(&self, work: &str, author: &str, done_ms: i64) -> Option<Attempt> {
+        let span = *self.done_spans.get(&(work, author, done_ms))?;
+        let claim_ms = span.from_ms;
+        let done = self.dones.get(&(work, author, done_ms))?;
+        let claim = self.claims.get(&(work, author, claim_ms));
         let (base, deps_in) = claim.map(|e| (e.base.clone(), e.deps_in.clone())).unwrap_or_default();
-        let (work, author) = (span.task.clone(), open.by.clone());
+        let (work, author) = (work.to_string(), author.to_string());
         let node = span.node.clone();
         Some(Attempt {
             drone: self.b.drones.get(&author).cloned().unwrap_or_default(),
@@ -663,19 +683,25 @@ impl<'a> Index<'a> {
     }
 }
 
-/// The accepted attempt of the work task `work`: that of the verify task whose `verified` made it
-/// verified (board.rs `TaskState::accepted`; a rejected `.vN` never counts, though the fold closes it
-/// as verified too). It has a base and a head: `decide` rejects a pass on work without them. What a
+/// The accepted attempt of the work task `work`: the first a verdict passed in the fold's order, or the
+/// one the newest integration merged (board.rs `TaskState::accepted_attempt`, phase f F5: chosen for good
+/// at the integration; a rejected `.vN` never counts, though the fold closes it as verified too). It has a base and a head: `decide` rejects a pass on work without them. What a
 /// dependent's claim brings in, and what an integration merges.
 pub fn accepted(events: &[Event], b: &Board, work: &str) -> Option<Attempt> {
-    attempt(events, b, b.tasks.get(work)?.accepted.as_deref()?)
+    let (author, done_ms) = b.tasks.get(work)?.accepted_attempt.clone()?;
+    attempt_of(events, b, work, &author, done_ms)
 }
 
 /// The transitive deps of the attempt's work whose accepted head its claim's tree did not hold (not
 /// in its `deps_in` as `task@head`), in `closure` order.
+/// A dep counts as in the tree when any of its verified attempts is (phase f F5: a dependent may build on
+/// any verified attempt; the accepted one is chosen at the integration).
 pub fn missing_deps(events: &[Event], b: &Board, a: &Attempt) -> Vec<String> {
     let Some(w) = b.tasks.get(&a.work) else { return Vec::new() };
-    board::closure(b, &w.task).into_iter().filter(|d| accepted(events, b, d).is_none_or(|x| !a.deps_in.contains(&format!("{d}@{}", x.head)))).collect()
+    let has = |d: &str, head: &str| a.deps_in.contains(&format!("{d}@{head}"));
+    let verified = |d: &str| b.tasks.get(d).is_some_and(|s| s.attempts.iter().any(|x| x.verified && has(d, &x.head)));
+    let held = |d: &str| verified(d) || accepted(events, b, d).is_some_and(|x| has(d, &x.head));
+    board::closure(b, &w.task).into_iter().filter(|d| !held(d)).collect()
 }
 
 /// The idempotence key of a verdict's credit.
@@ -760,14 +786,14 @@ impl Recorded {
 pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, cwd: &str, now: i64) -> Result<Recorded, String> {
     let path = super::tasks_path(home, &g.id);
     let events = board::read(&path);
-    let b = board::fold(&events);
+    let b = board::fold_on(&events, &super::node(home));
     let s = b.tasks.get(verify).ok_or_else(|| format!("no task {verify} in goal {}", g.id))?;
     if s.task.role != Role::Verify {
         return Err(format!("{verify} is not a verify task"));
     }
-    if s.live(now).is_none_or(|(by, _, _)| by != session) {
+    let Some(since) = s.live(now).filter(|(by, _, _)| *by == session).map(|(_, _, since)| since) else {
         return Err(format!("{verify} is not claimed by this session"));
-    }
+    };
     let a = attempt(&events, &b, verify).ok_or_else(|| format!("{verify}: no done of its work to judge"))?;
     let drone = b.drones.get(session).cloned().unwrap_or_else(|| super::drone_of(session));
     // A drone name is the author's only on the author's node: every runner names its drones d1..dN.
@@ -799,7 +825,14 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     let mut e = Event::new(d.ev, verify, session, now).with_note(&d.note);
     e.hacked = d.hacked.then_some(true);
     e.credit = d.kind.outcome().unwrap_or_default().into();
-    super::write(home, &g.id, vec![e]).map_err(|e| e.to_string())?;
+    // For good (phase f F5): written under the claim it names, while the board as it stands under the
+    // lock still gives it, and naming the attempt it judged by its head.
+    (e.claim, e.head) = (Some(since), a.head.clone());
+    let here = super::node(home);
+    let held = |events: &[Event]| board::fold_on(events, &here).tasks.get(verify).and_then(|s| s.live(learn::now_ms())).is_some_and(|(by, _, _)| by == session);
+    if super::write_if(home, &g.id, |events| held(events).then(|| vec![e])).map_err(|e| e.to_string())?.is_none() {
+        return Err(format!("{verify} is no longer claimed by this session"));
+    }
     let credited = match d.kind.outcome() {
         Some(kind) => settle(home, &g.id, verify, &a, kind, &d.note, &queen::repo_name(cwd), now),
         None => Vec::new(),
@@ -838,7 +871,7 @@ pub(crate) fn judged_events<'a>(events: &'a [Event], b: &Board) -> Vec<(&'a Even
         .iter()
         .filter(|e| matches!(e.ev, Ev::Verified | Ev::Rejected) && consistent(e) && b.tasks.get(&e.task).is_some_and(|s| s.task.role == Role::Verify))
         .filter(|e| x.ends.contains(&(e.task.as_str(), e.by.as_str(), e.ms, e.ev)))
-        .filter_map(|e| Some((e, x.attempt(&e.task)?)))
+        .filter_map(|e| Some((e, x.judged(e)?)))
         .collect()
 }
 

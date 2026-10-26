@@ -107,7 +107,7 @@ pub fn goals(home: &Path) -> Vec<String> {
 pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let g = goal::read(home, id).ok()?;
     let events = board::read(&super::tasks_path(home, id));
-    let b = board::fold(&events);
+    let b = board::fold_on(&events, &super::node(home));
     let here = super::node(home);
     let shown = |node: &str| if super::is_local(home, node) { String::new() } else { node.chars().take(8).collect() };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();

@@ -9,10 +9,12 @@
 //! per task in one queen question, waited for under the run lock, so a "no" stops the run with no
 //! worktree made and nothing claimed. `--yes` approves it at the command line (borg-eval's runs).
 //!
-//! Once the worktrees are made, the runner announces its node on the board (mod.rs `announce`) and,
-//! with mesh peers reachable, waits for one sync round with each, a few seconds at most: the drones of
-//! every node then start knowing each node's share (board.rs `next_for`), instead of racing for one task
-//! until their first lines sync. On one node there is no wait.
+//! Once the worktrees are made, the runner joins its node to the goal on the board (mod.rs `announce`)
+//! and, with mesh peers reachable, waits for one sync round with each, a few seconds at most: the
+//! drones of every node then start knowing each node's share (board.rs `next_for`), instead of racing
+//! for one task until their first lines sync. On one node there is no wait. While its drones run it
+//! beats on the board every `BEAT_MS` (`membership`), and it leaves the goal when they ended: a peer
+//! tells a node gone from one alive in seconds, apart from the 30-min work lease (phase f F4).
 //!
 //! Once every task is verified, the drone thread that sees it first integrates (integrate.rs): it
 //! claims the board's integrate task, merges the accepted attempts and runs the oracle on the combined
@@ -33,9 +35,11 @@
 //! whose claim carries the drone since the iteration started: omp and opencode keep ids of their own
 //! and report none.
 //!
-//! A run killed mid-iteration (Ctrl-C, a closed terminal) writes nothing more, and its sessions die
-//! with it (runner.rs `run_bounded`). The next run of the goal makes that good under the lock, before
-//! it counts what is spent ([`recover`]).
+//! A run stopped by Ctrl-C (SIGINT) or a closed terminal (SIGHUP) says on the board that its unsettled
+//! sessions ended and that its node left the goal, then exits (`trap`, `stop`); one killed otherwise
+//! writes nothing more, and its peers suspect it within `SUSPECT_MS`. Either way its sessions die with
+//! it (runner.rs `run_bounded`), and the next run of the goal makes good what it did not write under the
+//! lock, before it counts what is spent ([`recover`]).
 //!
 //! Budget across nodes: `spend.jsonl` syncs over the mesh (mod.rs `SYNCED`), each line naming its node,
 //! so every runner of a goal, on any node, reads the goal's one total ([`ledger`]): a run's share is
@@ -298,10 +302,113 @@ struct Ctx<'a> {
     before: &'a [Spend],
     /// This node's id (mod.rs `node`).
     here: &'a str,
+    /// The sessions running now: each drone's, with the board's clock at its start (mod.rs `clock`).
+    sessions: &'a Sessions,
+}
+
+type Sessions = std::sync::Mutex<BTreeMap<String, i64>>;
+
+/// The signal that stops the run (SIGINT, SIGHUP), 0 while none came (`trap`).
+static STOP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_stop(sig: libc::c_int) {
+    STOP.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// From here until `untrap` SIGINT (Ctrl-C) and SIGHUP (a closed terminal) stop the run as an end, not
+/// a death: the handler only notes the signal, and the run's membership thread (`membership`) says on
+/// the board that the node leaves and its unsettled sessions ended (`stop`), then exits. Before, such a
+/// run wrote nothing more, and its peers waited out its leases.
+fn trap() {
+    let handler = on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+/// The run's drones ended, the membership thread with them, and the node left the goal: SIGINT and
+/// SIGHUP act as they do by default again, so a Ctrl-C ends the hidden oracle's scoring (`after_run`) or
+/// the summary at once, as before `trap`, and a closed terminal ends the run instead of leaving it
+/// printing to nothing. A signal noted since the membership thread's last look (`STOP`) ends it here:
+/// nothing is left to write on the board.
+fn untrap(goal: &str) {
+    // SAFETY: restoring the default disposition is async-signal-safe and takes no pointer.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+    }
+    let sig = STOP.load(std::sync::atomic::Ordering::SeqCst);
+    if sig != 0 {
+        let name = if sig == libc::SIGHUP { "SIGHUP" } else { "SIGINT" };
+        println!("hive run {goal}: stopped by {name}; this node left the goal");
+        std::process::exit(128 + sig);
+    }
+}
+
+/// While the drones run (until `done`): this node's goal heartbeat every `BEAT_MS` (mod.rs `member`,
+/// phase f F4: its peers tell it from a node gone in `SUSPECT_MS`, seconds, apart from the work lease),
+/// one at once when a claim of another node arrived that no line of this node is stamped above yet
+/// (`board::to_ack`, phase f F5: the beat moves this node's watermark past it, so that claim is final a
+/// line's way later instead of at the next beat), and a look every `IDLE_TICK` for a stop signal
+/// (`trap`), which ends the run (`stop`). The board is read again only when its file grew.
+fn membership(home: &Path, goal: &str, sessions: &Sessions, done: &std::sync::atomic::AtomicBool) {
+    let beat = Duration::from_millis(super::BEAT_MS as u64);
+    let mut next = Instant::now() + beat;
+    let (path, here) = (super::tasks_path(home, goal), super::node(home));
+    let (mut len, mut acked) = (0, i64::MIN);
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        let sig = STOP.load(std::sync::atomic::Ordering::SeqCst);
+        if sig != 0 {
+            stop(home, goal, sessions, sig);
+        }
+        let grew = std::fs::metadata(&path).map_or(len, |m| m.len());
+        let ack = (grew != len).then(|| board::to_ack(&board::read(&path), &here)).flatten().filter(|m| *m > acked);
+        len = grew;
+        if Instant::now() >= next || ack.is_some() {
+            let _ = super::member(home, goal, board::BEAT);
+            next = Instant::now() + beat;
+            acked = acked.max(ack.unwrap_or(i64::MIN));
+        }
+        std::thread::sleep(IDLE_TICK);
+    }
+}
+
+/// A run stopped by `sig` (`trap`): each running session that has not settled on the board (claimed, or
+/// said that it ended) says that it ended, so no peer leaves a task to it (board.rs `starting`), and the
+/// node leaves the goal (`board::LEAVE`), so no peer waits on its drones' leases (`Local::gone`); then
+/// the process exits, its sessions with it (runner.rs `run_bounded`). What else the run did not write
+/// (its iterations' spend, its releases) the next run makes good (`recover`).
+fn stop(home: &Path, goal: &str, sessions: &Sessions, sig: i32) -> ! {
+    let (b, here) = (fold(home, goal), super::node(home));
+    let running = sessions.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (drone, at) in running {
+        if !super::settled_since(&b, &here, &drone, at) {
+            let _ = super::session(home, goal, &drone, false, learn::now_ms());
+        }
+    }
+    let _ = super::member(home, goal, board::LEAVE);
+    let name = if sig == libc::SIGHUP { "SIGHUP" } else { "SIGINT" };
+    println!("hive run {goal}: stopped by {name}; this node left the goal");
+    std::process::exit(128 + sig);
+}
+
+/// This node in the goal from the run's announcement (mod.rs `announce`) until it drops: then its leave
+/// (`board::LEAVE`), on every way out of the run but a signal's, which `stop` writes itself.
+struct Joined<'a> {
+    home: &'a Path,
+    goal: &'a str,
+}
+
+impl Drop for Joined<'_> {
+    fn drop(&mut self) {
+        let _ = super::member(self.home, self.goal, board::LEAVE);
+    }
 }
 
 fn fold(home: &Path, goal: &str) -> Board {
-    board::fold(&board::read(&super::tasks_path(home, goal)))
+    board::fold_on(&board::read(&super::tasks_path(home, goal)), &super::node(home))
 }
 
 /// What the board offers a drone at one moment (`open_to`).
@@ -504,7 +611,10 @@ fn estimate(dearest: f64, share: f64, spent: f64) -> f64 {
 /// drone of the goal runs now. Each iteration it started (a `run` join naming its session) that no
 /// spend line names is charged its estimate (`exit: "killed"`), and every claim a runner drone's
 /// session still holds on this node is released: the session is dead, and its lease would keep the
-/// task for `LEASE_MS`. A claim made on another node (a peer's d1) is live there and never released.
+/// task for `LEASE_MS`. Also one already read as gone (`Local::gone`: the run before left, and this
+/// run's join ends it too): released explicitly, so a peer that reads no membership (a node from before
+/// phase f F4) sees it free before its lease runs out, and no fold relies on membership for it. A claim
+/// made on another node (a peer's d1) is never released.
 fn recover(home: &Path, goal: &str, now: i64) {
     let here = super::node(home);
     let mut lines: Vec<Spend> = super::read_lines(&spend_path(home, goal));
@@ -533,14 +643,19 @@ fn recover(home: &Path, goal: &str, now: i64) {
     }
     let b = fold(home, goal);
     let runner = |d: &str| (1..=MAX_DRONES).any(|n| drone_name(n) == d);
-    let held: Vec<String> = b
+    let held: Vec<board::Event> = b
         .tasks
         .values()
-        .filter_map(|s| s.live(now))
-        .filter(|(by, node, _)| super::is_local(home, node) && b.drones.get(*by).is_some_and(|d| runner(d)))
-        .map(|(by, _, _)| by.to_string())
+        .filter_map(|s| match &s.status {
+            super::Status::Claimed { by, node, .. } if super::is_local(home, node) && b.drones.get(by).is_some_and(|d| runner(d)) => {
+                Some(board::Event::new(Ev::Released, &s.task.id, by, now).with_note("its run ended"))
+            }
+            _ => None,
+        })
         .collect();
-    release_held(home, goal, &b, &held, "its run ended", now);
+    if !held.is_empty() {
+        let _ = super::write(home, goal, held);
+    }
 }
 
 /// The board file's length and mtime (`idle_wait`), None while it does not exist.
@@ -550,13 +665,21 @@ fn mark(path: &Path) -> Mark {
     std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
 }
 
-/// Waits until the board file at `path` differs from `seen`, at most `cap`, looking every `IDLE_TICK`:
-/// whether it changed.
-fn idle_wait(path: &Path, seen: Mark, cap: Duration) -> bool {
+/// Waits until the board at `path` says something else than `b`, its fold when its file was `seen`, at
+/// most `cap`, looking at the file every `IDLE_TICK` and folding it only once that changed: whether it
+/// did. A line that changes no board ends no wait: a goal heartbeat (`board::BEAT`, phase f F4) moves
+/// only this node's clock of its writer (`Board::nodes`), and with every peer's beat ending each idle
+/// drone's wait as no idle poll, no idle drone would ever end.
+fn idle_wait(path: &Path, seen: Mark, b: &Board, cap: Duration) -> bool {
     let t0 = Instant::now();
+    let mut seen = seen;
     loop {
-        if mark(path) != seen {
-            return true;
+        let now = mark(path);
+        if now != seen {
+            if board::fold(&board::read(path)) != *b {
+                return true;
+            }
+            seen = now;
         }
         let left = cap.saturating_sub(t0.elapsed());
         if left.is_zero() {
@@ -618,7 +741,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
                 // Work held by another drone, or left to a peer's idle drone or one of this node before
                 // this one, may still open a verify task this drone can take; a wait the board's change
                 // ended early is no idle poll.
-                let changed = idle_wait(&tasks, seen, IDLE_WAIT);
+                let changed = idle_wait(&tasks, seen, &b, IDLE_WAIT);
                 if !offer.in_hand && !changed {
                     t.idle += 1;
                 }
@@ -652,7 +775,9 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         let _ = super::append_join(ctx.home, goal, &join);
         // The wall clock for the notice, the board's for which lines are this iteration's (`sessions_of`).
         let (started, at) = (learn::now_ms(), super::clock(ctx.home, goal));
+        ctx.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), at);
         let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, offer.task.as_ref().map_or(started, |(_, since)| *since), at);
+        ctx.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
         let out = ran.as_ref().map(|b| b.out.as_slice()).unwrap_or_default();
         let said = ctx.h.headless_end(out);
         log(ctx.home, goal, &name, iter, out);
@@ -690,7 +815,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         t.errors = if exit == "ok" { 0 } else { t.errors + 1 };
         let mine = progress(&events, &sessions, at);
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
-        let b = board::fold(&events);
+        let b = board::fold_on(&events, ctx.here);
         let now = learn::now_ms();
         t.stalls = stalls(t.stalls, mine.is_empty(), &offer, &open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now));
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
@@ -879,8 +1004,9 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
             }
         }
     }
-    // This node live on the board before its drones claim, and that heard by the peers (phase e E2b).
+    // This node in the goal before its drones claim, and that heard by the peers (phase e E2b, f F4).
     let names: Vec<String> = (1..=wts.len()).map(drone_name).collect();
+    trap();
     let (peers, heard, waited) = match super::announce(home, &g.id, &names) {
         Ok(w) => w,
         Err(e) => {
@@ -888,6 +1014,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
             return 1;
         }
     };
+    let joined = Joined { home, goal: &g.id };
     if peers > 0 {
         let how = if heard { "heard back" } else { "not all heard back" };
         println!("hive run {}: announced to {peers} mesh peer(s), {how} in {} ms", g.id, waited.as_millis());
@@ -906,11 +1033,25 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         eprintln!("borg hive run: {e}");
         return 1;
     }
-    let ctx =
-        Ctx { home, g: &g, h: o.harness, root: &repo, repo: &repo_name, model: o.model, share, iter_timeout: o.iter_timeout, before: &before, here: &here };
+    let sessions = Sessions::default();
+    let ctx = Ctx {
+        home,
+        g: &g,
+        h: o.harness,
+        root: &repo,
+        repo: &repo_name,
+        model: o.model,
+        share,
+        iter_timeout: o.iter_timeout,
+        before: &before,
+        here: &here,
+        sessions: &sessions,
+    };
     // The drones still running, named on the board at each one's end (mod.rs `roster`).
     let running = std::sync::Mutex::new(names);
+    let done = std::sync::atomic::AtomicBool::new(false);
     let ends: Vec<DroneEnd> = std::thread::scope(|s| {
+        let beats = s.spawn(|| membership(home, &g.id, &sessions, &done));
         let handles: Vec<_> = wts
             .iter()
             .enumerate()
@@ -927,8 +1068,13 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
                 })
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        let ends = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = beats.join();
+        ends
     });
+    drop(joined);
+    untrap(&g.id);
     leave_worktrees(home, &g.id, &wts);
     after_run(home, &g, &repo);
     for e in &ends {
@@ -1015,7 +1161,7 @@ mod tests {
     #[test]
     fn an_idle_drone_wakes_when_the_board_changes() {
         // A peer's line lands 100 ms into the wait: the drone looks again then, not after a blind
-        // IDLE_WAIT; a quiet board waits the cap out.
+        // IDLE_WAIT; a quiet board waits the cap out, and so does one only a goal heartbeat came to.
         let dir = std::env::temp_dir().join(format!("borg-hive-idle-wait-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1030,12 +1176,26 @@ mod tests {
             }
         });
         let t0 = Instant::now();
-        assert!(idle_wait(&path, seen, IDLE_WAIT), "the board changed");
+        assert!(idle_wait(&path, seen, &board::fold(&board::read(&path)), IDLE_WAIT), "the board changed");
         assert!(t0.elapsed() < IDLE_WAIT / 2, "{:?}", t0.elapsed());
         lands.join().unwrap();
         let t0 = Instant::now();
-        assert!(!idle_wait(&path, mark(&path), Duration::from_millis(150)), "nothing changed");
+        assert!(!idle_wait(&path, mark(&path), &board::fold(&board::read(&path)), Duration::from_millis(150)), "nothing changed");
         assert!(t0.elapsed() >= Duration::from_millis(150), "{:?}", t0.elapsed());
+        // A peer's goal heartbeat lands (phase f F4): the file changed, the board did not; the wait goes on.
+        let (seen, b) = (mark(&path), board::fold(&board::read(&path)));
+        let beats = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let beat = board::Event { node: "B".into(), ..board::Event::new(Ev::Heartbeat, "", "runner", 2).with_note(board::BEAT) };
+                board::append(&path, &[beat]).unwrap();
+            }
+        });
+        let t0 = Instant::now();
+        assert!(!idle_wait(&path, seen, &b, Duration::from_millis(200)), "a beat changes no board");
+        assert!(t0.elapsed() >= Duration::from_millis(200), "{:?}", t0.elapsed());
+        beats.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
