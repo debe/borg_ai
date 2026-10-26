@@ -430,7 +430,11 @@ const BUDGET_USD: f64 = 1.0;
 /// `borg hive run g1 --drones <n> --harness sim --yes` on machine `m`, its scripted drones signing as
 /// `node`, each doing one task per iteration at `ITER_USD`; its output in `<root>/run-<node>.out`.
 fn spawn_run(root: &Path, m: &Machine, node: &str, drones: usize) -> std::process::Child {
-    let plan = json!({"one_task": true, "work_s": 3});
+    spawn_scripted(root, m, node, drones, json!({"one_task": true, "work_s": 3}))
+}
+
+/// `spawn_run` with each drone scripted by `plan` (hive/sim_drone.rs).
+fn spawn_scripted(root: &Path, m: &Machine, node: &str, drones: usize, plan: Value) -> std::process::Child {
     let names: serde_json::Map<String, Value> = (1..=drones).map(|n| (format!("d{n}"), plan.clone())).collect();
     let script = m.base.join("script.json");
     std::fs::write(&script, json!({"usd_per_iter": ITER_USD, "node": node, "drones": names}).to_string()).unwrap();
@@ -446,6 +450,58 @@ fn spend_lines(store: &Path) -> std::collections::BTreeSet<String> {
     std::fs::read_to_string(hive::run::spend_path(store, "g1")).unwrap_or_default().lines().map(String::from).collect()
 }
 
+/// Two machines under `root` (emptied first), each with a clone of one remote and an object store of
+/// its own, members of one team, and their mesh nodes on loopback.
+async fn two_clones(root: &Path) -> (Machine, Machine, Node, Node) {
+    let _ = std::fs::remove_dir_all(root);
+    stub_models(root);
+    let (ma, mb) = (Machine::new(root, "a"), Machine::new(root, "b"));
+    let origin = root.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("README"), "app\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-qm", "base"]);
+    for m in [&ma, &mb] {
+        git(root, &["clone", "-q", "--no-local", origin.to_str().unwrap(), m.app.to_str().unwrap()]);
+    }
+    let alice = Identity::load_or_create(&ma.store()).unwrap();
+    let bob = Identity::load_or_create(&mb.store()).unwrap();
+    let mut m = Membership::found("work", &alice);
+    m.invite(&alice, &bob.public(), "member").unwrap();
+    m.save(&ma.store()).unwrap();
+    m.save(&mb.store()).unwrap();
+    let na = Node::bind(&ma.place(), LOCAL.parse().unwrap()).await.unwrap();
+    let nb = Node::bind(&mb.place(), LOCAL.parse().unwrap()).await.unwrap();
+    (ma, mb, na, nb)
+}
+
+/// Waits for `runs` to exit while the mesh syncs every 50 ms, at most `secs` (then stopped as an
+/// engineer stops a run, Ctrl-C, and the test fails): their exit codes.
+async fn sync_until_exit(runs: &mut [std::process::Child], na: &Node, nb: &Node, secs: u64) -> Vec<i32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut codes: Vec<Option<i32>> = vec![None; runs.len()];
+    while codes.iter().any(Option::is_none) {
+        for (c, code) in runs.iter_mut().zip(codes.iter_mut()) {
+            if code.is_none() {
+                *code = c.try_wait().unwrap().map(|s| s.code().unwrap_or(-1));
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            for c in runs.iter_mut() {
+                let _ = Command::new("kill").args(["-INT", &c.id().to_string()]).status();
+                let _ = c.wait();
+            }
+            panic!("the runs did not end within {secs} s");
+        }
+        round(na, nb).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    round(na, nb).await;
+    round(na, nb).await;
+    codes.into_iter().flatten().collect()
+}
+
 /// A goal's budget across nodes (tasks/todo.md D1): runs start at once on A (2 drones) and B (1), each
 /// splitting the whole budget (neither has seen the other's spend), while the mesh syncs every 50 ms.
 /// The goal's spend lines sync, so every drone stops once the goal's total over both nodes reaches the
@@ -454,27 +510,8 @@ fn spend_lines(store: &Path) -> std::collections::BTreeSet<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_on_two_nodes_spend_one_goal_budget() {
     let root = std::env::temp_dir().join(format!("borg-hive-mesh-budget-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    stub_models(&root);
-    let (ma, mb) = (Machine::new(&root, "a"), Machine::new(&root, "b"));
-    let origin = root.join("origin");
-    std::fs::create_dir_all(&origin).unwrap();
-    git(&origin, &["init", "-q", "-b", "main"]);
-    std::fs::write(origin.join("README"), "app\n").unwrap();
-    git(&origin, &["add", "-A"]);
-    git(&origin, &["commit", "-qm", "base"]);
-    for m in [&ma, &mb] {
-        git(&root, &["clone", "-q", "--no-local", origin.to_str().unwrap(), m.app.to_str().unwrap()]);
-    }
+    let (ma, mb, na, nb) = two_clones(&root).await;
     let (sa_store, sb_store) = (ma.store(), mb.store());
-    let alice = Identity::load_or_create(&sa_store).unwrap();
-    let bob = Identity::load_or_create(&sb_store).unwrap();
-    let mut m = Membership::found("work", &alice);
-    m.invite(&alice, &bob.public(), "member").unwrap();
-    m.save(&sa_store).unwrap();
-    m.save(&sb_store).unwrap();
-    let na = Node::bind(&ma.place(), LOCAL.parse().unwrap()).await.unwrap();
-    let nb = Node::bind(&mb.place(), LOCAL.parse().unwrap()).await.unwrap();
 
     // A opens the goal with more tasks than the budget pays for; B approves A's checks.
     ma.ok(&root, &["init", "g1", "--spec", "Write the files", "--oracle", "ok=true", "--budget", &BUDGET_USD.to_string()], &[]);
@@ -487,27 +524,7 @@ async fn runs_on_two_nodes_spend_one_goal_budget() {
     mb.ok(&root, &["approve", "g1"], &[]);
 
     let mut runs = [spawn_run(&root, &ma, "a", 2), spawn_run(&root, &mb, "b", 1)];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    let mut codes: [Option<i32>; 2] = [None, None];
-    while codes.iter().any(Option::is_none) {
-        for (c, code) in runs.iter_mut().zip(codes.iter_mut()) {
-            if code.is_none() {
-                *code = c.try_wait().unwrap().map(|s| s.code().unwrap_or(-1));
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            // Stopped as an engineer stops a run (Ctrl-C), then waited for.
-            for c in runs.iter_mut() {
-                let _ = Command::new("kill").args(["-INT", &c.id().to_string()]).status();
-                let _ = c.wait();
-            }
-            panic!("the runs did not end within 600 s");
-        }
-        round(&na, &nb).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    round(&na, &nb).await;
-    round(&na, &nb).await;
+    sync_until_exit(&mut runs, &na, &nb, 600).await;
     let out: Vec<String> = ["a", "b"].iter().map(|n| std::fs::read_to_string(root.join(format!("run-{n}.out"))).unwrap()).collect();
 
     // Each run split what it saw left (the whole budget, unless a peer's first lines had arrived): their
@@ -542,6 +559,47 @@ async fn runs_on_two_nodes_spend_one_goal_budget() {
     let view = borg::hive::view::of(&sb_store, "g1", borg::learn::now_ms()).unwrap();
     assert!((view.spent_usd - total.total).abs() < 1e-9, "monitoring shows the goal's total: {}", view.spent_usd);
     assert!(view.drones.iter().any(|d| d.drone.starts_with("d2@")), "A's drones under their node on B: {:?}", view.drones);
+    na.close().await;
+    nb.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A task left to its owner's session that is slow to claim stays in hand on the other node
+/// (d3-accept3 W2: the owner's model claimed 12 to 15 s after its session started, while A's idle drone
+/// counted idle polls and ended "nothing to do"; the verify task only A could take was stranded and both
+/// runs ended unfinished). B owns the one task and its drone claims 15 s into its session, longer than
+/// three idle polls; A's drone waits, verifies B's work, and both runs finish the board.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_slow_to_claim_its_task_is_waited_for() {
+    let root = std::env::temp_dir().join(format!("borg-hive-mesh-slow-{}", std::process::id()));
+    let (ma, mb, na, nb) = two_clones(&root).await;
+    let (ida, idb) = (hive::node(&ma.store()), hive::node(&mb.store()));
+    let live = std::collections::BTreeSet::from([ida.as_str(), idb.as_str()]);
+    let t = (0..).map(|i| format!("t{i}")).find(|t| board::owner(&live, t) == Some(idb.as_str())).unwrap();
+    ma.ok(&root, &["init", "g1", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "5"], &[]);
+    let accept = format!("ok=grep -q 'done {t}' f1.txt");
+    ma.ok(&root, &["open", "g1", "--id", &t, "--title", "write f1.txt", "--files", "f1.txt", "--accept", &accept], &[]);
+    round(&na, &nb).await;
+    mb.ok(&root, &["approve", "g1"], &[]);
+
+    // B's session has started on its task (its line reached A) before A's run starts.
+    let b_run = spawn_scripted(&root, &mb, "b", 1, json!({"claim_s": 15}));
+    let started = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let key = (idb.clone(), "d1".to_string());
+    while !ma.board().sessions.get(&key).is_some_and(|(start, settled)| start > settled) {
+        assert!(std::time::Instant::now() < started, "B's session start did not reach A");
+        round(&na, &nb).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut runs = [spawn_scripted(&root, &ma, "a", 1, json!({})), b_run];
+    let codes = sync_until_exit(&mut runs, &na, &nb, 300).await;
+    let out: Vec<String> = ["a", "b"].iter().map(|n| std::fs::read_to_string(root.join(format!("run-{n}.out"))).unwrap()).collect();
+    assert!(!out[0].contains("end: nothing to do"), "A waited for B's claim: {}", out[0]);
+    assert_eq!(codes, [0, 0], "both runs finished the board: {out:?}");
+    let (ba, bb) = (ma.board(), mb.board());
+    assert!(ba.finished() && bb.finished(), "{out:?}");
+    let node_of = |b: &board::Board, id: &str| b.spans.iter().find(|sp| sp.task == id).map(|sp| sp.node.clone());
+    assert_eq!((node_of(&ba, &t), node_of(&ba, &format!("{t}.v1"))), (Some(idb.clone()), Some(ida.clone())), "B did the work, A verified it");
     na.close().await;
     nb.close().await;
     let _ = std::fs::remove_dir_all(&root);

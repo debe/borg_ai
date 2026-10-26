@@ -823,6 +823,27 @@ pub fn taken_before(b: &Board, drone: &str, node: &str, repo: &str, now: i64, al
     pick(b, "", drone, node, repo, now, allowed).is_some_and(|p| p.free.is_none())
 }
 
+/// Whether the work `drone` of `node` could take is in hand at `now`, so an idle drone waits on it
+/// instead of ending (run.rs `open_to`): a task is held (`Board::in_flight`), a live peer's session
+/// started and has not claimed or ended (`Board::sessions`: it is about to hold one, also a task this
+/// drone may not claim, such as its own work's verify task, whose verdict may open a rework it can
+/// take), one it may claim is left to another node's idle drones (`left_to_another`: d3-accept3, a
+/// peer's session took 12 to 15 s to claim, and the drone here ended on idle polls while the task it
+/// was waiting for was hidden from it), or one is an idle drone's of its node before it
+/// (`taken_before`, which `free_for` leaves out). The wait on a peer is bounded by a lease, not
+/// seconds: a session counts, and a task is left to it, only while it has neither claimed nor ended
+/// (or for `OWNER_GRACE_MS` after the task became claimable), and only while its node wrote a line
+/// within `LEASE_MS` (`Board::live_nodes`). A peer stopped mid-session without its session end is
+/// waited on for up to `LEASE_MS`, as an abandoned claim is under `in_flight`.
+pub fn in_hand(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> bool {
+    let live = b.live_nodes(node, now);
+    let starting = b.sessions.iter().any(|((n, _), (started, settled))| n != node && live.contains(n.as_str()) && started > settled);
+    b.in_flight(now)
+        || starting
+        || b.tasks.values().any(|s| claimable_by(b, s, "", drone, node, now) && allowed(s) && left_to_owner(b, &live, s, node, now))
+        || taken_before(b, drone, node, repo, now, &allowed)
+}
+
 /// What `next_for` found: the first task the drone may claim that no idle drone before it takes, and
 /// the first it may claim at all.
 struct Pick<'a> {
@@ -1713,6 +1734,44 @@ mod tests {
         // A node without a runner's roster keeps nothing back.
         let bare = [on(Event::open(task(&bs[0]), "engineer:e", 0), "A"), on(ev(Ev::Progress, "warm", "sB", 1), "B")];
         assert_eq!(pick(&bare, 5), Some(bs[0].clone()));
+    }
+
+    #[test]
+    fn a_task_left_to_a_peers_starting_session_is_in_hand() {
+        // d3-accept3 W2: B's d1 started a session that had not claimed 12 s on; A's idle d1 saw nothing
+        // open and nothing in hand, and ended before B's claim. The task is not A's to take, and in hand.
+        let live = BTreeSet::from(["A", "B"]);
+        let t: String = (0..).map(|i| format!("b{i}")).find(|t| owner(&live, t) == Some("B")).unwrap();
+        let roster = on(Event::new(Ev::Heartbeat, "", "runner", 1).with_note(&roster_note(&["d1".to_string()])), "B");
+        let start = on(Event::new(Ev::Heartbeat, "", "runner", 2).with_note(&session_note("d1", true)), "B");
+        let opened = vec![on(Event::open(task(&t), "engineer:e", 0), "A"), roster];
+        let b = fold(&opened);
+        assert!(in_hand(&b, "d1", "A", "", 3, |_| true), "B's runner has OWNER_GRACE_MS to start a session for it");
+        assert!(!in_hand(&b, "d1", "A", "", 3, |s| s.task.id != t), "not when A may not claim it");
+        let started = [opened, vec![start]].concat();
+        let at = 10 * OWNER_GRACE_MS;
+        let b = fold(&started);
+        assert_eq!(free_for(&b, "", "d1", "A", "", at, |_| true).map(|s| s.task.id.clone()), None, "left to B's session");
+        assert!(!b.in_flight(at) && in_hand(&b, "d1", "A", "", at, |_| true), "in hand while B's session is on its way to it");
+        let ended = [started, vec![on(Event::new(Ev::Heartbeat, "", "runner", 9).with_note(&session_note("d1", false)), "B")]].concat();
+        let b = fold(&ended);
+        assert_eq!(free_for(&b, "", "d1", "A", "", at, |_| true).map(|s| s.task.id.clone()), Some(t), "it ended without a claim");
+        assert!(!in_hand(&b, "d1", "A", "", at, |_| true));
+    }
+
+    #[test]
+    fn a_peers_starting_session_is_in_hand_for_a_drone_barred_from_its_task() {
+        // The first hive_mesh run: B's d1 authored w and may not verify it; A's session started on w.v1 and
+        // had not claimed. Nothing is B's to claim, held or left to A, yet its verdict may open a rework.
+        let mut lines = worked("w", "sB", "d1", 2).into_iter().map(|e| on(e, "B")).collect::<Vec<_>>();
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 3).with_note(&roster_note(&["d1".to_string()])), "A"));
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 4).with_note(&session_note("d1", true)), "A"));
+        let at = 10 * OWNER_GRACE_MS;
+        let b = fold(&lines);
+        assert_eq!(free_for(&b, "", "d1", "B", "", at, |_| true).map(|s| s.task.id.clone()), None, "B's d1 may not verify its own work");
+        assert!(!b.in_flight(at) && in_hand(&b, "d1", "B", "", at, |_| true), "A's session is about to hold w.v1");
+        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 9).with_note(&session_note("d1", false)), "A"));
+        assert!(!in_hand(&fold(&lines), "d1", "B", "", at, |_| true), "A's session ended without a claim");
     }
 
     #[test]

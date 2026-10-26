@@ -263,7 +263,7 @@ pub fn absent_reason(absent: &[(TaskId, String, String)]) -> String {
 /// The integrate task an integration of `b` would take at `now`: one open to a claim while every work
 /// task is verified and the goal is not finished (its integrator died, an engineer opened or reopened
 /// one), else, when an integration is due (board.rs `integration_due`), a new one (`true`: to open).
-fn due(b: &Board, now: i64) -> Option<(TaskId, bool)> {
+pub(super) fn due(b: &Board, now: i64) -> Option<(TaskId, bool)> {
     let works_verified = b.tasks.values().filter(|s| s.task.role != Role::Integrate).all(|s| matches!(s.status, Status::Verified { .. }));
     let pending = b.tasks.values().find(|s| s.task.role == Role::Integrate && s.claimable(now)).map(|s| s.task.id.clone());
     match pending {

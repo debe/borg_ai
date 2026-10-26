@@ -52,6 +52,8 @@ pub mod oracle;
 pub mod plan;
 pub mod rework;
 pub mod run;
+#[cfg(test)]
+mod scenario;
 mod sim_drone;
 pub mod verdict;
 pub mod view;

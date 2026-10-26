@@ -13,6 +13,7 @@
 //! `work_s`: it holds a work claim this long before writing (a slow drone, while the others wait), firing
 //! the post_tool hook every `poll_s` (default 2; 0: never) meanwhile, as a real drone's tool calls do, and
 //! drops the task at once when the hook says the claim was lost;
+//! `claim_s`: each session waits this long before its first claim (a model reading its prompt and hooks);
 //! `one_task`: its turn ends after one finished task (one task per iteration, each costing `usd_per_iter`);
 //! `node` (top level): a label the drones sign their files with (`by d1@<node>`);
 //! `reject_first` (top level): the goal's first verdict is a reject whoever gives it, and a reworked task's
@@ -84,6 +85,8 @@ struct Plan {
     work_s: u64,
     #[serde(default = "default_poll")]
     poll_s: u64,
+    #[serde(default)]
+    claim_s: u64,
     #[serde(default)]
     one_task: bool,
     #[serde(default)]
@@ -221,6 +224,7 @@ pub fn main(here: &Here) -> i32 {
     let text = d.hook("prompt", json!({"prompt": var(sim::PROMPT_ENV)})).map(|v| v.to_string()).unwrap_or_default();
     let Ok(g) = goal::load(&here.home, &goal_id) else { return answer(&text, true) };
     let tasks = board::fold(&board::read(&super::tasks_path(&here.home, &g.id))).tasks.len();
+    std::thread::sleep(Duration::from_secs(plan.claim_s));
     // Each round finishes a task or ends the iteration: at most one per task, plus the last claim.
     for _ in 0..=tasks {
         let path = super::tasks_path(&here.home, &g.id);

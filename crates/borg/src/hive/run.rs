@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Board, Ev, Goal, Join, board, goal};
+use super::{Board, Ev, Goal, Join, TaskId, board, goal};
 use crate::harness::{self, Harness, Headless};
 use crate::{learn, queen, runner};
 
@@ -304,17 +304,41 @@ fn fold(home: &Path, goal: &str) -> Board {
     board::fold(&board::read(&super::tasks_path(home, goal)))
 }
 
-/// What the board offers `drone` of this node (`home`) at `now`: when the task open to it became
-/// claimable (board.rs `claimable_since`), if one is: one of its new sessions could claim it (its checks
-/// approved here, oracle.rs `Approvals`) and no idle drone of this node before it takes it (board.rs
-/// `free_for`); and whether the work is in hand instead: a task is held, or one it could claim is such
-/// a drone's, which a session of this one would only race.
-fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> (Option<i64>, bool) {
+/// What the board offers a drone at one moment (`open_to`).
+#[derive(Debug, Clone, Default)]
+pub(super) struct Offer {
+    /// The task open to it and when it became claimable (board.rs `claimable_since`): one of its new
+    /// sessions could claim it and no idle drone of its node before it takes it (board.rs `free_for`).
+    pub(super) task: Option<(TaskId, i64)>,
+    /// Every task its session could go for (claimable by it, allowed, not left to another node's idle
+    /// drones: `next_for`'s candidates), each with when it became claimable.
+    pub(super) open: BTreeMap<TaskId, i64>,
+    /// Whether the work is in hand instead (board.rs `in_hand`).
+    pub(super) in_hand: bool,
+}
+
+impl Offer {
+    /// The offer of `b` to `drone` of `node` in `repo` at `now`, among the tasks `allowed` lets it claim.
+    pub(super) fn of(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&board::TaskState) -> bool) -> Offer {
+        let since = |s: &board::TaskState| (s.task.id.clone(), board::claimable_since(b, s));
+        let open = b.tasks.values().filter(|s| board::claimable_by(b, s, "", drone, node, now) && allowed(s) && !board::left_to_another(b, s, node, now));
+        Offer {
+            task: board::free_for(b, "", drone, node, repo, now, &allowed).map(since),
+            open: open.map(since).collect(),
+            in_hand: board::in_hand(b, drone, node, repo, now, &allowed),
+        }
+    }
+}
+
+/// What the board offers `drone` of this node (`home`) at `now` (`Offer`), its checks approved here
+/// (oracle.rs `Approvals`): the task open to it, if one is, and whether the work is in hand instead
+/// (board.rs `in_hand`): a task is held, one it could claim is left to another node's idle drone or is
+/// an idle drone's of this node before it, which a session of this one would only race. The wait
+/// (`Next::Wait`) and the stall count (`stalls`) read this one answer.
+fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> Offer {
     let approvals = super::oracle::Approvals::load(home, &g.id);
     let allowed = |s: &board::TaskState| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty();
-    let node = super::node(home);
-    let open = board::free_for(b, "", drone, &node, repo, now, allowed).map(|s| board::claimable_since(b, s));
-    (open, b.in_flight(now) || (open.is_none() && board::taken_before(b, drone, &node, repo, now, allowed)))
+    Offer::of(b, drone, &super::node(home), repo, now, allowed)
 }
 
 /// Runs `cmd`, a session of `drone` on `goal` for a task claimable since `since` (`open_to`), within
@@ -348,12 +372,22 @@ fn run_session(home: &Path, goal: &str, drone: &str, cmd: Command, timeout: Dura
     })
 }
 
-/// The stall count after an iteration. One that wrote no board line is a stall only while work is
-/// still open to the drone: one beaten to its task (a race lost here or on another node) while that
-/// work is in hand (`open_to`: held, or left to an idle drone of this node before it) left nothing to
-/// do, so the runner waits on the holder instead of ending.
-fn stalls(n: u32, wrote_nothing: bool, open: bool, in_hand: bool) -> u32 {
-    match (wrote_nothing, open || !in_hand) {
+/// The stall count after an iteration, judged by what was open to its session: `start` is the board's
+/// offer as the session started, `end` as it ended (`open_to`). One that wrote no board line is a
+/// stall while the task open to the drone now was open to that session and has not become claimable
+/// again since (whichever task it went for), or nothing is open and no work is in hand: one beaten to
+/// its task (a race lost here or on another node) while that work is in hand (`open_to`: held, or left
+/// to a peer's idle drone or one of this node before it) left nothing to do, so the runner waits on the
+/// holder instead of ending; and a task that became claimable during the session (another drone's done
+/// opens its verify, a reject reopens its work) was never that session's to take. Both times are one
+/// task's own stamps, so no clock is compared with another (a peer's ahead of this one would otherwise
+/// count every empty session as no stall).
+pub(super) fn stalls(n: u32, wrote_nothing: bool, start: &Offer, end: &Offer) -> u32 {
+    let stalled = match &end.task {
+        Some((id, since)) => start.open.get(id).is_some_and(|at| since <= at),
+        None => !end.in_hand,
+    };
+    match (wrote_nothing, stalled) {
         (false, _) => 0,
         (true, false) => n,
         (true, true) => n + 1,
@@ -565,19 +599,19 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         // The goal's budget left after every node's spend, read before each decision: a peer's lines
         // arrive between iterations.
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
-        let (open, in_hand) = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
-        match step(&t, ctx.share, left, b.finished(), open.is_some()) {
+        let offer = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
+        match step(&t, ctx.share, left, b.finished(), offer.task.is_some()) {
             Next::End(r) => {
                 end.reason = r;
                 end.spent = t.spent;
                 return end;
             }
             Next::Wait => {
-                // Work held by another drone, or left to an idle drone of this node before this one,
-                // may still open a verify task this drone can take; a wait the board's change ended
-                // early is no idle poll.
+                // Work held by another drone, or left to a peer's idle drone or one of this node before
+                // this one, may still open a verify task this drone can take; a wait the board's change
+                // ended early is no idle poll.
                 let changed = idle_wait(&tasks, seen, IDLE_WAIT);
-                if !in_hand && !changed {
+                if !offer.in_hand && !changed {
                     t.idle += 1;
                 }
                 continue;
@@ -609,7 +643,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             Join { v: 1, ms: now, goal: goal.into(), dir, drone: name.clone(), session: session.clone(), harness: ctx.h.name().into(), by: "run".into() };
         let _ = super::append_join(ctx.home, goal, &join);
         let started = learn::now_ms();
-        let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, open.unwrap_or(started));
+        let ran = run_session(ctx.home, goal, &name, cmd, ctx.iter_timeout, offer.task.as_ref().map_or(started, |(_, since)| *since));
         let out = ran.as_ref().map(|b| b.out.as_slice()).unwrap_or_default();
         let said = ctx.h.headless_end(out);
         log(ctx.home, goal, &name, iter, out);
@@ -650,8 +684,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         let b = board::fold(&events);
         let now = learn::now_ms();
-        let (open, in_hand) = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
-        t.stalls = stalls(t.stalls, mine.is_empty(), open.is_some(), in_hand);
+        t.stalls = stalls(t.stalls, mine.is_empty(), &offer, &open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now));
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
         let note = match step(&t, ctx.share, left, b.finished(), true) {
             Next::End(r) => r,
@@ -1000,10 +1033,69 @@ mod tests {
 
     #[test]
     fn an_iteration_beaten_to_its_task_while_the_work_is_in_hand_is_no_stall() {
-        assert_eq!(stalls(1, false, true, true), 0, "a board line resets the count");
-        assert_eq!(stalls(1, true, true, true), 2, "work still open to it and it did nothing");
-        assert_eq!(stalls(1, true, false, false), 2, "nothing open and nothing in hand");
-        assert_eq!(stalls(1, true, false, true), 1, "beaten to the task: another drone holds the work");
+        let offer = |task: Option<(&str, i64)>, open: &[(&str, i64)], in_hand: bool| Offer {
+            task: task.map(|(id, at)| (id.to_string(), at)),
+            open: open.iter().map(|(id, at)| (id.to_string(), *at)).collect(),
+            in_hand,
+        };
+        let start = offer(Some(("t1", 0)), &[("t1", 0), ("t2", 5)], false);
+        assert_eq!(stalls(1, false, &start, &offer(Some(("t1", 0)), &[], true)), 0, "a board line resets the count");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 0)), &[], true)), 2, "work open to it as it started, and it did nothing");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t2", 5)), &[], false)), 2, "another task open to it as it started");
+        assert_eq!(stalls(1, true, &start, &offer(None, &[], false)), 2, "nothing open and nothing in hand");
+        assert_eq!(stalls(1, true, &start, &offer(None, &[], true)), 1, "beaten to the task: another drone holds the work");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t3", -9)), &[], false)), 1, "beaten to the task: work that became claimable during the session");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 7)), &[], false)), 1, "its task claimable again during the session (a reject reopened it)");
+        let ahead = offer(Some(("t1", 20_000)), &[("t1", 20_000)], false);
+        assert_eq!(stalls(1, true, &ahead, &ahead.clone()), 2, "stamped by a peer's clock 20 s ahead, still open to it: a stall");
+    }
+
+    /// CE3 (tasks/hive-soundness.md) on the board: b's first session writes nothing while its tasks
+    /// stay open to it; during its second, node a claims t1 and t2 and its done opens `t2.v1` to b
+    /// before b's runner looks again. Work that appeared during the session is no stall: b goes on to
+    /// verify instead of ending "stalled" as its work appears.
+    #[test]
+    fn a_session_that_ends_as_work_opens_to_it_is_no_stall() {
+        let task = |id: &str, role: board::Role, of: Option<&str>| board::Task {
+            id: id.into(),
+            role,
+            title: id.into(),
+            repo: String::new(),
+            files: vec![],
+            deps: vec![],
+            accept: vec![],
+            of: of.map(Into::into),
+            not_by: of.map_or(vec![], |_| vec!["sa".into(), "a1".into()]),
+            flags: vec![],
+            from: None,
+            group: None,
+        };
+        let on_a = |e: board::Event| board::Event { node: "a".into(), ..e };
+        let grace = super::super::OWNER_GRACE_MS;
+        let look = |events: &[board::Event], now: i64| Offer::of(&board::fold(events), "d1", "b", "", now, |_| true);
+        let mut events = vec![
+            on_a(board::Event::open(task("t1", board::Role::Work, None), "engineer:e", 0)),
+            on_a(board::Event::open(task("t2", board::Role::Work, None), "engineer:e", 0)),
+        ];
+        let mut t = Tally::default();
+        let started = 10 * grace;
+        let start = look(&events, started);
+        assert!(start.task.is_some(), "b's first session starts on an open task");
+        t.stalls = stalls(t.stalls, true, &start, &look(&events, started + 1));
+        assert_eq!(t.stalls, 1, "refused its task, which is still open to it");
+        let started = 20 * grace;
+        let start = look(&events, started);
+        events.extend([
+            on_a(board::Event::new(Ev::Claim, "t1", "sa1", started + 1).with_drone("a2")),
+            on_a(board::Event::new(Ev::Claim, "t2", "sa", started + 1).with_drone("a1")),
+            on_a(board::Event::new(Ev::Done, "t2", "sa", started + 2)),
+            on_a(board::Event::open(task("t2.v1", board::Role::Verify, Some("t2")), "sa", started + 2)),
+        ]);
+        let end = look(&events, 30 * grace);
+        assert_eq!(end.task.as_ref().map(|(id, _)| id.as_str()), Some("t2.v1"), "a's done opened t2.v1 to b");
+        t.stalls = stalls(t.stalls, true, &start, &end);
+        assert_eq!(t.stalls, 1, "beaten to t2; t2.v1 became claimable during the session");
+        assert_eq!(step(&t, 1.0, 1.0, false, true), Next::Go, "it verifies t2.v1");
     }
 
     #[test]
