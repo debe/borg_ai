@@ -22,9 +22,13 @@
 //! finished only when that passes; a failure opens a fix task the drones take like any work.
 //!
 //! Between iterations the runner reads the board once (`board::fold`) and decides ([`step`]): the
-//! board is finished, the share is spent or the goal's budget is (every node's spend, [`ledger`]), a session ended well without naming its cost or at $0 (fail
+//! board is finished on a stable prefix (every participant said its board was finished at that
+//! integration, with every line before that here: `Board::finished_for_good`), the share is spent or the goal's budget is (every node's spend, [`ledger`]), a session ended well without naming its cost or at $0 (fail
 //! closed: an unmetered harness, or one on a subscription, gets one iteration), two iterations in a row
-//! failed or timed out, two made no board progress, or nothing was open for three polls. An iteration
+//! failed or timed out, two made no board progress, or, with nothing open to the drone, a task no
+//! running drone of the goal may take while nothing else on the board can move (`board::stuck`,
+//! `board::moving`, said on the board and in the end report, exit 1). Nothing else ends a drone (phase f F6): with nothing open it waits on the board however long the
+//! goal is unfinished, since a peer's line may open work at any time; quiet is no termination. An iteration
 //! cut off at `--iter-timeout` without naming its cost is charged an estimate (`Spend::est`: the
 //! drone's dearest iteration so far, else the rest of its share). A harness that stops itself at a
 //! budget (`Caps::headless_budget`) gets the drone's dollars left; any other overshoots by at most one
@@ -68,7 +72,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Board, Ev, Goal, Join, TaskId, board, goal};
+use super::{Board, Commits, Ev, Goal, Join, TaskId, board, goal};
 use crate::harness::{self, Harness, Headless};
 use crate::{learn, queen, runner};
 
@@ -76,9 +80,8 @@ use crate::{learn, queen, runner};
 pub const MAX_DRONES: usize = 20;
 /// One iteration's cap when `--iter-timeout` names none.
 pub const DEFAULT_ITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// Guards, not tuned defaults: polls of a board with nothing open to the drone before it ends, failed
-/// iterations and iterations without board progress in a row.
-const IDLE_POLLS: u32 = 3;
+/// Guards, not tuned defaults: failed iterations and iterations without board progress in a row. An idle
+/// drone looks at the board again after `IDLE_WAIT` at the latest.
 pub(crate) const IDLE_WAIT: Duration = Duration::from_secs(3);
 /// How often an idle drone looks at the board's file within `IDLE_WAIT` (`idle_wait`): as often as the
 /// mesh daemon looks at the hive's logs (borg-mesh daemon.rs `hive_poll`), so a peer's line that lands
@@ -224,7 +227,6 @@ pub fn prompt(g: &Goal, drone: &str) -> String {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tally {
     pub spent: f64,
-    pub idle: u32,
     pub errors: u32,
     pub stalls: u32,
     /// An iteration that ended well reported no cost, or $0.
@@ -237,16 +239,72 @@ pub struct Tally {
 pub enum Next {
     /// Start an iteration.
     Go,
-    /// Nothing open to the drone: poll again.
+    /// Nothing open to the drone: wait for the board to change, and decide again.
     Wait,
     End(&'static str),
 }
 
-/// What a drone does next: the stop reasons in order, then whether a task is open to it. `left` is what
-/// is left of the goal's budget after every node's spend ([`ledger`]).
-pub fn step(t: &Tally, share: f64, left: f64, finished: bool, open: bool) -> Next {
-    if finished {
+/// What the board says of the goal's end to a drone (phase f F6, [`step`]): a goal ends by detection on
+/// what every participant said, never by a drone's own quiet (Dijkstra & Scholten 1980; Safra EWD998).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ending {
+    /// Unfinished, nothing stuck: the drone works, or waits however long.
+    Open,
+    /// Finished, and a participant may still change it (`Board::settling`): the drone waits, spending
+    /// nothing (nothing is open on a finished board).
+    Settling,
+    /// Finished on a stable prefix (`Board::finished_for_good`).
+    Finished,
+    /// Tasks no running drone of the goal may take, with why (`board::stuck`), and nothing else on the
+    /// board can move (`board::moving`): no held task, none another drone may still take.
+    Stuck(Vec<(TaskId, String)>),
+}
+
+impl Ending {
+    /// What `b` says to a drone of `here` at `now`, among the tasks `allowed` lets this node claim, with
+    /// the commits it lacks (`lacks`, mod.rs `lacking`; phase f F7): a task whose commits are on their way
+    /// counts as one this node may take (it waits for them, `takes`), one whose commits cannot come as
+    /// one it may not, stuck with why they cannot (`commits unavailable: …`) when no other node may.
+    pub(super) fn of(b: &Board, here: &str, now: i64, allowed: impl Fn(&board::TaskState) -> bool, lacks: &BTreeMap<TaskId, Commits>) -> Ending {
+        if b.finished_for_good(here, now) {
+            return Ending::Finished;
+        }
+        if b.finished() {
+            return Ending::Settling;
+        }
+        let mut stuck = board::stuck(b, here, now, takes(allowed, lacks));
+        for (t, why) in &mut stuck {
+            if let Some(Commits::Unavailable(w)) = lacks.get(t) {
+                *why = w.clone();
+            }
+        }
+        if stuck.is_empty() || board::moving(b, now, &stuck) { Ending::Open } else { Ending::Stuck(stuck) }
+    }
+}
+
+/// The tasks a session of this node may go for (phase f F7): `allowed`, and its commits here (none in
+/// `lacks`, mod.rs `lacking`). The runner's offer (`open_to`) and the session's pick (mod.rs `next_open`)
+/// filter by the same answer, so no session starts for a task it would then refuse.
+pub(super) fn offered<'a>(allowed: impl Fn(&board::TaskState) -> bool + 'a, lacks: &'a BTreeMap<TaskId, Commits>) -> impl Fn(&board::TaskState) -> bool + 'a {
+    move |s| allowed(s) && !lacks.contains_key(&s.task.id)
+}
+
+/// The tasks this node may take for its declines and its stuck (phase f F7): `allowed`, unless no line
+/// can bring its commits here (`Commits::Unavailable`). A task whose commits are on their way is one it
+/// takes once they are here: it is neither declined nor stuck, and its drones wait.
+pub(super) fn takes<'a>(allowed: impl Fn(&board::TaskState) -> bool + 'a, lacks: &'a BTreeMap<TaskId, Commits>) -> impl Fn(&board::TaskState) -> bool + 'a {
+    move |s| allowed(s) && !matches!(lacks.get(&s.task.id), Some(Commits::Unavailable(_)))
+}
+
+/// What a drone does next: the goal's end, the stop reasons in order, then whether a task is open to it,
+/// and with none whether a task is stuck. `left` is what is left of the goal's budget after every node's
+/// spend ([`ledger`]). A drone ends only on a finish for good, its budget, a fault of its own (errors,
+/// stalls, no cost reported) or a stuck: never on nothing to do, however long (phase f F6).
+pub fn step(t: &Tally, share: f64, left: f64, end: &Ending, open: bool) -> Next {
+    if *end == Ending::Finished {
         Next::End("goal finished")
+    } else if *end == Ending::Settling {
+        Next::Wait
     } else if t.spent >= share || left <= 0.0 {
         Next::End("budget")
     } else if t.unmetered {
@@ -257,8 +315,8 @@ pub fn step(t: &Tally, share: f64, left: f64, finished: bool, open: bool) -> Nex
         Next::End("stalled")
     } else if open {
         Next::Go
-    } else if t.idle >= IDLE_POLLS {
-        Next::End("nothing to do")
+    } else if matches!(end, Ending::Stuck(_)) {
+        Next::End("stuck")
     } else {
         Next::Wait
     }
@@ -273,6 +331,8 @@ pub struct DroneEnd {
     pub iters: u32,
     pub done: Vec<String>,
     pub reason: &'static str,
+    /// What it ended stuck on (`Ending::Stuck`).
+    pub stuck: Vec<(TaskId, String)>,
 }
 
 pub struct Opts<'a> {
@@ -417,35 +477,33 @@ pub(super) struct Offer {
     /// The task open to it and when it became claimable (board.rs `claimable_since`): one of its new
     /// sessions could claim it and no idle drone of its node before it takes it (board.rs `free_for`).
     pub(super) task: Option<(TaskId, i64)>,
-    /// Every task its session could go for (claimable by it, allowed, not left to another node's idle
-    /// drones: `next_for`'s candidates), each with when it became claimable.
+    /// Every task its session could go for (board.rs `open_for`, `next_for`'s candidates: eligible for it,
+    /// allowed, not left to another node's idle drones), each with when it became claimable.
     pub(super) open: BTreeMap<TaskId, i64>,
-    /// Whether the work is in hand instead (board.rs `in_hand`).
-    pub(super) in_hand: bool,
 }
 
 impl Offer {
     /// The offer of `b` to `drone` of `node` in `repo` at `now`, among the tasks `allowed` lets it claim.
     pub(super) fn of(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&board::TaskState) -> bool) -> Offer {
         let since = |s: &board::TaskState| (s.task.id.clone(), board::claimable_since(b, s));
-        let open = b.tasks.values().filter(|s| board::claimable_by(b, s, "", drone, node, now) && allowed(s) && !board::left_to_another(b, s, node, now));
-        Offer {
-            task: board::free_for(b, "", drone, node, repo, now, &allowed).map(since),
-            open: open.map(since).collect(),
-            in_hand: board::in_hand(b, drone, node, repo, now, &allowed),
-        }
+        let who = board::Actor::new(node, drone, "");
+        let open = b.tasks.values().filter(|s| board::open_for(b, s, who, now, &allowed));
+        Offer { task: board::free_for(b, who, repo, now, &allowed).map(since), open: open.map(since).collect() }
     }
 }
 
 /// What the board offers `drone` of this node (`home`) at `now` (`Offer`), its checks approved here
-/// (oracle.rs `Approvals`): the task open to it, if one is, and whether the work is in hand instead
-/// (board.rs `in_hand`): a task is held, one it could claim is left to another node's idle drone or is
-/// an idle drone's of this node before it, which a session of this one would only race. The wait
-/// (`Next::Wait`) and the stall count (`stalls`) read this one answer.
-fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, now: i64) -> Offer {
+/// (`allowed`) and its commits in this repo (`offered`, `lacks`): the task open to it, if one is. With
+/// none it waits (`Next::Wait`); the stall count (`stalls`) reads the same answer.
+fn open_to(home: &Path, g: &Goal, b: &Board, drone: &str, repo: &str, lacks: &BTreeMap<TaskId, Commits>, now: i64) -> Offer {
+    Offer::of(b, drone, &super::node(home), repo, now, offered(allowed(home, g, repo), lacks))
+}
+
+/// The tasks this node may claim in `repo` (mod.rs `may_claim`), their checks approved here (oracle.rs
+/// `Approvals`).
+fn allowed<'a>(home: &Path, g: &'a Goal, repo: &'a str) -> impl Fn(&board::TaskState) -> bool + 'a {
     let approvals = super::oracle::Approvals::load(home, &g.id);
-    let allowed = |s: &board::TaskState| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty();
-    Offer::of(b, drone, &super::node(home), repo, now, allowed)
+    move |s: &board::TaskState| super::may_claim(g, &s.task, repo) && approvals.pending(g, &s.task).is_empty()
 }
 
 /// Runs `cmd`, a session of `drone` on `goal` for a task claimable since `since` (`open_to`), within
@@ -482,18 +540,15 @@ fn run_session(home: &Path, goal: &str, drone: &str, cmd: Command, timeout: Dura
 /// The stall count after an iteration, judged by what was open to its session: `start` is the board's
 /// offer as the session started, `end` as it ended (`open_to`). One that wrote no board line is a
 /// stall while the task open to the drone now was open to that session and has not become claimable
-/// again since (whichever task it went for), or nothing is open and no work is in hand: one beaten to
-/// its task (a race lost here or on another node) while that work is in hand (`open_to`: held, or left
-/// to a peer's idle drone or one of this node before it) left nothing to do, so the runner waits on the
-/// holder instead of ending; and a task that became claimable during the session (another drone's done
-/// opens its verify, a reject reopens its work) was never that session's to take. Both times are one
-/// task's own stamps, so no clock is compared with another (a peer's ahead of this one would otherwise
-/// count every empty session as no stall).
+/// again since (whichever task it went for): a task that became claimable during the session (another
+/// drone's done opens its verify, a reject reopens its work) was never that session's to take. One
+/// beaten to its task (a race lost here or on another node) with nothing open after it is no stall: the
+/// drone waits on the board (phase f F6). Before F6 that was a stall unless the work was in hand (board.rs
+/// `in_hand`, held or left to another drone), a guard of the idle-poll end, which F6 removed with it.
+/// Both times are one task's own stamps, so no clock is compared with another (a peer's ahead of this
+/// one would otherwise count every empty session as no stall).
 pub(super) fn stalls(n: u32, wrote_nothing: bool, start: &Offer, end: &Offer) -> u32 {
-    let stalled = match &end.task {
-        Some((id, since)) => start.open.get(id).is_some_and(|at| since <= at),
-        None => !end.in_hand,
-    };
+    let stalled = end.task.as_ref().is_some_and(|(id, since)| start.open.get(id).is_some_and(|at| since <= at));
     match (wrote_nothing, stalled) {
         (false, _) => 0,
         (true, false) => n,
@@ -501,10 +556,12 @@ pub(super) fn stalls(n: u32, wrote_nothing: bool, start: &Offer, end: &Offer) ->
     }
 }
 
-/// A fresh UUID-shaped session id (Claude Code's `--session-id` takes only a UUID).
-fn session_id(goal: &str, drone: &str, iter: u32) -> String {
+/// A fresh UUID-shaped session id (Claude Code's `--session-id` takes only a UUID) of `drone` on `node`:
+/// the node is hashed in, so two nodes' runners (one pid each in two containers) in one ms name two
+/// sessions (phase f F8; the board compares sessions node for node all the same, board.rs `Actor`).
+fn session_id(node: &str, goal: &str, drone: &str, iter: u32) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [goal, drone, &iter.to_string(), &learn::now_ms().to_string(), &std::process::id().to_string()] {
+    for part in [node, goal, drone, &iter.to_string(), &learn::now_ms().to_string(), &std::process::id().to_string()] {
         h.update(part.as_bytes());
         h.update(b"\0");
     }
@@ -572,8 +629,9 @@ fn spent_before(lines: &[Spend], here: &str, drone: &str) -> (u32, f64) {
 
 /// Releases what `sessions` still hold on `b` at `now`, with `note`.
 fn release_held(home: &Path, goal: &str, b: &Board, sessions: &[String], note: &str, now: i64) {
+    let here = super::node(home);
     let held: Vec<board::Event> =
-        sessions.iter().filter_map(|s| board::holding(b, s, now).map(|t| board::Event::new(Ev::Released, &t.task.id, s, now).with_note(note))).collect();
+        sessions.iter().filter_map(|s| board::holding(b, &here, s, now).map(|t| board::Event::new(Ev::Released, &t.task.id, s, now).with_note(note))).collect();
     if !held.is_empty() {
         let _ = super::write(home, goal, held);
     }
@@ -647,7 +705,7 @@ fn recover(home: &Path, goal: &str, now: i64) {
         .tasks
         .values()
         .filter_map(|s| match &s.status {
-            super::Status::Claimed { by, node, .. } if super::is_local(home, node) && b.drones.get(by).is_some_and(|d| runner(d)) => {
+            super::Status::Claimed { by, node, .. } if super::is_local(home, node) && b.drone(node, by).is_some_and(runner) => {
                 Some(board::Event::new(Ev::Released, &s.task.id, by, now).with_note("its run ended"))
             }
             _ => None,
@@ -703,14 +761,19 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
     let goal = ctx.g.id.as_str();
     let (mut iter, dearest) = spent_before(ctx.before, ctx.here, &name);
     let mut t = Tally { dearest, ..Tally::default() };
-    let mut end = DroneEnd { drone: name.clone(), worktree: wt.to_path_buf(), spent: 0.0, iters: 0, done: Vec::new(), reason: "" };
+    let mut end = DroneEnd { drone: name.clone(), worktree: wt.to_path_buf(), spent: 0.0, iters: 0, done: Vec::new(), reason: "", stuck: Vec::new() };
     let text = prompt(ctx.g, &name);
     let env = [(super::ENV, goal.to_string()), (super::DRONE_ENV, name.clone())];
     let tasks = super::tasks_path(ctx.home, goal);
+    // What the drone last said it waits for (an integration's commits), said once.
+    let mut waiting: Option<String> = None;
     loop {
         let now = learn::now_ms();
         let seen = mark(&tasks);
         let b = fold(ctx.home, goal);
+        // A done of this node whose bundle line was never written (its session or stop hook cut during
+        // `git bundle create`): written now, so no peer waits for it while this node runs (phase f F7).
+        super::commits::republish(ctx.home, goal, &b, ctx.here, ctx.root);
         if let Some(o) = super::integrate::run(ctx.home, ctx.g, ctx.root, &name, now) {
             let head = o.head.as_deref().map_or("-", |h| &h[..h.len().min(12)]);
             match &o.verdict {
@@ -719,39 +782,77 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             }
             continue;
         }
-        // Accepted work whose commits are on another node only: this node cannot integrate it, and
-        // writes no board line for it (integrate.rs `absent`).
-        if let Some(why) = super::integrate::elsewhere(ctx.home, ctx.g, ctx.root, now) {
-            println!("{name}  {why}");
-            end.reason = "integration needs another node's commits";
-            end.spent = t.spent;
-            return end;
+        // Accepted work whose commits this repo lacks (integrate.rs `gate`, phase f F7): the drone waits
+        // while they may come or another node integrates; once no node can hold them together, the
+        // integration is stuck, said on the board. A node that cannot get one of them says so first
+        // (mod.rs `decline_integration`), so no peer waits for it to integrate.
+        let gate = super::integrate::elsewhere(ctx.home, ctx.g, ctx.root, now);
+        if let Some((id, _, true)) = &gate
+            && !b.declines(ctx.here, id)
+        {
+            let _ = super::decline_integration(ctx.home, goal, id);
+        }
+        match gate.map(|(id, c, _)| (id, c)) {
+            Some((id, Commits::Unavailable(why))) => {
+                println!("{name}  {id}  {why}");
+                let stuck = vec![(id, why)];
+                let _ = super::stuck_lines(ctx.home, goal, &stuck);
+                end.stuck = stuck;
+                end.reason = "stuck";
+                end.spent = t.spent;
+                return end;
+            }
+            Some((id, Commits::Coming(why))) => {
+                if waiting.as_deref() != Some(why.as_str()) {
+                    println!("{name}  {id}  waits: {why}");
+                    waiting = Some(why);
+                }
+                idle_wait(&tasks, seen, &b, IDLE_WAIT);
+                continue;
+            }
+            None => waiting = None,
         }
         // The goal's budget left after every node's spend, read before each decision: a peer's lines
         // arrive between iterations.
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
-        let offer = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now);
-        match step(&t, ctx.share, left, b.finished(), offer.task.is_some()) {
+        // The commits this node lacks, once per pass (mod.rs `lacking`): offer, declines and stuck read one answer.
+        let lacks = super::lacking_here(ctx.home, goal, &b, ctx.root, now);
+        let offer = open_to(ctx.home, ctx.g, &b, &name, ctx.repo, &lacks, now);
+        // This node's board is finished: it says so (mod.rs `finish_line`), and its drones wait until
+        // every participant did (phase f F6).
+        if board::finish_due(&b, ctx.here).is_some() {
+            let _ = super::finish_line(ctx.home, goal);
+        }
+        // A task this node may not take is said on the board, so no peer leaves it to this node (mod.rs
+        // `decline_lines`, phase f F6).
+        let ok = allowed(ctx.home, ctx.g, ctx.repo);
+        let take = takes(&ok, &lacks);
+        if !board::declines_due(&b, ctx.here, now, &take).is_empty() {
+            let _ = super::decline_lines(ctx.home, goal, &take);
+        }
+        let ending = Ending::of(&b, ctx.here, now, &ok, &lacks);
+        match step(&t, ctx.share, left, &ending, offer.task.is_some()) {
             Next::End(r) => {
+                // Said on the board, so every node sees why (a join of a node still in the goal clears it, `Board::stuck`).
+                if let (Ending::Stuck(stuck), "stuck") = (&ending, r) {
+                    let _ = super::stuck_lines(ctx.home, goal, stuck);
+                    end.stuck = stuck.clone();
+                }
                 end.reason = r;
                 end.spent = t.spent;
                 return end;
             }
             Next::Wait => {
-                // Work held by another drone, or left to a peer's idle drone or one of this node before
-                // this one, may still open a verify task this drone can take; a wait the board's change
-                // ended early is no idle poll.
-                let changed = idle_wait(&tasks, seen, &b, IDLE_WAIT);
-                if !offer.in_hand && !changed {
-                    t.idle += 1;
-                }
+                // Work held by another drone, a peer's session on its way to a task, a verdict to come:
+                // any line may open work this drone can take, so it waits on the board, however long.
+                idle_wait(&tasks, seen, &b, IDLE_WAIT);
                 continue;
             }
-            Next::Go => t.idle = 0,
+            Next::Go => {}
         }
         iter += 1;
         end.iters += 1;
-        let session = session_id(goal, &name, iter);
+        let session = session_id(ctx.here, goal, &name, iter);
         // The harness's own cap: the drone's dollars left, never more than the goal has left.
         let left = (ctx.share - t.spent).min(left).max(0.0);
         let run = Headless {
@@ -817,9 +918,10 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
         end.done.extend(mine.iter().filter(|e| matches!(e.ev, Ev::Done | Ev::Verified | Ev::Rejected)).map(|e| e.task.clone()));
         let b = board::fold_on(&events, ctx.here);
         let now = learn::now_ms();
-        t.stalls = stalls(t.stalls, mine.is_empty(), &offer, &open_to(ctx.home, ctx.g, &b, &name, ctx.repo, now));
+        let lacks = super::lacking_here(ctx.home, goal, &b, ctx.root, now);
+        t.stalls = stalls(t.stalls, mine.is_empty(), &offer, &open_to(ctx.home, ctx.g, &b, &name, ctx.repo, &lacks, now));
         let left = ctx.g.budget_usd - goal_spent(ctx.home, goal).total;
-        let note = match step(&t, ctx.share, left, b.finished(), true) {
+        let note = match step(&t, ctx.share, left, &if b.finished() { Ending::Finished } else { Ending::Open }, true) {
             Next::End(r) => r,
             _ => "iteration ended",
         };
@@ -1082,6 +1184,19 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         let done = if e.done.is_empty() { "-".to_string() } else { e.done.join(",") };
         println!("{}  {name}  ${:.2}/${share:.2}  {} iter  tasks done: {done}  end: {}", e.drone, e.spent, e.iters, e.reason);
     }
+    // A stuck task: no running drone of the goal may take it (phase f F6). The run gives up on it, and says
+    // what would unstick it.
+    let stuck: BTreeMap<&str, &str> = ends.iter().flat_map(|e| e.stuck.iter().map(|(t, why)| (t.as_str(), why.as_str()))).collect();
+    for (t, why) in &stuck {
+        println!("stuck: {t}: {why}");
+    }
+    if !stuck.is_empty() {
+        println!(
+            "hive run {}: stuck on {} task(s) no running drone of the goal may take; a run of a node that may take them (another node for a verify task) takes them up",
+            g.id,
+            stuck.len()
+        );
+    }
     // Races no board shows: claims a rival's beat to the write, each a session's start spent for nothing.
     let refused =
         super::read_lines::<super::Confirm>(&super::confirms_path(home, &g.id)).iter().filter(|c| c.ms >= run.ms && c.outcome == super::REFUSED).count();
@@ -1101,7 +1216,9 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     if let Some(i) = b.integrated.as_ref().filter(|_| b.finished()) {
         println!("integrated {} ({}, refs/heads/hive/{}/integrated)", i.head, i.task, g.id);
     }
-    if b.finished() { 0 } else { 1 }
+    // Exit 0 only on a finish for good (phase f F6): a drone saw it, or the board says it now.
+    let for_good = ends.iter().any(|e| e.reason == "goal finished") || b.finished_for_good(&here, now);
+    if b.finished() && for_good { 0 } else { 1 }
 }
 
 #[cfg(test)]
@@ -1200,21 +1317,19 @@ mod tests {
     }
 
     #[test]
-    fn an_iteration_beaten_to_its_task_while_the_work_is_in_hand_is_no_stall() {
-        let offer = |task: Option<(&str, i64)>, open: &[(&str, i64)], in_hand: bool| Offer {
+    fn an_iteration_beaten_to_its_task_is_no_stall() {
+        let offer = |task: Option<(&str, i64)>, open: &[(&str, i64)]| Offer {
             task: task.map(|(id, at)| (id.to_string(), at)),
             open: open.iter().map(|(id, at)| (id.to_string(), *at)).collect(),
-            in_hand,
         };
-        let start = offer(Some(("t1", 0)), &[("t1", 0), ("t2", 5)], false);
-        assert_eq!(stalls(1, false, &start, &offer(Some(("t1", 0)), &[], true)), 0, "a board line resets the count");
-        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 0)), &[], true)), 2, "work open to it as it started, and it did nothing");
-        assert_eq!(stalls(1, true, &start, &offer(Some(("t2", 5)), &[], false)), 2, "another task open to it as it started");
-        assert_eq!(stalls(1, true, &start, &offer(None, &[], false)), 2, "nothing open and nothing in hand");
-        assert_eq!(stalls(1, true, &start, &offer(None, &[], true)), 1, "beaten to the task: another drone holds the work");
-        assert_eq!(stalls(1, true, &start, &offer(Some(("t3", -9)), &[], false)), 1, "beaten to the task: work that became claimable during the session");
-        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 7)), &[], false)), 1, "its task claimable again during the session (a reject reopened it)");
-        let ahead = offer(Some(("t1", 20_000)), &[("t1", 20_000)], false);
+        let start = offer(Some(("t1", 0)), &[("t1", 0), ("t2", 5)]);
+        assert_eq!(stalls(1, false, &start, &offer(Some(("t1", 0)), &[])), 0, "a board line resets the count");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 0)), &[])), 2, "work open to it as it started, and it did nothing");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t2", 5)), &[])), 2, "another task open to it as it started");
+        assert_eq!(stalls(1, true, &start, &offer(None, &[])), 1, "beaten to the task, nothing open after it: it waits (phase f F6)");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t3", -9)), &[])), 1, "beaten to the task: work that became claimable during the session");
+        assert_eq!(stalls(1, true, &start, &offer(Some(("t1", 7)), &[])), 1, "its task claimable again during the session (a reject reopened it)");
+        let ahead = offer(Some(("t1", 20_000)), &[("t1", 20_000)]);
         assert_eq!(stalls(1, true, &ahead, &ahead.clone()), 2, "stamped by a peer's clock 20 s ahead, still open to it: a stall");
     }
 
@@ -1263,27 +1378,29 @@ mod tests {
         assert_eq!(end.task.as_ref().map(|(id, _)| id.as_str()), Some("t2.v1"), "a's done opened t2.v1 to b");
         t.stalls = stalls(t.stalls, true, &start, &end);
         assert_eq!(t.stalls, 1, "beaten to t2; t2.v1 became claimable during the session");
-        assert_eq!(step(&t, 1.0, 1.0, false, true), Next::Go, "it verifies t2.v1");
+        assert_eq!(step(&t, 1.0, 1.0, &Ending::Open, true), Next::Go, "it verifies t2.v1");
     }
 
     #[test]
     fn every_stop_reason_comes_from_the_tally() {
-        let t = |spent: f64, idle: u32, errors: u32, stalls: u32, unmetered: bool| Tally { spent, idle, errors, stalls, unmetered, dearest: 0.0 };
-        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, 1.0, false, true), Next::Go);
-        assert_eq!(step(&t(0.5, 0, 0, 0, false), 1.0, 1.0, true, true), Next::End("goal finished"), "finished first");
-        assert_eq!(step(&t(1.0, 0, 0, 0, false), 1.0, 1.0, false, true), Next::End("budget"));
-        assert_eq!(step(&t(1.2, 0, 2, 2, true), 1.0, 1.0, false, true), Next::End("budget"), "budget before the guards");
-        assert_eq!(step(&t(0.0, 0, 0, 0, true), 1.0, 1.0, false, true), Next::End("cost not reported"));
-        assert_eq!(step(&t(0.0, 0, 1, 0, false), 1.0, 1.0, false, true), Next::Go, "one failure is retried");
-        assert_eq!(step(&t(0.0, 0, 2, 0, false), 1.0, 1.0, false, true), Next::End("errors"));
-        assert_eq!(step(&t(0.0, 0, 0, 2, false), 1.0, 1.0, false, true), Next::End("stalled"));
-        assert_eq!(step(&t(0.0, 0, 0, 0, false), 1.0, 1.0, false, false), Next::Wait);
-        assert_eq!(step(&t(0.0, 2, 0, 0, false), 1.0, 1.0, false, false), Next::Wait);
-        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, 1.0, false, false), Next::End("nothing to do"));
-        assert_eq!(step(&t(0.0, 3, 0, 0, false), 1.0, 1.0, false, true), Next::Go, "an open task resets the wait");
-        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, 0.0, false, true), Next::End("budget"), "another node spent the rest of the goal's budget");
-        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, -0.3, false, true), Next::End("budget"));
-        assert_eq!(step(&t(0.1, 0, 0, 0, false), 1.0, 0.01, false, true), Next::Go);
+        let t = |spent: f64, errors: u32, stalls: u32, unmetered: bool| Tally { spent, errors, stalls, unmetered, dearest: 0.0 };
+        let (open, stuck) = (Ending::Open, Ending::Stuck(vec![("t1.v1".into(), "no running drone".into())]));
+        assert_eq!(step(&t(0.0, 0, 0, false), 1.0, 1.0, &open, true), Next::Go);
+        assert_eq!(step(&t(0.5, 0, 0, false), 1.0, 1.0, &Ending::Finished, true), Next::End("goal finished"), "finished first");
+        assert_eq!(step(&t(1.2, 2, 2, true), 1.0, 1.0, &Ending::Settling, false), Next::Wait, "finished, not for good yet: it waits, spending nothing");
+        assert_eq!(step(&t(1.0, 0, 0, false), 1.0, 1.0, &open, true), Next::End("budget"));
+        assert_eq!(step(&t(1.2, 2, 2, true), 1.0, 1.0, &open, true), Next::End("budget"), "budget before the guards");
+        assert_eq!(step(&t(0.0, 0, 0, true), 1.0, 1.0, &open, true), Next::End("cost not reported"));
+        assert_eq!(step(&t(0.0, 1, 0, false), 1.0, 1.0, &open, true), Next::Go, "one failure is retried");
+        assert_eq!(step(&t(0.0, 2, 0, false), 1.0, 1.0, &open, true), Next::End("errors"));
+        assert_eq!(step(&t(0.0, 0, 2, false), 1.0, 1.0, &open, true), Next::End("stalled"));
+        assert_eq!(step(&t(0.0, 0, 0, false), 1.0, 1.0, &open, false), Next::Wait, "nothing open: it waits, however long (phase f F6)");
+        assert_eq!(step(&t(0.0, 0, 0, false), 1.0, 1.0, &stuck, false), Next::End("stuck"));
+        assert_eq!(step(&t(0.0, 0, 0, false), 1.0, 1.0, &stuck, true), Next::Go, "work open to it goes first");
+        assert_eq!(step(&t(1.0, 0, 0, false), 1.0, 1.0, &stuck, false), Next::End("budget"));
+        assert_eq!(step(&t(0.1, 0, 0, false), 1.0, 0.0, &open, true), Next::End("budget"), "another node spent the rest of the goal's budget");
+        assert_eq!(step(&t(0.1, 0, 0, false), 1.0, -0.3, &open, true), Next::End("budget"));
+        assert_eq!(step(&t(0.1, 0, 0, false), 1.0, 0.01, &open, true), Next::Go);
     }
 
     fn spend(node: &str, drone: &str, iter: u32, usd: f64) -> Spend {
@@ -1396,10 +1513,11 @@ mod tests {
 
     #[test]
     fn session_ids_are_uuid_shaped_and_fresh() {
-        let a = session_id("g", "d1", 1);
+        let a = session_id("n", "g", "d1", 1);
         let re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$").unwrap();
         assert!(re.is_match(&a), "{a}");
-        assert_ne!(a, session_id("g", "d1", 2));
+        assert_ne!(a, session_id("n", "g", "d1", 2));
+        assert_ne!(a, session_id("m", "g", "d1", 1), "another node's runner names another session");
     }
 
     /// Phase f F3, after review: this node holds a peer's line stamped 5 min ahead of its clock, so its

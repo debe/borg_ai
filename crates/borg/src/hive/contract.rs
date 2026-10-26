@@ -100,10 +100,11 @@ pub fn read(path: &Path) -> Vec<Contract> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Contract>(l).ok()).filter(|c| c.v <= 1).collect()
 }
 
-/// Whether `new` is by the author of `old`: the same session, or another session (a later iteration)
-/// of the same drone on the same node.
+/// Whether `new` is by the author of `old`: on the same node, the same session or another session (a
+/// later iteration) of the same drone (phase f F8: a name says who only with its node; an unknown
+/// node, a contract from before nodes were stamped, matches any, as the board's `Actor::is` does).
 fn own(old: &Contract, new: &Contract) -> bool {
-    old.by == new.by || (!old.drone.is_empty() && old.drone == new.drone && old.node == new.node)
+    (old.node == new.node || old.node.is_empty() || new.node.is_empty()) && (old.by == new.by || (!old.drone.is_empty() && old.drone == new.drone))
 }
 
 /// The contracts in force: all but those a valid later line supersedes. A supersede is valid when its

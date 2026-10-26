@@ -220,7 +220,7 @@ async fn a_task_opened_on_a_is_claimed_done_and_verified_across_two_nodes() {
     let (ba, bb) = (ma.board(), mb.board());
     assert_eq!(ba, bb, "the same board on both nodes");
     assert!(matches!(&ba.tasks["t1"].status, Status::Claimed { by, .. } if by == sb), "{:?}", ba.tasks["t1"].status);
-    assert_eq!(board::lost_since(&ba, sa, 0), ["t1"]);
+    assert_eq!(board::lost_since(&ba, &hive::node(&ma.store()), sa, 0), ["t1"]);
     one_holder_at_a_time(&ba);
     assert!(ma.prompt(&root, sa, &d1_a).contains("Your claim on t1 did not take effect"), "A's drone learns at its next hook");
 
@@ -366,6 +366,7 @@ async fn work_done_on_b_is_verified_and_integrated_on_a_with_its_own_object_stor
             base: attempt.base.clone(),
             head: attempt.head.clone(),
             bundle,
+            why: String::new(),
         };
         serde_json::to_string(&b).unwrap()
     };

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 use super::TaskId;
-use super::board::{Board, Ev, Event, Role, Task, same_node};
+use super::board::{Board, Ev, Event, Role, Task};
 use super::guard::{self, Class};
 use super::{Goal, board};
 use crate::outcome::{self, Outcome};
@@ -670,7 +670,7 @@ impl<'a> Index<'a> {
         let (work, author) = (work.to_string(), author.to_string());
         let node = span.node.clone();
         Some(Attempt {
-            drone: self.b.drones.get(&author).cloned().unwrap_or_default(),
+            drone: self.b.drone(&node, &author).unwrap_or_default().to_string(),
             author,
             work,
             claim_ms,
@@ -786,18 +786,20 @@ impl Recorded {
 pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, cwd: &str, now: i64) -> Result<Recorded, String> {
     let path = super::tasks_path(home, &g.id);
     let events = board::read(&path);
-    let b = board::fold_on(&events, &super::node(home));
+    let here = super::node(home);
+    let b = board::fold_on(&events, &here);
     let s = b.tasks.get(verify).ok_or_else(|| format!("no task {verify} in goal {}", g.id))?;
     if s.task.role != Role::Verify {
         return Err(format!("{verify} is not a verify task"));
     }
-    let Some(since) = s.live(now).filter(|(by, _, _)| *by == session).map(|(_, _, since)| since) else {
+    let Some(since) = s.live(now).filter(|_| s.held_by(&here, session, now)).map(|(_, _, since)| since) else {
         return Err(format!("{verify} is not claimed by this session"));
     };
     let a = attempt(&events, &b, verify).ok_or_else(|| format!("{verify}: no done of its work to judge"))?;
-    let drone = b.drones.get(session).cloned().unwrap_or_else(|| super::drone_of(session));
-    // A drone name is the author's only on the author's node: every runner names its drones d1..dN.
-    if a.author == session || (!a.drone.is_empty() && a.drone == drone && same_node(&a.node, &super::node(home))) {
+    let drone = b.drone(&here, session).map_or_else(|| super::drone_of(session), str::to_string);
+    // The bar the claim was taken under (board.rs `eligible`), and the judged attempt's author: a name
+    // is the author's only on the author's node (phase f F8, `Actor`).
+    if b.judges_own(s, board::Actor::new(&here, &drone, session), (&a.node, &a.author, &a.drone)) {
         return Err("the author cannot verify its own work".into());
     }
     let work: Option<&Task> = b.tasks.get(&a.work).map(|w| &w.task);
@@ -828,8 +830,7 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     // For good (phase f F5): written under the claim it names, while the board as it stands under the
     // lock still gives it, and naming the attempt it judged by its head.
     (e.claim, e.head) = (Some(since), a.head.clone());
-    let here = super::node(home);
-    let held = |events: &[Event]| board::fold_on(events, &here).tasks.get(verify).and_then(|s| s.live(learn::now_ms())).is_some_and(|(by, _, _)| by == session);
+    let held = |events: &[Event]| board::fold_on(events, &here).tasks.get(verify).is_some_and(|s| s.held_by(&here, session, learn::now_ms()));
     if super::write_if(home, &g.id, |events| held(events).then(|| vec![e])).map_err(|e| e.to_string())?.is_none() {
         return Err(format!("{verify} is no longer claimed by this session"));
     }

@@ -552,8 +552,9 @@ pub fn pre_tool(home: &Path, input: &Value, now: i64) {
     if hits.is_empty() {
         return;
     }
-    let b = board::fold_on(&board::read(&super::tasks_path(home, &g.id)), &super::node(home));
-    let held = board::holding(&b, session, now);
+    let here = super::node(home);
+    let b = board::fold_on(&board::read(&super::tasks_path(home, &g.id)), &here);
+    let held = board::holding(&b, &here, session, now);
     let globs: Vec<regex::Regex> = held.map(|s| s.task.files.iter().map(|f| crate::assimilate_dir::glob(f)).collect()).unwrap_or_default();
     let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
     // The claim the flags fall in (`task@since`, `-` for none): a re-claim or the next task flags again.

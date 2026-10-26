@@ -364,8 +364,8 @@ fn lost_claims(b: &board::Board, events: &[board::Event]) -> (usize, Vec<(String
     let worked = b
         .lost
         .iter()
-        .filter(|(by, task, ms)| events.iter().any(|e| e.ev == board::Ev::Done && &e.task == task && &e.by == by && e.ms >= *ms))
-        .map(|(by, task, _)| (task.clone(), by.clone()))
+        .filter(|(by, node, task, ms)| events.iter().any(|e| e.ev == board::Ev::Done && &e.task == task && &e.by == by && &e.node == node && e.ms >= *ms))
+        .map(|(by, _, task, _)| (task.clone(), by.clone()))
         .collect();
     (b.lost.len(), worked)
 }
@@ -378,8 +378,8 @@ fn loser_waste(b: &board::Board, events: &[board::Event], spend: &[hive_run::Spe
     use board::Ev;
     b.lost
         .iter()
-        .map(|(by, task, ms)| {
-            let next = events.iter().filter(|e| &e.by == by && e.ms > *ms).filter(|e| match e.ev {
+        .map(|(by, node, task, ms)| {
+            let next = events.iter().filter(|e| &e.by == by && &e.node == node && e.ms > *ms).filter(|e| match e.ev {
                 Ev::Claim => true,
                 Ev::Released | Ev::Done | Ev::Blocked => &e.task == task,
                 _ => false,

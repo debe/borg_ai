@@ -94,7 +94,7 @@ impl Message {
     /// is not `here`.
     fn sender(&self, here: &str) -> String {
         let who = if self.drone.is_empty() { self.by.chars().take(8).collect() } else { self.drone.clone() };
-        match super::board::same_node(&self.node, here) {
+        match super::board::of_node(&self.node, here) {
             true => who,
             false => format!("{who} (node {})", self.node.chars().take(8).collect::<String>()),
         }
@@ -165,7 +165,7 @@ pub fn send(home: &Path, goal: &str, m: Message) -> Result<Message, String> {
 /// same session, or the same drone on the same node).
 pub fn for_session<'a>(msgs: &'a [Message], session: &str, drone: &str, node: &str, held: &str) -> Vec<&'a Message> {
     msgs.iter()
-        .filter(|m| m.by != session && !(!drone.is_empty() && m.drone == drone && m.node == node))
+        .filter(|m| !(super::board::of_node(&m.node, node) && (m.by == session || (!drone.is_empty() && m.drone == drone))))
         .filter(|m| m.to.is_empty() || m.to == session || (!held.is_empty() && m.to == held) || (!drone.is_empty() && m.to == drone && m.node == node))
         .collect()
 }

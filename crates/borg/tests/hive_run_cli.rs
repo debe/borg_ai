@@ -273,7 +273,7 @@ fn three_sim_drones_finish_a_board() {
     }
     assert!(out.contains(&format!("integrated {head}")), "{out}");
     // Every work task's verdict came from another drone than its author's.
-    let drone = |session: &str| b.drones.get(session).cloned().unwrap_or_default();
+    let drone = |session: &str| b.drones.iter().find(|((_, s), _)| s == session).map(|(_, d)| d.clone()).unwrap_or_default();
     for i in 1..=3 {
         let author = b.tasks[&format!("t{i}")].author.clone().unwrap();
         let Status::Verified { by, .. } = &b.tasks[&format!("t{i}.v1")].status else { panic!("t{i}.v1 verified") };
@@ -441,13 +441,15 @@ fn a_group_of_three_drones_integrates_the_winner_and_reflection_learns_what_it_d
     let b = fold(&root);
     assert!(b.finished(), "{out}");
     // Each attempt is another drone's, and none of them verified a rival's.
-    let drone = |t: &str| b.drones[b.tasks[t].author.as_ref().unwrap()].clone();
+    let of = |session: &str| b.drones.iter().find(|((_, s), _)| s == session).map(|(_, d)| d.clone()).unwrap();
+    let drone = |t: &str| of(b.tasks[t].author.as_ref().unwrap());
     let mut authors: Vec<String> = (1..=3).map(|n| drone(&format!("t1.g{n}"))).collect();
     authors.sort();
     authors.dedup();
     assert_eq!(authors.len(), 3, "{authors:?}");
     for n in 1..=3 {
-        let judges: Vec<String> = b.spans.iter().filter(|sp| sp.task.starts_with(&format!("t1.g{n}.v"))).map(|sp| b.drones[&sp.by].clone()).collect();
+        let judges: Vec<String> =
+            b.spans.iter().filter(|sp| sp.task.starts_with(&format!("t1.g{n}.v"))).map(|sp| b.drone(&sp.node, &sp.by).unwrap().to_string()).collect();
         assert!(!judges.is_empty() && judges.iter().all(|j| !authors.contains(j)), "t1.g{n} judged by {judges:?}, attempts by {authors:?}");
     }
     let w = drone("t1.g2");
@@ -605,7 +607,7 @@ fn a_conflicting_integration_opens_a_fix_task_and_the_hive_finishes() {
     assert_eq!((fix.task.files.as_slice(), fix.status.name()), (["shared.txt".to_string()].as_slice(), "verified"));
     let ev = events(&root);
     let claim = ev.iter().find(|e| e.ev == board::Ev::Claim && e.task == "integrate.1.fix" && e.base == m);
-    assert!(claim.is_some_and(|c| b.drones.get(&c.by).is_some_and(|d| d.starts_with('d'))), "a runner drone claimed it from M: {ev:?}");
+    assert!(claim.is_some_and(|c| b.drone(&c.node, &c.by).is_some_and(|d| d.starts_with('d'))), "a runner drone claimed it from M: {ev:?}");
     assert_eq!(b.tasks["integrate.2"].status.name(), "verified");
     let head = b.integrated.clone().unwrap().head;
     let shared = git(&work(&root), &["show", &format!("{head}:shared.txt")]);
@@ -625,7 +627,7 @@ fn a_drone_out_of_budget_releases_its_claim() {
     let ev = events(&root);
     let b = fold(&root);
     let claimed: Vec<&str> =
-        ev.iter().filter(|e| e.ev == board::Ev::Claim && !b.lost.iter().any(|l| l.0 == e.by && l.1 == e.task && l.2 == e.ms)).map(|e| e.by.as_str()).collect();
+        ev.iter().filter(|e| e.ev == board::Ev::Claim && !b.lost.iter().any(|l| l.0 == e.by && l.2 == e.task && l.3 == e.ms)).map(|e| e.by.as_str()).collect();
     assert!(!claimed.is_empty(), "{ev:?}");
     for by in claimed {
         assert!(ev.iter().any(|e| e.ev == board::Ev::Released && e.note == "budget" && e.by == by), "{by} released with the reason: {ev:?}");

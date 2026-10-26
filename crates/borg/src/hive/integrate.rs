@@ -32,7 +32,8 @@
 //! Across machines the commits travel as bundles beside the board (commits.rs): a goal integrates on a
 //! node whose repo holds every accepted attempt's snapshots, or takes them from their bundles
 //! ([`absent`]); elsewhere nothing is opened, claimed or written, and the caller says which work is on
-//! which node. A snapshot
+//! which node: a runner waits while the commits may come or another node holds them all, and says the
+//! integration stuck once no node can hold them together ([`gate`], phase f F7). A snapshot
 //! missing on the node that made it is still `blocked`.
 
 use std::path::Path;
@@ -288,15 +289,109 @@ pub(super) fn due(b: &Board, now: i64) -> Option<(TaskId, bool)> {
     }
 }
 
-/// Why `g` cannot integrate in `repo` at `now` although an integration is due: an accepted attempt's
-/// commits are on another node only (`absent`). None when none is due or every commit is here.
-pub fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<String> {
-    due(&board::fold_on(&board::read(&super::tasks_path(home, &g.id)), &super::node(home)), now)?;
-    let a = absent(home, g, repo);
-    (!a.is_empty()).then(|| absent_reason(&a))
+/// One accepted attempt an integration merges, as a node sees it (`gate`): its work task, the node it
+/// was done on, where its commits stand here (commits.rs `reach`), and whether a bundle of it is held
+/// here (a line carrying commits, not `stays`), so any participant can take it.
+#[derive(Debug, Clone)]
+pub(crate) struct Need {
+    pub task: TaskId,
+    pub node: String,
+    pub reach: super::commits::Reach,
+    pub travels: bool,
 }
 
-/// Integrates goal `g` when it is due (`due`), as `drone` (session `integrate-<drone>-<ms>`), in `repo`
+/// Why the integration `id` due `here` at `now` does not run here (phase f F7): None when every accepted
+/// attempt's commits are here. `Coming` while one is on its way from a node that may still take part
+/// (`Board::takers`), or while another taker can hold them all (each attempt its own or travelling) and
+/// has not declined `id` (`Board::declines`: a node whose own gate finds an attempt refused says so,
+/// mod.rs `decline_integration`, `refuses`), so that node integrates; else `Unavailable`: no node can
+/// hold them together, and the runner says the integration stuck, once that held for `SUSPECT_MS` since
+/// the integration became due here (`due_since`): the grace `board::stuck` gives a task, so a peer's
+/// join or roster still on its way is heard first. Nothing else on the board moves then (an integration
+/// is due only once every task is verified), so `board::moving` has nothing to wait for. Before, a
+/// runner ended "integration needs another node's commits" at once, also while the bundle was in flight
+/// or another node was about to integrate; and the wait was for the one node holding every absent
+/// attempt, whether or not it could take the others' lines: two nodes that each refused the other's line
+/// waited on each other for ever, and with two holders one node said stuck while a third integrated.
+/// Liveness only: no integration runs without every commit (`run` checks `absent` itself), at any timer;
+/// at 0 a stuck is said on a peer's decline still on its way, at infinity a dead peer is waited out by
+/// the lease (`takers`).
+pub(crate) fn gate(b: &Board, here: &str, now: i64, id: &str, needs: &[Need]) -> Option<super::Commits> {
+    use super::commits::Reach;
+    let absent: Vec<&Need> = needs.iter().filter(|n| n.reach != Reach::Here && !board::of_node(&n.node, here)).collect();
+    if absent.is_empty() {
+        return None;
+    }
+    let why = absent_reason(&absent.iter().map(|n| (n.task.clone(), n.node.clone(), String::new())).collect::<Vec<_>>());
+    let takers = b.takers(here, now);
+    if absent.iter().any(|n| n.reach == Reach::Coming && takers.contains(n.node.as_str())) {
+        return Some(super::Commits::Coming(why));
+    }
+    let holds = |n: &str| needs.iter().all(|x| x.node == n || x.travels);
+    if let Some(n) = takers.iter().find(|n| **n != here && !b.declines(n, id) && holds(n)) {
+        return Some(super::Commits::Coming(format!("{why}; node {} holds them and integrates", n.chars().take(8).collect::<String>())));
+    }
+    if now.saturating_sub(due_since(b, id)) <= super::SUSPECT_MS {
+        return Some(super::Commits::Coming(format!("{why}; no node can hold them together, said stuck unless one is heard")));
+    }
+    Some(super::Commits::Unavailable(format!("commits unavailable: {why}")))
+}
+
+/// Whether `here` may not run an integration whose attempts stand as `needs` (phase f F7): one of
+/// another node's attempts is refused here (its node said its commits stay there, or its line was
+/// refused), so no line will bring it; what mod.rs `decline_integration` says on the board.
+pub(crate) fn refuses(here: &str, needs: &[Need]) -> bool {
+    needs.iter().any(|n| matches!(n.reach, super::commits::Reach::Refused(_)) && !board::of_node(&n.node, here))
+}
+
+/// When the integration `id` became due, on this node's clock (`board::claimable_since` of its task,
+/// open again; of a new one, when this node held the last done or verdict).
+fn due_since(b: &Board, id: &str) -> i64 {
+    match b.tasks.get(id) {
+        Some(s) => board::claimable_since(b, s),
+        None => b.tasks.values().map(|s| s.local.status).max().unwrap_or(i64::MIN),
+    }
+}
+
+/// What stops an integration of `g` due at `now` in `repo` (`gate`): the integrate task, why, and whether
+/// this node may not run it (`refuses`). None when none is due or every accepted attempt's commits are
+/// here (one its bundle brought included).
+pub(crate) fn elsewhere(home: &Path, g: &Goal, repo: &Path, now: i64) -> Option<(TaskId, super::Commits, bool)> {
+    let events = board::read(&super::tasks_path(home, &g.id));
+    let here = super::node(home);
+    let b = board::fold_on(&events, &here);
+    let (id, _) = due(&b, now)?;
+    let scores = group::scores(home, &g.id);
+    let lines = super::commits::read(home, &g.id);
+    let needs: Vec<Need> = group::merged(&b, |v| scores.get(v).copied())
+        .into_iter()
+        .filter_map(|s| verdict::accepted(&events, &b, &s.task.id))
+        .map(|a| {
+            let reach = match super::is_local(home, &a.node) || a.base.is_empty() || a.head.is_empty() {
+                true => super::commits::Reach::Here,
+                false => super::commits::reach(home, &g.id, &a, repo),
+            };
+            let travels = lines.iter().any(|(_, l)| !l.stays() && l.task == a.work && l.base == a.base && l.head == a.head);
+            Need { task: a.work, node: a.node, reach, travels }
+        })
+        .collect();
+    let refused = refuses(&here, &needs);
+    gate(&b, &here, now, &id, &needs).map(|c| (id, c, refused))
+}
+
+/// The session of an integration by `drone` of `node` started at `now` (phase f F8):
+/// `integrate-<drone>@<node>-<ms>`, so two nodes' integrators in one ms are two sessions (before,
+/// `integrate-<drone>-<ms>` was one name on both nodes, and each read the other's claim as its own).
+/// The board tells sessions apart by node all the same (board.rs `Actor`); a store with no node id
+/// keeps the old name.
+pub fn session(node: &str, drone: &str, now: i64) -> String {
+    match node {
+        "" => format!("integrate-{drone}-{now}"),
+        _ => format!("integrate-{drone}@{node}-{now}"),
+    }
+}
+
+/// Integrates goal `g` when it is due (`due`), as `drone` (`session`), in `repo`
 /// (where the snapshots are): the claim, the merge, the oracle on the combined tree, the verdict. None
 /// when nothing is due, another runner won the claim, or an accepted attempt's commits are on another
 /// node only (`elsewhere` says so; nothing is written).
@@ -305,7 +400,7 @@ pub fn run(home: &Path, g: &Goal, repo: &Path, drone: &str, now: i64) -> Option<
     let b = board::fold_on(&board::read(&path), &super::node(home));
     let scores = group::scores(home, &g.id);
     let accepted = group::merged(&b, |v| scores.get(v).copied()).len();
-    let session = format!("integrate-{drone}-{now}");
+    let session = session(&super::node(home), drone, now);
     let (id, new) = due(&b, now)?;
     let mut lines = Vec::new();
     if new {
@@ -348,9 +443,10 @@ fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, foun
     });
     wrote.ok()??;
     let written = learn::now_ms();
-    let won = |b: &Board| b.tasks.get(&id).and_then(|s| s.live(stamp)).is_some_and(|(by, _, _)| by == session);
+    let here = super::node(home);
+    let won = |b: &Board| b.tasks.get(&id).is_some_and(|s| s.held_by(&here, session, stamp));
     let events = board::read(&path);
-    let b = board::fold_on(&events, &super::node(home));
+    let b = board::fold_on(&events, &here);
     if !won(&b) {
         return None;
     }
@@ -578,7 +674,8 @@ impl Integrator<'_> {
     /// Whether the board of `events` gives this integrator its claim now.
     fn holds_on(&self, events: &[Event]) -> bool {
         let now = learn::now_ms();
-        board::fold_on(events, &super::node(self.home)).tasks.get(self.id).and_then(|s| s.live(now)).is_some_and(|(by, _, _)| by == self.session)
+        let here = super::node(self.home);
+        board::fold_on(events, &here).tasks.get(self.id).is_some_and(|s| s.held_by(&here, self.session, now))
     }
 
     /// Writes this integrator's verdict `lines` (its fix task's open with a rejection) for good

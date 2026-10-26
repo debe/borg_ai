@@ -7,8 +7,9 @@
 //! clock (`skew`, plus its index in ms, so two nodes never stamp one ms unless a scenario says so). A
 //! line reaches the other nodes `delay` ticks after its write; a `Hold` keeps a chosen line back
 //! longer, from the others or from its own node's file too. Each drone runs run.rs's loop
-//! (`integrate::due`, `board::free_for` / `in_hand`, `run::step`, `run::stalls`, the session-start and
-//! session-end lines, a roster line at each drone's end) and each session claims as mod.rs `claim_cmd`
+//! (`integrate::due`, `board::free_for`, `run::Ending`, `run::step`, `run::stalls`, the session-start and
+//! session-end lines, a roster line at each drone's end, the finished and stuck lines of phase f F6) and
+//! each session claims as mod.rs `claim_cmd`
 //! and `claim` do (`board::next_for`, the claim checked under its node's board lock, the read-back),
 //! writing real `Event` lines. Each runner joins the goal with its roster, beats every `BEAT_MS` (a
 //! line no trace shows) and leaves once its drones ended (phase f F4); a killed one just stops. A
@@ -24,8 +25,12 @@
 //!
 //! Where the harness is not the run: no git, oracle, approvals or harness process (an iteration costs
 //! 1 of a node's `share`; every check passes, a verifier of a verify task `reject` names rejects);
-//! `open_to`'s `allowed` is `may_claim` (no integrate task),
-//! a session's adds `absent_from` (a verify task of another node's work only with `bundles`); every
+//! `open_to`'s `allowed` is `may_claim` (no integrate task); the data plane is a model of commits.rs
+//! (phase f F7): a done's node holds its commits, and its bundle line (or, without `bundles` or on a node
+//! whose commits `stays`, its line saying they stay there) reaches the other nodes `bundle_late` ticks
+//! after the done would, or is written by its runner's next pass when the done's session was cut first
+//! (`unpublished`), each node reading it through mod.rs `lacking` and integrate.rs `gate` as the run does
+//! (an unbundle succeeds but on a node that `refuses` lines); every
 //! node writes watermarks (F5), so no claim takes the confirm window's capped fallback; an integration's
 //! ref is a per-node token (integrate.rs `fence`), its git work none.
 //!
@@ -33,16 +38,18 @@
 //! order of the lines), S2' (a done, a verdict or an integration that took effect in a node's fold is in
 //! the converged board), integrate-once (one merge per integrate task), same-node
 //! exclusion (one read-back win per node per task attempt), no premature end (every runner ended:
-//! finished, or a budget spent, a node killed or a task blocked) and stable-prefix exit (exit 0 only
-//! on a finished converged board). A property that does not hold yet is `#[ignore]`d with the step of
+//! finished, or a budget spent, a node killed or a stuck whose constraint held, the commits a task
+//! needs on no running node that may take it included), no hang (every runner
+//! ended by the horizon, phase f F6) and stable-prefix exit (exit 0 only on a finished converged board). A property that does not hold yet is `#[ignore]`d with the step of
 //! tasks/todo.md phase f that fixes it, asserting it as the property reads, so `--ignored` shows the
 //! violation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::board::{self, Board, Ev, Event, Role, Status, Task, TaskState};
+use super::commits::Reach;
 use super::run::{self, Next, Offer, Tally};
-use super::{BEAT_MS, CLAIM_TRIES, LEASE_MS, START_CAP, SUSPECT_MS, TaskId, integrate};
+use super::{BEAT_MS, CLAIM_TRIES, Commits, LEASE_MS, START_CAP, SUSPECT_MS, TaskId, integrate};
 
 /// One tick, in ms.
 const TICK: i64 = 1000;
@@ -64,6 +71,11 @@ struct NodeCfg {
     /// The tick its runner's beats stop while it and its drones run on (a suspend, a failed beat write,
     /// a stalled beat thread).
     mute: Option<i64>,
+    /// Its attempts' commits stay on it (each bundle over `MAX_BUNDLE`), whatever `Cfg::bundles` says.
+    stays: bool,
+    /// It refuses every other node's bundle line (a prerequisite its repo lacks, an unbundle that never
+    /// finishes: commits.rs `reach`'s `Refused`), though the line carries the commits.
+    refuses: bool,
 }
 
 /// A line held back: the first `ev` line on `task` written on `node` lands in its own file `local` ticks
@@ -82,19 +94,28 @@ struct Hold {
 #[derive(Clone, Debug)]
 enum Guard {
     /// mod.rs `claim`: the task is `claimable_for` the session at its stamp.
-    Claim { task: String, session: String, picked: bool, now: i64 },
+    Claim { task: String, session: String, drone: String, picked: bool, now: i64 },
     /// integrate.rs `claim_due`: the integration found is still the one `due`.
     Integrate { found: (TaskId, bool), now: i64 },
     /// mod.rs `finish`, verdict.rs `record`, integrate.rs `write_held`: the session still holds the task.
     Holds { task: String, session: String, now: i64 },
+    /// mod.rs `finish_line`: the board is finished at `integration`, not said yet in this run.
+    Finished { integration: String },
+    /// mod.rs `decline_lines`: the tasks this node is to decline are still these.
+    Declines { tasks: Vec<String> },
 }
 
 impl Guard {
     fn holds(&self, b: &Board, here: &str) -> bool {
         match self {
-            Guard::Claim { task, session, picked, now } => super::claimable_for(b, task, session, *picked, here, *now),
+            Guard::Claim { task, session, drone, picked, now } => super::claimable_for(b, task, board::Actor::new(here, drone, session), *picked, *now),
             Guard::Integrate { found, now } => integrate::due(b, *now).as_ref() == Some(found),
-            Guard::Holds { task, session, now } => super::holding(b, task, session, *now).is_some(),
+            Guard::Holds { task, session, now } => super::holding(b, here, task, session, *now).is_some(),
+            Guard::Finished { integration } => board::finish_due(b, here) == Some(integration.as_str()),
+            Guard::Declines { tasks } => {
+                let joined = b.members.get(here).map_or(i64::MIN, |(join, _)| *join);
+                tasks.iter().all(|t| b.declined.get(&(here.to_string(), t.clone())).is_none_or(|ms| *ms <= joined))
+            }
         }
     }
 }
@@ -129,12 +150,26 @@ struct Cfg {
     /// backing off, its machine just resumed): a line due there then lands at `to`. The others receive
     /// its lines as ever.
     deaf: Vec<(&'static str, i64, i64)>,
-    /// A verify task's or an integration's commits reach the other nodes (commits.rs bundles).
+    /// A done's commits reach the other nodes as a bundle (commits.rs `publish`); without, its node says
+    /// they stay there (a bundle over `MAX_BUNDLE`).
     bundles: bool,
+    /// Ticks a bundle line takes to reach the other nodes after the done's line would (a mesh round of
+    /// its own, a big line).
+    bundle_late: i64,
+    /// Work tasks whose done writes no bundle line (mod.rs `finish`: its session killed at its timeout,
+    /// or its stop hook cut, during `git bundle create`): only the runner's pass writes it (commits.rs
+    /// `republish`).
+    unpublished: Vec<String>,
     /// Verify tasks every verifier rejects (`t0.v1`): a rework round, its attempts judged again.
     reject: Vec<String>,
     /// Sessions claim the task their prompt offered by name (mod.rs `offer`, `picked` false: G1).
     named: bool,
+    /// Work tasks an engineer opens during the run: (tick, node, task), a dep-free task on that node's board
+    /// (`borg hive open` there).
+    opens: Vec<(i64, &'static str, String)>,
+    /// Tasks no node may claim (mod.rs `may_claim` and the approvals: another repo's, its checks approved
+    /// on no node), as run.rs `allowed` says on every node.
+    refuse: Vec<String>,
     horizon: i64,
 }
 
@@ -149,7 +184,7 @@ impl Cfg {
     /// `tasks`: (its owner, the index of its dep). Work takes 3 ticks, a verdict and an integration 2,
     /// and a line one tick to reach the other node.
     fn new(tasks: &[(&str, Option<usize>)]) -> Cfg {
-        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None, mute: None };
+        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None, mute: None, stays: false, refuses: false };
         let mut ids: Vec<(String, Vec<String>)> = Vec::new();
         for (owner, dep) in tasks {
             let id = owned(owner, &ids);
@@ -168,9 +203,13 @@ impl Cfg {
             cuts: Vec::new(),
             deaf: Vec::new(),
             bundles: true,
+            bundle_late: 0,
+            unpublished: Vec::new(),
             reject: Vec::new(),
             named: false,
-            horizon: 90,
+            opens: Vec::new(),
+            refuse: Vec::new(),
+            horizon: 150,
         }
     }
 
@@ -234,11 +273,28 @@ struct Session {
 enum St {
     Off,
     Decide,
-    Wait { until: i64, seen: Box<Board>, in_hand: bool },
+    Wait { until: i64, seen: Box<Board> },
     Session(Box<Session>),
     Integrating { session: String, task: String, until: Option<i64> },
     Post { start: Box<Offer>, wrote: bool },
     Ended(&'static str),
+}
+
+/// The drones running at a tick on a node that had started and was not killed: (node, drone).
+type Running = Vec<(usize, String)>;
+
+/// An attempt as a bundle line names it: (work task, head).
+type AttemptKey = (String, String);
+
+/// A stuck line a runner wrote (phase f F6): the tick, its node, the task and why, and the drones then
+/// running on a node that had started and was not killed, (node, drone): who could have taken it.
+#[derive(Debug)]
+struct Stuck {
+    at: i64,
+    node: usize,
+    task: String,
+    why: String,
+    running: Vec<(usize, String)>,
 }
 
 struct Drone {
@@ -264,6 +320,10 @@ struct Sim {
     stopped: BTreeSet<usize>,
     exits: BTreeMap<usize, (bool, i64)>,
     ends: Vec<(String, &'static str, i64)>,
+    /// Each stuck line a runner wrote (phase f F6).
+    stuck: Vec<Stuck>,
+    /// Each drone that ended stuck: (its node, the tick, the drones then running as `Stuck::running`).
+    stuck_ends: Vec<(usize, i64, Running)>,
     seen: BTreeSet<Seen>,
     /// Integrators that started the merge (their claim final, their ref moved): integrate task -> sessions.
     integrations: BTreeMap<String, Vec<String>>,
@@ -281,6 +341,15 @@ struct Sim {
     /// Each node's last fold and how many lines it folded: a node's lines only grow, and between two
     /// beats most ticks bring none.
     folded: Vec<(usize, Board)>,
+    /// The bundle lines each node holds (commits.rs `bundles.jsonl`): (work task, head) -> None for a
+    /// bundle (its commits taken at once), Some(why) for a line saying they stay on their node.
+    bundles: Vec<BTreeMap<AttemptKey, Option<String>>>,
+    /// Bundle lines on their way: (tick, node, attempt, line).
+    bundles_pending: Vec<(i64, usize, AttemptKey, Option<String>)>,
+    /// The attempts a bundle was made of: their commits can reach any node.
+    published: BTreeSet<AttemptKey>,
+    /// Sessions that wrote no board line (run.rs `stalls`' `wrote_nothing`).
+    empty: Vec<String>,
 }
 
 fn work_task(id: &str, role: Role, deps: &[String]) -> Task {
@@ -327,9 +396,15 @@ fn judged_head(b: &Board, t: &TaskState) -> String {
     w.attempts.iter().find(|a| a.by == *by && a.done == *done).map_or_else(String::new, |a| a.head.clone())
 }
 
-/// run.rs `open_to` with every check approved.
-fn open_to(b: &Board, drone: &str, node: &str, now: i64) -> Offer {
-    Offer::of(b, drone, node, "", now, |s| s.task.role != Role::Integrate)
+/// run.rs `open_to` with every check approved but the tasks `Cfg::refuse` names, the commits `node`
+/// lacks left out (`lacks`, run.rs `offered`).
+fn open_to(cfg: &Cfg, b: &Board, drone: &str, node: &str, lacks: &BTreeMap<TaskId, Commits>, now: i64) -> Offer {
+    Offer::of(b, drone, node, "", now, run::offered(allowed(cfg), lacks))
+}
+
+/// run.rs `allowed` on every node: no integrate task (integrate.rs takes those), none `Cfg::refuse` names.
+fn allowed(cfg: &Cfg) -> impl Fn(&TaskState) -> bool + '_ {
+    |s| s.task.role != Role::Integrate && !cfg.refuse.contains(&s.task.id)
 }
 
 impl Sim {
@@ -357,6 +432,8 @@ impl Sim {
             stopped: BTreeSet::new(),
             exits: BTreeMap::new(),
             ends: Vec::new(),
+            stuck: Vec::new(),
+            stuck_ends: Vec::new(),
             seen: BTreeSet::new(),
             integrations: BTreeMap::new(),
             won: BTreeMap::new(),
@@ -366,9 +443,15 @@ impl Sim {
             ref_moves: BTreeMap::new(),
             log: Vec::new(),
             folded: vec![(usize::MAX, Board::default()); n],
+            bundles: vec![BTreeMap::new(); n],
+            bundles_pending: Vec::new(),
+            published: BTreeSet::new(),
+            empty: Vec::new(),
             cfg,
         };
-        while s.t < s.cfg.horizon && !(s.pending.is_empty() && s.landing.is_empty() && s.drones.iter().all(|d| matches!(d.st, St::Ended(_)))) {
+        while s.t < s.cfg.horizon
+            && !(s.pending.is_empty() && s.landing.is_empty() && s.bundles_pending.is_empty() && s.drones.iter().all(|d| matches!(d.st, St::Ended(_))))
+        {
             s.tick();
         }
         s
@@ -520,6 +603,17 @@ impl Sim {
             self.lines[to].push(Event { seen, ..e });
         }
         self.land();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.bundles_pending).into_iter().partition(|(at, _, _, _)| *at <= t);
+        self.bundles_pending = later;
+        for (_, to, attempt, line) in due {
+            self.note(to, format!("holds the bundle line of {}@{}{}", attempt.0, attempt.1, line.as_ref().map_or(String::new(), |w| format!(" (stays: {w})"))));
+            self.bundles[to].entry(attempt).or_insert(line);
+        }
+        for (_, node, id) in self.cfg.opens.clone().into_iter().filter(|(at, _, _)| *at == t) {
+            let i = self.cfg.nodes.iter().position(|n| n.name == node).unwrap();
+            let now = self.now(i);
+            self.write(i, vec![Event::open(work_task(&id, Role::Work, &[]), "engineer:e", now)]);
+        }
         for i in 0..self.cfg.nodes.len() {
             let start = self.cfg.nodes[i].start;
             if start == t {
@@ -584,7 +678,10 @@ impl Sim {
             self.lines[i].extend(out.into_iter().map(|e| Event { seen, ..e }));
             let all_ended = self.drones.iter().filter(|d| d.node == i).all(|d| matches!(d.st, St::Ended(_)));
             if all_ended && !self.stopped.contains(&i) && !self.exits.contains_key(&i) {
-                let finished = board::fold(&self.lines[i]).finished();
+                // run.rs `main`: exit 0 only on a finish for good (phase f F6).
+                let b = board::fold_on(&self.lines[i], self.name(i));
+                let saw = self.ends.iter().any(|(d, why, _)| *why == "goal finished" && d.starts_with(&format!("{}.", self.name(i))));
+                let finished = b.finished() && (saw || b.finished_for_good(self.name(i), self.now(i)));
                 self.exits.insert(i, (finished, t));
                 self.note(i, format!("runner exits {}", if finished { 0 } else { 1 }));
             }
@@ -616,20 +713,21 @@ impl Sim {
                 St::Ended(_) => return,
                 St::Off if self.t >= ready => self.drones[d].st = St::Decide,
                 St::Off => return,
-                St::Wait { until, seen, in_hand } => {
-                    // run.rs `idle_wait`: a change of the board ends the wait early, no idle poll; a line
-                    // that changes no board (a beat) does not.
-                    let changed = *b != *seen;
-                    if !changed && self.t < until {
+                St::Wait { until, seen } => {
+                    // run.rs `idle_wait`: a change of the board ends the wait early; a line that changes no
+                    // board (a beat) does not.
+                    if *b == *seen && self.t < until {
                         return;
-                    }
-                    if !changed && !in_hand {
-                        self.drones[d].tally.idle += 1;
                     }
                     self.drones[d].st = St::Decide;
                 }
                 St::Post { start, wrote } => {
-                    let end = open_to(b, &self.drones[d].name, self.name(node), self.now(node));
+                    let lacks = self.lacks(b, node, self.now(node));
+                    let end = open_to(&self.cfg, b, &self.drones[d].name, self.name(node), &lacks, self.now(node));
+                    if !wrote {
+                        let n = self.drones[d].iters;
+                        self.empty.push(format!("{}.{}#{n}", self.name(node), self.drones[d].name));
+                    }
                     if let Some((id, _)) = end.task.as_ref().filter(|_| !wrote && run::stalls(0, true, &start, &end) == 0) {
                         self.note(node, format!("{} wrote nothing; {id} became claimable during its session: no stall", self.drones[d].name));
                     }
@@ -653,21 +751,38 @@ impl Sim {
     fn decide(&mut self, d: usize, b: &Board) {
         let (node, now) = (self.drones[d].node, self.now(self.drones[d].node));
         let (here, drone) = (self.name(node), self.drones[d].name.clone());
+        // run.rs `drone`: commits.rs `republish`, each pass.
+        self.republish(node, b);
         if let Some((id, new)) = integrate::due(b, now) {
-            // integrate.rs `absent`: an accepted attempt done on another node, its bundle not here.
-            let absent = !self.cfg.bundles
-                && b.tasks.values().any(|s| {
-                    matches!(s.status, Status::Verified { .. })
-                        && s.task.role == Role::Work
-                        && b.spans.iter().any(|sp| sp.task == s.task.id && Some(&sp.by) == s.author.as_ref() && sp.node != here)
-                });
-            if absent {
-                self.drones[d].st = St::Ended("integration needs another node's commits");
-                return;
+            // run.rs `drone` on integrate.rs `elsewhere`: an accepted attempt whose commits this node lacks
+            // waits while they may come or another node that can hold them all integrates, else the
+            // integration is stuck; a node that cannot get one says so (mod.rs `decline_integration`).
+            let needs = self.needs(b, node);
+            if integrate::refuses(here, &needs) && !b.declines(here, &id) {
+                let line = self.runner(node, &board::decline_note(&id));
+                self.write_if(node, vec![line], Guard::Declines { tasks: vec![id.clone()] });
+            }
+            match integrate::gate(b, here, now, &id, &needs) {
+                Some(Commits::Unavailable(why)) => {
+                    let running = self.running();
+                    if b.stuck.get(&id).is_none_or(|(_, _, w)| *w != why) {
+                        self.stuck.push(Stuck { at: self.t, node, task: id.clone(), why: why.clone(), running: running.clone() });
+                        let line = self.runner(node, &board::stuck_note(&id, &why));
+                        self.write(node, vec![line]);
+                    }
+                    self.stuck_ends.push((node, self.t, running));
+                    self.drones[d].st = St::Ended("stuck");
+                    return;
+                }
+                Some(Commits::Coming(_)) => {
+                    self.drones[d].st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()) };
+                    return;
+                }
+                None => {}
             }
             // integrate.rs `run` and `claim_due`: the open when new, a claim and a heartbeat in one write,
             // under the lock while the integration is still the one due; refused, the drone goes on.
-            let session = format!("integrate-{drone}-{now}");
+            let session = integrate::session(here, &drone, now);
             let mut lines: Vec<Event> = new.then(|| Event::open(work_task(&id, Role::Integrate, &[]), &session, now)).into_iter().collect();
             lines.extend([Event::new(Ev::Claim, &id, &session, now).with_drone(&drone), Event::new(Ev::Heartbeat, &id, &session, now)]);
             if self.write_if(node, lines, Guard::Integrate { found: (id.clone(), new), now }).is_some() {
@@ -675,13 +790,41 @@ impl Sim {
                 return;
             }
         }
-        let offer = open_to(b, &drone, here, now);
-        let x = &mut self.drones[d];
-        match run::step(&x.tally, f64::from(self.cfg.nodes[node].share), 1.0, b.finished(), offer.task.is_some()) {
-            Next::End(why) => x.st = St::Ended(why),
-            Next::Wait => x.st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()), in_hand: offer.in_hand },
+        let lacks = self.lacks(b, node, now);
+        let offer = open_to(&self.cfg, b, &drone, here, &lacks, now);
+        // run.rs `drone`: a finished board is said (mod.rs `finish_line`, under the lock), and its drones end
+        // only once every participant said it (`Ending`, phase f F6).
+        if let Some(i) = board::finish_due(b, here) {
+            let line = self.runner(node, &board::finished_note(i));
+            self.write_if(node, vec![line], Guard::Finished { integration: i.to_string() });
+        }
+        // mod.rs `decline_lines`: the tasks this node may not take, said under its lock.
+        let declines = board::declines_due(b, here, now, run::takes(allowed(&self.cfg), &lacks));
+        if !declines.is_empty() {
+            let lines = declines.iter().map(|t| self.runner(node, &board::decline_note(t))).collect();
+            self.write_if(node, lines, Guard::Declines { tasks: declines });
+        }
+        let ending = run::Ending::of(b, here, now, allowed(&self.cfg), &lacks);
+        match run::step(&self.drones[d].tally, f64::from(self.cfg.nodes[node].share), 1.0, &ending, offer.task.is_some()) {
+            Next::End(why) => {
+                if let (run::Ending::Stuck(stuck), "stuck") = (&ending, why) {
+                    // mod.rs `stuck_lines`: each stuck task said once while it stands (`Board::stuck`).
+                    let running = self.running();
+                    let new: Vec<&(String, String)> = stuck.iter().filter(|(t, why)| b.stuck.get(t).is_none_or(|(_, _, w)| w != why)).collect();
+                    let lines = new.iter().map(|(t, why)| self.runner(node, &board::stuck_note(t, why))).collect::<Vec<_>>();
+                    for (t, why) in new {
+                        self.stuck.push(Stuck { at: self.t, node, task: t.clone(), why: why.clone(), running: running.clone() });
+                    }
+                    self.stuck_ends.push((node, self.t, running));
+                    if !lines.is_empty() {
+                        self.write(node, lines);
+                    }
+                }
+                self.drones[d].st = St::Ended(why);
+            }
+            Next::Wait => self.drones[d].st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()) },
             Next::Go => {
-                x.tally.idle = 0;
+                let x = &mut self.drones[d];
                 x.iters += 1;
                 let iters = x.iters as usize;
                 let id = format!("{here}.{drone}#{iters}");
@@ -711,11 +854,100 @@ impl Sim {
         }
     }
 
-    /// The task mod.rs `next_open` offers `session`: `next_for` among those it may take here.
+    /// The task mod.rs `next_open` offers `session`: `next_for` among those it may take here, its commits
+    /// here (`lacking`, as the runner's offer reads them).
     fn next(&self, b: &Board, session: &str, drone: &str, node: usize, now: i64) -> Option<String> {
+        let lacks = self.lacks(b, node, now);
+        board::next_for(b, board::Actor::new(self.name(node), drone, session), "", now, run::offered(allowed(&self.cfg), &lacks)).map(|s| s.task.id.clone())
+    }
+
+    /// The drones running now on a node that had started and was not killed: who could take a task.
+    fn running(&self) -> Running {
+        self.drones
+            .iter()
+            .filter(|x| !matches!(x.st, St::Ended(_)) && !self.stopped.contains(&x.node) && self.t >= self.cfg.nodes[x.node].start)
+            .map(|x| (x.node, x.name.clone()))
+            .collect()
+    }
+
+    /// commits.rs `reach` on `node` for the attempt (work task, head) done on `author`: here when done
+    /// there or its bundle line is held (refused on a node that `refuses` lines), refused when its line
+    /// says they stay there, else coming.
+    fn reach(&self, node: usize, author: &str, attempt: (String, String)) -> Reach {
+        match self.bundles[node].get(&attempt) {
+            _ if author == self.name(node) => Reach::Here,
+            Some(None) if self.cfg.nodes[node].refuses => Reach::Refused(format!("a prerequisite of node {author}'s bundle is not in this repo")),
+            Some(None) => Reach::Here,
+            Some(Some(why)) => Reach::Refused(format!("they stay on node {author}: {why}")),
+            None => Reach::Coming,
+        }
+    }
+
+    /// commits.rs `publish` on `node` for the attempt (work task, head): the bundle line, or one saying the
+    /// commits stay on this node, held here at once and on the others `bundle_late` ticks after a line.
+    fn publish(&mut self, node: usize, attempt: AttemptKey) {
+        let line = (!self.cfg.bundles || self.cfg.nodes[node].stays).then(|| "a 2048 KiB bundle, over 1024 KiB".to_string());
+        if line.is_none() {
+            self.published.insert(attempt.clone());
+        }
+        let at = self.arrive(self.t + self.cfg.delay + self.cfg.bundle_late);
+        self.bundles[node].insert(attempt.clone(), line.clone());
+        for to in (0..self.lines.len()).filter(|to| *to != node) {
+            self.bundles_pending.push((at, to, attempt.clone(), line.clone()));
+        }
+    }
+
+    /// commits.rs `republish` on `node`: the line of each attempt done there that has none.
+    fn republish(&mut self, node: usize, b: &Board) {
         let here = self.name(node);
-        let present = |s: &TaskState| self.cfg.bundles || s.task.role != Role::Verify || s.node == here;
-        board::next_for(b, session, drone, here, "", now, |s| s.task.role != Role::Integrate && present(s)).map(|s| s.task.id.clone())
+        let mine = b.tasks.values().flat_map(|s| s.attempts.iter().filter(|a| board::of_node(&a.node, here)).map(|a| (s.task.id.clone(), a.head.clone())));
+        let missing: Vec<AttemptKey> = mine.filter(|k| !self.bundles[node].contains_key(k)).collect();
+        for k in missing {
+            self.note(node, format!("republishes the bundle line of {}@{}", k.0, k.1));
+            self.publish(node, k);
+        }
+    }
+
+    /// mod.rs `lacking` on `node`: a verify task's attempt by `reach`.
+    fn lacks(&self, b: &Board, node: usize, now: i64) -> BTreeMap<TaskId, Commits> {
+        super::lacking(b, self.name(node), now, |s| match &s.task.of {
+            Some(w) => self.reach(node, &s.node, (w.clone(), judged_head(b, s))),
+            None => Reach::Here,
+        })
+    }
+
+    /// The accepted attempts of `b`'s verified work tasks: (work task, head, its node).
+    fn accepted(b: &Board) -> Vec<(String, String, String)> {
+        b.tasks
+            .values()
+            .filter(|s| s.task.role == Role::Work)
+            .filter_map(|s| {
+                let (by, done) = s.accepted_attempt.as_ref()?;
+                let a = s.attempts.iter().find(|a| a.by == *by && a.done == *done)?;
+                Some((s.task.id.clone(), a.head.clone(), a.node.clone()))
+            })
+            .collect()
+    }
+
+    /// integrate.rs `elsewhere`'s needs on `node`: each accepted attempt, where its commits stand there,
+    /// and whether a bundle of it is held there.
+    fn needs(&self, b: &Board, node: usize) -> Vec<integrate::Need> {
+        Self::accepted(b)
+            .into_iter()
+            .map(|(task, head, author)| {
+                let travels = self.bundles[node].get(&(task.clone(), head.clone())).is_some_and(|l| l.is_none());
+                integrate::Need { reach: self.reach(node, &author, (task.clone(), head)), task, node: author, travels }
+            })
+            .collect()
+    }
+
+    /// Whether node `n` holds, or a bundle can bring it, the commits of the attempt (work task, head) done
+    /// on `author`: what no stuck may deny (a node that `refuses` lines takes none). A bundle of a killed author not held on `n` yet is given up
+    /// with its author (mod.rs `lacking`, after a lease of silence), as a cut that long is.
+    fn reachable(&self, n: usize, author: &str, attempt: &(String, String)) -> bool {
+        let killed = self.cfg.nodes.iter().position(|c| c.name == author).is_some_and(|i| self.stopped.contains(&i));
+        let taken = (self.published.contains(attempt) && !killed) || self.bundles[n].get(attempt).is_some_and(|l| l.is_none());
+        self.name(n) == author || (taken && !self.cfg.nodes[n].refuses)
     }
 
     /// mod.rs `claim_cmd` up to `claim`'s write: the task claimed (its claim written, or held back to
@@ -725,13 +957,16 @@ impl Sim {
         let tries = if self.cfg.named { 1 } else { CLAIM_TRIES };
         while s.lost < tries {
             let id = match self.cfg.named {
-                true => s.offered.clone().filter(|id| b.tasks.get(id).is_some_and(|t| board::claimable_by(b, t, &s.id, &drone, self.name(node), now)))?,
+                true => s
+                    .offered
+                    .clone()
+                    .filter(|id| b.tasks.get(id).is_some_and(|t| board::claimable_by(b, t, board::Actor::new(self.name(node), &drone, &s.id), now)))?,
                 false => self.next(b, &s.id, &drone, node, now)?,
             };
             // mod.rs `claim`'s check under the lock: a rival holds it, or (a picked task) another node's
             // idle drones now take it, and the claim is refused unwritten.
             let lines = vec![Event::new(Ev::Claim, &id, &s.id, now).with_drone(&drone), Event::new(Ev::Heartbeat, &id, &s.id, now)];
-            let guard = Guard::Claim { task: id.clone(), session: s.id.clone(), picked: !self.cfg.named, now };
+            let guard = Guard::Claim { task: id.clone(), session: s.id.clone(), drone: drone.clone(), picked: !self.cfg.named, now };
             let Some(lands) = self.write_if(node, lines, guard) else {
                 s.lost += 1;
                 continue;
@@ -762,7 +997,7 @@ impl Sim {
                 s.task.is_none()
             }
             (Some(_), false) if self.t < s.lands => false,
-            (Some(id), false) => match super::holding(b, &id, &s.id, now) {
+            (Some(id), false) => match super::holding(b, here, &id, &s.id, now) {
                 // mod.rs `across`: the claim waits until it is final (phase f F5), every participant's
                 // watermark past its stamp, or the ones it waits for suspected.
                 Some(t) if !b.unconfirmed(here, since(&t, now), now).0.is_empty() => false,
@@ -782,7 +1017,7 @@ impl Sim {
                 }
             },
             // Its hooks tell a loser at its next tool call: it sets the work aside and ends.
-            (Some(id), true) => match super::holding(b, &id, &s.id, now) {
+            (Some(id), true) => match super::holding(b, here, &id, &s.id, now) {
                 None => {
                     self.note(node, format!("{} is told it lost {id}", s.id));
                     true
@@ -808,8 +1043,15 @@ impl Sim {
                             vec![Event { head: format!("head-{}", s.id), claim, ..Event::new(Ev::Done, &id, &s.id, now) }, Event::open(v, &s.id, now)]
                         }
                     };
+                    let done = lines.iter().find(|e| e.ev == Ev::Done).map(|e| (e.task.clone(), e.head.clone()));
                     if self.write_if(node, lines, Guard::Holds { task: id.clone(), session: s.id.clone(), now }).is_none() {
                         self.note(node, format!("{} no longer holds {id}: nothing written", s.id));
+                    } else if let Some(attempt) = done.filter(|_| !self.stopped.contains(&node)) {
+                        // mod.rs `finish` then commits.rs `publish`, unless the session is cut first.
+                        match self.cfg.unpublished.contains(&attempt.0) {
+                            true => self.note(node, format!("{} cut before the bundle line of {}@{}", s.id, attempt.0, attempt.1)),
+                            false => self.publish(node, attempt),
+                        }
                     }
                     true
                 }
@@ -833,7 +1075,7 @@ impl Sim {
     fn integrating(&mut self, d: usize, b: &Board, session: String, task: String, until: Option<i64>) -> bool {
         let (node, now) = (self.drones[d].node, self.now(self.drones[d].node));
         let here = self.name(node);
-        let held = b.tasks.get(&task).and_then(|s| s.live(now)).filter(|(by, _, _)| *by == session).map(|(_, _, since)| since);
+        let held = b.tasks.get(&task).filter(|s| s.held_by(here, &session, now)).and_then(|s| s.live(now)).map(|(_, _, since)| since);
         match (until, held) {
             (None, None) => {
                 self.drones[d].st = St::Decide;
@@ -900,20 +1142,66 @@ impl Sim {
         self.log.join("\n")
     }
 
-    /// No premature end: once every runner ended, the converged board is finished, or every drone's
-    /// budget ran out (one that ended with budget left could have gone on), a node was killed, or a task
-    /// is blocked. F6/F7's explicit stuck(task, constraint) joins these once it exists.
+    /// No premature end (phase f F6): once every runner ended, the converged board is finished, or every
+    /// drone's budget ran out (one that ended with budget left could have gone on), a node was killed, or
+    /// each drone ended on its budget or a stuck. Each stuck must have held when it was said: the task
+    /// blocked, a dep of it on no board, refused on every node (`Cfg::refuse`), or barred (on the converged
+    /// board) to every drone then running on a node that had started and was not killed, or its commits
+    /// (an integration's: one of its accepted attempts') on no such node for good (`reachable`, phase f
+    /// F7); a stuck said while a running drone could take it is itself an end too early. And a stuck end
+    /// gives up only what
+    /// the stuck lines name and what waits on it: a drone ends too early when the converged board has
+    /// another task left, claimable with its deps met, that a drone running at that end (itself included)
+    /// could have taken.
     fn premature_end(&self) -> Option<String> {
         let u = self.converged();
-        let excused = self.ends.iter().all(|(_, why, _)| *why == "budget")
-            || self.ends.iter().any(|(_, why, _)| *why == "killed")
-            || u.tasks.values().any(|s| matches!(s.status, Status::Blocked { .. }));
+        let refused = |s: &TaskState| !allowed(&self.cfg)(s) && s.task.role != Role::Integrate;
+        // The commits a verify task judges are on node n for good, or one of an integration's are not.
+        let lacks = |s: &TaskState, n: usize| s.task.of.as_ref().is_some_and(|w| !self.reachable(n, &s.node, &(w.clone(), judged_head(&u, s))));
+        let integrable = |n: usize| Self::accepted(&u).iter().all(|(w, head, author)| self.reachable(n, author, &(w.clone(), head.clone())));
+        let held = |x: &Stuck| match u.tasks.get(&x.task) {
+            None => x.running.iter().all(|(n, _)| !integrable(*n)),
+            Some(s) if s.task.role == Role::Integrate => x.running.iter().all(|(n, _)| !integrable(*n)),
+            Some(s) => {
+                matches!(s.status, Status::Blocked { .. })
+                    || s.task.deps.iter().any(|d| !u.tasks.contains_key(d))
+                    || refused(s)
+                    || x.running.iter().all(|(n, d)| u.barred(s, board::Actor::new(self.name(*n), d, "")) || lacks(s, *n))
+            }
+        };
+        if let Some(Stuck { at: t, node: n, task, why, running }) = self.stuck.iter().find(|x| !held(x)) {
+            return Some(format!("{} said {task} stuck at t={t} ({why}) while one of {running:?} could take it", self.name(*n)));
+        }
+        let named: BTreeSet<&str> = self.stuck.iter().map(|x| x.task.as_str()).collect();
+        let far = i64::MAX / 4;
+        let left = |running: &[(usize, String)]| {
+            u.tasks.values().find(|s| {
+                !named.contains(s.task.id.as_str())
+                    && !refused(s)
+                    && running.iter().any(|(n, d)| board::claimable_by(&u, s, board::Actor::new(self.name(*n), d, ""), far) && !lacks(s, *n))
+            })
+        };
+        for (n, t, running) in &self.stuck_ends {
+            if let Some(s) = left(running) {
+                return Some(format!("{} ended stuck at t={t} while {} was left to one of {running:?}", self.name(*n), s.task.id));
+            }
+        }
+        let excused = self.ends.iter().all(|(_, why, _)| *why == "budget" || *why == "stuck") || self.ends.iter().any(|(_, why, _)| *why == "killed");
         let all_ended = self.drones.iter().all(|d| matches!(d.st, St::Ended(_)));
         (all_ended && !u.finished() && !excused).then(|| {
             let open: Vec<String> =
                 u.tasks.values().filter(|s| !matches!(s.status, Status::Verified { .. })).map(|s| format!("{} {}", s.task.id, s.status.name())).collect();
             format!("unfinished board at every runner's end ({}): {:?}", open.join(", "), self.ends)
         })
+    }
+
+    /// No hang (phase f F6): every runner ended by the horizon. A drone that waits on the board ends only
+    /// on a finish for good, its budget, a fault of its own or a stuck, so one still running at the horizon
+    /// waits on something no node will write.
+    fn hung(&self) -> Option<String> {
+        let running: Vec<String> =
+            self.drones.iter().filter(|d| !matches!(d.st, St::Ended(_))).map(|d| format!("{}.{} {:?}", self.name(d.node), d.name, d.st)).collect();
+        (!running.is_empty()).then(|| format!("still running at the horizon t={}: {running:?}", self.cfg.horizon))
     }
 
     /// Stable-prefix exit: a runner exits 0 only when the converged board is finished.
@@ -976,8 +1264,9 @@ impl Sim {
 
     /// Every property but the ones `skip` names, with the trace.
     fn check(&self, skip: &[&str]) {
-        let props: [(&str, Option<String>); 6] = [
+        let props: [(&str, Option<String>); 7] = [
             ("end", self.premature_end()),
+            ("hang", self.hung()),
             ("exit", self.exit_unfinished()),
             ("S2'", self.retracted()),
             ("integrate", self.integrated_twice()),
@@ -1017,8 +1306,9 @@ fn same_in_any_order(lines: &[Event]) -> Result<(), String> {
 }
 
 /// A peer slow to claim (hivemc A; CE1, bug #23): one task, a's; a's model takes 12 s to claim it. b's
-/// drone waits while a's session started and has not claimed (`in_hand`) instead of ending after three
-/// idle polls, and verifies a's work. No premature end.
+/// drone waits while a's session started and has not claimed instead of ending after three idle polls
+/// (phase f F1's `in_hand`; since F6 a drone ends on no idle poll at all), and verifies a's work. No
+/// premature end.
 #[test]
 fn a_ce1_a_peer_slow_to_claim_keeps_the_other_node_waiting() {
     let r = Sim::run(Cfg::new(&[("a", None)]).lat("a", "d1", &[12]));
@@ -1028,7 +1318,8 @@ fn a_ce1_a_peer_slow_to_claim_keeps_the_other_node_waiting() {
 
 /// A dependency chain (hivemc B; CE2): a's two tasks, the second after the first; b's model takes 12 s
 /// to claim the first one's verify task. a's drone, which may claim nothing until b's verdict, waits on
-/// b's unsettled session (the peer session in `in_hand`) and then does the second. No premature end.
+/// b's unsettled session (F1's `in_hand`; since F6 it waits on any unfinished board) and then does the
+/// second. No premature end.
 #[test]
 fn b_ce2_a_peer_session_on_its_way_to_a_dep_keeps_the_waiting_drone() {
     let r = Sim::run(Cfg::new(&[("a", None), ("a", Some(0))]).lat("b", "d1", &[12, 1]));
@@ -1080,35 +1371,196 @@ fn f_a_late_start() {
     }
 }
 
-/// No bundles cross (hivemc G): a bundle over 1 MiB, or a fetch that fails. In the run a verify task of
-/// another node's work is not offered there (mod.rs `absent_from`), where hivemc let it be verified and
-/// stopped at the integration (`elsewhere`): each node's one drone may verify only the other's work, so
-/// both runners end with the verify tasks open, "stalled" (`open_to` offers them; the session finds
-/// nothing it may claim). No premature end: an end there must be an explicit stuck.
+/// No bundles cross (hivemc G): each attempt's bundle is over 1 MiB, so its node says its commits stay
+/// there (commits.rs `publish`), and each node's one drone may verify only the other's work. hivemc let
+/// it be verified and stopped at the integration (`elsewhere`); before phase f F7 the runner offered the
+/// verify task (`open_to` had no commits filter) and its sessions found nothing they could claim, so both
+/// runners ran empty sessions and ended "stalled", the board unfinished. The property: no session for a
+/// task whose commits a node lacks, no end but an explicit stuck: each node declines the other's verify
+/// task (mod.rs `lacking`: `Unavailable`), and once both declines are in each says both stuck,
+/// `commits unavailable`, whose constraint held (no running node holds or can get the commits it was
+/// not barred from: premature_end checks it), and exits 1.
 #[test]
-#[ignore = "F7: commits a node cannot fetch make the task stuck (premature_end's excuse then), not a runner's end"]
 fn g_unfetchable_commits_end_no_runner() {
     let r = Sim::run(Cfg { bundles: false, ..Cfg::new(&[("a", None), ("b", None)]) });
-    assert_eq!(r.premature_end(), None, "{}", r.trace());
+    r.check(&[]);
+    assert_eq!(r.empty, Vec::<String>::new(), "no session for a task whose commits its node lacks\n{}", r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck"), "{:?}\n{}", r.ends, r.trace());
+    let verify: BTreeSet<String> = r.cfg.tasks.iter().map(|(t, _)| format!("{t}.v1")).collect();
+    let said: BTreeSet<String> = r.stuck.iter().filter(|x| x.why.starts_with("commits unavailable")).map(|x| x.task.clone()).collect();
+    assert_eq!(said, verify, "{:?}\n{}", r.stuck, r.trace());
+    assert!(r.exits.values().all(|(ok, _)| !*ok), "{}", r.trace());
 }
 
-/// hivemc G with a's clock 20 s and 60 s ahead: b's sessions refuse the verify task they are offered,
-/// stamped by a's done, so its claimable time is ahead of each session's start. The stall is judged
-/// by the session's own start view (run.rs `stalls`, no clock against another), so b's drone ends
-/// "stalled" after as many iterations as with one clock, not on its budget.
+/// hivemc G with a's clock 20 s and 60 s ahead, and either way: b's end is the same as with one clock.
+/// Before phase f F7 b's sessions refused the verify task they were offered, stamped by a's done, and
+/// the stall was judged by the session's own start view (run.rs `stalls`), so b ended "stalled" after
+/// as many iterations for every skew. Since F7 b is offered no task whose commits it lacks: it ends stuck
+/// after its one work iteration for every skew, its stuck's grace on its own clock (`claimable_since`).
 #[test]
-fn g_a_peer_clock_ahead_hides_no_stall() {
+fn g_a_peer_clock_ahead_changes_no_end() {
     let ends = |skew: i64| {
         let r = Sim::run(Cfg { bundles: false, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.skew = skew));
         let b = r.drones.iter().find(|d| r.name(d.node) == "b").unwrap();
-        (b.iters, r.ends.iter().find(|(d, _, _)| d == "b.d1").map(|(_, why, _)| *why), r.trace())
+        (b.iters, r.ends.iter().find(|(d, _, _)| d == "b.d1").map(|(_, why, _)| *why), r.empty.clone(), r.trace())
     };
-    let (iters, why, trace) = ends(0);
-    assert_eq!(why, Some("stalled"), "{trace}");
+    let (iters, why, empty, trace) = ends(0);
+    assert_eq!((iters, why, empty), (1, Some("stuck"), Vec::new()), "{trace}");
     for skew in [20_000, 60_000, 10_000, -10_000, 300_000, -300_000] {
-        let (n, why, trace) = ends(skew);
-        assert_eq!((n, why), (iters, Some("stalled")), "a's clock {skew} ms ahead\n{trace}");
+        let (n, why, empty, trace) = ends(skew);
+        assert_eq!((n, why, empty), (iters, Some("stuck"), Vec::new()), "a's clock {skew} ms ahead\n{trace}");
     }
+}
+
+/// Phase f F7: a bundle that arrives late. Each attempt's bundle line reaches the other node 15 ticks after
+/// its done (a mesh round of its own, a big line: past `stuck`'s grace), lines in 1 to 3 s. Each node's drone, its own work
+/// done, waits for the other's commits with nothing open (mod.rs `lacking`: `Coming`, its node a taker):
+/// no session starts for the verify task before its bundle line is held there, none runs empty, and the
+/// goal is finished. Fails with the runner's offer unfiltered (run.rs `open_to` without `offered`): each
+/// drone runs sessions that find nothing to claim and ends "stalled"; and with a missing bundle read as
+/// unavailable at once, each node declines the other's verify task and ends stuck.
+#[test]
+fn a_bundle_that_arrives_late_is_waited_for() {
+    for delay in [1, 3] {
+        let r = Sim::run(Cfg { delay, bundle_late: SUSPECT_MS / TICK + 5, ..Cfg::new(&[("a", None), ("b", None)]) });
+        r.check(&[]);
+        assert!(r.converged().finished(), "delay {delay}\n{}", r.trace());
+        assert_eq!(r.empty, Vec::<String>::new(), "delay {delay}\n{}", r.trace());
+        for (node, other) in [("a", "b"), ("b", "a")] {
+            let work = r.cfg.tasks.iter().map(|(t, _)| t).find(|t| board::owner(&BTreeSet::from(["a", "b"]), t) == Some(other)).unwrap();
+            let held = r.first(node, &format!("holds the bundle line of {work}@")).unwrap_or(i64::MAX);
+            let claimed = r.first(node, &format!("claim {work}.v1@")).unwrap_or(i64::MIN);
+            assert!(held <= claimed, "delay {delay}: {node} claimed {work}.v1 at t={claimed}, its bundle there at t={held}\n{}", r.trace());
+        }
+        assert!(r.stuck.is_empty(), "{:?}\n{}", r.stuck, r.trace());
+    }
+}
+
+/// Phase f F7: an author that leaves before its bundle reached a peer. b's bundle line takes 40 ticks;
+/// b's runner is killed at t=9, after its done. a waits for b's commits while b may still take part
+/// (`Board::takers`: heard within `LEASE_MS`), then declines b's verify task and says it stuck,
+/// `commits unavailable`, once b was silent a lease: a cut that long is given up, and no line from b
+/// can bring them. Before F7 a's drone ran empty sessions on it and ended "stalled".
+#[test]
+fn an_author_gone_before_its_bundle_arrived_leaves_its_task_stuck() {
+    let lease = LEASE_MS / TICK;
+    let cfg = Cfg { bundle_late: lease + 300, horizon: lease + 120, ..Cfg::new(&[("a", None), ("b", None)]) }.node("b", |n| n.stop = Some(9));
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    assert_eq!(r.empty, Vec::<String>::new(), "{}", r.trace());
+    let bwork = r.cfg.tasks.iter().map(|(t, _)| t).find(|t| board::owner(&BTreeSet::from(["a", "b"]), t) == Some("b")).unwrap();
+    let x = r.stuck.iter().find(|x| x.task == format!("{bwork}.v1")).unwrap_or_else(|| panic!("{:?}\n{}", r.stuck, r.trace()));
+    assert!(x.why.contains("left the goal") && x.at > lease, "{:?}\n{}", r.stuck, r.trace());
+    assert_eq!(r.ends.iter().find(|(d, _, _)| d == "a.d1").map(|(_, why, _)| *why), Some("stuck"), "{}", r.trace());
+}
+
+/// Phase f F7: an integration no node can hold together. Two drones a node, each node's work verified by
+/// its other drone, no bundles: a holds only its attempt's commits, b only its own. Before F7 each
+/// runner ended "integration needs another node's commits", an end no stuck explained; now each says the
+/// integration stuck, `commits unavailable`, whose constraint held (no running node can hold every
+/// accepted attempt: premature_end checks it), and exits 1.
+#[test]
+fn an_integration_no_node_can_hold_together_ends_stuck() {
+    let cfg = Cfg { bundles: false, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.drones = 2).node("b", |n| n.drones = 2);
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    let u = r.converged();
+    assert!(u.tasks.values().filter(|s| s.task.role != Role::Integrate).all(|s| matches!(s.status, Status::Verified { .. })), "{}", r.trace());
+    assert!(
+        !r.stuck.is_empty() && r.stuck.iter().all(|x| x.task.starts_with("integrate") && x.why.starts_with("commits unavailable")),
+        "{:?}\n{}",
+        r.stuck,
+        r.trace()
+    );
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck") && r.exits.values().all(|(ok, _)| !*ok), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase f F7: an integration waits for the one node that holds its commits. a's two drones do and
+/// verify both tasks, no bundles; b's drone may take neither verify task (`Unavailable`: declined) and
+/// lacks both attempts at the integration, all a's (integrate.rs `gate`: one taker holds them all,
+/// `Coming`): it waits while a integrates, and ends on the finish. Before F7 b's runner ended
+/// "integration needs another node's commits" while a was about to integrate.
+#[test]
+fn an_integration_waits_for_the_one_node_that_holds_its_commits() {
+    let cfg = Cfg { bundles: false, ..Cfg::new(&[("a", None), ("a", None)]) }.node("a", |n| n.drones = 2);
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    assert!(r.converged().finished(), "{}", r.trace());
+    assert_eq!(r.ends.iter().find(|(d, _, _)| d == "b.d1").map(|(_, why, _)| *why), Some("goal finished"), "{:?}\n{}", r.ends, r.trace());
+    assert!(r.exits.values().all(|(ok, _)| *ok), "{}", r.trace());
+}
+
+/// Phase f F7: two nodes that each refuse the other's bundle line (a prerequisite its repo lacks), the
+/// lines carrying the commits. Two drones a node, so each node's work is verified by its other drone (the
+/// other node's verify task declined: `Unavailable`). At the integration each lacks the other's attempt,
+/// whose line travels: before, each read the other as the one holder that integrates (integrate.rs
+/// `gate`: `Coming`), and both waited for ever. Now each declines the integration (mod.rs
+/// `decline_integration`), and once both declines are in each says it stuck, `commits unavailable`,
+/// whose constraint held (premature_end), and exits 1: no hang at the horizon. Fails with the holder
+/// rule reading no declines: both still waiting at the horizon.
+#[test]
+fn nodes_that_refuse_each_others_lines_end_stuck_at_the_integration() {
+    let two = |n: &mut NodeCfg| {
+        n.drones = 2;
+        n.refuses = true;
+    };
+    let r = Sim::run(Cfg::new(&[("a", None), ("b", None)]).node("a", two).node("b", two));
+    r.check(&[]);
+    let u = r.converged();
+    assert!(u.tasks.values().filter(|s| s.task.role != Role::Integrate).all(|s| matches!(s.status, Status::Verified { .. })), "{}", r.trace());
+    let id = board::integrate_id(&u);
+    assert!(u.declines("a", &id) && u.declines("b", &id), "{:?}\n{}", u.declined, r.trace());
+    assert!(!r.stuck.is_empty() && r.stuck.iter().all(|x| x.task == id && x.why.starts_with("commits unavailable")), "{:?}\n{}", r.stuck, r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck") && r.exits.values().all(|(ok, _)| !*ok), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase f F7: three nodes, an integration two of them cannot hold and one can. Two drones a node; b's
+/// commits stay on b (over the cap), a refuses every other node's line. a lacks b's attempt (it stays)
+/// and c's (refused): two holders, and before, integrate.rs `gate` waited only for a single one, so a
+/// said the integration stuck at once and ended, exit 1, while b, which holds its own and takes every
+/// travelling line, integrated. Now a waits while a taker that can hold every attempt has not declined
+/// the integration: no stuck, every runner ends on the finish.
+#[test]
+fn an_integration_waits_for_any_node_that_can_hold_its_commits() {
+    let mut cfg = Cfg::new(&[("a", None), ("b", None), ("a", None), ("b", None)]);
+    cfg.nodes.push(NodeCfg { name: "c", ..cfg.nodes[0].clone() });
+    // a starts late, so b and c do the work.
+    let cfg = cfg
+        .node("a", |n| {
+            n.refuses = true;
+            n.start = 4;
+        })
+        .node("b", |n| n.stays = true);
+    let cfg = ["a", "b", "c"].into_iter().fold(cfg, |c, n| c.node(n, |n| n.drones = 2));
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    let u = r.converged();
+    let by: BTreeSet<&str> = u.tasks.values().filter(|s| s.task.role == Role::Work).filter_map(|s| s.attempts.first()).map(|a| a.node.as_str()).collect();
+    assert!(by.contains("b") && by.contains("c"), "work done on b and c: {by:?}\n{}", r.trace());
+    assert!(u.finished() && r.stuck.is_empty(), "{:?}\n{}", r.stuck, r.trace());
+    assert!(r.exits.values().all(|(ok, _)| *ok), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase f F7: a done whose bundle line is never written: a's session is cut during `git bundle create`
+/// after its done landed (mod.rs `finish`). b waits for the line (mod.rs `lacking`: `Coming` while a
+/// takes part) and a leaves its verify task to b (no decline): before, both waited for ever. Now a's
+/// runner writes the missing line on its next pass (commits.rs `republish`): b claims the verify task
+/// only once the line is held there, no session runs empty, and the goal is finished. Fails without the
+/// pass: both still waiting at the horizon.
+#[test]
+fn a_done_whose_bundle_line_was_never_written_is_published_by_its_runner() {
+    let mut cfg = Cfg::new(&[("a", None), ("b", None)]);
+    let awork = cfg.tasks.iter().map(|(t, _)| t.clone()).find(|t| board::owner(&BTreeSet::from(["a", "b"]), t) == Some("a")).unwrap();
+    cfg.unpublished = vec![awork.clone()];
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    assert!(r.converged().finished(), "{}", r.trace());
+    assert_eq!(r.empty, Vec::<String>::new(), "{}", r.trace());
+    let cut = r.first("a", &format!("cut before the bundle line of {awork}@")).unwrap_or_else(|| panic!("{}", r.trace()));
+    let again = r.first("a", &format!("republishes the bundle line of {awork}@")).unwrap_or(i64::MAX);
+    let held = r.first("b", &format!("holds the bundle line of {awork}@")).unwrap_or(i64::MAX);
+    let claimed = r.first("b", &format!("claim {awork}.v1@")).unwrap_or(i64::MIN);
+    assert!(cut <= again && again < held && held <= claimed, "cut t={cut}, republished t={again}, held on b t={held}, claimed t={claimed}\n{}", r.trace());
 }
 
 /// a's runner is killed at t=4 holding its task (hivemc H). Before phase f F4 b waited on the lease
@@ -1126,12 +1578,21 @@ fn h_a_killed_holder_hands_its_task_back() {
 }
 
 /// hivemc H ends no runner early: b takes a's task back once a is suspected (phase f F4; before, b
-/// waited on a's lease), does it, and ends once nothing is left it may do: only a could verify either
-/// task, and a is gone (F6 makes that an explicit stuck; a node killed excuses it here).
+/// waited on a's lease), does it, and then waits: only a could verify either task, and a killed node is
+/// told from a cut one only by time. Phase f F6: no end on nothing to do; b ends stuck once a was silent a
+/// whole lease (`Board::takers`), a cut that long given up, with a stuck line naming both verify tasks,
+/// whose constraint held (premature_end checks it), exit non-zero.
 #[test]
 fn h_a_killed_holder_ends_no_runner_early() {
-    let r = Sim::run(Cfg::new(&[("a", None), ("b", None)]).node("a", |n| n.stop = Some(4)));
+    let lease = LEASE_MS / TICK;
+    let r = Sim::run(Cfg { horizon: lease + 120, ..Cfg::new(&[("a", None), ("b", None)]) }.node("a", |n| n.stop = Some(4)));
     r.check(&[]);
+    assert_eq!(r.ends.iter().find(|(d, _, _)| d == "b.d1").map(|(_, why, _)| *why), Some("stuck"), "{}", r.trace());
+    let stuck: BTreeSet<&str> = r.stuck.iter().map(|x| x.task.as_str()).collect();
+    let verify: BTreeSet<String> = r.cfg.tasks.iter().map(|(t, _)| format!("{t}.v1")).collect();
+    assert_eq!(stuck, verify.iter().map(String::as_str).collect(), "{}", r.trace());
+    assert!(r.stuck.iter().all(|x| x.at > lease), "not before a was silent a lease\n{}", r.trace());
+    assert_eq!(r.exits.get(&1).map(|(ok, _)| *ok), Some(false), "{}", r.trace());
 }
 
 /// a has the budget for one iteration and its model is slow to claim (hivemc I): b verifies a's work.
@@ -1268,15 +1729,18 @@ fn same_node_claims_need_no_timing() {
     assert_eq!(r.same_node_twice(), None, "{}", r.trace());
 }
 
-/// Not in hivemc (it named integrators by node): an integrator's session is `integrate-<drone>-<ms>`,
-/// so drone d1 of a and of b integrating in one ms share a session; each read-back sees "its" session
-/// hold the task, whichever node's line won, and both integrate even with lines in a tick.
-/// Integrate-once.
+/// Not in hivemc (it named integrators by node): an integrator's session was `integrate-<drone>-<ms>`,
+/// so drone d1 of a and of b integrating in one ms shared a session; each read-back saw "its" session
+/// hold the task, whichever node's line won, and both integrated even with lines in a tick.
+/// Integrate-once, by phase f F8: the session names its node (integrate.rs `session`) and the fold
+/// tells holders apart node for node (board.rs `Actor`), so one claim wins and the other loses.
 #[test]
-#[ignore = "F8: unique node/session ids; an integrator's session names its node"]
 fn integrators_on_two_nodes_in_one_ms_are_two_sessions() {
     let r = Sim::run(Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.skew = -1));
     assert_eq!(r.integrated_twice(), None, "{}", r.trace());
+    // The name alone pins half of it: the two integrators' claims name two sessions.
+    let claims: BTreeSet<String> = r.union().into_iter().filter(|e| e.ev == Ev::Claim && e.task.starts_with("integrate")).map(|e| e.by).collect();
+    assert_eq!(claims.len(), 2, "{claims:?}\n{}", r.trace());
 }
 
 /// Not in hivemc (spec G5): b's integrate claim is stamped before a's (b's clock 2 s behind) and reaches
@@ -1438,7 +1902,9 @@ fn a_node_killed_mid_claim_hands_its_task_over_within_the_suspicion_window() {
             let b = board::fold(&r.lines[1]);
             let away = (stop..60).find(|&t| !b.participants("b", t * TICK + 1).contains("a"));
             assert!(r.converged().spans.iter().any(|sp| sp.task == t && sp.node == "b"), "b holds {t}\n{}", r.trace());
-            r.check(&[]);
+            // b then waits on a for a lease before it gives up the verify task only a may take (phase f F6,
+            // `h_a_killed_holder_ends_no_runner_early`): no end within this horizon.
+            r.check(&["hang"]);
             (took, away, free, r.trace())
         };
         let (took, away, free, trace) = run(0);
@@ -1729,4 +2195,136 @@ fn no_claim_works_before_it_is_final_without_a_suspicion() {
         eprintln!("final waits, lines in {delay} s: {} claims, mean {mean:.2} ticks, max {max}", w.len());
         assert!(max <= 2 * delay + BEAT_MS / TICK, "lines in {delay} s: a final wait of {max} ticks");
     }
+}
+
+/// Phase f F6, the case F5 found: one drone a node, each node's verifier the other's, a cut, a rejection.
+/// a's and b's work are done and each verified by the other node, a's first attempt rejected; the cut
+/// from t=8 for 30 s falls on the rework, so each node suspects the other and has nothing it may do. Before
+/// F6 a drone with nothing open and nothing in hand (a suspected peer's claim is in no hand) counted idle
+/// polls and ended "nothing to do" within the cut, leaving the rework no verifier once it healed. Now it
+/// waits on the board however long the goal is unfinished, a cut being no stuck within the lease
+/// (`Board::takers`): the goal finishes, every runner on a finish for good, exit 0.
+#[test]
+fn one_drone_a_node_a_cut_and_a_rejection_finish() {
+    let cfg = Cfg::new(&[("a", None), ("b", None)]);
+    let reject = vec![format!("{}.v1", cfg.tasks[0].0)];
+    let r = Sim::run(Cfg { reject, cuts: vec![(8, 38)], ..cfg });
+    r.check(&[]);
+    assert!(r.converged().finished(), "{}", r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "goal finished"), "{:?}\n{}", r.ends, r.trace());
+    assert!(r.exits.values().all(|(ok, _)| *ok), "{}", r.trace());
+}
+
+/// Phase f F6: a one-drone node whose work needs the other node's verifier finishes. a's one drone does
+/// a's one task; b's has nothing to do but verify it. The network is cut from t=2 to t=30, so a's claim
+/// waits on b's watermark until it suspects b, then proceeds and works in the cut, and b, suspecting a,
+/// sees nothing open and no claim of a live peer. Before F6 b ended "nothing to do" after three idle
+/// polls and a's work was never verified; now b waits, verifies it once the cut heals, and the goal
+/// finishes on both nodes.
+#[test]
+fn a_one_drone_node_whose_work_needs_the_other_nodes_verifier_finishes() {
+    let r = Sim::run(Cfg { cuts: vec![(2, 30)], ..Cfg::new(&[("a", None)]) });
+    r.check(&[]);
+    let t = &r.cfg.tasks[0].0;
+    assert!(r.first("b", &format!("verified {t}.v1")).is_some_and(|at| at >= 30), "b verifies once the cut healed\n{}", r.trace());
+    assert!(r.converged().finished() && r.exits.values().all(|(ok, _)| *ok), "{}", r.trace());
+}
+
+/// Phase f F6: a peer that leaves while it is the only possible verifier yields stuck on the remaining
+/// node, not a hang and not exit 0. b's one drone has the budget of one iteration: it does b's task and
+/// ends, so b's runner leaves the goal; a's one drone verifies b's work and does a's, whose verify task
+/// it may not take. No running drone of the goal may: a says so on the board (a stuck line, its
+/// constraint held: premature_end checks it) and ends "stuck", its runner exiting non-zero.
+#[test]
+fn a_peer_that_leaves_as_the_only_verifier_yields_stuck() {
+    let r = Sim::run(Cfg::new(&[("a", None), ("b", None)]).node("b", |n| n.share = 1));
+    r.check(&[]);
+    let mine = format!("{}.v1", r.cfg.tasks[0].0);
+    assert_eq!(r.stuck.iter().map(|x| (r.name(x.node), x.task.as_str())).collect::<Vec<_>>(), vec![("a", mine.as_str())], "{}", r.trace());
+    assert_eq!(r.ends.iter().find(|(d, _, _)| d == "a.d1").map(|(_, why, _)| *why), Some("stuck"), "{}", r.trace());
+    assert_eq!(r.exits.get(&0).map(|(ok, _)| *ok), Some(false), "{}", r.trace());
+    assert!(r.converged().stuck.contains_key(&mine), "the stuck line stands: {:?}", r.converged().stuck);
+}
+
+/// Phase f F6: a participant that joins late clears a stuck. a runs alone with one drone: it does its
+/// task, whose verify task it may not take, says it stuck once that held `SUSPECT_MS` and ends. b's runner
+/// starts at t=40: its join clears a's stuck line on every board (`Board::stuck`), its drone verifies a's
+/// work and integrates, and b ends on a finish for good, exit 0.
+#[test]
+fn a_participant_that_joins_late_clears_a_stuck() {
+    let r = Sim::run(Cfg::new(&[("a", None)]).node("b", |n| n.start = 40));
+    r.check(&[]);
+    let u = r.converged();
+    assert_eq!(r.ends.iter().find(|(d, _, _)| d == "a.d1").map(|(_, why, _)| *why), Some("stuck"), "{}", r.trace());
+    assert!(r.stuck.iter().all(|x| x.at < 40), "{}", r.trace());
+    assert!(u.stuck.is_empty() && u.finished(), "b's join cleared it, b finished the goal: {:?}\n{}", u.stuck, r.trace());
+    assert_eq!(r.exits.get(&1).map(|(ok, _)| *ok), Some(true), "{}", r.trace());
+}
+
+/// Phase f F6: a line on its way that opens a task ends no runner on a finish that is not for good (F5's
+/// "left": the stable-prefix exit). Lines take 2 s; an engineer opens a task on b at t=28, a tick after
+/// a's integration passed on a's board and before it reached b: b's board is not finished then, so b
+/// writes no finished line for it, and a, its own board finished, waits for one (`Board::settling`)
+/// until the open arrives; both nodes then do the new task, integrate again and end on that. Fails with
+/// `Board::settling` never waiting: a ends "goal finished" and exits 0 before the open reaches it, and the
+/// converged board is unfinished at every runner's end. (An open written after every participant's
+/// finished line is outside what any detection sees: the board was finished for good then.)
+#[test]
+fn a_line_on_its_way_that_opens_a_task_ends_no_runner_on_a_finish_not_for_good() {
+    let cfg = Cfg { delay: 2, opens: vec![(28, "b", "late".into())], ..Cfg::new(&[("a", None), ("b", None)]) };
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    let u = r.converged();
+    assert!(u.finished() && u.tasks["late"].status.name() == "verified" && u.integrations.len() == 2, "{}", r.trace());
+    assert!(r.first("a", "integrate-d1@a-21000 verified integrate.1").is_some_and(|t| t < 28), "a's board finished before the open\n{}", r.trace());
+    assert!(r.exits.values().all(|(ok, _)| *ok), "{}", r.trace());
+}
+
+/// Phase f F6: a peer starting seconds late is waited for, not given up. a runs alone with one drone and
+/// does its task by t=5, whose verify task it may not take; b's runner starts at t=10, its join reaching a
+/// within `SUSPECT_MS` of the verify task becoming claimable there, so a says no stuck (`board::stuck`'s
+/// grace) and b verifies. Fails with that grace at 0: a ends stuck before b's join arrives.
+#[test]
+fn a_peer_starting_seconds_late_is_waited_for_not_given_up() {
+    let r = Sim::run(Cfg::new(&[("a", None)]).node("b", |n| n.start = 10));
+    r.check(&[]);
+    assert!(r.stuck.is_empty() && r.converged().finished(), "{:?}\n{}", r.stuck, r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "goal finished"), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase f F6, after review: a stuck task gives up only itself and what waits on it, never the rest of the
+/// board. Beside a's one task, an engineer's task needs a task that is on no board (stuck at once). b's
+/// drone has nothing open while a holds its task, and waits on it (`board::moving`), then verifies it;
+/// both end stuck on the orphan alone. Fails with a drone ending on any stuck while work still moves: b
+/// ends at t=1 and a's work is never verified (`premature_end` names the verify task left to b).
+#[test]
+fn a_stuck_task_ends_no_drone_while_other_work_still_moves() {
+    let mut cfg = Cfg::new(&[("a", None)]);
+    cfg.tasks.push(("orphan".into(), vec!["gone".into()]));
+    let r = Sim::run(cfg);
+    r.check(&[]);
+    let u = r.converged();
+    let t = &r.cfg.tasks[0].0;
+    assert!(matches!(u.tasks[&format!("{t}.v1")].status, Status::Verified { .. }), "{}", r.trace());
+    assert_eq!(r.stuck.iter().map(|x| x.task.as_str()).collect::<BTreeSet<_>>(), BTreeSet::from(["orphan"]), "{}", r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck") && r.exits.values().all(|(ok, _)| !*ok), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase f F6, after review: a task no node may take ends stuck, not a hang. Its checks are approved on no
+/// node (`Cfg::refuse`), so each node's drone may not take it; each says so on the board (`declines`), and
+/// once both lines are in, every node reads the task stuck and the run ends, exit 1. Fails with another
+/// node counted as able to take whatever it declined: each node leaves the task to the other, and both
+/// drones wait at the horizon.
+#[test]
+fn a_task_no_node_may_take_ends_stuck_not_a_hang() {
+    let cfg = Cfg::new(&[("a", None), ("b", None)]);
+    let refuse = vec![cfg.tasks[0].0.clone()];
+    let r = Sim::run(Cfg { refuse: refuse.clone(), ..cfg });
+    r.check(&[]);
+    let u = r.converged();
+    assert_eq!(u.declined.keys().map(|(n, t)| (n.as_str(), t.as_str())).collect::<Vec<_>>(), vec![("a", refuse[0].as_str()), ("b", refuse[0].as_str())]);
+    assert!(r.stuck.iter().all(|x| x.task == refuse[0]) && !r.stuck.is_empty(), "{:?}\n{}", r.stuck, r.trace());
+    let other = format!("{}.v1", r.cfg.tasks[1].0);
+    assert!(matches!(u.tasks[&other].status, Status::Verified { .. }), "the other task is done and verified\n{}", r.trace());
+    assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck") && r.exits.values().all(|(ok, _)| !*ok), "{:?}\n{}", r.ends, r.trace());
 }

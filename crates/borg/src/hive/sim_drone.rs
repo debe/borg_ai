@@ -228,12 +228,13 @@ pub fn main(here: &Here) -> i32 {
     // Each round finishes a task or ends the iteration: at most one per task, plus the last claim.
     for _ in 0..=tasks {
         let path = super::tasks_path(&here.home, &g.id);
-        let mut b = board::fold_on(&board::read(&path), &super::node(&here.home));
-        if board::holding(&b, &session, learn::now_ms()).is_none() {
+        let node = super::node(&here.home);
+        let mut b = board::fold_on(&board::read(&path), &node);
+        if board::holding(&b, &node, &session, learn::now_ms()).is_none() {
             d.hive(&["claim"]);
-            b = board::fold_on(&board::read(&path), &super::node(&here.home));
+            b = board::fold_on(&board::read(&path), &node);
         }
-        let Some(held) = board::holding(&b, &session, learn::now_ms()).cloned() else { break };
+        let Some(held) = board::holding(&b, &node, &session, learn::now_ms()).cloned() else { break };
         if plan.crash {
             return 1;
         }

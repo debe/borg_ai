@@ -30,8 +30,11 @@
 //! between claims neither writer had seen. Every age the scheduling reads (a lease, a node's liveness,
 //! the owner's grace) is timed on the reader's own clock from when it first held the line (`Local`,
 //! `held_path`), never `now` against another node's stamp: a skew between nodes moves none of them.
-//! Drone names (`d1`..) repeat on every node: a drone name bars
-//! a verify task only on the node its work was done on (`Board::barred`); a session id bars everywhere.
+//! Identities are (node, name) (phase f F8, `Actor`): drone names (`d1`..) repeat on every node and a
+//! session id says who only with its node, so a holder, an author and a bar are each a name on a node
+//! (`Board::barred`). Whether an actor may take a task is one predicate, [`eligible`], which the fold's
+//! claim rule, the scheduling (`claimable_by`, `next_for`, `free_for`, `open_for`), the pre-write check
+//! (hive/mod.rs `claimable_for`) and the verdict's author check (`judges_own`) all read.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -272,8 +275,8 @@ impl Event {
 pub enum Status {
     Open,
     Claimed { by: String, node: String, since: i64, renewed: i64 },
-    Done { by: String, ms: i64 },
-    Verified { by: String, ms: i64 },
+    Done { by: String, node: String, ms: i64 },
+    Verified { by: String, node: String, ms: i64 },
     Blocked { by: String, note: String },
 }
 
@@ -389,10 +392,77 @@ impl Local {
     }
 }
 
-/// Whether two lines' nodes are one machine: equal, or either unknown (a line from before nodes were
-/// stamped), which bars conservatively.
+/// Whether two lines' nodes may be one machine, for a bar only (`Board::barred`, `rival`): equal, or
+/// either unknown (a line from before nodes were stamped), which bars conservatively: a bar too many
+/// costs a wait, never a result. Never an identity (phase f F8): who holds, wrote or is asked about a
+/// line is a name on a node (`Actor`), and an unknown node is no node in particular there.
 pub fn same_node(a: &str, b: &str) -> bool {
     a == b || a.is_empty() || b.is_empty()
+}
+
+/// Whether a line written on `line` is `here`'s own, as `here` asks of its sessions and drones: its id,
+/// or unknown, a line from before nodes were stamped, which only this node can have written (the logs
+/// synced only once every line named its node, hive.md C4) (hive/mod.rs `is_local`). An empty `here`
+/// owns only unknown lines: a stamped line is never anyone's by accident.
+pub fn of_node(line: &str, here: &str) -> bool {
+    line == here || line.is_empty()
+}
+
+/// Who takes, holds or judges a task (phase f F8): a session, of a runner's drone (empty: a session of
+/// its own), on a node. A name says who only with its node: every runner names its drones d1..dN, and
+/// two nodes' sessions may share a name (an integrator's before it named its node, a harness's own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Actor<'a> {
+    pub node: &'a str,
+    pub drone: &'a str,
+    pub session: &'a str,
+}
+
+impl<'a> Actor<'a> {
+    pub fn new(node: &'a str, drone: &'a str, session: &'a str) -> Actor<'a> {
+        Actor { node, drone, session }
+    }
+
+    /// The writer of `e`: its node, drone and session (`by`).
+    pub fn of(e: &'a Event) -> Actor<'a> {
+        Actor { node: &e.node, drone: &e.drone, session: &e.by }
+    }
+
+    /// Whether this is the session `by` of `node` (a line's writer, a holder): the same name on the same
+    /// node. Both are lines' nodes here (the fold's holder checks), and an unknown one, a line from
+    /// before nodes were stamped, is any: such a line was written on one node before the logs synced,
+    /// so a claim it made is renewed, finished or released by that session's stamped lines after an
+    /// upgrade. Two stamped lines of two nodes are never one session.
+    pub fn is(&self, node: &str, by: &str) -> bool {
+        self.session == by && (self.node == node || self.node.is_empty() || node.is_empty())
+    }
+}
+
+/// When a claim is judged (`eligible`): as the fold takes a claim line stamped `ms` naming the renewal
+/// `takes` it takes over (`Event::takes`), on stamps alone; or `Now`, on this node's clock, as every
+/// scheduling decision reads leases (`TaskState::claimable`).
+#[derive(Debug, Clone, Copy)]
+pub enum At {
+    Line { ms: i64, takes: Option<i64> },
+    Now(i64),
+}
+
+/// Whether `who` may claim `s` on `b` `at` (phase f F8): the task is open there (open, or its holder's
+/// lease ended: by stamps for a line, `TaskState::claimable_at` or a takeover naming the holder's last
+/// renewal; on this node's clock for a decision), its deps are verified (a verify task: its work done),
+/// and `who` is not barred (`Board::barred`). The one definition of "may X take t": the fold takes a
+/// claim line exactly when it says so of its writer (`apply`, but for the holder's own renewal), and
+/// every decision before a claim reads it (`claimable_by`, `next_for`/`free_for` through `open_for`,
+/// hive/mod.rs `claimable_for`, run.rs `Offer`, `stuck`, `left_to_owner`) or the bar it ends with
+/// (verdict.rs `record` through `judges_own`), adding only what narrows it (approvals, a repo, commits,
+/// an owner's share), so none can offer a task the fold refuses or refuse one it takes (G6, the drift
+/// behind #4, #20, #23 and #29). No timer decides it but the lease's, read by `At`.
+pub fn eligible(b: &Board, s: &TaskState, who: Actor, at: At) -> bool {
+    let open = match at {
+        At::Line { ms, takes } => s.claimable_at(ms) || matches!(s.status, Status::Claimed { renewed, .. } if takes == Some(renewed) && ms > renewed),
+        At::Now(now) => s.claimable(now),
+    };
+    open && deps_met(&b.tasks, &s.task) && !b.barred(s, who)
 }
 
 /// Verifier notes kept per task.
@@ -474,11 +544,12 @@ pub struct Integration {
 #[derive(Debug, Clone, Default)]
 pub struct Board {
     pub tasks: BTreeMap<TaskId, TaskState>,
-    /// Claims that lost a race or were invalid: (by, task, ms).
-    pub lost: Vec<(String, TaskId, i64)>,
+    /// Claims that lost a race or were invalid: (by, node, task, ms).
+    pub lost: Vec<(String, String, TaskId, i64)>,
     pub spans: Vec<Span>,
-    /// The drone each session claimed as (`Event::drone`): session -> drone.
-    pub drones: BTreeMap<String, String>,
+    /// The drone each session claimed as (`Event::drone`): (node, session) -> drone (phase f F8: a
+    /// session's name says who only with its node, `Actor`).
+    pub drones: BTreeMap<(String, String), String>,
     /// Each node's watermarks (phase f F5): node -> (other node -> stamp). For a node P and another X: the
     /// newest stamp of X's lines P had held when it wrote a beat or join line (`Event::marks`) that is held
     /// here with every line of P before it (`Event::seq`). Every line of P not held here yet was written
@@ -504,15 +575,49 @@ pub struct Board {
     /// and its newest claim or session end: (node, drone) -> (start ms, settled ms). A start newer than
     /// what settled it is a session that has not claimed yet (`left_to_owner`).
     pub sessions: BTreeMap<(String, String), (i64, i64)>,
+    /// Each node's newest finished line (phase f F6, `FINISHED`): the integration its board was finished
+    /// at, its stamp, and whether every line of its node before it is held here (`Event::seq`, as
+    /// `watermarks` reads it). What `settling` waits for.
+    pub finishes: BTreeMap<String, Finish>,
+    /// The stuck lines that stand (phase f F6, `STUCK`): task -> (stamp, node, why), the newest per task,
+    /// while the task is not verified and no node that joined the goal after it is still in it (a new
+    /// participant may take it: each node judges it again, `stuck`, and writes it again while it holds;
+    /// one that joined and left again took nothing, so the line stands).
+    pub stuck: BTreeMap<TaskId, (i64, String, String)>,
+    /// The tasks each node said it may not take (phase f F6, `DECLINES`): (node, task) -> the newest such
+    /// line's stamp. What another node's `stuck` reads of this node's repo scope and approvals.
+    pub declined: BTreeMap<(String, TaskId), i64>,
+}
+
+/// A node's newest finished line (`Board::finishes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finish {
+    pub ms: i64,
+    pub integration: TaskId,
+    pub complete: bool,
 }
 
 /// Two boards are one when they say the same of the lines: this node's clock (`Board::nodes`, each
 /// task's `Local`) is no part of it, so two nodes holding the same lines fold equal boards (S1).
 impl PartialEq for Board {
     fn eq(&self, o: &Board) -> bool {
-        let Board { tasks, lost, spans, drones, watermarks, integrated, integrations, nodes: _, members, rosters, sessions } = self;
-        (tasks, lost, spans, drones, watermarks, integrated, integrations, members, rosters, sessions)
-            == (&o.tasks, &o.lost, &o.spans, &o.drones, &o.watermarks, &o.integrated, &o.integrations, &o.members, &o.rosters, &o.sessions)
+        let Board { tasks, lost, spans, drones, watermarks, integrated, integrations, nodes: _, members, rosters, sessions, finishes, stuck, declined } = self;
+        declined == &o.declined
+            && (tasks, lost, spans, drones, watermarks, integrated, integrations, members, rosters, sessions, finishes, stuck)
+                == (
+                    &o.tasks,
+                    &o.lost,
+                    &o.spans,
+                    &o.drones,
+                    &o.watermarks,
+                    &o.integrated,
+                    &o.integrations,
+                    &o.members,
+                    &o.rosters,
+                    &o.sessions,
+                    &o.finishes,
+                    &o.stuck,
+                )
     }
 }
 
@@ -532,20 +637,68 @@ pub const JOIN: &str = "join";
 pub const BEAT: &str = "beat";
 pub const LEAVE: &str = "leave";
 
+/// The note of a runner's line saying its node's board was finished at an integrate task (phase f F6,
+/// `Board::finishes`): `finished integrate.1`. Written under the board lock while the node's file folds
+/// finished at that integration (hive/mod.rs `finish_line`): from then on no session of the node can
+/// write a line that changes the board while it stays so (a claim needs a claimable task, a done or a
+/// verdict a held one, an integration one due), so a peer holding this line and every line of the node
+/// before it holds every change the node can still make from that board.
+const FINISHED: &str = "finished";
+/// The note of a runner's line saying a task is stuck (phase f F6, `stuck`): `stuck t1.v1 <why>`.
+const STUCK: &str = "stuck";
+/// The note of a runner's line saying its node may not take a task (phase f F6, `declines_due`):
+/// `declines t1`. Its repo scope and its approvals are known on that node alone (mod.rs `may_claim`,
+/// oracle.rs `Approvals`), so another node's `stuck` reads them from this line.
+const DECLINES: &str = "declines";
+
+/// `FINISHED`'s note for `integration`.
+pub fn finished_note(integration: &str) -> String {
+    format!("{FINISHED} {integration}")
+}
+
+/// `STUCK`'s note for `task`, stuck for `why`.
+pub fn stuck_note(task: &str, why: &str) -> String {
+    format!("{STUCK} {task} {why}")
+}
+
+/// `DECLINES`'s note for `task`.
+pub fn decline_note(task: &str) -> String {
+    format!("{DECLINES} {task}")
+}
+
 /// The note of a runner's line naming the drones it runs (`Board::rosters`): `drones d1 d2 ...`.
 pub fn roster_note(drones: &[String]) -> String {
     std::iter::once("drones").chain(drones.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
 }
 
 impl Board {
-    /// Whether `s` is barred to `session` of `drone` (empty: none named) on `node`: by its id always;
-    /// by `drone`, or by the drone the session claimed as before, only when the work was done on the
-    /// same node (`same_node`: every runner names its drones d1..dN). The caller names the drone: a new
-    /// iteration's session has no line on the board yet.
-    pub fn barred(&self, s: &TaskState, session: &str, drone: &str, node: &str) -> bool {
-        let here = same_node(&s.node, node);
-        let named = |n: &str| (!drone.is_empty() && n == drone) || self.drones.get(session).is_some_and(|d| d == n);
-        s.task.not_by.iter().any(|n| n == session || (here && named(n))) || self.rival(s, session, node, named)
+    /// The drone `session` of `node` claimed as (`drones`), if any: its claims there, else one from
+    /// before nodes were stamped (`of_node`).
+    pub fn drone(&self, node: &str, session: &str) -> Option<&str> {
+        let of = |n: &str| self.drones.get(&(n.to_string(), session.to_string())).map(String::as_str);
+        of(node).or_else(|| of(""))
+    }
+
+    /// Whether `s` is barred to `who` (its drone empty: none named): by its session, by its drone, or by
+    /// the drone its session claimed as before, each a name on the node the task was opened on (phase f
+    /// F8: a verify task's open is written with its work's done, so its bars are the author's session and
+    /// drone there; another node's session or drone of the same name is another), or a group rival
+    /// (`rival`). A line from before nodes were stamped bars on every node (`same_node`). The caller names
+    /// the drone: a new iteration's session has no line on the board yet.
+    pub fn barred(&self, s: &TaskState, who: Actor) -> bool {
+        let named = |n: &str| {
+            (!who.session.is_empty() && n == who.session) || (!who.drone.is_empty() && n == who.drone) || self.drone(who.node, who.session) == Some(n)
+        };
+        (same_node(&s.node, who.node) && s.task.not_by.iter().any(|n| named(n))) || self.rival(s, who)
+    }
+
+    /// Whether `who`'s verdict on the verify task `s`, judging the attempt `judged` ((node, session,
+    /// drone) of its done), is the author's (verdict.rs `record`, phase f F8): `who` is barred from `s`
+    /// (`eligible`'s bar: the author of the attempt its open was written with), or is the judged
+    /// attempt's session or drone on its node, when a verdict names another attempt of the round.
+    pub fn judges_own(&self, s: &TaskState, who: Actor, judged: (&str, &str, &str)) -> bool {
+        let (node, by, drone) = judged;
+        self.barred(s, who) || (same_node(node, who.node) && (by == who.session || (!drone.is_empty() && drone == who.drone)))
     }
 
     /// The group member `t` belongs to: itself when it is one, the member it verifies when it is that
@@ -563,7 +716,7 @@ impl Board {
     /// attempts are different drones' (hive/group.rs), a drone that verified one member has read a rival
     /// solution and may not attempt another, and one that attempted a member may not judge a rival's.
     /// Verifying several members is no rivalry: one verifier may judge them all.
-    fn rival(&self, s: &TaskState, session: &str, node: &str, named: impl Fn(&str) -> bool) -> bool {
+    fn rival(&self, s: &TaskState, who: Actor) -> bool {
         let Some((mine, g)) = self.member_of(&s.task) else { return false };
         let verifying = s.task.role == Role::Verify;
         let rivals = |t: &str| {
@@ -572,10 +725,10 @@ impl Board {
                 .and_then(|o| Some((o.task.role, self.member_of(&o.task)?)))
                 .is_some_and(|(role, (m, og))| og == g && m != mine && !(verifying && role == Role::Verify))
         };
-        self.spans
-            .iter()
-            .filter(|sp| rivals(&sp.task))
-            .any(|sp| sp.by == session || (same_node(&sp.node, node) && self.drones.get(&sp.by).is_some_and(|d| named(d))))
+        self.spans.iter().filter(|sp| rivals(&sp.task)).any(|sp| {
+            same_node(&sp.node, who.node)
+                && (sp.by == who.session || self.drone(&sp.node, &sp.by).is_some_and(|d| d == who.drone || self.drone(who.node, who.session) == Some(d)))
+        })
     }
 
     /// The goal is reached: there are tasks, every one is verified (a work task by its verify task, a
@@ -590,27 +743,69 @@ impl Board {
             })
     }
 
-    /// Some task is held under a live lease at `now`: its done will open a verify task, its release
-    /// reopens it, and an abandoned one becomes claimable when the lease runs out.
-    pub fn in_flight(&self, now: i64) -> bool {
-        self.tasks.values().any(|s| s.live(now).is_some())
-    }
-
     /// The goal's participants at `now`, this node's clock (phase f F4): `node` (this one) and each node
     /// whose runner joined and has not left since (`members`) and of which this node held a new line
     /// within `SUSPECT_MS` (`nodes`: its runner beats every `BEAT_MS`, mod.rs `beat`), so a node killed or
     /// cut off drops out in seconds, measured on the observer's clock. Every coordination decision reads
-    /// this one set: a task's owner (`owner`, `left_to_owner`), the peer sessions in hand (`in_hand`),
-    /// whom a claim's confirm window waits for (mod.rs `across`). A node with no membership line (a
-    /// runner from before F4) takes part by the lease rule of before: a line held within `LEASE_MS`. An
-    /// engineer's lines (opens, releases, verdicts from the terminal) do not count: a node that only
-    /// opened the goal may run no drone, and a share of its own would wait last on every other node.
+    /// this one set: a task's owner (`owner`, `left_to_owner`), whom a claim's confirm window waits for (mod.rs `across`), whom a finish waits for (`settling`).
+    /// A node with no membership line (a runner from before F4) takes part by the lease rule of before: a
+    /// line held within `LEASE_MS`. An engineer's lines (opens, releases, verdicts from the terminal) do
+    /// not count: a node that only opened the goal may run no drone, and a share of its own would wait
+    /// last on every other node.
     pub fn participants<'a>(&'a self, node: &'a str, now: i64) -> BTreeSet<&'a str> {
+        self.heard_within(node, now, SUSPECT_MS)
+    }
+
+    /// The nodes that may still take a task at `now` (phase f F6, `stuck`): `participants` with `LEASE_MS`
+    /// for the suspicion window. A node cut off or suspended is no participant after `SUSPECT_MS` (no
+    /// claim waits for it), but it has not left: its drones may take the task once it is heard again, so a
+    /// task only it may take is no stuck until it left the goal or was silent for a whole lease. A cut
+    /// costs a wait, never a goal given up (with one drone a node, each node's verifier is the other's).
+    pub fn takers<'a>(&'a self, node: &'a str, now: i64) -> BTreeSet<&'a str> {
+        self.heard_within(node, now, LEASE_MS)
+    }
+
+    fn heard_within<'a>(&'a self, node: &'a str, now: i64, window: i64) -> BTreeSet<&'a str> {
         let taking_part = |n: &str, held: i64| match self.members.get(n) {
-            Some(&(join, leave)) => join > leave && now.saturating_sub(held) <= SUSPECT_MS,
+            Some(&(join, leave)) => join > leave && now.saturating_sub(held) <= window,
             None => now.saturating_sub(held) <= LEASE_MS,
         };
         self.nodes.iter().filter(|(n, held)| !n.is_empty() && taking_part(n, **held)).map(|(n, _)| n.as_str()).chain([node]).collect()
+    }
+
+    /// Whether node `n` said in its current run that it may not take `task` (`DECLINES`, since its newest
+    /// join): what `stuck` and `left_to_owner` read of another node's repo scope, approvals and commits.
+    pub fn declines(&self, n: &str, task: &str) -> bool {
+        let joined = self.members.get(n).map_or(i64::MIN, |(join, _)| *join);
+        self.declined.get(&(n.to_string(), task.to_string())).is_some_and(|ms| *ms > joined)
+    }
+
+    /// Whether `n` is in the goal and writes watermarks (phase f F5): a runner that can say what it held.
+    fn speaks(&self, n: &str) -> bool {
+        self.members.get(n).is_some_and(|(join, leave)| join > leave) && self.watermarks.contains_key(n)
+    }
+
+    /// Whom a finish `here` still waits for at `now` (phase f F6): the other participants that speak
+    /// (`speaks`) whose newest finished line (`finishes`) is missing, written before their node's newest
+    /// join (another run's), names another integration than the board's newest, or has a line of its node
+    /// before it not held here yet. Empty, the finished board is a stable prefix: each participant wrote,
+    /// under its lock, that its own board was finished at this integration, and every line it wrote
+    /// before that is here, so none of them can still add a line that changes it (`FINISHED`) unless a
+    /// line from outside the participants reaches it first (a suspected node's late done, an engineer's
+    /// open: termination detection with crashes needs the failure detector, Mittal et al. 2008). A
+    /// participant from before F5 is not waited for; one from F5 writes no finished line and is waited for
+    /// until it leaves (it ends on its own fold, as before). Empty on a board with no integration.
+    pub fn settling<'a>(&'a self, here: &'a str, now: i64) -> Vec<&'a str> {
+        let Some(i) = &self.integrated else { return Vec::new() };
+        let joined = |n: &str| self.members.get(n).map_or(i64::MIN, |(join, _)| *join);
+        let wrote = |n: &str| self.finishes.get(n).is_some_and(|f| f.complete && f.integration == i.task && f.ms > joined(n));
+        self.participants(here, now).into_iter().filter(|n| *n != here && self.speaks(n) && !wrote(n)).collect()
+    }
+
+    /// The goal is finished on a stable prefix at `now` as `here` reads it (phase f F6): `finished`, and
+    /// no participant can still change it (`settling`). The only finish a runner ends on or exits 0 for.
+    pub fn finished_for_good(&self, here: &str, now: i64) -> bool {
+        self.finished() && self.settling(here, now).is_empty()
     }
 
     /// Whom a claim `here` stamped `ms` still waits for at `now` before it is final (phase f F5): (the other
@@ -624,9 +819,8 @@ impl Board {
     /// detector reads within the lease) is in the second list: nothing makes a claim final against it
     /// (hive/mod.rs `across` waits for its mesh round, as before F5; the monotone results make that safe).
     pub fn unconfirmed<'a>(&'a self, here: &'a str, ms: i64, now: i64) -> (Vec<&'a str>, Vec<&'a str>) {
-        let speaks = |n: &str| self.members.get(n).is_some_and(|(join, leave)| join > leave) && self.watermarks.contains_key(n);
         let others: Vec<&str> = self.participants(here, now).into_iter().filter(|n| *n != here).collect();
-        let (speaking, mute): (Vec<&str>, Vec<&str>) = others.into_iter().partition(|n| speaks(n));
+        let (speaking, mute): (Vec<&str>, Vec<&str>) = others.into_iter().partition(|n| self.speaks(n));
         let past = |n: &str| self.watermarks.get(n).and_then(|w| w.get(here)).is_some_and(|w| *w >= ms);
         (speaking.into_iter().filter(|n| !past(n)).collect(), mute)
     }
@@ -638,6 +832,16 @@ impl Board {
         let joined = self.members.get(node).map_or(i64::MIN, |(join, _)| *join);
         self.sessions.get(&(node.to_string(), drone.to_string())).is_some_and(|(started, settled)| started > settled && *started > joined)
     }
+}
+
+/// The integration `here` is to say its board is finished at (phase f F6, `FINISHED`; hive/mod.rs
+/// `finish_line`): the newest, while `b` is finished and `here`'s run has not said so for it since its
+/// join. None otherwise.
+pub fn finish_due<'a>(b: &'a Board, here: &str) -> Option<&'a str> {
+    let i = b.integrated.as_ref().filter(|_| b.finished())?;
+    let joined = b.members.get(here).map_or(i64::MIN, |(join, _)| *join);
+    let said = b.finishes.get(here).is_some_and(|f| f.integration == i.task && f.ms > joined);
+    (!said).then_some(i.task.as_str())
 }
 
 /// An integration is due: every task is verified (integrate tasks included: none open, held or blocked)
@@ -978,12 +1182,16 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
     keyed.sort_by_key(|a| a.0);
     let mut b = Board { watermarks: watermarks(&keyed), ..Board::default() };
     // Every claim line, taken or not (phase f F5): a done or verdict written under one is for good.
-    let claims: BTreeSet<(&str, &str, i64)> = keyed.iter().filter(|(_, e)| e.ev == Ev::Claim).map(|(_, e)| (e.task.as_str(), e.by.as_str(), e.ms)).collect();
+    let claims: BTreeSet<(&str, &str, &str, i64)> =
+        keyed.iter().filter(|(_, e)| e.ev == Ev::Claim).map(|(_, e)| (e.task.as_str(), e.node.as_str(), e.by.as_str(), e.ms)).collect();
     // When this node held each node's newest join and leave (`Local::left`): local, beside `members`.
     let mut member_held: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // Each node's newest finished line, and each task's newest stuck line (phase f F6), in the fold's order.
+    let mut finished: BTreeMap<&str, &Event> = BTreeMap::new();
+    let mut stuck_lines: BTreeMap<&str, (&Event, &str)> = BTreeMap::new();
     for e in keyed.iter().map(|(_, e)| *e) {
         if !e.drone.is_empty() {
-            b.drones.insert(e.by.clone(), e.drone.clone());
+            b.drones.insert((e.node.clone(), e.by.clone()), e.drone.clone());
         }
         if e.node.is_empty() || by_engineer(&e.by) {
             continue;
@@ -993,6 +1201,15 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
         let runner = e.ev == Ev::Heartbeat && e.task.is_empty() && e.by == "runner";
         if let Some(names) = runner.then(|| e.note.strip_prefix("drones")).flatten() {
             b.rosters.insert(e.node.clone(), (e.ms, names.split_whitespace().map(String::from).collect()));
+        }
+        if runner && e.note.strip_prefix(FINISHED).is_some_and(|r| r.starts_with(' ')) {
+            finished.insert(&e.node, e);
+        }
+        if let Some((task, why)) = runner.then(|| e.note.strip_prefix(STUCK).and_then(|r| r.strip_prefix(' '))).flatten().and_then(|r| r.split_once(' ')) {
+            stuck_lines.insert(task, (e, why));
+        }
+        if let Some(task) = runner.then(|| e.note.strip_prefix(DECLINES).and_then(|r| r.strip_prefix(' '))).flatten() {
+            b.declined.insert((e.node.clone(), task.to_string()), e.ms);
         }
         if runner && (e.note == JOIN || e.note == LEAVE) {
             let (stamps, at) =
@@ -1020,6 +1237,18 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
         apply(&mut b, &mut fold, e);
     }
     accept_merged(&mut b);
+    let stamps = own_stamps(&keyed);
+    for (n, e) in finished {
+        let integration = e.note[FINISHED.len() + 1..].to_string();
+        b.finishes.insert(n.to_string(), Finish { ms: e.ms, integration, complete: complete(&stamps, e) });
+    }
+    let rejoined = |ms: i64| b.members.values().any(|(join, leave)| *join > ms && join > leave);
+    for (task, (e, why)) in stuck_lines {
+        let verified = b.tasks.get(task).is_some_and(|s| matches!(s.status, Status::Verified { .. }));
+        if !verified && !rejoined(e.ms) {
+            b.stuck.insert(task.to_string(), (e.ms, e.node.clone(), why.to_string()));
+        }
+    }
     // A runner's drone's claim lives while its node takes part (`Local::gone`): its membership after the
     // claim, and when this node last heard from it (never for this node's own, `fold_on`). Only on a
     // board every writing node of which joined: a node from before F4 folds a takeover within the lease
@@ -1031,7 +1260,7 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
     }
     for s in b.tasks.values_mut() {
         let Status::Claimed { by, node, since, .. } = &s.status else { continue };
-        let (Some(&(join, leave)), true) = (b.members.get(node), b.drones.get(by).is_some_and(|d| !d.is_empty())) else { continue };
+        let (Some(&(join, leave)), true) = (b.members.get(node), b.drones.get(&(node.clone(), by.clone())).is_some_and(|d| !d.is_empty())) else { continue };
         if join == i64::MIN {
             continue;
         }
@@ -1058,22 +1287,11 @@ type Key = (i64, u8, [u8; 32], [u8; 32]);
 /// ahead than P's clock may go, `AHEAD_MS`, says nothing of P's later stamps). A function of the set of
 /// lines (S1).
 fn watermarks(keyed: &[(Key, &Event)]) -> BTreeMap<String, BTreeMap<String, i64>> {
-    let mut stamps: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
-    let mut anchors: Vec<&Event> = Vec::new();
-    for (i, (k, e)) in keyed.iter().enumerate() {
-        if e.node.is_empty() || (i > 0 && keyed[i - 1].0 == *k) {
-            continue;
-        }
-        stamps.entry(e.node.as_str()).or_default().push(e.ms);
-        if e.seq.is_some() {
-            anchors.push(e);
-        }
-    }
+    let stamps = own_stamps(keyed);
     let mut out: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-    for e in anchors {
+    for (_, e) in keyed.iter().filter(|(_, e)| !e.node.is_empty() && e.seq.is_some()) {
         let marks = out.entry(e.node.clone()).or_default();
-        let held = stamps.get(e.node.as_str()).map_or(0, |v| v.partition_point(|m| *m < e.ms)) as u64;
-        if Some(held) != e.seq {
+        if !complete(&stamps, e) {
             continue;
         }
         for (x, m) in e.marks.iter().filter(|(_, m)| **m < e.ms) {
@@ -1084,12 +1302,31 @@ fn watermarks(keyed: &[(Key, &Event)]) -> BTreeMap<String, BTreeMap<String, i64>
     out
 }
 
+/// Each node's stamps of the lines in the fold's order, each line once (two copies are adjacent there).
+fn own_stamps<'a>(keyed: &[(Key, &'a Event)]) -> BTreeMap<&'a str, Vec<i64>> {
+    let mut stamps: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+    for (i, (k, e)) in keyed.iter().enumerate() {
+        if !e.node.is_empty() && (i == 0 || keyed[i - 1].0 != *k) {
+            stamps.entry(e.node.as_str()).or_default().push(e.ms);
+        }
+    }
+    stamps
+}
+
+/// Whether every line `e`'s node wrote before it is held (its `seq` lines of the node stamped below it,
+/// `own_stamps`): a node's stamps rise strictly in its file, so those are all of them. False on a line
+/// from before F5 (no `seq`).
+fn complete(stamps: &BTreeMap<&str, Vec<i64>>, e: &Event) -> bool {
+    let held = stamps.get(e.node.as_str()).map_or(0, |v| v.partition_point(|m| *m < e.ms)) as u64;
+    Some(held) == e.seq
+}
+
 /// What `apply` keeps beside the board while it folds: the open span of each task's holder (an index
 /// into `Board::spans`), every claim line (`fold_on`), and the rework round each claim line was made in.
 struct Fold<'a> {
     open_span: BTreeMap<TaskId, usize>,
-    claims: BTreeSet<(&'a str, &'a str, i64)>,
-    rounds: BTreeMap<(String, String, i64), u32>,
+    claims: BTreeSet<(&'a str, &'a str, &'a str, i64)>,
+    rounds: BTreeMap<(String, String, String, i64), u32>,
 }
 
 impl Fold<'_> {
@@ -1097,7 +1334,7 @@ impl Fold<'_> {
     /// one (`Event::claim`) and that claim line is on the board (phase f F5). Taken or lost in this fold,
     /// the writer's fold gave it the task when it wrote `e`.
     fn permanent(&self, e: &Event) -> Option<i64> {
-        e.claim.filter(|c| self.claims.contains(&(e.task.as_str(), e.by.as_str(), *c)))
+        e.claim.filter(|c| self.claims.contains(&(e.task.as_str(), e.node.as_str(), e.by.as_str(), *c)))
     }
 }
 
@@ -1137,7 +1374,8 @@ fn close(b: &mut Board, open_span: &mut BTreeMap<TaskId, usize>, task: &str, (to
 /// one the fold never took (its claim lost here) is added. One tenure per claim either way.
 fn settle(b: &mut Board, e: &Event, claim: i64) {
     let end = Span { task: e.task.clone(), by: e.by.clone(), node: e.node.clone(), from_ms: claim, to_ms: Some(e.ms), end: Some(e.ev) };
-    match b.spans.iter_mut().find(|sp| sp.task == e.task && sp.by == e.by && sp.from_ms == claim && sp.end.is_none() && sp.to_ms.is_some()) {
+    match b.spans.iter_mut().find(|sp| sp.task == e.task && Actor::of(e).is(&sp.node, &sp.by) && sp.from_ms == claim && sp.end.is_none() && sp.to_ms.is_some())
+    {
         Some(sp) => *sp = end,
         None => b.spans.push(end),
     }
@@ -1176,12 +1414,11 @@ fn written_with(t: &Task) -> Option<&str> {
     t.of.as_deref().or_else(|| t.from.as_ref().and(t.id.strip_suffix(".fix")))
 }
 
-/// The holder of a claimed task, whatever its lease.
-fn holder(s: &TaskState) -> Option<&str> {
-    match &s.status {
-        Status::Claimed { by, .. } => Some(by),
-        _ => None,
-    }
+/// Whether `e`'s writer holds `s` in the fold, whatever its lease: the holder's session on the holder's
+/// node (phase f F8, `Actor::is`: before, a line of another node's session of the same name, two
+/// integrators' `integrate-d1-<ms>` in one ms, renewed, finished or judged the other's claim).
+fn holds(s: &TaskState, e: &Event) -> bool {
+    matches!(&s.status, Status::Claimed { by, node, .. } if Actor::of(e).is(node, by))
 }
 
 fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
@@ -1198,12 +1435,12 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
             // the attempt it judged (`Event::head`).
             if let Some(w) = written_with(def) {
                 let end = if def.of.is_some() { Ev::Done } else { Ev::Rejected };
-                if !b.spans.iter().any(|sp| sp.task == w && sp.by == e.by && sp.to_ms == Some(e.ms) && sp.end == Some(end)) {
+                if !b.spans.iter().any(|sp| sp.task == w && Actor::of(e).is(&sp.node, &sp.by) && sp.to_ms == Some(e.ms) && sp.end == Some(end)) {
                     return;
                 }
                 // A fix task only with the rejection that closed its integration: a later one for good (an
                 // integrator whose claim lost in this fold) is an attempt only and opens nothing.
-                let closed = matches!(b.tasks.get(w).map(|s| &s.status), Some(Status::Verified { by, ms }) if *by == e.by && *ms == e.ms);
+                let closed = matches!(b.tasks.get(w).map(|s| &s.status), Some(Status::Verified { by, node, ms }) if Actor::of(e).is(node, by) && *ms == e.ms);
                 if def.of.is_none() && !closed {
                     return;
                 }
@@ -1236,11 +1473,11 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         }
         Ev::Claim => {
             let Some(s) = b.tasks.get(&e.task) else {
-                b.lost.push((e.by.clone(), e.task.clone(), e.ms));
+                b.lost.push((e.by.clone(), e.node.clone(), e.task.clone(), e.ms));
                 return;
             };
-            f.rounds.insert((e.task.clone(), e.by.clone(), e.ms), s.rework);
-            if holder(s) == Some(e.by.as_str()) {
+            f.rounds.insert((e.task.clone(), e.node.clone(), e.by.clone(), e.ms), s.rework);
+            if holds(s, e) {
                 // Claimed by itself already, no rival's claim taken since: a heartbeat (`claimable_at`).
                 if let Some(s) = b.tasks.get_mut(&e.task)
                     && let Status::Claimed { renewed, .. } = &mut s.status
@@ -1252,9 +1489,9 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
             }
             // A takeover of a holder whose node the claimant saw gone (`takes`) needs no lapsed lease: only
             // that the renewal it names is still the holder's last one here.
-            let takes = matches!(s.status, Status::Claimed { renewed, .. } if e.takes == Some(renewed) && e.ms > renewed);
-            if !(s.claimable_at(e.ms) || takes) || !deps_met(&b.tasks, &s.task) || b.barred(s, &e.by, &e.drone, &e.node) {
-                b.lost.push((e.by.clone(), e.task.clone(), e.ms));
+            // Taken exactly when its writer is `eligible` for the task on the line's stamp (phase f F8).
+            if !eligible(b, s, Actor::of(e), At::Line { ms: e.ms, takes: e.takes }) {
+                b.lost.push((e.by.clone(), e.node.clone(), e.task.clone(), e.ms));
                 return;
             }
             // The previous holder's lease expired: its tenure ends at its last sign of life.
@@ -1272,7 +1509,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         Ev::Heartbeat | Ev::Progress => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
             // The holder's, with no rival's claim taken since: it renews, whatever the gap (`claimable_at`).
-            let live = holder(s) == Some(e.by.as_str());
+            let live = holds(s, e);
             if let (true, Status::Claimed { renewed, .. }) = (live, &mut s.status) {
                 *renewed = e.ms;
                 s.local.renewed = s.local.renewed.max(seen(e));
@@ -1283,7 +1520,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         }
         Ev::Done => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            let held = holder(s) == Some(e.by.as_str());
+            let held = holds(s, e);
             if !held && permanent.is_none() {
                 return;
             }
@@ -1296,11 +1533,11 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
             // or a takeover of a node wrongly suspected): an attempt all the same. It is the task's done
             // when it is of the round open now and no attempt of that round is done yet (the holder it
             // displaces is told at its next hook); else one more attempt of a done task.
-            let round = f.rounds.get(&(e.task.clone(), e.by.clone(), claim)).copied().unwrap_or(s.rework);
+            let round = f.rounds.get(&(e.task.clone(), e.node.clone(), e.by.clone(), claim)).copied().unwrap_or(s.rework);
             let current = held || (round == s.rework && matches!(s.status, Status::Open | Status::Claimed { .. }));
             s.attempts.push(Attempt { by: e.by.clone(), node: e.node.clone(), claim, done: e.ms, head: e.head.clone(), verified: false });
             if current {
-                s.status = Status::Done { by: e.by.clone(), ms: e.ms };
+                s.status = Status::Done { by: e.by.clone(), node: e.node.clone(), ms: e.ms };
                 s.local.status = seen(e);
                 s.author = Some(e.by.clone());
                 if !e.note.is_empty() {
@@ -1319,7 +1556,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         }
         Ev::Verified | Ev::Rejected => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            let held = holder(s) == Some(e.by.as_str());
+            let held = holds(s, e);
             if !matches!(s.task.role, Role::Verify | Role::Integrate) || (!held && permanent.is_none()) {
                 return;
             }
@@ -1331,7 +1568,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
                 _ => permanent.unwrap_or(e.ms),
             };
             if first {
-                s.status = Status::Verified { by: e.by.clone(), ms: e.ms };
+                s.status = Status::Verified { by: e.by.clone(), node: e.node.clone(), ms: e.ms };
                 s.local.status = seen(e);
                 if e.ev == Ev::Rejected {
                     s.last_progress = format!("rejected: {}", e.note);
@@ -1375,7 +1612,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
                 // Verified for good: the first verdict that passed an attempt decides the status and its
                 // time, which a later verdict, a rework's claim or a rejection never moves.
                 if !matches!(w.status, Status::Verified { .. }) {
-                    w.status = Status::Verified { by: e.by.clone(), ms: e.ms };
+                    w.status = Status::Verified { by: e.by.clone(), node: e.node.clone(), ms: e.ms };
                     w.local.status = seen(e);
                     w.accepted = Some(e.task.clone());
                     w.accepted_attempt = Some(judged);
@@ -1386,7 +1623,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
                 // suspicion, a node not yet a participant) the done can move to the other one as its
                 // earlier-stamped line arrives, and the rejection's effect must not move with it (S2').
                 let attempt = w.attempts.iter().find(|a| (a.by.as_str(), a.done) == (judged.0.as_str(), judged.1));
-                let round = attempt.and_then(|a| f.rounds.get(&(w.task.id.clone(), a.by.clone(), a.claim)).copied());
+                let round = attempt.and_then(|a| f.rounds.get(&(w.task.id.clone(), a.node.clone(), a.by.clone(), a.claim)).copied());
                 round.is_none_or(|r| r == w.rework)
             } {
                 w.status = Status::Open;
@@ -1399,7 +1636,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         }
         Ev::Released => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            let mine = holder(s) == Some(e.by.as_str());
+            let mine = holds(s, e);
             let engineer = by_engineer(&e.by) && matches!(s.status, Status::Claimed { .. } | Status::Blocked { .. });
             if mine || engineer {
                 s.status = Status::Open;
@@ -1408,7 +1645,7 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
         }
         Ev::Blocked => {
             let Some(s) = b.tasks.get_mut(&e.task) else { return };
-            if holder(s) == Some(e.by.as_str()) {
+            if holds(s, e) {
                 s.status = Status::Blocked { by: e.by.clone(), note: e.note.clone() };
                 close(b, open_span, &e.task, (e.ms, seen(e)), Some(Ev::Blocked));
             }
@@ -1416,28 +1653,55 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
     }
 }
 
-/// The live claim of `session` at `now`, if any (one per drone: the CLI and the handover refuse a second).
-pub fn holding<'a>(b: &'a Board, session: &str, now: i64) -> Option<&'a TaskState> {
-    b.tasks.values().filter(|s| s.live(now).is_some_and(|(by, _, _)| by == session)).max_by_key(|s| s.live(now).map(|(_, _, since)| since))
+impl TaskState {
+    /// Whether `session` of node `here` holds this task live at `now` (`live`): its session on its node
+    /// (phase f F8; `of_node`: a claim from before nodes were stamped is this node's).
+    pub fn held_by(&self, here: &str, session: &str, now: i64) -> bool {
+        self.live(now).is_some_and(|(by, node, _)| by == session && of_node(node, here))
+    }
 }
 
-/// Whether `session`'s claim of `task` stamped `claim` ended in a done the fold keeps (phase f F5: an
-/// attempt for good, though the claim itself lost in this fold to a rival's that arrived later).
-pub fn attempted(b: &Board, session: &str, task: &str, claim: i64) -> bool {
-    b.tasks.get(task).is_some_and(|s| s.attempts.iter().any(|a| a.by == session && a.claim == claim))
+/// The live claim of `session` of node `here` at `now`, if any (one per drone: the CLI and the handover
+/// refuse a second).
+pub fn holding<'a>(b: &'a Board, here: &str, session: &str, now: i64) -> Option<&'a TaskState> {
+    b.tasks.values().filter(|s| s.held_by(here, session, now)).max_by_key(|s| s.live(now).map(|(_, _, since)| since))
 }
 
-/// The tasks `session` lost a claim on after `ms` (a race, or a claim the board did not allow).
-pub fn lost_since(b: &Board, session: &str, ms: i64) -> Vec<TaskId> {
-    let mut out: Vec<TaskId> = b.lost.iter().filter(|(by, _, at)| by == session && *at > ms).map(|(_, t, _)| t.clone()).collect();
+/// Whether `session` of node `here`'s claim of `task` stamped `claim` ended in a done the fold keeps
+/// (phase f F5: an attempt for good, though the claim itself lost in this fold to a rival's that
+/// arrived later).
+pub fn attempted(b: &Board, here: &str, session: &str, task: &str, claim: i64) -> bool {
+    b.tasks.get(task).is_some_and(|s| s.attempts.iter().any(|a| a.by == session && of_node(&a.node, here) && a.claim == claim))
+}
+
+/// The claims `session` of node `here` lost (a race, or a claim the board did not allow): (task, stamp).
+pub fn lost_by<'a>(b: &'a Board, here: &'a str, session: &'a str) -> impl Iterator<Item = (&'a TaskId, i64)> + 'a {
+    b.lost.iter().filter(move |(by, node, _, _)| by == session && of_node(node, here)).map(|(_, _, t, ms)| (t, *ms))
+}
+
+/// The tasks `session` of node `here` lost a claim on after `ms`.
+pub fn lost_since(b: &Board, here: &str, session: &str, ms: i64) -> Vec<TaskId> {
+    let mut out: Vec<TaskId> = lost_by(b, here, session).filter(|(_, at)| *at > ms).map(|(t, _)| t.clone()).collect();
     out.dedup();
     out
 }
 
-/// Whether `session` of `drone` on `node` may claim `s` at `now` (the fold's rules a-c: open or
-/// expired, dependencies verified, not barred).
-pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, node: &str, now: i64) -> bool {
-    s.claimable(now) && deps_met(&b.tasks, &s.task) && !b.barred(s, session, drone, node)
+/// Whether `who` may claim `s` at `now`, this node's clock: `eligible` there.
+pub fn claimable_by(b: &Board, s: &TaskState, who: Actor, now: i64) -> bool {
+    eligible(b, s, who, At::Now(now))
+}
+
+/// Whether a session of `who` would go for `s` at `now` (`next_for`'s candidates, run.rs `Offer`): it
+/// may claim it (`eligible`), `allowed` lets it here, and it is not another node's task left to that
+/// node's idle drones (`left_to_owner`, among `live`, the participants). Never true where `eligible` is
+/// false (phase f F8): every offer and pick is a claim the fold would take.
+fn open_among(b: &Board, live: &BTreeSet<&str>, s: &TaskState, who: Actor, now: i64, allowed: &impl Fn(&TaskState) -> bool) -> bool {
+    claimable_by(b, s, who, now) && allowed(s) && !left_to_owner(b, live, s, who.node, now)
+}
+
+/// `open_among` among the participants at `now` (`Board::participants`).
+pub fn open_for(b: &Board, s: &TaskState, who: Actor, now: i64, allowed: impl Fn(&TaskState) -> bool) -> bool {
+    open_among(b, &b.participants(who.node, now), s, who, now, &allowed)
 }
 
 /// The task `session` of `drone` on `node` in `repo` should take next at `now`, among those `allowed`
@@ -1462,43 +1726,86 @@ pub fn claimable_by(b: &Board, s: &TaskState, session: &str, drone: &str, node: 
 /// Another node's task is left to its owner while one of the owner's idle drones will take it
 /// (`left_to_owner`), so an idle drone here does not race the owner's for it (d3-accept2: node b's
 /// tasks all went to node a's drones, and b's sessions ran empty); a busy owner's tasks still spill.
-pub fn next_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
-    pick(b, session, drone, node, repo, now, allowed).map(|p| p.free.unwrap_or(p.first))
+pub fn next_for<'a>(b: &'a Board, who: Actor, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
+    pick(b, who, repo, now, allowed).map(|p| p.free.unwrap_or(p.first))
 }
 
 /// `next_for` without its last resort: None when every task `drone` may claim is one an idle drone of
 /// its node before it takes, so a runner leaves it to that drone instead of starting a session that
 /// would race it (two drones woken by one change of the board, run.rs `idle_wait`); `taken_before`
 /// says whether that is so.
-pub fn free_for<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
-    pick(b, session, drone, node, repo, now, allowed).and_then(|p| p.free)
+pub fn free_for<'a>(b: &'a Board, who: Actor, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<&'a TaskState> {
+    pick(b, who, repo, now, allowed).and_then(|p| p.free)
 }
 
-/// Whether a task `drone` may claim is taken by an idle drone of its node before it (`free_for`): one
-/// that drone will claim, so there is work in hand on the board.
-pub fn taken_before(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> bool {
-    pick(b, "", drone, node, repo, now, allowed).is_some_and(|p| p.free.is_none())
+/// The tasks no node that may still take one can take at `now`, as `here` reads `b` (phase f F6): (task,
+/// why). A drone with nothing open to it ends on these (run.rs `Ending::Stuck`) instead of waiting for
+/// ever; with none it waits however long the board stays unfinished (no local quiet ends it: Dijkstra &
+/// Scholten 1980, Safra EWD998, termination is detected, never inferred from a quiet prefix). A task is
+/// stuck when it is blocked (an engineer reopens it), when a dep is not on the board, or when it is
+/// claimable with its deps met and no running drone of any of `takers` may take it: barred (a verify
+/// task of a node's work, with no drone of another node left; a group's rival), or not allowed on the
+/// node (its checks not approved there, another repo's): here by `allowed`, on another node by its
+/// `DECLINES` line since its newest join (`declines_due`; with none it may, so its line is waited for).
+/// A node's running drones are its newest roster's (its drones that ended on a budget or a fault take
+/// nothing); a node with no roster may take anything it did not decline. A drone ends on these only
+/// once nothing else on the board can move (`moving`). The constraint must have held for `SUSPECT_MS` since the
+/// task became claimable here (`claimable_since`): a peer that started a moment later is heard within
+/// that (its join and roster are one write), so a run is not given up on a join still on its way.
+/// Not a safety rule: at 0 a stuck ends a run early and non-zero, at infinity a run waits on a dead
+/// peer (the lease bounds `takers` instead); no result and no exit 0 depends on it. Drinking
+/// philosophers' progress condition made explicit (Chandy & Misra 1984): a constrained task's eligible
+/// set must stay non-empty while it is open, and an empty one is shown, not waited out. Integrate tasks
+/// are none (integrate.rs runs them on any node).
+pub fn stuck(b: &Board, here: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Vec<(TaskId, String)> {
+    let takers = b.takers(here, now);
+    let takes = |s: &TaskState, n: &str| if n == here { allowed(s) } else { !b.declines(n, &s.task.id) };
+    let may = |s: &TaskState, n: &str| takes(s, n) && b.rosters.get(n).is_none_or(|(_, r)| r.iter().any(|d| !b.barred(s, Actor::new(n, d, ""))));
+    let names = takers.iter().copied().collect::<Vec<_>>().join(", ");
+    let mut out = Vec::new();
+    for s in b.tasks.values().filter(|s| s.task.role != Role::Integrate) {
+        let why = match &s.status {
+            Status::Blocked { note, .. } => Some(format!("blocked{}", if note.is_empty() { String::new() } else { format!(": {note}") })),
+            _ if !s.claimable(now) => None,
+            _ => match s.task.deps.iter().find(|d| !b.tasks.contains_key(*d)) {
+                Some(d) => Some(format!("needs {d}, which is not on the board")),
+                None if !deps_met(&b.tasks, &s.task) || now.saturating_sub(claimable_since(b, s)) <= SUSPECT_MS => None,
+                None if takers.iter().any(|n| may(s, n)) => None,
+                None => Some(format!("no running drone of the nodes in the goal ({names}) may take it")),
+            },
+        };
+        out.extend(why.map(|w| (s.task.id.clone(), w)));
+    }
+    out
 }
 
-/// Whether the work `drone` of `node` could take is in hand at `now`, so an idle drone waits on it
-/// instead of ending (run.rs `open_to`): a task is held (`Board::in_flight`), a live peer's session
-/// started and has not claimed or ended (`Board::sessions`: it is about to hold one, also a task this
-/// drone may not claim, such as its own work's verify task, whose verdict may open a rework it can
-/// take), one it may claim is left to another node's idle drones (`left_to_another`: d3-accept3, a
-/// peer's session took 12 to 15 s to claim, and the drone here ended on idle polls while the task it
-/// was waiting for was hidden from it), or one is an idle drone's of its node before it
-/// (`taken_before`, which `free_for` leaves out). The wait on a peer is bounded by a lease, not
-/// seconds: a session counts, and a task is left to it, only while it has neither claimed nor ended
-/// (or for `OWNER_GRACE_MS` after the task became claimable), and only while its node takes part in the
-/// goal (`Board::participants`, phase f F4: a runner beats every few seconds). A peer stopped
-/// mid-session without its session end is waited on for `SUSPECT_MS`, as its claims are (`Local::gone`).
-pub fn in_hand(b: &Board, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> bool {
-    let live = b.participants(node, now);
-    let starting = b.sessions.keys().any(|(n, d)| n != node && live.contains(n.as_str()) && b.starting(n, d));
-    b.in_flight(now)
-        || starting
-        || b.tasks.values().any(|s| claimable_by(b, s, "", drone, node, now) && allowed(s) && left_to_owner(b, &live, s, node, now))
-        || taken_before(b, drone, node, repo, now, &allowed)
+/// The tasks `here` is to say it may not take at `now` (phase f F6, `DECLINES`; hive/mod.rs
+/// `decline_lines`): each claimable one, deps met, not an integrate task, that `allowed` refuses on this
+/// node and that its run has not declined since its join. Another node's `stuck` counts this node out
+/// of such a task only by this line: without it, two nodes that may each not take a task would each
+/// leave it to the other and wait for ever. A decline stands for the run: a check approved here later
+/// lets this node's drones take the task (`allowed` is read again), while a peer may have ended stuck
+/// on it (liveness only: the task stays on the board).
+pub fn declines_due(b: &Board, here: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Vec<TaskId> {
+    let joined = b.members.get(here).map_or(i64::MIN, |(join, _)| *join);
+    let said = |s: &TaskState| b.declined.get(&(here.to_string(), s.task.id.clone())).is_some_and(|ms| *ms > joined);
+    b.tasks
+        .values()
+        .filter(|s| s.task.role != Role::Integrate && s.claimable(now) && deps_met(&b.tasks, &s.task) && !allowed(s) && !said(s))
+        .map(|s| s.task.id.clone())
+        .collect()
+}
+
+/// Whether a task not `stuck` can still change the board at `now` (phase f F6): one held under a live
+/// lease (its done, its release or its expiry is to come), or one claimable with its deps met (a drone
+/// of some taker may take it, or `stuck`'s grace is on it). Each change may open work a waiting drone
+/// can take (a verify task, a rework, a dependant), so a drone ends on a stuck only once none can: a
+/// stuck task anywhere is no reason to give up the rest of the board. Every other unfinished task waits
+/// on one of these or on a stuck one (a done task on its verify task, an open one on its deps), so with
+/// none the board changes only by a line from outside the goal's work (an engineer's, a joiner's).
+pub fn moving(b: &Board, now: i64, stuck: &[(TaskId, String)]) -> bool {
+    let is_stuck = |s: &TaskState| stuck.iter().any(|(t, _)| *t == s.task.id);
+    b.tasks.values().any(|s| !is_stuck(s) && (s.live(now).is_some() || (s.claimable(now) && deps_met(&b.tasks, &s.task))))
 }
 
 /// What `next_for` found: the first task the drone may claim that no idle drone before it takes, and
@@ -1508,7 +1815,8 @@ struct Pick<'a> {
     first: &'a TaskState,
 }
 
-fn pick<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<Pick<'a>> {
+fn pick<'a>(b: &'a Board, who: Actor, repo: &str, now: i64, allowed: impl Fn(&TaskState) -> bool) -> Option<Pick<'a>> {
+    let node = who.node;
     let live = b.participants(node, now);
     let class = |s: &TaskState| (repo.is_empty() || !s.task.repo.eq_ignore_ascii_case(repo), s.task.role.urgency());
     let key = |s: &TaskState| {
@@ -1518,17 +1826,17 @@ fn pick<'a>(b: &'a Board, session: &str, drone: &str, node: &str, repo: &str, no
         };
         (class(s), place, s.task.id.clone())
     };
-    let open = |s: &TaskState, sess: &str, d: &str| claimable_by(b, s, sess, d, node, now) && allowed(s) && !left_to_owner(b, &live, s, node, now);
+    let open = |s: &TaskState, sess: &str, d: &str| open_among(b, &live, s, Actor::new(node, d, sess), now, &allowed);
     let mut order: Vec<&TaskState> = b.tasks.values().collect();
     order.sort_by_cached_key(|s| key(s));
-    let first = *order.iter().find(|s| open(s, session, drone))?;
+    let first = *order.iter().find(|s| open(s, who.session, who.drone))?;
     let mut taken: BTreeSet<&str> = BTreeSet::new();
-    for d in idle_before(b, drone, node, now) {
+    for d in idle_before(b, who.drone, node, now) {
         if let Some(t) = order.iter().find(|s| !taken.contains(s.task.id.as_str()) && open(s, "", &d)) {
             taken.insert(&t.task.id);
         }
     }
-    let free = order.iter().copied().find(|s| !taken.contains(s.task.id.as_str()) && open(s, session, drone));
+    let free = order.iter().copied().find(|s| !taken.contains(s.task.id.as_str()) && open(s, who.session, who.drone));
     Some(Pick { free, first })
 }
 
@@ -1545,9 +1853,9 @@ fn idle_before(b: &Board, drone: &str, node: &str, now: i64) -> Vec<String> {
     let busy: BTreeSet<usize> = b
         .tasks
         .values()
-        .filter_map(|s| s.live(now).filter(|(_, at, _)| same_node(at, node)))
-        .filter_map(|(by, _, _)| b.drones.get(by).filter(|d| d.as_str() != drone))
-        .map(|d| slot(d))
+        .filter_map(|s| s.live(now).filter(|(_, at, _)| of_node(at, node)))
+        .filter_map(|(by, at, _)| b.drone(at, by).filter(|d| *d != drone))
+        .map(slot)
         .collect();
     (0..slot(drone)).filter(|&i| !busy.contains(&i) && !ended(i)).map(|i| format!("d{}", i + 1)).collect()
 }
@@ -1567,19 +1875,29 @@ pub fn left_to_another(b: &Board, s: &TaskState, node: &str, now: i64) -> bool {
 /// less than `OWNER_GRACE_MS` ago, the time for its runner to notice and its start to reach here. The
 /// tasks past the owner's idle drones spill at once, and an owner that did not take one (its drones
 /// barred, slow to start, or its session went for something else and claimed it or ended) loses no
-/// work: the task goes to whoever is idle. A node without a roster (no runner) keeps nothing back.
+/// work: the task goes to whoever is idle. A node without a roster (no runner) keeps nothing back, nor
+/// one that declined `s` (`Board::declines`; before phase f F7 an owner lacking a verify task's commits
+/// kept it back from the node that holds them, each node's drone waiting out the grace and then running
+/// sessions the owner's started ones kept refused).
 fn left_to_owner(b: &Board, live: &BTreeSet<&str>, s: &TaskState, node: &str, now: i64) -> bool {
     let Some(o) = owner(live, &s.task.id).filter(|o| *o != node) else { return false };
+    // An owner that declined it (phase f F7: its commits cannot reach it; F6: its scope, its approvals)
+    // takes it with none of its drones: it is no one's to wait for.
+    if b.declines(o, &s.task.id) {
+        return false;
+    }
     let Some((_, roster)) = b.rosters.get(o) else { return false };
-    let busy: BTreeSet<&str> =
-        b.tasks.values().filter_map(|t| t.live(now).filter(|(_, at, _)| *at == o)).filter_map(|(by, _, _)| b.drones.get(by).map(String::as_str)).collect();
+    let busy: BTreeSet<&str> = b.tasks.values().filter_map(|t| t.live(now).filter(|(_, at, _)| *at == o)).filter_map(|(by, at, _)| b.drone(at, by)).collect();
     let starting = |d: &str| b.starting(o, d);
     let fresh = now - claimable_since(b, s) < OWNER_GRACE_MS;
     let idle: Vec<&str> =
-        roster.iter().map(String::as_str).filter(|d| !busy.contains(d) && (fresh || starting(d)) && claimable_by(b, s, "", d, o, now)).collect();
+        roster.iter().map(String::as_str).filter(|d| !busy.contains(d) && (fresh || starting(d)) && claimable_by(b, s, Actor::new(o, d, ""), now)).collect();
     let key = |t: &TaskState| (t.task.role.urgency(), t.opened_ms, t.task.id.clone());
-    let ahead =
-        b.tasks.values().filter(|t| owner(live, &t.task.id) == Some(o) && key(t) < key(s) && idle.iter().any(|d| claimable_by(b, t, "", d, o, now))).count();
+    let ahead = b
+        .tasks
+        .values()
+        .filter(|t| owner(live, &t.task.id) == Some(o) && key(t) < key(s) && idle.iter().any(|d| claimable_by(b, t, Actor::new(o, d, ""), now)))
+        .count();
     ahead < idle.len()
 }
 
@@ -1676,6 +1994,14 @@ pub fn render(b: &Board, now: i64, width: usize) -> String {
                 line.push_str(&format!("  ({note})"));
             }
             out.push_str(&cut(&line, width));
+            out.push('\n');
+        }
+    }
+    // Phase f F6: what a runner gave up on, and why, until a node that may take it joins.
+    if !b.stuck.is_empty() {
+        out.push_str(&format!("stuck ({})\n", b.stuck.len()));
+        for (t, (_, _, why)) in &b.stuck {
+            out.push_str(&cut(&format!("  {t:<8} {why}"), width));
             out.push('\n');
         }
     }
@@ -1808,9 +2134,8 @@ mod tests {
         let b = fold(&[open, ev(Ev::Claim, "t1", "sa", 0), ev(Ev::Heartbeat, "t1", "sa", LEASE_MS - 1), ev(Ev::Claim, "t1", "sb", LEASE_MS + 1)]);
         assert_eq!(holder_of(&b, "t1").as_deref(), Some("sa"), "a heartbeat renews the lease");
         assert!(b.tasks["t1"].live(LEASE_MS - 1 + LEASE_MS).is_some() && b.tasks["t1"].live(2 * LEASE_MS).is_none());
-        assert!(b.in_flight(2 * LEASE_MS - 1) && !b.in_flight(2 * LEASE_MS), "in flight while the lease lives");
         let b = fold(&[Event::open(task("t2"), "engineer:e", 0), ev(Ev::Claim, "t2", "sa", 0), ev(Ev::Done, "t2", "sa", 1)]);
-        assert!(!b.in_flight(2), "a done task is not in flight");
+        assert!(b.tasks["t2"].live(2).is_none(), "a done task has no holder");
     }
 
     /// `e` written on `node`, first held here at `seen` (this node's clock).
@@ -1906,9 +2231,9 @@ mod tests {
         for p in permutations(&lines(Some(10))) {
             let b = fold(&p);
             let s = &b.tasks["t1"];
-            assert_eq!(s.status, Status::Done { by: "sa".into(), ms: 20 });
+            assert_eq!(s.status, Status::Done { by: "sa".into(), node: String::new(), ms: 20 });
             assert_eq!(s.attempts.iter().map(|a| (a.by.as_str(), a.claim, a.done)).collect::<Vec<_>>(), [("sa", 10, 20)]);
-            assert!(b.tasks.contains_key("t1.v1") && attempted(&b, "sa", "t1", 10));
+            assert!(b.tasks.contains_key("t1.v1") && attempted(&b, "", "sa", "t1", 10));
             assert!(b.spans.iter().any(|sp| sp.by == "sa" && sp.end == Some(Ev::Done)) && b.spans.iter().any(|sp| sp.by == "sb" && sp.to_ms == Some(20)));
         }
         let old = fold(&lines(None));
@@ -1971,7 +2296,7 @@ mod tests {
         }
         let b = fold(&[early, late].concat());
         assert_eq!(b.tasks["t1"].attempts.len(), 2);
-        assert!(claimable_by(&b, &b.tasks["t1"], "sc", "d2", "", 50), "the rework is claimable");
+        assert!(claimable_by(&b, &b.tasks["t1"], Actor::new("", "d2", "sc"), 50), "the rework is claimable");
     }
 
     #[test]
@@ -2046,9 +2371,9 @@ mod tests {
         let now = 3001 + SUSPECT_MS;
         let (peer, own) = (fold(&lines), fold_on(&lines, "A"));
         assert_eq!(peer, own, "one board");
-        assert!(claimable_by(&peer, &peer.tasks["t1"], "sa2", "d2", "A", now) && takes(&peer.tasks["t1"], now).is_some(), "a peer suspects A");
+        assert!(claimable_by(&peer, &peer.tasks["t1"], Actor::new("A", "d2", "sa2"), now) && takes(&peer.tasks["t1"], now).is_some(), "a peer suspects A");
         let s = &own.tasks["t1"];
-        assert!(!claimable_by(&own, s, "sa2", "d2", "A", now) && takes(s, now).is_none(), "A's own sibling may not take t1");
+        assert!(!claimable_by(&own, s, Actor::new("A", "d2", "sa2"), now) && takes(s, now).is_none(), "A's own sibling may not take t1");
         assert!(s.live(now).is_some_and(|(by, _, _)| by == "sa1") && s.live(1000 + LEASE_MS + 1).is_none(), "held for its lease");
         let left = fold_on(&[lines.clone(), vec![held_on("A", 3500, runner(LEAVE, 3500))]].concat(), "A");
         assert!(left.tasks["t1"].claimable(3500), "its leave");
@@ -2145,7 +2470,7 @@ mod tests {
         let base = vec![Event::open(task("t1"), "engineer:e", 0), Event::open(t2, "engineer:e", 0)];
         let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t2", "sa", 1)]].concat());
         assert_eq!(holder_of(&b, "t2"), None);
-        assert_eq!(lost_since(&b, "sa", 0), ["t2"]);
+        assert_eq!(lost_since(&b, "", "sa", 0), ["t2"]);
         let mut v = verify("t1", "sa", 3);
         v.id = "t1.v1".into();
         let done = vec![ev(Ev::Claim, "t1", "sa", 1), ev(Ev::Done, "t1", "sa", 2), Event::open(v, "sa", 2)];
@@ -2204,7 +2529,7 @@ mod tests {
     fn the_author_cannot_claim_its_verify_task() {
         let b = fold(&[done_t1(), vec![ev(Ev::Claim, "t1.v1", "sa", 3)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(!claimable_by(&b, &b.tasks["t1.v1"], "sa", "", "", 3) && claimable_by(&b, &b.tasks["t1.v1"], "sb", "", "", 3));
+        assert!(!claimable_by(&b, &b.tasks["t1.v1"], Actor::new("", "", "sa"), 3) && claimable_by(&b, &b.tasks["t1.v1"], Actor::new("", "", "sb"), 3));
         assert_eq!(b.tasks["t1"].author.as_deref(), Some("sa"));
     }
 
@@ -2217,10 +2542,10 @@ mod tests {
         // A later iteration of d1 (a new session) claims the verify task: it does not take effect.
         let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa2", 3).with_drone("d1")]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        assert!(b.barred(&b.tasks["t1.v1"], "sa2", "", "") && !claimable_by(&b, &b.tasks["t1.v1"], "sa2", "", "", 3));
-        assert!(b.barred(&b.tasks["t1.v1"], "sa3", "d1", "") && !b.barred(&b.tasks["t1.v1"], "sa3", "d2", ""));
+        assert!(b.barred(&b.tasks["t1.v1"], Actor::new("", "", "sa2")) && !claimable_by(&b, &b.tasks["t1.v1"], Actor::new("", "", "sa2"), 3));
+        assert!(b.barred(&b.tasks["t1.v1"], Actor::new("", "d1", "sa3")) && !b.barred(&b.tasks["t1.v1"], Actor::new("", "d2", "sa3")));
         // A fresh iteration of d1 that wrote no line yet is not offered it either.
-        assert_eq!(next_for(&b, "sa3", "d1", "", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "its own verify task is not offered to d1");
+        assert_eq!(next_for(&b, Actor::new("", "d1", "sa3"), "", 3, |_| true).map(|s| s.task.id.as_str()), None, "its own verify task is not offered to d1");
         let b = fold(&[base, vec![ev(Ev::Claim, "t1.v1", "sb", 3).with_drone("d2"), ev(Ev::Verified, "t1.v1", "sb", 4)]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
         assert!(!b.finished() && integration_due(&b), "every task verified: the combined tree is checked next");
@@ -2318,11 +2643,15 @@ mod tests {
             Event::open(v, "sx", 2),
         ];
         let b = fold(&events);
-        assert_eq!(next_for(&b, "me", "", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"), "verify before work in the same repo");
-        assert_eq!(next_for(&b, "sx", "", "", "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
-        assert_eq!(next_for(&b, "me", "", "", "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
-        assert_eq!(next_for(&b, "me", "", "", "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
-        assert_eq!(next_for(&b, "me", "", "", "other", 3, |s| s.task.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(
+            next_for(&b, Actor::new("", "", "me"), "app", 3, |_| true).map(|s| s.task.id.as_str()),
+            Some("t0.v1"),
+            "verify before work in the same repo"
+        );
+        assert_eq!(next_for(&b, Actor::new("", "", "sx"), "app", 3, |_| true).map(|s| s.task.id.as_str()), Some("z-mine"), "never the own verify task");
+        assert_eq!(next_for(&b, Actor::new("", "", "me"), "elsewhere", 3, |_| true).map(|s| s.task.id.as_str()), Some("t0.v1"));
+        assert_eq!(next_for(&b, Actor::new("", "", "me"), "other", 3, |_| true).map(|s| s.task.id.as_str()), Some("a-other"), "same repo first");
+        assert_eq!(next_for(&b, Actor::new("", "", "me"), "other", 3, |s| s.task.repo != "other").map(|s| s.task.id.as_str()), Some("t0.v1"));
     }
 
     fn integrate(id: &str) -> Task {
@@ -2354,7 +2683,7 @@ mod tests {
         assert_eq!(integrate_id(&b), "integrate.2");
         // While it is held, nothing is due and the goal is not reached.
         let b = fold(&[verified_t1(), claimed_integrate("integrate.1", 5)].concat());
-        assert!(!b.finished() && !integration_due(&b) && b.in_flight(6));
+        assert!(!b.finished() && !integration_due(&b) && b.tasks.values().any(|s| s.live(6).is_some()));
         // A verdict from someone not holding it changes nothing.
         let b = fold(&[verified_t1(), claimed_integrate("integrate.1", 5), vec![verdict(Ev::Verified, "integrate.1", "sx", 6, "m1")]].concat());
         assert!(!b.finished() && b.integrated.is_none() && holder_of(&b, "integrate.1").as_deref() == Some("si"));
@@ -2455,10 +2784,10 @@ mod tests {
     #[test]
     fn a_fresh_session_of_the_author_drone_is_not_offered_its_verify_task() {
         let b = fold(&done_by_d1_on(""));
-        assert!(b.spans.iter().all(|s| s.by != "fresh") && !b.drones.contains_key("fresh"), "the board has no line of the fresh session");
+        assert!(b.spans.iter().all(|s| s.by != "fresh") && !b.drones.keys().any(|(_, s)| s == "fresh"), "the board has no line of the fresh session");
         assert_eq!(b.tasks["t1.v1"].task.not_by, ["sa", "d1"]);
-        assert_eq!(next_for(&b, "fresh", "d1", "", "", 3, |_| true).map(|s| s.task.id.as_str()), None, "the runner's drone name bars it");
-        assert_eq!(next_for(&b, "fresh", "d2", "", "", 3, |_| true).map(|s| s.task.id.as_str()), Some("t1.v1"));
+        assert_eq!(next_for(&b, Actor::new("", "d1", "fresh"), "", 3, |_| true).map(|s| s.task.id.as_str()), None, "the runner's drone name bars it");
+        assert_eq!(next_for(&b, Actor::new("", "d2", "fresh"), "", 3, |_| true).map(|s| s.task.id.as_str()), Some("t1.v1"));
     }
 
     #[test]
@@ -2473,9 +2802,12 @@ mod tests {
         // A claimant line without a node (from before nodes were stamped) bars conservatively.
         let b = fold(&[base.clone(), vec![ev(Ev::Claim, "t1.v1", "sa3", 3).with_drone("d1")]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
-        // The author's session bars on every node.
-        let b = fold(&[base, vec![on(ev(Ev::Claim, "t1.v1", "sa", 3), "B")]].concat());
+        // The author's session bars on its node; since phase f F8 a session of that name on B is another
+        // (`Actor`: a name says who only with its node).
+        let b = fold(&[base.clone(), vec![on(ev(Ev::Claim, "t1.v1", "sa", 3), "A")]].concat());
         assert_eq!(holder_of(&b, "t1.v1"), None);
+        let b = fold(&[base, vec![on(ev(Ev::Claim, "t1.v1", "sa", 3), "B")]].concat());
+        assert_eq!(holder_of(&b, "t1.v1").as_deref(), Some("sa"));
         assert!(same_node("A", "A") && same_node("", "B") && !same_node("A", "B"));
     }
 
@@ -2494,7 +2826,8 @@ mod tests {
             let b = fold(p);
             assert_eq!(b, first, "the same board in every arrival order");
             assert_eq!(holder_of(&b, "t1").as_deref(), Some("sb"), "the earlier claim, on B, holds");
-            assert_eq!(lost_since(&b, "sa", 0), ["t1"], "A's claim lost; its later done is ignored");
+            assert_eq!(lost_since(&b, "A", "sa", 0), ["t1"], "A's claim lost; its later done is ignored");
+            assert!(lost_since(&b, "B", "sa", 0).is_empty(), "a session of that name on B lost nothing");
             // No two tenures of one task overlap.
             let spans: Vec<&Span> = b.spans.iter().filter(|s| s.task == "t1").collect();
             for (i, x) in spans.iter().enumerate() {
@@ -2518,7 +2851,7 @@ mod tests {
             let mut picks = Vec::new();
             for d in 1..=k {
                 let (session, drone) = (format!("{node}{d}"), format!("d{d}"));
-                let Some(t) = next_for(&fold(&lines), &session, &drone, node, "", 100, |_| true).map(|s| s.task.id.clone()) else { break };
+                let Some(t) = next_for(&fold(&lines), Actor::new(node, &drone, &session), "", 100, |_| true).map(|s| s.task.id.clone()) else { break };
                 lines.push(on(ev(Ev::Claim, &t, &session, 100).with_drone(&drone), node));
                 picks.push(t);
             }
@@ -2582,14 +2915,17 @@ mod tests {
                     let live: BTreeSet<&str> = nodes.iter().copied().collect();
                     let share = (0..m).filter(|&i| owner(&live, &id(i)) == Some("A")).count();
                     let b = fold(&lines);
-                    let at_once: Vec<TaskId> =
-                        (1..=3).map_while(|d| next_for(&b, &format!("A{d}"), &format!("d{d}"), "A", "", 100, |_| true).map(|s| s.task.id.clone())).collect();
+                    let at_once: Vec<TaskId> = (1..=3)
+                        .map_while(|d| next_for(&b, Actor::new("A", &format!("d{d}"), &format!("A{d}")), "", 100, |_| true).map(|s| s.task.id.clone()))
+                        .collect();
                     let distinct: BTreeSet<&TaskId> = at_once.iter().collect();
                     // Past the share they spill one after another into the far end: apart while there are tasks.
                     assert!(distinct.len() >= 3.min(m), "{nodes:?} m={m} share={share} trial {trial}: {at_once:?}");
                     let mut seen = Vec::new();
                     for d in 1..=3 {
-                        let Some(t) = next_for(&fold(&lines), &format!("A{d}"), &format!("d{d}"), "A", "", 100, |_| true).map(|s| s.task.id.clone()) else {
+                        let Some(t) =
+                            next_for(&fold(&lines), Actor::new("A", &format!("d{d}"), &format!("A{d}")), "", 100, |_| true).map(|s| s.task.id.clone())
+                        else {
                             break;
                         };
                         lines.push(on(ev(Ev::Claim, &t, &format!("A{d}"), 100).with_drone(&format!("d{d}")), "A"));
@@ -2611,7 +2947,8 @@ mod tests {
         // t2.v1 too (a walk from d2's place landed on it: a lost claim). Seeing d1's claim first, d2
         // picks the same.
         let lines = [worked("t1", "sa", "d1", 1), worked("t2", "sb", "", 2)].concat();
-        let pick = |lines: &[Event], d: usize| next_for(&fold(lines), &format!("A{d}"), &format!("d{d}"), "", "", 5, |_| true).map(|s| s.task.id.clone());
+        let pick =
+            |lines: &[Event], d: usize| next_for(&fold(lines), Actor::new("", &format!("d{d}"), &format!("A{d}")), "", 5, |_| true).map(|s| s.task.id.clone());
         assert_eq!((pick(&lines, 1), pick(&lines, 2)), (Some("t2.v1".into()), Some("t1.v1".into())));
         let seen = [lines.clone(), vec![ev(Ev::Claim, "t2.v1", "A1", 3).with_drone("d1")]].concat();
         assert_eq!(pick(&seen, 2), Some("t1.v1".into()));
@@ -2624,16 +2961,14 @@ mod tests {
         // something else, d2 may take it.
         let lines = vec![Event::open(task("t1"), "engineer:e", 1)];
         let b = fold(&lines);
-        assert_eq!(free_for(&b, "", "d1", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
-        assert!(!taken_before(&b, "d1", "", "", 5, |_| true));
-        assert_eq!(free_for(&b, "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), None);
-        assert!(taken_before(&b, "d2", "", "", 5, |_| true));
-        assert_eq!(next_for(&b, "A2", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        assert_eq!(free_for(&b, Actor::new("", "d1", ""), "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        assert_eq!(free_for(&b, Actor::new("", "d2", ""), "", 5, |_| true).map(|s| s.task.id.as_str()), None);
+        assert_eq!(next_for(&b, Actor::new("", "d2", "A2"), "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
         let busy = [lines.clone(), vec![Event::open(task("t0"), "engineer:e", 0), ev(Ev::Claim, "t0", "A1", 2).with_drone("d1")]].concat();
-        assert_eq!(free_for(&fold(&busy), "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
+        assert_eq!(free_for(&fold(&busy), Actor::new("", "d2", ""), "", 5, |_| true).map(|s| s.task.id.as_str()), Some("t1"));
         // A task d1 may not claim is d2's at once.
         let b = fold(&worked("w", "sx", "d1", 1));
-        assert_eq!(free_for(&b, "", "d2", "", "", 5, |_| true).map(|s| s.task.id.as_str()), Some("w.v1"));
+        assert_eq!(free_for(&b, Actor::new("", "d2", ""), "", 5, |_| true).map(|s| s.task.id.as_str()), Some("w.v1"));
     }
 
     #[test]
@@ -2647,7 +2982,7 @@ mod tests {
         let mut lines = vec![on(Event::open(plan, "engineer:e", 0), "A"), on(Event::open(task(&a), "engineer:e", 0), "A")];
         lines.extend(bs.iter().map(|t| on(Event::open(task(t), "engineer:e", 0), "A")));
         lines.extend([on(ev(Ev::Claim, "p", "A1", 1).with_drone("d1"), "A"), on(ev(Ev::Progress, "warm", "sB", 1), "B")]);
-        assert_eq!(next_for(&fold(&lines), "A2", "d2", "A", "", 2, |_| true).map(|s| s.task.id.clone()), Some(a));
+        assert_eq!(next_for(&fold(&lines), Actor::new("A", "d2", "A2"), "", 2, |_| true).map(|s| s.task.id.clone()), Some(a));
     }
 
     #[test]
@@ -2656,7 +2991,9 @@ mod tests {
         // reached it: each time two different tasks, the same ones either way.
         let opens: Vec<Event> = (1..=5).map(|i| on(Event::open(task(&format!("t{i}")), "engineer:e", i), "A")).collect();
         let claim = on(ev(Ev::Claim, "t1", "A1", 10).with_drone("d1"), "A");
-        let pick = |lines: &[Event], d: usize| next_for(&fold(lines), &format!("A{d}"), &format!("d{d}"), "A", "", 20, |_| true).map(|s| s.task.id.clone());
+        let pick = |lines: &[Event], d: usize| {
+            next_for(&fold(lines), Actor::new("A", &format!("d{d}"), &format!("A{d}")), "", 20, |_| true).map(|s| s.task.id.clone())
+        };
         let seen: Vec<Event> = opens.iter().cloned().chain([claim]).collect();
         assert_eq!((pick(&seen, 2), pick(&seen, 3)), (Some("t2".into()), Some("t3".into())), "both see d1's claim");
         assert_eq!((pick(&opens, 2), pick(&seen, 3)), (Some("t2".into()), Some("t3".into())), "d2 does not see it yet, d3 does");
@@ -2667,7 +3004,7 @@ mod tests {
         // The runner's newest line names d2 alone (d1 and d3 ended): d2 takes the oldest task, not the
         // second; with no such line every drone before it counts.
         let mut lines: Vec<Event> = (1..=3).map(|i| on(Event::open(task(&format!("t{i}")), "engineer:e", i), "A")).collect();
-        let pick = |lines: &[Event]| next_for(&fold(lines), "A2", "d2", "A", "", 20, |_| true).map(|s| s.task.id.clone());
+        let pick = |lines: &[Event]| next_for(&fold(lines), Actor::new("A", "d2", "A2"), "", 20, |_| true).map(|s| s.task.id.clone());
         assert_eq!(pick(&lines), Some("t2".into()));
         let all = ["d1", "d2", "d3"].map(String::from);
         lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 5).with_note(&roster_note(&all)), "A"));
@@ -2686,7 +3023,7 @@ mod tests {
         let bs: Vec<String> = (0..).map(|i| format!("b{i}")).filter(|t| owner(&live, t) == Some("B")).take(2).collect();
         let mut lines = vec![on(Event::open(task(&bs[0]), "engineer:e", 0), "A"), on(Event::open(task(&bs[1]), "engineer:e", 1), "A")];
         lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 1).with_note(&roster_note(&["d1".to_string()])), "B"));
-        let pick = |lines: &[Event], now: i64| next_for(&fold(lines), "A1", "d1", "A", "", now, |_| true).map(|s| s.task.id.clone());
+        let pick = |lines: &[Event], now: i64| next_for(&fold(lines), Actor::new("A", "d1", "A1"), "", now, |_| true).map(|s| s.task.id.clone());
         assert_eq!(pick(&lines[..1].iter().chain(&lines[2..]).cloned().collect::<Vec<_>>(), 5), None, "B's idle d1 takes its one task");
         assert_eq!(pick(&lines, 5), Some(bs[1].clone()), "B has one idle drone for two tasks: the second spills");
         // A's d2 took the second: the oldest is left to B's d1 within the grace, after it whoever is idle.
@@ -2716,41 +3053,115 @@ mod tests {
     }
 
     #[test]
-    fn a_task_left_to_a_peers_starting_session_is_in_hand() {
+    fn a_task_left_to_a_peers_starting_session_is_not_open_here() {
         // d3-accept3 W2: B's d1 started a session that had not claimed 12 s on; A's idle d1 saw nothing
-        // open and nothing in hand, and ended before B's claim. The task is not A's to take, and in hand.
+        // open, and ended before B's claim (phase f F6: it now waits while the goal is unfinished). The task
+        // is not A's to take while B's session is on its way to it.
         let live = BTreeSet::from(["A", "B"]);
         let t: String = (0..).map(|i| format!("b{i}")).find(|t| owner(&live, t) == Some("B")).unwrap();
         let roster = on(Event::new(Ev::Heartbeat, "", "runner", 1).with_note(&roster_note(&["d1".to_string()])), "B");
         let start = on(Event::new(Ev::Heartbeat, "", "runner", 2).with_note(&session_note("d1", true)), "B");
         let opened = vec![on(Event::open(task(&t), "engineer:e", 0), "A"), roster];
         let b = fold(&opened);
-        assert!(in_hand(&b, "d1", "A", "", 3, |_| true), "B's runner has OWNER_GRACE_MS to start a session for it");
-        assert!(!in_hand(&b, "d1", "A", "", 3, |s| s.task.id != t), "not when A may not claim it");
+        assert_eq!(
+            free_for(&b, Actor::new("A", "d1", ""), "", 3, |_| true).map(|s| s.task.id.clone()),
+            None,
+            "B's runner has OWNER_GRACE_MS to start a session for it"
+        );
         let started = [opened, vec![start]].concat();
         let at = 10 * OWNER_GRACE_MS;
         let b = fold(&started);
-        assert_eq!(free_for(&b, "", "d1", "A", "", at, |_| true).map(|s| s.task.id.clone()), None, "left to B's session");
-        assert!(!b.in_flight(at) && in_hand(&b, "d1", "A", "", at, |_| true), "in hand while B's session is on its way to it");
+        assert_eq!(free_for(&b, Actor::new("A", "d1", ""), "", at, |_| true).map(|s| s.task.id.clone()), None, "left to B's session");
         let ended = [started, vec![on(Event::new(Ev::Heartbeat, "", "runner", 9).with_note(&session_note("d1", false)), "B")]].concat();
         let b = fold(&ended);
-        assert_eq!(free_for(&b, "", "d1", "A", "", at, |_| true).map(|s| s.task.id.clone()), Some(t), "it ended without a claim");
-        assert!(!in_hand(&b, "d1", "A", "", at, |_| true));
+        assert_eq!(free_for(&b, Actor::new("A", "d1", ""), "", at, |_| true).map(|s| s.task.id.clone()), Some(t), "it ended without a claim");
     }
 
     #[test]
-    fn a_peers_starting_session_is_in_hand_for_a_drone_barred_from_its_task() {
-        // The first hive_mesh run: B's d1 authored w and may not verify it; A's session started on w.v1 and
-        // had not claimed. Nothing is B's to claim, held or left to A, yet its verdict may open a rework.
-        let mut lines = worked("w", "sB", "d1", 2).into_iter().map(|e| on(e, "B")).collect::<Vec<_>>();
-        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 3).with_note(&roster_note(&["d1".to_string()])), "A"));
-        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 4).with_note(&session_note("d1", true)), "A"));
-        let at = 10 * OWNER_GRACE_MS;
-        let b = fold(&lines);
-        assert_eq!(free_for(&b, "", "d1", "B", "", at, |_| true).map(|s| s.task.id.clone()), None, "B's d1 may not verify its own work");
-        assert!(!b.in_flight(at) && in_hand(&b, "d1", "B", "", at, |_| true), "A's session is about to hold w.v1");
-        lines.push(on(Event::new(Ev::Heartbeat, "", "runner", 9).with_note(&session_note("d1", false)), "A"));
-        assert!(!in_hand(&fold(&lines), "d1", "B", "", at, |_| true), "A's session ended without a claim");
+    fn a_task_no_running_drone_of_the_goal_may_take_is_stuck_until_one_joins() {
+        // Phase f F6. B's only drone d1 authored w: w.v1 is barred to it. While A runs a drone, w.v1 is
+        // A's to take and not stuck, whatever A's drone is doing; once A's roster is empty (its drone
+        // ended on its budget) or A left the goal, no running drone may take it, and once claimable for
+        // `SUSPECT_MS` it is stuck. A cut, a suspended A, is no stuck within the lease (`takers`). A join
+        // with a drone that may take it ends the stuck, also the stuck line's on the board.
+        let runner = |node: &str, ms: i64, note: &str| on(Event::new(Ev::Heartbeat, "", "runner", ms).with_note(note), node);
+        let d1 = || roster_note(&["d1".to_string()]);
+        let mut lines = vec![runner("B", 0, JOIN), runner("B", 0, &d1()), runner("A", 0, JOIN), runner("A", 0, &d1())];
+        lines.extend(worked("w", "sB", "d1", 2).into_iter().map(|e| on(e, "B")));
+        let at = 2 + SUSPECT_MS + 1;
+        let stuck_at = |lines: &[Event], now: i64| stuck(&fold_on(lines, "B"), "B", now, |_| true).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(stuck_at(&lines, at), Vec::<String>::new(), "A's d1 may verify it");
+        assert_eq!(stuck_at(&lines, LEASE_MS - 1), Vec::<String>::new(), "A silent but within the lease: a cut, not a stuck");
+        assert_eq!(stuck_at(&lines, LEASE_MS + 2), vec!["w.v1".to_string()], "A silent a whole lease");
+        let left = [lines.clone(), vec![runner("A", 3, LEAVE)]].concat();
+        assert_eq!(stuck_at(&left, 2 + SUSPECT_MS), Vec::<String>::new(), "claimable for no more than SUSPECT_MS");
+        assert_eq!(stuck_at(&left, at), vec!["w.v1".to_string()], "A left: only B's d1 runs, and it authored w");
+        let spent = [lines.clone(), vec![runner("A", 3, &roster_note(&[]))]].concat();
+        assert_eq!(stuck_at(&spent, at), vec!["w.v1".to_string()], "A's drone ended");
+        assert_eq!(stuck(&fold_on(&lines, "B"), "B", at, |s| s.task.id != "w.v1"), vec![], "not allowed here, A may take it");
+        // A says it may not take w.v1 (its checks not approved there): no running drone may. A decline
+        // from A's run before its newest join counts no more.
+        let declined = [lines.clone(), vec![runner("A", 3, &decline_note("w.v1"))]].concat();
+        assert_eq!(stuck_at(&declined, at), vec!["w.v1".to_string()], "A declined it");
+        assert_eq!(declines_due(&fold_on(&declined, "A"), "A", at, |s| s.task.id != "w.v1"), Vec::<String>::new(), "said once a run");
+        assert_eq!(declines_due(&fold_on(&lines, "A"), "A", at, |s| s.task.id != "w.v1"), vec!["w.v1".to_string()]);
+        let rejoined = [declined, vec![runner("A", 4, JOIN)]].concat();
+        assert_eq!(stuck_at(&rejoined, at), Vec::<String>::new(), "a new run of A judges it again");
+        // The runner says so on the board; a join of a node still in the goal clears it, and C's d1 may take w.v1.
+        let said = [left.clone(), vec![runner("B", at, &stuck_note("w.v1", "no running drone"))]].concat();
+        assert_eq!(fold(&said).stuck.get("w.v1").map(|(_, n, _)| n.as_str()), Some("B"));
+        assert!(render(&fold(&said), at, 120).contains("stuck (1)\n  w.v1     no running drone"), "{}", render(&fold(&said), at, 120));
+        let joined = [said, vec![runner("C", at + 1, JOIN), runner("C", at + 1, &d1())]].concat();
+        assert!(fold(&joined).stuck.is_empty(), "a join after it clears the stuck line");
+        assert_eq!(stuck_at(&joined, at + 2), Vec::<String>::new(), "C's d1 may take it");
+        // C leaves again without taking it: the line stands (`render` shows it), as the constraint does.
+        let gone = [joined, vec![runner("C", at + 2, LEAVE)]].concat();
+        assert_eq!(fold(&gone).stuck.get("w.v1").map(|(_, n, _)| n.as_str()), Some("B"), "a joiner that left clears nothing");
+        // One stuck task ends no drone while another task can still move (`moving`): a held one, or one
+        // claimable with its deps met; once neither is left, it does.
+        let st = vec![("w.v1".to_string(), String::new())];
+        let held = [left.clone(), vec![Event::open(task("z"), "engineer:e", 1), ev(Ev::Claim, "z", "sZ", at)]].concat();
+        assert!(moving(&fold_on(&held, "B"), at, &st) && moving(&fold_on(&left, "B"), at, &[]), "z held, w.v1 claimable");
+        assert!(!moving(&fold_on(&left, "B"), at, &st), "only w.v1 could move, and it is stuck");
+        // A blocked task is stuck at once; a dep not on the board too.
+        let blocked =
+            [lines.clone(), vec![Event::open(task("x"), "engineer:e", 1), ev(Ev::Claim, "x", "sX", 2), ev(Ev::Blocked, "x", "sX", 3).with_note("needs a key")]]
+                .concat();
+        assert!(stuck(&fold_on(&blocked, "B"), "B", 4, |_| true).contains(&("x".to_string(), "blocked: needs a key".to_string())));
+        let orphan = Task { deps: vec!["gone".into()], ..task("y") };
+        let b = fold_on(&[lines, vec![Event::open(orphan, "engineer:e", 1)]].concat(), "B");
+        assert_eq!(stuck(&b, "B", 2, |_| true), vec![("y".to_string(), "needs gone, which is not on the board".to_string())]);
+    }
+
+    #[test]
+    fn a_finish_is_for_good_once_every_participant_wrote_it_at_that_integration() {
+        // Phase f F6. A finished board on A: B is a participant that speaks (joined, writes watermarks).
+        // A finishes for good only once it holds B's finished line naming the board's integration, written
+        // in B's current run, with every line of B before it (a gap in B's lines keeps it settling).
+        let b_lines = |file: &[Event], notes: &[&str], at: i64| {
+            let ls = notes.iter().map(|n| Event { node: "B".into(), ..Event::new(Ev::Heartbeat, "", "runner", at).with_note(n) }).collect();
+            landing(file, ls)
+        };
+        let mut lines = vec![Event::open(task("t1"), "engineer:e", 0)];
+        lines.extend(b_lines(&lines, &[JOIN, &roster_note(&["d1".to_string()])], 1));
+        lines.extend([ev(Ev::Claim, "t1", "sa", 2), ev(Ev::Done, "t1", "sa", 3)]);
+        lines.extend([Event::open(verify("t1", "sa", 3), "sa", 3), ev(Ev::Claim, "t1.v1", "sv", 4), ev(Ev::Verified, "t1.v1", "sv", 5)]);
+        lines.extend([Event::open(Task { role: Role::Integrate, ..task("integrate.1") }, "si", 6), ev(Ev::Claim, "integrate.1", "si", 6)]);
+        lines.push(Event { head: "c0".into(), ..ev(Ev::Verified, "integrate.1", "si", 7) });
+        let now = 8;
+        let b = fold_on(&lines, "A");
+        assert!(b.finished() && !b.finished_for_good("A", now), "B wrote no finished line: {:?}", b.settling("A", now));
+        let beat = b_lines(&lines, &[BEAT], 8);
+        let fin = b_lines(&[lines.clone(), beat.clone()].concat(), &[&finished_note("integrate.1")], 9);
+        assert!(fold_on(&[lines.clone(), beat.clone(), fin.clone()].concat(), "A").finished_for_good("A", 10));
+        assert!(!fold_on(&[lines.clone(), fin.clone()].concat(), "A").finished_for_good("A", 10), "B's beat before it is not here");
+        let other = b_lines(&[lines.clone(), beat.clone()].concat(), &[&finished_note("integrate.0")], 9);
+        assert!(!fold_on(&[lines.clone(), beat.clone(), other].concat(), "A").finished_for_good("A", 10), "another integration");
+        let rejoin = b_lines(&[lines.clone(), beat.clone(), fin.clone()].concat(), &[JOIN], 10);
+        assert!(!fold_on(&[lines.clone(), beat.clone(), fin.clone(), rejoin].concat(), "A").finished_for_good("A", 11), "a new run of B");
+        let left = b_lines(&[lines.clone(), beat.clone()].concat(), &[LEAVE], 9);
+        assert!(fold_on(&[lines.clone(), beat, left].concat(), "A").finished_for_good("A", 10), "B left: no participant");
+        assert!(b.finished_for_good("A", 1 + SUSPECT_MS + 1), "B suspected: none waited for");
     }
 
     #[test]
@@ -2770,7 +3181,7 @@ mod tests {
             on(ev(Ev::Done, &w, "sB", 2), "B"),
             on(Event::open(v, "sB", 2), "B"),
         ];
-        let pick = |allowed: fn(&TaskState) -> bool| next_for(&fold(&lines), "A1", "d1", "A", "", 5, allowed).map(|s| s.task.id.clone());
+        let pick = |allowed: fn(&TaskState) -> bool| next_for(&fold(&lines), Actor::new("A", "d1", "A1"), "", 5, allowed).map(|s| s.task.id.clone());
         assert_eq!(pick(|_| true), Some(format!("{w}.v1")), "B's d1 may not verify its own work");
         assert_eq!(pick(|s| s.task.role != Role::Verify), None, "b is B's d1's");
     }
@@ -2781,7 +3192,7 @@ mod tests {
         let lines: Vec<Event> = ["c", "a", "b"].iter().enumerate().map(|(i, t)| on(Event::open(task(t), "engineer:e", 5 - i as i64), "A")).collect();
         let mut lines = [lines, vec![on(Event::open(task("d"), "engineer:e", 3), "A")]].concat();
         let mut picks = Vec::new();
-        while let Some(t) = next_for(&fold(&lines), "s", "", "A", "", 100, |_| true).map(|s| s.task.id.clone()) {
+        while let Some(t) = next_for(&fold(&lines), Actor::new("A", "", "s"), "", 100, |_| true).map(|s| s.task.id.clone()) {
             lines.push(on(ev(Ev::Claim, &t, &format!("s{t}"), 100), "A"));
             picks.push(t);
         }
@@ -2802,6 +3213,173 @@ mod tests {
             on(ev(Ev::Done, &v, "sb", 2), "B"),
             on(Event::open(verify(&v, "sb", 2), "sb", 2), "B"),
         ];
-        assert_eq!(next_for(&fold(&lines), "sa", "", "A", "", 3, |_| true).map(|s| s.task.id.clone()), Some(format!("{v}.v1")));
+        assert_eq!(next_for(&fold(&lines), Actor::new("A", "", "sa"), "", 3, |_| true).map(|s| s.task.id.clone()), Some(format!("{v}.v1")));
+    }
+
+    /// A seeded random board for `every_scheduling_predicate_is_derived_from_eligible` (no dependency:
+    /// splitmix64). Four work tasks (`t2` depending on `t1` in some boards, `g.g1` and `g.g2` one group),
+    /// then 4 to 27 lines at random gaps up to half a lease: claims (some naming a renewal they take
+    /// over), heartbeats, dones (with their verify task's open, barred to the author's session and drone,
+    /// some written under a claim of theirs), verdicts, releases and runners' joins. Writers are sessions
+    /// of a small pool on nodes A, B and none (a line from before nodes were stamped), so names collide
+    /// across nodes, as two nodes' integrators' did; each session is one drone's (`DRONES`) wherever it runs.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % n
+        }
+
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+
+    const NODES: [&str; 3] = ["A", "B", ""];
+    const SESSIONS: [&str; 4] = ["s1", "s2", "s3", "integrate-d1-7"];
+    const WORK: [&str; 4] = ["t1", "t2", "g.g1", "g.g2"];
+
+    fn drone_of(session: &str) -> &'static str {
+        match session {
+            "s1" | "integrate-d1-7" => "d1",
+            "s2" => "d2",
+            _ => "",
+        }
+    }
+
+    fn random_board(seed: u64) -> Vec<Event> {
+        let mut r = Rng(seed);
+        let mut t2 = task("t2");
+        if r.below(2) == 0 {
+            t2.deps = vec!["t1".into()];
+        }
+        let member = |id: &str| Task { group: Some("g".into()), ..task(id) };
+        let mut lines: Vec<Event> = [task("t1"), t2, member("g.g1"), member("g.g2")].into_iter().map(|t| on(Event::open(t, "engineer:e", 0), "A")).collect();
+        let tasks: Vec<String> = WORK.iter().flat_map(|w| [w.to_string(), format!("{w}.v1")]).collect();
+        let mut claims: Vec<(String, String, String, i64)> = Vec::new();
+        let mut ms = 0;
+        for _ in 0..4 + r.below(24) {
+            ms += 1 + r.below((LEASE_MS / 2) as u64) as i64;
+            let (node, by) = (r.pick(&NODES), r.pick(&SESSIONS));
+            let drone = drone_of(by);
+            let t = tasks[r.below(tasks.len() as u64) as usize].as_str();
+            let under = |claims: &[(String, String, String, i64)], t: &str| {
+                claims.iter().rev().find(|c| (c.0.as_str(), c.1.as_str(), c.2.as_str()) == (node, by, t)).map(|c| c.3)
+            };
+            let written: Vec<Event> = match r.below(8) {
+                0..=2 => {
+                    claims.push((node.into(), by.into(), t.into(), ms));
+                    let takes = (r.below(3) == 0).then(|| ms - 1 - r.below(LEASE_MS as u64) as i64);
+                    vec![Event { takes, ..ev(Ev::Claim, t, by, ms).with_drone(drone) }]
+                }
+                3 => vec![ev(Ev::Heartbeat, t, by, ms)],
+                4 => {
+                    let w = WORK[r.below(4) as usize];
+                    let claim = under(&claims, w).filter(|_| r.below(2) == 0);
+                    let v = Task { id: format!("{w}.v1"), role: Role::Verify, of: Some(w.into()), not_by: vec![by.into(), drone.into()], ..task("x") };
+                    vec![Event { head: format!("h{ms}"), claim, ..ev(Ev::Done, w, by, ms) }, Event::open(v, by, ms)]
+                }
+                5 => {
+                    let v = format!("{}.v1", WORK[r.below(4) as usize]);
+                    let claim = under(&claims, &v).filter(|_| r.below(2) == 0);
+                    let kind = if r.below(3) == 0 { Ev::Rejected } else { Ev::Verified };
+                    vec![Event { claim, ..ev(kind, &v, by, ms) }]
+                }
+                6 => vec![ev(Ev::Released, t, by, ms)],
+                _ if node.is_empty() => vec![],
+                _ => vec![ev(Ev::Heartbeat, "", "runner", ms).with_note(JOIN)],
+            };
+            lines.extend(written.into_iter().map(|e| on(e, node)));
+        }
+        lines
+    }
+
+    /// Phase f F8 (G6): over 250 random boards (`random_board`), as each of A and B folds them, at four
+    /// moments up to three leases past the last line, every scheduling predicate is `eligible` or a
+    /// narrowing of it, for every actor of the pool and a fresh session:
+    /// - `claimable_by` equals it at `now`;
+    /// - the fold takes a claim line exactly when its writer holds the task (a renewal) or is eligible on
+    ///   the line's stamp (`At::Line`): `apply` refolded with the line appended, for any `takes`;
+    /// - a claim `claimable_for` allows (hive/mod.rs, the check under the lock) and written as `claim`
+    ///   writes it (`claim_at`, `takes`, stamped above every line) is one the fold takes;
+    /// - `next_for` and `free_for` give only tasks `open_for` the actor, and something whenever one is;
+    ///   run.rs `Offer` offers exactly those, `free_for`'s first;
+    /// - the verdict's author check (`judges_own`, on the attempt its open was written with) is the bar.
+    ///
+    /// Fails with any of them read apart from `eligible` again: the fold's claim rule without the group
+    /// rival or a dep, `claimable_for` on the lease alone (an unmet dep written and lost), a holder
+    /// compared by session without its node (two nodes' `integrate-d1-7` renewing each other's claim).
+    #[test]
+    fn every_scheduling_predicate_is_derived_from_eligible() {
+        let mut fresh = 0u64;
+        for seed in 0..250u64 {
+            let lines = random_board(seed);
+            let last = lines.iter().map(|e| e.ms).max().unwrap_or(0);
+            let mut r = Rng(seed ^ 0x5eed);
+            for here in ["A", "B"] {
+                let b = fold_on(&lines, here);
+                let allowed = |s: &TaskState| s.task.id != "t2";
+                for now in [last, last + LEASE_MS / 2, last + LEASE_MS + 1, last + 3 * LEASE_MS] {
+                    for node in NODES {
+                        for session in SESSIONS.iter().copied().chain(["fresh", ""]) {
+                            let who = Actor::new(node, if session.is_empty() { "d2" } else { drone_of(session) }, session);
+                            let ctx = || format!("seed {seed}, {here} at {now}, {who:?}");
+                            let open: Vec<&str> = b.tasks.values().filter(|s| open_for(&b, s, who, now, allowed)).map(|s| s.task.id.as_str()).collect();
+                            for s in b.tasks.values() {
+                                let e = eligible(&b, s, who, At::Now(now));
+                                assert_eq!(claimable_by(&b, s, who, now), e, "{}: {}", ctx(), s.task.id);
+                                assert!(!open.contains(&s.task.id.as_str()) || e, "{}: {} open but not eligible", ctx(), s.task.id);
+                                if let (Some((by, done)), Some(w)) = (&s.of_attempt, s.task.of.as_ref().and_then(|w| b.tasks.get(w))) {
+                                    let a = w.attempts.iter().find(|a| (&a.by, a.done) == (by, *done)).unwrap();
+                                    let judged = (a.node.as_str(), a.by.as_str(), b.drone(&a.node, &a.by).unwrap_or_default());
+                                    assert_eq!(b.judges_own(s, who, judged), b.barred(s, who), "{}: {}", ctx(), s.task.id);
+                                }
+                                let allows = crate::hive::claimable_for(&b, &s.task.id, who, false, now);
+                                assert_eq!(allows, s.held_by(node, session, now) || e, "{}: {}", ctx(), s.task.id);
+                                if session.is_empty() || r.below(if allows { 6 } else { 24 }) != 0 {
+                                    continue;
+                                }
+                                // The line as hive/mod.rs `claim` writes it, then one at a random later stamp and takeover.
+                                let as_written = (claim_at(s, now).max(last + 1), takes(s, now));
+                                let random = (
+                                    last + 1 + r.below(3 * LEASE_MS as u64) as i64,
+                                    [None, takes(s, now), Some(r.below(last as u64 + 1) as i64)][r.below(3) as usize],
+                                );
+                                for (i, (ms, taking)) in [as_written, random].into_iter().enumerate() {
+                                    let c = Event { takes: taking, node: node.into(), ..ev(Ev::Claim, &s.task.id, session, ms).with_drone(who.drone) };
+                                    let refolded = fold_on(&[lines.clone(), vec![c.clone()]].concat(), here);
+                                    let taken = !refolded.lost.contains(&(session.to_string(), node.to_string(), s.task.id.clone(), ms));
+                                    let renews = matches!(&s.status, Status::Claimed { by, node: n, .. } if Actor::of(&c).is(n, by));
+                                    assert_eq!(
+                                        taken,
+                                        renews || eligible(&b, s, Actor::of(&c), At::Line { ms, takes: taking }),
+                                        "{}: {} claimed at {ms}",
+                                        ctx(),
+                                        s.task.id
+                                    );
+                                    assert!(i > 0 || !allows || taken, "{}: {} allowed under the lock, refused by the fold", ctx(), s.task.id);
+                                }
+                                fresh += 1;
+                            }
+                            if session.is_empty() {
+                                let o = super::super::run::Offer::of(&b, who.drone, node, "", now, allowed);
+                                assert_eq!(o.open.keys().map(String::as_str).collect::<Vec<_>>(), open, "{}", ctx());
+                                assert_eq!(o.task.map(|(t, _)| t), free_for(&b, who, "", now, allowed).map(|s| s.task.id.clone()), "{}", ctx());
+                            }
+                            let next = next_for(&b, who, "", now, allowed).map(|s| s.task.id.as_str());
+                            assert_eq!(next.is_some(), !open.is_empty(), "{}: next {next:?}, open {open:?}", ctx());
+                            assert!(next.is_none_or(|t| open.contains(&t)), "{}: next {next:?} not open", ctx());
+                            let free = free_for(&b, who, "", now, allowed).map(|s| s.task.id.as_str());
+                            assert!(free.is_none_or(|t| open.contains(&t)), "{}: free {free:?} not open", ctx());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fresh > 2000, "only {fresh} claims refolded");
     }
 }

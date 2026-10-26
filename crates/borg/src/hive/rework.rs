@@ -498,7 +498,10 @@ mod tests {
         let mut ev = vec![Event::open(task("t"), "engineer:e", 1)];
         ev.extend(attempt("t", 0, "d1", 10, V::Reject("wrong rounding")));
         let mut pass = attempt("t", 1, "d1", 20, V::Pass);
-        pass.last_mut().unwrap().node = "another-node".into();
+        // The verifier's claim and verdict on another node (phase f F8: its holder is its session there).
+        for e in pass.iter_mut().rev().take(2) {
+            e.node = "another-node".into();
+        }
         ev.extend(pass);
         // A node the goal synced to (held out, no oracle, no scores): its attempts wait, never recorded.
         let synced = Goal { held_out: true, ..goal(false) };

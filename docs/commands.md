@@ -287,14 +287,21 @@ overshoot by one session; a session cut off at `--iter-timeout`, or one that fai
 cost is charged the drone's dearest session so far (or the rest of its share). Drones run with every permission inside their worktree: run it on a repo you
 are willing to let them change. Every session is cut off at `--iter-timeout` (default 1800 s).
 
-A drone stops when the board is finished (every task verified and integrated), its share is spent, the
+A drone stops when the board is finished (every task verified and integrated) and every node in the
+goal said its board was too, its share is spent, the
 goal's budget is spent (by any node's drones: see [Across machines](#across-machines)), a session ended
 without naming its cost or at $0 (codex reports tokens only and a subscription model $0, so such a
 drone gets one session), two sessions
-in a row failed or timed out, two made no board progress, or nothing was open to it for three polls.
+in a row failed or timed out, two made no board progress, or, with nothing open to it, a task is stuck
+and nothing else on the board can move (no task held, none another drone may still take): no running
+drone of a node in the goal may take it (a verify task of this node's work with no other node's drone
+left, a blocked task, checks approved on no node in the goal; each node says on the board which tasks it
+may not take). The run prints each stuck task and why,
+and says so on the board (`borg hive board`); a node that joins and may take it takes it up. With
+nothing open and nothing stuck a drone waits, however long: a peer's line may open work for it.
 Whatever an ended session still held is released (the note names why), so no claim waits for its
 lease. A verify task is never claimed by a session of the drone that did the work. Exit 0 when the board
-is finished, 1 when it is not, 2 when a precondition fails: an unknown goal, `--drones` outside 1–20, a
+is finished for good (every node in the goal said so), 1 when it is not (a stuck task included), 2 when a precondition fails: an unknown goal, `--drones` outside 1–20, a
 goal without a budget, a repo outside the goal's, a harness that cannot run headless, a group with more
 attempts than `--drones` (see [Groups](#groups-of-attempts)), or another run of the goal still going (one
 at a time).
