@@ -257,7 +257,8 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
         let mut rows: Vec<&Drone> = c.drones.iter().collect();
         rows.sort_by_key(|d| (d.state == State::Ended, d.number));
         for d in rows {
-            let hive = c.hives.iter().flat_map(|v| &v.monitor.interactive).find(|r| r.session == d.p.session);
+            // The hive's rows name a session by its first 8 characters.
+            let hive = c.hives.iter().flat_map(|v| &v.monitor.interactive).find(|r| !r.session.is_empty() && d.p.session.starts_with(&r.session));
             let held = work.get(d.p.session.as_str()).map(|w| w.0.clone()).unwrap_or_default();
             let (word, task) = match hive {
                 Some(r) => match r.state.split_once(' ') {
@@ -338,8 +339,10 @@ fn verb(e: &Event) -> Option<(&'static str, St)> {
 }
 
 fn goal_lines(lines: &mut Vec<Ln>, v: &HiveView, now: i64) {
-    let total = v.tasks.len().max(1);
-    let verified = v.counts.get("verified").copied().unwrap_or(0);
+    // Work tasks only: verify and integrate tasks open as work finishes, and would move the total.
+    let work: Vec<_> = v.tasks.iter().filter(|t| t.role == "work").collect();
+    let total = work.len().max(1);
+    let verified = work.iter().filter(|t| t.status == "verified").count();
     let claimed = v.counts.get("claimed").copied().unwrap_or(0);
     let (state, st) = if v.finished {
         ("finished", St::Green)
@@ -354,7 +357,7 @@ fn goal_lines(lines: &mut Vec<Ln>, v: &HiveView, now: i64) {
             .add(St::Plain, "  ")
             .add(St::Bold, format!("GOAL {}  ", v.goal))
             .add(St::Green, bar(verified as f64 / total as f64, 20))
-            .add(St::Plain, format!(" {verified}/{} verified   ", v.tasks.len()))
+            .add(St::Plain, format!(" {verified}/{} verified   ", work.len()))
             .add(if spend >= 0.9 { St::Red } else { St::Magenta }, bar(spend, 10))
             .add(St::Plain, format!(" ${:.2} of ${:.2}   ", v.spent_usd, v.budget_usd))
             .add(st, format!("● {state}")),
