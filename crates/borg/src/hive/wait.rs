@@ -575,5 +575,7 @@ fn stopped(here: &Here, drone: &str) {
 
 /// The drone's leave once its single goal is finished for good (interactive.rs `leave_quietly`).
 fn interactive_leave(here: &Here, session: &str, hs: &HiveSession) -> i32 {
-    i32::from(interactive::leave_quietly(here, session, hs).is_err())
+    // Stamped now, not at the waiter's start: a streaming waiter (omp, opencode, codex) lives for hours.
+    let here = Here { home: here.home.clone(), cwd: here.cwd.clone(), now: learn::now_ms() };
+    i32::from(interactive::leave_quietly(&here, session, hs).is_err())
 }
