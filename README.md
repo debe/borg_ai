@@ -148,7 +148,7 @@ flowchart LR
 
 Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
-What syncs and what stays is under [Privacy](#privacy). `borg top` lists the team's running drones;
+What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones and hive goals, like Unix `top`;
 `borg steer` sends them a signed instruction. Set up: `borg setup --team` or `--join`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 

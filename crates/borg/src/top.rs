@@ -1,9 +1,10 @@
-//! `borg top [--dir DIR] [--watch] [--json]`: the drones of each collective, one screen.
+//! `borg top [--dir DIR] [--once] [--json]`: the drones of each collective, one screen.
 //!
 //! Local drones come from presence records (presence.rs), remote ones from what the mesh daemon
 //! last heard from members (only for a collective that may sync). Drones are designated by start
 //! order across both, Borg style: "Two of Five". `--dir` shows only the collective DIR routes to;
-//! otherwise every collective on this machine that has drones. `--watch` redraws every 2 s,
+//! otherwise every collective on this machine that has drones. On a terminal it is a live screen until
+//! `q` (top_live.rs); piped, or with `--once`, it prints the text once (`--watch` reprints it every 2 s);
 //! `--json` prints the same data for scripts.
 
 use std::path::Path;
@@ -166,6 +167,35 @@ fn routes(dir: Option<&str>) -> Result<Vec<Route>, String> {
     })
 }
 
+/// Every collective to show with its drones, hive goals and their board events (top_live.rs).
+pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>, String> {
+    let mut out = Vec::new();
+    for r in routes(dir)? {
+        let Route::Collective { name, home, share } = &r else { continue };
+        presence::prune(home, now);
+        let mut ds = drones(home, collective::may_sync(&r), now);
+        for d in &mut ds {
+            d.p.engineer = collective::aliases().display(&d.p.engineer);
+        }
+        let hives = crate::hive::view::all(home, now);
+        if ds.is_empty() && hives.is_empty() && dir.is_none() {
+            continue;
+        }
+        let events = hives
+            .iter()
+            .flat_map(|v| {
+                crate::hive::board::read(&crate::hive::tasks_path(home, &v.goal))
+                    .into_iter()
+                    .filter(|e| !crate::hive::board::is_beat(e))
+                    .map(|e| (v.goal.clone(), e))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.push(crate::top_live::Coll { name: name.clone(), share: *share, drones: ds, hives, events });
+    }
+    Ok(out)
+}
+
 fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String> {
     let mut text = String::new();
     let mut all = Vec::new();
@@ -206,6 +236,9 @@ pub fn main(args: &[&str]) -> i32 {
     let flag = |f: &str| args.contains(&f);
     let dir = args.iter().position(|a| *a == "--dir").and_then(|i| args.get(i + 1)).copied();
     let (watch, json_out) = (flag("--watch"), flag("--json"));
+    if !json_out && !flag("--once") && unsafe { libc::isatty(1) } == 1 {
+        return crate::top_live::run(dir);
+    }
     loop {
         match screen(dir, json_out, learn::now_ms()) {
             Ok(s) if watch => print!("\x1b[2J\x1b[H{s}"),
@@ -222,6 +255,11 @@ pub fn main(args: &[&str]) -> i32 {
         let _ = std::io::stdout().flush();
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn tests_fixture() -> Vec<Drone> {
+    tests::fixture()
 }
 
 #[cfg(test)]
@@ -246,7 +284,7 @@ mod tests {
 
     const NOW: i64 = 10_000_000;
 
-    fn fixture() -> Vec<Drone> {
+    pub(crate) fn fixture() -> Vec<Drone> {
         let local = vec![
             p("aaaa1111-x", "alice@x", 100, NOW - 5_000, "post_tool", "fix the flaky sync test", &["crates/borg-mesh/src/sync.rs", "src/recon.rs"]),
             p("cccc3333-x", "alice@x", 300, NOW - presence::IDLE_MS - 60_000, "stop", "write the release notes for the mesh daemon and more words", &[]),

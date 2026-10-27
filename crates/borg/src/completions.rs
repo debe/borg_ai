@@ -19,7 +19,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
     ("assimilate", &[], crate::assimilate::FLAGS, false),
     ("reach", &[], &["--plan", "--apply", "--jobs"], false),
     ("queen", &["show", "ask", "answer", "skip", "dismiss", "next", "dedupe", "notify"], &["--json", "--repo", "--dir", "--collective", "--apply"], false),
-    ("top", &[], &["--watch", "--json", "--dir"], false),
+    ("top", &[], &["--once", "--watch", "--json", "--dir"], false),
     ("no", &[], crate::veto::FLAGS, false),
     (
         "hive",

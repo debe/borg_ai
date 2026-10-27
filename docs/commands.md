@@ -19,7 +19,7 @@
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
 | `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1, with a Learning tab that shows week by week whether learning works ([details](statistics.md)) and a Hive tab that shows each goal's tasks over time, its nodes and its interactive drones ([Watching the hive](#interactive-drones)) |
-| `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
+| `borg top [--once] [--json]` | A live screen, like Unix `top`: the drones of each collective (local and remote) with their state, task and what each is doing, each hive goal as progress bars with its tasks, plan and nodes, and the newest board events. Redraws every second, fits the window, quits on `q`, Esc or Ctrl-C (`NO_COLOR` turns colour off). Piped, or with `--once`, it prints the plain text once (`--watch` reprints it every 2 s) |
 | `borg steer <drone\|session\|all> "<text>"` | Send a signed instruction to running drones; `--pause`, `--resume` |
 | `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson; see [below](#saying-no) |
 | `borg why <path>[:<line>[-<line>]] \| <commit> [--full] [--json]` | The reasoning behind code: blame, Borg notes, linked lessons, and both ends of a decision → fix link: "→ fixed in Y (task)" on the decision, "← decided in X (task) → fixed here" on the fix (three each, all with `--full`; `--json` adds `fixed_in` and `fixes`) |
