@@ -4093,6 +4093,12 @@ mod tests {
         let (again, waited) = across(&home, "g", "t1", "sa", at, written, &board::fold(&board::read(&path)), None).expect("B takes part");
         beat.join().unwrap();
         assert!(again.is_some() && waited >= Duration::from_millis(1500), "final on B's mark, past the old cap: {waited:?}");
+        // B's rival is stamped above B's last line, its beat: with t2's claim in that beat's millisecond the
+        // two would tie on one stamp. Past it by more than the rival's 50 ms, the rival sorts first.
+        let beat_ms = board::read(&path).iter().filter(|e| e.node == "B").map(|e| e.ms).max().unwrap();
+        while learn::now_ms() <= beat_ms + 60 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let (at, written) = claim("t2", "sa2");
         let beat = beat_after(Duration::from_millis(100), Some(Event::new(Ev::Claim, "t2", "sb", at - 50)));
         let (again, _) = across(&home, "g", "t2", "sa2", at, written, &board::fold(&board::read(&path)), None).expect("B takes part");
