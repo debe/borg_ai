@@ -24,7 +24,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "0.1.0" }
+borg-trace = { path = "../borg-trace", version = "0.2.0" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 serde_json = { workspace = true, features = ["preserve_order"] }

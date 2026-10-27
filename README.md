@@ -8,7 +8,7 @@ teammate's, meets the same decision. It runs as hooks in Claude Code and Codex a
 (oh-my-pi) and opencode, learns in one plain session with nothing else running, and shares lessons with a
 team peer to peer, with no server.
 
-**Status:** 0.1.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
+**Status:** 0.2.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
 NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)

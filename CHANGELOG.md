@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0 (unreleased)
 
 First release. In use at a company with lessons syncing between engineers over the mesh, across NATs;
 tested on Linux and macOS.
@@ -9,7 +9,7 @@ Release checklist (the heading keeps "unreleased" until the tag exists):
 
 1. `scripts/check.sh` passes on main, and CI is green on Linux and macOS.
 2. `cargo publish --dry-run --workspace` passes.
-3. Replace "(unreleased)" above with the date, commit, and tag `v0.1.0`. The release workflow builds
+3. Replace "(unreleased)" above with the date, commit, and tag `v0.2.0`. The release workflow builds
    the tarballs, attaches them with their sha256 files and publishes the crates in order.
 4. `scripts/install.sh` from that release in a clean home, then `borg doctor`.
 
