@@ -138,7 +138,22 @@ pub fn drone_name(home: &Path, session: &str) -> String {
     format!("i-{}", &blake3::hash(format!("{}\n{session}", node(home)).as_bytes()).to_hex()[..6])
 }
 
-/// A process's command name, parent and start time (`/proc/<pid>/stat`, Linux).
+/// A process's command name, parent and start time (`/proc/<pid>/stat` on Linux, `proc_pidinfo` on
+/// macOS, None elsewhere).
+#[cfg(target_os = "macos")]
+fn proc_stat(pid: u32) -> Option<(String, u32, u64)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, a plain C struct of that size.
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if n != size {
+        return None;
+    }
+    let comm: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    Some((String::from_utf8_lossy(&comm).into_owned(), info.pbi_ppid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn proc_stat(pid: u32) -> Option<(String, u32, u64)> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (l, r) = (s.find('(')?, s.rfind(')')?);
@@ -155,7 +170,7 @@ const WRAPPERS: &[&str] = &[
 ];
 
 /// The harness process this command or hook runs under: the nearest ancestor that is no shell, wrapper
-/// or borg (`WRAPPERS`), with its start time, so a reused pid is no match. None off Linux or when the
+/// or borg (`WRAPPERS`), with its start time, so a reused pid is no match. None off Linux and macOS or when the
 /// walk finds none: a session is then rebound by nothing but its own id.
 pub fn harness_pid() -> Option<(u32, u64)> {
     let mut pid = std::os::unix::process::parent_id();
