@@ -207,6 +207,40 @@ Release checklist (the heading keeps "unreleased" until the tag exists):
 - `borg doctor` checks for any model CLI borg can run its calls through (claude, omp or opencode), not
   only `claude`.
 
+### Hive: interactive drones
+
+- A hive is many drones on one goal: a signed, synced board of leased tasks, each finished only when its
+  checks pass, verified by another drone and merged into `hive/<goal>/integrated`, which must pass the
+  goal's oracle. Across machines the board, contracts, messages, commits and spend sync over the mesh.
+- Drones are the sessions you open: Claude Code, omp, opencode 1.x and 2.x, and codex, in any mix.
+  `borg hive join`, run by the model inside a session, makes only that session a drone, in its own
+  worktree; `borg hive leave`, `/exit` or a closed terminal makes it a plain session again and releases
+  its claim.
+- A drone with nothing to do waits at no token cost (`borg hive wait`) and is woken by its harness's own
+  path: Claude Code's background wait, omp's `sendMessage`, opencode's prompt (1.x) or queued prompt
+  (2.x), and `codex queue` for codex. No task is handed into the engineer's own turn, and a claim no turn
+  takes up within 60 s is released.
+- `borg mesh serve` is the node's worker while every drone idles: it beats, acks peers' claims, reaps
+  drones whose session is gone, integrates the verified work and says when the goal is finished or stuck.
+  Without it, one drone's waiter does that work.
+- The planning session: tell one session what to build and its borg skill opens the goal and shows the
+  plan. You answer `yes` (or `no, because ...`) at that session's prompt; no drone takes a task before
+  you do, and the model can never approve its own plan. `borg hive ratify <goal> [--budget USD]` approves
+  from a terminal.
+- Spend: each claim of a Claude Code drone is metered from its transcript (and its subagents') and
+  priced by model; omp, opencode and codex claims are `unmetered`. New claims stop at the goal's budget
+  until you raise it.
+- The coordination protocol holds with every timer at 0 or infinity: claims are final before any work,
+  results are monotone across arrival orders, integration runs once per epoch, and a goal ends only on a
+  finish every node agrees on (docs/design/hive.md, phase f).
+- Accepted with real sessions on two nodes (Claude Code and omp on one, opencode and codex on the
+  other): one 4-task goal approved at the prompt, every task verified and integrated once, no model call
+  while drones waited, wake-ups in 0.1 to 4.6 s, $0.17.
+- `borg top` is a live screen like Unix `top`: the drones by state, each goal's progress and budget bars,
+  its tasks, plan and nodes, and the newest board events; `q` quits. Piped, or with `--once`, it prints
+  the plain text once. The Hive tab of `borg web` shows the same, with each goal's history.
+- `borg hive run --drones N` runs headless drones for evals.
+
 ### Off by default (experimental)
 
 - The queen (`BORG_QUEEN=on`), engineering concepts (`BORG_CONCEPTS=on`), facets (`BORG_FACETS=on`).

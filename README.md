@@ -169,19 +169,35 @@ flowchart LR
   I -->|"passes"| R["refs/heads/hive/goal/integrated"]
 ```
 
-**Drones are interactive sessions you open.** Built: `borg hive init` makes a goal; a session started with
-`BORG_HIVE=<goal>`, joined with `borg hive join <goal>`, or started in a repo marked with
-`borg hive join <goal> --here` gets the board at its prompt, claims a task and has its stop gated on the
-task's checks; `borg hive integrate <goal>` merges the verified work. In a team collective the board,
-contracts, messages and spend sync, so drones on several machines share one board and one budget (proven
-on two loopback nodes). Verdicts, reworks and groups of attempts credit and teach lessons like any
-outcome. Tell any session what to build: its borg skill opens the goal (small tasks, contracts first,
-a check per task) and asks you to approve the plan at your own prompt (`yes`, or `no, because ...`);
-no drone takes a task before your yes, and the session then says how many drones wait. A goal you open
-from a terminal is approved with `borg hive ratify <goal>`. Claude Code drones' claims are metered
-from their transcripts, and new claims stop at the goal's budget until you raise it. Coming: a
-measured run across real machines. `borg hive run --drones N` runs headless drones in
-worktrees; it is what the evals use. A session that never joins a goal sees no change.
+**Drones are interactive sessions you open.** Claude Code, omp, opencode (1.x and 2.x) and codex, in
+any mix, on one machine or several:
+
+1. Keep `borg mesh serve` running on each machine (in a team collective it also syncs the board). It
+   beats for the node, integrates the verified work and says when the goal is finished, while every
+   drone idles.
+2. Open the sessions yourself and ask each one to "join the hive". Its model runs `borg hive join`
+   from inside it, so only that session becomes a drone, in a worktree of its own. A session that never
+   joins sees no change.
+3. Tell one session what to build. Its borg skill opens the goal: small tasks, contracts first, a check
+   per task. It shows you the plan and leaves the answer to you: say `yes` at that session's prompt, or
+   `no, because ...` and it revises. No drone takes a task before your yes. A goal you open from a
+   terminal is approved with `borg hive ratify <goal>`.
+4. The drones wake by themselves. A drone with nothing to do waits at no token cost and is woken by
+   its harness's own path when a task opens to it; a task is never handed into your own turn in that
+   session. Each finished task is verified by another drone, the verified work is merged into
+   `hive/<goal>/integrated` and run against the goal's oracle, and the drones become plain sessions
+   again.
+5. Watch it with `borg top` (a live screen, like Unix `top`) or the Hive tab of `borg web`.
+
+<!-- hive-demo -->
+
+Lessons apply and sync as in a plain session; verdicts, reworks and groups of attempts credit and teach
+them like any outcome. Claude Code drones' claims are metered from their transcripts, and new claims
+stop at the goal's budget until you raise it (answer the session's question with the new budget,
+or run `borg hive ratify <goal> --budget USD`). Proven with real sessions: Claude Code and omp on one node, opencode and codex on a
+second, one 4-task goal approved at the prompt, every task verified and integrated once, no model call
+while the drones waited, wake-ups in 0.1 to 4.6 s. `borg hive run --drones N` runs headless drones in
+worktrees; it is what the evals use.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive) · [Design and status](https://github.com/debe/borg_ai/blob/main/docs/design/hive.md)
 
 ## Monitoring
