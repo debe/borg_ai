@@ -533,15 +533,18 @@ pub(super) fn takeup(here: &Here, goal: &str, key: &str, session: &str) -> i32 {
     }
     let here_node = node(&here.home);
     let note = interactive::NOT_TAKEN_UP;
+    // Marked before the release lands: the waiter that reads the task open again must already find the
+    // wake missed, or it claims and wakes the session for it once more.
+    interactive::mark_missed(session, learn::now_ms());
     let released = super::write_if(&here.home, goal, |events| {
         let b = board::fold_on(events, &here_node);
         super::holding(&b, &here_node, task, session, learn::now_ms()).map(|_| vec![Event::new(Ev::Released, task, session, learn::now_ms()).with_note(note)])
     });
     let _ = std::fs::remove_file(hook::state_file(session).with_extension("hive-takeup"));
     if !matches!(released, Ok(Some(_))) {
+        interactive::unmark_missed(session);
         return 1;
     }
-    interactive::mark_missed(session, learn::now_ms());
     0
 }
 

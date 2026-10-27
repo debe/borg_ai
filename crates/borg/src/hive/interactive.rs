@@ -725,6 +725,11 @@ pub(crate) fn mark_missed(session: &str, now: i64) {
     let _ = std::fs::write(missed_path(session), now.to_string());
 }
 
+/// Takes back `mark_missed` when the release it went with was never written (wait.rs `takeup`).
+pub(crate) fn unmark_missed(session: &str) {
+    let _ = std::fs::remove_file(missed_path(session));
+}
+
 /// Whether `session`'s last wake was missed (`mark_missed`) and no hook event of it came since.
 pub fn missed(session: &str) -> bool {
     missed_path(session).exists()
