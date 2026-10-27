@@ -827,36 +827,36 @@ impl Stream {
     }
 }
 
-/// The perl binary a link to it runs as itself: macOS's `/usr/bin/perl` is a stub that starts the
-/// versioned `/usr/bin/perl5.N`, which would name the process `perl5.N`, not the link's name.
-fn perl_bin() -> String {
-    let mut real: Vec<_> = std::fs::read_dir("/usr/bin")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            cfg!(target_os = "macos")
-                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.strip_prefix("perl5.").is_some_and(|v| v.parse::<u32>().is_ok()))
-        })
-        .collect();
-    real.sort_by_key(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n[6..].parse::<u32>().ok()));
-    match real.pop() {
-        Some(p) => p.display().to_string(),
-        None => String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap().trim().to_string(),
+/// A copy of perl at `to`, a process named by its file: a harness process to join under. A copy, not a
+/// link: macOS names a process by the file a link resolves to (`perl`), Linux by the link.
+fn perl_as(to: &Path) {
+    if !to.exists() {
+        let perl = String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap();
+        let part = to.with_extension("part");
+        std::fs::copy(perl.trim(), &part).unwrap();
+        std::fs::rename(&part, to).unwrap();
     }
 }
 
-/// A process named `name` (a link to perl) that runs `args` and sleeps: a harness process to join
+/// `c` started, again while the copy it runs is busy (ETXTBSY): another test thread's fork can hold
+/// the copy's write handle open for a moment, until that child's exec closes it.
+fn spawn_copy(c: &mut Command) -> std::process::Child {
+    for _ in 0..50 {
+        match c.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(Duration::from_millis(20)),
+            r => return r.unwrap(),
+        }
+    }
+    c.spawn().unwrap()
+}
+
+/// A process named `name` (a copy of perl) that runs `args` and sleeps: a harness process to join
 /// under, stopped as an engineer stops it when dropped.
 fn harness_named(root: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (Waiter, u32) {
-    let perl = perl_bin();
     let link = root.join("bin").join(name);
-    if !link.exists() {
-        std::os::unix::fs::symlink(perl.trim(), &link).unwrap();
-    }
+    perl_as(&link);
     let all: Vec<&str> = ["-e", "system(@ARGV); sleep 600"].into_iter().chain(args.iter().copied()).collect();
-    let w = Waiter(Some(command_with(link.to_str().unwrap(), root, &all, env).spawn().unwrap()));
+    let w = Waiter(Some(spawn_copy(&mut command_with(link.to_str().unwrap(), root, &all, env))));
     let pid = w.0.as_ref().unwrap().id();
     (w, pid)
 }
@@ -1135,7 +1135,7 @@ fn codex_event(root: &Path, name: &str, s: &str, said: &str, extra: Value) -> Va
     v
 }
 
-/// A process named `codex` (a link to perl) that runs each line it is sent with `sh -c`, as codex runs
+/// A process named `codex` (a copy of perl) that runs each line it is sent with `sh -c`, as codex runs
 /// its hooks: their nearest harness ancestor is it. Stopped as an engineer stops it when dropped.
 struct Codex {
     proc: Waiter,
@@ -1170,16 +1170,13 @@ fn queued(root: &Path) -> Vec<Vec<String>> {
 
 impl Codex {
     fn start(root: &Path) -> Self {
-        let perl = perl_bin();
         std::fs::create_dir_all(root.join("proc")).unwrap();
         let link = root.join("proc/codex");
-        if !link.exists() {
-            std::os::unix::fs::symlink(perl.trim(), &link).unwrap();
-        }
+        perl_as(&link);
         let script = "$| = 1; while (my $l = <STDIN>) { chomp $l; system('sh', '-c', $l); print \"done\\n\"; }";
         let mut c = command_with(link.to_str().unwrap(), root, &["-e", script], &[("BORG_HIVE_TAKEUP_MS", "20000")]);
         c.stdin(Stdio::piped()).stderr(Stdio::null());
-        let mut child = c.spawn().unwrap();
+        let mut child = spawn_copy(&mut c);
         let (to, from) = (child.stdin.take().unwrap(), std::io::BufReader::new(child.stdout.take().unwrap()));
         let pid = child.id();
         Codex { proc: Waiter(Some(child)), to, from, pid }
