@@ -228,7 +228,9 @@ pub enum Level {
     Fail,
 }
 
-/// The stop's budget assumed where a harness names none: Claude Code's default command-hook timeout.
+/// The stop's budget assumed where a harness names none: 60 s, Claude Code's default command-hook timeout
+/// before it became 600 s (claude.rs `STOP_TIMEOUT_S`), so a hook installed with no `timeout` on an older
+/// Claude Code is never cut off. A safe floor, not a measured limit: `borg install` gives the Stop hook 90 s.
 pub const DEFAULT_STOP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Set (to anything) by the conformance suites: only then are the hidden harnesses found by name, so

@@ -76,6 +76,15 @@ struct NodeCfg {
     /// It refuses every other node's bundle line (a prerequisite its repo lacks, an unbundle that never
     /// finishes: commits.rs `reach`'s `Refused`), though the line carries the commits.
     refuses: bool,
+    /// Its drones are interactive sessions (phase g, mod.rs interactive.rs and wait.rs): no runner, so no
+    /// roster, session or decline lines and no integration (phase g G4's daemon runs it); the node's join
+    /// written once at its drones' join, before any claim of theirs (interactive.rs `ensure_member`); its
+    /// beats every `BEAT_MS` as a runner's, the beats G4's mesh daemon writes (on this step the waiters
+    /// beat while a drone waits and the hooks while it works, which leaves gaps as long as a model turn
+    /// or a tool call: not modelled); one session a drone for good,
+    /// which claims a tick after its wait saw the task (the wake), works it as a runner's session does,
+    /// and waits again (wait.rs `step`): a stuck said once, never an end but a finish for good.
+    interactive: bool,
 }
 
 /// A line held back: the first `ev` line on `task` written on `node` lands in its own file `local` ticks
@@ -184,7 +193,7 @@ impl Cfg {
     /// `tasks`: (its owner, the index of its dep). Work takes 3 ticks, a verdict and an integration 2,
     /// and a line one tick to reach the other node.
     fn new(tasks: &[(&str, Option<usize>)]) -> Cfg {
-        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None, mute: None, stays: false, refuses: false };
+        let node = |name| NodeCfg { name, drones: 1, start: 0, skew: 0, share: 9, stop: None, mute: None, stays: false, refuses: false, interactive: false };
         let mut ids: Vec<(String, Vec<String>)> = Vec::new();
         for (owner, dep) in tasks {
             let id = owned(owner, &ids);
@@ -350,6 +359,8 @@ struct Sim {
     published: BTreeSet<AttemptKey>,
     /// Sessions that wrote no board line (run.rs `stalls`' `wrote_nothing`).
     empty: Vec<String>,
+    /// Each stuck an interactive drone was told (wait.rs `Next::Stuck`): (tick, drone, the tasks).
+    told_stuck: Vec<(i64, String, Vec<String>)>,
 }
 
 fn work_task(id: &str, role: Role, deps: &[String]) -> Task {
@@ -447,6 +458,7 @@ impl Sim {
             bundles_pending: Vec::new(),
             published: BTreeSet::new(),
             empty: Vec::new(),
+            told_stuck: Vec::new(),
             cfg,
         };
         while s.t < s.cfg.horizon
@@ -617,11 +629,15 @@ impl Sim {
         for i in 0..self.cfg.nodes.len() {
             let start = self.cfg.nodes[i].start;
             if start == t {
-                // mod.rs `announce`: the join and the roster in one write.
+                // mod.rs `announce`: the join and the roster in one write; interactive drones' join, the
+                // node's join alone (interactive.rs `ensure_member`).
                 let names: Vec<String> = (1..=self.cfg.nodes[i].drones).map(|k| format!("d{k}")).collect();
                 let now = self.now(i);
                 let line = |note: &str| Event::new(Ev::Heartbeat, "", "runner", now).with_note(note);
-                self.write(i, vec![line(board::JOIN), line(&board::roster_note(&names))]);
+                match self.cfg.nodes[i].interactive {
+                    true => self.write(i, vec![line(board::JOIN)]),
+                    false => self.write(i, vec![line(board::JOIN), line(&board::roster_note(&names))]),
+                };
             }
             // run.rs `membership`: a goal heartbeat every `BEAT_MS` while the runner runs.
             let beats = |n: &NodeCfg| n.stop.into_iter().chain(n.mute).all(|stop| t < stop);
@@ -663,8 +679,10 @@ impl Sim {
                 self.note(node, format!("{} ends: {why}", self.drones[d].name));
                 // Its runner names the drones still running (each end its own ms, as the threads end apart).
                 let still: Vec<String> = self.drones.iter().filter(|x| x.node == node && !matches!(x.st, St::Ended(_))).map(|x| x.name.clone()).collect();
-                let roster = self.runner(node, &board::roster_note(&still));
-                self.write(node, vec![roster]);
+                if !self.cfg.nodes[node].interactive {
+                    let roster = self.runner(node, &board::roster_note(&still));
+                    self.write(node, vec![roster]);
+                }
                 // run.rs `main`: its drones ended, the runner leaves the goal (`Joined`).
                 if still.is_empty() && !self.stopped.contains(&node) {
                     let leave = self.runner(node, board::LEAVE);
@@ -721,6 +739,7 @@ impl Sim {
                     }
                     self.drones[d].st = St::Decide;
                 }
+                St::Post { .. } if self.cfg.nodes[node].interactive => self.drones[d].st = St::Decide,
                 St::Post { start, wrote } => {
                     let lacks = self.lacks(b, node, self.now(node));
                     let end = open_to(&self.cfg, b, &self.drones[d].name, self.name(node), &lacks, self.now(node));
@@ -751,6 +770,9 @@ impl Sim {
     fn decide(&mut self, d: usize, b: &Board) {
         let (node, now) = (self.drones[d].node, self.now(self.drones[d].node));
         let (here, drone) = (self.name(node), self.drones[d].name.clone());
+        if self.cfg.nodes[node].interactive {
+            return self.wait(d, b);
+        }
         // run.rs `drone`: commits.rs `republish`, each pass.
         self.republish(node, b);
         if let Some((id, new)) = integrate::due(b, now) {
@@ -849,6 +871,52 @@ impl Sim {
                     wrote: false,
                 };
                 self.note(node, format!("{drone} starts {} (claims at t={})", s.id, s.claim_at));
+                self.session(d, b, s);
+            }
+        }
+    }
+
+    /// One pass of an interactive drone's wait (wait.rs `waiting`): the goal's end and the task open to
+    /// its one session (mod.rs `next_open`), read by wait.rs `step`.
+    fn wait(&mut self, d: usize, b: &Board) {
+        let (node, now) = (self.drones[d].node, self.now(self.drones[d].node));
+        let (here, drone) = (self.name(node), self.drones[d].name.clone());
+        let id = format!("{here}.{drone}");
+        self.republish(node, b);
+        let lacks = self.lacks(b, node, now);
+        let ending = run::Ending::of(b, here, now, allowed(&self.cfg), &lacks);
+        let open = self.next(b, &id, &drone, node, now).is_some();
+        match super::wait::step(&ending, open, false) {
+            super::wait::Next::Finished => self.drones[d].st = St::Ended("goal finished"),
+            super::wait::Next::Wait => self.drones[d].st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()) },
+            super::wait::Next::Stuck(stuck) => {
+                let tasks: Vec<String> = stuck.into_iter().map(|(t, _)| t).collect();
+                if !self.told_stuck.iter().any(|(_, who, ts)| *who == id && *ts == tasks) {
+                    self.note(node, format!("{drone} is told {tasks:?} stuck and waits on"));
+                    self.told_stuck.push((self.t, id, tasks));
+                }
+                self.drones[d].st = St::Wait { until: self.t + IDLE_WAIT, seen: Box::new(b.clone()) };
+            }
+            super::wait::Next::Claim => {
+                self.drones[d].iters += 1;
+                let lat = self.cfg.lat.iter().find(|((n, dn), _)| *n == here && *dn == drone).map_or(1, |(_, l)| l[0]);
+                let s = Session {
+                    id,
+                    at: board::stamp(&self.file(node), here, now),
+                    offer: Offer::default(),
+                    notice: i64::MAX,
+                    noticed: true,
+                    said: false,
+                    claim_at: self.t + lat,
+                    offered: None,
+                    lost: 0,
+                    task: None,
+                    lands: 0,
+                    won: false,
+                    until: 0,
+                    wrote: false,
+                };
+                self.note(node, format!("{drone}'s wait claims (at t={})", s.claim_at));
                 self.session(d, b, s);
             }
         }
@@ -2327,4 +2395,76 @@ fn a_task_no_node_may_take_ends_stuck_not_a_hang() {
     let other = format!("{}.v1", r.cfg.tasks[1].0);
     assert!(matches!(u.tasks[&other].status, Status::Verified { .. }), "the other task is done and verified\n{}", r.trace());
     assert!(r.ends.iter().all(|(_, why, _)| *why == "stuck") && r.exits.values().all(|(ok, _)| !*ok), "{:?}\n{}", r.ends, r.trace());
+}
+
+/// Phase g G2: interactive drones on one node (`NodeCfg::interactive`: no runner thread, the node's join
+/// at their join, beats from their waits and hooks, one session each for good, the claim from the wait,
+/// wait.rs `step`). Two drones, three tasks, one after another's: every task is done once (same-node
+/// exclusion: one read-back win a task), by one session, and verified by the other drone (never its
+/// author), no done or verdict is voided (S2'), and no drone ever ends: with nothing left they wait (no
+/// integration runs on this step, phase g G4's daemon runs it), so the horizon's `hang` is the intended
+/// idle wait and is not checked. The node writes its join and beats only: no roster, session or leave
+/// line, and its join lands before any claim of its drones. Fails with an open board read as an end
+/// (wait.rs `step`): the drones end on an unfinished board (`end`).
+#[test]
+fn interactive_drones_on_one_node_take_every_task_once_and_wait_on() {
+    let mut cfg = Cfg::new(&[("a", None), ("a", None), ("a", Some(0))]).node("a", |n| (n.drones, n.interactive) = (2, true));
+    cfg.nodes.truncate(1);
+    let r = Sim::run(cfg);
+    r.check(&["hang"]);
+    let u = r.converged();
+    for (t, _) in &r.cfg.tasks {
+        assert!(matches!(u.tasks[&format!("{t}.v1")].status, Status::Verified { .. }), "{t}\n{}", r.trace());
+        let dones: Vec<&str> = u.spans.iter().filter(|sp| sp.task == *t && sp.end == Some(Ev::Done)).map(|sp| sp.by.as_str()).collect();
+        let verdicts: Vec<&str> = u.spans.iter().filter(|sp| sp.task == format!("{t}.v1") && sp.end.is_some()).map(|sp| sp.by.as_str()).collect();
+        assert!(dones.len() == 1 && verdicts.len() == 1 && dones[0] != verdicts[0], "{t}: done by {dones:?}, verified by {verdicts:?}\n{}", r.trace());
+    }
+    assert!(r.ends.is_empty() && r.drones.iter().all(|d| matches!(d.st, St::Wait { .. })), "{:?}\n{}", r.ends, r.trace());
+    let lines = r.union();
+    let notes: Vec<&str> = lines.iter().filter(|e| e.by == "runner" && e.note != board::BEAT).map(|e| e.note.as_str()).collect();
+    assert_eq!(notes, [board::JOIN], "{}", r.trace());
+    let join = lines.iter().find(|e| e.note == board::JOIN).unwrap().ms;
+    assert!(lines.iter().filter(|e| e.ev == Ev::Claim).all(|c| c.ms > join), "{}", r.trace());
+}
+
+/// Phase g correction 17: a stuck goal is said once and the interactive drones keep waiting. A task whose
+/// dep names no task (no drone may ever take it) is stuck once the other task is verified: each drone is
+/// told so once, writes no stuck line (no runner on this step) and waits on to the horizon. Fails with a
+/// stuck read as an end, as a runner's drone reads it (run.rs `step`): both drones end on an unfinished
+/// board (`end`).
+#[test]
+fn a_stuck_goal_is_said_once_and_interactive_drones_wait_on() {
+    let mut cfg = Cfg::new(&[("a", None)]).node("a", |n| (n.drones, n.interactive) = (2, true));
+    cfg.nodes.truncate(1);
+    cfg.tasks.push(("orphan".into(), vec!["gone".into()]));
+    let r = Sim::run(cfg);
+    r.check(&["hang"]);
+    let u = r.converged();
+    let t = &r.cfg.tasks[0].0;
+    assert!(matches!(u.tasks[&format!("{t}.v1")].status, Status::Verified { .. }), "{}", r.trace());
+    let told: Vec<(&str, Vec<&str>)> = r.told_stuck.iter().map(|(_, who, ts)| (who.as_str(), ts.iter().map(String::as_str).collect())).collect();
+    assert_eq!(told, [("a.d1", vec!["orphan"]), ("a.d2", vec!["orphan"])], "each drone told once\n{}", r.trace());
+    assert!(r.ends.is_empty() && r.drones.iter().all(|d| matches!(d.st, St::Wait { .. })), "{:?}\n{}", r.ends, r.trace());
+    assert!(u.stuck.is_empty(), "no stuck line on this step");
+}
+
+/// Phase g, two nodes of interactive drones (each node's join at its drones' join, no leave while they
+/// live): a task each, each node's drone verifies the other's work, every claim waits until final (phase
+/// f F5), none is read gone because of its own node's membership lines (no read-back lost), and both
+/// drones wait on at the end. Its nodes beat every `BEAT_MS` for the whole run, as G4's mesh daemon will
+/// (`NodeCfg::interactive`): it proves F5 and F6 under those beats, not under this step's, where a
+/// working drone's node beats only at its hook events and any model turn or tool call longer than
+/// `SUSPECT_MS` lets a peer suspect it.
+#[test]
+fn interactive_drones_on_two_nodes_keep_their_claims_and_final_claims() {
+    let cfg = Cfg::new(&[("a", None), ("b", None)]).node("a", |n| n.interactive = true).node("b", |n| n.interactive = true);
+    let r = Sim::run(cfg);
+    r.check(&["hang"]);
+    let u = r.converged();
+    for (t, _) in &r.cfg.tasks {
+        assert!(matches!(u.tasks[&format!("{t}.v1")].status, Status::Verified { .. }), "{t}\n{}", r.trace());
+    }
+    assert!(!r.log.iter().any(|l| l.contains(" lost ") || l.contains("is told it lost")), "{}", r.trace());
+    assert!(r.waits.iter().all(|w| *w >= 1), "every claim waited for the peer's watermark: {:?}\n{}", r.waits, r.trace());
+    assert!(r.ends.is_empty(), "{:?}", r.ends);
 }

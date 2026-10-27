@@ -542,7 +542,8 @@ pub fn pre_tool(home: &Path, input: &Value, now: i64) {
     let Some(hs) = super::bound(session) else { return };
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
     let tool_input = input.get("tool_input").unwrap_or(&Value::Null);
-    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    // An interactive drone works in its own worktree, whatever directory the event names (phase g).
+    let cwd = if hs.worktree.is_empty() { input.get("cwd").and_then(Value::as_str).unwrap_or_default() } else { hs.worktree.as_str() };
     if cwd.is_empty() {
         return;
     }

@@ -103,9 +103,9 @@ pub struct DroneRun {
 pub type Drone<'a> = &'a dyn Fn(&Path, &str, Duration) -> DroneRun;
 
 /// The stop hook's time budget when the harness names none (`BORG_STOP_BUDGET_MS`, which the omp and
-/// opencode adapters set to their own timeout): Claude Code's default command-hook timeout. `borg
-/// install claude` gives the Stop hook a longer `timeout` (install.rs), so this keeps a margin even
-/// on an install that predates it.
+/// opencode adapters set to their own timeout): 60 s, Claude Code's old default command-hook timeout
+/// (harness/mod.rs `DEFAULT_STOP_BUDGET`). `borg install claude` gives the Stop hook a longer `timeout`
+/// (install.rs), so this keeps a margin even on an install that predates it.
 pub const DEFAULT_STOP_BUDGET: Duration = crate::harness::DEFAULT_STOP_BUDGET;
 pub const STOP_BUDGET_ENV: &str = "BORG_STOP_BUDGET_MS";
 /// Time kept back from the budget for the rest of the hook (merge, log, print).

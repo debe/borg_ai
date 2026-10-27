@@ -450,7 +450,7 @@ fn claim_due(home: &Path, goal: &str, session: &str, drone: &str, now: i64, foun
     if !won(&b) {
         return None;
     }
-    match super::across(home, goal, &id, session, stamp, written, &b) {
+    match super::across(home, goal, &id, session, stamp, written, &b, None) {
         None => Some((events, b)),
         Some((None, _)) => None,
         Some((Some(_), _)) => {

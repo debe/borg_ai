@@ -47,6 +47,7 @@ pub mod group;
 pub mod guard;
 pub mod hidden;
 pub mod integrate;
+pub mod interactive;
 pub mod message;
 pub mod oracle;
 pub mod plan;
@@ -57,6 +58,7 @@ mod scenario;
 mod sim_drone;
 pub mod verdict;
 pub mod view;
+mod wait;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -372,9 +374,31 @@ pub struct HiveSession {
     /// The claim the counter counts for (`task@since`): a new claim starts it again.
     #[serde(default)]
     pub blocks_for: String,
-    /// The drone this session is an iteration of (`DRONE_ENV`); empty for a session of its own.
+    /// The drone this session is an iteration of (`DRONE_ENV`); empty for a session of its own. An
+    /// interactive drone's own name (interactive.rs `drone_name`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub drone: String,
+    /// A session the engineer made a drone from inside it (`borg hive join`, phase g, interactive.rs):
+    /// its stop asks for a wait when nothing is in hand, and it never runs the engineer's commands.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
+    /// It serves every open goal of the collective in its repo; `goal` is the one it works on now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any: bool,
+    /// Its own worktree: where its hooks claim, snapshot and run the oracle, whatever directory a hook
+    /// event names (phase g correction 14). Empty: the event's directory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree: String,
+    /// When its hooks last beat for its node on `goal` (interactive.rs `touch`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_ms: i64,
+    /// Its stop asked it to start a wait this turn (interactive.rs `after_stop`): once a turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asked_wait: bool,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 /// The session's goal; None when it joined none, or on any error (fail open).
@@ -996,9 +1020,58 @@ fn with_reason(text: &str, out: Option<Value>, may_block: bool) -> Option<Value>
 pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
     let started = Instant::now();
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
-    let Some(mut hs) = bound(session) else { return inner() };
-    let Ok(g) = goal::load(home, &hs.goal) else { return inner() };
-    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    // A join that bound an id no hook carries (interactive.rs `adopt`): its own PostToolUse moves it here.
+    let (hs, adopted) = match bound(session) {
+        Some(hs) => (hs, false),
+        None => match (event == "post_tool").then(|| interactive::adopt(home, input)).flatten() {
+            Some(hs) => (hs, true),
+            None => return inner(),
+        },
+    };
+    if adopted {
+        let text = format!(
+            "[borg hive] This session is drone {}: the join named another session id (a `--continue` or `--resume`), so the drone is this session now.",
+            hs.drone
+        );
+        return with_context(session, "PostToolUse", text, h.caps().tool_context, around_bound(h, home, event, input, now, started, session, hs, inner));
+    }
+    around_bound(h, home, event, input, now, started, session, hs, inner)
+}
+
+/// `around` for a session bound to a goal (`hs`).
+#[allow(clippy::too_many_arguments)]
+fn around_bound(
+    h: &dyn Harness,
+    home: &Path,
+    event: &str,
+    input: &Value,
+    now: i64,
+    started: Instant,
+    session: &str,
+    mut hs: HiveSession,
+    inner: impl FnOnce() -> Option<Value>,
+) -> Option<Value> {
+    // An interactive drone (phase g): its handed claim taken up, the engineer's turn, its node's beat.
+    if hs.interactive && interactive::touch(home, event, &mut hs, session, now) {
+        save(session, &hs);
+    }
+    let cwd = match hs.worktree.is_empty() {
+        true => input.get("cwd").and_then(Value::as_str).unwrap_or_default().to_string(),
+        false => hs.worktree.clone(),
+    };
+    let Ok(g) = goal::load(home, &hs.goal) else {
+        // An interactive drone of every open goal with none to work on yet still waits for one.
+        return match hs.interactive && event == "stop" {
+            true => interactive::after_stop(home, &mut hs, session, &cwd, input, inner(), now),
+            false if hs.interactive && event == "end" => {
+                let out = inner();
+                interactive::ended(home, &hs, session, &cwd, input, now);
+                out
+            }
+            false => inner(),
+        };
+    };
+    let cwd = cwd.as_str();
     let repo = queen::repo_name(cwd);
     let (events, end, b) = board_for(home, &g);
     let ctx = Ctx { h, home, g: &g, session, cwd, repo: &repo, now, started };
@@ -1017,13 +1090,22 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
             let text = ctx.post_tool(&b, &events, input);
             with_context(session, "PostToolUse", text, h.caps().tool_context, inner())
         }
-        "stop" => ctx.stop(&mut hs, &b, &events, input, started, inner),
+        "stop" => {
+            let out = ctx.stop(&mut hs, &b, &events, input, started, inner);
+            match hs.interactive {
+                true => interactive::after_stop(home, &mut hs, session, cwd, input, out, now),
+                false => out,
+            }
+        }
         "end" => {
             let out = inner();
             if let Some(s) = board::holding(&b, &node(home), session, now)
                 && write(home, &g.id, vec![Event::new(Ev::Released, &s.task.id, session, now).with_note("session ended")]).is_ok()
             {
                 count(home, stats::HIVE_RELEASED, session, &g.id, &s.task.id, &repo);
+            }
+            if hs.interactive {
+                interactive::ended(home, &hs, session, cwd, input, now);
             }
             out
         }
@@ -1035,14 +1117,27 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
 /// session's latest claim was lost and it holds no task (`lost_claim`), with the lost claim's news
 /// when it is new (told once, as at any other hook) and `NOT_YOURS`. A claim lost across nodes is
 /// learnt at a sync, so the loser's next edit is its last attempt at the task, not its next turn. The
-/// worktree is not set aside here (a 2 s hook on opencode and omp): at the stop or the next claim. Any
-/// other tool gets None at once; an edit in no goal after one failed file open.
+/// worktree is not set aside here (a 2 s hook on opencode and omp): at the stop or the next claim. An
+/// interactive drone's edit of its repo outside its own worktree is denied (interactive.rs
+/// `outside_tree`): its work never lands in the engineer's checkout. Any
+/// other tool gets None after one failed file open (an interactive drone's tool call keeps the
+/// engineer's turn busy, interactive.rs `touch`); an edit in no goal after the same.
 pub fn pre_tool(h: &dyn Harness, home: &Path, input: &Value, now: i64) -> Option<Value> {
+    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+    let mut hs = bound(session);
+    if let Some(hs) = hs.as_mut().filter(|hs| hs.interactive) {
+        interactive::touch(home, "pre_tool", hs, session, now);
+    }
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
     hook::edit_text(tool, input.get("tool_input").unwrap_or(&Value::Null))?;
-    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
-    let g = goal::load(home, &bound(session)?.goal).ok()?;
-    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
+    let hs = hs?;
+    if hs.interactive
+        && let Some(reason) = interactive::outside_tree(&hs, tool, input)
+    {
+        return Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}));
+    }
+    let g = goal::load(home, &hs.goal).ok()?;
+    let cwd = if hs.worktree.is_empty() { input.get("cwd").and_then(Value::as_str).unwrap_or_default() } else { hs.worktree.as_str() };
     let repo = queen::repo_name(cwd);
     let (events, _, b) = board_for(home, &g);
     let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
@@ -1122,14 +1217,18 @@ impl Ctx<'_> {
             parts.push(format!("This repo ({}) is outside the goal's repos ({}): claim only tasks of this repo.", self.repo, names.join(", ")));
             marks.push(REPO_MARKER.into());
         }
-        let holding = board::holding(b, &node(self.home), self.session, self.now);
+        // An interactive drone's claim it was never shown is not final yet (`stop`): neither shown here,
+        // in what is the engineer's own turn, nor offered past; the waiter hands it once final.
+        let unshown = hs.interactive && interactive::unshown(self.home, hs, self.session, self.now).is_some_and(|(_, shown)| !shown);
+        let holding = board::holding(b, &node(self.home), self.session, self.now).filter(|_| !unshown);
         let key = holding.map_or_else(|| "-".to_string(), |s| format!("{}@{}", s.task.id, s.live(self.now).map_or(0, |l| l.2)));
         match holding {
+            _ if unshown => {}
             Some(s) if last != Some(key.as_str()) => parts.push(describe(self.home, self.g, s, self.session, self.cwd)),
             Some(s) => parts.push(format!("Your claim: {} ({}) {}.", s.task.id, s.task.role.name(), s.task.title)),
             None => parts.push(offer(self.home, self.g, b, self.session, self.repo, self.cwd, self.now)),
         }
-        if last != Some(key.as_str()) {
+        if last != Some(key.as_str()) && !unshown {
             marks.push(format!("{TASK_MARKER}{key}"));
         }
         parts.extend(self.lost_told(b, events, &state, false));
@@ -1280,7 +1379,10 @@ impl Ctx<'_> {
     }
 
     /// The stop: with a claim, its oracle decides (block, publish blocked, or publish done and hand
-    /// over the next task); without one, `inner()` with any waiting hive text.
+    /// over the next task); without one, `inner()` with any waiting hive text. An interactive drone's
+    /// claim it was never shown (the stop's capped claim, not final yet, interactive.rs `unshown`) is
+    /// nothing in hand: no oracle, no done, no block, so no task reaches it before its claim is final
+    /// (phase f F5) and no end of the engineer's own turn is held up by hive work; the waiter hands it.
     fn stop(
         &self,
         hs: &mut HiveSession,
@@ -1294,7 +1396,8 @@ impl Ctx<'_> {
         let waiting = std::fs::read_to_string(wait_path(self.session)).unwrap_or_default();
         let _ = std::fs::remove_file(wait_path(self.session));
         let path = tasks_path(self.home, &self.g.id);
-        let Some(held) = board::holding(b, &node(self.home), self.session, self.now) else {
+        let unshown = hs.interactive && interactive::unshown(self.home, hs, self.session, self.now).is_some_and(|(_, shown)| !shown);
+        let Some(held) = board::holding(b, &node(self.home), self.session, self.now).filter(|_| !unshown) else {
             let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
             let lost = self.lost_told(b, lines, &state, true);
             let mut text = waiting;
@@ -1431,11 +1534,13 @@ impl Ctx<'_> {
         if left < MIN_ORACLE {
             return None;
         }
+        // An interactive drone's confirm waits at most `HAND_CAP` here; the waiter waits on (phase g).
+        let cap = bound(self.session).is_some_and(|hs| hs.interactive).then_some(interactive::HAND_CAP);
         let won = loop {
             let now = self.clock();
             let b = board::fold_on(&board::read(path), &node(self.home));
             let next = next_open(self.home, self.g, &b, self.session, &drone_of(self.session), self.repo, self.cwd, now)?;
-            match claim(self.home, self.g, self.session, &next.task, true, self.cwd, now, left) {
+            match claim(self.home, self.g, self.session, &next.task, true, self.cwd, now, left, cap) {
                 Ok(won) => break won,
                 // Passed over, as `borg hive claim` does: `next_open` picks another.
                 Err(Refused::Deps(_)) => refuse(self.session, &next.task.id),
@@ -1444,7 +1549,13 @@ impl Ctx<'_> {
         };
         count(self.home, stats::HIVE_CLAIM, self.session, &self.g.id, &won.task.id, self.repo);
         let now = self.clock();
-        hook::append(self.session, &format!("{TASK_MARKER}{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2)));
+        let key = format!("{}@{}", won.task.id, won.live(now).map_or(0, |l| l.2));
+        // Not final within the cap: not handed now (no work before a claim is final, phase f F5), so not
+        // marked shown; the stop asks for the waiter, which hands it once final (wait.rs `pending`).
+        if cap.is_some() && !is_final(self.home, &self.g.id, &won, now) {
+            return None;
+        }
+        hook::append(self.session, &format!("{TASK_MARKER}{key}"));
         let risk = plan::escalate(self.home, self.g, &won.task, self.session, self.cwd, now).map(|t| format!("\n{t}")).unwrap_or_default();
         Some(format!("{}{risk}", describe(self.home, self.g, &won, self.session, self.cwd)))
     }
@@ -1771,8 +1882,20 @@ fn confirm(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: 
 /// F5, a node with no runner) is waited for as before F5: the confirm window on its mesh round (`confirm`,
 /// at most `CONFIRM_CAP`, a liveness bound where no failure detector reads it), or `CROSS_SETTLE` with none
 /// reachable. Both `claim` and the integrate claim (integrate.rs `claim_due`) take it; each wait is a line
-/// of `confirms.jsonl` (`final`, `suspected`, `lost`; `won`/`cap` for the window).
-pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64, written: i64, b: &Board) -> Option<(Option<TaskState>, Duration)> {
+/// of `confirms.jsonl` (`final`, `suspected`, `lost`; `won`/`cap` for the window). A `cap` (an interactive
+/// drone's stop, phase g correction 9) ends the wait for watermarks there, the claim still held and not
+/// final (`cap`): its caller hands nothing then (`is_final`), and the waiter waits on with none.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn across(
+    home: &Path,
+    goal: &str,
+    id: &str,
+    session: &str,
+    now: i64,
+    written: i64,
+    b: &Board,
+    cap: Option<Duration>,
+) -> Option<(Option<TaskState>, Duration)> {
     let here = node(home);
     if b.participants(&here, learn::now_ms()).len() <= 1 {
         return None;
@@ -1782,6 +1905,7 @@ pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64,
     let t0 = Instant::now();
     let waited_on: Vec<String> = b.unconfirmed(&here, since, learn::now_ms()).0.into_iter().map(String::from).collect();
     let (mut len, mut b) = (u64::MAX, b.clone());
+    let mut capped = false;
     let confirmed = loop {
         let at = std::fs::metadata(&path).map_or(0, |m| m.len());
         if at != len {
@@ -1804,12 +1928,17 @@ pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64,
             }
             break Some(s);
         }
+        if cap.is_some_and(|c| t0.elapsed() >= c) {
+            capped = true;
+            break Some(s);
+        }
         std::thread::sleep(Duration::from_millis(5));
     };
     let waited = t0.elapsed();
     let live = b.participants(&here, learn::now_ms());
     let outcome = match &confirmed {
         None => "lost",
+        Some(_) if capped => "cap",
         Some(_) if waited_on.iter().any(|n| !live.contains(n.as_str())) => "suspected",
         Some(_) => "final",
     };
@@ -1824,6 +1953,14 @@ pub(super) fn across(home: &Path, goal: &str, id: &str, session: &str, now: i64,
     };
     let _ = append_line(&confirms_path(home, goal), &line);
     Some((confirmed, waited))
+}
+
+/// Whether the claim `won` of goal `goal` is final at `now` (phase f F5, `Board::unconfirmed`): no other
+/// participant's watermark is short of its stamp.
+fn is_final(home: &Path, goal: &str, won: &TaskState, now: i64) -> bool {
+    let here = node(home);
+    let since = won.live(now).map_or(now, |(_, _, since)| since);
+    board::fold_on(&board::read(&tasks_path(home, goal)), &here).unconfirmed(&here, since, now).0.is_empty()
 }
 
 /// The mesh members of `reachable` a claim's confirm window waits for (phase f F4, G2): those whose key
@@ -1906,11 +2043,25 @@ fn refuse(session: &str, task: &str) {
 /// attempt (board.rs `closure` order) is brought into the tree (verdict.rs `bring_in`), and the claim
 /// names them (`deps_in`). The base then holds them, so the work's diff is its own. A dep that cannot
 /// be brought in (this tree's own changes overlap it) refuses the claim, and a lost claim takes out
-/// what it brought in: either way the tree is as it was.
+/// what it brought in: either way the tree is as it was. `cap` bounds the wait until final (`across`).
 #[allow(clippy::too_many_arguments)]
-fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &str, now: i64, within: Duration) -> Result<TaskState, Refused> {
+fn claim(
+    home: &Path,
+    g: &Goal,
+    session: &str,
+    task: &Task,
+    picked: bool,
+    cwd: &str,
+    now: i64,
+    within: Duration,
+    cap: Option<Duration>,
+) -> Result<TaskState, Refused> {
     let path = tasks_path(home, &g.id);
     let drone = drone_of(session);
+    // An interactive drone's node joins the goal before its first claim there (phase g correction 1).
+    if bound(session).is_some_and(|hs| hs.interactive) {
+        interactive::ensure_member(home, &g.id).map_err(|e| Refused::Io(format!("could not join goal {}: {e}", g.id)))?;
+    }
     let reset = task.from.is_some() && runner_worktree(g, session, cwd);
     if let Some(from) = task.from.as_deref().filter(|from| !reset && !checkout_of(cwd, from)) {
         return Err(Refused::NotHere(fix_where(&task.id, from)));
@@ -1982,7 +2133,7 @@ fn claim(home: &Path, g: &Goal, session: &str, task: &Task, picked: bool, cwd: &
     // have synced yet. A round with each reachable peer after the claim brings it, so a lost claim is
     // known before any work starts. On one node no wait (`across`).
     let mut waited = Duration::ZERO;
-    if let Some((again, w)) = across(home, &g.id, id, session, now, written, &b) {
+    if let Some((again, w)) = across(home, &g.id, id, session, now, written, &b, cap) {
         waited = w;
         match again {
             Some(again) => s = again,
@@ -2151,6 +2302,9 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   integrate <goal>                                          merge the accepted work and run the oracle on it (git 2.40+)
   approve <goal>                                            run the checks other nodes wrote here (lists each one it approves)
   board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
+  join [<goal>]                                             inside a session: it becomes a drone of the goal (none: of
+                                                            every open goal of this repo), in a worktree of its own
+  wait                                                      a drone waits for work at no token cost, then prints its task
   join <goal> [--session ID|DRONE]                          a running drone joins the goal
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
   leave [--here]                                            the drone leaves (its claim is released); --here: new
@@ -2306,6 +2460,11 @@ impl Here {
             // SAFETY: single-threaded: the command has started no thread yet.
             unsafe { std::env::set_var("BORG_STATE", home.join("state")) };
         }
+        // An interactive drone's command acts in its worktree, wherever its shell is (phase g).
+        let cwd = match interactive::env_drone() {
+            Some((_, hs)) if a.value("--dir").is_none() && !hs.worktree.is_empty() => hs.worktree,
+            _ => cwd,
+        };
         Ok(Here { home, cwd, now: learn::now_ms() })
     }
 
@@ -2314,12 +2473,19 @@ impl Here {
     }
 
     /// The session a drone command acts for, and its goal: `--session` names a hive session, or a drone
-    /// (`borg top`'s designation or session prefix); without it, the one drone of this repo.
+    /// (`borg top`'s designation or session prefix); without it, the interactive drone whose session this
+    /// runs in, else the one drone of this repo.
     fn drone(&self, named: Option<&str>) -> Result<(String, HiveSession), String> {
         if let Some(n) = named
             && let Some(hs) = bound(n)
         {
             return Ok((n.to_string(), hs));
+        }
+        // Inside an interactive drone's session: that session (its harness's id, interactive.rs).
+        if named.is_none()
+            && let Some(d) = interactive::env_drone()
+        {
+            return Ok(d);
         }
         if named.is_none()
             && let Some(s) = self.runner_session()
@@ -2397,11 +2563,22 @@ pub fn main(args: &[&str]) -> i32 {
             Err(e) => fail(e),
         },
         ("join", [id]) if a.on("--here") => join_here(&here, id, a.value("--drone")),
+        // Inside a session (its harness's id): it becomes an interactive drone (phase g).
+        ("join", [] | [_])
+            if session.is_none()
+                && let Some(s) = interactive::env_session() =>
+        {
+            interactive::join(&here, rest.first().copied(), &s)
+        }
+        ("join", []) => fail("run `borg hive join` inside the session that is to become a drone"),
         ("join", [id]) => join(&here, id, session),
         ("leave", []) if a.on("--here") => leave_here(&here),
+        ("wait", []) => wait::main(&here, session),
+        ("takeup", [goal, key]) => wait::takeup(&here, goal, key, session.unwrap_or_default()),
         ("run", [id]) => run_cmd(&here, &a, id),
         ("sim-drone", []) if std::env::var_os(crate::harness::TEST_ENV).is_some() => sim_drone::main(&here),
         ("leave", []) => match here.drone(session) {
+            Ok((s, hs)) if hs.interactive => interactive::leave(&here, &s, &hs),
             Ok((s, hs)) => {
                 let b = goal::load(&here.home, &hs.goal).map(|g| here.board(&g)).unwrap_or_default();
                 if let Some(t) = board::holding(&b, &node(&here.home), &s, here.now) {
@@ -2809,7 +2986,7 @@ fn claim_cmd(here: &Here, named: Option<&str>, task: Option<&str>) -> i32 {
             },
         };
         let id = pick.task.id.clone();
-        match claim(&here.home, &g, &session, &pick.task.clone(), task.is_none(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT) {
+        match claim(&here.home, &g, &session, &pick.task.clone(), task.is_none(), &here.cwd, now, verdict::SNAPSHOT_TIMEOUT, None) {
             Ok(won) => {
                 count(&here.home, stats::HIVE_CLAIM, &session, &g.id, &id, &repo);
                 hook::append(&session, &format!("{TASK_MARKER}{id}@{}", won.live(learn::now_ms()).map_or(0, |l| l.2)));
@@ -2930,12 +3107,13 @@ fn drone_here(here: &Here) -> bool {
 }
 
 /// Whether a process in `cwd` runs for a drone: launched into a goal (`BORG_HIVE`, `BORG_HIVE_DRONE`),
-/// or in a worktree `borg hive run` made and has not left (a harness that drops the env). What the
+/// in a worktree `borg hive run` made and has not left (a harness that drops the env), or for an
+/// interactive drone (its harness session bound, or in its worktree, phase g correction 6). What the
 /// engineer-only commands and the queen's questions about a hive's plan and tasks are never run,
 /// answered or delivered by (queen.rs).
 pub fn drone(home: &Path, cwd: &str) -> bool {
     let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
-    set(ENV) || set(DRONE_ENV) || joined(home, cwd).is_some_and(|j| j.by == "run")
+    set(ENV) || set(DRONE_ENV) || joined(home, cwd).is_some_and(|j| j.by == "run") || interactive::drone_here(cwd)
 }
 
 /// `borg hive approve <goal>`: the engineer approves the checks of goal `id` that other nodes wrote (the
@@ -3299,7 +3477,7 @@ mod tests {
         // No rival, through `claim`: won once the round completed, within the cap.
         let t2 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t2"].task.clone();
         let round = peer_round(&home, Duration::from_millis(300), Vec::new());
-        assert!(claim(&home, &g, "sa", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT, None).is_ok());
         round.join().unwrap();
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str(), c.peers)).collect::<Vec<_>>(), [("t1", "lost", 1), ("t2", "won", 1)]);
@@ -3325,7 +3503,7 @@ mod tests {
         let filler: Vec<Event> = (0..20_000).map(|i| Event::new(Ev::Heartbeat, &format!("x{i}"), "sx", 1)).collect();
         board::append(&tasks_path(&home, "g"), &filler).unwrap();
         let t1 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t1"].task.clone();
-        assert!(claim(&home, &g, "sa", &t1, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t1, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT, None).is_ok());
         let ms = board::read(&tasks_path(&home, "g")).iter().find(|e| e.ev == Ev::Claim && e.by == "sa").unwrap().ms;
         let landed = std::fs::metadata(tasks_path(&home, "g")).unwrap().modified().unwrap();
         let landed = landed.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -3341,12 +3519,12 @@ mod tests {
         let (t1, t2) = (b.tasks["t1"].task.clone(), b.tasks["t2"].task.clone());
         // No other node live: no wait, no confirm line, the peer reachable or not.
         let t0 = Instant::now();
-        assert!(claim(&home, &g, "sa", &t1, false, "", now, verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa", &t1, false, "", now, verdict::SNAPSHOT_TIMEOUT, None).is_ok());
         assert!(t0.elapsed() < CONFIRM_CAP / 2, "{:?}", t0.elapsed());
         assert!(read_lines::<Confirm>(&confirms_path(&home, "g")).is_empty());
         board::append(&tasks_path(&home, "g"), &[on_b(Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()))]).unwrap();
         let t0 = Instant::now();
-        assert!(claim(&home, &g, "sa2", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok());
+        assert!(claim(&home, &g, "sa2", &t2, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT, None).is_ok());
         assert!(t0.elapsed() >= CONFIRM_CAP && t0.elapsed() < CONFIRM_CAP * 2, "{:?}", t0.elapsed());
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [("t2", "cap")]);
@@ -3366,7 +3544,7 @@ mod tests {
         board::append(&tasks_path(&home, "g"), &[Event::open(t.clone(), "engineer:e", now - 10)]).unwrap();
         board::append(&tasks_path(&home, "g"), &[on_b(Event::new(Ev::Heartbeat, "", "runner", now).with_note(&board::roster_note(&["d1".to_string()])))])
             .unwrap();
-        assert_eq!(claim(&home, &g, "sa", &t, true, "", now + 1, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        assert_eq!(claim(&home, &g, "sa", &t, true, "", now + 1, verdict::SNAPSHOT_TIMEOUT, None), Err(Refused::Lost));
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(b.tasks[&id].claimable(now + 1) && b.lost.is_empty());
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
@@ -3390,7 +3568,7 @@ mod tests {
                         let (home, g, t, barrier) = (&home, &g, t, &barrier);
                         sc.spawn(move || {
                             barrier.wait();
-                            claim(home, g, &format!("{}-s{i}", t.id), t, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT).is_ok()
+                            claim(home, g, &format!("{}-s{i}", t.id), t, false, "", learn::now_ms(), verdict::SNAPSHOT_TIMEOUT, None).is_ok()
                         })
                     })
                     .collect();
@@ -3410,7 +3588,7 @@ mod tests {
         let (home, g, now) = two_node_store("prewrite");
         let t1 = board::fold(&board::read(&tasks_path(&home, "g"))).tasks["t1"].task.clone();
         write(&home, "g", vec![Event::new(Ev::Claim, "t1", "s-rival", now)]).unwrap();
-        assert_eq!(claim(&home, &g, "sa", &t1, false, "", now + 1, verdict::SNAPSHOT_TIMEOUT), Err(Refused::Lost));
+        assert_eq!(claim(&home, &g, "sa", &t1, false, "", now + 1, verdict::SNAPSHOT_TIMEOUT, None), Err(Refused::Lost));
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(b.lost.is_empty(), "{:?}", b.lost);
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
@@ -3498,16 +3676,74 @@ mod tests {
         };
         let (at, written) = claim("t1", "sa");
         let beat = beat_after(Duration::from_millis(1500), None);
-        let (again, waited) = across(&home, "g", "t1", "sa", at, written, &board::fold(&board::read(&path))).expect("B takes part");
+        let (again, waited) = across(&home, "g", "t1", "sa", at, written, &board::fold(&board::read(&path)), None).expect("B takes part");
         beat.join().unwrap();
         assert!(again.is_some() && waited >= Duration::from_millis(1500), "final on B's mark, past the old cap: {waited:?}");
         let (at, written) = claim("t2", "sa2");
         let beat = beat_after(Duration::from_millis(100), Some(Event::new(Ev::Claim, "t2", "sb", at - 50)));
-        let (again, _) = across(&home, "g", "t2", "sa2", at, written, &board::fold(&board::read(&path))).expect("B takes part");
+        let (again, _) = across(&home, "g", "t2", "sa2", at, written, &board::fold(&board::read(&path)), None).expect("B takes part");
         beat.join().unwrap();
         assert!(again.is_none(), "B's earlier claim, before its mark: lost");
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [("t1", "final"), ("t2", "lost")]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_interactive_stops_capped_confirm_hands_nothing_that_is_not_final() {
+        // Phase g correction 9. B joined and writes watermarks but has not marked this node's claim: the
+        // stop's wait ends at its cap with the claim still held and not final (`cap`), so the stop hands
+        // nothing (`is_final`); once B's beat marks it, it is final, and the waiter hands it.
+        let (home, _, now) = two_node_store("capped");
+        let path = tasks_path(&home, "g");
+        let on = board::landing(&board::read(&path), vec![on_b(Event::new(Ev::Heartbeat, "", "runner", now - 5).with_note(board::JOIN))]);
+        board::append(&path, &on).unwrap();
+        board::note_held(&path);
+        let landed = write(&home, "g", vec![Event::new(Ev::Claim, "t1", "sa", learn::now_ms())]).unwrap();
+        let (at, written) = (landed[0].ms, learn::now_ms());
+        let b = board::fold(&board::read(&path));
+        let t0 = Instant::now();
+        let (held, _) = across(&home, "g", "t1", "sa", at, written, &b, Some(Duration::from_millis(200))).expect("B takes part");
+        assert!(t0.elapsed() < Duration::from_secs(2), "the cap ends the wait");
+        let held = held.expect("still held at the cap");
+        assert!(!is_final(&home, "g", &held, learn::now_ms()), "not final: nothing is handed");
+        let beat = Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(board::BEAT);
+        board::append(&path, &board::landing(&board::read(&path), vec![on_b(beat)])).unwrap();
+        board::note_held(&path);
+        assert!(is_final(&home, "g", &held, learn::now_ms()), "B's mark makes it final");
+        let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
+        assert_eq!(lines.iter().map(|c| c.outcome.as_str()).collect::<Vec<_>>(), ["cap"]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_interactive_stop_on_a_claim_it_was_never_shown_runs_no_oracle_and_writes_no_done() {
+        // Phase g G2 (e), (b). The stop's capped claim of t1 is held and not final (B has not marked it)
+        // and was never shown (no `TASK_MARKER`): a later stop, the drone's after it armed the wait or the
+        // end of the engineer's own turn, has nothing in hand. Fails with the claim read as in hand: the
+        // goal's empty oracle passes on the base and the stop publishes a done of no work.
+        let (home, g, now) = two_node_store("unshown-stop");
+        let path = tasks_path(&home, "g");
+        let on = board::landing(&board::read(&path), vec![on_b(Event::new(Ev::Heartbeat, "", "runner", now - 5).with_note(board::JOIN))]);
+        board::append(&path, &on).unwrap();
+        board::note_held(&path);
+        let session = format!("unshown-stop-{}", std::process::id());
+        write(&home, "g", vec![Event::new(Ev::Claim, "t1", &session, learn::now_ms())]).unwrap();
+        let mut hs = HiveSession { goal: "g".into(), interactive: true, drone: "i-test".into(), ..HiveSession::default() };
+        let here = node(&home);
+        let lines: Vec<(u64, Event)> = board::read(&path).into_iter().enumerate().map(|(i, e)| (i as u64, e)).collect();
+        let b = board::fold_on(&lines.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(), &here);
+        let held = board::holding(&b, &here, &session, learn::now_ms()).expect("held").clone();
+        assert!(!is_final(&home, "g", &held, learn::now_ms()), "not final");
+        let dir = home.display().to_string();
+        let ctx =
+            Ctx { h: &crate::harness::sim::Sim, home: &home, g: &g, session: &session, cwd: &dir, repo: "app", now: learn::now_ms(), started: Instant::now() };
+        let out = ctx.stop(&mut hs, &b, &lines, &json!({"stop_hook_active": false}), Instant::now(), || None);
+        assert_eq!(out, None, "no block, nothing handed");
+        assert!(!board::read(&path).iter().any(|e| e.ev == Ev::Done), "no done");
+        assert!(board::holding(&board::fold_on(&board::read(&path), &here), &here, &session, learn::now_ms()).is_some(), "still held for the waiter");
+        let _ = std::fs::remove_file(hook::state_file(&session));
+        unbind(&session);
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -3534,7 +3770,7 @@ mod tests {
         let written = learn::now_ms();
         let round = peer_round(&home, Duration::from_millis(50), Vec::new());
         let b = board::fold(&board::read(&path));
-        let (again, waited) = across(&home, "g", "t1", "sa", now, written, &b).expect("B takes part: a confirm window");
+        let (again, waited) = across(&home, "g", "t1", "sa", now, written, &b, None).expect("B takes part: a confirm window");
         round.join().unwrap();
         assert!(again.is_some() && waited < CONFIRM_CAP, "won on kb's round alone: {waited:?}");
         // A participant whose key is not known here (no origin record): every reachable member, as before.
@@ -3544,7 +3780,7 @@ mod tests {
         board::append(&path, &[join(board::LEAVE, now - 4)]).unwrap();
         board::note_held(&path);
         let b = board::fold(&board::read(&path));
-        assert_eq!(across(&home, "g", "t1", "sa", now, written, &b), None);
+        assert_eq!(across(&home, "g", "t1", "sa", now, written, &b, None), None);
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -3686,8 +3922,8 @@ mod tests {
         bind_as(&home, &own_s, "g", "").unwrap();
         let (w, r) = (wt.display().to_string(), repo.display().to_string());
         // An engineer's checkout, or a session of its own: refused, nothing written.
-        assert!(matches!(claim(&home, &g, &runner_s, &fix, false, &r, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
-        assert!(matches!(claim(&home, &g, &own_s, &fix, false, &w, 2, verdict::SNAPSHOT_TIMEOUT), Err(Refused::NotHere(_))));
+        assert!(matches!(claim(&home, &g, &runner_s, &fix, false, &r, 2, verdict::SNAPSHOT_TIMEOUT, None), Err(Refused::NotHere(_))));
+        assert!(matches!(claim(&home, &g, &own_s, &fix, false, &w, 2, verdict::SNAPSHOT_TIMEOUT, None), Err(Refused::NotHere(_))));
         assert_eq!(board::read(&tasks_path(&home, "g")).len(), 4);
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(offer(&home, &g, &b, &own_s, "app", &w, 2).starts_with("No claim, and no task"), "not offered where it cannot be claimed");
@@ -3696,7 +3932,7 @@ mod tests {
         std::fs::write(wt.join("README"), "stray edit\n").unwrap();
         std::fs::write(wt.join("stray.txt"), "x\n").unwrap();
         let now = learn::now_ms();
-        let won = claim(&home, &g, &runner_s, &fix, false, &w, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed");
+        let won = claim(&home, &g, &runner_s, &fix, false, &w, now, verdict::SNAPSHOT_TIMEOUT, None).expect("claimed");
         assert!(won.live(now + 1).is_some_and(|(by, _, _)| by == runner_s));
         assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), m);
         assert_eq!(std::fs::read_to_string(wt.join("README")).unwrap(), "base\n");
@@ -3716,7 +3952,7 @@ mod tests {
         let now = learn::now_ms();
         let b = board::fold(&board::read(&tasks_path(&home, "g")));
         assert!(offer(&home, &g, &b, &own_s, "app", &c, now).contains("integrate.1.fix"));
-        let won = claim(&home, &g, &own_s, &fix, false, &c, now, verdict::SNAPSHOT_TIMEOUT).expect("claimed in a checkout of from");
+        let won = claim(&home, &g, &own_s, &fix, false, &c, now, verdict::SNAPSHOT_TIMEOUT, None).expect("claimed in a checkout of from");
         assert!(co.join("notes.txt").exists(), "no reset");
         let c = board::read(&tasks_path(&home, "g")).into_iter().rfind(|e| e.ev == Ev::Claim).unwrap();
         assert_eq!(git_ok(&repo, &["rev-parse", &format!("{}^", c.base)]), m, "a snapshot on the combined tree");

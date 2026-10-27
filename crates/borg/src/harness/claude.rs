@@ -9,7 +9,10 @@ use serde_json::Value;
 use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
-pub const EVENTS: [(&str, &str); 6] = [
+pub const EVENTS: [(&str, &str); 7] = [
+    // Only an interactive hive drone's session answers here (its `/clear` rebound, its wait re-armed,
+    // hive/interactive.rs `session_start`); any other session after one failed open.
+    ("SessionStart", "start"),
     ("UserPromptSubmit", "prompt"),
     // Only a paused drone's tool calls are refused here (steer.rs); otherwise a stat and out.
     ("PreToolUse", "pre_tool"),
@@ -19,9 +22,12 @@ pub const EVENTS: [(&str, &str); 6] = [
     ("SessionEnd", "end"),
 ];
 
-/// Seconds Claude Code gives borg's Stop hook (its own default for a command hook is 60 s). The
-/// expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow drone never costs the
-/// conscience's answer.
+/// Seconds Claude Code gives borg's Stop hook. Its own default for a command hook is 600 s now (its hooks
+/// docs, checked 2026-10-27; earlier versions gave 60 s): 90 s bounds how long a stuck stop can hold the
+/// engineer's turn, and no wait for hive work runs inside the hook (an interactive drone waits in a
+/// background `borg hive wait`, hive/wait.rs; the stop's own claim confirm keeps within
+/// `interactive::HAND_CAP`). The expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow
+/// drone never costs the conscience's answer.
 pub const STOP_TIMEOUT_S: u64 = 90;
 
 pub struct Claude;
@@ -41,8 +47,9 @@ impl Harness for Claude {
             transcript: Transcript::Claude,
             deny_capture: true,
             sends_pid: false,
-            // Not the 90 s install gives: the expert drone keeps inside Claude Code's 60 s default
-            // (`DEFAULT_STOP_BUDGET`), so an install that predates that timeout keeps a margin too.
+            // Not the 90 s install gives: the expert drone keeps inside the 60 s of `DEFAULT_STOP_BUDGET`,
+            // so an install that predates that timeout, on a Claude Code whose default was 60 s, keeps a
+            // margin too.
             stop_budget: None,
             headless_budget: true,
         }

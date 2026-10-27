@@ -572,7 +572,7 @@ fn session_id(node: &str, goal: &str, drone: &str, iter: u32) -> String {
 /// git in `dir`, running no hook: a drone can plant one in the shared `.git/hooks` (`worktree add`
 /// runs post-checkout), and the runner runs as the engineer, outside any iteration's cap (as
 /// integrate.rs `git`).
-fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+pub(super) fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(["-c", "core.hooksPath=/dev/null"]).args(args).env("GIT_TERMINAL_PROMPT", "0");
     match runner::run_capped_status(cmd, None, timeout)? {
@@ -588,7 +588,7 @@ pub fn repo_of(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Whether `path` is a worktree's own top (not merely a directory inside the repo).
-fn is_worktree(path: &Path) -> bool {
+pub(super) fn is_worktree(path: &Path) -> bool {
     path.is_dir() && git(path, &["rev-parse", "--show-toplevel"], Duration::from_secs(5)).is_some_and(|t| Path::new(&t) == path)
 }
 
@@ -608,7 +608,7 @@ fn ensure_worktree(repo: &Path, goal: &str, n: usize, base: &str) -> Result<Path
 
 /// Keeps `.worktrees/` out of the engineer's `git status`: one line in the repo's local
 /// `info/exclude` (never committed), written once.
-fn exclude_worktrees(repo: &Path) -> Result<(), String> {
+pub(super) fn exclude_worktrees(repo: &Path) -> Result<(), String> {
     let common = git(repo, &["rev-parse", "--git-common-dir"], Duration::from_secs(5)).ok_or("not a git repo")?;
     let common = if Path::new(&common).is_absolute() { PathBuf::from(common) } else { repo.join(common) };
     let path = common.join("info/exclude");
@@ -717,9 +717,9 @@ fn recover(home: &Path, goal: &str, now: i64) {
 }
 
 /// The board file's length and mtime (`idle_wait`), None while it does not exist.
-type Mark = Option<(u64, Option<std::time::SystemTime>)>;
+pub(super) type Mark = Option<(u64, Option<std::time::SystemTime>)>;
 
-fn mark(path: &Path) -> Mark {
+pub(super) fn mark(path: &Path) -> Mark {
     std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
 }
 
@@ -1027,6 +1027,17 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
             }
         }
     };
+    // Read under the run lock (an interactive join writes its drone, then looks for this lock): a node
+    // runs a runner or interactive drones for a goal, never both, since the run's join and leave would
+    // end the drones' claims on every peer (phase g correction 3, board.rs `Local::left`).
+    if let Some(d) = super::interactive::serving(home, &g.id).filter(|_| !o.dry_run) {
+        return usage(format!(
+            "interactive drone {} (session {}) serves goal {} on this node: a node runs a runner or interactive drones for a goal, never both (`borg hive leave` in that session)",
+            d.drone,
+            super::short(&d.session),
+            g.id
+        ));
+    }
     if !o.dry_run {
         recover(home, &g.id, learn::now_ms());
         // The engineer's approval of the plan before any drone starts (plan.rs): no worktree, run line
