@@ -189,7 +189,7 @@ any mix, on one machine or several:
    again.
 5. Watch it with `borg top` (a live screen, like Unix `top`) or the Hive tab of `borg web`.
 
-<!-- hive-demo -->
+<p align="center"><img src="docs/img/hive-demo.gif" width="900" alt="tmux: a planning Claude Code session opens a goal, two Claude Code drones wake on yes and work it, borg top shows the tasks turn verified and the goal finish"></p>
 
 Lessons apply and sync as in a plain session; verdicts, reworks and groups of attempts credit and teach
 them like any outcome. Claude Code drones' claims are metered from their transcripts, and new claims

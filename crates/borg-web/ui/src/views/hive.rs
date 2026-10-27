@@ -59,8 +59,8 @@ const STATES: [(&str, &str); 6] = [
     ("stuck", "var(--c-heat)"),
 ];
 
-/// Interactive drones by state, in the order a reader scans them: what moves first, the gone last.
-const DRONE_STATES: [&str; 5] = ["working", "busy", "waiting", "not waiting", "gone"];
+/// Interactive drones by state, in the order a reader scans them: what moves first, the left and gone last.
+const DRONE_STATES: [&str; 6] = ["working", "busy", "waiting", "not waiting", "left", "gone"];
 
 /// A drone state's badge class (index.html `.badge`).
 fn badge(state: &str) -> &'static str {

@@ -256,7 +256,8 @@ pub fn drones(home: &Path, goal: &str, b: &Board, events: &[Event], spend: &[Spe
             let harness = lines.iter().rev().find(|e| e.drone == drone && !e.harness.is_empty()).map(|e| e.harness.clone()).unwrap_or_default();
             let session = lines.iter().rev().find(|e| e.drone == drone && e.by != "leave").map_or_else(|| last.session.clone(), |e| e.session.clone());
             let (state, task) = match live.get(&drone) {
-                None => ("gone", String::new()),
+                // Its newest registry line is its leave: the session lives on as a plain one.
+                None => ("left", String::new()),
                 // A harness pid read in another pid namespace (a join from a sandboxed shell) says nothing here.
                 Some(e) if (interactive::reapable(e) && interactive::harness_gone(e)) || super::bound(&e.session).is_none_or(|hs| !hs.interactive) => {
                     ("gone", String::new())
@@ -300,7 +301,7 @@ pub fn drones(home: &Path, goal: &str, b: &Board, events: &[Event], spend: &[Spe
             })
         })
         .collect();
-    rows.sort_by_key(|r| (r.state == "gone", r.drone.clone()));
+    rows.sort_by_key(|r| (matches!(r.state.as_str(), "left" | "gone"), r.drone.clone()));
     rows
 }
 
@@ -505,7 +506,7 @@ mod tests {
     }
 
     /// A drone of this node shows its harness and state: working its task, busy in the engineer's turn,
-    /// waiting with its waiter running, not waiting, gone once it left; its wakes (hand to take-up, and
+    /// waiting with its waiter running, not waiting, left once it left; its wakes (hand to take-up, and
     /// the wake no turn took up), the tasks it did and what its claims were charged.
     #[test]
     fn drones_show_their_state_wakes_and_work() {
@@ -573,7 +574,7 @@ mod tests {
                 ("i-idle", "opencode", "not waiting", ""),
                 ("i-wait", "omp", "waiting", ""),
                 ("i-work", "claude", "working", "t1"),
-                ("i-gone", "claude", "gone", "")
+                ("i-gone", "claude", "left", "")
             ]
         );
         let work = rows.iter().find(|r| r.drone == "i-work").unwrap();

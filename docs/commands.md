@@ -320,7 +320,7 @@ the goal from its first task even when you open it late:
   `waiter <drone>`, or `none`. When an integration is due and nothing runs it, the goal says
   "integration due, no node worker".
 - **Interactive drones** of this machine, grouped by state: `working <task>`, `busy` (your own turn in
-  the session), `waiting` (its wait runs), `not waiting`, or `gone`. Each shows its harness, the tasks it
+  the session), `waiting` (its wait runs), `not waiting`, `left` (it left the hive; its session goes on as a plain one), or `gone` (its session ended). Each shows its harness, the tasks it
   finished and judged, its spend, and its wake latency (from the hand to the turn that took it up, on this node's clock).
   Click a drone to see each wake, including wakes no turn took up.
 - **Stuck and declined** tasks with their reasons, and every **integration** with its result and the
