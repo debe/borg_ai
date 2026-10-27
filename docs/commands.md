@@ -75,8 +75,8 @@ $ borg hive board
 |---|---|
 | `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,.."]... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes. `--hidden-dir`/`--hidden`: a hidden oracle, see [Guardrails](#guardrails-and-the-hidden-oracle) |
 | `borg hive board [<goal>] [--json] [--watch]` | The tasks by status, with holders, age, rework and dependencies |
-| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. Its model never runs `approve`, `integrate`, `score` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone |
-| `borg hive wait` | An interactive drone waits for work without spending tokens (its node beats meanwhile), claims the next task open to it, prints it and exits; Claude Code starts the next turn with that output. Never while the engineer's own turn runs in the session. A claim no hook event of the session takes up within 60 s is released. A stuck goal is said once, then the drone waits on; a drone of one goal leaves once it is finished for good |
+| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. Its model never runs `approve`, `integrate`, `score` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone. In a repo of no collective it says so on stderr with the `borg setup` that adds the repo, and changes nothing ([Interactive drones](#interactive-drones)) |
+| `borg hive wait` | An interactive drone waits for work without spending tokens, claims the next task open to it, prints it and exits; Claude Code starts the next turn with that output. Never while the engineer's own turn runs in the session. A claim no hook event of the session takes up within 60 s is released. A stuck goal is said once, then the drone waits on; a drone of one goal leaves once it is finished for good. Once its session is gone (its Claude Code process ended) it leaves and exits. While no `borg mesh serve` runs on the machine, one waiter does the node's goal work (see [Interactive drones](#interactive-drones)) |
 | `borg hive join <goal> [--session ID\|DRONE]` · `borg hive leave` | A running drone joins the goal, or leaves it (its claim is released). A drone started with `BORG_HIVE=<goal>` joins at its first hook |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
 | `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]` | Headless drones in worktrees, once the plan is approved, see [Running drones](#running-drones). Exit 1 when you said no to the plan (nothing was started or claimed) |
@@ -137,6 +137,73 @@ claim passed to another drone meanwhile) is reported instead, and nothing is han
 the stop. A paused drone is never blocked by its oracle.
 
 Nothing changes for a session that never joined a goal.
+
+### Interactive drones
+
+A session becomes a drone when its model runs `borg hive join` in it (ask it to "join the hive"). It
+then works in its own worktree and, with nothing open, ends each turn on a background `borg hive wait`
+and the line `Drone idle: waiting for hive work, which starts here by itself when a task opens.` Leave
+it alone: the next task starts a turn on its own. It stays a drone until you ask it to leave the hive.
+
+**What a stop says.** Claude Code shows a drone's stop as hook feedback, not as a hook error. When a
+task's checks pass, the stop says that first, for example `[borg hive] t1 done: its checks passed
+(unit); verify task t1.v1 is open for another drone.` When a check fails, it says which one and why.
+Only then does it hand over the next task or ask for the wait. The model writes its last message before
+the checks run, so the done's note on the board is the stop's own summary: the checks that passed, the
+files the attempt changed and its commit subjects. The model's message is not used. A note given with
+`borg hive done --note` is kept as written.
+
+**Ending a session.** The hive takes nothing from the board when a drone's session ends:
+
+- `/exit` while the wait runs shows Claude Code's `Background work is running` dialog. **Exit and stop
+  tasks** stops the wait, and the session's end releases any claim it held and leaves the hive. The
+  node leaves the goal with its last drone. Ctrl-C or Ctrl-D twice and logging out end it the same way.
+- **Move to background and exit** backgrounds the session in agent view, and the wait carries over
+  with it. Once the Claude Code process the drone joined under has exited, the wait sees that and
+  leaves the hive the same way, then exits. No orphan waiter is left. A session you attach to again is
+  a plain session; ask it to join again if you want it as a drone. (This path follows Claude Code's
+  agent-view docs and has not been watched in a live session yet.)
+- **Stay** keeps the drone waiting.
+- A terminal closed under a session, or a crash, has the same outcome as moving to the background: the
+  waiter leaves for the session. A drone whose session dies in the middle of a task, with no wait
+  running, is left for by the node's worker (below): its claim is released `its session is gone`
+  within a second or so of the worker's next look.
+- `/clear` and compact keep the same drone.
+
+**The node's worker.** A runner's threads did more than run drones: they kept the node in the goal,
+said the board finished, integrated it. For interactive drones `borg mesh serve` does that work, on a
+thread of its own, for every goal a drone of the machine serves:
+
+- It beats for the node every 3 s, and at once when another node claims, so peers never take the
+  node's claims for a dead node's while its drones idle or think.
+- It keeps the node's roster of takers: the drones waiting for work or holding a task. A drone in your
+  own turn, or with no wait running, drops out after 10 s, so a task only it could take shows as stuck
+  instead of waiting on a session nothing wakes.
+- It says the board finished, which tasks the node may not take, and what is stuck.
+- It reaps a drone whose Claude Code process is gone (above).
+- Once every task is verified it runs `borg hive integrate` as a child process (output in the goal's
+  `logs/node-integrate.log`), so the goal is integrated and finished while every drone is idle.
+
+It never makes the node join or leave a goal. Ctrl-C (or SIGTERM) stops the daemon and writes nothing,
+and its start writes no join, so the claims of the machine's drones live through a restart. Drones'
+joins and their last leave are what move the node's membership. While the daemon is down its peers
+hear nothing of the node: after 10 s they may treat its claims as a dead node's (a task done twice at
+worst), as during any network stall.
+
+Without a daemon (one machine, no mesh) the waiter of one drone does the same work while it holds the
+node lock (`hive/node.lock`); the daemon takes the lock once that waiter exits. With no daemon and no
+wait running, nothing integrates until one of them runs (`borg hive integrate` by hand still does).
+
+**The first wake after an idle stretch costs more.** Claude Code's prompt cache lasts 5 minutes. A
+task that arrives after a longer wait starts a turn that reads the whole conversation again uncached.
+In the live probe that was about 42,000 tokens written to the cache, about $0.16 on Sonnet. Wakes that
+come within 5 minutes of each other read from the cache. Waiting itself costs nothing, however long.
+
+**A repo in no collective.** The hive keeps its board in a collective's store, so `borg hive init` and
+`join` in a repo that belongs to no collective refuse and print the command that adds the repo:
+`borg setup --private <repo>` (this machine only) or `borg setup --team <name> --paths <repo>`. Run it
+in a terminal. A fresh `borg setup` that took every default adds no repo, and borg never adds one for
+you. A repo on the config's `off` list is told that the hive does not run there.
 
 ### Guardrails and the hidden oracle
 
@@ -521,8 +588,8 @@ not this one.
   flight when the total reached it, one per drone, each at most its drone's dollars left, while the
   mesh syncs faster than a session lasts (the daemon dials as soon as a hive log changes, looked at every 25 ms); a machine that lags longer
   lets each of its drones start one more session per sync it missed.
-- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/10` or
-  earlier do not sync with this version (`borg/mesh/11` carries the ratified constraints, 10 the goal's spend, 9 the
+- **Not measured** across real machines yet (arm E is a later paid run). Peers on `borg/mesh/11` or
+  earlier do not sync with this version (`borg/mesh/12` carries each goal's beats in the live exchange instead of the board, 11 the ratified constraints, 10 the goal's spend, 9 the
   bundles): upgrade every member.
   The mesh log and `borg doctor` name each member on another version and who has to upgrade.
 

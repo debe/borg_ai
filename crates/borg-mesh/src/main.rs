@@ -261,6 +261,14 @@ async fn run(args: &[String]) -> Result<(), String> {
                 eprintln!("borg mesh: no relay connection yet ({}): members behind another NAT may not reach this node until it has one", relay.setting());
             }
             let opts = Options { interval: Duration::from_secs(interval.max(1)), ..Options::default() };
+            // The node's goal work for its interactive drones (borg hive/node.rs, phase g G4) on a thread
+            // of its own, so no merge or board read holds up a sync round; stopped with the daemon, it
+            // writes nothing on the way out (no leave of any goal).
+            let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker = {
+                let (home, quit) = (node.home().to_path_buf(), quit.clone());
+                std::thread::spawn(move || borg::hive::node::serve(&home, &quit))
+            };
             daemon::serve(node, opts, stop(), |e| match e {
                 Event::Served(Ok(r)) if r.joined > 0 => println!("a new member joined with an invite (`borg mesh members`)"),
                 Event::Served(Ok(r)) => println!("served: {}", show(&r)),
@@ -271,6 +279,8 @@ async fn run(args: &[String]) -> Result<(), String> {
                 Event::Gate(Err(e)) => eprintln!("borg mesh: {e}; paused until the config allows it"),
             })
             .await;
+            quit.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
             println!("stopped");
         }
         Some("sync") => {
@@ -403,14 +413,29 @@ fn help() -> String {
     out
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
         print!("{}", help());
         return;
     }
-    if let Err(e) = run(&args).await {
+    // The daemon's node worker reads its drones' scratch state where their hooks and `borg hive` keep it
+    // (borg hook.rs `main`, hive/mod.rs `Here::locate`): the store's `state` unless BORG_STATE names one.
+    if args.first().map(String::as_str) == Some("serve")
+        && std::env::var_os("BORG_STATE").is_none()
+        && let Route::Collective { home, .. } = place(&args).route()
+    {
+        // SAFETY: single-threaded: the runtime and its threads start below.
+        unsafe { std::env::set_var("BORG_STATE", home.join("state")) };
+    }
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("borg mesh: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = rt.block_on(run(&args)) {
         eprintln!("borg mesh: {e}");
         std::process::exit(1);
     }

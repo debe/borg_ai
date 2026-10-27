@@ -85,6 +85,7 @@ pub type State = BTreeMap<PathBuf, (u64, Option<SystemTime>)>;
 /// A cheap fingerprint of what a round would carry: size and mtime of the synced files.
 fn local_state(home: &Path) -> State {
     let mut files = crate::lines::logs(home);
+    files.extend(crate::beats::files(home)); // a new beat travels at once: an ack makes a claim final (phase f F5)
     files.push(membership::path(home));
     files.push(crate::steer::outbox(home)); // a new directive travels at once (presence waits for the interval)
     state(files)
@@ -92,10 +93,11 @@ fn local_state(home: &Path) -> State {
 
 /// The same fingerprint of every goal's hive logs (borg-eval's sync pump, which holds a few goals).
 pub fn hive_state(home: &Path) -> State {
-    state(crate::lines::hive_logs(home))
+    state(crate::lines::hive_logs(home).into_iter().chain(crate::beats::files(home)).collect())
 }
 
-/// The hive logs `hive_poll` looks at: every synced log (existing or not) of each goal in `seen` with
+/// The hive logs `hive_poll` looks at: every synced log and the beats store (existing or not, beats.rs:
+/// an ack beat makes another node's claim final, so it goes at once) of each goal in `seen` with
 /// a file changed within `LEASE_MS`, a goal being worked on (a run's drones renew their leases well
 /// within it, and its start writes a line, borg hive/mod.rs `announce`). The others' first change is
 /// seen by the whole store's `poll`, which makes their goal live from then on.
@@ -107,7 +109,9 @@ pub fn live_hive_logs(home: &Path, seen: &State) -> Vec<PathBuf> {
         .filter(|(p, (_, at))| at.is_some_and(|t| t >= since) && p.parent().and_then(Path::parent) == Some(hive.as_path()))
         .filter_map(|(p, _)| p.parent()?.file_name()?.to_str())
         .collect();
-    ids.into_iter().flat_map(|id| crate::lines::hive_files(home, id)).collect()
+    ids.into_iter()
+        .flat_map(|id| crate::lines::hive_files(home, id).into_iter().chain([borg::hive::board::beats_path(&borg::hive::tasks_path(home, id))]))
+        .collect()
 }
 
 /// One stat per file; a missing one reads (0, None).
@@ -162,7 +166,7 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
             },
             Some(done) = sessions.join_next() => {
                 let result = done.unwrap_or_else(|e| Err(format!("session task: {e}")));
-                if result.as_ref().is_ok_and(|r| r.received > 0 || r.quarantined > 0 || r.steered > 0 || r.joined > 0) {
+                if result.as_ref().is_ok_and(|r| r.received > 0 || r.quarantined > 0 || r.steered > 0 || r.joined > 0 || r.beats > 0) {
                     dirty = true; // pass it on to the others
                 }
                 on(Event::Served(result));
@@ -177,7 +181,7 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
                 match &result {
                     Ok(r) => {
                         *b = Backoff::default();
-                        dirty |= r.received > 0 || r.quarantined > 0 || r.steered > 0;
+                        dirty |= r.received > 0 || r.quarantined > 0 || r.steered > 0 || r.beats > 0;
                     }
                     Err(_) => {
                         b.failures = b.failures.saturating_add(1);

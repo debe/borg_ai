@@ -371,6 +371,28 @@ pub fn local_owner_of<'a>(cfg: Option<&'a Config>, home: &Path, base: &Path) -> 
     cfg?.collectives.iter().find(|c| c.share == Share::Local && store(base, &c.name) == home).map(|c| c.name.as_str())
 }
 
+/// How deep `cwd` lies inside a config path (`None`: not inside it). A path and the one its symlinks
+/// resolve to are one place (macOS's /tmp is /private/tmp; a harness may report either), on both sides:
+/// an `off` path written through a link must still win.
+fn within(cwd: &str) -> impl Fn(&str) -> Option<usize> {
+    let lexical = expand(cwd);
+    let paths: Vec<Vec<String>> = std::iter::once(normal(&lexical)).chain(lexical.canonicalize().ok().map(|p| normal(&p))).collect();
+    move |prefix: &str| {
+        let real = expand(prefix).canonicalize().ok().map(|p| p.to_string_lossy().into_owned());
+        let prefixes = std::iter::once(prefix.to_string()).chain(real);
+        prefixes.filter_map(|pre| paths.iter().filter_map(|p| inside(p, &pre)).max()).max()
+    }
+}
+
+/// Whether `cwd` lies inside one of `cfg`'s `off` paths: kept out of every collective, whatever else
+/// the config says (`route` checks them first).
+pub fn kept_off(cfg: &Config, cwd: &str) -> bool {
+    !cwd.trim().is_empty() && {
+        let within = within(cwd);
+        cfg.off.iter().any(|p| within(p).is_some())
+    }
+}
+
 /// Which collective `cwd` belongs to. `base` is the root store (`BORG_HOME`).
 pub fn route(cfg: Option<&Config>, cwd: &str, base: &Path) -> Route {
     let Some(cfg) = cfg else {
@@ -379,15 +401,7 @@ pub fn route(cfg: Option<&Config>, cwd: &str, base: &Path) -> Route {
     if cwd.trim().is_empty() {
         return Route::Off; // unknown location: never guess
     }
-    // A path and the one its symlinks resolve to are one place (macOS's /tmp is /private/tmp; a harness
-    // may report either), on both sides: an `off` path written through a link must still win.
-    let lexical = expand(cwd);
-    let paths: Vec<Vec<String>> = std::iter::once(normal(&lexical)).chain(lexical.canonicalize().ok().map(|p| normal(&p))).collect();
-    let within = |prefix: &str| -> Option<usize> {
-        let real = expand(prefix).canonicalize().ok().map(|p| p.to_string_lossy().into_owned());
-        let prefixes = std::iter::once(prefix.to_string()).chain(real);
-        prefixes.flat_map(|pre| paths.iter().filter_map(move |p| inside(p, &pre))).max()
-    };
+    let within = within(cwd);
     if cfg.off.iter().any(|p| within(p).is_some()) {
         return Route::Off;
     }

@@ -45,6 +45,8 @@ use crate::{learn, queen, runner, stats, veto};
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A whole snapshot outside the stop hook (the CLI): its four git calls.
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(40);
+/// The subject of every snapshot commit (`snapshot`): borg's, never the work's (mod.rs `stop_note`).
+pub const SNAPSHOT_SUBJECT: &str = "borg hive snapshot";
 /// A whole [`diff`]: its two git calls (inside the stop hook's 60 s default budget).
 pub const DIFF_TIMEOUT: Duration = Duration::from_secs(2 * GIT_TIMEOUT.as_secs());
 /// What a reason quotes of a line.
@@ -116,7 +118,7 @@ pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     clean();
     let tree = tree?;
     let who = [("GIT_AUTHOR_NAME", "borg"), ("GIT_AUTHOR_EMAIL", "borg@localhost"), ("GIT_COMMITTER_NAME", "borg"), ("GIT_COMMITTER_EMAIL", "borg@localhost")];
-    let mut args = vec!["commit-tree", tree.as_str(), "-m", "borg hive snapshot"];
+    let mut args = vec!["commit-tree", tree.as_str(), "-m", SNAPSHOT_SUBJECT];
     let parent = git(dir, &["rev-parse", "--verify", "-q", "HEAD"], &[]);
     if let Some(p) = parent.as_deref() {
         args.extend(["-p", p]);

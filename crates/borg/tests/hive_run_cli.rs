@@ -414,7 +414,8 @@ fn sigint_ends_the_unsettled_session_and_leaves_the_goal() {
     let notes = notes(&root);
     let at = |note: &str| notes.iter().rposition(|n| n == note);
     assert!(at(board::JOIN) < at("session-start d1") && at("session-start d1") < at("session-end d1"), "{notes:?}");
-    assert_eq!(notes.last().map(String::as_str), Some(board::LEAVE), "{notes:?}");
+    // The board's last runner line; beats are no board lines (the goal's beats store, read after them).
+    assert_eq!(notes.iter().rev().find(|n| *n != board::BEAT).map(String::as_str), Some(board::LEAVE), "{notes:?}");
     let b = fold(&root);
     assert!(b.sessions.values().all(|(started, settled)| started <= settled), "{:?}", b.sessions);
     assert!(b.members.values().all(|(join, leave)| join < leave), "{:?}", b.members);

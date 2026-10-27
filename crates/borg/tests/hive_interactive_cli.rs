@@ -105,8 +105,15 @@ fn stop(root: &Path, s: &str, again: bool, background: Value) -> Option<Value> {
     )
 }
 
+/// What a stop says to the model and goes on with: a block's reason, or a drone's Stop feedback (its
+/// `additionalContext`, interactive.rs `feedback`).
 fn reason(v: &Option<Value>) -> String {
-    v.as_ref().and_then(|v| v["reason"].as_str()).unwrap_or_default().to_string()
+    v.as_ref().and_then(|v| v["reason"].as_str().or_else(|| v["hookSpecificOutput"]["additionalContext"].as_str())).unwrap_or_default().to_string()
+}
+
+/// Whether a stop continues the turn (a block, or Stop feedback with text).
+fn continues(v: &Option<Value>) -> bool {
+    !reason(v).is_empty()
 }
 
 /// The background task a model started for `borg hive wait`, as Claude Code's Stop input lists it.
@@ -260,7 +267,7 @@ fn a_joined_session_waits_at_no_cost_and_takes_the_task_that_arrives() {
     // The oracle runs in the drone's worktree, not the directory the event names.
     std::fs::write(tree.join("ok"), "").unwrap();
     let r = reason(&stop(&root, s, false, json!([])));
-    assert!(r.contains("t1 done, verify task t1.v1 opened") || task_state(&root, "t1").0 == "done", "{r}");
+    assert!(r.starts_with("[borg hive] t1 done: its checks passed (ok); verify task t1.v1 is open for another drone."), "the result first: {r}");
     assert_eq!(task_state(&root, "t1").0, "done");
     assert!(r.contains("hive wait --session"), "nothing it may take (its own verify task is barred): wait again: {r}");
     // Leave: a plain session again, and with the node's last drone the node leaves the goal.
@@ -315,11 +322,11 @@ fn the_engineers_turn_is_never_handed_work() {
     assert!(w.running() && task_state(&root, "t1").0 == "open", "nothing handed during the engineer's turn");
     hook(&root, "post_tool", s, json!({"tool_name": "Bash", "tool_input": {"command": "cargo build"}, "tool_response": {"stdout": ""}}));
     // A stop that blocks (the conscience's questions) continues the engineer's turn: still nothing handed.
-    if stop(&root, s, false, wait_task(&root, s)).is_some_and(|v| v["decision"] == "block") {
+    if continues(&stop(&root, s, false, wait_task(&root, s))) {
         std::thread::sleep(Duration::from_millis(1500));
         assert!(w.running() && task_state(&root, "t1").0 == "open", "a blocked stop goes on with the engineer's turn");
     }
-    assert!(stop(&root, s, true, wait_task(&root, s)).is_none_or(|v| v["decision"] != "block"), "the turn ends");
+    assert!(!continues(&stop(&root, s, true, wait_task(&root, s))), "the turn ends");
     let (code, text) = w.ended(20);
     assert!(code == 0 && text.contains("Your claim: t1"), "{text}");
     hook(&root, "prompt", s, json!({"prompt": "go"}));
@@ -418,7 +425,7 @@ fn an_unshown_claim_waits_out_the_engineers_turn() {
     let out = stop(&root, s, false, wait_task(&root, s));
     assert!(!reason(&out).contains("not done") && !reason(&out).contains("t1"), "no oracle on a claim not in hand: {out:?}");
     let out = stop(&root, s, true, wait_task(&root, s));
-    assert!(out.as_ref().is_none_or(|v| v["decision"] != "block"), "the turn ends: {out:?}");
+    assert!(!continues(&out), "the turn ends: {out:?}");
     let (code, text) = w.ended(20);
     assert!(code == 0 && text.contains("Work arrived") && text.contains("Your claim: t1"), "{text}");
     assert!(held_by(&root, "t1", s));
@@ -499,6 +506,126 @@ fn a_drones_edit_of_the_engineers_checkout_is_refused() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A drone's stop with its task done says the result before anything else, as Stop feedback, not an
+/// error (live probe gaps 1 and 3): the model wrote its last message before the checks ran ("I didn't
+/// tell borg the task is done"), so the done's note on the board is the stop's own summary, the checks,
+/// the files and the commits, and never that message. Its idle line says the work comes by itself.
+/// Fails with the stop's done unsaid (only the wait asked for), with the model's message as the note,
+/// and with a `decision: block` (shown as "Stop hook error").
+#[test]
+fn a_done_is_said_first_and_its_note_is_the_stops_own() {
+    let root = setup("hive-i-done-said");
+    let s = "sess-done-said-1";
+    ok(&root, &["join", "g1"], &inside(s));
+    open_task(&root, "t1");
+    let (code, text) = spawn_wait(&root, s, &[("BORG_HIVE_TAKEUP_MS", "20000")]).ended(20);
+    assert!(code == 0 && text.contains("Your claim: t1"), "{text}");
+    prompt(&root, s);
+    let tree = PathBuf::from(hs(&root, s)["worktree"].as_str().unwrap());
+    std::fs::write(tree.join("ok"), "hello hive\n").unwrap();
+    git(&tree, &["add", "ok"]);
+    git(&tree, &["commit", "-q", "-m", "Add the ok marker"]);
+    let wrong = "I finished task t1. I didn't tell borg the task is done, because the instructions didn't say how.";
+    let out = hook(&root, "stop", s, json!({"last_assistant_message": wrong, "stop_hook_active": false, "background_tasks": [], "session_crons": []}));
+    let v = out.clone().expect("the stop goes on");
+    assert!(v.get("decision").is_none() && v["hookSpecificOutput"]["hookEventName"] == "Stop", "Stop feedback, not a block: {v}");
+    let r = reason(&out);
+    assert!(r.starts_with("[borg hive] t1 done: its checks passed (ok); verify task t1.v1 is open for another drone."), "{r}");
+    let (done_at, wait_at) = (r.find("t1 done").unwrap(), r.find("hive wait --session").expect("then the wait"));
+    assert!(done_at < wait_at, "{r}");
+    assert!(r.contains(interactive::IDLE_LINE) && r.contains("only on the engineer's request"), "{r}");
+    let done = events(&root).into_iter().find(|e| e.ev == board::Ev::Done).unwrap();
+    assert!(!done.note.contains("didn't tell borg"), "not the model's message: {}", done.note);
+    assert!(done.note.starts_with("its checks passed (ok)") && done.note.contains("it changed ok") && done.note.contains("Add the ok marker"), "{}", done.note);
+    assert!(!done.note.contains("borg hive snapshot"), "{}", done.note);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A drone whose session ends with no SessionEnd (a closed terminal, Claude Code's "Move to background
+/// and exit", a crash) leaves no orphan waiter (live probe gap 2): the waiter sees its harness process
+/// gone, leaves (the registry, the node's leave with its last drone) and exits. The harness here is a
+/// perl process the join ran under, stopped with SIGTERM. Fails with the waiter blind to its harness:
+/// it waits on.
+#[test]
+fn a_waiter_whose_session_is_gone_leaves_and_ends() {
+    let root = setup("hive-i-gone");
+    let s = "sess-gone-1";
+    let dir = work(&root).display().to_string();
+    let args = ["-e", "system(@ARGV); sleep 600", env!("CARGO_BIN_EXE_borg"), "hive", "join", "g1", "--dir", &dir];
+    let mut harness = Waiter(Some(command_with("perl", &root, &args, &inside(s)).spawn().unwrap()));
+    let pid = harness.0.as_ref().unwrap().id();
+    until(20, "the join", || interactive::live(&store(&root)).iter().any(|e| e.session == s));
+    assert_eq!(interactive::live(&store(&root))[0].pid, pid, "the join's harness process");
+    let mut w = spawn_wait(&root, s, &[]);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(w.running(), "its session lives: it waits");
+    // SAFETY: kill(2) on the perl process this test spawned and has not reaped.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let _ = harness.0.take().unwrap().wait();
+    let (code, out) = w.ended(15);
+    assert!(code == 0 && out.contains("session is gone"), "{out}");
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty(), "a plain session no more bound");
+    assert!(events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE), "the node left with its last drone");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A joined session's end (SessionEnd: `/exit` with "Exit and stop tasks", Ctrl-C or Ctrl-D, logout)
+/// leaves cleanly (live probe gap 2): its waiter stops, a claim it held is released and its node leaves
+/// with its last drone. Fails with the end leaving the drone bound (its waiter waits on).
+#[test]
+fn a_session_end_stops_the_waiter_releases_the_claim_and_leaves() {
+    let root = setup("hive-i-end");
+    let s = "sess-end-1";
+    ok(&root, &["join", "g1"], &inside(s));
+    let w = spawn_wait(&root, s, &[]);
+    std::thread::sleep(Duration::from_millis(800));
+    hook(&root, "end", s, json!({"reason": "prompt_input_exit"}));
+    let (code, _) = w.ended(15);
+    assert_eq!(code, 128 + libc::SIGTERM, "stopped by the leave");
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty());
+    assert!(events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE));
+    // Holding a task: the end releases it.
+    let s2 = "sess-end-2";
+    ok(&root, &["join", "g1"], &inside(s2));
+    open_task(&root, "t1");
+    ok(&root, &["claim"], &inside(s2));
+    assert!(held_by(&root, "t1", s2));
+    hook(&root, "end", s2, json!({"reason": "other"}));
+    assert_eq!(task_state(&root, "t1").0, "open", "released");
+    assert!(hs(&root, s2).is_null());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A repo in no collective: `borg hive join` and `init` say so on stderr with the one step that fixes it
+/// (live probe gap 6: a fresh `borg setup` that took the defaults left the repo off, and the hive refused
+/// with a line naming no fix); an `off` path says the hive does not run there. Nothing is changed for
+/// the engineer.
+#[test]
+fn a_repo_in_no_collective_is_told_how_to_join_one() {
+    let root = setup("hive-i-off");
+    let config = std::fs::read_to_string(root.join("collectives.json")).unwrap();
+    std::fs::write(root.join("collectives.json"), json!({"default": "off", "collectives": []}).to_string()).unwrap();
+    for args in [&["join"][..], &["init", "g2", "--spec", "x", "--oracle", "ok=true"][..]] {
+        let (out, err, code) = hive(&root, args, &inside("sess-off-1"));
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(err.contains("belongs to no collective") && err.contains("borg setup --private") && err.contains("borg setup --team"), "{err}");
+    }
+    let w = work(&root).display().to_string();
+    std::fs::write(
+        root.join("collectives.json"),
+        json!({"default": "off", "off": [w], "collectives": [{"name": "corp", "paths": [root.join("harbor_orion")], "share": "local"}]}).to_string(),
+    )
+    .unwrap();
+    let (_, err, code) = hive(&root, &["join"], &inside("sess-off-1"));
+    assert!(code == 1 && err.contains("is an `off` path") && !err.contains("borg setup"), "{err}");
+    // An `off` path no collective path or default covers is still said to be one: a setup would not lift it.
+    std::fs::write(root.join("collectives.json"), json!({"default": "off", "off": [w], "collectives": []}).to_string()).unwrap();
+    let (_, err, code) = hive(&root, &["join"], &inside("sess-off-1"));
+    assert!(code == 1 && err.contains("is an `off` path") && !err.contains("borg setup"), "{err}");
+    std::fs::write(root.join("collectives.json"), config).unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The events of a plain session that never joined, through `bin`'s hooks: (event, output with the
 /// root as `<root>`).
 fn plain_session(bin: &str, root: &Path) -> Vec<(String, String)> {
@@ -551,5 +678,95 @@ fn an_unjoined_session_answers_byte_for_byte_as_before_phase_g() {
         .filter(|n| n.starts_with("plain-unjoined.hive"))
         .collect();
     assert!(state.is_empty(), "no hive state for it: {state:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `borg hive <args> --dir <dir>` with `env`: a drone's command in its own tree.
+fn ok_in(root: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let d = dir.display().to_string();
+    let all: Vec<&str> = ["hive"].iter().copied().chain(args.iter().copied()).chain(["--dir", d.as_str()]).collect();
+    let out = command(root, &all, env).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "borg hive {args:?} in {d}: {text}");
+    text
+}
+
+fn tree_of(root: &Path, s: &str) -> PathBuf {
+    PathBuf::from(hs(root, s)["worktree"].as_str().unwrap())
+}
+
+/// Phase g G4, the waiter's fallback: with no mesh daemon on the node, the waiter of one of its drones
+/// does the node's goal work while it holds the node lock (hive/node.rs): t1 done by one drone and
+/// verified by the other, every task verified and no drone working, the goal is integrated by the
+/// node's `borg hive integrate` child and said finished, and the single-goal drone ends on it. While
+/// another process holds the node lock (a daemon) the waiter does none of it: no beat, no integration.
+/// Fails with the waiter's node work removed: nobody integrates and the wait waits on.
+#[test]
+fn with_no_daemon_a_drones_wait_does_the_nodes_work_and_integrates() {
+    let root = setup("hive-i-node-wait");
+    open_task(&root, "t1");
+    let (sa, sb) = ("sess-node-wait-a", "sess-node-wait-b");
+    ok(&root, &["join", "g1"], &inside(sa));
+    let ta = tree_of(&root, sa);
+    ok_in(&root, &ta, &["claim"], &inside(sa));
+    std::fs::write(ta.join("ok"), "").unwrap();
+    ok_in(&root, &ta, &["done"], &inside(sa));
+    ok(&root, &["join", "g1"], &inside(sb));
+    let tb = tree_of(&root, sb);
+    assert!(ok_in(&root, &tb, &["claim"], &inside(sb)).contains("t1.v1"));
+    ok_in(&root, &tb, &["verify", "--pass"], &inside(sb));
+    let b = board::fold(&events(&root));
+    assert!(board::integration_due(&b), "every task verified, nothing integrated yet");
+    // A daemon holds the node lock: the wait waits and does none of the node's work.
+    let lock = borg::hive::node::take(&store(&root)).expect("the node lock");
+    let mut w = spawn_wait(&root, sa, &[]);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(w.running(), "it waits");
+    assert!(!events(&root).iter().any(board::is_beat), "no beat of the waiter's while a daemon does the node's work");
+    assert!(!board::fold(&events(&root)).tasks.contains_key("integrate.1"), "nor an integration");
+    // No daemon: the waiter takes the lock, beats, integrates (its child) and the goal ends.
+    drop(lock);
+    let (code, out) = w.ended(60);
+    assert!(code == 0 && out.contains("the goal is finished"), "{out}");
+    let evs = events(&root);
+    let b = board::fold(&evs);
+    assert!(b.finished() && matches!(b.tasks["integrate.1"].status, borg::hive::Status::Verified { .. }), "integrated");
+    assert!(evs.iter().any(board::is_beat), "the waiter beat for its node");
+    assert!(evs.iter().any(|e| e.by == "runner" && e.note == board::finished_note("integrate.1")), "the node said it finished");
+    assert!(evs.iter().any(|e| e.by == "runner" && e.note.starts_with("drones ")), "the roster of its takers");
+    ok(&root, &["leave"], &inside(sb));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Phase g G4, the reaper: a drone whose session dies mid-task with no wait of its own running (its
+/// harness process gone, no SessionEnd) is reaped by its node's worker, here the other drone's waiter:
+/// its claim released `its session is gone`, it is no drone any more, and the node stays in the goal for
+/// the drone that lives on, whose wait then takes the task. The harness is a perl process the join and
+/// the claim ran under, stopped with SIGTERM. Fails with no reaper: the claim stays held for its lease.
+#[test]
+fn a_drone_whose_session_died_mid_task_is_reaped_by_its_nodes_worker() {
+    let root = setup("hive-i-node-reap");
+    open_task(&root, "t1");
+    let (sa, sb) = ("sess-node-reap-a", "sess-node-reap-b");
+    let dir = work(&root).display().to_string();
+    let bin = env!("CARGO_BIN_EXE_borg");
+    let script = format!("{bin} hive join g1 --dir {dir} && {bin} hive claim --dir {dir}");
+    let args = ["-e", "system('sh', '-c', $ARGV[0]); sleep 600", script.as_str()];
+    let mut harness = Waiter(Some(command_with("perl", &root, &args, &inside(sa)).spawn().unwrap()));
+    let pid = harness.0.as_ref().unwrap().id();
+    until(20, "the claim", || held_by(&root, "t1", sa));
+    ok(&root, &["join", "g1"], &inside(sb));
+    let w = spawn_wait(&root, sb, &[("BORG_HIVE_TAKEUP_MS", "20000")]);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(held_by(&root, "t1", sa), "its session lives: it keeps its claim");
+    // SAFETY: kill(2) on the perl process this test spawned and has not reaped.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let _ = harness.0.take().unwrap().wait();
+    until(15, "the reap", || events(&root).iter().any(|e| e.ev == board::Ev::Released && e.by == sa && e.note == "its session is gone"));
+    assert!(hs(&root, sa).is_null() && interactive::live(&store(&root)).iter().all(|e| e.session == sb), "no drone any more");
+    assert!(!events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE), "the node stays for the drone that lives on");
+    let (code, out) = w.ended(20);
+    assert!(code == 0 && out.contains("Your claim: t1"), "the living drone takes it: {out}");
+    ok(&root, &["leave"], &inside(sb));
     let _ = std::fs::remove_dir_all(root);
 }

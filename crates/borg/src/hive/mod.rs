@@ -49,6 +49,7 @@ pub mod hidden;
 pub mod integrate;
 pub mod interactive;
 pub mod message;
+pub mod node;
 pub mod oracle;
 pub mod plan;
 pub mod rework;
@@ -968,10 +969,13 @@ fn release_lost(home: &Path, goal: &str, session: &str, lost: &[String]) {
     }
 }
 
-/// The board of goal `g` for `session` at `now`: its lines with their offsets, the end offset, the fold.
+/// The board of goal `g` for `session` at `now`: its lines with their offsets, the end offset, the fold
+/// (of the lines and the goal's beats, `board::read`).
 fn board_for(home: &Path, g: &Goal) -> (Vec<(u64, Event)>, u64, Board) {
-    let (events, end) = board::read_from(&tasks_path(home, &g.id), 0);
-    let b = board::fold_on(&events.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>(), &node(home));
+    let path = tasks_path(home, &g.id);
+    let (events, end) = board::read_from(&path, 0);
+    let all: Vec<Event> = events.iter().map(|(_, e)| e.clone()).chain(board::beats_of(&path)).collect();
+    let b = board::fold_on(&all, &node(home));
     (events, end, b)
 }
 
@@ -1477,7 +1481,11 @@ impl Ctx<'_> {
             // No conscience round on unfinished work: its model call would judge work still changing.
             return Some(json!({"decision": "block", "reason": reason}));
         }
-        let mut text = waiting;
+        // An interactive drone hears what became of its task before anything else (`done`).
+        let (mut text, after) = match hs.interactive {
+            true => (String::new(), waiting),
+            false => (waiting, String::new()),
+        };
         let mut handed = false;
         if let Some(check) = verdict.check() {
             // At the cap: the drone may stop; the board says why the task stands still.
@@ -1494,13 +1502,14 @@ impl Ctx<'_> {
                 task.id
             ));
         } else {
-            let (said, next) = self.done(held, input, &path, &left);
+            let (said, next) = self.done(hs.interactive, held, input, &path, &left);
             text.push_str(&said);
             if next {
                 handed = true;
                 hs.beat_ms = self.now;
             }
         }
+        text.push_str(&after);
         hs.oracle_blocks = 0;
         hs.blocks_for.clear();
         save(self.session, hs);
@@ -1513,14 +1522,25 @@ impl Ctx<'_> {
     /// drone. The text to block with, and whether it holds a new claim; a done the board did not take
     /// says so and hands over nothing. The done's snapshot keeps within what is `left` of the hook's
     /// time; the next claim is made only when time is left.
-    fn done(&self, held: &TaskState, input: &Value, path: &Path, left: &dyn Fn() -> Duration) -> (String, bool) {
+    ///
+    /// An interactive drone (`interactive`) hears the done's result first, whatever follows: its model
+    /// wrote its last message before the checks ran, so without it the model would report a state that
+    /// was never true (the live probe: "I didn't tell borg the task is done"). Its done's note is the
+    /// stop's own summary (`Note::Stop`), never that message. A runner's drone is told as before.
+    fn done(&self, interactive: bool, held: &TaskState, input: &Value, path: &Path, left: &dyn Fn() -> Duration) -> (String, bool) {
         let task = &held.task;
         let message = crate::harness::plan(self.h.caps(), input);
-        match finish(self.home, self.g, held, self.session, Path::new(self.cwd), &message, left()) {
-            Ok(vid) => match self.hand_next(path, left()) {
-                Some(next) => (format!("[borg hive] {} done, verify task {vid} opened. Next: {next}\n\n", task.id), true),
-                None => (String::new(), false),
-            },
+        let note = if interactive { Note::Stop } else { Note::Said(&message) };
+        match finish(self.home, self.g, held, self.session, Path::new(self.cwd), &note, left()) {
+            Ok(vid) => {
+                let said = format!("[borg hive] {} done: {}; verify task {vid} is open for another drone.", task.id, passed(self.g, task));
+                match self.hand_next(path, left()) {
+                    Some(next) if interactive => (format!("{said} Next: {next}\n\n"), true),
+                    Some(next) => (format!("[borg hive] {} done, verify task {vid} opened. Next: {next}\n\n", task.id), true),
+                    None if interactive => (format!("{said}\n\n"), false),
+                    None => (String::new(), false),
+                }
+            }
             Err(Unfinished::Lost(why)) => (format!("[borg hive] {why}\n\n"), false),
             Err(Unfinished::Io(e)) => (format!("[borg hive] the done of {} was not recorded: {e}\n\n", task.id), false),
         }
@@ -1576,6 +1596,51 @@ fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Pat
     (done, check)
 }
 
+/// What a done's note on the board says (`finish`): what a verifier, a rework and the playbooks read of
+/// the attempt (board.rs `render_change`, playbook.rs, rework.rs).
+enum Note<'a> {
+    /// Words written with the result known or as the done's own claim: `borg hive done --note`, or a
+    /// runner drone's last message (which it writes knowing its stop runs the checks).
+    Said(&'a str),
+    /// The stop's own summary (`stop_note`): the checks that passed, the files the attempt changed and
+    /// its commits. An interactive drone's last message is written before its checks ran and may say
+    /// anything of the task's state; the summary is only what the stop knows (live probe, phase g).
+    Stop,
+}
+
+/// What a passed task's checks are said as: `its checks passed (a, b)`.
+fn passed(g: &Goal, t: &Task) -> String {
+    let checks: Vec<String> = oracle::checks(g, t).iter().map(|c| c.name.clone()).collect();
+    match checks.is_empty() {
+        true => "it has no checks".into(),
+        false => format!("its checks passed ({})", checks.join(", ")),
+    }
+}
+
+/// The stop's summary of an attempt (`Note::Stop`) from its claim's snapshot `base` to its done's
+/// `head` in `dir`: its checks passed, the files it changed and its commits' subjects (borg's own
+/// snapshot commits left out), each git call within `within` (at most 5 s). Only the checks when either
+/// snapshot is missing.
+fn stop_note(g: &Goal, t: &Task, base: &str, head: &str, dir: &Path, within: Duration) -> String {
+    let mut note = passed(g, t);
+    if base.is_empty() || head.is_empty() {
+        return note;
+    }
+    let cap = within.min(Duration::from_secs(5));
+    let files = run::git(dir, &["diff", "--name-only", base, head], cap).unwrap_or_default();
+    let files: Vec<&str> = files.lines().map(str::trim).filter(|f| !f.is_empty()).collect();
+    if !files.is_empty() {
+        let more = files.len().saturating_sub(8);
+        note.push_str(&format!("; it changed {}{}", files[..files.len() - more].join(", "), if more > 0 { format!(" (+{more} more)") } else { String::new() }));
+    }
+    let log = run::git(dir, &["log", "--format=%s", &format!("{base}..{head}")], cap).unwrap_or_default();
+    let subjects: Vec<&str> = log.lines().map(str::trim).filter(|s| !s.is_empty() && *s != verdict::SNAPSHOT_SUBJECT).collect();
+    if !subjects.is_empty() {
+        note.push_str(&format!("; its commits: {}", subjects.join(" | ")));
+    }
+    note
+}
+
 /// Why a `done` took no effect.
 enum Unfinished {
     /// The board could not be written.
@@ -1590,18 +1655,32 @@ enum Unfinished {
 /// an attempt for good (phase f F5, board.rs `Fold::permanent`), which no claim that arrives later voids.
 /// A claim that passed to another drone meanwhile (a suite that ran past the lease, a rival's earlier
 /// claim from a suspected node) writes nothing: nothing is counted and the drone is told who holds the
-/// task. The verify task's id when it took. `borg hive done` and the stop share it.
-fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, note: &str, within: Duration) -> Result<TaskId, Unfinished> {
+/// task. The verify task's id when it took. `borg hive done` and the stop share it; the done's note is
+/// `note` (`Note`).
+fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, note: &Note, within: Duration) -> Result<TaskId, Unfinished> {
     let path = tasks_path(home, &g.id);
     let id = &held.task.id;
     let since = match held.status {
         Status::Claimed { since, .. } => since,
         _ => i64::MIN,
     };
+    let started = Instant::now();
     let (done, check) = done_events(home, g, held, session, dir, since, within);
     let (vid, ms) = (check.id.clone(), done.ms);
     let here = node(home);
-    let lines = vec![done.with_note(&hook::one_line(&crate::notes::redact(note), 200)), Event::open(check, session, ms)];
+    let note = match note {
+        Note::Said(n) => n.to_string(),
+        Note::Stop => {
+            let base = board::read(&path)
+                .into_iter()
+                .rev()
+                .find(|e| e.ev == Ev::Claim && e.task == *id && e.by == session && e.ms == since && board::of_node(&e.node, &here))
+                .map(|e| e.base)
+                .unwrap_or_default();
+            stop_note(g, &held.task, &base, &done.head, dir, within.saturating_sub(started.elapsed()))
+        }
+    };
+    let lines = vec![done.with_note(&hook::one_line(&crate::notes::redact(&note), 200)), Event::open(check, session, ms)];
     let landed = write_if(home, &g.id, |events| holding(&board::fold_on(events, &here), &here, id, session, learn::now_ms()).map(|_| lines))
         .map_err(|e| Unfinished::Io(e.to_string()))?;
     let events = board::read(&path);
@@ -1748,9 +1827,36 @@ pub(crate) fn roster(home: &Path, goal: &str, drones: &[String]) -> std::io::Res
 
 /// This node's runner says on `goal`'s board that it is still in the goal (`board::BEAT`, every
 /// `BEAT_MS`, run.rs) or that it leaves it (`board::LEAVE`, at the run's end, also on SIGINT or SIGHUP):
-/// a heartbeat of no task, as `roster`'s (phase f F4).
+/// a heartbeat of no task, as `roster`'s (phase f F4). A beat goes to the goal's beats store (`beat`),
+/// never to the board's file.
 pub(crate) fn member(home: &Path, goal: &str, note: &str) -> std::io::Result<()> {
-    write(home, goal, vec![Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(note)]).map(drop)
+    let line = Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(note);
+    match note == board::BEAT {
+        true => beat(home, goal, line),
+        false => write(home, goal, vec![line]).map(drop),
+    }
+}
+
+/// This node's beat `line` on `goal` (phase g, board.rs `beats_path`): stamped and marked under the
+/// board file's lock as any line of the board is (`land`: above every line the node holds, beats
+/// included, with its `seq` and marks), then kept in the goal's beats store in place of this node's
+/// earlier beats (`board::merge_beats`). The board's synced file does not grow: an idle node costs the
+/// goal one record, whatever its time idle. The mesh signs and sends it in its next session.
+fn beat(home: &Path, goal: &str, line: Event) -> std::io::Result<()> {
+    let path = tasks_path(home, goal);
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    crate::live::locked(&path, || {
+        let file = board::read(&path);
+        let events = board::landing(&file, stamped(home, goal, vec![line])?);
+        let records: Vec<board::BeatRecord> = events
+            .iter()
+            .map(|e| serde_json::to_string(e).map(|line| board::BeatRecord { line, seen: learn::now_ms(), key: String::new(), sig: String::new() }))
+            .collect::<Result<_, _>>()
+            .map_err(std::io::Error::other)?;
+        board::merge_beats(&path, records, |_| true).map(drop)
+    })
 }
 
 /// This node says on `goal`'s board that its board is finished at its newest integration (phase f F6,
@@ -1904,12 +2010,13 @@ pub(super) fn across(
     let path = tasks_path(home, goal);
     let t0 = Instant::now();
     let waited_on: Vec<String> = b.unconfirmed(&here, since, learn::now_ms()).0.into_iter().map(String::from).collect();
-    let (mut len, mut b) = (u64::MAX, b.clone());
+    let (mut seen, mut b) = (None, b.clone());
     let mut capped = false;
     let confirmed = loop {
-        let at = std::fs::metadata(&path).map_or(0, |m| m.len());
-        if at != len {
-            (len, b) = (at, board::fold_on(&board::read(&path), &here));
+        // The board's lines or a beat (its beats store, where a peer's ack lands) changed: fold again.
+        let at = board::mark(&path);
+        if seen != Some(at) {
+            (seen, b) = (Some(at), board::fold_on(&board::read(&path), &here));
         }
         let t = learn::now_ms();
         let Some(s) = holding(&b, &here, id, session, t) else { break None };
@@ -2447,12 +2554,12 @@ impl Here {
     fn locate(a: &Args) -> Result<Here, i32> {
         let dir = a.value("--dir").map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
         let cwd = std::path::absolute(&dir).unwrap_or(dir).display().to_string();
-        let route = match collective::load() {
-            Ok(cfg) => collective::route(cfg.as_ref(), &cwd, &learn::home()),
+        let cfg = match collective::load() {
+            Ok(cfg) => cfg,
             Err(e) => return Err(fail(format!("invalid collectives config: {e}"))),
         };
-        let collective::Route::Collective { home, .. } = route else {
-            eprintln!("off: {cwd} belongs to no collective; borg records nothing here");
+        let collective::Route::Collective { home, .. } = collective::route(cfg.as_ref(), &cwd, &learn::home()) else {
+            eprintln!("{}", off_here(cfg.as_ref(), &cwd));
             return Err(1);
         };
         // The drone's scratch state, as its hooks keep it (hook.rs main).
@@ -2536,6 +2643,27 @@ impl Here {
     fn board(&self, g: &Goal) -> Board {
         board::fold_on(&board::read(&tasks_path(&self.home, &g.id)), &node(&self.home))
     }
+}
+
+/// Why a hive command in `cwd` does nothing, and the one step that fixes it (phase g live probe: a
+/// fresh `borg setup` that took every default leaves each repo in no collective, and `borg hive init`
+/// or `join` then refused with a line that named no fix). Nothing is changed for the engineer: a repo
+/// joins a collective only by their own setup. A repo kept out of every collective (an `off` path) is
+/// said so: the hive does not run there.
+fn off_here(cfg: Option<&collective::Config>, cwd: &str) -> String {
+    let repo = run::repo_of(Path::new(cwd)).map_or_else(|| cwd.to_string(), |r| r.display().to_string());
+    if cfg.is_some_and(|c| collective::kept_off(c, cwd)) {
+        return format!(
+            "borg hive: {repo} is an `off` path in your collectives config (`borg collective {}`): no collective sees it, so the hive does not run here. Run the hive in a repo of a collective.",
+            queen::sh_quote(&repo)
+        );
+    }
+    format!(
+        "borg hive: {repo} belongs to no collective, so there is no hive board for it. Add it once, in a terminal: \
+`borg setup --private {r}` (this machine only), or `borg setup --team <name> --paths {r}` to share the hive with your team over the mesh; \
+then run this again. `borg collective {r}` shows where a repo belongs.",
+        r = queen::sh_quote(&repo)
+    )
 }
 
 /// `borg hive <command>` (see `USAGE`). Exit 0, 1 on an error, 2 on a usage error, 3 when a claim lost.
@@ -3051,7 +3179,7 @@ fn done_cmd(here: &Here, named: Option<&str>, note: &str) -> i32 {
     let dir = Path::new(&here.cwd);
     match renewing(&here.home, &g.id, &s.task.id, &session, HEARTBEAT, || oracle::run(&here.home, &g, &s.task, dir, None)) {
         oracle::Verdict::Pass => {
-            let vid = match finish(&here.home, &g, &s, &session, dir, note, verdict::SNAPSHOT_TIMEOUT) {
+            let vid = match finish(&here.home, &g, &s, &session, dir, &Note::Said(note), verdict::SNAPSHOT_TIMEOUT) {
                 Ok(vid) => vid,
                 Err(Unfinished::Io(e)) => return fail(e),
                 Err(Unfinished::Lost(why)) => {
@@ -3686,6 +3814,67 @@ mod tests {
         assert!(again.is_none(), "B's earlier claim, before its mark: lost");
         let lines: Vec<Confirm> = read_lines(&confirms_path(&home, "g"));
         assert_eq!(lines.iter().map(|c| (c.task.as_str(), c.outcome.as_str())).collect::<Vec<_>>(), [("t1", "final"), ("t2", "lost")]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_idle_hour_of_beats_adds_nothing_to_the_synced_board() {
+        // Phase g (live probe gap 4): a node beats every `BEAT_MS` while it is in a goal, an hour idle
+        // is 1,200 beats. They go to the goal's beats store, each node's newest only: the synced logs
+        // do not grow at all, the store stays one record. Before, each beat was a board line, synced and
+        // given an origin record on every node: 1,200 lines an hour. Fails with `member` writing beats
+        // to the board (`write`).
+        let (home, _, _) = two_node_store("idle-hour");
+        let path = tasks_path(&home, "g");
+        let synced = || SYNCED.iter().map(|f| std::fs::metadata(dir(&home, "g").join(f)).map_or(0, |m| m.len())).sum::<u64>();
+        member(&home, "g", board::JOIN).unwrap();
+        member(&home, "g", board::BEAT).unwrap();
+        let (board_after_one, store_after_one) = (synced(), std::fs::metadata(board::beats_path(&path)).unwrap().len());
+        for _ in 0..1200 {
+            member(&home, "g", board::BEAT).unwrap();
+        }
+        assert_eq!(synced(), board_after_one, "the synced board did not grow");
+        let store = std::fs::metadata(board::beats_path(&path)).unwrap().len();
+        assert!(store <= store_after_one + 16, "one record, its numbers a little longer: {store_after_one} -> {store}");
+        assert_eq!(board::beat_records(&board::beats_path(&path)).len(), 1);
+        // What a beat says still reaches the fold: the node's newest beat, above its join.
+        let b = board::fold(&board::read(&path));
+        let beat = board::read(&path).into_iter().filter(board::is_beat).max_by_key(|e| e.ms).unwrap();
+        assert!(b.members.get(&node(&home)).is_some_and(|(join, _)| *join < beat.ms));
+        assert_eq!(b.nodes.get(&node(&home)), Some(&beat.seen.0.unwrap()), "its liveness: when this node held its newest beat");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_peers_beat_from_the_beats_store_makes_a_claim_final() {
+        // Phase g with phase f F5: B joined and writes watermarks; its beat comes through the goal's beats
+        // store (the mesh's live exchange, board.rs `merge_beats`), not the board. This node's claim of t1
+        // waits until B's beat marks it, then is final. Fails with `board::read` reading no beats store
+        // (the claim waits until B is suspected).
+        let (home, _, now) = two_node_store("store-final");
+        let path = tasks_path(&home, "g");
+        let landed = board::landing(&board::read(&path), vec![on_b(Event::new(Ev::Heartbeat, "", "runner", now - 5).with_note(board::JOIN))]);
+        board::append(&path, &landed).unwrap();
+        board::note_held(&path);
+        let (at, written) = {
+            let landed = write(&home, "g", vec![Event::new(Ev::Claim, "t1", "sa", learn::now_ms())]).unwrap();
+            (landed[0].ms, learn::now_ms())
+        };
+        let beat = {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(600));
+                let path = tasks_path(&home, "g");
+                let beat = board::landing(&board::read(&path), vec![on_b(Event::new(Ev::Heartbeat, "", "runner", learn::now_ms()).with_note(board::BEAT))]);
+                let line = serde_json::to_string(&beat[0]).unwrap();
+                let r = board::BeatRecord { line, seen: learn::now_ms(), key: "kb".into(), sig: "s".into() };
+                assert_eq!(board::merge_beats(&path, vec![r], |_| true).unwrap(), 1);
+            })
+        };
+        let (again, waited) = across(&home, "g", "t1", "sa", at, written, &board::fold(&board::read(&path)), None).expect("B takes part");
+        beat.join().unwrap();
+        assert!(again.is_some() && waited >= Duration::from_millis(600) && waited < Duration::from_millis(SUSPECT_MS as u64), "final on B's mark: {waited:?}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"beat\""), "no beat on the board");
         let _ = std::fs::remove_dir_all(home);
     }
 

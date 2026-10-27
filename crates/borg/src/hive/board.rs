@@ -632,7 +632,9 @@ const SESSION_END: &str = "session-end";
 
 /// The notes of a runner's membership lines (phase f F4; a heartbeat of no task by `runner`, as a
 /// roster's): its node joins the goal at the run's start (`JOIN`), says every `BEAT_MS` that it is still
-/// in it (`BEAT`, read only as the node's newest line, `Board::nodes`), and leaves at its end (`LEAVE`).
+/// in it (`BEAT`, read only as the node's newest line, `Board::nodes`, and its watermarks), and leaves at
+/// its end (`LEAVE`). A beat is no board line (phase g, `beats_path`): it lives in the goal's beats store,
+/// the newest of each node only, so liveness costs O(1) space per node, never a line per beat.
 pub const JOIN: &str = "join";
 pub const BEAT: &str = "beat";
 pub const LEAVE: &str = "leave";
@@ -933,15 +935,17 @@ pub fn stamp(events: &[Event], node: &str, wall: i64) -> i64 {
 /// of this write. Every later line of the node is stamped above every one of these, so that count is fixed
 /// for good: a peer that holds that many lines of the node stamped below a line holds every one written
 /// before it. A runner's join or beat also carries its marks (`Event::marks`): what it held of each other
-/// node (`Board::watermarks`).
+/// node (`Board::watermarks`). A beat counts in no `seq` (`is_beat`): beats are kept newest-only
+/// (`beats_path`), so no count of them could be held complete, and no beat is a rival of a claim.
 pub fn landing(file: &[Event], mut events: Vec<Event>) -> Vec<Event> {
     for e in &mut events {
         e.ms = stamp(file, &e.node, e.ms);
     }
-    let own = |node: &str| file.iter().filter(|e| e.node == node).map(line_hash).collect::<BTreeSet<_>>().len();
+    // Beats count in no `seq` (`is_beat`): only each node's newest is kept anywhere (`beats_path`).
+    let own = |node: &str| file.iter().filter(|e| e.node == node && !is_beat(e)).map(line_hash).collect::<BTreeSet<_>>().len();
     let seqs: Vec<Option<u64>> = events
         .iter()
-        .map(|e| (!e.node.is_empty()).then(|| (own(&e.node) + events.iter().filter(|o| o.node == e.node && o.ms < e.ms).count()) as u64))
+        .map(|e| (!e.node.is_empty()).then(|| (own(&e.node) + events.iter().filter(|o| o.node == e.node && o.ms < e.ms && !is_beat(o)).count()) as u64))
         .collect();
     for (e, seq) in events.iter_mut().zip(seqs) {
         e.seq = seq;
@@ -952,10 +956,13 @@ pub fn landing(file: &[Event], mut events: Vec<Event>) -> Vec<Event> {
     events
 }
 
-/// For each node but `node` with lines in `file`, the newest stamp of them (`Event::marks`).
+/// For each node but `node` with lines in `file`, the newest stamp of them (`Event::marks`), beats left
+/// out: a beat travels in the mesh's live exchange, outside the board's reconciliation (`beats_path`), so
+/// holding a node's beat says nothing about holding its lines stamped below it, and a mark past a claim
+/// this node never held would make that claim final on its node (`Board::unconfirmed`).
 fn held_marks(file: &[Event], node: &str) -> BTreeMap<String, i64> {
     let mut out: BTreeMap<String, i64> = BTreeMap::new();
-    for e in file.iter().filter(|e| !e.node.is_empty() && e.node != node) {
+    for e in file.iter().filter(|e| !e.node.is_empty() && e.node != node && !is_beat(e)) {
         let m = out.entry(e.node.clone()).or_insert(i64::MIN);
         *m = (*m).max(e.ms);
     }
@@ -1092,9 +1099,166 @@ fn parse(line: &str) -> Option<Event> {
     serde_json::from_str::<Event>(line).ok().filter(|e| e.v <= 1)
 }
 
-/// Every event of the board at `path`, in file order.
+/// Every event of the board at `path`, in file order, and after them, for a goal's board
+/// (`tasks.jsonl`), the beats its beats store holds (`beats`): what every fold of the goal reads.
 pub fn read(path: &Path) -> Vec<Event> {
-    read_from(path, 0).0.into_iter().map(|(_, e)| e).collect()
+    let mut events: Vec<Event> = read_from(path, 0).0.into_iter().map(|(_, e)| e).collect();
+    events.extend(beats_of(path));
+    events
+}
+
+/// The beats store's events of the goal whose board is at `path` (`beats_path`), none for any other file.
+pub fn beats_of(path: &Path) -> Vec<Event> {
+    match path.file_name().is_some_and(|f| f == "tasks.jsonl") {
+        true => beats(&beats_path(path)),
+        false => Vec::new(),
+    }
+}
+
+/// Whether `e` is a node's goal heartbeat (`BEAT`): a runner's line of no task saying its node is still in
+/// the goal, with its watermarks. A beat of a board from before phase g's beats store still folds as one.
+pub fn is_beat(e: &Event) -> bool {
+    e.ev == Ev::Heartbeat && e.task.is_empty() && e.by == "runner" && e.note == BEAT
+}
+
+// ---------------------------------------------------------------- the beats store
+
+/// A goal's beats store beside its board (`<goal>/beats.jsonl`, phase g): each node's newest beat
+/// (`BeatRecord`), and its newest complete one when that is older (`kept`), rewritten whole on each new
+/// beat, so a node idle for an hour costs the goal one record, not 1,200 board lines (3 s beats). Never a
+/// reconciled log: the board's lines sync as a set union (borg-mesh lines.rs), which would bring every
+/// compacted beat back and give each a signed origin record for good. The mesh carries a store's
+/// records in its ephemeral exchange instead, signed by their node (borg-mesh beats.rs), newest wins,
+/// as presence is (live.rs). What a beat says is unchanged (phase f F4, F5): the fold reads it with the
+/// board's lines (`read`), its liveness from when this node first held it, on this node's clock
+/// (`BeatRecord::seen`), its marks only once complete.
+pub fn beats_path(board: &Path) -> std::path::PathBuf {
+    board.with_file_name(BEATS_FILE)
+}
+
+pub const BEATS_FILE: &str = "beats.jsonl";
+
+/// One beat in a goal's beats store: the beat's board line as its node wrote it (`line`, a JSON `Event`),
+/// when this node first held it (`seen`, its clock), and for a peer's beat the member key that signed it
+/// and the signature (borg-mesh beats.rs; empty for this node's own beats, signed when they are sent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeatRecord {
+    pub line: String,
+    pub seen: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
+}
+
+impl BeatRecord {
+    fn event(&self) -> Option<Event> {
+        parse(&self.line).filter(is_beat).map(|e| Event { seen: Seen(Some(self.seen)), ..e })
+    }
+}
+
+/// What a wait on the goal whose board is at `board` re-folds on (mod.rs `across`): the board file's and
+/// its beats store's length and mtime. A beat replaces another in place, so the store's length alone
+/// may not change.
+pub fn mark(board: &Path) -> [(u64, Option<std::time::SystemTime>); 2] {
+    let at = |p: &Path| std::fs::metadata(p).map_or((0, None), |m| (m.len(), m.modified().ok()));
+    [at(board), at(&beats_path(board))]
+}
+
+/// The records of the beats store at `path` (`beats_path`), none for a missing or torn one.
+pub fn beat_records(path: &Path) -> Vec<BeatRecord> {
+    std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// The beats the store at `path` holds, as events seen when this node first held them.
+pub fn beats(path: &Path) -> Vec<Event> {
+    beat_records(path).iter().filter_map(BeatRecord::event).collect()
+}
+
+/// Of `records`, the ones that still say anything on a board holding `file` (its lines, beats aside):
+/// for each node, its newest beat (its liveness: `Board::nodes` reads a node's newest line) and its newest
+/// complete one (`complete` on `file`: every line of its node before it held, so its marks count,
+/// `Board::watermarks`), one record when they are the same. A node's marks only grow, so the newest
+/// complete beat says all its older ones did: no watermark moves back when the older beats go. A
+/// function of the records and `file`.
+pub fn kept(file: &[Event], records: Vec<BeatRecord>) -> Vec<BeatRecord> {
+    kept_by(file, records.into_iter().filter_map(|r| Some((r.event()?, r))).collect())
+}
+
+/// `kept` of beats given as events (each with when it was held, `Event::seen`) among a board's other
+/// lines: the lines as they are, then the beats that still say anything. What a node holds of a goal's
+/// lines and beats at any time (scenario.rs keeps each node's view so).
+pub fn compact(events: Vec<Event>) -> Vec<Event> {
+    let (beats, mut lines): (Vec<Event>, Vec<Event>) = events.into_iter().partition(is_beat);
+    let kept = kept_by(&lines, beats.into_iter().map(|e| (e.clone(), e)).collect());
+    lines.extend(kept);
+    lines
+}
+
+/// `kept` of `items`, each a beat and what stands for it, against `file`'s other lines; a beat seen
+/// earlier wins a tie of one stamp (two copies of one beat: when this node first held it).
+fn kept_by<T: Clone>(file: &[Event], items: Vec<(Event, T)>) -> Vec<T> {
+    let lines: Vec<&Event> = file.iter().filter(|e| !is_beat(e)).collect();
+    let mut keyed: Vec<(Key, &Event)> = lines.iter().map(|e| ((e.ms, 1, rank(e), line_hash(e)), *e)).collect();
+    keyed.sort_by_key(|a| a.0);
+    let stamps = own_stamps(&keyed);
+    let mut newest: BTreeMap<String, (i64, i64, T)> = BTreeMap::new();
+    let mut whole: BTreeMap<String, (i64, i64, T)> = BTreeMap::new();
+    for (e, item) in items {
+        if e.node.is_empty() {
+            continue;
+        }
+        let at = (e.ms, seen(&e));
+        let later = |m: &BTreeMap<String, (i64, i64, T)>| m.get(&e.node).is_none_or(|(ms, held, _)| at.0 > *ms || (at.0 == *ms && at.1 < *held));
+        if complete(&stamps, &e) && later(&whole) {
+            whole.insert(e.node.clone(), (at.0, at.1, item.clone()));
+        }
+        if later(&newest) {
+            newest.insert(e.node.clone(), (at.0, at.1, item));
+        }
+    }
+    let mut out: Vec<T> = Vec::new();
+    for (node, (ms, _, item)) in newest {
+        if let Some((_, _, c)) = whole.remove(&node).filter(|(w, _, _)| *w != ms) {
+            out.push(c);
+        }
+        out.push(item);
+    }
+    out
+}
+
+/// Adds `records` (each a beat line and when it was held) to the beats store of the board at `board`,
+/// under the store's lock, keeping what still says anything (`kept`); records `keep` refuses (a key no
+/// longer a member) go. Rewritten whole by a rename, so a reader sees the store before or after, never
+/// half. How many of `records` were kept: a beat older than one already held is not. When the store
+/// holds each of `records` already and `keep` refuses none it holds, nothing changes, and the board is
+/// not read (a peer sends the beats it holds each session).
+pub fn merge_beats(board: &Path, records: Vec<BeatRecord>, keep: impl Fn(&BeatRecord) -> bool) -> std::io::Result<usize> {
+    let path = beats_path(board);
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    crate::live::locked(&path, || {
+        let held = beat_records(&path);
+        if held.iter().all(&keep) && records.iter().all(|r| r.event().is_none() || held.iter().any(|h| h.line == r.line)) {
+            return Ok(0);
+        }
+        let file: Vec<Event> = read_from(board, 0).0.into_iter().map(|(_, e)| e).collect();
+        let all: Vec<BeatRecord> = held.iter().cloned().chain(records.iter().cloned()).filter(&keep).collect();
+        let kept = kept(&file, all);
+        let new = records.iter().filter(|r| kept.contains(r) && !held.contains(r)).count();
+        if kept != held {
+            let tmp = path.with_extension("jsonl.tmp");
+            let mut body = String::new();
+            for r in &kept {
+                body.push_str(&serde_json::to_string(r).map_err(std::io::Error::other)?);
+                body.push('\n');
+            }
+            std::fs::write(&tmp, body)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        Ok(new)
+    })
 }
 
 /// The events after byte `offset` (each with the offset its line ends at) and the offset to read from
@@ -1302,11 +1466,12 @@ fn watermarks(keyed: &[(Key, &Event)]) -> BTreeMap<String, BTreeMap<String, i64>
     out
 }
 
-/// Each node's stamps of the lines in the fold's order, each line once (two copies are adjacent there).
+/// Each node's stamps of the lines in the fold's order, each line once (two copies are adjacent there),
+/// beats left out (`landing`: no `seq` counts them).
 fn own_stamps<'a>(keyed: &[(Key, &'a Event)]) -> BTreeMap<&'a str, Vec<i64>> {
     let mut stamps: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
     for (i, (k, e)) in keyed.iter().enumerate() {
-        if !e.node.is_empty() && (i == 0 || keyed[i - 1].0 != *k) {
+        if !e.node.is_empty() && !is_beat(e) && (i == 0 || keyed[i - 1].0 != *k) {
             stamps.entry(e.node.as_str()).or_default().push(e.ms);
         }
     }
@@ -2356,6 +2521,18 @@ mod tests {
     }
 
     #[test]
+    fn a_peers_beat_marks_nothing_of_its_node() {
+        // Phase g, after review: C's beat (500) reaches B through the live exchange before C's claim of t1
+        // (400) reaches it through reconciliation. B's next beat marks C only to the claim B holds, so on C
+        // the claim still waits for B (`Board::unconfirmed`) instead of passing for one B acknowledged.
+        let on = |node: &str, e: Event| Event { node: node.into(), ..e };
+        let runner = |node: &str, note: &str, ms: i64| on(node, ev(Ev::Heartbeat, "", "runner", ms).with_note(note));
+        let b_file = vec![on("C", Event::open(task("t1"), "engineer:e", 0)), runner("C", JOIN, 10), runner("C", BEAT, 500)];
+        let beat = landing(&b_file, vec![runner("B", BEAT, 600)]).remove(0);
+        assert_eq!(beat.marks.get("C"), Some(&10), "marked to C's join, below its claim at 400, not to its beat: {beat:?}");
+    }
+
+    #[test]
     fn a_node_never_suspects_itself() {
         // Phase f F4, after review: A's runner joins at 0 and its drone d1's session sa1 claims t1 at 1000;
         // A holds no line of its own after its beat at 3000 (a suspend, a failed beat write, a stalled
@@ -3151,10 +3328,15 @@ mod tests {
         let now = 8;
         let b = fold_on(&lines, "A");
         assert!(b.finished() && !b.finished_for_good("A", now), "B wrote no finished line: {:?}", b.settling("A", now));
-        let beat = b_lines(&lines, &[BEAT], 8);
+        // B's line before its finished line (a roster): the gap. A beat is none (phase g: beats are kept
+        // newest-only, so no `seq` counts them, `landing`).
+        let beat = b_lines(&lines, &[&roster_note(&["d1".to_string()])], 8);
         let fin = b_lines(&[lines.clone(), beat.clone()].concat(), &[&finished_note("integrate.1")], 9);
         assert!(fold_on(&[lines.clone(), beat.clone(), fin.clone()].concat(), "A").finished_for_good("A", 10));
-        assert!(!fold_on(&[lines.clone(), fin.clone()].concat(), "A").finished_for_good("A", 10), "B's beat before it is not here");
+        assert!(!fold_on(&[lines.clone(), fin.clone()].concat(), "A").finished_for_good("A", 10), "B's line before it is not here");
+        let pulse = b_lines(&lines, &[BEAT], 8);
+        let after_pulse = b_lines(&[lines.clone(), pulse].concat(), &[&finished_note("integrate.1")], 9);
+        assert!(fold_on(&[lines.clone(), after_pulse].concat(), "A").finished_for_good("A", 10), "a beat of B not held here is no gap");
         let other = b_lines(&[lines.clone(), beat.clone()].concat(), &[&finished_note("integrate.0")], 9);
         assert!(!fold_on(&[lines.clone(), beat.clone(), other].concat(), "A").finished_for_good("A", 10), "another integration");
         let rejoin = b_lines(&[lines.clone(), beat.clone(), fin.clone()].concat(), &[JOIN], 10);

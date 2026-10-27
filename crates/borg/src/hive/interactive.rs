@@ -12,10 +12,11 @@
 //!   taken up yet (`handed`, `untaken`; `touch` takes it up, wait.rs `takeup` releases it otherwise).
 //! - `<state>/<drone>.hive-waiter`: locked by the drone's running waiter (`waiting`).
 //!
-//! Membership on this step: `join` (and any claim path, `ensure_member`) writes the node's JOIN under the
-//! board lock before any claim of the drone, the waiter beats while it waits and the hooks while the
-//! drone works (`touch`), and the node's LEAVE comes only with its last drone of the goal (`leave`).
-//! Phase g G4 hands the beats to the node's mesh daemon, so they no longer depend on a waiter or a hook.
+//! Membership: `join` (and any claim path, `ensure_member`) writes the node's JOIN under the board lock
+//! before any claim of the drone, and the node's LEAVE comes only with its last drone of the goal
+//! (`leave`, the node reaper's `leave_noted` and `forget`). The beats and the rest of the node's goal work
+//! are the node worker's (node.rs, phase g G4: the mesh daemon, or a waiter while none runs); the hooks
+//! beat while the drone works only when no worker runs (`touch`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,7 +76,8 @@ pub fn registry_path(home: &Path) -> PathBuf {
 /// One line of `drones.local`: drone `drone` is now session `session` (`by` join or rebind), or left
 /// (`leave`). It serves `goal`, or every open goal of the collective in its repo (`any`), and works in
 /// `worktree`. `pid`, `pid_start`: the harness process that ran the join (`harness_pid`), which a session
-/// after `/clear` is rebound by; 0 when unknown.
+/// after `/clear` is rebound by; 0 when unknown. `pid_ns`: the pid namespace that pid is of (`pid_ns`),
+/// empty on a line from before it was recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub v: u8,
@@ -88,6 +90,8 @@ pub struct Entry {
     pub pid: u32,
     #[serde(default)]
     pub pid_start: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pid_ns: String,
     #[serde(default)]
     pub any: bool,
     #[serde(default)]
@@ -145,7 +149,10 @@ fn proc_stat(pid: u32) -> Option<(String, u32, u64)> {
 
 /// Processes between a harness and borg: its shell, a wrapper, a sandbox (Claude Code's bubblewrap), borg
 /// itself.
-const WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "borg", "env", "timeout", "nice", "nohup", "setsid", "script", "bwrap"];
+const WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish", "borg", "env", "timeout", "nice", "nohup", "setsid", "script",
+    "bwrap",
+];
 
 /// The harness process this command or hook runs under: the nearest ancestor that is no shell, wrapper
 /// or borg (`WRAPPERS`), with its start time, so a reused pid is no match. None off Linux or when the
@@ -263,6 +270,7 @@ pub(super) fn join(here: &Here, goal_id: Option<&str>, session: &str) -> i32 {
         harness,
         pid,
         pid_start,
+        pid_ns: pid_ns(),
         any: hs.any,
         goal: goal_id.unwrap_or_default().into(),
         worktree: tree.clone(),
@@ -301,7 +309,7 @@ pub(super) fn join(here: &Here, goal_id: Option<&str>, session: &str) -> i32 {
         ""
     };
     println!(
-        "{} joined {what} as drone {drone}.{tree} When nothing is open its turn ends with a wait for work that costs no tokens; `borg hive leave` makes it a plain session again.{clear}",
+        "{} joined {what} as drone {drone}.{tree} When nothing is open its turn ends with a wait for work that costs no tokens, and it stays a drone: leaving the hive is only on the engineer's request.{clear}",
         short(session)
     );
     0
@@ -324,15 +332,27 @@ pub(super) fn leave(here: &Here, session: &str, hs: &HiveSession) -> i32 {
 /// An interactive drone leaves: its claim released, its waiter stopped (SIGTERM, it says nothing more;
 /// not when the waiter is the one leaving), its registry leave, and for each goal no other live drone of
 /// this node serves, the node's leave (`board::LEAVE`): only with its last drone (phase g correction 2).
-/// Its worktree stays.
+/// Its worktree stays. One leave at a time per drone (its leave lock): a session's end runs its SessionEnd
+/// (`ended`) and its waiter's `stopped` (wait.rs) at once, and the one that comes second finds the session
+/// unbound and writes nothing, so a drone leaves with one registry leave and one node leave at most.
 pub(super) fn leave_quietly(here: &Here, session: &str, hs: &HiveSession) -> std::io::Result<()> {
+    leave_noted(here, session, hs, "left the goal")
+}
+
+/// `leave_quietly`, its claim released with `note` (the node's reaper: `its session is gone`, node.rs).
+pub(super) fn leave_noted(here: &Here, session: &str, hs: &HiveSession, note: &str) -> std::io::Result<()> {
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(hook::state_file(&hs.drone).with_extension("hive-leave"))?;
+    lock.lock()?;
+    if bound(session).is_none() {
+        return Ok(()); // left already
+    }
     let here_node = node(&here.home);
     let repo = queen::repo_name(if hs.worktree.is_empty() { &here.cwd } else { &hs.worktree });
     let goals = served(&here.home, hs, &repo);
     for g in &goals {
         let b = board::fold_on(&board::read(&tasks_path(&here.home, &g.id)), &here_node);
         if let Some(t) = board::holding(&b, &here_node, session, here.now) {
-            super::write(&here.home, &g.id, vec![Event::new(Ev::Released, &t.task.id, session, here.now).with_note("left the goal")])?;
+            super::write(&here.home, &g.id, vec![Event::new(Ev::Released, &t.task.id, session, here.now).with_note(note)])?;
         }
     }
     stop_waiter(&hs.drone);
@@ -348,6 +368,30 @@ pub(super) fn leave_quietly(here: &Here, session: &str, hs: &HiveSession) -> std
         }
     }
     Ok(())
+}
+
+/// Registry line `e`, whose session is no drone any more (its membership file gone without a leave of
+/// the registry), is closed as a leave closes it: its registry leave, and the node's leave of each goal
+/// no other live drone of this node serves (the node reaper, node.rs `reap`).
+pub(super) fn forget(home: &Path, e: &Entry, now: i64) {
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(hook::state_file(&e.drone).with_extension("hive-leave"));
+    let Ok(lock) = lock else { return };
+    if lock.lock().is_err() || entry_of(home, &e.drone).is_none_or(|now_e| now_e != *e) {
+        return; // left, or moved, meanwhile
+    }
+    let here_node = node(home);
+    let probe = HiveSession { goal: e.goal.clone(), any: e.any, interactive: true, ..HiveSession::default() };
+    let goals = served(home, &probe, &queen::repo_name(&e.worktree));
+    if record(home, &Entry { v: 1, ms: now, drone: e.drone.clone(), session: e.session.clone(), by: "leave".into(), ..Entry::default() }).is_err() {
+        return;
+    }
+    let others = live(home);
+    for g in &goals {
+        let b = board::fold_on(&board::read(&tasks_path(home, &g.id)), &here_node);
+        if member_open(&b, &here_node) && !others.iter().any(|o| o.serves(&g.id)) {
+            let _ = member(home, &g.id, board::LEAVE);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- busy, take-up, waiter
@@ -424,9 +468,30 @@ fn stop_waiter(drone: &str) {
     }
 }
 
-/// The session `drone` is now (its newest registry line), None once it left.
-pub(crate) fn session_of(home: &Path, drone: &str) -> Option<String> {
-    live(home).into_iter().find(|e| e.drone == drone).map(|e| e.session)
+/// `drone`'s newest registry line (which session it is now: a `/clear` moves it), None once it left.
+pub(crate) fn entry_of(home: &Path, drone: &str) -> Option<Entry> {
+    live(home).into_iter().find(|e| e.drone == drone)
+}
+
+/// Whether the harness process of registry line `e` is gone (`harness_pid`: its pid no longer runs, or
+/// runs another process, a later start time): the session the drone was is over, whether or not its
+/// SessionEnd ran (a terminal closed, Claude Code's "Move to background and exit", a crash). False when
+/// the join found no harness process (pid 0): then only the session's own end or a leave ends it.
+pub(crate) fn harness_gone(e: &Entry) -> bool {
+    e.pid != 0 && proc_stat(e.pid).is_none_or(|(_, _, start)| start != e.pid_start)
+}
+
+/// This process's pid namespace (`/proc/self/ns/pid`, e.g. `pid:[4026531836]`); empty off Linux.
+pub(crate) fn pid_ns() -> String {
+    std::fs::read_link("/proc/self/ns/pid").map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// Whether this process may reap registry line `e` (node.rs `reap`): it sees `e`'s harness pid as the
+/// join saw it, the two in one pid namespace. A daemon in a container, or a join in a sandbox with a pid
+/// namespace of its own, would read every drone's harness as gone: such a line is left to its own waiter
+/// and its session's end. A line with no namespace recorded (from before) is too.
+pub(crate) fn reapable(e: &Entry) -> bool {
+    e.pid_ns == pid_ns()
 }
 
 // ---------------------------------------------------------------- the hooks
@@ -434,7 +499,8 @@ pub(crate) fn session_of(home: &Path, drone: &str) -> Option<String> {
 /// An interactive drone's step at each hook event but its start (mod.rs `around`, `pre_tool`): any event
 /// takes a handed claim up (`untaken`, phase g correction 10); the engineer's prompt starts a busy turn,
 /// a tool call keeps it, its end moves it on (`busy`); and while the drone works, a goal heartbeat
-/// (`board::BEAT`) when one is due (`BEAT_MS`), so its node stays a participant while no waiter runs.
+/// (`board::BEAT`) when one is due (`BEAT_MS`) and no node worker runs (node.rs `worker_runs`), so its node
+/// stays a participant with no daemon and no waiter.
 /// Whether `hs` changed (to save).
 pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &str, now: i64) -> bool {
     let _ = std::fs::remove_file(takeup_path(session));
@@ -451,6 +517,11 @@ pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &st
     }
     if event == "pre_tool" || hs.goal.is_empty() || now - hs.member_ms < super::BEAT_MS {
         return changed;
+    }
+    // The node's worker beats (its mesh daemon, or a waiter while none runs, node.rs): no beat of its own.
+    if super::node::worker_runs(home) {
+        hs.member_ms = now;
+        return true;
     }
     let here = node(home);
     if member_open(&board::fold_on(&board::read(&tasks_path(home, &hs.goal)), &here), &here) && member(home, &hs.goal, board::BEAT).is_ok() {
@@ -532,33 +603,73 @@ fn wait_armed(input: &Value) -> bool {
 }
 
 /// An interactive drone's stop, after the hive's own (`out`): a drone with nothing in hand (no claim,
-/// or one it was never shown: the stop's capped claim, not final yet, mod.rs `hand_next`) and no waiter (none in the stop's
-/// `background_tasks`, none holding its lock) is asked once a turn to start one (`borg hive wait` with
-/// `run_in_background`): a block that makes it call a tool, so Claude Code's continuation cap never
-/// counts it. A stop that ends the turn ends the engineer's busy turn too (`busy`).
+/// or one it was never shown: the stop's capped claim, not final yet, mod.rs `hand_next`) and no waiter
+/// (none in the stop's `background_tasks`, none holding its lock) is asked once a turn to start one
+/// (`borg hive wait` with `run_in_background`), after whatever the hive's stop said first (a done's
+/// result, mod.rs `Ctx::done`), so the model never reports a state the stop has changed. It makes the
+/// model call a tool, so Claude Code's continuation cap never counts it. Everything a drone's stop says
+/// goes as Stop feedback (`feedback`), not as a hook error. A stop that ends the turn ends the
+/// engineer's busy turn too (`busy`).
 pub(crate) fn after_stop(home: &Path, hs: &mut HiveSession, session: &str, cwd: &str, input: &Value, out: Option<Value>, now: i64) -> Option<Value> {
     let working = unshown(home, hs, session, now).is_some_and(|(_, shown)| shown);
-    let blocks = |o: &Option<Value>| o.as_ref().is_some_and(|o| o.get("decision").and_then(Value::as_str) == Some("block"));
     if working || hs.asked_wait || wait_armed(input) || waiting(&hs.drone) {
         if !blocks(&out) {
             clear_busy(session);
         }
-        return out;
+        return feedback(out);
     }
     hs.asked_wait = true;
     save(session, hs);
-    super::with_reason(&arm_text(hs, session, cwd), out, true)
+    let arm = arm_text(hs, session, cwd);
+    let reason = match out.as_ref().and_then(|o| o.get("reason")).and_then(Value::as_str) {
+        Some(r) => format!("{}\n\n{arm}", r.trim_end()),
+        None => arm,
+    };
+    let mut o = out.filter(|o| o.is_object()).unwrap_or_else(|| json!({}));
+    o["decision"] = json!("block");
+    o["reason"] = Value::String(reason);
+    feedback(Some(o))
 }
 
-/// What a drone with nothing in hand is told to run.
+fn blocks(o: &Option<Value>) -> bool {
+    o.as_ref().is_some_and(|o| o.get("decision").and_then(Value::as_str) == Some("block"))
+}
+
+/// A drone's blocking stop (`decision: block`, its `reason`) as Claude Code's Stop feedback
+/// (`hookSpecificOutput.additionalContext`): the turn goes on with the same text through the same loop
+/// protections (`stop_hook_active`, the 8-continuation cap), but the transcript shows it as hook
+/// feedback, not "Stop hook error" (hooks docs, Stop decision control). A drone's stop says a handover
+/// (a task done, the next one, the wait to start), never an error. Anything else passes as it is.
+fn feedback(out: Option<Value>) -> Option<Value> {
+    if !blocks(&out) {
+        return out;
+    }
+    let mut o = out?;
+    let map = o.as_object_mut()?;
+    let reason = map.remove("reason").and_then(|r| r.as_str().map(String::from)).unwrap_or_default();
+    map.remove("decision");
+    let theirs = map.get("hookSpecificOutput").and_then(|h| h.get("additionalContext")).and_then(Value::as_str).filter(|t| !t.is_empty());
+    let text = match theirs {
+        Some(t) => format!("{reason}\n\n{t}"),
+        None => reason,
+    };
+    map.insert("hookSpecificOutput".into(), json!({"hookEventName": "Stop", "additionalContext": text}));
+    Some(o)
+}
+
+/// What a drone with nothing in hand is told to run, and the line it idles on: one that says the work
+/// comes by itself, so the obvious next step is to keep waiting, and leaving the engineer's call.
 fn arm_text(hs: &HiveSession, session: &str, cwd: &str) -> String {
     let head = if hs.goal.is_empty() || hs.any { "[borg hive]".to_string() } else { format!("[borg hive {}]", hs.goal) };
     format!(
-        "{head} Nothing is open to you now. Wait for hive work without spending tokens: run `{}` with the Bash tool's `run_in_background` set to true, \
-then end your turn with: Drone idle: waiting for hive work (type anything to use this session). When the wait exits, its output is your next task.",
+        "{head} Nothing is open to you now, so wait for hive work without spending tokens: run `{}` with the Bash tool's `run_in_background` set to true, \
+then end your turn with: {IDLE_LINE} When the wait exits, its output is your next task. You stay a drone; leaving the hive is only on the engineer's request.",
         command("wait", session, cwd)
     )
 }
+
+/// The line an idle drone ends its turn on (`arm_text`).
+pub const IDLE_LINE: &str = "Drone idle: waiting for hive work, which starts here by itself when a task opens.";
 
 /// Claude Code's SessionStart (`start`) of a session of this node's drones (phase g correction 7):
 /// `/clear` gives the session a new id and compact may, so a session no drone is on yet but whose harness
@@ -583,7 +694,7 @@ pub fn session_start(_h: &dyn Harness, home: &Path, input: &Value, now: i64) -> 
         && let Some((pid, pid_start)) = harness_pid()
         && let Some(mut e) = live(home).into_iter().find(|e| e.drone == hs.drone).filter(|e| (e.pid, e.pid_start) != (pid, pid_start))
     {
-        (e.pid, e.pid_start, e.ms, e.by) = (pid, pid_start, now, "rebind".into());
+        (e.pid, e.pid_start, e.pid_ns, e.ms, e.by) = (pid, pid_start, pid_ns(), now, "rebind".into());
         let _ = record(home, &e);
     }
     clear_busy(session);
@@ -598,7 +709,8 @@ pub fn session_start(_h: &dyn Harness, home: &Path, input: &Value, now: i64) -> 
             format!("When nothing is in hand, run `{}` with the Bash tool's `run_in_background` set to true and end your turn.", command("wait", session, &cwd))
         }
     };
-    let text = format!("[borg hive] This session is drone {} of {what}.{tree} {wait} `borg hive leave` makes it a plain session again.", hs.drone);
+    let text =
+        format!("[borg hive] This session is drone {} of {what}.{tree} {wait} It stays a drone: leaving the hive is only on the engineer's request.", hs.drone);
     Some(json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
 }
 

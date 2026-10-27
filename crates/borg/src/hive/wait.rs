@@ -4,8 +4,9 @@
 //! Code starts the session's next turn with that output (a background command's end), so work reaches
 //! an idle session at once and the session never just quits.
 //!
-//! While it waits it beats for its node on each goal it serves (`board::BEAT` every `BEAT_MS`, at once
-//! on a claim of another node, as run.rs `membership`): an idle drone's node is not suspected. It hands
+//! While no mesh daemon runs on the node, the waiter that holds the node lock does the node's goal work
+//! (node.rs, phase g G4: beats, the roster of takers, finished, decline and stuck lines, the reaper, the
+//! integration child), so a node with no mesh still integrates while its drones idle. It hands
 //! nothing while the engineer's own turn runs in the session (interactive.rs `busy`), says a stuck goal
 //! once and keeps waiting (phase g correction 17), and leaves a single goal only once it is finished for
 //! good. A claim it hands counts once a hook event of the session takes it up; otherwise a watcher it
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::interactive;
 use super::run::Ending;
-use super::{Board, Ev, Event, Goal, Here, HiveSession, TaskId, TaskState, board, bound, fail, member, node, save, short, tasks_path};
+use super::{Board, Ev, Event, Goal, Here, HiveSession, TaskId, TaskState, board, bound, fail, node, save, short, tasks_path};
 use crate::{hook, learn, queen, stats};
 
 /// What a waiting drone does next on one goal (`step`): what the waiter (`main`) and the scenario
@@ -114,38 +115,42 @@ pub(super) fn main(here: &Here, named: Option<&str>) -> i32 {
 /// The waiter's loop (`main`), for `drone`, holding its lock.
 fn waiting(here: &Here, drone: &str) -> i32 {
     let here_node = node(&here.home);
-    let beat = Duration::from_millis(super::BEAT_MS as u64);
-    let mut next_beat = Instant::now();
-    let mut acked = i64::MIN;
+    // The node's goal work (phase g G4, node.rs): its mesh daemon's, or this waiter's while it holds the
+    // node lock (no daemon runs, no other waiter took it), until it exits.
+    let mut worker: Option<(std::fs::File, super::node::Worker)> = None;
     loop {
         let sig = STOP.load(std::sync::atomic::Ordering::SeqCst);
         if sig != 0 {
+            if sig != libc::SIGINT {
+                stopped(here, drone);
+            }
             return 128 + sig;
         }
         // The drone's session now: a `/clear` moved it (interactive.rs `rebind`).
-        let Some(session) = interactive::session_of(&here.home, drone) else {
+        let Some(entry) = interactive::entry_of(&here.home, drone) else {
             println!("[borg hive] drone {drone} left the hive: nothing more to wait for");
             return 0;
         };
+        let session = entry.session.clone();
         let Some(mut hs) = bound(&session).filter(|hs| hs.interactive) else {
             println!("[borg hive] drone {drone} left the hive: nothing more to wait for");
             return 0;
         };
+        // Its session is over without a SessionEnd that said so (a terminal closed, Claude Code's "Move
+        // to background and exit", a crash): no orphan waiter, no claim or membership left behind.
+        if interactive::harness_gone(&entry) {
+            let code = interactive_leave(here, &session, &hs);
+            println!("[borg hive] drone {drone}'s session is gone: it left the hive");
+            return code;
+        }
         let cwd = if hs.worktree.is_empty() { here.cwd.clone() } else { hs.worktree.clone() };
         let repo = queen::repo_name(&cwd);
         let goals = interactive::served(&here.home, &hs, &repo);
-        // Membership: a beat every `BEAT_MS`, at once on another node's claim (phase f F5), on each goal
-        // this node is a member of.
-        let ack = goals.iter().filter_map(|g| board::to_ack(&board::read(&tasks_path(&here.home, &g.id)), &here_node)).max().filter(|m| *m > acked);
-        if Instant::now() >= next_beat || ack.is_some() {
-            for g in &goals {
-                let b = fold(&here.home, &g.id);
-                if interactive::member_open(&b, &here_node) {
-                    let _ = member(&here.home, &g.id, board::BEAT);
-                }
-            }
-            next_beat = Instant::now() + beat;
-            acked = acked.max(ack.unwrap_or(i64::MIN));
+        if worker.is_none() {
+            worker = super::node::take(&here.home).map(|l| (l, super::node::Worker::for_waiter(drone)));
+        }
+        if let Some((_, w)) = worker.as_mut() {
+            w.tick(&here.home);
         }
         let now = learn::now_ms();
         let busy = interactive::busy(&session, now);
@@ -196,6 +201,9 @@ a new drone, an approval or `borg hive open {} --id <task> --again` clears it.",
         let (seen, t0) = (marks(), Instant::now());
         while t0.elapsed() < LOOK && STOP.load(std::sync::atomic::Ordering::SeqCst) == 0 && marks() == seen {
             std::thread::sleep(TICK);
+            if let Some((_, w)) = worker.as_mut() {
+                w.tick(&here.home);
+            }
         }
     }
 }
@@ -333,6 +341,34 @@ pub(super) fn takeup(here: &Here, goal: &str, key: &str, session: &str) -> i32 {
     });
     let _ = std::fs::remove_file(hook::state_file(session).with_extension("hive-takeup"));
     i32::from(!matches!(released, Ok(Some(_))))
+}
+
+/// How long a stopped waiter looks for its session's end (`stopped`).
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// The waiter got SIGTERM or SIGHUP: Claude Code stops its background tasks when the session exits
+/// ("Exit and stop tasks", Ctrl-C or Ctrl-D twice, `/exit`), a closed terminal sends SIGHUP, the engineer
+/// stops it from `/tasks`, or `borg hive leave` stops it (SIGTERM too: the leave unbinds the session and
+/// writes its registry leave within the grace, so the waiter finds the drone gone and only stops). SIGINT,
+/// a Ctrl-C at a shell the engineer ran it in, only stops it. When its session is ending (its harness process gone
+/// within `STOP_GRACE`) and nothing else made the drone leave (its SessionEnd, the leave), it leaves
+/// (interactive.rs `leave_quietly`): its claim released, its registry leave, its node's leave with its
+/// last drone. A session that lives on (the task stopped by hand) stays a drone, and its next stop asks
+/// for a wait again.
+fn stopped(here: &Here, drone: &str) {
+    let t0 = Instant::now();
+    while t0.elapsed() < STOP_GRACE {
+        let Some(e) = interactive::entry_of(&here.home, drone) else { return };
+        let Some(hs) = bound(&e.session).filter(|hs| hs.interactive) else { return };
+        if e.pid == 0 {
+            return;
+        }
+        if interactive::harness_gone(&e) {
+            let _ = interactive::leave_quietly(here, &e.session, &hs);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The drone's leave once its single goal is finished for good (interactive.rs `leave_quietly`).

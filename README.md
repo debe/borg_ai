@@ -271,7 +271,7 @@ borg doctor
 Hooks call the binary by path, so a reinstall needs no rewiring. Codex trusts each hook's command and
 timeout: after an upgrade that moves borg or changes a timeout, trust them again with `/hooks`
 (`borg doctor` says so). Stores are append-only JSONL and need no migration. A team must upgrade
-together when the mesh protocol changes (now `borg/mesh/11`): nothing syncs with a member on another
+together when the mesh protocol changes (now `borg/mesh/12`): nothing syncs with a member on another
 version, and `borg doctor` names that member and which side has to upgrade.
 
 ```sh

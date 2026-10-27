@@ -41,8 +41,9 @@
 //!    an admitted excerpt for one (or a link record with it on either side) answers with it, author
 //!    or replica, so the "why" can be read back while its author is offline.
 //! 6. `Live`: ephemeral, never reconciled into a log: presence (live.rs: which drones run where,
-//!    latest per member and session, a day at most) and signed steering directives (steer.rs:
-//!    checked against the membership on receipt; refused ones are dropped and logged).
+//!    latest per member and session, a day at most), signed steering directives (steer.rs:
+//!    checked against the membership on receipt; refused ones are dropped and logged) and each hive
+//!    goal's newest beat per node (beats.rs: signed by its node, kept only when newer).
 //!
 //! A completed session, dialled or served, is recorded on each side by when it started, per member
 //! (`mesh/synced.json`, borg presence.rs `synced_path`): a hive claim made before that ms has reached
@@ -79,12 +80,14 @@ use crate::{live, steer};
 
 mod vectors;
 
-/// The session protocol. 11: `constraints.jsonl` is a fifth synced log (lines.rs `SYNCED`); the logs
+/// The session protocol. 12: a hive goal's beats are no board lines but each node's newest in the live
+/// exchange (beats.rs); a peer on 11 would hear no beat of this node and suspect its drones, and its own
+/// beats would grow every board, so it is refused at the handshake. 11: `constraints.jsonl` is a fifth synced log (lines.rs `SYNCED`); the logs
 /// reconcile in a fixed list, so a peer on 10 would reconcile another file at the same step and is
 /// refused at the handshake instead. 10: a goal's `spend.jsonl` is a seventh synced hive log (borg
 /// hive/run.rs `ledger`).
-pub const ALPN: &[u8] = b"borg/mesh/11";
-/// The protocols of older nodes (`borg/mesh/10` down to `/1`), offered and accepted beside `ALPN` only to
+pub const ALPN: &[u8] = b"borg/mesh/12";
+/// The protocols of older nodes (`borg/mesh/11` down to `/1`), offered and accepted beside `ALPN` only to
 /// tell a mismatch: without them the handshake fails and nothing says why. A session on one is closed at
 /// once and the peer recorded (`mismatch`). A newer node does the same with this one's `ALPN`.
 fn older() -> Vec<Vec<u8>> {
@@ -213,6 +216,8 @@ pub struct Report {
     pub answered: usize,
     /// Remote presence records that were new or newer (live.rs).
     pub presence: usize,
+    /// Hive goal beats of other nodes that were new or newer (beats.rs).
+    pub beats: usize,
     /// Steering directives newly filed / refused (steer.rs).
     pub steered: usize,
     pub dropped: usize,
@@ -274,6 +279,9 @@ enum Msg {
     Live {
         presence: Vec<borg::presence::Remote>,
         directives: Vec<borg::steer::Directive>,
+        /// Each hive goal's newest beat per node (beats.rs, `borg/mesh/12`).
+        #[serde(default)]
+        beats: Vec<crate::beats::Beat>,
     },
 }
 
@@ -742,13 +750,18 @@ impl Node {
 
         // Live: presence and steering, ephemeral (live.rs, steer.rs).
         let now = borg::learn::now_ms();
-        let live = Msg::Live { presence: live::outgoing(home, &self.me, now), directives: steer::outgoing(home, now) };
+        let live = Msg::Live {
+            presence: live::outgoing(home, &self.me, now),
+            directives: steer::outgoing(home, now),
+            beats: crate::beats::outgoing(home, &self.me, now),
+        };
         self.gate()?; // again just before anything leaves
-        let Msg::Live { presence, directives } = swap(dialler, tx, rx, live).await? else {
+        let Msg::Live { presence, directives, beats } = swap(dialler, tx, rx, live).await? else {
             return Err("protocol: expected live".into());
         };
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         report.presence += live::receive(home, &mine, &me, presence, now)?;
+        report.beats += crate::beats::receive(home, &mine, &me, beats, borg::learn::now_ms())?;
         let (new, dropped) = steer::receive(home, &mine, &me, &directives, now);
         (report.steered, report.dropped) = (report.steered + new, report.dropped + dropped);
         borg::veto::apply_inbox(home); // a veto for a drone of this node: its credit and episode, once
