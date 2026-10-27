@@ -7,6 +7,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -766,4 +767,325 @@ test("opencode 2: a tool context whose steer fails is kept for the next call or 
   await v2.say("go on")
   assert.deepEqual(v2.synthetics.map((s: any) => s.text), ["STEER-FAILED"])
   await v2.cleanup()
+})
+
+// ---- Interactive hive drones (phase g): the plugin binds the session, keeps its waiter and wakes it.
+
+/** A fake borg for hive drones: `hive join … --bind` answers a join (its args and BORG_HARNESS
+ *  recorded), `hive wait --stream` prints each line written to $WAKE until it is stopped, and a hook
+ *  records `<event>\t<stdin>`; its stop blocks with a hive handover (`hive: true`) while $HANDOVER is set,
+ *  with a conscience's questions alone (a drone's too: no mark) while $QUESTIONS is.
+ *  Returns [binary, record file]. */
+function hiveFake(): [string, string] {
+  const dir = mkdtempSync(join(tmpdir(), "borg-oc-hive-"))
+  const rec = join(dir, "rec.jsonl")
+  const bin = join(dir, "borg-hive")
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+case "$1 $2" in
+"hive join") printf 'join\\t%s\\t%s\\n' "$BORG_HARNESS" "$*" >> "${rec}"; echo "S joined hive goal g1 as drone i-abc123."; exit 0;;
+"hive wait") printf 'wait\\t%s\\n' "$*" >> "${rec}"; trap 'exit 143' TERM INT HUP
+  while :; do if [ -n "$WAKE" ] && [ -s "$WAKE" ]; then cat "$WAKE"; : > "$WAKE"; fi; sleep 0.05; done;;
+esac
+in=$(cat)
+printf '%s\\t%s\\n' "$3" "$in" >> "${rec}"
+[ "$3" = stop ] && [ -n "$HANDOVER" ] && echo '{"decision":"block","hive":true,"reason":"[borg hive] t1 done: its checks passed (ok). Next: t2."}'
+[ "$3" = stop ] && [ -n "$QUESTIONS" ] && echo '{"decision":"block","reason":"1. [G1] Did I check the relay race? [borg hive] Nothing is open to you now."}'
+exit 0
+`,
+  )
+  chmodSync(bin, 0o755)
+  return [bin, rec]
+}
+
+function lines(rec: string): string[][] {
+  return existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").map((l) => l.split("\t")) : []
+}
+
+async function until(ms: number, what: string, done: () => boolean) {
+  const t0 = Date.now()
+  while (!done()) {
+    assert.ok(Date.now() - t0 < ms, `${what} within ${ms} ms`)
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
+const wakeLine = (text: string) => JSON.stringify({ wake: text, left: false }) + "\n"
+
+test("opencode 1: a session's `borg hive join` is bound by the plugin, its waiter starts at the bind, and a wake goes in by promptAsync only while it is idle", async () => {
+  const [bin, rec] = hiveFake()
+  const wake = join(mkdtempSync(join(tmpdir(), "borg-oc-wake-")), "wake")
+  process.env.BORG_BIN = bin
+  process.env.WAKE = wake
+  const { client, prompts } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  try {
+    assert.equal(process.env.BORG_HIVE_BINDER, "opencode", "every command the model runs knows the plugin binds")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("join the hive"))
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "j1" }, { args: { command: "borg hive join g1" } })
+    const out = { title: "", output: "[borg hive] this session's harness plugin binds it", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "j1", args: { command: "borg hive join g1" } }, out)
+    assert.match(out.output, /binds it\n\nS joined hive goal g1 as drone i-abc123\./, "the model reads the bind's answer")
+    const join_ = lines(rec).find((l) => l[0] === "join")!
+    assert.deepEqual(join_.slice(1), ["opencode", `hive join g1 --bind --session ${SESSION} --dir /work/repo`])
+    await until(5_000, "the waiter", () => lines(rec).some((l) => l[0] === "wait"))
+    assert.deepEqual(lines(rec).find((l) => l[0] === "wait")!.slice(1), [`hive wait --stream --session ${SESSION} --dir /work/repo`])
+    // Work arrives while the join's turn runs, with a long tool call in it: held.
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "b1" }, { args: { command: "cargo build" } })
+    writeFileSync(wake, wakeLine("[borg hive g1] Work arrived. Your claim: t1"))
+    await new Promise((r) => setTimeout(r, 800))
+    assert.deepEqual(prompts, [], "no wake inside the turn")
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "b1", args: { command: "cargo build" } }, { title: "", output: "", metadata: {} })
+    await hooks.event!(idleEvent)
+    await until(5_000, "the wake", () => prompts.length === 1)
+    assert.deepEqual(prompts[0], { path: { id: SESSION }, body: { parts: [{ type: "text", text: "[borg hive g1] Work arrived. Your claim: t1", ...marked }] } })
+    // Its echo is ours, not the engineer's: no prompt reaches borg.
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("[borg hive g1] Work arrived. Your claim: t1", marked))
+    assert.equal(lines(rec).filter((l) => l[0] === "prompt").length, 1)
+    // A plain session's join of a directory, or another session's: nothing bound.
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "ses_plain", callID: "p1", args: { command: "borg hive join g1 --here" } }, { title: "", output: "", metadata: {} })
+    assert.equal(lines(rec).filter((l) => l[0] === "join").length, 1)
+  } finally {
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+    delete process.env.WAKE
+  }
+})
+
+test("opencode 1: a drone's hive handover is not dropped by an engineer prompt during its stop nor counted by MAX_ROUNDS; a plain session's still is", async () => {
+  const [bin, rec] = hiveFake()
+  process.env.BORG_BIN = bin
+  process.env.HANDOVER = "1"
+  const { client, prompts } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  const idle = (id: string) => hooks.event!({ event: { type: "session.idle", properties: { sessionID: id } } as any })
+  try {
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("join the hive"))
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "j1", args: { command: "borg hive join" } }, { title: "", output: "", metadata: {} })
+    await idle(SESSION)
+    assert.equal(prompts.length, 1, "the handover went in")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("x", marked))
+    // The next stop (stop_hook_active): a handover again, sent.
+    await idle(SESSION)
+    assert.equal(prompts.length, 2, "not counted by MAX_ROUNDS")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("x", marked))
+    // The engineer types while the stop runs: the handover holds a claim, so it is queued, not dropped.
+    const stopping = idle(SESSION)
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("what are you on?"))
+    await stopping
+    assert.equal(prompts.length, 3, "not dropped by the engineer's prompt")
+    for (const p of prompts) assert.match(p.body.parts[0].text, /^\[borg hive\] t1 done/)
+    const stops = lines(rec).filter((l) => l[0] === "stop").map((l) => JSON.parse(l[1]).stop_hook_active)
+    // The engineer's prompt starts a fresh cycle: that stop is a first round again.
+    assert.deepEqual(stops, [false, true, false])
+    // A plain session with the same answers: one round per engineer prompt, as before.
+    const plain = "ses_plain_rounds"
+    await hooks["chat.message"]!({ sessionID: plain }, userMessage("fix the race"))
+    await idle(plain)
+    await hooks["chat.message"]!({ sessionID: plain }, userMessage("x", marked))
+    await idle(plain)
+    assert.equal(prompts.filter((p) => p.path.id === plain).length, 1)
+  } finally {
+    delete process.env.HANDOVER
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  }
+})
+
+test("opencode 2: the plugin binds a hive drone's session from its execute.after, wakes it by session.prompt with delivery queue once idle, also after an interrupted turn", async () => {
+  const [bin, rec] = hiveFake()
+  const wake = join(mkdtempSync(join(tmpdir(), "borg-oc-wake-")), "wake")
+  process.env.BORG_BIN = bin
+  process.env.WAKE = wake
+  const v2 = await setupV2()
+  try {
+    await v2.say("join the hive")
+    await v2.hooks["tool.execute.before"]({ tool: "shell", sessionID: SESSION, id: "j1", input: { command: "borg hive join" } })
+    await v2.hooks["tool.execute.after"]({ tool: "shell", sessionID: SESSION, id: "j1", input: { command: "borg hive join" }, status: "completed", result: { output: "binds it" } })
+    assert.deepEqual(v2.synthetics.map((s: any) => [s.text, s.delivery]), [["S joined hive goal g1 as drone i-abc123.", "steer"]], "the model reads the bind's answer")
+    assert.equal(lines(rec).find((l) => l[0] === "join")![2], `hive join --bind --session ${SESSION} --dir /work/repo`)
+    await until(5_000, "the waiter", () => lines(rec).some((l) => l[0] === "wait"))
+    writeFileSync(wake, wakeLine("[borg hive] Work arrived. Your claim: t1"))
+    await new Promise((r) => setTimeout(r, 800))
+    assert.deepEqual(v2.prompts, [], "no wake inside the turn")
+    // Esc: the turn is interrupted, no stop; the session is idle, so the wake goes in.
+    await v2.emit("session.execution.interrupted", { sessionID: SESSION, reason: "user" })
+    await until(5_000, "the wake", () => v2.prompts.length === 1)
+    assert.deepEqual(v2.prompts[0], { sessionID: SESSION, text: "[borg hive] Work arrived. Your claim: t1", metadata: { borg: true }, delivery: "queue" })
+    assert.equal(lines(rec).filter((l) => l[0] === "stop").length, 0, "no stop for the interrupted turn")
+    // borg hears the halt, so its waiter's busy flag ends with the turn (not 5 minutes later).
+    await until(5_000, "the halted event", () => lines(rec).some((l) => l[0] === "halted"))
+    assert.deepEqual(JSON.parse(lines(rec).find((l) => l[0] === "halted")![1]), { session_id: SESSION, cwd: "/work/repo", pid: process.pid })
+    // A plain session's halt: nothing sent.
+    await v2.emit("session.execution.interrupted", { sessionID: "ses_plain_halt", reason: "user" })
+    await settle()
+    assert.equal(lines(rec).filter((l) => l[0] === "halted").length, 1)
+  } finally {
+    delete process.env.WAKE
+    await v2.cleanup()
+  }
+  await settle()
+  assert.ok(lines(rec).some((l) => l[0] === "end"), "the cleanup ends the session")
+})
+
+/** A store, a collective over a committed git repo `harbor_orion` and goal g1 (its oracle passes once
+ *  `ok` exists in the drone's tree), with this process's env pointed at them; `restore` puts it back. */
+function hiveWorld() {
+  const saved = { ...process.env }
+  const root = mkdtempSync(join(tmpdir(), "borg-oc-hive-real-"))
+  const work = join(root, "harbor_orion")
+  const store = join(root, "store/collectives/corp")
+  for (const d of [work, store, join(root, "home")]) mkdirSync(d, { recursive: true })
+  writeFileSync(join(root, "collectives.json"), JSON.stringify({ default: "off", collectives: [{ name: "corp", paths: [work], share: "local" }] }))
+  for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "BORG_HIVE", "BORG_HIVE_DRONE", "WAKE", "HANDOVER"]) delete process.env[k]
+  Object.assign(process.env, {
+    BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1",
+    BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MODE: "hook", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+    BORG_HIVE_TAKEUP_MS: "20000",
+  })
+  const git = (...args: string[]) => execFileSync("git", ["-C", work, "-c", "user.email=e@x", "-c", "user.name=E", ...args], { stdio: "pipe" })
+  git("init", "-q", "-b", "main")
+  writeFileSync(join(work, "README"), "orion\n")
+  git("add", ".")
+  git("commit", "-q", "-m", "start")
+  const hive = (args: string[]) => execFileSync(BORG, ["hive", ...args, "--dir", work], { env: process.env, encoding: "utf8" })
+  hive(["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f ok", "--budget", "5"])
+  const registry = () =>
+    existsSync(join(store, "hive/drones.local")) ? readFileSync(join(store, "hive/drones.local"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []
+  // borg's scratch state names a session by its letters, digits and dashes (hook.rs `state_file`).
+  const state = (s: string, ext: string) => join(store, `state/${s.replace(/[^A-Za-z0-9-]/g, "")}.${ext}`)
+  const hs = (s: string) => (existsSync(state(s, "hive")) ? JSON.parse(readFileSync(state(s, "hive"), "utf8")) : null)
+  const restore = () => {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]
+    Object.assign(process.env, saved)
+  }
+  return { work, store, hive, registry, hs, state, restore }
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+test("real borg, opencode 1: a bound drone of one opencode process waits from its bind, is woken only once idle, says its done first through the hive path and leaves at its end; another session's join binds only it", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
+  const w = hiveWorld()
+  const B = "ses_hive_other"
+  const { client, prompts } = fakeClient(() => "I made the change.")
+  const hooks = await load(client, w.work)
+  const idle = (id: string) => hooks.event!({ event: { type: "session.idle", properties: { sessionID: id } } as any })
+  const after = (id: string, callID: string, command: string, output: string) =>
+    hooks["tool.execute.after"]!({ tool: "bash", sessionID: id, callID, args: { command } }, { title: "", output, metadata: { exit: 0 } })
+  try {
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("join the hive"))
+    // The model's own join: its shell has no session id, so borg leaves the bind to the plugin.
+    const said = w.hive(["join"])
+    assert.match(said, /harness plugin binds it/)
+    assert.equal(w.registry().length, 0, "the command itself binds nobody")
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "j1" }, { args: { command: "borg hive join" } })
+    const out = { title: "", output: said, metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "j1", args: { command: "borg hive join" } }, out)
+    assert.match(out.output, /joined every open hive goal of this repo \(g1\) as drone i-[0-9a-f]{6}/)
+    const [entry] = w.registry()
+    assert.deepEqual([entry.session, entry.harness, entry.pid], [SESSION, "opencode", process.pid], "the session that ran it, under opencode's own process")
+    const drone = w.hs(SESSION).drone
+    const lock = join(w.store, `state/${drone}.hive-waiter`)
+    await until(5_000, "the waiter", () => existsSync(lock) && readFileSync(lock, "utf8").trim() !== "")
+    const waiter = Number(readFileSync(lock, "utf8").trim())
+    // Another session of the same opencode process joins: it is its own drone, the first stays.
+    await after(B, "j2", "borg hive join", w.hive(["join"]))
+    assert.deepEqual(w.registry().map((e) => [e.session, e.by]), [[SESSION, "join"], [B, "join"]])
+    assert.notEqual(w.hs(B).drone, drone)
+    // Still the join's turn, a long tool call in it: the task that opens is not handed.
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "b1" }, { args: { command: "cargo build" } })
+    w.hive(["open", "g1", "--id", "t1", "--title", "do t1"])
+    await new Promise((r) => setTimeout(r, 1_500))
+    assert.equal(prompts.filter((p) => p.path.id === SESSION).length, 0, "nothing in the engineer's turn")
+    await after(SESSION, "b1", "cargo build", "")
+    // B's turn is over first: t1 may go to either drone; end B so it goes to this session.
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: B } } } as any })
+    await idle(SESSION)
+    await until(10_000, "the wake", () => prompts.some((p) => p.path.id === SESSION))
+    const woke = prompts.find((p) => p.path.id === SESSION)!
+    assert.match(woke.body.parts[0].text, /^\[borg hive g1\] Work arrived\..*Your claim: t1 \(work\) do t1/s)
+    assert.deepEqual(woke.body.parts[0].metadata, { borg: true })
+    assert.ok(existsSync(w.state(SESSION, "hive-takeup")), "handed, not taken up yet")
+    // The woken turn: its echo (ours), then its first tool call takes the claim up.
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage(woke.body.parts[0].text, marked))
+    await hooks["tool.execute.before"]!({ tool: "read", sessionID: SESSION, callID: "r1" }, { args: { filePath: join(w.work, "README") } })
+    assert.ok(!existsSync(w.state(SESSION, "hive-takeup")), "taken up")
+    writeFileSync(join(w.hs(SESSION).worktree, "ok"), "")
+    await idle(SESSION)
+    const handover = prompts.filter((p) => p.path.id === SESSION)
+    assert.equal(handover.length, 2, "the stop's handover went in")
+    assert.match(handover[1].body.parts[0].text, /^\[borg hive\] t1 done: its checks passed \(ok\); verify task t1\.v1 is open for another drone\./)
+    assert.match(handover[1].body.parts[0].text, /Drone idle: waiting for hive work/)
+    assert.doesNotMatch(handover[1].body.parts[0].text, /run_in_background/)
+    assert.ok(alive(waiter), "one waiter for the session's life")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage(handover[1].body.parts[0].text, marked))
+    await idle(SESSION)
+    // The session's end: the drone leaves, its waiter stops.
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+    assert.equal(w.hs(SESSION), null)
+    assert.equal(w.registry().filter((e) => e.by !== "leave").length, 2, "two joins")
+    assert.deepEqual(w.registry().filter((e) => e.by === "leave").map((e) => e.session).sort(), [B, SESSION].sort())
+    await until(10_000, "the waiter's end", () => !alive(waiter))
+  } finally {
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: B } } } as any })
+    w.restore()
+  }
+})
+
+test("opencode 1: a drone's block of questions alone keeps the rules for questions: dropped when the engineer spoke during its stop", async () => {
+  const [bin, rec] = hiveFake()
+  process.env.BORG_BIN = bin
+  process.env.QUESTIONS = "1"
+  const { client, prompts } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  const idle = (id: string) => hooks.event!({ event: { type: "session.idle", properties: { sessionID: id } } as any })
+  try {
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("join the hive"))
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "j1", args: { command: "borg hive join" } }, { title: "", output: "", metadata: {} })
+    const stopping = idle(SESSION)
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("what are you on?"))
+    await stopping
+    assert.deepEqual(prompts, [], "questions about a superseded turn are dropped, though their text names the hive")
+    // The next stop of the engineer's new turn: one round of questions, then no more.
+    await idle(SESSION)
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("x", marked))
+    await idle(SESSION)
+    assert.equal(prompts.length, 1, "counted by MAX_ROUNDS")
+    assert.ok(lines(rec).filter((l) => l[0] === "stop").length >= 2)
+  } finally {
+    delete process.env.QUESTIONS
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  }
+})
+
+test("opencode 2: a wake that fails to go in is kept and sent again, never dropped", async () => {
+  const [bin] = hiveFake()
+  const wake = join(mkdtempSync(join(tmpdir(), "borg-oc-wake-")), "wake")
+  process.env.BORG_BIN = bin
+  process.env.WAKE = wake
+  const v2 = await setupV2()
+  const send = v2.ctx.session.prompt
+  let failed = 0
+  v2.ctx.session.prompt = async (input: any) => {
+    if (failed++ === 0) throw new Error("server busy")
+    return send(input)
+  }
+  try {
+    await v2.hooks["tool.execute.after"]({ tool: "shell", sessionID: SESSION, id: "j1", input: { command: "borg hive join" }, status: "completed", result: { output: "" } })
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    writeFileSync(wake, wakeLine("[borg hive] Work arrived. Your claim: t1"))
+    await until(15_000, "the wake, sent again", () => v2.prompts.length === 1)
+    assert.equal(failed, 2, "the first send failed, the second went in")
+    assert.equal(v2.prompts[0].text, "[borg hive] Work arrived. Your claim: t1")
+  } finally {
+    delete process.env.WAKE
+    await v2.cleanup()
+  }
 })

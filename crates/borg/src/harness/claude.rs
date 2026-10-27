@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
 pub const EVENTS: [(&str, &str); 7] = [
@@ -52,6 +52,9 @@ impl Harness for Claude {
             // margin too.
             stop_budget: None,
             headless_budget: true,
+            session_env: Some("CLAUDE_CODE_SESSION_ID"),
+            drone_wake: DroneWake::Model,
+            one_session_per_process: true,
         }
     }
 

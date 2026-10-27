@@ -396,6 +396,14 @@ pub struct HiveSession {
     /// Its stop asked it to start a wait this turn (interactive.rs `after_stop`): once a turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub asked_wait: bool,
+    /// The harness process its registry line names (interactive.rs `harness_pid`, or the pid its
+    /// harness's plugin sends, `own_pid`); 0 when none was found.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub pid: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 fn is_zero(v: &i64) -> bool {
@@ -1006,6 +1014,11 @@ fn with_context(session: &str, hook_event: &str, text: String, allowed: bool, ou
     Some(out)
 }
 
+/// The block reason of a hook answer, if it blocks with one.
+fn reason_of(out: &Option<Value>) -> Option<&str> {
+    out.as_ref().and_then(|o| o.get("reason")).and_then(Value::as_str)
+}
+
 /// `out` with `text` before its block reason; a stop that would not block blocks with `text` only when
 /// it `may_block` (its first round, so never a loop; or a handover, which follows a finished task).
 fn with_reason(text: &str, out: Option<Value>, may_block: bool) -> Option<Value> {
@@ -1029,7 +1042,13 @@ pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64
         Some(hs) => (hs, false),
         None => match (event == "post_tool").then(|| interactive::adopt(home, input)).flatten() {
             Some(hs) => (hs, true),
-            None => return inner(),
+            // A codex join whose thread is not this session's: it left again, and the session hears why.
+            None => {
+                match (event == "post_tool" && h.caps().drone_wake == crate::harness::DroneWake::Queue).then(|| interactive::mismatch(home, input)).flatten() {
+                    Some(text) => return with_context(session, "PostToolUse", text, h.caps().tool_context, inner()),
+                    None => return inner(),
+                }
+            }
         },
     };
     if adopted {
@@ -1056,7 +1075,7 @@ fn around_bound(
     inner: impl FnOnce() -> Option<Value>,
 ) -> Option<Value> {
     // An interactive drone (phase g): its handed claim taken up, the engineer's turn, its node's beat.
-    if hs.interactive && interactive::touch(home, event, &mut hs, session, now) {
+    if hs.interactive && interactive::touch(home, event, &mut hs, session, h.name(), input, now) {
         save(session, &hs);
     }
     let cwd = match hs.worktree.is_empty() {
@@ -1066,7 +1085,7 @@ fn around_bound(
     let Ok(g) = goal::load(home, &hs.goal) else {
         // An interactive drone of every open goal with none to work on yet still waits for one.
         return match hs.interactive && event == "stop" {
-            true => interactive::after_stop(home, &mut hs, session, &cwd, input, inner(), now),
+            true => interactive::after_stop(home, &mut hs, session, &cwd, input, inner(), interactive::Wake::of(h.name(), false), now),
             false if hs.interactive && event == "end" => {
                 let out = inner();
                 interactive::ended(home, &hs, session, &cwd, input, now);
@@ -1095,9 +1114,20 @@ fn around_bound(
             with_context(session, "PostToolUse", text, h.caps().tool_context, inner())
         }
         "stop" => {
-            let out = ctx.stop(&mut hs, &b, &events, input, started, inner);
+            // While an interactive drone's stop runs, its waiter claims and hands nothing (the stop's own
+            // done and handover, `Ctx::done`, decide its next claim): interactive.rs `Stopping`.
+            let budget = crate::expert_route::stop_budget(h).unwrap_or(crate::expert_route::DEFAULT_STOP_BUDGET);
+            let _stopping = hs.interactive.then(|| interactive::Stopping::mark(session, now + budget.as_millis() as i64));
+            // What the conscience (and the rest of `inner`) said, so the hive's own words are told apart.
+            let theirs = std::cell::RefCell::new(None);
+            let out = ctx.stop(&mut hs, &b, &events, input, started, || {
+                let o = inner();
+                *theirs.borrow_mut() = Some(o.clone());
+                o
+            });
+            let hive = reason_of(&out) != theirs.borrow().as_ref().and_then(reason_of);
             match hs.interactive {
-                true => interactive::after_stop(home, &mut hs, session, cwd, input, out, now),
+                true => interactive::after_stop(home, &mut hs, session, cwd, input, out, interactive::Wake::of(h.name(), hive), now),
                 false => out,
             }
         }
@@ -1129,8 +1159,10 @@ fn around_bound(
 pub fn pre_tool(h: &dyn Harness, home: &Path, input: &Value, now: i64) -> Option<Value> {
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let mut hs = bound(session);
-    if let Some(hs) = hs.as_mut().filter(|hs| hs.interactive) {
-        interactive::touch(home, "pre_tool", hs, session, now);
+    if let Some(hs) = hs.as_mut().filter(|hs| hs.interactive)
+        && interactive::touch(home, "pre_tool", hs, session, h.name(), input, now)
+    {
+        save(session, hs);
     }
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
     hook::edit_text(tool, input.get("tool_input").unwrap_or(&Value::Null))?;
@@ -1222,8 +1254,9 @@ impl Ctx<'_> {
             marks.push(REPO_MARKER.into());
         }
         // An interactive drone's claim it was never shown is not final yet (`stop`): neither shown here,
-        // in what is the engineer's own turn, nor offered past; the waiter hands it once final.
-        let unshown = hs.interactive && interactive::unshown(self.home, hs, self.session, self.now).is_some_and(|(_, shown)| !shown);
+        // in what is the engineer's own turn, nor offered past; the waiter hands it once final. Nor is a
+        // codex wake's claim this turn did not start from (interactive.rs `not_in_hand`).
+        let unshown = hs.interactive && interactive::not_in_hand(self.home, hs, self.session, self.now);
         let holding = board::holding(b, &node(self.home), self.session, self.now).filter(|_| !unshown);
         let key = holding.map_or_else(|| "-".to_string(), |s| format!("{}@{}", s.task.id, s.live(self.now).map_or(0, |l| l.2)));
         match holding {
@@ -1387,6 +1420,8 @@ impl Ctx<'_> {
     /// claim it was never shown (the stop's capped claim, not final yet, interactive.rs `unshown`) is
     /// nothing in hand: no oracle, no done, no block, so no task reaches it before its claim is final
     /// (phase f F5) and no end of the engineer's own turn is held up by hive work; the waiter hands it.
+    /// Nor is a claim a codex wake handed that the turn ending here was not started by (the engineer's
+    /// turn, ahead of the wake in codex's queue, interactive.rs `not_in_hand`): its own turn comes next.
     fn stop(
         &self,
         hs: &mut HiveSession,
@@ -1400,7 +1435,7 @@ impl Ctx<'_> {
         let waiting = std::fs::read_to_string(wait_path(self.session)).unwrap_or_default();
         let _ = std::fs::remove_file(wait_path(self.session));
         let path = tasks_path(self.home, &self.g.id);
-        let unshown = hs.interactive && interactive::unshown(self.home, hs, self.session, self.now).is_some_and(|(_, shown)| !shown);
+        let unshown = hs.interactive && interactive::not_in_hand(self.home, hs, self.session, self.now);
         let Some(held) = board::holding(b, &node(self.home), self.session, self.now).filter(|_| !unshown) else {
             let state = std::fs::read_to_string(hook::state_file(self.session)).unwrap_or_default();
             let lost = self.lost_told(b, lines, &state, true);
@@ -2151,6 +2186,9 @@ fn refuse(session: &str, task: &str) {
 /// names them (`deps_in`). The base then holds them, so the work's diff is its own. A dep that cannot
 /// be brought in (this tree's own changes overlap it) refuses the claim, and a lost claim takes out
 /// what it brought in: either way the tree is as it was. `cap` bounds the wait until final (`across`).
+/// A `picked` claim is refused, unwritten, when the session holds a task under the lock: of two
+/// claimers of one session (an interactive drone's stop handing its next task and its waiter), only
+/// the first writes, so a drone never holds two claims nor gets one task twice.
 #[allow(clippy::too_many_arguments)]
 fn claim(
     home: &Path,
@@ -2209,7 +2247,10 @@ fn claim(
         c.ms = b.tasks.get(id).map_or(at, |s| board::claim_at(s, at));
         c.takes = b.tasks.get(id).and_then(|s| board::takes(s, at));
         let beat = Event::new(Ev::Heartbeat, id, session, c.ms);
-        claimable_for(&b, id, board::Actor::new(&here, &drone, session), picked, at).then(|| vec![c, beat])
+        // A picked claim of a session that holds a task by now (another of its claimers won first: an
+        // interactive drone's stop and its waiter, phase g) is no claim to write: one claim a drone.
+        let fresh = !picked || board::holding(&b, &here, session, at).is_none();
+        (fresh && claimable_for(&b, id, board::Actor::new(&here, &drone, session), picked, at)).then(|| vec![c, beat])
     });
     let now = at;
     let stamp = match wrote {
@@ -2396,10 +2437,13 @@ pub const FLAGS: &[&str] = &[
     "--to",
     "--re",
     "--group",
+    "--bind",
+    "--stream",
+    "--queue",
 ];
 
 /// The flags that take no value.
-const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here", "--yes"];
+const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here", "--yes", "--bind", "--stream", "--queue"];
 
 const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   init <goal> --spec TEXT|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]...
@@ -2411,7 +2455,12 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
   join [<goal>]                                             inside a session: it becomes a drone of the goal (none: of
                                                             every open goal of this repo), in a worktree of its own
-  wait                                                      a drone waits for work at no token cost, then prints its task
+  join [<goal>] --bind --session ID                         a harness plugin binds its session ID (opencode: no session id
+                                                            in its shell), as `join` inside that session would
+  wait [--stream|--queue]                                   a drone waits for work at no token cost, then prints its task;
+                                                            --stream: a plugin's waiter for the session's life, one JSON
+                                                            line a wake ({\"wake\": TEXT, \"left\": BOOL}); --queue:
+                                                            codex's, started by its stop, waking it with `codex queue`
   join <goal> [--session ID|DRONE]                          a running drone joins the goal
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
   leave [--here]                                            the drone leaves (its claim is released); --here: new
@@ -2691,6 +2740,11 @@ pub fn main(args: &[&str]) -> i32 {
             Err(e) => fail(e),
         },
         ("join", [id]) if a.on("--here") => join_here(&here, id, a.value("--drone")),
+        // A harness plugin binds the session that ran the join (opencode: its shell has no session id).
+        ("join", [] | [_]) if a.on("--bind") => match session {
+            Some(s) => interactive::join(&here, rest.first().copied(), s),
+            None => fail("`borg hive join --bind` names the session it binds: --session ID"),
+        },
         // Inside a session (its harness's id): it becomes an interactive drone (phase g).
         ("join", [] | [_])
             if session.is_none()
@@ -2698,10 +2752,16 @@ pub fn main(args: &[&str]) -> i32 {
         {
             interactive::join(&here, rest.first().copied(), &s)
         }
+        // Inside a session whose harness's plugin binds it (opencode): the plugin binds it once this
+        // command ends, never another session of the directory.
+        ("join", [] | [_]) if session.is_none() && interactive::plugin_binds() => {
+            println!("[borg hive] this session's harness plugin binds it to the hive once this command ends: nothing more to run.");
+            0
+        }
         ("join", []) => fail("run `borg hive join` inside the session that is to become a drone"),
         ("join", [id]) => join(&here, id, session),
         ("leave", []) if a.on("--here") => leave_here(&here),
-        ("wait", []) => wait::main(&here, session),
+        ("wait", []) => wait::main(&here, session, wait::Mode::of(a.on("--stream"), a.on("--queue"))),
         ("takeup", [goal, key]) => wait::takeup(&here, goal, key, session.unwrap_or_default()),
         ("run", [id]) => run_cmd(&here, &a, id),
         ("sim-drone", []) if std::env::var_os(crate::harness::TEST_ENV).is_some() => sim_drone::main(&here),

@@ -1,0 +1,68 @@
+[
+  [
+    "prompt",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID",
+      "prompt": "join the hive",
+      "last_assistant_message": "I made the change."
+    }
+  ],
+  [
+    "pre_tool",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "borg hive join"
+      }
+    }
+  ],
+  [
+    "post_tool",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "borg hive join"
+      },
+      "tool_response": "joined"
+    }
+  ],
+  [
+    "pre_tool",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID",
+      "tool_name": "Read",
+      "tool_input": {
+        "filePath": "WORK/README",
+        "file_path": "WORK/README"
+      }
+    }
+  ],
+  [
+    "stop",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID",
+      "last_assistant_message": "I made the change.",
+      "stop_hook_active": false
+    }
+  ],
+  [
+    "end",
+    {
+      "session_id": "SESSION",
+      "cwd": "WORK",
+      "pid": "PID"
+    }
+  ]
+]

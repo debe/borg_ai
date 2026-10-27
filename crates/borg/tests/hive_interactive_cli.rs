@@ -770,3 +770,668 @@ fn a_drone_whose_session_died_mid_task_is_reaped_by_its_nodes_worker() {
     ok(&root, &["leave"], &inside(sb));
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------- omp and opencode (phase g G3)
+
+/// The hook JSON the omp or opencode adapter sends for a drone's turn, recorded from the adapter itself
+/// with a recording borg (fixtures/<harness>/hive-drone.json: prompt, the join's pre_tool and post_tool,
+/// a read's pre_tool, stop, end), with session `s`, the repo and the harness pid `pid` put in.
+fn adapter_events(harness: &str, root: &Path, s: &str, pid: u32) -> Vec<(String, Value)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{harness}/hive-drone.json"));
+    let text =
+        std::fs::read_to_string(path).unwrap().replace("SESSION", s).replace("WORK", &work(root).display().to_string()).replace("\"PID\"", &pid.to_string());
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The recorded `event` input of `harness` (the `nth` of that event), `extra` merged in.
+fn adapter_event(harness: &str, root: &Path, s: &str, pid: u32, event: &str, nth: usize, extra: Value) -> Value {
+    let mut v = adapter_events(harness, root, s, pid).into_iter().filter(|(e, _)| e == event).nth(nth).unwrap().1;
+    v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    v
+}
+
+/// `borg hook <harness> <event>` with `input`: its output.
+fn hook_as(root: &Path, harness: &str, event: &str, input: &Value) -> Option<Value> {
+    let mut c = command(root, &["hook", harness, event], &[]);
+    c.stdin(Stdio::piped()).stderr(Stdio::null());
+    let mut child = c.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.to_string().as_bytes()).unwrap();
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).trim().to_string();
+    (!out.is_empty()).then(|| serde_json::from_str(&out).unwrap())
+}
+
+/// A `borg hive wait --stream` as a plugin keeps it: its stdout's lines as they come, and the process,
+/// stopped as an engineer stops it when dropped (`Waiter`).
+struct Stream {
+    waiter: Waiter,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn spawn_stream(root: &Path, s: &str) -> Stream {
+    let dir = work(root).display().to_string();
+    let mut child = command(root, &["hive", "wait", "--stream", "--session", s, "--dir", &dir], &[("BORG_HIVE_TAKEUP_MS", "20000")]).spawn().unwrap();
+    let out = child.stdout.take().unwrap();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    std::thread::spawn(move || {
+        for l in std::io::BufRead::lines(std::io::BufReader::new(out)).map_while(Result::ok) {
+            sink.lock().unwrap().push(l);
+        }
+    });
+    Stream { waiter: Waiter(Some(child)), lines }
+}
+
+impl Stream {
+    fn wakes(&self) -> Vec<Value> {
+        self.lines.lock().unwrap().iter().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v.get("wake").is_some()).collect()
+    }
+}
+
+/// A process named `name` (a link to perl) that runs `args` and sleeps: a harness process to join
+/// under, stopped as an engineer stops it when dropped.
+fn harness_named(root: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (Waiter, u32) {
+    let perl = String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap();
+    let link = root.join("bin").join(name);
+    if !link.exists() {
+        std::os::unix::fs::symlink(perl.trim(), &link).unwrap();
+    }
+    let all: Vec<&str> = ["-e", "system(@ARGV); sleep 600"].into_iter().chain(args.iter().copied()).collect();
+    let w = Waiter(Some(command_with(link.to_str().unwrap(), root, &all, env).spawn().unwrap()));
+    let pid = w.0.as_ref().unwrap().id();
+    (w, pid)
+}
+
+/// omp (phase g G3): a session joins by the `PI_SESSION_ID` omp gives its shell; the waiter its
+/// extension keeps from the join (`--stream`) hands the task that opens only once the engineer's turn
+/// has stopped, as one JSON line, and waits on while the drone works it; the stop passes with no ask to
+/// start a wait, and says the done first as a block (the `decision`/`reason` the adapter reads, never
+/// Claude's Stop feedback); the pid the extension sends is the drone's harness process from its first
+/// event on; the session's end leaves and stops the waiter. All with the hook JSON the adapter sends.
+/// Fails with the stop asking for a background wait (Claude's arm), with the done turned into Stop
+/// feedback (the adapter would drop it), with a waiter that exits at its first hand, and with the
+/// registry's pid left at the join's ancestor.
+#[test]
+fn an_omp_drone_is_woken_by_its_extensions_waiter_and_its_stop_speaks_omps_block() {
+    let root = setup("hive-i-omp");
+    let s = "omp-sess-1";
+    let out = ok(&root, &["join"], &[("PI_SESSION_ID", s)]);
+    assert!(out.contains("joined every open hive goal of this repo (g1)") && out.contains("plugin waits for work"), "{out}");
+    let entry = interactive::live(&store(&root)).into_iter().next().unwrap();
+    assert_eq!((entry.session.as_str(), entry.harness.as_str()), (s, "omp"));
+    // omp's own process, as its extension names it (`process.pid`), not the join's ancestor.
+    let (_omp, omp_pid) = harness_named(&root, "omp", &[], &[]);
+    let ev = |event: &str, nth: usize, extra: Value| adapter_event("omp", &root, s, omp_pid, event, nth, extra);
+    let w = spawn_stream(&root, s);
+    // The join's turn is the engineer's: its join, then a task opens.
+    assert_eq!(hook_as(&root, "omp", "pre_tool", &ev("pre_tool", 0, json!({}))), None);
+    hook_as(&root, "omp", "post_tool", &ev("post_tool", 0, json!({})));
+    let e = interactive::live(&store(&root)).into_iter().next().unwrap();
+    assert_eq!((e.pid, e.by.as_str()), (omp_pid, "rebind"), "the extension's pid is the drone's harness");
+    open_task(&root, "t1");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(w.wakes().is_empty() && task_state(&root, "t1").0 == "open", "nothing handed in the engineer's turn");
+    // The conscience may ask its questions at the turn's first stop; never for a wait to start.
+    let out = hook_as(&root, "omp", "stop", &ev("stop", 0, json!({})));
+    assert!(!reason(&out).contains("hive wait") && out.as_ref().is_none_or(|o| o.get("hookSpecificOutput").is_none()), "the extension's waiter runs: {out:?}");
+    // Questions alone: no hive mark and no idle line, so the adapter's rules for questions hold.
+    let out = out.expect("the conscience asks");
+    assert!(out.get("hive").is_none() && !out["reason"].as_str().unwrap().contains(interactive::IDLE_LINE), "{out}");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(w.wakes().is_empty(), "a blocked stop goes on with the engineer's turn");
+    assert_eq!(hook_as(&root, "omp", "stop", &ev("stop", 0, json!({"stop_hook_active": true}))), None, "the turn ends");
+    until(15, "the wake", || !w.wakes().is_empty());
+    let wake = w.wakes()[0].clone();
+    assert_eq!(wake["left"], false);
+    assert!(wake["wake"].as_str().unwrap().starts_with("[borg hive g1] Work arrived.") && wake["wake"].as_str().unwrap().contains("Your claim: t1"), "{wake}");
+    assert!(held_by(&root, "t1", s));
+    // The woken turn's first tool call takes it up; the waiter waits on while the drone works.
+    hook_as(&root, "omp", "pre_tool", &ev("pre_tool", 1, json!({})));
+    assert!(!store(&root).join(format!("state/{s}.hive-takeup")).exists(), "taken up");
+    let mut w = w;
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(w.waiter.running() && w.wakes().len() == 1, "one waiter for the session's life");
+    std::fs::write(tree_of(&root, s).join("ok"), "").unwrap();
+    let done = hook_as(&root, "omp", "stop", &ev("stop", 0, json!({}))).expect("the done is said");
+    assert_eq!(done["decision"], "block", "omp reads a block: {done}");
+    let r = done["reason"].as_str().unwrap();
+    assert!(r.starts_with("[borg hive] t1 done: its checks passed (ok); verify task t1.v1 is open for another drone."), "{r}");
+    assert!(r.contains(interactive::IDLE_LINE) && !r.contains("hive wait"), "{r}");
+    assert!(done.get("hookSpecificOutput").is_none(), "not Claude's Stop feedback: {done}");
+    assert_eq!(done["hive"], true, "marked the hive's own, apart from a conscience's questions: {done}");
+    assert_eq!(hook_as(&root, "omp", "stop", &ev("stop", 0, json!({"stop_hook_active": true}))), None);
+    // The session's end: the drone leaves, its waiter is stopped by the leave.
+    hook_as(&root, "omp", "end", &ev("end", 0, json!({})));
+    let (code, _) = w.waiter.ended(15);
+    assert_eq!(code, 128 + libc::SIGTERM);
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty());
+    assert!(events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE), "the node left with its last drone");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// opencode (phase g G3): its shell has no session id, so a `borg hive join` its model runs binds
+/// nobody, not even a session whose variable it inherited from an outer harness (the nearest harness
+/// process is opencode): its plugin binds the session that ran it (`--bind --session`, under opencode's
+/// own process, the harness `opencode`). Another session of the same opencode process running a join
+/// never moves the drone (`adopt` is Claude Code's). A stream waiter whose harness process is gone
+/// leaves for its session. Fails with the inherited id bound, with the drone moved to the other
+/// session, and with the plugin's harness pid unrecorded.
+#[test]
+fn an_opencode_session_is_bound_by_its_plugin_never_by_its_command() {
+    let root = setup("hive-i-opencode");
+    let s = "ses-opencode-1";
+    let dir = work(&root).display().to_string();
+    let bin = env!("CARGO_BIN_EXE_borg");
+    let binder = [("BORG_HIVE_BINDER", "opencode"), ("CLAUDE_CODE_SESSION_ID", "outer-claude-session")];
+    // The model's own join, in opencode's shell (a process named opencode), with an outer Claude Code
+    // session's variable inherited.
+    let (_cmd, _) = harness_named(&root, "opencode", &["sh", "-c", &format!("{bin} hive join --dir {dir} > {}", root.join("said").display())], &binder);
+    until(20, "the model's join", || std::fs::read_to_string(root.join("said")).is_ok_and(|t| !t.is_empty()));
+    let said = std::fs::read_to_string(root.join("said")).unwrap();
+    assert!(said.contains("harness plugin binds it"), "{said}");
+    assert!(interactive::live(&store(&root)).is_empty() && hs(&root, "outer-claude-session").is_null(), "nobody bound");
+    // The plugin's bind from opencode's process, then (once `go` exists) the post_tool of another
+    // session of that process whose model ran a join: both children of opencode, as the plugin spawns them.
+    let other = adapter_event("opencode", &root, "ses-opencode-2", 0, "post_tool", 0, json!({}));
+    std::fs::write(root.join("other.json"), other.to_string()).unwrap();
+    let script = format!(
+        "{bin} hive join --bind --session {s} --dir {dir} && while [ ! -f {go} ]; do sleep 0.05; done; {bin} hook opencode post_tool < {o} > {out}.part; mv {out}.part {out}",
+        go = root.join("go").display(),
+        o = root.join("other.json").display(),
+        out = root.join("other.out").display()
+    );
+    let (mut oc, oc_pid) = harness_named(&root, "opencode", &["sh", "-c", &script], &[("BORG_HARNESS", "opencode"), ("BORG_HIVE_BINDER", "opencode")]);
+    until(20, "the bind", || interactive::live(&store(&root)).iter().any(|e| e.session == s));
+    let e = interactive::live(&store(&root)).into_iter().find(|e| e.session == s).unwrap();
+    assert_eq!((e.harness.as_str(), e.pid), ("opencode", oc_pid));
+    let drone = e.drone.clone();
+    // Another session of the process runs a join: its post_tool moves nothing.
+    std::fs::write(root.join("go"), "").unwrap();
+    until(20, "the other session's post_tool", || root.join("other.out").exists());
+    assert_eq!(hs(&root, s)["drone"], drone.as_str(), "the drone stays");
+    assert!(hs(&root, "ses-opencode-2").is_null());
+    // Its stop passes (the plugin waits), and its waiter leaves once opencode's process is gone.
+    hook_as(&root, "opencode", "prompt", &adapter_event("opencode", &root, s, oc_pid, "prompt", 0, json!({})));
+    let out = hook_as(&root, "opencode", "stop", &adapter_event("opencode", &root, s, oc_pid, "stop", 0, json!({})));
+    assert!(!reason(&out).contains("hive wait"), "no ask to start a wait: {out:?}");
+    assert_eq!(hook_as(&root, "opencode", "stop", &adapter_event("opencode", &root, s, oc_pid, "stop", 0, json!({"stop_hook_active": true}))), None);
+    let w = spawn_stream(&root, s);
+    std::thread::sleep(Duration::from_millis(800));
+    // SAFETY: kill(2) on the process this test spawned and has not reaped.
+    unsafe { libc::kill(oc_pid as libc::pid_t, libc::SIGTERM) };
+    let _ = oc.0.take().unwrap().wait();
+    let lines = w.lines.clone();
+    let (code, _) = w.waiter.ended(15);
+    assert_eq!(code, 0);
+    let last: Value = serde_json::from_str(lines.lock().unwrap().last().unwrap()).unwrap();
+    assert!(last["left"] == true && last["wake"].as_str().unwrap().contains("session is gone"), "{last}");
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The events of a plain omp or opencode session that never joined, as its adapter sends them, through
+/// `bin`'s hooks: (event, output with the root as `<root>`).
+fn plain_adapter_session(bin: &str, root: &Path, harness: &str) -> Vec<(String, String)> {
+    let s = "plain-unjoined";
+    let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": work(root).join("src/net.rs"), "new_string": "drain the Orion budget place"}});
+    let steps = [
+        ("prompt", json!({"prompt": "fix the Orion net budget drain and the websocket edge case"})),
+        ("pre_tool", edit.clone()),
+        ("post_tool", edit),
+        ("pre_tool", json!({"tool_name": "Bash", "tool_input": {"command": "borg hive join"}})),
+        ("post_tool", json!({"tool_name": "Bash", "tool_input": {"command": "borg hive join"}, "tool_response": "nothing joined"})),
+        (
+            "stop",
+            json!({"last_assistant_message": "Done: the budget place is drained, and the websocket handling covers the websocket edge case and its limits.", "stop_hook_active": false}),
+        ),
+        ("stop", json!({"last_assistant_message": "Done.", "stop_hook_active": true})),
+        ("end", json!({})),
+    ];
+    let shown = root.display().to_string();
+    steps
+        .into_iter()
+        .map(|(e, extra)| {
+            let mut input = json!({"session_id": s, "cwd": work(root), "pid": std::process::id()});
+            input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let mut c = command_with(bin, root, &["hook", harness, e], &[]);
+            c.stdin(Stdio::piped()).stderr(Stdio::null());
+            let mut child = c.spawn().unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.to_string().as_bytes()).unwrap();
+            let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).trim().to_string();
+            (e.to_string(), out.replace(&shown, "<root>"))
+        })
+        .collect()
+}
+
+/// Phase g correction 18 for omp and opencode: a session that never joined answers exactly as at HEAD
+/// 2e8fd8e, before their drones, while another session of its repo is an omp drone with a stream waiter
+/// running (its join command in the plain session included). The pins were taken with that commit's
+/// binary (`BORG_PIN_BIN=<it> cargo test --test hive_interactive_cli unjoined_omp`, which rewrites them).
+#[test]
+fn an_unjoined_omp_or_opencode_session_answers_byte_for_byte_as_before() {
+    for harness in ["omp", "opencode"] {
+        let root = setup(&format!("hive-i-unjoined-{harness}"));
+        open_task(&root, "t1");
+        let pin = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{harness}/unjoined-session.json"));
+        if let Ok(bin) = std::env::var("BORG_PIN_BIN") {
+            let outs = plain_adapter_session(&bin, &root, harness);
+            std::fs::write(&pin, serde_json::to_string_pretty(&outs).unwrap() + "\n").unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            continue;
+        }
+        ok(&root, &["join"], &[("PI_SESSION_ID", "omp-drone-beside")]);
+        let _w = spawn_stream(&root, "omp-drone-beside");
+        let got = plain_adapter_session(env!("CARGO_BIN_EXE_borg"), &root, harness);
+        let pinned: Vec<(String, String)> = serde_json::from_str(&std::fs::read_to_string(&pin).unwrap()).unwrap();
+        assert!(pinned.iter().any(|(e, out)| e == "stop" && !out.is_empty()), "{harness}: the pin covers a stop that answered");
+        assert_eq!(got, pinned, "{harness}");
+        assert!(interactive::live(&store(&root)).iter().all(|e| e.session == "omp-drone-beside"), "{harness}: no drone made of it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The done at a plugin drone's stop while its stream waiter runs, with a second task open: the board's
+/// done never makes the waiter claim beside the stop's handover (it holds off while the stop runs,
+/// interactive.rs `Stopping`; and a picked claim of a session that holds a task is never written, mod.rs
+/// `claim`), so t2 gets one claim line and reaches the drone once, by the stop's `Next`. Fails, as
+/// reproduced, with the waiter free to claim during the stop: two `Claim t2` lines, and t2 both in the
+/// stop's block and in a second wake.
+#[test]
+fn a_done_at_a_plugin_drones_stop_hands_its_next_task_once() {
+    let root = setup("hive-i-omp-race");
+    let s = "omp-race-1";
+    ok(&root, &["join"], &[("PI_SESSION_ID", s)]);
+    let (_omp, omp_pid) = harness_named(&root, "omp", &[], &[]);
+    let ev = |event: &str, nth: usize, extra: Value| adapter_event("omp", &root, s, omp_pid, event, nth, extra);
+    let w = spawn_stream(&root, s);
+    open_task(&root, "t1");
+    hook_as(&root, "omp", "stop", &ev("stop", 0, json!({})));
+    hook_as(&root, "omp", "stop", &ev("stop", 0, json!({"stop_hook_active": true})));
+    until(15, "t1's wake", || w.wakes().len() == 1);
+    hook_as(&root, "omp", "pre_tool", &ev("pre_tool", 1, json!({})));
+    open_task(&root, "t2");
+    std::fs::write(tree_of(&root, s).join("ok"), "").unwrap();
+    let done = hook_as(&root, "omp", "stop", &ev("stop", 0, json!({}))).expect("the done is said");
+    let r = done["reason"].as_str().unwrap().to_string();
+    assert!(r.starts_with("[borg hive] t1 done"), "{r}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let claims = events(&root).iter().filter(|e| e.ev == board::Ev::Claim && e.task == "t2").count();
+    let by_stop = usize::from(r.contains("Your claim: t2"));
+    let by_wake = w.wakes().iter().filter(|v| v["wake"].as_str().unwrap_or_default().contains("Your claim: t2")).count();
+    assert_eq!((claims, by_stop + by_wake), (1, 1), "one claim, one delivery: stop {r:?}, wakes {:?}", w.wakes());
+    assert!(held_by(&root, "t2", s));
+    hook_as(&root, "omp", "end", &ev("end", 0, json!({})));
+    let _ = w.waiter.ended(15);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// opencode (phase g correction 12): the engineer's turn halted with no stop (an Esc) is over on borg's
+/// side too once the plugin sends `halted`, so the drone's stream waiter hands the task that opens within
+/// seconds, not `BUSY_IDLE_MS` later; a plain session's `halted` writes nothing. Fails with the busy flag
+/// the prompt wrote left until its 5 minutes run out.
+#[test]
+fn an_opencode_drones_halted_turn_lets_its_waiter_hand_work_at_once() {
+    let root = setup("hive-i-opencode-halted");
+    let s = "ses-opencode-halt";
+    let dir = work(&root).display().to_string();
+    let (_oc, oc_pid) = harness_named(&root, "opencode", &[], &[]);
+    ok(&root, &["join", "--bind", "--session", s, "--dir", &dir], &[("BORG_HARNESS", "opencode")]);
+    let ev = |event: &str, extra: Value| adapter_event("opencode", &root, s, oc_pid, event, 0, extra);
+    let w = spawn_stream(&root, s);
+    hook_as(&root, "opencode", "prompt", &ev("prompt", json!({})));
+    open_task(&root, "t1");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(w.wakes().is_empty(), "nothing in the engineer's turn");
+    // Esc: no stop, the plugin's `halted` (the session id alone, as it sends it).
+    let halted = json!({"session_id": s, "cwd": work(&root), "pid": oc_pid});
+    assert_eq!(hook_as(&root, "opencode", "halted", &halted), None);
+    until(10, "the wake after the halted turn", || !w.wakes().is_empty());
+    assert!(w.wakes()[0]["wake"].as_str().unwrap().contains("Your claim: t1"));
+    // A plain session's `halted`: nothing written for it.
+    let plain = json!({"session_id": "ses-plain-halt", "cwd": work(&root), "pid": oc_pid});
+    assert_eq!(hook_as(&root, "opencode", "halted", &plain), None);
+    assert!(!store(&root).join("state/ses-plain-halt.hive-busy").exists() && hs(&root, "ses-plain-halt").is_null());
+    hook_as(&root, "opencode", "end", &ev("end", json!({})));
+    let _ = w.waiter.ended(15);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------- codex (phase g G3)
+
+/// codex 0.153.2's hook input `name` (tests/fixtures/codex: recorded from codex itself, against a local
+/// mock model), for session `s` in the repo, `said` as a tool's output, `extra` merged in.
+fn codex_event(root: &Path, name: &str, s: &str, said: &str, extra: Value) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/codex/{name}.json"));
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut v: Value = serde_json::from_str(&text).unwrap();
+    for (k, with) in
+        [("session_id", s.to_string()), ("cwd", work(root).display().to_string()), ("transcript_path", root.join("none.jsonl").display().to_string())]
+    {
+        v[k] = Value::String(with);
+    }
+    if v["tool_response"] == "{{said}}" {
+        v["tool_response"] = Value::String(said.into());
+    }
+    v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    v
+}
+
+/// A process named `codex` (a link to perl) that runs each line it is sent with `sh -c`, as codex runs
+/// its hooks: their nearest harness ancestor is it. Stopped as an engineer stops it when dropped.
+struct Codex {
+    proc: Waiter,
+    to: std::process::ChildStdin,
+    from: std::io::BufReader<std::process::ChildStdout>,
+    pid: u32,
+}
+
+/// The fake `codex` CLI on the tests' PATH (`root/bin/codex`): each call's arguments, NUL-separated, in
+/// `root/queue/<n>`; exit 1 while `root/queue.fail` exists.
+fn fake_codex_cli(root: &Path) {
+    let q = root.join("queue");
+    std::fs::create_dir_all(&q).unwrap();
+    let script = format!(
+        "#!/bin/sh\nn=$(ls {q} | wc -l)\nprintf '%s\\0' \"$@\" > {q}/$((n + 1000))\nif [ -f {fail} ]; then echo 'Error: failed to queue session message' >&2; exit 1; fi\necho \"Queued message m1 for thread $3.\"\n",
+        q = q.display(),
+        fail = root.join("queue.fail").display()
+    );
+    let bin = root.join("bin/codex");
+    std::fs::write(&bin, script).unwrap();
+    let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&bin, perm).unwrap();
+}
+
+/// The `codex queue` calls so far: each one's arguments.
+fn queued(root: &Path) -> Vec<Vec<String>> {
+    let mut names: Vec<_> = std::fs::read_dir(root.join("queue")).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    names.sort();
+    names.iter().map(|p| std::fs::read_to_string(p).unwrap_or_default().split('\0').filter(|a| !a.is_empty()).map(String::from).collect()).collect()
+}
+
+impl Codex {
+    fn start(root: &Path) -> Self {
+        let perl = String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap();
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        let link = root.join("proc/codex");
+        if !link.exists() {
+            std::os::unix::fs::symlink(perl.trim(), &link).unwrap();
+        }
+        let script = "$| = 1; while (my $l = <STDIN>) { chomp $l; system('sh', '-c', $l); print \"done\\n\"; }";
+        let mut c = command_with(link.to_str().unwrap(), root, &["-e", script], &[("BORG_HIVE_TAKEUP_MS", "20000")]);
+        c.stdin(Stdio::piped()).stderr(Stdio::null());
+        let mut child = c.spawn().unwrap();
+        let (to, from) = (child.stdin.take().unwrap(), std::io::BufReader::new(child.stdout.take().unwrap()));
+        let pid = child.id();
+        Codex { proc: Waiter(Some(child)), to, from, pid }
+    }
+
+    /// `borg hook codex <event>` with `input`, run by codex's process: its output.
+    fn hook(&mut self, root: &Path, event: &str, input: &Value) -> Option<Value> {
+        let (i, o) = (root.join("codex-in.json"), root.join("codex-out.json"));
+        std::fs::write(&i, input.to_string()).unwrap();
+        let line = format!("{} hook codex {event} < {} > {}\n", env!("CARGO_BIN_EXE_borg"), i.display(), o.display());
+        std::io::Write::write_all(&mut self.to, line.as_bytes()).unwrap();
+        let mut done = String::new();
+        std::io::BufRead::read_line(&mut self.from, &mut done).unwrap();
+        assert_eq!(done.trim(), "done");
+        let out = std::fs::read_to_string(&o).unwrap().trim().to_string();
+        (!out.is_empty()).then(|| serde_json::from_str(&out).unwrap())
+    }
+}
+
+/// Whether `drone`'s waiter runs (its lock is held).
+fn waiter_runs(root: &Path, drone: &str) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(store(root).join(format!("state/{drone}.hive-waiter"))) else { return false };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// codex (phase g G3): a session joins by the `CODEX_THREAD_ID` codex gives its shell (here outside the
+/// harness, as from codex's sandbox: the join finds no codex process); the join's own PostToolUse,
+/// whose `session_id` is that thread, ties the drone to codex's process (its hooks run as its children);
+/// the stop that ends the engineer's turn starts the waiter detached and passes at once, never asking
+/// the model for a wait; the waiter wakes the idle session with `codex queue --thread <thread>
+/// --message <task>`, which the woken turn's prompt takes up; the done is said first as a block with
+/// the idle line; one waiter for the session's life; a queue that exits nonzero releases its claim at
+/// once and is tried again; SessionEnd leaves and stops the waiter. All with codex's own hook JSON.
+/// Fails with the stop asking for a background wait (Claude's arm), with no waiter started by the
+/// stop, with a failed queue leaving the claim held, and without `CODEX_THREAD_ID` in `SESSION_ENV`.
+#[test]
+fn a_codex_drone_is_woken_by_codex_queue_from_the_waiter_its_stop_starts() {
+    let root = setup("hive-i-codex");
+    fake_codex_cli(&root);
+    let s = "01a17d2b-1640-7d00-83a5-32e2d9613929";
+    let said = ok(&root, &["join"], &[("CODEX_THREAD_ID", s)]);
+    assert!(said.contains("joined every open hive goal of this repo (g1)") && said.contains("codex queue") && !said.contains("/clear"), "{said}");
+    let entry = interactive::live(&store(&root)).into_iter().next().unwrap();
+    assert_eq!((entry.session.as_str(), entry.harness.as_str()), (s, "codex"));
+    let drone = entry.drone.clone();
+    let mut cx = Codex::start(&root);
+    // The join's PostToolUse: its thread is the session's, so nothing is said; codex's process is the
+    // drone's harness from now on.
+    assert_eq!(cx.hook(&root, "post_tool", &codex_event(&root, "hive_join", s, &said, json!({}))), None);
+    let e = interactive::live(&store(&root)).into_iter().next().unwrap();
+    assert_eq!((e.pid, e.by.as_str()), (cx.pid, "rebind"), "codex's process is the drone's harness");
+    cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({})));
+    open_task(&root, "t1");
+    // The turn's stops: a conscience may ask at the first; none asks for a wait, and none blocks for it.
+    let mut out = cx.hook(&root, "stop", &codex_event(&root, "stop", s, "", json!({})));
+    if out.is_some() {
+        assert!(!reason(&out).contains("hive wait") && out.as_ref().unwrap().get("hookSpecificOutput").is_none(), "{out:?}");
+        assert!(!waiter_runs(&root, &drone) && queued(&root).is_empty(), "a blocked stop goes on with the engineer's turn");
+        out = cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({})));
+    }
+    assert_eq!(out, None, "the stop passes at once");
+    until(15, "the queued wake", || !queued(&root).is_empty());
+    let q = queued(&root)[0].clone();
+    assert_eq!(&q[..4], ["queue", "--thread", s, "--message"], "{q:?}");
+    assert!(q[4].starts_with("[borg hive g1] Work arrived.") && q[4].contains("Your claim: t1"), "{}", q[4]);
+    assert!(held_by(&root, "t1", s) && waiter_runs(&root, &drone));
+    // The queued turn's prompt (codex sends it as UserPromptSubmit) takes the claim up.
+    cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({"prompt": q[4]})));
+    assert!(!store(&root).join(format!("state/{s}.hive-takeup")).exists(), "taken up");
+    std::fs::write(tree_of(&root, s).join("ok"), "").unwrap();
+    let done = cx.hook(&root, "stop", &codex_event(&root, "stop", s, "", json!({}))).expect("the done is said");
+    assert_eq!(done["decision"], "block", "codex reads a block: {done}");
+    let r = done["reason"].as_str().unwrap();
+    assert!(r.starts_with("[borg hive] t1 done: its checks passed (ok)") && r.contains(interactive::IDLE_LINE) && !r.contains("hive wait"), "{r}");
+    assert_eq!(cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({}))), None);
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(queued(&root).len(), 1, "nothing more to hand: its own verify task is not its");
+    // A queue codex refuses: the claim is released at once (not at the 20 s take-up), then tried again.
+    std::fs::write(root.join("queue.fail"), "").unwrap();
+    open_task(&root, "t2");
+    until(8, "the failed queue's release", || events(&root).iter().any(|e| e.ev == board::Ev::Released && e.task == "t2" && e.note.contains("codex queue")));
+    assert!(!held_by(&root, "t2", s), "released");
+    std::fs::remove_file(root.join("queue.fail")).unwrap();
+    until(20, "the wake tried again", || queued(&root).iter().filter(|q| q[4].contains("Your claim: t2")).count() == 2);
+    assert!(held_by(&root, "t2", s));
+    // The session's end: the drone leaves, its waiter is stopped by the leave.
+    cx.hook(&root, "end", &codex_event(&root, "end", s, "", json!({})));
+    until(15, "the waiter's end", || !waiter_runs(&root, &drone));
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty());
+    assert_eq!(task_state(&root, "t2").0, "open", "the end released its claim");
+    assert!(events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE), "the node left with its last drone");
+    drop(cx.proc);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// codex's first hook after the join checks the thread (phase g spec 3.1): a join whose
+/// `CODEX_THREAD_ID` is not the `session_id` the session's hooks carry would be woken on a thread nobody
+/// types in, so its PostToolUse makes the drone leave and says so; the busy turn an engineer's prompt
+/// starts ends at codex's Interrupt (an Esc, with no Stop after it: correction 8), and a plain session's
+/// Interrupt writes nothing; a waiter whose codex process is gone leaves and queues nothing. Fails with
+/// no `mismatch` (the stale drone stays bound), with no `Interrupt` hook (busy for 5 minutes), and with
+/// the hook's harness pid unrecorded (the waiter waits on for a codex that is gone).
+#[test]
+fn a_codex_join_on_another_thread_unbinds_an_interrupt_ends_the_turn_and_a_gone_codex_ends_the_waiter() {
+    let root = setup("hive-i-codex-check");
+    fake_codex_cli(&root);
+    let said = ok(&root, &["join"], &[("CODEX_THREAD_ID", "01a17d2b-0000-7000-8000-00000000aaaa")]);
+    let mut cx = Codex::start(&root);
+    let s = "01a17d2b-0000-7000-8000-00000000bbbb";
+    let out = cx.hook(&root, "post_tool", &codex_event(&root, "hive_join", s, &said, json!({})));
+    let text = common::context(&out.map(|v| v.to_string()).unwrap_or_default());
+    assert!(text.contains("01a17d2b-0000-7000-8000-00000000aaaa") && text.contains("is no drone"), "{text}");
+    assert!(interactive::live(&store(&root)).is_empty() && hs(&root, "01a17d2b-0000-7000-8000-00000000aaaa").is_null(), "unbound");
+    assert!(events(&root).iter().any(|e| e.by == "runner" && e.note == board::LEAVE), "the node left with it");
+    // The same thread: a drone. The engineer's prompt is a busy turn until codex's Interrupt.
+    let said = ok(&root, &["join"], &[("CODEX_THREAD_ID", s)]);
+    assert_eq!(cx.hook(&root, "post_tool", &codex_event(&root, "hive_join", s, &said, json!({}))), None);
+    let drone = interactive::live(&store(&root))[0].drone.clone();
+    cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({})));
+    let busy = store(&root).join(format!("state/{s}.hive-busy"));
+    assert!(busy.exists());
+    assert_eq!(cx.hook(&root, "halted", &codex_event(&root, "interrupt", s, "", json!({}))), None);
+    assert!(!busy.exists(), "the interrupted turn is over");
+    assert_eq!(cx.hook(&root, "halted", &codex_event(&root, "interrupt", "plain-codex", "", json!({}))), None);
+    assert!(!store(&root).join("state/plain-codex.hive-busy").exists() && hs(&root, "plain-codex").is_null());
+    // Its waiter, from its stop; then codex's process ends with no SessionEnd.
+    cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({})));
+    until(15, "the waiter", || waiter_runs(&root, &drone));
+    drop(cx.proc);
+    until(15, "the waiter's end", || !waiter_runs(&root, &drone));
+    assert!(hs(&root, s).is_null() && interactive::live(&store(&root)).is_empty(), "it left for its session");
+    let log = std::fs::read_to_string(store(&root).join(format!("state/{drone}.hive-wait.log"))).unwrap_or_default();
+    assert!(log.contains("session is gone") && queued(&root).is_empty(), "{log}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A codex wake queues behind a turn the engineer started meanwhile (phase g: never hijacks an
+/// engineer's turn): that turn's prompt is not the handed text, so the claim stays not taken up, and its
+/// stop runs no check, says no done and blocks nothing, though the check would pass; the wake's own turn,
+/// whose prompt is the handed text, takes it up and its stop says the done. Fails with any event taking a
+/// codex claim up (the engineer's stop publishes t1's done) and with the stop reading a handed claim as
+/// in hand.
+#[test]
+fn a_codex_wake_queued_behind_the_engineers_turn_is_not_done_by_that_turn() {
+    let root = setup("hive-i-codex-behind");
+    fake_codex_cli(&root);
+    let s = "01a17d2b-1640-7d00-83a5-32e2d9610001";
+    let said = ok(&root, &["join"], &[("CODEX_THREAD_ID", s)]);
+    let drone = interactive::live(&store(&root))[0].drone.clone();
+    let mut cx = Codex::start(&root);
+    assert_eq!(cx.hook(&root, "post_tool", &codex_event(&root, "hive_join", s, &said, json!({}))), None);
+    assert_eq!(cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({}))), None);
+    until(15, "the waiter", || waiter_runs(&root, &drone));
+    open_task(&root, "t1");
+    until(15, "the queued wake", || !queued(&root).is_empty());
+    let handed = queued(&root)[0][4].clone();
+    assert!(handed.starts_with("[borg hive g1] Work arrived."), "{handed}");
+    // The engineer's prompt comes first; codex runs its turn and the wake waits in its queue.
+    std::fs::write(tree_of(&root, s).join("ok"), "").unwrap();
+    cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({})));
+    let takeup = store(&root).join(format!("state/{s}.hive-takeup"));
+    assert!(takeup.exists(), "the engineer's prompt takes nothing up");
+    let mut out = cx.hook(&root, "stop", &codex_event(&root, "stop", s, "", json!({})));
+    if out.is_some() {
+        assert!(!reason(&out).contains("t1"), "nothing of t1 in the engineer's stop: {out:?}");
+        out = cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({})));
+    }
+    assert_eq!(out, None, "the engineer's turn ends as it would");
+    assert!(held_by(&root, "t1", s) && takeup.exists(), "still the wake's");
+    assert!(!events(&root).iter().any(|e| e.ev == board::Ev::Done), "no done for the engineer's turn");
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(queued(&root).len(), 1, "handed once");
+    // The wake's own turn.
+    cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({"prompt": handed})));
+    assert!(!takeup.exists(), "taken up");
+    let done = cx.hook(&root, "stop", &codex_event(&root, "stop", s, "", json!({}))).expect("the done is said");
+    assert!(done["reason"].as_str().unwrap().starts_with("[borg hive] t1 done"), "{done}");
+    cx.hook(&root, "end", &codex_event(&root, "end", s, "", json!({})));
+    until(15, "the waiter's end", || !waiter_runs(&root, &drone));
+    drop(cx.proc);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A wake `codex queue` took that no turn takes up (a thread no codex runs: the TUI moved on with
+/// `/new`) is released after the take-up time and not claimed again until a hook event of the session
+/// comes: one claim, one queued message, the task open to other drones meanwhile; the session's next
+/// hook event ends the hold. Fails with the waiter claiming and queueing the task again every take-up.
+#[test]
+fn a_codex_wake_no_turn_takes_up_is_not_claimed_again_until_the_session_speaks() {
+    let root = setup("hive-i-codex-missed");
+    fake_codex_cli(&root);
+    let s = "01a17d2b-1640-7d00-83a5-32e2d9610002";
+    ok(&root, &["join"], &[("CODEX_THREAD_ID", s)]);
+    let dir = work(&root).display().to_string();
+    let _w = Waiter(Some(command(&root, &["hive", "wait", "--queue", "--session", s, "--dir", &dir], &[("BORG_HIVE_TAKEUP_MS", "500")]).spawn().unwrap()));
+    open_task(&root, "t1");
+    until(15, "the queued wake", || queued(&root).len() == 1);
+    until(15, "its release", || events(&root).iter().any(|e| e.ev == board::Ev::Released && e.note.starts_with("not taken up")));
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(queued(&root).len(), 1, "not queued again");
+    assert_eq!(task_state(&root, "t1").0, "open", "open to other drones");
+    let claims = events(&root).iter().filter(|e| e.ev == board::Ev::Claim && e.task == "t1").count();
+    assert_eq!(claims, 1, "claimed once");
+    // A hook event of the session: codex runs the thread again.
+    hook_as(&root, "codex", "pre_tool", &codex_event(&root, "pre_tool", s, "", json!({})));
+    until(15, "the wake again", || queued(&root).len() == 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The events of a plain codex session that never joined, as codex sends them (fixtures/codex), through
+/// `bin`'s hooks: (event, output with the root as `<root>`).
+fn plain_codex_session(bin: &str, root: &Path) -> Vec<(String, String)> {
+    let s = "plain-unjoined";
+    let steps = [
+        ("prompt", "prompt"),
+        ("pre_tool", "pre_tool"),
+        ("post_tool", "edit"),
+        ("post_tool", "hive_join"),
+        ("halted", "interrupt"),
+        ("prompt", "correction"),
+        ("stop", "stop"),
+        ("stop", "stop_again"),
+        ("end", "end"),
+    ];
+    let shown = root.display().to_string();
+    steps
+        .into_iter()
+        .map(|(e, name)| {
+            let input = codex_event(root, name, s, "nothing joined", json!({}));
+            let mut c = command_with(bin, root, &["hook", "codex", e], &[]);
+            c.stdin(Stdio::piped()).stderr(Stdio::null());
+            let mut child = c.spawn().unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.to_string().as_bytes()).unwrap();
+            let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).trim().to_string();
+            (e.to_string(), out.replace(&shown, "<root>"))
+        })
+        .collect()
+}
+
+/// Phase g correction 18 for codex: a session that never joined answers exactly as at HEAD 2e8fd8e,
+/// before codex drones, while another session of its repo is a codex drone with its waiter running (a
+/// `borg hive join` PostToolUse and an Interrupt in the plain session included). The pin was taken with
+/// that commit's binary (`BORG_PIN_BIN=<it> cargo test --test hive_interactive_cli unjoined_codex`, which
+/// rewrites it).
+#[test]
+fn an_unjoined_codex_session_answers_byte_for_byte_as_before() {
+    let root = setup("hive-i-unjoined-codex");
+    fake_codex_cli(&root);
+    open_task(&root, "t0");
+    let pin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/unjoined-session.json");
+    if let Ok(bin) = std::env::var("BORG_PIN_BIN") {
+        let outs = plain_codex_session(&bin, &root);
+        std::fs::write(&pin, serde_json::to_string_pretty(&outs).unwrap() + "\n").unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        return;
+    }
+    ok(&root, &["join"], &[("CODEX_THREAD_ID", "codex-drone-beside")]);
+    let dir = work(&root).display().to_string();
+    let _w = Waiter(Some(
+        command(&root, &["hive", "wait", "--queue", "--session", "codex-drone-beside", "--dir", &dir], &[("BORG_HIVE_TAKEUP_MS", "20000")]).spawn().unwrap(),
+    ));
+    let got = plain_codex_session(env!("CARGO_BIN_EXE_borg"), &root);
+    let pinned: Vec<(String, String)> = serde_json::from_str(&std::fs::read_to_string(&pin).unwrap()).unwrap();
+    assert!(pinned.iter().any(|(e, out)| e == "stop" && !out.is_empty()), "the pin covers a stop that answered");
+    assert_eq!(got, pinned);
+    assert!(interactive::live(&store(&root)).iter().all(|e| e.session == "codex-drone-beside"), "no drone made of it");
+    let state: Vec<String> = std::fs::read_dir(store(&root).join("state"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("plain-unjoined.hive"))
+        .collect();
+    assert!(state.is_empty(), "no hive state for it: {state:?}");
+    let _ = std::fs::remove_dir_all(root);
+}

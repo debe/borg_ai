@@ -1,0 +1,9 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a17d2f-1b11-7b82-bf97-51f0a7bba680",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "Interrupt",
+  "model": "mock-plain",
+  "permission_mode": "default"
+}

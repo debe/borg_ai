@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Probe, Transcript, Wiring};
 
 /// Native names unlike any real harness's: the event table, not a name, decides the canonical event.
 pub const EVENTS: [(&str, &str); 6] = [
@@ -40,6 +40,9 @@ pub fn caps_of(list: &str) -> Caps {
         sends_pid: on("pid"),
         stop_budget: None,
         headless_budget: on("budget"),
+        session_env: None,
+        drone_wake: DroneWake::Model,
+        one_session_per_process: false,
     }
 }
 

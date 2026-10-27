@@ -1,0 +1,15 @@
+{
+  "session_id": "{{session}}",
+  "turn_id": "01a17d2b-1649-7ea0-8859-c43dce34d619",
+  "transcript_path": "{{transcript}}",
+  "cwd": "{{cwd}}",
+  "hook_event_name": "PostToolUse",
+  "model": "mock-plain",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "borg hive join"
+  },
+  "tool_response": "{{said}}",
+  "tool_use_id": "call_1"
+}

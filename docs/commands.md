@@ -75,8 +75,8 @@ $ borg hive board
 |---|---|
 | `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,.."]... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes. `--hidden-dir`/`--hidden`: a hidden oracle, see [Guardrails](#guardrails-and-the-hidden-oracle) |
 | `borg hive board [<goal>] [--json] [--watch]` | The tasks by status, with holders, age, rework and dependencies |
-| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. Its model never runs `approve`, `integrate`, `score` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone. In a repo of no collective it says so on stderr with the `borg setup` that adds the repo, and changes nothing ([Interactive drones](#interactive-drones)) |
-| `borg hive wait` | An interactive drone waits for work without spending tokens, claims the next task open to it, prints it and exits; Claude Code starts the next turn with that output. Never while the engineer's own turn runs in the session. A claim no hook event of the session takes up within 60 s is released. A stuck goal is said once, then the drone waits on; a drone of one goal leaves once it is finished for good. Once its session is gone (its Claude Code process ended) it leaves and exits. While no `borg mesh serve` runs on the machine, one waiter does the node's goal work (see [Interactive drones](#interactive-drones)) |
+| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`, omp's `PI_SESSION_ID`, codex's `CODEX_THREAD_ID`; in opencode, whose shell has no session id, the borg plugin binds the session that ran the command) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. Its model never runs `approve`, `integrate`, `score` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone. In a repo of no collective it says so on stderr with the `borg setup` that adds the repo, and changes nothing ([Interactive drones](#interactive-drones)) |
+| `borg hive wait [--stream]` | An interactive drone waits for work without spending tokens, claims the next task open to it, prints it and exits; Claude Code starts the next turn with that output. `--stream` is the omp and opencode adapters' waiter: it runs from the join for the session's life and prints each wake as one JSON line (`{"wake": "<text>", "left": false}`), which the adapter sends into the session. `--queue` is codex's: a codex drone's stop starts it, and it wakes the session with `codex queue --thread <session> --message <text>`; a queue that fails releases the claim at once. Never while the engineer's own turn or a stop runs in the session. A claim no hook event of the session takes up within 60 s is released. A stuck goal is said once, then the drone waits on; a drone of one goal leaves once it is finished for good. Once its session is gone (its Claude Code, omp, opencode or codex process ended) it leaves and exits. While no `borg mesh serve` runs on the machine, one waiter does the node's goal work (see [Interactive drones](#interactive-drones)) |
 | `borg hive join <goal> [--session ID\|DRONE]` · `borg hive leave` | A running drone joins the goal, or leaves it (its claim is released). A drone started with `BORG_HIVE=<goal>` joins at its first hook |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
 | `borg hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]` | Headless drones in worktrees, once the plan is approved, see [Running drones](#running-drones). Exit 1 when you said no to the plan (nothing was started or claimed) |
@@ -145,6 +145,71 @@ then works in its own worktree and, with nothing open, ends each turn on a backg
 and the line `Drone idle: waiting for hive work, which starts here by itself when a task opens.` Leave
 it alone: the next task starts a turn on its own. It stays a drone until you ask it to leave the hive.
 
+**omp and opencode.** Ask the session to "join the hive" as in Claude Code. The difference is who
+waits. In omp and opencode the borg adapter keeps the drone's waiter itself, from the join for as long
+as the session lives, so no turn ends on a background command and the stop never asks for one:
+
+| | omp (18.12) | opencode 1.x | opencode 2.x |
+|---|---|---|---|
+| Who binds the session | `borg hive join` itself, from `PI_SESSION_ID` | the plugin, from its `tool.execute.after` of the session that ran `borg hive join` (`borg hive join --bind --session <id>`); the command alone binds nobody | as 1.x, from `execute.after` |
+| How a wake goes in | `pi.sendMessage({customType: "borg-hive", ...}, {deliverAs: "nextTurn", triggerTurn: true})`: starts a turn on an idle session, waits behind a running one | `session.promptAsync`, once the session is idle | `session.prompt({delivery: "queue"})`, once the session is idle |
+| Idle | omp's own `nextTurn` queue | from a prompt or tool call to `session.idle` (an Esc-halted turn too) | from a prompt or tool call to `session.execution.succeeded`, `.failed` or `.interrupted` |
+
+- The waiter (`borg hive wait --stream`) hands nothing while the engineer's own turn runs, including
+  the turn that ran the join. The join's turn ends at its stop.
+- An opencode turn you halt (Esc, a provider error) has no stop: the plugin tells borg (`borg hook
+  opencode halted`), so work goes in as soon as the session is idle.
+- A woken turn's first tool call or stop takes the claim up. Otherwise it is released after 60 s, as in
+  Claude Code. A wake opencode refuses is sent again a few seconds later.
+- A stop that finishes a task says the result first, then `Drone idle: ...`, as a plain block, which
+  both adapters send back into the session. borg marks it `"hive": true`. In opencode such a hive
+  handover is never dropped because you typed while the stop ran: it holds a claim, so it queues behind
+  your turn. It is never counted against the one round of questions an engineer prompt gets. A drone's
+  block of questions alone has no mark and follows the rules for questions.
+- While a drone's stop runs, its waiter claims nothing: the stop hands the next task, once.
+- The pid the adapter sends with every event (omp's or opencode's own process) is the drone's harness
+  process from its first event on. The waiter and the node's reaper end the drone with that process.
+  One opencode process may run several sessions: another session's `borg hive join` binds only that
+  session.
+- The session's end (omp `session_shutdown`; opencode `session.deleted` or the plugin's unload) makes
+  the drone leave, which stops its waiter.
+
+**codex.** Ask the session to "join the hive" as in Claude Code: `borg hive join` binds the thread
+codex names in the command's `CODEX_THREAD_ID`. No codex hook can start a turn in an idle session, so
+borg wakes it the way codex itself offers, with `codex queue` (codex 0.149 or newer):
+
+- The stop that ends a drone's turn starts its waiter (`borg hive wait --queue`) in the background,
+  detached from the hook, and passes at once: the stop never waits on it, and the stop's 90 s timeout
+  stays as it is (changing a hook's timeout makes codex ask you to trust borg's hooks again). One waiter
+  runs per drone, for the session's life.
+- When a task is open to the drone and you are not typing in the session, the waiter claims it and runs
+  `codex queue --thread <session> --message "[borg hive <goal>] Work arrived. ..."`. The idle session
+  takes the message up as a new turn, a few seconds later. That turn's prompt, the message itself,
+  takes the claim up; otherwise it is released after 60 s, as in Claude Code (`codex queue` also takes
+  a message for a thread no codex runs). After such a release the waiter claims nothing more until the
+  session's next hook event, so a thread you left (`/new`, `/resume`) is not handed the same task
+  again every minute. A `codex queue` that fails (a nonzero exit, no `codex` on the PATH) releases the
+  claim at once, and the waiter claims nothing for 10 s.
+- If you type in the session after the message was queued, codex runs your turn first and the task's
+  turn after it. Your turn never touches the task: its stop runs no check, reports no done and blocks
+  nothing for it.
+- A stop that finishes a task says the result first, then the idle line, as a plain block, which codex
+  continues the turn with.
+- Your own turn in the session holds the waiter off from your prompt to the turn's stop. A turn you
+  interrupt (Esc) has no stop: borg's `Interrupt` hook ends it. That hook is new, and codex runs it
+  only once you trust it in `/hooks` (an install from before it adds it with `borg install codex
+  --apply`). Without it, a quiet turn stops holding the waiter off a minute after its last event; work
+  sent then waits in codex's queue behind any turn that still runs, so nothing needs doing.
+- The join's own hook checks that the session's hooks carry the thread the join bound. If they carry
+  another id, the session is no drone, and the session is told why.
+- codex runs its hooks as children of its own process, so the hooks tie the drone to codex's process.
+  `/quit` leaves at once (SessionEnd). Once the process is gone without one (a closed terminal, a
+  crash), the waiter sees it, leaves for the drone and exits.
+- In codex's default sandbox (`workspace-write`) the repo's `.git` and borg's store are read-only to
+  the model's commands, so the join cannot register the drone's worktree there. It says so: run it
+  outside the sandbox (codex asks you to approve the escalated command). borg's hooks run outside the
+  sandbox and need nothing.
+
 **What a stop says.** Claude Code shows a drone's stop as hook feedback, not as a hook error. When a
 task's checks pass, the stop says that first, for example `[borg hive] t1 done: its checks passed
 (unit); verify task t1.v1 is open for another drone.` When a check fails, it says which one and why.
@@ -180,7 +245,7 @@ thread of its own, for every goal a drone of the machine serves:
   own turn, or with no wait running, drops out after 10 s, so a task only it could take shows as stuck
   instead of waiting on a session nothing wakes.
 - It says the board finished, which tasks the node may not take, and what is stuck.
-- It reaps a drone whose Claude Code process is gone (above).
+- It reaps a drone whose harness process is gone (Claude Code's, omp's or opencode's; above).
 - Once every task is verified it runs `borg hive integrate` as a child process (output in the goal's
   `logs/node-integrate.log`), so the goal is integrated and finished while every drone is idle.
 

@@ -125,13 +125,13 @@ grep -q "run /hooks to trust borg's hooks" "$W/install.out" || fail "install nam
 python3 -I - "$CODEX_HOME/hooks.json" "$BORG" <<'EOF' || fail "hooks.json: $(cat "$CODEX_HOME/hooks.json")"
 import json, sys
 h = json.load(open(sys.argv[1]))["hooks"]
-want = {"UserPromptSubmit": ("prompt", 30), "PreToolUse": ("pre_tool", 10), "PostToolUse": ("post_tool", 30), "Stop": ("stop", 90), "SessionEnd": ("end", 3)}
+want = {"UserPromptSubmit": ("prompt", 30), "PreToolUse": ("pre_tool", 10), "PostToolUse": ("post_tool", 30), "Stop": ("stop", 90), "SessionEnd": ("end", 3), "Interrupt": ("halted", 3)}
 for native, (ev, t) in want.items():
     ours = [x for g in h[native] for x in g["hooks"] if x["command"] == f"{sys.argv[2]} hook codex {ev}"]
     assert len(ours) == 1 and ours[0]["timeout"] == t, (native, ours)
 assert "echo prompt" in h["UserPromptSubmit"][0]["hooks"][0]["command"] and "echo stop" in h["Stop"][0]["hooks"][0]["command"], "theirs first, kept"
 EOF
-ok "install: borg's 5 hooks appended with their timeouts, the engineer's kept first"
+ok "install: borg's 6 hooks appended with their timeouts, the engineer's kept first"
 
 # ---------------------------------------------------------------- 2. a turn through codex
 (cd "$REPOD" && timeout 120 codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -s workspace-write --json \

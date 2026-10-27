@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
 
 pub const ADAPTER: &str = include_str!("../../assets/adapters/omp/borg.ts");
 
@@ -31,6 +31,9 @@ impl Harness for Omp {
             // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
             stop_budget: None,
             headless_budget: false,
+            session_env: Some("PI_SESSION_ID"),
+            drone_wake: DroneWake::Plugin,
+            one_session_per_process: false,
         }
     }
 

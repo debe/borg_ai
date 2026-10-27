@@ -347,7 +347,7 @@ fn integrate_child(home: &Path, goal: &str, repo: &Path) -> std::io::Result<std:
     let log = integrate_log(home, goal)?;
     let mut c = std::process::Command::new(borg_exe());
     c.args(["hive", "integrate", goal, "--dir", &repo.display().to_string()]).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    for k in interactive::SESSION_ENV.iter().chain(&[super::ENV, super::DRONE_ENV]) {
+    for k in interactive::session_vars().into_iter().map(|(k, _)| k).chain([super::ENV, super::DRONE_ENV]) {
         c.env_remove(k);
     }
     // SAFETY: setsid(2) between fork and exec only makes the child its own session.

@@ -1624,6 +1624,12 @@ pub fn main(name: &str, event: &str) {
         }
         return;
     }
+    // A turn halted with no stop (opencode's plugin, codex's Interrupt, for an interactive hive drone
+    // only): its engineer's turn is over (hive/interactive.rs `halted`); nothing else is read or written.
+    if event == "halted" {
+        crate::hive::interactive::halted(input.get("session_id").and_then(Value::as_str).unwrap_or_default());
+        return;
+    }
     // Not at pre_tool (every tool call): there only the hive's refusal of a lost claim's edits
     // (hive/mod.rs `pre_tool`), its guard flags (hive/guard.rs: one failed open for a session in no
     // goal; a refused edit never runs, so it flags nothing) and steering reads, only once someone steered.

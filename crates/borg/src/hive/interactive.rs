@@ -10,6 +10,8 @@
 //!   work while it lasts.
 //! - `<state>/<session>.hive-takeup`: a claim a waiter handed and no hook event of the session has
 //!   taken up yet (`handed`, `untaken`; `touch` takes it up, wait.rs `takeup` releases it otherwise).
+//! - `<state>/<session>.hive-missed`: a wake no turn took up (wait.rs `takeup` released its claim): the
+//!   waiter claims nothing more until a hook event of the session comes (`missed`, `touch`).
 //! - `<state>/<drone>.hive-waiter`: locked by the drone's running waiter (`waiting`).
 //!
 //! Membership: `join` (and any claim path, `ensure_member`) writes the node's JOIN under the board lock
@@ -25,14 +27,79 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{Board, Ev, Event, Here, HiveSession, board, bound, command, fail, goal, member, node, run, save, session_path, short, tasks_path, write_if};
-use crate::{harness::Harness, hook, learn, queen};
+use crate::harness::{DroneWake, Harness};
+use crate::{hook, learn, queen};
 
-/// The variables a harness sets to its session's id in every command its model runs and every hook it
-/// runs: Claude Code's equals the hook input's `session_id` and follows `/clear`, but under `--continue`
-/// or `--resume` without an id it may be the startup id instead (its env-vars docs), so the join's own
-/// PostToolUse moves the drone to the id its hooks carry (`adopt`). What binds a session from inside
-/// it: only the session that runs `borg hive join` becomes a drone.
-pub const SESSION_ENV: &[&str] = &["CLAUDE_CODE_SESSION_ID"];
+/// The variables harnesses set to their session's id in every command their model runs and every hook
+/// they run (`Caps::session_env`), each with its harness, in `harness::ALL`'s order: Claude Code's
+/// (`CLAUDE_CODE_SESSION_ID`) equals the hook input's `session_id` and follows `/clear`, but under
+/// `--continue` or `--resume` without an id it may be the startup id instead (its env-vars docs), so
+/// the join's own PostToolUse moves the drone to the id its hooks carry (`adopt`); omp's (`PI_SESSION_ID`) is its session manager's id, the one its extension sends; codex's
+/// (`CODEX_THREAD_ID`, 0.153.2, also inside its sandbox) is the thread id its hooks carry as `session_id`
+/// and `codex queue --thread` takes, which the join's own PostToolUse checks (`mismatch`). What binds a
+/// session from inside it: only the session that runs `borg hive join` becomes a drone. opencode gives
+/// its shell no session id: its plugin binds the session that ran the join (`BINDER_ENV`).
+pub fn session_vars() -> Vec<(&'static str, &'static str)> {
+    crate::harness::ALL.iter().filter_map(|h| h.caps().session_env.map(|v| (v, h.name()))).collect()
+}
+
+/// Set by a harness plugin that binds the session itself (opencode's, in its own process, so every
+/// command its model runs has it): a `borg hive join` with no session id in its environment is then
+/// the plugin's to bind (`borg hive join --bind --session S`, from its `tool.execute.after` for the
+/// session that ran it), not refused.
+pub const BINDER_ENV: &str = "BORG_HIVE_BINDER";
+
+/// How an interactive drone of a harness gets its next task once idle, which its stop follows
+/// (`after_stop`; the harness's `Caps::drone_wake`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// Claude Code: the stop asks the model to start `borg hive wait` in the background, whose end
+    /// starts the next turn.
+    Model,
+    /// omp, opencode: the adapter keeps the drone's waiter itself, from the join for the session's life
+    /// (phase g correction 12: `borg hive wait --stream`), and wakes the session by its own path when the
+    /// waiter hands it work (omp `pi.sendMessage` with `nextTurn` and `triggerTurn`, opencode 1.x
+    /// `session.promptAsync`, 2.x `session.prompt` with `delivery: "queue"`). Its stops never ask the
+    /// model to start a wait. `hive`: the hive's stop said something itself (not only a conscience's
+    /// questions).
+    Plugin { hive: bool },
+    /// codex: no hook can wake its idle session (0.153: a Stop hook only continues a turn that runs, and
+    /// a finished async hook starts none), so the stop starts a waiter detached from the hook (`borg hive
+    /// wait --queue`, `spawn_waiter`), which wakes the session with `codex queue --thread <session>
+    /// --message <task>` (its own path since 0.149.0; an idle TUI takes the message up as a new turn,
+    /// checked with 0.153.2 against a local mock model). Its hooks run as children of the harness
+    /// process, so a hook's nearest harness ancestor is the drone's harness (`hook_pid`).
+    Queue { hive: bool },
+}
+
+impl Wake {
+    /// How harness `name`'s drones are woken (its `Caps::drone_wake`; an unknown name's: the model's
+    /// wait); `hive` as in `Plugin`.
+    pub(crate) fn of(name: &str, hive: bool) -> Self {
+        match crate::harness::by_name(name).map(|h| h.caps().drone_wake) {
+            Some(DroneWake::Plugin) => Wake::Plugin { hive },
+            Some(DroneWake::Queue) => Wake::Queue { hive },
+            Some(DroneWake::Model) | None => Wake::Model,
+        }
+    }
+
+    /// Whether harness `name`'s drones are woken through its CLI (`Queue`).
+    pub(crate) fn queues(name: &str) -> bool {
+        matches!(Wake::of(name, false), Wake::Queue { .. })
+    }
+}
+
+/// The harness process a hook event of harness `name` runs under: the pid its plugin sent
+/// (`event_pid`), or, for a harness that runs its hooks as its own children (`Wake::Queue`: codex runs
+/// each as `sh -c` under its process), the hook's nearest harness ancestor (`harness_proc`) when
+/// it is that harness by name (a hook run by hand from another harness's shell names none). So a codex
+/// drone whose join ran in codex's sandbox (a pid namespace of its own, where the walk finds no harness)
+/// is tied to codex's process from its first hook on (`touch`, `own_pid`). None for every other harness
+/// that sends none.
+pub(crate) fn hook_pid(name: &str, input: &Value) -> Option<u32> {
+    let own = || Wake::queues(name).then(harness_proc).flatten().filter(|(_, _, comm)| comm.starts_with(name)).map(|(pid, _, _)| pid);
+    event_pid(input).or_else(own)
+}
 
 /// The registry of this node's interactive drones, beside the goals (`hive/drones.local`): never synced.
 pub const REGISTRY: &str = "drones.local";
@@ -44,14 +111,47 @@ pub const TAKEUP: Duration = Duration::from_secs(60);
 /// How long an engineer's turn that never reached its stop (an Esc, a crash) still counts as busy after
 /// its last tool call ended (`busy`): a tool call still running never expires it (phase g correction 8).
 pub const BUSY_IDLE_MS: i64 = 5 * 60_000;
+/// `BUSY_IDLE_MS` for a codex drone (`Wake::Queue`): its wake waits in codex's queue behind any turn
+/// that still runs and only the turn it starts takes it up (`touch`), so a turn that is quiet this long
+/// no longer holds its waiter off. An Esc codex's `Interrupt` hook did not report (an install from
+/// before that hook, or the hook not trusted yet in `/hooks`) delays the drone's work by this, not by
+/// `BUSY_IDLE_MS`, with nothing for the engineer to do.
+pub const QUEUE_BUSY_IDLE_MS: i64 = 60_000;
 /// The longest the stop's own claim of the next task waits for it to be final across nodes (phase f
 /// F5) before the stop hands it to the waiter, which waits on with no cap (phase g correction 9): no
 /// Stop spinner waits on peers.
 pub const HAND_CAP: Duration = Duration::from_secs(5);
 
-/// The session id the harness gave the process this runs in (`SESSION_ENV`), if any.
+/// The session id the harness gave the process this runs in (`session_vars`), if any.
 pub fn env_session() -> Option<String> {
-    SESSION_ENV.iter().find_map(|k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+    env_session_of().map(|(s, _)| s)
+}
+
+/// The session id the harness gave the process this runs in, and that harness (`session_vars`). A
+/// harness started inside another's shell (omp in a Claude Code session, opencode in either) inherits the
+/// outer one's variable too: when more than one is set, or a binding plugin's (`BINDER_ENV`) is, the
+/// nearest harness process (`harness_proc`) decides which session this is, so a join never binds the
+/// outer session; opencode's: none (its plugin binds it). Else the first set, in `session_vars`' order.
+pub fn env_session_of() -> Option<(String, &'static str)> {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let mut set: Vec<(String, &'static str)> = session_vars().into_iter().filter_map(|(k, h)| var(k).map(|v| (v, h))).collect();
+    let binder = var(BINDER_ENV).is_some();
+    if set.len() > 1 || (binder && !set.is_empty()) {
+        let comm = harness_proc().map(|p| p.2).unwrap_or_default();
+        if let Some(i) = set.iter().position(|(_, h)| comm.starts_with(h)) {
+            return Some(set.swap_remove(i));
+        }
+        if binder && comm.contains("opencode") {
+            return None;
+        }
+    }
+    set.into_iter().next()
+}
+
+/// Whether a binding plugin runs this process's harness (`BINDER_ENV`): a join with no session id of
+/// its own is that plugin's to bind.
+pub fn plugin_binds() -> bool {
+    std::env::var_os(BINDER_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// The interactive drone this process runs for: the harness's session (`env_session`) when it is bound
@@ -173,11 +273,16 @@ const WRAPPERS: &[&str] = &[
 /// or borg (`WRAPPERS`), with its start time, so a reused pid is no match. None off Linux and macOS or when the
 /// walk finds none: a session is then rebound by nothing but its own id.
 pub fn harness_pid() -> Option<(u32, u64)> {
+    harness_proc().map(|(pid, start, _)| (pid, start))
+}
+
+/// `harness_pid` with the harness process's command name (`claude`, `omp`, `opencode`, ...).
+fn harness_proc() -> Option<(u32, u64, String)> {
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..16 {
         let (comm, ppid, start) = proc_stat(pid)?;
         if !WRAPPERS.contains(&comm.as_str()) {
-            return Some((pid, start));
+            return Some((pid, start, comm));
         }
         if ppid <= 1 {
             return None;
@@ -239,12 +344,28 @@ fn worktree(cwd: &str, drone: &str) -> Result<String, String> {
     }
     run::exclude_worktrees(&repo)?;
     let p = path.display().to_string();
-    run::git(&repo, &["worktree", "add", "--detach", &p, "HEAD"], Duration::from_secs(60))
-        .ok_or_else(|| format!("git worktree add --detach {p} HEAD failed"))?;
+    run::git(&repo, &["worktree", "add", "--detach", &p, "HEAD"], Duration::from_secs(60)).ok_or_else(|| {
+        // A sandbox that keeps `.git` read-only (codex's workspace-write) is said as such (`sandboxed`).
+        let git = repo.join(".git");
+        match read_only(&git) {
+            true => format!("{}: Read-only file system", git.display()),
+            false => format!("git worktree add --detach {p} HEAD failed"),
+        }
+    })?;
     Ok(p)
 }
 
-/// `borg hive join [<goal>]` inside a session: the harness's session (`env_session`) becomes an
+/// Whether `p` is on a file system this process may not write (access(2) says EROFS: a read-only mount,
+/// as a sandbox binds one).
+fn read_only(p: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(p.as_os_str())) else { return false };
+    // SAFETY: access(2) reads the NUL-terminated path it is given and nothing else.
+    let r = unsafe { libc::access(c.as_ptr(), libc::W_OK) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EROFS)
+}
+
+/// `borg hive join [<goal>]` inside a session: the harness's session (`env_session`, or the session a
+/// binding plugin names, `borg hive join --bind --session S`) becomes an
 /// interactive drone of `goal`, or of every open goal of this collective in this repo without one. Writes
 /// its membership (`interactive`, its worktree) and its registry line, then, for each goal it serves now,
 /// the node's join under the lock. Refused for a session that is a drone already, and while a `borg hive
@@ -267,22 +388,28 @@ pub(super) fn join(here: &Here, goal_id: Option<&str>, session: &str) -> i32 {
     let drone = drone_name(&here.home, session);
     let tree = match worktree(&here.cwd, &drone) {
         Ok(t) => t,
-        Err(e) => return fail(e),
+        Err(e) => return fail(sandboxed(e)),
     };
     let first = goals.first().map(|g| g.id.clone()).unwrap_or_default();
     let cursor = std::fs::metadata(tasks_path(&here.home, &first)).map_or(0, |m| m.len());
-    let hs = HiveSession { goal: first, cursor, drone: drone.clone(), worktree: tree.clone(), ..probe };
-    if let Err(e) = steer_write(session, &hs) {
-        return fail(e);
-    }
     let (pid, pid_start) = harness_pid().unwrap_or_default();
-    let harness = crate::harness::named_current().map(|h| h.name().to_string()).unwrap_or_else(|| "claude".into());
+    let hs = HiveSession { goal: first, cursor, drone: drone.clone(), worktree: tree.clone(), pid, ..probe };
+    if let Err(e) = steer_write(session, &hs) {
+        return fail(sandboxed(e.to_string()));
+    }
+    // The plugin that binds names its harness (`BORG_HARNESS`); else the harness whose variable named the
+    // session.
+    let harness = crate::harness::named_current()
+        .map(|h| h.name())
+        .or_else(|| env_session_of().filter(|(s, _)| s == session).map(|(_, h)| h))
+        .unwrap_or("claude")
+        .to_string();
     let e = Entry {
         v: 1,
         ms: here.now,
         drone: drone.clone(),
         session: session.into(),
-        harness,
+        harness: harness.clone(),
         pid,
         pid_start,
         pid_ns: pid_ns(),
@@ -318,16 +445,42 @@ pub(super) fn join(here: &Here, goal_id: Option<&str>, session: &str) -> i32 {
     };
     let tree = if tree.is_empty() { String::new() } else { format!(" It works in its own worktree {tree}.") };
     // No harness process found (a sandbox's pid namespace, not Linux): nothing ties a later id to it.
-    let clear = if pid == 0 {
+    // A codex drone's first hook names codex's process (`hook_pid`).
+    let clear = if pid == 0 && !Wake::queues(&harness) {
         " Its harness process was not found, so a `/clear` leaves the drone behind: `borg hive leave` before one, and join again after."
     } else {
         ""
     };
+    // A plugin's waiter starts at the join, inside the turn that ran it, whose prompt came before the
+    // session was a drone: that turn is the engineer's until its stop (`busy`), so no wake lands in it.
+    if matches!(Wake::of(&harness, false), Wake::Plugin { .. }) {
+        set_busy(session, false, here.now, BUSY_IDLE_MS);
+    }
+    let wait = match Wake::of(&harness, false) {
+        Wake::Plugin { .. } => "When nothing is open it ends its turn and its harness's plugin waits for work for it at no token cost",
+        Wake::Queue { .. } => {
+            "When nothing is open it ends its turn and borg waits for work for it at no token cost, then starts its next turn with `codex queue`"
+        }
+        Wake::Model => "When nothing is open its turn ends with a wait for work that costs no tokens",
+    };
     println!(
-        "{} joined {what} as drone {drone}.{tree} When nothing is open its turn ends with a wait for work that costs no tokens, and it stays a drone: leaving the hive is only on the engineer's request.{clear}",
+        "{} joined {what} as drone {drone}.{tree} {wait}, and it stays a drone: leaving the hive is only on the engineer's request.{clear}",
         short(session)
     );
     0
+}
+
+/// A join's error `e`, with the step that gets past it when a sandbox made the write fail: codex's
+/// `workspace-write` sandbox keeps the repo's `.git` (where the drone's worktree is registered) and
+/// anything outside the workspace (borg's store) read-only to the model's commands (checked with codex
+/// 0.153.2: `.git/info/exclude: Read-only file system`), while its hooks run outside it.
+fn sandboxed(e: String) -> String {
+    match e.contains("Read-only file system") {
+        true => format!(
+            "{e}. This command runs in a sandbox that keeps the repo's .git or borg's store read-only (codex's workspace-write does): run `borg hive join` again outside the sandbox (in codex: with escalated permissions, which the engineer approves)"
+        ),
+        false => e,
+    }
 }
 
 fn steer_write(session: &str, hs: &HiveSession) -> std::io::Result<()> {
@@ -373,6 +526,7 @@ pub(super) fn leave_noted(here: &Here, session: &str, hs: &HiveSession, note: &s
     stop_waiter(&hs.drone);
     clear_busy(session);
     let _ = std::fs::remove_file(takeup_path(session));
+    let _ = std::fs::remove_file(missed_path(session));
     super::unbind(session);
     record(&here.home, &Entry { v: 1, ms: here.now, drone: hs.drone.clone(), session: session.into(), by: "leave".into(), ..Entry::default() })?;
     let others = live(&here.home);
@@ -424,9 +578,10 @@ pub(crate) fn waiter_path(drone: &str) -> PathBuf {
     hook::state_file(drone).with_extension("hive-waiter")
 }
 
-/// The engineer's turn in `session` started or moved on at `now`: `tool` whether a tool call runs.
-fn set_busy(session: &str, tool: bool, now: i64) {
-    let _ = std::fs::write(busy_path(session), format!("{} {now}", u8::from(tool)));
+/// The engineer's turn in `session` started or moved on at `now`: `tool` whether a tool call runs,
+/// `idle` how long after `now` with no tool running it still holds the waiter off (`busy`).
+fn set_busy(session: &str, tool: bool, now: i64, idle: i64) {
+    let _ = std::fs::write(busy_path(session), format!("{} {now} {idle}", u8::from(tool)));
 }
 
 pub(crate) fn clear_busy(session: &str) {
@@ -436,12 +591,72 @@ pub(crate) fn clear_busy(session: &str) {
 /// Whether `session` is in a turn of the engineer's at `now` (phase g correction 8): from its prompt to
 /// its stop, and once its stop never came, until `BUSY_IDLE_MS` after its last tool call ended; a tool
 /// call still running (a long build, a test suite) keeps it busy however long. No waiter hands it work
-/// meanwhile: the handoff never lands inside the engineer's turn.
+/// meanwhile: the handoff never lands inside the engineer's turn. A codex drone's quiet turn holds it
+/// off `QUEUE_BUSY_IDLE_MS` only (its wake queues behind the turn, `touch`).
 pub fn busy(session: &str, now: i64) -> bool {
+    busy_for(session, now, None)
+}
+
+/// Whether `session`'s turn may still run at `now` by the longest measure (`BUSY_IDLE_MS`, whatever the
+/// harness): a handed wake waits its take-up out meanwhile (wait.rs `takeup`), since a codex wake waits
+/// in codex's queue behind such a turn.
+pub(crate) fn turn_may_run(session: &str, now: i64) -> bool {
+    busy_for(session, now, Some(BUSY_IDLE_MS))
+}
+
+fn busy_for(session: &str, now: i64, idle: Option<i64>) -> bool {
     let Ok(text) = std::fs::read_to_string(busy_path(session)) else { return false };
     let mut it = text.split_whitespace();
     let (tool, ms) = (it.next() == Some("1"), it.next().and_then(|m| m.parse::<i64>().ok()).unwrap_or(i64::MIN));
-    tool || now.saturating_sub(ms) <= BUSY_IDLE_MS
+    let own = it.next().and_then(|m| m.parse::<i64>().ok()).unwrap_or(BUSY_IDLE_MS);
+    tool || now.saturating_sub(ms) <= idle.unwrap_or(own)
+}
+
+fn stopping_path(session: &str) -> PathBuf {
+    hook::state_file(session).with_extension("hive-stopping")
+}
+
+/// A stop of an interactive drone's session runs (mod.rs `around_bound`): marked from its start until
+/// it returns (the guard's drop), or until `until` should the harness kill the hook first. Meanwhile
+/// the drone's waiter claims and hands nothing (`held_off`): the stop's own done and handover decide
+/// what the drone gets next, so a done the waiter sees on the board never makes it claim beside the
+/// stop's handover, and a claim the stop made is never handed by the waiter before the stop marks it
+/// shown (phase g, no double delivery).
+pub(crate) struct Stopping(PathBuf);
+
+impl Stopping {
+    pub(crate) fn mark(session: &str, until: i64) -> Self {
+        let path = stopping_path(session);
+        let _ = std::fs::write(&path, until.to_string());
+        Self(path)
+    }
+}
+
+impl Drop for Stopping {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether a stop of `session` runs at `now` (`Stopping`).
+pub fn stopping(session: &str, now: i64) -> bool {
+    std::fs::read_to_string(stopping_path(session)).ok().and_then(|t| t.trim().parse::<i64>().ok()).is_some_and(|until| now <= until)
+}
+
+/// Whether `session`'s waiter holds off at `now`: the engineer's turn runs (`busy`) or its stop does
+/// (`stopping`).
+pub fn held_off(session: &str, now: i64) -> bool {
+    busy(session, now) || stopping(session, now)
+}
+
+/// The engineer's turn in `session` was halted with no stop (an Esc, a provider error, a permission
+/// rejected without words: opencode's plugin sends `halted`, hook.rs): it is over, so the drone's
+/// waiter hands work again at once, not `BUSY_IDLE_MS` later (phase g correction 12). Nothing for a
+/// session that is no interactive drone, after one failed open.
+pub fn halted(session: &str) {
+    if bound(session).is_some_and(|hs| hs.interactive) {
+        clear_busy(session);
+    }
 }
 
 /// A waiter handed `key` (`task@claim`) of `goal` to `session` at `now`: open until a hook event of the
@@ -458,6 +673,29 @@ pub(crate) fn untaken(session: &str) -> Option<(String, String, i64)> {
     let mut it = text.split_whitespace();
     let (g, k) = (it.next()?, it.next()?);
     Some((g.to_string(), k.to_string(), it.next().and_then(|m| m.parse().ok()).unwrap_or(0)))
+}
+
+/// What a wake that hands a claim of `goal` starts with (wait.rs `deliver`): the prompt a codex wake's
+/// own turn starts with (`touch`).
+pub(crate) fn arrived(goal: &str) -> String {
+    format!("[borg hive {goal}] Work arrived.")
+}
+
+fn missed_path(session: &str) -> PathBuf {
+    hook::state_file(session).with_extension("hive-missed")
+}
+
+/// A wake to `session` was not taken up by any turn and its claim was released (wait.rs `takeup`): its
+/// waiter claims nothing more until a hook event of the session comes (`touch` ends it), so a thread no
+/// harness runs any more (a codex TUI moved to another thread, which `codex queue` still takes messages
+/// for) is not handed the same task again and again, each wake holding it `TAKEUP` from every other drone.
+pub(crate) fn mark_missed(session: &str, now: i64) {
+    let _ = std::fs::write(missed_path(session), now.to_string());
+}
+
+/// Whether `session`'s last wake was missed (`mark_missed`) and no hook event of it came since.
+pub fn missed(session: &str) -> bool {
+    missed_path(session).exists()
 }
 
 /// How long a handed claim waits for its take-up (`TAKEUP`, or `BORG_HIVE_TAKEUP_MS`).
@@ -481,6 +719,40 @@ fn stop_waiter(drone: &str) {
         // SAFETY: kill(2) with SIGTERM on the pid the running waiter wrote into the file it holds locked.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
+}
+
+/// Where a waiter started by a stop (`spawn_waiter`) writes what it says and why it ended: it has no
+/// terminal, and the session hears it by `codex queue` alone.
+pub(crate) fn waiter_log(drone: &str) -> PathBuf {
+    hook::state_file(drone).with_extension("hive-wait.log")
+}
+
+/// Starts the waiter of codex drone `hs` of `session` (`borg hive wait --queue`, wait.rs) from its stop:
+/// in a session of its own (setsid), stdin from nothing and its output appended to `waiter_log`, so it
+/// outlives the hook, codex never waits on the hook's pipes, and its end at the hook's timeout is no
+/// end of it; with the root store as its `BORG_HOME` (the hook set it to the collective's own, `home`),
+/// so it routes its directory as a command does. Not awaited. A second one started meanwhile finds the
+/// lock held and exits.
+fn spawn_waiter(home: &Path, hs: &HiveSession, session: &str, cwd: &str) {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(waiter_log(&hs.drone)) else { return };
+    let Ok(err) = log.try_clone() else { return };
+    let mut c = std::process::Command::new(exe);
+    c.args(["hive", "wait", "--queue", "--session", session]);
+    if !cwd.is_empty() {
+        c.args(["--dir", cwd]);
+    }
+    c.env("BORG_HOME", crate::collective::root_of(home)).stdin(std::process::Stdio::null()).stdout(log).stderr(err);
+    // SAFETY: setsid(2) between fork and exec only makes the child its own session, so the end of the
+    // hook's process group leaves it running.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let _ = c.spawn();
 }
 
 /// `drone`'s newest registry line (which session it is now: a `/clear` moves it), None once it left.
@@ -511,23 +783,42 @@ pub(crate) fn reapable(e: &Entry) -> bool {
 
 // ---------------------------------------------------------------- the hooks
 
-/// An interactive drone's step at each hook event but its start (mod.rs `around`, `pre_tool`): any event
-/// takes a handed claim up (`untaken`, phase g correction 10); the engineer's prompt starts a busy turn,
-/// a tool call keeps it, its end moves it on (`busy`); and while the drone works, a goal heartbeat
+/// An interactive drone's step at each hook event of harness `name` (`input`) but its start (mod.rs
+/// `around`, `pre_tool`): any event takes a handed claim up (`untaken`, phase g correction 10) and ends
+/// a missed wake's hold (`missed`), but a codex drone's (`Wake::Queue`) is taken up by the prompt of the
+/// turn its wake starts alone (the handed text, `arrived`): codex queues the wake behind a turn the
+/// engineer started meanwhile, whose events leave the claim not in hand (`not_in_hand`), so that turn's
+/// stop runs no check, says no done and blocks nothing for it (never hijacks an engineer's turn). The
+/// engineer's prompt starts a busy turn, a tool call keeps it, its end moves it on (`busy`); and while
+/// the drone works, a goal heartbeat
 /// (`board::BEAT`) when one is due (`BEAT_MS`) and no node worker runs (node.rs `worker_runs`), so its node
-/// stays a participant with no daemon and no waiter.
+/// stays a participant with no daemon and no waiter. A harness whose plugin sends its own pid (`pid`,
+/// omp's and opencode's `process.pid`) is the drone's harness process from its first event on
+/// (`own_pid`), whatever ancestors the join's shell had.
 /// Whether `hs` changed (to save).
-pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &str, now: i64) -> bool {
-    let _ = std::fs::remove_file(takeup_path(session));
+pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &str, name: &str, input: &Value, now: i64) -> bool {
+    let queued = Wake::queues(name);
+    let takes_up = !queued
+        || event == "prompt"
+            && untaken(session).is_some_and(|(g, _, _)| input.get("prompt").and_then(Value::as_str).unwrap_or_default().trim_start().starts_with(&arrived(&g)));
+    if takes_up {
+        let _ = std::fs::remove_file(takeup_path(session));
+    }
+    let _ = std::fs::remove_file(missed_path(session));
+    let idle = if queued { QUEUE_BUSY_IDLE_MS } else { BUSY_IDLE_MS };
     let mut changed = false;
+    if let Some(p) = hook_pid(name, input).filter(|p| *p != 0 && *p != hs.pid) {
+        own_pid(home, hs, session, p, now);
+        changed = true;
+    }
     match event {
         "prompt" => {
-            set_busy(session, false, now);
+            set_busy(session, false, now, idle);
             changed = hs.asked_wait;
             hs.asked_wait = false;
         }
-        "pre_tool" if busy_path(session).exists() => set_busy(session, true, now),
-        "post_tool" | "post_tool_failure" if busy_path(session).exists() => set_busy(session, false, now),
+        "pre_tool" if busy_path(session).exists() => set_busy(session, true, now, idle),
+        "post_tool" | "post_tool_failure" if busy_path(session).exists() => set_busy(session, false, now, idle),
         _ => {}
     }
     if event == "pre_tool" || hs.goal.is_empty() || now - hs.member_ms < super::BEAT_MS {
@@ -546,6 +837,25 @@ pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &st
     changed
 }
 
+/// The pid a hook event's harness sent as its own (`pid`: omp and opencode run their adapter in their
+/// own process); None from a harness that sends none (hook.rs drops it then).
+pub(crate) fn event_pid(input: &Value) -> Option<u32> {
+    input.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok())
+}
+
+/// Drone `hs` of `session` runs under harness process `pid` (its plugin said so): its registry line
+/// names that process, with its start and pid namespace, when it named another (the join's ancestor
+/// walk stopped short of the harness, or found none), so its waiter and the node's reaper end the drone
+/// with that process and no other (phase g spec 3.1: "plugins pass `process.pid`"). A pid that runs
+/// nothing is not taken.
+fn own_pid(home: &Path, hs: &mut HiveSession, session: &str, pid: u32, now: i64) {
+    hs.pid = pid;
+    let Some(mut e) = entry_of(home, &hs.drone).filter(|e| e.session == session && e.pid != pid) else { return };
+    let Some((_, _, start)) = proc_stat(pid) else { return };
+    (e.pid, e.pid_start, e.pid_ns, e.ms, e.by) = (pid, start, pid_ns(), now.max(e.ms + 1), "rebind".into());
+    let _ = record(home, &e);
+}
+
 /// `p` with its `.` and `..` parts resolved, no file system read: where an edit lands.
 fn lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -561,19 +871,36 @@ fn lexical(p: &Path) -> PathBuf {
     out
 }
 
+/// `p` resolved (`lexical`) with its nearest existing ancestor's symlinks resolved too, so a path through
+/// a linked directory (macOS's `/var` is `/private/var`) and the same path written plainly compare equal.
+fn real(p: &Path) -> PathBuf {
+    let p = lexical(p);
+    let mut base = p.as_path();
+    loop {
+        if let Ok(r) = base.canonicalize() {
+            return r.join(p.strip_prefix(base).unwrap_or(Path::new("")));
+        }
+        match base.parent() {
+            Some(up) => base = up,
+            None => return p,
+        }
+    }
+}
+
 /// Why `tool`'s edit (`input`, a PreToolUse) is refused to the drone of `hs`: a file it writes is in
 /// the drone's repo but outside its own worktree (the engineer's checkout, another drone's tree), where
 /// its work would never reach its done and its claim's checks (phase g spec 3.1). None for a drone with
 /// no worktree, and for files outside the repo (a scratch file, the drone's own notes).
 pub(crate) fn outside_tree(hs: &HiveSession, tool: &str, input: &Value) -> Option<String> {
-    let tree = Path::new(&hs.worktree);
+    let tree = real(Path::new(&hs.worktree));
+    let tree = tree.as_path();
     let repo = tree.parent().filter(|p| p.file_name().is_some_and(|n| n == ".worktrees")).and_then(Path::parent)?;
     let ti = input.get("tool_input").unwrap_or(&Value::Null);
     let cwd = input.get("cwd").and_then(Value::as_str).map_or_else(|| tree.to_path_buf(), PathBuf::from);
     let path = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).filter(|f| !f.is_empty()).map(String::from);
     let files = [path(ti, "file_path"), path(ti, "notebook_path")].into_iter().flatten();
     let files = files.chain(ti.get("edits").and_then(Value::as_array).into_iter().flatten().filter_map(|e| path(e, "file_path")));
-    let off = files.map(|f| lexical(&cwd.join(f))).find(|f| f.starts_with(repo) && !f.starts_with(tree))?;
+    let off = files.map(|f| real(&cwd.join(f))).find(|f| f.starts_with(repo) && !f.starts_with(tree))?;
     let rel = off.strip_prefix(repo).unwrap_or(&off);
     let there = if rel.starts_with(".worktrees") { tree.to_path_buf() } else { tree.join(rel) };
     Some(format!(
@@ -597,6 +924,17 @@ pub(crate) fn unshown(home: &Path, hs: &HiveSession, session: &str, now: i64) ->
     let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
     let shown = super::last_marked(&state, super::TASK_MARKER) == Some(key.as_str());
     Some((held, shown))
+}
+
+/// Whether drone `hs` of `session` holds a claim not in its hand at `now`: one it was never shown
+/// (`unshown`), or one a wake handed that no turn of its own took up yet (`untaken`: a codex wake that
+/// waits in codex's queue behind the engineer's turn, `touch`). Such a claim is nothing in hand at the
+/// prompt and the stop (mod.rs `Ctx::prompt`, `Ctx::stop`): no check, no done, no block of the turn.
+pub(crate) fn not_in_hand(home: &Path, hs: &HiveSession, session: &str, now: i64) -> bool {
+    unshown(home, hs, session, now).is_some_and(|(held, shown)| {
+        let key = format!("{}@{}", held.task.id, held.live(now).map_or(0, |l| l.2));
+        !shown || untaken(session).is_some_and(|(g, k, _)| g == hs.goal && k == key)
+    })
 }
 
 /// An interactive drone's session ended (SessionEnd), not by a `/clear`, whose new session is rebound
@@ -625,8 +963,59 @@ fn wait_armed(input: &Value) -> bool {
 /// model call a tool, so Claude Code's continuation cap never counts it. Everything a drone's stop says
 /// goes as Stop feedback (`feedback`), not as a hook error. A stop that ends the turn ends the
 /// engineer's busy turn too (`busy`).
-pub(crate) fn after_stop(home: &Path, hs: &mut HiveSession, session: &str, cwd: &str, input: &Value, out: Option<Value>, now: i64) -> Option<Value> {
+///
+/// A drone of a harness whose plugin keeps its waiter (`Wake::Plugin`: omp, opencode)
+/// is never asked for a wait: its plugin's waiter runs from the join on and wakes the session. Its stop
+/// passes as the hive's own (`decision: block` and `reason`, which those adapters read). A block with
+/// the hive's words (`hive`: a done, the next task, a check that failed) carries `hive: true`, which the
+/// adapters tell from a conscience's questions by (the opencode adapter's rules for questions, a
+/// superseded turn's dropped and a round cap, are kept for questions alone); one of them that leaves
+/// nothing in hand (a done said, a task published blocked) ends with the idle line, so the model ends
+/// its turn on it. A block of questions alone passes as it is.
+///
+/// A codex drone (`Wake::Queue`) is never asked either: a stop that ends its turn (it does not block)
+/// starts the drone's waiter, detached, when none runs (`spawn_waiter`), and passes at once, so no stop
+/// waits on it and codex's stop timeout stays as it is; a block goes on as codex reads it (its
+/// continuation prompt), the hive's own one that leaves nothing in hand with the idle line, as above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn after_stop(
+    home: &Path,
+    hs: &mut HiveSession,
+    session: &str,
+    cwd: &str,
+    input: &Value,
+    out: Option<Value>,
+    wake: Wake,
+    now: i64,
+) -> Option<Value> {
     let working = unshown(home, hs, session, now).is_some_and(|(_, shown)| shown);
+    let idle = |hs: &HiveSession, out: Option<Value>, mark: bool| {
+        let mut o = out?;
+        if mark {
+            o["hive"] = Value::Bool(true);
+        }
+        if !working {
+            let reason = o.get("reason").and_then(Value::as_str).unwrap_or_default().trim_end().to_string();
+            o["reason"] = Value::String(format!(
+                "{reason}\n\n{} Nothing is open to you now: end your turn with: {IDLE_LINE} You stay a drone; leaving the hive is only on the engineer's request.",
+                head_of(hs)
+            ));
+        }
+        Some(o)
+    };
+    match wake {
+        Wake::Plugin { .. } | Wake::Queue { .. } if !blocks(&out) => {
+            clear_busy(session);
+            if matches!(wake, Wake::Queue { .. }) && !waiting(&hs.drone) {
+                spawn_waiter(home, hs, session, cwd);
+            }
+            return out;
+        }
+        Wake::Plugin { hive: false } | Wake::Queue { hive: false } => return out,
+        Wake::Plugin { hive: true } => return idle(hs, out, true),
+        Wake::Queue { hive: true } => return idle(hs, out, false),
+        Wake::Model => {}
+    }
     if working || hs.asked_wait || wait_armed(input) || waiting(&hs.drone) {
         if !blocks(&out) {
             clear_busy(session);
@@ -675,12 +1064,18 @@ fn feedback(out: Option<Value>) -> Option<Value> {
 /// What a drone with nothing in hand is told to run, and the line it idles on: one that says the work
 /// comes by itself, so the obvious next step is to keep waiting, and leaving the engineer's call.
 fn arm_text(hs: &HiveSession, session: &str, cwd: &str) -> String {
-    let head = if hs.goal.is_empty() || hs.any { "[borg hive]".to_string() } else { format!("[borg hive {}]", hs.goal) };
+    let head = head_of(hs);
     format!(
         "{head} Nothing is open to you now, so wait for hive work without spending tokens: run `{}` with the Bash tool's `run_in_background` set to true, \
 then end your turn with: {IDLE_LINE} When the wait exits, its output is your next task. You stay a drone; leaving the hive is only on the engineer's request.",
         command("wait", session, cwd)
     )
+}
+
+/// What a drone's hive text starts with: `[borg hive <goal>]`, or `[borg hive]` for a drone of every
+/// open goal or of none yet.
+fn head_of(hs: &HiveSession) -> String {
+    if hs.goal.is_empty() || hs.any { "[borg hive]".to_string() } else { format!("[borg hive {}]", hs.goal) }
 }
 
 /// The line an idle drone ends its turn on (`arm_text`).
@@ -746,6 +1141,9 @@ fn rebind(home: &Path, session: &str, now: i64) -> Option<HiveSession> {
 /// harness process (`harness_pid`) moves to it (`move_to`), so the join never leaves a drone nothing
 /// wakes or a binding that refuses runners for nobody. Anything else, and every event but a join
 /// command's, gets None after no read at all; one failed open when no drone ever ran on this node.
+/// Only a drone of a harness whose process runs one session at a time moves (`Caps::
+/// one_session_per_process`: Claude Code): one opencode or omp process may run several sessions, so another
+/// of its sessions' join command is never this drone's (opencode's plugin binds the session that ran it).
 pub(crate) fn adopt(home: &Path, input: &Value) -> Option<HiveSession> {
     let command = input.get("tool_input").and_then(|t| t.get("command")).and_then(Value::as_str)?;
     if !command.contains("hive join") || !registry_path(home).exists() {
@@ -753,9 +1151,48 @@ pub(crate) fn adopt(home: &Path, input: &Value) -> Option<HiveSession> {
     }
     let session = input.get("session_id").and_then(Value::as_str)?;
     let (pid, pid_start) = harness_pid()?;
-    let mut made = live(home).into_iter().filter(|e| e.by == "join" && e.pid == pid && e.pid_start == pid_start && e.session != session);
+    let mut made = live(home)
+        .into_iter()
+        .filter(|e| e.by == "join" && one_session_per_process(&e.harness) && e.pid == pid && e.pid_start == pid_start && e.session != session);
     let (e, None) = (made.next()?, made.next()) else { return None };
     move_to(home, e, session, learn::now_ms())
+}
+
+/// codex's first hook event after a join, the join command's own PostToolUse, of a session no drone is
+/// on (phase g spec 3.1): `borg hive join` bound the `CODEX_THREAD_ID` codex gave the command, which
+/// `codex queue --thread` wakes. A hook whose `session_id` is another id shows the two are not one
+/// thread here: the drone that join made (the one its output names, `as drone <name>`) would be woken
+/// on a thread nobody types in, so it leaves (`leave_quietly`: a plain session again) and the session
+/// is told so. Nothing for a matching id (the session is bound, and `around` never asks), for any other
+/// command, and after no read for an event that is no join's; one failed open when no drone ever ran
+/// on this node. A drone woken through its harness's CLI only (`Wake::Queue`: codex); a Claude Code
+/// drone moves to the hook's id (`adopt`).
+pub(crate) fn mismatch(home: &Path, input: &Value) -> Option<String> {
+    let command = input.get("tool_input").and_then(|t| t.get("command")).and_then(Value::as_str)?;
+    if !command.contains("hive join") || !registry_path(home).exists() {
+        return None;
+    }
+    let session = input.get("session_id").and_then(Value::as_str)?;
+    let said = match input.get("tool_response") {
+        Some(Value::String(t)) => t.clone(),
+        Some(v) => v.to_string(),
+        None => return None,
+    };
+    let e = live(home)
+        .into_iter()
+        .find(|e| Wake::queues(&e.harness) && e.by == "join" && e.session != session && said.contains(&format!("as drone {}.", e.drone)))?;
+    let hs = bound(&e.session).filter(|hs| hs.interactive)?;
+    let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default().to_string();
+    leave_quietly(&Here { home: home.to_path_buf(), cwd, now: learn::now_ms() }, &e.session, &hs).ok()?;
+    Some(format!(
+        "[borg hive] The join bound thread {} (the CODEX_THREAD_ID codex gave the command), but this session's hooks name {session}: the hive could not wake this session, so it is no drone (drone {} left again). It is a plain session; nothing more to do.",
+        e.session, e.drone
+    ))
+}
+
+/// Whether harness `name`'s process runs one session at a time (`Caps::one_session_per_process`).
+fn one_session_per_process(name: &str) -> bool {
+    crate::harness::by_name(name).is_some_and(|h| h.caps().one_session_per_process)
 }
 
 /// Drone `e` is session `session` from now on: its membership moved, what its old id held released, a
@@ -773,6 +1210,7 @@ fn move_to(home: &Path, e: Entry, session: &str, now: i64) -> Option<HiveSession
     super::unbind(&e.session);
     clear_busy(&e.session);
     let _ = std::fs::remove_file(takeup_path(&e.session));
+    let _ = std::fs::remove_file(missed_path(&e.session));
     record(home, &Entry { ms: now, session: session.into(), by: "rebind".into(), ..e }).ok()?;
     Some(hs)
 }
@@ -780,6 +1218,15 @@ fn move_to(home: &Path, e: Entry, session: &str, now: i64) -> Option<HiveSession
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_join_refused_by_a_read_only_sandbox_names_the_step_past_it() {
+        // codex 0.153.2's workspace-write sandbox, as the join's own error read in it.
+        let e = "/w/harbor_orion/.git/info/exclude: Read-only file system (os error 30)".to_string();
+        let said = sandboxed(e.clone());
+        assert!(said.starts_with(&e) && said.contains("outside the sandbox") && said.contains("escalated permissions"), "{said}");
+        assert_eq!(sandboxed("git worktree add --detach /w HEAD failed".into()), "git worktree add --detach /w HEAD failed", "any other error as it is");
+    }
 
     #[test]
     fn a_drone_of_every_goal_refuses_runners_only_of_its_repos_goals() {

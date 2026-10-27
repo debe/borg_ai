@@ -16,6 +16,15 @@
 //                                                      stop_hook_active for the next stop: one round per turn)
 //   session_shutdown            -> end
 //
+// Interactive hive drones (phase g, docs/commands.md "Interactive drones"): a session whose model runs
+// `borg hive join` binds itself (omp gives the command PI_SESSION_ID); seeing that join succeed in its
+// tool_result, the extension starts the drone's waiter, `borg hive wait --stream`, and keeps it for the
+// session's life (re-armed at a stop when none runs). The waiter waits at no token cost, hands nothing
+// while the engineer's own turn runs, and says each wake as a JSON line; the extension sends it into
+// the session with pi.sendMessage(..., {deliverAs: "nextTurn", triggerTurn: true}), which starts a turn
+// on an idle session and waits behind a running one. Spawned, never awaited: omp gives a handler 30 s.
+// The session's end (session_shutdown -> borg's end) makes the drone leave, which stops its waiter.
+//
 // Fails open: a missing borg binary, a crash, a timeout or bad output is a no-op.
 // borg is found via $BORG_BIN, else `borg` on PATH. Plain erasable TypeScript, so omp (Bun) loads
 // it as an extension and `node --test` runs its contract test without a build step.
@@ -199,6 +208,72 @@ export function runBorg(event: string, payload: Canonical, timeoutMs: number, si
 	});
 }
 
+/** Whether a shell command runs `borg hive join` for the session it runs in (not `--here`, which is for
+ *  runner worktrees, nor a join of another, named session), and the goal it names, if any. */
+export function hiveJoin(command: string): { goal?: string } | undefined {
+	for (const part of command.split(/&&|\|\||[;|\n]/)) {
+		const m = /(?:^|\s)(?:\S*\/)?borg\s+hive\s+join(?:\s+(.*))?$/.exec(part.trim());
+		if (!m) continue;
+		const args = (m[1] ?? "").trim().split(/\s+/).filter(Boolean);
+		if (args.some((a) => a === "--here" || a === "--bind" || a === "--session" || a.startsWith("--session="))) return undefined;
+		let goal: string | undefined;
+		for (let i = 0; i < args.length; i++) {
+			if (args[i] === "--dir" || args[i] === "--drone") i++;
+			else if (!args[i].startsWith("-")) goal ??= args[i].replace(/^['"]|['"]$/g, "");
+		}
+		return { goal };
+	}
+	return undefined;
+}
+
+/** One line of a drone's waiter (`borg hive wait --stream`): a wake to send into the session, and
+ *  whether the drone is one no more (`left`: the waiter ends). Anything else: undefined. */
+export function waiterLine(line: string): { wake?: string; left: boolean } | undefined {
+	try {
+		const v = JSON.parse(line);
+		if (!v || typeof v !== "object") return undefined;
+		const wake = typeof v.wake === "string" && v.wake.trim() ? v.wake : undefined;
+		return { wake, left: v.left === true };
+	} catch {
+		return undefined;
+	}
+}
+
+/** A drone's waiter: `borg hive wait --stream` for `session`, each wake handed to `onWake`; `onEnd` once
+ *  it exits, with whether the drone is one no more (a `left` line, or exit 1: no drone). Its stderr is
+ *  dropped; a spawn failure ends it at once (fails open). */
+export function startWaiter(session: string, cwd: string, onWake: (text: string) => void, onEnd: (left: boolean) => void): ReturnType<typeof spawn> | undefined {
+	let child: ReturnType<typeof spawn>;
+	try {
+		child = spawn(process.env.BORG_BIN || "borg", ["hive", "wait", "--stream", "--session", session, "--dir", cwd], { stdio: ["ignore", "pipe", "ignore"] });
+	} catch {
+		onEnd(false);
+		return undefined;
+	}
+	let left = false;
+	let rest = "";
+	child.stdout?.on("data", (d) => {
+		rest += d;
+		let nl: number;
+		while ((nl = rest.indexOf("\n")) >= 0) {
+			const line = waiterLine(rest.slice(0, nl));
+			rest = rest.slice(nl + 1);
+			if (!line) continue;
+			left ||= line.left;
+			if (line.wake) onWake(line.wake);
+		}
+	});
+	let ended = false;
+	const end = (code: number | null) => {
+		if (ended) return;
+		ended = true;
+		onEnd(left || code === 1);
+	};
+	child.on("error", () => end(null));
+	child.on("close", (code) => end(code));
+	return child;
+}
+
 // Per-event budgets: capture is file appends (ms); stop may call a model (the consequence model) but omp
 // gives handlers a fixed 30 s (no setting changes it for session_stop), so the stop sizes its wait for a
 // live check and its model call from BORG_STOP_BUDGET_MS = STOP_MS; omp waits only 2 s on
@@ -218,6 +293,30 @@ export default function borg(pi: any): void {
 	let asked = "";
 	// tool_call input by id: a denial (tool_approval_resolved) carries only the tool's name.
 	const calls = new Map<string, unknown>();
+	// Interactive hive drones of this omp process (their session ids) and each one's running waiter.
+	const drones = new Set<string>();
+	const waiters = new Map<string, ReturnType<typeof spawn>>();
+	/** The drone's waiter, unless one runs: its wakes go into the session as a custom message that starts
+	 *  the next turn (now, on an idle session; after the running turn, else). */
+	const arm = (session: string, cwd: string) => {
+		if (!drones.has(session) || waiters.has(session)) return;
+		// Declared first: a spawn that fails ends the waiter before startWaiter returns.
+		let child: ReturnType<typeof spawn> | undefined;
+		child = startWaiter(
+			session,
+			cwd,
+			(content) => {
+				try {
+					pi.sendMessage({ customType: "borg-hive", content, display: true }, { deliverAs: "nextTurn", triggerTurn: true });
+				} catch {}
+			},
+			(left) => {
+				if (child && waiters.get(session) === child) waiters.delete(session);
+				if (left) drones.delete(session);
+			},
+		);
+		if (child && child.exitCode === null) waiters.set(session, child);
+	};
 
 	const safe = (fn: (ev: any, ctx: any) => Promise<unknown>) => async (ev: any, ctx: any) => {
 		try {
@@ -283,6 +382,12 @@ export default function borg(pi: any): void {
 			// A live check's questions (or graded lessons) waiting since an earlier call reach the model
 			// before its next step, as a hidden message; the tool output stays as it is.
 			const c = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
+			// The session joined the hive (`borg hive join` bound it by PI_SESSION_ID): its waiter starts now.
+			const command = (ev.input as any)?.command;
+			if (event === "post_tool" && payload.tool_name === "Bash" && typeof command === "string" && hiveJoin(command)) {
+				drones.add(payload.session_id);
+				arm(payload.session_id, payload.cwd);
+			}
 			return typeof c === "string" && c.trim() ? { additionalContext: c } : undefined;
 		}),
 	);
@@ -301,7 +406,10 @@ export default function borg(pi: any): void {
 	pi.on(
 		"session_stop",
 		safe(async (ev, ctx) => {
-			const out = await runBorg("stop", stopEvent(ctx, ev), STOP_MS, ev.signal);
+			const payload = stopEvent(ctx, ev);
+			const out = await runBorg("stop", payload, STOP_MS, ev.signal);
+			// A drone whose waiter is not running (it ended, a crash) waits again from here.
+			arm(payload.session_id, payload.cwd);
 			if (out?.decision === "block" && typeof out.reason === "string" && out.reason) {
 				asked = out.reason.trim();
 				return { decision: "block", reason: out.reason };
@@ -313,7 +421,16 @@ export default function borg(pi: any): void {
 	pi.on(
 		"session_shutdown",
 		safe(async (_ev, ctx) => {
-			await runBorg("end", where(ctx), END_MS);
+			const at = where(ctx);
+			// The drone leaves at its end (its claim released, its waiter stopped by borg); a waiter still
+			// running after that is stopped here.
+			drones.delete(at.session_id);
+			await runBorg("end", at, END_MS);
+			const w = waiters.get(at.session_id);
+			waiters.delete(at.session_id);
+			try {
+				if (w && w.exitCode === null) w.kill("SIGTERM");
+			} catch {}
 		}),
 	);
 }

@@ -11,6 +11,7 @@ hooks to `~/.codex/hooks.json` (`$CODEX_HOME/hooks.json`), each running `<path t
 | `PostToolUse` | `post_tool` | 30 s | `apply_patch` becomes an edit of every file the patch names (`*** Add/Update/Delete File:`, and a rename's `*** Move to:`), with the added lines as its text. In live mode a check's questions come back as `additionalContext`, which reaches the model's next request. |
 | `Stop` | `stop` | 90 s | borg's `{"decision":"block","reason"}` starts one more round. Codex never caps the rounds, but borg answers nothing to a stop with `stop_hook_active` set, so there is one round of questions per turn. The 90 s are borg's whole budget at the stop. |
 | `SessionEnd` | `end` | 3 s | Codex's maximum. borg starts `borg learn --session` in the background and returns. |
+| `Interrupt` | `halted` | 3 s | An Esc during a turn, which then has no `Stop`. Read only for a hive drone: your turn in the session is over, so hive work may start it again ([Interactive drones](../../docs/commands.md#interactive-drones)). Added after the first five: trust it in `/hooks` once. Without it, a drone's quiet turn holds hive work off for a minute after its last event, not until a stop. |
 
 Codex has no failure event, so a denied tool call does not become an episode; corrections you type
 still do. Codex's `transcript_path` is its own rollout format, which borg does not read: a live check
@@ -53,7 +54,7 @@ Nothing pins codex for you: with neither setting, borg's calls go to `claude`, `
 
 `adapters/codex/smoke.sh` runs a real `codex exec` in a fresh temp dir (its own `CODEX_HOME`, `HOME`
 and borg store) against `mock.py`, a local stand-in for the model API: 0 tokens, no network. It checks
-that install appends the five hooks with their timeouts beside your own, that an `apply_patch` lands in
+that install appends the six hooks with their timeouts beside your own, that an `apply_patch` lands in
 borg's `.edits`, that a live check's question reaches the model's next request, that your own hooks run
 beside borg's, that in hook mode borg blocks the first stop once and lets the second
 (`stop_hook_active`) pass, that borg's own codex call fires no hook, and that `borg doctor` reports the
@@ -65,4 +66,14 @@ write trust. A shim also forces the flag onto borg's own codex call, to show tha
 
 ```sh
 cargo build -p borg-ai && adapters/codex/smoke.sh     # KEEP=1 keeps the temp dir
+```
+
+`adapters/codex/hive-smoke.sh` runs the codex TUI in tmux the same way, against `hive_mock.py`, as an
+interactive hive drone: "join the hive" binds the thread and its stop starts the waiter; a task opened
+from a terminal is claimed, sent with `codex queue`, taken up by the woken turn and done; `/quit` leaves
+and ends the waiter; in codex's `workspace-write` sandbox the join is refused and says to run it outside
+the sandbox. 0 tokens; needs tmux.
+
+```sh
+cargo build -p borg-ai && adapters/codex/hive-smoke.sh   # KEEP=1 keeps the temp dir
 ```

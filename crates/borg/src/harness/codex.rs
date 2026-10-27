@@ -15,17 +15,28 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::wiring::Hooks;
-use super::{Caps, Harness, Headless, HeadlessEnd, Level, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Level, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
-/// tool call fires no PostToolUse at all), so denials are not captured.
-pub const EVENTS: [(&str, &str); 5] =
-    [("UserPromptSubmit", "prompt"), ("PreToolUse", "pre_tool"), ("PostToolUse", "post_tool"), ("Stop", "stop"), ("SessionEnd", "end")];
+/// tool call fires no PostToolUse at all), so denials are not captured. `Interrupt` (an Esc during a
+/// turn, which then has no Stop; 0.153.2 sends the session, turn and cwd) is `halted`: an interactive
+/// hive drone's engineer turn is over (hive/interactive.rs `halted`), and nothing else is read or written
+/// for it (hook.rs).
+pub const EVENTS: [(&str, &str); 6] = [
+    ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "pre_tool"),
+    ("PostToolUse", "post_tool"),
+    ("Stop", "stop"),
+    ("SessionEnd", "end"),
+    ("Interrupt", "halted"),
+];
 
-/// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd,
-/// which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one here makes every
-/// engineer trust borg's hooks again.
-pub const TIMEOUTS: [(&str, u64); 5] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3)];
+/// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd
+/// and Interrupt, which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one
+/// here makes every engineer trust borg's hooks again (a hook added, `halted`, asks for its own trust
+/// only; until then codex skips it, and a drone's quiet turn ends a minute after its last event instead,
+/// hive/interactive.rs `QUEUE_BUSY_IDLE_MS`).
+pub const TIMEOUTS: [(&str, u64); 6] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3), ("halted", 3)];
 
 /// The stop's timeout, and so its budget: the live wait, the stop's model call and the expert drone keep
 /// inside it.
@@ -56,6 +67,12 @@ impl Harness for Codex {
             sends_pid: false,
             stop_budget: Some(Duration::from_secs(STOP_TIMEOUT_S)),
             headless_budget: false,
+            // Also inside its sandbox; equal to the hooks' `session_id` and to `codex queue --thread`'s
+            // thread (0.153.2, against a local mock model).
+            session_env: Some("CODEX_THREAD_ID"),
+            drone_wake: DroneWake::Queue,
+            // A codex process runs its threads' sub-agents too.
+            one_session_per_process: false,
         }
     }
 
@@ -474,8 +491,9 @@ mod tests {
         let k = Hooks::of(&Codex).unwrap();
         let v: Value = serde_json::from_str(&k.install(None, Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         let timeout = |native: &str| v["hooks"][native][0]["hooks"][0]["timeout"].as_u64();
-        let got: Vec<Option<u64>> = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"].iter().map(|n| timeout(n)).collect();
-        assert_eq!(got, [Some(30), Some(10), Some(30), Some(90), Some(3)]);
+        let got: Vec<Option<u64>> = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "Interrupt"].iter().map(|n| timeout(n)).collect();
+        assert_eq!(got, [Some(30), Some(10), Some(30), Some(90), Some(3), Some(3)]);
+        assert_eq!(v["hooks"]["Interrupt"][0]["hooks"][0]["command"], "/b/borg hook codex halted");
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "/b/borg hook codex stop");
         assert_eq!(Codex.caps().stop_budget, Some(Duration::from_secs(90)), "the stop's budget is its timeout");
         let none = |_: &str| None;

@@ -178,6 +178,31 @@ pub struct Caps {
     /// A headless session stops itself at a dollar budget it is given ([`Headless::budget_usd`]);
     /// without it the hive runner checks the budget between iterations only (hive/run.rs).
     pub headless_budget: bool,
+    /// The variable the harness sets to its session's id in every command its model runs, which `borg
+    /// hive join` binds the session by (hive/interactive.rs `env_session_of`); None: the harness gives
+    /// its shell no id (opencode: its plugin binds the session).
+    pub session_env: Option<&'static str>,
+    /// How an idle interactive hive drone of the harness gets its next task (hive/interactive.rs `Wake`).
+    pub drone_wake: DroneWake,
+    /// One harness process runs one session at a time, so a later id under the process a drone joined
+    /// in is that drone's session (Claude Code's `--continue`, `/clear`: hive/interactive.rs `adopt`,
+    /// `rebind`); false where one process runs several (omp, opencode, codex's threads).
+    pub one_session_per_process: bool,
+}
+
+/// How an idle interactive hive drone of a harness is woken with work (phase g G3, docs/design/hive.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroneWake {
+    /// Its stop asks the model to run `borg hive wait` in the background, whose end starts the next turn
+    /// (Claude Code).
+    Model,
+    /// Its adapter keeps the waiter from the join for the session's life and wakes the session by the
+    /// harness's own path (omp `pi.sendMessage`, opencode `session.promptAsync`/`prompt`).
+    Plugin,
+    /// No hook can wake an idle session: its stop starts the waiter detached, which wakes the session
+    /// through the harness's CLI (codex `codex queue --thread`). Its hooks run as children of the harness
+    /// process, which sends no pid of its own.
+    Queue,
 }
 
 /// Where the turn's work and the drone's last message come from.
