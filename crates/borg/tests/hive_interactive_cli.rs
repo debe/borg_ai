@@ -827,10 +827,30 @@ impl Stream {
     }
 }
 
+/// The perl binary a link to it runs as itself: macOS's `/usr/bin/perl` is a stub that starts the
+/// versioned `/usr/bin/perl5.N`, which would name the process `perl5.N`, not the link's name.
+fn perl_bin() -> String {
+    let mut real: Vec<_> = std::fs::read_dir("/usr/bin")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            cfg!(target_os = "macos")
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.strip_prefix("perl5.").is_some_and(|v| v.parse::<u32>().is_ok()))
+        })
+        .collect();
+    real.sort_by_key(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n[6..].parse::<u32>().ok()));
+    match real.pop() {
+        Some(p) => p.display().to_string(),
+        None => String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap().trim().to_string(),
+    }
+}
+
 /// A process named `name` (a link to perl) that runs `args` and sleeps: a harness process to join
 /// under, stopped as an engineer stops it when dropped.
 fn harness_named(root: &Path, name: &str, args: &[&str], env: &[(&str, &str)]) -> (Waiter, u32) {
-    let perl = String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap();
+    let perl = perl_bin();
     let link = root.join("bin").join(name);
     if !link.exists() {
         std::os::unix::fs::symlink(perl.trim(), &link).unwrap();
@@ -1150,7 +1170,7 @@ fn queued(root: &Path) -> Vec<Vec<String>> {
 
 impl Codex {
     fn start(root: &Path) -> Self {
-        let perl = String::from_utf8(Command::new("sh").args(["-c", "command -v perl"]).output().unwrap().stdout).unwrap();
+        let perl = perl_bin();
         std::fs::create_dir_all(root.join("proc")).unwrap();
         let link = root.join("proc/codex");
         if !link.exists() {
