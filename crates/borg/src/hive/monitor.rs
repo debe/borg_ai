@@ -257,7 +257,10 @@ pub fn drones(home: &Path, goal: &str, b: &Board, events: &[Event], spend: &[Spe
             let session = lines.iter().rev().find(|e| e.drone == drone && e.by != "leave").map_or_else(|| last.session.clone(), |e| e.session.clone());
             let (state, task) = match live.get(&drone) {
                 None => ("gone", String::new()),
-                Some(e) if interactive::harness_gone(e) || super::bound(&e.session).is_none_or(|hs| !hs.interactive) => ("gone", String::new()),
+                // A harness pid read in another pid namespace (a join from a sandboxed shell) says nothing here.
+                Some(e) if (interactive::reapable(e) && interactive::harness_gone(e)) || super::bound(&e.session).is_none_or(|hs| !hs.interactive) => {
+                    ("gone", String::new())
+                }
                 Some(e) => match board::holding(b, here, &e.session, now) {
                     Some(t) => ("working", t.task.id.clone()),
                     None if interactive::busy(&e.session, now) => ("busy", String::new()),
@@ -367,7 +370,8 @@ pub fn of(home: &Path, g: &super::Goal, events: &[Event], b: &Board, spend: &[Sp
     Monitor {
         history: history(events, &here),
         members: members(home, b, events, &here, now),
-        interactive: drones(home, &g.id, b, events, spend, &here, now),
+        // The drones' session files are in the collective's state, where their hooks keep them.
+        interactive: crate::hook::in_state(home.join("state"), || drones(home, &g.id, b, events, spend, &here, now)),
         stuck,
         declines,
         integrations: integrations(b),
@@ -507,6 +511,10 @@ mod tests {
     fn drones_show_their_state_wakes_and_work() {
         let home = temp("drones");
         let g = seed(&home);
+        // The drones' files where their hooks keep them, the collective's state; `of` and the view below
+        // read them with no state directory set.
+        let st = home.join("state");
+        let in_st = |f: &mut dyn FnMut()| crate::hook::in_state(st.clone(), f);
         let tag = format!("mon{}", std::process::id());
         let s = |n: &str| format!("{tag}-{n}");
         let now = learn::now_ms();
@@ -516,15 +524,16 @@ mod tests {
                 Entry { v: 1, ms: now - 50_000, drone: d.into(), session: s(d), harness: h.into(), goal: "g".into(), by: "join".into(), ..Entry::default() };
             super::super::append_line(&reg, &e).unwrap();
             let hs = HiveSession { goal: "g".into(), drone: d.into(), interactive: true, ..HiveSession::default() };
-            std::fs::write(super::super::session_path(&s(d)), serde_json::to_string(&hs).unwrap()).unwrap();
+            in_st(&mut || std::fs::write(super::super::session_path(&s(d)), serde_json::to_string(&hs).unwrap()).unwrap());
         }
         super::super::append_line(&reg, &Entry { v: 1, ms: now - 1_000, drone: "i-gone".into(), session: s("i-gone"), by: "leave".into(), ..Entry::default() })
             .unwrap();
-        let busy = crate::hook::state_file(&s("i-busy")).with_extension("hive-busy");
+        let busy = crate::hook::in_state(st.clone(), || crate::hook::state_file(&s("i-busy"))).with_extension("hive-busy");
         std::fs::write(&busy, format!("0 {now} 300000")).unwrap();
-        let waiter = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(interactive::waiter_path("i-wait")).unwrap();
+        let (wait_at, idle_at) = crate::hook::in_state(st.clone(), || (interactive::waiter_path("i-wait"), interactive::waiter_path("i-idle")));
+        let waiter = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(wait_at).unwrap();
         waiter.lock().unwrap();
-        let _ = std::fs::remove_file(interactive::waiter_path("i-idle"));
+        let _ = std::fs::remove_file(idle_at);
         let ev = |e: Ev, t: &str, d: &str, ms: i64| Event::new(e, t, &s(d), ms).with_drone(d);
         super::super::write(
             &home,
@@ -542,9 +551,11 @@ mod tests {
         super::super::write(&home, "g", vec![Event::new(Ev::Released, "t3", &s("i-wait"), now - 14_000).with_note(interactive::NOT_TAKEN_UP)]).unwrap();
         super::super::write(&home, "g", vec![ev(Ev::Claim, "t1", "i-work", now - 3_000)]).unwrap();
         // The take-up of the claim of t1, through the hooks' own step (`touch` of a prompt).
-        interactive::handed(&s("i-work"), "g", &format!("t1@{}", now - 3_000), now - 2_900);
-        let mut hs = super::super::bound(&s("i-work")).unwrap();
-        interactive::touch(&home, "prompt", &mut hs, &s("i-work"), "claude", &serde_json::json!({}), now - 1_500);
+        in_st(&mut || {
+            interactive::handed(&s("i-work"), "g", &format!("t1@{}", now - 3_000), now - 2_900);
+            let mut hs = super::super::bound(&s("i-work")).unwrap();
+            interactive::touch(&home, "prompt", &mut hs, &s("i-work"), "claude", &serde_json::json!({}), now - 1_500);
+        });
         let spend = vec![
             Spend { v: 1, ms: now, drone: "i-work".into(), usd: Some(0.25), exit: "interactive".into(), claim: "t2@1".into(), ..Spend::default() },
             Spend { v: 1, ms: now, drone: "i-wait".into(), usd: None, exit: "unmetered".into(), claim: "t3@1".into(), ..Spend::default() },
@@ -553,7 +564,7 @@ mod tests {
         let spend: Vec<Spend> = spend.iter().chain(&spend).cloned().collect();
         let (events, b) = fold(&home);
         let here = super::super::node(&home);
-        let rows = drones(&home, "g", &b, &events, &spend, &here, now);
+        let rows = of(&home, &g, &events, &b, &spend, now).interactive;
         let states: Vec<(&str, &str, &str, &str)> = rows.iter().map(|r| (r.drone.as_str(), r.harness.as_str(), r.state.as_str(), r.task.as_str())).collect();
         assert_eq!(
             states,
@@ -580,10 +591,7 @@ mod tests {
             "{text}"
         );
         drop(waiter);
-        for d in ["i-work", "i-busy", "i-wait", "i-idle", "i-gone"] {
-            let _ = std::fs::remove_file(super::super::session_path(&s(d)));
-            let _ = std::fs::remove_file(crate::hook::state_file(&s(d)).with_extension("hive-busy"));
-        }
+        let _ = std::fs::remove_dir_all(&st);
         let _ = std::fs::remove_file(busy);
         let _ = std::fs::remove_dir_all(home);
     }

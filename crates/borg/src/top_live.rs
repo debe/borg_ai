@@ -271,7 +271,7 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
             };
             let st = state_style(&word);
             let wake = hive.and_then(|r| r.wakes.iter().rev().find(|w| w.taken)).map(|w| format!("{:.1}s", w.latency_ms as f64 / 1000.0)).unwrap_or_default();
-            let spent = hive.map(|r| if r.unmetered && r.usd == 0.0 { "-".to_string() } else { format!("${:.2}", r.usd) }).unwrap_or_default();
+            let spent = hive.map(|r| if r.unmetered && r.usd == 0.0 { "-".to_string() } else { format!("${:.2}", r.usd.max(0.0)) }).unwrap_or_default();
             let done = work.get(d.p.session.as_str()).map(|w| w.1).filter(|n| *n > 0).map(|n| n.to_string()).unwrap_or_default();
             let harness = if d.p.harness.is_empty() { hive.map(|r| r.harness.clone()).unwrap_or_default() } else { d.p.harness.clone() };
             let node = if d.node.is_empty() { "here".to_string() } else { short(&d.node) };

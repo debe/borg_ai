@@ -243,7 +243,10 @@ async fn an_interactive_goal_shows_its_history_nodes_drones_and_lines() {
     };
     std::fs::write(hive::interactive::registry_path(&corp), format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
     let hs = hive::HiveSession { goal: "g".into(), drone: "i-abc123".into(), interactive: true, ..Default::default() };
-    std::fs::write(hive::session_path(&session), serde_json::to_string(&hs).unwrap()).unwrap();
+    // Where its hooks keep it: the collective's own state (borg-web sets no BORG_STATE).
+    let bound = corp.join("state").join(hive::session_path(&session).file_name().unwrap());
+    std::fs::create_dir_all(corp.join("state")).unwrap();
+    std::fs::write(&bound, serde_json::to_string(&hs).unwrap()).unwrap();
     let taken = hive::Confirm { v: 1, ms: now - 1, task: "t2".into(), session: session.clone(), peers: 0, waited_ms: 2_000, outcome: hive::TAKEN.into() };
     std::fs::write(hive::confirms_path(&corp, "g"), format!("{}\n", serde_json::to_string(&taken).unwrap())).unwrap();
     let spend = hive::run::spend_path(&corp, "g");
@@ -270,6 +273,5 @@ async fn an_interactive_goal_shows_its_history_nodes_drones_and_lines() {
     assert_eq!((g["declines"][0]["task"].as_str(), g["declines"][0]["why"].as_str()), (Some("t1"), Some("its commits are not here")));
     assert!((g["metered_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9 && g["unmetered"] == 1, "{g}");
     assert_eq!(g["integrations"], serde_json::json!([]));
-    let _ = std::fs::remove_file(hive::session_path(&session));
     let _ = std::fs::remove_dir_all(&base);
 }

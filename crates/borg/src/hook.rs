@@ -17,8 +17,23 @@ use crate::harness::{self, Harness};
 use crate::learn::learning;
 use crate::{collective, conscience, learn, live, outcome, predict, prefilter};
 
+thread_local! {
+    /// The state directory a reader of a collective's sessions uses on this thread (`in_state`).
+    static STATE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f` with `dir` as this thread's state directory unless `BORG_STATE` names one: a reader of a
+/// collective's drones (monitoring: `borg top`, borg-web) finds their session files where the hooks and
+/// hive commands keep them, the collective's own `state` (`main`), though it never set `BORG_STATE`.
+pub(crate) fn in_state<R>(dir: PathBuf, f: impl FnOnce() -> R) -> R {
+    let before = STATE.with(|s| s.replace(Some(dir)));
+    let out = f();
+    STATE.with(|s| *s.borrow_mut() = before);
+    out
+}
+
 pub(crate) fn state_file(session: &str) -> PathBuf {
-    let dir = PathBuf::from(std::env::var("BORG_STATE").unwrap_or_else(|_| "/tmp/borg".into()));
+    let dir = std::env::var_os("BORG_STATE").map(PathBuf::from).or_else(|| STATE.with(|s| s.borrow().clone())).unwrap_or_else(|| PathBuf::from("/tmp/borg"));
     let _ = std::fs::create_dir_all(&dir);
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
     dir.join(format!("{safe}.ctx"))
