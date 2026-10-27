@@ -5,7 +5,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use borg::hive::{Status, board};
@@ -50,6 +50,76 @@ fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     c
+}
+
+/// A `borg hive run` this test started in the background (`spawn`). It never outlives its test: dropped
+/// while it still runs (a failed assertion, a panic) it is stopped as an engineer stops it, Ctrl-C, then
+/// a closed terminal (SIGHUP), each waited for, with its output drained so no full pipe holds it, and
+/// reaped. On Linux the kernel also sends it SIGINT should the test's thread die first (a test binary
+/// stopped from outside). Before, a run that waited for the plan outlived a failed test by days.
+struct Runner(Option<Child>);
+
+/// `c` started in the background as a `Runner`.
+fn spawn(c: &mut Command) -> Runner {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl(2) between fork and exec only sets this process's own parent-death signal.
+        unsafe {
+            c.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGINT);
+                Ok(())
+            });
+        }
+    }
+    Runner(Some(c.spawn().unwrap()))
+}
+
+impl Runner {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+
+    fn id(&mut self) -> u32 {
+        self.child().id()
+    }
+
+    /// Whether the run still runs.
+    fn running(&mut self) -> bool {
+        self.child().try_wait().unwrap().is_none()
+    }
+
+    /// The run's output once it ends, however long that takes.
+    fn output(mut self) -> Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        if let Some(mut out) = child.stdout.take() {
+            std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+        }
+        if let Some(mut err) = child.stderr.take() {
+            std::thread::spawn(move || std::io::copy(&mut err, &mut std::io::sink()));
+        }
+        for sig in [libc::SIGINT, libc::SIGHUP] {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            // SAFETY: kill(2) on the runner this test spawned and has not reaped (try_wait above).
+            unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(10) {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        eprintln!("borg hive run {} outlived SIGINT and SIGHUP", child.id());
+    }
 }
 
 /// `borg hive <args> --dir <work>`: (stdout, stderr, exit code).
@@ -329,7 +399,7 @@ fn sigint_ends_the_unsettled_session_and_leaves_the_goal() {
     let root = setup("sigint", 1, "3", json!({"usd_per_iter": 0.10, "drones": {"d1": {"claim_s": 60}}}));
     let dir = work(&root).display().to_string();
     let args = ["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", dir.as_str()];
-    let child = command(&root, &args, &[]).spawn().unwrap();
+    let mut child = spawn(&mut command(&root, &args, &[]));
     let notes = |root: &Path| events(root).into_iter().filter(|e| e.by == "runner" && e.task.is_empty()).map(|e| e.note).collect::<Vec<_>>();
     let t0 = Instant::now();
     while !(notes(&root).iter().any(|n| n == "session-start d1") && notes(&root).iter().any(|n| n == board::BEAT)) {
@@ -337,7 +407,7 @@ fn sigint_ends_the_unsettled_session_and_leaves_the_goal() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
-    let out = child.wait_with_output().unwrap();
+    let out = child.output();
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(130), "{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("stopped by SIGINT"), "{text}");
@@ -371,20 +441,20 @@ fn sigint_after_the_drones_ended_stops_the_run_at_once() {
     ok(&root, &["open", "g", "--id", "t1", "--title", "write f1.txt", "--files", "f1.txt", "--accept", "ok=grep -q 'done t1' f1.txt"]);
     let dir = w.display().to_string();
     let args = ["hive", "run", "g", "--drones", "2", "--harness", "sim", "--yes", "--dir", dir.as_str()];
-    let mut child = command(&root, &args, &[]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = spawn(command(&root, &args, &[]).stdout(Stdio::null()).stderr(Stdio::null()));
     let left = |root: &Path| events(root).iter().any(|e| e.by == "runner" && e.task.is_empty() && e.note == board::LEAVE);
     let t0 = Instant::now();
     while !left(&root) {
         assert!(t0.elapsed() < Duration::from_secs(120), "the run never left the goal");
-        assert!(child.try_wait().unwrap().is_none(), "the run ended before the scoring");
+        assert!(child.running(), "the run ended before the scoring");
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(500));
-    assert!(child.try_wait().unwrap().is_none(), "the run is scoring");
+    assert!(child.running(), "the run is scoring");
     assert!(Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap().success());
     let t0 = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.child().try_wait().unwrap() {
             break status;
         }
         if t0.elapsed() > Duration::from_secs(10) {
@@ -723,7 +793,7 @@ fn a_failed_iteration_that_names_no_cost_is_charged() {
 fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_run() {
     let root = setup("killed", 1, "2", json!({"drones": {"d1": {"hang": true}}}));
     let w = work(&root).display().to_string();
-    let mut child = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]).spawn().unwrap();
+    let mut child = spawn(&mut command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
     let t0 = Instant::now();
     while !events(&root).iter().any(|e| e.ev == board::Ev::Claim) {
         assert!(t0.elapsed() < Duration::from_secs(30), "no claim");
@@ -734,19 +804,18 @@ fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_ru
     // with it (runner.rs `Watchdog`).
     // SAFETY: kill(2) with SIGINT on the runner this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) }, 0);
-    let status = child.wait().unwrap();
+    let status = child.child().wait().unwrap();
     assert!(!status.success(), "Ctrl-C ends the run: {status:?}");
     std::fs::write(root.join("script.json"), json!({}).to_string()).unwrap();
-    let mut rerun = command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]).spawn().unwrap();
+    let mut rerun = spawn(&mut command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
     let t0 = Instant::now();
-    while rerun.try_wait().unwrap().is_none() {
+    while rerun.running() {
         if t0.elapsed() > Duration::from_secs(60) {
-            let _ = rerun.kill();
             panic!("the rerun waits on the dead session's claim");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let out = String::from_utf8_lossy(&rerun.wait_with_output().unwrap().stdout).to_string();
+    let out = String::from_utf8_lossy(&rerun.output().stdout).to_string();
     // The dead iteration is charged its estimate (the rest of its share): nothing is left to spend.
     let lines = spend(&root);
     assert_eq!(lines.iter().map(|l| (l["exit"].as_str().unwrap(), l["est"].as_f64())).collect::<Vec<_>>(), [("killed", Some(2.0))], "{out}");
@@ -871,40 +940,54 @@ fn queen(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i
 }
 
 /// `borg hive run g --drones <n> --harness sim` without `--yes`, started in the background.
-fn spawn_run(root: &Path, drones: &str) -> std::process::Child {
+fn spawn_run(root: &Path, drones: &str) -> Runner {
     let w = work(root).display().to_string();
-    command(root, &["hive", "run", "g", "--drones", drones, "--harness", "sim", "--dir", &w], &[]).spawn().unwrap()
+    spawn(&mut command(root, &["hive", "run", "g", "--drones", drones, "--harness", "sim", "--dir", &w], &[]))
 }
 
 /// The open plan question of the waiting run `child`, once it is queued (within 30 s).
-fn plan_question(root: &Path, child: &mut std::process::Child) -> borg::queen::Entry {
+fn plan_question(root: &Path, child: &mut Runner) -> borg::queen::Entry {
     let t0 = Instant::now();
     loop {
         if let Some(e) = borg::queen::open(&store(root)).into_iter().find(|e| e.kind == borg::queen::Kind::Plan) {
             return e;
         }
-        assert!(child.try_wait().unwrap().is_none(), "the run ended without asking");
+        assert!(child.running(), "the run ended without asking");
         assert!(t0.elapsed() < Duration::from_secs(30), "no plan question");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// The run's exit code and stdout once it ends (within `secs`); past that it is stopped as an engineer
-/// stops it, Ctrl-C, and the test fails.
-fn ended(child: std::process::Child, secs: u64) -> (i32, String) {
+/// The run's exit code and stdout once it ends (within `secs`); past that the test fails, and the run
+/// is stopped as an engineer stops it, Ctrl-C (`Runner`).
+fn ended(mut child: Runner, secs: u64) -> (i32, String) {
     let t0 = Instant::now();
-    let mut child = child;
-    while child.try_wait().unwrap().is_none() {
-        if t0.elapsed() > Duration::from_secs(secs) {
-            // SAFETY: kill(2) with SIGINT on the runner this test spawned and has not reaped.
-            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
-            let _ = child.wait();
-            panic!("the run did not end within {secs}s");
-        }
+    while child.running() {
+        assert!(t0.elapsed() < Duration::from_secs(secs), "the run did not end within {secs}s");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let out = child.wait_with_output().unwrap();
+    let out = child.output();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into())
+}
+
+/// Phase g G0: a run a failed test started does not outlive it. The run waits for the plan (no `--yes`)
+/// when an assertion of the test fails; unwinding drops its `Runner`, which stops it with Ctrl-C and
+/// reaps it, so no `borg hive run` is left waiting (before, two such runs waited for days).
+#[test]
+fn a_failed_test_stops_the_run_it_started() {
+    let root = setup("dropped", 1, "1", json!({}));
+    let pid = std::sync::atomic::AtomicU32::new(0);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut child = spawn_run(&root, "1");
+        plan_question(&root, &mut child);
+        pid.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        panic!("an assertion fails while the run waits for the plan");
+    }));
+    assert!(failed.is_err());
+    let pid = pid.into_inner() as libc::pid_t;
+    // SAFETY: kill(2) with signal 0 sends nothing; it only asks whether the process is there.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the run {pid} outlived its test");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -922,7 +1005,7 @@ fn a_run_waits_for_the_plan_and_a_no_stops_it_with_nothing_claimed() {
     );
     // It waits: no drone, no worktree, no run line, no claim.
     std::thread::sleep(Duration::from_secs(2));
-    assert!(child.try_wait().unwrap().is_none(), "the run waits for the engineer");
+    assert!(child.running(), "the run waits for the engineer");
     assert!(!work(&root).join(".worktrees").exists() && !goal_dir(&root).join("runs.jsonl").exists());
     assert!(!events(&root).iter().any(|e| e.ev == board::Ev::Claim));
     let top = command(&root, &["top", "--dir", &work(&root).display().to_string()], &[]).output().unwrap();
@@ -1007,7 +1090,7 @@ fn a_task_opened_while_the_plan_waits_is_asked_about_before_any_drone_starts() {
         if let Some(e) = borg::queen::open(&store(&root)).into_iter().find(|e| e.kind == borg::queen::Kind::Plan && e.id != first.id) {
             break e;
         }
-        assert!(child.try_wait().unwrap().is_none(), "the run ended without asking again");
+        assert!(child.running(), "the run ended without asking again");
         assert!(t0.elapsed() < Duration::from_secs(30), "no second plan question");
         std::thread::sleep(Duration::from_millis(100));
     };
