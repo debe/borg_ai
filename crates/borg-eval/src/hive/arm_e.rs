@@ -633,8 +633,15 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let start_wait_ms: BTreeMap<&str, Option<u64>> =
         sides.iter().map(|s| (s.name, read_jsonl::<hive_run::RunLine>(&hive_run::runs_path(&s.store, &o.goal)).last().map(|r| r.waited_ms))).collect();
     let name_of = |id: &str| sides.iter().find(|s| s.id == id).map(|s| s.name);
+    // Which node owns each work and verify task (rendezvous over both nodes, board.rs `owner`): a node
+    // that owns none is left nothing by an idle owner, so the acceptance asks no work of it (d3-accept4 W2 s2).
+    let ids: BTreeSet<&str> = sides.iter().map(|s| s.id.as_str()).collect();
+    let owned = |id: &str| folds[0].tasks.values().filter(|t| t.task.role != board::Role::Integrate && board::owner(&ids, &t.task.id) == Some(id)).count();
     for (s, (b, ev)) in sides.iter().zip(folds.iter().zip(&events)) {
         let mut v = node_stats(b, ev, s, &o.goal);
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("owned".into(), json!(owned(&s.id)));
+        }
         if let (Some(obj), Some(extra)) = (v.as_object_mut(), per_node.get(s.name).and_then(Value::as_object)) {
             obj.extend(extra.clone());
         }
