@@ -420,6 +420,8 @@ test(
 			// Still the engineer's turn (the join's), with a long tool call: nothing is handed.
 			await h.tool_call({ type: "tool_call", toolName: "bash", toolCallId: "b1", input: { command: "cargo build" } }, ctx);
 			w.hive(["open", "g1", "--id", "t1", "--title", "do t1"]);
+			// The engineer approves the plan from their own terminal (G5): no drone takes an unapproved task.
+			w.hive(["ratify", "g1"]);
 			await new Promise((r) => setTimeout(r, 1_500));
 			assert.equal(sent.length, 0, "no wake in the engineer's turn, its tool call running");
 			await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "b1", input: { command: "cargo build" }, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
@@ -484,6 +486,8 @@ test(
 			// The engineer types: their turn, in which a task opens.
 			await h.input({ type: "input", text: "look at the parser tests", source: "interactive" }, ctx);
 			w.hive(["open", "g1", "--id", "t1", "--title", "do t1"]);
+			// The engineer approves the plan from their own terminal (G5): no drone takes an unapproved task.
+			w.hive(["ratify", "g1"]);
 			await new Promise((r) => setTimeout(r, 1_500));
 			assert.equal(sent.length, 0, "never inside the engineer's turn");
 			assert.equal(await h.session_stop({ ...stop, last_assistant_message: "The tests pass." }, ctx), undefined);

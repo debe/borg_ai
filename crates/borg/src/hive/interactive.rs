@@ -517,17 +517,22 @@ pub(super) fn leave_noted(here: &Here, session: &str, hs: &HiveSession, note: &s
     let here_node = node(&here.home);
     let repo = queen::repo_name(if hs.worktree.is_empty() { &here.cwd } else { &hs.worktree });
     let goals = served(&here.home, hs, &repo);
-    for g in &goals {
-        let b = board::fold_on(&board::read(&tasks_path(&here.home, &g.id)), &here_node);
-        if let Some(t) = board::holding(&b, &here_node, session, here.now) {
-            super::write(&here.home, &g.id, vec![Event::new(Ev::Released, &t.task.id, session, here.now).with_note(note)])?;
-        }
-    }
+    // The waiter is stopped first (it ends on the signal, saying nothing), then the session unbound, then
+    // its claim released, decided under the board lock: a waiter's claim decided under that lock after
+    // the unbind finds the session no drone (mod.rs `claim`), and one decided before it has landed by the
+    // time the release takes the lock and is released, so no claim outlives a leave.
     stop_waiter(&hs.drone);
+    super::unbind(session);
+    for g in &goals {
+        super::write_if(&here.home, &g.id, |events| {
+            let now = learn::now_ms();
+            let b = board::fold_on(events, &here_node);
+            board::holding(&b, &here_node, session, now).map(|t| vec![Event::new(Ev::Released, &t.task.id, session, now).with_note(note)])
+        })?;
+    }
     clear_busy(session);
     let _ = std::fs::remove_file(takeup_path(session));
     let _ = std::fs::remove_file(missed_path(session));
-    super::unbind(session);
     record(&here.home, &Entry { v: 1, ms: here.now, drone: hs.drone.clone(), session: session.into(), by: "leave".into(), ..Entry::default() })?;
     let others = live(&here.home);
     for g in &goals {
@@ -675,6 +680,33 @@ pub(crate) fn untaken(session: &str) -> Option<(String, String, i64)> {
     Some((g.to_string(), k.to_string(), it.next().and_then(|m| m.parse().ok()).unwrap_or(0)))
 }
 
+/// The note of a handed claim's release when no turn of its session took it up (wait.rs `takeup`):
+/// monitoring reads a wake missed from it.
+pub const NOT_TAKEN_UP: &str = "not taken up: no hook event of the session followed its wake";
+
+/// A turn of `session` took up `key` (`task@claim`) of `goal`, handed at `handed`, at `now` (`touch`):
+/// one `taken` line in the goal's local confirms.jsonl, the wake's latency from its hand to now
+/// (`waited_ms`), both on this node's clock, so monitoring shows each drone's wake latency over time
+/// (phase g G6). Never from the claim's stamp: a hybrid stamp runs up to `board::AHEAD_MS` past this
+/// clock once the board holds a peer's line stamped ahead, and would show a wake shorter than it was. Only
+/// while the session still holds that claim on the board: a wake wait.rs `takeup` released meanwhile
+/// is a missed one, never also a taken one. A hand of no time (a take-up file from before) writes no line.
+/// One line per wake: the take-up file is removed with it.
+fn taken_up(home: &Path, goal: &str, key: &str, handed: i64, session: &str, now: i64) {
+    let Some((task, claim)) = key.rsplit_once('@') else { return };
+    let Ok(claim) = claim.parse::<i64>() else { return };
+    if handed <= 0 || claim == 0 {
+        return;
+    }
+    let b = board::fold_on(&board::read(&tasks_path(home, goal)), &node(home));
+    if !board::holding(&b, &node(home), session, now).is_some_and(|s| s.task.id == task && s.live(now).is_some_and(|l| l.2 == claim)) {
+        return;
+    }
+    let waited = (now - handed).max(0);
+    let line = super::Confirm { v: 1, ms: now, task: task.into(), session: session.into(), peers: 0, waited_ms: waited as u64, outcome: super::TAKEN.into() };
+    let _ = super::append_line(&super::confirms_path(home, goal), &line);
+}
+
 /// What a wake that hands a claim of `goal` starts with (wait.rs `deliver`): the prompt a codex wake's
 /// own turn starts with (`touch`).
 pub(crate) fn arrived(goal: &str) -> String {
@@ -802,6 +834,9 @@ pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &st
         || event == "prompt"
             && untaken(session).is_some_and(|(g, _, _)| input.get("prompt").and_then(Value::as_str).unwrap_or_default().trim_start().starts_with(&arrived(&g)));
     if takes_up {
+        if let Some((goal, key, handed)) = untaken(session) {
+            taken_up(home, &goal, &key, handed, session, now);
+        }
         let _ = std::fs::remove_file(takeup_path(session));
     }
     let _ = std::fs::remove_file(missed_path(session));
@@ -820,6 +855,11 @@ pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &st
         "pre_tool" if busy_path(session).exists() => set_busy(session, true, now, idle),
         "post_tool" | "post_tool_failure" if busy_path(session).exists() => set_busy(session, false, now, idle),
         _ => {}
+    }
+    // Where its usage is (Claude Code's transcript), for a claim that ends outside a hook (meter.rs).
+    if let Some(t) = input.get("transcript_path").and_then(Value::as_str).filter(|t| !t.is_empty() && *t != hs.transcript) {
+        hs.transcript = t.into();
+        changed = true;
     }
     if event == "pre_tool" || hs.goal.is_empty() || now - hs.member_ms < super::BEAT_MS {
         return changed;
@@ -938,12 +978,14 @@ pub(crate) fn not_in_hand(home: &Path, hs: &HiveSession, session: &str, now: i64
 }
 
 /// An interactive drone's session ended (SessionEnd), not by a `/clear`, whose new session is rebound
-/// (`session_start`): the drone leaves (`leave_quietly`).
-pub(crate) fn ended(home: &Path, hs: &HiveSession, session: &str, cwd: &str, input: &Value, now: i64) {
-    if input.get("reason").and_then(Value::as_str) != Some("clear") {
-        let here = Here { home: home.to_path_buf(), cwd: cwd.to_string(), now };
-        let _ = leave_quietly(&here, session, hs);
+/// (`session_start`): the drone leaves, its claim released as `session ended` (`leave_noted`). Whether it
+/// left.
+pub(crate) fn ended(home: &Path, hs: &HiveSession, session: &str, cwd: &str, input: &Value, now: i64) -> bool {
+    if input.get("reason").and_then(Value::as_str) == Some("clear") {
+        return false;
     }
+    let here = Here { home: home.to_path_buf(), cwd: cwd.to_string(), now };
+    leave_noted(&here, session, hs, "session ended").is_ok()
 }
 
 /// Whether the stop's input shows a `borg hive wait` running in the background (Claude Code's
@@ -1218,6 +1260,51 @@ fn move_to(home: &Path, e: Entry, session: &str, now: i64) -> Option<HiveSession
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wake's latency is its hand to its take-up on this node's clock, never from the claim's stamp: a
+    /// peer's line stamped an hour ahead lifts the claim's stamp `board::AHEAD_MS` past this clock, and a
+    /// latency from it would read 0. A wake released meanwhile (wait.rs `takeup`) is no taken one, and a
+    /// hand of no time writes no line. Fails with `taken_up` on the claim's stamp: 0, not 700.
+    #[test]
+    fn a_wake_is_timed_from_its_hand_on_this_clock_and_only_while_held() {
+        let home = std::env::temp_dir().join(format!("borg-hive-takenup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let session = format!("takenup-{}", std::process::id());
+        let task = super::super::Task {
+            id: "t1".into(),
+            role: super::super::Role::Work,
+            title: "do t1".into(),
+            repo: String::new(),
+            files: vec!["t1.txt".into()],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+            group: None,
+        };
+        let now = learn::now_ms();
+        let path = tasks_path(&home, "g");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        board::append(&path, &[Event::open(task, "engineer:e", now - 1_000)]).unwrap();
+        let ahead = Event { node: "remote-abcdef12".into(), ..Event::new(Ev::Heartbeat, "", "runner", now + 3_600_000).with_note(board::JOIN) };
+        board::append(&path, &[ahead]).unwrap();
+        let landed = super::super::write(&home, "g", vec![Event::new(Ev::Claim, "t1", &session, now)]).unwrap();
+        let claim = landed[0].ms;
+        assert!(claim >= now + board::AHEAD_MS, "the peer's line lifts the claim's stamp: {claim} vs {now}");
+        let key = format!("t1@{claim}");
+        let taken = || -> Vec<super::super::Confirm> { super::super::read_lines(&super::super::confirms_path(&home, "g")) };
+        taken_up(&home, "g", &key, 0, &session, now + 700);
+        assert!(taken().is_empty(), "a hand of no time: no line");
+        taken_up(&home, "g", &key, now, &session, now + 700);
+        let got: Vec<(String, u64, String)> = taken().into_iter().map(|c| (c.task, c.waited_ms, c.outcome)).collect();
+        assert_eq!(got, [("t1".to_string(), 700, super::super::TAKEN.to_string())], "hand to take-up on this clock");
+        super::super::write(&home, "g", vec![Event::new(Ev::Released, "t1", &session, now + 800).with_note(NOT_TAKEN_UP)]).unwrap();
+        taken_up(&home, "g", &key, now, &session, now + 900);
+        assert_eq!(taken().len(), 1, "a wake released meanwhile is missed, never also taken");
+        let _ = std::fs::remove_dir_all(home);
+    }
 
     #[test]
     fn a_join_refused_by_a_read_only_sandbox_names_the_step_past_it() {

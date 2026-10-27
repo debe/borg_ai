@@ -208,3 +208,68 @@ async fn a_page_on_another_host_name_is_refused() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A goal of interactive drones (phase g G6), from the files the hive keeps: its tasks by state over
+/// time, backfilled from the board's first line; its nodes with their membership, last beat's age and
+/// this node's worker; this node's drones with harness, state and wake latency; the stuck and declines
+/// lines with their reasons; the integrations; metered against unmetered spend.
+#[tokio::test]
+async fn an_interactive_goal_shows_its_history_nodes_drones_and_lines() {
+    let base = std::env::temp_dir().join(format!("borg-web-interactive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let corp = base.join("corp");
+    let now = learn::now_ms();
+    seed(&corp, now);
+    let here = hive::node(&corp);
+    let tasks = hive::tasks_path(&corp, "g");
+    let runner = |note: &str, ms: i64| Event { node: here.clone(), ..Event::new(Ev::Heartbeat, "", "runner", ms).with_note(note) };
+    board::append(
+        &tasks,
+        &[runner(board::JOIN, now - 9), runner(&board::stuck_note("t1", "no participant may take it"), now - 2), runner(&board::decline_note("t1"), now - 2)],
+    )
+    .unwrap();
+    // The drone that holds t2: joined from a Claude Code session, woken once.
+    let session = format!("web{}-sess", std::process::id());
+    board::append(&tasks, &[Event { node: here.clone(), ..Event::new(Ev::Claim, "t2", &session, now - 3).with_drone("i-abc123") }]).unwrap();
+    let e = hive::interactive::Entry {
+        v: 1,
+        ms: now - 9,
+        drone: "i-abc123".into(),
+        session: session.clone(),
+        harness: "claude".into(),
+        goal: "g".into(),
+        by: "join".into(),
+        ..Default::default()
+    };
+    std::fs::write(hive::interactive::registry_path(&corp), format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
+    let hs = hive::HiveSession { goal: "g".into(), drone: "i-abc123".into(), interactive: true, ..Default::default() };
+    std::fs::write(hive::session_path(&session), serde_json::to_string(&hs).unwrap()).unwrap();
+    let taken = hive::Confirm { v: 1, ms: now - 1, task: "t2".into(), session: session.clone(), peers: 0, waited_ms: 2_000, outcome: hive::TAKEN.into() };
+    std::fs::write(hive::confirms_path(&corp, "g"), format!("{}\n", serde_json::to_string(&taken).unwrap())).unwrap();
+    let spend = hive::run::spend_path(&corp, "g");
+    let claim = serde_json::json!({"v": 1, "ms": now, "drone": "i-abc123", "node": here, "iter": 1, "harness": "claude", "usd": null, "session": session, "exit": "unmetered", "claim": "t2@1"});
+    std::fs::write(&spend, format!("{}{claim}\n", std::fs::read_to_string(&spend).unwrap())).unwrap();
+
+    let (status, v) = get(app(vec![("corp", corp.clone())]), "/api/hive?c=corp").await;
+    assert_eq!(status, StatusCode::OK);
+    let g = &v["goals"][0];
+    let history = g["history"].as_array().unwrap();
+    assert_eq!((history[0]["ms"].as_i64(), history[0]["open"].as_u64()), (Some(now - 10), Some(2)), "from the board's first line: {g}");
+    let last = history.last().unwrap();
+    assert_eq!((last["claimed"].as_u64(), last["stuck"].as_u64()), (Some(1), Some(1)), "{last}");
+    let node = &g["members"][0];
+    assert_eq!((node["here"].as_bool(), node["state"].as_str(), node["worker"].as_str()), (Some(true), Some("in"), Some("none")), "{node}");
+    let d = &g["interactive"][0];
+    assert_eq!(
+        (d["drone"].as_str(), d["harness"].as_str(), d["state"].as_str(), d["task"].as_str()),
+        (Some("i-abc123"), Some("claude"), Some("working"), Some("t2")),
+        "{d}"
+    );
+    assert_eq!((d["wakes"][0]["latency_ms"].as_i64(), d["unmetered"].as_bool()), (Some(2_000), Some(true)));
+    assert_eq!((g["stuck"][0]["task"].as_str(), g["stuck"][0]["why"].as_str()), (Some("t1"), Some("no participant may take it")));
+    assert_eq!((g["declines"][0]["task"].as_str(), g["declines"][0]["why"].as_str()), (Some("t1"), Some("its commits are not here")));
+    assert!((g["metered_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9 && g["unmetered"] == 1, "{g}");
+    assert_eq!(g["integrations"], serde_json::json!([]));
+    let _ = std::fs::remove_file(hive::session_path(&session));
+    let _ = std::fs::remove_dir_all(&base);
+}

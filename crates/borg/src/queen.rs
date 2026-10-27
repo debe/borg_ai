@@ -1197,8 +1197,11 @@ pub fn deliver(store: &Path, session: &str, cwd: &str, repos: impl FnOnce() -> V
         append_line(&visits_path(store), &v).ok()?;
         visits.push(v);
     }
-    // A hive drone is never asked the engineer's questions about its own goal's plan and tasks.
-    let offer: Vec<Entry> = open.iter().filter(|e| !(hive_question(e) && crate::hive::drone(store, cwd))).cloned().collect();
+    // A hive drone is never asked the engineer's questions about its own goal's plan and tasks; an
+    // interactive goal's plan or budget only in the session that opened it, at the engineer's own prompt
+    // (hive/plan.rs `at_prompt`), never as a question another session's model records.
+    let offer: Vec<Entry> =
+        open.iter().filter(|e| !(hive_question(e) && crate::hive::drone(store, cwd)) && !crate::hive::plan::at_own_prompt(e)).cloned().collect();
     let (_, e) = eligible(&offer, &skips(store), &delivered, &visits, session, &repos, now)?;
     let n = open.iter().position(|o| o.id == e.id).unwrap_or_default() + 1;
     append_line(&delivered_path(store), &Mark { id: e.id.clone(), session: session.into(), ms: now }).ok()?;
@@ -1585,7 +1588,19 @@ pub fn main(args: &[&str]) -> i32 {
             let author = learn::engineer(&cwd);
             // `--dir` names the session's directory, which may be a drone's worktree the process is not in.
             let drone = |e: &Entry| hive_question(e) && crate::hive::drone(&store, &cwd);
-            let checked = find(key).and_then(|e| if drone(&e) { Err(format!("{} is the engineer's to answer, never a hive drone's", e.id)) } else { Ok(e) });
+            // An interactive goal's plan or budget (hive/plan.rs `at_own_prompt`): the engineer's own prompt
+            // answers it in the session that opened it, never a command that session's model runs.
+            let in_session = |e: &Entry| {
+                crate::hive::plan::at_own_prompt(e) && (crate::hive::interactive::env_session().is_some() || crate::hive::interactive::plugin_binds())
+            };
+            let checked = find(key).and_then(|e| match () {
+                _ if drone(&e) => Err(format!("{} is the engineer's to answer, never a hive drone's", e.id)),
+                _ if in_session(&e) => Err(format!(
+                    "{} is answered by the engineer at their own prompt (`yes`, or `no, because ...`), or from their terminal: never by a command run inside a session",
+                    e.id
+                )),
+                _ => Ok(e),
+            });
             match checked.and_then(|e| answer(&store, &e.id, &option_answer(&e, &text.join(" "))?, &author, now)) {
                 Ok(e) if e.kind == Kind::Reach => {
                     println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
@@ -1603,6 +1618,10 @@ pub fn main(args: &[&str]) -> i32 {
                         true => println!("{} answered: the edit is promoted into {}", e.id, store.join(crate::playbook::FILE).display()),
                         false => println!("{} answered: the playbook stays as it is", e.id),
                     }
+                    0
+                }
+                Ok(e) if e.kind == Kind::Plan && e.payload.as_ref().is_some_and(|p| p["budget"].is_number()) => {
+                    println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
                     0
                 }
                 Ok(e) if e.kind == Kind::Plan => {

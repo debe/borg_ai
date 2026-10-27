@@ -624,7 +624,12 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
     let waste = loser_waste(&folds[0], &events[0], &spend);
     let known: Vec<f64> = waste.iter().flatten().copied().collect();
     // The added claim latency (phase e E4: each confirm window, both nodes') and each run's start wait (E2b).
-    let confirms: Vec<borg::hive::Confirm> = sides.iter().flat_map(|s| read_jsonl(&borg::hive::confirms_path(&s.store, &o.goal))).collect();
+    // A wake's take-up (`TAKEN`, an interactive drone's) is no confirm window: left out.
+    let confirms: Vec<borg::hive::Confirm> = sides
+        .iter()
+        .flat_map(|s| read_jsonl::<borg::hive::Confirm>(&borg::hive::confirms_path(&s.store, &o.goal)))
+        .filter(|c| c.outcome != borg::hive::TAKEN)
+        .collect();
     let confirm_ms: Vec<f64> = confirms.iter().filter(|c| c.outcome != borg::hive::REFUSED).map(|c| c.waited_ms as f64).collect();
     let mut confirm_outcomes: BTreeMap<String, usize> = BTreeMap::new();
     for c in &confirms {

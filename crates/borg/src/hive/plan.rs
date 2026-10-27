@@ -114,7 +114,13 @@ pub fn card(t: &Task) -> Card {
 
 /// The plan of board `b`: a card per work or plan task, fix tasks left out, in id order.
 pub fn cards(b: &Board) -> Vec<Card> {
-    b.tasks.values().filter(|s| matches!(s.task.role, Role::Work | Role::Plan) && s.task.from.is_none()).map(|s| card(&s.task)).collect()
+    b.tasks.values().filter(|s| super::board::needs_plan(&s.task)).map(|s| card(&s.task)).collect()
+}
+
+/// The cards of `b` the engineer has not approved yet (board.rs `Board::plan_approved`): the plan an
+/// interactive goal still waits on (phase g G5).
+pub fn unratified(b: &Board) -> Vec<Card> {
+    b.tasks.values().filter(|s| !b.plan_approved(&s.task)).map(|s| card(&s.task)).collect()
 }
 
 /// The plan's decision key: the goal and every card's task, intent, files, deps and checks. The same
@@ -148,7 +154,8 @@ pub struct Decision {
     pub key: String,
     pub approved: bool,
     pub by: String,
-    /// `queen` (an answer to the plan question, the run's terminal included) or `yes` (`--yes`).
+    /// `queen` (an answer to the plan question, the run's terminal included), `yes` (`--yes`) or `ratify`
+    /// (`borg hive ratify`, phase g G5).
     pub via: String,
     #[serde(default)]
     pub answer: String,
@@ -219,8 +226,20 @@ fn plan_session(goal: &str) -> String {
 pub fn ratify(store: &Path, e: &Entry, answer: &str, author: &str, now: i64) -> Result<bool, String> {
     let p = e.payload.as_ref().ok_or_else(|| format!("{} carries no plan", e.id))?;
     let goal = p["goal"].as_str().filter(|g| super::goal::valid_id(g)).ok_or_else(|| format!("{}: no valid goal in its plan", e.id))?;
+    // The budget question (`ask_budget`): a raise is a line of the goal's board, every node's budget.
+    if let Some(spent) = p["budget"].as_f64() {
+        return match raise_of(answer, spent) {
+            Some(usd) => raise_budget(store, goal, usd, author, now).map(|_| true).map_err(|err| err.to_string()),
+            None => Ok(false),
+        };
+    }
     let cards: Vec<Card> = serde_json::from_value(p["cards"].clone()).map_err(|err| format!("{}: unreadable plan ({err})", e.id))?;
     let approved = approves(answer);
+    // An interactive goal's plan (`ask_opener`): approved, its tasks open to the drones on every node.
+    if approved && p["interactive"] == true {
+        let ids: Vec<TaskId> = cards.iter().map(|c| c.task.clone()).collect();
+        ratify_board(store, goal, &ids, author, now).map_err(|err| err.to_string())?;
+    }
     let d = Decision {
         v: 1,
         ms: now,
@@ -243,6 +262,256 @@ pub fn ratify(store: &Path, e: &Entry, answer: &str, author: &str, now: i64) -> 
         veto::record(store, &said).map_err(|err| err.to_string())?;
     }
     Ok(approved)
+}
+
+/// Says on `goal`'s board that the engineer `author` approved the plan of `tasks` (board.rs
+/// `ratified_note`), under the board lock, naming only those not approved yet: none, no line. Every
+/// waiting interactive drone's wait wakes on the line (its board file changed) and may claim them.
+/// The number of tasks it approved now.
+///
+/// # Errors
+/// The board cannot be written.
+pub fn ratify_board(home: &Path, goal: &str, tasks: &[TaskId], author: &str, now: i64) -> std::io::Result<usize> {
+    let here = super::node(home);
+    let mut n = 0;
+    super::write_if(home, goal, |events| {
+        let b = super::board::fold_on(events, &here);
+        let new: Vec<TaskId> = tasks.iter().filter(|t| !b.ratified.contains(*t)).cloned().collect();
+        n = new.len();
+        (!new.is_empty())
+            .then(|| vec![super::Event::new(super::Ev::Heartbeat, "", &format!("engineer:{author}"), now).with_note(&super::board::ratified_note(&new))])
+    })?;
+    Ok(n)
+}
+
+/// The decision of `borg hive ratify` (mod.rs `ratify_cmd`) for `cards`, in plan.jsonl: `via` `ratify`,
+/// shown as `borg hive run`'s and the queen's decisions are (`row`).
+pub fn note_ratified(home: &Path, goal: &str, cards: &[Card], author: &str, now: i64) {
+    let d = Decision {
+        v: 1,
+        ms: now,
+        key: key(goal, cards),
+        approved: true,
+        by: author.into(),
+        via: "ratify".into(),
+        answer: String::new(),
+        question: String::new(),
+        tasks: cards.len(),
+        high: cards.iter().filter(|c| c.risk == Risk::High).count(),
+    };
+    let _ = record(home, goal, &d);
+}
+
+/// Says on `goal`'s board that the engineer `author` raised its budget to `usd` (board.rs `budget_note`).
+///
+/// # Errors
+/// The board cannot be written.
+pub fn raise_budget(home: &Path, goal: &str, usd: f64, author: &str, now: i64) -> std::io::Result<()> {
+    super::write(home, goal, vec![super::Event::new(super::Ev::Heartbeat, "", &format!("engineer:{author}"), now).with_note(&super::board::budget_note(usd))])
+        .map(drop)
+}
+
+/// The budget an answer to "raise the budget?" sets, the goal having `spent` so far: the first number
+/// standing as a word of its own (`20`, `$12.5`, `20.`), when it is above what was spent; a plain yes
+/// doubles it; a refusal ("no, 20 dollars is too much", `refuses`) and anything else raise nothing.
+fn raise_of(answer: &str, spent: f64) -> Option<f64> {
+    if refuses(answer) {
+        return None;
+    }
+    let number = answer.split_whitespace().find_map(|w| {
+        let w = w.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']).trim_start_matches('(');
+        let w = w.strip_prefix('$').unwrap_or(w);
+        w.strip_suffix('$').unwrap_or(w).parse::<f64>().ok()
+    });
+    match number {
+        Some(n) => (n.is_finite() && n > spent).then_some(n),
+        None if approves(answer) || answer.trim().to_lowercase().starts_with("raise") => Some((spent * 2.0).max(1.0)),
+        None => None,
+    }
+}
+
+/// The answers of the budget question.
+pub const RAISE_OPTION: &str = "raise: to twice what is spent (or name the dollars)";
+pub const KEEP_OPTION: &str = "no: keep the budget, claim nothing more";
+
+/// The one question of a goal whose metered spend reached its budget (phase g G5, `spent` of `budget`
+/// dollars): "raise the budget of G?", once per budget (a raise makes a new budget and, once it is spent,
+/// a new question). Interactive drones claim nothing of the goal meanwhile (mod.rs `next_open`).
+pub fn ask_budget(home: &Path, g: &Goal, spent: f64, budget: f64, cwd: &str, now: i64) {
+    let key = queen::decision_key(Kind::Plan, &g.id, &format!("budget {budget}"));
+    let e = Entry {
+        id: format!("q{}", &key[..8]),
+        decision_key: key,
+        kind: Kind::Plan,
+        question: format!(
+            "Hive goal {}: its drones spent ${spent:.2} of its ${budget:.2} budget (metered sessions only) and claim nothing more. Raise the budget of {}?",
+            g.id, g.id
+        ),
+        options: vec![RAISE_OPTION.into(), KEEP_OPTION.into()],
+        default: KEEP_OPTION.into(),
+        evidence: Vec::new(),
+        session: opener(home, &g.id).unwrap_or_else(|| plan_session(&g.id)),
+        cwd: cwd.into(),
+        repo: queen::repo_name(cwd),
+        engineer: learn::engineer(cwd),
+        ms: now,
+        answer: None,
+        answered_by: None,
+        answered_ms: None,
+        disagreeing: Vec::new(),
+        dismissed: None,
+        dismissed_ms: None,
+        payload: Some(json!({"goal": g.id, "budget": spent, "interactive": true})),
+    };
+    // The opener's prompts are read for the answer (`at_prompt`), its plan's marker long removed.
+    if queen::ask_once(home, &e).is_ok() && !e.session.starts_with("hive-plan-") {
+        let _ = std::fs::write(opener_path(&e.session), &g.id);
+    }
+}
+
+/// Whether `e` is a plan or budget question of an interactive goal (`ask_opener`, `ask_budget`): answered
+/// at the engineer's own prompt in the session that opened the goal, or from a terminal, never by a
+/// command a session's model runs (queen.rs `main`), and never delivered to another session (queen.rs
+/// `deliver`).
+pub fn at_own_prompt(e: &Entry) -> bool {
+    e.kind == Kind::Plan && e.payload.as_ref().is_some_and(|p| p["interactive"] == true)
+}
+
+/// The marker of a session that opened an interactive goal's plan: its prompts are read for the
+/// engineer's answer (`at_prompt`); a session without it costs one failed stat.
+fn opener_path(session: &str) -> PathBuf {
+    crate::hook::state_file(session).with_extension("hive-plan")
+}
+
+/// The session that opened goal `goal`'s newest plan question, if any.
+fn opener(home: &Path, goal: &str) -> Option<String> {
+    queen::entries(home)
+        .into_iter()
+        .rev()
+        .find(|e| at_own_prompt(e) && e.payload.as_ref().is_some_and(|p| p["goal"] == goal && p["cards"].is_array()))
+        .map(|e| e.session)
+        .filter(|s| !s.starts_with("hive-plan-"))
+}
+
+/// The plan question of an interactive goal `g` (board `b`) opened by `session` in `cwd` (`borg hive
+/// init` or `open` run by its model, phase g G5): one `Kind::Plan` question of the cards not approved yet,
+/// naming the session, which the engineer answers at their own prompt there (`at_prompt`). An older
+/// open question of the goal's plan is dismissed: the plan it asked about changed. None with nothing to
+/// approve.
+pub fn ask_opener(home: &Path, g: &Goal, b: &Board, session: &str, cwd: &str, now: i64) -> Option<(Entry, Vec<Card>)> {
+    let cards = unratified(b);
+    if cards.is_empty() {
+        return None;
+    }
+    let key = key(&g.id, &cards);
+    let mut e = question(g, &cards, &key, &queen::repo_name(cwd), cwd, &learn::engineer(cwd), now);
+    e.session = session.into();
+    e.question = format!(
+        "Hive goal {}: approve its plan? No drone takes a task of it before. {} task(s): {}",
+        g.id,
+        cards.len(),
+        stats::excerpt(
+            &cards.iter().map(|c| format!("{} \"{}\" ({})", c.task, stats::excerpt(&c.intent, 80), c.risk.name())).collect::<Vec<_>>().join("; "),
+            600
+        )
+    );
+    e.payload = Some(json!({"goal": g.id, "cards": cards, "interactive": true}));
+    for old in queen::open(home)
+        .into_iter()
+        .filter(|o| o.decision_key != key && at_own_prompt(o) && o.payload.as_ref().is_some_and(|p| p["goal"] == g.id.as_str() && p["cards"].is_array()))
+    {
+        let _ = queen::dismiss(home, &old.id, &format!("the plan changed: {} asks it again", e.id), now);
+    }
+    queen::ask_once(home, &e).ok()?;
+    // Queued now or before and still open: a plan asked and answered once is not asked again.
+    let e = queen::open(home).into_iter().find(|o| o.decision_key == key)?;
+    let _ = std::fs::write(opener_path(session), &g.id);
+    Some((e, cards))
+}
+
+/// Whether an answer refuses: it starts with a no-word ("no", "nope", "n") on its own.
+fn refuses(answer: &str) -> bool {
+    let a = answer.trim();
+    ["no", "nope", "n"]
+        .iter()
+        .any(|w| a.get(..w.len()).is_some_and(|p| p.eq_ignore_ascii_case(w)) && a[w.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric()))
+}
+
+/// The engineer's prompt in `session` while a plan or budget question it opened waits (`ask_opener`,
+/// `ask_budget`), phase g G5: a yes approves it, a "no, because ..." refuses it (a veto, `ratify`), each
+/// answered in the engineer's own words at their own prompt, never by a command the model runs. What the
+/// session is told: the outcome, and after an approval how many drones wait for the work; anything else
+/// the engineer says leaves the question open and reminds the session of it. None for a session that
+/// opened no plan (one failed stat).
+pub fn at_prompt(home: &Path, session: &str, prompt: &str, now: i64) -> Option<String> {
+    if !opener_path(session).exists() {
+        return None;
+    }
+    let open: Vec<Entry> = queen::open(home).into_iter().filter(|e| at_own_prompt(e) && e.session == session).collect();
+    let Some(e) = open.last() else {
+        let _ = std::fs::remove_file(opener_path(session));
+        return None;
+    };
+    let p = e.payload.clone().unwrap_or_default();
+    let goal = p["goal"].as_str().unwrap_or_default().to_string();
+    let budget = p["budget"].is_number();
+    let cwd = e.cwd.clone();
+    let engineer = learn::engineer(&cwd);
+    let said = prompt.trim();
+    let answer = if refuses(said) {
+        Some(said.to_string())
+    } else if approves(said) || (budget && raise_of(said, p["budget"].as_f64().unwrap_or(0.0)).is_some()) {
+        Some(if budget { said.to_string() } else { APPROVE_OPTION.to_string() })
+    } else {
+        None
+    };
+    let Some(answer) = answer else {
+        return Some(format!(
+            "[borg hive] {} of hive goal {goal} still waits for the engineer (queen question {}): ask them to answer at their prompt, `yes` {}, or `no, because <why>`. Never answer it yourself.",
+            if budget { "The budget question" } else { "The plan" },
+            e.id,
+            if budget { "or the new budget in dollars to raise it" } else { "to approve it" }
+        ));
+    };
+    if let Err(err) = queen::answer(home, &e.id, &answer, &engineer, now) {
+        return Some(format!("[borg hive] the engineer's answer to queen question {} was not recorded: {err}", e.id));
+    }
+    if open.len() == 1 {
+        let _ = std::fs::remove_file(opener_path(session));
+    }
+    let b = super::board::fold_on(&super::board::read(&super::tasks_path(home, &goal)), &super::node(home));
+    let (drones, nodes) = waiting(home, &goal, &b);
+    let waiting = format!("{drones} drone(s) on {nodes} node(s) waiting");
+    let yes = match budget {
+        true => raise_of(&answer, p["budget"].as_f64().unwrap_or(0.0)).is_some(),
+        false => approves(&answer),
+    };
+    Some(match (budget, yes) {
+        (true, true) => {
+            format!("[borg hive] The engineer raised the budget of hive goal {goal}: its drones claim again; {waiting}. Tell the engineer so in one line.")
+        }
+        (true, false) => {
+            format!("[borg hive] The engineer kept the budget of hive goal {goal}: its drones claim nothing more. Tell the engineer so in one line.")
+        }
+        (false, true) => format!(
+            "[borg hive] The engineer approved the plan of hive goal {goal}: its tasks are open to the drones now; {waiting}. Tell the engineer \"{waiting}\" in one line and go on with their request."
+        ),
+        (false, false) => format!(
+            "[borg hive] The engineer refused the plan of hive goal {goal}: \"{}\". No drone takes a task of it. Revise the plan with them: open the changed or new tasks (`borg hive open {goal} --id ... --title ... --accept NAME=CMD`), and the plan is asked again; never answer it yourself.",
+            stats::excerpt(said, 300)
+        ),
+    })
+}
+
+/// The interactive drones waiting for work of `goal` (board `b`): this node's registered drones that
+/// serve it, and each other node's takers its node worker rostered while its membership is open. (drones,
+/// nodes).
+pub fn waiting(home: &Path, goal: &str, b: &Board) -> (usize, usize) {
+    let here = super::node(home);
+    let local = super::interactive::live(home).into_iter().filter(|e| e.serves(goal)).count();
+    let others: Vec<usize> =
+        b.rosters.iter().filter(|(n, _)| **n != here && super::interactive::member_open(b, n)).map(|(_, (_, names))| names.len()).filter(|n| *n > 0).collect();
+    (local + others.iter().sum::<usize>(), usize::from(local > 0) + others.len())
 }
 
 /// The open plan question of `key`, if one is queued.
@@ -496,6 +765,9 @@ pub struct Row {
     pub question: String,
     pub answer: String,
     pub cards: Vec<Card>,
+    /// An interactive goal's plan (phase g G5): approved on the board, or asked at the planning session's
+    /// prompt; the engineer answers it there or with `borg hive ratify`, never with `borg queen answer`.
+    pub interactive: bool,
 }
 
 /// The plan of goal `goal` (board `b`) and its decision; None without a card.
@@ -504,7 +776,15 @@ pub fn row(home: &Path, goal: &str, b: &Board) -> Option<Row> {
     if cards.is_empty() {
         return None;
     }
-    let key = key(goal, &cards);
+    // An interactive goal's plan is approved task by task on the board (phase g G5): the plan still
+    // waiting is its cards not approved yet, and with none left it is approved.
+    let pending = unratified(b);
+    let key = match b.ratified.is_empty() {
+        true => key(goal, &cards),
+        false => key(goal, &pending),
+    };
+    let open = open_question(home, &key);
+    let interactive = !b.ratified.is_empty() || open.as_ref().is_some_and(at_own_prompt);
     let r = |state: &str, by: String, via: String, ms: i64, question: String, answer: String| Row {
         state: state.into(),
         by,
@@ -513,8 +793,16 @@ pub fn row(home: &Path, goal: &str, b: &Board) -> Option<Row> {
         question,
         answer,
         cards: cards.clone(),
+        interactive,
     };
-    Some(match (decided(home, goal, &key), open_question(home, &key)) {
+    if !b.ratified.is_empty() && pending.is_empty() {
+        let d = super::read_lines::<Decision>(&path(home, goal)).into_iter().rfind(|d| d.approved);
+        return Some(match d {
+            Some(d) => r("approved", d.by, d.via, d.ms, d.question, d.answer),
+            None => r("approved", String::new(), "ratify".into(), 0, String::new(), String::new()),
+        });
+    }
+    Some(match (decided(home, goal, &key), open) {
         (Some(d), _) => r(if d.approved { "approved" } else { "refused" }, d.by, d.via, d.ms, d.question, d.answer),
         (None, Some(e)) => r("waiting", String::new(), "queen".into(), e.ms, e.id, String::new()),
         (None, None) => r("not asked", String::new(), String::new(), 0, String::new(), String::new()),
@@ -593,6 +881,7 @@ mod tests {
         fix.from = Some("abc".into());
         let mut verify = task("t1.v1", "verify t1", &[]);
         verify.role = Role::Verify;
+        verify.of = Some("t1".into());
         seed(&home, vec![task("t1", "a", &["a.rs"]), task("t2", "b", &["b.rs"]), fix, verify]);
         let cs = cards(&board(&home));
         assert_eq!(cs.iter().map(|c| c.task.as_str()).collect::<Vec<_>>(), ["t1", "t2"], "no fix or verify task is a card");
@@ -668,6 +957,43 @@ mod tests {
         let Gate::Approved(d) = gate(&home, &g, &b, &home, true).unwrap() else { panic!("approved") };
         assert_eq!((d.via.as_str(), d.question.as_str()), ("queen", e.id.as_str()));
         assert!(queen::open(&home).is_empty());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_answer_raises_the_budget_or_refuses_only_when_it_says_so() {
+        assert_eq!(raise_of("20", 5.0), Some(20.0));
+        assert_eq!(raise_of("raise it to $12.5", 5.0), Some(12.5));
+        assert_eq!(raise_of("yes", 5.0), Some(10.0), "a yes doubles it");
+        assert_eq!(raise_of(RAISE_OPTION, 0.2), Some(1.0));
+        assert_eq!(raise_of("3", 5.0), None, "not above what is spent");
+        assert_eq!(raise_of(KEEP_OPTION, 5.0), None);
+        assert_eq!(raise_of("no, because 20 dollars is too much", 5.0), None, "a refusal with a number raises nothing");
+        assert_eq!(raise_of("go t1", 0.5), None, "a digit inside a word is no number");
+        assert_eq!(raise_of("ok, 20.", 5.0), Some(20.0));
+        assert_eq!(raise_of("(30$)", 5.0), Some(30.0));
+        for a in ["no", "No, because t1 first", "n", "nope: later"] {
+            assert!(refuses(a), "{a}");
+        }
+        for a in ["not yet", "nothing to add", "yes", "what does t1 do?"] {
+            assert!(!refuses(a), "{a}");
+        }
+    }
+
+    /// Phase g G5: an interactive goal's plan question goes to the session that opened it and to no
+    /// other (queen.rs `deliver`), and is asked once per plan; a changed plan dismisses the old one.
+    #[test]
+    fn an_interactive_plan_is_asked_in_its_opening_session_only() {
+        let home = temp("opener");
+        let g = seed(&home, vec![task("t1", "a", &["a.rs"])]);
+        let (e, cards) = ask_opener(&home, &g, &board(&home), "sess-q", "/w/app", 1).expect("asked");
+        assert_eq!((e.session.as_str(), cards.len(), at_own_prompt(&e)), ("sess-q", 1, true));
+        assert!(queen::deliver(&home, "sess-other", "/w/app", || vec!["app".into()], "", 2).is_none(), "never another session's");
+        super::super::board::append(&super::super::tasks_path(&home, "g"), &[Event::open(task("t2", "b", &["b.rs"]), "engineer:e", 11)]).unwrap();
+        let (e2, cards) = ask_opener(&home, &g, &board(&home), "sess-q", "/w/app", 3).expect("asked again");
+        assert_eq!(cards.len(), 2);
+        let open = queen::open(&home);
+        assert_eq!(open.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), [e2.id.as_str()], "the old plan's question is dismissed");
         let _ = std::fs::remove_dir_all(home);
     }
 

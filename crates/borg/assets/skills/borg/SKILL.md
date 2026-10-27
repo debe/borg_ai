@@ -42,15 +42,29 @@ on this machine unless the collective they belong to is synced with a team over 
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
 | Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` |
-| Several drones on one goal (a hive: board, claims, contracts) | `borg hive board`, `borg hive init <goal> ...`, `borg hive join <goal> --session <drone>` |
+| To have drones build something (a hive goal: tasks, checks, plan approval) | this session plans it: `borg hive init <goal> ... --task ...`, then the engineer's yes ([hive](references/hive.md)) |
+| This session to become a drone that waits for hive work | `borg hive join` (every open goal of the repo), `borg hive leave` |
+| The board of a goal, or the engineer approving a plan from a terminal | `borg hive board <goal>`, `borg hive ratify <goal>` |
 | Every command | `borg help`, `borg mesh --help` |
 
-**Hive (a local spike).** When the engineer mentions a hive, a goal or the board: `borg hive board` shows
-the tasks and who holds them; `borg hive init <goal> --spec ... --oracle NAME=CMD --budget USD --task
-"ID|role|title|files|deps"` makes a goal (show the engineer the oracle first: it decides "done");
-`borg hive join <goal> --session <drone>` or `BORG_HIVE=<goal>` brings a drone in; `borg hive open <goal>
---id ID --again` reopens a blocked task. A drone in a goal finds its own commands (claim, done, verify,
-contract) in its hook context. Details: `docs/commands.md#hive`.
+**Hive.** When the engineer says what the drones should build, this session plans it. Follow
+[hive](references/hive.md) step by step:
+- Split the work into small, independent tasks, with contracts before their dependants and a check for
+  every task.
+- Open the goal with `borg hive init <goal> --spec ... --oracle NAME=CMD --budget USD --task
+  "ID|role|title|files|deps|NAME=CMD"`.
+- Show the engineer the plan it prints. They answer at their own prompt: `yes`, or `no, because ...`.
+  Never answer it yourself. No drone takes a task before the yes.
+- Once approved, tell the engineer "N drones on M nodes waiting", as the context says.
+
+Other hive commands:
+- `borg hive join` makes this session a drone that waits for work.
+- `borg hive board` shows the tasks and who holds them.
+- `borg hive open <goal> --id ID --again` reopens a blocked task.
+
+A drone finds its own commands (claim, done, verify, contract) in its hook context. Subagents and
+workflows may help inside a task, but never run `borg hive claim` or `borg hive done`. Details:
+`docs/commands.md#hive`.
 
 ## Safety rules
 
@@ -92,3 +106,5 @@ contract) in its hook context. Details: `docs/commands.md#hive`.
 - [references/team.md](references/team.md): admin and joiner steps, relays, proxies, mesh problems.
 - [references/vectors.md](references/vectors.md): fetch, rebuild, mirrors, turning them off.
 - [references/troubleshooting.md](references/troubleshooting.md): `borg doctor` lines and their fixes.
+- [references/hive.md](references/hive.md): planning a hive goal (tasks, contracts, checks), the
+  engineer's approval at their prompt, the budget.

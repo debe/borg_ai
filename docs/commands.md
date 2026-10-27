@@ -18,7 +18,7 @@
 | `borg memory <lessons.jsonl>` | Each lesson's activation, usefulness (with its `regretted` share of later fixes), weight, and long-term or dormant state, from this machine's outcomes and the team's synced ones |
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | Vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg queen ...` | Open decisions for the engineer; see [below](#answering-the-queen) |
-| `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1, with a Learning tab that shows week by week whether learning works ([details](statistics.md)) |
+| `borg web [--port PORT] [--dir DIR]` | A live page of the collective's knowledge and statistics on 127.0.0.1, with a Learning tab that shows week by week whether learning works ([details](statistics.md)) and a Hive tab that shows each goal's tasks over time, its nodes and its interactive drones ([Watching the hive](#interactive-drones)) |
 | `borg top [--watch] [--json]` | The running drones of each collective, local and remote |
 | `borg steer <drone\|session\|all> "<text>"` | Send a signed instruction to running drones; `--pause`, `--resume` |
 | `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson; see [below](#saying-no) |
@@ -73,9 +73,10 @@ $ borg hive board
 
 | Command | Effect |
 |---|---|
-| `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,.."]... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes. `--hidden-dir`/`--hidden`: a hidden oracle, see [Guardrails](#guardrails-and-the-hidden-oracle) |
+| `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,..\|NAME=CMD"]... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes. `--hidden-dir`/`--hidden`: a hidden oracle, see [Guardrails](#guardrails-and-the-hidden-oracle) |
+| `borg hive ratify <goal> [--budget USD]` | The engineer approves the goal's plan from their terminal: every task not approved yet (each shown as its card) is approved on the board, which every node syncs, and interactive drones may take it from then on; a queued plan question of the goal is answered so. `--budget USD` raises the goal's budget instead, once its metered spend stopped new claims, and settles the queued budget question. Refused to a drone and inside any harness session: there the engineer answers at their own prompt ([The planning session](#the-planning-session)) |
 | `borg hive board [<goal>] [--json] [--watch]` | The tasks by status, with holders, age, rework and dependencies |
-| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`, omp's `PI_SESSION_ID`, codex's `CODEX_THREAD_ID`; in opencode, whose shell has no session id, the borg plugin binds the session that ran the command) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. Its model never runs `approve`, `integrate`, `score` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone. In a repo of no collective it says so on stderr with the `borg setup` that adds the repo, and changes nothing ([Interactive drones](#interactive-drones)) |
+| `borg hive join [<goal>]` (inside a session) · `borg hive leave` | The session it runs in (Claude Code's `CLAUDE_CODE_SESSION_ID`, omp's `PI_SESSION_ID`, codex's `CODEX_THREAD_ID`; in opencode, whose shell has no session id, the borg plugin binds the session that ran the command) becomes an interactive drone of the goal, or without one of every open goal of this collective in this repo, and works in a worktree of its own (`.worktrees/hive-i-<drone>`). No other session is touched. When nothing is open to it, its stop asks it to run `borg hive wait` in the background; `/clear` keeps it the same drone. It takes only tasks of a plan the engineer approved ([The planning session](#the-planning-session)), and its model never runs `approve`, `integrate`, `score`, `ratify` or answers a plan question. Refused while a `borg hive run` of the goal runs on this node, and `borg hive run` is refused while an interactive drone serves the goal. `leave` releases its claim, stops its wait and makes it a plain session again; the node leaves the goal with its last drone. In a repo of no collective it says so on stderr with the `borg setup` that adds the repo, and changes nothing ([Interactive drones](#interactive-drones)) |
 | `borg hive wait [--stream]` | An interactive drone waits for work without spending tokens, claims the next task open to it, prints it and exits; Claude Code starts the next turn with that output. `--stream` is the omp and opencode adapters' waiter: it runs from the join for the session's life and prints each wake as one JSON line (`{"wake": "<text>", "left": false}`), which the adapter sends into the session. `--queue` is codex's: a codex drone's stop starts it, and it wakes the session with `codex queue --thread <session> --message <text>`; a queue that fails releases the claim at once. Never while the engineer's own turn or a stop runs in the session. A claim no hook event of the session takes up within 60 s is released. A stuck goal is said once, then the drone waits on; a drone of one goal leaves once it is finished for good. Once its session is gone (its Claude Code, omp, opencode or codex process ended) it leaves and exits. While no `borg mesh serve` runs on the machine, one waiter does the node's goal work (see [Interactive drones](#interactive-drones)) |
 | `borg hive join <goal> [--session ID\|DRONE]` · `borg hive leave` | A running drone joins the goal, or leaves it (its claim is released). A drone started with `BORG_HIVE=<goal>` joins at its first hook |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every session that starts in this repo (its git toplevel, or a worktree's own) joins the goal at its first hook, as drone NAME (default `j-` and a hash of the directory). For a harness whose sessions lose the launch env (opencode 2.x's background service). `leave --here` stops new joins; sessions that joined stay |
@@ -137,6 +138,42 @@ claim passed to another drone meanwhile) is reported instead, and nothing is han
 the stop. A paused drone is never blocked by its oracle.
 
 Nothing changes for a session that never joined a goal.
+
+### The planning session
+
+Tell any session what the drones should build. Its borg skill turns your request into a goal:
+small, independent tasks, a contract task before the tasks that use its interface, and a check for
+every task (`--task "ID|work|title|files|deps|NAME=CMD"`, or `borg hive open ... --accept NAME=CMD`).
+
+```
+$ borg hive init parser --spec "..." --oracle "all=cargo test" --budget 20 --task "ast|work|..." ...
+[borg hive] The plan of goal parser waits for the engineer's approval (queen question q1f0c9e2a); no drone takes a task of it before:
+  ast  define the AST · files src/ast.rs · checks ast=cargo test ast:: · risk normal (ordinary work)
+  ...
+```
+
+- **You approve the plan at your own prompt** in that session. `yes` approves it. `no, because <why>`
+  refuses it: the reason is a veto, borg learns from it, and the session revises the plan with you
+  (changed or new tasks with `borg hive open`), which is then asked again. Anything else you type
+  leaves the question open, and the session is reminded of it.
+- **No drone takes a task of a plan you have not approved**, whatever its harness: not its waiter, its
+  stop's handover or `borg hive claim`. The approval is a line of the goal's board (`ratified t1 t2`),
+  decided under the board lock, so every node reads it and no approval is ever taken back. Once you
+  approve, every waiting drone wakes on that board change, and the session tells you how many are
+  waiting: "3 drone(s) on 2 node(s) waiting".
+- **The session's model cannot approve it.** `borg queen answer` and `borg hive ratify` refuse inside a
+  harness session, and no other session is offered the question. A goal you opened from your own
+  terminal has no session to ask: approve it there with `borg hive ratify <goal>`.
+- **A task may use subagents or workflows.** They run under the drone's session, so its claim, its
+  worktree and its contracts apply to them. They never run `borg hive claim` or `borg hive done`.
+- **Budget.** Each claim of a Claude Code drone adds one line to the goal's `spend.jsonl` when it ends
+  (done, verdict, release or the session's end): the usage of its transcript since the claim, and of
+  its subagents' transcripts, priced by model (`exit: "interactive"`). omp, opencode and codex report no
+  usage, so their lines say `unmetered` and charge nothing. When the goal's metered spend on every node
+  reaches its `--budget`, its interactive drones claim nothing more, and you are asked once: "Raise the
+  budget of G?". Answer with the new budget in dollars at the planning session's prompt, or run
+  `borg hive ratify <goal> --budget USD`. There are no per-drone shares.
+- `borg hive run` keeps its own plan gate (below) and its inputs.
 
 ### Interactive drones
 
@@ -269,6 +306,25 @@ come within 5 minutes of each other read from the cache. Waiting itself costs no
 `borg setup --private <repo>` (this machine only) or `borg setup --team <name> --paths <repo>`. Run it
 in a terminal. A fresh `borg setup` that took every default adds no repo, and borg never adds one for
 you. A repo on the config's `off` list is told that the hive does not run there.
+
+**Watching the hive.** The Hive tab of `borg web` (and, more briefly, `borg top`) shows each goal of
+interactive drones from the files the hive keeps anyway, so nothing needs setting up and the page shows
+the goal from its first task even when you open it late:
+
+- **Tasks over time**: open, claimed, done, verified, blocked and stuck, rebuilt from the board's own
+  lines (each point is the board as of that moment).
+- **Spend**: what was spent against the budget, how much of it was metered, and how many claims had no
+  usage to meter (omp, opencode and codex sessions that report none).
+- **Nodes**: whether each node is in the goal, how long ago this machine last heard its beat (on this
+  machine's clock), its takers, and who does this node's goal work: `daemon` (`borg mesh serve`),
+  `waiter <drone>`, or `none`. When an integration is due and nothing runs it, the goal says
+  "integration due, no node worker".
+- **Interactive drones** of this machine, grouped by state: `working <task>`, `busy` (your own turn in
+  the session), `waiting` (its wait runs), `not waiting`, or `gone`. Each shows its harness, the tasks it
+  finished and judged, its spend, and its wake latency (from the hand to the turn that took it up, on this node's clock).
+  Click a drone to see each wake, including wakes no turn took up.
+- **Stuck and declined** tasks with their reasons, and every **integration** with its result and the
+  newest lines of the node's integration log.
 
 ### Guardrails and the hidden oracle
 

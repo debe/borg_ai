@@ -1001,6 +1001,8 @@ test("real borg, opencode 1: a bound drone of one opencode process waits from it
     // Still the join's turn, a long tool call in it: the task that opens is not handed.
     await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "b1" }, { args: { command: "cargo build" } })
     w.hive(["open", "g1", "--id", "t1", "--title", "do t1"])
+    // The engineer approves the plan from their own terminal (G5), outside the plugin's process env.
+    execFileSync(BORG, ["hive", "ratify", "g1", "--dir", w.work], { env: { ...process.env, BORG_HIVE_BINDER: "" }, encoding: "utf8" })
     await new Promise((r) => setTimeout(r, 1_500))
     assert.equal(prompts.filter((p) => p.path.id === SESSION).length, 0, "nothing in the engineer's turn")
     await after(SESSION, "b1", "cargo build", "")

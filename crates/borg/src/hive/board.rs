@@ -587,6 +587,15 @@ pub struct Board {
     /// The tasks each node said it may not take (phase f F6, `DECLINES`): (node, task) -> the newest such
     /// line's stamp. What another node's `stuck` reads of this node's repo scope and approvals.
     pub declined: BTreeMap<(String, TaskId), i64>,
+    /// The tasks whose plan the engineer approved (phase g G5, `RATIFIED`): every task an engineer's
+    /// ratified line names, on any node. A set that only grows: no line takes an approval back, so the
+    /// fold is the same in any arrival order (S1) and a task once open to interactive drones stays so.
+    /// What `plan_approved` reads; a task no card stands for (verify, integrate, fix) needs none.
+    pub ratified: BTreeSet<TaskId>,
+    /// The goal's budget as the engineer raised it (phase g G5, `BUDGET`): the largest an engineer's
+    /// budget line names, None without one. Only grows, as `ratified`; the goal's own budget stands
+    /// below it (mod.rs `budget_of`).
+    pub budget_usd: Option<f64>,
 }
 
 /// A node's newest finished line (`Board::finishes`).
@@ -601,8 +610,27 @@ pub struct Finish {
 /// task's `Local`) is no part of it, so two nodes holding the same lines fold equal boards (S1).
 impl PartialEq for Board {
     fn eq(&self, o: &Board) -> bool {
-        let Board { tasks, lost, spans, drones, watermarks, integrated, integrations, nodes: _, members, rosters, sessions, finishes, stuck, declined } = self;
+        let Board {
+            tasks,
+            lost,
+            spans,
+            drones,
+            watermarks,
+            integrated,
+            integrations,
+            nodes: _,
+            members,
+            rosters,
+            sessions,
+            finishes,
+            stuck,
+            declined,
+            ratified,
+            budget_usd,
+        } = self;
         declined == &o.declined
+            && ratified == &o.ratified
+            && budget_usd == &o.budget_usd
             && (tasks, lost, spans, drones, watermarks, integrated, integrations, members, rosters, sessions, finishes, stuck)
                 == (
                     &o.tasks,
@@ -653,6 +681,39 @@ const STUCK: &str = "stuck";
 /// oracle.rs `Approvals`), so another node's `stuck` reads them from this line.
 const DECLINES: &str = "declines";
 
+/// The note of an engineer's line approving the plan of tasks (phase g G5, `Board::ratified`):
+/// `ratified t1 t2`, a heartbeat of no task by `engineer:<email>`, written by `borg hive ratify` or an
+/// approving answer to an interactive goal's plan question (hive/plan.rs `ratify_board`). An engineer's
+/// line, so no participant's (`Board::nodes`); a node from before reads a heartbeat of no task, nothing.
+const RATIFIED: &str = "ratified";
+/// The note of an engineer's line raising the goal's budget (phase g G5, `Board::budget_usd`):
+/// `budget 12.5`, in dollars.
+const BUDGET: &str = "budget";
+
+/// `RATIFIED`'s note for `tasks`.
+pub fn ratified_note(tasks: &[TaskId]) -> String {
+    std::iter::once(RATIFIED).chain(tasks.iter().map(String::as_str)).collect::<Vec<_>>().join(" ")
+}
+
+/// `BUDGET`'s note for `usd`.
+pub fn budget_note(usd: f64) -> String {
+    format!("{BUDGET} {usd}")
+}
+
+/// Whether task `t` is a card of its goal's plan (hive/plan.rs `cards`): every task that does not
+/// follow from approved work. Only such a task waits for the engineer's approval
+/// (`Board::plan_approved`). What follows needs none: a fix task a failed integration opened (`from`),
+/// a verify task a done work task opened (`of`), and an integrate task, which only an integration
+/// claims (no drone may, mod.rs `INTEGRATE_REFUSED`). A verify task someone opened by hand names no
+/// work, so it is a card like any work task and no drone claims it before the approval.
+pub fn needs_plan(t: &Task) -> bool {
+    match t.role {
+        Role::Integrate => false,
+        Role::Verify => t.of.is_none(),
+        Role::Work | Role::Plan => t.from.is_none(),
+    }
+}
+
 /// `FINISHED`'s note for `integration`.
 pub fn finished_note(integration: &str) -> String {
     format!("{FINISHED} {integration}")
@@ -674,6 +735,19 @@ pub fn roster_note(drones: &[String]) -> String {
 }
 
 impl Board {
+    /// Whether the engineer approved `t`'s part of the plan (phase g G5): a task that is no card
+    /// (`needs_plan`), or one an engineer's ratified line names (`ratified`). What an interactive drone's
+    /// claim reads under the board lock (hive/mod.rs `claim`): monotone, so a task once approved is
+    /// approved on every node that holds the line, whatever else arrives.
+    pub fn plan_approved(&self, t: &Task) -> bool {
+        !needs_plan(t) || self.ratified.contains(&t.id)
+    }
+
+    /// The cards of the plan not approved yet, in id order (`plan_approved`).
+    pub fn unratified(&self) -> Vec<TaskId> {
+        self.tasks.values().filter(|s| !self.plan_approved(&s.task)).map(|s| s.task.id.clone()).collect()
+    }
+
     /// The drone `session` of `node` claimed as (`drones`), if any: its claims there, else one from
     /// before nodes were stamped (`of_node`).
     pub fn drone(&self, node: &str, session: &str) -> Option<&str> {
@@ -1356,6 +1430,15 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
     for e in keyed.iter().map(|(_, e)| *e) {
         if !e.drone.is_empty() {
             b.drones.insert((e.node.clone(), e.by.clone()), e.drone.clone());
+        }
+        if e.ev == Ev::Heartbeat && e.task.is_empty() && by_engineer(&e.by) {
+            if let Some(ids) = e.note.strip_prefix(RATIFIED).and_then(|r| r.strip_prefix(' ')) {
+                b.ratified.extend(ids.split_whitespace().map(String::from));
+            }
+            let raised = e.note.strip_prefix(BUDGET).and_then(|r| r.strip_prefix(' ')).and_then(|r| r.trim().parse::<f64>().ok());
+            if let Some(usd) = raised.filter(|u| u.is_finite() && *u >= 0.0) {
+                b.budget_usd = Some(b.budget_usd.map_or(usd, |u| u.max(usd)));
+            }
         }
         if e.node.is_empty() || by_engineer(&e.by) {
             continue;
@@ -2212,6 +2295,44 @@ mod tests {
 
     fn ev(kind: Ev, t: &str, by: &str, ms: i64) -> Event {
         Event::new(kind, t, by, ms)
+    }
+
+    /// Phase g G5: the plan's approval is a set of tasks that only grows, the same in any arrival order,
+    /// and only an engineer's line adds to it; a task no card stands for needs none; the budget is the
+    /// largest raise. Fails with an approval read from a session's line, or one a later line takes back, or
+    /// a verify task opened by hand that skips the approval.
+    #[test]
+    fn the_plans_approval_only_grows_and_folds_the_same_in_any_order() {
+        let mut fix = task("integrate.1.fix");
+        fix.from = Some("abc".into());
+        let mut verify = task("t1.v1");
+        verify.role = Role::Verify;
+        verify.of = Some("t1".into());
+        let by_hand = Task { role: Role::Verify, ..task("v1") };
+        let opens = [task("t1"), task("t2")].map(|t| Event::open(t, "engineer:e", 1));
+        let line = |by: &str, note: String, ms: i64| ev(Ev::Heartbeat, "", by, ms).with_note(&note);
+        let lines = [
+            line("engineer:e", ratified_note(&["t1".into()]), 5),
+            line("sess-a", ratified_note(&["t2".into()]), 6),
+            line("runner", ratified_note(&["t2".into()]), 7),
+            line("engineer:e", budget_note(3.0), 8),
+            line("engineer:e", budget_note(2.0), 9),
+            line("engineer:e", "budget -1".into(), 10),
+        ];
+        let all: Vec<Event> = opens.iter().chain(lines.iter()).cloned().collect();
+        let b = fold(&all);
+        assert_eq!(b.ratified.iter().map(String::as_str).collect::<Vec<_>>(), ["t1"], "an engineer's line alone approves");
+        assert!(b.plan_approved(&b.tasks["t1"].task) && !b.plan_approved(&b.tasks["t2"].task));
+        assert!(b.plan_approved(&fix) && b.plan_approved(&verify), "no card, no approval needed");
+        assert!(!b.plan_approved(&by_hand), "a verify task opened by hand names no work: a card like any other");
+        assert_eq!(b.unratified(), ["t2"]);
+        assert_eq!(b.budget_usd, Some(3.0), "the largest raise; a negative one is none");
+        let mut rev = all.clone();
+        rev.reverse();
+        assert_eq!(fold(&rev), b, "S1: the same board in any order");
+        let more: Vec<Event> = all.iter().cloned().chain([line("engineer:f", ratified_note(&["t2".into()]), 11)]).collect();
+        assert!(fold(&more).ratified.is_superset(&b.ratified), "monotone");
+        assert_ne!(fold(&more), b, "an approval is part of the board");
     }
 
     #[test]

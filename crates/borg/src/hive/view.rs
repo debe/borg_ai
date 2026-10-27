@@ -1,10 +1,12 @@
 //! The hive as `borg top` and borg-web show it: per goal, the board's tasks (status, holder, lease
-//! left), the budget and what each drone of `borg hive run` spent of its share, the integration (the
+//! left), the budget (as the engineer raised it, phase g G5) and what each drone spent (a `borg hive
+//! run` drone of its share; an interactive drone's claims, metered or unmetered), the integration (the
 //! combined tree's commit, or why the last one failed), the newest contracts and messages between
 //! drones, which holders are on other nodes (the board syncs over the mesh), and each group of attempts
 //! (hive/group.rs) with its winners, losers and reflection, each task verified after a rejection
 //! (hive/rework.rs) with its reflection, the bundles of commits that travel (hive/commits.rs), and the
-//! plan's intent cards with the engineer's decision (hive/plan.rs). One
+//! plan's intent cards with the engineer's decision (hive/plan.rs; an interactive goal's, approved on
+//! the board task by task). One
 //! fold of the board
 //! and one pass over each of spend.jsonl, runs.jsonl, contracts.jsonl and messages.jsonl per goal;
 //! nothing at all for a store without a hive.
@@ -42,12 +44,15 @@ pub struct TaskRow {
 pub struct DroneSpend {
     pub drone: String,
     pub usd: f64,
-    /// Its share in the latest run; 0 when no run named it.
+    /// Its share in the latest run; 0 when no run named it, and for an interactive drone, which has none.
     pub share: f64,
     pub iters: u32,
     pub last_exit: String,
     /// An iteration reported no cost (`usd` is then a lower bound).
     pub unmetered: bool,
+    /// An interactive drone's (phase g G5): its lines are its claims (`Spend::claim`), charged to the
+    /// goal's budget as a whole, never to a share of a run.
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -84,6 +89,10 @@ pub struct HiveView {
     /// The plan (hive/plan.rs): its intent cards and whether the engineer approved, refused or has yet
     /// to answer it; None without a work task.
     pub plan: Option<super::plan::Row>,
+    /// Interactive monitoring (hive/monitor.rs, phase g G6): the tasks by state over time, the nodes,
+    /// this node's interactive drones, the stuck and declines lines, the integrations, metered spend.
+    #[serde(flatten)]
+    pub monitor: super::monitor::Monitor,
 }
 
 /// What stops goal `g` (board `b`) on this node, as the board and borg-web say it.
@@ -148,16 +157,19 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     // A drone's row is its latest run's: its share is of what that run found left. spend.jsonl syncs
     // (run.rs `ledger`): another node's drone is named `d1@<its node>`, with all of its lines and no
     // share (its runs stay on its node).
-    for s in spend.iter().filter(|s| s.owner(&here) != here || s.ms >= since) {
+    // An interactive drone's claim lines (`claim`) are no run's: each counts, whenever it was written.
+    for s in spend.iter().filter(|s| s.owner(&here) != here || s.ms >= since || !s.claim.is_empty()) {
         let local = s.owner(&here) == here;
+        let interactive = !s.claim.is_empty();
         let name = if local { s.drone.clone() } else { format!("{}@{}", s.drone, shown(&s.node)) };
         let d = drones.entry(name.clone()).or_insert_with(|| DroneSpend {
             drone: name,
             usd: 0.0,
-            share: if local { share } else { 0.0 },
+            share: if local && !interactive { share } else { 0.0 },
             iters: 0,
             last_exit: String::new(),
             unmetered: false,
+            interactive,
         });
         d.usd += s.charged();
         d.iters += 1;
@@ -183,15 +195,19 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     msgs.sort_by_key(|m| (m.ms, m.id.clone()));
     let messages = msgs[msgs.len().saturating_sub(CONTRACTS)..].to_vec();
     let nodes = events.iter().map(|e| e.node.as_str()).filter(|n| !n.is_empty() && *n != here).collect::<std::collections::BTreeSet<_>>().len();
-    let alerts = alerts(home, &g, &b);
+    let mut alerts = alerts(home, &g, &b);
+    alerts.extend(super::monitor::no_worker(home, id, &b, now));
+    let monitor = super::monitor::of(home, &g, &events, &b, &spend, now);
     let groups = super::group::rows(home, &g, &events, &b);
     let reworks = super::rework::rows(home, &g, &events, &b);
     let commits = super::commits::rows(home, id);
     let plan = super::plan::row(home, id, &b);
+    // The goal's budget as the engineer raised it on the board (phase g G5).
+    let budget = super::budget_of(&g, &b);
     Some(HiveView {
         goal: g.id,
         spec: g.spec.lines().next().unwrap_or_default().to_string(),
-        budget_usd: g.budget_usd,
+        budget_usd: budget,
         spent_usd: super::run::ledger(&spend, &here).total,
         tasks,
         claims,
@@ -207,6 +223,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
         reworks,
         commits,
         plan,
+        monitor,
     })
 }
 
@@ -299,8 +316,30 @@ pub fn render(v: &HiveView) -> String {
     if !v.drones.is_empty() {
         s.push_str(&format!("  {:<10} {:<15} {:>5}  {}\n", "DRONE", "SPENT/SHARE", "ITERS", "LAST"));
         for d in &v.drones {
-            let spent = format!("${:.2}/${:.2}{}", d.usd, d.share, if d.unmetered { "+" } else { "" });
+            let more = if d.unmetered { "+" } else { "" };
+            let spent = if d.interactive { format!("${:.2}{more}", d.usd) } else { format!("${:.2}/${:.2}{more}", d.usd, d.share) };
             s.push_str(&format!("  {:<10} {:<15} {:>5}  {}\n", d.drone, spent, d.iters, d.last_exit));
+        }
+    }
+    let m = &v.monitor;
+    for r in m.stuck.iter().map(|r| ("stuck", r)).chain(m.declines.iter().map(|r| ("declines", r))) {
+        let why = if r.1.why.is_empty() { String::new() } else { format!(": {}", r.1.why) };
+        s.push_str(&format!("  {}\n", cut(&format!("{} {} @{}{why}", r.0, r.1.task, r.1.node), 200)));
+    }
+    // A goal of interactive drones: its nodes, then this node's drones with their state and wakes.
+    if !m.interactive.is_empty() {
+        for n in &m.members {
+            let beat = n.beat_age_ms.map_or_else(|| "no beat".to_string(), |a| format!("beat {}s ago", a / 1000));
+            let worker = if n.here { format!(" · worker {}", n.worker) } else { String::new() };
+            let takers = if n.takers.is_empty() { String::new() } else { format!(" · takers {}", n.takers.join(",")) };
+            s.push_str(&format!("  node {}{}: {} · {beat}{worker}{takers}\n", n.node, if n.here { " (here)" } else { "" }, n.state));
+        }
+        s.push_str(&format!("  {:<10} {:<9} {:<12} {:<10} {:>4}  {}\n", "DRONE", "HARNESS", "STATE", "TASK", "DONE", "WAKE"));
+        for d in &m.interactive {
+            let wake = d.wakes.iter().rev().find(|w| w.taken).map_or_else(|| "-".to_string(), |w| format!("{:.1}s", w.latency_ms as f64 / 1000.0));
+            let line = format!("  {:<10} {:<9} {:<12} {:<10} {:>4}  {wake}", d.drone, d.harness, d.state, cut(&d.task, 10), d.done);
+            s.push_str(line.trim_end());
+            s.push('\n');
         }
     }
     s
@@ -326,10 +365,30 @@ pub fn files(home: &Path) -> Vec<PathBuf> {
                 "bundles.jsonl",
                 "unbundled.jsonl",
                 "plan.jsonl",
+                board::BEATS_FILE,
+                "confirms.jsonl",
             ]
             .map(|f| d.join(f))
+            .into_iter()
+            .chain([d.join("logs").join(super::node::INTEGRATE_LOG)])
         })
+        .chain(interactive_files(home))
         .collect()
+}
+
+/// The registry, the node lock and each live drone's busy and waiter files: a drone's state changes
+/// with them (hive/monitor.rs).
+fn interactive_files(home: &Path) -> Vec<PathBuf> {
+    let live = super::interactive::live(home);
+    if live.is_empty() && !super::interactive::registry_path(home).exists() {
+        return Vec::new();
+    }
+    let mut out = vec![super::interactive::registry_path(home), super::node::lock_path(home)];
+    for e in live {
+        out.push(crate::hook::state_file(&e.session).with_extension("hive-busy"));
+        out.push(super::interactive::waiter_path(&e.drone));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -441,7 +500,12 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
         assert_eq!(j["tasks"][0]["holder"], "sess-one-1234");
         assert_eq!((j["tasks"][0]["node"].as_str(), j["nodes"].as_u64()), (Some(""), Some(0)), "every line is this node's");
         assert_eq!(j["drones"][1]["unmetered"], true);
-        assert_eq!(files(&home).len(), 12);
+        // Every goal file a view reads, its beats, confirms and node integration log included; no
+        // registry, so no drone file.
+        assert_eq!(files(&home).len(), 15);
+        for k in ["history", "members", "interactive", "stuck", "declines", "integrations", "integrate_log", "metered_usd", "unmetered"] {
+            assert!(j.get(k).is_some(), "{k}");
+        }
         assert_eq!((j["plan"]["state"].as_str(), j["plan"]["cards"][0]["risk"].as_str()), (Some("not asked"), Some("normal")));
         // An approval shows who gave it; a high-risk card is listed.
         let b = board::fold(&board::read(&super::super::tasks_path(&home, "g")));

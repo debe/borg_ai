@@ -96,6 +96,8 @@ fn setup(name: &str) -> PathBuf {
     git(&a, &["commit", "-q", "-m", "start"]);
     hive(&root, &a, None, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f ok", "--budget", "5"]);
     hive(&root, &a, None, &["open", "g1", "--id", "t1", "--title", "do t1"]);
+    // The engineer approves the plan from the terminal: interactive drones take only approved tasks.
+    hive(&root, &a, None, &["ratify", "g1"]);
     root
 }
 

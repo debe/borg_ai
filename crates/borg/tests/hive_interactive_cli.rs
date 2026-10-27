@@ -149,7 +149,15 @@ fn setup(name: &str) -> PathBuf {
     root
 }
 
+/// The engineer opens task `id` from a terminal and approves it there (`borg hive ratify`, phase g G5):
+/// interactive drones take only approved tasks.
 fn open_task(root: &Path, id: &str) {
+    open_unapproved(root, id);
+    ok(root, &["ratify", "g1"], &[]);
+}
+
+/// The engineer opens task `id` from a terminal, its plan not approved yet.
+fn open_unapproved(root: &Path, id: &str) {
     ok(root, &["open", "g1", "--id", id, "--title", &format!("do {id}")], &[]);
 }
 
@@ -350,21 +358,24 @@ fn a_claim_no_hook_takes_up_is_released() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A drone's model never runs the engineer's commands (phase g correction 6): approving checks,
-/// integrating, scoring are refused inside its session and inside its worktree.
+/// A drone's model never runs the engineer's commands (phase g correction 6): approving checks or the
+/// plan (`ratify`, phase g G5), integrating, scoring are refused inside its session and inside its
+/// worktree.
 #[test]
 fn a_drones_model_is_refused_the_engineers_commands() {
     let root = setup("hive-i-refused");
     let s = "sess-refused-1";
     ok(&root, &["join", "g1"], &inside(s));
-    for cmd in [["approve", "g1"], ["integrate", "g1"], ["score", "g1"]] {
+    for cmd in [["approve", "g1"], ["integrate", "g1"], ["score", "g1"], ["ratify", "g1"]] {
         let (out, err, code) = hive(&root, &cmd, &inside(s));
         assert!(code == 1 && err.contains("never by a drone") || err.contains("integrate tasks are run by"), "{cmd:?}: {out}{err}");
     }
     // In its worktree without the session's variable (another shell of the drone's).
     let tree = hs(&root, s)["worktree"].as_str().unwrap().to_string();
-    let out = command(&root, &["hive", "approve", "g1", "--dir", &tree], &[]).output().unwrap();
-    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("never by a drone"), "{}", String::from_utf8_lossy(&out.stderr));
+    for cmd in ["approve", "ratify"] {
+        let out = command(&root, &["hive", cmd, "g1", "--dir", &tree], &[]).output().unwrap();
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("never by a drone"), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+    }
     // The engineer's terminal (no session) approves.
     assert_eq!(hive(&root, &["approve", "g1"], &[]).2, 0);
     let _ = std::fs::remove_dir_all(root);
@@ -887,7 +898,7 @@ fn an_omp_drone_is_woken_by_its_extensions_waiter_and_its_stop_speaks_omps_block
     hook_as(&root, "omp", "post_tool", &ev("post_tool", 0, json!({})));
     let e = interactive::live(&store(&root)).into_iter().next().unwrap();
     assert_eq!((e.pid, e.by.as_str()), (omp_pid, "rebind"), "the extension's pid is the drone's harness");
-    open_task(&root, "t1");
+    open_unapproved(&root, "t1");
     std::thread::sleep(Duration::from_millis(1500));
     assert!(w.wakes().is_empty() && task_state(&root, "t1").0 == "open", "nothing handed in the engineer's turn");
     // The conscience may ask its questions at the turn's first stop; never for a wait to start.
@@ -899,6 +910,11 @@ fn an_omp_drone_is_woken_by_its_extensions_waiter_and_its_stop_speaks_omps_block
     std::thread::sleep(Duration::from_millis(800));
     assert!(w.wakes().is_empty(), "a blocked stop goes on with the engineer's turn");
     assert_eq!(hook_as(&root, "omp", "stop", &ev("stop", 0, json!({"stop_hook_active": true}))), None, "the turn ends");
+    // Its plan is not approved (phase g G5): the idle drone's waiter hands nothing; the engineer's
+    // approval wakes it.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(w.wakes().is_empty() && task_state(&root, "t1").0 == "open", "an unapproved task is never handed");
+    ok(&root, &["ratify", "g1"], &[]);
     until(15, "the wake", || !w.wakes().is_empty());
     let wake = w.wakes()[0].clone();
     assert_eq!(wake["left"], false);
@@ -918,6 +934,11 @@ fn an_omp_drone_is_woken_by_its_extensions_waiter_and_its_stop_speaks_omps_block
     assert!(r.contains(interactive::IDLE_LINE) && !r.contains("hive wait"), "{r}");
     assert!(done.get("hookSpecificOutput").is_none(), "not Claude's Stop feedback: {done}");
     assert_eq!(done["hive"], true, "marked the hive's own, apart from a conscience's questions: {done}");
+    // omp's events carry no usage: the claim's spend line says it is unmetered (phase g G5).
+    let spend = std::fs::read_to_string(store(&root).join("hive/g1/spend.jsonl")).unwrap_or_default();
+    let line: Value = serde_json::from_str(spend.lines().next().expect("a spend line for the claim")).unwrap();
+    assert_eq!((line["exit"].as_str(), line["harness"].as_str(), line["usd"].is_null()), (Some("unmetered"), Some("omp"), true), "{line}");
+    assert!(line["claim"].as_str().unwrap().starts_with("t1@"), "{line}");
     assert_eq!(hook_as(&root, "omp", "stop", &ev("stop", 0, json!({"stop_hook_active": true}))), None);
     // The session's end: the drone leaves, its waiter is stopped by the leave.
     hook_as(&root, "omp", "end", &ev("end", 0, json!({})));
@@ -1229,7 +1250,7 @@ fn a_codex_drone_is_woken_by_codex_queue_from_the_waiter_its_stop_starts() {
     let e = interactive::live(&store(&root)).into_iter().next().unwrap();
     assert_eq!((e.pid, e.by.as_str()), (cx.pid, "rebind"), "codex's process is the drone's harness");
     cx.hook(&root, "prompt", &codex_event(&root, "prompt", s, "", json!({})));
-    open_task(&root, "t1");
+    open_unapproved(&root, "t1");
     // The turn's stops: a conscience may ask at the first; none asks for a wait, and none blocks for it.
     let mut out = cx.hook(&root, "stop", &codex_event(&root, "stop", s, "", json!({})));
     if out.is_some() {
@@ -1238,6 +1259,11 @@ fn a_codex_drone_is_woken_by_codex_queue_from_the_waiter_its_stop_starts() {
         out = cx.hook(&root, "stop", &codex_event(&root, "stop_again", s, "", json!({})));
     }
     assert_eq!(out, None, "the stop passes at once");
+    // Its plan is not approved (phase g G5): the waiter the stop started queues nothing until it is.
+    until(15, "the waiter the stop started", || waiter_runs(&root, &drone));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(queued(&root).is_empty() && task_state(&root, "t1").0 == "open", "an unapproved task is never handed");
+    ok(&root, &["ratify", "g1"], &[]);
     until(15, "the queued wake", || !queued(&root).is_empty());
     let q = queued(&root)[0].clone();
     assert_eq!(&q[..4], ["queue", "--thread", s, "--message"], "{q:?}");
@@ -1450,5 +1476,226 @@ fn an_unjoined_codex_session_answers_byte_for_byte_as_before() {
         .filter(|n| n.starts_with("plain-unjoined.hive"))
         .collect();
     assert!(state.is_empty(), "no hive state for it: {state:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The queen session (phase g G5): a plain session's model opens the goal's tasks (`borg hive init`/`open`
+/// with the harness's session id in its environment) and is told to put the plan to the engineer; no
+/// waiting drone, on the waiter's path, the stop's handover or `borg hive claim`, takes a task of it
+/// before the engineer approves; the model can neither approve it (`borg queen answer`, `borg hive
+/// ratify` inside its session) nor is the question offered to another session; the engineer's prompt
+/// answers it: anything else leaves it waiting, "no, because ..." refuses it (the session revises: a new
+/// task, a new question), a yes approves it, and the waiting drone wakes within one board change and
+/// takes the work. Fails with the gate off (the waiter claims t1 at once), with the plan approvable by
+/// the model's own command, and with the answer read from anything but the engineer's prompt.
+#[test]
+fn the_plan_is_approved_at_the_engineers_own_prompt_in_the_session_that_opened_it() {
+    let root = setup("hive-i-queen");
+    let (q, d) = ("sess-queen-1", "sess-drone-1");
+    ok(&root, &["join", "g1"], &inside(d));
+    // The drone's turn ended: its wait runs.
+    let mut w = spawn_wait(&root, d, &[("BORG_HIVE_TAKEUP_MS", "20000")]);
+    let out = ok(&root, &["open", "g1", "--id", "t1", "--title", "add the lexer", "--files", "src/lexer.rs", "--accept", "ok=test -f ok"], &inside(q));
+    assert!(out.contains("[borg hive] The plan of goal g1 waits for the engineer's approval (queen question q"), "{out}");
+    assert!(out.contains("t1  add the lexer · files src/lexer.rs · checks ok=test -f ok") && out.contains("Never answer it yourself"), "{out}");
+    let id = out.split("queen question ").nth(1).unwrap().split(')').next().unwrap().to_string();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(w.running() && task_state(&root, "t1").0 == "open", "no drone takes a task of an unapproved plan");
+    // Nor by the drone's own claim or its stop's handover.
+    let (_, err, code) = hive(&root, &["claim", "t1"], &inside(d));
+    assert!(code == 1 && err.contains("waits for the engineer's approval of goal g1's plan"), "{err}");
+    assert_eq!(hive(&root, &["claim"], &inside(d)).0.trim(), format!("no task is open to {} now", &d[..8]));
+    prompt(&root, d);
+    assert!(!reason(&stop(&root, d, false, wait_task(&root, d))).contains("Your claim"), "the stop hands nothing");
+    assert!(!reason(&stop(&root, d, true, wait_task(&root, d))).contains("Your claim"), "the turn ends");
+    assert_eq!(task_state(&root, "t1").0, "open");
+    // The opening session's model cannot approve it.
+    let queen_answer = |text: &str, env: &[(&str, &str)]| {
+        let dir = work(&root).display().to_string();
+        let out = command(&root, &["queen", "answer", &id, text, "--dir", &dir], env).output().unwrap();
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, err) = queen_answer("yes", &inside(q));
+    assert!(code != 0 && err.contains("at their own prompt"), "{err}");
+    let (_, err, code) = hive(&root, &["ratify", "g1"], &inside(q));
+    assert!(code == 1 && err.contains("never inside a session"), "{err}");
+    // The engineer's prompt: something else first, then a no with its reason.
+    let said = |text: &str| hook(&root, "prompt", q, json!({"prompt": text})).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(said("what does t1 touch?").contains("still waits for the engineer"), "reminded, not answered");
+    let r = said("no, because the lexer needs a test task first");
+    assert!(r.contains("The engineer refused the plan of hive goal g1") && r.contains("Revise the plan"), "{r}");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(w.running() && task_state(&root, "t1").0 == "open", "a refused plan is never claimed");
+    let decisions = std::fs::read_to_string(store(&root).join("hive/g1/plan.jsonl")).unwrap();
+    assert!(decisions.contains("\"approved\":false") && decisions.contains("the lexer needs a test task first"), "{decisions}");
+    // The session revises: a new task, a new question of the whole plan not approved yet.
+    let out = ok(&root, &["open", "g1", "--id", "t0", "--title", "test the lexer", "--files", "tests/lexer.rs"], &inside(q));
+    assert!(out.contains("t0  test the lexer") && out.contains("t1  add the lexer"), "{out}");
+    let r = said("yes");
+    assert!(r.contains("The engineer approved the plan of hive goal g1") && r.contains("1 drone(s) on 1 node(s) waiting"), "{r}");
+    let b = board::fold(&events(&root));
+    assert_eq!(b.ratified.iter().map(String::as_str).collect::<Vec<_>>(), ["t0", "t1"]);
+    // The waiting drone wakes on that board change and takes the work.
+    let (code, text) = w.ended(15);
+    assert!(code == 0 && text.contains("Your claim: t"), "{text}");
+    assert!(said("carry on").is_empty(), "answered: nothing more to say");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A goal opened from a terminal has no session to ask (phase g correction 16): `init` says how to
+/// approve it, and `borg hive ratify` does, once, answering the plan with every task not approved yet.
+/// Fails with `ratify` approving nothing on the board, or approving twice.
+#[test]
+fn a_terminals_goal_is_approved_with_ratify() {
+    let root = setup("hive-i-ratify");
+    let out = ok(&root, &["init", "g2", "--spec", "x", "--oracle", "ok=true", "--budget", "1", "--task", "a|work|write a|a.rs||ok=test -f a"], &[]);
+    assert!(out.contains("`borg hive ratify g2` approves it"), "{out}");
+    let task = board::fold(&board::read(&store(&root).join("hive/g2/tasks.jsonl"))).tasks["a"].task.clone();
+    assert_eq!(task.accept.iter().map(|c| (c.name.as_str(), c.cmd.as_str())).collect::<Vec<_>>(), [("ok", "test -f a")], "a check per task");
+    let out = ok(&root, &["ratify", "g2"], &[]);
+    assert!(out.contains("approve a  write a") && out.contains("the plan of 1 task(s) is approved"), "{out}");
+    assert_eq!(ok(&root, &["ratify", "g2"], &[]).trim(), "nothing to approve in goal g2: every task of its plan is approved");
+    let lines = board::read(&store(&root).join("hive/g2/tasks.jsonl"));
+    assert_eq!(lines.iter().filter(|e| e.note.starts_with("ratified")).count(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A verify task someone opens by hand (`open --role verify`, no work task named) is a card of the plan
+/// like any work task (phase g G5): no drone claims it before the engineer approves it, and `ratify`
+/// shows and approves it. Fails with every verify task exempt from the approval.
+#[test]
+fn a_verify_task_opened_by_hand_waits_for_the_plans_approval() {
+    let root = setup("hive-i-verify-by-hand");
+    let d = "sess-vhand-1";
+    ok(&root, &["join", "g1"], &inside(d));
+    ok(&root, &["open", "g1", "--id", "v1", "--role", "verify", "--title", "implement the whole parser"], &[]);
+    let (_, err, code) = hive(&root, &["claim", "v1"], &inside(d));
+    assert!(code == 1 && err.contains("waits for the engineer's approval of goal g1's plan"), "{err}");
+    assert_eq!(task_state(&root, "v1").0, "open");
+    let out = ok(&root, &["ratify", "g1"], &[]);
+    assert!(out.contains("approve v1  implement the whole parser"), "{out}");
+    let (out, err, code) = hive(&root, &["claim", "v1"], &inside(d));
+    assert!(code == 0 && out.contains("claimed v1"), "{out}{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The budget question reaches the session that opened the goal's plan (phase g G5): with the plan
+/// approved long before, a spent budget asks it there, and the engineer's prompt "$20" raises the
+/// board's budget and the drone claims again. Fails with the question queued for that session but its
+/// prompts no longer read (the plan's marker removed at the approval).
+#[test]
+fn the_budget_question_is_answered_at_the_planning_sessions_prompt() {
+    let root = setup("hive-i-budget-prompt");
+    let (q, d) = ("sess-qbudget-1", "sess-dbudget-1");
+    ok(&root, &["join", "g1"], &inside(d));
+    ok(&root, &["open", "g1", "--id", "t1", "--title", "add the lexer", "--accept", "ok=test -f ok"], &inside(q));
+    let said = |text: &str| hook(&root, "prompt", q, json!({"prompt": text})).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(said("yes").contains("The engineer approved the plan of hive goal g1"));
+    assert!(said("carry on").is_empty(), "answered: nothing more to say");
+    // Spent: another node's metered claims reach the goal's $5.
+    let other = json!({"v": 1, "ms": 1, "drone": "i-other", "node": "ffffffffffffffff", "iter": 0, "harness": "claude", "usd": 5.0, "session": "x", "exit": "interactive", "claim": "z@1"});
+    std::fs::write(store(&root).join("hive/g1/spend.jsonl"), format!("{other}\n")).unwrap();
+    assert_eq!(hive(&root, &["claim"], &inside(d)).0.trim(), format!("no task is open to {} now", &d[..8]));
+    let queue = std::fs::read_to_string(store(&root).join("queen/queue.jsonl")).unwrap_or_default();
+    assert!(queue.lines().any(|l| l.contains("Raise the budget of g1?") && l.contains(q)), "asked of the planning session: {queue}");
+    assert!(said("how much is spent?").contains("The budget question of hive goal g1 still waits"), "reminded, not answered");
+    let r = said("$20");
+    assert!(r.contains("The engineer raised the budget of hive goal g1"), "{r}");
+    assert_eq!(board::fold(&events(&root)).budget_usd, Some(20.0));
+    let (out, err, code) = hive(&root, &["claim"], &inside(d));
+    assert!(code == 0 && out.contains("claimed t1"), "{out}{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A transcript of Claude Code (`fixtures/claude/transcript-usage.jsonl`, its assistant lines' shape,
+/// stamps made relative to the claim) and a subagent's beside it, put where the drone's hooks name it.
+fn transcript_fixture(root: &Path, at: i64) -> PathBuf {
+    let fix = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
+    let ts = |ms: i64| {
+        let s = ms / 1000;
+        let (days, rem) = (s.div_euclid(86_400), s.rem_euclid(86_400));
+        // Civil from days (Howard Hinnant).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600, rem % 3600 / 60, rem % 60, ms.rem_euclid(1000))
+    };
+    let fill = |name: &str| std::fs::read_to_string(fix.join(name)).unwrap().replace("BEFORE", &ts(at - 60_000)).replace("AFTER", &ts(at + 5_000));
+    let t = root.join("transcript.jsonl");
+    std::fs::write(&t, fill("transcript-usage.jsonl")).unwrap();
+    std::fs::create_dir_all(root.join("transcript/subagents")).unwrap();
+    std::fs::write(root.join("transcript/subagents/agent-1.jsonl"), fill("transcript-subagent.jsonl")).unwrap();
+    t
+}
+
+/// Metered spend (phase g G5, correction 13): a Claude Code drone's claim, at its done, adds one line to
+/// the goal's spend.jsonl, the usage of its transcript (and its subagent's) since the claim, each message
+/// once, priced by its model, `exit: "interactive"`; once the goal's metered spend reaches its budget its
+/// drones claim nothing more and the engineer is asked once to raise it; `borg hive ratify --budget`
+/// raises it and the waiting drone takes the work. Fails with the message before the claim counted, with
+/// a repeated message counted twice, with no budget stop, and with the raise not reaching the waiter.
+#[test]
+fn a_claude_drones_claim_is_metered_from_its_transcript_and_the_budget_stops_new_claims() {
+    let root = setup("hive-i-spend");
+    let s = "sess-spend-1";
+    ok(&root, &["join", "g1"], &inside(s));
+    open_task(&root, "t1");
+    let (code, text) = spawn_wait(&root, s, &[("BORG_HIVE_TAKEUP_MS", "20000")]).ended(20);
+    assert!(code == 0 && text.contains("Your claim: t1"), "{text}");
+    let board::Status::Claimed { since, .. } = board::fold(&events(&root)).tasks["t1"].status.clone() else { panic!("t1 is claimed") };
+    let t = transcript_fixture(&root, since);
+    let with = |extra: Value| {
+        let mut v = json!({"transcript_path": t});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        v
+    };
+    hook(&root, "prompt", s, with(json!({"prompt": "carry on"})));
+    std::fs::write(tree_of(&root, s).join("ok"), "").unwrap();
+    let r = reason(&hook(
+        &root,
+        "stop",
+        s,
+        with(json!({"last_assistant_message": "done", "stop_hook_active": false, "background_tasks": wait_task(&root, s), "session_crons": []})),
+    ));
+    assert!(r.contains("t1 done"), "{r}");
+    // The turn ends (the done's feedback went on with it).
+    hook(
+        &root,
+        "stop",
+        s,
+        with(json!({"last_assistant_message": "ok", "stop_hook_active": true, "background_tasks": wait_task(&root, s), "session_crons": []})),
+    );
+    let spend = std::fs::read_to_string(store(&root).join("hive/g1/spend.jsonl")).unwrap();
+    let lines: Vec<Value> = spend.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 1, "one line a claim: {spend}");
+    let l = &lines[0];
+    assert_eq!((l["exit"].as_str(), l["harness"].as_str(), l["session"].as_str()), (Some("interactive"), Some("claude"), Some(s)), "{l}");
+    assert_eq!(l["claim"].as_str(), Some(format!("t1@{since}").as_str()));
+    // claude-opus-5-5: 1000 in, 2000 out, 10000 cache write, 100000 cache read = $0.114, once though
+    // listed twice; the subagent's claude-sonnet-4-6 100 in, 100 out = $0.0018; the line before the
+    // claim not at all.
+    assert!((l["usd"].as_f64().unwrap() - 0.1158).abs() < 1e-9, "{l}");
+    // The budget: spent to the goal's $5 by another node's metered claim.
+    let other = json!({"v": 1, "ms": 1, "drone": "i-other", "node": "ffffffffffffffff", "iter": 0, "harness": "claude", "usd": 4.9, "session": "x", "exit": "interactive", "claim": "z@1"});
+    std::fs::write(store(&root).join("hive/g1/spend.jsonl"), format!("{spend}{other}\n")).unwrap();
+    let mut w = spawn_wait(&root, s, &[("BORG_HIVE_TAKEUP_MS", "20000")]);
+    open_task(&root, "t2");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(w.running() && task_state(&root, "t2").0 == "open", "a spent budget: nothing claimed");
+    let queue = std::fs::read_to_string(store(&root).join("queen/queue.jsonl")).unwrap_or_default();
+    assert_eq!(queue.lines().filter(|l| l.contains("Raise the budget of g1?")).count(), 1, "asked once: {queue}");
+    let out = ok(&root, &["ratify", "g1", "--budget", "20"], &[]);
+    assert!(out.contains("budget raised to $20.00"), "{out}");
+    let queue = std::fs::read_to_string(store(&root).join("queen/queue.jsonl")).unwrap_or_default();
+    let asked = queue.lines().rfind(|l| l.contains("Raise the budget of g1?")).unwrap_or_default();
+    assert!(asked.contains("borg hive ratify --budget"), "the raise settles the question: {asked}");
+    let (code, text) = w.ended(15);
+    assert!(code == 0 && text.contains("Your claim: t2"), "{text}");
     let _ = std::fs::remove_dir_all(root);
 }

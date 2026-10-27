@@ -70,6 +70,14 @@ pub fn ago(ms: f64) -> String {
     }
 }
 
+/// A moment as the local time of day, "14:05", with its day before it when that is not today
+/// ("Oct 12 14:05").
+pub fn clock(ms: f64) -> String {
+    let d = js_sys::Date::new(&ms.into());
+    let hm = format!("{:02}:{:02}", d.get_hours(), d.get_minutes());
+    if day_of_ms(ms) == day_of_ms(now_ms()) { hm } else { format!("{} {hm}", short_day(day_of_ms(ms))) }
+}
+
 /// A duration in ms as "1.2 s", "4 min", "3 h", "2 d".
 pub fn duration(ms: f64) -> String {
     let s = ms / 1000.0;

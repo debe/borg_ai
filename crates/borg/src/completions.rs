@@ -39,6 +39,7 @@ const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
             "score",
             "integrate",
             "approve",
+            "ratify",
             "contract",
             "ask",
             "tell",

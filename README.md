@@ -175,8 +175,12 @@ flowchart LR
 task's checks; `borg hive integrate <goal>` merges the verified work. In a team collective the board,
 contracts, messages and spend sync, so drones on several machines share one board and one budget (proven
 on two loopback nodes). Verdicts, reworks and groups of attempts credit and teach lessons like any
-outcome. Coming: plan approval with intent cards for joined sessions (today only the headless runner asks
-it), and a measured run across real machines. `borg hive run --drones N` runs headless drones in
+outcome. Tell any session what to build: its borg skill opens the goal (small tasks, contracts first,
+a check per task) and asks you to approve the plan at your own prompt (`yes`, or `no, because ...`);
+no drone takes a task before your yes, and the session then says how many drones wait. A goal you open
+from a terminal is approved with `borg hive ratify <goal>`. Claude Code drones' claims are metered
+from their transcripts, and new claims stop at the goal's budget until you raise it. Coming: a
+measured run across real machines. `borg hive run --drones N` runs headless drones in
 worktrees; it is what the evals use. A session that never joins a goal sees no change.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive) · [Design and status](https://github.com/debe/borg_ai/blob/main/docs/design/hive.md)
 
@@ -189,7 +193,8 @@ borg web        # http://127.0.0.1:7979/, the collective of the current director
 A live page on 127.0.0.1 with tabs for the Overview, Knowledge (every lesson, its belief and state),
 Conscience (checks, questions and what they led to per channel), Drones, the Queen (open questions, the
 queen's attention score), Learning (week by week: lessons per source, the share of asked lessons that
-changed the work, repeated vetoes, hive mistakes caught, playbook versions), Hive and Cost. It reads the
+changed the work, repeated vetoes, hive mistakes caught, playbook versions), Hive (each goal's tasks over time, its nodes, and its interactive drones: working,
+busy, waiting or gone, with their wake latency) and Cost. It reads the
 same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
 spend), `borg doctor` (what is broken), `borg memory`, `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)

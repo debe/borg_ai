@@ -141,7 +141,14 @@ pub struct Spend {
     pub est: Option<f64>,
     #[serde(default)]
     pub session: String,
+    /// `ok`, `timeout`, `error` or `killed` for a runner's iteration; for an interactive drone's claim
+    /// (phase g G5, meter.rs) `interactive` (metered from its transcript) or `unmetered` (its harness
+    /// says no usage: charged nothing, shown as such).
     pub exit: String,
+    /// An interactive drone's claim the line meters (`task@stamp`, meter.rs): one line a claim. Empty on
+    /// a runner's line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub claim: String,
 }
 
 impl Spend {
@@ -172,13 +179,19 @@ pub struct Ledger {
 /// the fold is the same whatever order the mesh delivered the lines in, and a line delivered twice
 /// counts once.
 pub fn ledger(lines: &[Spend], here: &str) -> Ledger {
-    let distinct: BTreeMap<String, &Spend> = lines.iter().map(|s| (serde_json::to_string(s).unwrap_or_default(), s)).collect();
     let mut l = Ledger::default();
-    for s in distinct.values() {
+    for s in distinct(lines) {
         l.total += s.charged();
         *l.nodes.entry(s.owner(here).to_string()).or_default() += s.charged();
     }
     l
+}
+
+/// Each distinct line of `lines` once, in one fixed order (by the serialized line): a synced spend.jsonl
+/// can hold one line twice, and every sum of it (`ledger`, monitor.rs) counts it once.
+pub fn distinct(lines: &[Spend]) -> Vec<&Spend> {
+    let by: BTreeMap<String, &Spend> = lines.iter().map(|s| (serde_json::to_string(s).unwrap_or_default(), s)).collect();
+    by.into_values().collect()
 }
 
 /// The ledger of `goal` in `home`.
@@ -694,6 +707,7 @@ fn recover(home: &Path, goal: &str, now: i64) {
             est: Some(estimate(dearest, share, spent)),
             session: j.session.clone(),
             exit: "killed".into(),
+            claim: String::new(),
         };
         if super::append_line(&spend_path(home, goal), &line).is_ok() {
             lines.push(line);
@@ -903,6 +917,7 @@ fn drone(ctx: &Ctx, n: usize, wt: &Path) -> DroneEnd {
             est,
             session: sessions.join(","),
             exit: exit.into(),
+            claim: String::new(),
         };
         let _ = super::append_line(&spend_path(ctx.home, goal), &line);
         t.spent += line.charged();
@@ -1498,6 +1513,7 @@ mod tests {
             est,
             session: String::new(),
             exit: "ok".into(),
+            claim: String::new(),
         };
         assert_eq!((line(Some(0.4), Some(9.0)).charged(), line(None, Some(0.4)).charged(), line(None, None).charged()), (0.4, 0.4, 0.0));
         assert_eq!(spent_before(&[line(Some(0.2), None), line(None, Some(0.7)), line(Some(0.1), None)], "n", "d1"), (1, 0.7));

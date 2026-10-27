@@ -14,12 +14,13 @@ use super::change::{Action, Change, read};
 use crate::harness::{Harness, Level};
 
 /// The skill's files, relative to its directory, and their content.
-pub const FILES: [(&str, &str); 5] = [
+pub const FILES: [(&str, &str); 6] = [
     ("SKILL.md", include_str!("../../assets/skills/borg/SKILL.md")),
     ("references/collectives.md", include_str!("../../assets/skills/borg/references/collectives.md")),
     ("references/team.md", include_str!("../../assets/skills/borg/references/team.md")),
     ("references/vectors.md", include_str!("../../assets/skills/borg/references/vectors.md")),
     ("references/troubleshooting.md", include_str!("../../assets/skills/borg/references/troubleshooting.md")),
+    ("references/hive.md", include_str!("../../assets/skills/borg/references/hive.md")),
 ];
 
 /// Where `h` loads the `borg` skill from: `skills/borg` in its config directory, the one holding its hook

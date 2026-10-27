@@ -459,6 +459,8 @@ pub struct HiveDrone {
     pub iters: f64,
     pub last_exit: String,
     pub unmetered: bool,
+    /// An interactive drone's: no share of a run, its claims charged to the goal's budget.
+    pub interactive: bool,
 }
 
 /// One hive goal (borg hive/view.rs `HiveView`).
@@ -491,6 +493,153 @@ pub struct HiveGoal {
     /// The plan's intent cards and the engineer's decision (borg hive/plan.rs `Row`); None without a
     /// work task.
     pub plan: Option<HivePlan>,
+    /// Interactive monitoring (borg hive/monitor.rs, phase g G6), backfilled from the board.
+    pub monitor: HiveMonitor,
+}
+
+/// The board at one moment: its tasks by state (borg hive/monitor.rs `Point`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct HivePoint {
+    pub ms: f64,
+    pub open: f64,
+    pub claimed: f64,
+    pub done: f64,
+    pub verified: f64,
+    pub blocked: f64,
+    pub stuck: f64,
+}
+
+/// One node of a goal (borg hive/monitor.rs `NodeRow`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveNode {
+    pub node: String,
+    pub here: bool,
+    /// `in`, `left` or `not joined`.
+    pub state: String,
+    pub joined_ms: f64,
+    pub left_ms: f64,
+    /// Its newest beat's age on this node's clock; None without a beat.
+    pub beat_age_ms: Option<f64>,
+    pub line_age_ms: Option<f64>,
+    pub takers: Vec<String>,
+    /// This node's: `daemon`, `waiter <drone>`, `a process` or `none`.
+    pub worker: String,
+}
+
+/// One wake of an interactive drone: hand to take-up, or a wake no turn took up.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveWake {
+    pub task: String,
+    pub ms: f64,
+    pub latency_ms: f64,
+    pub taken: bool,
+}
+
+/// One interactive drone of this node (borg hive/monitor.rs `DroneRow`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveMember {
+    pub drone: String,
+    pub harness: String,
+    pub session: String,
+    /// `working`, `busy`, `waiting`, `not waiting` or `gone`.
+    pub state: String,
+    pub task: String,
+    pub since_ms: f64,
+    pub done: f64,
+    pub judged: f64,
+    pub wakes: Vec<HiveWake>,
+    pub usd: f64,
+    pub unmetered: bool,
+}
+
+/// A stuck line or a decline, with its reason.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveLine {
+    pub task: String,
+    pub node: String,
+    pub ms: f64,
+    pub why: String,
+}
+
+/// One integration and how it ended.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HiveIntegration {
+    pub task: String,
+    pub status: String,
+    pub result: String,
+    pub opened_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct HiveMonitor {
+    pub history: Vec<HivePoint>,
+    pub members: Vec<HiveNode>,
+    pub interactive: Vec<HiveMember>,
+    pub stuck: Vec<HiveLine>,
+    pub declines: Vec<HiveLine>,
+    pub integrations: Vec<HiveIntegration>,
+    pub integrate_log: Vec<String>,
+    pub metered_usd: f64,
+    pub unmetered: f64,
+}
+
+fn arr(v: &Value) -> impl Iterator<Item = &Value> {
+    v.as_array().into_iter().flatten()
+}
+
+fn parse_monitor(g: &Value) -> HiveMonitor {
+    let line = |l: &Value| HiveLine { task: s(&l["task"]), node: s(&l["node"]), ms: f(&l["ms"]), why: s(&l["why"]) };
+    HiveMonitor {
+        history: arr(&g["history"])
+            .map(|p| HivePoint {
+                ms: f(&p["ms"]),
+                open: f(&p["open"]),
+                claimed: f(&p["claimed"]),
+                done: f(&p["done"]),
+                verified: f(&p["verified"]),
+                blocked: f(&p["blocked"]),
+                stuck: f(&p["stuck"]),
+            })
+            .collect(),
+        members: arr(&g["members"])
+            .map(|n| HiveNode {
+                node: s(&n["node"]),
+                here: n["here"].as_bool().unwrap_or(false),
+                state: s(&n["state"]),
+                joined_ms: f(&n["joined_ms"]),
+                left_ms: f(&n["left_ms"]),
+                beat_age_ms: n["beat_age_ms"].as_f64(),
+                line_age_ms: n["line_age_ms"].as_f64(),
+                takers: strs(&n["takers"]),
+                worker: s(&n["worker"]),
+            })
+            .collect(),
+        interactive: arr(&g["interactive"])
+            .map(|d| HiveMember {
+                drone: s(&d["drone"]),
+                harness: s(&d["harness"]),
+                session: s(&d["session"]),
+                state: s(&d["state"]),
+                task: s(&d["task"]),
+                since_ms: f(&d["since_ms"]),
+                done: f(&d["done"]),
+                judged: f(&d["judged"]),
+                wakes: arr(&d["wakes"])
+                    .map(|w| HiveWake { task: s(&w["task"]), ms: f(&w["ms"]), latency_ms: f(&w["latency_ms"]), taken: w["taken"].as_bool().unwrap_or(false) })
+                    .collect(),
+                usd: f(&d["usd"]),
+                unmetered: d["unmetered"].as_bool().unwrap_or(false),
+            })
+            .collect(),
+        stuck: arr(&g["stuck"]).map(line).collect(),
+        declines: arr(&g["declines"]).map(line).collect(),
+        integrations: arr(&g["integrations"])
+            .map(|i| HiveIntegration { task: s(&i["task"]), status: s(&i["status"]), result: s(&i["result"]), opened_ms: f(&i["opened_ms"]) })
+            .collect(),
+        integrate_log: strs(&g["integrate_log"]),
+        metered_usd: f(&g["metered_usd"]),
+        unmetered: f(&g["unmetered"]),
+    }
 }
 
 /// A goal's plan as the engineer approves it before `borg hive run` starts its drones.
@@ -499,11 +648,13 @@ pub struct HivePlan {
     /// `approved`, `refused`, `waiting` or `not asked`.
     pub state: String,
     pub by: String,
-    /// `queen` or `yes` (`--yes`).
+    /// `queen`, `yes` (`--yes`) or `ratify` (`borg hive ratify`).
     pub via: String,
     pub question: String,
     pub answer: String,
     pub cards: Vec<HiveCard>,
+    /// An interactive goal's plan: answered at the planning session's prompt or with `borg hive ratify`.
+    pub interactive: bool,
 }
 
 /// One task's intent card.
@@ -594,6 +745,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                     iters: f(&d["iters"]),
                     last_exit: s(&d["last_exit"]),
                     unmetered: d["unmetered"].as_bool().unwrap_or(false),
+                    interactive: d["interactive"].as_bool().unwrap_or(false),
                 })
                 .collect(),
             contracts: g["contracts"].as_array().into_iter().flatten().map(|c| (s(&c["task"]), s(&c["text"]), strs(&c["scope"]))).collect(),
@@ -641,6 +793,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                 via: s(&g["plan"]["via"]),
                 question: s(&g["plan"]["question"]),
                 answer: s(&g["plan"]["answer"]),
+                interactive: g["plan"]["interactive"].as_bool().unwrap_or(false),
                 cards: g["plan"]["cards"]
                     .as_array()
                     .into_iter()
@@ -655,6 +808,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                     })
                     .collect(),
             }),
+            monitor: parse_monitor(g),
         })
         .collect()
 }

@@ -49,6 +49,8 @@ pub mod hidden;
 pub mod integrate;
 pub mod interactive;
 pub mod message;
+pub mod meter;
+pub mod monitor;
 pub mod node;
 pub mod oracle;
 pub mod plan;
@@ -400,6 +402,10 @@ pub struct HiveSession {
     /// harness's plugin sends, `own_pid`); 0 when none was found.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub pid: u32,
+    /// The transcript its harness's hooks name (Claude Code's `transcript_path`), for what a claim cost
+    /// when it ends outside a hook (`borg hive release`, meter.rs); empty when none named one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transcript: String,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -567,8 +573,17 @@ fn may_take(g: &Goal, t: &Task, repo: &str, session: &str, cwd: &str) -> bool {
 /// commits are in this repo (`lacking`, the filter run.rs `open_to` applies too), whose checks this node
 /// approved (oracle.rs `Approvals`), and not one refused to it before (`REFUSED_MARKER`), which
 /// `next_for`'s fixed order would pick again.
+///
+/// An interactive drone (phase g G5, `gated`) takes only tasks whose plan the engineer approved
+/// (board.rs `Board::plan_approved`), and nothing of a goal whose metered spend reached its budget
+/// (`spent_out`, which asks the engineer once whether to raise it).
 #[allow(clippy::too_many_arguments)]
 fn next_open<'a>(home: &Path, g: &Goal, b: &'a Board, session: &str, drone: &str, repo: &str, cwd: &str, now: i64) -> Option<&'a TaskState> {
+    let gate = gated(session);
+    if gate && let Some((spent, budget)) = spent_out(home, g, b) {
+        plan::ask_budget(home, g, spent, budget, cwd, now);
+        return None;
+    }
     let state = std::fs::read_to_string(hook::state_file(session)).unwrap_or_default();
     let refused = hook::listed(&state, REFUSED_MARKER);
     let here = node(home);
@@ -576,10 +591,33 @@ fn next_open<'a>(home: &Path, g: &Goal, b: &'a Board, session: &str, drone: &str
     let lacks = lacking_here(home, &g.id, b, Path::new(cwd), now);
     board::next_for(b, board::Actor::new(&here, drone, session), repo, now, |s| {
         !refused.contains(s.task.id.as_str())
+            && (!gate || b.plan_approved(&s.task))
             && may_take(g, &s.task, repo, session, cwd)
             && approvals.pending(g, &s.task).is_empty()
             && !lacks.contains_key(&s.task.id)
     })
+}
+
+/// Whether `session`'s claims wait for the engineer's approval of the plan and stop at the goal's budget
+/// (phase g G5): an interactive drone's, whose work nobody approved by starting it. A runner's drones
+/// start only once `borg hive run`'s own gate approved the plan (plan.rs `gate`), and a plain session's
+/// claim is the engineer's own step, both as before.
+fn gated(session: &str) -> bool {
+    bound(session).is_some_and(|hs| hs.interactive)
+}
+
+/// The budget of goal `g` on board `b`: the goal's own, or what the engineer raised it to (board.rs
+/// `Board::budget_usd`), whichever is larger.
+pub fn budget_of(g: &Goal, b: &Board) -> f64 {
+    b.budget_usd.map_or(g.budget_usd, |u| u.max(g.budget_usd))
+}
+
+/// (spent, budget) when goal `g`'s metered spend on every node (spend.jsonl, run.rs `ledger`) reached its
+/// budget (`budget_of`): its interactive drones claim nothing more of it. An unmetered session's spend
+/// counts nothing (meter.rs), as a runner's that named no cost.
+fn spent_out(home: &Path, g: &Goal, b: &Board) -> Option<(f64, f64)> {
+    let (spent, budget) = (run::goal_spent(home, &g.id).total, budget_of(g, b));
+    (spent >= budget).then_some((spent, budget))
 }
 
 /// Where the commits a task starts from stand for a node that lacks them (phase f F7, `lacking`).
@@ -1035,6 +1073,21 @@ fn with_reason(text: &str, out: Option<Value>, may_block: bool) -> Option<Value>
 /// The hook's hive step, inside steering and around everything else it answers (`inner`). A session in
 /// no goal (or a goal gone) gets `inner()` untouched.
 pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
+    // The engineer's answer to a plan this session opened (phase g G5, plan.rs `at_prompt`): read from
+    // their own prompt, first in its context. One failed stat for a session that opened none.
+    if event == "prompt" {
+        let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+        let prompt = input.get("prompt").and_then(Value::as_str).unwrap_or_default();
+        if let Some(text) = plan::at_prompt(home, session, prompt, now) {
+            let allowed = h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false));
+            return with_context(session, "UserPromptSubmit", text, allowed, around_session(h, home, event, input, now, inner));
+        }
+    }
+    around_session(h, home, event, input, now, inner)
+}
+
+/// `around` for any session: a bound one's hive step (`around_bound`), else `inner()` untouched.
+fn around_session(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
     let started = Instant::now();
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     // A join that bound an id no hook carries (interactive.rs `adopt`): its own PostToolUse moves it here.
@@ -1120,11 +1173,16 @@ fn around_bound(
             let _stopping = hs.interactive.then(|| interactive::Stopping::mark(session, now + budget.as_millis() as i64));
             // What the conscience (and the rest of `inner`) said, so the hive's own words are told apart.
             let theirs = std::cell::RefCell::new(None);
+            let held = board::holding(&b, &node(home), session, now).cloned();
             let out = ctx.stop(&mut hs, &b, &events, input, started, || {
                 let o = inner();
                 *theirs.borrow_mut() = Some(o.clone());
                 o
             });
+            // Its done, verdict, block or release at this stop ended the claim: what it cost (meter.rs).
+            if let Some(held) = held {
+                meter_end(home, &g.id, session, &hs, &held, h.name(), crate::harness::transcript(h.caps(), input));
+            }
             let hive = reason_of(&out) != theirs.borrow().as_ref().and_then(reason_of);
             match hs.interactive {
                 true => interactive::after_stop(home, &mut hs, session, cwd, input, out, interactive::Wake::of(h.name(), hive), now),
@@ -1133,13 +1191,17 @@ fn around_bound(
         }
         "end" => {
             let out = inner();
-            if let Some(s) = board::holding(&b, &node(home), session, now)
-                && write(home, &g.id, vec![Event::new(Ev::Released, &s.task.id, session, now).with_note("session ended")]).is_ok()
-            {
-                count(home, stats::HIVE_RELEASED, session, &g.id, &s.task.id, &repo);
-            }
-            if hs.interactive {
-                interactive::ended(home, &hs, session, cwd, input, now);
+            let held = board::holding(&b, &node(home), session, now);
+            // An interactive drone's end is its leave, which unbinds it before it releases its claim
+            // (interactive.rs `ended`), so its waiter claims nothing after; a `/clear` or any other
+            // session's end releases here.
+            let left = hs.interactive && interactive::ended(home, &hs, session, cwd, input, now);
+            if let Some(s) = held {
+                let released = left || write(home, &g.id, vec![Event::new(Ev::Released, &s.task.id, session, now).with_note("session ended")]).is_ok();
+                if released {
+                    count(home, stats::HIVE_RELEASED, session, &g.id, &s.task.id, &repo);
+                    meter_end(home, &g.id, session, &hs, s, h.name(), crate::harness::transcript(h.caps(), input));
+                }
             }
             out
         }
@@ -1783,6 +1845,10 @@ pub fn verify_task(t: &Task, rework: u32, author: &str) -> Task {
 
 /// A `Confirm` line's outcome for a claim refused before its write.
 pub const REFUSED: &str = "refused";
+/// A `Confirm` line's outcome for a claim a waiter handed that a turn of its session took up
+/// (interactive.rs `taken_up`): `waited_ms` is the wake's latency, from its hand to its take-up on this
+/// node's clock. No confirm window: a reader of the windows (phase e E4) leaves it out.
+pub const TAKEN: &str = "taken";
 
 /// `<goal>/confirms.jsonl`: each claim's confirm window across nodes, and each claim refused before its
 /// write (`claim`), local, never synced.
@@ -1795,6 +1861,7 @@ pub fn confirms_path(home: &Path, goal: &str) -> PathBuf {
 /// again: `won`, `lost`, or `cap` (it kept the claim though a peer's round did not complete in time).
 /// A claim not written because a rival's had landed since the pick (`claim`'s pre-write check) is a
 /// line too, `refused`, with no peers and no wait: a race no board shows, which cost the session it ran in.
+/// A wake's take-up is one too (`TAKEN`, phase g G6), with no peers and its latency as the wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirm {
     pub v: u8,
@@ -2203,8 +2270,23 @@ fn claim(
 ) -> Result<TaskState, Refused> {
     let path = tasks_path(home, &g.id);
     let drone = drone_of(session);
+    let gate = gated(session);
+    // An interactive drone takes no task of a plan the engineer has not approved, nor of a goal whose
+    // budget is spent (phase g G5): said before anything is written.
+    if gate {
+        let b = board::fold_on(&board::read(&path), &node(home));
+        if !b.plan_approved(task) {
+            return Err(Refused::NotHere(unapproved(&g.id, &task.id)));
+        }
+        if let Some((spent, budget)) = spent_out(home, g, &b) {
+            return Err(Refused::NotHere(format!(
+                "goal {} spent ${spent:.2} of its ${budget:.2} budget: its drones claim nothing more until the engineer raises it",
+                g.id
+            )));
+        }
+    }
     // An interactive drone's node joins the goal before its first claim there (phase g correction 1).
-    if bound(session).is_some_and(|hs| hs.interactive) {
+    if gate {
         interactive::ensure_member(home, &g.id).map_err(|e| Refused::Io(format!("could not join goal {}: {e}", g.id)))?;
     }
     let reset = task.from.is_some() && runner_worktree(g, session, cwd);
@@ -2250,7 +2332,13 @@ fn claim(
         // A picked claim of a session that holds a task by now (another of its claimers won first: an
         // interactive drone's stop and its waiter, phase g) is no claim to write: one claim a drone.
         let fresh = !picked || board::holding(&b, &here, session, at).is_none();
-        (fresh && claimable_for(&b, id, board::Actor::new(&here, &drone, session), picked, at)).then(|| vec![c, beat])
+        // The plan's approval is decided on the board under the lock too (phase g G5): monotone, so the
+        // check above stands, and no claim of an unapproved task is ever written.
+        let approved = !gate || b.tasks.get(id).is_some_and(|s| b.plan_approved(&s.task));
+        // An interactive drone that left meanwhile (its leave unbinds it before it releases, interactive.rs
+        // `leave_noted`) claims nothing: no claim of a waiter follows its drone's leave.
+        let drone_still = !gate || bound(session).is_some();
+        (fresh && approved && drone_still && claimable_for(&b, id, board::Actor::new(&here, &drone, session), picked, at)).then(|| vec![c, beat])
     });
     let now = at;
     let stamp = match wrote {
@@ -2308,6 +2396,31 @@ fn claim(
         save(session, &hs);
     }
     Ok(s)
+}
+
+/// An interactive drone's (`hs`) claim `held` of goal `goal`, as it stood before a hook or command acted
+/// on it: once `session` no longer holds that claim, what it cost goes into the goal's spend (meter.rs),
+/// from `transcript` of harness `harness` (else the one its hooks named last). Nothing for a runner's or
+/// a plain session's claim.
+fn meter_end(home: &Path, goal: &str, session: &str, hs: &HiveSession, held: &TaskState, harness: &str, transcript: Option<&str>) {
+    if !hs.interactive {
+        return;
+    }
+    let Status::Claimed { since, .. } = held.status else { return };
+    let b = board::fold_on(&board::read(&tasks_path(home, goal)), &node(home));
+    let still = b.tasks.get(&held.task.id).is_some_and(|s| matches!(s.status, Status::Claimed { since: at, ref by, .. } if at == since && by == session));
+    if still {
+        return;
+    }
+    let transcript = transcript.or(Some(hs.transcript.as_str()).filter(|t| !t.is_empty()));
+    meter::record(home, goal, session, &hs.drone, harness, &format!("{}@{since}", held.task.id), since, transcript, learn::now_ms());
+}
+
+/// Why an interactive drone may not claim `task` of `goal` yet (phase g G5).
+fn unapproved(goal: &str, task: &str) -> String {
+    format!(
+        "{task} waits for the engineer's approval of goal {goal}'s plan: no drone takes it before (`borg hive ratify {goal}`, or their yes at the prompt of the session that opened it)"
+    )
 }
 
 /// A dep's change a claim brought into its tree: the (base, head) of its accepted attempt.
@@ -2447,11 +2560,13 @@ const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run
 
 const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   init <goal> --spec TEXT|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]...
-       [--task \"ID|role|title|files,..|deps,..\"]...       a goal, its oracle and its first tasks
+       [--task \"ID|role|title|files,..|deps,..|NAME=CMD\"]...  a goal, its oracle and its first tasks (each its check)
        [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  held-out checks outside the repo, run after verdicts
   score <goal>                                              the hidden oracle scores the judged tasks not scored yet
   integrate <goal>                                          merge the accepted work and run the oracle on it (git 2.40+)
   approve <goal>                                            run the checks other nodes wrote here (lists each one it approves)
+  ratify <goal> [--budget USD]                              the engineer approves the goal's plan from a terminal (its
+                                                            interactive drones take no task before); --budget: raise it
   board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
   join [<goal>]                                             inside a session: it becomes a drone of the goal (none: of
                                                             every open goal of this repo), in a worktree of its own
@@ -2536,14 +2651,19 @@ fn valid_task_id(id: &str) -> bool {
     (1..=40).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// `ID|role|title|files,..|deps,..` (`--task`).
+/// `ID|role|title|files,..|deps,..|NAME=CMD` (`--task`): the last field, the task's own check, is the
+/// rest of the line, so its command may hold a `|` of its own (phase g G5: a check per task).
 fn parse_task(s: &str) -> Result<Task, String> {
-    let f: Vec<&str> = s.split('|').map(str::trim).collect();
+    let f: Vec<&str> = s.splitn(6, '|').map(str::trim).collect();
     let (Some(id), Some(role), Some(title)) = (f.first(), f.get(1), f.get(2)) else {
-        return Err(format!("--task {s:?}: give ID|role|title[|files,..[|deps,..]]"));
+        return Err(format!("--task {s:?}: give ID|role|title[|files,..[|deps,..[|NAME=CMD]]]"));
     };
     let role = Role::parse(role).ok_or_else(|| format!("--task {s:?}: role is plan, work, verify or integrate"))?;
-    new_task(id, role, title, "", f.get(3).map(|x| split_list(x)).unwrap_or_default(), f.get(4).map(|x| split_list(x)).unwrap_or_default(), Vec::new())
+    let accept = match f.get(5).filter(|c| !c.is_empty()) {
+        Some(c) => vec![Check::parse(c, 600).map_err(|e| format!("--task {s:?}: {e}"))?],
+        None => Vec::new(),
+    };
+    new_task(id, role, title, "", f.get(3).map(|x| split_list(x)).unwrap_or_default(), f.get(4).map(|x| split_list(x)).unwrap_or_default(), accept)
 }
 
 fn new_task(id: &str, role: Role, title: &str, repo: &str, files: Vec<String>, deps: Vec<String>, accept: Vec<Check>) -> Result<Task, String> {
@@ -2779,6 +2899,7 @@ pub fn main(args: &[&str]) -> i32 {
             Err(e) => fail(e),
         },
         ("open", [id]) => open(&here, &a, id),
+        ("ratify", [id]) => ratify_cmd(&here, &a, id),
         ("claim", [] | [_]) => claim_cmd(&here, session, rest.first().copied()),
         ("progress" | "block", [_, ..]) => {
             let ev = if cmd == "progress" { Ev::Progress } else { Ev::Blocked };
@@ -2889,6 +3010,97 @@ fn init(here: &Here, a: &Args, id: &str) -> i32 {
         dir(&here.home, id).display()
     );
     println!("join a running drone: borg hive join {id} --session <ID|DRONE>; or start drones with {ENV}={id}");
+    plan_said(here, &g);
+    0
+}
+
+/// What `init` or `open` says of the plan its tasks wait on (phase g G5), when a task of it is not
+/// approved yet: run by a session's model (the harness's session id in its environment, no drone), the
+/// plan question goes to that session (plan.rs `ask_opener`), whose model shows it to the engineer, who
+/// answers at their own prompt; from a terminal, the command that approves it. Interactive drones take
+/// no task of it before (`next_open`).
+fn plan_said(here: &Here, g: &Goal) {
+    let b = here.board(g);
+    let n = b.unratified().len();
+    if n == 0 {
+        return;
+    }
+    let asked = interactive::env_session().filter(|_| !drone_here(here)).and_then(|s| plan::ask_opener(&here.home, g, &b, &s, &here.cwd, here.now));
+    let Some((e, cards)) = asked else {
+        println!("the plan of {n} task(s) waits for the engineer: `borg hive ratify {}` approves it; interactive drones take none of its tasks before", g.id);
+        return;
+    };
+    println!("[borg hive] The plan of goal {} waits for the engineer's approval (queen question {}); no drone takes a task of it before:", g.id, e.id);
+    for c in &cards {
+        println!("  {}", plan::render_card(c));
+    }
+    println!(
+        "Show the engineer these tasks and ask them to answer at their own prompt: `yes` approves the plan, `no, because <why>` refuses it. Never answer it yourself: no command run in this session approves it."
+    );
+}
+
+/// `borg hive ratify <goal> [--budget USD]`: the engineer approves goal `id`'s plan from a terminal (phase g
+/// G5; a goal whose tasks were opened from a terminal has no session to ask): every task not approved
+/// yet, each a card shown here, approved on the board (plan.rs `ratify_board`), a queued plan question of
+/// it answered so, and the decision in plan.jsonl. `--budget USD` raises the goal's budget instead and
+/// settles (dismisses) its queued budget question. Never
+/// a drone's command, nor one run inside a harness session: a model never approves the plan it works on.
+fn ratify_cmd(here: &Here, a: &Args, id: &str) -> i32 {
+    if drone_here(here) {
+        return fail("the plan is approved by the engineer, never by a drone of a hive goal");
+    }
+    if interactive::env_session().is_some() || interactive::plugin_binds() {
+        return fail(
+            "`borg hive ratify` runs in the engineer's own terminal, never inside a session: there the engineer answers the plan question at their prompt (`yes`, or `no, because ...`)",
+        );
+    }
+    let g = match goal::load(&here.home, id) {
+        Ok(g) => g,
+        Err(e) => return fail(e),
+    };
+    let engineer = learn::engineer(&here.cwd);
+    if let Some(usd) = a.value("--budget") {
+        let b = here.board(&g);
+        let Some(usd) = usd.parse::<f64>().ok().filter(|u| u.is_finite() && *u > budget_of(&g, &b)) else {
+            return fail(format!("--budget {usd}: give dollars above the goal's budget now (${:.2})", budget_of(&g, &b)));
+        };
+        return match plan::raise_budget(&here.home, id, usd, &engineer, here.now) {
+            Ok(()) => {
+                // A queued budget question of the goal is settled: the raise answered it.
+                for e in queen::open(&here.home)
+                    .into_iter()
+                    .filter(|e| plan::at_own_prompt(e) && e.payload.as_ref().is_some_and(|p| p["goal"] == id && p["budget"].is_number()))
+                {
+                    let _ = queen::dismiss(&here.home, &e.id, &format!("the engineer raised the budget to ${usd:.2} (borg hive ratify --budget)"), here.now);
+                }
+                println!("goal {id}: budget raised to ${usd:.2} (spent ${:.2})", run::goal_spent(&here.home, id).total);
+                0
+            }
+            Err(e) => fail(e),
+        };
+    }
+    let b = here.board(&g);
+    let cards = plan::unratified(&b);
+    if cards.is_empty() {
+        println!("nothing to approve in goal {id}: every task of its plan is approved");
+        return 0;
+    }
+    for c in &cards {
+        println!("approve {}", plan::render_card(c));
+    }
+    // A queued question of the plan is answered, as the engineer would at the prompt.
+    for e in
+        queen::open(&here.home).into_iter().filter(|e| plan::at_own_prompt(e) && e.payload.as_ref().is_some_and(|p| p["goal"] == id && p["cards"].is_array()))
+    {
+        let _ = queen::answer(&here.home, &e.id, plan::APPROVE_OPTION, &engineer, here.now);
+    }
+    let ids: Vec<TaskId> = cards.iter().map(|c| c.task.clone()).collect();
+    if let Err(e) = plan::ratify_board(&here.home, id, &ids, &engineer, here.now) {
+        return fail(e);
+    }
+    plan::note_ratified(&here.home, &g.id, &cards, &engineer, here.now);
+    let (drones, nodes) = plan::waiting(&here.home, id, &here.board(&g));
+    println!("goal {id}: the plan of {} task(s) is approved; {drones} drone(s) on {nodes} node(s) waiting", cards.len());
     0
 }
 
@@ -3094,6 +3306,7 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
     {
         println!("group {gr}: {} attempts, each another drone's (`borg hive run` needs one drone more, to verify them); the best is integrated", tasks.len());
     }
+    plan_said(here, &g);
     0
 }
 
@@ -3215,6 +3428,10 @@ fn held_event(here: &Here, named: Option<&str>, ev: Ev, note: &str) -> i32 {
     match held(here, named) {
         Ok((session, g, s)) => match write(&here.home, &g.id, vec![Event::new(ev, &s.task.id, &session, here.now).with_note(note.trim())]) {
             Ok(_) => {
+                // A release or block of an interactive drone's own claim: what it cost (meter.rs).
+                if let Some(hs) = bound(&session) {
+                    meter_end(&here.home, &g.id, &session, &hs, &s, &harness_of(&here.home, &session), None);
+                }
                 if ev == Ev::Released {
                     count(&here.home, stats::HIVE_RELEASED, &session, &g.id, &s.task.id, &queen::repo_name(&here.cwd));
                 }
@@ -3251,6 +3468,7 @@ fn done_cmd(here: &Here, named: Option<&str>, note: &str) -> i32 {
                 hs.oracle_blocks = 0;
                 hs.blocks_for.clear();
                 save(&session, &hs);
+                meter_end(&here.home, &g.id, &session, &hs, &s, &harness_of(&here.home, &session), None);
             }
             println!("{} done: the oracle passed; verify task {vid} opened", s.task.id);
             0
@@ -3282,11 +3500,19 @@ fn verdict_cmd(here: &Here, named: Option<&str>, said: verdict::Said) -> i32 {
     }
     match verdict::record(&here.home, &g, &s.task.id, &said, &session, &here.cwd, here.now) {
         Ok(r) => {
+            if let Some(hs) = bound(&session) {
+                meter_end(&here.home, &g.id, &session, &hs, &s, &harness_of(&here.home, &session), None);
+            }
             println!("{}", r.summary(&s.task.id));
             0
         }
         Err(e) => fail(e),
     }
+}
+
+/// The harness of interactive drone `session` (its registry line), empty for any other session.
+fn harness_of(home: &Path, session: &str) -> String {
+    bound(session).filter(|hs| hs.interactive).and_then(|hs| interactive::entry_of(home, &hs.drone)).map(|e| e.harness).unwrap_or_default()
 }
 
 /// Whether this command runs for a drone ([`drone`]).

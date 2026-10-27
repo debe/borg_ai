@@ -270,7 +270,7 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
         let repo = queen::repo_name(&cwd);
         let goals = interactive::served(&here.home, &hs, &repo);
         if worker.is_none() {
-            worker = super::node::take(&here.home).map(|l| (l, super::node::Worker::for_waiter(drone)));
+            worker = super::node::take_as(&here.home, &format!("waiter {drone}")).map(|l| (l, super::node::Worker::for_waiter(drone)));
         }
         if let Some((_, w)) = worker.as_mut() {
             w.tick(&here.home);
@@ -532,7 +532,7 @@ pub(super) fn takeup(here: &Here, goal: &str, key: &str, session: &str) -> i32 {
         return 0;
     }
     let here_node = node(&here.home);
-    let note = "not taken up: no hook event of the session followed its wake";
+    let note = interactive::NOT_TAKEN_UP;
     let released = super::write_if(&here.home, goal, |events| {
         let b = board::fold_on(events, &here_node);
         super::holding(&b, &here_node, task, session, learn::now_ms()).map(|_| vec![Event::new(Ev::Released, task, session, learn::now_ms()).with_note(note)])

@@ -60,13 +60,26 @@ pub fn lock_path(home: &Path) -> PathBuf {
     home.join("hive").join(LOCK)
 }
 
-/// The node lock, when no other process holds it: held for as long as the returned file is open. None
-/// when another holds it (a daemon, a waiter) or it cannot be opened.
+/// What the mesh daemon's worker writes into the node lock it holds (`take`, `worker`).
+pub const DAEMON: &str = "daemon";
+
+/// The node lock for the mesh daemon (`take_as` with `DAEMON`).
 pub fn take(home: &Path) -> Option<std::fs::File> {
+    take_as(home, DAEMON)
+}
+
+/// The node lock, when no other process holds it: held for as long as the returned file is open, and
+/// saying who holds it (`who`: `daemon`, or `waiter <drone>`), which monitoring reads (`worker`). None
+/// when another holds it (a daemon, a waiter) or it cannot be opened. The lock is taken before the file
+/// is rewritten, so a reader never finds a loser's name in it.
+pub fn take_as(home: &Path, who: &str) -> Option<std::fs::File> {
+    use std::io::Write;
     let path = lock_path(home);
     std::fs::create_dir_all(path.parent()?).ok()?;
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
-    f.try_lock().ok().map(|()| f)
+    let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    f.try_lock().ok()?;
+    let _ = f.set_len(0).and_then(|()| f.write_all(format!("{who}\n").as_bytes()));
+    Some(f)
 }
 
 /// Whether a process does this node's goal work now (it holds the node lock): then a drone's hooks write
@@ -74,6 +87,20 @@ pub fn take(home: &Path) -> Option<std::fs::File> {
 pub fn worker_runs(home: &Path) -> bool {
     let Ok(f) = std::fs::OpenOptions::new().write(true).open(lock_path(home)) else { return false };
     matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Who does this node's goal work now (monitoring, phase g G6): `daemon` (the mesh daemon), `waiter
+/// <drone>` (a drone's waiter, while no daemon runs), `a process` (a holder from before the lock named
+/// it), or `none` when no process holds the node lock.
+pub fn worker(home: &Path) -> String {
+    if !worker_runs(home) {
+        return "none".into();
+    }
+    let who = std::fs::read_to_string(lock_path(home)).unwrap_or_default();
+    match who.trim() {
+        "" => "a process".into(),
+        w => w.to_string(),
+    }
 }
 
 /// The mesh daemon's node worker (borg-mesh main.rs `serve`): takes the node lock (a waiter that holds it
@@ -360,11 +387,14 @@ fn integrate_child(home: &Path, goal: &str, repo: &Path) -> std::io::Result<std:
     c.spawn()
 }
 
+/// The node's integration log of a goal, in its `logs/` (`integrate_log`; monitoring shows its tail).
+pub const INTEGRATE_LOG: &str = "node-integrate.log";
+
 /// The goal's `logs/node-integrate.log`, opened to append.
 fn integrate_log(home: &Path, goal: &str) -> std::io::Result<std::fs::File> {
     let logs = super::dir(home, goal).join("logs");
     std::fs::create_dir_all(&logs)?;
-    std::fs::OpenOptions::new().create(true).append(true).open(logs.join("node-integrate.log"))
+    std::fs::OpenOptions::new().create(true).append(true).open(logs.join(INTEGRATE_LOG))
 }
 
 /// `line` appended to the goal's `logs/node-integrate.log`, else on stderr (the daemon's or the waiter's).
