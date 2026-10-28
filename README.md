@@ -127,10 +127,9 @@ constraint you can ratify. [Saying no](https://github.com/debe/borg_ai/blob/main
 **Memory.** Use strengthens a lesson, disuse fades it: about 54 sessions without use make it dormant,
 never deleted. The clock counts sessions, not days. [Memory](https://github.com/debe/borg_ai/blob/main/docs/learning.md#memory)
 
-**The queen** holds decisions no lesson answers (open decisions from documents, proposed constraints,
-playbook edits). The drone asks you one at a session's first prompt; `borg queen` lists them. Playbooks, the team's steps for a kind of task, are also learned from
-plain sessions that end clean. [The queen](https://github.com/debe/borg_ai/blob/main/docs/learning.md#the-queen) ·
-[Playbooks](https://github.com/debe/borg_ai/blob/main/docs/commands.md#playbooks)
+**The queen** holds decisions no lesson answers (open decisions from documents, proposed constraints).
+The drone asks you one at a session's first prompt; `borg queen` lists them.
+[The queen](https://github.com/debe/borg_ai/blob/main/docs/learning.md#the-queen)
 
 ## The team
 
@@ -210,10 +209,10 @@ borg web        # http://127.0.0.1:7979/, the collective of the current director
 
 A live page on 127.0.0.1 with tabs for the Overview, Knowledge (every lesson, its belief and state),
 Conscience (checks, questions and what they led to per channel), Learning (week by week: lessons per
-source, the share of asked lessons that changed the work, repeated vetoes, playbook versions), Steering
+source, the share of asked lessons that changed the work, repeated vetoes), Steering
 (corrections, rejected tool calls, pauses and vetoes, the tool calls a pause refused), Messages (the last
-7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost, Drones,
-and Playbooks once the collective has one. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
+7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost and Drones.
+It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
@@ -242,8 +241,7 @@ lessons (with author emails and repo names); redacted reasoning excerpts of land
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
 of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them; the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
-ratified constraints (the invariant, its lesson and who ratified it, never the veto's words); and promoted
-playbook edits.
+and ratified constraints (the invariant, its lesson and who ratified it, never the veto's words).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content; run your own to keep even
 that in-house ([Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh), [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md)).

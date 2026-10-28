@@ -83,8 +83,6 @@ wrong fix links; that replay has not run, so `BORG_REGRESS` stays `links`.
   reader is not yet checked against a real spawned rollout.
 - Green-test credit sees only test runs whose result the harness shows; a runner whose output the
   adapter does not send counts as no run.
-- A plain session's playbook reflection takes its first task prompt as the task and runs only at
-  session end, never while the session is idle.
 - Decision → fix links have been measured only on a scripted repo, not on real notes, and only for the
   subject and revert signals: check `borg regress --replay` on your own history and
   `borg regress --session ID --explain` on a few real sessions before `BORG_REGRESS=learn`.

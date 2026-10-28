@@ -75,11 +75,10 @@ pub fn reason_in(prompt: &str) -> Option<String> {
 }
 
 /// The lessons the drone was shown in `session` so far, sorted and unique: its `asked` outcomes (stop
-/// or live), the playbook versions shown to it (`outcome::PLAYBOOK`, playbook.rs), and its stats events
-/// of the delivering kinds (early, queued, live asks, blocks).
+/// or live) and its stats events of the delivering kinds (early, queued, live asks, blocks).
 pub fn shown(home: &Path, session: &str) -> Vec<String> {
     const DELIVERED: [&str; 4] = [stats::EARLY, stats::QUEUED_FREE, stats::LIVE_ASK, stats::BLOCK];
-    let asked = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| outcome::shows(&o.kind) && o.session == session).flat_map(|o| o.lessons);
+    let asked = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| o.kind == outcome::ASKED && o.session == session).flat_map(|o| o.lessons);
     let delivered = stats::events(home).into_iter().filter(|e| e.session == session && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
     let mut out: Vec<String> = asked.chain(delivered).filter(|l| !l.is_empty()).collect();
     out.sort();

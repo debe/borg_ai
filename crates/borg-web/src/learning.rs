@@ -2,14 +2,13 @@
 //! anyway (no state of its own, so the history is there from the first view).
 //!
 //! Each section says where its numbers come from: `team` when they fold synced logs (stats.jsonl
-//! rollups, outcomes, lessons.jsonl, playbooks) in a team collective, `this machine`
+//! rollups, lessons.jsonl) in a team collective, `this machine`
 //! when they fold the local event log (stats/events.jsonl, which keeps the lesson sources) or the
 //! collective is local.
 //! - lessons written per source (session, review, regret, veto, queen, import, ...), and
 //!   the team's lessons written (from lessons.jsonl, each lesson once) and merged;
 //! - asked lessons' verdicts: changed the work, ignored, corrected anyway (the asked→changed rate);
-//! - vetoes and repeated vetoes (the same "no" said twice: a lesson that did not hold);
-//! - the playbooks with each shown version's belief (playbook.rs `view`).
+//! - vetoes and repeated vetoes (the same "no" said twice: a lesson that did not hold).
 //!
 //! The weeks run from the first counted one to the current one (`partial_week`). The history before
 //! live counting began (stats.rs `backfill`) derives no merges, repeated vetoes or lesson sources:
@@ -138,7 +137,6 @@ fn view_at(name: &str, home: &Path, share: Share, now: i64) -> Value {
         "asked": {"scope": synced, "changed": t(stats::CHANGED), "ignored": t(stats::IGNORED), "corrected": t(stats::CORRECTED),
             "not_corrected": t(stats::NOT_CORRECTED)},
         "vetoes": {"scope": synced, "veto": t(stats::VETO), "repeat": since(stats::VETO_REPEAT)},
-        "playbooks": {"scope": synced, "list": borg::playbook::view(home)},
     })
 }
 

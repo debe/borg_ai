@@ -1,18 +1,17 @@
 //! A plain interactive session, end to end through the binary and every harness's hooks, in both
 //! delivery modes: its prompt gets its lessons where the harness delivers them early, its stop a
-//! verdict, and it leaves outcomes; and a store without playbooks shows none. The model is the fake
+//! verdict, and it leaves outcomes. The model is the fake
 //! `claude` of `common`: no test makes a real model call.
 
 mod common;
 
 use std::path::Path;
 
-use common::{borg, borg_as, context, setup, state};
+use common::{borg_as, context, setup, state};
 use serde_json::{Value, json};
 
-/// Learning stays on, as for an engineer.
-const ON: [(&str, &str); 1] = [("BORG_LEARN", "on")];
-/// And the stop always asks the model (no free gate), so it has a verdict to compare.
+/// Learning stays on, as for an engineer, and the stop always asks the model (no free gate), so it has
+/// a verdict to compare.
 const ASKED: [(&str, &str); 2] = [("BORG_LEARN", "on"), ("BORG_PREFILTER", "off")];
 
 /// The harnesses whose hooks run a plain session, and the delivery modes: `hook` judges at the turn's
@@ -80,17 +79,4 @@ fn a_plain_session_gets_its_lessons_and_a_verdict_in_every_harness() {
             let _ = std::fs::remove_dir_all(root);
         }
     }
-}
-
-#[test]
-fn a_store_without_playbooks_shows_no_playbook() {
-    let root = setup("plain-playbooks");
-    assert!(!root.join("store/collectives/corp/playbooks.jsonl").exists());
-    let cwd = root.join("harbor_orion");
-    let out = borg(&root, "prompt", &json!({"session_id": "pb1", "cwd": cwd, "prompt": "Follow the playbook to tidy the Orion net's budget handling"}), &ON);
-    let ctx = context(&out);
-    assert!(!ctx.is_empty(), "the prompt got its lessons: {out}");
-    assert!(!ctx.to_lowercase().contains("playbook for this kind of task"), "{ctx}");
-    assert!(!state(&root, "pb1", "ctx").lines().any(|l| l.starts_with("#borg-playbook")), "{}", state(&root, "pb1", "ctx"));
-    let _ = std::fs::remove_dir_all(root);
 }

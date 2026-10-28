@@ -132,23 +132,23 @@ fn borg_queen_ask_off_delivers_nothing() {
     assert!(context(&hook(&root, &payload("s1", &pw, "fix the README"), &[])).contains("AskUserQuestion"));
 }
 
-/// A plain session's one question goes to the engineer's own work first: a playbook edit queued before
-/// it waits, and a later session gets it only once no other question is eligible.
+/// A queue from 0.4.0 still holds a playbook edit's question, a kind borg no longer has: the queue
+/// reads as before, the line is skipped, and no session is ever asked it.
 #[test]
-fn the_engineers_own_decision_comes_before_a_playbook_question() {
-    let root = setup("proposal-last");
+fn a_removed_kinds_question_is_skipped_never_asked() {
+    let root = setup("removed-kind");
     let pw = root.join("work/lumen_handbook");
     let queue = root.join("store/collectives/team/queen/queue.jsonl");
     let own = std::fs::read_to_string(&queue).unwrap();
     let playbook = json!({"id": "qbook", "decision_key": "playbook:lumen_handbook:qbook", "kind": "playbook",
-        "question": "Promote this edit to the handbook playbook?", "options": [borg::playbook::KEEP_OPTION, borg::playbook::PROMOTE_OPTION],
-        "default": borg::playbook::KEEP_OPTION, "evidence": [], "session": "s0", "cwd": pw, "engineer": "e@x", "ms": 0});
+        "question": "Promote this edit to the handbook playbook?", "options": ["keep the playbook as it is", "promote: apply this edit to the playbook"],
+        "default": "keep the playbook as it is", "evidence": [], "session": "s0", "cwd": pw, "engineer": "e@x", "ms": 0});
     std::fs::write(&queue, format!("{playbook}\n{own}")).unwrap();
 
     let ctx = context(&hook(&root, &payload("s1", &pw, "fix the README"), &[]));
-    assert!(ctx.contains("Question: Should spikes be capped at 3 story points"), "the engineer's decision first: {ctx}");
+    assert!(ctx.contains("Question: Should spikes be capped at 3 story points"), "the queue still reads: {ctx}");
     assert!(!ctx.contains("handbook playbook"), "{ctx}");
-    // The next session: the engineer's decision was just delivered, so the playbook's question.
-    let ctx = context(&hook(&root, &payload("s2", &pw, "fix the README"), &[]));
-    assert!(ctx.contains("Promote this edit to the handbook playbook?"), "a playbook question once none other is eligible: {ctx}");
+    // The next session: the engineer's decision was just delivered, and the removed kind's line is never offered.
+    let out = hook(&root, &payload("s2", &pw, "fix the README"), &[]);
+    assert_eq!(out.trim(), "", "a removed kind is never asked");
 }

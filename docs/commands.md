@@ -45,7 +45,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | Command | Shows or does |
 |---|---|
 | `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), and the last day's messages below. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
-| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: an overview, knowledge, checks (Conscience), learning week by week, steering and refusals, messages, the queen, cost, drones and, once there are any, playbooks ([details](statistics.md)) |
+| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: an overview, knowledge, checks (Conscience), learning week by week, steering and refusals, messages, the queen, cost and drones ([details](statistics.md)) |
 
 ### Team
 
@@ -147,25 +147,6 @@ after `--off` or when the session is gone; 1 when the session does not listen; 2
 128 + the signal when stopped. `borg top` shows `on` (listens, no waiter yet) or `waiter` in its WAKE
 column, and the same in `borg top --json` as each session's `listen`.
 
-## Playbooks
-
-A playbook is the team's procedure for a kind of task: its shape ("fix the parser") and a short list of
-steps. `playbooks.jsonl` holds edits (add, change or remove one step), never whole playbooks, so it syncs
-like lessons and every reader folds the same playbooks.
-
-```console
-$ borg queen
-app (1)
-  1  Add to the team's playbook: "Run the parser's tests before calling it done"?
-$ borg queen answer 1 b
-```
-
-After a session ends clean (it landed commits, its last test run passed, and you neither corrected nor
-vetoed it), `borg learn` asks the model once for at most one edit. The edit is never applied by
-learning: it is queued as a queen question, and only your `promote` answer appends it. A session sees
-the playbooks its prompt names; each version shown is credited like a lesson. `BORG_PLAYBOOKS=off`
-shows and proposes nothing.
-
 ## Saying no
 
 A veto is the engineer's "no" to what a drone is doing, with the reason: the strongest negative signal
@@ -205,7 +186,7 @@ With `BORG_LEARN=off` the command records nothing and says so.
 
 The queen's queue holds decisions no lesson answers: open decisions found in team documents
 (`borg assimilate --from-dir`), who should hear an existing lesson (`borg reach`), proposed
-constraints, playbook edits and, with `BORG_QUEEN=on`, questions raised at a turn end. Similar questions are queued once.
+constraints and, with `BORG_QUEEN=on`, questions raised at a turn end. Similar questions are queued once.
 
 ```console
 $ borg queen

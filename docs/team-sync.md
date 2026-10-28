@@ -135,7 +135,7 @@ append-only files, so nothing is overwritten; when two machines improved the sam
 version wins everywhere. Cost grows with what changed: a laptop back from three weeks' vacation
 downloads three weeks of lessons.
 
-**What travels.** Six logs, each line signed by the machine that wrote it and quarantined when that
+**What travels.** Five logs, each line signed by the machine that wrote it and quarantined when that
 machine is revoked:
 
 - **Lessons.** Raw episodes stay where they were captured, so each is learned exactly once.
@@ -144,7 +144,6 @@ machine is revoked:
   the blame), when, and the probability it was asked, with session, repo and regret hashed. Every
   member derives the same lesson usefulness and trust from them. `BORG_SHARE_OUTCOMES=off` keeps a
   machine's outcomes local.
-- **Playbooks**: the edits engineers promoted.
 - **Ratified constraints** (`borg no`, `borg queen`): the invariant, its lesson and who ratified it,
   never the veto's words. Every member's sessions get them as standing lessons.
 - **Messages between sessions** (`borg tell`, `borg ask`, and `borg pause`, `borg resume` or a

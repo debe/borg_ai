@@ -34,9 +34,16 @@
 - The hive: `borg hive` and `borg debug hive`, interactive drones, and goals with their boards, claims,
   verify tasks, oracles, integration, contracts and plans. The Hive tab of `borg web`, the goal sections
   of `borg top`, and the `BORG_HIVE*`, `BORG_GROUP_REFLECT` and `BORG_REWORK_REFLECT` variables go with
-  it. Messages between sessions replace it. Plain sessions, lessons, playbooks, `borg no` and team sync
+  it. Messages between sessions replace it. Plain sessions, lessons, `borg no` and team sync
   work as before. `borg install` removes the Claude Code `SessionStart` hook only the hive used. An old
   store's `hive/` directory is no longer read; `borg doctor` names it and the command that removes it.
+- Playbooks are removed: no playbook was ever promoted, and lessons already cover mistakes of procedure.
+  A clean session no longer proposes a playbook edit, no prompt shows one, and `borg queen` asks no
+  playbook question. The Playbooks tab of `borg web`, `/api/playbooks`, the `playbook_*` statistics and
+  `BORG_PLAYBOOKS` go with them. An old store's `playbooks.jsonl`, `playbooks-reflected.txt` and
+  `playbooks-plain.txt` are no longer read or synced, and an old queued playbook question is skipped;
+  `borg doctor` names the files and the command that removes them. The mesh protocol stays `borg/mesh/13`: a session still steps
+  through the playbooks' log and keeps nothing a 0.3.0 or 0.4.0 member offers there.
 
 ## 0.3.0 (unreleased)
 

@@ -5,6 +5,5 @@ pub mod knowledge;
 pub mod learning;
 pub mod messages;
 pub mod overview;
-pub mod playbooks;
 pub mod queen;
 pub mod steering;

@@ -33,7 +33,6 @@ pub mod notes;
 pub(crate) mod notify;
 pub mod ope;
 pub mod outcome;
-pub mod playbook;
 #[doc(hidden)]
 pub mod predict;
 pub mod prefilter;

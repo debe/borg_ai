@@ -32,10 +32,6 @@ use serde_json::Value;
 /// repos or text. Plain lines (no `id` + `version`), so `settle` leaves them alone; signed and
 /// quarantined like every synced log.
 ///
-/// And the team's L1 playbooks (borg playbook.rs): promoted edits, each a delta to one step, folded
-/// order-independently by every reader, so a union is all a merge needs. Plain lines too (`pb` +
-/// `edit`, no `id` + `version`).
-///
 /// And the ratified constraints (borg veto.rs `ratify`): standing lessons every member's sessions get
 /// (conscience.rs `standing`), lines holding what a lesson does (the redacted invariant, its lesson,
 /// who ratified it). Plain lines (no `version`); the conscience keeps the earliest ratification per id,
@@ -44,8 +40,11 @@ use serde_json::Value;
 /// And the messages between sessions (borg msg.rs): plain lines, each naming its author's node. That
 /// name is a claim, so a message travels only under an origin of the key it names (`travels`), and
 /// only while it is fresh: a line one node pruned would otherwise come back from every peer. Last in
-/// the list: a 0.3.0 peer (`borg/mesh/12`) reconciles the five before it and never this one.
-pub const SYNCED: [&str; 6] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE, borg::veto::FILE, borg::msg::FILE];
+/// the list: a 0.3.0 peer (`borg/mesh/12`) never reconciles this one.
+///
+/// The removed playbooks' log is not listed: a session still steps through it after the outcomes
+/// and keeps nothing (sync.rs `PLAYBOOKS`).
+pub const SYNCED: [&str; 5] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::veto::FILE, borg::msg::FILE];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).

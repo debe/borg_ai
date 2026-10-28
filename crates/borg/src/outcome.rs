@@ -92,18 +92,6 @@ pub const REGRETTED: &str = "regretted";
 /// after a change on the lesson's point. Once per (session, lesson), dated at that pass.
 pub const TESTED: &str = "tested";
 
-/// The playbook versions shown to a session (playbook.rs; `lessons`: each `Playbook::key`). Local, never
-/// shared, and no result: like `asked` it is what the session's later results credit, the veto
-/// (veto.rs `shown`) and the regret (`regretted`), so a playbook version gets the
-/// usefulness belief a lesson gets (memory.rs `derive`, keyed by the version).
-pub const PLAYBOOK: &str = "playbook";
-
-/// Whether a record of `kind` shows its `lessons` to its session: an `asked` lesson or a shown playbook
-/// version, what later results of the session credit.
-pub fn shows(kind: &str) -> bool {
-    matches!(kind, ASKED | PLAYBOOK)
-}
-
 /// A session without asks or episodes for this long is treated as ended (24h).
 pub const IDLE_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -493,26 +481,13 @@ fn credited(outcomes: &[Outcome], cause: &str, lesson: &str) -> bool {
 /// with `credit = strength / n`; n counts the blamed lessons before the already-credited ones are left
 /// out, so a re-run writes nothing and the shares never change. Every record's session has an earlier
 /// `asked` record, so it never moves memory.rs's `Clock`.
-///
-/// The playbook versions shown in the session before the decision (`PLAYBOOK` records) share the same
-/// regret among themselves, the same way, apart from the lessons: a shown playbook never dilutes a
-/// lesson's share, nor a lesson a playbook's.
 #[allow(clippy::too_many_arguments)]
 pub fn regretted(outcomes: &[Outcome], session: &str, before_ms: i64, cause: &str, target: &[String], strength: f64, ms: i64, repo: &str) -> Vec<Outcome> {
     if session.is_empty() || before_ms <= 0 || strength <= 0.0 {
         return Vec::new();
     }
-    let mut out: Vec<Outcome> =
-        [ASKED, PLAYBOOK].iter().flat_map(|kind| blamed(outcomes, kind, session, before_ms, cause, target, strength, ms, repo)).collect();
-    out.sort_by(|a, b| a.lessons.cmp(&b.lessons));
-    out
-}
-
-/// One pool of `regretted`: the ids the records of `kind` showed in `session` before `before_ms`.
-#[allow(clippy::too_many_arguments)]
-fn blamed(outcomes: &[Outcome], kind: &str, session: &str, before_ms: i64, cause: &str, target: &[String], strength: f64, ms: i64, repo: &str) -> Vec<Outcome> {
     let mut asked: Vec<&str> =
-        outcomes.iter().filter(|o| o.kind == kind && o.session == session && o.ms < before_ms).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
+        outcomes.iter().filter(|o| o.kind == ASKED && o.session == session && o.ms < before_ms).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
     asked.sort_unstable();
     asked.dedup();
     if asked.iter().any(|l| target.iter().any(|t| t == l)) {
@@ -896,10 +871,6 @@ mod tests {
         assert!(regretted(&log, "", 20, "R1", &[], 0.5, 99, "r").is_empty());
         assert!(regretted(&log, "s", 0, "R1", &[], 0.5, 99, "r").is_empty(), "no decision time");
         assert!(regretted(&log, "s", 20, "R1", &[], 0.0, 99, "r").is_empty(), "not strong");
-        // A playbook version shown before the decision shares the regret apart: the lessons keep theirs.
-        let mut shown = log.clone();
-        shown.push(o(PLAYBOOK, "s", &["P1@1.aaaaaa"], 12));
-        assert_eq!(blame(&shown, &[]), vec![want("A", 0.25), want("B", 0.25), want("P1@1.aaaaaa", 0.5)]);
         // An old line without cause and credit still reads; a regretted line round-trips.
         let old: Outcome = serde_json::from_str(r#"{"kind":"asked","session":"s","lessons":["A"],"ms":1,"repo":"r"}"#).unwrap();
         assert_eq!(old, o(ASKED, "s", &["A"], 1));

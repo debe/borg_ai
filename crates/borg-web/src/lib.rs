@@ -184,7 +184,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 31] = [
+const NOTABLE: [&str; 28] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -211,9 +211,6 @@ const NOTABLE: [&str; 31] = [
     stats::EARLY,
     stats::QUEUED_FREE,
     stats::MODEL_CALL,
-    stats::PLAYBOOK_SHOWN,
-    stats::PLAYBOOK_PROPOSED,
-    stats::PLAYBOOK_PROMOTED,
     // Messages between sessions: each one sent, and each refused. A delivery is one row per recipient
     // (a broadcast many): `/api/messages` says whom each was shown to instead.
     stats::MSG_SENT,
@@ -294,13 +291,6 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
     Json(json!({"collective": m.name, "messages": out, "unread": unread})).into_response()
 }
 
-/// The collective's L1 playbooks (playbook.rs `view`): steps, each shown version's belief, edits
-/// waiting for the engineer.
-async fn playbooks(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
-    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
-    Json(json!({"collective": m.name, "playbooks": borg::playbook::view(&m.home)})).into_response()
-}
-
 /// Whether learning works in the collective, week by week (learning.rs), backfilled from its logs.
 async fn learning_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
@@ -337,20 +327,8 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("messages", vec![msg::path(home), msg::seen_path(home)]),
         ("feed", vec![stats::events_path(home)]),
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
-        // Playbooks: their edits, the queue that proposes them, the outcomes that credit them.
-        ("playbooks", vec![home.join(borg::playbook::FILE), home.join("queen"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE)]),
-        // Learning health folds the lessons, the rollups, the local events and the playbooks.
-        (
-            "learning",
-            vec![
-                home.join("lessons.jsonl"),
-                home.join("stats.jsonl"),
-                stats::events_path(home),
-                home.join(borg::playbook::FILE),
-                home.join(outcome::TEAM_FILE),
-                home.join("outcomes.jsonl"),
-            ],
-        ),
+        // Learning health folds the lessons, the rollups and the local events.
+        ("learning", vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home)]),
     ]
 }
 
@@ -405,7 +383,6 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/drones", get(drones))
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
-        .route("/api/playbooks", get(playbooks))
         .route("/api/messages", get(messages))
         .route("/api/learning", get(learning_of))
         .route("/api/events", get(events))
@@ -416,7 +393,7 @@ pub fn router(app: Arc<App>) -> Router {
 /// Answers only a request whose Host names this machine's loopback. The 127.0.0.1 bind keeps other
 /// machines out but not a page in the engineer's browser whose name re-resolves to 127.0.0.1 (DNS
 /// rebinding): to the browser the port is then that page's own origin, CORS does not apply, and its
-/// script could read the lessons, playbooks and spend. Such a request carries that name.
+/// script could read the lessons, messages and spend. Such a request carries that name.
 async fn loopback_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(loopback) {
         true => next.run(req).await,

@@ -48,15 +48,6 @@ codex's serde names, not yet checked against a real spawned rollout. See
 
 **Vetoes.** The reason of a `borg no` becomes a lesson at the next session end ([Saying no](#saying-no)).
 
-**Playbooks.** A plain session that ends clean (it landed commits, its own last test run passed, and you
-neither corrected nor vetoed it) is reflected on once at session end: `borg learn` asks the model for at
-most one edit to the team's playbook for that kind of task. The task is the session's first task prompt,
-not a later "commit it", and the change runs from where the session started to its newest commit. When
-the model does not answer, the session waits in `playbooks-plain.txt` for a later run. The edit waits in
-`borg queen` until you answer "promote". A later session whose prompt names at least 60% of the
-significant words of the playbook's shape gets its steps. Built, preparation: no value metric yet. `BORG_PLAYBOOKS=off` turns it
-off. See [Playbooks](commands.md#playbooks).
-
 ## Outcomes and the usefulness belief
 
 Each delivered lesson gets an `asked` outcome, and what follows is recorded against it: `changed` or
@@ -146,7 +137,7 @@ A session reads only its own collective's lessons.
 ## The queen
 
 The queen holds the decisions no lesson answers: open decisions from team documents, proposed
-constraints, playbook edits and reach questions. At the first prompt of a session the drone asks you one
+constraints and reach questions. At the first prompt of a session the drone asks you one
 question of that session's repo: Claude Code in its question dialog, the other harnesses at the start of
 the reply. Answer
 in the terminal with `borg queen` and `borg queen ask`. See [Answering the queen](commands.md#answering-the-queen).

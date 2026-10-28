@@ -6,7 +6,7 @@ machines over the mesh: peer to peer, end-to-end encrypted, no server of ours. E
 keeps working offline. `borg mesh` runs the separate `borg-mesh` binary; if it is missing:
 `cargo install borg-mesh --locked` (or `--path crates/borg-mesh` from a borg checkout).
 
-What travels: lessons, daily usage counts, the team's redacted outcomes, playbooks, ratified
+What travels: lessons, daily usage counts, the team's redacted outcomes, ratified
 constraints, messages between sessions, which sessions are running, and the redacted reasoning behind
 commits. Each line is signed by its writer's node. Raw episodes and transcripts stay where they were
 captured.

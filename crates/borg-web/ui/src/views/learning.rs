@@ -1,14 +1,14 @@
 //! Learning: is learning working in this collective? Week by week, backfilled from the logs Borg keeps
 //! (borg-web learning.rs): lessons written per source, the share of asked lessons that changed the work,
-//! the share of vetoes that repeated an earlier "no", and the playbook versions with their beliefs. Each panel says
-//! whether its numbers are the team's (synced logs) or this machine's.
+//! and the share of vetoes that repeated an earlier "no". Each panel says whether its numbers are the team's
+//! (synced logs) or this machine's.
 
 use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::api::data;
 use crate::charts::{Row, Series, StackedChart, Tile};
-use crate::util::{day_num, num, palette, pct, short_day, trunc};
+use crate::util::{day_num, num, palette, pct, short_day};
 
 fn nums(v: &Value) -> Vec<f64> {
     v.as_array().into_iter().flatten().map(|x| x.as_f64().unwrap_or(0.0)).collect()
@@ -41,9 +41,6 @@ struct Learning {
     veto: Vec<f64>,
     repeat: Vec<f64>,
     veto_scope: String,
-    /// (playbook shape, version key, belief mean, corrected, vetoed, regretted).
-    versions: Vec<(String, String, f64, f64, f64, f64)>,
-    playbooks_scope: String,
 }
 
 fn parse(v: &Value) -> Learning {
@@ -56,18 +53,6 @@ fn parse(v: &Value) -> Learning {
         w.push_str(" (so far)");
     }
     let l = &v["lessons"];
-    let versions = v["playbooks"]["list"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|p| {
-            let shape = s(&p["shape"]);
-            p["versions"].as_array().cloned().unwrap_or_default().into_iter().map(move |x| {
-                let n = |k: &str| x[k].as_f64().unwrap_or(0.0);
-                (shape.clone(), s(&x["key"]), n("mean"), n("corrected"), n("vetoed"), n("regretted"))
-            })
-        })
-        .collect();
     Learning {
         weeks,
         live,
@@ -84,8 +69,6 @@ fn parse(v: &Value) -> Learning {
         veto: nums(&v["vetoes"]["veto"]),
         repeat: nums(&v["vetoes"]["repeat"]),
         veto_scope: s(&v["vetoes"]["scope"]),
-        versions,
-        playbooks_scope: s(&v["playbooks"]["scope"]),
     }
 }
 
@@ -306,23 +289,6 @@ pub fn Learning() -> impl IntoView {
                 <h2>"Vetoes"<small>{move || lr.with(|l| format!("per week, a repeat is the same no said again{} ", since(l)))}</small>{move || scope(lr.with(|l| l.veto_scope.clone()))}</h2>
                 <StackedChart rows=veto_rows series=veto_series width=600.0 />
             </div>
-        </section>
-        <section class="panel">
-            <h2>"Playbook versions"<small>"each shown version's belief: does following it get the work through without a correction? "</small>{move || scope(lr.with(|l| l.playbooks_scope.clone()))}</h2>
-            {move || {
-                let vs = lr.with(|l| l.versions.clone());
-                if vs.is_empty() {
-                    return view! { <p class="empty">"No playbook version shown to a drone yet."</p> }.into_any();
-                }
-                view! {
-                    <table class="mono">
-                        <tr><th>"playbook"</th><th>"version"</th><th>"useful"</th><th>"corrected"</th><th>"vetoed"</th><th>"regretted"</th></tr>
-                        {vs.into_iter().map(|(shape, key, mean, c, v, r)| view! {
-                            <tr><td>{trunc(&shape, 60)}</td><td>{key}</td><td>{pct(mean, 1.0)}</td><td>{num(c)}</td><td>{num(v)}</td><td>{format!("{r:.2}")}</td></tr>
-                        }).collect_view()}
-                    </table>
-                }.into_any()
-            }}
         </section>
         {move || src.missing.get().then(|| view! { <p class="hint">"This server has no learning view yet: update borg-web."</p> })}
     }

@@ -89,12 +89,6 @@ pub const QUEEN_STAMP: &str = "queen_stamp";
 pub const QUEEN_MISSED: &str = "queen_missed";
 /// One imported chunk of team documents (`n`: lessons, `usd`).
 pub const ASSIMILATED: &str = "assimilated";
-/// L1 playbooks (playbook.rs): versions shown to a drone (`lessons`: their keys, `n`), an edit proposed
-/// to the engineer from a session that ended clean, and one promoted by an engineer's answer (`lessons`: the
-/// playbook, `why`: add/modify/remove, `text`: the step).
-pub const PLAYBOOK_SHOWN: &str = "playbook_shown";
-pub const PLAYBOOK_PROPOSED: &str = "playbook_proposed";
-pub const PLAYBOOK_PROMOTED: &str = "playbook_promoted";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {

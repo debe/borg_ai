@@ -34,16 +34,15 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `/api/queen?c=` | The queen's questions and answers, and the team's attention reward (`queen_no`, `queen_stamp`, `queen_missed`) |
 | `/api/drones?c=` | The sessions, as in `borg top`, each with its unread messages |
 | `/api/messages?c=&limit=` | Messages between sessions from the last 7 days, newest first: sender, recipient (`to_kind`: `all`, `engineer` or `session`), text, how many sessions here were shown it, and the unread total |
-| `/api/playbooks?c=` | The playbooks: their steps, each shown version's belief, and edits waiting for an engineer |
-| `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts, the playbook versions with their beliefs; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
+| `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/events?c=` | A server-sent event stream naming the views whose files changed |
 
 **Is learning working?** The Learning tab answers it per collective, week by week, from the logs
 Borg keeps anyway (no state of its own, so the history is there from the first view): lessons written
 per source (session, review, regret, veto, queen, import) and the team's lessons written
 and merged; the share of asked lessons that changed the work (should rise) and of vetoes that repeated
-an earlier "no" (should fall); and each playbook version shown to a drone with its belief. Each panel
-is labelled `team` when it folds synced logs (rollups, lessons, playbooks) of a team collective,
+an earlier "no" (should fall). Each panel
+is labelled `team` when it folds synced logs (rollups, lessons) of a team collective,
 or `this machine` when it folds the local event log, the only place a lesson's source is kept.
 The weeks run up to the current one, marked "so far", so an idle month shows as idle weeks. The team's
 new lessons are counted from the lessons themselves, each once in the week it was learned. The history derived before live counting began holds no lesson sources, merges or
@@ -55,8 +54,7 @@ one lesson can get on top of either, as on the Conscience tab.
 **The tabs.** Overview (the day's activity and a live feed), Knowledge (the lessons), Conscience
 (checks and what their questions led to), Learning (above), Steering (corrections, pauses, resumes,
 vetoes and refused steers), Messages (the conversation between sessions, sends and refusals), Queen,
-Cost, Drones (which sessions run where, and their unread messages) and Playbooks (shown once the
-collective has one).
+Cost and Drones (which sessions run where, and their unread messages).
 
 ## How counting works
 
@@ -97,7 +95,6 @@ collective has one).
 | `pause_refused` | A tool call refused because its drone was paused |
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |
 | `queen_no`, `queen_stamp`, `queen_missed` | The queen's attention reward, shown on the Queen tab and never optimised: an escalation answered by changing course, one answered "yes, fine", and a veto or a later fix of merged work from a session the queen never escalated |
-| `playbook_shown`, `playbook_proposed`, `playbook_promoted` | Playbook versions shown to a drone, an edit proposed to the engineer after a session ended clean, and an edit an engineer promoted (`why`: add, modify or remove) |
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.

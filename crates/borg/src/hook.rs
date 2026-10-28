@@ -119,12 +119,6 @@ fn task_file(session: &str) -> PathBuf {
     state_file(session).with_extension("task")
 }
 
-/// The session's first task prompt, never overwritten: what a plain session's commits set out to do
-/// (playbook.rs `plain_win`), where its task file holds the latest prompt ("commit it", "thanks").
-fn first_task_file(session: &str) -> PathBuf {
-    state_file(session).with_extension("first-task")
-}
-
 /// A tool call refused without words, waiting for the engineer's next prompt (their reason).
 /// Pending only while the drone waits: a later successful tool call or the session's end clears it,
 /// because omp lets the model carry on after a denial and the next prompt may be about anything.
@@ -149,9 +143,6 @@ fn capture_prompt(h: &dyn Harness, session: &str, input: &Value, prompt: &str) {
     }
     if !learn::is_correction(prompt) || task.is_empty() {
         let task: String = prompt.chars().take(3000).collect();
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(first_task_file(session)) {
-            let _ = f.write_all(task.as_bytes());
-        }
         let _ = std::fs::write(task_file(session), task);
         return;
     }
@@ -1146,9 +1137,7 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     let out = (h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false))).then(|| {
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
         let ask = queen_ask(h, session, cwd);
-        let playbook =
-            learning().then(|| crate::playbook::for_prompt(&learn::home(), session, &crate::queen::repo_name(cwd), prompt, learn::now_ms())).flatten();
-        let extra: Vec<String> = [playbook, ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
+        let extra: Vec<String> = [ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
         free_context_with(h, "UserPromptSubmit", session, input, prompt, (!extra.is_empty()).then(|| extra.join("\n\n")))
     });
     // A new turn's work starts, after a live ask handed over here took the last turn's as its evidence.

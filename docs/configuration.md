@@ -177,7 +177,6 @@ root). The mesh syncs the files marked *synced*, and only for a team collective.
 | `outcomes.jsonl` | What followed each lesson asked: ignored, changed, corrected, vetoed, regretted, tested |
 | `outcomes-team.jsonl` | The outcomes redacted for the team: lesson ids, what followed, when, the asking probability, session and repo hashed. Synced. `outcomes-team.published` (local) remembers how much was published |
 | `stats.jsonl` | One usage rollup per node, engineer and day: counts, cost, lesson ids. Synced. The raw events stay in `stats/events.jsonl` |
-| `playbooks.jsonl` | Promoted [playbook](commands.md#playbooks) edits. Synced |
 | `constraints.jsonl` | Constraints ratified from a [`borg no`](commands.md#saying-no). Synced |
 | `messages.jsonl` | [Messages](commands.md#messages) between sessions, pauses, resumes and vetoes: a week at most, the newest 500. Synced. `messages/` (local) records which session saw each one, and which pauses and vetoes count here |
 | `reasoning.jsonl` | Redacted reasoning excerpts and [decision → fix links](#decision--fix-links), replicated by the mesh |
@@ -470,7 +469,6 @@ All are optional.
 | `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
 | `BORG_TEST_CREDIT` | on | `off`: a session's own tests going green after a lesson was asked no longer credit it (`tested` outcomes; [Green tests credit the question](learning.md#outcomes-and-the-usefulness-belief)). For an eval's frozen arm. Also off with `BORG_LEARN=off` |
 | `BORG_SHARE_OUTCOMES` | on | `off`: publish no outcomes for the team and read none (lesson usefulness and trust from this machine only); lines already synced stay |
-| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a session, and `borg learn` proposes no playbook edit from a clean session ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
 | `BORG_VETO` | on | `off`: a prompt starting "borg no" is an ordinary prompt (the `borg no` command still works; [Saying no](commands.md#saying-no)) |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |

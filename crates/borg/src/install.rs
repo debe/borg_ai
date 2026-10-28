@@ -444,15 +444,7 @@ pub fn collective_checks(cfg: &Result<Option<collective::Config>, String>, base:
         {
             out.push((Level::Warn, format!("collective {name}: live mode is off while {why} is set; its drones check at the turn end only (hook mode)")));
         }
-        // The hive's goals and drone registry (0.3.0 and before): nothing reads them now, and borg never
-        // deletes a store's data on its own.
-        let hive = home.join("hive");
-        if hive.is_dir() {
-            out.push((
-                Level::Warn,
-                format!("store {name}: {} is a removed feature's data (the hive), unused now; remove it with: rm -r '{}'", hive.display(), hive.display()),
-            ));
-        }
+        out.extend(orphans::store_checks(name, home));
         let probe = home.join(".borg-doctor-probe");
         let ok = std::fs::create_dir_all(home).and_then(|_| std::fs::write(&probe, b"ok")).and_then(|_| std::fs::remove_file(&probe));
         match ok {

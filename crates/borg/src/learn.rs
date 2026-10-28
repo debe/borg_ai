@@ -23,9 +23,6 @@
 //! session, not only its own (a terminal veto may name an ended session). A veto merged into a lesson
 //! an earlier veto made counts as `veto_repeat`; an invariant of a lesson placed in this store becomes
 //! a proposed constraint in the queen's queue (`veto::propose`), never a constraint.
-//!
-//! **Playbooks** (playbook.rs): every run with `track` then reflects once on the session that just
-//! ended clean, and queues at most one playbook edit for the engineer to promote.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -323,15 +320,9 @@ fn veto_schema() -> Value {
 }
 
 /// The answer schema for `prompt`: a veto's prompt (it starts with `veto::OPENING`) gets the invariant
-/// field, a playbook reflection (`playbook::OPENING`) its edit; correction and regret calls stay as they were.
+/// field; correction and regret calls stay as they were.
 pub fn schema_for(prompt: &str) -> Value {
-    if prompt.starts_with(crate::veto::OPENING) {
-        veto_schema()
-    } else if prompt.starts_with(crate::playbook::OPENING) {
-        crate::playbook::schema()
-    } else {
-        schema()
-    }
+    if prompt.starts_with(crate::veto::OPENING) { veto_schema() } else { schema() }
 }
 
 /// The model call failed (quota, rate limit, not logged in, network, malformed answer): unlike a
@@ -804,11 +795,6 @@ fn learn_unlocked(
             ended.push(s.to_string());
         }
         let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
-        // The session that just ended (its end hook's `--session`, never an idle one: that may still be
-        // open) without a correction or veto (no episode) that ended clean proposes playbook edits to the
-        // engineer (playbook.rs), once each.
-        let clean: Vec<&str> = session.filter(|s| !last_episode.contains_key(*s)).into_iter().collect();
-        crate::playbook::reflect_pending(home, ask, now, &clean, &state, &outcomes);
         for s in &ended {
             // The session's own tests that went green after an ask (hook.rs `capture_test`) credit the
             // lessons asked, once each, as it settles.

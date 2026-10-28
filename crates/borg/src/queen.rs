@@ -68,10 +68,6 @@ pub enum Kind {
     /// collective. Queued by `borg learn`, not a checkpoint; only an engineer's answer ratifies it, and
     /// the default keeps it a lesson only.
     Constraint,
-    /// An edit to an L1 playbook learned from a session that ended clean (playbook.rs `propose`).
-    /// Queued by `borg learn`, not a checkpoint; only an engineer's answer promotes it, and the
-    /// default keeps the playbook as it is.
-    Playbook,
 }
 
 impl Kind {
@@ -102,7 +98,6 @@ impl Kind {
             Kind::OpenDecision => "a decision the team's documents leave open",
             Kind::Reach => "who should hear a lesson",
             Kind::Constraint => "an invariant proposed as a constraint",
-            Kind::Playbook => "an edit to a team playbook",
         }
     }
 
@@ -117,7 +112,6 @@ impl Kind {
             Kind::OpenDecision => ("keep the documented interim rule", "decide it now"),
             Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
             Kind::Constraint => (crate::veto::KEEP_OPTION, crate::veto::RATIFY_OPTION),
-            Kind::Playbook => (crate::playbook::KEEP_OPTION, crate::playbook::PROMOTE_OPTION),
         }
     }
 }
@@ -407,8 +401,8 @@ pub struct Entry {
     pub dismissed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_ms: Option<i64>,
-    /// What answering acts on, for a kind that carries more than its question (a `Playbook`: the
-    /// proposed edit); None on every other kind and on older lines.
+    /// What a 0.3.0 hive task's question carried (its goal and task, `legacy_hive`); None on every
+    /// other line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
 }
@@ -808,8 +802,6 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     // its veto is a lesson already, and ratifying it writes the constraint (veto.rs).
     if e.kind == Kind::Constraint {
         crate::veto::ratify(store, &e, text, author, now)?;
-    } else if e.kind == Kind::Playbook {
-        crate::playbook::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Reach {
         crate::reach::answer(store, &e, text)?;
     } else {
@@ -826,7 +818,7 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.text = crate::stats::excerpt(text, 160);
     });
     crate::escalation::answered(store, &e, text, author, now);
-    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Playbook) {
+    if !matches!(e.kind, Kind::Reach | Kind::Constraint) {
         counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
             ev.engineer = author.into();
             ev.why = "queen".into();
@@ -1094,8 +1086,8 @@ pub fn ask_on(value: Option<&str>) -> bool {
 /// The question to deliver in `session`, pure. None once `delivered` has one for this session (one per
 /// session). Else an open question of one of `repos` (never another repo's), not skipped within
 /// `SKIP_MS`, and, if delivered before, only once more than `REOFFER_SESSIONS` sessions of `visits`
-/// (first-seen order) began since. The engineer's decisions about the work come first: a playbook edit
-/// or a 0.3.0 hive task's question (`legacy_hive`) only when none of them is eligible. Then
+/// (first-seen order) began since. The engineer's decisions about the work come first: a 0.3.0 hive
+/// task's question (`legacy_hive`) only when none of them is eligible. Then
 /// never-delivered questions first, then asking order. The index is into `open`.
 pub fn eligible<'a>(
     open: &'a [Entry],
@@ -1114,13 +1106,13 @@ pub fn eligible<'a>(
         .enumerate()
         .filter(|(_, e)| repos.iter().any(|r| same_repo(r, &repo(e))) && !skipped(skips, &e.id, now))
         .filter_map(|(i, e)| {
-            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((later(e), false, i, e)) };
+            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((legacy_hive(e), false, i, e)) };
             let since = match (at(&last.session), at(session)) {
                 (Some(t), Some(n)) => n.saturating_sub(t),
                 // The delivering session's record is gone: count sessions first seen after the delivery.
                 _ => visits.iter().filter(|v| v.ms > last.ms).count(),
             };
-            (since > REOFFER_SESSIONS).then_some((later(e), true, i, e))
+            (since > REOFFER_SESSIONS).then_some((legacy_hive(e), true, i, e))
         })
         .min_by_key(|&(proposal, again, i, _)| (proposal, again, i))
         .map(|(_, _, i, e)| (i, e))
@@ -1166,11 +1158,6 @@ fn legacy_hive(e: &Entry) -> bool {
     e.kind.escalates() && e.payload.as_ref().is_some_and(|p| p["goal"].is_string() && p["task"].is_string())
 }
 
-/// Whether `e` waits until a session's own decisions are answered: a playbook edit or a `legacy_hive` question.
-fn later(e: &Entry) -> bool {
-    e.kind == Kind::Playbook || legacy_hive(e)
-}
-
 /// At most five words of an option, up to its first ':' or ',': its label in a dialog.
 pub fn label(option: &str) -> String {
     let head = option.split([':', ',']).next().filter(|h| !h.trim().is_empty()).unwrap_or(option);
@@ -1200,7 +1187,6 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
         _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
         _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
-        _ if q.kind == Kind::Playbook => (q.question.clone(), "learned from a session that ended clean"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1531,13 +1517,6 @@ pub fn main(args: &[&str]) -> i32 {
                     match e.answer.as_deref().is_some_and(|a| a.trim().to_lowercase().starts_with("ratify")) {
                         true => println!("{} answered: constraint added to {}", e.id, crate::veto::constraints_path(&store).display()),
                         false => println!("{} answered: kept as a lesson only", e.id),
-                    }
-                    0
-                }
-                Ok(e) if e.kind == Kind::Playbook => {
-                    match e.answer.as_deref().is_some_and(crate::playbook::promotes) {
-                        true => println!("{} answered: the edit is promoted into {}", e.id, store.join(crate::playbook::FILE).display()),
-                        false => println!("{} answered: the playbook stays as it is", e.id),
                     }
                     0
                 }

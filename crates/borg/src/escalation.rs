@@ -18,7 +18,7 @@
 //!
 //! Escalations are the questions the queen chooses to raise: the four checkpoint kinds
 //! (`Kind::escalates`). The other queue kinds are proposals or gates an engineer must answer whatever
-//! the queen thinks (constraints, playbooks, reach, open decisions), so they earn nothing.
+//! the queen thinks (constraints, reach, open decisions), so they earn nothing.
 //! "No escalation" is judged against this node's queue: the queue is local, and so are the sessions it
 //! names.
 //!
@@ -223,7 +223,7 @@ mod tests {
         let mut e = entry("q1", Kind::PublicApi, "s1");
         assert_eq!(answered(&store, &e, "keep the old contract working", "ann@x", 10), Some(stats::QUEEN_NO));
         assert_eq!(answered(&store, &e, "proceed as planned", "ann@x", 11), Some(stats::QUEEN_STAMP));
-        for k in [Kind::Constraint, Kind::Playbook, Kind::Reach, Kind::OpenDecision] {
+        for k in [Kind::Constraint, Kind::Reach, Kind::OpenDecision] {
             e.kind = k;
             assert_eq!(answered(&store, &e, "anything", "ann@x", 12), None, "{k:?} is a gate, not the queen's choice");
         }
@@ -245,7 +245,7 @@ mod tests {
         assert!(escalated(&store, "s2"));
         assert!(!missed(&store, "s2", "regret", "r2", "app", 7));
         // A gate question from s3 is no escalation.
-        let line = serde_json::to_string(&entry("q10", Kind::Playbook, "s3")).unwrap();
+        let line = serde_json::to_string(&entry("q10", Kind::Constraint, "s3")).unwrap();
         std::fs::write(queen::dir(&store).join("queue.jsonl"), format!("{line}\n")).unwrap();
         assert!(missed(&store, "s3", "regret", "r3", "app", 8));
         let y = team(&store);

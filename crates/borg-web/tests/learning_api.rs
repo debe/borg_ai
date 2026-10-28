@@ -92,7 +92,6 @@ async fn the_learning_view_shows_per_week_whether_learning_works() {
     );
     // The derived veto counts; whether it repeated an earlier no is unknown.
     assert_eq!((first(&v["vetoes"]["veto"]), first(&v["vetoes"]["repeat"])), (json!([1, 2, 0]), json!([null, 1, 0])));
-    assert!(v["playbooks"]["list"].is_array());
     assert!(!home.join("learning").exists(), "the view keeps no state of its own");
     let _ = std::fs::remove_dir_all(&home);
 }

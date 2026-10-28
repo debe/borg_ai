@@ -14,7 +14,8 @@
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
 //! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl`, `messages.jsonl`
-//!    (lines.rs `SYNCED`; a 0.3.0 peer's `borg/mesh/12` session stops before the messages), each in turn:
+//!    (lines.rs `SYNCED` and the removed playbooks' step, `PLAYBOOKS`; a 0.3.0 peer's `borg/mesh/12`
+//!    session stops before the messages), each in turn:
 //!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
 //!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies,
@@ -24,6 +25,10 @@
 //!    node, the `KEEP` newest), on offer and on receipt, and what the window cuts is pruned (`prune`).
 //!    A pause, resume or veto from another node counts only once admitted under its node's role
 //!    (steer.rs `admit`), when it is stored.
+//!
+//!    The playbooks are removed, but their step is still spoken so a 0.3.0 or 0.4.0 peer keeps its
+//!    order: this node offers nothing there, follows the peer's reconciliation and stores nothing
+//!    (`skip`), as for a hive goal below.
 //!
 //!    3b. `Goals`: the removed hive's step, still spoken so a 0.3.0 peer keeps syncing on
 //!    `borg/mesh/12`. This node names no goal; for each valid goal id the peer names it follows the
@@ -77,7 +82,7 @@ use crate::{live, steer};
 
 mod vectors;
 
-/// The session protocol. 13: `messages.jsonl` is a sixth synced log (lines.rs `SYNCED`). The logs
+/// The session protocol. 13: `messages.jsonl` joined the synced logs (lines.rs `SYNCED`). The logs
 /// reconcile in a fixed list, so a peer on another list would reconcile another file at the same step;
 /// 11 added `constraints.jsonl` and refused 10 at the handshake for that reason.
 pub const ALPN: &[u8] = b"borg/mesh/13";
@@ -104,11 +109,19 @@ fn spoken(alpn: &[u8]) -> bool {
     alpn == ALPN || alpn == LEGACY_ALPN
 }
 
-/// The logs a session on `alpn` reconciles, in order: all of `SYNCED`, or on `LEGACY_ALPN` the five a
+/// The removed playbooks' log. Its step (after the outcomes) stays in the session, so `ALPN` and
+/// `LEGACY_ALPN` keep their order; a peer that still reconciles it is followed and nothing is kept
+/// (`skip`). A leftover file in a store is neither offered nor stamped.
+const PLAYBOOKS: &str = "playbooks.jsonl";
+
+/// The logs a session on `ALPN` steps through, in order: `SYNCED` with the `PLAYBOOKS` step.
+const STEPS: [&str; 6] = [SYNCED[0], SYNCED[1], SYNCED[2], PLAYBOOKS, SYNCED[3], SYNCED[4]];
+
+/// The logs a session on `alpn` steps through, in order: all of `STEPS`, or on `LEGACY_ALPN` the five a
 /// 0.3.0 peer knows.
 fn synced(alpn: &[u8]) -> impl Iterator<Item = &'static str> {
     let legacy = alpn == LEGACY_ALPN;
-    SYNCED.into_iter().filter(move |f| !legacy || *f != borg::msg::FILE)
+    STEPS.into_iter().filter(move |f| !legacy || *f != borg::msg::FILE)
 }
 
 /// The number of a session protocol (`borg/mesh/<n>`).
@@ -342,8 +355,9 @@ pub struct Node {
     announce: bool,
     /// How peers are reached (addr.rs), fixed when the endpoint was built.
     relay: Relay,
-    /// The hashes each 0.3.0 peer gave per hive goal log (3b), by (peer, goal, log): never stored, so
-    /// the next dial reconciles against them and the peer gives only what is new.
+    /// The hashes each peer gave per log this node follows and keeps nowhere (`skip`: the playbooks, or
+    /// a 0.3.0 peer's hive goal log, 3b), by (peer, goal or file, log): never stored, so the next dial
+    /// reconciles against them and the peer gives only what is new.
     legacy: Mutex<HashMap<(String, String, usize), BTreeSet<Hash>>>,
 }
 
@@ -720,9 +734,13 @@ impl Node {
         self.stamp()?;
         let origins = origin::load(home);
 
-        // Lessons, and the other synced logs: reconcile with everyone.
+        // Lessons, and the other synced logs: reconcile with everyone. The playbooks: followed, nothing kept.
         for file in synced(alpn) {
-            self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
+            if file == PLAYBOOKS {
+                self.skip(dialler, tx, rx, (remote.to_string(), file.to_string(), 0)).await?;
+            } else {
+                self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
+            }
         }
 
         // A 0.3.0 peer's hive goals (3b): followed, nothing kept.
@@ -824,7 +842,9 @@ impl Node {
         self.store_lines(path, got, &r.want, mine, None, report)
     }
 
-    /// One log of a 0.3.0 peer's hive goal (3b), followed in step with it and kept nowhere. The listener
+    /// One log a peer reconciles and this node no longer keeps (the `PLAYBOOKS` step, or a log of a
+    /// 0.3.0 peer's hive goal, 3b), followed in step with it and kept nowhere. `log` names it: the peer,
+    /// then the goal or the file (no goal id holds a dot), then the goal's log. The listener
     /// answers the peer's first round with that round itself, which closes it with nothing to give
     /// either way. The dialler speaks first, so it reconciles the hashes this peer gave before (`legacy`)
     /// and remembers the ones it gives now: the peer sends each line once per process, not per session.
@@ -1237,37 +1257,27 @@ mod tests {
         }
     }
 
-    /// Each node promoted an edit to the same playbook; after a round both fold the same steps, in the
-    /// same order, under the same version.
+    /// A store upgraded from 0.4.0 still holds playbooks.jsonl, stamped: it is neither offered nor
+    /// taken, and the session still steps through it, so the two nodes stay in order.
     #[tokio::test(flavor = "multi_thread")]
-    async fn playbook_edits_sync_and_fold_the_same_on_both_nodes() {
+    async fn a_leftover_playbooks_log_is_not_synced() {
         let (pa, pb) = team("playbooks");
         let (a, b) = (home(&pa), home(&pb));
-        let edit = |step: &str, text: &str, ms: i64, ok: &str| {
-            let mut e = borg::playbook::Edit {
-                pb: borg::playbook::playbook_id("", "fix the parser"),
-                step: step.into(),
-                text: text.into(),
-                shape: "fix the parser".into(),
-                ms,
-                ok_by: ok.into(),
-                ..Default::default()
-            };
-            e.edit = borg::playbook::edit_id(&e);
-            serde_json::to_string(&e).unwrap()
-        };
-        write(&a, borg::playbook::FILE, &[edit("s1", "run the parser tests", 1, "q1")]);
-        write(&b, borg::playbook::FILE, &[edit("s2", "add a failing test first", 2, "q2")]);
+        let edit = json!({"pb": "p1", "edit": "e1", "step": "s1", "text": "run the parser tests", "ms": 1}).to_string();
+        write(&a, PLAYBOOKS, std::slice::from_ref(&edit));
+        let h = lines::hash(&edit);
+        origin::append(&a, &[Origin::new(&Identity::load_or_create(&a).unwrap(), &h, 1)]).unwrap();
+        let c = json!({"id": "cabc", "text": "locks are taken in id order", "lesson": "L1", "by": "lead@x", "ms": 5, "source": "veto"}).to_string();
+        write(&a, borg::veto::FILE, std::slice::from_ref(&c));
         let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
         let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
         let ticket = alice.ticket();
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        served.unwrap();
-        synced.unwrap();
-        let (fa, fb) = (borg::playbook::read(&a), borg::playbook::read(&b));
-        assert_eq!(fa, fb);
-        assert_eq!(fa[0].steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2"]);
-        assert_eq!(fa[0].key(), fb[0].key());
+        let (served, synced) = (served.unwrap(), synced.unwrap());
+        assert_eq!((synced.received, served.sent), (1, 1), "only the constraint, the step after the playbooks', moves");
+        assert!(holds(&b, borg::veto::FILE, &c));
+        assert!(!b.join(PLAYBOOKS).exists(), "no playbook reaches bob");
+        assert!(holds(&a, PLAYBOOKS, &edit), "alice's leftover stays untouched");
         alice.close().await;
         bob.close().await;
     }
@@ -1551,7 +1561,8 @@ mod tests {
         let below = format!("borg/mesh/{}", n - 1);
         assert_eq!((o.len(), o[0].as_slice(), o[o.len() - 1].as_slice()), (n as usize - 1, below.as_bytes(), b"borg/mesh/1".as_slice()));
         assert!(o.iter().all(|a| !spoken(a)));
-        assert_eq!(synced(ALPN).count(), SYNCED.len());
+        assert_eq!(synced(ALPN).filter(|f| *f != PLAYBOOKS).collect::<Vec<_>>(), SYNCED, "every synced log, in order");
+        assert_eq!(synced(ALPN).collect::<Vec<_>>(), [&OLD_SYNCED[..], &[borg::msg::FILE]].concat(), "0.4.0's list, in its order");
         assert_eq!(synced(LEGACY_ALPN).collect::<Vec<_>>(), OLD_SYNCED, "0.3.0's list, in its order");
     }
 
@@ -1988,10 +1999,10 @@ mod tests {
         got
     }
 
-    /// A 0.3.0 peer (it names hive goals, reconciles their logs and sends beats in `Live`) keeps
-    /// syncing with this node in both roles: lessons and presence arrive both ways, its directives are
-    /// ignored, no hive file is written, and a hive line it gave once is not sent again when this node
-    /// dials.
+    /// A 0.3.0 peer (it names hive goals, reconciles their logs and the playbooks, and sends beats in
+    /// `Live`) keeps syncing with this node in both roles: lessons and presence arrive both ways, its
+    /// directives are ignored, no hive or playbooks file is written, and a hive line it gave once is not
+    /// sent again when this node dials.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_0_3_0_peer_syncs_in_both_roles_and_its_hive_lines_come_once() {
         let (pa, pb) = team("legacy");
@@ -2004,6 +2015,9 @@ mod tests {
         let (l1, l2) = (lesson("L1", 1, "lock order?"), lesson("L2", 1, "retry budget?"));
         write(&a, "lessons.jsonl", std::slice::from_ref(&l1));
         write(&b, "lessons.jsonl", std::slice::from_ref(&l2));
+        let edit = json!({"pb": "p1", "edit": "e1", "step": "s1", "text": "run the parser tests", "ms": 1}).to_string();
+        write(&a, PLAYBOOKS, std::slice::from_ref(&edit));
+        origin::append(&a, &[Origin::new(&alice_id, &lines::hash(&edit), 1)]).unwrap();
         let now = borg::learn::now_ms();
         for (h, p, who) in [(&a, &pa, "alice"), (&b, &pb, "bob")] {
             let ev = json!({"session_id": format!("{who}-s1"), "cwd": p.dir, "prompt": format!("{who} works")});
@@ -2034,6 +2048,7 @@ mod tests {
         new_got.unwrap();
         assert_eq!(old_got.unwrap().0, 1, "what was given before is not sent again");
         assert!(!b.join("hive").exists(), "no hive file on the new node");
+        assert!(!b.join(PLAYBOOKS).exists(), "the old node's playbook edit is followed, not kept");
         assert!(holds(&b, borg::msg::FILE, &tell) && !a.join(borg::msg::FILE).exists(), "messages stay off a 0.3.0 session");
         old.close().await;
         new.close().await;

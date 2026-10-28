@@ -473,64 +473,6 @@ pub fn parse_messages(v: &Value) -> Vec<Message> {
         .collect()
 }
 
-/// One version of a playbook that was shown, with its usefulness belief (borg memory.rs).
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlaybookVersion {
-    pub key: String,
-    pub mean: f64,
-    pub corrected: f64,
-    pub vetoed: f64,
-    pub regretted: f64,
-}
-
-/// An L1 playbook (borg playbook.rs `view`): the steps for a kind of task, promoted by engineers.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Playbook {
-    pub id: String,
-    pub key: String,
-    pub shape: String,
-    pub repo: String,
-    pub edits: f64,
-    pub promoted_ms: f64,
-    /// (step id, text), in order.
-    pub steps: Vec<(String, String)>,
-    pub versions: Vec<PlaybookVersion>,
-    /// Edits waiting for an engineer's answer in the queen's queue, and each one's (op, text).
-    pub proposed: f64,
-    pub waiting: Vec<(String, String)>,
-}
-
-pub fn parse_playbooks(v: &Value) -> Vec<Playbook> {
-    v["playbooks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|p| Playbook {
-            id: s(&p["id"]),
-            key: s(&p["key"]),
-            shape: s(&p["shape"]),
-            repo: s(&p["repo"]),
-            edits: f(&p["edits"]),
-            promoted_ms: f(&p["promoted_ms"]),
-            steps: p["steps"].as_array().into_iter().flatten().map(|x| (s(&x["id"]), s(&x["text"]))).collect(),
-            versions: p["versions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|x| PlaybookVersion {
-                    key: s(&x["key"]),
-                    mean: f(&x["mean"]),
-                    corrected: f(&x["corrected"]),
-                    vetoed: f(&x["vetoed"]),
-                    regretted: f(&x["regretted"]),
-                })
-                .collect(),
-            proposed: f(&p["proposed"]),
-            waiting: p["waiting"].as_array().into_iter().flatten().map(|x| (s(&x["op"]), s(&x["text"]))).collect(),
-        })
-        .collect()
-}
-
 /// One view's raw JSON, whether the server has it (old servers lack feed and queen), and how to load it.
 #[derive(Clone, Copy)]
 pub struct Source {
@@ -571,7 +513,7 @@ pub struct Data {
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
     /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source.
-    pub sources: [Source; 8],
+    pub sources: [Source; 7],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -579,8 +521,6 @@ pub struct Data {
     /// The queen's attention reward (served with the queue).
     pub attention: Memo<Attention>,
     pub drones: Memo<Vec<Drone>>,
-    /// The collective's L1 playbooks; empty without one (or on a server without `/api/playbooks`).
-    pub playbooks: Memo<Vec<Playbook>>,
     /// Messages between sessions, newest first, and how many wait unread on this node.
     pub messages: Memo<Vec<Message>>,
     pub unread: Memo<f64>,
@@ -618,11 +558,10 @@ pub fn provide() -> Data {
         Source::new("feed"),
         Source::new("queen"),
         Source::new("drones"),
-        Source::new("playbooks"),
         Source::new("learning"),
         Source::new("messages"),
     ];
-    let [st, le, fe, qu, dr, pb, _, me] = sources;
+    let [st, le, fe, qu, dr, _, me] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -634,7 +573,6 @@ pub fn provide() -> Data {
         queen: Memo::new(move |_| parse_queen(&qu.raw.get())),
         attention: Memo::new(move |_| parse_attention(&qu.raw.get())),
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
-        playbooks: Memo::new(move |_| parse_playbooks(&pb.raw.get())),
         messages: Memo::new(move |_| parse_messages(&me.raw.get())),
         unread: Memo::new(move |_| f(&me.raw.get()["unread"])),
         seen: RwSignal::new(0.0),
