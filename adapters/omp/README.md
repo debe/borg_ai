@@ -37,7 +37,7 @@ Other ways to load it:
 - For one run: `omp -e adapters/omp/borg.ts`.
 - If you set `PI_CODING_AGENT_DIR`, user extensions live in `$PI_CODING_AGENT_DIR/extensions`.
 
-The `BORG_*` variables are documented in `crates/borg/src/main.rs`. Set `BORG_LEARN=off` for eval drones.
+The `BORG_*` variables are listed in [Environment variables](../../docs/configuration.md#environment-variables). Set `BORG_LEARN=off` for eval drones.
 
 ## Reasoning on demand: `borg why`
 

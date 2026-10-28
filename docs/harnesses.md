@@ -25,13 +25,14 @@ data, and that data lives in `crates/borg/src/harness/`:
 pub trait Harness: Sync {
     fn name(&self) -> &'static str;          // `borg hook <name>`, `borg install <name>`, BORG_HARNESS
     fn caps(&self) -> Caps;                  // what reaches its model, and when
-    fn wiring(&self) -> Wiring;              // CommandHooks { events, timeouts, through_links } | AdapterFile { source }
+    fn wiring(&self) -> Wiring;              // CommandHooks { events, timeouts, retired, through_links } | AdapterFile { source }
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf; // the config file install writes
     fn probe(&self) -> Probe;                // what `borg doctor` asks its CLI
     fn hidden(&self) -> bool { false }       // the simulated harness
     fn normalise(&self, raw: Value) -> Value { raw }                       // native payload -> canonical event
     fn checks(&self, target: &Path) -> Vec<(Level, String)> { vec![] }     // doctor checks of its own (e.g. hook trust)
     fn install_notes(&self) -> Vec<String> { vec![] }                      // steps install asks of the engineer
+    fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> { vec![] } // its sub-agent runs, for review → fix
 }
 
 pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Opencode, &codex::Codex, &sim::Sim];
@@ -39,9 +40,9 @@ pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Openc
 
 | File | What |
 |---|---|
-| `harness/mod.rs` | The trait, `Caps`, `Transcript`, `Wiring`, `Probe`, `ALL`, `by_name`, and the transcript-or-event readers keyed on `Caps::transcript`: `work_so_far` (live mode's evidence), `last_message` (the drone's last message, whole) and `plan` (what the queen and the experts read) |
+| `harness/mod.rs` | The trait, `Caps`, `DroneWake`, `Transcript`, `Wiring`, `Probe`, `Run`, `SubAgent`, `ALL`, `by_name`, and the transcript-or-event readers keyed on `Caps::transcript`: `work_so_far` (live mode's evidence), `last_message` (the drone's last message, whole) and `plan` (what the queen and the experts read) |
 | `harness/wiring.rs` | The generic command-hook merge: install, uninstall and status for any `CommandHooks` harness. Each hook runs `<borg> hook <harness> <event>` |
-| `harness/claude.rs`, `omp.rs`, `opencode.rs`, `codex.rs` | One harness each: event table or compiled-in adapter, config path, capabilities, doctor probe. Claude's transcript readers are in `claude.rs`; Codex's patch-to-edit `normalise` and its hook-trust check for `borg doctor` are in `codex.rs` |
+| `harness/claude.rs`, `omp.rs`, `opencode.rs`, `codex.rs` | One harness each: event table or compiled-in adapter, config path, capabilities, doctor probe, and the reader of its sub-agent runs ([Review → fix findings](configuration.md#review--fix-findings)). Claude's transcript readers are in `claude.rs`; Codex's patch-to-edit `normalise` and its hook-trust check for `borg doctor` are in `codex.rs` |
 | `harness/sim.rs` | The simulated harness, used by the conformance suite. It is hidden from help, completions, `all`, status and doctor, and `borg install sim` and `borg hook sim …` know it only with `BORG_TEST_HARNESS` set, as the suites run them |
 | `hook.rs` | The shared hook handler, `hook::dispatch(h, event, input)`, with one function per event |
 | `install.rs` | Plan, apply, diff, backup, status and doctor, generic over `&dyn Harness` |
@@ -66,6 +67,8 @@ effect of a refactor.
 | `transcript` | Where the turn's work and the last message come from | Claude JSONL | none: the tool calls the hook logs (`.turn`) | none | none: `transcript_path` is a Codex rollout and is dropped |
 | `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored) | yes | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event |
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
+| `session_env` | The variable the harness sets to its session's id in every command its model runs, so `borg listen`, `tell` and `inbox` know the session | `CLAUDE_CODE_SESSION_ID` | `PI_SESSION_ID` | none: the shell gets no session id, so the plugin binds the session itself | `CODEX_THREAD_ID` |
+| `pid_env` | For a harness without `session_env`: the variable that carries its pid, which its events carry too, so presence names the session | none | none | `OPENCODE_PID` | none |
 | `drone_wake` | How `borg listen` wakes an idle session ([Waking a session](commands.md#waking-a-session)) | `Model`: the model runs `borg listen --wait` in the background | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
 | `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | none (the adapter sets 28 s) | none (the adapter sets 90 s) | 90 s, the Stop hook's timeout |
 
@@ -74,11 +77,13 @@ an evaluation shows they help. Standing lessons (ratified constraints) are exemp
 guess, so they arrive early on every harness whose `prompt_context` or `tool_context` takes them
 (hook.rs `early`).
 
-With no budget at all, the expert drone keeps inside 60 s, Claude Code's own command-hook default, and
-the model call inside the model's own limit. Claude Code's Stop hook gets a 90 s `timeout` from
-`borg install`, so an install made before that timeout existed keeps a margin. A `CommandHooks` harness
-gives any event's hook its own `timeout` (`timeouts`, canonical event → seconds); Claude Code's table
-names the stop only, Codex's every event.
+With no budget at all, the expert drone keeps inside 60 s and the model call inside the model's own
+limit. The 60 s is Claude Code's old command-hook default, so a Stop hook installed without a `timeout`
+on an older Claude Code is never cut off. `borg install` now gives Claude Code's Stop hook 90 s. A
+`CommandHooks` harness gives any event's hook its own `timeout` (`timeouts`, canonical event → seconds);
+Claude Code's table names the stop only, Codex's every event. Hooks an older borg installed and this one
+does not (`retired`: Claude Code's `SessionStart`, which served the hive up to 0.3) are removed at
+install and uninstall alike.
 
 | Wiring | Harness | Installs |
 |---|---|---|
@@ -121,6 +126,9 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
   is 600 s.
 - **The end.** Codex gives SessionEnd at most 3 s (1 s by default). Borg's `end` only starts `borg learn`
   in the background.
+- **Esc.** Codex's `Interrupt` hook (3 s) becomes `halted`: the turn of a listening session ends at
+  once, so wakes go in again. Without it, a turn with no stop and a tool call that never ended would
+  hold wakes off for 10 minutes.
 - **Borg's own calls.** `--ignore-user-config` still loads `$CODEX_HOME/hooks.json`. The `codex:` runner
   passes `-c features.hooks=false`, so its call never runs borg's hooks, and never passes
   `--dangerously-bypass-hook-trust`.
@@ -137,7 +145,10 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
    `install_notes`; a doctor check of its own (a version too old for live mode, untrusted hooks) is
    `checks` (doctor runs it only once the CLI answered `--version`). Neither needs a change in `install.rs`.
 3. **Capabilities.** Set `Caps` to what the harness verifiably delivers. Leave a flag off until an
-   evaluation shows it helps. Extend the snapshot in `caps_are_todays`.
+   evaluation shows it helps. Extend the snapshot in `caps_are_todays`. Name the variable that gives a
+   command the session's id (`session_env`, or `pid_env` where the shell gets only a pid) and pick how
+   an idle session is woken (`drone_wake`). Where the harness runs sub-agents, `sub_runs` reads them,
+   so their review findings are learned from.
 4. **Normalise.** If the native payload differs from the canonical event (tool names, input keys, a
    transcript in another format), override `normalise` or translate in the adapter. Borg reads
    `file_path`, `new_string`, `content` and `command`, and for an edit of several files `edits[]`
@@ -147,8 +158,9 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
      picks up every `CommandHooks` harness in `ALL`. A step whose event the harness wires no hook for
      (Codex has no failure event) needs no fixture, and is skipped.
    - Adapter: add a profile to `adapters/conformance/conformance.test.ts`.
-6. **Docs.** Add a row to the capability table above, write the adapter's README, and update the README's
-   *Supported agents* list.
+6. **Docs.** Add a column to the capability table above, write the adapter's README, add the harness
+   to the README's opening paragraph, and add a row to [Waking a session](commands.md#waking-a-session)
+   and [Review → fix findings](configuration.md#review--fix-findings).
 
 ## Conformance
 

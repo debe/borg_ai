@@ -14,7 +14,7 @@ Borg spends tokens only where a lesson is likely to matter.
 
 1. **Early, free.** When a prompt or touched file first names a lesson's topic, Borg adds that topic's
    top lessons to the context, by word matching only, on Claude Code only so far: omp, opencode and Codex
-   could take it, but it waits for an evaluation there (`Caps::early_delivery`). Standing lessons
+   could take it, but it waits for an evaluation there. Standing lessons
    (ratified constraints, see [Saying no](learning.md#saying-no)) are no ranking guess: they arrive early
    on every harness that takes the context, once their scope is named, an unscoped one at the first
    prompt. `BORG_EARLY=off` turns early delivery off.

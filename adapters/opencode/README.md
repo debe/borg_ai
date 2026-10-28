@@ -134,7 +134,8 @@ replaces. `borg uninstall opencode --apply` removes it again, `borg doctor` chec
    sends and every error it swallowed.
 
 borg's own environment applies unchanged: `BORG_HOME`, `BORG_LEARN=off`, `BORG_CONSCIENCE`,
-`BORG_MATCH` and the others are listed in `crates/borg/src/main.rs`.
+`BORG_MATCH` and the others are listed in
+[Environment variables](../../docs/configuration.md#environment-variables).
 
 ## Reasoning on demand: `borg why`
 

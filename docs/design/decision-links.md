@@ -34,7 +34,7 @@ Reuse: `why::blamed` (why.rs), `reasoning::reasoning_for` and `notes_of` (notes/
 
 ### 2. Live surfacing
 
-**Hook point:** `on_post_tool` (hook.rs). Today it reads only the paths and new text (`touched`, `edit_text`), never `old_string`, line numbers or `tool_response`. It needs:
+**Hook point:** `on_post_tool` (hook.rs). Today it reads the paths and new text (`touched`, `edit_text`) and, for a test run, the shell output (`tool_response`, `capture_test`), never `old_string` or line numbers. It needs:
 - Claude: read `tool_response.structuredPatch` if present, else find `old_string` in the file.
 - Codex and omp: parse the `@@` hunks from the patch text.
 - opencode: the adapter needs to map `oldString` too (assets/adapters/opencode/borg.ts).
@@ -98,6 +98,6 @@ Update `docs/configuration.md`, the borg skill (crates/borg/assets/skills/borg) 
 **Other checks:**
 - A sim-harness test shows one notice per decision, stays within the opencode budget and fails open on timeout.
 - `borg fixes` and a `fixes:` commit line both produce a strong link; `borg why` shows both directions.
-- `scripts/check.sh` and `arch.sh` pass. Watch M10: `install.rs` is at 39 of 40 functions. lizard, rust-code-analysis and clippy pedantic show no regressions against the baseline.
+- `scripts/check.sh` and `arch.sh` pass. Watch M10: `install.rs` must stay under 40 functions, tests aside. lizard, rust-code-analysis and clippy pedantic show no regressions against the baseline.
 
 **On real repos:** run `borg regress --replay <range>`, extended to report the fix shapes it found. Spot-check precision before setting `BORG_REGRESS=learn`.

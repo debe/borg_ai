@@ -150,7 +150,7 @@ svg("architecture.svg", 1000, 260, "Layers: harness hooks, the borg CLI, the loc
 <rect x="16" y="110" width="478" height="40" rx="3" class="box"/><text x="32" y="135" class="d" font-size="14">Local store</text><text x="160" y="135" class="m" font-size="11">append-only JSONL per collective</text>
 <rect x="506" y="110" width="478" height="40" rx="3" class="box"/><text x="522" y="135" class="d" font-size="14">Turn-end check</text><text x="680" y="135" class="m" font-size="11">free gate → one graded model call</text>
 <rect x="16" y="158" width="968" height="40" rx="3" class="box"/><text x="32" y="183" class="d" font-size="14">Peer mesh</text><text x="330" y="183" class="m" font-size="11.5">iroh QUIC, signed membership, set reconciliation, no leader, no model calls</text>
-<rect x="16" y="206" width="968" height="40" rx="3" class="box-h"/><text x="32" y="231" class="d" font-size="14">Team trust</text><text x="330" y="231" class="m" font-size="11.5">identity keys, signed steering, trust per engineer × area, redaction at origin</text>""")
+<rect x="16" y="206" width="968" height="40" rx="3" class="box-h"/><text x="32" y="231" class="d" font-size="14">Team trust</text><text x="330" y="231" class="m" font-size="11.5">identity keys, role-gated pause and veto, trust per engineer × area, redaction at origin</text>""")
 
 svg("escalation.svg", 1000, 300, "Escalation: memory, an expert repo, a live drone, the engineer; each step only when the one before cannot answer", """
 <rect x="20" y="40" width="220" height="200" rx="4" class="box-a"/><text x="34" y="66" class="d" font-size="14">1 · Memory</text>
@@ -200,7 +200,7 @@ svg("team.svg", 1000, 412, "Machines linked peer to peer: a member's laptop, an 
 <text x="300" y="300" class="h" font-size="10.5">catch-up ∝ what changed</text>
 <text x="500" y="396" text-anchor="middle" class="m" font-size="11">Reasoning travels as git notes when work lands, plus copies on two peers. Code stays in git.</text>""")
 
-svg("mesh-sync.svg", 1000, 430, "One sync session between two peers in six steps: hello, membership, reconcile lessons, reasoning replicas, ask, live presence and steering", """
+svg("mesh-sync.svg", 1000, 430, "One sync session between two peers in six steps: hello, membership, reconcile lessons, reasoning replicas, ask, live presence", """
 <defs><marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" class="f-a"/></marker></defs>
 <rect x="16" y="16" width="200" height="398" rx="5" class="box"/>
 <text x="116" y="44" text-anchor="middle" class="d" font-size="16">Peer A</text>
@@ -212,15 +212,15 @@ svg("mesh-sync.svg", 1000, 430, "One sync session between two peers in six steps
 <g font-size="11.5">
 <path class="ln-a" d="M220 92 L780 92" marker-end="url(#ar4)"/><text x="236" y="84" class="d" font-size="13">1 · Hello</text><text x="380" y="84" class="m">which collective; a different name is refused</text>
 <path class="ln-a" d="M220 148 L780 148" marker-end="url(#ar4)"/><text x="236" y="140" class="d" font-size="13">2 · Membership first</text><text x="420" y="140" class="m">signed member list; revocations before data</text>
-<path class="ln-a" d="M220 204 L780 204" marker-end="url(#ar4)"/><text x="236" y="196" class="d" font-size="13">3 · Reconcile lessons</text><text x="430" y="196" class="m">compare fingerprints, send only missing lines</text>
+<path class="ln-a" d="M220 204 L780 204" marker-end="url(#ar4)"/><text x="236" y="196" class="d" font-size="13">3 · Reconcile logs</text><text x="430" y="196" class="m">lessons and messages: send only missing lines</text>
 <path class="ln-a dash" d="M220 260 L780 260" marker-end="url(#ar4)"/><text x="236" y="252" class="d" font-size="13">4 · Reasoning replicas</text><text x="440" y="252" class="m">git-note excerpts to 2 chosen peers, not all</text>
 <path class="ln-a dash" d="M780 316 L220 316" marker-end="url(#ar4)"/><text x="236" y="308" class="d" font-size="13">5 · Ask</text><text x="330" y="308" class="m">"why was commit 3f2a made?" any holder answers</text>
-<path class="ln-a dash" d="M220 372 L780 372" marker-end="url(#ar4)"/><text x="236" y="364" class="d" font-size="13">6 · Live</text><text x="330" y="364" class="m">who runs which drone; signed steering; kept a day at most</text>
+<path class="ln-a dash" d="M220 372 L780 372" marker-end="url(#ar4)"/><text x="236" y="364" class="d" font-size="13">6 · Live</text><text x="330" y="364" class="m">who runs which drone; kept a day at most</text>
 </g>
 <text x="116" y="100" text-anchor="middle" class="m" font-size="10.5">lessons.jsonl</text>
 <text x="116" y="116" text-anchor="middle" class="m" font-size="10.5">membership</text>
 <text x="116" y="132" text-anchor="middle" class="m" font-size="10.5">reasoning excerpts</text>
-<text x="116" y="148" text-anchor="middle" class="m" font-size="10.5">presence, directives</text>
+<text x="116" y="148" text-anchor="middle" class="m" font-size="10.5">messages, presence</text>
 <text x="116" y="380" text-anchor="middle" class="a" font-size="10.5">episodes stay here</text>
 <text x="116" y="396" text-anchor="middle" class="a" font-size="10.5">private stays here</text>""")
 print("\n".join(sorted(p.name for p in OUT.iterdir())))

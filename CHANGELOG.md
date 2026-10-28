@@ -5,34 +5,38 @@
 ### Added
 
 - Messages between sessions: `borg tell <to> "<text>"`, `borg ask <to> "<question>"` and `borg inbox`.
-  A session on any harness, or the engineer's terminal, writes to a drone, a session, `all` or the
-  engineer; the recipient sees it once at its next prompt or tool call, as peer data with the command
-  that replies. Messages are redacted, rate limited, kept 7 days and synced with the team collective.
-  Stats count `msg_sent`, `msg_delivered` and `msg_dropped`.
+  A session on any harness, or the engineer's terminal, writes to a drone (as `borg top` names it), a
+  session (`<session>@<node>` across machines), `all` or the engineer. The recipient sees each message
+  once, at its next prompt or tool call, as peer data with the command that replies. Messages are
+  redacted, limited to one per sender and recipient every 10 minutes, kept 7 days and synced with the
+  team collective. Stats count `msg_sent`, `msg_delivered` and `msg_dropped`; `borg web` shows them.
 - `borg listen` wakes an idle session when a message arrives for it, until `borg listen --off` or the
   session's end. On Claude Code the stop asks the model to run `borg listen --wait` in the background;
   the omp and opencode adapters keep `borg listen --stream` running and send each wake in as a new turn;
   on codex a detached `borg listen --queue` queues one with `codex queue`. A wake names the senders and
-  the count, never the text. Nothing wakes a session during the engineer's own turn. `borg top` shows a
-  WAKE column.
+  the count, never the text. Nothing wakes a session during the engineer's own turn; on codex, the
+  `Interrupt` hook the hive used now ends that hold at once on an Esc. `borg top` shows a WAKE
+  column.
 
 ### Changed
 
 - Steering is now messages: `borg pause <to> [note]` and `borg resume <to> [note]`, and `borg no` to a
-  drone on another machine sends a veto message. They are shown at the next prompt or tool call on every
-  harness, not only on Claude Code. Another machine's count only when the mesh admits them for an `admin`
-  or `steer` member. `borg steer` is removed: use `borg pause`, `borg resume`, or `borg tell` for an
-  instruction. Stats keep `steer_issued`, `steer_delivered`, `steer_dropped` and `pause_refused`.
+  drone on another machine sends a veto message. Every harness shows them at the next prompt or tool
+  call, not only Claude Code. One from another machine counts only when the mesh admits its sender as
+  an `admin` or `steer` member. The rate limit never holds them back. `borg steer` is removed: use
+  `borg pause`, `borg resume`, or `borg tell` for an instruction. Stats keep `steer_issued`,
+  `steer_delivered`, `steer_dropped` and `pause_refused`.
+- The mesh protocol is `borg/mesh/13`. A 0.3.0 member (`borg/mesh/12`) still syncs everything except
+  messages; older members do not sync, and `borg doctor` names them.
 
 ### Removed
 
 - The hive: `borg hive` and `borg debug hive`, interactive drones, and goals with their boards, claims,
   verify tasks, oracles, integration, contracts and plans. The Hive tab of `borg web`, the goal sections
   of `borg top`, and the `BORG_HIVE*`, `BORG_GROUP_REFLECT` and `BORG_REWORK_REFLECT` variables go with
-  it. Messages between sessions, across harnesses and machines, will replace it. Plain sessions,
-  lessons, playbooks, `borg no` and team sync work as before. `borg install` removes
-  the hooks only the hive used (Claude Code `SessionStart`, codex `Interrupt`). An old store's `hive/`
-  directory is no longer read; `borg doctor` offers to remove it.
+  it. Messages between sessions replace it. Plain sessions, lessons, playbooks, `borg no` and team sync
+  work as before. `borg install` removes the Claude Code `SessionStart` hook only the hive used. An old
+  store's `hive/` directory is no longer read; `borg doctor` names it and the command that removes it.
 
 ## 0.3.0 (unreleased)
 

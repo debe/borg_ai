@@ -44,17 +44,17 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 
 | Command | Shows or does |
 |---|---|
-| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote). Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
-| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: knowledge, checks, the queen, learning week by week and cost ([details](statistics.md)) |
+| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), and the last day's messages below. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
+| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: an overview, knowledge, checks (Conscience), learning week by week, steering and refusals, messages, the queen, cost, drones and, once there are any, playbooks ([details](statistics.md)) |
 
 ### Team
 
 | Command | Shows or does |
 |---|---|
-| `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
-| `borg tell <drone\|session\|all\|engineer> "<text>" [--re ID] [--from SESSION]` | A message to other sessions, on any harness or member's machine, shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
-| `borg ask <drone\|session\|all\|engineer> "<question>" [--re ID] [--from SESSION]` | As `tell`, for a message that asks for a reply |
-| `borg inbox [--all] [--json] [--from SESSION]` | In a session: its messages, new or shown, then marks them shown. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to |
+| `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync`, `fetch` ([details](team-sync.md)) |
+| `borg tell <drone\|session\|all\|engineer> "<text>" [--re ID] [--from SESSION] [--dir DIR]` | A message to other sessions, on any harness or member's machine, shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
+| `borg ask <drone\|session\|all\|engineer> "<question>" [--re ID] [--from SESSION] [--dir DIR]` | As `tell`, for a message that asks for a reply |
+| `borg inbox [--all] [--json] [--from SESSION] [--dir DIR]` | In a session: its messages, new or shown, then marks them shown. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to |
 | `borg pause <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
 | `borg resume <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Lets a paused session's tool calls run again |
 | `borg listen [--off] [--session S] [--dir DIR]` | Wakes this session when a message arrives while it is idle, until `--off` or the session's end ([Waking a session](#waking-a-session)) |
@@ -94,6 +94,9 @@ Text is redacted, put on one line and cut to 1,000 characters. One message per s
 newest, and sync with the team collective like lessons ([Team sync](team-sync.md#how-a-sync-works)).
 An idle session sees a message when it next runs, unless it listens ([Waking a session](#waking-a-session)).
 
+**Seen in monitoring.** `borg top` shows each drone's unread messages and the last day's messages;
+borg web's Messages page counts messages sent, shown and dropped (a rate-limit refusal or the 500 cap).
+
 ### Pause and resume
 
 `borg pause` and `borg resume` are messages of their own kind; a veto from `borg no` to a drone on
@@ -102,14 +105,16 @@ resume may have no text. A veto names exactly one session on one machine (`<sess
 rate limited, so a resume can follow a pause at once.
 
 They count only when admitted. This machine's own are admitted when sent: the engineer here steers
-their own sessions. Another machine's are admitted by `borg mesh serve` when the member list gives
-the sender the `admin` or `steer` role; a `share: local` collective admits none. A message without an
+their own sessions. Another machine's are admitted by the mesh when a sync brings them in and the member list
+gives the sender the `admin` or `steer` role; a `share: local` collective admits none. A message without an
 admission is neither shown nor in force.
 
 Every harness shows them at the next prompt or tool call: each veto once, and of a session's pauses and
 resumes only the latest. While the latest is a pause, the session's tool calls are refused with its note.
 Its stop is not blocked and the conscience does not run. A pause lapses after 24 hours. Anything borg
-cannot read counts as not paused. `borg inbox` lists tells and asks only.
+cannot read counts as not paused. `borg inbox` lists tells and asks only; `borg top` shows a paused
+drone as `paused`, and borg web's Steering page counts pauses and vetoes issued, shown and refused,
+and the tool calls a pause refused.
 
 ### Waking a session
 
@@ -124,7 +129,7 @@ harness allows:
 | Harness | How the waiter runs | How the wake arrives |
 |---|---|---|
 | Claude Code | The stop asks the model, once a turn, to run `borg listen --wait` in the background | The waiter exits with a summary, and Claude Code starts the next turn with it |
-| omp, opencode | The stop's answer carries `"listen": true`; the adapter keeps `borg listen --stream` running for the session's life | One JSON line per wake (`{"wake": "<text>"}`), sent in as a new turn: omp `pi.sendMessage`, opencode 1.x `session.promptAsync`, 2.x `session.prompt` with `delivery: "queue"` |
+| omp, opencode | The stop's answer carries `"listen": true`; the adapter keeps `borg listen --stream` running for the session's life | One JSON line per wake (`{"wake": "<text>"}`), sent in as a new turn: omp `pi.sendMessage`, opencode 1.x `session.promptAsync`, 2.x `session.prompt` with `delivery: "queue"`. A wake that arrives during a turn waits for its end, and is dropped if that turn already showed its messages |
 | Codex CLI | The stop starts `borg listen --queue` detached, logging to `<store>/listen/<session>.log` | `codex queue --thread <session> --message <text>`, 30 s at most; a failure waits 10 s, doubling up to 5 minutes, before the same messages are tried again |
 
 The wake text names the number of messages, their senders and kinds, never their text. The session's
@@ -199,8 +204,8 @@ With `BORG_LEARN=off` the command records nothing and says so.
 ## Answering the queen
 
 The queen's queue holds decisions no lesson answers: open decisions found in team documents
-(`borg assimilate --from-dir`), proposed constraints, playbook edits and, with
-`BORG_QUEEN=on`, questions raised at a turn end. Similar questions are queued once.
+(`borg assimilate --from-dir`), who should hear an existing lesson (`borg reach`), proposed
+constraints, playbook edits and, with `BORG_QUEEN=on`, questions raised at a turn end. Similar questions are queued once.
 
 ```console
 $ borg queen
@@ -215,7 +220,7 @@ $ borg queen answer 1 b
 | `borg queen [--json] [--repo NAME]` | Open questions, numbered and grouped by repo (`--json`: an array, for drones and scripts) |
 | `borg queen show <n\|id>` | One question with its evidence |
 | `borg queen ask` | Answer them one by one (a terminal) |
-| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson. A letter or number picks an option |
+| `borg queen answer <n\|id> <text\|a\|b\|1\|2>` | Answer one; the answer becomes a lesson (a reach answer moves the lesson instead). A letter or number picks an option |
 | `borg queen skip <n\|id>` | Not delivered again for 3 days |
 | `borg queen dismiss <n\|id> [reason]` | Drop it without a lesson |
 | `borg queen dedupe [--apply]` | Dismiss later near-duplicates (a dry run first) |
@@ -223,8 +228,8 @@ $ borg queen answer 1 b
 Each takes `--dir DIR` or `--collective NAME`.
 
 **In the harness.** At the first prompt of a session in a repo with an open question, borg hands that
-one question to the drone, which asks you (Claude Code in its question dialog, omp and opencode at the
-start of the reply) and records your answer with `borg queen answer`. One question per session; a
+one question to the drone, which asks you (Claude Code in its question dialog, omp, opencode and Codex at
+the start of the reply) and records your answer with `borg queen answer`. One question per session; a
 skipped one waits 3 days. `BORG_QUEEN_ASK=off` or `BORG_LEARN=off` turns this off.
 
 **The queen's attention.** Only the questions the queen chooses to raise count (an external mutation,

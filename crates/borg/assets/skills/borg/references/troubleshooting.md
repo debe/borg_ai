@@ -15,7 +15,8 @@ an invalid config or a missing binary explains most of what follows it.
 | `WARN no harness is wired to borg` | Nothing captures or checks anything | `borg install all` (dry run), then `borg install all --apply` |
 | `FAIL <harness>: <file>: cannot read` / a JSON error | The harness config is unreadable or invalid; borg will not touch it | Fix the file's permissions or JSON by hand, then re-run install |
 | `WARN <harness>: hooks missing for ...` | Only some events are wired | `borg install <harness>`, then with `--apply` |
-| `FAIL <harness>: hook <event> runs <path>, which does not exist` | borg moved or was reinstalled elsewhere | `borg install <harness> --apply` rewires to the current binary |
+| `WARN <harness>: an older borg's hooks for ... are still wired` | Hooks of events this borg no longer uses | `borg install <harness> --apply` removes them |
+| `FAIL <harness>: hook <event> runs <path>, which does not exist or is not executable` | borg moved or was reinstalled elsewhere | `borg install <harness> --apply` rewires to the current binary |
 | `WARN <harness>: <file> differs from this borg's adapter` | An older borg's adapter, or a hand edit | `borg install <harness>` (dry run shows the diff), then `--apply` |
 | `WARN <harness>: the borg skill is missing` / `differs from this borg's` | The skill predates this borg, or was edited | `borg install <harness>` (dry run), then `borg install <harness> --apply`, for each harness the line names |
 | `WARN codex: skips borg's hooks silently (...)` | Codex has not trusted borg's hooks, or they changed since | Open codex, run `/hooks`, trust borg's hooks. Needed again after every reinstall that changes the hook command |
@@ -23,6 +24,8 @@ an invalid config or a missing binary explains most of what follows it.
 | `FAIL COLLECTIVES CONFIG INVALID (...)` | collectives.json is broken: **every repo routes off** | Fix the error named in the line; see [collectives](collectives.md) |
 | `WARN collectives: default "x" names no collective` | Unmatched repos route off | Set `default` to `"off"` or an existing collective's name |
 | `WARN collectives: a name appears twice` | Two entries share one store | Rename one |
+| `WARN store x: ... is a removed feature's data (the hive), unused now` / `WARN worktree ... was made by a removed feature (the hive)` | Left over from borg 0.3 or earlier; nothing reads it | The `rm -r` or `git worktree remove` command the line names, once the engineer agrees |
+| `WARN mesh x: peer ... speaks ..., this node ...: nothing syncs with it` | That member runs a borg whose mesh protocol differs | Upgrade the side the line names |
 | `WARN collective x: ... mode "..." is neither "hook" nor "live"` | A typo in `mode` or `BORG_MODE` | Use `"live"` or `"hook"` |
 | `WARN collective x: live mode is off while BORG_MATCH=bm25 is set` (or `BORG_ONLY`, `BORG_CRITIC`) | Live checks need the model | Unset that variable, or accept turn-end checks only |
 | `FAIL store x: ... not writable` | borg cannot record anything for that collective | Fix permissions on `$BORG_HOME/collectives/<name>` |
@@ -50,8 +53,11 @@ shell profile, after showing the engineer the change.
 | Lessons do not reach a teammate | `borg collective <repo>` on both machines: `may sync: true`? | See [team](team.md); `borg mesh serve` must run on both |
 | `borg vectors` says `model: missing` | | `borg vectors --fetch`, then `borg vectors --rebuild`; see [vectors](vectors.md) |
 | `index: none at ...` or `built with another model` | | `borg vectors --rebuild` in a repo of that collective |
-| A drone is paused and refuses tool calls | `borg top` lists the drones | `borg resume <drone>` |
-| Too many questions or blocks | `borg status` (cost and stop gate lines) | `"mode": "hook"` for that collective (about a tenth of live's cost) |
+| A drone is paused and refuses tool calls | `borg top` lists the drones | `borg resume <drone>`; a pause lapses by itself after 24 hours |
+| A message never shows in the other session | `borg inbox --all` from a terminal | It shows at that session's next prompt or tool call. `borg tell` refuses a second message to one recipient within 10 minutes. On another machine, both must route the repo to one `team` collective with `borg mesh serve` running |
+| An idle session is not woken by a message | Run `borg listen` inside that session | Claude Code starts a background waiter at its next stop; omp and opencode need the current adapter (`borg install <harness> --apply`, then restart); Codex is woken through `codex queue` |
+| A pause or veto from another member does nothing | That member's role: `borg mesh members` | Only an `admin` or `steer` role steers other members' sessions; the admin re-invites with `borg mesh invite <key> --role steer` |
+| Too many questions or blocks | `borg status` (cost and stop gate lines) | `"mode": "hook"` for that collective (about an eighth of live's cost) |
 | After upgrading borg | `borg doctor` | `borg install all` (dry run), then `borg install all --apply`; for Codex, `/hooks` again |
 
 ## Undo

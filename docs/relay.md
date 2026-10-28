@@ -251,7 +251,8 @@ To move an existing collective to a new relay, change `"relay"` on every member'
    ```
 
 2. **The routing:** `borg collective ~/work/acme/some-repo` must name the collective with
-   `may sync: true`. `borg doctor` must show the config as valid. It does not contact the relay.
+   `may sync: true`. `borg doctor` must show the config as valid. It checks neither the relay setting
+   nor the relay itself: step 3 does.
 3. **A member:** `borg mesh serve --collective acme` prints `serving ... (self-hosted relay; Ctrl-C
    stops)`, and its `reachable at` line lists `https://relay.acme.example/`. If it prints
    `no relay connection yet (https://relay.acme.example/)`, the machine cannot reach the relay: check

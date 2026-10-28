@@ -6,7 +6,10 @@ machines over the mesh: peer to peer, end-to-end encrypted, no server of ours. E
 keeps working offline. `borg mesh` runs the separate `borg-mesh` binary; if it is missing:
 `cargo install borg-mesh --locked` (or `--path crates/borg-mesh` from a borg checkout).
 
-Only lessons travel (each line signed by its writer). Raw episodes stay where they were captured.
+What travels: lessons, daily usage counts, the team's redacted outcomes, playbooks, ratified
+constraints, messages between sessions, which sessions are running, and the redacted reasoning behind
+commits. Each line is signed by its writer's node. Raw episodes and transcripts stay where they were
+captured.
 `share: "local"` collectives and `off` repos are refused before any connection opens.
 
 ## Before anything: decide the relay
@@ -79,7 +82,8 @@ borg mesh invites --revoke <id>                          # withdraw one
 borg mesh revoke <key>                                   # remove a member
 ```
 
-Roles: `member`, `steer` (may also steer drones), `observe`. Anyone holding an unused ticket can join,
+Roles: `member`, `steer` (may also pause, resume and veto other members' sessions, as the admin may),
+`observe` (may not steer). Anyone holding an unused ticket can join,
 so it goes through a private channel. The admin's `serve` must be running while the member joins.
 
 ## Joiner

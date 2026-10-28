@@ -3,7 +3,7 @@
 [← README](../README.md)
 
 Borg counts what it does: turn ends it checked, questions it asked, what the drones did with them,
-corrections, pauses and vetoes, the queen's decisions and model costs. Each team member sees the whole team's
+corrections, pauses and vetoes, messages between sessions, the queen's decisions and model costs. Each team member sees the whole team's
 numbers, and `borg web` shows them with the collective's knowledge on a local page.
 
 - [The page](#the-page)
@@ -28,11 +28,13 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | API | Returns |
 |---|---|
 | `/api/collectives` | The collectives on this machine, each with its delivery `mode` (`hook` or `live`), and which one to show first |
-| `/api/stats?c=` | Totals, a zero-filled series per day, and the same per engineer. Totals carry `counts`, `usd`, `usd_by` (cost per kind), `usd_mode` (check cost per delivery mode) and `channels` (asks and results per channel) |
+| `/api/stats?c=` | Totals, a zero-filled series per day, the same per engineer, the number of machines counted (`nodes`) and the support of off-policy evaluation on this machine (`ope`: decisions, and those left out for lack of `p` or a pool). Totals carry `counts`, `usd`, `usd_by` (cost per kind), `usd_mode` (check cost per delivery mode), `channels` (asks and results per channel) and `dur_ms` |
 | `/api/lessons?c=` | Every lesson with its memory state and how often it was asked, used, ignored or corrected |
-| `/api/feed?c=&limit=` | This machine's notable events, newest first |
-| `/api/queen?c=` | The queen's questions and answers |
-| `/api/drones?c=` | The drones, as in `borg top` |
+| `/api/feed?c=&limit=` | This machine's notable events, newest first (200 by default, at most 2000) |
+| `/api/queen?c=` | The queen's questions and answers, and the team's attention reward (`queen_no`, `queen_stamp`, `queen_missed`) |
+| `/api/drones?c=` | The sessions, as in `borg top`, each with its unread messages |
+| `/api/messages?c=&limit=` | Messages between sessions from the last 7 days, newest first: sender, recipient (`to_kind`: `all`, `engineer` or `session`), text, how many sessions here were shown it, and the unread total |
+| `/api/playbooks?c=` | The playbooks: their steps, each shown version's belief, and edits waiting for an engineer |
 | `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts, the playbook versions with their beliefs; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/events?c=` | A server-sent event stream naming the views whose files changed |
 
@@ -49,6 +51,12 @@ repeated vetoes: those series start at the week live counting began on this mach
 `live_from`; earlier weeks are `null`), and a repeated veto is dated when it was said, in its veto's
 week. A "verdict on an asked lesson" is a Stop's changed or ignored, or a later correction anyway, which
 one lesson can get on top of either, as on the Conscience tab.
+
+**The tabs.** Overview (the day's activity and a live feed), Knowledge (the lessons), Conscience
+(checks and what their questions led to), Learning (above), Steering (corrections, pauses, resumes,
+vetoes and refused steers), Messages (the conversation between sessions, sends and refusals), Queen,
+Cost, Drones (which sessions run where, and their unread messages) and Playbooks (shown once the
+collective has one).
 
 ## How counting works
 
@@ -79,15 +87,17 @@ one lesson can get on top of either, as on the Conscience tab.
 | `regretted` | `borg learn` counted a later fix, or a review finding, against a lesson asked before the decision (`lessons`: that lesson). Its share of the blame is the `credit` of the `regretted` record in `outcomes.jsonl`, keyed by the regret episode (`cause`) |
 | `tested` | `borg learn` credited a lesson asked before the session's own tests went green: a failed run after the question, then a pass, or a pass after the drone changed its work on it; never for a question it ignored (`lessons`: that lesson). Weighs 0.5 in its usefulness, once per session and lesson |
 | `correction` | An engineer corrected a drone: a rejected tool call or a pushback |
-| `veto` | An engineer said no to a drone's work (`borg no`, or a prompt starting "borg no"); `lessons` the lessons shown in the session so far, `n` their number, `why` `cli` or `prompt` |
+| `veto` | An engineer said no to a drone's work (`borg no`, or a prompt starting "borg no"); `lessons` the lessons shown in the session so far, `n` their number, `why` `cli`, `prompt` or `mesh` (a `borg no` from another machine, counted where the session runs) |
 | `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned and dated when the veto was said, so the latest days can still grow |
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
-| `steer_issued`, `steer_delivered`, `steer_dropped` | A pause, resume or veto message (`borg pause`, `borg resume`, `borg no` to another machine) sent, shown to a session, or refused admission (`why`: the reason); `why` on the first two is the kind. They replace `borg steer`'s directives, which are still read from an old store |
-| `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: rate` when the rate limit refused it, `why: bounds` when the 500-line cap cut it. Lines that expire are not counted |
+| `steer_issued`, `steer_delivered`, `steer_dropped` | A pause, resume or veto message (`borg pause`, `borg resume`, or `borg no` naming a session on another machine) sent, shown to a session, or refused because the sending machine may not steer here (`why`: its role, or that it is revoked or unknown). On the first two, `why` is the kind (`pause`, `resume`, `veto`). A store from before 0.4 adds its old directives to the history |
+| `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: rate` when the rate limit refused it, `why: bounds` when the log's 500-line cap cut it (`n` lines). Lines that expire after 7 days are not counted |
 | `pause_refused` | A tool call refused because its drone was paused |
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |
+| `queen_no`, `queen_stamp`, `queen_missed` | The queen's attention reward, shown on the Queen tab and never optimised: an escalation answered by changing course, one answered "yes, fine", and a veto or a later fix of merged work from a session the queen never escalated |
+| `playbook_shown`, `playbook_proposed`, `playbook_promoted` | Playbook versions shown to a drone, an edit proposed to the engineer after a session ended clean, and an edit an engineer promoted (`why`: add, modify or remove) |
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.

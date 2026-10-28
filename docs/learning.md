@@ -79,8 +79,8 @@ The lesson it merged into takes the blame if it was asked; otherwise the asked l
 The blame grows with the fix's evidence (one signal 0.5, two 0.75, three 0.875; a review finding 0.5,
 confirmed by a verifier 0.75). It costs 0 tokens, each regret counts once, and it weighs at most half a
 correction, so a lesson that keeps being asked before decisions that break sinks slowly. A regret judged
-"not a lesson", or one whose lesson went to a private store, blames nothing; outcomes are not synced yet,
-so a decision made on another machine finds no asks here. `borg debug memory` and the page show it as
+"not a lesson", or one whose lesson went to a private store, blames nothing. Regret credit reads only
+this machine's outcome log, so a decision made on another machine finds no asks here. `borg debug memory` and the page show it as
 `regretted`; `BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by a pre-registered
 offline check: the belief with the regret term must predict later outcomes at least as well as without it.
 
@@ -111,8 +111,10 @@ costs 0 tokens and has these effects:
 4. In the session, the drone is told to stop and not argue the veto back.
 
 The measure is the *repeat-veto rate*: vetoes that repeat an earlier one, which should fall toward zero;
-`borg web` shows it. Name a drone on a teammate's machine with `--session` and the veto travels as a
-signed steering directive (steer role needed). A veto of work that already merged, from a session the
+`borg web` shows it. Name a drone on a teammate's machine with `--session` and `borg no` sends it a veto
+[message](commands.md#messages). It counts there only when the mesh admitted your machine as an `admin`
+or `steer` member; that machine records the credit and the lesson, and its drone hears the veto at its
+next prompt or tool call. A veto of work that already merged, from a session the
 queen never asked you about, counts as a missed escalation in the queen's attention score, shown in the
 queen view; nothing optimises it. See [Saying no](commands.md#saying-no).
 
@@ -149,8 +151,8 @@ question of that session's repo: Claude Code in its question dialog, the other h
 the reply. Answer
 in the terminal with `borg queen` and `borg queen ask`. See [Answering the queen](commands.md#answering-the-queen).
 
-When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; step 3 (a live drone) is
-not:
+When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built. Step 3, asking a live
+drone, is not automatic; a session can ask one itself with `borg ask`:
 
 ![Escalation: memory, an expert repo, a live drone, the engineer](img/escalation.svg)
 
@@ -159,7 +161,10 @@ not:
 - `borg why <file>:<line>` shows the redacted reasoning behind a commit, kept as a git note
   (`refs/notes/borg`, never pushed), and both ends of a decision → fix link: "→ fixed in Y" on the
   decision, "← decided in X → fixed here" on the fix.
-- `borg top` lists the drones running across the team; `borg pause` and `borg resume` hold or release them, and `borg tell` sends them a message.
+- `borg top` lists the drones running across the team. `borg tell`, `borg ask` and `borg inbox` let
+  sessions and engineers talk, on any harness and across machines; `borg pause` and `borg resume` hold
+  or release a drone; `borg listen` wakes an idle session when a message arrives. See
+  [Messages](commands.md#messages).
 - **Expert repos:** a collective can name local checkouts of its dependencies. A turn end that touches
   one gets at most three cited claims from that checkout, at the pinned version.
 

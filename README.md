@@ -17,12 +17,13 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.3.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
-NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
+**Status:** 0.4.0, which removed the hive: sessions now message each other instead. In daily use, with
+lessons syncing between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
 - [How it works in one session](#how-it-works-in-one-session)
 - [The team](#the-team)
+- [Talking to other sessions](#talking-to-other-sessions)
 - [Monitoring](#monitoring)
 - [Cost](#cost)
 - [Privacy](#privacy)
@@ -119,8 +120,8 @@ regret also counts against the lessons asked before the decision. [Decision → 
 passed after the drone changed its work on the point, the lesson gets a `tested` credit at 0 tokens.
 [Green tests](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
 
-**`borg no <reason>`** (or a prompt starting "borg no") vetoes what the drone is doing, at 0 tokens: the
-lessons it was shown lose credit, the reason becomes a lesson, and an invariant in it is proposed as a
+**`borg no <reason>`** (or a prompt starting "borg no") vetoes what the drone is doing: the
+lessons it was shown lose credit, the reason becomes a lesson (learned like a correction), and an invariant in it is proposed as a
 constraint you can ratify. [Saying no](https://github.com/debe/borg_ai/blob/main/docs/learning.md#saying-no)
 
 **Memory.** Use strengthens a lesson, disuse fades it: about 54 sessions without use make it dormant,
@@ -167,11 +168,11 @@ borg ask all "is anyone editing crates/borg/src/hook.rs?"
 borg inbox      # in a session: its messages; in a terminal: every message of the last 7 days
 ```
 
-The recipient is a drone as `borg top` names it, a session id, `all` (the sessions running when it was
-sent) or `engineer`. The message is shown once, at the recipient's next prompt or tool call, marked as
+The recipient is a drone as `borg top` names it, a session id (`<session>@<node>` on another machine),
+`all` (the sessions running when it was sent) or `engineer`. The message is shown once, at the recipient's next prompt or tool call, marked as
 peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
 Text is redacted and cut to 1,000 characters, and one sender may send a recipient one message per 10
-minutes.
+minutes. Messages are kept 7 days and sync to the team collective's members.
 
 The engineer can also hold a session, or every one:
 
@@ -181,8 +182,9 @@ borg resume Two
 borg no --session Two "never look merges up in the commit log"   # a veto, on this or another machine
 ```
 
-These are messages too, shown at the next prompt or tool call on every harness. From another member's
-machine they count only if that member has the `admin` or `steer` role.
+These are messages too, shown at the next prompt or tool call on every harness, and never rate limited.
+From another member's machine they count only if that member has the `admin` or `steer` role. A pause
+lapses after a day.
 
 A session that is idle sees a message when it next runs, unless it listens. Inside a session:
 
@@ -190,6 +192,8 @@ A session that is idle sees a message when it next runs, unless it listens. Insi
 borg listen         # wake this session when a message arrives while it is idle
 borg listen --off
 ```
+
+The opt-in lasts until `--off` or the session's end.
 
 When its turn ends, borg wakes it in the way its harness allows. On Claude Code the model starts
 `borg listen --wait` in the background. The omp and opencode adapters keep a stream running. On codex a
@@ -205,10 +209,11 @@ borg web        # http://127.0.0.1:7979/, the collective of the current director
 ```
 
 A live page on 127.0.0.1 with tabs for the Overview, Knowledge (every lesson, its belief and state),
-Conscience (checks, questions and what they led to per channel), Drones, the Queen (open questions, the
-queen's attention score), Learning (week by week: lessons per source, the share of asked lessons that
-changed the work, repeated vetoes, playbook versions) and Cost. It reads the
-same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
+Conscience (checks, questions and what they led to per channel), Learning (week by week: lessons per
+source, the share of asked lessons that changed the work, repeated vetoes, playbook versions), Steering
+(corrections, rejected tool calls, pauses and vetoes, the tool calls a pause refused), Messages (the last
+7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost, Drones,
+and Playbooks once the collective has one. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
@@ -222,7 +227,8 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 - **Live mode** adds one call per burst of changes: about 8× borg's own spend in hook mode, while whole
   runs cost about the same ([Why live is the default](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#why-live-is-the-default)).
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66). `assimilate --from-dir` makes one call per chunk and
-  prints its cost. `borg no`, review → fix, regrets and green tests cost 0 tokens.
+  prints its cost. Messages, `borg no`, review → fix, regrets and green tests are found at 0 tokens; a
+  veto's reason or a fixed finding is then learned like any correction.
 - There is no cost cap: `borg status` and the Cost tab show what each mode spent.
 
 ## Privacy
@@ -294,9 +300,9 @@ borg doctor
 
 Hooks call the binary by path, so a reinstall needs no rewiring. Codex trusts each hook's command and
 timeout: after an upgrade that moves borg or changes a timeout, trust them again with `/hooks`
-(`borg doctor` says so). Stores are append-only JSONL and need no migration. A team must upgrade
-together when the mesh protocol changes (now `borg/mesh/12`): nothing syncs with a member on another
-version, and `borg doctor` names that member and which side has to upgrade.
+(`borg doctor` says so). Stores are append-only JSONL and need no migration. The mesh protocol is
+now `borg/mesh/13`. A 0.3.0 member (`borg/mesh/12`) still syncs everything except messages; nothing syncs
+with an older one, and `borg doctor` names that member and which side has to upgrade.
 
 ```sh
 borg uninstall all --apply    # removes only what install added; keeps a backup
@@ -319,13 +325,14 @@ node --test adapters/omp/borg.test.ts         # adapter tests; need target/debug
 node --test adapters/opencode/borg.test.ts
 node --test adapters/conformance/conformance.test.ts   # harness conformance (docs/harnesses.md)
 scripts/arch.sh                               # the harness abstraction's metrics and gates
+scripts/ui.sh                                 # rebuilds the page's committed dist/ (check.sh checks it is fresh)
 python3 scripts/figures.py                    # regenerates the figures in docs/img
 ```
 
 | Path | What |
 |---|---|
 | `crates/borg` | The product (crate `borg-ai`, binary and library `borg`): CLI, hooks, learning, checks, memory, collectives, install, vectors. `assets/` holds the skill and the TS adapters it compiles in |
-| `crates/borg-mesh` | Peer sync, membership, presence, steering (iroh); separate so the hook binary stays small |
+| `crates/borg-mesh` | Peer sync, membership, presence, admission of pauses and vetoes from other machines (iroh); separate so the hook binary stays small |
 | `crates/borg-trace` | Parses Claude Code and omp transcripts |
 | `crates/borg-web` | `borg web`, the live page; `dist/` is its built Leptos client (`ui/`), committed |
 | `crates/borg-eval`, `crates/borg-search`, `eval/` | Eval harness and benchmarks; not shipped, use local paths under `~/.local/share/borg/eval/` |

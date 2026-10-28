@@ -2,7 +2,7 @@
 
 [← README](../README.md)
 
-Members of a team collective share its lessons machine to machine, with no server, across NATs (home
+Members of a team collective share its lessons, statistics and messages machine to machine, with no server, across NATs (home
 office, hotel, phone hotspot). Each machine runs `borg mesh serve`, a peer like every other. Hooks read
 and write only local files, so agents never wait for the mesh, and Borg keeps working offline. The mesh
 never calls a model.
@@ -41,8 +41,9 @@ borg mesh invite --role steer --expires 2d --uses 1 --png invite.png
 
 Send the ticket privately (chat, password manager) or let the member scan the QR code: anyone holding
 an unused ticket can join with its role. Defaults: role `member`, one use, valid 7 days. Roles are
-`member`, `steer` (may also pause, resume and veto other members' sessions) and `observe`. `borg mesh invites` lists open tickets;
-`borg mesh invites --revoke <id>` withdraws one.
+`member`, `steer` and `observe`. Every role syncs. Only `steer` and `admin` may pause, resume and veto
+sessions on other members' machines; a `member` or `observe` machine's pause counts nowhere but on its
+own machine. `borg mesh invites` lists open tickets; `borg mesh invites --revoke <id>` withdraws one.
 
 **3. New member.** Install Borg, then:
 
@@ -61,8 +62,10 @@ members learn of the newcomer at their next sync. Spent, expired and withdrawn t
 key cannot rejoin with an old ticket; an admin must re-invite it by key.
 
 **Other commands:** `borg mesh members`, `borg mesh revoke <key>` (admin), `borg mesh id`,
-`borg mesh sync <key>` (once), `borg mesh peer [<key>[@<ip:port>]]`. The older manual flow still works:
-`borg mesh invite <key>` and `borg mesh join membership-history.jsonl`.
+`borg mesh sync <key>` (once), `borg mesh peer [<key>[@<ip:port>]]`, `borg mesh fetch [<commit>...]`
+(reasoning notes from members). `borg mesh serve` listens on `0.0.0.0:7878` and syncs every 60 s;
+`--bind IP:PORT` and `--interval SECS` change that. `borg mesh invite <key> [--role R]` adds or
+changes a member by key; with `borg mesh join membership-history.jsonl` it is the older manual flow.
 
 ## Company collective
 
@@ -132,25 +135,38 @@ append-only files, so nothing is overwritten; when two machines improved the sam
 version wins everywhere. Cost grows with what changed: a laptop back from three weeks' vacation
 downloads three weeks of lessons.
 
-**What travels.** Lessons, each line signed by the machine that wrote it. Raw episodes stay where they
-were captured, so each is learned exactly once. Outcome lines say which lesson was asked, what followed
-(including a veto, and a later regret's share of the blame), when, and the probability it was asked,
-with the session, repo and regret hashed, so every member derives the same lesson usefulness. They are signed and
-quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
-(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Ratified constraints (`borg no`, `borg queen`) sync
-too, signed and quarantined like lessons, holding the invariant, its lesson and who ratified it, never the
-veto's words; every member's sessions get them as standing lessons. Messages between sessions (`borg tell`, `borg ask`)
-sync like lessons: a union of `messages.jsonl`, each line authenticated by the machine it came from and
-checked on read, its text already redacted. Peers on `borg/mesh/11` and earlier
-do not sync with this version: upgrade every member. A session with a
-member on another version ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
-("peer <key> speaks borg/mesh/5, this node borg/mesh/12: nothing syncs with it; upgrade it") until a session with
-it completes or it leaves the member list; the old node's log gets the same line from its side ("… upgrade this node"). Reasoning excerpts go to two peers chosen by hash,
-so the "why" survives its author going offline.
+**What travels.** Six logs, each line signed by the machine that wrote it and quarantined when that
+machine is revoked:
+
+- **Lessons.** Raw episodes stay where they were captured, so each is learned exactly once.
+- **Statistics rollups**, one per machine, engineer and day ([Statistics](statistics.md)).
+- **Outcomes**: which lesson was asked, what followed (including a veto, and a later regret's share of
+  the blame), when, and the probability it was asked, with session, repo and regret hashed. Every
+  member derives the same lesson usefulness and trust from them. `BORG_SHARE_OUTCOMES=off` keeps a
+  machine's outcomes local.
+- **Playbooks**: the edits engineers promoted.
+- **Ratified constraints** (`borg no`, `borg queen`): the invariant, its lesson and who ratified it,
+  never the veto's words. Every member's sessions get them as standing lessons.
+- **Messages between sessions** (`borg tell`, `borg ask`, and `borg pause`, `borg resume` or a
+  `borg no` aimed at another machine), already redacted, checked on read, and kept for 7 days. A pause,
+  resume or veto from another machine counts only when the membership gives that machine the `steer`
+  or `admin` role; any other is refused and counted as `steer_dropped`.
+
+Beside the logs, each session tells the other machines which sessions run where (shown by `borg top`,
+kept a day at most), and reasoning excerpts go to two members chosen by hash, so the "why" survives
+its author going offline.
+
+**Versions.** This release speaks `borg/mesh/13`. It still syncs with a 0.3 peer (`borg/mesh/12`), but
+messages do not reach that peer: upgrade it. Peers on `borg/mesh/11` and earlier do not sync at all. Such a
+session ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
+("peer <key> speaks borg/mesh/5, this node borg/mesh/13: nothing syncs with it; upgrade it") until a
+session with it completes or it leaves the member list. The old node's log gets the same line from its
+side ("… upgrade this node").
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key
-and drops lines it stamped after the revocation; earlier contributions stay. A pause, resume or veto from
-another machine is admitted against the same list.
+and drops lines it stamped after the revocation; earlier contributions stay. A revoked machine's
+pause, resume or veto stops counting at the next sync, and so does one from a machine that lost its
+steering role.
 
 ## How peers find each other
 
@@ -201,9 +217,9 @@ end-to-end encrypted between member keys.
 |---|---|
 | `join` hangs, then says the admin did not answer | The admin's `borg mesh serve` is not running, or the two sides use different `relay` settings |
 | `the invite was already used` / `has expired` | Ask the admin for a new ticket |
-| `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync. Behind a proxy that re-signs TLS (corporate VPN), its CA must be in the system trust store |
+| `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync. Behind a proxy that re-signs TLS (a company VPN), its CA must be in the system trust store |
 | `no direct address ... relays are disabled` | With `"relay": "disabled"`, give peers as `<key>@<ip:port>` |
-| `collective "x" is not in collectives.json` | Run `join` with `--apply`, or add the entry by hand |
+| `collective "x" is not in …/collectives.json` | Run `join` with `--apply`, or add the entry by hand |
 | Nothing syncs after joining | Replace the placeholder path (or join again with `--paths`); `borg collective <repo>` must name the team collective with `may sync: true` |
 
 ## Testing across real NATs

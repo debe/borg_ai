@@ -32,14 +32,14 @@ into `~/.local/bin` and runs `borg setup`; options go after `sh -s --`
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
-curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.3.0 --dir ~/bin --no-setup
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.4.0 --dir ~/bin --no-setup
 ```
 
 From crates.io (the package is `borg-ai`; the binary is `borg`), or from a checkout:
 
 ```sh
 cargo install borg-ai --locked      # the CLI and hook binary, vectors included
-cargo install borg-mesh --locked    # only for team sync, borg top across machines, pausing other members' sessions
+cargo install borg-mesh --locked    # only for a team: sync, messages and borg top across machines
 cargo install borg-web --locked     # only for borg web, the live page
 
 git clone https://github.com/debe/borg_ai borg && cd borg
@@ -63,7 +63,7 @@ confirm:
 - **Vectors:** fetches the model (~490 MB, once) and indexes every store with lessons. A failed
   download asks for a mirror (`BORG_VECTOR_URL`) and never stops setup.
 - **Wiring:** the hooks or adapter of each harness, and the `borg` skill, which teaches the agent itself
-  to explain borg, edit `collectives.json` and run these commands for you.
+  to explain borg, edit `collectives.json`, message other sessions and run these commands for you.
 - **Import:** optionally learns the 50 newest corrections from your past sessions (model calls).
 
 It ends with `borg doctor`. A second run changes nothing. Its flags are in [Commands](commands.md#overview).
@@ -168,13 +168,26 @@ answer with `borg queen`. Answering one moves the lesson; it writes no new lesso
 ## Storage
 
 Each collective keeps plain files in `~/.local/share/borg/collectives/<name>/` (`BORG_HOME` moves the
-root): `episodes.jsonl`, `lessons.jsonl`, `outcomes.jsonl`, `outcomes-team.jsonl` (the outcomes
-redacted for the team: lesson ids, what followed, when, the asking probability, session and repo hashed;
-the mesh syncs it for team collectives; `outcomes-team.published`, never synced, remembers how much of
-`outcomes.jsonl` was published), `lessons.jsonl.lock` (one `borg learn` per collective at a time),
-`reasoning.jsonl` (reasoning excerpts and
-decision → fix links from the mesh), and, when used, `vectors/`, `mesh/`, `queen/`
-and `presence/`. Per-session scratch state lives in `/tmp/borg` (`BORG_STATE`).
+root). The mesh syncs the files marked *synced*, and only for a team collective.
+
+| File | Holds |
+|---|---|
+| `lessons.jsonl` | The lessons. Synced |
+| `episodes.jsonl` | The corrections, vetoes and regrets `borg learn` turns into lessons |
+| `outcomes.jsonl` | What followed each lesson asked: ignored, changed, corrected, vetoed, regretted, tested |
+| `outcomes-team.jsonl` | The outcomes redacted for the team: lesson ids, what followed, when, the asking probability, session and repo hashed. Synced. `outcomes-team.published` (local) remembers how much was published |
+| `stats.jsonl` | One usage rollup per node, engineer and day: counts, cost, lesson ids. Synced. The raw events stay in `stats/events.jsonl` |
+| `playbooks.jsonl` | Promoted [playbook](commands.md#playbooks) edits. Synced |
+| `constraints.jsonl` | Constraints ratified from a [`borg no`](commands.md#saying-no). Synced |
+| `messages.jsonl` | [Messages](commands.md#messages) between sessions, pauses, resumes and vetoes: a week at most, the newest 500. Synced. `messages/` (local) records which session saw each one, and which pauses and vetoes count here |
+| `reasoning.jsonl` | Redacted reasoning excerpts and [decision → fix links](#decision--fix-links), replicated by the mesh |
+| `lessons.jsonl.lock` | Lets one `borg learn` run per collective at a time |
+| `queen/` | Open questions for the engineer and their answers |
+| `presence/` | One record per running session, for `borg top` and message routing |
+| `listen/` | The sessions that asked to be woken by a message, and their waiters |
+| `vectors/`, `mesh/` | The vector index; the mesh's own state |
+
+Per-session scratch state lives in `/tmp/borg` (`BORG_STATE`).
 
 ## System map
 
@@ -192,18 +205,24 @@ testing.
 - **Claude Code:** one hook per event in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`):
   `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop` (90 s timeout) and
   `SessionEnd`. Each runs `<path to borg> hook claude <event>`. Your other keys and hooks stay.
-- **omp:** copies the adapter to `~/.omp/agent/extensions/borg.ts`.
-- **opencode:** copies the adapter to `~/.config/opencode/plugins/borg.ts`.
+  `PreToolUse` costs one `stat` until someone first [pauses](commands.md#pause-and-resume) a session; then
+  it refuses a paused session's tool calls.
+- **omp:** copies the adapter to `~/.omp/agent/extensions/borg.ts` (or `$PI_CODING_AGENT_DIR/extensions`).
+- **opencode:** copies the adapter to `~/.config/opencode/plugins/borg.ts` (or
+  `$OPENCODE_CONFIG_DIR/plugins`, `$XDG_CONFIG_HOME/opencode/plugins`).
 - **Codex CLI:** one hook per event appended to `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`):
-  `UserPromptSubmit` (30 s), `PreToolUse` (10 s), `PostToolUse` (30 s), `Stop` (90 s) and `SessionEnd`
-  (3 s, Codex's maximum). Each runs `<path to borg> hook codex <event>`. Codex runs them only after you
+  `UserPromptSubmit` (30 s), `PreToolUse` (10 s), `PostToolUse` (30 s), `Stop` (90 s), `SessionEnd`
+  (3 s, Codex's maximum) and `Interrupt` (3 s: an Esc ends the turn of a session that
+  [listens](commands.md#waking-a-session)). Each runs `<path to borg> hook codex <event>`. Codex runs them only after you
   trust them: open codex and run `/hooks`. `borg doctor` reports any of borg's hooks codex does not trust.
+- **Upgrades:** install and uninstall also remove the hooks and skill files an older borg installed and
+  this one no longer uses, such as Claude Code's `SessionStart` hook from 0.3 and before.
 
 - **The `borg` skill,** for every harness above: `SKILL.md` and `references/*.md` in
   `~/.claude/skills/borg` (or `$CLAUDE_CONFIG_DIR/skills/borg`), `~/.omp/agent/skills/borg`,
   `~/.config/opencode/skills/borg` and `~/.codex/skills/borg` (or `$CODEX_HOME/skills/borg`). It teaches
-  the agent what borg is, how `collectives.json` works, and when to run `setup`, `doctor`, `mesh` and
-  `vectors`; it tells the agent to show you every dry run before `--apply`. Each file is copied whole.
+  the agent what borg is, how `collectives.json` works, when to run `setup`, `doctor`, `mesh` and
+  `vectors`, and how to message other sessions (`tell`, `ask`, `inbox`, `listen`); it tells the agent to show you every dry run before `--apply`. Each file is copied whole.
   Uninstall removes only files exactly as this borg ships them, then the empty directory; a file you
   edited stays and is named. A skill directory that is a symlink is yours and left alone. `borg status`
   and `borg doctor` report a missing or stale skill; `borg install <harness> --apply` updates it there.
@@ -433,7 +452,8 @@ All are optional.
 | `BORG_CONFIG` | `~/.config/borg/collectives.json` | The collectives config |
 | `BORG_HOME` | `~/.local/share/borg` | Root of the stores |
 | `BORG_STATE` | `/tmp/borg` | Per-session scratch state |
-| `BORG_BIN` | `borg` on `PATH` | The binary the omp and opencode adapters run |
+| `BORG_BIN` | `borg` on `PATH` | The binary the omp and opencode adapters run, for hooks and for `borg listen` |
+| `BORG_OPENCODE_LOG` | none | A file the opencode adapter logs what it did to, with every error it swallowed |
 | `BORG_RELAY` | the collective's `relay` | Mesh relay for every collective: `default` (n0), `disabled`, or URL(s) |
 
 **Learning and delivery**
