@@ -255,7 +255,7 @@ fn waiting(here: &Here, drone: &str, mode: Mode, lock: &std::fs::File, image: &m
     let here_node = node(&here.home);
     // The node's goal work (phase g G4, node.rs): its mesh daemon's, or this waiter's while it holds the
     // node lock (no daemon runs, no other waiter took it), until it exits.
-    let mut worker: Option<(std::fs::File, super::node::Worker)> = None;
+    let mut worker: Option<(super::node::NodeLock, super::node::Worker)> = None;
     // A wake `codex queue` did not take: nothing claimed or handed before this (`QUEUE_RETRY`).
     let mut retry_at: Option<Instant> = None;
     // A missed wake (interactive.rs `missed`) was said in the log: once a miss.
@@ -482,7 +482,7 @@ enum Took {
 /// drone is told (`deliver`). The engineer's turn is looked at again once the claim is won (its
 /// snapshot takes a while): one begun meanwhile gets nothing handed (`Took::Kept`), so no wake lands in
 /// it or queues behind it. A task whose deps cannot come in is passed over, as the stop's handover
-/// does.
+/// does; one whose start git did not compute in time is not (`Refused::Later`): the next poll tries it.
 fn take(here: &Here, g: &Goal, hs: &mut HiveSession, session: &str, cwd: &str, repo: &str) -> Took {
     for _ in 0..super::CLAIM_TRIES {
         let now = learn::now_ms();
@@ -492,7 +492,7 @@ fn take(here: &Here, g: &Goal, hs: &mut HiveSession, session: &str, cwd: &str, r
             Ok(_) if interactive::held_off(session, learn::now_ms()) => return Took::Kept,
             Ok(won) => return Took::Handed(deliver(here, g, hs, session, cwd, &won)),
             Err(super::Refused::Deps(_)) => super::refuse(session, &next.task.id),
-            Err(super::Refused::Lost) => {}
+            Err(super::Refused::Lost | super::Refused::Blocked(_)) => {}
             Err(_) => return Took::Nothing,
         }
     }

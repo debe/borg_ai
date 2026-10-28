@@ -63,30 +63,49 @@ pub fn lock_path(home: &Path) -> PathBuf {
 /// What the mesh daemon's worker writes into the node lock it holds (`take`, `worker`).
 pub const DAEMON: &str = "daemon";
 
+/// The node lock, held while this is: let go when it drops, at once. A `flock` belongs to the file's
+/// open description, and a child another thread forked holds a copy of it until its exec: closing this
+/// fd alone would keep the lock held that long, so it is unlocked first.
+#[derive(Debug)]
+pub struct NodeLock(std::fs::File);
+
+impl Drop for NodeLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// The node lock for the mesh daemon (`take_as` with `DAEMON`).
-pub fn take(home: &Path) -> Option<std::fs::File> {
+pub fn take(home: &Path) -> Option<NodeLock> {
     take_as(home, DAEMON)
 }
 
-/// The node lock, when no other process holds it: held for as long as the returned file is open, and
+/// The node lock, when no other process holds it: held for as long as the returned lock lives, and
 /// saying who holds it (`who`: `daemon`, or `waiter <drone>`), which monitoring reads (`worker`). None
 /// when another holds it (a daemon, a waiter) or it cannot be opened. The lock is taken before the file
 /// is rewritten, so a reader never finds a loser's name in it.
-pub fn take_as(home: &Path, who: &str) -> Option<std::fs::File> {
+pub fn take_as(home: &Path, who: &str) -> Option<NodeLock> {
     use std::io::Write;
     let path = lock_path(home);
     std::fs::create_dir_all(path.parent()?).ok()?;
     let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
     f.try_lock().ok()?;
     let _ = f.set_len(0).and_then(|()| f.write_all(format!("{who}\n").as_bytes()));
-    Some(f)
+    Some(NodeLock(f))
 }
 
 /// Whether a process does this node's goal work now (it holds the node lock): then a drone's hooks write
 /// no beat of their own (interactive.rs `touch`).
 pub fn worker_runs(home: &Path) -> bool {
     let Ok(f) = std::fs::OpenOptions::new().write(true).open(lock_path(home)) else { return false };
-    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    match f.try_lock() {
+        // The probe held it a moment: let go at once (`NodeLock`), not when a forked child's copy closes.
+        Ok(()) => {
+            let _ = f.unlock();
+            false
+        }
+        Err(e) => matches!(e, std::fs::TryLockError::WouldBlock),
+    }
 }
 
 /// Who does this node's goal work now (monitoring, phase g G6): `daemon` (the mesh daemon), `waiter
@@ -409,6 +428,43 @@ fn note_integrate(home: &Path, goal: &str, line: &str) {
 mod tests {
     use super::*;
 
+    /// A lock let go is free at once, though a child another thread forked meanwhile holds a copy of the
+    /// lock file's description until its exec (a `flock` belongs to the description, so closing this
+    /// process's fd alone kept it held): the next `take` gets it, and the monitoring says who holds it.
+    #[test]
+    fn a_lock_let_go_is_free_while_a_child_forked_meanwhile_has_not_run_its_exec() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let home = std::env::temp_dir().join(format!("borg-node-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let lock = take(&home).expect("the node lock");
+        let (mut forked, said) = std::io::pipe().unwrap();
+        let fd = said.as_raw_fd();
+        let child = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("true");
+            // SAFETY: write(2) and usleep(3) only, both async-signal-safe, between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::write(fd, b"x".as_ptr().cast(), 1);
+                    libc::usleep(1_500_000);
+                    Ok(())
+                });
+            }
+            let status = cmd.status();
+            drop(said);
+            status
+        });
+        forked.read_exact(&mut [0u8; 1]).unwrap();
+        drop(lock);
+        assert_eq!(worker(&home), "none", "a lock let go names no worker");
+        let again = take_as(&home, "waiter i-x").expect("free at once, the child's exec not run yet");
+        assert_eq!(worker(&home), "waiter i-x");
+        drop(again);
+        assert!(child.join().unwrap().is_ok_and(|s| s.success()));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn a_served_goal_with_no_membership_here_is_read_once_a_look() {
         // A drone of every goal serves a goal opened after its join, with no join of this node there
@@ -429,6 +485,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         super::super::goal::create(&home, &goal).unwrap();
         let s = Served { goal, drones: Vec::new(), repos: Vec::new() };

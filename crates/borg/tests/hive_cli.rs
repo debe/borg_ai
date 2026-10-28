@@ -672,8 +672,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// The work dir as a git repo with `src/parse.rs` committed and an uncommitted `notes.md` (in every
-/// claim's base, so a reset to the base keeps it).
+/// The work dir as a git repo with `src/parse.rs` committed: the origin of a goal made in it after,
+/// and every claim's start there (a checkout off its start claims nothing, hive/start.rs).
 fn git_work(root: &Path) -> PathBuf {
     let w = work(root);
     std::fs::create_dir_all(w.join("src")).unwrap();
@@ -681,7 +681,6 @@ fn git_work(root: &Path) -> PathBuf {
     git(&w, &["init", "-q", "-b", "main"]);
     git(&w, &["add", "-A"]);
     git(&w, &["-c", "user.name=x", "-c", "user.email=x@y", "commit", "-q", "-m", "one"]);
-    std::fs::write(w.join("notes.md"), "mine, before any claim\n").unwrap();
     w
 }
 
@@ -692,8 +691,8 @@ fn tool_ctx(root: &Path, session: &str) -> String {
 #[test]
 fn a_lost_claims_worktree_is_set_aside_at_its_stop_in_a_pinned_snapshot_and_reset_to_its_base() {
     let root = common::setup("hive-lost-reset");
-    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     let w = git_work(&root);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     join(&root, "lr1");
     ok(&root, &["claim", "t1", "--session", "lr1"]);
     // The loser works on: a tracked file changed, a new file, before the sync tells it.
@@ -709,7 +708,6 @@ fn a_lost_claims_worktree_is_set_aside_at_its_stop_in_a_pinned_snapshot_and_rese
     assert!(r.contains("your worktree is back at the claim's start"), "{r}");
     assert_eq!(std::fs::read_to_string(w.join("src/parse.rs")).unwrap(), "fn parse() {}\n", "the tracked file is as at the claim");
     assert!(!w.join("src/lost.rs").exists(), "the new file is gone");
-    assert_eq!(std::fs::read_to_string(w.join("notes.md")).unwrap(), "mine, before any claim\n", "the base's own change stays");
     assert_eq!(git(&w, &["show", &format!("{snap}:src/lost.rs")]), "lost work", "the snapshot holds the discarded work");
     assert_eq!(git(&w, &["show", &format!("{snap}:src/parse.rs")]), "fn parse() { todo!() }");
     assert_eq!(git(&w, &["rev-parse", &format!("refs/borg/hive/g1/{snap}")]), snap, "pinned: gc keeps it");
@@ -719,7 +717,7 @@ fn a_lost_claims_worktree_is_set_aside_at_its_stop_in_a_pinned_snapshot_and_rese
         .unwrap()
         .to_string();
     assert_eq!(git(&w, &["diff", "--name-only", &base, &snap]), "src/lost.rs\nsrc/parse.rs", "the discarded diff, against the base");
-    assert_eq!(git(&w, &["status", "--porcelain"]), "?? notes.md", "the worktree equals the base: nothing else differs from HEAD");
+    assert_eq!(git(&w, &["status", "--porcelain"]), "", "the worktree equals the base: nothing differs from HEAD");
     // Once only: the next stop neither tells nor resets again.
     std::fs::write(w.join("scratch.txt"), "after\n").unwrap();
     let again = reason(&stop(&root, "lr1", false));
@@ -730,8 +728,8 @@ fn a_lost_claims_worktree_is_set_aside_at_its_stop_in_a_pinned_snapshot_and_rese
 #[test]
 fn a_lost_claim_is_set_aside_at_the_next_claim_before_it_takes_its_base() {
     let root = common::setup("hive-lost-next-claim");
-    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     let w = git_work(&root);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     join(&root, "ln1");
     ok(&root, &["claim", "t1", "--session", "ln1"]);
     std::fs::write(w.join("src/lost.rs"), "lost work\n").unwrap();
@@ -746,28 +744,31 @@ fn a_lost_claim_is_set_aside_at_the_next_claim_before_it_takes_its_base() {
 #[test]
 fn a_second_loss_of_a_task_claimed_again_sets_aside_only_this_claims_work() {
     let root = common::setup("hive-lost-twice");
-    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     let w = git_work(&root);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     join(&root, "lt1");
     ok(&root, &["claim", "t1", "--session", "lt1"]);
     lose_to_remote(&root, "lt1", "t1");
     stop(&root, "lt1", false);
-    // t2's work, done in the same worktree.
+    // t2's work, done in the same checkout.
     ok(&root, &["claim", "t2", "--session", "lt1"]);
     std::fs::write(w.join("t2.txt"), "t2's work\n").unwrap();
     std::fs::write(w.join("ok"), "").unwrap();
     ok(&root, &["done", "--session", "lt1"]);
-    // The rival lets t1 go; s1 claims it again (its base: its first claim's, from before t2) and loses
-    // once more.
+    // The rival lets t1 go. A checkout that holds t2's work is not at t1's start: never t1's base, so
+    // refused, the tree untouched; once the engineer cleared it, lt1 claims t1 again and loses once more.
     let ms = claim_ms(&root, "lt1", "t1");
     append_board(&root, &[json!({"v": 1, "ev": "released", "task": "t1", "ms": ms + 1, "by": "sr", "node": "remote-node-7"})]);
+    let (_, err, code) = hive(&root, &["claim", "t1", "--session", "lt1"]);
+    assert!(code == 1 && err.contains("this checkout is not at t1's start"), "{err}");
+    assert!(w.join("t2.txt").exists(), "nothing reset");
+    git(&w, &["clean", "-fdq"]);
     ok(&root, &["claim", "t1", "--session", "lt1"]);
     std::fs::write(w.join("t1-again.txt"), "lost again\n").unwrap();
     lose_to(&root, "sr2", "lt1", "t1");
     let r = reason(&stop(&root, "lt1", false));
     assert!(r.contains("set aside in commit"), "{r}");
     assert!(!w.join("t1-again.txt").exists(), "this claim's work is set aside");
-    assert_eq!(std::fs::read_to_string(w.join("t2.txt")).unwrap(), "t2's work\n", "t2's done work stays");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -805,8 +806,8 @@ fn a_refused_edit_of_a_test_file_raises_no_flag() {
 #[test]
 fn a_lost_claim_in_a_tree_another_session_holds_a_task_in_is_left_as_it_is() {
     let root = common::setup("hive-lost-shared");
-    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     let w = git_work(&root);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     join(&root, "lh1");
     join(&root, "lh2");
     ok(&root, &["claim", "t1", "--session", "lh1"]);
@@ -822,8 +823,8 @@ fn a_lost_claim_in_a_tree_another_session_holds_a_task_in_is_left_as_it_is() {
 #[test]
 fn a_lost_claim_learnt_while_holding_the_next_task_resets_nothing() {
     let root = common::setup("hive-lost-held");
-    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     let w = git_work(&root);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
     join(&root, "s1");
     ok(&root, &["claim", "t1", "--session", "s1"]);
     lose_to_remote(&root, "s1", "t1");

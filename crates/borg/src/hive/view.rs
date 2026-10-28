@@ -38,6 +38,10 @@ pub struct TaskRow {
     pub rework: u32,
     /// The holder's node: empty on this node, else its first 8 characters.
     pub node: String,
+    /// Where its newest claim with a tree started (hive/start.rs): the start commit and the deps' work
+    /// it holds, and the reset of a drone's worktree (where the tree before is kept, whether a rework's
+    /// previous attempt is back); empty without one.
+    pub start: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -103,7 +107,44 @@ pub fn alerts(home: &Path, g: &goal::Goal, b: &board::Board) -> Vec<String> {
         let what: Vec<String> = pending.iter().map(|(at, c)| format!("{at} {}: {}", c.name, c.cmd)).collect();
         out.push(format!("checks from another node wait for `borg hive approve {}`: {}", g.id, what.join("; ")));
     }
+    // A clone that lacks the goal's origin: its drones would sit idle without saying why (start.rs).
+    out.extend(super::start::not_here(home, &g.id).into_iter().map(|(repo, why)| format!("no work starts in {repo} on this node: {why}")));
     out
+}
+
+type StartIndex<'a> = BTreeMap<&'a str, (&'a board::Event, Option<&'a board::Event>)>;
+
+/// Each task's newest claim with a tree, and the reset note (mod.rs `START_NOTE`) its claimant wrote
+/// after it: one pass over the board.
+fn starts(events: &[board::Event]) -> StartIndex<'_> {
+    let mut out: StartIndex<'_> = BTreeMap::new();
+    for e in events {
+        match e.ev {
+            board::Ev::Claim if !e.base.is_empty() && out.get(e.task.as_str()).is_none_or(|(c, _)| c.ms <= e.ms) => {
+                out.insert(&e.task, (e, None));
+            }
+            board::Ev::Progress if e.note.starts_with(super::START_NOTE) => {
+                if let Some((_, reset)) = out.get_mut(e.task.as_str()).filter(|(c, _)| c.by == e.by && c.ms <= e.ms) {
+                    *reset = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What `TaskRow::start` says of the claim `c` of `t` and its reset note.
+fn start_row(t: &board::Task, c: &board::Event, reset: Option<&board::Event>) -> String {
+    if let Some(r) = reset {
+        return r.note.clone();
+    }
+    let base: String = c.base.chars().take(12).collect();
+    match &t.from {
+        Some(_) => format!("{}{base} (the combined tree)", super::START_NOTE),
+        None if c.deps_in.is_empty() => format!("{}{base} (the goal's origin with no dep's work)", super::START_NOTE),
+        None => format!("{}{base} (the goal's origin with {})", super::START_NOTE, c.deps_in.join(", ")),
+    }
 }
 
 /// The goals of the store `home`, sorted; empty without a hive (one failed read_dir).
@@ -120,6 +161,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
     let here = super::node(home);
     let shown = |node: &str| if super::is_local(home, node) { String::new() } else { node.chars().take(8).collect() };
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let starts = starts(&events);
     let tasks: Vec<TaskRow> = b
         .tasks
         .values()
@@ -146,6 +188,7 @@ pub fn of(home: &Path, id: &str, now: i64) -> Option<HiveView> {
                 files: s.task.files.clone(),
                 rework: s.rework,
                 node: shown(&node),
+                start: starts.get(s.task.id.as_str()).map(|(c, reset)| start_row(&s.task, c, *reset)).unwrap_or_default(),
             }
         })
         .collect();
@@ -421,6 +464,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         goal::create(home, &g).unwrap();
         let t = |id: &str, f: &str| Task {

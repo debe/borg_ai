@@ -1486,6 +1486,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         let p = prompt(&g, "d3");
         assert!(p.contains("drone d3 of hive goal parser") && p.contains("`borg hive board parser`") && p.contains("the commits its claim names"));

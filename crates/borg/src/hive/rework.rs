@@ -360,6 +360,7 @@ mod tests {
             sig: String::new(),
             hidden: hidden.then(|| goal::Hidden { dir: "/x".into(), commands: vec!["true".into()], timeout_s: 60 }),
             held_out: false,
+            origin: Vec::new(),
         }
     }
 

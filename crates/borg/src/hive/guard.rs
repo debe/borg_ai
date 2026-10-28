@@ -654,6 +654,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         let goal_json = super::super::goal_path(home, "g");
         assert!(!guarded(home, &g).contains(&goal_json), "without a hidden oracle goal.json names nothing held out");
@@ -697,6 +698,7 @@ mod tests {
             sig: String::new(),
             hidden: Some(goal::Hidden { dir: "/held/out".into(), commands: vec!["true".into()], timeout_s: 30 }),
             held_out: false,
+            origin: Vec::new(),
         };
         assert_eq!(synced_path(&g, Class::Oracle, "/held/out/tests/test_edge_case_42.py"), HIDDEN_PATH);
         assert_eq!(synced_path(&g, Class::Oracle, "/held/out/../out/x.py"), HIDDEN_PATH, "lexically under it");

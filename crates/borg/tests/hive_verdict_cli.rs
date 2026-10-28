@@ -388,6 +388,8 @@ fn the_hidden_oracle_decides_the_credit_once() {
     for s in ["sa", "sb"] {
         ok(&root, &["leave", "--session", s]);
     }
+    // A checkout claims where its tree is the start (hive/start.rs): the engineer sets g2's edit aside.
+    git(&work(&root), &["checkout", "-q", "--", "."]);
     work_done(&root, "g3", "src/parse.py", comment);
     ok(&root, &["verify", "--pass", "--session", "sb"]);
     debug_ok(&root, &["score", "g3"]);
@@ -512,6 +514,8 @@ fn a_verified_task_proposes_a_playbook_edit_and_once_promoted_it_reaches_the_nex
     for s in ["sc", "sd", "se"] {
         join(&root, s, "g1");
     }
+    // A checkout claims where its tree is the start (hive/start.rs): the engineer sets t1's edit aside.
+    git(&work(&root), &["checkout", "-q", "--", "."]);
     ok(&root, &["claim", "t2", "--session", "sc"]);
     ok(&root, &["claim", "t3", "--session", "sd"]);
     let prompt = |s: &str, text: &str| context(&hook(&root, "claude", "prompt", s, json!({"prompt": text}), &[]));

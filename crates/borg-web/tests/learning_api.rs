@@ -85,6 +85,7 @@ fn seed(home: &std::path::Path) {
         sig: String::new(),
         hidden: None,
         held_out: false,
+        origin: Vec::new(),
     };
     goal::create(home, &g).unwrap();
     let tasks = hive::tasks_path(home, "g");

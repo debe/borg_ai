@@ -103,8 +103,14 @@ $ borg hive board
 
 Drone commands take `--session ID` (the hook's context prints the exact command) and `--dir DIR`.
 
-- **Dependencies.** A task is claimable once every dep is verified. The claim applies each dep's
-  verified change to the claimant's worktree first, so the work's diff starts after its deps.
+- **Dependencies.** A task is claimable once every dep is verified. A claim starts from the goal's
+  origin (the commit `borg hive init` ran on; in another repo, its HEAD when the goal's first claim
+  there was made) with each dep's verified change applied, so the work's diff starts after its deps.
+  Commits the engineer makes after that reach drone trees only through a task. A drone's own worktree is reset to that start when the claim wins; what
+  it held before is kept in a pinned commit that `borg top`, the Hive tab and the drone are told. A
+  rework gets the drone's previous attempt back on top, uncommitted. Any other checkout claims only
+  where its tree is the start already (the refusal names the commit to check out). Deps whose changes
+  conflict block the task with the paths, once.
 - **Claims are leases.** Hooks renew a claim every 10 minutes; it expires after 30 without one. Of two
   claims on one task, the lowest (stamp, hash) wins on every node; the loser hears it at its next hook,
   its edits are refused and its worktree is set back, the lost work kept in a snapshot commit.
@@ -189,8 +195,8 @@ a turn on its own; waiting costs no tokens. It stays a drone until you ask it to
 A drone can pass a visible check by changing it. The hive lets that happen, records it and makes it
 useless ([design](design/hive.md#learning)):
 
-- **Snapshots.** A claim records a commit of the drone's tree, and its done another; the verdict diffs
-  the two. A rework keeps the base of its first claim.
+- **Snapshots.** A claim records its start, and its done a commit of the drone's tree; the verdict
+  diffs the two, after it recomputed the start from the deps the claim names.
 - **Hacked.** The verdict is `rejected` with `hacked`, whatever the verifier said, when the diff
   changes a file the goal's oracle runs; or, outside the task's own `--files`, changes CI config or a
   test runner's config, deletes or renames a test, or weakens one: a removed line no added line matches

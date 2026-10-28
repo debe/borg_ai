@@ -517,6 +517,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         goal::create(home, &g).unwrap();
         g

@@ -335,7 +335,8 @@ pub fn served(home: &Path, hs: &HiveSession, repo: &str) -> Vec<goal::Goal> {
 }
 
 /// The drone's own worktree, `<repo>/.worktrees/hive-i-<drone>`, detached at HEAD of the repo `cwd` is in
-/// (reused when it is one already), kept out of the engineer's `git status` (run.rs `exclude_worktrees`).
+/// (reused when it is one already; each claim resets it to the claim's start, mod.rs `claim`), kept out
+/// of the engineer's `git status` (run.rs `exclude_worktrees`).
 /// Empty when `cwd` is in no git repo: the drone works where its session runs.
 fn worktree(cwd: &str, drone: &str) -> Result<String, String> {
     let Some(repo) = run::repo_of(Path::new(cwd)) else { return Ok(String::new()) };
@@ -1362,6 +1363,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         goal::create(&home, &goal("g1", &[])).unwrap();
         goal::create(&home, &goal("g2", &["harbor_vega"])).unwrap();

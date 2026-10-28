@@ -45,6 +45,24 @@ pub struct Goal {
     /// waits for that node's score.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held_out: bool,
+    /// The commit each repo in scope was at when the goal was made (`borg hive init`, the repo it runs
+    /// in): every work claim there starts from it plus its deps' accepted changes (hive/start.rs).
+    /// Empty on a goal made outside git, or before origins were recorded. Another repo's origin is
+    /// recorded on the board by its first claim (board.rs `Board::origins`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<Origin>,
+}
+
+/// One repo's origin: the repo by name as the hooks name it (`queen::repo_name`), and its commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    pub repo: String,
+    pub sha: String,
+}
+
+/// The origin of `repo` in `g` (case as `in_scope` compares names), if one was recorded.
+pub fn origin_of<'a>(g: &'a Goal, repo: &str) -> Option<&'a str> {
+    g.origin.iter().find(|o| o.repo.eq_ignore_ascii_case(repo)).map(|o| o.sha.as_str())
 }
 
 /// Whether `g` is scored by a hidden oracle: here (`hidden`), or on the node that made it (`held_out`).
@@ -292,6 +310,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         }
     }
 

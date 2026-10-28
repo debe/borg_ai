@@ -758,6 +758,61 @@ fn with_no_daemon_a_drones_wait_does_the_nodes_work_and_integrates() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A blocked task's commit never vanishes into the next claim (the release incident, hive/start.rs):
+/// drone A commits its work for t1 in its worktree and blocks; the engineer reopens t1 and A claims it
+/// again there. That claim starts from the goal's origin, the commit pinned and named, never in its
+/// base; A brings the work back, so t1's verified diff carries it, and the dependent t2, which B's wait
+/// claims, starts with it in its base and its tree.
+#[test]
+fn a_blocked_tasks_commit_does_not_vanish_into_the_next_claim() {
+    let root = setup("hive-i-blocked-commit");
+    ok(&root, &["open", "g1", "--id", "t1", "--title", "do t1"], &[]);
+    ok(&root, &["open", "g1", "--id", "t2", "--title", "do t2 on t1", "--deps", "t1"], &[]);
+    ok(&root, &["ratify", "g1"], &[]);
+    let origin = git(&work(&root), &["rev-parse", "HEAD"]);
+    let (sa, sb) = ("sess-blocked-a", "sess-blocked-b");
+    ok(&root, &["join", "g1"], &inside(sa));
+    let ta = tree_of(&root, sa);
+    assert!(ok_in(&root, &ta, &["claim"], &inside(sa)).contains("t1"));
+    std::fs::write(ta.join("ok"), "the work\n").unwrap();
+    git(&ta, &["add", "ok"]);
+    git(&ta, &["commit", "-q", "-m", "t1's work"]);
+    let work_commit = git(&ta, &["rev-parse", "HEAD"]);
+    ok_in(&root, &ta, &["block", "the check cannot pass yet"], &inside(sa));
+    assert_eq!(task_state(&root, "t1").0, "blocked");
+    ok(&root, &["open", "g1", "--id", "t1", "--again"], &[]);
+    assert!(ok_in(&root, &ta, &["claim"], &inside(sa)).contains("t1"));
+    let claim_of = |id: &str, s: &str| events(&root).into_iter().rfind(|e| e.ev == board::Ev::Claim && e.task == id && e.by == s).expect("a claim line");
+    let again = claim_of("t1", sa);
+    assert_eq!(
+        git(&ta, &["rev-parse", &format!("{}^{{tree}}", again.base)]),
+        git(&ta, &["rev-parse", &format!("{origin}^{{tree}}")]),
+        "no blocked commit in the base"
+    );
+    assert!(!ta.join("ok").exists(), "the worktree is reset to the start");
+    let note = events(&root).into_iter().rfind(|e| e.ev == board::Ev::Progress && e.task == "t1" && e.by == sa).expect("the reset's note").note;
+    let kept = note.split("worktree before the reset: ").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_hexdigit()).next()).expect(&note).to_string();
+    assert_eq!(git(&ta, &["show", &format!("{kept}:ok")]), "the work", "the commit is kept, pinned: {note}");
+    git(&ta, &["cherry-pick", &work_commit]);
+    ok_in(&root, &ta, &["done"], &inside(sa));
+    let head = events(&root).into_iter().rfind(|e| e.ev == board::Ev::Done && e.task == "t1").unwrap().head;
+    assert_eq!(git(&ta, &["diff", "--name-only", &again.base, &head]), "ok", "t1's diff carries the work");
+    ok(&root, &["join", "g1"], &inside(sb));
+    let tb = tree_of(&root, sb);
+    assert!(ok_in(&root, &tb, &["claim"], &inside(sb)).contains("t1.v1"));
+    ok_in(&root, &tb, &["verify", "--pass"], &inside(sb));
+    // B's wait claims t2 and ends with it (a wait that does not is stopped by Ctrl-C, then SIGHUP).
+    let (code, out) = spawn_wait(&root, sb, &[]).ended(30);
+    assert!(code == 0 && out.contains("Your claim: t2"), "{out}");
+    let dependent = claim_of("t2", sb);
+    assert_eq!(dependent.deps_in, [format!("t1@{head}")]);
+    assert_eq!(git(&tb, &["show", &format!("{}:ok", dependent.base)]), "the work", "the dependent's base holds it");
+    assert_eq!(std::fs::read_to_string(tb.join("ok")).unwrap(), "the work\n", "and so does its tree");
+    ok(&root, &["leave"], &inside(sa));
+    ok(&root, &["leave"], &inside(sb));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Phase g G4, the reaper: a drone whose session dies mid-task with no wait of its own running (its
 /// harness process gone, no SessionEnd) is reaped by its node's worker, here the other drone's waiter:
 /// its claim released `its session is gone`, it is no drone any more, and the node stays in the goal for

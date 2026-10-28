@@ -48,18 +48,32 @@ key's lines quarantined). Synced text is redacted when written; ids, commits, sc
 are kept.
 
 - **Goal** (`goal.json`, synced as a projection in `goal.jsonl`): the spec, the oracle checks, the
-  budget and the repos in scope. A hidden oracle stays on its node. Two definitions of one id stop the
+  budget, the repos in scope and the origin commit of the repo `init` ran in. The first claim in any
+  other repo (or in a goal made outside git) records that repo's main checkout HEAD as its origin on
+  the board (an empty root commit, built alike on every node, for a repo with no commit); the first
+  such line in the board's order holds on every node. A node whose clone lacks the origin, after the
+  deps' bundles came (they carry an origin no remote holds), claims no work there and shows why as an
+  alert in `borg top` and the Hive tab. A hidden oracle stays on its node. Two definitions of one id stop the
   goal everywhere until one is left. A check written by another node runs only after the engineer's
   `borg hive approve`.
 - **Board** (`tasks.jsonl`): `open`, `claim`, `heartbeat`, `progress`, `done`, `verified`, `rejected`,
   `released`, `blocked`. A task has a role (`work`, `verify`, `integrate`), files in scope, deps and
-  acceptance checks. A claim needs every dep verified and brings the deps' accepted work into the
-  claimant's tree first.
+  acceptance checks. A claim needs every dep verified. It starts from the goal's origin for its repo
+  (see Goal) plus each dep's accepted change: one commit, computed from the board and git objects
+  alone, never from the drone's tree, and named on the claim with the attempt of every dep it applied. A
+  drone's own worktree is reset to it once the claim won, the tree before kept in a pinned commit
+  named on the board; a rework gets its previous attempt back on top. Another checkout claims only
+  where its tree is the start already. Deps whose changes conflict block the task once, for the
+  engineer. A task whose start a session's tree cannot take (a checkout off it) is passed over for
+  that session; one whose start git did not compute in time stays offered and is tried again. So no work a blocked, rejected or lost attempt left behind reaches a base, and every line
+  of an accepted head comes from the origin or a verified diff.
 - **Verification:** every `done` opens a verify task its author may not take; a rejection reopens the
-  work with the verifier's note. Changes to tests outside the task, CI config or oracle files are
+  work with the verifier's note. The verdict recomputes the work's start from the attempts its claim
+  names, fetching their commits from their bundles on another node; a base that is not it is an
+  unchecked reject. Changes to tests outside the task, CI config or oracle files are
   flagged and judged as hacked.
 - **Integration:** once every task is verified, an integrate task merges the accepted attempts (each
-  claim's base to its done's head, in dependency order, with `git merge-tree`) into
+  claim's base to its done's head, in dependency order, with `git merge-tree`, onto the goal's origin) into
   `refs/heads/hive/<goal>/integrated` and runs the oracle and every task's checks on the result. A
   failure opens a fix task from the combined tree. No model session ever integrates.
 - **Contracts** (`contracts.jsonl`) and **messages** (`messages.jsonl`, `borg hive ask` and `tell`),

@@ -10,7 +10,9 @@
 //! from its accepted claim's `base` to its done's `head` (verdict.rs `accepted`), in order (by `deps`,
 //! then by when it was verified, then by id), each applied with `git merge-tree --merge-base` (git 2.40+)
 //! onto the tree before it, from the goal's origin: the newest common ancestor of the HEADs every work
-//! claim started from, so no drone's own commits (a rejected attempt it committed, say) are in it. Each
+//! claim started from, so no drone's own commits (a rejected attempt it committed, say) are in it. A
+//! claim's base is its start (start.rs), a commit whose one parent is the goal's recorded origin, so
+//! for a goal with one that ancestor is the origin itself. Each
 //! step is a commit with a fixed identity and date, so the same attempts give the same commits,
 //! conflict markers included: the next round replays them to the same tree, and a fix made on it
 //! applies cleanly. Changes in a worktree that no claim and done cover never enter. The result is kept
@@ -73,7 +75,7 @@ pub struct Merged {
 
 /// `git -C repo args` with `env`, within `GIT_TIMEOUT` and before `deadline`, no hook run (`update-ref`
 /// runs `reference-transaction`; git.rs): (exit code, stdout).
-fn git(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<(i32, String), String> {
+pub(crate) fn git(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<(i32, String), String> {
     let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
     if left.is_zero() {
         return Err("the merge ran out of time".into());
@@ -102,7 +104,7 @@ fn git_in(repo: &Path, args: &[&str], input: &str, deadline: Instant) -> Result<
 }
 
 /// `git` that must succeed: its trimmed stdout.
-fn git_ok(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<String, String> {
+pub(crate) fn git_ok(repo: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Result<String, String> {
     match git(repo, args, env, deadline)? {
         (0, out) => Ok(out.trim().to_string()),
         (code, _) => Err(format!("git {} failed (exit {code})", args.first().unwrap_or(&""))),
@@ -154,30 +156,11 @@ pub(crate) fn merge(repo: &Path, claims: &[&str], attempts: &[Attempt], within: 
     let mut steps: Vec<String> = Vec::new();
     let mut conflicted: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, a) in attempts.iter().enumerate() {
-        let base = format!("--merge-base={}", a.base);
-        let (code, out) = git(repo, &["merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", &base, &t, &a.head], &[], deadline)?;
-        if code != 0 && code != 1 {
-            return Err(format!("git merge-tree --merge-base failed on {} (exit {code}; it needs git 2.40+)", a.work));
-        }
-        // `<tree>\0<path>\0...\0\0`: the conflicted paths (exit 1) up to the empty field.
-        let mut fields = out.split('\0');
-        let tree = fields.next().unwrap_or_default().trim().to_string();
-        if code == 1 {
-            let mut paths: Vec<String> = fields.take_while(|p| !p.is_empty()).map(String::from).collect();
-            paths.dedup();
+        let (tree, paths) = step(repo, &a.base, &t, &a.head, deadline).map_err(|e| format!("{e} on {}", a.work))?;
+        if !paths.is_empty() {
             conflicted.push((i, paths));
         }
-        let date = format!("@{} +0000", a.done_ms.max(0) / 1000);
-        let who = [
-            ("GIT_AUTHOR_NAME", "borg"),
-            ("GIT_AUTHOR_EMAIL", "borg@localhost"),
-            ("GIT_COMMITTER_NAME", "borg"),
-            ("GIT_COMMITTER_EMAIL", "borg@localhost"),
-            ("GIT_AUTHOR_DATE", date.as_str()),
-            ("GIT_COMMITTER_DATE", date.as_str()),
-        ];
-        let msg = format!("integrate {}", a.work);
-        t = git_ok(repo, &["commit-tree", &tree, "-p", &t, "-p", &a.head, "-m", &msg], &who, deadline)?;
+        t = commit(repo, &tree, &[&t, &a.head], &format!("integrate {}", a.work), a.done_ms, deadline)?;
         steps.push(t.clone());
     }
     let mut conflicts = Vec::new();
@@ -204,6 +187,50 @@ pub(crate) fn merge(repo: &Path, claims: &[&str], attempts: &[Attempt], within: 
         }
     }
     Ok(Merged { head: t, conflicts })
+}
+
+/// The change from `base` to `head` applied onto the commit `onto` (`git merge-tree --write-tree
+/// --merge-base`, git 2.40+): the tree it writes, and the paths that conflicted (empty: a clean merge;
+/// else the tree holds their conflict markers). Shared by the integration and a claim's start
+/// (start.rs), so both apply an attempt's change the same way.
+///
+/// # Errors
+/// A git call that fails or runs out of time.
+pub(crate) fn step(repo: &Path, base: &str, onto: &str, head: &str, deadline: Instant) -> Result<(String, Vec<String>), String> {
+    let base = format!("--merge-base={base}");
+    let (code, out) = git(repo, &["merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", &base, onto, head], &[], deadline)?;
+    if code != 0 && code != 1 {
+        return Err(format!("git merge-tree --merge-base failed (exit {code}; it needs git 2.40+)"));
+    }
+    // `<tree>\0<path>\0...\0\0`: the conflicted paths (exit 1) up to the empty field.
+    let mut fields = out.split('\0');
+    let tree = fields.next().unwrap_or_default().trim().to_string();
+    let mut paths: Vec<String> = if code == 1 { fields.take_while(|p| !p.is_empty()).map(String::from).collect() } else { Vec::new() };
+    paths.dedup();
+    Ok((tree, paths))
+}
+
+/// A commit of `tree` on `parents` with borg's identity and `ms` as its date: the same inputs give the
+/// same commit on every node.
+///
+/// # Errors
+/// The git call fails or runs out of time.
+pub(crate) fn commit(repo: &Path, tree: &str, parents: &[&str], msg: &str, ms: i64, deadline: Instant) -> Result<String, String> {
+    let date = format!("@{} +0000", ms.max(0) / 1000);
+    let who = [
+        ("GIT_AUTHOR_NAME", "borg"),
+        ("GIT_AUTHOR_EMAIL", "borg@localhost"),
+        ("GIT_COMMITTER_NAME", "borg"),
+        ("GIT_COMMITTER_EMAIL", "borg@localhost"),
+        ("GIT_AUTHOR_DATE", date.as_str()),
+        ("GIT_COMMITTER_DATE", date.as_str()),
+    ];
+    let mut args = vec!["commit-tree", tree];
+    for p in parents {
+        args.extend(["-p", p]);
+    }
+    args.extend(["-m", msg]);
+    git_ok(repo, &args, &who, deadline)
 }
 
 /// The `paths` that hold a conflict marker line (`<<<<<<< ` or `>>>>>>> ` at a line's start) in the
@@ -844,6 +871,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         }
     }
 

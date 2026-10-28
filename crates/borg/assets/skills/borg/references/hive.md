@@ -54,6 +54,12 @@ with `borg hive ratify <goal>`.
 ## While the drones work
 
 - `borg hive board <goal>` shows the tasks, who holds them, and what is verified and integrated.
+- Every claim starts from the goal's origin (the commit `init` ran on; in another repo, its HEAD
+  when the goal's first claim there was made) plus its deps' verified changes. A node whose clone
+  lacks the origin claims nothing there and says why in `borg top`. A drone's worktree is reset to that start when it wins a claim; what the tree held before
+  is kept in a pinned commit, named in the claim's notice, `borg top` and the Hive tab. Commits the
+  engineer makes after `init` are not in drone trees. Deps whose changes conflict block the task:
+  reopen one on top of the other.
 - A drone may use subagents or workflows inside its task: they work under its session. They never run
   `borg hive claim`, `borg hive done` or any other `borg hive` drone command. Only the drone's own
   session claims and finishes its task.

@@ -939,6 +939,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         goal::create(home, &g).unwrap();
         let events: Vec<Event> = tasks.into_iter().map(|t| Event::open(t, "engineer:e", 10)).collect();

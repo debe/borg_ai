@@ -174,9 +174,9 @@ pub struct Event {
     /// `snapshot`); on its `done`, `head`, the same at the done. The verdict diffs the two.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
-    /// On a claim of a work task with deps: `task@head` for each of its transitive deps (`closure`),
-    /// whose verified work was in the claimant's tree before `base` was taken (brought in at the claim,
-    /// hive/verdict.rs `bring_in`, or there already). A pass on work whose claim lacks one is rejected.
+    /// On a claim of a work task with deps: `task@head` for each of its transitive deps (`closure`), the
+    /// verified attempt whose change its start (`base`) applied (hive/start.rs). A pass on work whose
+    /// claim lacks one, or whose base is not the start of what it names, is rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps_in: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -596,6 +596,10 @@ pub struct Board {
     /// budget line names, None without one. Only grows, as `ratified`; the goal's own budget stands
     /// below it (mod.rs `budget_of`).
     pub budget_usd: Option<f64>,
+    /// The origin of each repo the goal recorded none for (`ORIGIN`, hive/start.rs `origin`): repo
+    /// (lowercase) -> commit, the first line in the fold's order, so every node holding the lines reads
+    /// the same commit whatever order they came in (S1).
+    pub origins: BTreeMap<String, String>,
 }
 
 /// A node's newest finished line (`Board::finishes`).
@@ -627,8 +631,10 @@ impl PartialEq for Board {
             declined,
             ratified,
             budget_usd,
+            origins,
         } = self;
         declined == &o.declined
+            && origins == &o.origins
             && ratified == &o.ratified
             && budget_usd == &o.budget_usd
             && (tasks, lost, spans, drones, watermarks, integrated, integrations, members, rosters, sessions, finishes, stuck)
@@ -689,6 +695,10 @@ const RATIFIED: &str = "ratified";
 /// The note of an engineer's line raising the goal's budget (phase g G5, `Board::budget_usd`):
 /// `budget 12.5`, in dollars.
 const BUDGET: &str = "budget";
+/// The note of a line recording a repo's origin (`Board::origins`): `origin <repo> <sha>`, a heartbeat
+/// of no task by the session whose claim was the first in that repo of a goal that recorded none (made
+/// in another repo, outside git, or by an older borg; hive/start.rs `origin`).
+const ORIGIN: &str = "origin";
 
 /// `RATIFIED`'s note for `tasks`.
 pub fn ratified_note(tasks: &[TaskId]) -> String {
@@ -712,6 +722,11 @@ pub fn needs_plan(t: &Task) -> bool {
         Role::Verify => t.of.is_none(),
         Role::Work | Role::Plan => t.from.is_none(),
     }
+}
+
+/// `ORIGIN`'s note for `repo` at `sha`.
+pub fn origin_note(repo: &str, sha: &str) -> String {
+    format!("{ORIGIN} {repo} {sha}")
 }
 
 /// `FINISHED`'s note for `integration`.
@@ -847,6 +862,11 @@ impl Board {
             None => now.saturating_sub(held) <= LEASE_MS,
         };
         self.nodes.iter().filter(|(n, held)| !n.is_empty() && taking_part(n, **held)).map(|(n, _)| n.as_str()).chain([node]).collect()
+    }
+
+    /// The origin of `repo` recorded on the board (`ORIGIN`), if any.
+    pub fn origin(&self, repo: &str) -> Option<&str> {
+        self.origins.get(&repo.to_ascii_lowercase()).map(String::as_str)
     }
 
     /// Whether node `n` said in its current run that it may not take `task` (`DECLINES`, since its newest
@@ -1439,6 +1459,10 @@ pub fn fold_on(events: &[Event], here: &str) -> Board {
             if let Some(usd) = raised.filter(|u| u.is_finite() && *u >= 0.0) {
                 b.budget_usd = Some(b.budget_usd.map_or(usd, |u| u.max(usd)));
             }
+        }
+        let origin = (e.ev == Ev::Heartbeat && e.task.is_empty()).then(|| e.note.strip_prefix(ORIGIN).and_then(|r| r.strip_prefix(' '))).flatten();
+        if let Some((repo, sha)) = origin.and_then(|r| r.rsplit_once(' ')) {
+            b.origins.entry(repo.to_ascii_lowercase()).or_insert_with(|| sha.trim().to_string());
         }
         if e.node.is_empty() || by_engineer(&e.by) {
             continue;

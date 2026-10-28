@@ -10,9 +10,11 @@
 //!   shrink), and the drone may not have touched the oracle's files (guard.rs flags). Either makes the
 //!   verdict `rejected` with `hacked`, a done that passed the visible oracle by changing it; the work
 //!   reopens with the paths to restore and why.
-//! - work with deps must have started from a tree holding each dep's verified work: its claim's
-//!   `deps_in` names every transitive dep's accepted head ([`accepted`], brought in by [`bring_in`] at
-//!   the claim), or a pass is an unchecked reject ([`NO_DEPS`]).
+//! - work must have started from its start (start.rs): its base the goal's origin with the verified
+//!   change of each dep its claim's `deps_in` names (each found on the board by its head), every other
+//!   dep of its closure one whose change was empty; recomputed here, a base that is not it, or a check
+//!   out of time, makes a pass an unchecked reject ([`NO_DEPS`]). A goal without an origin is checked
+//!   on the board alone ([`missing_deps`]).
 //!
 //! The reward: every lesson shown to the author's session while it held the claim
 //! (veto.rs `shown_between`) gets the verdict as an outcome (outcome.rs `verified`, `rejected`,
@@ -77,7 +79,12 @@ pub fn parse(message: &str) -> Option<Said> {
 
 /// `git -C dir args` (git.rs) within `GIT_TIMEOUT` and before `deadline`: its trimmed stdout on success.
 fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Option<String> {
-    let left = deadline.saturating_duration_since(Instant::now()).min(GIT_TIMEOUT);
+    git_until(dir, args, env, deadline.min(Instant::now() + GIT_TIMEOUT))
+}
+
+/// `git -C dir args` (git.rs) before `deadline` alone: its trimmed stdout on success.
+fn git_until(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) -> Option<String> {
+    let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return None;
     }
@@ -91,8 +98,9 @@ fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) ->
 
 /// A commit of `dir`'s working tree as it is (tracked and untracked files, `.gitignore` respected),
 /// written without touching the index, HEAD or any ref: a scratch index copied from the real one (so
-/// unchanged files are not hashed again), `add -A`, `write-tree`, `commit-tree`, all `within` (each
-/// git call also within `GIT_TIMEOUT`: the stop hook passes what is left of its time). None outside a
+/// unchanged files are not hashed again), `add -A`, `write-tree`, `commit-tree`, all `within` (the stop
+/// hook passes what is left of its time; no git call has a cap of its own, as a disk busy writing back
+/// can hold one for longer than `GIT_TIMEOUT` and the snapshot is lost either way). None outside a
 /// git repo or on any failure: the verdict then cannot check the work's diff, and says so.
 ///
 /// The scratch index lies beside the real one, in the worktree's git dir: a fresh name created anew
@@ -100,7 +108,7 @@ fn git_by(dir: &Path, args: &[&str], env: &[(&str, &str)], deadline: Instant) ->
 /// cut off at the deadline leaves behind.
 pub fn snapshot(dir: &Path, within: Duration) -> Option<String> {
     let deadline = Instant::now() + within;
-    let git = |dir: &Path, args: &[&str], env: &[(&str, &str)]| git_by(dir, args, env, deadline);
+    let git = |dir: &Path, args: &[&str], env: &[(&str, &str)]| git_until(dir, args, env, deadline);
     let index = dir.join(git(dir, &["rev-parse", "--git-path", "index"], &[])?);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let name = format!("borg-hive-index-{}-{nanos}", std::process::id());
@@ -169,11 +177,10 @@ fn patch_of(dir: &Path, base: &str, head: &str, deadline: Instant) -> Result<(St
     }
 }
 
-/// Puts a dependency's own change (`base..head`, the snapshots of its accepted attempt) into `dir`'s
-/// working tree, all `within`, without touching the index, HEAD or any ref: `git apply --check`, then
-/// `git apply`, at the toplevel. `Ok(true)` when it applied, `Ok(false)` when the change is in already
-/// (its reverse applies: the dep's author drone claims the dependent in its own tree, or a rework in a
-/// tree it was brought into before) or empty.
+/// Puts an attempt's own change (`base..head`, its snapshots: a rework's previous attempt, mod.rs
+/// `onto_start`) into `dir`'s working tree, all `within`, without touching the index, HEAD or any ref:
+/// `git apply --check`, then `git apply`, at the toplevel. `Ok(true)` when it applied, `Ok(false)` when
+/// the change is in already (its reverse applies) or empty.
 ///
 /// # Errors
 /// Neither applies (the tree's own changes overlap it), or git failed or ran out of time: the tree is
@@ -825,7 +832,9 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     let prot = protected(&changed, work.map_or(&[][..], |w| &w.files), &guard::oracle_files(g, root));
     let oracle_flags: Vec<String> =
         guard::flags_of(home, &g.id, &a.author, a.claim_ms, a.done_ms).into_iter().filter(|f| f.class == Class::Oracle).map(|f| f.path).collect();
-    let d = decide(said, &prot, &oracle_flags, checked, &missing_deps(&events, &b, &a), super::goal::has_hidden(g));
+    // Its start, recomputed from what its claim names: a base that is not it is no pass (start.rs).
+    let missing = if checked { super::start::missing(home, g, &events, &b, &a, root, DIFF_TIMEOUT) } else { missing_deps(&events, &b, &a) };
+    let d = decide(said, &prot, &oracle_flags, checked, &missing, super::goal::has_hidden(g));
     let mut e = Event::new(d.ev, verify, session, now).with_note(&d.note);
     e.hacked = d.hacked.then_some(true);
     e.credit = d.kind.outcome().unwrap_or_default().into();
@@ -1314,6 +1323,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         super::super::goal::create(&home, &g).unwrap();
         let t1 = Task {
@@ -1380,6 +1390,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         super::super::goal::create(&home, &g).unwrap();
         let t1 = Task {
@@ -1440,6 +1451,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         super::super::goal::create(home, &g).unwrap();
         ids.iter()

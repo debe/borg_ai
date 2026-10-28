@@ -173,12 +173,19 @@ fn setup(name: &str, tasks: usize, budget: &str, script: Value) -> PathBuf {
 
 /// `setup` with task tN scoped to `files[N-1]` (its oracle wants `done tN` there).
 fn setup_files(name: &str, files: &[&str], budget: &str, script: Value) -> PathBuf {
+    setup_with(name, files, budget, script, |_| {})
+}
+
+/// `setup_files` with `before` run on the work dir before the goal is made: what it commits is in the
+/// goal's origin, the tree every claim starts from (hive/start.rs).
+fn setup_with(name: &str, files: &[&str], budget: &str, script: Value, before: impl FnOnce(&Path)) -> PathBuf {
     let root = common::setup(&format!("hive-run-{name}"));
     let w = work(&root);
     git(&w, &["init", "-q", "-b", "main"]);
     std::fs::write(w.join("README"), "orion\n").unwrap();
     git(&w, &["add", "."]);
     git(&w, &["commit", "-q", "-m", "start"]);
+    before(&w);
     std::fs::write(root.join("script.json"), script.to_string()).unwrap();
     ok(&root, &["init", "g", "--spec", "Write the files", "--oracle", "ok=true", "--budget", budget]);
     for (i, file) in files.iter().enumerate() {
@@ -255,17 +262,23 @@ fn a_dependent_task_starts_from_its_dependencys_verified_work() {
     ok_in(&root, a, &["done", "--session", sa]);
     ok_in(&root, b, &["claim", "t1.v1", "--session", sb]);
     assert!(ok_in(&root, b, &["verify", "--pass", "--session", sb]).contains("t1 is verified"));
-    // 3. sb's claim of t2 brings t1's verified work into B, and leaves B's index and HEAD alone.
-    let head_b = git(b, &["rev-parse", "HEAD"]);
+    // 3. t2 starts from the goal's origin with t1's verified work (hive/start.rs). B, a checkout of the
+    // origin, is not there: refused with the start named, nothing written; checked out at it, sb claims.
+    let n = events(&root).len();
+    let (_, err, code) = hive_in(&root, b, &["claim", "t2", "--session", sb]);
+    assert!(code == 1 && err.contains("this checkout is not at t2's start"), "{err}");
+    assert_eq!(events(&root).len(), n);
+    let start = err.split("or check out ").nth(1).and_then(|s| s.split_whitespace().next()).expect(&err).to_string();
+    git(b, &["checkout", "-q", "--detach", &start]);
     let out = ok_in(&root, b, &["claim", "t2", "--session", sb]);
     assert!(out.contains("after t1 (its verified work is in your tree)"), "{out}");
     assert_eq!(std::fs::read_to_string(b.join("f1.txt")).unwrap(), "done t1\n");
-    assert_eq!((git(b, &["rev-parse", "HEAD"]), git(b, &["diff", "--cached", "--name-only"])), (head_b, String::new()));
-    assert_eq!(git(b, &["status", "--porcelain"]), "?? f1.txt");
+    assert_eq!(git(b, &["status", "--porcelain"]), "");
     let ev = events(&root);
     let t1_head = ev.iter().find(|e| e.ev == board::Ev::Done && e.task == "t1").unwrap().head.clone();
     let claim = ev.iter().find(|e| e.ev == board::Ev::Claim && e.task == "t2" && e.by == sb).unwrap().clone();
     assert_eq!(claim.deps_in, [format!("t1@{t1_head}")]);
+    assert_eq!(git(b, &["rev-parse", "HEAD"]), claim.base, "its base is the start");
     // 4. Its work is only f2.txt; its oracle passes on the tree with t1's work, and so does its verify.
     std::fs::write(b.join("f2.txt"), "done t2\n").unwrap();
     ok_in(&root, b, &["done", "--session", sb]);
@@ -285,14 +298,14 @@ fn a_dependent_task_starts_from_its_dependencys_verified_work() {
     ok_in(&root, c, &["done", "--session", sc]);
     ok_in(&root, b, &["claim", "t3.v1", "--session", sb]);
     let out = ok_in(&root, b, &["verify", "--pass", "--session", sb]);
-    assert!(out.contains("t3 not verified (the work started from a tree without its dependencies' verified work (t1)"), "{out}");
+    assert!(out.contains("t3 not verified (") && out.contains("t1's verified work is not in its tree"), "{out}");
     let b_now = fold(&root);
     assert_eq!((b_now.tasks["t3"].status.name(), b_now.tasks["t3"].rework), ("open", 1));
     assert!(events(&root).iter().any(|e| e.ev == board::Ev::Rejected && e.task == "t3.v1" && e.hacked.is_none()));
-    // 6. A tree whose own f1.txt differs cannot take t1's work: the claim is refused and changes nothing.
+    // 6. A tree whose own f1.txt differs is not t3's start: the claim is refused and changes nothing.
     std::fs::write(c.join("f1.txt"), "mine\n").unwrap();
     let (_, err, code) = hive_in(&root, c, &["claim", "t3", "--session", sc]);
-    assert!(code == 1 && err.contains("cannot bring t1's verified work into this tree: ") && err.contains("f1.txt"), "{err}");
+    assert!(code == 1 && err.contains("this checkout is not at t3's start"), "{err}");
     assert_eq!(std::fs::read_to_string(c.join("f1.txt")).unwrap(), "mine\n");
     assert_eq!(fold(&root).tasks["t3"].status.name(), "open");
     let _ = std::fs::remove_dir_all(root);
@@ -655,12 +668,14 @@ fn a_drone_that_grows_an_existing_test_is_not_hacked() {
     // Every drone appends to one test file in its worktree: the attempts may conflict there, and the fix
     // task that drops the conflict markers keeps every appended line.
     let grow = json!({"grow_tests": true});
-    let root = setup("grow", 2, "4", json!({"usd_per_iter": 0.10, "drones": {"d1": grow, "d2": grow, "d3": grow}}));
+    let script = json!({"usd_per_iter": 0.10, "drones": {"d1": grow, "d2": grow, "d3": grow}});
+    let root = setup_with("grow", &["f1.txt", "f2.txt"], "4", script, |w| {
+        std::fs::create_dir_all(w.join("tests")).unwrap();
+        std::fs::write(w.join("tests/sim_edit.txt"), "original\n").unwrap();
+        git(w, &["add", "."]);
+        git(w, &["commit", "-q", "-m", "a test"]);
+    });
     let w = work(&root);
-    std::fs::create_dir_all(w.join("tests")).unwrap();
-    std::fs::write(w.join("tests/sim_edit.txt"), "original\n").unwrap();
-    git(&w, &["add", "."]);
-    git(&w, &["commit", "-q", "-m", "a test"]);
     let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
     assert_eq!(code, 0, "{out}{err}");
     let b = fold(&root);
@@ -1190,60 +1205,43 @@ exec "$real" "$@"
 }
 
 #[test]
-fn a_verified_fix_ends_the_conflict_its_integration_found_and_a_missing_snapshot_is_retried() {
-    // The 2026-10-25 gate run, reproduced: t1's claim got no snapshot (git timed out under load), its
-    // drone went on to t2 in the same tree, then reworked t1 from a base that held its first attempt.
-    // Integrated after t2, t1's change is a modify/delete conflict in f1.txt (no markers), which every
-    // verified fix left as it was: 11 integrations, each rejected the same way, until the budget ran out.
-    let root = setup("conflict-loop", 2, "2", json!({"usd_per_iter": 0.10}));
+fn a_claim_that_cannot_see_its_tree_writes_nothing_and_a_fix_without_a_snapshot_is_retried() {
+    // The 2026-10-25 gate run: t1's claim got no snapshot (git timed out under load) and was written
+    // without a base, its drone went on to t2 in the same tree and reworked t1 from a base that held
+    // its first attempt; 11 integrations were rejected the same way until the budget ran out. A claim's
+    // base is its start now (hive/start.rs), never a snapshot: a checkout whose tree cannot be compared
+    // with the start claims nothing, and drones in their own worktrees start every claim there.
+    let slow = json!({"work_s": 2});
+    let script = json!({"usd_per_iter": 0.10, "drones": {"d1": slow, "d2": slow, "d3": slow}});
+    let root = setup_files("conflict-loop", &["f1.txt", "f1.txt"], "4", script);
     failing_git(&root);
     let w = work(&root);
-    std::fs::write(w.join(".git/info/exclude"), "/.worktrees/\n").unwrap();
-    let (a, b) = (w.join(".worktrees/a"), w.join(".worktrees/b"));
-    for (d, n) in [(&a, "a"), (&b, "b")] {
-        git(&w, &["worktree", "add", "-q", "-b", &format!("wt-{n}"), d.to_str().unwrap()]);
-    }
-    let (sa, sb) = ("sess-a-loop", "sess-b-loop");
-    for s in [sa, sb] {
-        ok(&root, &["join", "g", "--session", s]);
-    }
+    let sa = "sess-a-loop";
+    ok(&root, &["join", "g", "--session", sa]);
     let fail = root.join("fail-snapshot");
     std::fs::write(&fail, "").unwrap();
-    ok_in(&root, &a, &["claim", "t1", "--session", sa]);
+    let n = events(&root).len();
+    let (_, err, code) = hive_in(&root, &w, &["claim", "t1", "--session", sa]);
+    assert!(code == 1 && err.contains("no snapshot of this tree"), "{err}");
+    assert_eq!(events(&root).len(), n, "nothing written");
     std::fs::remove_file(&fail).unwrap();
-    assert!(events(&root).iter().any(|e| e.ev == board::Ev::Claim && e.task == "t1" && e.by == sa && e.base.is_empty()), "the claim has no snapshot");
-    std::fs::write(a.join("f1.txt"), "done t1\n").unwrap();
-    ok_in(&root, &a, &["done", "--session", sa]);
-    ok_in(&root, &b, &["claim", "t1.v1", "--session", sb]);
-    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t1 not verified (the work has no snapshot"));
-    ok_in(&root, &a, &["claim", "t2", "--session", sa]);
-    std::fs::write(a.join("f2.txt"), "done t2\n").unwrap();
-    ok_in(&root, &a, &["done", "--session", sa]);
-    ok_in(&root, &b, &["claim", "t2.v1", "--session", sb]);
-    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t2 is verified"));
-    ok_in(&root, &a, &["claim", "t1", "--session", sa]);
-    std::fs::write(a.join("f1.txt"), "done t1\nchecked by: ok\n").unwrap();
-    ok_in(&root, &a, &["done", "--session", sa]);
-    ok_in(&root, &b, &["claim", "t1.v2", "--session", sb]);
-    assert!(ok_in(&root, &b, &["verify", "--pass", "--session", sb]).contains("t1 is verified"));
-    // The drones integrate, fix and verify; the fix's first done gets no snapshot either.
+    ok(&root, &["leave", "--session", sa]);
+    // Both tasks write f1.txt from the origin: their attempts conflict. The drones integrate, fix and
+    // verify; the fix's first done gets no snapshot.
     std::fs::write(root.join("fail-fix"), "").unwrap();
-    let (out, err, code) = run(&root, &["--drones", "2", "--harness", "sim"]);
+    let (out, err, code) = run(&root, &["--drones", "3", "--harness", "sim"]);
+    assert_eq!(code, 0, "{out}{err}");
     let bd = fold(&root);
-    let integrations: Vec<(&str, &str)> =
-        bd.tasks.values().filter(|s| s.task.role == board::Role::Integrate).map(|s| (s.task.id.as_str(), s.status.name())).collect();
-    assert_eq!((code, integrations.as_slice()), (0, [("integrate.1", "verified"), ("integrate.2", "verified")].as_slice()), "{out}{err}");
-    assert!(out.contains("integrate.1") && out.contains("conflict: t1 onto t2 in f1.txt"), "{out}");
+    assert!(bd.finished(), "{out}");
+    assert!(bd.tasks["integrate.1"].last_progress.contains("conflict: t"), "{}", bd.tasks["integrate.1"].last_progress);
     assert!(!root.join("fail-fix").exists(), "the fix's done lost its snapshot once");
     // That fix was retried as what it was, a missing snapshot: its verify rejected it unchecked, and
     // its rework was integrated; no second conflict, no second fix.
     let ev = events(&root);
     assert!(ev.iter().any(|e| e.ev == board::Ev::Rejected && e.task == "integrate.1.fix.v1" && e.note.contains("no snapshot")), "{out}");
     assert_eq!(bd.tasks.keys().filter(|t| t.ends_with(".fix")).count(), 1);
-    let i1 = ev.iter().find(|e| e.ev == board::Ev::Rejected && e.task == "integrate.1").unwrap().head.clone();
     let head = bd.integrated.clone().unwrap().head;
-    assert_eq!(git(&w, &["rev-parse", &format!("{head}^1")]), i1, "the passing integration builds on the tree the fix verified");
-    assert_eq!(git(&w, &["show", &format!("{head}:f1.txt")]), "done t1\nchecked by: ok");
-    assert!(git(&w, &["show", &format!("{head}:f2.txt")]).starts_with("done t2"));
+    let f1 = git(&w, &["show", &format!("{head}:f1.txt")]);
+    assert!(f1.contains("done t1") && f1.contains("done t2") && !f1.contains("<<<<<<<"), "{f1}");
     let _ = std::fs::remove_dir_all(root);
 }

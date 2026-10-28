@@ -49,6 +49,7 @@ fn seed(home: &Path, now: i64) {
         sig: String::new(),
         hidden: None,
         held_out: false,
+        origin: Vec::new(),
     };
     goal::create(home, &g).unwrap();
     let t = |id: &str| Task {

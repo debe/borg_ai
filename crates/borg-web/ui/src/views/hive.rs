@@ -361,6 +361,7 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                                 </td>
                                 <td>{if t.lease_left_ms > 0.0 { format!("{}m", (t.lease_left_ms / 60_000.0).floor()) } else { String::new() }}</td>
                                 <td>{t.files.join(", ")}</td>
+                                <td title=t.start.clone()>{trunc(&t.start, 80)}</td>
                             </tr>
                         }).collect_view()}
                     </table>

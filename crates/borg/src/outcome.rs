@@ -1044,6 +1044,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         crate::hive::goal::create(&home, &g).unwrap();
         let work = |id: &str| Task {

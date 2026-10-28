@@ -380,6 +380,11 @@ fn goal_lines(lines: &mut Vec<Ln>, v: &HiveView, now: i64) {
         chips = chips.add(St::Dim, format!("+{rest} verify/integrate"));
     }
     lines.push(chips);
+    // Where each held work claim started (hive/start.rs): the deps' work in its tree, and where the tree
+    // its reset replaced is kept.
+    for t in v.tasks.iter().filter(|t| t.role == "work" && t.status == "claimed" && !t.start.is_empty()).take(3) {
+        lines.push(Ln::default().add(St::Dim, format!("    {} ", t.id)).add(St::Plain, short_hashes(&t.start)));
+    }
     let mut info = Ln::default().add(St::Dim, "    plan ");
     info = match &v.plan {
         Some(p) if p.state == "approved" => info.add(St::Green, format!("✔ approved{}", if p.by.is_empty() { String::new() } else { format!(" by {}", p.by) })),

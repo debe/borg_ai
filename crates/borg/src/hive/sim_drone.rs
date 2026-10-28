@@ -363,6 +363,7 @@ mod tests {
             sig: String::new(),
             hidden: None,
             held_out: false,
+            origin: Vec::new(),
         };
         goal::create(&home, &g).unwrap();
         let task = super::super::new_task("t1.v1", Role::Verify, "verify t1", "", vec![], vec![], vec![]).unwrap();

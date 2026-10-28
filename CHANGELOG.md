@@ -54,6 +54,14 @@ and documentation whose claims match their reports. The release steps are in
   messages to the planner on the goal's home node, and `borg hive board` in a terminal lists the ones
   not read on that machine and marks them read. `borg hive leave` in a session that only plans ends its
   planning.
+- Verified work no longer disappears when a drone reuses its worktree after a blocked attempt: every
+  claim starts from the goal's origin plus its deps' verified changes, the drone's worktree is reset
+  to it (the tree before kept in a pinned commit `borg top` and `borg web` name), and a verdict rejects
+  work whose base is not that start. Deps whose changes conflict block the task once, with the paths.
+- Drone trees no longer follow the engineer's HEAD: work starts from the commit `borg hive init` ran
+  on (in another repo in scope, its HEAD at the goal's first claim there), and later engineer commits
+  reach drones only through a task. A plain checkout claims only where its tree is that start, and a
+  node whose clone lacks it says so in `borg top` and the Hive tab.
 
 ### Documentation
 

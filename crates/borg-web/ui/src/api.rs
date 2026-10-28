@@ -449,6 +449,8 @@ pub struct HiveTask {
     pub files: Vec<String>,
     /// The holder's node: empty on this node.
     pub node: String,
+    /// Where its newest claim started (borg hive/start.rs): the start, the deps' work in it, the reset.
+    pub start: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -739,6 +741,7 @@ pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
                     lease_left_ms: f(&t["lease_left_ms"]),
                     files: strs(&t["files"]),
                     node: s(&t["node"]),
+                    start: s(&t["start"]),
                 })
                 .collect(),
             drones: g["drones"]
