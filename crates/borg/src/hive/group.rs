@@ -5,7 +5,7 @@
 //! `group: T` (board.rs `Task::group`). Each is an ordinary task (claim, done, verify, rework), with
 //! one bar more: a session or drone that held one member, or verified one, may not claim another, and
 //! one that held a member may not verify another (board.rs `Board::rival`), so the K attempts are K
-//! drones' and independent, and no attempt is judged by a rival (`borg hive run` needs K+1 drones). Every member is verified like any work; an
+//! drones' and independent, and no attempt is judged by a rival (`borg debug hive run` needs K+1 drones). Every member is verified like any work; an
 //! integration merges only the group's best accepted attempt ([`best`]): the one the hidden oracle
 //! passed, else the one with the fewest rejections, then the earliest verified (integrate.rs scores
 //! the group's attempts first when the goal has a hidden oracle, hidden.rs).
@@ -366,7 +366,7 @@ fn record(home: &Path, gr: &Group, g: &Goal, known: &HashSet<String>) -> Reflect
         let waiting = gr.tries.iter().filter(|t| t.win.is_none()).count();
         let why = match (gr.verified, waiting) {
             (false, _) => "not every attempt is verified yet".to_string(),
-            (true, n) => format!("{n} attempt(s) wait for the hidden oracle (`borg hive score {}`)", gr.goal),
+            (true, n) => format!("{n} attempt(s) wait for the hidden oracle (`borg debug hive score {}`)", gr.goal),
         };
         return Reflected::Nothing(format!("{}: {why}", gr.id));
     }

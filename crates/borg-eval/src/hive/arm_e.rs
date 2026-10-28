@@ -12,7 +12,7 @@
 //! `hive::main`; a test calling the cell directly runs it with the test's, the row's `sync.credit`).
 //!
 //! The goal is opened on A as arm D3 opens it; once it has synced to B, B's engineer approves A's check
-//! (`borg hive approve`, as hive_mesh.rs does) and `borg hive run --yes` starts on both nodes at once:
+//! (`borg hive approve`, as hive_mesh.rs does) and `borg debug hive run --yes` starts on both nodes at once:
 //! [`NODES`] drones on A and on B, each run in its node's sandbox as D3's is. Whichever node's drone
 //! integrates (the hive's rules: the first runner to see every task verified, with every accepted
 //! attempt's commits present or fetchable), the scored tree is that integration's commit, found in
@@ -541,7 +541,7 @@ pub(super) fn run(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut ser
         return Err(format!("borg hive approve on b: exit {code}: {out}{err}"));
     }
     eprintln!(
-        "  {} e: borg hive run on a (--drones {}) and b (--drones {}) (cap ${:.2}, wall cap {}s, goal on b after {goal_synced_s:.1}s) …",
+        "  {} e: borg debug hive run on a (--drones {}) and b (--drones {}) (cap ${:.2}, wall cap {}s, goal on b after {goal_synced_s:.1}s) …",
         wl.id, NODES[0].1, NODES[1].1, o.cap, o.timeout_s
     );
     mark_paid(row);

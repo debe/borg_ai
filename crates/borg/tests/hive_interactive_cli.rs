@@ -70,6 +70,14 @@ fn ok(root: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
     out
 }
 
+/// `borg debug hive <args> --dir <work>` with `env`: `score` lives there.
+fn debug_hive(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let dir = work(root).display().to_string();
+    let all: Vec<&str> = ["debug", "hive"].iter().copied().chain(args.iter().copied()).chain(["--dir", dir.as_str()]).collect();
+    let out = command(root, &all, env).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
 /// The environment of a command the model of Claude Code session `s` runs.
 fn inside(s: &str) -> [(&str, &str); 1] {
     [("CLAUDE_CODE_SESSION_ID", s)]
@@ -367,7 +375,7 @@ fn a_drones_model_is_refused_the_engineers_commands() {
     let s = "sess-refused-1";
     ok(&root, &["join", "g1"], &inside(s));
     for cmd in [["approve", "g1"], ["integrate", "g1"], ["score", "g1"], ["ratify", "g1"]] {
-        let (out, err, code) = hive(&root, &cmd, &inside(s));
+        let (out, err, code) = if cmd[0] == "score" { debug_hive(&root, &cmd, &inside(s)) } else { hive(&root, &cmd, &inside(s)) };
         assert!(code == 1 && err.contains("never by a drone") || err.contains("integrate tasks are run by"), "{cmd:?}: {out}{err}");
     }
     // In its worktree without the session's variable (another shell of the drone's).
@@ -389,7 +397,8 @@ fn a_runner_and_interactive_drones_never_share_a_goal_on_one_node() {
     let s = "sess-mixed-1";
     ok(&root, &["join", "g1"], &inside(s));
     let dir = work(&root).display().to_string();
-    let run = Waiter(Some(command(&root, &["hive", "run", "g1", "--drones", "1", "--harness", "claude", "--yes", "--dir", &dir], &[]).spawn().unwrap()));
+    let run =
+        Waiter(Some(command(&root, &["debug", "hive", "run", "g1", "--drones", "1", "--harness", "claude", "--yes", "--dir", &dir], &[]).spawn().unwrap()));
     let (code, out) = run.ended(30);
     assert!(code == 2 && out.contains("serves goal g1 on this node"), "refused before anything starts: {out}");
     assert!(!work(&root).join(".worktrees/hive-g1-1").exists() && !events(&root).iter().any(|e| e.ev == board::Ev::Claim), "nothing started");
@@ -398,7 +407,7 @@ fn a_runner_and_interactive_drones_never_share_a_goal_on_one_node() {
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(store(&root).join("hive/g1/run.lock")).unwrap();
     lock.try_lock().unwrap();
     let (out, err, code) = hive(&root, &["join", "g1"], &inside("sess-mixed-2"));
-    assert!(code == 1 && err.contains("a `borg hive run g1` runs on this node"), "{out}{err}");
+    assert!(code == 1 && err.contains("a `borg debug hive run g1` runs on this node"), "{out}{err}");
     assert!(hs(&root, "sess-mixed-2").is_null() && interactive::live(&store(&root)).is_empty());
     drop(lock);
     let _ = std::fs::remove_dir_all(root);

@@ -35,7 +35,7 @@
 //!   kind of evidence, read from a test runner's output rather than judged by a verifier. Additive like a
 //!   verdict, never a use, no tick, and nothing for a session whose result is a correction or a veto.
 //!   A fractional α (a candidate weight) is rounded the same way
-//!   (`draw`). `Weights` holds the hand-set weights so that `borg ope` (ope.rs, hive.md L6)
+//!   (`draw`). `Weights` holds the hand-set weights so that `borg debug ope` (ope.rs, hive.md L6)
 //!   can replay the belief under other values offline; the counts `derive` returns are constant-free.
 //! - **Weight** = `squash(A) × (0.5 + x)`, where `x` is a Thompson sample from the belief, seeded by
 //!   (session, lesson) so a session sees one stable ranking, or the belief's mean without a session.
@@ -84,14 +84,14 @@ pub const REGRET: f64 = 1.0;
 pub const VERIFIED_W: u32 = 1;
 pub const REJECTED_W: u32 = 1;
 pub const HACKED_W: u32 = 3;
-/// What one `tested` result (outcome.rs) adds to α: half a verified task (design-chosen, `borg ope`
+/// What one `tested` result (outcome.rs) adds to α: half a verified task (design-chosen, `borg debug ope`
 /// estimates others): the session's own runner, not a verifier, said the work passes.
 pub const TESTED_W: f64 = VERIFIED_W as f64 / 2.0;
 /// What one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
 /// (design-chosen, no eval behind it yet; hive.md L6).
 pub const VETOED_W: u32 = 3;
 
-/// The belief's hand-set weights (design-chosen; `borg ope` estimates others offline, never applies them).
+/// The belief's hand-set weights (design-chosen; `borg debug ope` estimates others offline, never applies them).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Weights {
     pub vetoed: f64,
@@ -439,7 +439,7 @@ pub const NOVEL_WORDS: usize = 3;
 /// The word rule: what the drone did with each asked lesson after it was delivered: (changed, ignored).
 /// Never an outcome: its labels measured shared vocabulary (55% "changed" against 38% on a mismatched
 /// control, internal evaluation "phase-r" R1, not published). It only decides whether an early-delivered lesson counts as done
-/// (main.rs `early_acted`) and serves the offline replay (`borg resolve`); asked lessons are labelled by
+/// (main.rs `early_acted`) and serves the offline replay (`borg debug resolve`); asked lessons are labelled by
 /// the consequence model (main.rs `pending`).
 /// - Declared, in its final message: `<id>: applies` is a change, `<id>: skip` an ignore (the block
 ///   asks for one such line per question).

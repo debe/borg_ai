@@ -271,8 +271,8 @@ fn the_queue_answers_by_number_dismisses_and_speaks_json() {
         (v[0]["n"].as_u64(), v[1]["id"].as_str(), v[1]["answer_cmd"].as_str(), code),
         (Some(1), Some("qb"), Some("borg queen answer 'qb' '<answer>'"), Some(0))
     );
-    let (out, _, _) = borg(&root, &base, &["queen", "next", "--json", "--repo", "app"], "", &project);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"], "qa");
+    let (out, _, _) = borg(&root, &base, &["queen", "--json", "--repo", "app"], "", &project);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()[0]["id"], "qa");
 
     // An option's letter answers with its text; a number names the question.
     let (_, err, code) = borg(&root, &base, &["queen", "answer", "1", "b"], "", &project);
@@ -281,8 +281,8 @@ fn the_queue_answers_by_number_dismisses_and_speaks_json() {
     // Numbers follow the open list: qb is now 1.
     let (out, _, code) = borg(&root, &base, &["queen", "dismiss", "1", "not", "ours"], "", &project);
     assert_eq!((out.trim(), code), ("qb dismissed (not ours); no lesson written", Some(0)));
-    let (out, _, _) = borg(&root, &base, &["queen", "next", "--json"], "", &project);
-    assert_eq!(out.trim(), "null");
+    let (out, _, _) = borg(&root, &base, &["queen", "--json"], "", &project);
+    assert_eq!(out.trim(), "[]");
     let (out, _, _) = borg(&root, &base, &["queen"], "", &project);
     assert!(out.starts_with("no open queen questions"), "{out}");
     // `ask` wants a terminal.

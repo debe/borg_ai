@@ -1,73 +1,210 @@
-//! `borg completions <bash|zsh|fish>`: a shell completion script for borg, printed to stdout.
+//! The command table of the borg CLI, and `borg completions <bash|zsh|fish>`: a shell completion script
+//! for borg, printed to stdout.
 //!
-//! One table (`COMMANDS`) of commands, their subcommands and flags feeds all three shells, so a new
-//! command needs one line here; `HARNESSES` stands for the harnesses' names (harness/mod.rs `ALL`). Paths
-//! complete as files where a command takes one (`why`, `memory`).
+//! One table (`GROUPS`, plus `DEBUG` for `borg debug`) feeds `borg help`, the dispatch gate in main.rs
+//! (`known`) and all three shells, so a new command needs one entry here; `HARNESSES` stands for the
+//! harnesses' names (harness/mod.rs `ALL`). Paths complete as files where a command takes one (`why`).
 
 /// In a subcommand list: every visible harness's name.
-const HARNESSES: &str = "<harnesses>";
+pub const HARNESSES: &str = "<harnesses>";
 
-/// (command, subcommands, flags, takes a path)
-const COMMANDS: &[(&str, &[&str], &[&str], bool)] = &[
-    ("status", &[], &[], false),
-    ("doctor", &[], &[], false),
-    ("collective", &[], &[], true),
-    ("setup", &[], crate::install::setup::FLAGS, false),
-    ("install", &[HARNESSES, "all"], &["--apply", "--home"], false),
-    ("uninstall", &[HARNESSES, "all"], &["--apply", "--home"], false),
-    ("learn", &[], &["--session", "--group"], false),
-    ("assimilate", &[], crate::assimilate::FLAGS, false),
-    ("reach", &[], &["--plan", "--apply", "--jobs"], false),
-    ("queen", &["show", "ask", "answer", "skip", "dismiss", "next", "dedupe", "notify"], &["--json", "--repo", "--dir", "--collective", "--apply"], false),
-    ("top", &[], &["--once", "--watch", "--json", "--dir"], false),
-    ("no", &[], crate::veto::FLAGS, false),
+/// One command: its name, its help rows (the arguments after the name, what it does), and for the
+/// shells its subcommands, its flags and whether it takes a path.
+pub struct Command {
+    pub name: &'static str,
+    pub help: &'static [(&'static str, &'static str)],
+    pub subs: &'static [&'static str],
+    pub flags: &'static [&'static str],
+    pub path: bool,
+}
+
+const fn cmd(name: &'static str, help: &'static [(&'static str, &'static str)], subs: &'static [&'static str], flags: &'static [&'static str]) -> Command {
+    Command { name, help, subs, flags, path: false }
+}
+
+/// `borg help`: the commands grouped by what they are for.
+pub const GROUPS: &[(&str, &[Command])] = &[
     (
+        "Setup",
+        &[
+            cmd("setup", &[("[--yes] [--no-vectors]", "guided setup: collectives, team, vectors, wiring")], &[], crate::install::setup::FLAGS),
+            cmd("install", &[("<HARNESS|all> [--apply]", "wire the hooks (a dry run without --apply)")], &[HARNESSES, "all"], &["--apply", "--home"]),
+            cmd("uninstall", &[("<HARNESS|all> [--apply]", "unwire them")], &[HARNESSES, "all"], &["--apply", "--home"]),
+            cmd("status", &[("", "each collective's lessons, outcomes and wiring")], &[], &["--home"]),
+            cmd("doctor", &[("", "what is broken: config, hooks, adapters, the model CLI")], &[], &["--home"]),
+            Command { path: true, ..cmd("collective", &[("[DIR]", "which collective a directory belongs to")], &[], &[]) },
+            cmd("vectors", &[("[--fetch|--rebuild] [--store LESSONS]", "the vector model and index")], &[], &["--fetch", "--rebuild", "--store"]),
+            cmd("completions", &[("<bash|zsh|fish>", "a shell completion script")], &["bash", "zsh", "fish"], &[]),
+        ],
+    ),
+    (
+        "Learning",
+        &[
+            cmd("learn", &[("[--group GOAL/TASK]", "turn waiting corrections (or a hive group's winners vs losers) into lessons now")], &[], &["--group"]),
+            cmd(
+                "no",
+                &[("[--session ID] <reason>", "say no to a drone's work: shown lessons lose credit, the reason becomes a lesson")],
+                &[],
+                crate::veto::FLAGS,
+            ),
+            cmd(
+                "assimilate",
+                &[
+                    ("[--apply] [--since DATE] [--limit N]", "import corrections from past sessions"),
+                    ("--from-dir DIR [--plan FILE] [--apply]", "import lessons from team documents"),
+                ],
+                &[],
+                crate::assimilate::FLAGS,
+            ),
+            cmd("reach", &[("[--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal")], &[], &["--plan", "--apply", "--jobs"]),
+            cmd("facets", &[("[--apply] [--store FILE] [--jobs N]", "search facets for lessons")], &[], &["--apply", "--store", "--jobs"]),
+        ],
+    ),
+    (
+        "Decisions",
+        &[
+            cmd(
+                "queen",
+                &[("[show|ask|answer|skip|dismiss|dedupe]", "open decisions waiting for you")],
+                &["show", "ask", "answer", "skip", "dismiss", "dedupe"],
+                &["--json", "--repo", "--dir", "--collective", "--apply"],
+            ),
+            Command {
+                path: true,
+                ..cmd("why", &[("<path>[:<line>[-<line>]] | <commit>", "the reasoning behind code  [--full] [--json]")], &[], &["--full", "--json", "--dir"])
+            },
+            cmd("notes", &[("fetch [<commit>...]", "fetch the team's reasoning notes behind commits")], &["fetch"], &["--dir"]),
+            cmd(
+                "regress",
+                &[("[--replay A..B] [--explain] [--json]", "which earlier decisions later commits fixed (dry run)")],
+                &[],
+                crate::notes::regress_cli::FLAGS,
+            ),
+            cmd(
+                "review-fix",
+                &[("[--since DATE] [--json]", "bugs workflow reviews found and fix steps fixed, before any commit")],
+                &[],
+                crate::review_fix::FLAGS,
+            ),
+            cmd("trust", &[("[--dir DIR]", "trust per engineer and area")], &[], &["--dir"]),
+        ],
+    ),
+    (
+        "Watching",
+        &[
+            cmd("top", &[("[--once] [--json] [--dir DIR]", "the drones running across the team, live (q quits)")], &[], &["--once", "--json", "--dir"]),
+            cmd("web", &[("[--port PORT] [--dir DIR]", "a live page of knowledge and stats on 127.0.0.1")], &[], &["--port", "--dir"]),
+        ],
+    ),
+    (
+        "Team",
+        &[
+            cmd(
+                "mesh",
+                &[("<command>", "sync with team members (borg mesh --help)")],
+                &["id", "init", "invite", "invites", "join", "revoke", "members", "peer", "serve", "sync", "fetch"],
+                &["--collective", "--apply", "--paths", "--role", "--expires", "--uses", "--png", "--revoke"],
+            ),
+            cmd(
+                "steer",
+                &[("<drone|all> <text> | --pause | --resume", "a signed instruction to running drones")],
+                &["all"],
+                &["--pause", "--resume", "--veto"],
+            ),
+        ],
+    ),
+    (
+        "Hive",
+        &[cmd(
+            "hive",
+            &[
+                ("init <goal> --spec T --oracle N=CMD --budget USD", "many drones, one goal: its plan, checks and budget"),
+                ("ratify <goal>", "approve the goal's plan from a terminal"),
+                ("board [<goal>] [--json]", "the tasks, who holds them, rework"),
+                ("join [<goal>] | leave", "this session becomes a drone that waits for work, or stops being one"),
+                ("open <goal> --id ID ... [--again]", "open a task, or reopen a blocked one"),
+                ("integrate <goal> | approve <goal>", "merge the accepted work; run the checks other nodes wrote"),
+                ("claim|progress|release|block|done|verify|contract|ask|tell", "a drone's own commands (its context names them)"),
+            ],
+            &[
+                "init",
+                "board",
+                "join",
+                "leave",
+                "wait",
+                "open",
+                "claim",
+                "progress",
+                "release",
+                "block",
+                "done",
+                "verify",
+                "integrate",
+                "approve",
+                "ratify",
+                "contract",
+                "ask",
+                "tell",
+            ],
+            crate::hive::FLAGS,
+        )],
+    ),
+];
+
+/// `borg debug <command>`: evaluation and debugging tools, out of the main help.
+pub const DEBUG: &[Command] = &[
+    Command { path: true, ..cmd("recall", &[("<lessons.jsonl> [before_ms]", "rank lessons for text on stdin")], &[], &[]) },
+    Command { path: true, ..cmd("resolve", &[("<lessons.jsonl>", "the word rule's changed/ignored for {asked, before, edits, final} on stdin")], &[], &[]) },
+    Command { path: true, ..cmd("prefilter", &[("<lessons.jsonl> [before_ms]", "the free gate's score for a turn on stdin")], &[], &[]) },
+    Command { path: true, ..cmd("memory", &[("<lessons.jsonl> [--session ID]", "each lesson's activation and usefulness")], &[], &["--session"]) },
+    Command {
+        path: true,
+        ..cmd("expert", &[("<repo> --at <commit> --q <text>", "at most 3 cited claims from an expert repo")], &[], &["--at", "--version", "--q"])
+    },
+    cmd("vectors", &[("--query [--store LESSONS]", "the vector shortlist for a context on stdin")], &[], &["--query", "--store"]),
+    cmd("ope", &[("[--dir DIR | --file FILE] [--json]", "off-policy estimates of the belief's hand-set weights")], &[], &["--dir", "--file", "--json"]),
+    cmd(
         "hive",
         &[
-            "init",
-            "run",
-            "board",
-            "join",
-            "leave",
-            "open",
-            "claim",
-            "progress",
-            "release",
-            "block",
-            "done",
-            "verify",
-            "score",
-            "integrate",
-            "approve",
-            "ratify",
-            "contract",
-            "ask",
-            "tell",
+            ("run <goal> --drones N [--harness H] [--yes]", "headless drones in worktrees, each with a share of the budget"),
+            ("score <goal>", "the hidden oracle scores the judged tasks not scored yet"),
+            ("init <goal> ... --hidden-dir DIR --hidden CMD", "a goal with held-out checks outside the repo"),
         ],
-        crate::hive::FLAGS,
-        false,
+        &["run", "score", "init"],
+        crate::hive::DEBUG_FLAGS,
     ),
-    ("steer", &["all"], &["--pause", "--resume", "--veto"], false),
-    ("why", &[], &["--full", "--json"], true),
-    ("web", &[], &["--port", "--dir"], false),
-    ("trust", &[], &["--dir"], false),
-    ("ope", &[], &["--dir", "--file", "--json"], false),
-    ("notes", &["attach", "fetch"], &[], false),
-    ("regress", &[], crate::notes::regress_cli::FLAGS, false),
-    ("review-fix", &[], crate::review_fix::FLAGS, false),
-    (
-        "mesh",
-        &["id", "init", "invite", "invites", "join", "revoke", "members", "peer", "serve", "sync", "fetch"],
-        &["--collective", "--apply", "--paths", "--role", "--expires", "--uses", "--png", "--revoke"],
-        false,
-    ),
-    ("vectors", &[], &["--fetch", "--rebuild", "--query", "--store"], false),
-    ("memory", &[], &["--session"], true),
-    ("facets", &[], &["--apply", "--store", "--jobs"], false),
-    ("expert", &[], &["--at", "--version", "--q"], true),
-    ("recall", &[], &[], true),
-    ("completions", &["bash", "zsh", "fish"], &[], false),
 ];
+
+/// What hooks and drones run, never listed: dispatched, not shown.
+pub const INTERNAL: &[&str] = &["hook", "check"];
+
+/// Every command of the main help, in its order.
+pub fn commands() -> impl Iterator<Item = &'static Command> {
+    GROUPS.iter().flat_map(|(_, cmds)| cmds.iter())
+}
+
+/// Whether `name` is a top-level borg command (dispatched by main.rs): listed, `debug`, `help` or internal.
+pub fn known(name: &str) -> bool {
+    commands().any(|c| c.name == name) || INTERNAL.contains(&name) || matches!(name, "debug" | "help" | "-h" | "--help")
+}
+
+/// The completions' commands: the main help's, then `debug` with the debug commands as subcommands and
+/// all their flags (`--yes` of `debug hive run` among them).
+fn completed() -> Vec<(&'static str, Vec<&'static str>, Vec<&'static str>, bool)> {
+    let mut out: Vec<_> = commands().map(|c| (c.name, subs_of(c.subs), c.flags.to_vec(), c.path)).collect();
+    let mut flags: Vec<&str> = DEBUG.iter().flat_map(|c| c.flags.iter().copied()).collect();
+    flags.sort_unstable();
+    flags.dedup();
+    out.push(("debug", DEBUG.iter().map(|c| c.name).chain(["help"]).collect(), flags, true));
+    out
+}
+
+/// The debug commands that take subcommands of their own (`borg debug hive run`): (name, its
+/// subcommands and flags). Completed by the third word, so `borg debug hive` offers run, score and
+/// init rather than the debug commands again.
+fn nested() -> Vec<(&'static str, String)> {
+    DEBUG.iter().filter(|c| !c.subs.is_empty()).map(|c| (c.name, [subs_of(c.subs).as_slice(), c.flags].concat().join(" "))).collect()
+}
 
 const USAGE: &str = "usage: borg completions <bash|zsh|fish>
   bash: borg completions bash > ~/.local/share/bash-completion/completions/borg
@@ -94,15 +231,17 @@ fn subs_of(subs: &[&'static str]) -> Vec<&'static str> {
 
 /// The shell's `case` lines: `line(command, its subcommands and flags, takes a path)` for each command.
 fn cases(line: impl Fn(&str, &str, bool) -> String) -> String {
-    COMMANDS.iter().map(|(cmd, subs, flags, path)| line(cmd, &[subs_of(subs).as_slice(), flags].concat().join(" "), *path)).collect()
+    completed().iter().map(|(cmd, subs, flags, path)| line(cmd, &[subs.as_slice(), flags].concat().join(" "), *path)).collect()
 }
 
 fn names() -> String {
-    COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>().join(" ")
+    completed().iter().map(|c| c.0).collect::<Vec<_>>().join(" ")
 }
 
 pub fn bash() -> String {
     let cases = cases(|cmd, words, path| format!("        {cmd}) words=\"{words}\"; files=\"{}\" ;;\n", if path { " -f" } else { "" }));
+    let nested: String =
+        nested().iter().map(|(cmd, words)| format!("            {cmd}) COMPREPLY=($(compgen -W \"{words}\" -- \"$cur\")); return ;;\n")).collect();
     format!(
         r#"# bash completion for borg (borg completions bash)
 _borg() {{
@@ -110,6 +249,10 @@ _borg() {{
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=($(compgen -W "{names}" -- "$cur"))
         return
+    fi
+    if [ "$COMP_CWORD" -gt 2 ] && [ "${{COMP_WORDS[1]}}" = debug ]; then
+        case "${{COMP_WORDS[2]}}" in
+{nested}        esac
     fi
     case "${{COMP_WORDS[1]}}" in
 {cases}    esac
@@ -126,6 +269,7 @@ complete -o default -F _borg borg
 
 pub fn zsh() -> String {
     let cases = cases(|cmd, words, path| format!("        {cmd}) compadd -- {words}{} ;;\n", if path { "; _files" } else { "" }));
+    let nested: String = nested().iter().map(|(cmd, words)| format!("            {cmd}) compadd -- {words}; return ;;\n")).collect();
     format!(
         r#"#compdef borg
 # zsh completion for borg (borg completions zsh)
@@ -133,6 +277,10 @@ _borg() {{
     if (( CURRENT == 2 )); then
         compadd -- {names}
         return
+    fi
+    if (( CURRENT > 3 )) && [[ ${{words[2]}} == debug ]]; then
+        case "${{words[3]}}" in
+{nested}        esac
     fi
     case "${{words[2]}}" in
 {cases}    esac
@@ -146,17 +294,27 @@ _borg "$@"
 pub fn fish() -> String {
     let mut out =
         format!("# fish completion for borg (borg completions fish)\ncomplete -c borg -f\ncomplete -c borg -n __fish_use_subcommand -a '{}'\n", names());
-    for (cmd, subs, flags, path) in COMMANDS {
-        let when = format!("__fish_seen_subcommand_from {cmd}");
+    // fish sees every word: `borg debug hive` has also seen `hive`, so a command a debug one shares a
+    // name with completes only outside `debug`, and a nested debug command's subcommands only inside it.
+    for (cmd, subs, flags, path) in completed() {
+        let when = if DEBUG.iter().any(|d| d.name == cmd) {
+            format!("__fish_seen_subcommand_from {cmd}; and not __fish_seen_subcommand_from debug")
+        } else {
+            format!("__fish_seen_subcommand_from {cmd}")
+        };
         if !subs.is_empty() {
-            out.push_str(&format!("complete -c borg -n '{when}' -a '{}'\n", subs_of(subs).join(" ")));
+            out.push_str(&format!("complete -c borg -n '{when}' -a '{}'\n", subs.join(" ")));
         }
-        for f in *flags {
+        for f in flags {
             out.push_str(&format!("complete -c borg -n '{when}' -l {}\n", f.trim_start_matches("--")));
         }
-        if *path {
+        if path {
             out.push_str(&format!("complete -c borg -n '{when}' -F\n"));
         }
+    }
+    for c in DEBUG.iter().filter(|c| !c.subs.is_empty()) {
+        let subs = subs_of(c.subs).join(" ");
+        out.push_str(&format!("complete -c borg -n '__fish_seen_subcommand_from debug; and __fish_seen_subcommand_from {}' -a '{subs}'\n", c.name));
     }
     out
 }
@@ -168,7 +326,7 @@ mod tests {
     #[test]
     fn every_shell_names_every_command() {
         for script in [bash(), zsh(), fish()] {
-            for (cmd, ..) in COMMANDS {
+            for (cmd, ..) in completed() {
                 assert!(script.contains(cmd), "{cmd} missing");
             }
         }
@@ -177,5 +335,16 @@ mod tests {
         assert!(fish().contains("-n '__fish_seen_subcommand_from install' -l apply"));
         assert!(bash().contains("install) words=\"claude omp opencode codex all --apply"), "{}", bash());
         assert!(!bash().contains(" sim ") && !bash().contains(HARNESSES), "the simulated harness stays hidden");
+    }
+
+    #[test]
+    fn debug_hive_completes_its_own_subcommands() {
+        assert!(bash().contains("            hive) COMPREPLY=($(compgen -W \"run score init --drones"), "{}", bash());
+        assert!(zsh().contains("            hive) compadd -- run score init --drones"), "{}", zsh());
+        let fish = fish();
+        assert!(fish.contains("-n '__fish_seen_subcommand_from debug; and __fish_seen_subcommand_from hive' -a 'run score init'"), "{fish}");
+        assert!(fish.contains("-n '__fish_seen_subcommand_from hive; and not __fish_seen_subcommand_from debug' -a 'init board"), "{fish}");
+        assert!(fish.contains("-n '__fish_seen_subcommand_from vectors; and not __fish_seen_subcommand_from debug' -l fetch"), "{fish}");
+        assert!(fish.contains("-n '__fish_seen_subcommand_from debug' -a 'recall"), "{fish}");
     }
 }

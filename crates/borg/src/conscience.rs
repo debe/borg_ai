@@ -697,7 +697,7 @@ fn kept_share(pool: &[(f64, &Challenge)], session: &str, keep: impl Fn(Vec<&Chal
 
 /// A pooled lesson's score without its usefulness factor: s / (0.5 + mean belief) = relevance ×
 /// squash(A) × trust / NEUTRAL (`rank`, memory.rs `Memory::weight`). Under another belief the score is
-/// base × (0.5 + its mean), and `propensity` orders by base × (0.5 + draw), so `borg ope` (ope.rs) can
+/// base × (0.5 + its mean), and `propensity` orders by base × (0.5 + draw), so `borg debug ope` (ope.rs) can
 /// replay a slot under other weights.
 pub fn pool_base(s: f64, c: &Challenge) -> f64 {
     let (a, b) = c.belief;

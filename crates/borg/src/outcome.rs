@@ -54,7 +54,7 @@
 //! force at that check (its propensity), for off-policy evaluation of another policy from this log. An
 //! `asked` record from a Thompson slot draw (the bm25 and non-graded paths) also carries that draw's
 //! pool (`pool`, `base`, `scoped`): every competitor with its score before the usefulness factor, so
-//! `borg ope` (ope.rs) can recompute the propensity under other belief weights. Local only: the team
+//! `borg debug ope` (ope.rs) can recompute the propensity under other belief weights. Local only: the team
 //! projection drops them.
 //!
 //! **Team outcomes.** The raw log stays on this machine (it holds session ids and repos). `publish`
@@ -180,7 +180,7 @@ pub struct Outcome {
     /// `#borg-pool`): the pool the check drew from, in ranking order, the asked lessons included; each
     /// one's score without its usefulness factor (conscience.rs `pool_base`, unrounded so a replay is
     /// exact); and whether it is scoped. Aligned with each other, not with `lessons`. Empty for graded
-    /// and live asks and free deliveries. Local: never shared (`share`). For `borg ope` (ope.rs).
+    /// and live asks and free deliveries. Local: never shared (`share`). For `borg debug ope` (ope.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

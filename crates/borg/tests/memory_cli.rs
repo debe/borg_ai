@@ -1,6 +1,6 @@
 //! R1 end to end through the binary: the Stop block names each lesson's id; the drone's answer and its
 //! work after the block are evidence; the consequence model's next call at a later Stop of the session
-//! (a fake `claude` here) judges them into `asked_then_changed` / `asked_ignored`, and `borg memory`
+//! (a fake `claude` here) judges them into `asked_then_changed` / `asked_ignored`, and `borg debug memory`
 //! derives activation and usefulness from them. The word rule and the drone's declaration alone never
 //! label. A temp BORG_CONFIG and either BORG_MATCH=bm25 or a fake `claude` on PATH: no real model call,
 //! no real store.
@@ -210,10 +210,11 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     assert!(!calls(&root)[2].0.contains("[Llock] question"));
     assert_eq!(kind(&root, "asked_then_changed"), ["Llock"]);
 
-    // `borg memory`: the changed lesson now weighs more than the ignored one, and more than a new one (1).
+    // `borg debug memory`: the changed lesson now weighs more than the ignored one, and more than a new one (1).
     let lessons = root.join("store/collectives/corp/lessons.jsonl");
-    let memory =
-        || -> Vec<Value> { borg(&root, &["memory", lessons.to_str().unwrap()], "", false, &[]).lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
+    let memory = || -> Vec<Value> {
+        borg(&root, &["debug", "memory", lessons.to_str().unwrap()], "", false, &[]).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    };
     let m = |mem: &[Value], id: &str| mem.iter().find(|m| m["id"] == id).unwrap().clone();
     let mem = memory();
     assert_eq!((m(&mem, "Llock")["changed"].as_u64(), m(&mem, "Ldrain")["ignored"].as_u64()), (Some(1), Some(1)));
@@ -375,7 +376,7 @@ fn teammates_sessions_age_a_team_lesson_and_a_repo_convention_only_in_its_repo()
     };
     let dormant = |root: &Path| -> std::collections::HashMap<String, bool> {
         let path = store.join("lessons.jsonl");
-        borg(root, &["memory", path.to_str().unwrap()], "", false, &[])
+        borg(root, &["debug", "memory", path.to_str().unwrap()], "", false, &[])
             .lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
             .map(|v| (v["id"].as_str().unwrap().to_string(), v["dormant"].as_bool().unwrap()))
@@ -391,7 +392,7 @@ fn teammates_sessions_age_a_team_lesson_and_a_repo_convention_only_in_its_repo()
     assert_eq!((busy_here["Lgit"], busy_here["Lconv"]), (true, true), "{busy_here:?}");
     // Kept to this machine's view, the teammates' sessions age nothing.
     let path = store.join("lessons.jsonl");
-    let off = borg(&root, &["memory", path.to_str().unwrap()], "", false, &[("BORG_SHARE_OUTCOMES", "off")]);
+    let off = borg(&root, &["debug", "memory", path.to_str().unwrap()], "", false, &[("BORG_SHARE_OUTCOMES", "off")]);
     assert!(off.lines().all(|l| l.contains("\"dormant\":false")), "{off}");
     let _ = std::fs::remove_dir_all(root);
 }

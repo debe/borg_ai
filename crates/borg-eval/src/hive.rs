@@ -28,14 +28,14 @@
 //! - A: one `claude -p` session, subagents disallowed. B: one session invited to use subagents.
 //! - F: three A sessions in parallel at cap/3 each, the best chosen by the visible check (then cost,
 //!   then index); wall = the slowest candidate + the selection.
-//! - D3: `borg hive init` + `borg hive run --drones 3` inside the sandbox (no hidden oracle there),
+//! - D3: `borg hive init` + `borg debug hive run --drones 3` inside the sandbox (no hidden oracle there),
 //!   under the same wall cap as one A/B session, its drones' `claude` given the same appended system
 //!   prompt. The hive integrates (borg hive/integrate.rs: the accepted attempts merged, the oracle run
 //!   on the combined tree, a fix task on a failure); the harness scores `refs/heads/hive/pilot/integrated`
 //!   as the board names it (the base when no integration merged anything); wall = the run.
 //! - E: D3 across two nodes on this machine (hive/arm_e.rs; tasks/todo.md "Arm E on one machine"): two
 //!   stores of one collective, each node's workspace a clone of one bare remote with its own objects,
-//!   synced by borg-mesh over loopback while `borg hive run` runs on both (2 drones on A, 1 on B).
+//!   synced by borg-mesh over loopback while `borg debug hive run` runs on both (2 drones on A, 1 on B).
 //!
 //! Every agent sandbox and the scorer have a PID namespace of their own: nothing started inside (a
 //! Gradle daemon) outlives them; /run is masked in both (no Docker daemon, agent or bus socket). A
@@ -1093,7 +1093,7 @@ fn d3_tokens(logs: &Path) -> (Tokens, Vec<String>) {
     (t, models.into_iter().collect())
 }
 
-/// D3: what the sessions still running when the wall cap killed `borg hive run` are charged. They never
+/// D3: what the sessions still running when the wall cap killed `borg debug hive run` are charged. They never
 /// got a spend.jsonl line: each iteration the runner started (a `by: "run"` line in joins.jsonl) whose
 /// session no spend line names. Each was launched with its drone's dollars left (`--max-budget-usd`),
 /// so it is charged that: the run's share (runs.jsonl, else `share`) less what the drone's lines
@@ -1355,7 +1355,7 @@ fn d3_init_args(wl: &Workload, spec_file: &Path, cap: f64, goal: &str) -> Vec<St
     a
 }
 
-/// `borg hive run` of D3's goal. `--yes`: the eval approves the plan itself (hive/plan.rs), so the run
+/// `borg debug hive run` of D3's goal. `--yes`: the eval approves the plan itself (hive/plan.rs), so the run
 /// never waits for an engineer the sandbox does not have.
 fn d3_run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &str) -> Vec<String> {
     run_args(model, base, iter_timeout_s, sim, goal, DRONES)
@@ -1363,7 +1363,7 @@ fn d3_run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &s
 
 /// `d3_run_args` with `drones` drones (arm E's runs, one per node).
 fn run_args(model: &str, base: &str, iter_timeout_s: u32, sim: bool, goal: &str, drones: usize) -> Vec<String> {
-    let mut a: Vec<String> = ["borg", "hive", "run", goal, "--yes", "--drones"].map(String::from).to_vec();
+    let mut a: Vec<String> = ["borg", "debug", "hive", "run", goal, "--yes", "--drones"].map(String::from).to_vec();
     a.extend([drones.to_string(), "--model".into(), model.into(), "--base".into(), base.into(), "--iter-timeout".into(), iter_timeout_s.to_string()]);
     if sim {
         a.extend(["--harness".into(), "sim".into()]);
@@ -1708,7 +1708,7 @@ fn wired_events(home: &Path) -> usize {
         .count()
 }
 
-/// Arm D3: borg installed, the goal made, `borg hive run --drones 3` (which integrates), its combined
+/// Arm D3: borg installed, the goal made, `borg debug hive run --drones 3` (which integrates), its combined
 /// tree scored. The run has the same wall cap as an A/B session (`--timeout-s`), and so does each
 /// iteration within it. With a learning arm, `borg learn` runs after it (the learner's dollars count);
 /// with a chain, the HOME is the chain's (hive_seq.rs) and the row carries `seq`.
@@ -1776,7 +1776,7 @@ fn arm_d3(o: &Opts, wl: &Workload, env: &Env, cell: &Path, row: &mut serde_json:
     if code != 0 {
         return Err(format!("borg hive init: exit {code}: {out}{err}"));
     }
-    eprintln!("  {} d3: borg hive run --drones {DRONES} (cap ${:.2}, wall cap {}s) …", wl.id, o.cap, o.timeout_s);
+    eprintln!("  {} d3: borg debug hive run --drones {DRONES} (cap ${:.2}, wall cap {}s) …", wl.id, o.cap, o.timeout_s);
     mark_paid(row);
     let start_ms = borg::learn::now_ms();
     let t0 = Instant::now();
@@ -2430,7 +2430,7 @@ mod tests {
         assert_eq!(at(&init, "--task").as_deref(), Some("t1|work|fix a.txt|r/a.txt"));
         assert!(!init.iter().any(|x| x.starts_with("--hidden")), "no hidden oracle in the sandbox: {init:?}");
         let run = d3_run_args("sonnet", "abc", 3600, false, "pilot");
-        assert_eq!(d3_run_args("sonnet", "abc", 1, false, "h5-g1")[3], "h5-g1");
+        assert_eq!(d3_run_args("sonnet", "abc", 1, false, "h5-g1")[4], "h5-g1");
         assert_eq!(at(&run, "--drones").as_deref(), Some("3"));
         assert_eq!(at(&run, "--base").as_deref(), Some("abc"));
         assert_eq!(at(&run, "--iter-timeout").as_deref(), Some("3600"));

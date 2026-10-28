@@ -7,8 +7,8 @@
 //! `<goal>/oracle.jsonl` holds one `Score` per judged attempt, read by the runner only: no hook shows
 //! it, it never syncs, and a drone that opens it is flagged (guard.rs). A score runs in a scratch
 //! worktree `<goal>/scratch/<task>-<ms>` checked out at the done's snapshot and removed afterwards;
-//! each command is bounded by the goal's `timeout_s`. `borg hive run` scores what its drones left when
-//! they end, `borg hive score <goal>` any time (an engineer's command: a drone is refused); one attempt
+//! each command is bounded by the goal's `timeout_s`. `borg debug hive run` scores what its drones left when
+//! they end, `borg debug hive score <goal>` any time (an engineer's command: a drone is refused); one attempt
 //! is never scored twice, and one the oracle could not run on (a failed checkout) is not scored yet.
 //!
 //! Held out from drones, not from the code under test: the commands run the work's own code (a check

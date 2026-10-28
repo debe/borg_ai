@@ -39,7 +39,7 @@ pub struct Contract {
     /// The queen entry that let it supersede another drone's contract.
     #[serde(default)]
     pub ok_by: Option<String>,
-    /// The drone `by` is an iteration of (`borg hive run` names it, hive/run.rs); empty for a session
+    /// The drone `by` is an iteration of (`borg debug hive run` names it, hive/run.rs); empty for a session
     /// of its own. Each iteration is a new session: the drone is the contract's author.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub drone: String,
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_later_session_of_the_same_drone_supersedes_its_own_contract() {
-        // Each iteration of a `borg hive run` drone is a new session.
+        // Each iteration of a `borg debug hive run` drone is a new session.
         let home = std::env::temp_dir().join(format!("borg-hive-contract-drone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let a = c("sa", 1, &["repo:app"], "fn parse() -> Item", None).with_drone("d1");

@@ -112,7 +112,7 @@ pub fn Conscience() -> impl IntoView {
                 <Donut parts=outcomes center=useful caption="judged questions changed the work" />
                 <p class="empty">{by_channel}</p>
                 <p class="empty">{move || format!("{} more asked with no verdict: no correction followed, which says nothing either way.", num(unjudged()))}</p>
-                <p class="empty">{move || st.with(|s| format!("Off-policy support (borg ope): {} logged decisions with a pool ({} asks without p).", s.ope.0, s.ope.1))}</p>
+                <p class="empty">{move || st.with(|s| format!("Off-policy support (borg debug ope): {} logged decisions with a pool ({} asks without p).", s.ope.0, s.ope.1))}</p>
             </div>
             <div class="panel">
                 <h2>"Asked most"</h2>

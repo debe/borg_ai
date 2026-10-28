@@ -309,7 +309,7 @@ pub(crate) fn ensure_member(home: &Path, goal: &str) -> std::io::Result<bool> {
     write_if(home, goal, |events| (!member_open(&board::fold_on(events, &here), &here)).then(line)).map(|w| w.is_some())
 }
 
-/// Whether a `borg hive run` of `goal` runs on this node (it holds the goal's run lock, run.rs).
+/// Whether a `borg debug hive run` of `goal` runs on this node (it holds the goal's run lock, run.rs).
 pub fn runner_runs(home: &Path, goal: &str) -> bool {
     let path = super::dir(home, goal).join("run.lock");
     let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) else { return false };
@@ -426,7 +426,7 @@ pub(super) fn join(here: &Here, goal_id: Option<&str>, session: &str) -> i32 {
         super::unbind(session);
         let _ = record(&here.home, &Entry { v: 1, ms: here.now, drone, session: session.into(), by: "leave".into(), ..Entry::default() });
         return fail(format!(
-            "a `borg hive run {}` runs on this node: a node runs a runner or interactive drones for a goal, never both (its join and leave would end their claims)",
+            "a `borg debug hive run {}` runs on this node: a node runs a runner or interactive drones for a goal, never both (its join and leave would end their claims)",
             g.id
         ));
     }

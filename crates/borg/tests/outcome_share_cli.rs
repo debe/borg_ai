@@ -1,5 +1,5 @@
 //! Team outcomes through the binary (outcome.rs "Team outcomes"): `borg learn` publishes a redacted
-//! projection of the local outcomes to `outcomes-team.jsonl`, and `borg memory` counts a teammate's
+//! projection of the local outcomes to `outcomes-team.jsonl`, and `borg debug memory` counts a teammate's
 //! synced result once and this machine's own published copy not at all. No model call
 //! (BORG_LEARN_MODEL=off), no real store.
 
@@ -57,7 +57,7 @@ fn team(root: &Path) -> String {
 
 fn changed(root: &Path, env: &[(&str, &str)]) -> u64 {
     let lessons = root.join("store/collectives/corp/lessons.jsonl");
-    let out = borg(root, &["memory", lessons.to_str().unwrap()], env);
+    let out = borg(root, &["debug", "memory", lessons.to_str().unwrap()], env);
     let v: Value = serde_json::from_str(out.lines().next().unwrap_or_else(|| panic!("no memory: {out:?}"))).unwrap();
     v["changed"].as_u64().unwrap()
 }

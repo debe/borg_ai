@@ -58,7 +58,7 @@ pub trait Harness: Sync {
     fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
         Vec::new()
     }
-    /// The command that runs one headless drone session (`borg hive run`, hive/run.rs), with the
+    /// The command that runs one headless drone session (`borg debug hive run`, hive/run.rs), with the
     /// engineer's hooks on so borg's own hooks run in it; None: the harness's CLI cannot.
     fn headless(&self, _run: &Headless) -> Option<std::process::Command> {
         None

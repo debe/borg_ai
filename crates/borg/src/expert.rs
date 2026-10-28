@@ -1,7 +1,7 @@
 //! L2 of the expertise ladder: a version-keyed expert index of another repo (PLAN.md, "Expertise
 //! and the queen").
 //!
-//! `borg expert <repo> --at <commit> [--version <v>] --q "<text>"` answers with at most 3 cited
+//! `borg debug expert <repo> --at <commit> [--version <v>] --q "<text>"` answers with at most 3 cited
 //! claims from the expert repo *as it was at `<commit>`*: every file is read through `git ls-tree`
 //! and `git show <commit>:<path>`, never the working tree, so nothing written later can leak in.
 //! Git runs with the caller's GIT_DIR / GIT_WORK_TREE / index / object overrides removed and with
@@ -96,12 +96,12 @@ impl Answer {
 
 static HEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{4,40}$").unwrap());
 
-/// `borg expert <repo> --at <commit> [--version <v>] [--q <text>]` (the question on stdin without
+/// `borg debug expert <repo> --at <commit> [--version <v>] [--q <text>]` (the question on stdin without
 /// `--q`).
 pub fn main(repo: &str, rest: &[&str]) -> i32 {
     let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied();
     let Some(at) = flag("--at") else {
-        eprintln!("borg expert: --at <commit> is required");
+        eprintln!("borg debug expert: --at <commit> is required");
         return 2;
     };
     let query = flag("--q").map_or_else(
@@ -118,7 +118,7 @@ pub fn main(repo: &str, rest: &[&str]) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("borg expert: {e}");
+            eprintln!("borg debug expert: {e}");
             1
         }
     }

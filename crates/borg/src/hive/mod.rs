@@ -19,14 +19,14 @@
 //!   weakened tests or changed CI or check files makes it `hacked`, and the lessons shown during the
 //!   claim are credited.
 //! - `joins.jsonl`: directories whose sessions join the goal (`borg hive join --here`, and each
-//!   worktree `borg hive run` makes, with the session of each iteration, left when the run ends).
+//!   worktree `borg debug hive run` makes, with the session of each iteration, left when the run ends).
 //! - `spend.jsonl`, `runs.jsonl` (run.rs): each headless iteration's cost (synced, naming its node:
-//!   every node's runner reads the goal's one budget), each `borg hive run` (local).
+//!   every node's runner reads the goal's one budget), each `borg debug hive run` (local).
 //! - `confirms.jsonl` (`claim`): each claim's confirm window across nodes, its wait and outcome, and each
 //!   claim refused before its write (local).
 //! - `logs/` (run.rs): each iteration's output, local only: it never syncs.
 //!
-//! `borg hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
+//! `borg debug hive run` (run.rs) starts N headless drones, each in a git worktree of its own, until the
 //! board is finished or their budget share spent; its drone threads integrate the accepted work and run
 //! the oracle on the combined tree (integrate.rs, also `borg hive integrate`); view.rs is the hive in
 //! `borg top` and borg-web.
@@ -482,7 +482,7 @@ pub fn bind_from_env(home: &Path, session: &str, cwd: &str) {
 }
 
 /// One line of joins.jsonl: sessions starting in `dir` (a git toplevel or worktree, absolute) join
-/// `goal`; `by` is `join` (`borg hive join --here`) or `run` (a worktree of `borg hive run`, with the
+/// `goal`; `by` is `join` (`borg hive join --here`) or `run` (a worktree of `borg debug hive run`, with the
 /// iteration's `session` when the runner chose it). An empty `goal` is a leave: it shadows the joins
 /// before it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -561,7 +561,7 @@ pub fn may_claim(g: &Goal, t: &Task, repo: &str) -> bool {
 }
 
 /// Why integrate tasks are refused to a drone's claim.
-const INTEGRATE_REFUSED: &str = "integrate tasks are run by `borg hive run` or `borg hive integrate`";
+const INTEGRATE_REFUSED: &str = "integrate tasks are run by `borg hive integrate` or `borg debug hive run`";
 
 /// Whether `session` in `cwd` may take `t` (`may_claim`, and a fix task only in a runner worktree or
 /// a checkout of its `from`).
@@ -600,7 +600,7 @@ fn next_open<'a>(home: &Path, g: &Goal, b: &'a Board, session: &str, drone: &str
 
 /// Whether `session`'s claims wait for the engineer's approval of the plan and stop at the goal's budget
 /// (phase g G5): an interactive drone's, whose work nobody approved by starting it. A runner's drones
-/// start only once `borg hive run`'s own gate approved the plan (plan.rs `gate`), and a plain session's
+/// start only once `borg debug hive run`'s own gate approved the plan (plan.rs `gate`), and a plain session's
 /// claim is the engineer's own step, both as before.
 fn gated(session: &str) -> bool {
     bound(session).is_some_and(|hs| hs.interactive)
@@ -719,7 +719,7 @@ fn checkout_of(cwd: &str, from: &str) -> bool {
     crate::runner::run_capped_status(cmd, None, Duration::from_secs(5)).is_some_and(|(st, out)| st.success() && String::from_utf8_lossy(&out).trim() == from)
 }
 
-/// Whether `cwd` is the worktree `borg hive run` made for the drone `session` is an iteration of
+/// Whether `cwd` is the worktree `borg debug hive run` made for the drone `session` is an iteration of
 /// (`d<n>` in `.worktrees/hive-<goal>-<n>`): the only place a fix task's claim may reset to its `from`.
 /// An engineer's checkout, or a session of its own, never is.
 fn runner_worktree(g: &Goal, session: &str, cwd: &str) -> bool {
@@ -2535,18 +2535,8 @@ pub const FLAGS: &[&str] = &[
     "--pass",
     "--again",
     "--json",
-    "--watch",
-    "--drones",
-    "--harness",
-    "--model",
-    "--base",
-    "--iter-timeout",
-    "--dry-run",
     "--here",
     "--drone",
-    "--hidden-dir",
-    "--hidden",
-    "--hidden-timeout",
     "--to",
     "--re",
     "--group",
@@ -2555,19 +2545,21 @@ pub const FLAGS: &[&str] = &[
     "--queue",
 ];
 
+/// The flags only `borg debug hive` reads (`run`, `init`'s hidden oracle; completions.rs).
+pub const DEBUG_FLAGS: &[&str] =
+    &["--drones", "--harness", "--model", "--base", "--iter-timeout", "--dry-run", "--yes", "--hidden-dir", "--hidden", "--hidden-timeout"];
+
 /// The flags that take no value.
-const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--watch", "--dry-run", "--here", "--yes", "--bind", "--stream", "--queue"];
+const SWITCHES: &[&str] = &["--pass", "--again", "--json", "--here", "--bind", "--stream", "--queue", "--dry-run", "--yes"];
 
 const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   init <goal> --spec TEXT|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]...
        [--task \"ID|role|title|files,..|deps,..|NAME=CMD\"]...  a goal, its oracle and its first tasks (each its check)
-       [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  held-out checks outside the repo, run after verdicts
-  score <goal>                                              the hidden oracle scores the judged tasks not scored yet
   integrate <goal>                                          merge the accepted work and run the oracle on it (git 2.40+)
   approve <goal>                                            run the checks other nodes wrote here (lists each one it approves)
   ratify <goal> [--budget USD]                              the engineer approves the goal's plan from a terminal (its
                                                             interactive drones take no task before); --budget: raise it
-  board [<goal>] [--json] [--watch]                         the board: tasks by status, holders, rework
+  board [<goal>] [--json]                                   the board: tasks by status, holders, rework
   join [<goal>]                                             inside a session: it becomes a drone of the goal (none: of
                                                             every open goal of this repo), in a worktree of its own
   join [<goal>] --bind --session ID                         a harness plugin binds its session ID (opencode: no session id
@@ -2580,17 +2572,22 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
   leave [--here]                                            the drone leaves (its claim is released); --here: new
                                                             sessions here join no more (joined ones stay)
-  run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]
-                                                            N headless drones in worktrees until done or the budget is spent,
-                                                            once the engineer approved the plan (--yes: approved here)
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
-       [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one;
+       [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one, its given title, files, deps or checks replacing the old;
                                                             --group K: K attempts ID.g1.. by different drones, the
                                                             best integrated, `borg learn --group <goal>/ID` compares them)
   drone commands (the goal is the session's):
   claim [TASK] | progress \"note\" | release | block \"why\" | done [--note N]
   verify --pass | --reject \"why\" (or end the turn with `VERDICT: pass|reject <why>`) | contract \"text\" --scope a,b [--supersedes ID]
   ask \"text\" [--to TASK|DRONE|SESSION] | tell \"text\" [--to TASK|DRONE|SESSION] [--re ID]   a message to the goal's drones";
+
+const DEBUG_USAGE: &str = "usage: borg debug hive <command> [--dir DIR]
+  init <goal> ... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  a goal (borg hive init's flags) with held-out
+                                                            checks outside the repo, run after verdicts
+  score <goal>                                              the hidden oracle scores the judged tasks not scored yet
+  run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]
+                                                            N headless drones in worktrees until done or the budget is spent,
+                                                            once the engineer approved the plan (--yes: approved here)";
 
 /// The command line: words, flag values (repeatable), and switches.
 struct Args<'a> {
@@ -2600,14 +2597,17 @@ struct Args<'a> {
 }
 
 impl<'a> Args<'a> {
-    fn parse(args: &[&'a str]) -> Result<Args<'a>, String> {
+    /// `debug`: `borg debug hive`, which also reads `DEBUG_FLAGS`.
+    fn parse(args: &[&'a str], debug: bool) -> Result<Args<'a>, String> {
         let mut out = Args { words: Vec::new(), values: Vec::new(), switches: Vec::new() };
         let mut i = 0;
         while i < args.len() {
             let a = args[i];
-            if SWITCHES.contains(&a) {
+            if DEBUG_FLAGS.contains(&a) && !FLAGS.contains(&a) && !debug {
+                return Err(format!("unknown flag {a}"));
+            } else if SWITCHES.contains(&a) {
                 out.switches.push(a);
-            } else if FLAGS.contains(&a) {
+            } else if FLAGS.contains(&a) || DEBUG_FLAGS.contains(&a) {
                 let v = args.get(i + 1).ok_or_else(|| format!("{a} needs a value"))?;
                 out.values.push((a, v));
                 i += 1;
@@ -2837,17 +2837,37 @@ then run this again. `borg collective {r}` shows where a repo belongs.",
 
 /// `borg hive <command>` (see `USAGE`). Exit 0, 1 on an error, 2 on a usage error, 3 when a claim lost.
 pub fn main(args: &[&str]) -> i32 {
-    let a = match Args::parse(args) {
+    cli(args, false)
+}
+
+/// `borg debug hive`: `run`, `score` and `init`'s hidden oracle, evaluation's commands.
+pub fn debug(args: &[&str]) -> i32 {
+    cli(args, true)
+}
+
+fn cli(args: &[&str], debug: bool) -> i32 {
+    let usage = if debug { DEBUG_USAGE } else { USAGE };
+    let a = match Args::parse(args, debug) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("borg hive: {e}\n{USAGE}");
+            eprintln!("borg hive: {e}\n{usage}");
             return 2;
         }
     };
     let Some((&cmd, rest)) = a.words.split_first() else {
-        eprintln!("{USAGE}");
+        eprintln!("{usage}");
         return 2;
     };
+    if debug && !matches!(cmd, "run" | "score" | "init") {
+        eprintln!("{usage}");
+        return 2;
+    }
+    // Refused before the board is looked up: the old names fail as gone, never on the directory's
+    // collective (an off repo would answer exit 1 as if the command still ran).
+    if !debug && matches!(cmd, "run" | "score") {
+        eprintln!("borg hive: unknown command {cmd} (borg debug hive {cmd})\n{usage}");
+        return 2;
+    }
     let here = match Here::locate(&a) {
         Ok(h) => h,
         Err(code) => return code,
@@ -2883,7 +2903,7 @@ pub fn main(args: &[&str]) -> i32 {
         ("leave", []) if a.on("--here") => leave_here(&here),
         ("wait", []) => wait::main(&here, session, wait::Mode::of(a.on("--stream"), a.on("--queue"))),
         ("takeup", [goal, key]) => wait::takeup(&here, goal, key, session.unwrap_or_default()),
-        ("run", [id]) => run_cmd(&here, &a, id),
+        ("run", [id]) if debug => run_cmd(&here, &a, id),
         ("sim-drone", []) if std::env::var_os(crate::harness::TEST_ENV).is_some() => sim_drone::main(&here),
         ("leave", []) => match here.drone(session) {
             Ok((s, hs)) if hs.interactive => interactive::leave(&here, &s, &hs),
@@ -2907,7 +2927,7 @@ pub fn main(args: &[&str]) -> i32 {
         }
         ("release", []) => held_event(&here, session, Ev::Released, ""),
         ("done", []) => done_cmd(&here, session, a.value("--note").unwrap_or_default()),
-        ("score", [id]) => score_cmd(&here, id),
+        ("score", [id]) if debug => score_cmd(&here, id),
         ("integrate", [id]) => integrate_cmd(&here, id),
         ("approve", [id]) => approve_cmd(&here, id),
         ("verify", []) => match (a.on("--pass"), a.value("--reject")) {
@@ -2921,7 +2941,7 @@ pub fn main(args: &[&str]) -> i32 {
         ("contract", [_, ..]) => contract_cmd(&here, session, &rest.join(" "), a.list("--scope"), a.value("--supersedes")),
         ("ask" | "tell", [_, ..]) => message_cmd(&here, session, cmd, &rest.join(" "), a.value("--to"), a.value("--re")),
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{usage}");
             2
         }
     }
@@ -3105,49 +3125,43 @@ fn ratify_cmd(here: &Here, a: &Args, id: &str) -> i32 {
 }
 
 fn board_cmd(here: &Here, g: &Goal, a: &Args) -> i32 {
-    loop {
-        let now = learn::now_ms();
-        let b = here.board(g);
-        if a.on("--json") {
-            let rows: Vec<Value> = b
-                .tasks
-                .values()
-                .map(|s| {
-                    let (by, renewed) = match &s.status {
-                        Status::Claimed { by, renewed, .. } => (by.clone(), *renewed),
-                        Status::Done { by, ms, .. } | Status::Verified { by, ms, .. } => (by.clone(), *ms),
-                        Status::Blocked { by, .. } => (by.clone(), 0),
-                        Status::Open => (String::new(), 0),
-                    };
-                    json!({"id": s.task.id, "role": s.task.role, "title": s.task.title, "status": s.shown_status(now), "by": by, "renewed": renewed,
-                        "rework": s.rework, "deps": s.task.deps})
-                })
-                .collect();
-            println!("{}", Value::Array(rows));
-            return 0;
-        }
-        let mut head = format!(
-            "hive goal {} (budget ${:.2}, by {})\n{}\n\n",
-            g.id,
-            g.budget_usd,
-            if g.author.is_empty() { "?" } else { &g.author },
-            g.spec.lines().next().unwrap_or_default()
-        );
-        let alerts = view::alerts(&here.home, g, &b);
-        for alert in &alerts {
-            head.push_str(&format!("! {alert}\n"));
-        }
-        if !alerts.is_empty() {
-            head.push('\n');
-        }
-        let body = board::render(&b, now, queen::width());
-        if !a.on("--watch") {
-            print!("{head}{body}");
-            return 0;
-        }
-        print!("\x1b[2J\x1b[H{head}{body}");
-        std::thread::sleep(Duration::from_secs(2));
+    let now = learn::now_ms();
+    let b = here.board(g);
+    if a.on("--json") {
+        let rows: Vec<Value> = b
+            .tasks
+            .values()
+            .map(|s| {
+                let (by, renewed) = match &s.status {
+                    Status::Claimed { by, renewed, .. } => (by.clone(), *renewed),
+                    Status::Done { by, ms, .. } | Status::Verified { by, ms, .. } => (by.clone(), *ms),
+                    Status::Blocked { by, .. } => (by.clone(), 0),
+                    Status::Open => (String::new(), 0),
+                };
+                json!({"id": s.task.id, "role": s.task.role, "title": s.task.title, "status": s.shown_status(now), "by": by, "renewed": renewed,
+                    "rework": s.rework, "deps": s.task.deps})
+            })
+            .collect();
+        println!("{}", Value::Array(rows));
+        return 0;
     }
+    let mut head = format!(
+        "hive goal {} (budget ${:.2}, by {})\n{}\n\n",
+        g.id,
+        g.budget_usd,
+        if g.author.is_empty() { "?" } else { &g.author },
+        g.spec.lines().next().unwrap_or_default()
+    );
+    let alerts = view::alerts(&here.home, g, &b);
+    for alert in &alerts {
+        head.push_str(&format!("! {alert}\n"));
+    }
+    if !alerts.is_empty() {
+        head.push('\n');
+    }
+    let body = board::render(&b, now, queen::width());
+    print!("{head}{body}");
+    0
 }
 
 fn join(here: &Here, id: &str, named: Option<&str>) -> i32 {
@@ -3207,14 +3221,14 @@ fn leave_here(here: &Here) -> i32 {
 
 fn run_cmd(here: &Here, a: &Args, id: &str) -> i32 {
     let Some(drones) = a.value("--drones").and_then(|n| n.parse::<usize>().ok()) else {
-        eprintln!("borg hive run: give --drones N (1 to {})", run::MAX_DRONES);
+        eprintln!("borg debug hive run: give --drones N (1 to {})", run::MAX_DRONES);
         return 2;
     };
     let harness = match a.value("--harness") {
         Some(n) => match crate::harness::by_name(n) {
             Some(h) => h,
             None => {
-                eprintln!("borg hive run: unknown harness {n} (one of {})", crate::harness::names(", "));
+                eprintln!("borg debug hive run: unknown harness {n} (one of {})", crate::harness::names(", "));
                 return 2;
             }
         },
@@ -3224,7 +3238,7 @@ fn run_cmd(here: &Here, a: &Args, id: &str) -> i32 {
         None => run::DEFAULT_ITER_TIMEOUT,
         Some(Ok(s)) if s > 0 => Duration::from_secs(s),
         Some(_) => {
-            eprintln!("borg hive run: --iter-timeout is seconds, above 0");
+            eprintln!("borg debug hive run: --iter-timeout is seconds, above 0");
             return 2;
         }
     };
@@ -3304,7 +3318,10 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
     if let [first, ..] = tasks.as_slice()
         && let Some(gr) = &first.group
     {
-        println!("group {gr}: {} attempts, each another drone's (`borg hive run` needs one drone more, to verify them); the best is integrated", tasks.len());
+        println!(
+            "group {gr}: {} attempts, each another drone's (`borg debug hive run` needs one drone more, to verify them); the best is integrated",
+            tasks.len()
+        );
     }
     plan_said(here, &g);
     0
@@ -3521,7 +3538,7 @@ fn drone_here(here: &Here) -> bool {
 }
 
 /// Whether a process in `cwd` runs for a drone: launched into a goal (`BORG_HIVE`, `BORG_HIVE_DRONE`),
-/// in a worktree `borg hive run` made and has not left (a harness that drops the env), or for an
+/// in a worktree `borg debug hive run` made and has not left (a harness that drops the env), or for an
 /// interactive drone (its harness session bound, or in its worktree, phase g correction 6). What the
 /// engineer-only commands and the queen's questions about a hive's plan and tasks are never run,
 /// answered or delivered by (queen.rs).
@@ -3562,7 +3579,7 @@ fn approve_cmd(here: &Here, id: &str) -> i32 {
     }
 }
 
-/// `borg hive score <goal>`: the hidden oracle scores every judged attempt not scored yet. An engineer's
+/// `borg debug hive score <goal>`: the hidden oracle scores every judged attempt not scored yet. An engineer's
 /// command: a drone that learned the held-out checks' results could optimise against them.
 fn score_cmd(here: &Here, id: &str) -> i32 {
     if drone_here(here) {
@@ -3601,11 +3618,11 @@ fn score_cmd(here: &Here, id: &str) -> i32 {
 /// Where the fix task `t` (from the combined tree `from`) is claimed.
 fn fix_where(t: &str, from: &str) -> String {
     format!(
-        "{t} starts from the integrated tree {from}: claim it in a checkout of it (`git worktree add <dir> {from}`, then `borg hive claim {t}` there), or a drone of `borg hive run` takes it in its own worktree"
+        "{t} starts from the integrated tree {from}: claim it in a checkout of it (`git worktree add <dir> {from}`, then `borg hive claim {t}` there), or a drone of `borg debug hive run` takes it in its own worktree"
     )
 }
 
-/// `borg hive integrate <goal>`: what `borg hive run` does once every task is verified (integrate.rs),
+/// `borg hive integrate <goal>`: what `borg debug hive run` does once every task is verified (integrate.rs),
 /// from the goal's repo. Exit 0 when the combined tree passed, 1 when it failed (a fix task is open), is
 /// blocked, or needs another node's commits (nothing written), 2 when no integration is due. The
 /// engineer's: a drone's session never integrates.

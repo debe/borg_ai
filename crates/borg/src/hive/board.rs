@@ -9,7 +9,7 @@
 //! took effect (`Board::lost`), so it needs no `released`.
 //!
 //! The goal is reached when every task is verified and an integration passed after the last of them
-//! ([`Board::finished`]): an `integrate` task (hive/integrate.rs, run by `borg hive run` or `borg hive
+//! ([`Board::finished`]): an `integrate` task (hive/integrate.rs, run by `borg debug hive run` or `borg hive
 //! integrate`, never by a model session) merges the accepted attempts and runs the oracle on the
 //! combined tree; its `verified` or `rejected` carries that tree's commit (`head`). A rejected one
 //! opens a fix task that starts `from` the combined tree.
@@ -181,7 +181,7 @@ pub struct Event {
     pub deps_in: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub head: String,
-    /// On a claim: the drone the session is one iteration of (`borg hive run` names it, hive/run.rs);
+    /// On a claim: the drone the session is one iteration of (`borg debug hive run` names it, hive/run.rs);
     /// empty for a session of its own. A verify task barred to an author drone is barred to all its
     /// sessions.
     #[serde(default, skip_serializing_if = "String::is_empty")]

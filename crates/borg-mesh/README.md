@@ -8,7 +8,7 @@ Install it next to [borg](https://github.com/debe/borg_ai) for a team:
 
 ```sh
 cargo install borg-ai borg-mesh --locked
-borg setup --team      # or --join <ticket>
+borg setup --team <name>      # or --join <ticket>
 ```
 
 Setup, relays and corporate networks: [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md).

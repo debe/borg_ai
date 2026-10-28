@@ -1,4 +1,4 @@
-//! `borg hive run` through the binary (hive/run.rs): drones of the simulated harness (a scripted drone,
+//! `borg debug hive run` through the binary (hive/run.rs): drones of the simulated harness (a scripted drone,
 //! hive/sim_drone.rs) in worktrees of a real git repo, against the real board and the real hooks. No
 //! model call: the stop runs with word matching only and no prediction model.
 
@@ -52,7 +52,7 @@ fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
     c
 }
 
-/// A `borg hive run` this test started in the background (`spawn`). It never outlives its test: dropped
+/// A `borg debug hive run` this test started in the background (`spawn`). It never outlives its test: dropped
 /// while it still runs (a failed assertion, a panic) it is stopped as an engineer stops it, Ctrl-C, then
 /// a closed terminal (SIGHUP), each waited for, with its output drained so no full pipe holds it, and
 /// reaped. On Linux the kernel also sends it SIGINT should the test's thread die first (a test binary
@@ -118,7 +118,7 @@ impl Drop for Runner {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        eprintln!("borg hive run {} outlived SIGINT and SIGHUP", child.id());
+        eprintln!("borg debug hive run {} outlived SIGINT and SIGHUP", child.id());
     }
 }
 
@@ -133,6 +133,20 @@ fn hive(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i3
 fn ok(root: &Path, args: &[&str]) -> String {
     let (out, err, code) = hive(root, args, &[]);
     assert_eq!(code, 0, "borg hive {args:?}: {out}{err}");
+    out
+}
+
+/// `borg debug hive <args> --dir <work>` with `env`: `run` and the hidden oracle live there.
+fn debug_hive(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
+    let dir = work(root).display().to_string();
+    let all: Vec<&str> = ["debug", "hive"].iter().copied().chain(args.iter().copied()).chain(["--dir", dir.as_str()]).collect();
+    let out = command(root, &all, env).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
+fn debug_ok(root: &Path, args: &[&str]) -> String {
+    let (out, err, code) = debug_hive(root, args, &[]);
+    assert_eq!(code, 0, "borg debug hive {args:?}: {out}{err}");
     out
 }
 
@@ -175,11 +189,11 @@ fn setup_files(name: &str, files: &[&str], budget: &str, script: Value) -> PathB
     root
 }
 
-/// `borg hive run g <args> --yes`: the engineer approved the plan on the command line (plan.rs), as
+/// `borg debug hive run g <args> --yes`: the engineer approved the plan on the command line (plan.rs), as
 /// every suite here but the approval's own does.
 fn run(root: &Path, args: &[&str]) -> (String, String, i32) {
     let all: Vec<&str> = ["run", "g"].iter().copied().chain(args.iter().copied()).chain(["--yes"]).collect();
-    hive(root, &all, &[])
+    debug_hive(root, &all, &[])
 }
 
 fn fold(root: &Path) -> board::Board {
@@ -398,7 +412,7 @@ fn three_sim_drones_finish_a_board() {
 fn sigint_ends_the_unsettled_session_and_leaves_the_goal() {
     let root = setup("sigint", 1, "3", json!({"usd_per_iter": 0.10, "drones": {"d1": {"claim_s": 60}}}));
     let dir = work(&root).display().to_string();
-    let args = ["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", dir.as_str()];
+    let args = ["debug", "hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", dir.as_str()];
     let mut child = spawn(&mut command(&root, &args, &[]));
     let notes = |root: &Path| events(root).into_iter().filter(|e| e.by == "runner" && e.task.is_empty()).map(|e| e.note).collect::<Vec<_>>();
     let t0 = Instant::now();
@@ -438,10 +452,10 @@ fn sigint_after_the_drones_ended_stops_the_run_at_once() {
     let held = root.join("held");
     std::fs::create_dir_all(&held).unwrap();
     let held = held.display().to_string();
-    ok(&root, &["init", "g", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "3", "--hidden-dir", &held, "--hidden", "sleep 30"]);
+    debug_ok(&root, &["init", "g", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "3", "--hidden-dir", &held, "--hidden", "sleep 30"]);
     ok(&root, &["open", "g", "--id", "t1", "--title", "write f1.txt", "--files", "f1.txt", "--accept", "ok=grep -q 'done t1' f1.txt"]);
     let dir = w.display().to_string();
-    let args = ["hive", "run", "g", "--drones", "2", "--harness", "sim", "--yes", "--dir", dir.as_str()];
+    let args = ["debug", "hive", "run", "g", "--drones", "2", "--harness", "sim", "--yes", "--dir", dir.as_str()];
     let mut child = spawn(command(&root, &args, &[]).stdout(Stdio::null()).stderr(Stdio::null()));
     let left = |root: &Path| events(root).iter().any(|e| e.by == "runner" && e.task.is_empty() && e.note == board::LEAVE);
     let t0 = Instant::now();
@@ -494,7 +508,7 @@ fn a_group_of_three_drones_integrates_the_winner_and_reflection_learns_what_it_d
     let held = root.join("held");
     std::fs::create_dir_all(&held).unwrap();
     let held = held.display().to_string();
-    ok(
+    debug_ok(
         &root,
         &["init", "g", "--spec", "Write the file", "--oracle", "ok=true", "--budget", "3", "--hidden-dir", &held, "--hidden", "grep -q 'done t1.g2 by' f1.txt"],
     );
@@ -727,7 +741,7 @@ fn fail_first_is_blocked_at_the_stop_until_the_oracle_passes() {
 #[test]
 fn a_harness_without_headless_is_refused() {
     let root = setup("refused", 1, "1", json!({}));
-    let (out, err, code) = hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[("BORG_SIM_CAPS", "prompt,tool")]);
+    let (out, err, code) = debug_hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[("BORG_SIM_CAPS", "prompt,tool")]);
     assert_eq!(code, 2, "{out}{err}");
     assert!(err.contains("sim cannot run headless drones (Harness::headless); use one of: claude"), "{err}");
     assert!(!work(&root).join(".worktrees").exists(), "nothing made");
@@ -794,7 +808,7 @@ fn a_failed_iteration_that_names_no_cost_is_charged() {
 fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_run() {
     let root = setup("killed", 1, "2", json!({"drones": {"d1": {"hang": true}}}));
     let w = work(&root).display().to_string();
-    let mut child = spawn(&mut command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
+    let mut child = spawn(&mut command(&root, &["debug", "hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
     let t0 = Instant::now();
     while !events(&root).iter().any(|e| e.ev == board::Ev::Claim) {
         assert!(t0.elapsed() < Duration::from_secs(30), "no claim");
@@ -808,7 +822,7 @@ fn a_killed_runs_iterations_are_charged_and_their_claims_released_by_the_next_ru
     let status = child.child().wait().unwrap();
     assert!(!status.success(), "Ctrl-C ends the run: {status:?}");
     std::fs::write(root.join("script.json"), json!({}).to_string()).unwrap();
-    let mut rerun = spawn(&mut command(&root, &["hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
+    let mut rerun = spawn(&mut command(&root, &["debug", "hive", "run", "g", "--drones", "1", "--harness", "sim", "--yes", "--dir", &w], &[]));
     let t0 = Instant::now();
     while rerun.running() {
         if t0.elapsed() > Duration::from_secs(60) {
@@ -940,10 +954,10 @@ fn queen(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, i
     (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
 }
 
-/// `borg hive run g --drones <n> --harness sim` without `--yes`, started in the background.
+/// `borg debug hive run g --drones <n> --harness sim` without `--yes`, started in the background.
 fn spawn_run(root: &Path, drones: &str) -> Runner {
     let w = work(root).display().to_string();
-    spawn(&mut command(root, &["hive", "run", "g", "--drones", drones, "--harness", "sim", "--dir", &w], &[]))
+    spawn(&mut command(root, &["debug", "hive", "run", "g", "--drones", drones, "--harness", "sim", "--dir", &w], &[]))
 }
 
 /// The open plan question of the waiting run `child`, once it is queued (within 30 s).
@@ -973,7 +987,7 @@ fn ended(mut child: Runner, secs: u64) -> (i32, String) {
 
 /// Phase g G0: a run a failed test started does not outlive it. The run waits for the plan (no `--yes`)
 /// when an assertion of the test fails; unwinding drops its `Runner`, which stops it with Ctrl-C and
-/// reaps it, so no `borg hive run` is left waiting (before, two such runs waited for days).
+/// reaps it, so no `borg debug hive run` is left waiting (before, two such runs waited for days).
 #[test]
 fn a_failed_test_stops_the_run_it_started() {
     let root = setup("dropped", 1, "1", json!({}));
@@ -1015,7 +1029,7 @@ fn a_run_waits_for_the_plan_and_a_no_stops_it_with_nothing_claimed() {
     // A drone never answers it.
     let (_, err, code) = queen(&root, &["answer", &q.id, "a"], &[("BORG_HIVE", "g")]);
     assert!(code == 1 && err.contains("never a hive drone's"), "{err}");
-    // Nor a drone whose harness dropped the env, in a worktree `borg hive run` joined.
+    // Nor a drone whose harness dropped the env, in a worktree `borg debug hive run` joined.
     let wt = work(&root).join(".git/wt-drone");
     std::fs::create_dir_all(&wt).unwrap();
     let join = json!({"v": 1, "ms": 1, "goal": "g", "dir": wt.display().to_string(), "drone": "d9", "by": "run"});
@@ -1038,7 +1052,7 @@ fn a_run_waits_for_the_plan_and_a_no_stops_it_with_nothing_claimed() {
     let episodes = std::fs::read_to_string(store(&root).join("episodes.jsonl")).unwrap_or_default();
     assert!(episodes.contains("\"kind\":\"veto\"") && episodes.contains("t2 must come before t1"), "{episodes}");
     // The same plan again: refused at once, not asked again.
-    let (out, _, code) = hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
+    let (out, _, code) = debug_hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
     assert!(code == 1 && out.contains("the engineer said no to the plan"), "{out}");
     assert_eq!(borg::queen::entries(&store(&root)).len(), 1);
     let _ = std::fs::remove_dir_all(root);
@@ -1069,7 +1083,7 @@ fn an_approved_plan_runs_to_the_end_and_a_high_risk_claim_escalates_once() {
     let top = String::from_utf8_lossy(&top.stdout);
     assert!(top.contains(&format!("plan approved ({}) · 2 card(s), 1 high-risk", q.id)) && top.contains("card t2  drop the users table"), "{top}");
     // A rerun of the approved plan asks nothing.
-    let (out, _, code) = hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
+    let (out, _, code) = debug_hive(&root, &["run", "g", "--drones", "2", "--harness", "sim"], &[]);
     assert!(code == 0 && out.contains("plan approved"), "{out}");
     assert_eq!(borg::queen::entries(&store(&root)).iter().filter(|e| e.kind == borg::queen::Kind::Plan).count(), 1);
     let _ = std::fs::remove_dir_all(root);

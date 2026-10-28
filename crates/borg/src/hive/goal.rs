@@ -85,7 +85,7 @@ impl Hidden {
 }
 
 /// Whether `h` may be a goal's hidden oracle: its dir absolute, an existing directory, and outside
-/// `repo` (the repo the goal is made in, with every worktree `borg hive run` puts under it), so no
+/// `repo` (the repo the goal is made in, with every worktree `borg debug hive run` puts under it), so no
 /// drone's checkout holds the held-out checks.
 ///
 /// # Errors

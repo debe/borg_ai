@@ -106,7 +106,7 @@ pub struct Stats {
     pub days: Vec<Day>,
     pub engineers: Vec<Engineer>,
     pub nodes: u64,
-    /// `borg ope`'s support: logged Thompson decisions with a pool, asked lessons without p, asked
+    /// `borg debug ope`'s support: logged Thompson decisions with a pool, asked lessons without p, asked
     /// records with p but no pool.
     pub ope: (u64, u64, u64),
 }
@@ -642,7 +642,7 @@ fn parse_monitor(g: &Value) -> HiveMonitor {
     }
 }
 
-/// A goal's plan as the engineer approves it before `borg hive run` starts its drones.
+/// A goal's plan as the engineer approves it before any drone takes one of its tasks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HivePlan {
     /// `approved`, `refused`, `waiting` or `not asked`.

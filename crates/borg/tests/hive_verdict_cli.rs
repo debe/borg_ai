@@ -57,6 +57,20 @@ fn ok(root: &Path, args: &[&str]) -> String {
     out
 }
 
+/// `borg debug hive <args> --dir <work>`: the hidden oracle and `score` live there.
+fn debug_hive(root: &Path, args: &[&str]) -> (String, String, i32) {
+    let dir = work(root).display().to_string();
+    let all: Vec<&str> = ["debug", "hive"].iter().copied().chain(args.iter().copied()).chain(["--dir", dir.as_str()]).collect();
+    let out = command(root, &all).stdin(Stdio::null()).output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), out.status.code().unwrap_or(-1))
+}
+
+fn debug_ok(root: &Path, args: &[&str]) -> String {
+    let (out, err, code) = debug_hive(root, args);
+    assert_eq!(code, 0, "borg debug hive {args:?}: {out}{err}");
+    out
+}
+
 /// `borg hook <harness> <event>` with `extra` in the input: its stdout.
 fn hook(root: &Path, harness: &str, event: &str, session: &str, extra: Value, env: &[(&str, &str)]) -> String {
     let mut input = json!({"session_id": session, "cwd": work(root)});
@@ -238,8 +252,8 @@ fn a_verdict_on_a_diff_that_edited_tests_is_hacked_and_credits_the_claims_lesson
     let (before_b, before_o) = (board_lines(&root, "g1").len(), outcomes(&root, "hacked").len());
     assert_eq!(hive(&root, &["verify", "--pass", "--session", "sb"]).2, 1);
     assert_eq!((board_lines(&root, "g1").len(), outcomes(&root, "hacked").len()), (before_b, before_o));
-    // `borg memory` shows it.
-    let mem = command(&root, &["memory", store(&root).join("lessons.jsonl").to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
+    // `borg debug memory` shows it.
+    let mem = command(&root, &["debug", "memory", store(&root).join("lessons.jsonl").to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
     let m: Vec<Value> = String::from_utf8_lossy(&mem.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let mdrain = m.iter().find(|l| l["id"] == "Mdrain").unwrap();
     assert_eq!((mdrain["hacked"].as_u64(), mdrain["verified"].as_u64()), (Some(1), Some(0)), "{mdrain}");
@@ -302,7 +316,7 @@ fn the_hidden_oracle_decides_the_credit_once() {
     let h = held.display().to_string();
     for (goal, cmd) in [("g2", "test -f \"$BORG_WORK/src/parse.py\" && test -d \"$BORG_HIDDEN\""), ("g3", "exit 1")] {
         let task = "t1|work|Fix the parser|src/*.py";
-        ok(
+        debug_ok(
             &root,
             &[
                 "init",
@@ -324,7 +338,7 @@ fn the_hidden_oracle_decides_the_credit_once() {
             ],
         );
     }
-    let (_, err, code) = hive(
+    let (_, err, code) = debug_hive(
         &root,
         &[
             "init",
@@ -349,25 +363,25 @@ fn the_hidden_oracle_decides_the_credit_once() {
     assert!(outcomes(&root, "verified").is_empty() && stats(&root, "task_verified").is_empty(), "deferred to the score");
     // A drone never runs the hidden oracle.
     let dir = work(&root).display().to_string();
-    let out = command(&root, &["hive", "score", "g2", "--dir", &dir]).env("BORG_HIVE", "g2").stdin(Stdio::null()).output().unwrap();
+    let out = command(&root, &["debug", "hive", "score", "g2", "--dir", &dir]).env("BORG_HIVE", "g2").stdin(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("never by a drone"), "{}", String::from_utf8_lossy(&out.stderr));
     // Scored from another repo, the checkout fails: no score and no credit, so the right repo still scores it.
     let other = work(&root).join("other");
     std::fs::create_dir_all(&other).unwrap();
     git(&other, &["init", "-q"]);
-    let out = command(&root, &["hive", "score", "g2", "--dir", other.to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
+    let out = command(&root, &["debug", "hive", "score", "g2", "--dir", other.to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.code() == Some(1) && text.contains("not scored") && text.contains("0 attempt(s) scored"), "{text}");
     assert!(lines(&store(&root).join("hive/g2/oracle.jsonl")).is_empty() && outcomes(&root, "rejected").is_empty());
     std::fs::remove_dir_all(&other).unwrap();
-    let out = ok(&root, &["score", "g2"]);
+    let out = debug_ok(&root, &["score", "g2"]);
     assert!(out.contains("1 attempt(s) scored"), "{out}");
     let scores = lines(&store(&root).join("hive/g2/oracle.jsonl"));
     assert_eq!((scores.len(), scores[0]["pass"].as_bool(), scores[0]["agree"].as_bool()), (1, Some(true), Some(true)), "{scores:?}");
     assert_eq!(outcomes(&root, "verified").len(), 1);
     assert_eq!(stats(&root, "task_verified").len(), 1);
-    assert!(ok(&root, &["score", "g2"]).contains("0 attempt(s) scored"), "scored once");
+    assert!(debug_ok(&root, &["score", "g2"]).contains("0 attempt(s) scored"), "scored once");
     assert_eq!(outcomes(&root, "verified").len(), 1);
     assert!(!store(&root).join("hive/g2/scratch").read_dir().is_ok_and(|mut d| d.next().is_some()), "no scratch checkout left");
     // g3: the verifier passes, the hidden oracle fails: rejected, and the disagreement is logged.
@@ -376,7 +390,7 @@ fn the_hidden_oracle_decides_the_credit_once() {
     }
     work_done(&root, "g3", "src/parse.py", comment);
     ok(&root, &["verify", "--pass", "--session", "sb"]);
-    ok(&root, &["score", "g3"]);
+    debug_ok(&root, &["score", "g3"]);
     let scores = lines(&store(&root).join("hive/g3/oracle.jsonl"));
     assert_eq!((scores[0]["pass"].as_bool(), scores[0]["agree"].as_bool()), (Some(false), Some(false)));
     let r = outcomes(&root, "rejected");
@@ -406,7 +420,7 @@ fn hive_at(root: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Str
 
 #[test]
 fn a_goal_of_joined_sessions_integrates_fixes_and_finishes_through_the_cli() {
-    // No `borg hive run`: the engineer integrates, and a joined session fixes the combined tree in a
+    // No `borg debug hive run`: the engineer integrates, and a joined session fixes the combined tree in a
     // checkout of it.
     let root = setup("verdict-integrate");
     ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=grep -rq fixed src", "--budget", "5"]);

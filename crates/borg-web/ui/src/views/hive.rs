@@ -2,7 +2,7 @@
 //! node named with it), what stops it here (conflicting definitions, checks awaiting `borg hive
 //! approve`), its integration, its reworks, its groups of attempts (winners, losers, the one integrated, what
 //! reflection learned), the attempts' commits carried between nodes, the plan's intent cards and the
-//! engineer's approval of them, what each drone of `borg hive run`
+//! engineer's approval of them, what each drone
 //! spent of its share, and the newest contracts and messages between drones. A goal of interactive drones
 //! (phase g G6, borg hive/monitor.rs) shows its tasks by state over time from its first line, metered
 //! against unmetered spend, its nodes (membership, last beat, the node's worker), this node's drones by
@@ -265,7 +265,7 @@ fn goal_view(g: HiveGoal) -> impl IntoView {
                 let title = if p.interactive {
                     "the engineer approves the plan before any drone claims a task of it"
                 } else {
-                    "the engineer approves the plan before borg hive run starts a drone"
+                    "the engineer approves the plan before any drone takes a task"
                 };
                 view! {
                     <h3 title=title>{format!("Plan {}{how}", p.state)}</h3>

@@ -1,6 +1,6 @@
 //! Integration: the combined tree of a goal's accepted work, checked by the oracle before the goal counts
 //! as reached (docs/design/hive.md "Board", "Roles"). An `integrate` task is an ordinary board task
-//! (open, claim, lease, verdict), run in process by `borg hive run`'s drone threads or by `borg hive
+//! (open, claim, lease, verdict), run in process by `borg debug hive run`'s drone threads or by `borg hive
 //! integrate`, never by a model session (mod.rs `may_claim`): the work is mechanical, a suite outlasts
 //! any stop hook, and a model would judge a tree it did not build.
 //!

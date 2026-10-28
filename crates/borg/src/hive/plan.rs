@@ -1,6 +1,6 @@
 //! Plan approval and intent cards (docs/design/hive.md "The engineer's role", C1;
 //! L7b): the engineer approves a goal's plan once, through the queen, before
-//! `borg hive run` starts a drone, and a task the plan marks high-risk escalates once when it is claimed.
+//! `borg debug hive run` starts a drone, and a task the plan marks high-risk escalates once when it is claimed.
 //!
 //! - **Intent cards** ([`cards`]): one per work or plan task (a fix task an integration opened is the
 //!   approved scope's, never a card): its intent (the title, redacted when it was written), files,
@@ -8,7 +8,7 @@
 //!   checkpoint kinds, deterministic, 0 tokens) finds a high-consequence move in the title: the card
 //!   names the kind. `low` when every file in scope is docs or tests (hive.md's auto-approved
 //!   class). `normal` otherwise. Only `high` routes anything; `low` and `normal` are shown.
-//! - **The plan question** ([`gate`]): `borg hive run` raises one `Kind::Plan` queen question whose
+//! - **The plan question** ([`gate`]): `borg debug hive run` raises one `Kind::Plan` queen question whose
 //!   payload holds the cards, keyed by the goal and the cards ([`key`]), and waits: the engineer answers
 //!   it at the run's terminal (`y`, or why not), with `borg queen answer`, or wherever the queue is
 //!   answered. Until then no worktree is made, no run line written and nothing claimed. An approval
@@ -285,7 +285,7 @@ pub fn ratify_board(home: &Path, goal: &str, tasks: &[TaskId], author: &str, now
 }
 
 /// The decision of `borg hive ratify` (mod.rs `ratify_cmd`) for `cards`, in plan.jsonl: `via` `ratify`,
-/// shown as `borg hive run`'s and the queen's decisions are (`row`).
+/// shown as `borg debug hive run`'s and the queen's decisions are (`row`).
 pub fn note_ratified(home: &Path, goal: &str, cards: &[Card], author: &str, now: i64) {
     let d = Decision {
         v: 1,
@@ -560,7 +560,7 @@ pub enum Gate {
     Refused(Decision),
 }
 
-/// The plan gate of `borg hive run` for goal `g` (board `b`) in the repo at `root`: approved already,
+/// The plan gate of `borg debug hive run` for goal `g` (board `b`) in the repo at `root`: approved already,
 /// approved by `--yes` (`yes`), or the plan question raised (or found queued) and waited for, answered
 /// at this terminal or anywhere the queue is. Under the run lock, before any worktree is made.
 ///
@@ -668,7 +668,7 @@ pub fn gate(home: &Path, g: &Goal, b: &Board, root: &Path, yes: bool) -> Result<
             };
             // A typo is said and asked again; an answer lands in plan.jsonl, which the loop reads next.
             if let Err(err) = text.and_then(|t| queen::answer(home, &e.id, &t, &engineer, learn::now_ms())) {
-                eprint!("borg hive run: {err}\napprove the plan? [y/N, or why not] ");
+                eprint!("borg debug hive run: {err}\napprove the plan? [y/N, or why not] ");
             }
             continue;
         }

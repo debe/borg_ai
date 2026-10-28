@@ -1424,7 +1424,7 @@ fn append_p<'a>(session: &str, chosen: impl IntoIterator<Item = (&'a str, f64)>,
 /// `append_p` for lessons `budget`/`widen` asked from `pool`: their chance of a slot under the
 /// session's posterior (conscience.rs `propensity`). Then the pool itself, `#borg-pool
 /// <id>=<base>[:s],… @<check>` in ranking order (`:s` a scoped lesson, base conscience.rs `pool_base`,
-/// unrounded), so the `asked` record can carry it (`pool_of`) and `borg ope` can replay the draw. Both
+/// unrounded), so the `asked` record can carry it (`pool_of`) and `borg debug ope` can replay the draw. Both
 /// lines carry the same `check` (a hash of the pool line and its p line), which ties the p of an asked
 /// lesson to the pool its draw was over.
 fn append_p_of(session: &str, pool: &[(f64, &conscience::Challenge)], asked: &[&conscience::Challenge]) {
@@ -1721,7 +1721,7 @@ mod tests {
 
     /// Track R's merged ask: a live check drew A and B from one pool, a stop check drew A again from
     /// another; the stop merges the waiting B into its ask of A. Their p come from two draws, so the
-    /// record carries no pool (counted as no_pool by `borg ope`), never one draw's pool with both p.
+    /// record carries no pool (counted as no_pool by `borg debug ope`), never one draw's pool with both p.
     #[test]
     fn a_merged_ask_of_two_draws_carries_no_pool() {
         let session = format!("pool-merge-{}", std::process::id());

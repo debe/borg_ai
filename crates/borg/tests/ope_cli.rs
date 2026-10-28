@@ -1,4 +1,4 @@
-//! `borg ope`: off-policy estimates of the belief's weights from a log, through the CLI: a file alone,
+//! `borg debug ope`: off-policy estimates of the belief's weights from a log, through the CLI: a file alone,
 //! the routed collective's store, an off repo, and bad usage.
 
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ fn ope_reads_a_file_and_prints_a_table_per_weight() {
     let root = tmp("file");
     let file = root.join("outcomes.jsonl");
     std::fs::write(&file, log()).unwrap();
-    let out = borg(&["ope", "--file", file.to_str().unwrap()], &root);
+    let out = borg(&["debug", "ope", "--file", file.to_str().unwrap()], &root);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.starts_with("file "), "{text}");
@@ -74,7 +74,7 @@ fn ope_reads_a_file_and_prints_a_table_per_weight() {
     }
     assert!(text.contains("value") && text.contains("estimate") && text.contains("95% CI") && text.contains("ESS"), "{text}");
     assert!(text.trim_end().ends_with("constants unchanged"), "{text}");
-    let out = borg(&["ope", "--file", file.to_str().unwrap(), "--json"], &root);
+    let out = borg(&["debug", "ope", "--file", file.to_str().unwrap(), "--json"], &root);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!((v["report"]["decisions"].as_u64(), v["report"]["rows"].as_array().map(Vec::len)), (Some(2), Some(21)), "{v}");
     let _ = std::fs::remove_dir_all(&root);
@@ -92,16 +92,16 @@ fn ope_reads_the_routed_store_and_off_has_none() {
     let store = borg::collective::store(&root.join("store"), "corp");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("outcomes.jsonl"), log()).unwrap();
-    let out = borg(&["ope", "--dir", corp.to_str().unwrap()], &root);
+    let out = borg(&["debug", "ope", "--dir", corp.to_str().unwrap()], &root);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success() && text.starts_with("collective corp") && text.contains("decisions: 2"), "{text}");
-    let out = borg(&["ope", "--dir", off.to_str().unwrap()], &root);
+    let out = borg(&["debug", "ope", "--dir", off.to_str().unwrap()], &root);
     assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("off:"));
     // An empty store: too thin, nothing changed.
     std::fs::write(store.join("outcomes.jsonl"), "").unwrap();
-    let text = String::from_utf8_lossy(&borg(&["ope", "--dir", corp.to_str().unwrap()], &root).stdout).into_owned();
+    let text = String::from_utf8_lossy(&borg(&["debug", "ope", "--dir", corp.to_str().unwrap()], &root).stdout).into_owned();
     assert!(text.contains("too thin") && text.contains("constants unchanged"), "{text}");
-    for bad in [&["ope", "--bogus"][..], &["ope", "--dir"], &["ope", "--dir", "a", "--file", "b"]] {
+    for bad in [&["debug", "ope", "--bogus"][..], &["debug", "ope", "--dir"], &["debug", "ope", "--dir", "a", "--file", "b"]] {
         assert_eq!(borg(bad, &root).status.code(), Some(2), "{bad:?}");
     }
     let _ = std::fs::remove_dir_all(&root);

@@ -22,8 +22,8 @@
 //! so the Stop hook asks the queen only with `BORG_QUEEN=on`. `borg queen` (list, answer) works either way.
 //!
 //! Answering the queue: `borg queen` numbers the open questions (asking order) for the terminal, `--json`
-//! and `next --json` give drones a stable schema (`Question`), `dismiss` closes a question without a
-//! lesson, `skip` holds it back for `SKIP_MS`, and a near-duplicate of a queued question of the same repo
+//! gives drones a stable schema (`Question`), `dismiss` closes a question without a lesson, `skip`
+//! holds it back for `SKIP_MS`, and a near-duplicate of a queued question of the same repo
 //! is never queued (`duplicate`; `dedupe` cleans old queues). The prompt hook delivers at most one
 //! question per session, only of the session's own repos (`deliver`, `render_delivery`;
 //! `BORG_QUEEN_ASK=off` disables it), and newly queued questions get one desktop notification (notify.rs).
@@ -76,7 +76,7 @@ pub enum Kind {
     /// learn`, not a checkpoint; only an engineer's answer promotes it, and the default keeps the
     /// playbook as it is.
     Playbook,
-    /// A hive goal's plan, one intent card per task (hive/plan.rs `gate`). Raised by `borg hive run`
+    /// A hive goal's plan, one intent card per task (hive/plan.rs `gate`). Raised by `borg debug hive run`
     /// before its drones start, not a checkpoint; only an engineer's approval starts them, and the
     /// default starts nothing.
     Plan,
@@ -1056,11 +1056,11 @@ pub fn dedupe(store: &Path, apply: bool, now: i64) -> Result<Vec<(String, String
     Ok(found)
 }
 
-/// One open question for a drone or a script: `borg queen --json` (an array), `borg queen next --json`
-/// (one, or null) and the prompt hook. The schema is stable: `id`, `n` (its number in `borg queen`),
-/// `repo`, `kind` (snake_case `Kind`), `question`, `options`, `default`, `evidence`, `ms` (asked, epoch
-/// ms) and three exact shell commands: `answer_cmd` (replace `<answer>` inside its single quotes),
-/// `skip_cmd` and `dismiss_cmd` (a reason may follow).
+/// One open question for a drone or a script: `borg queen --json` (an array) and the prompt hook. The
+/// schema is stable: `id`, `n` (its number in `borg queen`), `repo`, `kind` (snake_case `Kind`),
+/// `question`, `options`, `default`, `evidence`, `ms` (asked, epoch ms) and three exact shell commands:
+/// `answer_cmd` (replace `<answer>` inside its single quotes), `skip_cmd` and `dismiss_cmd` (a reason
+/// may follow).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Question {
     pub id: String,
@@ -1118,12 +1118,6 @@ impl Question {
 /// The open questions as `borg queen --json` lists them, only `only`'s repo when given.
 pub fn questions(open: &[Entry], only: Option<&str>, scope: &str) -> Vec<Question> {
     open.iter().enumerate().filter(|(_, e)| only.is_none_or(|r| same_repo(r, &repo(e)))).map(|(i, e)| Question::of(e, i + 1, scope)).collect()
-}
-
-/// The question a drone should ask now (`borg queen next`): the first open one (of `only`'s repo when
-/// given) not skipped within `SKIP_MS`. Read only.
-pub fn next(open: &[Entry], skips: &[Mark], only: Option<&str>, now: i64, scope: &str) -> Option<Question> {
-    questions(open, only, scope).into_iter().find(|q| !skipped(skips, &q.id, now))
 }
 
 /// Whether the prompt hook delivers queen questions: `BORG_QUEEN_ASK` is not "off" (default on).
@@ -1254,7 +1248,7 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
         _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
         _ if q.kind == Kind::Contract => (q.question.clone(), "proposed by a drone of a hive goal"),
         _ if q.kind == Kind::Playbook => (q.question.clone(), "learned from verified hive work"),
-        _ if q.kind == Kind::Plan => (q.question.clone(), "raised by `borg hive run`, whose drones wait for it"),
+        _ if q.kind == Kind::Plan => (q.question.clone(), "raised by `borg debug hive run`, whose drones wait for it"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1487,7 +1481,7 @@ fn fail(msg: impl std::fmt::Display) -> i32 {
     1
 }
 
-/// `borg queen`: list, show, ask, answer, dismiss, skip, next, dedupe, notify (see `usage`). `--dir DIR`
+/// `borg queen`: list, show, ask, answer, dismiss, skip, dedupe (see `usage`). `--dir DIR`
 /// (default: the current directory) or `--collective NAME` picks the collective.
 pub fn main(args: &[&str]) -> i32 {
     use std::io::IsTerminal;
@@ -1509,12 +1503,16 @@ pub fn main(args: &[&str]) -> i32 {
             a => rest.push(a),
         }
     }
+    // An unknown command fails everywhere, also in a repo that routes off.
+    if !matches!(rest.first(), None | Some(&("show" | "ask" | "answer" | "dismiss" | "skip" | "dedupe"))) {
+        return usage();
+    }
     let cwd = dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default().display().to_string());
     let store = match locate(&cwd, named.as_deref()) {
         Ok(Some(s)) => s,
         Ok(None) => {
             match json {
-                true => println!("{}", if rest.first() == Some(&"next") { "null" } else { "[]" }),
+                true => println!("[]"),
                 false => println!("off: {cwd} belongs to no collective; the queen is never asked here"),
             }
             return 0;
@@ -1545,20 +1543,6 @@ pub fn main(args: &[&str]) -> i32 {
                 render_list(&open, only.as_deref(), width(), std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()))
             );
             0
-        }
-        ["next"] => {
-            let q = next(&open, &skips(&store), only.as_deref(), now, &scope);
-            match (json, q) {
-                (true, q) => print_json(&q),
-                (false, None) => {
-                    println!("no question to ask now");
-                    0
-                }
-                (false, Some(q)) => {
-                    println!("{:>3}  {}", q.n, q.question);
-                    0
-                }
-            }
         }
         ["show", key] => match find(key) {
             Ok(e) => {
@@ -1674,17 +1658,6 @@ pub fn main(args: &[&str]) -> i32 {
             }
             Err(err) => fail(err),
         },
-        ["notify"] => {
-            match crate::notify::message(&open) {
-                None => println!("no open queen questions"),
-                Some(_) if !crate::notify::enabled() => println!("{} open; no notification (BORG_NOTIFY=off, no display or no notify-send)", open.len()),
-                Some(_) => {
-                    crate::notify::queued(&open);
-                    println!("notified: {} open", open.len());
-                }
-            }
-            0
-        }
         _ => usage(),
     }
 }
@@ -1697,9 +1670,7 @@ fn usage() -> i32 {
        borg queen answer <n|id> <text|a|b|1|2>    answer one (an option letter or number picks it)
        borg queen dismiss <n|id> [reason]         drop one: no lesson, never delivered
        borg queen skip <n|id>                     not delivered again for 3 days
-       borg queen next --json [--repo NAME]       the one question a drone should ask now (or null)
        borg queen dedupe [--apply]                dismiss later near-duplicates (dry run by default)
-       borg queen notify                          one desktop notification of the open questions
   each takes --dir DIR (default: the current directory) or --collective NAME"
     );
     2
@@ -2286,12 +2257,6 @@ mod tests {
         assert_eq!(serde_json::from_value::<Question>(v).unwrap(), qs[0]);
         assert_eq!(questions(&open(&store), Some("lib"), "").iter().map(|q| (q.id.as_str(), q.n)).collect::<Vec<_>>(), [("qb", 2)]);
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
-        // `next`: the first open one of the repo, skipped ones left out.
-        let open = open(&store);
-        assert_eq!(next(&open, &[], None, 1, "").map(|q| q.id), Some("qa".into()));
-        let sk = [Mark { id: "qa".into(), session: "cli".into(), ms: 1 }];
-        assert_eq!(next(&open, &sk, Some("app"), 2, "").map(|q| q.id), Some("qc".into()));
-        assert_eq!(next(&open, &sk, Some("nope"), 2, ""), None);
     }
 
     #[test]

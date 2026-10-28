@@ -4,8 +4,8 @@
 //! last heard from members (only for a collective that may sync). Drones are designated by start
 //! order across both, Borg style: "Two of Five". `--dir` shows only the collective DIR routes to;
 //! otherwise every collective on this machine that has drones. On a terminal it is a live screen until
-//! `q` (top_live.rs); piped, or with `--once`, it prints the text once (`--watch` reprints it every 2 s);
-//! `--json` prints the same data for scripts.
+//! `q` (top_live.rs); piped, or with `--once`, it prints the text once; `--json` prints the same data
+//! for scripts.
 
 use std::path::Path;
 
@@ -233,28 +233,38 @@ fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String>
 }
 
 pub fn main(args: &[&str]) -> i32 {
-    let flag = |f: &str| args.contains(&f);
-    let dir = args.iter().position(|a| *a == "--dir").and_then(|i| args.get(i + 1)).copied();
-    let (watch, json_out) = (flag("--watch"), flag("--json"));
-    if !json_out && !flag("--once") && unsafe { libc::isatty(1) } == 1 {
+    let (mut dir, mut once, mut json_out) = (None, false, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--dir" if dir.is_none() => match it.next() {
+                Some(d) => dir = Some(*d),
+                None => return usage("--dir needs a value"),
+            },
+            "--once" => once = true,
+            "--json" => json_out = true,
+            a => return usage(&format!("unknown flag {a}")),
+        }
+    }
+    // SAFETY: isatty only inspects the descriptor.
+    if !json_out && !once && unsafe { libc::isatty(1) } == 1 {
         return crate::top_live::run(dir);
     }
-    loop {
-        match screen(dir, json_out, learn::now_ms()) {
-            Ok(s) if watch => print!("\x1b[2J\x1b[H{s}"),
-            Ok(s) => print!("{s}"),
-            Err(e) => {
-                eprintln!("borg top: {e}");
-                return 1;
-            }
+    match screen(dir, json_out, learn::now_ms()) {
+        Ok(s) => {
+            print!("{s}");
+            0
         }
-        if !watch {
-            return 0;
+        Err(e) => {
+            eprintln!("borg top: {e}");
+            1
         }
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        std::thread::sleep(std::time::Duration::from_secs(2));
     }
+}
+
+fn usage(why: &str) -> i32 {
+    eprintln!("borg top: {why}\nusage: borg top [--once] [--json] [--dir DIR]");
+    2
 }
 
 #[cfg(test)]

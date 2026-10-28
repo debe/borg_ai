@@ -1,4 +1,4 @@
-//! `borg hive run <goal> --drones N`: N headless drones on one board, each an iteration loop in a git
+//! `borg debug hive run <goal> --drones N`: N headless drones on one board, each an iteration loop in a git
 //! worktree of its own (`<repo>/.worktrees/hive-<goal>-<n>` on branch `hive/<goal>/<n>`, kept with its
 //! commits across runs), each with an equal share of what is left of the goal's budget (all runs'
 //! spend counted). One run of a goal at a time (a lock on `run.lock`). A drone is a sequence of headless sessions of the harness
@@ -199,7 +199,7 @@ pub fn goal_spent(home: &Path, goal: &str) -> Ledger {
     ledger(&super::read_lines(&spend_path(home, goal)), &super::node(home))
 }
 
-/// One `borg hive run`.
+/// One `borg debug hive run`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunLine {
     pub v: u8,
@@ -954,7 +954,7 @@ fn after_run(home: &Path, g: &Goal, repo: &Path) {
         println!("hidden oracle: {passed} of {} judged attempt(s) passed", scored.scores.len());
     }
     for why in &scored.skipped {
-        println!("hidden oracle: {why} (not scored; `borg hive score {}` retries)", g.id);
+        println!("hidden oracle: {why} (not scored; `borg debug hive score {}` retries)", g.id);
     }
 }
 
@@ -994,11 +994,11 @@ fn headless_names(probe: &Headless) -> String {
 }
 
 fn usage(msg: impl std::fmt::Display) -> i32 {
-    eprintln!("borg hive run: {msg}");
+    eprintln!("borg debug hive run: {msg}");
     2
 }
 
-/// `borg hive run` from `dir` (in the goal's collective): exit 0 when the board is finished, 1 when it
+/// `borg debug hive run` from `dir` (in the goal's collective): exit 0 when the board is finished, 1 when it
 /// is not (or on an error), 2 on a refused precondition.
 pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     let g = match goal::load(home, o.goal) {
@@ -1035,9 +1035,9 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     } else {
         match run_lock(home, &g.id) {
             Ok(Some(l)) => Some(l),
-            Ok(None) => return usage(format!("another `borg hive run {}` is running: one run of a goal at a time", g.id)),
+            Ok(None) => return usage(format!("another `borg debug hive run {}` is running: one run of a goal at a time", g.id)),
             Err(e) => {
-                eprintln!("borg hive run: {e}");
+                eprintln!("borg debug hive run: {e}");
                 return 1;
             }
         }
@@ -1078,7 +1078,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
                 }
                 Ok(super::plan::Gate::Nothing) => {}
                 Err(e) => {
-                    eprintln!("borg hive run: {e}");
+                    eprintln!("borg debug hive run: {e}");
                     return 1;
                 }
             }
@@ -1119,7 +1119,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         return 0;
     }
     if let Err(e) = exclude_worktrees(&repo) {
-        eprintln!("borg hive run: {e}");
+        eprintln!("borg debug hive run: {e}");
         return 1;
     }
     let mut wts = Vec::new();
@@ -1127,7 +1127,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         match ensure_worktree(&repo, &g.id, n, o.base) {
             Ok(p) => wts.push(p),
             Err(e) => {
-                eprintln!("borg hive run: {e}");
+                eprintln!("borg debug hive run: {e}");
                 return 1;
             }
         }
@@ -1138,7 +1138,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
     let (peers, heard, waited) = match super::announce(home, &g.id, &names) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("borg hive run: {e}");
+            eprintln!("borg debug hive run: {e}");
             return 1;
         }
     };
@@ -1158,7 +1158,7 @@ pub fn main(home: &Path, dir: &str, o: &Opts) -> i32 {
         waited_ms: waited.as_millis() as u64,
     };
     if let Err(e) = super::append_line(&runs_path(home, &g.id), &run) {
-        eprintln!("borg hive run: {e}");
+        eprintln!("borg debug hive run: {e}");
         return 1;
     }
     let sessions = Sessions::default();

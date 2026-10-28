@@ -459,7 +459,7 @@ impl Bounded {
 /// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
 /// `cmd` exits (nothing it started, such as an MCP server, outlives it). The group also dies with this
 /// process, on every platform ([`Watchdog`]): a harness that kills `borg` (its own hook timeout) never
-/// leaves a model call running and spending, and a killed `borg hive run` leaves no drone at work.
+/// leaves a model call running and spending, and a killed `borg debug hive run` leaves no drone at work.
 pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Bounded> {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);

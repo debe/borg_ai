@@ -1,4 +1,4 @@
-//! `/api/stats` carries `borg ope`'s support from the local outcome log, in process (no port): logged
+//! `/api/stats` carries `borg debug ope`'s support from the local outcome log, in process (no port): logged
 //! Thompson decisions with a pool, asked lessons without p, and asked records with p but no pool.
 
 use std::sync::Arc;

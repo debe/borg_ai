@@ -1,4 +1,4 @@
-//! `borg ope`: off-policy estimates of the usefulness belief's hand-set weights (hive.md
+//! `borg debug ope`: off-policy estimates of the usefulness belief's hand-set weights (hive.md
 //! L6), from the outcome log alone. Reports, never applies: no constant changes.
 //!
 //! **What is estimated.** The per-ask change rate under a candidate policy: of the lessons a check
@@ -509,11 +509,11 @@ fn store_view(lessons: &Path) -> Vec<Outcome> {
     out
 }
 
-/// `borg ope [--dir DIR | --file OUTCOMES.jsonl] [--json]`: the store of the collective DIR routes to
+/// `borg debug ope [--dir DIR | --file OUTCOMES.jsonl] [--json]`: the store of the collective DIR routes to
 /// (the working directory by default), or one outcomes file alone.
 pub fn main(args: &[&str]) -> i32 {
     let usage = || {
-        eprintln!("usage: borg ope [--dir DIR | --file OUTCOMES.jsonl] [--json]");
+        eprintln!("usage: borg debug ope [--dir DIR | --file OUTCOMES.jsonl] [--json]");
         2
     };
     let (mut dir, mut file, mut json): (Option<String>, Option<String>, bool) = (None, None, false);
@@ -542,7 +542,7 @@ pub fn main(args: &[&str]) -> i32 {
                     return 0;
                 }
                 Err(e) => {
-                    eprintln!("borg ope: invalid collectives config ({e}); everything is off");
+                    eprintln!("borg debug ope: invalid collectives config ({e}); everything is off");
                     return 1;
                 }
             }

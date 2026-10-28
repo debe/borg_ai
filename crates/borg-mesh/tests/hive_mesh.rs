@@ -428,7 +428,7 @@ async fn work_done_on_b_is_verified_and_integrated_on_a_with_its_own_object_stor
 const ITER_USD: f64 = 0.25;
 const BUDGET_USD: f64 = 1.0;
 
-/// `borg hive run g1 --drones <n> --harness sim --yes` on machine `m`, its scripted drones signing as
+/// `borg debug hive run g1 --drones <n> --harness sim --yes` on machine `m`, its scripted drones signing as
 /// `node`, each doing one task per iteration at `ITER_USD`; its output in `<root>/run-<node>.out`.
 fn spawn_run(root: &Path, m: &Machine, node: &str, drones: usize) -> std::process::Child {
     spawn_scripted(root, m, node, drones, json!({"one_task": true, "work_s": 3}))
@@ -442,7 +442,7 @@ fn spawn_scripted(root: &Path, m: &Machine, node: &str, drones: usize, plan: Val
     let out = std::fs::File::create(root.join(format!("run-{node}.out"))).unwrap();
     let (n, dir, script) = (drones.to_string(), m.app.display().to_string(), script.display().to_string());
     let env = [("BORG_TEST_HARNESS", "1"), ("BORG_SIM_CAPS", "prompt,tool,deny,headless"), ("BORG_SIM_SCRIPT", script.as_str()), ("BORG_LEARN", "off")];
-    let mut c = m.borg(root, &["hive", "run", "g1", "--drones", &n, "--harness", "sim", "--yes", "--dir", &dir], &env);
+    let mut c = m.borg(root, &["debug", "hive", "run", "g1", "--drones", &n, "--harness", "sim", "--yes", "--dir", &dir], &env);
     c.stdin(Stdio::null()).stdout(out.try_clone().unwrap()).stderr(out);
     c.spawn().unwrap()
 }

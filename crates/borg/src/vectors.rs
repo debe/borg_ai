@@ -151,12 +151,12 @@ pub fn refresh(lessons: &Path) -> usize {
 }
 
 #[cfg(feature = "vectors")]
-const USAGE: &str =
-    "usage: borg vectors [--store LESSONS.jsonl] [--rebuild] | borg vectors --fetch | borg vectors --query [--store LESSONS.jsonl] (context on stdin)";
+const USAGE: &str = "usage: borg vectors [--store LESSONS.jsonl] [--rebuild] | borg vectors --fetch";
 
 /// `borg vectors`: status of the model and the store's index; `--rebuild` (re)builds the index;
-/// `--fetch` downloads the model (pinned revision, sha256 checked); `--query` prints the Stop step's
-/// shortlist for a context on stdin (offline checks, latency). The exit code.
+/// `--fetch` downloads the model (pinned revision, sha256 checked); `--query` (reached only as
+/// `borg debug vectors --query`) prints the Stop step's shortlist for a context on stdin (offline
+/// checks, latency). The exit code.
 pub fn main(args: &[&str]) -> i32 {
     let flag = |f: &str| args.iter().position(|a| *a == f).and_then(|i| args.get(i + 1)).copied();
     // Without --store: the collective the current directory routes to (as the hooks do).
