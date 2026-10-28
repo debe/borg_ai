@@ -541,7 +541,7 @@ pub struct HiveMember {
     pub drone: String,
     pub harness: String,
     pub session: String,
-    /// `working`, `busy`, `waiting`, `not waiting` or `gone`.
+    /// `working`, `busy`, `waiting`, `waiting (old borg, restarting)`, `not waiting` or `gone`.
     pub state: String,
     pub task: String,
     pub since_ms: f64,

@@ -54,6 +54,7 @@ pub mod monitor;
 pub mod node;
 pub mod oracle;
 pub mod plan;
+pub mod reexec;
 pub mod rework;
 pub mod run;
 #[cfg(test)]
@@ -730,10 +731,10 @@ fn runner_worktree(g: &Goal, session: &str, cwd: &str) -> bool {
     n >= 1 && same(cwd, &run::worktree(&repo, &g.id, n))
 }
 
-/// A shell word that runs this borg (the hook's own executable), so a printed command works in any
-/// harness's shell.
+/// A shell word that runs this borg (the path the process was started by, reexec.rs `exe_path`), so a
+/// printed command works in any harness's shell, from a waiter whose binary was replaced too.
 fn exe() -> String {
-    std::env::current_exe().map_or_else(|_| "borg".into(), |e| queen::sh_quote(&e.display().to_string()))
+    queen::sh_quote(&reexec::exe_path().display().to_string())
 }
 
 /// The command a drone runs for `sub`, with its session and directory.

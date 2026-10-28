@@ -118,6 +118,17 @@ fast, never whether.
   omp by `sendMessage` from its adapter; opencode by `promptAsync` (1.x) or a queued `prompt` (2.x);
   codex by `codex queue`. No task is handed into the engineer's own turn. A wake no turn takes up
   within a minute is released and the drone claims nothing until its session speaks again.
+- **A reinstall.** A waiter lives for its session, so a reinstall of borg would leave it on the old
+  code. A waiter whose borg was replaced claims nothing more, gives up the node's work to the daemon
+  or another waiter, and re-executes the new borg in place:
+  same process, output and lock, so no second waiter starts, no session restarts and no stop signal is
+  lost. A borg that cannot run leaves it waiting, claiming nothing and beating for no one, until
+  borg is installed again: reaps and integrations wait for a daemon or a fresh install, and with
+  neither on the node its peers come to suspect it and take its drones' claims over. The mesh
+  daemon does the same for a reinstall of borg-mesh: its worker stops at once, it stops serving and
+  re-executes the new borg-mesh in the same process; a stop sent meanwhile ends the new one. A
+  borg-mesh that would not take that over (one built before it could, as a downgrade installs it)
+  is never run so: the daemon exits 1 with a message.
 - **The node's worker.** One process per node, the mesh daemon (or else one drone's waiter), beats,
   writes finished and stuck lines, reaps drones whose session ended and runs integrations, while every
   drone idles. It never writes a join or leave of its own, so a restart ends no claim.
@@ -170,3 +181,7 @@ what is learned (lessons, playbooks) is the shared state. The model's weights ne
 - Claims are provisional until a sync round; clocks must stay well within a lease of each other.
 - Every member stores every goal's logs and bundles; compaction is not built.
 - A secret inside a check command still syncs: it is code, and changing it would change what runs.
+- A daemon restarts only on a new borg-mesh: a reinstall of borg alone leaves it on the borg code it
+  was built with, so reinstall both together.
+- A node on an older borg folds the board with that borg's rules (an `open --again`, for one) until it
+  is upgraded: re-execution fixes a node's own stale code, not a version skew between nodes.

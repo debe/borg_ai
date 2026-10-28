@@ -829,7 +829,10 @@ struct Stream {
 
 fn spawn_stream(root: &Path, s: &str) -> Stream {
     let dir = work(root).display().to_string();
-    let mut child = command(root, &["hive", "wait", "--stream", "--session", s, "--dir", &dir], &[("BORG_HIVE_TAKEUP_MS", "20000")]).spawn().unwrap();
+    stream_of(command(root, &["hive", "wait", "--stream", "--session", s, "--dir", &dir], &[("BORG_HIVE_TAKEUP_MS", "20000")]).spawn().unwrap())
+}
+
+fn stream_of(mut child: Child) -> Stream {
     let out = child.stdout.take().unwrap();
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = lines.clone();
@@ -1175,14 +1178,16 @@ struct Codex {
 }
 
 /// The fake `codex` CLI on the tests' PATH (`root/bin/codex`): each call's arguments, NUL-separated, in
-/// `root/queue/<n>`; exit 1 while `root/queue.fail` exists.
+/// `root/queue/<n>`; exit 1 while `root/queue.fail` exists; while `root/queue.linger` exists, a process
+/// of its own session (`setsid`) holds its output for 20 s.
 fn fake_codex_cli(root: &Path) {
     let q = root.join("queue");
     std::fs::create_dir_all(&q).unwrap();
     let script = format!(
-        "#!/bin/sh\nn=$(ls {q} | wc -l)\nprintf '%s\\0' \"$@\" > {q}/$((n + 1000))\nif [ -f {fail} ]; then echo 'Error: failed to queue session message' >&2; exit 1; fi\necho \"Queued message m1 for thread $3.\"\n",
+        "#!/bin/sh\nn=$(ls {q} | wc -l)\nprintf '%s\\0' \"$@\" > {q}/$((n + 1000))\nif [ -f {fail} ]; then echo 'Error: failed to queue session message' >&2; exit 1; fi\nif [ -f {linger} ]; then setsid sleep 20 & fi\necho \"Queued message m1 for thread $3.\"\n",
         q = q.display(),
-        fail = root.join("queue.fail").display()
+        fail = root.join("queue.fail").display(),
+        linger = root.join("queue.linger").display()
     );
     let bin = root.join("bin/codex");
     std::fs::write(&bin, script).unwrap();
@@ -1706,5 +1711,240 @@ fn a_claude_drones_claim_is_metered_from_its_transcript_and_the_budget_stops_new
     assert!(asked.contains("borg hive ratify --budget"), "the raise settles the question: {asked}");
     let (code, text) = w.ended(15);
     assert!(code == 0 && text.contains("Your claim: t2"), "{text}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// borg installed at `root/bin/borg` as a rename over what was there (as `cargo install` does): a bash
+/// wrapper that writes `<pid> <args>` to `root/reexec` at each start, then execs this test's borg under
+/// its own name (`exec -a`), so the path a waiter started by is the wrapper, never the binary it runs.
+/// `body` replaces the wrapper (a file that cannot be exec'd).
+fn install_borg(root: &Path, body: Option<&str>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = root.join("bin/borg");
+    let part = root.join("bin/borg.part");
+    std::fs::write(&part, body.unwrap_or(&wrapper(root))).unwrap();
+    std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&part, &p).unwrap();
+    p
+}
+
+/// `install_borg`'s wrapper.
+fn wrapper(root: &Path) -> String {
+    format!("#!/usr/bin/env bash\necho \"$$ $1 $2\" >> {}\nexec -a \"$0\" {} \"$@\"\n", root.join("reexec").display(), env!("CARGO_BIN_EXE_borg"))
+}
+
+/// How often the borg of `root/bin/borg` started as waiter `pid` (its wrapper's lines).
+fn starts(root: &Path, pid: u32) -> usize {
+    let text = std::fs::read_to_string(root.join("reexec")).unwrap_or_default();
+    text.lines().filter(|l| *l == format!("{pid} hive wait")).count()
+}
+
+/// A joined Claude Code session `s` whose turn ended, its drone, and a `--stream` waiter for it started
+/// from `root/bin/borg` (`install_borg`) with `env`, once it holds its lock.
+fn waiter_from_install(root: &Path, s: &str, env: &[(&str, &str)]) -> (String, Stream, u32) {
+    ok(root, &["join"], &inside(s));
+    let drone = hs(root, s)["drone"].as_str().unwrap().to_string();
+    prompt(root, s);
+    stop(root, s, false, json!([]));
+    stop(root, s, true, json!([]));
+    let bin = install_borg(root, None);
+    let dir = work(root).display().to_string();
+    let env: Vec<(&str, &str)> = [("BORG_HIVE_TAKEUP_MS", "20000")].into_iter().chain(env.iter().copied()).collect();
+    let w = stream_of(spawn_copy(&mut command_with(bin.to_str().unwrap(), root, &["hive", "wait", "--stream", "--session", s, "--dir", &dir], &env)));
+    let pid = w.waiter.0.as_ref().unwrap().id();
+    let lock = waiter_lock(root, &drone);
+    until(15, "the waiter holds its lock", || starts(root, pid) == 1 && locked(&lock));
+    (drone, w, pid)
+}
+
+fn waiter_lock(root: &Path, drone: &str) -> PathBuf {
+    store(root).join(format!("state/{drone}.hive-waiter"))
+}
+
+/// Whether some process holds the lock of the file at `p`.
+fn locked(p: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(p) else { return false };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// The lock of the file at `p` looked at every few ms from now: the returned call stops that and says
+/// how often it was free.
+fn sample_lock(p: PathBuf) -> impl FnOnce() -> usize {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = std::thread::spawn({
+        let done = done.clone();
+        move || {
+            let mut free = 0;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                free += usize::from(!locked(&p));
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            free
+        }
+    });
+    move || {
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        sampler.join().unwrap()
+    }
+}
+
+impl Stream {
+    /// The index of the first line holding `what`.
+    fn line(&self, what: &str) -> Option<usize> {
+        self.lines.lock().unwrap().iter().position(|l| l.contains(what))
+    }
+}
+
+/// A waiter follows a reinstall of borg in place (reexec.rs): the borg it started from replaced by a
+/// rename, it claims nothing with the old image and execs the new one, same pid, same stdout (one
+/// JSON note, then the wake, on the plugin's pipe), its lock never free in between; its wake names the
+/// path borg was started by, never `(deleted)`. Started from a wrapper (a shim), it never re-execs for
+/// that. Fails with no re-exec (the old image claims and wakes, the wrapper starts once).
+#[test]
+fn a_waiter_follows_a_reinstall_in_place_and_never_claims_with_the_old_borg() {
+    let root = setup("hive-i-reexec");
+    let s = "sess-reexec-1";
+    let (drone, w, pid) = waiter_from_install(&root, s, &[]);
+    std::thread::sleep(Duration::from_millis(1600));
+    assert_eq!(starts(&root, pid), 1, "a wrapper is no reinstall: no re-exec loop");
+    // The lock is looked at every few ms through the reinstall: never free.
+    let free = sample_lock(waiter_lock(&root, &drone));
+    let bin = install_borg(&root, None);
+    open_task(&root, "t1");
+    until(20, "the wake", || !w.wakes().is_empty());
+    assert_eq!(free(), 0, "the waiter's lock was free during the re-exec");
+    assert_eq!(starts(&root, pid), 2, "one re-exec, in place");
+    let (note, wake) = (w.line("runs the reinstalled borg").expect("the re-exec's note"), w.line("\"wake\"").unwrap());
+    assert!(note < wake, "the old image claimed nothing: {:?}", w.lines.lock().unwrap());
+    let text = w.wakes()[0]["wake"].as_str().unwrap().to_string();
+    assert!(text.contains("Your claim: t1") && !text.contains("(deleted)") && text.contains(&bin.display().to_string()), "{text}");
+    assert!(held_by(&root, "t1", s));
+    assert!(!store(&root).join(format!("state/{drone}.hive-waiter-stale")).exists(), "it runs the borg installed now");
+    drop(w);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A reinstall the waiter cannot exec (no program) leaves it running, gated: it says so once, claims
+/// nothing and does none of the node's work (the node lock free for a daemon or another waiter,
+/// monitoring's mark up) until borg is installed again, then follows that. It writes no beat of its
+/// own either: nothing on the node reaps meanwhile, so its peers must come to suspect the node and take
+/// its drones' claims over. Fails with the old image claiming the task, holding the node lock, or
+/// beating for the node.
+#[test]
+fn a_waiter_whose_reinstall_cannot_run_claims_nothing_until_the_next() {
+    let root = setup("hive-i-reexec-fail");
+    let s = "sess-reexec-2";
+    let (drone, mut w, pid) = waiter_from_install(&root, s, &[]);
+    until(10, "the waiter does the node's work", || borg::hive::node::worker(&store(&root)) == format!("waiter {drone}"));
+    install_borg(&root, Some("not a program\n"));
+    until(10, "the failed exec's note", || w.line("could not restart on the reinstalled borg").is_some());
+    assert!(store(&root).join(format!("state/{drone}.hive-waiter-stale")).exists(), "monitoring shows it");
+    let newest_beat = || events(&root).iter().filter(|e| board::is_beat(e)).map(|e| e.ms).max().unwrap_or(0);
+    let gated_at = borg::learn::now_ms();
+    open_task(&root, "t1");
+    // Longer than a beat's interval (3 s): a gated image's own beat would land meanwhile.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(w.waiter.running() && w.wakes().is_empty() && task_state(&root, "t1").0 == "open", "{:?}", w.lines.lock().unwrap());
+    assert_eq!(borg::hive::node::worker(&store(&root)), "none", "the gated image holds no node lock");
+    assert!(newest_beat() <= gated_at, "a gate with no re-exec to come beats on: its peers would never take its drones' claims over");
+    assert_eq!(w.lines.lock().unwrap().iter().filter(|l| l.contains("could not restart")).count(), 1, "said once");
+    install_borg(&root, None);
+    until(20, "the wake", || !w.wakes().is_empty());
+    assert_eq!(starts(&root, pid), 2);
+    assert!(w.line("runs the reinstalled borg").unwrap() < w.line("\"wake\"").unwrap());
+    drop(w);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A stop that comes while the waiter re-execs is never lost: the new image holds SIGINT, SIGHUP and
+/// SIGTERM blocked until it trapped them (here held there by the test-only `BORG_HIVE_ADOPT_MS`), then
+/// ends on it as a stop, 128 + SIGHUP. Fails with the default action killing it (no exit code).
+#[test]
+#[cfg(target_os = "linux")]
+fn a_stop_during_the_reexec_ends_the_waiter_as_a_stop() {
+    let root = setup("hive-i-reexec-stop");
+    let s = "sess-reexec-3";
+    let (_, w, pid) = waiter_from_install(&root, s, &[("BORG_HIVE_ADOPT_MS", "3000")]);
+    install_borg(&root, None);
+    let real = std::fs::canonicalize(env!("CARGO_BIN_EXE_borg")).unwrap();
+    let exe = || std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    until(10, "the new image runs", || starts(&root, pid) == 2 && exe().is_some_and(|e| e == real));
+    // SAFETY: kill(2) with SIGHUP (a closed terminal) on the waiter this test spawned.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    let Stream { waiter, .. } = w;
+    let (code, out) = waiter.ended(20);
+    assert_eq!(code, 128 + libc::SIGHUP, "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Whether the main thread of process `pid` holds SIGTERM blocked (reexec.rs: across its exec).
+#[cfg(target_os = "linux")]
+fn main_thread_holds_stops(pid: u32) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/status")).unwrap_or_default();
+    let blocked = status.lines().find_map(|l| l.strip_prefix("SigBlk:")).and_then(|h| u64::from_str_radix(h.trim(), 16).ok()).unwrap_or(0);
+    blocked & 1 << (libc::SIGTERM - 1) != 0
+}
+
+/// How many threads process `pid` runs.
+#[cfg(target_os = "linux")]
+fn threads(pid: u32) -> usize {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status.lines().find_map(|l| l.strip_prefix("Threads:")).and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+}
+
+/// codex's waiter (`--queue`, the one mode whose `codex queue` leaves run_bounded reader threads, one
+/// alive while a process that left codex's group holds its output) follows a reinstall the same way:
+/// one re-exec at the same pid, its lock never free. A SIGTERM sent while the old image holds its stops
+/// blocked across the exec (the new file still open for writing: execve is retried on ETXTBSY), with
+/// that reader thread alive, ends the new image as a stop, 143, so no second waiter starts for the
+/// drone. Fails with run_bounded's threads spawned plainly (the reader takes the SIGTERM, the old image
+/// sets its stop and execs: the stop is lost and the waiter waits on).
+#[test]
+#[cfg(target_os = "linux")]
+fn a_codex_waiter_follows_a_reinstall_and_a_stop_during_it_ends_it() {
+    let root = setup("hive-i-reexec-codex");
+    fake_codex_cli(&root);
+    // `codex queue` leaves a process of its own session holding its output: run_bounded's reader lives on.
+    std::fs::write(root.join("queue.linger"), "").unwrap();
+    let s = "01a17d2b-1640-7d00-83a5-32e2d9610003";
+    ok(&root, &["join"], &[("CODEX_THREAD_ID", s)]);
+    let drone = interactive::live(&store(&root)).into_iter().next().unwrap().drone;
+    let bin = install_borg(&root, None);
+    let dir = work(&root).display().to_string();
+    // The new image holds the stop blocked a second before it traps it: the lock is looked at meanwhile.
+    let env = [("BORG_HIVE_TAKEUP_MS", "20000"), ("BORG_HIVE_ADOPT_MS", "1000")];
+    let w = Waiter(Some(spawn_copy(&mut command_with(bin.to_str().unwrap(), &root, &["hive", "wait", "--queue", "--session", s, "--dir", &dir], &env))));
+    let pid = w.0.as_ref().unwrap().id();
+    let lock = waiter_lock(&root, &drone);
+    until(15, "the waiter holds its lock", || starts(&root, pid) == 1 && locked(&lock));
+    open_task(&root, "t1");
+    until(15, "the queued wake", || !queued(&root).is_empty() && held_by(&root, "t1", s));
+    let free = sample_lock(lock);
+    // The new borg renamed into place while still open for writing, as a copy not yet closed.
+    let busy = {
+        use std::os::unix::fs::PermissionsExt;
+        let part = root.join("bin/borg.part");
+        let mut f = std::fs::File::create(&part).unwrap();
+        std::io::Write::write_all(&mut f, wrapper(&root).as_bytes()).unwrap();
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&part, &bin).unwrap();
+        f
+    };
+    let t0 = Instant::now();
+    while !main_thread_holds_stops(pid) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the old image's exec, its stops held");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(starts(&root, pid), 1, "still the old image");
+    assert!(threads(pid) >= 2, "a run_bounded reader is alive in the old image");
+    // SAFETY: kill(2) with SIGTERM on the waiter this test spawned.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    drop(busy);
+    until(10, "the new image", || starts(&root, pid) == 2);
+    assert_eq!(free(), 0, "the waiter's lock was free during the re-exec");
+    let (code, out) = w.ended(20);
+    assert_eq!(code, 128 + libc::SIGTERM, "{out}");
+    assert_eq!(starts(&root, pid), 2, "one re-exec, in place: {out}");
+    assert!(out.contains("runs the reinstalled borg"), "{out}");
     let _ = std::fs::remove_dir_all(root);
 }

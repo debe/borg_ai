@@ -9,7 +9,8 @@
 //!   drone's waiter, or none);
 //! - each interactive drone of this node that served the goal (`drones`, from `hive/drones.local`): its
 //!   harness, its state (`working` a task, `busy` in the engineer's turn, `waiting` with its waiter
-//!   running, `not waiting`, or `gone`), its wakes (hand to take-up, from `confirms.jsonl`'s `taken`
+//!   running, `waiting (old borg, restarting)` while that waiter runs a borg that was replaced,
+//!   `not waiting`, or `gone`), its wakes (hand to take-up, from `confirms.jsonl`'s `taken`
 //!   lines, and the wakes no turn took up, released on the board), the tasks it did and judged;
 //! - the stuck and declines lines that stand (`stuck`, `declines`), each with its reason;
 //! - every integration of the goal (`integrations`) and the tail of the node's integration log;
@@ -26,6 +27,10 @@ use serde::Serialize;
 use super::interactive::{self, Entry};
 use super::run::Spend;
 use super::{Board, Ev, Event, Role, Status, board};
+
+/// A drone whose waiter runs a borg that was replaced (wait.rs, reexec.rs): it claims nothing until its
+/// re-exec, within half a second unless a failed `codex queue` waits out its retry or the exec failed.
+pub const STALE: &str = "waiting (old borg, restarting)";
 
 /// The most points a goal's history carries: a long goal's lines are sampled evenly.
 pub const POINTS: usize = 60;
@@ -86,7 +91,7 @@ pub struct DroneRow {
     pub harness: String,
     /// Its session now (the first 8 characters), or the last one before it left.
     pub session: String,
-    /// `working`, `busy`, `waiting`, `not waiting` or `gone`.
+    /// `working`, `busy`, `waiting`, `waiting (old borg, restarting)` (`STALE`), `not waiting` or `gone`.
     pub state: String,
     /// The task it holds while `working`.
     pub task: String,
@@ -265,6 +270,8 @@ pub fn drones(home: &Path, goal: &str, b: &Board, events: &[Event], spend: &[Spe
                 Some(e) => match board::holding(b, here, &e.session, now) {
                     Some(t) => ("working", t.task.id.clone()),
                     None if interactive::busy(&e.session, now) => ("busy", String::new()),
+                    // Its waiter runs a borg that was replaced: it claims nothing until it re-execs.
+                    None if interactive::waiting_stale(&drone) => (STALE, String::new()),
                     None if interactive::waiting(&drone) => ("waiting", String::new()),
                     None => ("not waiting", String::new()),
                 },
@@ -577,6 +584,11 @@ mod tests {
                 ("i-gone", "claude", "left", "")
             ]
         );
+        // Its waiter runs a borg that was replaced (wait.rs, reexec.rs): it shows until the re-exec.
+        in_st(&mut || interactive::mark_stale("i-wait", true));
+        let stale = of(&home, &g, &events, &b, &spend, now).interactive;
+        assert_eq!(stale.iter().find(|r| r.drone == "i-wait").map(|r| r.state.as_str()), Some(STALE));
+        in_st(&mut || interactive::mark_stale("i-wait", false));
         let work = rows.iter().find(|r| r.drone == "i-work").unwrap();
         assert_eq!((work.done, work.usd, work.unmetered), (1, 0.25, false));
         assert_eq!(work.wakes, [WakeRow { task: "t1".into(), ms: now - 1_500, latency_ms: 1_400, taken: true }], "hand to take-up");

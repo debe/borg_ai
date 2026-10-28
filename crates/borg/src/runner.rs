@@ -492,13 +492,13 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
         // Written on a thread: a child that reads slowly must not block the deadline below.
         let data = data.to_vec();
-        std::thread::spawn(move || {
+        helper(move || {
             let _ = pipe.write_all(&data);
         });
     }
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
+    helper(move || {
         let mut buf = vec![0u8; 64 * 1024];
         while let Ok(n) = stdout.read(&mut buf) {
             if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
@@ -521,6 +521,25 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
                 return Some(Bounded { out: drain(&rx), status: None });
             }
         }
+    }
+}
+
+/// A thread of `run_bounded` that may outlive it (a straggler holds the pipe): it starts with SIGINT,
+/// SIGHUP and SIGTERM blocked (a new thread inherits its spawner's mask, held so only around the spawn),
+/// so a stop always reaches a thread that may trap it, and one sent while that thread holds them blocked
+/// (hive/reexec.rs, across an exec) stays pending for the process.
+fn helper(f: impl FnOnce() + Send + 'static) {
+    // SAFETY: sigemptyset(3)/sigaddset(3) initialise the zeroed sets; pthread_sigmask(3) on this thread,
+    // its old mask restored right after the spawn.
+    unsafe {
+        let (mut set, mut old): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
+        libc::sigemptyset(&mut set);
+        for s in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM] {
+            libc::sigaddset(&mut set, s);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        std::thread::spawn(f);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
     }
 }
 
@@ -606,6 +625,24 @@ mod tests {
     fn the_watchdog_kills_the_group_once_its_writer_is_gone_and_never_after_a_stop() {
         assert!(!group_alive_after(false), "borg gone: the group dies with it");
         assert!(group_alive_after(true), "a stopped watchdog kills nothing");
+    }
+
+    /// A helper thread holds the stop signals blocked from its first instruction, its spawner's mask
+    /// as it was: a stop reaches only a thread that may trap it (a hive waiter's re-exec loses none).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_helper_thread_never_takes_a_stop() {
+        let blocked = || {
+            let s = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let hex = s.lines().find_map(|l| l.strip_prefix("SigBlk:")).unwrap().trim().to_string();
+            u64::from_str_radix(&hex, 16).unwrap()
+        };
+        let stops = [libc::SIGINT, libc::SIGHUP, libc::SIGTERM].iter().fold(0u64, |m, s| m | 1 << (s - 1));
+        let before = blocked();
+        let (tx, rx) = std::sync::mpsc::channel();
+        helper(move || tx.send(blocked()).unwrap());
+        assert_eq!(rx.recv().unwrap() & stops, stops, "the helper holds SIGINT, SIGHUP and SIGTERM blocked");
+        assert_eq!(blocked(), before, "the spawner's mask is as it was");
     }
 
     fn only(cli: &'static [&'static str]) -> impl Fn(&str) -> bool {

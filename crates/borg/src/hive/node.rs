@@ -104,10 +104,10 @@ pub fn worker(home: &Path) -> String {
 }
 
 /// The mesh daemon's node worker (borg-mesh main.rs `serve`): takes the node lock (a waiter that holds it
-/// keeps it until it exits; the daemon takes it then) and ticks until `stop`, then returns writing
-/// nothing: a daemon's stop is no leave of the node (phase g correction 2).
-pub fn serve(home: &Path, stop: &std::sync::atomic::AtomicBool) {
-    let stopped = || stop.load(std::sync::atomic::Ordering::SeqCst);
+/// keeps it until it exits; the daemon takes it then) and ticks until `stopped` says so (a stop, or
+/// borg-mesh replaced: no tick of old code), then returns writing nothing: a daemon's stop is no leave
+/// of the node (phase g correction 2).
+pub fn serve(home: &Path, stopped: impl Fn() -> bool) {
     let lock = loop {
         if stopped() {
             return;
@@ -355,10 +355,10 @@ fn reap_child(pace: &mut Pace, now: i64) {
 /// The `borg` binary: this process when it is one (a waiter), else the one beside it (the mesh daemon's
 /// `borg-mesh`, installed together), else `borg` on PATH.
 fn borg_exe() -> PathBuf {
-    let me = std::env::current_exe().ok();
+    let me = super::reexec::exe_path();
     match me {
-        Some(p) if p.file_stem().is_some_and(|s| s == "borg") => p,
-        Some(p) if p.with_file_name("borg").is_file() => p.with_file_name("borg"),
+        p if p.file_stem().is_some_and(|s| s == "borg") => p,
+        p if p.with_file_name("borg").is_file() => p.with_file_name("borg"),
         _ => PathBuf::from("borg"),
     }
 }

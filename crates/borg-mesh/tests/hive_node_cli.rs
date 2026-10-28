@@ -245,3 +245,131 @@ fn the_mesh_daemon_does_its_nodes_goal_work_for_interactive_drones() {
     hive(&root, &a, Some(sc), &["leave"]);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// borg-mesh installed at `root/bin/borg-mesh` as a rename over what was there (as `cargo install`
+/// does): a bash wrapper that writes its pid to `root/mesh-starts` at each start, then execs this
+/// test's borg-mesh under its own name (`exec -a`), so the daemon's path is the wrapper. With `busy`
+/// the new file stays open for writing (the returned handle): its exec fails with ETXTBSY meanwhile.
+fn install_mesh(root: &Path, busy: bool) -> (PathBuf, Option<std::fs::File>) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let (p, part) = (root.join("bin/borg-mesh"), root.join("bin/borg-mesh.part"));
+    let wrapper =
+        format!("#!/usr/bin/env bash\necho $$ >> {}\nexec -a \"$0\" {} \"$@\"\n", root.join("mesh-starts").display(), env!("CARGO_BIN_EXE_borg-mesh"));
+    let mut f = std::fs::File::create(&part).unwrap();
+    f.write_all(wrapper.as_bytes()).unwrap();
+    std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&part, &p).unwrap();
+    (p, busy.then_some(f))
+}
+
+/// How often the wrapper started daemon `pid`.
+fn mesh_starts(root: &Path, pid: u32) -> usize {
+    std::fs::read_to_string(root.join("mesh-starts")).unwrap_or_default().lines().filter(|l| *l == pid.to_string()).count()
+}
+
+/// `borg-mesh serve` started from `bin`, its output in `root/serve-<n>.log`.
+fn serve_from(root: &Path, bin: &Path, n: u32) -> (Proc, u32) {
+    let log = std::fs::File::create(root.join(format!("serve-{n}.log"))).unwrap();
+    let mut c = cmd(root, bin, &["serve", "--bind", "127.0.0.1:0", "--interval", "1", "--dir", &app(root).display().to_string()], &[]);
+    c.stdout(log.try_clone().unwrap()).stderr(log);
+    let child = c.spawn().unwrap();
+    let pid = child.id();
+    (Proc(Some(child)), pid)
+}
+
+fn log_of(root: &Path, n: u32) -> String {
+    std::fs::read_to_string(root.join(format!("serve-{n}.log"))).unwrap_or_default()
+}
+
+/// A daemon that outlives a reinstall of borg-mesh does no node work with the replaced code: it stops
+/// and runs the new borg-mesh in the same process (same pid, same output, so a terminal or a service
+/// sees one daemon), which takes the node's work up again; Ctrl-C then stops it as before. Started
+/// from a wrapper, it never restarts for that. Fails with no restart (the old code serves on).
+#[test]
+fn a_daemon_runs_a_reinstalled_borg_mesh_in_place() {
+    let root = setup("reinstall");
+    let (bin, _) = install_mesh(&root, false);
+    let (d, pid) = serve_from(&root, &bin, 1);
+    until(20, "the daemon does the node's work", || mesh_starts(&root, pid) == 1 && hive::node::worker(&store(&root)) == "daemon");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(mesh_starts(&root, pid), 1, "a wrapper is no reinstall: no restart loop");
+    install_mesh(&root, false);
+    until(20, "the restart in place", || mesh_starts(&root, pid) == 2);
+    until(20, "the node's work again", || log_of(&root, 1).matches("serving corp").count() == 2 && hive::node::worker(&store(&root)) == "daemon");
+    let log = log_of(&root, 1);
+    assert!(log.contains("borg-mesh was reinstalled"), "{log}");
+    assert_eq!(d.interrupt(), 0, "Ctrl-C stops it cleanly: {}", log_of(&root, 1));
+    assert_eq!(mesh_starts(&root, pid), 2);
+    assert!(log_of(&root, 1).trim_end().ends_with("stopped"), "{}", log_of(&root, 1));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A reinstalled borg-mesh that would not take over a running daemon (one built before it could, as a
+/// downgrade installs it) is never exec'd with the stops blocked, where none of them would ever reach
+/// it: the daemon stops with a message and exit code 1 instead. Here the old borg-mesh answers `--help`
+/// as every borg-mesh does and records any other start. Fails with the old one started in its place.
+#[test]
+fn a_daemon_never_restarts_into_a_borg_mesh_that_cannot_take_it_over() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = setup("reinstall-old");
+    let (bin, _) = install_mesh(&root, false);
+    let (d, pid) = serve_from(&root, &bin, 1);
+    until(20, "the daemon does the node's work", || mesh_starts(&root, pid) == 1 && hive::node::worker(&store(&root)) == "daemon");
+    let part = root.join("bin/borg-mesh.part");
+    let old = format!(
+        "#!/usr/bin/env bash\nif [ \"$1\" = --help ]; then echo 'Usage: borg mesh <command>'; exit 0; fi\necho $$ >> {}\nexit 3\n",
+        root.join("old-starts").display()
+    );
+    std::fs::write(&part, old).unwrap();
+    std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&part, &bin).unwrap();
+    let mut d = d;
+    let t0 = Instant::now();
+    while matches!(d.0.as_mut().unwrap().try_wait(), Ok(None)) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the daemon stops: {}", log_of(&root, 1));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = log_of(&root, 1);
+    assert!(!root.join("old-starts").exists(), "the old borg-mesh was started in its place: {log}");
+    assert_eq!(d.0.take().unwrap().wait().unwrap().code(), Some(1), "{log}");
+    assert!(log.contains("cannot take over a running `borg mesh serve`"), "{log}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A stop that comes while the daemon restarts is never lost: SIGINT and SIGTERM are held blocked
+/// across the exec (here the new file still open for writing, so execve is retried on ETXTBSY) and
+/// the new image ends on it as a stop, before it serves. Fails with the stop taken by the old image
+/// (the new one serves on).
+#[test]
+#[cfg(target_os = "linux")]
+fn a_stop_during_the_daemons_restart_ends_it() {
+    let root = setup("reinstall-stop");
+    let (bin, _) = install_mesh(&root, false);
+    let (d, pid) = serve_from(&root, &bin, 1);
+    until(20, "the daemon does the node's work", || mesh_starts(&root, pid) == 1 && hive::node::worker(&store(&root)) == "daemon");
+    let (_, busy) = install_mesh(&root, true);
+    let held = || {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/status")).unwrap_or_default();
+        let blocked = status.lines().find_map(|l| l.strip_prefix("SigBlk:")).and_then(|h| u64::from_str_radix(h.trim(), 16).ok()).unwrap_or(0);
+        blocked & 1 << (15 - 1) != 0 // SIGTERM
+    };
+    let t0 = Instant::now();
+    while !held() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the old image's exec, its stops held: {}", log_of(&root, 1));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut d = d;
+    signal(d.0.as_ref().unwrap(), "TERM");
+    drop(busy);
+    let t0 = Instant::now();
+    while matches!(d.0.as_mut().unwrap().try_wait(), Ok(None)) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the stop was lost across the restart: {}", log_of(&root, 1));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = log_of(&root, 1);
+    assert_eq!(d.0.take().unwrap().wait().unwrap().code(), Some(0), "{log}");
+    assert_eq!(mesh_starts(&root, pid), 2, "{log}");
+    assert_eq!(log.matches("serving corp").count(), 1, "the new image ends before it serves: {log}");
+    let _ = std::fs::remove_dir_all(root);
+}

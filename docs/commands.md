@@ -151,6 +151,13 @@ a turn on its own; waiting costs no tokens. It stays a drone until you ask it to
   the next task or the idle line. The done's note is the stop's own summary of checks, files and commits.
 - Ending the session (`/exit`, a closed terminal, a crash) releases its claim and leaves the hive;
   `/clear` and compact keep the same drone.
+- Reinstalling borg (`cargo install`) needs no session restart: a waiter whose borg was replaced
+  claims nothing more and runs the new borg in the same process within half a second, or after a
+  failed `codex queue`'s retry; a borg that cannot run leaves it claiming nothing and beating for no
+  one until borg is installed again (peers then take the node's claims over unless a daemon serves
+  it). `borg mesh serve` restarts in place on a reinstalled borg-mesh (same process); one that
+  cannot run, or one built before it could restart so (a downgrade), stops it with a message and
+  exit code 1.
 - **The node's worker.** `borg mesh serve` (or, without a daemon, one drone's waiter) beats for the
   node, keeps its roster of drones, reaps drones whose session is gone, says what is stuck and runs
   `borg hive integrate` once every task is verified. A restart ends no claim.
@@ -159,7 +166,7 @@ a turn on its own; waiting costs no tokens. It stays a drone until you ask it to
   cache (about 42,000 tokens in the live probe); waiting itself is free.
 - **Watching.** `borg top` and the Hive tab of `borg web` show per goal its tasks over time, spend
   against the budget, each node and who does its work, each drone's state (`working`, `busy`,
-  `waiting`, `not waiting`, `left`, `gone`) with its wake latency, stuck tasks and integrations.
+  `waiting`, `waiting (old borg, restarting)`, `not waiting`, `left`, `gone`) with its wake latency, stuck tasks and integrations.
 
 ### Guardrails and the hidden oracle
 

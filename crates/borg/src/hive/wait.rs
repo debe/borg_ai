@@ -34,13 +34,17 @@
 //! handed once the turn is over (`take`, `pending`). A wake no turn took up (`takeup` released it)
 //! makes the waiter claim nothing more until a hook event of the session comes (interactive.rs
 //! `missed`), so a thread no harness runs is not handed the same task again and again.
+//!
+//! A reinstall of borg (reexec.rs): a waiter whose borg was replaced claims, hands and decides nothing
+//! more, gives up the node lock (its node work goes to the daemon or another waiter), and re-execs the
+//! new one in place at its loop top, same pid, stdout and lock, so every mode above lives on.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::interactive;
 use super::run::Ending;
 use super::{Board, Ev, Event, Goal, Here, HiveSession, TaskId, TaskState, board, bound, fail, node, save, short, tasks_path};
+use super::{interactive, reexec};
 use crate::{hook, learn, queen, stats};
 
 /// What a waiting drone does next on one goal (`step`): what the waiter (`main`) and the scenario
@@ -136,6 +140,9 @@ const LOOK: Duration = Duration::from_millis(500);
 /// no interactive drone; 128 + the signal when it was stopped. One waiter a drone: a second exits at once.
 /// `mode`: who started it, and so how it says a wake and whether it waits on (module doc).
 pub(super) fn main(here: &Here, named: Option<&str>, mode: Mode) -> i32 {
+    // Re-exec'd by its previous image (reexec.rs): its stops trapped, then unblocked, before any return.
+    let inherited = reexec::inherited(trap);
+    let mut image = reexec::Image::now();
     let Some(session) = named.map(String::from).or_else(interactive::env_session) else {
         return fail("run `borg hive wait` inside the drone's session (or give --session)");
     };
@@ -144,32 +151,53 @@ pub(super) fn main(here: &Here, named: Option<&str>, mode: Mode) -> i32 {
     };
     let drone = hs.drone.clone();
     let path = interactive::waiter_path(&drone);
-    let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => return fail(format!("{}: {e}", path.display())),
-    };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            match mode {
-                Mode::Stream => println!("{}", serde_json::json!({"note": format!("[borg hive] drone {drone}'s wait for work runs already")})),
-                Mode::Queue => println!("[borg hive] drone {drone}'s wait for work runs already"),
-                Mode::Print => println!("[borg hive] drone {drone}'s wait for work runs already: end your turn"),
-            }
-            return 0;
+    // The lock its previous image held, never free in between: same pid, so the file names it already.
+    let lock = match inherited.and_then(|fd| reexec::adopt(fd, &path)) {
+        Some(lock) => {
+            let text = format!("[borg hive] drone {drone}'s wait for work runs the reinstalled borg {} now", env!("CARGO_PKG_VERSION"));
+            note(mode, &text);
+            lock
         }
-        Err(std::fs::TryLockError::Error(e)) => return fail(format!("{}: {e}", path.display())),
-    }
-    let _ = lock.set_len(0);
-    let _ = std::io::Write::write_all(&mut &lock, std::process::id().to_string().as_bytes());
+        None => {
+            let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => return fail(format!("{}: {e}", path.display())),
+            };
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    match mode {
+                        Mode::Print => println!("[borg hive] drone {drone}'s wait for work runs already: end your turn"),
+                        _ => note(mode, &format!("[borg hive] drone {drone}'s wait for work runs already")),
+                    }
+                    return 0;
+                }
+                Err(std::fs::TryLockError::Error(e)) => return fail(format!("{}: {e}", path.display())),
+            }
+            let _ = lock.set_len(0);
+            let _ = std::io::Write::write_all(&mut &lock, std::process::id().to_string().as_bytes());
+            lock
+        }
+    };
+    interactive::mark_stale(&drone, false);
     // The stop's ask is answered: once this waiter ends (a stuck said, a task handed), a stop may ask again.
     let mut hs = hs;
     hs.asked_wait = false;
     save(&session, &hs);
     trap();
-    let code = waiting(here, &drone, mode);
+    let code = waiting(here, &drone, mode, &lock, &mut image);
     drop(lock);
     code
+}
+
+/// A line about the waiter itself, never a wake: a plugin's JSON `note` (its adapter logs it), codex's
+/// log, and for a waiter its model started stderr, so the wake its stdout carries stays the turn's text.
+fn note(mode: Mode, text: &str) {
+    match mode {
+        Mode::Stream => println!("{}", serde_json::json!({"note": text})),
+        Mode::Queue => println!("{text}"),
+        Mode::Print => eprintln!("{text}"),
+    }
 }
 
 /// What the waiter tells `session`: the text, as it is (a background command's output, Claude Code),
@@ -221,8 +249,9 @@ fn unqueued(here: &Here, session: &str, why: &str) {
     let _ = std::fs::remove_file(hook::state_file(session).with_extension("hive-takeup"));
 }
 
-/// The waiter's loop (`main`), for `drone`, holding its lock; `mode`: who started it (module doc).
-fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
+/// The waiter's loop (`main`), for `drone`, holding its `lock`, running `image`; `mode`: who started it
+/// (module doc).
+fn waiting(here: &Here, drone: &str, mode: Mode, lock: &std::fs::File, image: &mut reexec::Image) -> i32 {
     let here_node = node(&here.home);
     // The node's goal work (phase g G4, node.rs): its mesh daemon's, or this waiter's while it holds the
     // node lock (no daemon runs, no other waiter took it), until it exits.
@@ -231,6 +260,10 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
     let mut retry_at: Option<Instant> = None;
     // A missed wake (interactive.rs `missed`) was said in the log: once a miss.
     let mut told_missed = false;
+    // Its borg was replaced (reexec.rs `stale`): marked for monitoring while it runs the old code.
+    let mut marked = false;
+    // When a gated image last beat its drone's goal itself (`own_beat`).
+    let mut beat_ms = 0;
     loop {
         let sig = STOP.load(std::sync::atomic::Ordering::SeqCst);
         if sig != 0 {
@@ -238,6 +271,31 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
                 stopped(here, drone);
             }
             return 128 + sig;
+        }
+        // Old code claims nothing (the gate, before `take` again) and does none of the node's work: the
+        // node lock goes, so a daemon or another waiter folds with the borg installed now; its drone's
+        // own beat goes on while none does and a re-exec is still to come (below), so peers do not
+        // suspect the node for that moment. It re-execs
+        // here, where every claim it won is said or on the board for the new image's `pending` to hand;
+        // not while a failed `codex queue`'s retry runs, which lives in memory alone (gated meanwhile).
+        let stale = image.stale();
+        if stale != marked {
+            interactive::mark_stale(drone, stale);
+            marked = stale;
+        }
+        if stale {
+            worker = None;
+        }
+        if stale && retry_at.is_none_or(|t| Instant::now() >= t) && image.due() {
+            if let Err(why) = image.reexec(lock, || STOP.load(std::sync::atomic::Ordering::SeqCst) != 0) {
+                note(
+                    mode,
+                    &format!(
+                        "[borg hive] drone {drone}'s wait for work could not restart on the reinstalled borg ({why}): it claims nothing until borg is installed again"
+                    ),
+                );
+            }
+            continue;
         }
         // The drone's session now: a `/clear` moved it (interactive.rs `rebind`).
         // Left: said to a waiter whose model started it; a plugin's says nothing (its session's end, a
@@ -269,13 +327,22 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
         let cwd = if hs.worktree.is_empty() { here.cwd.clone() } else { hs.worktree.clone() };
         let repo = queen::repo_name(&cwd);
         let goals = interactive::served(&here.home, &hs, &repo);
-        if worker.is_none() {
+        if worker.is_none() && !stale {
             worker = super::node::take_as(&here.home, &format!("waiter {drone}")).map(|l| (l, super::node::Worker::for_waiter(drone)));
         }
-        if let Some((_, w)) = worker.as_mut() {
+        // Old code runs no tick, a reinstall since the loop top included.
+        if let Some((_, w)) = worker.as_mut().filter(|_| !image.stale()) {
             w.tick(&here.home);
         }
         let now = learn::now_ms();
+        // Gated with a re-exec to come (a failed `codex queue`'s retry, at most `QUEUE_RETRY`): the
+        // drone's beat alone, as its hooks write it while no worker runs (a write of the node's
+        // liveness, no decision from the old fold), so its idle claims are not taken over meanwhile.
+        // Not once an exec failed or no borg is there: nothing on the node reaps until the next
+        // install, so its peers must come to suspect it and take its drones' claims over.
+        if stale && image.due() && interactive::own_beat(&here.home, &hs.goal, hs.member_ms.max(beat_ms), now) {
+            beat_ms = now;
+        }
         // The engineer's turn, or a stop of the session (its own handover decides), runs: nothing handed;
         // nor while a failed `codex queue` waits out its retry, nor after a wake no turn took up until a
         // hook event of the session comes.
@@ -293,7 +360,8 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
         };
         // A claim the stop's capped confirm left not final: waited for with no cap, then handed once the
         // engineer's turn is over.
-        let held = match pending(here, &mut hs, &session, &cwd, busy) {
+        // A gated image hands nothing either: a kept claim waits for the borg installed now.
+        let held = match pending(here, &mut hs, &session, &cwd, busy || stale) {
             Held::Holds(task) if !mode.lives() => {
                 println!("[borg hive {}] you hold {task}: finish it first (ending your turn runs its checks)", hs.goal);
                 return 0;
@@ -310,13 +378,19 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
             Held::Holds(_) => true,
             Held::Free => false,
         };
-        for g in goals.iter().filter(|_| !held) {
+        // A gated image decides nothing from its fold: no claim, no stuck, no finished goal to leave.
+        for g in goals.iter().filter(|_| !held && !stale) {
             let b = fold(&here.home, &g.id);
             let lacks = super::lacking_here(&here.home, &g.id, &b, Path::new(&cwd), now);
             let end = Ending::of(&b, &here_node, now, allowed(&here.home, g, &repo), &lacks);
             let open = super::next_open(&here.home, g, &b, &session, drone, &repo, &cwd, now).is_some();
             match step(&end, open, busy) {
                 Next::Finished if !hs.any => {
+                    // The node's worker says the goal finished before its drone goes: the integration
+                    // can end between its tick and this fold, and no tick of this waiter follows.
+                    if worker.is_some() {
+                        let _ = super::finish_line(&here.home, &g.id);
+                    }
                     let code = interactive_leave(here, &session, &hs);
                     let _ = say(mode, &session, &format!("[borg hive {}] the goal is finished: drone {drone} is a plain session again", g.id), true);
                     return code;
@@ -348,6 +422,8 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
                         }
                     }
                 }
+                // Its borg was replaced since the loop top: the next pass re-execs.
+                Next::Claim if image.stale() => {}
                 Next::Claim => match take(here, g, &mut hs, &session, &cwd, &repo) {
                     Took::Handed(text) => {
                         if let Err(why) = say(mode, &session, &text, false) {
@@ -366,12 +442,13 @@ fn waiting(here: &Here, drone: &str, mode: Mode) -> i32 {
             }
         }
         // Until a board of a served goal changes (its file), half a second passes (the busy flag, the next
-        // beat) or a signal comes.
+        // beat), a signal comes, or borg is replaced (the worker's next tick would run old code).
         let marks = || goals.iter().map(|g| super::run::mark(&tasks_path(&here.home, &g.id))).collect::<Vec<_>>();
         let (seen, t0) = (marks(), Instant::now());
-        while t0.elapsed() < LOOK && STOP.load(std::sync::atomic::Ordering::SeqCst) == 0 && marks() == seen {
+        let restart = || image.stale() != stale || (image.due() && retry_at.is_none_or(|t| Instant::now() >= t));
+        while t0.elapsed() < LOOK && STOP.load(std::sync::atomic::Ordering::SeqCst) == 0 && marks() == seen && !restart() {
             std::thread::sleep(TICK);
-            if let Some((_, w)) = worker.as_mut() {
+            if let Some((_, w)) = worker.as_mut().filter(|_| !image.stale()) {
                 w.tick(&here.home);
             }
         }
@@ -490,8 +567,7 @@ fn deliver(here: &Here, g: &Goal, hs: &mut HiveSession, session: &str, cwd: &str
 /// Starts the watcher of a handed claim (`takeup`), detached from the waiter, which exits now.
 fn spawn_takeup(here: &Here, goal: &str, key: &str, session: &str) {
     use std::os::unix::process::CommandExt;
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut c = std::process::Command::new(exe);
+    let mut c = std::process::Command::new(reexec::exe_path());
     c.args(["hive", "takeup", goal, key, "--session", session, "--dir", &here.cwd])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

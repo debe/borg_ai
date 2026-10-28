@@ -19,7 +19,8 @@
 //!        borg-mesh serve [--bind IP:PORT] [--interval SECS]
 //!                                             (run until Ctrl-C / SIGTERM: answer members, sync with
 //!                                              every known peer each interval and on local change;
-//!                                              default 0.0.0.0:7878, 60 s)
+//!                                              default 0.0.0.0:7878, 60 s; a reinstalled borg-mesh
+//!                                              runs in its place, same process)
 //!        borg-mesh sync <key>[@<hints>]       (reconcile with one member, once)
 //!        borg-mesh steer <drone|session|all> "<text>" | <drone> --pause | --resume | --veto "<reason>"
 //!                                             (signed steering, steer.rs; `borg steer` runs this)
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use borg::collective::Route;
+use borg::hive::reexec::{self, Image};
 use borg_mesh::addr::Relay;
 use borg_mesh::daemon::{self, Event, Options};
 use borg_mesh::identity::Identity;
@@ -239,6 +241,8 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
         }
         Some("serve") => {
+            // What it runs, before anything: a reinstall of borg-mesh from here on replaces it.
+            let image = Image::now();
             let bind = flag(args, "--bind").unwrap_or("0.0.0.0:7878").parse().map_err(|e| format!("--bind: {e}"))?;
             let interval = flag(args, "--interval").map(|s| s.parse::<u64>().map_err(|e| format!("--interval: {e}"))).transpose()?.unwrap_or(60);
             let node = Arc::new(Node::bind(&place, bind).await?);
@@ -264,12 +268,16 @@ async fn run(args: &[String]) -> Result<(), String> {
             // The node's goal work for its interactive drones (borg hive/node.rs, phase g G4) on a thread
             // of its own, so no merge or board read holds up a sync round; stopped with the daemon, it
             // writes nothing on the way out (no leave of any goal).
+            // Its code replaced by a reinstall of borg-mesh (borg hive/reexec.rs): the worker stops ticking
+            // at once, the daemon stops as on Ctrl-C, and `main` runs the new borg-mesh in this process.
             let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker = {
-                let (home, quit) = (node.home().to_path_buf(), quit.clone());
-                std::thread::spawn(move || borg::hive::node::serve(&home, &quit))
+                let (home, quit, image) = (node.home().to_path_buf(), quit.clone(), image.watch());
+                std::thread::spawn(move || borg::hive::node::serve(&home, || quit.load(std::sync::atomic::Ordering::SeqCst) || image.stale()))
             };
-            daemon::serve(node, opts, stop(), |e| match e {
+            let reinstalled = std::sync::atomic::AtomicBool::new(false);
+            let shutdown = async { reinstalled.store(stop(&image).await, std::sync::atomic::Ordering::SeqCst) };
+            daemon::serve(node, opts, shutdown, |e| match e {
                 Event::Served(Ok(r)) if r.joined > 0 => println!("a new member joined with an invite (`borg mesh members`)"),
                 Event::Served(Ok(r)) => println!("served: {}", show(&r)),
                 Event::Served(Err(e)) => eprintln!("borg mesh: turned away: {e}"),
@@ -281,7 +289,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             .await;
             quit.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tokio::task::spawn_blocking(move || worker.join()).await;
-            println!("stopped");
+            match reinstalled.into_inner() {
+                true => {
+                    println!("borg-mesh was reinstalled: stopped to run the new one in this process");
+                    *RESTART.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image);
+                }
+                false => println!("stopped"),
+            }
         }
         Some("sync") => {
             let target = args.get(1).ok_or("sync <key>[@<ip:port>]")?;
@@ -356,21 +370,24 @@ fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String
     borg_mesh::steer::issue(&home, &name, borg::collective::may_sync(r), &engineer, target, kind, &text, borg::learn::now_ms())
 }
 
-/// Ctrl-C or SIGTERM.
-async fn stop() {
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
+/// Until Ctrl-C or SIGTERM (borg hive/reexec.rs `trap_stops`, from `main`): false; or until `image`'s
+/// borg-mesh was replaced by one that can run: true.
+async fn stop(image: &Image) -> bool {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    for n in 0u64.. {
+        tick.tick().await;
+        if reexec::stopped() {
+            return false;
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term => {}
+        if n % 10 == 0 && image.due() {
+            return true;
+        }
     }
+    false
 }
+
+/// The image `serve` stopped for, replaced by a reinstall: `main` runs the new one once the runtime is gone.
+static RESTART: std::sync::Mutex<Option<Image>> = std::sync::Mutex::new(None);
 
 /// `borg mesh --help`: the commands grouped by who runs them.
 const HELP: &[(&str, &[(&str, &str)])] = &[
@@ -414,10 +431,22 @@ fn help() -> String {
 }
 
 fn main() {
+    // A daemon about to run this borg-mesh in its process asks first (borg hive/reexec.rs `restart`).
+    if reexec::probed() {
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
         print!("{}", help());
         return;
+    }
+    if args.first().map(String::as_str) == Some("serve") {
+        // Its stops trapped while one thread runs; one held across a restart (`RESTART`) ends it here.
+        reexec::trap_stops();
+        if reexec::stopped() {
+            println!("stopped");
+            return;
+        }
     }
     // The daemon's node worker reads its drones' scratch state where their hooks and `borg hive` keep it
     // (borg hook.rs `main`, hive/mod.rs `Here::locate`): the store's `state` unless BORG_STATE names one.
@@ -438,5 +467,16 @@ fn main() {
     if let Err(e) = rt.block_on(run(&args)) {
         eprintln!("borg mesh: {e}");
         std::process::exit(1);
+    }
+    let restart = RESTART.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(mut image) = restart {
+        rt.shutdown_timeout(Duration::from_secs(5));
+        match image.restart() {
+            Ok(()) => println!("stopped"),
+            Err(why) => {
+                eprintln!("borg mesh: {why}");
+                std::process::exit(1);
+            }
+        }
     }
 }

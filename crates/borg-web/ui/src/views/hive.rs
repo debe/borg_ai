@@ -60,13 +60,15 @@ const STATES: [(&str, &str); 6] = [
 ];
 
 /// Interactive drones by state, in the order a reader scans them: what moves first, the left and gone last.
-const DRONE_STATES: [&str; 6] = ["working", "busy", "waiting", "not waiting", "left", "gone"];
+const DRONE_STATES: [&str; 7] = ["working", "busy", "waiting", "waiting (old borg, restarting)", "not waiting", "left", "gone"];
 
 /// A drone state's badge class (index.html `.badge`).
 fn badge(state: &str) -> &'static str {
     match state {
         "working" => "badge working",
         "waiting" => "badge waiting",
+        // Its waiter runs a borg that was replaced: it claims nothing until it re-execs.
+        "waiting (old borg, restarting)" => "badge paused",
         "busy" => "badge paused",
         "not waiting" => "badge idle",
         _ => "badge",

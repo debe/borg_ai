@@ -12,7 +12,8 @@
 //!   taken up yet (`handed`, `untaken`; `touch` takes it up, wait.rs `takeup` releases it otherwise).
 //! - `<state>/<session>.hive-missed`: a wake no turn took up (wait.rs `takeup` released its claim): the
 //!   waiter claims nothing more until a hook event of the session comes (`missed`, `touch`).
-//! - `<state>/<drone>.hive-waiter`: locked by the drone's running waiter (`waiting`).
+//! - `<state>/<drone>.hive-waiter`: locked by the drone's running waiter (`waiting`); beside it
+//!   `.hive-waiter-stale` while that waiter runs a borg that was replaced (`mark_stale`).
 //!
 //! Membership: `join` (and any claim path, `ensure_member`) writes the node's JOIN under the board lock
 //! before any claim of the drone, and the node's LEAVE comes only with its last drone of the goal
@@ -746,6 +747,22 @@ pub fn waiting(drone: &str) -> bool {
     matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
+/// The mark a waiter whose borg was replaced keeps while it runs the old code (wait.rs, reexec.rs): it
+/// claims nothing until its re-exec. Monitoring shows the drone `waiting (old borg, restarting)`.
+fn stale_path(drone: &str) -> PathBuf {
+    hook::state_file(drone).with_extension("hive-waiter-stale")
+}
+
+/// Marks `drone`'s waiter as running a replaced borg (`stale`), or not.
+pub(crate) fn mark_stale(drone: &str, stale: bool) {
+    let _ = if stale { std::fs::write(stale_path(drone), "") } else { std::fs::remove_file(stale_path(drone)) };
+}
+
+/// Whether `drone`'s waiter runs and still runs the borg that was replaced (`mark_stale`).
+pub fn waiting_stale(drone: &str) -> bool {
+    stale_path(drone).exists() && waiting(drone)
+}
+
 /// Stops `drone`'s waiter, if one runs: SIGTERM to the pid its lock file names, which it ends on quietly.
 fn stop_waiter(drone: &str) {
     if !waiting(drone) {
@@ -772,7 +789,7 @@ pub(crate) fn waiter_log(drone: &str) -> PathBuf {
 /// lock held and exits.
 fn spawn_waiter(home: &Path, hs: &HiveSession, session: &str, cwd: &str) {
     use std::os::unix::process::CommandExt;
-    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = super::reexec::exe_path();
     let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open(waiter_log(&hs.drone)) else { return };
     let Ok(err) = log.try_clone() else { return };
     let mut c = std::process::Command::new(exe);
@@ -866,20 +883,26 @@ pub(crate) fn touch(home: &Path, event: &str, hs: &mut HiveSession, session: &st
         hs.transcript = t.into();
         changed = true;
     }
-    if event == "pre_tool" || hs.goal.is_empty() || now - hs.member_ms < super::BEAT_MS {
+    if event == "pre_tool" || !own_beat(home, &hs.goal, hs.member_ms, now) {
         return changed;
+    }
+    hs.member_ms = now;
+    true
+}
+
+/// A drone's own beat of `goal` at `now` (`touch`, and a waiter gated on a replaced borg, wait.rs):
+/// written when the last was `BEAT_MS` ago (`last`), the node's membership of it is open and no node
+/// worker runs; whether the drone's beat counts as done now (written, or the worker beats).
+pub(crate) fn own_beat(home: &Path, goal: &str, last: i64, now: i64) -> bool {
+    if goal.is_empty() || now - last < super::BEAT_MS {
+        return false;
     }
     // The node's worker beats (its mesh daemon, or a waiter while none runs, node.rs): no beat of its own.
     if super::node::worker_runs(home) {
-        hs.member_ms = now;
         return true;
     }
     let here = node(home);
-    if member_open(&board::fold_on(&board::read(&tasks_path(home, &hs.goal)), &here), &here) && member(home, &hs.goal, board::BEAT).is_ok() {
-        hs.member_ms = now;
-        changed = true;
-    }
-    changed
+    member_open(&board::fold_on(&board::read(&tasks_path(home, goal)), &here), &here) && member(home, goal, board::BEAT).is_ok()
 }
 
 /// The pid a hook event's harness sent as its own (`pid`: omp and opencode run their adapter in their

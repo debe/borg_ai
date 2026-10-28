@@ -139,6 +139,7 @@ fn state_style(s: &str) -> St {
         "working" => St::Green,
         "busy" => St::Magenta,
         "waiting" => St::Cyan,
+        crate::hive::monitor::STALE => St::Yellow,
         "idle" | "paused" => St::Yellow,
         "not waiting" => St::Red,
         _ => St::Dim,

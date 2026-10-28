@@ -62,6 +62,14 @@ with `borg hive ratify <goal>`.
   drones claim nothing more, and the engineer is asked once: "raise budget of G?". They answer at their
   prompt in the session that opened the goal: the new budget in dollars, or `yes` to double it, or
   `no` to keep it. Or they run `borg hive ratify <goal> --budget USD` in a terminal.
+- **Reinstalling borg** needs no session restart: each drone's waiter claims nothing with the replaced
+  borg and restarts on the new one in place. `borg top` shows it as `waiting (old borg, restarting)`
+  meanwhile; a drone that stays so has a borg that cannot run, which a fresh install fixes (until
+  then nothing on the node reaps or beats for it, so peers take its drones' claims over). A
+  running `borg mesh serve` restarts in place on a reinstalled borg-mesh (install both together); one
+  that cannot run, or one built before it could restart so (a downgrade), stops it with a message
+  and exit code 1: start it again. A downgrade below 0.3.0 ends the waiter instead; the drone's next
+  stop starts it again.
 - To stop being a drone, say "leave the hive": `borg hive leave`.
 
 ## Commands at a glance

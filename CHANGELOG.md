@@ -36,6 +36,16 @@ and documentation whose claims match their reports. The release steps are in
   builds borg-web on its own (its tarball binary leaves out the vectors stack) and smoke-runs it. Every
   GitHub action is pinned to a commit SHA. `scripts/check.sh` ends with the same publish dry run.
 
+### Hive
+
+- A drone's waiter follows a reinstall of borg (`cargo install`) in place: it never claims with the
+  replaced code, runs the new borg in the same process, so no session restarts, and shows as
+  `waiting (old borg, restarting)` in `borg top` and `borg web` until it does.
+- Until it runs the new borg, a waiter also gives up its node's work (reaps, integrations) to the
+  mesh daemon or another drone's waiter, beating only for its own drone so peers keep its claims.
+- `borg mesh serve` follows a reinstall of borg-mesh the same way: it stops serving the old code and
+  runs the new borg-mesh in the same process, so a terminal or a service keeps one daemon.
+
 ### Documentation
 
 - [Evidence and limits](docs/evidence.md) states each result as its report has it: the turn-end result
