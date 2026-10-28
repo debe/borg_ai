@@ -19,9 +19,10 @@ seekstorm = ["dep:seekstorm", "dep:tokio", "dep:model2vec-rs"]
 vectors = ["borg/vectors"]
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "0.2.0" }
+borg = { package = "borg-ai", path = "../borg", version = "=0.3.0" }
 serde.workspace = true
 serde_json.workspace = true
+# pinned `=` with borg-ai's, which explains why (crates/borg/Cargo.toml)
 seekstorm = { version = "=3.3.13", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
 # the version SeekStorm links, for the full-length query embedding variant (descriptive arms)

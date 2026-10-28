@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "borg-ai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -422,13 +422,14 @@ dependencies = [
 
 [[package]]
 name = "borg-eval"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "borg-ai",
  "borg-mesh",
  "borg-trace",
  "libc",
+ "rayon",
  "regex",
  "serde",
  "serde_json",
@@ -437,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "borg-mesh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -453,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "borg-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "borg-ai",
  "model2vec-rs",
@@ -465,9 +466,8 @@ dependencies = [
 
 [[package]]
 name = "borg-trace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
- "rayon",
  "regex",
  "serde",
  "serde_json",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "borg-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "borg-ai",

@@ -3,14 +3,14 @@ name = "borg-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-readme.workspace = true
+readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 # dist/ is the built page, checked in (scripts/ui.sh --check); ui/, its sources, is a separate workspace.
-include = ["/src/**", "/dist/**", "/tests/**", "/LICENSE-*"]
+include = ["/src/**", "/dist/**", "/tests/**", "/README.md", "/LICENSE-*"]
 description = "A local, live page of a collective's knowledge and usage statistics"
 
 # A separate binary, like borg-mesh: the web stack stays out of the hook. `borg web ...` forwards here.
@@ -21,7 +21,7 @@ name = "borg-web"
 path = "src/main.rs"
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "0.2.0", default-features = false }
+borg = { package = "borg-ai", path = "../borg", version = "=0.3.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }

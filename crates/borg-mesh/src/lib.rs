@@ -28,6 +28,9 @@
 //! The gate: `borg::collective::may_sync` is asked before any byte of a collective leaves, on both
 //! sides, on the config as it is at that moment. A local collective or an off repo is refused before
 //! a connection is even opened, and so is a store a local collective also maps to.
+//!
+//! **Internal API, no semver.** The product is the `borg-mesh` binary; this library exists for borg's own
+//! crates, which pin it `=` to the same version. Any release may change or remove any item.
 
 pub mod addr;
 pub mod beats;

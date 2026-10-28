@@ -3,17 +3,16 @@ name = "borg-trace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-readme.workspace = true
+readme = "README.md"
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
-include = ["/src/**", "/LICENSE-*"]
+include = ["/src/**", "/README.md", "/LICENSE-*"]
 description = "Parse Claude Code / omp transcripts into canonical touch streams"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-rayon.workspace = true
 regex.workspace = true
