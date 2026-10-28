@@ -382,7 +382,7 @@ async function until(done: () => boolean | Promise<boolean>) {
 
 /** A fake borg: `listen --stream` records `stream\t<args>`, prints what is written to $WAKE (each
  *  line once), ends with `{"end"}` when $WAKE holds `END`, and records `stopped` on SIGTERM; a hook
- *  records `<event>` and answers a stop with $STOP_ANSWER. Returns [binary, record file, wake file]. */
+ *  records `<event>`, answers a stop with $STOP_ANSWER and a post_tool with $POST_ANSWER. Returns [binary, record file, wake file]. */
 function listenFake(): [string, string, string] {
 	const dir = mkdtempSync(join(tmpdir(), "borg-omp-listen-"));
 	const [bin, rec, wake] = [join(dir, "borg"), join(dir, "rec"), join(dir, "wake")];
@@ -395,7 +395,7 @@ if [ "$1 $2" = "listen --stream" ]; then
   while :; do
     if [ -s "${wake}" ]; then
       if grep -q '^END$' "${wake}"; then : > "${wake}"; echo '{"end":"listens no more"}'; exit 0; fi
-      cat "${wake}"; : > "${wake}"
+      cat "${wake}"; : > "${wake}"; printf 'printed\n' >> "${rec}"
     fi
     sleep 0.05
   done
@@ -403,6 +403,7 @@ fi
 cat > /dev/null
 printf '%s\\n' "$3" >> "${rec}"
 [ "$3" = stop ] && [ -n "$STOP_ANSWER" ] && echo "$STOP_ANSWER"
+[ "$3" = post_tool ] && [ -n "$POST_ANSWER" ] && echo "$POST_ANSWER"
 exit 0
 `,
 	);
@@ -451,6 +452,51 @@ test("a listening omp session: its waiter starts at its `borg listen`, wakes it 
 		assert.equal(sent.length, 1);
 	} finally {
 		delete process.env.STOP_ANSWER;
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+test("a wake that arrives while omp runs the session's turn waits for its end, and is dropped if a hook of the turn showed its messages", { timeout: 20_000 }, async () => {
+	const [bin, rec, wake] = listenFake();
+	process.env.BORG_BIN = bin;
+	delete process.env.STOP_ANSWER;
+	delete process.env.POST_ANSWER;
+	const sent: [any, any][] = [];
+	const h = load((m, o) => sent.push([m, o]));
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const call = (id: string) => h.tool_call({ type: "tool_call", toolName: "read", toolCallId: id, input: { path: "/r/a" } }, ctx);
+	const result = (id: string, command = "cat a", said = "x") =>
+		h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: id, input: { command }, content: [{ type: "text", text: said }], isError: false }, ctx);
+	// The fake prints each wake before it records `printed`; the next hook's borg run is the sync point
+	// by which the adapter has read it.
+	const wakeDuring = async (n: number) => {
+		await call(`c${n}`);
+		writeFileSync(wake, `{"wake":"[borg listen] 1 message from other sessions waits for you (${n})."}\n`);
+		await until(() => records(rec).filter((r) => r === "printed").length === n);
+	};
+	try {
+		await result("l1", "borg listen", "[borg listen] This session listens: a message for it wakes it while it is idle.");
+		await until(() => records(rec).some((r) => r.startsWith("stream\t")));
+		// Held while the turn runs; a hook that shows no message keeps it; the turn's end sends it in.
+		await wakeDuring(1);
+		await result("c1");
+		assert.equal(sent.length, 0, "held while the turn runs");
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }], willContinue: true }, ctx);
+		assert.equal(sent.length, 0, "a run that continues is no end");
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+		assert.equal(sent.length, 1);
+		assert.match(sent[0][0].content, /waits for you \(1\)/);
+		// The wake's own turn ends; then a turn whose tool call shows the message drops its wake.
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+		await wakeDuring(2);
+		process.env.POST_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "[borg] Message from Two of Two (tell): rebase" } });
+		await result("c2");
+		delete process.env.POST_ANSWER;
+		assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), undefined);
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+		assert.equal(sent.length, 1, "the turn showed its message: no wake");
+	} finally {
+		delete process.env.POST_ANSWER;
 		await h.session_shutdown({ type: "session_shutdown" }, ctx);
 	}
 });

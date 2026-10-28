@@ -16,6 +16,15 @@ Codex has no failure event, so a denied tool call does not become an episode; co
 still do. Codex's `transcript_path` is its own rollout format, which borg does not read: a live check
 reads the turn's tool calls and edits, not the drone's prose.
 
+**Listening sessions.** After the model runs `borg listen`, the session's next stop that does not
+block starts a detached waiter, `borg listen --queue --session <id> --dir <cwd>`, logging to
+`<store>/listen/<session>.log`. It costs no tokens and holds wakes off while the engineer's turn
+runs. Each message that arrives for the idle session goes in with
+`codex queue --thread <session> --message <text>` (codex 0.149 or later), which starts a turn, or
+waits in codex's queue behind one that runs. A call gets 30 s; a failure is tried again after 10 s,
+doubling up to 5 minutes. `borg listen --off`, or the session's end, stops the waiter. See
+[Waking a session](../../docs/commands.md#waking-a-session).
+
 ## Install
 
 ```sh

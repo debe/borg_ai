@@ -22,9 +22,10 @@
 // session's waiter, `borg listen --stream`, once the model's own `borg listen` succeeds in its
 // tool_result (omp gives the command PI_SESSION_ID, so it bound this session), or once a stop's answer
 // carries `"listen": true` (borg says no waiter runs). The waiter waits at no token cost, holds wakes
-// off while the engineer's turn runs, and says each wake as a JSON line; the extension sends it in with
-// pi.sendMessage(..., {deliverAs: "nextTurn", triggerTurn: true}), which starts a turn on an idle
-// session and waits behind a running one. Its `{"end"}` line ends it until the next `"listen": true`;
+// off while the engineer's turn runs, and says each wake as a JSON line. The extension holds a wake
+// that arrives while omp runs a turn of the session (from its prompt or tool call to its last
+// agent_end or a stop that does not block) and drops it if a hook of that turn showed its messages;
+// otherwise it sends it in with pi.sendMessage(..., {deliverAs: "nextTurn", triggerTurn: true}). Its `{"end"}` line ends it until the next `"listen": true`;
 // `borg listen --off` in the session, or its end, stops it. Spawned, never awaited.
 //
 // Fails open: a missing borg binary, a crash, a timeout or bad output is a no-op.
@@ -227,6 +228,22 @@ export function listenCommand(command: string): "on" | "off" | undefined {
 /** What `borg listen` prints once it opted the session in. */
 const LISTENS = "[borg listen] This session listens";
 
+// How a hook's context shows each message (msg.rs `line`), and how a wake counts them (listen.rs `summary`).
+const MESSAGE_LINE = /^\[borg\] Message from /gm;
+const WAKE_COUNT = /^\[borg listen\] (\d+) messages? /;
+
+/** How many messages a wake announces; Infinity for a wording it does not know (never taken as shown). */
+export function wakeCount(wake: string): number {
+	const m = WAKE_COUNT.exec(wake);
+	return m ? Number(m[1]) : Infinity;
+}
+
+/** How many messages borg's answer `out` showed the model. */
+export function shownCount(out: unknown): number {
+	const c = (out as any)?.hookSpecificOutput?.additionalContext;
+	return typeof c === "string" ? (c.match(MESSAGE_LINE)?.length ?? 0) : 0;
+}
+
 /** One line of the waiter (`borg listen --stream`): a wake to send in, a note, or its last line. */
 export type StreamLine = { wake: string } | { note: string } | { end: string };
 
@@ -326,8 +343,47 @@ export default function borg(pi: any): void {
 
 	// Each listening session's waiter (`borg listen --stream`) in this omp process.
 	const streams = new Map<string, ReturnType<typeof spawn>>();
+	// Each session's turn: whether omp runs one, and the wakes held until it ends.
+	const turns = new Map<string, { busy: boolean; held: { text: string; at: number }[] }>();
+	const turn = (session: string) => {
+		let t = turns.get(session);
+		if (!t) turns.set(session, (t = { busy: false, held: [] }));
+		return t;
+	};
+	/** Sends a wake in; false when omp refused it. */
+	const wakeIn = (content: string): boolean => {
+		try {
+			pi.sendMessage({ customType: "borg-listen", content, display: true }, { deliverAs: "nextTurn", triggerTurn: true });
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	/** The session's turn ended: its held wakes go in, as one message that starts the next turn. */
+	const idle = (session: string) => {
+		const t = turn(session);
+		t.busy = false;
+		const held = t.held.splice(0);
+		if (held.length) t.busy = wakeIn(held.map((w) => w.text).join("\n\n"));
+	};
+	/** borg's answer to a hook asked at `asked` showed messages: the wakes held from before then that it
+	 *  showed all of are dropped, so no turn is spent on messages the model already read. */
+	const shown = (session: string, asked: number, out: unknown) => {
+		const k = shownCount(out);
+		const t = turns.get(session);
+		if (!k || !t) return;
+		const held = t.held.filter((w) => w.at < asked);
+		if (held.length && k >= held.reduce((a, w) => a + wakeCount(w.text), 0)) t.held = t.held.filter((w) => w.at >= asked);
+	};
+	/** A borg call for the session that may show it messages (`shown`). */
+	const ask = async (session: string, event: string, payload: Json, ms: number) => {
+		const t0 = Date.now();
+		const out = await runBorg(event, payload, ms);
+		shown(session, t0, out);
+		return out;
+	};
 	/** The session's waiter, unless one runs: its wakes go in as a custom message that starts the next
-	 *  turn (now, on an idle session; after the running one, else). */
+	 *  turn, at once on an idle session, else once its turn ended (`idle`). */
 	const arm = (session: string, cwd: string) => {
 		if (streams.has(session)) return;
 		// Declared first: a spawn that fails ends the stream before startStream returns.
@@ -336,9 +392,12 @@ export default function borg(pi: any): void {
 			session,
 			cwd,
 			(content) => {
-				try {
-					pi.sendMessage({ customType: "borg-listen", content, display: true }, { deliverAs: "nextTurn", triggerTurn: true });
-				} catch {}
+				const t = turn(session);
+				if (t.busy) t.held.push({ text: content, at: Date.now() });
+				else {
+					// The wake's own turn: a later wake waits for its end.
+					t.busy = wakeIn(content);
+				}
 			},
 			() => {
 				if (child && streams.get(session) === child) streams.delete(session);
@@ -350,6 +409,7 @@ export default function borg(pi: any): void {
 	const disarm = (session: string) => {
 		const child = streams.get(session);
 		streams.delete(session);
+		turns.delete(session);
 		try {
 			if (child && child.exitCode === null) child.kill("SIGTERM");
 		} catch {}
@@ -362,7 +422,11 @@ export default function borg(pi: any): void {
 			inputSeen = true;
 			const said = ev.text.trim();
 			command = isCommand(said);
-			if (said && !command) keep(await runBorg("prompt", promptEvent(ctx, ev.text), FAST_MS));
+			if (said && !command) {
+				const at = where(ctx).session_id;
+				turn(at).busy = true;
+				keep(await ask(at, "prompt", promptEvent(ctx, ev.text), FAST_MS));
+			}
 		}),
 	);
 
@@ -371,8 +435,10 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			const fromCommand = command;
 			command = false;
+			const at = where(ctx).session_id;
+			turn(at).busy = true;
 			if ((!inputSeen || fromCommand) && typeof ev.prompt === "string" && ev.prompt.trim() && ev.prompt.trim() !== asked) {
-				keep(await runBorg("prompt", promptEvent(ctx, ev.prompt), FAST_MS));
+				keep(await ask(at, "prompt", promptEvent(ctx, ev.prompt), FAST_MS));
 			}
 			const content = take();
 			return content ? { message: { customType: "borg", content, display: false } } : undefined;
@@ -384,6 +450,7 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			if (calls.size > 256) calls.delete(calls.keys().next().value as string);
 			calls.set(String(ev.toolCallId), ev.input);
+			turn(where(ctx).session_id).busy = true;
 			// A drone paused by `borg pause` has its tool calls refused.
 			const out = await runBorg("pre_tool", { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: toolInput(String(ev.toolName ?? ""), ev.input) }, PRE_MS);
 			const deny = (out as any)?.hookSpecificOutput;
@@ -402,7 +469,7 @@ export default function borg(pi: any): void {
 			// A live check's questions (or graded lessons) waiting since an earlier call reach the model
 			// before its next step, as a hidden message; the tool output stays as it is.
 			// Context kept from a mid-turn steer goes first.
-			const out = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
+			const out = ((await ask(payload.session_id, event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
 			const c = [take(), typeof out === "string" ? out.trim() : ""].filter(Boolean).join("\n\n");
 			// The model's own `borg listen` (PI_SESSION_ID bound this session) or `--off`.
 			const command = (ev.input as any)?.command;
@@ -435,6 +502,7 @@ export default function borg(pi: any): void {
 				asked = out.reason.trim();
 				return { decision: "block", reason: out.reason };
 			}
+			idle(payload.session_id);
 			return undefined;
 		}),
 	);
@@ -444,7 +512,9 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			// An Esc: no stop follows, so borg hears that the engineer's turn is over (its wakes go in again).
 			const at = where(ctx);
-			if (ev.willContinue !== true && streams.has(at.session_id) && aborted(ev.messages)) await runBorg("halted", at, FAST_MS);
+			if (ev.willContinue === true) return;
+			if (streams.has(at.session_id) && aborted(ev.messages)) await runBorg("halted", at, FAST_MS);
+			idle(at.session_id);
 		}),
 	);
 
