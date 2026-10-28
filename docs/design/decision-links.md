@@ -100,4 +100,4 @@ Update `docs/configuration.md`, the borg skill (crates/borg/assets/skills/borg) 
 - `borg fixes` and a `fixes:` commit line both produce a strong link; `borg why` shows both directions.
 - `scripts/check.sh` and `arch.sh` pass. Watch M10: `install.rs` is at 39 of 40 functions. lizard, rust-code-analysis and clippy pedantic show no regressions against the baseline.
 
-**On real repos** (the company repos are on another machine): run `borg regress --replay <range>`, extended to report the fix shapes it found. Spot-check precision before setting `BORG_REGRESS=learn`.
+**On real repos:** run `borg regress --replay <range>`, extended to report the fix shapes it found. Spot-check precision before setting `BORG_REGRESS=learn`.
