@@ -25,6 +25,7 @@ pub mod hook;
 pub mod install;
 pub(crate) mod jsonl;
 pub mod learn;
+pub mod listen;
 pub mod live;
 pub mod memory;
 pub mod msg;

@@ -88,7 +88,7 @@ fn a_terminal_veto_credits_the_shown_lessons_and_records_the_reason() {
 
     let (out, err, code) = borg(&root, &work, &["no", "never", "read", "the", "commit", "log", "for", "merges"], "", &[]);
     assert_eq!(code, Some(0), "{out}{err}");
-    assert!(out.contains("vetoed One of One (aaaa-111)") && out.contains("Lmerge") && out.contains("borg steer aaaa-111 --pause"), "{out}");
+    assert!(out.contains("vetoed One of One (aaaa-111)") && out.contains("Lmerge") && out.contains("borg pause aaaa-111"), "{out}");
     let vetoed = of_kind(&store(&root).join("outcomes.jsonl"), "vetoed");
     assert_eq!((vetoed.len(), vetoed[0]["lessons"].clone(), vetoed[0]["session"].clone()), (1, json!(["Lmerge"]), json!("aaaa-1111")));
     let eps = of_kind(&store(&root).join("episodes.jsonl"), "veto");

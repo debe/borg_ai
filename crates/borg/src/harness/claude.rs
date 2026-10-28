@@ -1,6 +1,6 @@
 //! Claude Code: native command hooks in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`), each running
 //! `<borg> hook claude <event>`; its events are borg's canonical shape already. The one harness with a
-//! transcript (the readers below), early delivery, steering in context and the question dialog.
+//! transcript (the readers below), early delivery and the question dialog.
 
 use std::path::{Path, PathBuf};
 
@@ -40,7 +40,6 @@ impl Harness for Claude {
             prompt_context: true,
             tool_context: true,
             early_delivery: true,
-            steer_in_context: true,
             question_dialog: true,
             transcript: Transcript::Claude,
             deny_capture: true,

@@ -8,7 +8,21 @@
   A session on any harness, or the engineer's terminal, writes to a drone, a session, `all` or the
   engineer; the recipient sees it once at its next prompt or tool call, as peer data with the command
   that replies. Messages are redacted, rate limited, kept 7 days and synced with the team collective.
-  Stats count `msg_sent`, `msg_delivered` and `msg_dropped`. Waking an idle session comes later.
+  Stats count `msg_sent`, `msg_delivered` and `msg_dropped`.
+- `borg listen` wakes an idle session when a message arrives for it, until `borg listen --off` or the
+  session's end. On Claude Code the stop asks the model to run `borg listen --wait` in the background;
+  the omp and opencode adapters keep `borg listen --stream` running and send each wake in as a new turn;
+  on codex a detached `borg listen --queue` queues one with `codex queue`. A wake names the senders and
+  the count, never the text. Nothing wakes a session during the engineer's own turn. `borg top` shows a
+  WAKE column.
+
+### Changed
+
+- Steering is now messages: `borg pause <to> [note]` and `borg resume <to> [note]`, and `borg no` to a
+  drone on another machine sends a veto message. They are shown at the next prompt or tool call on every
+  harness, not only on Claude Code. Another machine's count only when the mesh admits them for an `admin`
+  or `steer` member. `borg steer` is removed: use `borg pause`, `borg resume`, or `borg tell` for an
+  instruction. Stats keep `steer_issued`, `steer_delivered`, `steer_dropped` and `pause_refused`.
 
 ### Removed
 
@@ -16,7 +30,7 @@
   verify tasks, oracles, integration, contracts and plans. The Hive tab of `borg web`, the goal sections
   of `borg top`, and the `BORG_HIVE*`, `BORG_GROUP_REFLECT` and `BORG_REWORK_REFLECT` variables go with
   it. Messages between sessions, across harnesses and machines, will replace it. Plain sessions,
-  lessons, playbooks, `borg steer`, `borg no` and team sync work as before. `borg install` removes
+  lessons, playbooks, `borg no` and team sync work as before. `borg install` removes
   the hooks only the hive used (Claude Code `SessionStart`, codex `Interrupt`). An old store's `hive/`
   directory is no longer read; `borg doctor` offers to remove it.
 

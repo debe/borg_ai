@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use borg::harness::{self, Caps, Harness, Transcript, Wiring, sim};
+use borg::msg::{self, Message, Sender};
 use common::{answer, prompts, setup, state};
 use serde_json::{Value, json};
 
@@ -49,7 +50,7 @@ fn profiles() -> Vec<Profile> {
             continue;
         }
         if h.hidden() {
-            for caps in ["prompt,tool,deny", "prompt,deny", "", "prompt,tool,early,steer,dialog,transcript,deny,pid"] {
+            for caps in ["prompt,tool,deny", "prompt,deny", "", "prompt,tool,early,dialog,transcript,deny,pid"] {
                 out.push(Profile { h, sim_caps: Some(caps) });
             }
         } else {
@@ -356,7 +357,7 @@ fn hooks_record_the_turn_block_once_and_end_the_drone() {
         assert_eq!((top["harness"].as_str(), top["state"].as_str()), (Some(p.h.name()), Some("working")), "{tag}: {top}");
         assert_eq!(top["prompt"], "Tidy the budget handling of the Orion net", "{tag}");
 
-        // pre_tool says nothing while nobody steers.
+        // pre_tool says nothing while nobody pauses.
         assert_eq!(d.step("pre_tool", "pre_tool"), Value::Null, "{tag}");
 
         // Tool calls: touches in the state, the edit's path and text in .edits.
@@ -397,29 +398,26 @@ fn hooks_record_the_turn_block_once_and_end_the_drone() {
 fn a_paused_drone_has_its_tools_refused() {
     for p in profiles() {
         let d = Drone::new(&p, "pause", "hook");
+        let caps = p.caps();
+        let tag = p.tag();
         d.step("prompt", "prompt");
-        let inbox = d.root.join("store/collectives/corp/steer/inbox.jsonl");
-        std::fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+        // The engineer's `borg pause` from this machine: a pause message, admitted locally (steer.rs).
+        let store = d.root.join("store/collectives/corp");
+        let from = Sender { by: "engineer:bob@x".into(), name: "bob@x".into(), harness: "terminal".into(), node: msg::node(&store) };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-        let directive = |id: &str, kind: &str, text: &str| {
-            json!({"id": id, "collective": "corp", "key": "ab".repeat(32), "engineer": "bob@x", "target": {"node": "", "session": d.session},
-                "kind": kind, "text": text, "ms": now, "sig": "00", "role": "steer"})
-            .to_string()
-                + "\n"
-        };
-        // Steering: at the next tool call where the harness shows it there, else at the stop.
-        std::fs::write(&inbox, directive("d1", "say", "use the mock db")).unwrap();
-        let at_tool = context(&d.step("post_tool", "read"));
-        let at_stop = d.step("stop", "stop");
-        if p.caps().steer_in_context {
-            assert!(at_tool.contains("use the mock db"), "{}: {at_tool}", p.tag());
-        } else {
-            assert!(at_tool.is_empty() && at_stop["reason"].as_str().unwrap_or_default().contains("use the mock db"), "{}: {at_stop}", p.tag());
-        }
-        std::fs::write(&inbox, std::fs::read_to_string(&inbox).unwrap() + &directive("p1", "pause", "")).unwrap();
+        msg::send(&store, Message::new(msg::Kind::Pause, &from, &d.session, None, now, "use the mock db"), now).unwrap();
         let deny = d.step("pre_tool", "pre_tool");
-        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny", "{}: {deny}", p.tag());
-        assert!(deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("paused"), "{}", p.tag());
+        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny", "{tag}: {deny}");
+        assert!(deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("paused by bob@x"), "{tag}");
+        // Shown at the next tool call where the harness takes context there, else at the next prompt.
+        let at_tool = context(&d.step("post_tool", "read"));
+        let shown = if caps.tool_context { at_tool } else { context(&d.step("prompt", "prompt")) };
+        if caps.tool_context || caps.prompt_context {
+            assert!(shown.contains("[borg] Pause from bob@x") && shown.contains("role local") && shown.contains("use the mock db"), "{tag}: {shown}");
+        }
+        assert_ne!(d.step("stop", "stop")["decision"], "block", "{tag}: a paused drone's stop is its waiting");
+        msg::send(&store, Message::new(msg::Kind::Resume, &from, &d.session, None, now + 1, ""), now + 1).unwrap();
+        assert_eq!(d.step("pre_tool", "pre_tool"), Value::Null, "{tag}: resumed");
     }
 }
 

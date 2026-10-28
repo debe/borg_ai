@@ -167,7 +167,8 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
         lines.push(Ln::default().add(St::Head, format!(" {} ", c.name)).add(St::Head, format!("· {share} · {} drone(s)", c.drones.len())));
         lines.push(Ln::default().add(
             St::Bold,
-            format!("  {}{}{}{}{}{}", pad("DRONE", 16), pad("HARNESS", 9), pad("NODE", 8), pad("STATE", 13), pad("IDLE", 6), pad("MSG", 5)) + "DOING",
+            format!("  {}{}{}{}{}{}{}", pad("DRONE", 16), pad("HARNESS", 9), pad("NODE", 8), pad("STATE", 13), pad("WAKE", 7), pad("IDLE", 6), pad("MSG", 5))
+                + "DOING",
         ));
         let mut rows: Vec<&Drone> = c.drones.iter().collect();
         rows.sort_by_key(|d| (d.state == State::Ended, d.number));
@@ -182,6 +183,7 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
                     .add(St::Plain, pad(&d.p.harness, 9))
                     .add(St::Dim, pad(&node, 8))
                     .add(state_style(word), pad(&format!("● {word}"), 13))
+                    .add(if c.inbox.listen.contains_key(&d.p.session) { St::Cyan } else { St::Dim }, pad(top::wake_cell(&c.inbox, d), 7))
                     .add(St::Dim, pad(&ago(now - d.p.ms), 6))
                     .add(if c.inbox.unread.get(&d.p.session).is_some_and(|n| *n > 0) { St::Cyan } else { St::Dim }, pad(&top::unread_cell(&c.inbox, d), 5))
                     .add(if ended { St::Dim } else { St::Plain }, doing(&d.p.prompt)),

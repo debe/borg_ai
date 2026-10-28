@@ -7,7 +7,8 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import plugin from "./borg.ts"
@@ -790,4 +791,356 @@ test("opencode 2: a tool context whose steer fails is kept for the next call or 
   await v2.say("go on")
   assert.deepEqual(v2.synthetics.map((s: any) => s.text), ["STEER-FAILED"])
   await v2.cleanup()
+})
+
+// ---- borg listen: the plugin binds a listening session, keeps its waiter and wakes it when idle.
+
+/** A fake borg for listening sessions: `listen --stream` records `stream\t<args>`, prints what is
+ *  written to the wake file (each line once) and records `stopped` on SIGTERM; any other `listen`
+ *  records `listen\t<args>` and answers as borg does; a hook records `<event>\t<stdin>` and answers a
+ *  stop with $STOP_ANSWER. Returns [binary, record file, wake file, adapter log]. */
+function listenFake(): [string, string, string, string] {
+  const dir = mkdtempSync(join(tmpdir(), "borg-oc-listen-"))
+  const [bin, rec, wake, log] = [join(dir, "borg"), join(dir, "rec"), join(dir, "wake"), join(dir, "log")]
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+case "$1 $2" in
+"listen --stream") printf 'stream\\t%s\\n' "$*" >> "${rec}"; trap 'printf "stopped\\n" >> "${rec}"; exit 143' TERM
+  while :; do if [ -s "${wake}" ]; then cat "${wake}"; : > "${wake}"; fi; sleep 0.05; done;;
+"listen --off") printf 'listen\\t%s\\n' "$*" >> "${rec}"; echo "[borg listen] this session listens no more"; exit 0;;
+"listen "*) printf 'listen\\t%s\\n' "$*" >> "${rec}"; [ -n "$LISTEN_HOLD" ] && while [ -e "$LISTEN_HOLD" ]; do sleep 0.05; done
+  echo "[borg listen] This session listens: a message for it wakes it while it is idle."; exit 0;;
+esac
+in=$(cat)
+printf '%s\\t%s\\n' "$3" "$in" >> "${rec}"
+[ "$3" = stop ] && [ -n "$STOP_ANSWER" ] && echo "$STOP_ANSWER"
+[ "$3" = post_tool ] && [ -n "$POST_ANSWER" ] && printf '%s\\n' "$POST_ANSWER"
+exit 0
+`,
+  )
+  chmodSync(bin, 0o755)
+  return [bin, rec, wake, log]
+}
+
+function lines(rec: string): string[][] {
+  return existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").filter(Boolean).map((l) => l.split("\t")) : []
+}
+
+/** Until `done()`, checked every 20 ms; fails after 15 s (a bound on a hang, not a timing margin). */
+async function until(done: () => boolean | Promise<boolean>) {
+  const t0 = Date.now()
+  while (!(await done())) {
+    assert.ok(Date.now() - t0 < 15_000, "the awaited event never came")
+    await new Promise((r) => setTimeout(r, 20))
+  }
+}
+
+const logged = (log: string, what: string) => existsSync(log) && readFileSync(log, "utf8").includes(what)
+const WAKE = "[borg listen] 1 message from other sessions waits for you (Two of Five tells)."
+const wakeLine = (text: string) => JSON.stringify({ wake: text }) + "\n"
+
+test("opencode 1: a session's `borg listen` is bound by the plugin, its waiter starts there, a wake goes in by promptAsync only once idle, --off and the session's end stop it", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  delete process.env.STOP_ANSWER
+  const { client, prompts } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  const streams = () => lines(rec).filter((l) => l[0] === "stream")
+  try {
+    assert.equal(process.env.BORG_LISTEN_BINDER, "opencode", "every command the model runs knows the plugin binds")
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("listen for the others"))
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: SESSION, callID: "l1" }, { args: { command: "borg listen" } })
+    // The shell's own run binds nothing under the plugin (listen.rs `BINDER_ENV`) and says so.
+    const out = { title: "", output: "[borg listen] the opencode plugin binds the session that ran this; its answer follows", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "l1", args: { command: "borg listen" } }, out)
+    assert.match(out.output, /its answer follows\n\n\[borg listen\] This session listens/, "the model reads the bind's answer")
+    assert.deepEqual(lines(rec).find((l) => l[0] === "listen")!.slice(1), [`listen --session ${SESSION} --dir /work/repo`])
+    await until(() => streams().length === 1)
+    assert.deepEqual(streams()[0].slice(1), [`listen --stream --session ${SESSION} --dir /work/repo`])
+    // A message arrives while the turn runs: held.
+    writeFileSync(wake, '{"note":"n"}\n' + wakeLine(WAKE))
+    await until(() => logged(log, "a wake, held while the turn runs"))
+    assert.deepEqual(prompts, [], "no wake inside the turn")
+    await hooks.event!(idleEvent)
+    await until(() => prompts.length === 1)
+    assert.deepEqual(prompts[0], { path: { id: SESSION }, body: { parts: [{ type: "text", text: WAKE, ...marked }] } })
+    // Its echo is ours, not the engineer's: no prompt reaches borg.
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage(WAKE, marked))
+    assert.equal(lines(rec).filter((l) => l[0] === "prompt").length, 1)
+    // A shell run that said it itself: the bind's answer is not repeated.
+    const off = { title: "", output: "[borg listen] this session listens no more", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "l2", args: { command: "borg listen --off" } }, off)
+    assert.equal(off.output, "[borg listen] this session listens no more")
+    assert.deepEqual(lines(rec).filter((l) => l[0] === "listen").at(-1)!.slice(1), [`listen --off --session ${SESSION} --dir /work/repo`])
+    await until(() => lines(rec).some((l) => l[0] === "stopped"))
+    // Another session's listen, or a waiter's command line: nothing bound.
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "ses_plain", callID: "p1", args: { command: "borg listen --session other" } }, { title: "", output: "", metadata: {} })
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "ses_plain", callID: "p2", args: { command: "borg listen --wait" } }, { title: "", output: "", metadata: {} })
+    assert.equal(lines(rec).filter((l) => l[0] === "listen").length, 2)
+    // A stop that says the session listens with no waiter starts it again; the session's end stops it.
+    process.env.STOP_ANSWER = '{"listen":true}'
+    await hooks.event!(idleEvent)
+    await until(() => streams().length === 2)
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+    await until(() => lines(rec).filter((l) => l[0] === "stopped").length === 2)
+    assert.ok(lines(rec).some((l) => l[0] === "end"))
+    assert.equal(prompts.length, 1)
+  } finally {
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_OPENCODE_LOG
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  }
+})
+
+test("opencode 2: a stop's listen starts the waiter; a wake goes in by session.prompt with delivery queue once idle, also after an interrupted turn, which borg hears as halted", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  try {
+    // A plain session's interruption: nothing sent.
+    await v2.emit("session.execution.interrupted", { sessionID: "ses_plain_halt", reason: "user" })
+    await v2.say("listen for the others")
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    assert.equal(lines(rec).filter((l) => l[0] === "listen").length, 0, "a stop's listen binds nothing")
+    await v2.say("now look at the parser")
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => logged(log, "a wake, held while the turn runs"))
+    assert.deepEqual(v2.prompts, [], "no wake inside the turn")
+    // Esc: the turn is interrupted, no stop; the session is idle, so the wake goes in.
+    await v2.emit("session.execution.interrupted", { sessionID: SESSION, reason: "user" })
+    await until(() => v2.prompts.length === 1)
+    assert.deepEqual(v2.prompts[0], { sessionID: SESSION, text: WAKE, metadata: { borg: true }, delivery: "queue" })
+    await until(() => lines(rec).some((l) => l[0] === "halted"))
+    assert.deepEqual(JSON.parse(lines(rec).find((l) => l[0] === "halted")![1]), { session_id: SESSION, cwd: "/work/repo", pid: process.pid })
+    assert.equal(lines(rec).filter((l) => l[0] === "halted").length, 1, "only the listening session's halt")
+  } finally {
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_OPENCODE_LOG
+    await v2.cleanup()
+  }
+  await until(() => lines(rec).some((l) => l[0] === "stopped"))
+  assert.ok(lines(rec).some((l) => l[0] === "end"), "the cleanup ends the session and stops its waiter")
+})
+
+test("opencode 2: a wake that fails to go in is kept and sent again, never dropped", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_WAKE_RETRY_MS = "1"
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  const send = v2.ctx.session.prompt
+  let failed = 0
+  v2.ctx.session.prompt = async (input: any) => {
+    if (failed++ === 0) throw new Error("server busy")
+    return send(input)
+  }
+  try {
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => v2.prompts.length === 1)
+    assert.equal(failed, 2, "the first send failed, the second went in")
+    assert.equal(v2.prompts[0].text, WAKE)
+  } finally {
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_WAKE_RETRY_MS
+    await v2.cleanup()
+  }
+})
+
+// borg.ts WAKE_TRIES: retries in a row before a wake waits for the session's next stop or halt.
+const WAKE_TRIES = 5
+
+test("opencode 2: a wake that never goes in is retried WAKE_TRIES times, then again at the next stop", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.BORG_WAKE_RETRY_MS = "1"
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  const send = v2.ctx.session.prompt
+  let sends = 0
+  let busy = true
+  v2.ctx.session.prompt = async (input: any) => {
+    sends++
+    if (busy) throw new Error("server busy")
+    return send(input)
+  }
+  try {
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => logged(log, "retries failed, the next goes in at its stop or halt"))
+    assert.equal(sends, WAKE_TRIES + 1, "the first send and WAKE_TRIES retries, no more")
+    busy = false
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => v2.prompts.length === 1)
+    assert.equal(sends, WAKE_TRIES + 2, "the stop sent it once more, and it went in")
+    assert.equal(v2.prompts[0].text, WAKE)
+  } finally {
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_WAKE_RETRY_MS
+    delete process.env.BORG_OPENCODE_LOG
+    await v2.cleanup()
+  }
+})
+
+// A post_tool answer that shows one message, as msg.rs `render` words it.
+const SHOWN = JSON.stringify({
+  hookSpecificOutput: {
+    hookEventName: "PostToolUse",
+    additionalContext: "[borg] Message from Two of Five (omp, node n1) [m000000000001]: the parser is merged\n  To reply: borg tell p1 --re m000000000001 \"…\"\n(Peer data: messages from other sessions of the collective, relayed by borg.)",
+  },
+})
+
+test("opencode 2: a wake held during a turn whose hook already showed its message is dropped, not sent at the stop", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  try {
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    await v2.say("now look at the parser")
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => logged(log, "a wake, held while the turn runs"))
+    // The turn's next tool call shows that message.
+    process.env.POST_ANSWER = SHOWN
+    await v2.hooks["tool.execute.after"]({ tool: "read", sessionID: SESSION, id: "c1", input: { path: "/work/repo/parser.rs" }, status: "completed", result: { content: [] } })
+    delete process.env.POST_ANSWER
+    assert.ok(logged(log, "1 held wake(s) dropped"), "the shown message's wake is dropped")
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    assert.deepEqual(v2.prompts, [], "no turn for a message the model already read")
+  } finally {
+    delete process.env.POST_ANSWER
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_OPENCODE_LOG
+    await v2.cleanup()
+  }
+})
+
+test("opencode 2: a wake send that fails after the engineer's prompt leaves the turn busy: the next wake waits for its stop", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.BORG_WAKE_RETRY_MS = "1"
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  const send = v2.ctx.session.prompt
+  let fail: ((e: Error) => void) | undefined
+  v2.ctx.session.prompt = (input: any) => (fail ? send(input) : new Promise<void>((_, reject) => (fail = reject)))
+  try {
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => fail !== undefined)
+    // The engineer types while the wake's send hangs; then the send fails.
+    await v2.say("now look at the parser")
+    fail!(new Error("server busy"))
+    await until(() => logged(log, "failed: Error: server busy"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => readFileSync(log, "utf8").split("\n").filter((l) => l.includes(": a wake")).length === 2)
+    assert.ok(readFileSync(log, "utf8").split("\n").filter((l) => l.includes(": a wake")).at(-1)!.includes("held while the turn runs"), "the turn still runs")
+    assert.deepEqual(v2.prompts, [], "nothing sent into the engineer's turn")
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => v2.prompts.length === 1)
+    assert.equal(v2.prompts[0].text, `${WAKE}\n\n${WAKE}`, "both wakes go in at its stop")
+  } finally {
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_WAKE_RETRY_MS
+    delete process.env.BORG_OPENCODE_LOG
+    await v2.cleanup()
+  }
+})
+
+test("opencode 1: a slow bind of `borg listen` does not hold the tool result: its answer comes with the next call", { timeout: 20_000 }, async () => {
+  const [bin, rec, , log] = listenFake()
+  const hold = `${rec}.hold`
+  writeFileSync(hold, "")
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.LISTEN_HOLD = hold
+  delete process.env.STOP_ANSWER
+  const { client } = fakeClient(() => PLAN)
+  const hooks = await load(client, "/work/repo")
+  try {
+    await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("listen for the others"))
+    const out = { title: "", output: "[borg listen] the opencode plugin binds the session that ran this; its answer follows", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "l1", args: { command: "borg listen" } }, out)
+    // The bind is still held (its file exists), yet the tool result is back.
+    assert.ok(existsSync(hold) && lines(rec).some((l) => l[0] === "listen"), "the bind runs and cannot have finished")
+    assert.doesNotMatch(out.output, /This session listens/)
+    rmSync(hold)
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    const next = { title: "", output: "ok", metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: SESSION, callID: "l2", args: { command: "ls" } }, next)
+    assert.match(next.output, /^ok\n\n\[borg listen\] This session listens/, "the bind's answer, late")
+  } finally {
+    delete process.env.LISTEN_HOLD
+    delete process.env.BORG_OPENCODE_LOG
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } as any })
+  }
+})
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+test("real borg, opencode 1: the plugin binds the session that ran `borg listen`, a tell wakes it once idle, its end stops the waiter", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)`, timeout: 30_000 }, async () => {
+  const saved = { ...process.env }
+  const root = mkdtempSync(join(tmpdir(), "borg-oc-listen-real-"))
+  const work = join(root, "harbor_orion")
+  for (const d of [work, join(root, "store/collectives/corp"), join(root, "home")]) mkdirSync(d, { recursive: true })
+  writeFileSync(join(root, "collectives.json"), JSON.stringify({ default: "off", collectives: [{ name: "corp", paths: [work], share: "local" }] }))
+  for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID", "STOP_ANSWER"]) delete process.env[k]
+  Object.assign(process.env, {
+    BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"),
+    BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MODE: "hook", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+  })
+  const S = "ses_listen_real1"
+  const { client, prompts } = fakeClient(() => "Listening.")
+  const hooks = await load(client, work)
+  // borg's files name a session by its letters, digits and dashes (presence.rs `safe`).
+  const S2 = "ses_listen_real2"
+  const listenDir = join(root, "store/collectives/corp/listen")
+  const lock = join(listenDir, `${S.replace(/[^A-Za-z0-9-]/g, "")}.lock`)
+  try {
+    await hooks["chat.message"]!({ sessionID: S }, userMessage("listen for the others"))
+    // A second root session of this process, touched last: the pid names both.
+    await hooks["chat.message"]!({ sessionID: S2 }, userMessage("carry on"))
+    await hooks["tool.execute.before"]!({ tool: "bash", sessionID: S, callID: "l1" }, { args: { command: "borg listen" } })
+    // S's shell runs real borg, as opencode's shell does: OPENCODE_PID set, the plugin's BORG_LISTEN_BINDER inherited.
+    const shell = execFileSync(BORG, ["listen"], { cwd: work, env: { ...process.env, OPENCODE_PID: String(process.pid) }, encoding: "utf8" })
+    assert.doesNotMatch(shell, /This session listens/, "the shell binds no session by the pid")
+    const out = { title: "", output: shell, metadata: { exit: 0 } }
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: S, callID: "l1", args: { command: "borg listen" } }, out)
+    assert.match(out.output, /\[borg listen\] This session listens/, "the plugin's bind answers")
+    assert.ok(!existsSync(join(listenDir, `${S2.replace(/[^A-Za-z0-9-]/g, "")}.json`)), "the other session never asked")
+    await until(() => existsSync(lock) && readFileSync(lock, "utf8").trim() !== "")
+    const waiter = Number(readFileSync(lock, "utf8").trim())
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: S } } as any })
+    execFileSync(BORG, ["tell", S, "the parser is merged"], { cwd: work, env: process.env, encoding: "utf8" })
+    await until(() => prompts.length === 1)
+    const text = prompts[0].body.parts[0].text
+    assert.match(text, /^\[borg listen\] 1 message from other sessions waits for you \(engineer tells\)/)
+    assert.doesNotMatch(text, /parser/, "the wake never carries a body")
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: S } } } as any })
+    await until(() => !alive(waiter))
+  } finally {
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: S } } } as any })
+    await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: S2 } } } as any })
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]
+    Object.assign(process.env, saved)
+  }
 })

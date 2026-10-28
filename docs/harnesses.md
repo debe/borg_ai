@@ -62,14 +62,14 @@ effect of a refactor.
 | `prompt_context` | Context returned at a prompt reaches the model | yes | yes (hidden custom message) | yes (synthetic part / `session.synthetic`) | yes (a developer message in the next request) |
 | `tool_context` | Context after a tool call reaches the model before its next step (live mode's asks) | yes | yes (omp ≥ 18.4.4) | yes (appended to the output / steered in) | yes (a developer message in the next request; in code mode after the whole `exec` script) |
 | `early_delivery` | A prompt or touch naming a lesson's scope gets that scope's lessons at once | yes | no | no | no |
-| `steer_in_context` | Steering is shown at the next prompt or tool call (otherwise at the next stop) | yes | no | no | no |
 | `question_dialog` | A queen question uses the AskUserQuestion dialog (otherwise it is asked inline) | yes | no | no | no |
 | `transcript` | Where the turn's work and the last message come from | Claude JSONL | none: the tool calls the hook logs (`.turn`) | none | none: `transcript_path` is a Codex rollout and is dropped |
 | `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored) | yes | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event |
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
+| `drone_wake` | How `borg listen` wakes an idle session ([Waking a session](commands.md#waking-a-session)) | `Model`: the model runs `borg listen --wait` in the background | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
 | `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | none (the adapter sets 28 s) | none (the adapter sets 90 s) | 90 s, the Stop hook's timeout |
 
-omp and opencode already have channels for early delivery and steering in context. Both stay off until
+omp and opencode already have a channel for early delivery. It stays off until
 an evaluation shows they help. Standing lessons (ratified constraints) are exempt: they are no ranking
 guess, so they arrive early on every harness whose `prompt_context` or `tool_context` takes them
 (hook.rs `early`).
@@ -184,11 +184,11 @@ cargo test -p borg-web --test drones_api                     # the page's /api/d
 | Hooks | An off-repo prompt writes nothing. The prompt is recorded. Touches go to `.ctx`, and an edit's path and text go to `.edits`. A paused drone's tool call is refused. The stop blocks once, within its budget, and the second round passes; a model slower than the budget (`BORG_STOP_BUDGET_MS`) never holds the stop past it. `end` ends the drone. Garbage input fails open. |
 | Live | An edit starts a detached check and the hook returns at once. The ask is queued and delivered with the next tool call; without tool context, with the next prompt; with neither, at the stop. A covered stop makes no model call. |
 | Web | `borg top --json` shows the drone with its `harness` and its state: working, then waiting, then ended. `/api/drones` and `/api/collectives` show the same. |
-| Capabilities | Context at a prompt and after a tool call, early delivery, steering in context, the transcript source, denials to episodes, and a gone pid, each on both sides. |
+| Capabilities | Context at a prompt and after a tool call, early delivery, the transcript source, denials to episodes, and a gone pid, each on both sides. |
 
 `sim` runs four profiles: the default flags (`prompt,tool,deny`), no tool context (`prompt,deny`), no flag
 at all, and every flag on. Together they put `prompt_context`, `tool_context`, `early_delivery`,
-`steer_in_context`, `transcript`, `deny_capture` and `sends_pid` on both sides from one binary. The real
+`transcript`, `deny_capture` and `sends_pid` on both sides from one binary. The real
 harnesses add the sides they have. `question_dialog` is the exception: no conformance test asks a queen
 question yet, so only the queen's unit tests cover it.
 

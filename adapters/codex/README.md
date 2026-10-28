@@ -7,7 +7,7 @@ hooks to `~/.codex/hooks.json` (`$CODEX_HOME/hooks.json`), each running `<path t
 | Codex event | borg event | Timeout | Notes |
 |---|---|---|---|
 | `UserPromptSubmit` | `prompt` | 30 s | borg's context for the prompt reaches the model as a developer message. |
-| `PreToolUse` | `pre_tool` | 10 s | Only a drone paused by `borg steer --pause` gets an answer: a deny. A slow hook never blocks a tool: Codex runs the tool once the timeout passes. |
+| `PreToolUse` | `pre_tool` | 10 s | Only a drone paused by `borg pause` gets an answer: a deny. A slow hook never blocks a tool: Codex runs the tool once the timeout passes. |
 | `PostToolUse` | `post_tool` | 30 s | `apply_patch` becomes an edit of every file the patch names (`*** Add/Update/Delete File:`, and a rename's `*** Move to:`), with the added lines as its text. In live mode a check's questions come back as `additionalContext`, which reaches the model's next request. |
 | `Stop` | `stop` | 90 s | borg's `{"decision":"block","reason"}` starts one more round. Codex never caps the rounds, but borg answers nothing to a stop with `stop_hook_active` set, so there is one round of questions per turn. The 90 s are borg's whole budget at the stop. |
 | `SessionEnd` | `end` | 3 s | Codex's maximum. borg starts `borg learn --session` in the background and returns. |

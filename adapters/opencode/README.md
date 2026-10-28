@@ -10,11 +10,12 @@ opencode's hooks and events into borg's canonical hook event and pipes it to
 | opencode 1.x | opencode 2.x | borg event | what borg does |
 |---|---|---|---|
 | `chat.message` (the engineer's text) | session hook `prompt` | `prompt` | records the task; a correction becomes an episode; borg's context for the prompt (a queen question) reaches the drone but stays hidden in the TUI: on 1.x a synthetic text part of the message, on 2.x a synthetic session input without a description, just before the prompt; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
-| `tool.execute.before` | tool hook `execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg steer --pause` (refuses the call); fails open after 2 s |
+| `tool.execute.before` | tool hook `execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg pause` (refuses the call); fails open after 2 s |
 | `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`, an edit's `newString` → `new_string`); borg's context for the call (in live mode a check's questions, or waiting graded lessons) reaches the model before its next step, see below |
 | a tool part that ends in `error`, including a permission rejected with feedback | `execute.after` with an error (a rejection with feedback carries it), or `session.tool.failed` for a call declined without feedback | `post_tool_failure` | the engineer's feedback becomes an episode |
 | `session.idle` | `session.execution.succeeded` | `stop` | the conscience may answer `{"decision":"block","reason"}`; the plugin sends the reason back into the session as a user message |
-| `session.deleted`, opencode shutting down | `session.deleted`, the plugin's cleanup (reload, shutdown) | `end` | runs `borg learn --session ID` in the background |
+| `session.deleted`, opencode shutting down | `session.deleted`, the plugin's cleanup (reload, shutdown) | `end` | runs `borg learn --session ID` in the background; the session's waiter is stopped |
+| a halted turn (`session.idle` after an abort) of a listening session | `session.execution.interrupted` or `.failed` of a listening session | `halted` | ends the engineer's turn at once, so wakes go in again (see "Listening sessions") |
 
 The plugin answers a stop with borg's questions at most once per engineer prompt. The next idle is
 sent with `stop_hook_active: true`, as Claude Code does. Three more guards keep the plugin from
@@ -42,8 +43,28 @@ failed tool call, so a question waiting then goes with the next successful call,
 stop. opencode writes no Claude transcript, so borg's live check reads the turn's tool calls and edits,
 not the drone's prose.
 
+**Listening sessions.** opencode gives its shell no session id, so the plugin binds the session that
+runs `borg listen` itself. It sets `BORG_LISTEN_BINDER=opencode` in its own process, so every command
+the model runs has it, and borg run from that shell binds no session itself: one opencode process can
+run several sessions under one pid, so the pid cannot tell which one ran the command. When a session's
+own `tool.execute.after` shows `borg listen` (or `borg listen --off`), the plugin runs
+`borg listen [--off] --session <id> --dir <directory>` behind the session's other borg calls. If the
+shell's own run did not say it, borg's answer is added to what the model reads. The tool result waits at
+most 2 s for the tool call's answer and the bind together; a later answer goes with the next tool call
+or prompt. From then on, or from a stop whose answer carries `"listen": true` (the session listens and no
+waiter runs), the plugin keeps the session's waiter, `borg listen --stream`. The waiter costs no tokens,
+holds wakes off while the engineer's turn runs and prints one JSON line per wake.
+The plugin sends a wake in only while the session is idle, from its stop (or a halted turn) to its next
+prompt or tool call: opencode 1.x with `session.promptAsync`, opencode 2.x with `session.prompt` and
+`delivery: "queue"`, both marked `{ borg: true }` so the echo is not the engineer's prompt. A wake that
+fails to go in is kept and sent again 5 s later, at most 5 times in a row, then at the session's next
+stop or halt. A wake held during a turn is dropped when a hook of that turn already showed its
+messages, so no turn is spent on messages the model has read. A halted turn of a listening session (no stop) is sent to borg as `halted`, so its waiter
+holds nothing off any more. An `{"end"}` line ends the waiter until the next `"listen": true`;
+`--off`, the session's end and the plugin's unload stop it.
+
 The plugin ignores subagent (child) sessions, except before a tool call: a child's `pre_tool` asks
-as its root session, so a drone paused by `borg steer --pause` cannot keep working through a subagent.
+as its root session, so a drone paused by `borg pause` cannot keep working through a subagent.
 
 The plugin fails open. If borg is missing, slow or broken, opencode carries on as if the plugin were
 not there. A stop gets 90 s (opencode sets no limit of its own), which the plugin passes to borg as

@@ -49,6 +49,8 @@ pub struct Inbox {
     /// This node as messages name it (msg.rs `node`).
     #[serde(skip)]
     pub here: String,
+    /// Per local drone's session that listens for wakes (listen.rs), whether its waiter runs.
+    pub listen: BTreeMap<String, crate::listen::Status>,
 }
 
 /// How many messages the screen lists.
@@ -109,14 +111,15 @@ pub fn assemble(local: Vec<Presence>, remote: Vec<presence::Remote>, now: i64, a
 /// The drones of the collective stored at `home` as of `now`; remote ones only if it may sync.
 pub fn drones(home: &Path, may_sync: bool, now: i64) -> Vec<Drone> {
     let remote = if may_sync { presence::remote(home, now) } else { Vec::new() };
-    assemble(presence::local(home, now), remote, now, presence::alive, |p| steer::pending(home, &p.session, p.started, now).paused.is_some())
+    assemble(presence::local(home, now), remote, now, presence::alive, |p| steer::paused(home, &p.session, Some(p.started), now))
 }
 
 /// The messages of the store at `home` for its `drones` as of `now` (one read of the log, one
 /// directory listing per local drone that has a message).
 pub fn inbox(home: &Path, drones: &[Drone], now: i64) -> Inbox {
+    let listen = listen_of(home, drones);
     if std::fs::metadata(msg::path(home)).is_err() {
-        return Inbox::default();
+        return Inbox { listen, ..Inbox::default() };
     }
     let all: Vec<Message> = msg::read(home).into_iter().filter(|m| now - m.ms <= msg::TTL_MS).collect();
     let here = msg::node(home);
@@ -125,7 +128,22 @@ pub fn inbox(home: &Path, drones: &[Drone], now: i64) -> Inbox {
     let mut recent = all;
     recent.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
     recent.truncate(RECENT);
-    Inbox { unread, recent, day, here }
+    Inbox { unread, recent, day, here, listen }
+}
+
+/// Per local drone's session that listens for wakes, whether its waiter runs (one stat for any other).
+fn listen_of(home: &Path, drones: &[Drone]) -> BTreeMap<String, crate::listen::Status> {
+    drones
+        .iter()
+        .filter(|d| d.node.is_empty() && d.state != State::Ended)
+        .filter_map(|d| crate::listen::status(home, &d.p.session).map(|s| (d.p.session.clone(), s)))
+        .collect()
+}
+
+/// A drone's wake as the screen shows it: `on` (it listens, the next stop starts its waiter), `waiter`
+/// (its waiter runs), `-` (it is never woken, or this node cannot tell).
+pub fn wake_cell(inbox: &Inbox, d: &Drone) -> &'static str {
+    inbox.listen.get(&d.p.session).map_or("-", |s| s.name())
 }
 
 /// Per live local drone's session, how many of the already-read `all` messages were not shown to it
@@ -244,19 +262,20 @@ pub fn render(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, now: i6
 
 fn drone_table(drones: &[Drone], inbox: &Inbox, now: i64) -> String {
     let mut s = format!(
-        "  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6} {:>6}  {:<40} {}\n",
-        "DRONE", "SESSION", "ENGINEER", "REPO", "STATE", "IDLE", "UNREAD", "DOING", "FILES"
+        "  {:<18} {:<8} {:<24} {:<14} {:<8} {:<6} {:>6} {:>6}  {:<40} {}\n",
+        "DRONE", "SESSION", "ENGINEER", "REPO", "STATE", "WAKE", "IDLE", "UNREAD", "DOING", "FILES"
     );
     for d in drones {
         let state = if d.paused { "paused" } else { d.state.name() };
         let engineer = if d.node.is_empty() { d.p.engineer.clone() } else { format!("{} @{}", d.p.engineer, d.node.get(..6).unwrap_or(&d.node)) };
         let line = format!(
-            "  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6} {:>6}  {:<40} {}",
+            "  {:<18} {:<8} {:<24} {:<14} {:<8} {:<6} {:>6} {:>6}  {:<40} {}",
             d.designation,
             cut(&d.p.session, 8),
             cut(if engineer.is_empty() { "?" } else { &engineer }, 24),
             cut(&d.p.repo, 14),
             state,
+            wake_cell(inbox, d),
             ago(now - d.p.ms),
             unread_cell(inbox, d),
             cut(&d.p.prompt, 40),
@@ -279,6 +298,9 @@ pub fn to_json_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox) -
         for (o, d) in ds.iter_mut().zip(drones) {
             if let Some(n) = inbox.unread.get(&d.p.session) {
                 o["unread"] = json!(n);
+            }
+            if let Some(l) = inbox.listen.get(&d.p.session) {
+                o["listen"] = json!(l);
             }
         }
     }
@@ -423,11 +445,11 @@ mod tests {
         assemble(local, remote, NOW, |_| true, |p| p.session.starts_with("aaaa"))
     }
 
-    fn message(by: &str, name: &str, to: &str, kind: &str, ms: i64, text: &str) -> Message {
+    fn message(by: &str, name: &str, to: &str, kind: msg::Kind, ms: i64, text: &str) -> Message {
         message_on("n1", by, name, to, kind, ms, text)
     }
 
-    fn message_on(node: &str, by: &str, name: &str, to: &str, kind: &str, ms: i64, text: &str) -> Message {
+    fn message_on(node: &str, by: &str, name: &str, to: &str, kind: msg::Kind, ms: i64, text: &str) -> Message {
         let from = msg::Sender { by: by.into(), name: name.into(), harness: "claude".into(), node: node.into() };
         Message::new(kind, &from, to, None, ms, text)
     }
@@ -442,6 +464,9 @@ mod tests {
             ],
             day: 3,
             here: "n1".into(),
+            listen: [("aaaa1111-x".to_string(), crate::listen::Status::Waits), ("cccc3333-x".to_string(), crate::listen::Status::Listens)]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -450,10 +475,10 @@ mod tests {
         let out = render("corp", Share::Team, &fixture(), &inbox_fixture(), NOW);
         let expected = "\
 corp (team): 3 drone(s), 2 active, 1 remote
-  DRONE              SESSION  ENGINEER                 REPO           STATE      IDLE UNREAD  DOING                                    FILES
-  One of Three       aaaa111… alice@x                  borg-ai        paused       5s      2  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
-  Two of Three       bbbb222… bob@y @beefca            borg-ai        waiting      2m      -  review PR 42                             README.md
-  Three of Three     cccc333… alice@x                  borg-ai        idle        31m      0  write the release notes for the mesh da…
+  DRONE              SESSION  ENGINEER                 REPO           STATE    WAKE     IDLE UNREAD  DOING                                    FILES
+  One of Three       aaaa111… alice@x                  borg-ai        paused   waiter     5s      2  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
+  Two of Three       bbbb222… bob@y @beefca            borg-ai        waiting  -          2m      -  review PR 42                             README.md
+  Three of Three     cccc333… alice@x                  borg-ai        idle     on        31m      0  write the release notes for the mesh da…
   messages: 3 in the last day, 2 unread
       1m  Three of Three asks -> One of Three: which test flakes?
       2m  alice@x -> all: release at five

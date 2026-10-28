@@ -27,7 +27,6 @@ impl Harness for Opencode {
             tool_context: true,
             // The channels exist (borg.ts); turning these on waits for an evaluation.
             early_delivery: false,
-            steer_in_context: false,
             question_dialog: false,
             transcript: Transcript::None,
             deny_capture: true,

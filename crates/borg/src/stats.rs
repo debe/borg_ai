@@ -438,7 +438,8 @@ fn derive_history(home: &Path) -> Vec<Event> {
             });
         }
     }
-    // Directives this node issued (the mesh outbox) and those it accepted (the inbox).
+    // History: an older store's directives (the mesh outbox, the steer inbox). Nothing writes these
+    // files any more; steering now counts as it happens (msg.rs `send`, `deliver`).
     for (file, kind) in [(home.join("mesh").join("directives.jsonl"), STEER_ISSUED), (home.join("steer").join("inbox.jsonl"), STEER_DELIVERED)] {
         for d in lines(&file) {
             out.push(Event {
@@ -451,7 +452,7 @@ fn derive_history(home: &Path) -> Vec<Event> {
             });
         }
     }
-    for d in lines(&home.join("steer").join("dropped.jsonl")) {
+    for d in lines(&crate::steer::dropped_path(home)) {
         out.push(Event { ms: ms(&d, "ms"), kind: STEER_DROPPED.into(), engineer: s(&d, "engineer"), why: s(&d, "why"), ..Default::default() });
     }
     out.extend(turns_from_state(&home.join("state"), &who));

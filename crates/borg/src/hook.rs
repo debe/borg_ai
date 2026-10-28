@@ -1018,11 +1018,8 @@ fn live_trigger(session: &str, input: &Value, tool: &str, changed: bool) {
     let now = learn::now_ms();
     // A paused drone (steer.rs) is waiting for its engineer, not working: nothing to check.
     let home = learn::home();
-    if crate::steer::inbox(&home).exists() {
-        let started = crate::presence::read(&home, session).map_or(i64::MAX, |p| p.started);
-        if crate::steer::pending(&home, session, started, now).paused.is_some() {
-            return;
-        }
+    if crate::steer::active(&home) && crate::steer::paused(&home, session, crate::presence::read(&home, session).map(|p| p.started), now) {
+        return;
     }
     let lock = live::lock_state(&ctx, now, live::stale_ms(), live::alive);
     if live::decide(live::Mode::Live, lock, live::count(&ctx), live::read_mark(&ctx), now, live::debounce_ms()).is_err() {
@@ -1617,27 +1614,34 @@ pub fn main(name: &str, event: &str) {
     }
     // Who is working where (presence.rs, for `borg top`): one small atomic write per hook.
     let now = learn::now_ms();
-    // A session's start and a halted turn (hooks of an older install) read and write nothing.
+    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+    // The turn of a session that listens for wakes (listen.rs): one stat of its opt-in for any other, at
+    // a prompt, a tool call's start or end, a halted turn and the end. With steering's stat below, an idle
+    // tool call costs two failed stats: the opt-in is per session, the admissions are per store.
+    crate::listen::touch(&home, event, session, now);
+    // A session's start (a hook of an older install) and a halted turn read and write nothing more.
     if matches!(event, "start" | "halted") {
         return;
     }
-    // Not at pre_tool (every tool call): there only steering reads, once someone steered.
-    let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
+    // Not at pre_tool (every tool call): there only steering reads, once someone steered (steer.rs
+    // `active`, the second stat).
     let me = match event {
         "pre_tool" => {
-            if !crate::steer::inbox(&home).exists() {
+            if !crate::steer::active(&home) {
                 return;
             }
             crate::presence::read(&home, session)
         }
         _ => crate::presence::touch(&home, &name, h.name(), event, &input, now),
     };
-    // Signed steering (steer.rs) wraps the answer: shown once, and a pause holds tools and the stop.
+    // Steering (steer.rs) wraps the answer: a pause refuses tools and lets the stop wait.
     // At a stop, the routed collective's experts join the conscience's block (expert_route.rs).
     let started = me.map(|p| p.started);
-    let out = crate::steer::around(&home, h.caps().steer_in_context, event, &input, started, now, || {
-        crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input))
-    });
+    // A listening session's stop holds its wakes off until its answer is out (listen.rs).
+    let stopping = crate::listen::stopping(&home, event, session, now);
+    let out = crate::steer::around(&home, event, &input, started, now, || crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input)));
+    // A listening session's stop starts its waiter, or asks for it (listen.rs).
+    let out = crate::listen::after_stop(&home, h, stopping.as_ref(), &input, out);
     // Messages from other sessions (msg.rs) join a prompt's or tool call's context, each once.
     if let Some(out) = crate::msg::deliver(&home, h.caps(), event, &input, started, now, out) {
         println!("{out}");

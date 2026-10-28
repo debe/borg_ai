@@ -389,11 +389,11 @@ for (const p of PROFILES) {
     const s = `conf-pause-${p.harness}`
     const h = await drone(w, p, s)
     await h.prompt(PROMPT)
-    const inbox = join(w.root, "store/collectives/corp/steer/inbox.jsonl")
-    mkdirSync(join(inbox, ".."), { recursive: true })
-    const d = { id: "p1", collective: "corp", key: "ab".repeat(32), engineer: "bob@x", target: { node: "", session: s }, kind: "pause", text: "", ms: Date.now(), sig: "00", role: "steer" }
-    writeFileSync(inbox, JSON.stringify(d) + "\n")
-    assert.match(await h.refused({ kind: "bash", command: "ls" }, "c1"), /paused/)
+    // The engineer's `borg pause` from this machine: a pause message, admitted locally (steer.rs).
+    assert.match(w.cli("pause", s, "--dir", w.cwd, "use the mock db"), /^paused /)
+    assert.match(await h.refused({ kind: "bash", command: "ls" }, "c1"), /paused by/)
+    w.cli("resume", s, "--dir", w.cwd)
+    assert.equal(await h.refused({ kind: "bash", command: "ls" }, "c2"), "", "resumed")
     await h.close()
     rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })

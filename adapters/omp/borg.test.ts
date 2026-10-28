@@ -4,21 +4,23 @@
 // runner.ts, session/agent-session.ts in the omp bundle).
 
 import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
-import borg, { runBorg, text, toolEvent, toolInput } from "./borg.ts";
+import borg, { aborted, listenCommand, runBorg, streamLine, text, toolEvent, toolInput } from "./borg.ts";
 
 const root = resolve(import.meta.dirname, "../..");
 const BORG = process.env.BORG_BIN || join(root, "target/debug/borg");
 const SESSION = "0199c0de-omp-contract";
 
-/** Load the extension into a fake ExtensionAPI and return its handlers. */
-function load(): Record<string, (ev: unknown, ctx: unknown) => Promise<any>> {
+/** Load the extension into a fake ExtensionAPI and return its handlers; `send` gets its
+ *  pi.sendMessage calls (message, options). */
+function load(send: (m: any, o: any) => void = () => {}): Record<string, (ev: unknown, ctx: unknown) => Promise<any>> {
 	const handlers: Record<string, any> = {};
-	borg({ on: (name: string, fn: any) => (handlers[name] = fn) });
+	borg({ on: (name: string, fn: any) => (handlers[name] = fn), sendMessage: send });
 	return handlers;
 }
 
@@ -347,3 +349,165 @@ test("fails open: missing borg binary, bad output", async () => {
 	assert.equal(await runBorg("stop", { session_id: "s", cwd: "/" }, 1000), null);
 	assert.equal(await h.session_stop({}, {}), undefined, "even a malformed event/context is a no-op");
 });
+
+// ---- borg listen: the extension keeps a listening session's waiter and sends its wakes in.
+
+test("a shell command opts its own session in or out only as `borg listen [--off]`; waiter lines parse", () => {
+	assert.equal(listenCommand("borg listen"), "on");
+	assert.equal(listenCommand("cd /r && /usr/local/bin/borg listen --dir /r"), "on");
+	assert.equal(listenCommand("borg listen --off"), "off");
+	assert.equal(listenCommand("borg listen --wait --session s"), undefined, "Claude's waiter");
+	assert.equal(listenCommand("borg listen --stream"), undefined);
+	assert.equal(listenCommand("borg listen --session s2"), undefined, "another session's");
+	assert.equal(listenCommand("echo borg listens; ls"), undefined);
+	assert.equal(listenCommand("borg tell all hi"), undefined);
+	assert.deepEqual(streamLine('{"wake":"[borg listen] 1 message"}'), { wake: "[borg listen] 1 message" });
+	assert.deepEqual(streamLine('{"note":"n"}'), { note: "n" });
+	assert.deepEqual(streamLine('{"end":"stopped"}'), { end: "stopped" });
+	assert.equal(streamLine('{"wake":"  "}'), undefined);
+	assert.equal(streamLine("not json"), undefined);
+	assert.equal(aborted([{ role: "user" }, { role: "assistant", stopReason: "aborted" }]), true);
+	assert.equal(aborted([{ role: "assistant", stopReason: "aborted" }, { role: "assistant", stopReason: "stop" }]), false);
+	assert.equal(aborted(undefined), false);
+});
+
+/** Until `done()`, checked every 20 ms; fails after 15 s (a bound on a hang, not a timing margin). */
+async function until(done: () => boolean | Promise<boolean>) {
+	const t0 = Date.now();
+	while (!(await done())) {
+		assert.ok(Date.now() - t0 < 15_000, "the awaited event never came");
+		await new Promise((r) => setTimeout(r, 20));
+	}
+}
+
+/** A fake borg: `listen --stream` records `stream\t<args>`, prints what is written to $WAKE (each
+ *  line once), ends with `{"end"}` when $WAKE holds `END`, and records `stopped` on SIGTERM; a hook
+ *  records `<event>` and answers a stop with $STOP_ANSWER. Returns [binary, record file, wake file]. */
+function listenFake(): [string, string, string] {
+	const dir = mkdtempSync(join(tmpdir(), "borg-omp-listen-"));
+	const [bin, rec, wake] = [join(dir, "borg"), join(dir, "rec"), join(dir, "wake")];
+	writeFileSync(
+		bin,
+		`#!/bin/sh
+if [ "$1 $2" = "listen --stream" ]; then
+  printf 'stream\\t%s\\n' "$*" >> "${rec}"
+  trap 'printf "stopped\\n" >> "${rec}"; exit 143' TERM
+  while :; do
+    if [ -s "${wake}" ]; then
+      if grep -q '^END$' "${wake}"; then : > "${wake}"; echo '{"end":"listens no more"}'; exit 0; fi
+      cat "${wake}"; : > "${wake}"
+    fi
+    sleep 0.05
+  done
+fi
+cat > /dev/null
+printf '%s\\n' "$3" >> "${rec}"
+[ "$3" = stop ] && [ -n "$STOP_ANSWER" ] && echo "$STOP_ANSWER"
+exit 0
+`,
+	);
+	chmodSync(bin, 0o755);
+	return [bin, rec, wake];
+}
+
+const records = (rec: string) => (existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").filter(Boolean) : []);
+
+test("a listening omp session: its waiter starts at its `borg listen`, wakes it by pi.sendMessage(nextTurn, triggerTurn), an Esc reaches borg as halted, --off stops it, a stop's listen restarts it, its end stops it", { timeout: 20_000 }, async () => {
+	const [bin, rec, wake] = listenFake();
+	process.env.BORG_BIN = bin;
+	delete process.env.STOP_ANSWER;
+	const sent: [any, any][] = [];
+	const h = load((m, o) => sent.push([m, o]));
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const listen = (command: string, said: string) =>
+		h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "l1", input: { command }, content: [{ type: "text", text: said }], isError: false }, ctx);
+	const streams = () => records(rec).filter((r) => r.startsWith("stream\t"));
+	try {
+		// A `borg listen` that did not opt in (outside a collective): no waiter.
+		await listen("borg listen", "off: /r belongs to no collective; no messages here");
+		await listen("borg listen", "[borg listen] This session listens: a message for it wakes it while it is idle.");
+		await until(() => streams().length === 1);
+		assert.deepEqual(streams(), ["stream\tlisten --stream --session s --dir /r"]);
+		writeFileSync(wake, '{"note":"ignored"}\n{"wake":"[borg listen] 1 message from other sessions waits for you."}\n');
+		await until(() => sent.length === 1);
+		assert.deepEqual(sent[0], [{ customType: "borg-listen", content: "[borg listen] 1 message from other sessions waits for you.", display: true }, { deliverAs: "nextTurn", triggerTurn: true }]);
+		// A finished run is no halt; an Esc is.
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "aborted" }], willContinue: true }, ctx);
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "aborted" }] }, ctx);
+		assert.equal(records(rec).filter((r) => r === "halted").length, 1);
+		await listen("borg listen --off", "[borg listen] this session listens no more");
+		await until(() => records(rec).includes("stopped"));
+		// The stop says the session listens with no waiter: it starts again, and its `end` line ends it.
+		process.env.STOP_ANSWER = '{"listen":true}';
+		assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), undefined);
+		await until(() => streams().length === 2);
+		// Its `end` line: it ends, and only a later stop's listen starts it again (one per stop that says so).
+		writeFileSync(wake, "END\n");
+		await until(async () => (await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), streams().length === 3));
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+		await until(() => records(rec).filter((r) => r === "stopped").length === 2);
+		assert.ok(records(rec).includes("end"));
+		assert.equal(sent.length, 1);
+	} finally {
+		delete process.env.STOP_ANSWER;
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+/** Whether process `pid` runs. */
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+test(
+	"real borg: an omp session that runs `borg listen` is woken by a tell once its turn ended, and its end stops the waiter",
+	{ skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)`, timeout: 30_000 },
+	async () => {
+		const saved = { ...process.env };
+		const root = mkdtempSync(join(tmpdir(), "borg-omp-listen-real-"));
+		const work = join(root, "harbor_orion");
+		for (const d of [work, join(root, "store/collectives/corp"), join(root, "home")]) mkdirSync(d, { recursive: true });
+		writeFileSync(join(root, "collectives.json"), JSON.stringify({ default: "off", collectives: [{ name: "corp", paths: [work], share: "local" }] }));
+		for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID", "STOP_ANSWER"]) delete process.env[k];
+		Object.assign(process.env, {
+			BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"),
+			BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MODE: "hook", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+		});
+		const S = "omp-listen-1";
+		const sent: [any, any][] = [];
+		const h = load((m, o) => sent.push([m, o]));
+		const ctx = { cwd: work, sessionManager: { getSessionId: () => S } };
+		const lock = join(root, "store/collectives/corp/listen", `${S}.lock`);
+		try {
+			await h.input({ type: "input", text: "listen for the others", source: "interactive" }, ctx);
+			// The model's bash runs it: omp gives it PI_SESSION_ID.
+			const said = execFileSync(BORG, ["listen"], { cwd: work, env: { ...process.env, PI_SESSION_ID: S }, encoding: "utf8" });
+			assert.match(said, /^\[borg listen\] This session listens/);
+			await h.tool_call({ type: "tool_call", toolName: "bash", toolCallId: "l1", input: { command: "borg listen" } }, ctx);
+			await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "l1", input: { command: "borg listen" }, content: [{ type: "text", text: said }], isError: false }, ctx);
+			await until(() => existsSync(lock) && readFileSync(lock, "utf8").trim() !== "");
+			const waiter = Number(readFileSync(lock, "utf8").trim());
+			// The turn ends; the waiter runs, so the stop says nothing.
+			assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "Listening.", session_id: S }, ctx), undefined);
+			execFileSync(BORG, ["tell", S, "the parser is merged"], { cwd: work, env: process.env, encoding: "utf8" });
+			await until(() => sent.length === 1);
+			const [message, options] = sent[0];
+			assert.equal(message.customType, "borg-listen");
+			assert.match(message.content, /^\[borg listen\] 1 message from other sessions waits for you \(engineer tells\)/);
+			assert.doesNotMatch(message.content, /parser/, "the wake never carries a body");
+			assert.deepEqual(options, { deliverAs: "nextTurn", triggerTurn: true });
+			await h.session_shutdown({ type: "session_shutdown" }, ctx);
+			await until(() => !alive(waiter));
+		} finally {
+			await h.session_shutdown({ type: "session_shutdown" }, ctx);
+			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			Object.assign(process.env, saved);
+		}
+	},
+);

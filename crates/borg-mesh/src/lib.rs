@@ -14,8 +14,10 @@
 //!   their author to two member replicas, and any holder answers a member asking for a commit's.
 //! - **Sync** (sync.rs, recon.rs): iroh QUIC between two nodes, trust first (membership and
 //!   revocations before any data), then range-based set reconciliation, cost ∝ difference.
-//! - **Live** (live.rs, steer.rs): presence of the members' drones and signed steering directives,
-//!   ephemeral, carried in every session after the logs; never reconciled into a log.
+//! - **Live** (live.rs): presence of the members' drones, ephemeral, carried in every session after
+//!   the logs; never reconciled into a log.
+//! - **Steering** (steer.rs): a pause, resume or veto is a message line, authenticated by its origin;
+//!   another node's counts only under its member role `admin` or `steer`, admitted when stored.
 //! - **Daemon** (daemon.rs, peers.rs): `serve` accepts members and dials the known ones every
 //!   interval and on local change, with backoff, until Ctrl-C / SIGTERM.
 //! - **Reach** (addr.rs): peers are dialled by key; across NAT through iroh's hole punching with

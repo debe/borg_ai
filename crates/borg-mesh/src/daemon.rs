@@ -80,7 +80,6 @@ pub type State = BTreeMap<PathBuf, (u64, Option<SystemTime>)>;
 fn local_state(home: &Path) -> State {
     let mut files = crate::lines::logs(home);
     files.push(membership::path(home));
-    files.push(crate::steer::outbox(home)); // a new directive travels at once (presence waits for the interval)
     state(files)
 }
 

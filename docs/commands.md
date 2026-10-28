@@ -52,10 +52,12 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | Command | Shows or does |
 |---|---|
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
-| `borg steer <drone\|session\|all> "<text>" \| --pause \| --resume` | A signed instruction to running drones |
 | `borg tell <drone\|session\|all\|engineer> "<text>" [--re ID] [--from SESSION]` | A message to other sessions, on any harness or member's machine, shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
 | `borg ask <drone\|session\|all\|engineer> "<question>" [--re ID] [--from SESSION]` | As `tell`, for a message that asks for a reply |
 | `borg inbox [--all] [--json] [--from SESSION]` | In a session: its messages, new or shown, then marks them shown. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to |
+| `borg pause <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
+| `borg resume <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Lets a paused session's tool calls run again |
+| `borg listen [--off] [--session S] [--dir DIR]` | Wakes this session when a message arrives while it is idle, until `--off` or the session's end ([Waking a session](#waking-a-session)) |
 
 **Shell completion:**
 
@@ -90,7 +92,55 @@ rest come at the next one. opencode gives its shell no session id, so its reply 
 Text is redacted, put on one line and cut to 1,000 characters. One message per sender and recipient per
 10 minutes; a repeat is refused. Messages live in `<store>/messages.jsonl` for 7 days, at most the 500
 newest, and sync with the team collective like lessons ([Team sync](team-sync.md#how-a-sync-works)).
-An idle session sees a message when it next runs; nothing wakes it yet.
+An idle session sees a message when it next runs, unless it listens ([Waking a session](#waking-a-session)).
+
+### Pause and resume
+
+`borg pause` and `borg resume` are messages of their own kind; a veto from `borg no` to a drone on
+another machine is one too. They go to a drone, a session or `all`, never to `engineer`; a pause or
+resume may have no text. A veto names exactly one session on one machine (`<session>@<node>`). They are not
+rate limited, so a resume can follow a pause at once.
+
+They count only when admitted. This machine's own are admitted when sent: the engineer here steers
+their own sessions. Another machine's are admitted by `borg mesh serve` when the member list gives
+the sender the `admin` or `steer` role; a `share: local` collective admits none. A message without an
+admission is neither shown nor in force.
+
+Every harness shows them at the next prompt or tool call: each veto once, and of a session's pauses and
+resumes only the latest. While the latest is a pause, the session's tool calls are refused with its note.
+Its stop is not blocked and the conscience does not run. A pause lapses after 24 hours. Anything borg
+cannot read counts as not paused. `borg inbox` lists tells and asks only.
+
+### Waking a session
+
+`borg listen`, run inside a session, opts it in. The opt-in lives in `<store>/listen/<session>.json`,
+is never synced, and ends with `borg listen --off`, the session's end or the prune of its presence
+record. A plain session is never woken. Without `--session`, the session comes from the harness's
+variables, or on opencode from `OPENCODE_PID`.
+
+When a listening session's turn ends without being blocked, its stop starts a waiter in the way the
+harness allows:
+
+| Harness | How the waiter runs | How the wake arrives |
+|---|---|---|
+| Claude Code | The stop asks the model, once a turn, to run `borg listen --wait` in the background | The waiter exits with a summary, and Claude Code starts the next turn with it |
+| omp, opencode | The stop's answer carries `"listen": true`; the adapter keeps `borg listen --stream` running for the session's life | One JSON line per wake (`{"wake": "<text>"}`), sent in as a new turn: omp `pi.sendMessage`, opencode 1.x `session.promptAsync`, 2.x `session.prompt` with `delivery: "queue"` |
+| Codex CLI | The stop starts `borg listen --queue` detached, logging to `<store>/listen/<session>.log` | `codex queue --thread <session> --message <text>`, 30 s at most; a failure waits 10 s, doubling up to 5 minutes, before the same messages are tried again |
+
+The wake text names the number of messages, their senders and kinds, never their text. The session's
+next prompt hook shows the messages themselves, once. Each message wakes a session once; a wake it never
+took leaves the message unread, and the next message wakes it again. While the engineer's own turn runs,
+from its prompt to the end of its stop, nothing wakes the session; that turn's hooks show what arrives.
+A turn that never reached its stop (an Esc) stops holding wakes off 5 minutes after its last event (a
+minute on Codex CLI), or 10 minutes after a tool call that never ended. A wake's own turn holds the next
+wake off the same way, until its stop. A paused session is not woken, nor asked for a wait, until it is
+resumed.
+
+There is one waiter per session. It follows a reinstall of borg in place and ends on SIGINT, SIGHUP or
+SIGTERM, on `borg listen --off`, or once the session is gone. Exit codes: 0 after a wake (`--wait`),
+after `--off` or when the session is gone; 1 when the session does not listen; 2 on bad arguments;
+128 + the signal when stopped. `borg top` shows `on` (listens, no waiter yet) or `waiter` in its WAKE
+column, and the same in `borg top --json` as each session's `listen`.
 
 ## Playbooks
 
@@ -119,14 +169,15 @@ borg learns from, at 0 tokens.
 ```console
 $ borg no never look merges up in the commit log, use the review API
 vetoed One of Two (3f9c2a1b): 2 shown lesson(s) lose credit (L17, L42); the reason becomes a lesson when borg learn runs
-to stop it now: borg steer 3f9c2a1b --pause
+to stop it now: borg pause 3f9c2a1b
 ```
 
 **Which drone.** Without `--session`, the one local drone working in the current repo (or `--dir`), or,
 with none running, the most recently seen one. With several running it lists them; name one with
 `--session` (as `borg top` shows it, its number, a session id or a prefix of 4+ characters). A drone on
-another member's machine is named with `--session`, and the veto travels as a signed steering directive
-(it needs the `admin` or `steer` role); that machine records it once.
+another member's machine is named with `--session`, and the veto travels as a message to
+`<session>@<node>` ([Pause and resume](#pause-and-resume)); it counts there only if you have the
+`admin` or `steer` role, and that machine records it once.
 
 **Inside the session**, a prompt that starts with `borg no` is the same veto. The drone stops the vetoed
 approach and may ask one clarifying question. `BORG_VETO=off` turns this off; the command still works.

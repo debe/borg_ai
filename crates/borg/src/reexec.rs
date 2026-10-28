@@ -1,3 +1,13 @@
+//! A long-lived process follows a reinstall in place: `cargo install` renames a new file over the old,
+//! and an old image would go on running the code it was started with.
+//!
+//! - A session's waiter (listen.rs) re-execs its own path (`Image::reexec`), same pid, same stdout (a
+//!   plugin's JSON line protocol and Claude Code's background task survive), its lock's open file
+//!   description passed on (`ADOPT_FD`), so the lock is never free between the images and no second
+//!   waiter starts meanwhile. SIGINT, SIGHUP and SIGTERM are blocked across the exec and seen by the new
+//!   image once it trapped them (`inherited`): none is lost. Its only other threads (runner.rs
+//!   `run_bounded`'s readers) start with them blocked too.
+//!
 //! The mesh daemon (borg-mesh main.rs `serve`) follows a reinstall of borg-mesh in place: it lives as
 //! long as the machine serves, and `cargo install` renames a new file over the old. Once its image is
 //! stale (`Image::due`) it stops as on Ctrl-C, and `Image::restart` execs the new borg-mesh in the same
@@ -14,8 +24,13 @@
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// The lock fd a re-exec'd waiter inherits from its previous image (`Image::reexec`, `adopt`). Never set
+/// by an engineer: removed from the environment first thing, so no child sees it.
+const ADOPT_FD: &str = "BORG_LISTEN_FD";
 
 /// How often an exec of a busy file (`ETXTBSY`) is tried, 25 ms apart, the stop signals held meanwhile.
 const BUSY_TRIES: u32 = 20;
@@ -60,7 +75,7 @@ fn exec_id(p: &Path) -> Option<Id> {
 /// the file named; else the running binary with Linux's ` (deleted)` cut off; else `borg`. What a
 /// long-lived process starts borg as and prints commands with: `current_exe()` of a replaced binary
 /// reads `<path> (deleted)`.
-fn exe_path() -> PathBuf {
+pub(crate) fn exe_path() -> PathBuf {
     static P: OnceLock<PathBuf> = OnceLock::new();
     P.get_or_init(|| from_argv0(std::env::args_os().next(), std::env::var_os("PATH")).unwrap_or_else(running)).clone()
 }
@@ -81,6 +96,32 @@ fn running() -> PathBuf {
 fn undeleted(p: &Path) -> PathBuf {
     let b = p.as_os_str().as_bytes();
     PathBuf::from(std::ffi::OsStr::from_bytes(b.strip_suffix(b" (deleted)").unwrap_or(b)))
+}
+
+/// Why `Image::reexec` did not replace the image.
+#[derive(Debug)]
+pub enum ReexecError {
+    /// The lock's fd could not be duplicated for the new image.
+    Dup(std::io::Error),
+    /// The exec of this path failed.
+    Exec(PathBuf, std::io::Error),
+}
+
+impl std::fmt::Display for ReexecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReexecError::Dup(e) => write!(f, "the lock could not be passed on: {e}"),
+            ReexecError::Exec(path, e) => write!(f, "{}: {e}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for ReexecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReexecError::Dup(e) | ReexecError::Exec(_, e) => Some(e),
+        }
+    }
 }
 
 /// What a long-lived process's image was started from (`now`, at its start): whether it is the binary
@@ -106,7 +147,7 @@ impl Image {
 
     /// The path names another file than at the start (or none), or the running binary was deleted: this
     /// image is old code.
-    fn stale(&self) -> bool {
+    pub fn stale(&self) -> bool {
         exec_id(&self.path) != self.base || self.running.as_ref().is_some_and(|f| f.metadata().is_ok_and(|m| m.nlink() == 0))
     }
 
@@ -114,6 +155,45 @@ impl Image {
     pub fn due(&self) -> bool {
         let now = exec_id(&self.path);
         now.is_some() && !self.failed.contains(&now) && self.stale()
+    }
+
+    /// For a waiter (listen.rs): replaces this process's image by the file at its path, same pid, argv
+    /// and environment, stdout and stderr flushed, the stop signals blocked across (`stopped` looked at
+    /// once more after they are), `lock`'s open file description passed on as a duplicate without
+    /// close-on-exec (`ADOPT_FD`). Returns only when it did not happen: Ok when a stop came (the caller
+    /// ends as stopped), Err with why the exec failed (the path is not tried again until it changes).
+    ///
+    /// # Errors
+    /// The dup or the exec failed (`ReexecError`).
+    pub fn reexec(&mut self, lock: &std::fs::File, stopped: impl Fn() -> bool) -> Result<(), ReexecError> {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        let target = exec_id(&self.path);
+        let set = stop_set();
+        // SAFETY: pthread_sigmask(3) on a set built by sigemptyset/sigaddset.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut()) };
+        let unblock = || {
+            // SAFETY: as above.
+            unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
+        };
+        if stopped() {
+            unblock();
+            return Ok(());
+        }
+        // SAFETY: fcntl(2) F_DUPFD on the lock's own open fd: a new fd, close-on-exec clear.
+        let dup = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD, 3) };
+        let err = if dup < 0 {
+            ReexecError::Dup(std::io::Error::last_os_error())
+        } else {
+            let e = execve_retrying(&self.path, ADOPT_FD, &dup.to_string());
+            // SAFETY: close(2) of the duplicate made above, which nothing else owns.
+            unsafe { libc::close(dup) };
+            ReexecError::Exec(self.path.clone(), e)
+        };
+        unblock();
+        self.failed.push(target);
+        if stopped() { Ok(()) } else { Err(err) }
     }
 
     /// For the mesh daemon, once it stopped serving: replaces its image by the file at its path, stdout
@@ -143,7 +223,7 @@ impl Image {
             unblock();
             return Ok(());
         }
-        let err = takes.then(|| execve_retrying(&self.path));
+        let err = takes.then(|| execve_retrying(&self.path, RESTARTED, "1"));
         unblock();
         // The exec did not happen: the path is not tried again until it changes.
         self.failed.push(target);
@@ -162,17 +242,17 @@ impl Image {
     }
 }
 
-/// execve(2) of `path` with this process's argv and environment, `RESTARTED` set to 1 in it (any
-/// value it had dropped); a busy file (`ETXTBSY`) tried again `BUSY_TRIES` times. Returns only on
-/// failure, with why.
-fn execve_retrying(path: &Path) -> std::io::Error {
+/// execve(2) of `path` with this process's argv and environment, `var` set to `value` in it (any value
+/// it had dropped); a busy file (`ETXTBSY`) tried again `BUSY_TRIES` times. Returns only on failure,
+/// with why.
+fn execve_retrying(path: &Path, var: &str, value: &str) -> std::io::Error {
     let cstr = |b: &[u8]| CString::new(b).ok();
     let file = cstr(path.as_os_str().as_bytes());
     let argv: Option<Vec<CString>> = std::env::args_os().map(|a| cstr(a.as_bytes())).collect();
     let envp: Option<Vec<CString>> = std::env::vars_os()
-        .filter(|(k, _)| k != RESTARTED)
+        .filter(|(k, _)| k != var)
         .map(|(k, v)| cstr(&[k.as_bytes(), b"=", v.as_bytes()].concat()))
-        .chain([cstr(format!("{RESTARTED}=1").as_bytes())])
+        .chain([cstr(format!("{var}={value}").as_bytes())])
         .collect();
     let (Some(file), Some(argv), Some(envp)) = (file, argv, envp) else { return std::io::Error::from(std::io::ErrorKind::InvalidInput) };
     let ptrs = |v: &[CString]| v.iter().map(|c| c.as_ptr()).chain([std::ptr::null()]).collect::<Vec<_>>();
@@ -259,20 +339,36 @@ extern "C" fn on_stop(_: libc::c_int) {
 /// the stop signals unblocked only then, so a stop that came across the exec is seen now (a SIGHUP
 /// then ends it, as it would have the old one).
 pub fn trap_stops() {
-    let handler = on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
-    unsafe {
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-    }
+    on_signals(&[libc::SIGINT, libc::SIGTERM], on_stop);
     if std::env::var_os(RESTARTED).is_some() {
         // SAFETY: called while the process runs one thread (the doc above); no other reads the
         // environment.
         unsafe { std::env::remove_var(RESTARTED) };
-        let set = stop_set();
-        // SAFETY: pthread_sigmask(3) on a set built by sigemptyset/sigaddset.
-        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        unblock_stops();
     }
+}
+
+/// `handler` for each of `sigs`, by sigaction(2): it stays installed across deliveries, and a call it
+/// interrupts restarts. `handler` must be async-signal-safe (store to an atomic, no more).
+pub fn on_signals(sigs: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
+    for &sig in sigs {
+        // SAFETY: a zeroed sigaction is valid; only its handler, its empty mask and SA_RESTART are set
+        // before sigaction(2) reads it.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The stop signals (`stop_set`) unblocked: one held across an exec is delivered now.
+fn unblock_stops() {
+    let set = stop_set();
+    // SAFETY: pthread_sigmask(3) on a set built by sigemptyset/sigaddset.
+    unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
 }
 
 /// Whether a stop came since `trap_stops`.
@@ -290,6 +386,40 @@ fn stop_set() -> libc::sigset_t {
         }
         set
     }
+}
+
+/// The first step of a waiter (listen.rs), once it trapped its stop signals: when a previous image
+/// re-exec'd it (`Image::reexec`), the inherited lock fd, its variable gone from the environment, the
+/// stop signals unblocked only now, so a stop that came across the exec is seen; None for a fresh
+/// start. The fd is the waiter's lock only once `adopt` checked it.
+pub fn inherited() -> Option<RawFd> {
+    let fd = std::env::var_os(ADOPT_FD)?;
+    // SAFETY: the waiter is single-threaded this early; no other thread reads the environment.
+    unsafe { std::env::remove_var(ADOPT_FD) };
+    unblock_stops();
+    fd.to_str().and_then(|s| s.parse::<RawFd>().ok()).filter(|fd| *fd > 2)
+}
+
+/// The inherited `fd` as the lock of `path`, when it is that file's open description and holds its lock
+/// (a try_lock on the same description succeeds); else None (a forged or stale variable: the waiter
+/// takes the lock as a fresh one does). Close-on-exec again from here.
+pub fn adopt(fd: RawFd, path: &Path) -> Option<std::fs::File> {
+    // SAFETY: fcntl(2) F_GETFD only asks whether `fd` is open, so an fd that is not is never owned.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is open and was handed to this process for it alone (`Image::reexec`): owned here.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let same = match (f.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    if !same || f.try_lock().is_err() {
+        return None;
+    }
+    // SAFETY: fcntl(2) F_SETFD on the fd owned above.
+    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(f)
 }
 
 #[cfg(test)]
@@ -356,6 +486,27 @@ mod tests {
         assert_eq!(from_argv0(Some("borg".into()), Some(path.clone())), Some(d.join("borg")), "a bare word on PATH");
         assert_eq!(from_argv0(Some("/a/b/borg".into()), Some(path)), Some(PathBuf::from("/a/b/borg")), "as given, never canonicalized");
         assert_eq!(from_argv0(Some("nope".into()), Some(d.as_os_str().into())), None, "the running binary then");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// An inherited fd is a waiter's lock only when it is that file's description holding its lock.
+    #[test]
+    fn an_inherited_fd_of_another_file_is_not_adopted() {
+        use std::os::unix::io::IntoRawFd;
+        let d = temp("adopt");
+        let (lock, other) = (d.join("w.lock"), d.join("other"));
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let fd = |p: &Path| std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        assert!(adopt(fd(&other).into_raw_fd(), &lock).is_none(), "another file");
+        let held = fd(&lock);
+        held.lock().unwrap();
+        assert!(adopt(fd(&lock).into_raw_fd(), &lock).is_none(), "another description, the lock held by it");
+        drop(held);
+        let mine = fd(&lock);
+        mine.lock().unwrap();
+        assert!(adopt(mine.into_raw_fd(), &lock).is_some(), "the description that holds the lock");
+        assert!(adopt(9999, &lock).is_none(), "no open fd");
         let _ = std::fs::remove_dir_all(d);
     }
 }

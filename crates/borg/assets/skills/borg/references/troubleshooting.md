@@ -50,7 +50,7 @@ shell profile, after showing the engineer the change.
 | Lessons do not reach a teammate | `borg collective <repo>` on both machines: `may sync: true`? | See [team](team.md); `borg mesh serve` must run on both |
 | `borg vectors` says `model: missing` | | `borg vectors --fetch`, then `borg vectors --rebuild`; see [vectors](vectors.md) |
 | `index: none at ...` or `built with another model` | | `borg vectors --rebuild` in a repo of that collective |
-| A drone is paused and refuses tool calls | `borg top` lists the drones | `borg steer <drone> --resume` |
+| A drone is paused and refuses tool calls | `borg top` lists the drones | `borg resume <drone>` |
 | Too many questions or blocks | `borg status` (cost and stop gate lines) | `"mode": "hook"` for that collective (about a tenth of live's cost) |
 | After upgrading borg | `borg doctor` | `borg install all` (dry run), then `borg install all --apply`; for Codex, `/hooks` again |
 

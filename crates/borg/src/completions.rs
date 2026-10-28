@@ -114,11 +114,13 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             cmd("ask", &[("<session|drone|all|engineer> <question> [--re ID]", "a message that asks for a reply")], &["all"], crate::msg::FLAGS),
             cmd("inbox", &[("[--all] [--json]", "this session's messages; from a terminal, every recent one")], &[], crate::msg::INBOX_FLAGS),
             cmd(
-                "steer",
-                &[("<drone|all> <text> | --pause | --resume", "a signed instruction to running drones")],
-                &["all"],
-                &["--pause", "--resume", "--veto"],
+                "listen",
+                &[("[--off]", "wake this session when a message arrives while it is idle"), ("--wait|--stream|--queue", "the waiter (started by borg)")],
+                &[],
+                crate::listen::FLAGS,
             ),
+            cmd("pause", &[("<session|drone|all> [note]", "refuse a session's tool calls until it is resumed")], &["all"], crate::msg::STEER_FLAGS),
+            cmd("resume", &[("<session|drone|all> [note]", "let a paused session's tool calls run again")], &["all"], crate::msg::STEER_FLAGS),
         ],
     ),
 ];

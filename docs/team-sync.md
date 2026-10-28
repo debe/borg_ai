@@ -41,7 +41,7 @@ borg mesh invite --role steer --expires 2d --uses 1 --png invite.png
 
 Send the ticket privately (chat, password manager) or let the member scan the QR code: anyone holding
 an unused ticket can join with its role. Defaults: role `member`, one use, valid 7 days. Roles are
-`member`, `steer` (may also steer drones) and `observe`. `borg mesh invites` lists open tickets;
+`member`, `steer` (may also pause, resume and veto other members' sessions) and `observe`. `borg mesh invites` lists open tickets;
 `borg mesh invites --revoke <id>` withdraws one.
 
 **3. New member.** Install Borg, then:
@@ -149,8 +149,8 @@ it completes or it leaves the member list; the old node's log gets the same line
 so the "why" survives its author going offline.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key
-and drops lines it stamped after the revocation; earlier contributions stay. Steering directives are
-checked against the same list.
+and drops lines it stamped after the revocation; earlier contributions stay. A pause, resume or veto from
+another machine is admitted against the same list.
 
 ## How peers find each other
 

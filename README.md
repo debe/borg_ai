@@ -153,7 +153,7 @@ flowchart LR
 Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
 What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones, like Unix `top`;
-`borg steer` sends them a signed instruction. Set up: `borg setup --team <name>` or `--join <ticket>`, or
+`borg pause` and `borg resume` hold or release any of them ([Talking to other sessions](#talking-to-other-sessions)). Set up: `borg setup --team <name>` or `--join <ticket>`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 
 ## Talking to other sessions
@@ -171,7 +171,31 @@ The recipient is a drone as `borg top` names it, a session id, `all` (the sessio
 sent) or `engineer`. The message is shown once, at the recipient's next prompt or tool call, marked as
 peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
 Text is redacted and cut to 1,000 characters, and one sender may send a recipient one message per 10
-minutes. A session that is idle sees it when it next runs; waking it comes later.
+minutes.
+
+The engineer can also hold a session, or every one:
+
+```sh
+borg pause Two "wait for the schema change"   # its tool calls are refused, with the note, until resumed
+borg resume Two
+borg no --session Two "never look merges up in the commit log"   # a veto, on this or another machine
+```
+
+These are messages too, shown at the next prompt or tool call on every harness. From another member's
+machine they count only if that member has the `admin` or `steer` role.
+
+A session that is idle sees a message when it next runs, unless it listens. Inside a session:
+
+```sh
+borg listen         # wake this session when a message arrives while it is idle
+borg listen --off
+```
+
+When its turn ends, borg wakes it in the way its harness allows. On Claude Code the model starts
+`borg listen --wait` in the background. The omp and opencode adapters keep a stream running. On codex a
+detached waiter queues a turn with `codex queue`. The wake names who wrote and how many messages wait,
+and the session's next prompt hook shows the messages themselves. Nothing wakes a session while the
+engineer's own turn runs. `borg top` shows who listens in its WAKE column.
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
 
 ## Monitoring
@@ -210,7 +234,7 @@ per-session state.
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
 lessons (with author emails and repo names); redacted reasoning excerpts of landed commits, each held by
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
-of your latest prompt, touched paths); redacted messages between sessions; steering and the signed member list; daily usage counts per
+of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them; the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
 ratified constraints (the invariant, its lesson and who ratified it, never the veto's words); and promoted
 playbook edits.

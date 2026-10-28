@@ -31,7 +31,7 @@ pub fn Steering() -> impl IntoView {
             <Tile label="Corrections" value=Signal::derive(move || num(t().n("correction"))) sub=Signal::derive(move || format!("{} rejected tool calls in the feed", rejected.with(Vec::len))) color="var(--c-heat)" up_is_good=false />
             <Tile label="Steers sent" value=Signal::derive(move || num(t().n("steer_issued"))) sub=Signal::derive(move || format!("{} delivered to drones", num(t().n("steer_delivered")))) color="var(--c-amber)" />
             <Tile label="Paused tool calls" value=Signal::derive(move || num(t().n("pause_refused"))) sub=Signal::derive(|| "refused while a drone was paused".to_string()) color="var(--c-pink)" />
-            <Tile label="Steers refused" value=Signal::derive(move || num(t().n("steer_dropped"))) sub=Signal::derive(|| "unsigned, expired or not a member".to_string()) color="var(--c-heat)" up_is_good=false />
+            <Tile label="Steers refused" value=Signal::derive(move || num(t().n("steer_dropped"))) sub=Signal::derive(|| "sent by a node without a steering role".to_string()) color="var(--c-heat)" up_is_good=false />
         </section>
         <section class="panel">
             <h2>"Corrections and steering"<small>"per day"</small></h2>
@@ -40,11 +40,11 @@ pub fn Steering() -> impl IntoView {
         {move || (steered() == 0.0).then(|| view! {
             <section class="panel explain">
                 <h2>"No drone has been steered yet"</h2>
-                <p>"Steering sends a signed instruction to running drones, yours or a teammate's. A drone receives it at its next hook; a pause holds its tool calls until resumed, and every refused call is counted here."</p>
+                <p>"Steering pauses, resumes or vetoes running sessions, yours or a teammate's. A session sees it at its next prompt or tool call; a pause holds its tool calls until resumed, and every refused call is counted here."</p>
                 <pre>"borg top                                # find the drone
-borg steer \"Three of Five\" \"use the shared retry helper\"
-borg steer all --pause                  # hold every drone
-borg steer all --resume"</pre>
+borg tell \"Three of Five\" \"use the shared retry helper\"
+borg pause all                          # hold every drone
+borg resume all"</pre>
             </section>
         })}
         <section class="two">

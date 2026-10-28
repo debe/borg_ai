@@ -22,6 +22,8 @@
 //!    (lines.rs `travels`: a message names its origin key as its node, and is fresh). Messages also
 //!    travel only within a `window` (one per sender and recipient per rate slot, a share of `KEEP` per
 //!    node, the `KEEP` newest), on offer and on receipt, and what the window cuts is pruned (`prune`).
+//!    A pause, resume or veto from another node counts only once admitted under its node's role
+//!    (steer.rs `admit`), when it is stored.
 //!
 //!    3b. `Goals`: the removed hive's step, still spoken so a 0.3.0 peer keeps syncing on
 //!    `borg/mesh/12`. This node names no goal; for each valid goal id the peer names it follows the
@@ -38,9 +40,8 @@
 //!    an admitted excerpt for one (or a link record with it on either side) answers with it, author
 //!    or replica, so the "why" can be read back while its author is offline.
 //! 6. `Live`: ephemeral, never reconciled into a log: presence (live.rs: which drones run where,
-//!    latest per member and session, a day at most) and signed steering directives (steer.rs:
-//!    checked against the membership on receipt; refused ones are dropped and logged). A 0.3.0
-//!    peer's hive beats in it are ignored.
+//!    latest per member and session, a day at most). A 0.3.0 peer's hive beats and signed steering
+//!    directives in it are ignored: steering travels as messages, admitted when stored (steer.rs).
 //!
 //! A completed session, dialled or served, is recorded on each side by when it started, per member
 //! (`mesh/synced.json`, borg presence.rs `synced_path`).
@@ -234,7 +235,7 @@ pub struct Report {
     pub answered: usize,
     /// Remote presence records that were new or newer (live.rs).
     pub presence: usize,
-    /// Steering directives newly filed / refused (steer.rs).
+    /// Another node's pauses, resumes and vetoes newly admitted / refused (steer.rs).
     pub steered: usize,
     pub dropped: usize,
     /// Members this node admitted with an invite (`admit`).
@@ -294,8 +295,26 @@ enum Msg {
     },
     Live {
         presence: Vec<borg::presence::Remote>,
-        directives: Vec<borg::steer::Directive>,
+        #[serde(default)]
+        directives: Directives,
     },
+}
+
+/// 0.3.0's signed steering directives in `Live`: sent empty, as a 0.3.0 peer requires the field, and
+/// a 0.3.0 peer's ignored unread. Steering travels as messages now (steer.rs).
+#[derive(Debug, Default)]
+struct Directives;
+
+impl Serialize for Directives {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(std::iter::empty::<()>())
+    }
+}
+
+impl<'de> Deserialize<'de> for Directives {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| Directives)
+    }
 }
 
 /// Which CAs vouch for a relay's, address lookup's or DNS-over-HTTPS server's certificate: the
@@ -692,7 +711,7 @@ impl Node {
             let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let (held, _) = Membership::adopt(home, &docs).unwrap_or((mine, false));
             report.quarantined += origin::apply_if_new(home, &held)?;
-            steer::enforce(home, &held, borg::learn::now_ms()); // a signer who lost the right to steer stops steering here
+            steer::enforce(home, &held, borg::learn::now_ms()); // a node that lost the right to steer, or an expired steer, stops here
             held
         };
         if mine.role_of(remote).is_none() {
@@ -758,18 +777,15 @@ impl Node {
         let want: BTreeSet<Hash> = got.iter().filter(|s| about(&ask, &s.line)).map(|s| lines::hash(&s.line)).filter(|h| !held.contains_key(h)).collect();
         self.store_lines(&path, got, &want, &mine, None, &mut report)?;
 
-        // Live: presence and steering, ephemeral (live.rs, steer.rs).
+        // Live: presence, ephemeral (live.rs).
         let now = borg::learn::now_ms();
-        let live = Msg::Live { presence: live::outgoing(home, &self.me, now), directives: steer::outgoing(home, now) };
+        let live = Msg::Live { presence: live::outgoing(home, &self.me, now), directives: Directives };
         self.gate()?; // again just before anything leaves
-        let Msg::Live { presence, directives } = swap(dialler, tx, rx, live).await? else {
+        let Msg::Live { presence, .. } = swap(dialler, tx, rx, live).await? else {
             return Err("protocol: expected live".into());
         };
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         report.presence += live::receive(home, &mine, &me, presence, now)?;
-        let (new, dropped) = steer::receive(home, &mine, &me, &directives, now);
-        (report.steered, report.dropped) = (report.steered + new, report.dropped + dropped);
-        borg::veto::apply_inbox(home); // a veto for a drone of this node: its credit and episode, once
         Ok(report)
     }
 
@@ -879,7 +895,7 @@ impl Node {
             return Ok(());
         }
         // Messages: under the log's lock (borg msg.rs `send`), only what the window of held and new takes.
-        borg::live::locked(path, || {
+        let a = borg::live::locked(path, || {
             let held = travelling(path, &known, m, now);
             let mut all = held.clone();
             all.extend(keep.iter().map(|(h, s)| (*h, s.line.clone())));
@@ -887,10 +903,21 @@ impl Node {
             let before = keep.len();
             keep.retain(|h, _| w.contains(h));
             report.rejected += before - keep.len();
+            let new: Vec<borg::msg::Message> =
+                keep.iter().filter(|(h, _)| !known.contains_key(*h)).filter_map(|(_, s)| serde_json::from_str(&s.line).ok()).collect();
             origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
             report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
-            prune(path, &held, &w, now)
-        })
+            prune(path, &held, &w, now)?;
+            // After the merge: a hook that sees the line before its admission shows it at its next call.
+            steer::admit(&self.home, m, &self.me.public(), &new, now).map_err(|e| format!("admissions: {e}"))
+        })?;
+        (report.steered, report.dropped) = (report.steered + a.new, report.dropped + a.dropped);
+        drop(_w);
+        // Outside both locks: it rereads the log and the outcomes, and a `send` must not wait on it.
+        if a.new > 0 {
+            borg::veto::apply_messages(&self.home, now);
+        }
+        Ok(())
     }
 }
 
@@ -920,10 +947,12 @@ fn per_node(m: &Membership) -> usize {
     (borg::msg::KEEP / m.members.len().max(1)).max(1)
 }
 
-/// The messages of `set` that travel: per node, sender and recipient one per `msg::RATE_MS` (the
-/// earliest wins, as `send` refuses the later), the `per_node` newest per node, and the `msg::KEEP`
-/// newest of those. Ordered by (ms, hash), so nodes holding the same lines pick the same ones, and a
-/// line cut here is neither offered nor taken back from a peer that still holds it.
+/// The messages of `set` that travel: per node, sender and recipient one tell or ask per `msg::RATE_MS`
+/// (the earliest wins, as `send` refuses the later; a steer is not paced, as `send` does not pace it:
+/// a resume follows its pause at once), then for conversation and for steers apart (as msg.rs
+/// `bound` keeps them, so no tell pushes a pause out) the `per_node` newest per node and the
+/// `msg::KEEP` newest of those. Ordered by (ms, hash), so nodes holding the same lines pick the same
+/// ones, and a line cut here is neither offered nor taken back from a peer that still holds it.
 fn window(set: &BTreeMap<Hash, String>, per_node: usize) -> BTreeSet<Hash> {
     let mut all: Vec<(i64, Hash, borg::msg::Message)> = set
         .iter()
@@ -931,25 +960,34 @@ fn window(set: &BTreeMap<Hash, String>, per_node: usize) -> BTreeSet<Hash> {
         .collect();
     all.sort_by_key(|x| (x.0, x.1));
     let mut last: HashMap<(String, String, String), i64> = HashMap::new();
-    let mut paced: Vec<(Hash, String)> = Vec::new();
+    let mut paced: Vec<(Hash, String, bool)> = Vec::new();
     for (ms, h, m) in all {
+        if m.kind.privileged() {
+            paced.push((h, m.node, true));
+            continue;
+        }
         let slot = last.entry((m.node.clone(), m.by, m.to)).or_insert(i64::MIN);
         if ms.saturating_sub(*slot) >= borg::msg::RATE_MS {
             *slot = ms;
-            paced.push((h, m.node));
+            paced.push((h, m.node, false));
         }
     }
-    let mut per: HashMap<String, usize> = HashMap::new();
+    let mut per: HashMap<(String, bool), usize> = HashMap::new();
+    let mut total = [0usize; 2];
     paced
         .into_iter()
         .rev()
-        .filter(|(_, node)| {
-            let n = per.entry(node.clone()).or_default();
+        .filter(|(_, node, steers)| {
+            let n = per.entry((node.clone(), *steers)).or_default();
             *n += 1;
             *n <= per_node
         })
-        .take(borg::msg::KEEP)
-        .map(|(h, _)| h)
+        .filter(|(_, _, steers)| {
+            let t = &mut total[usize::from(*steers)];
+            *t += 1;
+            *t <= borg::msg::KEEP
+        })
+        .map(|(h, _, _)| h)
         .collect()
 }
 
@@ -1760,57 +1798,54 @@ mod tests {
         }
     }
 
-    /// Appends a stats line `i` to alice's store (`a`) and waits for it in bob's (`b`): how long it took, in
-    /// ms. Not a lesson: a received lesson re-indexes bob's vectors before the session ends (vectors.rs
-    /// `reindexed`), which times the embedding model, not the dials.
-    async fn stat_trip(a: &Path, b: &Path, i: u64, failed: &std::sync::Mutex<Vec<String>>) -> f64 {
-        let l = rollup(&format!("n{i}"), 1, i);
-        let at = std::time::Instant::now();
-        append_lines(a, "stats.jsonl", std::slice::from_ref(&l));
-        while !holds(b, "stats.jsonl", &l) {
-            assert!(at.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for alice's line {i} at bob; failures: {:?}", failed.lock().unwrap());
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        at.elapsed().as_secs_f64() * 1000.0
-    }
-
-    /// Carol is a member alice dials, but her endpoint is gone: her dials wait out their `timeout`
-    /// (and come back after the first retry), and alice's lines still reach bob a `poll` later.
-    /// Carol's session record from before goes with her first failed dial.
+    /// Carol is a member alice dials, and she takes the dial and never answers: she reads alice's hello
+    /// and holds the connection until the test lets her go. While alice's dial to carol is still open,
+    /// a line alice writes reaches bob, whom only alice's dials reach. Once carol closes, alice's dial
+    /// fails and carol's session record from before goes with it. Ordered by events, not by time:
+    /// the dial timeout is far past the test.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_peer_that_does_not_answer_holds_no_line_back() {
         use std::sync::Arc;
         use std::time::Duration;
+        use tokio::sync::oneshot;
         let p = crew("deaf", &["alice", "bob", "carol"]);
         let (a, b) = (home(&p[0]), home(&p[1]));
         let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
         let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
         let carol = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
-        let (key, at) = (carol.public(), addr_of(&carol));
-        carol.close().await;
-        assert!(peers::remember(&a, &key, &at).unwrap());
-        assert!(peers::remember(&b, &alice.public(), &addr_of(&alice)).unwrap());
+        let key = carol.public();
+        assert!(peers::remember(&a, &key, &addr_of(&carol)).unwrap());
+        assert!(peers::remember(&a, &bob.public(), &addr_of(&bob)).unwrap());
         borg::presence::note_synced(&a, &key, borg::learn::now_ms()).unwrap();
+        let (held_tx, held) = oneshot::channel::<()>();
+        let (release, release_rx) = oneshot::channel::<()>();
+        let deaf = tokio::spawn(async move {
+            let conn = carol.incoming().await.expect("alice dials carol").await.expect("handshake");
+            let (_tx, mut rx) = conn.accept_bi().await.expect("alice's stream");
+            assert!(matches!(recv(&mut rx).await, Ok(Msg::Hello { .. })), "alice's hello");
+            let _ = held_tx.send(());
+            let _ = release_rx.await;
+            let open = conn.close_reason().is_none();
+            conn.close(1u32.into(), b"deaf");
+            carol.close().await;
+            open
+        });
         let opts =
-            crate::daemon::Options { poll: Duration::from_millis(100), timeout: Duration::from_secs(3), grace: Duration::from_secs(1), ..Default::default() };
+            crate::daemon::Options { poll: Duration::from_millis(100), timeout: Duration::from_secs(600), grace: Duration::from_secs(1), ..Default::default() };
         let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
-        eventually("bob's address at alice", Duration::from_secs(10), || peers::load(&a).contains_key(&bob.public())).await;
-        // Over 6 s: carol's first dial, its retry a `poll` after it failed, and the one after.
-        let mut took = Vec::new();
-        for i in 1..=15u64 {
-            took.push(stat_trip(&a, &b, i, &serve.failed).await);
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-        let failed = serve.failed.lock().unwrap().clone();
-        assert!(failed.iter().any(|f| f.contains(&key)), "carol's dials failed: {failed:?}");
-        assert!(!borg::presence::synced(&a).contains_key(&key), "a failed dial drops carol's record");
+        let limit = Duration::from_secs(60); // liveness only: every wait below ends on an event
+        tokio::time::timeout(limit, held).await.expect("carol holds alice's dial").unwrap();
+
+        let l = rollup("n1", 1, 1);
+        append_lines(&a, "stats.jsonl", std::slice::from_ref(&l));
+        eventually("alice's line at bob", limit, || holds(&b, "stats.jsonl", &l)).await;
+        assert!(serve.failed.lock().unwrap().iter().all(|f| !f.contains(&key)), "carol's dial has not ended");
+        release.send(()).unwrap();
+        assert!(deaf.await.unwrap(), "alice's dial to carol was still open when bob got the line");
+
+        eventually("alice's dial to carol failed", limit, || serve.failed.lock().unwrap().iter().any(|f| f.contains(&key))).await;
+        eventually("carol's record dropped", limit, || !borg::presence::synced(&a).contains_key(&key)).await;
         serve.stop().await;
-        // A line carol held back would wait out her 3 s `timeout`; a lost handshake packet costs one
-        // trip about a second now and then (the transport's retransmit), so the bar is the median.
-        assert!(took.iter().all(|&t| t < 3000.0), "no line waits for carol's dial, took {took:?}");
-        let mut sorted = took.clone();
-        sorted.sort_by(f64::total_cmp);
-        assert!(sorted[sorted.len() / 2] < 500.0, "lines reach bob a `poll` or two later, took {took:?}");
     }
 
     /// Alice's first dial to bob fails (his node runs no `serve` yet); the lesson it was to carry reaches
@@ -1876,9 +1911,9 @@ mod tests {
 
     /// What a 0.3.0 node said after the hello, step by step (base 188c262 `exchange`): its goal ids
     /// (a duplicate and an invalid one among them), a full reconciliation of each valid goal's logs,
-    /// and `Live` with its hive beats. Returns the hive lines it gave and the presence and directives
-    /// it took in.
-    async fn old_exchange(n: &Node, dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+    /// and `Live` with its hive beats and a signed directive. Returns the hive lines it gave and the
+    /// presence it took in.
+    async fn old_exchange(n: &Node, dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, goal: &OldGoal) -> Result<(usize, usize), String> {
         let home = n.home.as_path();
         let mine = members(home)?;
         let Msg::Membership { .. } = swap(dialler, tx, rx, Msg::Membership { docs: Membership::history(home) }).await? else { return Err("membership".into()) };
@@ -1915,7 +1950,9 @@ mod tests {
             swap(dialler, tx, rx, m).await?;
         }
         let now = borg::learn::now_ms();
-        let live = json!({"t": "live", "presence": live::outgoing(home, &n.me, now), "directives": steer::outgoing(home, now),
+        let directive = json!({"id": "d1", "collective": "work", "key": n.me.public(), "engineer": "old@x", "target": {"node": "", "session": ""},
+            "kind": "pause", "text": "", "ms": now, "sig": "00"});
+        let live = json!({"t": "live", "presence": live::outgoing(home, &n.me, now), "directives": [directive],
             "beats": [{"goal": "g1", "line": "{}", "key": n.me.public(), "sig": "00"}]});
         let theirs = if dialler {
             send_raw(tx, &live).await?;
@@ -1925,13 +1962,11 @@ mod tests {
             send_raw(tx, &live).await?;
             theirs
         };
-        let Msg::Live { presence, directives } = theirs else { return Err("live".into()) };
-        let me = n.me.public();
-        let presence = live::receive(home, &mine, &me, presence, now)?;
-        Ok((gave, presence, steer::receive(home, &mine, &me, &directives, now).0))
+        let Msg::Live { presence, .. } = theirs else { return Err("live".into()) };
+        Ok((gave, live::receive(home, &mine, &n.me.public(), presence, now)?))
     }
 
-    async fn old_dial(n: &Node, target: &str, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+    async fn old_dial(n: &Node, target: &str, goal: &OldGoal) -> Result<(usize, usize), String> {
         let t = Target::parse(target)?;
         let conn = n.endpoint.connect(t.endpoint_addr(&n.relay)?, LEGACY_ALPN).await.map_err(|e| e.to_string())?;
         let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
@@ -1942,7 +1977,7 @@ mod tests {
         got
     }
 
-    async fn old_serve(n: &Node, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+    async fn old_serve(n: &Node, goal: &OldGoal) -> Result<(usize, usize), String> {
         let conn = n.incoming().await.ok_or("closed")?.await.map_err(|e| e.to_string())?;
         let (mut tx, mut rx) = conn.accept_bi().await.map_err(|e| e.to_string())?;
         let Msg::Hello { .. } = recv(&mut rx).await? else { return Err("hello".into()) };
@@ -1954,8 +1989,9 @@ mod tests {
     }
 
     /// A 0.3.0 peer (it names hive goals, reconciles their logs and sends beats in `Live`) keeps
-    /// syncing with this node in both roles: lessons, presence and directives arrive both ways, no
-    /// hive file is written, and a hive line it gave once is not sent again when this node dials.
+    /// syncing with this node in both roles: lessons and presence arrive both ways, its directives are
+    /// ignored, no hive file is written, and a hive line it gave once is not sent again when this node
+    /// dials.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_0_3_0_peer_syncs_in_both_roles_and_its_hive_lines_come_once() {
         let (pa, pb) = team("legacy");
@@ -1981,19 +2017,16 @@ mod tests {
 
         // The new node dials: every hive line comes once and is dropped.
         let (old_got, new_got) = tokio::join!(old_serve(&old, &goal), new.sync(&old_at));
-        let (new_got, (gave, presence, _)) = (new_got.unwrap(), old_got.unwrap());
+        let (new_got, (gave, presence)) = (new_got.unwrap(), old_got.unwrap());
         assert_eq!((gave, presence, new_got.presence), (LEGACY_GOAL_LOGS, 1, 1));
         assert!(holds(&a, "lessons.jsonl", &l2) && holds(&b, "lessons.jsonl", &l1), "lessons both ways");
 
-        // The old node dials: directives both ways, and the listener's echo moves no hive line.
-        for (h, id, who) in [(&a, &alice_id, "alice@x"), (&b, &bob_id, "bob@x")] {
-            let d = crate::steer::sign(id, crate::steer::new("work", who, borg::steer::Target::default(), borg::steer::SAY, "run the tests", now));
-            let held = std::fs::read_to_string(crate::steer::outbox(h)).unwrap_or_default();
-            std::fs::write(crate::steer::outbox(h), format!("{held}{}\n", serde_json::to_string(&d).unwrap())).unwrap();
-        }
+        // The old node dials: its directive (bob may steer) is ignored, and the listener's echo moves
+        // no hive line.
         let (old_got, new_got) = tokio::join!(old_dial(&old, &new_at, &goal), new.accept());
-        let (new_got, (gave, _, steered)) = (new_got.unwrap(), old_got.unwrap());
-        assert_eq!((gave, steered, new_got.steered), (0, 1, 1));
+        let (new_got, (gave, _)) = (new_got.unwrap(), old_got.unwrap());
+        assert_eq!((gave, new_got.steered, new_got.dropped), (0, 0, 0));
+        assert!(!borg::steer::active(&b), "a 0.3.0 directive counts nowhere");
 
         // The new node dials again: only the line added since comes.
         goal.add(&alice_id, 5, "{\"bundle\":\"new\"}");
@@ -2248,15 +2281,25 @@ mod tests {
         }
     }
 
-    /// Presence and steering ride the session: bob (role steer) sees alice's drone, pauses it, and
-    /// alice's hook gets the signed directive; a relayed observer's directive is dropped and logged.
+    /// A steer from the node whose member key is `node` (its engineer at a terminal) to `to`.
+    fn steering(node: &str, kind: borg::msg::Kind, to: &str, ms: i64, text: &str) -> borg::msg::Message {
+        let from = borg::msg::Sender { by: "engineer:bob@x".into(), name: "bob@x".into(), harness: "terminal".into(), node: node.into() };
+        borg::msg::Message::new(kind, &from, to, None, ms, text)
+    }
+
+    /// Presence and steering ride the session: bob (role steer) sees alice's drone and pauses it, a
+    /// message line whose origin is bob's node; alice admits it under bob's role and her hook refuses
+    /// tools until bob's resume, sent at once after. An observer's pause is stored but refused and
+    /// logged; once bob is revoked, his pause no longer holds.
     #[tokio::test(flavor = "multi_thread")]
-    async fn presence_and_signed_steering_travel_between_members() {
+    async fn presence_and_steering_travel_between_members() {
+        use borg::msg::Kind;
         let (pa, pb) = team("live");
         let (a, b) = (home(&pa), home(&pb));
         let (alice_id, bob_id) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&b).unwrap());
+        let (alice_key, bob_key) = (alice_id.public(), bob_id.public());
         let mut m = Membership::load(&a).unwrap().unwrap();
-        m.invite(&alice_id, &bob_id.public(), "steer").unwrap();
+        m.invite(&alice_id, &bob_key, "steer").unwrap();
         m.save(&a).unwrap(); // every version goes into the history, or the chain breaks
         let observer = Identity::load_or_create(&a.join("observer")).unwrap();
         m.invite(&alice_id, &observer.public(), "observe").unwrap();
@@ -2272,67 +2315,57 @@ mod tests {
         served.unwrap();
         assert_eq!(synced.unwrap().presence, 1);
         let ds = borg::top::drones(&b, true, now);
-        assert_eq!((ds.len(), ds[0].node.as_str(), ds[0].p.prompt.as_str()), (1, alice_id.public().as_str(), "refactor the recon loop"));
+        assert_eq!((ds.len(), ds[0].node.as_str(), ds[0].p.prompt.as_str()), (1, alice_key.as_str(), "refactor the recon loop"));
         let lessons = std::fs::read_to_string(b.join("lessons.jsonl")).unwrap_or_default();
         assert!(!lessons.contains("recon loop"), "never in lessons");
 
-        // Bob pauses alice's drone by its designation. Alongside travel an observer's directive
-        // (bob's own check removes it before it leaves) and one of bob's with its text altered
-        // after signing (alice drops and logs it).
-        let said = crate::steer::issue(&b, "work", true, "bob@x", "One", borg::steer::PAUSE, "", now).unwrap();
-        assert!(said.starts_with("paused One of One (session alice-s1, alice@x)"), "{said}");
-        assert!(borg::steer::read_inbox(&b).is_empty(), "not for bob's own drones");
-        let by_observer = crate::steer::sign(&observer, crate::steer::new("work", "obs@x", borg::steer::Target::default(), borg::steer::SAY, "ship it", now));
-        let mut tampered =
-            crate::steer::sign(&bob_id, crate::steer::new("work", "bob@x", borg::steer::Target::default(), borg::steer::SAY, "run the tests", now));
-        tampered.text = "force-push main".into();
-        let held = std::fs::read_to_string(crate::steer::outbox(&b)).unwrap();
-        let extra: String = [&by_observer, &tampered].iter().map(|d| format!("{}\n", serde_json::to_string(d).unwrap())).collect();
-        std::fs::write(crate::steer::outbox(&b), format!("{held}{extra}")).unwrap();
-        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        synced.unwrap();
-        let served = served.unwrap();
-        assert_eq!((served.steered, served.dropped), (1, 1));
-        let inbox = borg::steer::read_inbox(&a);
-        assert_eq!((inbox.len(), inbox[0].role.as_str(), inbox[0].d.engineer.as_str()), (1, "steer", "bob@x"));
-        let log = std::fs::read_to_string(borg::steer::dropped_path(&a)).unwrap();
-        assert!(log.contains("signature") && log.contains(&tampered.id), "{log}");
-        assert!(!std::fs::read_to_string(crate::steer::outbox(&b)).unwrap().contains("ship it"), "an observer's directive is not relayed");
-        // Alice's hook refuses tools until bob resumes.
+        let to = format!("alice-s1@{alice_key}");
         let pre = json!({"session_id": "alice-s1", "cwd": pa.dir, "tool_name": "Bash"});
-        let deny = borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 1, || None).unwrap();
-        assert!(
-            deny["hookSpecificOutput"]["permissionDecisionReason"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("paused by bob@x [key {}] (signed, role steer)", &bob_id.public()[..12]))
-        );
-        crate::steer::issue(&b, "work", true, "bob@x", "alice-s1", borg::steer::RESUME, "", now + 2).unwrap();
-        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        synced.unwrap();
-        assert_eq!(served.unwrap().steered, 1);
-        assert_eq!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 3, || None), None);
+        let refused = |at: i64| borg::steer::around(&a, "pre_tool", &pre, Some(now), at, || None);
+        let round = || async {
+            let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+            synced.unwrap();
+            served.unwrap()
+        };
+        borg::msg::send(&b, steering(&bob_key, Kind::Pause, &to, now, ""), now).unwrap();
+        let served = round().await;
+        assert_eq!((served.steered, served.dropped), (1, 0));
+        let deny = refused(now + 1).expect("paused");
+        let why = deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(why.contains(&format!("paused by bob@x (node {}, role steer)", &bob_key[..12])), "{why}");
 
-        // Bob is revoked: his directives stop holding at alice.
-        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        let _ = (served.unwrap(), synced.unwrap());
-        crate::steer::issue(&b, "work", true, "bob@x", "One", borg::steer::PAUSE, "", now + 4).unwrap();
-        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
-        let _ = (served.unwrap(), synced.unwrap());
-        assert!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 5, || None).is_some(), "paused again");
+        // An observer's pause, handed over signed by its node: stored, refused, logged.
+        let by_observer = serde_json::to_string(&steering(&observer.public(), Kind::Pause, ALL_TO, now, "")).unwrap();
+        let h = lines::hash(&by_observer);
+        let mut report = Report::default();
+        let got = vec![Signed { origin: Origin::new(&observer, &h, now), line: by_observer.clone() }];
+        alice.store_lines(&a.join(borg::msg::FILE), got, &BTreeSet::from([h]), &members(&a).unwrap(), None, &mut report).unwrap();
+        assert_eq!((report.received, report.steered, report.dropped), (1, 0, 1));
+        let log = std::fs::read_to_string(borg::steer::dropped_path(&a)).unwrap();
+        assert!(log.contains("role observe may not steer"), "{log}");
+
+        // Bob's resume, a moment after his pause: not paced away, and it lifts the pause.
+        borg::msg::send(&b, steering(&bob_key, Kind::Resume, &to, now + 2, ""), now + 2).unwrap();
+        assert_eq!(round().await.steered, 1);
+        assert_eq!(refused(now + 3), None);
+
+        // Bob pauses again, then is revoked: his pause stops holding at alice.
+        borg::msg::send(&b, steering(&bob_key, Kind::Pause, &to, now + 4, ""), now + 4).unwrap();
+        assert_eq!(round().await.steered, 1);
+        assert!(refused(now + 5).is_some(), "paused again");
         let mut m = Membership::load(&a).unwrap().unwrap();
-        m.revoke(&alice_id, &bob_id.public(), now + 5).unwrap();
+        m.revoke(&alice_id, &bob_key, now + 5).unwrap();
         m.save(&a).unwrap();
         alice.enforce().unwrap();
-        assert!(borg::steer::read_inbox(&a).is_empty(), "the revoked signer's directives are gone");
-        assert_eq!(borg::steer::around(&a, true, "pre_tool", &pre, Some(now), now + 6, || None), None, "and the pause no longer holds");
+        assert!(borg::steer::read_admitted(&a).iter().all(|x| x.node != bob_key), "the revoked node's admissions are gone");
+        assert_eq!(refused(now + 6), None, "and the pause no longer holds");
         alice.close().await;
         bob.close().await;
     }
 
-    /// `borg no` on bob's node for alice's drone: signed, carried by the round's steering, recorded once on
-    /// alice's node (credit, episode, stat), shown to her drone once, and back on bob's node as a team
-    /// outcome, so both nodes' beliefs count the veto once.
+    /// `borg no` on bob's node for alice's drone: a veto message, admitted and recorded once on alice's
+    /// node (credit, episode, stat), shown to her drone once, and back on bob's node as a team outcome,
+    /// so both nodes' beliefs count the veto once.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_veto_on_one_node_reaches_the_drones_node_once() {
         let (pa, pb) = team("veto");
@@ -2353,9 +2386,9 @@ mod tests {
         let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
         let _ = (served.unwrap(), synced.unwrap());
 
-        let said = crate::steer::issue(&b, "work", true, "bob@x", "One", borg::steer::VETO, "never look merges up in the commit log", now).unwrap();
-        assert!(said.starts_with("vetoed One of One (session alice-s1, alice@x)"), "{said}");
-        assert!(crate::steer::issue(&b, "work", true, "bob@x", "all", borg::steer::VETO, "no", now).is_err(), "a veto names one drone");
+        let to = format!("alice-s1@{}", alice_id.public());
+        let veto = steering(&bob_id.public(), borg::msg::Kind::Veto, &to, now, "never look merges up in the commit log");
+        borg::msg::send(&b, veto, now).unwrap();
         assert!(!b.join("episodes.jsonl").exists(), "the issuing node records no veto of its own");
         for _ in 0..2 {
             let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
@@ -2369,12 +2402,13 @@ mod tests {
         assert!(eps.contains("\"kind\":\"veto\"") && eps.contains("bob@x") && eps.contains("never look merges up"), "{eps}");
         let stats: Vec<_> = borg::stats::events(&a).into_iter().filter(|e| e.kind == borg::stats::VETO).collect();
         assert_eq!((stats.len(), stats[0].why.as_str()), (1, "mesh"));
-        // Alice's drone is told once, labelled with bob's key.
+        // Alice's drone is told once, labelled with bob's node and role.
+        let caps = borg::harness::by_name("claude").unwrap().caps();
         let prompt = json!({"session_id": "alice-s1", "cwd": pa.dir});
-        let out = borg::steer::around(&a, true, "prompt", &prompt, Some(now - 10), now + 1, || None).unwrap();
+        let out = borg::msg::deliver(&a, caps, "prompt", &prompt, Some(now - 10), now + 1, None).expect("shown");
         let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert!(ctx.starts_with(&format!("[borg] Veto from bob@x [key {}] (signed, role steer): The engineer said no", &bob_id.public()[..12])), "{ctx}");
-        assert_eq!(borg::steer::around(&a, true, "prompt", &prompt, Some(now - 10), now + 2, || None), None);
+        assert!(ctx.contains(&format!("[borg] Veto from bob@x (node {}, role steer)", &bob_id.public()[..12])), "{ctx}");
+        assert_eq!(borg::msg::deliver(&a, caps, "prompt", &prompt, Some(now - 10), now + 2, None), None, "once");
         // Both nodes' beliefs count it once: alice's from her own record, bob's from the team outcome.
         let l1 = [borg::conscience::Challenge { id: "L1".into(), ..Default::default() }];
         let belief = |h: &Path| borg::memory::derive(&borg::outcome::read_team(&h.join("lessons.jsonl")), &l1, None)["L1"].vetoed;
@@ -2385,17 +2419,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_local_collectives_presence_and_directives_never_leave() {
+    async fn a_local_collectives_presence_and_steering_never_leave() {
         let p = node("live-private", "local");
         let h = home(&p);
         let now = borg::learn::now_ms();
         let ev = json!({"session_id": "s1", "cwd": p.dir, "prompt": "private diary"});
         borg::presence::write(&h, &borg::presence::update(None, "work", "claude", "prompt", &ev, now, |_| ("me@x".into(), "r".into()))).unwrap();
-        let said = crate::steer::issue(&h, "work", false, "me@x", "One", borg::steer::SAY, "lunch", now).unwrap();
-        assert!(said.contains("never leaves this machine"), "{said}");
-        assert_eq!(borg::steer::read_inbox(&h)[0].role, "local");
-        assert!(!crate::steer::outbox(&h).exists(), "nothing queued for the mesh");
+        let me = Identity::load_or_create(&h).unwrap().public();
+        borg::msg::send(&h, steering(&me, borg::msg::Kind::Pause, ALL_TO, now, "lunch"), now).unwrap();
+        let held = borg::steer::read_admitted(&h);
+        assert_eq!((held.len(), held[0].role), (1, borg::steer::Role::Local), "this machine's engineer steers it");
         assert!(Node::bind(&p, LOCAL.parse().unwrap()).await.is_err(), "no socket at all");
+    }
+
+    /// A pause and its resume from one sender to one session within a rate slot both travel (send
+    /// does not pace a steer); a second tell within the slot does not.
+    #[test]
+    fn the_window_paces_tells_and_not_steers() {
+        use borg::msg::Kind;
+        let node = "a".repeat(64);
+        let to = format!("s1@{}", "b".repeat(64));
+        let ms = [
+            steering(&node, Kind::Pause, &to, 1000, ""),
+            steering(&node, Kind::Resume, &to, 1001, ""),
+            steering(&node, Kind::Tell, &to, 1002, "hi"),
+            steering(&node, Kind::Tell, &to, 1003, "again"),
+        ];
+        let set: BTreeMap<Hash, String> = ms.iter().map(|m| serde_json::to_string(m).unwrap()).map(|l| (lines::hash(&l), l)).collect();
+        let w = window(&set, 10);
+        let kept: Vec<&str> = ms.iter().filter(|m| w.contains(&lines::hash(&serde_json::to_string(m).unwrap()))).map(|m| m.kind.as_str()).collect();
+        assert_eq!(kept, ["pause", "resume", "tell"]);
+    }
+
+    /// A pause and then `per_node + 1` newer tells from its node: the pause stays in the window (steers
+    /// have their own cap), so `prune` keeps it and it holds; the oldest tell goes.
+    #[test]
+    fn newer_tells_never_push_a_pause_out_of_the_window() {
+        use borg::msg::Kind;
+        let (node, per) = ("a".repeat(64), 5);
+        let to = |i: usize| format!("s{i}@{}", "b".repeat(64));
+        let ms: Vec<borg::msg::Message> = std::iter::once(steering(&node, Kind::Pause, &to(0), 1000, ""))
+            .chain((0..=per).map(|i| steering(&node, Kind::Tell, &to(i), 1001 + i as i64, "hi")))
+            .collect();
+        let set: BTreeMap<Hash, String> = ms.iter().map(|m| serde_json::to_string(m).unwrap()).map(|l| (lines::hash(&l), l)).collect();
+        let w = window(&set, per);
+        let kept = |m: &borg::msg::Message| w.contains(&lines::hash(&serde_json::to_string(m).unwrap()));
+        assert!(kept(&ms[0]), "the pause travels");
+        assert_eq!((kept(&ms[1]), ms[2..].iter().filter(|m| kept(m)).count()), (false, per), "the oldest tell went");
+    }
+
+    /// `Live` still carries the `directives` a 0.3.0 peer requires, always empty, and takes whatever
+    /// such a peer puts there without reading it.
+    #[test]
+    fn live_keeps_an_empty_directives_field_for_0_3_0() {
+        let out = serde_json::to_value(Msg::Live { presence: Vec::new(), directives: Directives }).unwrap();
+        assert_eq!(out, json!({"t": "live", "presence": [], "directives": []}));
+        let theirs = json!({"t": "live", "presence": [], "directives": [{"kind": "pause", "sig": "00"}], "beats": []});
+        assert!(matches!(serde_json::from_value::<Msg>(theirs).unwrap(), Msg::Live { .. }));
+        assert!(matches!(serde_json::from_value::<Msg>(json!({"t": "live", "presence": []})).unwrap(), Msg::Live { .. }));
     }
 
     /// The admin answers every dial-in (joins and syncs) until the test ends.

@@ -1,6 +1,6 @@
 //! Presence, `borg top` and steering through the binary: hooks keep a presence record per session,
-//! `borg top` lists the drones, a directive in the inbox is shown once and a pause refuses tools,
-//! and an off repo is left without a single file.
+//! `borg top` lists the drones, a tell and a steer are shown once, a pause refuses tools until it is
+//! resumed and only under an admitted role, and an off repo is left without a single file.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -130,18 +130,16 @@ fn an_off_repo_writes_nothing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn accepted(id: &str, kind: &str, session: &str, text: &str, ms: i64) -> String {
-    json!({"id": id, "collective": "corp", "key": "ab".repeat(32), "engineer": "bob@x", "target": {"node": "", "session": session},
-        "kind": kind, "text": text, "ms": ms, "sig": "00", "role": "steer"})
-    .to_string()
-}
-
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
+fn context(out: &Option<Value>) -> String {
+    out.as_ref().and_then(|o| o["hookSpecificOutput"]["additionalContext"].as_str()).unwrap_or_default().to_string()
+}
+
 #[test]
-fn a_directive_is_shown_once_and_a_pause_holds_until_resumed() {
+fn a_pause_holds_until_resumed_and_each_steer_is_shown_once() {
     let (root, work, _, _) = setup("steer");
     let w = work.display().to_string();
     let ev = |extra: Value| {
@@ -151,28 +149,60 @@ fn a_directive_is_shown_once_and_a_pause_holds_until_resumed() {
     };
     hook(&root, "claude", "prompt", ev(json!({"prompt": "go"})));
     assert_eq!(hook(&root, "claude", "pre_tool", ev(json!({"tool_name": "Bash"}))), None, "nobody steers: nothing");
-    let inbox = store(&root, "corp").join("steer/inbox.jsonl");
-    std::fs::create_dir_all(inbox.parent().unwrap()).unwrap();
-    std::fs::write(&inbox, accepted("d1", "say", "s-one", "the staging db is down, use the mock", now()) + "\n").unwrap();
+    assert!(!store(&root, "corp").join("messages/admitted.jsonl").exists(), "the tool call's one stat finds nothing");
 
-    let out = hook(&root, "claude", "post_tool", ev(json!({"tool_name": "Read", "tool_input": {"file_path": "x"}}))).unwrap();
-    let ctx = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-    assert!(ctx.starts_with("[borg] Steering from bob@x [key abababababab] (signed, role steer): the staging db is down, use the mock"), "{ctx}");
-    assert!(ctx.contains("not the user's own instruction"));
+    // `say` is a tell now.
+    let (_, code) = borg(&root, &["tell", "s-one", "the staging db is down, use the mock", "--dir", &w], "");
+    assert_eq!(code, Some(0));
+    let ctx = context(&hook(&root, "claude", "post_tool", ev(json!({"tool_name": "Read", "tool_input": {"file_path": "x"}}))));
+    assert!(ctx.starts_with("[borg] Message from alice@x") && ctx.contains("the staging db is down, use the mock"), "{ctx}");
     assert_eq!(hook(&root, "claude", "post_tool", ev(json!({"tool_name": "Read"}))), None, "once");
 
-    // Pause: tools refused, the stop announces it once and then lets the drone wait.
-    std::fs::write(&inbox, std::fs::read_to_string(&inbox).unwrap() + &accepted("p1", "pause", "s-one", "", now()) + "\n").unwrap();
+    // Pause: tools refused, the stop lets the drone wait, the next prompt says why once.
+    let (out, code) = borg(&root, &["pause", "s-one", "--dir", &w, "lunch"], "");
+    assert_eq!(code, Some(0));
+    assert!(out.starts_with("paused s-one"), "{out}");
     let deny = hook(&root, "claude", "pre_tool", ev(json!({"tool_name": "Bash"}))).unwrap();
     assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
-    let stop = hook(&root, "claude", "stop", ev(json!({"last_assistant_message": "done", "stop_hook_active": false}))).unwrap();
-    assert!(stop["reason"].as_str().unwrap().contains("PAUSE"));
-    assert_eq!(hook(&root, "claude", "stop", ev(json!({"last_assistant_message": "done", "stop_hook_active": false}))), None);
+    assert!(deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("paused by alice@x"), "{deny}");
+    let (out, _) = borg(&root, &["top", "--json"], "");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()[0]["drones"][0]["paused"], true);
+    let stop = hook(&root, "claude", "stop", ev(json!({"last_assistant_message": "done", "stop_hook_active": false})));
+    assert!(stop.as_ref().is_none_or(|s| s.get("decision").is_none()), "{stop:?}");
+    let ctx = context(&hook(&root, "claude", "prompt", ev(json!({"prompt": "status?"}))));
+    assert!(ctx.starts_with("[borg] Pause from alice@x") && ctx.contains("role local") && ctx.contains("Note: lunch"), "{ctx}");
+    assert!(context(&hook(&root, "claude", "prompt", ev(json!({"prompt": "again?"})))).is_empty(), "once");
     assert!(hook(&root, "claude", "pre_tool", ev(json!({"tool_name": "Edit"}))).is_some(), "still paused");
-    std::fs::write(&inbox, std::fs::read_to_string(&inbox).unwrap() + &accepted("r1", "resume", "s-one", "", now() + 1) + "\n").unwrap();
+
+    // Resume, at once: a steer is not rate limited.
+    let (_, code) = borg(&root, &["resume", "s-one", "--dir", &w], "");
+    assert_eq!(code, Some(0));
     assert_eq!(hook(&root, "claude", "pre_tool", ev(json!({"tool_name": "Edit"}))), None, "resumed");
     let (out, _) = borg(&root, &["top", "--json"], "");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v[0]["drones"][0]["paused"], false);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()[0]["drones"][0]["paused"], false);
+    assert!(context(&hook(&root, "claude", "prompt", ev(json!({"prompt": "go on"})))).starts_with("[borg] Resume from alice@x"));
+    let (_, code) = borg(&root, &["pause", "engineer", "--dir", &w], "");
+    assert_eq!(code, Some(1), "a steer never goes to the engineer");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Another node's pause counts only once the mesh admitted it under a steering role.
+#[test]
+fn a_peers_pause_holds_only_under_an_admitted_role() {
+    let (root, work, _, _) = setup("peer");
+    let w = work.display().to_string();
+    let ev = json!({"session_id": "s-one", "cwd": w, "tool_name": "Bash"});
+    hook(&root, "claude", "prompt", json!({"session_id": "s-one", "cwd": w, "prompt": "go"}));
+    let corp = store(&root, "corp");
+    let from = borg::msg::Sender { by: "engineer:bob@x".into(), name: "bob@x".into(), harness: "terminal".into(), node: "cd".repeat(32) };
+    let pause = borg::msg::Message::new(borg::msg::Kind::Pause, &from, "s-one", None, now(), "");
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(borg::msg::path(&corp)).unwrap();
+    writeln!(log, "{}", serde_json::to_string(&pause).unwrap()).unwrap();
+    assert_eq!(hook(&root, "claude", "pre_tool", ev.clone()), None, "merged, not admitted");
+    borg::steer::admit(&corp, &[borg::steer::Admission::of(&pause, borg::steer::Role::Steer)], now()).unwrap();
+    let deny = hook(&root, "claude", "pre_tool", ev.clone()).unwrap();
+    assert!(deny["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("paused by bob@x (node cdcdcdcdcdcd, role steer)"), "{deny}");
+    borg::steer::retain(&corp, now(), |a| a.role == borg::steer::Role::Local).unwrap();
+    assert_eq!(hook(&root, "claude", "pre_tool", ev), None, "the demoted node's pause no longer holds");
     let _ = std::fs::remove_dir_all(&root);
 }

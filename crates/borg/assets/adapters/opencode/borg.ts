@@ -35,12 +35,27 @@
 // An answer later than POST_MS (a prompt's: PROMPT_MS) is kept for the next call or prompt: borg already
 // counts it delivered.
 //
+// A session that listens (`borg listen`, docs/commands.md) is woken by the plugin. opencode gives its
+// shell no session id, so the plugin binds the session itself: it sets BORG_LISTEN_BINDER in its own
+// process (every command its model runs has it, and borg's own run there binds no session: one pid can
+// name several), and seeing `borg listen [--off]` in a session's own tool.execute.after it runs
+// `borg listen [--off] --session <id>`, adding borg's answer to what the model reads when the shell's own
+// run did not say it (within the tool call's POST_MS; a later one waits in `late`). From then on, or from a stop whose answer carries
+// `"listen": true` (borg says no waiter runs), it keeps the session's waiter, `borg listen --stream`:
+// it waits at no token cost, holds wakes off while the engineer's turn runs and says each wake as a
+// JSON line. The plugin sends a wake in only while the session is idle (from a prompt or tool call to
+// its stop, also a halted one, it is not): opencode 1 with session.promptAsync, opencode 2 with
+// session.prompt({delivery: "queue"}); one that fails to go in is kept and sent again (WAKE_TRIES,
+// then at the next stop or halt); a held wake whose messages a hook of the turn showed is dropped. A halted turn (no stop) is sent to borg as `halted`, so the waiter
+// holds nothing off any more. Its `{"end"}` line ends it until the next `"listen": true`; `--off`, the
+// session's end and the plugin's unload stop it.
+//
 // Subagent (child) sessions are ignored, like Claude's hooks ignore subagents, with one exception:
 // a child's tool call still asks pre_tool, as its root session, so a paused drone cannot carry on
 // through a subagent.
 // Fails open: if borg is missing, slow or broken, opencode carries on untouched.
 // borg is found via $BORG_BIN, else `borg` on PATH. $BORG_OPENCODE_LOG names a file that gets
-// what the adapter did and every error it swallowed.
+// what the adapter did and every error it swallowed. $BORG_WAKE_RETRY_MS overrides WAKE_RETRY_MS (tests).
 //
 // The module has a single default export: opencode 1 calls every exported function as a plugin.
 
@@ -78,6 +93,24 @@ const AUTO_REJECTED = "This non-interactive run cannot ask the user for permissi
 const DENIED = "The user doesn't want to proceed with this tool use."
 // How much of a shell call's output borg gets (its end, where a test run's summary is).
 const OUTPUT_TAIL = 4_000
+// How long the plugin's own `borg listen [--off] --session <id>` may take (a few file writes).
+const LISTEN_MS = 10_000
+// A wake that failed to go in is sent again this much later, at most WAKE_TRIES times in a row; then at
+// the session's next stop or halt.
+const WAKE_RETRY_MS = 5_000
+const WAKE_TRIES = 5
+const wakeRetryMs = () => Number(process.env.BORG_WAKE_RETRY_MS) || WAKE_RETRY_MS
+// What `borg listen` prints once it opted the session in.
+const LISTENS = "[borg listen] This session listens"
+// How a hook's context shows each message (msg.rs `line`), and how a wake counts them (listen.rs `summary`).
+const MESSAGE_LINE = /^\[borg\] Message from /gm
+const WAKE_COUNT = /^\[borg listen\] (\d+) messages? /
+
+/** How many messages a wake announces; Infinity for a wording it does not know (never taken as shown). */
+function wakeCount(text: string): number {
+  const m = WAKE_COUNT.exec(text)
+  return m ? Number(m[1]) : Infinity
+}
 
 // opencode tool ids -> the Claude names borg matches on (borg reads Bash command, Grep/Glob pattern,
 // else file_path/path from tool_input). Unknown tools keep their id.
@@ -171,6 +204,48 @@ function note(msg: string) {
   } catch {}
 }
 
+/** What a shell command does to the listening of the session it runs in: `on` for `borg listen`, `off`
+ *  for `borg listen --off`. Undefined for anything else: a waiter (`--wait`, `--stream`, `--queue`) or
+ *  another, named session's (`--session`). */
+function listenCommand(command: string): "on" | "off" | undefined {
+  for (const part of command.split(/&&|\|\||[;|\n]/)) {
+    const m = /(?:^|\s)(?:\S*\/)?borg\s+listen(?:\s+(.*))?$/.exec(part.trim())
+    if (!m) continue
+    const args = (m[1] ?? "").trim().split(/\s+/).filter(Boolean)
+    if (args.some((a) => ["--wait", "--stream", "--queue", "--session"].includes(a) || a.startsWith("--session="))) return undefined
+    return args.includes("--off") ? "off" : "on"
+  }
+  return undefined
+}
+
+/** Runs `borg <args>` (no stdin); resolves to its stdout and exit code, or null (fails open). */
+function borgRun(args: string[], timeoutMs: number): Promise<{ out: string; code: number | null } | null> {
+  return new Promise((resolve) => {
+    let out = ""
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(process.env.BORG_BIN || "borg", args, { stdio: ["ignore", "pipe", "ignore"] })
+    } catch (e) {
+      note(`spawn borg ${args.join(" ")} failed: ${e}`)
+      return resolve(null)
+    }
+    const timer = setTimeout(() => {
+      note(`borg ${args.slice(0, 2).join(" ")}: timed out`)
+      child.kill()
+    }, timeoutMs)
+    child.on("error", (e) => {
+      clearTimeout(timer)
+      note(`borg ${args.slice(0, 2).join(" ")}: ${e}`)
+      resolve(null)
+    })
+    child.stdout!.on("data", (d) => (out += d))
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      resolve({ out, code })
+    })
+  })
+}
+
 /** Runs `borg hook opencode <event>` with `payload` on stdin; resolves to its JSON answer or null. */
 function borg(event: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<any> {
   return new Promise((resolve) => {
@@ -230,6 +305,11 @@ type Session = {
   failed: Set<string> // callIDs already reported as failures
   worded: boolean // opencode 1: a call was rejected with the engineer's words since their last prompt
   late: string[] // context that came after POST_MS or PROMPT_MS: delivered with the next call or prompt
+  stream?: ReturnType<typeof spawn> // its waiter, `borg listen --stream`, while the session listens
+  busy: boolean // a turn runs: from a prompt or tool call to its stop (also a halted one)
+  owner: number // bumped by each mark of busy: a failed send frees only the mark it made (`occupy`)
+  wakes: { text: string; at: number }[] // the waiter's wakes not sent yet, when each came: sent once idle
+  retries: number // failed sends of the waiting wakes in a row (<= WAKE_TRIES)
 }
 
 /** What the session state machine needs from one opencode version. */
@@ -249,7 +329,7 @@ function drones(io: Io) {
   const get = (id: string): Session => {
     let s = sessions.get(id)
     if (!s) {
-      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set(), worded: false, late: [] }
+      s = { chain: Promise.resolve(), child: false, continued: false, gen: 0, rounds: 0, echoes: 0, stopping: false, used: false, ended: false, args: new Map(), failed: new Set(), worded: false, late: [], busy: false, owner: 0, wakes: [], retries: 0 }
       sessions.set(id, s)
     }
     return s
@@ -275,12 +355,41 @@ function drones(io: Io) {
   }
   const lastText = async (id: string) => (await history(id)).text
 
+  /** Marks the session busy; the mark's number, for `release`. */
+  const occupy = (s: Session) => {
+    s.busy = true
+    return ++s.owner
+  }
+  /** A send that failed frees the session, unless a prompt or tool call marked it busy since. */
+  const release = (s: Session, mark: number) => {
+    if (s.owner === mark) s.busy = false
+  }
+
+  /** A hook started at `asked` showed messages (`out`'s context): wakes held from before then that it
+   *  showed all of are dropped, so no turn is spent on messages the model already read. */
+  const shown = (id: string, asked: number, out: any) => {
+    const s = get(id)
+    const k = contextOf(out)?.match(MESSAGE_LINE)?.length ?? 0
+    if (!k) return
+    const held = s.wakes.filter((w) => w.at < asked)
+    const n = held.reduce((a, w) => a + wakeCount(w.text), 0)
+    if (!held.length || k < n) return
+    s.wakes = s.wakes.filter((w) => w.at >= asked)
+    note(`${id}: ${held.length} held wake(s) dropped, the turn showed their messages`)
+  }
+
   // Queue a borg call behind the session's earlier ones. `build` runs in turn, so it sees their effects.
   const send = (id: string, event: string, build: () => Promise<Record<string, unknown>>): Promise<any> => {
     const s = get(id)
     s.used = true
     // pid: opencode's own (the plugin runs in its process), so `borg top` sees a vanished opencode.
-    const run = s.chain.then(async () => borg(event, { session_id: id, cwd: io.directory, pid: process.pid, ...(await build()) }))
+    const run = s.chain.then(async () => {
+      const payload = { session_id: id, cwd: io.directory, pid: process.pid, ...(await build()) }
+      const asked = Date.now()
+      const out = await borg(event, payload)
+      shown(id, asked, out)
+      return out
+    })
     s.chain = run.catch(() => null)
     return run.catch(() => null)
   }
@@ -298,6 +407,8 @@ function drones(io: Io) {
     const s = get(id)
     if (s.child) return
     // Our own stop answer coming back: not the engineer speaking.
+    // Any prompt starts a turn: no wake goes in until its stop.
+    occupy(s)
     if (marked) {
       s.echoes = Math.max(0, s.echoes - 1)
       return
@@ -347,11 +458,12 @@ function drones(io: Io) {
     return parts.length ? parts.join("\n\n") : undefined
   }
 
-  /** Before a tool call: throws borg's reason when the drone is paused by signed steering
-   *  (borg steer --pause). Not queued behind the session's other calls, and fail open after PRE_MS.
+  /** Before a tool call: throws borg's reason when the drone is paused
+   *  (`borg pause`). Not queued behind the session's other calls, and fail open after PRE_MS.
    *  A subagent's call is asked as its root session: the pause holds for the drone's subagents. */
   const preTool = async (id: string, callID: string, tool: string, args: any) => {
     get(id).args.set(callID, { tool, args })
+    occupy(get(root(id)))
     const out = await borg("pre_tool", {
       session_id: root(id), cwd: io.directory, pid: process.pid,
       tool_name: TOOL_NAMES[tool] ?? tool, tool_input: toolInput(tool, args),
@@ -373,7 +485,124 @@ function drones(io: Io) {
     const response = name === "Bash" ? shellResponse(output, exit) : undefined
     const answer = send(id, "post_tool", async () => ({ tool_name: name, tool_input: toolInput(tool, args), ...(response ? { tool_response: response } : {}) })).then(contextOf)
     // Behind a stop still thinking (a model call) the answer can only come late: the call does not wait.
-    return withLate(s, await within(id, answer, s.stopping ? 0 : POST_MS, "tool"))
+    const until = Date.now() + (s.stopping ? 0 : POST_MS)
+    const context = withLate(s, await within(id, answer, until - Date.now(), "tool"))
+    const which = name === "Bash" && typeof args?.command === "string" ? listenCommand(args.command) : undefined
+    if (!which) return context
+    // The bind waits behind the post_tool call: the tool result waits for both no longer than POST_MS.
+    const said = await within(id, listen(id, which, output ?? ""), Math.max(0, until - Date.now()), "listen")
+    return [context, said].filter((t): t is string => !!t).join("\n\n") || undefined
+  }
+
+  /** The session's model ran `borg listen [--off]`: the plugin opts this session in or out (its shell
+   *  has no session id) behind its other borg calls, and starts or stops its waiter once that ran. borg's
+   *  answer, for the model, when the shell's own run (`output`) did not say it. */
+  const listen = (id: string, which: "on" | "off", output: string): Promise<string | undefined> => {
+    const s = get(id)
+    const args = ["listen", ...(which === "off" ? ["--off"] : []), "--session", id, "--dir", io.directory]
+    const run = s.chain.then(async () => {
+      const res = await borgRun(args, LISTEN_MS)
+      const said = (res?.out ?? "").trim()
+      note(`${id}: borg ${args.slice(0, 2).join(" ")} -> ${res?.code} ${said.slice(0, 200)}`)
+      if (which === "off") disarm(id)
+      else if (res?.code === 0) arm(id)
+      const told = which === "on" ? output.includes(LISTENS) : output.includes("[borg listen] this session")
+      return told ? undefined : said || undefined
+    })
+    s.chain = run.catch(() => null)
+    return run.catch(() => undefined)
+  }
+
+  /** The session's waiter, unless one runs: each wake goes in once the session is idle (`flush`). */
+  const arm = (id: string) => {
+    const s = get(id)
+    if (s.child || s.ended || s.stream) return
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(process.env.BORG_BIN || "borg", ["listen", "--stream", "--session", id, "--dir", io.directory], { stdio: ["ignore", "pipe", "ignore"] })
+    } catch (e) {
+      return note(`${id}: starting the waiter failed: ${e}`)
+    }
+    s.stream = child
+    let rest = ""
+    child.stdout!.on("data", (d) => {
+      rest += d
+      let nl: number
+      while ((nl = rest.indexOf("\n")) >= 0) {
+        const line = rest.slice(0, nl)
+        rest = rest.slice(nl + 1)
+        try {
+          const v = JSON.parse(line)
+          if (typeof v?.wake === "string" && v.wake.trim()) {
+            s.wakes.push({ text: v.wake, at: Date.now() })
+            note(`${id}: a wake${s.busy || s.stopping ? ", held while the turn runs" : ""}`)
+            flush(id)
+          } else if (typeof v?.note === "string" || typeof v?.end === "string") note(`${id}: waiter: ${v.note ?? `ends: ${v.end}`}`)
+        } catch {}
+      }
+    })
+    const end = (code: number | null) => {
+      if (s.stream === child) s.stream = undefined
+      note(`${id}: the waiter ended (${code})`)
+    }
+    child.on("error", () => end(null))
+    child.on("close", end)
+    note(`${id}: the waiter runs`)
+  }
+
+  /** The session listens no more (`--off`, its end, the plugin's unload): its waiter is stopped. */
+  const disarm = (id: string) => {
+    const s = get(id)
+    const child = s.stream
+    s.stream = undefined
+    s.wakes = []
+    try {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM")
+    } catch {}
+  }
+
+  /** Sends the session's waiting wakes, as one marked message, while it is idle and no stop runs. One
+   *  that fails to go in is kept and sent again (WAKE_RETRY_MS later, at most WAKE_TRIES times, then at
+   *  the session's next stop or halt): the messages stay unread until a wake goes in. */
+  const flush = (id: string) => {
+    const s = get(id)
+    if (s.busy || s.stopping || s.ended || !s.wakes.length) return
+    const sent = s.wakes.splice(0)
+    const mark = occupy(s)
+    io.ask(id, sent.map((w) => w.text).join("\n\n")).then(
+      () => {
+        s.retries = 0
+        note(`woke ${id}: messages wait`)
+      },
+      (e) => {
+        note(`waking ${id} failed: ${e}`)
+        release(s, mark)
+        if (s.ended) return
+        s.wakes.unshift(...sent)
+        if (++s.retries <= WAKE_TRIES) setTimeout(() => flush(id), wakeRetryMs()).unref?.()
+        else note(`waking ${id}: ${WAKE_TRIES} retries failed, the next goes in at its stop or halt`)
+      },
+    )
+  }
+
+  /** The session's turn was halted with no stop (opencode 2's session.execution.failed or
+   *  .interrupted; opencode 1's halted turn still reaches `stop`, which says so): it is idle, and its
+   *  waiting wakes go in, so an Esc never leaves a listening session that nothing wakes. */
+  const idle = (id: string) => {
+    const s = get(id)
+    if (s.child) return
+    s.busy = false
+    halt(id)
+    flush(id)
+  }
+
+  /** A listening session's turn was halted with no stop: borg ends the engineer's turn on its side too
+   *  (`borg hook opencode halted`), so its waiter holds nothing off. Nothing for any other session. */
+  const halt = (id: string) => {
+    const s = get(id)
+    if (!s.stream || s.ended) return
+    s.retries = 0
+    send(id, "halted", async () => ({}))
   }
 
   /** A failed tool call; `args` undefined takes the input seen before the call. */
@@ -401,17 +630,22 @@ function drones(io: Io) {
     const s = get(id)
     if (s.child || s.stopping) return
     s.stopping = true
-    let sent = false
+    s.busy = false
+    let sent = 0 // the busy mark of borg's questions sent back, once they are
     try {
       const gen = s.gen
       const { text, halted } = await history(id)
       if (halted) {
         // The engineer (or the provider) stopped the drone: not a turn ending on its own.
-        return note(`${id} halted (${halted}): no stop`)
+        note(`${id} halted (${halted}): no stop`)
+        halt(id)
+        return
       }
       const active = s.continued
       s.continued = false
       const out = await send(id, "stop", async () => ({ last_assistant_message: text, stop_hook_active: active }))
+      // The session listens and no waiter runs.
+      if (out?.listen === true) arm(id)
       if (out?.decision !== "block" || typeof out.reason !== "string") return
       if (active) return
       // The engineer spoke while borg thought: the questions are about a turn already superseded.
@@ -420,7 +654,7 @@ function drones(io: Io) {
       s.rounds++
       s.continued = true
       s.echoes++
-      sent = true
+      sent = occupy(s)
       await io.ask(id, out.reason)
       note(`sent borg's questions into ${id}`)
     } catch (e) {
@@ -428,9 +662,13 @@ function drones(io: Io) {
       if (sent) {
         s.continued = false
         s.echoes = Math.max(0, s.echoes - 1)
+        release(s, sent)
       }
     } finally {
       s.stopping = false
+      s.retries = 0
+      // Wakes that came during the turn go in now that it is idle.
+      flush(id)
     }
   }
 
@@ -438,7 +676,11 @@ function drones(io: Io) {
     const s = get(id)
     if (s.child || !s.used || s.ended) return
     s.ended = true
-    return send(id, "end", async () => ({}))
+    // borg's end forgets the opt-in; the waiter is stopped here at once.
+    return send(id, "end", async () => ({})).then((out) => {
+      disarm(id)
+      return out
+    })
   }
 
   /** opencode is shutting down (e.g. `opencode run` finished): end every session borg has heard of. */
@@ -446,12 +688,13 @@ function drones(io: Io) {
     await Promise.all([...sessions.keys()].map(end))
   }
 
-  return { get, child, prompt, preTool, postTool, failure, stop, end, endAll }
+  return { get, child, prompt, preTool, postTool, failure, stop, idle, end, endAll }
 }
 
 // ---- opencode 1.x: a `server` function that returns hooks; bus events through `event`.
 
 const server: Plugin = async ({ client, directory }) => {
+  process.env.BORG_LISTEN_BINDER = "opencode"
   const d = drones({
     directory,
     // The last assistant message ({info, parts}) tells a halted turn; its last visible text is borg's
@@ -525,7 +768,7 @@ const server: Plugin = async ({ client, directory }) => {
           if (p.sessionID && p.callID) d.failure(p.sessionID, p.callID, undefined, undefined, String(p.error?.message ?? ""))
           break
         case "session.idle":
-          // Also after a halted turn: stop tells it from the last assistant message.
+          // Also after a halted turn: stop tells it from the last assistant message (and sends `halted`).
           if (p.sessionID) await d.stop(p.sessionID)
           break
         case "session.deleted":
@@ -541,6 +784,7 @@ const server: Plugin = async ({ client, directory }) => {
 // ---- opencode 2.x: `setup(ctx)` registers hooks and reads the event stream.
 
 async function setup(ctx: any) {
+  process.env.BORG_LISTEN_BINDER = "opencode"
   const d = drones({
     directory: ctx.location?.directory ?? process.cwd(),
     // A stop only follows session.execution.succeeded, so the turn finished: nothing to tell apart.
@@ -626,7 +870,10 @@ async function setup(ctx: any) {
             break
           case "session.execution.failed":
           case "session.execution.interrupted":
-            if (p.sessionID) note(`${p.sessionID} halted (${e.type.slice("session.execution.".length)} ${p.reason ?? p.error?.type ?? ""}): no stop`)
+            if (p.sessionID) {
+              note(`${p.sessionID} halted (${e.type.slice("session.execution.".length)} ${p.reason ?? p.error?.type ?? ""}): no stop`)
+              d.idle(p.sessionID)
+            }
             break
           case "session.deleted":
             if (p.sessionID) await d.end(p.sessionID)

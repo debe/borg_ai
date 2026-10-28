@@ -7,7 +7,6 @@ use std::process::Command;
 
 use borg_mesh::identity::Identity;
 use borg_mesh::membership::{self, Membership};
-use borg_mesh::steer::{Authority, file, new, sign};
 use serde_json::{Value, json};
 
 fn tmp(name: &str) -> PathBuf {
@@ -42,17 +41,22 @@ fn now() -> i64 {
     borg::learn::now_ms()
 }
 
-/// Files a pause signed by `by` into `root`'s store under `m`, as a mesh round would.
+/// A pause from `by`'s node stored in `root`'s store and admitted under `m`, as a mesh round would.
 fn paused_by(root: &Path, m: &Membership, by: &Identity) {
     let home = store(root);
     let me = Identity::load_or_create(&home).unwrap().public();
-    let d = sign(by, new("corp", "s@x", Default::default(), borg::steer::PAUSE, "", now()));
-    assert_eq!(file(&home, "corp", &Authority::Team { m, me: &me }, &me, true, &d, now()), Ok(true));
+    let from = borg::msg::Sender { by: "engineer:s@x".into(), name: "s@x".into(), harness: "terminal".into(), node: by.public() };
+    let pause = borg::msg::Message::new(borg::msg::Kind::Pause, &from, borg::msg::ALL, None, now(), "");
+    let mut log = std::fs::read_to_string(borg::msg::path(&home)).unwrap_or_default();
+    log.push_str(&format!("{}\n", serde_json::to_string(&pause).unwrap()));
+    std::fs::write(borg::msg::path(&home), log).unwrap();
+    let admitted = borg_mesh::steer::admit(&home, m, &me, &[pause], now()).unwrap();
+    assert_eq!(admitted.new, 1);
 }
 
 fn pre_tool(root: &Path) -> Option<Value> {
     let ev = json!({"session_id": "s1", "cwd": root.join("work/app"), "tool_name": "Bash"});
-    borg::steer::around(&store(root), true, "pre_tool", &ev, Some(0), now(), || None)
+    borg::steer::around(&store(root), "pre_tool", &ev, Some(0), now(), || None)
 }
 
 #[test]
@@ -91,38 +95,4 @@ fn revoke_demote_and_join_lift_the_steerers_pause_without_a_daemon() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&peer);
-}
-
-/// `borg steer <drone> --veto "<reason>"` (what `borg no` runs for a drone on another machine) for a
-/// drone of this machine: signed, filed and recorded as this machine's veto at once, without a daemon;
-/// a veto without a reason, or for every drone, is refused.
-#[test]
-fn a_signed_veto_of_a_local_drone_is_recorded_at_once() {
-    let root = tmp("veto");
-    mesh(&root, &["init"]);
-    let home = store(&root);
-    let ev = json!({"session_id": "s1", "cwd": root.join("work/app"), "prompt": "look merges up"});
-    borg::presence::write(&home, &borg::presence::update(None, "corp", "claude", "prompt", &ev, now(), |_| ("ann@x".into(), "app".into()))).unwrap();
-    let said = mesh(&root, &["steer", "s1", "--veto", "never", "read", "the", "commit", "log"]);
-    assert!(said.starts_with("vetoed One of One (session s1, ann@x): signed"), "{said}");
-    let eps = std::fs::read_to_string(home.join("episodes.jsonl")).unwrap();
-    assert_eq!(eps.lines().count(), 1);
-    assert!(eps.contains("\"kind\":\"veto\"") && eps.contains("never read the commit log"), "{eps}");
-    let stats = std::fs::read_to_string(home.join("stats/events.jsonl")).unwrap();
-    assert_eq!(stats.lines().filter(|l| l.contains("\"kind\":\"veto\"") && l.contains("\"why\":\"mesh\"")).count(), 1);
-    for args in [&["steer", "s1", "--veto"][..], &["steer", "all", "--veto", "no"][..]] {
-        let out = Command::new(env!("CARGO_BIN_EXE_borg-mesh"))
-            .args(args)
-            .args(["--dir", &root.join("work/app").display().to_string()])
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", root.join("home"))
-            .env("BORG_HOME", root.join("base"))
-            .env("BORG_CONFIG", root.join("collectives.json"))
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "{args:?} is refused");
-    }
-    assert_eq!(std::fs::read_to_string(home.join("episodes.jsonl")).unwrap().lines().count(), 1);
-    let _ = std::fs::remove_dir_all(&root);
 }

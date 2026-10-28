@@ -25,14 +25,13 @@ const DEFAULT_CAPS: &str = "prompt,tool,deny";
 
 pub struct Sim;
 
-/// The flags in a comma list: prompt, tool, early, steer, dialog, transcript, deny, pid.
+/// The flags in a comma list: prompt, tool, early, dialog, transcript, deny, pid.
 pub fn caps_of(list: &str) -> Caps {
     let on = |f: &str| list.split(',').any(|x| x.trim() == f);
     Caps {
         prompt_context: on("prompt"),
         tool_context: on("tool"),
         early_delivery: on("early"),
-        steer_in_context: on("steer"),
         question_dialog: on("dialog"),
         transcript: if on("transcript") { Transcript::Claude } else { Transcript::None },
         deny_capture: on("deny"),
@@ -76,8 +75,8 @@ mod tests {
 
     #[test]
     fn caps_come_from_the_list() {
-        let c = caps_of("early, steer,transcript");
-        assert!(c.early_delivery && c.steer_in_context && !c.question_dialog && !c.prompt_context);
+        let c = caps_of("early,transcript");
+        assert!(c.early_delivery && !c.question_dialog && !c.prompt_context);
         assert_eq!(c.transcript, Transcript::Claude);
         let d = caps_of(DEFAULT_CAPS);
         assert!(d.prompt_context && d.tool_context && d.deny_capture && !d.early_delivery && !d.sends_pid);

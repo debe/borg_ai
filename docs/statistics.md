@@ -3,7 +3,7 @@
 [← README](../README.md)
 
 Borg counts what it does: turn ends it checked, questions it asked, what the drones did with them,
-corrections, steering, the queen's decisions and model costs. Each team member sees the whole team's
+corrections, pauses and vetoes, the queen's decisions and model costs. Each team member sees the whole team's
 numbers, and `borg web` shows them with the collective's knowledge on a local page.
 
 - [The page](#the-page)
@@ -56,7 +56,7 @@ one lesson can get on top of either, as on the Conscience tab.
    `<store>/stats/events.jsonl`. The line can hold the session, the repo and a short excerpt of a
    correction, so this file never leaves the machine.
 2. **History, once.** The first time a store is counted, Borg derives earlier events from the logs it
-   kept anyway: corrections, outcomes, lessons, the queen's queue, imports, expert calls and steering.
+   kept anyway: corrections, outcomes, lessons, the queen's queue, imports, expert calls, pauses and vetoes.
    It writes them to `<store>/stats/backfill.jsonl`. Turn ends from before then are dated by the time
    their session's state file last changed.
 3. **Rollups, shared.** At each session end, and once a minute while `borg web` runs, the events
@@ -84,7 +84,7 @@ one lesson can get on top of either, as on the Conscience tab.
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
-| `steer_issued`, `steer_delivered`, `steer_dropped` | A signed directive sent, shown to a drone, or refused on receipt |
+| `steer_issued`, `steer_delivered`, `steer_dropped` | A pause, resume or veto message (`borg pause`, `borg resume`, `borg no` to another machine) sent, shown to a session, or refused admission (`why`: the reason); `why` on the first two is the kind. They replace `borg steer`'s directives, which are still read from an old store |
 | `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: rate` when the rate limit refused it, `why: bounds` when the 500-line cap cut it. Lines that expire are not counted |
 | `pause_refused` | A tool call refused because its drone was paused |
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |

@@ -203,12 +203,12 @@ pub fn prune(home: &Path, now: i64) {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .is_some_and(|d| now - d.as_millis() as i64 > PRUNE_MS);
         if old {
+            // Its message claims stay: a resumed session keeps its id, and they must outlive the messages
+            // they cover (msg.rs drops them past the TTL).
             let _ = std::fs::remove_file(e.path());
-            // Its steering claims go with it (the file stem is the safe session id). Its message claims
-            // stay: a resumed session keeps its id, and they must outlive the messages they cover (msg.rs
-            // drops them past the TTL).
+            // Its opt-in to wakes (listen.rs) goes with it (the file stem is the safe session id).
             if let Some(session) = e.path().file_stem().and_then(|s| s.to_str()).filter(|s| !s.starts_with('.')) {
-                crate::steer::forget_session(home, session);
+                crate::listen::forget(home, session);
             }
         }
     }
@@ -514,11 +514,8 @@ mod tests {
         // A day later the record is no longer listed, and pruning (by file time) removes it.
         assert!(local(&home, 5_000 + PRUNE_MS + 1).is_empty());
         let far = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + PRUNE_MS + 1000;
-        let claims = crate::steer::dir(&home).join("seen").join("s1");
-        std::fs::create_dir_all(&claims).unwrap();
         prune(&home, far);
         assert!(read(&home, "s/../1").is_none());
-        assert!(!claims.exists(), "its steering delivery claims go with it");
         let _ = std::fs::remove_dir_all(&home);
     }
 

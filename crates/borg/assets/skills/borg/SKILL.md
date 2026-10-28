@@ -42,7 +42,9 @@ on this machine unless the collective they belong to is synced with a team over 
 | Which later commit fixed a decision, or which decision a fix corrected | `borg why <path>[:<line>]` ("→ fixed in", "← decided in") |
 | The decision → fix links borg would make, before learning from them | `borg regress --replay <A..B> --explain` (dry run; [details](references/collectives.md#decision--fix-links)) |
 | The engineer says no to a drone's work (a veto: shown lessons lose credit, the reason becomes a lesson) | `borg no "<reason>"`, or `borg no --session <drone> "<reason>"` when several drones work in the repo |
-| To redirect or pause running drones | `borg steer <drone\|all> "<text>"`, `borg steer <drone> --pause`, `borg steer <drone> --resume` |
+| To pause or resume running drones | `borg pause <drone\|session\|all> "<note>"`, `borg resume <drone\|session\|all>` |
+| To redirect a running drone | `borg tell <drone\|session\|all> "<text>"` |
+| To be woken when a message arrives while this session is idle | `borg listen`; `borg listen --off` stops it |
 | To tell another session something it needs (a change that affects its work, a finding, a hand-off) | `borg tell <drone\|session\|all> "<text>"`, or `borg tell engineer "<text>"` |
 | To ask another session, or the engineer, a question only they can answer | `borg ask <drone\|session\|engineer> "<question>"`; a reply arrives at a later prompt or tool call |
 | To answer a message shown to this session | The reply line it came with: `borg tell <session> --re <id> "<answer>"` |

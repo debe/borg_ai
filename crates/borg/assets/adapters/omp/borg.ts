@@ -14,7 +14,18 @@
 //   session_stop                -> stop               ({"decision":"block","reason"} is returned to omp,
 //                                                      which injects it as a continuation and sets
 //                                                      stop_hook_active for the next stop: one round per turn)
+//   agent_end, last stop aborted -> halted           (an Esc ends the turn with no session_stop: a
+//                                                      listening session's wakes are held off no longer)
 //   session_shutdown            -> end
+//
+// A session that listens (`borg listen`, docs/commands.md) is woken by the extension: it starts the
+// session's waiter, `borg listen --stream`, once the model's own `borg listen` succeeds in its
+// tool_result (omp gives the command PI_SESSION_ID, so it bound this session), or once a stop's answer
+// carries `"listen": true` (borg says no waiter runs). The waiter waits at no token cost, holds wakes
+// off while the engineer's turn runs, and says each wake as a JSON line; the extension sends it in with
+// pi.sendMessage(..., {deliverAs: "nextTurn", triggerTurn: true}), which starts a turn on an idle
+// session and waits behind a running one. Its `{"end"}` line ends it until the next `"listen": true`;
+// `borg listen --off` in the session, or its end, stops it. Spawned, never awaited.
 //
 // Fails open: a missing borg binary, a crash, a timeout or bad output is a no-op.
 // borg is found via $BORG_BIN, else `borg` on PATH. Plain erasable TypeScript, so omp (Bun) loads
@@ -199,6 +210,78 @@ export function runBorg(event: string, payload: Canonical, timeoutMs: number, si
 	});
 }
 
+/** What a shell command does to the listening of the session it runs in: `on` for `borg listen`, `off`
+ *  for `borg listen --off`. Undefined for anything else: a waiter (`--wait`, `--stream`, `--queue`) or
+ *  another, named session's (`--session`). */
+export function listenCommand(command: string): "on" | "off" | undefined {
+	for (const part of command.split(/&&|\|\||[;|\n]/)) {
+		const m = /(?:^|\s)(?:\S*\/)?borg\s+listen(?:\s+(.*))?$/.exec(part.trim());
+		if (!m) continue;
+		const args = (m[1] ?? "").trim().split(/\s+/).filter(Boolean);
+		if (args.some((a) => ["--wait", "--stream", "--queue", "--session"].includes(a) || a.startsWith("--session="))) return undefined;
+		return args.includes("--off") ? "off" : "on";
+	}
+	return undefined;
+}
+
+/** What `borg listen` prints once it opted the session in. */
+const LISTENS = "[borg listen] This session listens";
+
+/** One line of the waiter (`borg listen --stream`): a wake to send in, a note, or its last line. */
+export type StreamLine = { wake: string } | { note: string } | { end: string };
+
+export function streamLine(line: string): StreamLine | undefined {
+	try {
+		const v = JSON.parse(line);
+		if (typeof v?.wake === "string" && v.wake.trim()) return { wake: v.wake };
+		if (typeof v?.note === "string") return { note: v.note };
+		if (typeof v?.end === "string") return { end: v.end };
+	} catch {}
+	return undefined;
+}
+
+/** The session's waiter, `borg listen --stream --session <id> --dir <cwd>`: each wake to `onWake`,
+ *  `onEnd` once it exits. Its stderr is dropped; a spawn failure ends it at once (fails open). */
+export function startStream(session: string, cwd: string, onWake: (text: string) => void, onEnd: () => void): ReturnType<typeof spawn> | undefined {
+	let child: ReturnType<typeof spawn>;
+	try {
+		child = spawn(process.env.BORG_BIN || "borg", ["listen", "--stream", "--session", session, "--dir", cwd], { stdio: ["ignore", "pipe", "ignore"] });
+	} catch {
+		onEnd();
+		return undefined;
+	}
+	let rest = "";
+	child.stdout?.on("data", (d) => {
+		rest += d;
+		let nl: number;
+		while ((nl = rest.indexOf("\n")) >= 0) {
+			const line = streamLine(rest.slice(0, nl));
+			rest = rest.slice(nl + 1);
+			if (line && "wake" in line) onWake(line.wake);
+		}
+	});
+	let ended = false;
+	const end = () => {
+		if (!ended) {
+			ended = true;
+			onEnd();
+		}
+	};
+	child.on("error", end);
+	child.on("close", end);
+	return child;
+}
+
+/** Whether omp's run `messages` ended on an abort (Esc): the turn reaches no session_stop. */
+export function aborted(messages: unknown): boolean {
+	if (!Array.isArray(messages)) return false;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (m?.role === "assistant") return m.stopReason === "aborted";
+	}
+	return false;
+}
+
 // Per-event budgets: capture is file appends (ms); stop may call a model (the consequence model) but omp
 // gives handlers a fixed 30 s (no setting changes it for session_stop), so the stop sizes its wait for a
 // live check and its model call from BORG_STOP_BUDGET_MS = STOP_MS; omp waits only 2 s on
@@ -241,6 +324,37 @@ export default function borg(pi: any): void {
 	};
 	const take = () => pending.splice(0).join("\n\n");
 
+	// Each listening session's waiter (`borg listen --stream`) in this omp process.
+	const streams = new Map<string, ReturnType<typeof spawn>>();
+	/** The session's waiter, unless one runs: its wakes go in as a custom message that starts the next
+	 *  turn (now, on an idle session; after the running one, else). */
+	const arm = (session: string, cwd: string) => {
+		if (streams.has(session)) return;
+		// Declared first: a spawn that fails ends the stream before startStream returns.
+		let child: ReturnType<typeof spawn> | undefined;
+		child = startStream(
+			session,
+			cwd,
+			(content) => {
+				try {
+					pi.sendMessage({ customType: "borg-listen", content, display: true }, { deliverAs: "nextTurn", triggerTurn: true });
+				} catch {}
+			},
+			() => {
+				if (child && streams.get(session) === child) streams.delete(session);
+			},
+		);
+		if (child && child.exitCode === null && child.signalCode === null) streams.set(session, child);
+	};
+	/** The session listens no more (`--off`, its end): its waiter is stopped. */
+	const disarm = (session: string) => {
+		const child = streams.get(session);
+		streams.delete(session);
+		try {
+			if (child && child.exitCode === null) child.kill("SIGTERM");
+		} catch {}
+	};
+
 	pi.on(
 		"input",
 		safe(async (ev, ctx) => {
@@ -270,7 +384,7 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			if (calls.size > 256) calls.delete(calls.keys().next().value as string);
 			calls.set(String(ev.toolCallId), ev.input);
-			// A drone paused by signed steering (borg steer --pause) has its tool calls refused.
+			// A drone paused by `borg pause` has its tool calls refused.
 			const out = await runBorg("pre_tool", { ...where(ctx), tool_name: toolName(String(ev.toolName ?? "")), tool_input: toolInput(String(ev.toolName ?? ""), ev.input) }, PRE_MS);
 			const deny = (out as any)?.hookSpecificOutput;
 			if (deny?.permissionDecision === "deny" && typeof deny.permissionDecisionReason === "string") {
@@ -290,6 +404,11 @@ export default function borg(pi: any): void {
 			// Context kept from a mid-turn steer goes first.
 			const out = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
 			const c = [take(), typeof out === "string" ? out.trim() : ""].filter(Boolean).join("\n\n");
+			// The model's own `borg listen` (PI_SESSION_ID bound this session) or `--off`.
+			const command = (ev.input as any)?.command;
+			const listen = event === "post_tool" && payload.tool_name === "Bash" && typeof command === "string" ? listenCommand(command) : undefined;
+			if (listen === "on" && text(ev.content).includes(LISTENS)) arm(payload.session_id, payload.cwd);
+			else if (listen === "off") disarm(payload.session_id);
 			return c ? { additionalContext: c } : undefined;
 		}),
 	);
@@ -310,6 +429,8 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			const payload = stopEvent(ctx, ev);
 			const out = await runBorg("stop", payload, STOP_MS, ev.signal);
+			// The session listens and no waiter runs.
+			if (out?.listen === true) arm(payload.session_id, payload.cwd);
 			if (out?.decision === "block" && typeof out.reason === "string" && out.reason) {
 				asked = out.reason.trim();
 				return { decision: "block", reason: out.reason };
@@ -319,9 +440,21 @@ export default function borg(pi: any): void {
 	);
 
 	pi.on(
+		"agent_end",
+		safe(async (ev, ctx) => {
+			// An Esc: no stop follows, so borg hears that the engineer's turn is over (its wakes go in again).
+			const at = where(ctx);
+			if (ev.willContinue !== true && streams.has(at.session_id) && aborted(ev.messages)) await runBorg("halted", at, FAST_MS);
+		}),
+	);
+
+	pi.on(
 		"session_shutdown",
 		safe(async (_ev, ctx) => {
-			await runBorg("end", where(ctx), END_MS);
+			const at = where(ctx);
+			// borg's end forgets the opt-in; the waiter is stopped here at once.
+			await runBorg("end", at, END_MS);
+			disarm(at.session_id);
 		}),
 	);
 }

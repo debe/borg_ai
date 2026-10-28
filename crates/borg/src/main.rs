@@ -229,12 +229,8 @@ fn main() {
         // The harness's event on stdin (hook.rs); an unknown harness fails open, like any hook error.
         ["hook", name, event] => borg::hook::main(name, event),
         ["collective", rest @ ..] => collective_cmd(rest),
-        [cmd @ ("mesh" | "steer"), rest @ ..] => {
-            // The mesh is its own binary (crates/borg-mesh): the networking stack stays out of the hook.
-            // So is steering: it signs with the member key and checks the membership (steer.rs).
-            let args: Vec<&str> = if *cmd == "steer" { std::iter::once("steer").chain(rest.iter().copied()).collect() } else { rest.to_vec() };
-            exec("mesh", &args)
-        }
+        // The mesh is its own binary (crates/borg-mesh): the networking stack stays out of the hook.
+        ["mesh", rest @ ..] => exec("mesh", rest),
         // The live page (crates/borg-web): its web stack stays out of the hook binary too.
         ["web", rest @ ..] => exec("web", rest),
         ["learn", rest @ ..] => learn_cmd(rest),
@@ -273,7 +269,8 @@ fn main() {
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
-        [cmd @ ("tell" | "ask" | "inbox"), rest @ ..] => std::process::exit(borg::msg::main(cmd, rest)),
+        [cmd @ ("tell" | "ask" | "pause" | "resume" | "inbox"), rest @ ..] => std::process::exit(borg::msg::main(cmd, rest)),
+        ["listen", rest @ ..] => std::process::exit(borg::listen::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),

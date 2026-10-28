@@ -22,8 +22,6 @@
 //!                                              default 0.0.0.0:7878, 60 s; a reinstalled borg-mesh
 //!                                              runs in its place, same process)
 //!        borg-mesh sync <key>[@<hints>]       (reconcile with one member, once)
-//!        borg-mesh steer <drone|session|all> "<text>" | <drone> --pause | --resume | --veto "<reason>"
-//!                                             (signed steering, steer.rs; `borg steer` runs this)
 //!        borg-mesh fetch [<commit>...]        (ask every known member for the reasoning excerpts of these
 //!                                              commits, default: recent commits without a note, and
 //!                                              write them as git notes; `borg notes fetch` runs this)
@@ -184,7 +182,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             let mut m = Membership::load(&home)?.ok_or(format!("{name} has no membership: `borg mesh init`"))?;
             m.invite(&Identity::load_or_create(&home)?, key, flag(args, "--role").unwrap_or("member"))?;
             m.save(&home)?;
-            // A demoted steerer's directives stop holding here now, not at the next daemon round.
+            // A demoted steerer's pauses stop holding here now, not at the next daemon round.
             borg_mesh::steer::enforce(&home, &m, borg::learn::now_ms());
             println!("{key} is a member of {name} (version {}); hand them {} (`borg mesh join` it)", m.version, membership::history_path(&home).display());
         }
@@ -320,44 +318,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             let written = borg::notes::restore(&repo, &home, &commits)?;
             println!("{} note(s) written to {} (not pushed)", written.len(), borg::notes::NOTES_REF);
         }
-        Some("steer") => println!("{}", steer_cmd(&place, &r, &args[1..])?),
         _ => return Err(format!("unknown command\n\n{}", help())),
     }
     Ok(())
-}
-
-/// `steer <drone|session|all> "<text>" | --pause [text] | --resume [text] | --veto <reason>` (`borg no`
-/// for another node's drone runs the last): works for a local
-/// collective too (signed with this machine's key, never leaves it); never for an off repo.
-fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String> {
-    let (name, home) = store(r)?;
-    let mut words = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--dir" => i += 1,
-            "--pause" | "--resume" | "--veto" => {}
-            w => words.push(w.to_string()),
-        }
-        i += 1;
-    }
-    let kind = if args.iter().any(|a| a == "--pause") {
-        borg::steer::PAUSE
-    } else if args.iter().any(|a| a == "--resume") {
-        borg::steer::RESUME
-    } else if args.iter().any(|a| a == "--veto") {
-        borg::steer::VETO
-    } else {
-        borg::steer::SAY
-    };
-    let usage = "usage: borg steer <drone|session|all> \"<text>\" | <drone> --pause | <drone> --resume | <drone> --veto \"<reason>\" [--dir DIR]";
-    let target = words.first().ok_or(usage)?;
-    let text = words[1..].join(" ");
-    if (kind == borg::steer::SAY || kind == borg::steer::VETO) && text.trim().is_empty() {
-        return Err(usage.into());
-    }
-    let engineer = borg::learn::engineer(&place.dir);
-    borg_mesh::steer::issue(&home, &name, borg::collective::may_sync(r), &engineer, target, kind, &text, borg::learn::now_ms())
 }
 
 /// Until Ctrl-C or SIGTERM (borg reexec.rs `trap_stops`, from `main`): false; or until `image`'s

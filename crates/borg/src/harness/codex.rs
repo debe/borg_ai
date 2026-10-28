@@ -18,17 +18,25 @@ use super::wiring::Hooks;
 use super::{Caps, DroneWake, Harness, Level, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
-/// tool call fires no PostToolUse at all), so denials are not captured.
-pub const EVENTS: [(&str, &str); 5] =
-    [("UserPromptSubmit", "prompt"), ("PreToolUse", "pre_tool"), ("PostToolUse", "post_tool"), ("Stop", "stop"), ("SessionEnd", "end")];
+/// tool call fires no PostToolUse at all), so denials are not captured. `Interrupt` (an Esc) ends the
+/// turn of a session that listens for wakes (listen.rs), which a turn with no stop and a tool call that
+/// never ended would hold off for `listen::TOOL_MS`.
+pub const EVENTS: [(&str, &str); 6] = [
+    ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "pre_tool"),
+    ("PostToolUse", "post_tool"),
+    ("Stop", "stop"),
+    ("SessionEnd", "end"),
+    ("Interrupt", "halted"),
+];
 
-/// Hooks an older borg installed: `Interrupt` served the hive's drones (0.3.0 and before).
-pub const RETIRED: [(&str, &str); 1] = [("Interrupt", "halted")];
+/// Hooks an older borg installed and this one does not.
+pub const RETIRED: [(&str, &str); 0] = [];
 
 /// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd,
 /// which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one here makes every
 /// engineer trust borg's hooks again.
-pub const TIMEOUTS: [(&str, u64); 5] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3)];
+pub const TIMEOUTS: [(&str, u64); 6] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3), ("halted", 3)];
 
 /// The stop's timeout, and so its budget: the live wait, the stop's model call and the expert drone keep
 /// inside it.
@@ -51,7 +59,6 @@ impl Harness for Codex {
             prompt_context: true,
             tool_context: true,
             early_delivery: false,
-            steer_in_context: false,
             question_dialog: false,
             // `transcript_path` is a Codex rollout, not a Claude transcript (`normalise` drops it).
             transcript: Transcript::None,

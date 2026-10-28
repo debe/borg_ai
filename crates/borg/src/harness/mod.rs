@@ -127,8 +127,6 @@ pub struct Caps {
     pub tool_context: bool,
     /// Early delivery: a prompt or touch naming a lesson's scope gets that scope's lessons at once (hook.rs `early`).
     pub early_delivery: bool,
-    /// Steering is shown at the next prompt or tool call; without it, at the next stop (steer.rs `around`).
-    pub steer_in_context: bool,
     /// A queen question is asked with a dialog (AskUserQuestion), else inline (queen.rs `render_delivery`).
     pub question_dialog: bool,
     pub transcript: Transcript,
@@ -339,13 +337,13 @@ mod tests {
     fn caps_are_todays() {
         let row = |n: &str| {
             let c = by_name(n).unwrap().caps();
-            (c.prompt_context, c.tool_context, c.early_delivery, c.steer_in_context, c.question_dialog, c.transcript, c.deny_capture, c.sends_pid)
+            (c.prompt_context, c.tool_context, c.early_delivery, c.question_dialog, c.transcript, c.deny_capture, c.sends_pid)
         };
-        assert_eq!(row("claude"), (true, true, true, true, true, Transcript::Claude, true, false));
+        assert_eq!(row("claude"), (true, true, true, true, Transcript::Claude, true, false));
         for n in ["omp", "opencode"] {
-            assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true), "{n}");
+            assert_eq!(row(n), (true, true, false, false, Transcript::None, true, true), "{n}");
         }
-        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false));
+        assert_eq!(row("codex"), (true, true, false, false, Transcript::None, false, false));
         // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; codex: its
         // stop hook's timeout.
         let budgets = [("claude", None), ("omp", None), ("opencode", None), ("codex", Some(90)), ("sim", None)];

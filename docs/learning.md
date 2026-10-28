@@ -159,7 +159,7 @@ not:
 - `borg why <file>:<line>` shows the redacted reasoning behind a commit, kept as a git note
   (`refs/notes/borg`, never pushed), and both ends of a decision → fix link: "→ fixed in Y" on the
   decision, "← decided in X → fixed here" on the fix.
-- `borg top` lists the drones running across the team; `borg steer` sends them a signed instruction.
+- `borg top` lists the drones running across the team; `borg pause` and `borg resume` hold or release them, and `borg tell` sends them a message.
 - **Expert repos:** a collective can name local checkouts of its dependencies. A turn end that touches
   one gets at most three cited claims from that checkout, at the pinned version.
 

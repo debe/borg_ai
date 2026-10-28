@@ -39,7 +39,7 @@ From crates.io (the package is `borg-ai`; the binary is `borg`), or from a check
 
 ```sh
 cargo install borg-ai --locked      # the CLI and hook binary, vectors included
-cargo install borg-mesh --locked    # only for team sync, borg top across machines, borg steer
+cargo install borg-mesh --locked    # only for team sync, borg top across machines, pausing other members' sessions
 cargo install borg-web --locked     # only for borg web, the live page
 
 git clone https://github.com/debe/borg_ai borg && cd borg
