@@ -9,3 +9,27 @@ node_modules/
 # eval runs and sandboxes write under target/ (target/eval-runs, target/dogfood); eval data and
 # borg's own stores live outside the repo (~/.local/share/borg, ~/.config/borg).
 /crates/borg-web/ui/target
+# Local working files: plans, task notes and scratch probes, never published.
+/PLAN.md
+/tasks/
+/target-probe/
+# hive drones work in worktrees under the repo (`borg hive join`)
+/.worktrees/
+# Eval suites and reports are local unless published: each published one is re-included by name, so a
+# new one is published by adding its line here, never by a stray `git add`.
+/eval/*
+!/eval/dogfood/
+!/eval/regress/
+!/eval/swe-chat/
+!/eval/trap-ledger/
+/reports/*
+!/reports/b0-vanilla-sonnet.md
+!/reports/dogfood-e2e.md
+!/reports/regress.md
+!/reports/swe-chat.md
+!/reports/swe-chat-engineering.md
+!/reports/swe-chat-engineering-transfer.md
+# borg-eval's optional replay modules (build.rs compiles them when present): not published
+/crates/borg-eval/src/preempt.rs
+/crates/borg-eval/src/queen_replay.rs
+/crates/borg-eval/src/queen_test.rs

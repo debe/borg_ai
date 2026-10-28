@@ -23,9 +23,31 @@ It stops at the first failure and runs, in order:
 5. `scripts/arch.sh`, the architecture gates below;
 6. `cargo test -p borg-ai --no-default-features`;
 7. the adapter tests and the harness conformance suite (`node --test adapters/...`).
+8. `cargo publish --dry-run --workspace --locked`: every published crate packages and builds as
+   crates.io would see it (needs the network).
 
 CI runs `scripts/check.sh` on Linux and macOS for every push to main. It does not run on pull
 requests, so run it yourself and say in the pull request that it passed.
+
+## Releasing
+
+Every crate shares the workspace version, and the workspace's own path dependencies are pinned `=` to
+it, so the crates are released together. Release notes collect under "(unreleased)" in the CHANGELOG
+until the tag exists.
+
+1. Set `[workspace.package] version` in the root `Cargo.toml` to X.Y.Z and every `version = "=..."` pin
+   on a workspace path dependency in `crates/*/Cargo.toml` to `=X.Y.Z`, then run `cargo update -w` so
+   `Cargo.lock` follows; `--locked` builds fail otherwise.
+2. `scripts/check.sh` passes on main, and CI is green on Linux and macOS.
+3. Replace "(unreleased)" with the date. Commit, push to main, tag `vX.Y.Z` and push the tag with
+   `git push origin vX.Y.Z` (a plain `git push` leaves tags behind). The release workflow checks that
+   the tag matches every crate's version, builds the tarballs, runs `cargo publish --dry-run` before it
+   creates the GitHub release, attaches the tarballs with their sha256 files and publishes the crates
+   in order (borg-trace, borg-ai, borg-mesh, borg-web).
+4. `scripts/install.sh` from that release in a clean home, then `borg doctor`.
+
+The workflows pin every action to a commit SHA, with the release in a comment. To bump one, resolve
+the new tag with `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`.
 
 ## Architecture gates
 

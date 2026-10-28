@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release checks: formatting, lints, the workspace tests, the vectors build's tests and, when bun is
-# installed, the omp and opencode adapter tests and the adapter harnesses' conformance suite. Stops at
-# the first failure.
+# installed, the omp and opencode adapter tests and the adapter harnesses' conformance suite, then a
+# publish dry run of every crate (needs the network). Stops at the first failure.
 #
 # usage: scripts/check.sh
 set -euo pipefail
@@ -25,13 +25,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo clippy -p borg-ai --no-default-features (all targets, -D warnings)"
 cargo clippy -p borg-ai --all-targets --no-default-features -- -D warnings
 
+# The build leaves gigabytes of binaries the disk is still writing back, which holds the tests' git calls
+# for tens of seconds: tests start once it is on disk (sync).
+
 step "cargo test --workspace"
+cargo test --workspace --no-run
+sync
 cargo test --workspace
 
 step "harness architecture gates (scripts/arch.sh; rows of a missing tool are skipped)"
 scripts/arch.sh
 
 step "cargo test -p borg-ai --no-default-features"
+cargo test -p borg-ai --no-default-features --no-run
+sync
 cargo test -p borg-ai --no-default-features
 
 # The adapter contract tests drive the borg just built, wherever cargo puts it (the conformance suite
@@ -52,5 +59,11 @@ elif command -v bun >/dev/null 2>&1; then
 else
     step "adapter tests SKIPPED: neither node 23.6+ nor bun found"
 fi
+
+# Each published crate is packaged and built as crates.io would see it, the workspace's own crates from
+# a local overlay: a file left out of `include` or a dependency without a version fails here, not at the
+# tag. --allow-dirty lets it check uncommitted work; the release workflow runs it on the tag's checkout.
+step "cargo publish --dry-run --workspace --locked"
+cargo publish --dry-run --workspace --locked --allow-dirty
 
 step "all checks passed"

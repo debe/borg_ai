@@ -1,4 +1,6 @@
 # scripts/check.sh on Linux and macOS for every push to main (no PR runs: work lands on main).
+# Actions are pinned to commit SHAs (the comment names the release); bump them with
+# `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`.
 name: ci
 
 on:
@@ -25,13 +27,14 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The adapter tests and the conformance suite run TypeScript with `node --test` (Node 23.6+).
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       # esaxx-rs (tokenizers) builds C++ against libc++; point it at the SDK's headers.
