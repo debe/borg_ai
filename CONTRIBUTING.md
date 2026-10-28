@@ -32,19 +32,30 @@ requests, so run it yourself and say in the pull request that it passed.
 ## Releasing
 
 Every crate shares the workspace version, and the workspace's own path dependencies are pinned `=` to
-it, so the crates are released together. Release notes collect under "(unreleased)" in the CHANGELOG
-until the tag exists.
+it, so the crates are released together. Each change set that ships bumps the version and opens its
+CHANGELOG section as "## X.Y.Z (unreleased)"; release notes collect there until the release.
 
-1. Set `[workspace.package] version` in the root `Cargo.toml` to X.Y.Z and every `version = "=..."` pin
-   on a workspace path dependency in `crates/*/Cargo.toml` to `=X.Y.Z`, then run `cargo update -w` so
-   `Cargo.lock` follows; `--locked` builds fail otherwise.
-2. `scripts/check.sh` passes on main, and CI is green on Linux and macOS.
-3. Replace "(unreleased)" with the date. Commit, push to main, tag `vX.Y.Z` and push the tag with
-   `git push origin vX.Y.Z` (a plain `git push` leaves tags behind). The release workflow checks that
-   the tag matches every crate's version, builds the tarballs, runs `cargo publish --dry-run` before it
-   creates the GitHub release, attaches the tarballs with their sha256 files and publishes the crates
-   in order (borg-trace, borg-ai, borg-mesh, borg-web).
-4. `scripts/install.sh` from that release in a clean home, then `borg doctor`.
+A release is made from your machine with `scripts/release.sh`, as in libpetri. Pushing a tag on its
+own publishes nothing to crates.io.
+
+1. `scripts/release.sh --dry-run X.Y.Z` on an up-to-date main sets the version, if it isn't set
+   already (workspace version, every `=` pin, `Cargo.lock`), and runs `scripts/check.sh`. It commits
+   nothing.
+2. `scripts/release.sh X.Y.Z` does the same, then:
+   - dates the CHANGELOG section and commits `release: X.Y.Z`;
+   - publishes borg-trace, borg-ai, borg-mesh and borg-web to crates.io in dependency order. A
+     re-run after a partial publish skips the crates already there.
+   - tags `vX.Y.Z`, pushes main and the tag, and creates a draft GitHub release whose notes are the
+     CHANGELOG section.
+
+   It needs `cargo login` and an authenticated `gh`.
+3. The tag starts the release workflow: it builds the Linux and macOS tarballs, attaches them with
+   their sha256 files to the draft and publishes the release. `scripts/install.sh` therefore never
+   sees a latest release without its tarballs.
+   A tag can be pushed ahead of the crates. Date the CHANGELOG section in the commit you tag; the
+   tag's workflow run then only builds. `scripts/release.sh X.Y.Z` later publishes from that tag and
+   creates the draft without a new commit, then re-runs the workflow on the tag.
+4. Run `scripts/install.sh` from that release in a clean home, then `borg doctor`.
 
 The workflows pin every action to a commit SHA, with the release in a comment. To bump one, resolve
 the new tag with `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`.

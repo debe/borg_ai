@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-10-28)
 
 The first release on crates.io (0.4.0, 0.3.0 and 0.2.0 were never published: 0.4.0's notes are
 part of this section, and those of 0.3.0 and 0.2.0 below are history). borg keeps the shared memory:
@@ -47,6 +47,10 @@ others `=0.5.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#rele
 - The documentation was checked against the code: the README, the command, configuration, harness,
   team and statistics references, the adapter READMEs and the borg skill describe messages, pause and
   `borg listen`, and the mesh figures no longer show the old steering.
+- Releases are made locally with `scripts/release.sh X.Y.Z`, as in libpetri: it runs the gate,
+  publishes the crates to crates.io, then tags and creates a draft GitHub release. A pushed tag no
+  longer publishes anything; the release workflow only builds the tarballs, attaches them and
+  publishes the draft.
 
 ### Removed
 

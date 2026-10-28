@@ -1,11 +1,11 @@
-# On a tag v*: build borg, borg-mesh and borg-web for Linux x86_64/aarch64 and macOS aarch64 (Apple
-# silicon only: Intel Macs are deprecated; they build with cargo install borg-ai), attach
-# one tarball per target with its .sha256 to a GitHub release (scripts/install.sh fetches these), then
-# publish the crates to crates.io in dependency order. The GitHub release waits for a
-# `cargo publish --dry-run`, so a crate that would not publish stops the tag before anything is released. Run by hand (workflow_dispatch) it only builds
-# and uploads the tarballs as workflow artifacts: no release, no publish.
+# On a tag v*, pushed by scripts/release.sh: build borg, borg-mesh and borg-web for Linux x86_64/aarch64
+# and macOS aarch64 (Apple silicon only: Intel Macs are deprecated; they build with cargo install
+# borg-ai), attach one tarball per target with its .sha256 to the draft release the script created
+# (scripts/install.sh fetches these), then publish that release, so releases/latest never lacks its
+# tarballs. It publishes nothing to crates.io: the script does that before it tags. Run by hand
+# (workflow_dispatch) on a branch it only builds and uploads the tarballs as workflow artifacts; on a tag
+# it does what the tag push does (scripts/release.sh runs it so after a tag pushed ahead of the release).
 #
-# Needs the repository secret CARGO_REGISTRY_TOKEN (a crates.io token with publish-update scope).
 # Actions are pinned to commit SHAs, as in ci.yml.
 name: release
 
@@ -19,6 +19,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The tag (vX.Y.Z), or the branch name when run by hand.
+  TAG: ${{ github.ref_name }}
 
 jobs:
   build:
@@ -38,15 +40,13 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      # Every published crate takes version.workspace, but check them all: a crate that pins its own
-      # version would otherwise fail only at cargo publish, after the GitHub release exists.
       - name: the tag matches every published crate version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          bad=$(cargo metadata --format-version 1 --no-deps | jq -r --arg v "${GITHUB_REF_NAME#v}" \
+          bad=$(cargo metadata --format-version 1 --no-deps | jq -r --arg v "${TAG#v}" \
             '.packages[] | select(.publish != []) | select(.version != $v) | "\(.name) \(.version)"')
           if [ -n "$bad" ]; then
-            echo "tag $GITHUB_REF_NAME does not match: $bad" >&2
+            echo "tag $TAG does not match: $bad" >&2
             exit 1
           fi
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -73,7 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="borg-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="borg-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/{borg,borg-mesh,borg-web} "dist/$name/"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
@@ -89,21 +89,8 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  # Every crate packages and builds as crates.io would see it (workspace members from a local overlay),
-  # before the GitHub release exists: a publish failure then leaves no half-done release behind.
-  publish-dry-run:
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo publish --dry-run --workspace --locked
-
-  release:
-    needs: [build, publish-dry-run]
+  attach:
+    needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -114,43 +101,15 @@ jobs:
           pattern: borg-*
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/*.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-
-  # cargo publish --workspace publishes borg-trace, borg-ai, borg-mesh and borg-web in dependency
-  # order and skips the publish = false crates (borg-eval, borg-search). crates.io refuses a version
-  # it already has, so a re-run after a partial publish excludes the crates the sparse index lists.
-  publish:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: cargo publish
-        shell: bash
+      - name: attach the tarballs and publish the release
         run: |
-          set -euo pipefail
-          v="${GITHUB_REF_NAME#v}"
-          names=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.publish != []) | .name')
-          exclude=() left=0
-          for name in $names; do
-            if curl -fsS "https://index.crates.io/${name:0:2}/${name:2:2}/$name" 2>/dev/null \
-              | jq -e --arg v "$v" 'select(.vers == $v)' >/dev/null; then
-              echo "$name $v is already on crates.io, skipping"
-              exclude+=(--exclude "$name")
-            else
-              left=$((left + 1))
-            fi
-          done
-          if [ "$left" -eq 0 ]; then exit 0; fi
-          cargo publish --workspace --locked "${exclude[@]}"
+          set -eu
+          # A tag pushed ahead of scripts/release.sh has no draft yet; the script re-runs this then.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "no release for $TAG yet: scripts/release.sh creates it and re-runs this workflow"
+            exit 0
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
