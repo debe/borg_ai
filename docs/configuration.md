@@ -32,7 +32,7 @@ into `~/.local/bin` and runs `borg setup`; options go after `sh -s --`
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
-curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.2.0 --dir ~/bin --no-setup
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.3.0 --dir ~/bin --no-setup
 ```
 
 From crates.io (the package is `borg-ai`; the binary is `borg`), or from a checkout:
@@ -335,14 +335,8 @@ is written and again when `borg why` shows it.
 - `off`: no links.
 
 **Regret reaches back.** With `learn`, each regret learned as a lesson also blames the lessons asked in
-the deciding session before the decision commit (its committer time): asking them did not prevent the
-decision. `borg learn` writes a `regretted` outcome for each, at 0 tokens and once per regret. If the
-lesson the regret merged into was asked, it takes all the blame; otherwise the asked lessons share it
-equally. The blame grows with the fix's evidence (one signal 0.5, two 0.75, three 0.875) and counts as at
-most half a correction in a lesson's usefulness (a veto counts more than a correction). It shows in the
-feed and in `borg memory` (`regretted`). A regret judged "not a lesson", or one whose lesson went to a
-private store, blames nothing. Outcomes are not synced yet, so a decision made on another machine finds
-no asks here. `BORG_REGRET_CREDIT=off` turns it off.
+the deciding session before the decision commit; how much, and how it moves their usefulness, is under
+[Outcomes](learning.md#outcomes-and-the-usefulness-belief). `BORG_REGRET_CREDIT=off` turns it off.
 
 Before you switch to `learn`, check what the detector finds in your own history:
 
@@ -423,9 +417,9 @@ lessons asked in the session before the finding get a `regretted` outcome, half 
 blamed twice. `BORG_REGRET_CREDIT=off` turns this part off.
 
 Why on: in the value eval lessons from earlier findings raised the share of later bugs a plan avoided
-by 6 points, never worse overall, and 89% of the lessons state their finding faithfully. The interval
-still reaches −5.1, just past the −5 bar set before the run; the engineer turned it on, since a user who
-never configures would otherwise never get it. `borg web` counts the findings learned, so you can
+by 6 points [−5.1, +17.9], and 89% of the lessons state their finding faithfully. The rule set before
+the run (borg beats a plain agent with an interval excluding 0) was not met; the engineer turned it on
+anyway, since a user who never configures would otherwise never get it. `borg web` counts the findings learned, so you can
 watch it. Numbers in [Evidence and limits](evidence.md).
 
 ## Environment variables
@@ -518,8 +512,8 @@ project.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored). Unset: a join record of the session's directory decides (`borg hive join --here`, `borg hive run`'s worktrees). Empty: no goal at all |
-| `BORG_HIVE_DRONE` | unset | Set by `borg hive run`: the drone a session is an iteration of. A verify task is barred to every session of the drone that did the work |
+| `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored). Unset: a join record of the session's directory decides (`borg hive join --here`, `borg debug hive run`'s worktrees). Empty: no goal at all |
+| `BORG_HIVE_DRONE` | unset | Set by `borg debug hive run`: the drone a session is an iteration of. A verify task is barred to every session of the drone that did the work |
 | `BORG_HIVE_CREDIT` | on | `off`: hive verdicts credit no lessons (`verified`, `rejected`, `hacked` outcomes); the board, the flags and the `task_*` statistics still record. For an eval's frozen arm. Also off with `BORG_LEARN=off` |
 | `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a drone or a session, and `borg learn` proposes no playbook edit from verified hive work or a clean plain session ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
 | `BORG_GROUP_REFLECT` | on | `off`: `borg learn` no longer turns settled hive groups into reflection episodes ([Groups](commands.md#groups-of-attempts)); `borg learn --group` still does. For an eval arm without group reflection. Also off with `BORG_LEARN=off` |

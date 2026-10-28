@@ -121,7 +121,7 @@ then after 2, 4, 8 … minutes (at most 30), and carries what the failed one mis
 from A reaches C in B's next round. After each session that completed, dialled or
 answered, a peer notes when it started in `mesh/synced.json` (per member key, local only): what it held
 then has reached that member; a failed dial removes the member from it. A hive claim beside another
-machine's drones, and `borg hive run` at its start, wait on this file for a round with each member
+machine's drones, and `borg debug hive run` at its start, wait on this file for a round with each member
 synced in the last 2 minutes (at most 1 s and 3 s).
 
 **Membership.** Each machine holds one ed25519 key per collective; the key is also its network address,

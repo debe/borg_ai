@@ -8,7 +8,17 @@ teammate's, meets the same decision. It runs as hooks in Claude Code and Codex a
 (oh-my-pi) and opencode, learns in one plain session with nothing else running, and shares lessons with a
 team peer to peer, with no server.
 
-**Status:** 0.2.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
+Why: an agent forgets a correction when its session ends, so you make the same correction next week, and
+each teammate makes it again.
+
+- **Lesson:** what a correction becomes: a question the agent asks itself, the situations where it
+  applies, and the consequence it prevents.
+- **Drone:** one agent session wired to Borg.
+- **Collective:** one memory for a set of repos: shared with a team, private, or off.
+- **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
+- **Hive:** many drones on one goal, each task checked and verified by another drone.
+
+**Status:** 0.3.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
 NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
@@ -21,11 +31,6 @@ NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits
 - [Evidence and limits](#evidence-and-limits)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 - [Development](#development)
-
-Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/docs/learning.md) · [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md) ·
-[Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md) · [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md) · [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md) ·
-[Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md) · [Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) · [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md) ·
-[Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports)
 
 ## Quick start
 
@@ -68,12 +73,14 @@ one every repo joins a team collective named `default`), then `borg install all`
 `borg install all --apply`, `borg vectors --fetch`, and optionally `borg assimilate --apply --limit 50`.
 Intel Macs, the macOS C++ header workaround and source builds: [Install](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#install).
 
+Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/docs/learning.md) · [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md) ·
+[Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md) · [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md) · [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md) ·
+[Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md) · [Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) · [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md) ·
+[Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports)
+
 ## How it works in one session
 
-A **drone** is one agent session. A **lesson** is what a correction becomes: a question the agent should
-ask itself, the situations where it applies, and the consequence it prevents. A **collective** is one
-memory for a set of repos. Everything in this section works in one plain interactive session, with no
-team and no hive.
+Everything in this section works in one plain interactive session, with no team and no hive.
 
 ```mermaid
 flowchart LR
@@ -99,8 +106,8 @@ grade 3 blocks the stop for one more round. The same call judges whether what wa
 changed the work. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
 
 **Outcomes and belief.** Every delivery is logged with its probability, and what followed (changed,
-ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's usefulness belief. `borg memory`
-shows it; `borg ope` replays the weights offline. [Outcomes](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
+ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's usefulness belief. The
+Knowledge tab of `borg web` shows it. [Outcomes](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
 
 **Review → fix.** A reviewer sub-agent finds a bug and a fix step fixes it before any commit. `borg
 review-fix` reads those runs from Claude Code, omp, opencode and Codex at 0 tokens, and each fixed finding
@@ -149,7 +156,7 @@ flowchart LR
 Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
 What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones and hive goals, like Unix `top`;
-`borg steer` sends them a signed instruction. Set up: `borg setup --team` or `--join`, or
+`borg steer` sends them a signed instruction. Set up: `borg setup --team <name>` or `--join <ticket>`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 
 ## The hive
@@ -195,9 +202,9 @@ Lessons apply and sync as in a plain session; verdicts, reworks and groups of at
 them like any outcome. Claude Code drones' claims are metered from their transcripts, and new claims
 stop at the goal's budget until you raise it (answer the session's question with the new budget,
 or run `borg hive ratify <goal> --budget USD`). Proven with real sessions: Claude Code and omp on one node, opencode and codex on a
-second, one 4-task goal approved at the prompt, every task verified and integrated once, no model call
-while the drones waited, wake-ups in 0.1 to 4.6 s. `borg hive run --drones N` runs headless drones in
-worktrees; it is what the evals use.
+second node on the same machine, one 4-task goal approved at the prompt, every task verified and integrated once, no model call
+while the drones waited, wake-ups in 0.1 to 4.6 s. Headless drones in worktrees
+(`borg debug hive run`) exist for the evals.
 [Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive) · [Design and status](https://github.com/debe/borg_ai/blob/main/docs/design/hive.md)
 
 ## Monitoring
@@ -212,7 +219,7 @@ queen's attention score), Learning (week by week: lessons per source, the share 
 changed the work, repeated vetoes, hive mistakes caught, playbook versions), Hive (each goal's tasks over time, its nodes, and its interactive drones: working,
 busy, waiting or gone, with their wake latency) and Cost. It reads the
 same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
-spend), `borg doctor` (what is broken), `borg memory`, `borg queen`, `borg top`.
+spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
 ## Cost
@@ -222,8 +229,8 @@ spend), `borg doctor` (what is broken), `borg memory`, `borg queen`, `borg top`.
   for.
 - **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s. An extra round
   happens only for a grade-3 lesson.
-- **Live mode** adds one call per burst of changes: on the benchmark, borg's side cost $0.56 per task in
-  live mode and $0.07 in hook mode, while whole runs cost about the same ($5.05 vs $4.97).
+- **Live mode** adds one call per burst of changes: about 8× borg's own spend in hook mode, while whole
+  runs cost about the same ([Why live is the default](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#why-live-is-the-default)).
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66). `assimilate --from-dir` makes one call per chunk and
   prints its cost. `borg no`, review → fix, regrets and green tests cost 0 tokens.
 - There is no cost cap: `borg status` and the Cost tab show what each mode spent.
@@ -259,24 +266,35 @@ the next run. [Time limits](https://github.com/debe/borg_ai/blob/main/docs/deliv
 
 ## Evidence and limits
 
-**Shown, against rules written before each paid run** (mostly on the author's and a few colleagues'
+**Measured, against rules written before each paid run** (mostly on the author's and a few colleagues'
 sessions, so the data is not here):
 
-- lessons at the turn end raised engineer points from 34% to 63% on 15 real decisions in a sealed sandbox;
+- lessons at the turn end, 15 real decisions in a sealed sandbox: 25% → 34% engineer points on all 15,
+  +8.8 [−1.4, +22.2], not significant; 34% → 63% on the subgroup of 4 cases with a directly relevant
+  lesson, +29.2 [+4.2, +68.8];
 - a memory of 21 lessons from 10 sessions held 21 useful ones; accuracy tied with Hindsight on the same
   memory model;
-- team documents as lessons: +1.7 knowledge checks per run, level with a hand-written skill;
 - the system gate cut wrong-system deliveries from 83 to 0;
-- live mode: not worse than hook, sometimes better (+0.38 criteria per task [0, +0.88], 0 redo rounds);
-- review → fix lessons: +6 points of later bugs avoided [−5.1, +18], on by default although the lower
-  bound misses its pre-set −5 by 0.1;
+- live mode: not worse than hook (+0.38 criteria per task [0, +0.88], 8 pairs, p = 0.50, directional
+  only: 2 pairs differ; 0 redo rounds);
 - the hive finished every board and passed every held-out check in 6 acceptance runs.
+
+**On although its rule was not met:** review → fix lessons, +6.3 points of later bugs avoided
+[−5.1, +17.9]; the pre-registered rule (an interval excluding 0) failed, and the engineer turned it on so
+that users who never configure get it.
+
+**Rule not met:** team documents as lessons, n = 9: +1.7 [+0.8, +2.4] knowledge checks over a plain agent
+(comparison runs not concurrent), but against a hand-written skill +0.11 [−0.56, +0.78], short of the
+pre-registered lower bound of −0.5.
 
 **Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit
 improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests;
-whether a hive beats one session with subagents; the hive across real machines. omp, opencode and Codex
-get no early delivery of ordinary lessons, and there a live check sees tool calls, not prose.
+whether a hive beats one session with subagents (one pilot probe run per arm, before the bug fixes:
+one session 5 of 5, the hive 2 of 5; no fair comparison since); whether the hive's learning helps (the
+test stopped undecided, and its kill criterion was not applied); the hive across real machines. omp,
+opencode and Codex get no early delivery of ordinary lessons, and there a live check sees tool calls,
+not prose.
 Full table, the regret check and every known limit: [Evidence and limits](https://github.com/debe/borg_ai/blob/main/docs/evidence.md).
 
 ## Upgrade and uninstall

@@ -110,7 +110,7 @@ reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or 
 `queued_free` event, never as a `block`, and the next turn end's model call judges it as it judges a
 question (questions keep their judge slots first; free deliveries alone pay for no model call). A
 correction `borg learn` merges into a lesson delivered free is `asked_then_corrected`; one a graded check
-left unchosen stays `applied_then_corrected` too, since a free delivery asks nothing, and `borg ope`
+left unchosen stays `applied_then_corrected` too, since a free delivery asks nothing, and `borg debug ope`
 leaves free deliveries out: they draw from no pool. A veto adds a `vetoed` record per lesson shown in the session
 before it (no channel; it is counted as the `veto` event, not as an outcome kind of its own). `asked`
 and `graded` records also carry `p`, each lesson's probability of being asked under the policy in force,

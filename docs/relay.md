@@ -23,18 +23,11 @@ keys.
 
 ## What the relay sees
 
-Peers connect to each other by key with end-to-end encrypted QUIC. The relay helps them find each other's
-public address and forwards packets when no direct path works (symmetric NAT, blocked UDP). It cannot
-read those packets, and without a member key it can neither join a collective nor inject data.
-
-It does see metadata:
-
-- each node id (a per-collective key) and its public IP address;
-- which node ids talk to each other, when, and how much;
-- its own logs and Prometheus metrics, kept wherever you keep them.
-
-It never sees a lesson, member list, repo name or email. With a custom relay, borg also skips n0's
-public address lookup (DNS and pkarr), so nothing about the collective reaches n0.
+The relay helps peers find each other's public address and forwards packets when no direct path works
+(symmetric NAT, blocked UDP). What any relay can and cannot see is under
+[Privacy on the mesh](team-sync.md#privacy-on-the-mesh). Your own relay adds its logs and Prometheus
+metrics, kept wherever you keep them; with a custom relay, borg also skips n0's public address lookup (DNS
+and pkarr), so nothing about the collective reaches n0.
 
 ## Install
 

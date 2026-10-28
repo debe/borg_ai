@@ -32,16 +32,10 @@ lesson.
 **Team documents.** `borg assimilate --from-dir` condenses a checkout of written team knowledge into
 scoped lessons, and its open decisions into queen questions ([Import](configuration.md#import-what-you-already-have)).
 
-**Decision → fix links (regrets).** Some choices look fine and break weeks later. At session end, after
-the reasoning notes are written, Borg blames the lines each landed commit removed or changed and finds
-the decision behind them: an earlier commit with Borg reasoning, from another session, at least
-`BORG_REGRESS_MIN_AGE` (2 days) older. The link goes into both commits' notes and, for a team
-collective, to the mesh. It is a *fix* when the commit reverts the decision, its subject reads like a
-fix, or a test failed and then passed in the session while your prompts spoke of a bug; otherwise it is a
-weak *revisited* link that Borg never learns from. With `BORG_REGRESS=learn`, a fix becomes an episode,
-and `borg learn` words it as a question for the decision point: "Before choosing X here, has Y been
-considered?" Links are recorded by default (`links`); learning from them waits until you have checked a
-dry run (`borg regress --replay A..B`). See [Decision → fix links](configuration.md#decision--fix-links).
+**Decision → fix links (regrets).** Some choices look fine and break weeks later. At session end Borg
+links each landed commit to the earlier decisions whose lines it fixed. With `BORG_REGRESS=learn` a fix
+becomes a lesson for the decision point; by default links are only recorded. How links are found, where
+they are written and how to check them first: [Decision → fix links](configuration.md#decision--fix-links).
 
 **Review → fix.** Most bugs never reach a commit. A workflow builds, a reviewer finds a problem, and a
 fix step fixes it, all inside one session. `borg review-fix` reads the sub-agent runs of Claude Code
@@ -70,8 +64,8 @@ off. See [Playbooks](commands.md#playbooks).
 Each delivered lesson gets an `asked` outcome, and what follows is recorded against it: `changed` or
 `ignored` (judged by the next turn-end model call, see [Delivery](delivery.md)), `corrected` anyway,
 `vetoed`, `regretted`, `tested`. These outcomes form each lesson's usefulness belief, which ranks it
-against others and decides whether it keeps being asked. `borg memory <lessons.jsonl>` shows each lesson's
-belief, activation and state. `borg ope` replays the hand-set weights offline against the logged asks,
+against others and decides whether it keeps being asked. `borg debug memory <lessons.jsonl>` shows each lesson's
+belief, activation and state. `borg debug ope` replays the hand-set weights offline against the logged asks,
 with their asking probability, and reports; it never changes them.
 
 | Outcome | Weight in the belief | Set by |
@@ -83,10 +77,13 @@ with their asking probability, and reports; it never changes them.
 
 **Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
 against the lessons asked in the deciding session before the decision: asking them did not prevent it.
-The lesson it merged into takes the blame if it was asked; otherwise the asked lessons share it. It costs
-0 tokens, each regret counts once, and it weighs at most half a correction, so a lesson that keeps being
-asked before decisions that break sinks slowly. `borg memory` and the page show it as `regretted`;
-`BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by a pre-registered
+The lesson it merged into takes the blame if it was asked; otherwise the asked lessons share it equally.
+The blame grows with the fix's evidence (one signal 0.5, two 0.75, three 0.875; a review finding 0.5,
+confirmed by a verifier 0.75). It costs 0 tokens, each regret counts once, and it weighs at most half a
+correction, so a lesson that keeps being asked before decisions that break sinks slowly. A regret judged
+"not a lesson", or one whose lesson went to a private store, blames nothing; outcomes are not synced yet,
+so a decision made on another machine finds no asks here. `borg debug memory` and the page show it as
+`regretted`; `BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by a pre-registered
 offline check: the belief with the regret term must predict later outcomes at least as well as without it.
 
 **Green tests credit the question.** A session's own test runs count too, in a plain session as in a

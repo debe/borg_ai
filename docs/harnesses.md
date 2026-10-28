@@ -68,9 +68,9 @@ effect of a refactor.
 | `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored) | yes | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event |
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
 | `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | none (the adapter sets 28 s) | none (the adapter sets 90 s) | 90 s, the Stop hook's timeout |
-| `headless_budget` | A headless hive drone stops itself at the dollar budget it is given; otherwise `borg hive run` checks the budget between sessions only | yes (`--max-budget-usd`) | no | no | no |
+| `headless_budget` | A headless hive drone stops itself at the dollar budget it is given; otherwise `borg debug hive run` checks the budget between sessions only | yes (`--max-budget-usd`) | no | no | no |
 
-**Headless drones** (`Harness::headless`, `headless_end`; `borg hive run`, hive/run.rs). A fact about
+**Headless drones** (`Harness::headless`, `headless_end`; `borg debug hive run`, hive/run.rs). A fact about
 each CLI, not a tuned behaviour, checked against its `--help`:
 
 | | Claude Code 2.1.308 | omp 18.10.4 | opencode 1.19.0 / 2.x | Codex CLI 0.153.2 |
