@@ -67,11 +67,26 @@ are kept.
   engineer. A task whose start a session's tree cannot take (a checkout off it) is passed over for
   that session; one whose start git did not compute in time stays offered and is tried again. So no work a blocked, rejected or lost attempt left behind reaches a base, and every line
   of an accepted head comes from the origin or a verified diff.
+- **Scope asks and amends.** A definition no change could pass is refused when it is written (`init`,
+  `open`, `open --again`): a directory in `files` is its tree (`dir/**`), a file the goal's check
+  reads is refused, and each check runs once on the tree, bounded at 5 s; one no change could make
+  pass is refused (its command word not installed, or a usage error from a system tool no file of
+  the tree configures, such as git, with no script of the repo named), and one still running is said
+  unprobed. A missing script, a flag the task adds to the repo's own tool or registers with a test
+  runner, or a file it commits fails today and opens. A drone whose task needs more files or another check asks with `borg hive scope`: a
+  message to the planner carrying the exact `borg hive open --again` line, alerted in `borg top` and
+  the Hive tab until answered. Only the engineer amends, from a terminal: title, files and checks of
+  an open, held or blocked task, the claim kept; deps only while no one holds it. The engineer says no
+  by replying to the ask from a terminal (`borg hive tell --re`); a planning session's reply answers
+  nothing, and its prompt shows an ask with no reply hint to it. The holder hears either at its next hook, and its
+  waiter wakes it if it was idle.
 - **Verification:** every `done` opens a verify task its author may not take; a rejection reopens the
   work with the verifier's note. The verdict recomputes the work's start from the attempts its claim
   names, fetching their commits from their bundles on another node; a base that is not it is an
   unchecked reject. Changes to tests outside the task, CI config or oracle files are
-  flagged and judged as hacked.
+  flagged and judged as hacked, against the files its verify task carries (the done's definition).
+  A `done` (or a stop) runs the same judge on its own diff first and is refused with each path and the
+  `borg hive scope` line that would admit it.
 - **Integration:** once every task is verified, an integrate task merges the accepted attempts (each
   claim's base to its done's head, in dependency order, with `git merge-tree`, onto the goal's origin) into
   `refs/heads/hive/<goal>/integrated` and runs the oracle and every task's checks on the result. A
@@ -86,7 +101,8 @@ are kept.
   log alone on the goal's home node (its first open's) and on a node with a planner session, so a goal
   opened from a terminal, which no session plans, still shows its drones' reports; the engineer's
   terminal reads them with `borg hive board`, which marks them read on that node only (`planner-read`,
-  never synced). A planner that is a drone hears only its own goal, as a drone; `borg hive leave` in a
+  never synced); a scope ask there offers its amend, a reply without `--re` and the explicit no, the
+  only one that replies to it, since any terminal reply to the ask is the engineer's no. A planner that is a drone hears only its own goal, as a drone; `borg hive leave` in a
   session that only plans removes its planner record.
 - **Commits travel** (`bundles.jsonl`): each attempt's two snapshots as a git bundle line, so a
   verifier or integrator on another node gets the work while its author is offline. A node takes a
@@ -127,6 +143,25 @@ fast, never whether.
 - **Data plane.** A node offers no task whose commits it lacks, waits while they may still come, and
   says stuck once no line can bring them.
 - **Identities are (node, name).** A session or drone name says who only together with its node.
+- **S-def, definitions are the engineer's.** A task's title, files and checks change only by an
+  engineer's open line: a session's open of an existing id changes nothing, a held task keeps its
+  claim, and a done or verified task keeps the definition its done was made under. Only a line with
+  the `amended:` note (what `open --again` writes) amends an open or held task; an engineer's open
+  without it, as a borg before 0.3.0 wrote `--again`, reopens a blocked task with its definition as
+  the fold did then, so old logs and older peers fold as before. `open --again`
+  refuses a drone and any harness session, the same convention gate as `ratify` (every open line is
+  written as the engineer's, so the fold cannot tell who ran it).
+- **S-judge, one verdict.** A done is judged and integrated against the definition its verify task
+  carries, written in the done's batch, so an amend that reached two nodes in different orders gives
+  them the same verdict.
+- **S-done.** No done is written whose readable diff the verifier's rule flags under the definition
+  the drone holds; an unreadable diff is left to the verifier. An unanswered scope ask holds no lock:
+  only a stop held up by the precheck alone, on paths the asked files would all admit, waits on it
+  (no attempt counted); every other stop runs
+  its checks, so a holder that drops the change finishes, and one that fails a check blocks after 3
+  stops. An amend applies whoever holds the task, so a lapsed lease loses nothing. After the answer
+  (an amend, or the engineer's reply to the ask) the precheck counts as a failing check, so the claim ends within
+  3 stops; liveness with the change kept needs the engineer's answer.
 
 ## Interactive drones
 

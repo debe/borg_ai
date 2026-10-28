@@ -88,14 +88,15 @@ $ borg hive board
 |---|---|
 | `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,..\|NAME=CMD"]...` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes |
 | `borg hive ratify <goal> [--budget USD]` | The engineer approves the goal's plan from a terminal; `--budget` raises the budget once its spend stopped new claims. Refused inside a harness session ([The planning session](#the-planning-session)) |
-| `borg hive board [<goal>] [--json]` | The tasks by status, with holders, age, rework and dependencies; in your terminal, then the drones' messages to the planner not read on this machine, marked read |
+| `borg hive board [<goal>] [--json]` | The tasks by status, with holders, age, rework and dependencies; in your terminal, then the drones' messages to the planner not read on this machine, marked read, each with the reply that answers it (a scope ask: its amend, a reply without `--re`, and `--re` only on the explicit no) |
 | `borg hive join [<goal>]` · `borg hive leave` | Inside a session: it becomes an interactive drone of the goal (or of every open goal of this repo) in a worktree of its own, or stops being one ([Interactive drones](#interactive-drones)) |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
-| `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task; `--again` reopens a blocked one, and `--title`, `--files`, `--deps` or `--accept` given with it replace those parts (a wrong check, say); `--group K` opens K attempts ([Groups](#groups-of-attempts)) |
+| `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task. A directory in `--files` is its tree; a file the goal's check reads, or a check that cannot pass on any tree (each runs once, 5 s at most: a command not installed, or a usage error of a tool no repo configures, such as git; a script, or a flag the task adds to a script or test runner, opens), is refused. `--again` amends an open, claimed or blocked task: `--title`, `--files`, `--deps` (not while it is claimed) or `--accept` given with it replace those parts, a blocked task opens again and a claimed one keeps its claim. `--again` is refused to a drone and inside a harness session ([Scope asks](#scope-asks)). `--group K` opens K attempts ([Groups](#groups-of-attempts)) |
 | `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts into `refs/heads/hive/<goal>/integrated` and run the oracle and every task's checks on it. A failure opens a fix task. Needs git 2.40+. Refused to a drone and inside a harness session |
 | `borg hive approve <goal>` | Run the checks another node wrote (a synced goal's oracle, a task opened elsewhere with `--accept`) on this machine; prints each command. Refused to a drone and inside a harness session |
 | `borg hive claim [TASK]` · `progress "<note>"` · `release` · `block "<why>"` | A drone claims a task (exit 3 when another drone won it), reports on it, gives it back or blocks it |
-| `borg hive done [--note N]` | Run the task's checks with their own timeouts; on a pass publish done and open its verify task |
+| `borg hive done [--note N]` | Run the task's checks with their own timeouts; on a pass publish done and open its verify task. Refused (exit 1) when its diff changes files the verifier protects outside the task's files, listing each with the `borg hive scope` line that would admit it |
+| `borg hive scope [--files +a,-b] [--accept NAME=CMD]... "<why>"` | The holder of a work task asks the engineer to amend its files or checks ([Scope asks](#scope-asks)) |
 | `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the turn with `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note |
 | `borg hive contract "<text>" --scope a,b [--supersedes ID]` | Publish a contract scoped to files (globs), `id:NAME` or `repo:NAME`, shown to drones whose edits touch it |
 | `borg hive ask "<text>" [--to TASK\|DRONE\|SESSION\|planner]` · `tell "<text>" [--to …] [--re ID]` | A message to the goal's drones, or with `--to planner` to the sessions that planned it, shown once at each recipient's next prompt |
@@ -149,6 +150,28 @@ independent tasks, a contract task before the tasks that use its interface, and 
   `borg hive board <goal>` in your terminal lists the ones not read on this machine, each with the
   command that answers it, and marks them read there.
 - **Subagents and workflows** may help inside a task under the drone's claim; they never claim or finish.
+
+### Scope asks
+
+A task's files and checks are the engineer's. When the work needs a test file outside them, or the
+check itself is wrong, the drone asks instead of working around the guard:
+
+- **The hook says so first.** An edit of a test or CI file outside the task's files tells the drone to
+  ask; a file the goal's check reads is never in any task's scope. A `done` whose diff the verifier
+  would reject is refused with each path, and so is the stop. A failing check's block names the ask
+  for a check that is wrong on any tree.
+- **The ask** is `borg hive scope --files +tests/cli.rs "why"` (or `--accept NAME=CMD`), from the
+  holder only, at most 8 new files, never the whole repo or deps. It writes nothing on the board: it
+  is a message to the planner with the exact amend to run, and `borg top`, `borg hive board` and the
+  Hive tab alert it until you answer.
+- **While it waits** the drone keeps its claim and works in scope. A stop held up only by files the
+  ask would admit ends its turn waiting, with no attempt counted; any other stop runs as usual, so a
+  drone that drops the change finishes the task without an answer.
+- **You answer** yes by running that line in your own terminal, `borg hive open <goal> --id <task>
+  --again --files ...`, or no by replying to the ask from your terminal, `borg hive tell "why not"
+  --goal <goal> --re <ask id>` (both shown with the alert). A planning session's reply is no answer.
+  Either answer wakes a drone idle on its ask. After a no, the asked change blocks its stop like a
+  failing check: it undoes the change and finishes, or the task is blocked after 3 stops.
 - **Budget.** Each claim of a Claude Code drone adds its transcript's metered spend to `spend.jsonl`;
   omp, opencode and codex report no usage (`unmetered`). At the budget no drone claims, and you are
   asked once to raise it, at the planning session's prompt or with `borg hive ratify <goal> --budget USD`.

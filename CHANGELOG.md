@@ -62,6 +62,16 @@ and documentation whose claims match their reports. The release steps are in
   on (in another repo in scope, its HEAD at the goal's first claim there), and later engineer commits
   reach drones only through a task. A plain checkout claims only where its tree is that start, and a
   node whose clone lacks it says so in `borg top` and the Hive tab.
+- A wrong task definition is caught before a drone wastes rounds on it: `init` and `open` refuse a
+  file the goal's check reads and a check that cannot pass on any tree, and read a directory as its
+  tree; `done` (and the stop) refuses work the verifier would reject for its scope, naming each file;
+  the drone asks with `borg hive scope --files +a "why"`, which `borg top` and `borg web` alert until
+  the engineer runs the amend it carries or says no with `borg hive tell --re` from a terminal; while
+  it waits the drone works in scope and may finish without the change; `open --again` now amends an open or
+  claimed task in place, keeping the claim and waking a drone idle on its ask, and refuses a drone
+  and any harness session. A `--again` line an older borg wrote still reopens a blocked task. A check
+  refused at `open` is one no change could pass (a missing command, a usage error of a tool no repo
+  configures, such as git), never a script or a flag the task adds or registers with a test runner.
 
 ### Documentation
 

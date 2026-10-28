@@ -192,7 +192,7 @@ fn completions_name_the_hive_wait_and_the_debug_runs_yes() {
     let root = tmp("completions");
     let (bash, _, _) = borg(&root, &["completions", "bash"]);
     let hive = bash.lines().find(|l| l.trim_start().starts_with("hive) words=")).unwrap();
-    assert!(hive.contains(" wait ") && !hive.contains(" run ") && !hive.contains(" score ") && !hive.contains("--watch"), "{hive}");
+    assert!(hive.contains(" wait ") && hive.contains(" scope") && !hive.contains(" run ") && !hive.contains(" score ") && !hive.contains("--watch"), "{hive}");
     assert!(!bash.lines().find(|l| l.trim_start().starts_with("top) words=")).unwrap().contains("--watch"));
     assert!(!bash.lines().find(|l| l.trim_start().starts_with("queen) words=")).unwrap().contains("next"));
     let debug = completed(&bash, "debug");

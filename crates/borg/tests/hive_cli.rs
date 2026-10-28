@@ -82,7 +82,9 @@ fn reason(v: &Option<Value>) -> String {
 
 /// A goal `g1` whose oracle passes once `ok` exists in the drone's directory, with `tasks`.
 fn init(root: &Path, tasks: &[&str]) {
-    let mut args = vec!["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f ok", "--budget", "5"];
+    // `ok` by its path: a file the goal's check names is one the verifier protects (verdict.rs
+    // `protected`), and the done's precheck with it; here it is the work itself.
+    let mut args = vec!["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f \"$PWD/ok\"", "--budget", "5"];
     for t in tasks {
         args.extend(["--task", t]);
     }
@@ -188,6 +190,28 @@ fn the_stop_blocks_while_the_oracle_fails() {
     let b = board(&root);
     assert_eq!(b["t1"], ("done".into(), "s1".into()));
     assert_eq!(b["t1.v1"].0, "open", "a verify task is opened for every done");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_reopen_again_replaces_the_checks_it_is_given() {
+    let root = common::setup("hive-again-accept");
+    init(&root, &["t1|work|Add the parser"]);
+    prompt(&root, "s1", &[("BORG_HIVE", "g1")]);
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    for again in [false, true, true, true] {
+        stop(&root, "s1", again);
+    }
+    assert_eq!(board(&root)["t1"].0, "blocked");
+    // The check that blocked it is replaced: `ok` alone no longer passes, `ok2` does.
+    ok(&root, &["open", "g1", "--id", "t1", "--again", "--title", "Add the parser, fixed", "--accept", "ok2=test -e ok2"]);
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    std::fs::write(work(&root).join("ok"), "").unwrap();
+    let r = reason(&stop(&root, "s1", false));
+    assert!(r.contains("t1 is not done: ok2 failed"), "{r}");
+    std::fs::write(work(&root).join("ok2"), "").unwrap();
+    assert!(!reason(&stop(&root, "s1", true)).contains("is not done"));
+    assert_eq!(board(&root)["t1"].0, "done");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -835,5 +859,56 @@ fn a_lost_claim_learnt_while_holding_the_next_task_resets_nothing() {
     assert!(ctx.contains("Your claim on t1 did not take effect") && !ctx.contains("set aside"), "told, nothing reset: {ctx}");
     assert_eq!(std::fs::read_to_string(w.join("src/parse.rs")).unwrap(), "t2's work\n", "the held task's work is untouched");
     assert_eq!(denied(&hook(&root, "pre_tool", "s1", edit(&root), &[])), None, "it holds t2: edits run");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A goal g1 with tasks t1 and t2, and drone s1 joined to it.
+fn store_and_goal(name: &str) -> PathBuf {
+    let root = common::setup(name);
+    init(&root, &["t1|work|Add the parser", "t2|work|Document it"]);
+    join(&root, "s1");
+    root
+}
+
+/// scope-request S-def: a task's definition is the engineer's. `open --again` from a drone is refused
+/// with this text (the fold cannot tell who wrote an open line: every one is the engineer's), and the
+/// board and the node's approved checks are unchanged. Fails while a drone may block its task and then
+/// reopen it with wider files and a check of its own.
+#[test]
+fn a_drone_cannot_amend_its_own_task() {
+    let root = store_and_goal("hive-again-drone");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    ok(&root, &["block", "needs more files", "--session", "s1"]);
+    let before = std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap();
+    let dir = work(&root).display().to_string();
+    let out = command(&root, &["hive", "open", "g1", "--id", "t1", "--again", "--files", "x", "--accept", "y=true", "--dir", &dir], &[("BORG_HIVE", "g1")])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "borg hive: a task's definition is amended by the engineer, never by a drone of a hive goal: ask with `borg hive scope --files +a \"why\"` (or `--accept NAME=CMD`)"
+    );
+    assert_eq!(std::fs::read_to_string(store(&root).join("hive/g1/tasks.jsonl")).unwrap(), before, "the board is unchanged");
+    let approved = std::fs::read_to_string(store(&root).join("hive/g1/approved.jsonl")).unwrap_or_default();
+    assert!(!approved.contains("\"y\""), "{approved}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The engineer's amend of a held task keeps the claim (S-def): new files reach the holder at its next
+/// prompt; deps change only on a task no one holds; a done task keeps its definition.
+#[test]
+fn an_engineers_amend_keeps_the_claim_and_never_changes_a_held_tasks_deps() {
+    let root = store_and_goal("hive-again-held");
+    ok(&root, &["claim", "t1", "--session", "s1"]);
+    let (_, err, code) = hive(&root, &["open", "g1", "--id", "t1", "--again", "--deps", "t2"]);
+    assert!(code == 1 && err.contains("deps change only on a task no one holds"), "{err}");
+    assert!(ok(&root, &["open", "g1", "--id", "t1", "--again", "--files", "src/lexer.rs"]).contains("amended t1 in goal g1: files +src/lexer.rs"));
+    assert_eq!(board(&root)["t1"], ("claimed".into(), "s1".into()), "the claim is kept");
+    assert!(prompt(&root, "s1", &[]).contains("amended t1: files +src/lexer.rs"));
+    std::fs::write(work(&root).join("ok"), "").unwrap();
+    ok(&root, &["done", "--session", "s1"]);
+    let (_, err, code) = hive(&root, &["open", "g1", "--id", "t1", "--again", "--files", "src/**"]);
+    assert!(code == 1 && err.contains("t1 is done: it keeps the definition its done was judged under"), "{err}");
     let _ = std::fs::remove_dir_all(root);
 }

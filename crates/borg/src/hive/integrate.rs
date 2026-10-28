@@ -595,7 +595,9 @@ impl Integrator<'_> {
             return self.fenced(&why);
         }
         let ids: Vec<&str> = works.iter().map(|w| w.task.id.as_str()).collect();
-        let tasks: Vec<&Task> = works.iter().map(|w| &w.task).collect();
+        // Each task's definition as its accepted done carried it, its verify task's (S-judge): its checks run
+        // and its files scope a fix, never a live definition another node may hold amended.
+        let tasks: Vec<&Task> = works.iter().map(|w| w.accepted.as_ref().and_then(|v| b.tasks.get(v)).map_or(&w.task, |v| &v.task)).collect();
         let checks = checks_of(self.g, &tasks);
         // Checks another node wrote run only once approved here; a fix task carrying them would approve
         // them by being opened here (hive/mod.rs `write`).
@@ -899,7 +901,8 @@ mod tests {
         edit(dir);
         let mut done = Event::new(Ev::Done, &t.id, author, ms + 2);
         done.head = verdict::snapshot(dir, verdict::SNAPSHOT_TIMEOUT).unwrap();
-        let v = Task { role: Role::Verify, of: Some(t.id.clone()), not_by: vec![author.into()], ..board_task(&format!("{}.v1", t.id)) };
+        // As a done writes it: the work's definition, carried (mod.rs `verify_task`).
+        let v = super::super::verify_task(&t, 0, author);
         let vid = v.id.clone();
         let opened = if t.from.is_some() { Vec::new() } else { vec![Event::open(t.clone(), "engineer:e", ms)] };
         let lines = [

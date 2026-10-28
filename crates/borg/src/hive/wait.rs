@@ -361,12 +361,26 @@ fn waiting(here: &Here, drone: &str, mode: Mode, lock: &std::fs::File, image: &m
         // A claim the stop's capped confirm left not final: waited for with no cap, then handed once the
         // engineer's turn is over.
         // A gated image hands nothing either: a kept claim waits for the borg installed now.
-        let held = match pending(here, &mut hs, &session, &cwd, busy || stale) {
-            Held::Holds(task) if !mode.lives() => {
+        // A drone whose scope ask waits holds its claim and waits with it (scope.rs); the amend or the
+        // engineer's no that answers it is a wake, said once and never in the engineer's own turn.
+        let held = match (pending(here, &mut hs, &session, &cwd, busy || stale), super::scope::ask_state(&here.home, &hs, &session, now)) {
+            (Held::Holds(_), Some(super::scope::Ask::Waits)) => true,
+            (Held::Holds(_), Some(super::scope::Ask::Wake { .. })) if busy || stale => true,
+            (Held::Holds(_), Some(super::scope::Ask::Wake { text, told })) => {
+                match say(mode, &session, &text, false) {
+                    Ok(()) => super::scope::told(&session, &told),
+                    Err(why) => failed(why),
+                }
+                if !mode.lives() {
+                    return 0;
+                }
+                true
+            }
+            (Held::Holds(task), _) if !mode.lives() => {
                 println!("[borg hive {}] you hold {task}: finish it first (ending your turn runs its checks)", hs.goal);
                 return 0;
             }
-            Held::Handed(text) => {
+            (Held::Handed(text), _) => {
                 if let Err(why) = say(mode, &session, &text, false) {
                     failed(why);
                 }
@@ -375,8 +389,8 @@ fn waiting(here: &Here, drone: &str, mode: Mode, lock: &std::fs::File, image: &m
                 }
                 continue;
             }
-            Held::Holds(_) => true,
-            Held::Free => false,
+            (Held::Holds(_), _) => true,
+            (Held::Free, _) => false,
         };
         // A gated image decides nothing from its fold: no claim, no stuck, no finished goal to leave.
         for g in goals.iter().filter(|_| !held && !stale) {

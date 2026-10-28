@@ -1057,9 +1057,12 @@ pub(crate) fn after_stop(
     input: &Value,
     out: Option<Value>,
     wake: Wake,
+    asks: bool,
     now: i64,
 ) -> Option<Value> {
-    let working = unshown(home, hs, session, now).is_some_and(|(_, shown)| shown);
+    // A claim whose stop ended waiting on a scope ask (`asks`, mod.rs `Ctx::stop`) is no work in hand:
+    // its waiter is armed, and wakes the drone once the task is amended or the ask answered.
+    let working = !asks && unshown(home, hs, session, now).is_some_and(|(_, shown)| shown);
     let idle = |hs: &HiveSession, out: Option<Value>, mark: bool| {
         let mut o = out?;
         if mark {

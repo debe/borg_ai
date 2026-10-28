@@ -145,8 +145,16 @@ fn weaken(body: &str) -> String {
     body.replace("assert parse('a') == 'a'", "assert True")
 }
 
+/// A done as a borg before the done's precheck wrote it (`BORG_HIVE_UNCHECKED_DONE`, tests only): the
+/// verifier's own guard is what these tests judge, and a done can still reach it with protected
+/// changes (a diff unreadable at the done, another node's older borg).
+fn unchecked_done(root: &Path, session: &str) {
+    let (out, err, code) = hive_at(root, &work(root), &["done", "--session", session], &[("BORG_HIVE_UNCHECKED_DONE", "1")]);
+    assert_eq!(code, 0, "{out}{err}");
+}
+
 /// `sa` claims t1 of `goal`, is shown `Mdrain`, edits `edit` by `change` (an Edit its pre_tool hook
-/// sees) and publishes done; `sb` claims the verify task.
+/// sees) and publishes done (`unchecked_done`); `sb` claims the verify task.
 fn work_done(root: &Path, goal: &str, edit: &str, change: fn(&str) -> String) {
     join(root, "sa", goal);
     join(root, "sb", goal);
@@ -156,7 +164,7 @@ fn work_done(root: &Path, goal: &str, edit: &str, change: fn(&str) -> String) {
     hook(root, "claude", "pre_tool", "sa", json!({"tool_name": "Edit", "tool_input": {"file_path": p, "new_string": "x"}}), &[]);
     let body = std::fs::read_to_string(&p).unwrap_or_default();
     std::fs::write(&p, change(&body)).unwrap();
-    ok(root, &["done", "--session", "sa"]);
+    unchecked_done(root, "sa");
     asked(root, "sa", "Pbeacon");
     ok(root, &["claim", "t1.v1", "--session", "sb"]);
 }
@@ -209,7 +217,7 @@ fn a_hacked_attempt_reworked_in_the_same_tree_is_still_hacked() {
     ok(&root, &["claim", "t1", "--session", "sa"]);
     let src = work(&root).join("src/parse.py");
     std::fs::write(&src, format!("{}# rework\n", std::fs::read_to_string(&src).unwrap())).unwrap();
-    ok(&root, &["done", "--session", "sa"]);
+    unchecked_done(&root, "sa");
     ok(&root, &["claim", "t1.v2", "--session", "sb"]);
     let out = ok(&root, &["verify", "--pass", "--session", "sb"]);
     assert!(out.contains("rejected as hacked") && out.contains("tests/test_parse.py"), "the rework's diff runs from the first claim's tree: {out}");
@@ -543,5 +551,154 @@ fn a_verified_task_proposes_a_playbook_edit_and_once_promoted_it_reaches_the_nex
     assert!(!prompt("sn", "tidy the docs").contains("playbook"));
     let plain = prompt("sn", "please fix the parser, it breaks on tabs");
     assert!(plain.contains("the team's playbook") && plain.contains("Run the parser's tests"), "{plain}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The task row of `id` in `borg hive board <goal> --json`.
+fn task_row(root: &Path, goal: &str, id: &str) -> Value {
+    let board: Value = serde_json::from_str(&ok(root, &["board", goal, "--json"])).unwrap();
+    board.as_array().unwrap().iter().find(|t| t["id"] == id).cloned().unwrap_or(Value::Null)
+}
+
+/// The release incident (scope-request): a plan no change could ever pass is refused when it is
+/// written. Release listed the goal's own check file (the verifier protects it before any scope), a
+/// bare directory (a glob of itself alone, so `ci.yml` in it was "CI config modified"), and a check
+/// that exits 128 on any tree (`git check-ignore -q` with three paths); it was claimed four times by
+/// three drones and never passed. A slow check is not refused: it is said unprobed.
+#[test]
+fn a_plan_no_change_could_pass_is_refused_when_it_is_opened() {
+    let root = setup("scope-release");
+    let w = work(&root);
+    std::fs::create_dir_all(w.join("scripts")).unwrap();
+    std::fs::create_dir_all(w.join(".github/workflows")).unwrap();
+    std::fs::write(w.join("scripts/check.sh"), "true\n").unwrap();
+    std::fs::write(w.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+    let bad = "ign=git check-ignore -q PLAN.md tasks/x target-probe/x";
+    let task = "release|work|Cut the release|.github/workflows,scripts/check.sh|";
+    let (_, err, code) = hive(&root, &["init", "g1", "--spec", "Release", "--oracle", "ok=sh scripts/check.sh", "--budget", "5", "--task", task]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("scripts/check.sh is a file the goal's check reads"), "{err}");
+    assert!(!store(&root).join("hive/g1/goal.json").exists(), "nothing written");
+    ok(&root, &["init", "g1", "--spec", "Release", "--oracle", "ok=sh scripts/check.sh", "--budget", "5"]);
+    let (_, err, code) = hive(&root, &["open", "g1", "--id", "release", "--title", "Cut the release", "--files", ".github/workflows", "--accept", bad]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("check ign cannot pass on any tree (exit 128") && err.contains("only valid with a single pathname"), "{err}");
+    ok(&root, &["open", "g1", "--id", "release", "--title", "Cut the release", "--files", ".github/workflows", "--accept", "ign=git check-ignore -q PLAN.md"]);
+    assert_eq!(task_row(&root, "g1", "release")["files"], json!([".github/workflows/**"]), "a directory is its tree");
+    let slow = command(&root, &["hive", "open", "g1", "--id", "slow", "--title", "Soak", "--accept", "soak=sleep 5", "--dir", w.to_str().unwrap()])
+        .env("BORG_HIVE_PROBE_MS", "300")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&slow.stdout);
+    assert!(slow.status.success() && out.contains("check soak not probed"), "{out}{}", String::from_utf8_lossy(&slow.stderr));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A check a change could make pass opens: the probe refuses only what no change to the tree fixes.
+/// A script the task creates (run by an interpreter, or behind an env assignment), a flag the task
+/// adds to the repo's own tool or to a system tool the repo configures, a file the task commits: each
+/// fails today and opens. A command no tree has, and the usage error of a tool no tree configures
+/// (git), are refused. Fails while a system tool's usage error is refused whatever the tool.
+#[test]
+fn a_check_a_change_could_pass_opens() {
+    let root = setup("scope-probe");
+    let w = work(&root);
+    std::fs::write(w.join("tool.py"), "import argparse\nargparse.ArgumentParser().parse_args()\n").unwrap();
+    // A system test runner whose options the repo's config adds to (pytest's `pytest_addoption` in a
+    // conftest.py): its usage error today is gone once the task registers the flag.
+    let runner = root.join("bin/runtests");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::write(
+        &runner,
+        "#!/bin/sh\necho 'ERROR: usage: runtests [options] [file_or_dir]'\necho 'runtests: error: unrecognized arguments: --run-integration'\nexit 4\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    ok(&root, &["init", "g1", "--spec", "Probe", "--oracle", "ok=true", "--budget", "5"]);
+    let opens =
+        ["new=bash scripts/new_check.sh", "env=FOO=1 ./x.sh", "flag=python3 tool.py --strict", "show=git show HEAD:newfile", "it=runtests --run-integration"];
+    for (i, c) in opens.iter().enumerate() {
+        let (out, err, code) = hive(&root, &["open", "g1", "--id", &format!("o{i}"), "--title", "Opens", "--accept", c]);
+        assert_eq!(code, 0, "{c}: {out}{err}");
+    }
+    let refused = [("gone=no-such-tool-anywhere --check", "exit 127"), ("ign=git check-ignore -q a b c", "exit 128")];
+    for (i, (c, why)) in refused.iter().enumerate() {
+        let (out, err, code) = hive(&root, &["open", "g1", "--id", &format!("r{i}"), "--title", "Refused", "--accept", c]);
+        assert!(code == 1 && err.contains("cannot pass on any tree") && err.contains(why), "{c}: {out}{err}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A file the goal's check reads is outside every scope: an edit of it tells the drone to leave it and
+/// tell the planner, never to ask for it (the hook tests it before its CI class), and a drone's ask
+/// for it is refused with the same advice, not the engineer's.
+#[test]
+fn an_edit_of_the_goals_check_file_is_never_asked_for() {
+    let root = setup("scope-oracle-hook");
+    let w = work(&root);
+    std::fs::create_dir_all(w.join("scripts")).unwrap();
+    std::fs::write(w.join("scripts/check.sh"), "true\n").unwrap();
+    git(&w, &["add", "."]);
+    git(&w, &["commit", "-q", "-m", "check"]);
+    ok(&root, &["init", "g1", "--spec", "Ship", "--oracle", "ok=sh scripts/check.sh", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
+    join(&root, "sa", "g1");
+    ok(&root, &["claim", "t1", "--session", "sa"]);
+    let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": w.join("scripts/check.sh"), "new_string": "exit 0"}});
+    let said = hook(&root, "claude", "post_tool", "sa", edit, &[]);
+    assert!(said.contains("scripts/check.sh is a file the goal's check reads") && said.contains("--to planner"), "{said}");
+    assert!(!said.contains("borg hive scope"), "{said}");
+    let (out, err, code) = hive(&root, &["scope", "--files", "+scripts/check.sh", "the check is too strict", "--session", "sa"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains("--to planner") && !err.contains("make this change yourself"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The cli incident (scope-request): a drone changed test files outside its task's files, the done
+/// landed, and the verifier rejected it twice (the second time a test reshaped to slip past the
+/// guard). Now the done is refused with the paths and the ask; the ask reaches the planner with the
+/// engineer's exact amend; the amend keeps the claim; the same work is then done and verified.
+#[test]
+fn a_done_the_verifier_would_reject_is_refused_and_the_engineers_amend_lets_it_through() {
+    let root = setup("scope-cli");
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=true", "--budget", "5", "--task", "t1|work|Fix the parser|src/*.py"]);
+    join(&root, "sa", "g1");
+    join(&root, "sb", "g1");
+    ok(&root, &["claim", "t1", "--session", "sa"]);
+    let test = work(&root).join("tests/test_parse.py");
+    std::fs::write(&test, weaken(&std::fs::read_to_string(&test).unwrap())).unwrap();
+    let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": test, "new_string": "assert True"}});
+    let said = hook(&root, "claude", "post_tool", "sa", edit, &[]);
+    assert!(said.contains("borg hive scope --files +tests/test_parse.py") && !said.contains("fine if the task needs it"), "{said}");
+    let (out, err, code) = hive(&root, &["done", "--session", "sa"]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("t1 is not done") && out.contains("tests/test_parse.py") && out.contains("borg hive scope --files +tests/test_parse.py"), "{out}");
+    assert!(!board_lines(&root, "g1").iter().any(|e| e["ev"] == "done"), "no done line");
+    // The ask: a message to the planner with the engineer's amend, nothing on the board.
+    let before = board_lines(&root, "g1").len();
+    let out = ok(&root, &["scope", "--files", "+tests/test_parse.py", "the parser's new contract changes this test", "--session", "sa"]);
+    let amend = "borg hive open g1 --id t1 --again --files 'src/*.py,tests/test_parse.py'";
+    assert!(out.contains(amend), "{out}");
+    assert_eq!(board_lines(&root, "g1").len(), before, "an ask changes no definition");
+    let msgs = lines(&store(&root).join("hive/g1/messages.jsonl"));
+    assert_eq!((msgs[0]["to"].as_str(), msgs[0]["cmd"].as_str(), msgs[0]["task"].as_str()), (Some("@planner"), Some(amend), Some("t1")));
+    // Monitoring: the board (and borg top, the Hive tab) alerts it until the engineer amends.
+    let shown = ok(&root, &["board", "g1"]);
+    assert!(shown.contains("a scope ask waits for the engineer") && shown.contains(amend), "{shown}");
+    // A drone never amends; the engineer does, from a terminal, and sa keeps its claim.
+    let (_, err, code) =
+        hive_at(&root, &work(&root), &["open", "g1", "--id", "t1", "--again", "--files", "src/*.py,tests/test_parse.py"], &[("BORG_HIVE", "g1")]);
+    assert_eq!(code, 1, "{err}");
+    let claim = |root: &Path| board_lines(root, "g1").into_iter().filter(|e| e["ev"] == "claim" && e["task"] == "t1").count();
+    ok(&root, &["open", "g1", "--id", "t1", "--again", "--files", "src/*.py,tests/test_parse.py"]);
+    let row = task_row(&root, "g1", "t1");
+    assert_eq!((row["status"].as_str(), row["by"].as_str(), claim(&root)), (Some("claimed"), Some("sa"), 1), "{row}");
+    assert!(!ok(&root, &["board", "g1"]).contains("a scope ask waits"), "answered");
+    let told = hook(&root, "claude", "prompt", "sa", json!({"prompt": "carry on"}), &[]);
+    assert!(told.contains("amended t1: files +tests/test_parse.py"), "{told}");
+    assert!(ok(&root, &["done", "--session", "sa"]).contains("t1 done"));
+    ok(&root, &["claim", "t1.v1", "--session", "sb"]);
+    let out = ok(&root, &["verify", "--pass", "--session", "sb"]);
+    assert!(out.contains("t1.v1 verified"), "{out}");
     let _ = std::fs::remove_dir_all(root);
 }

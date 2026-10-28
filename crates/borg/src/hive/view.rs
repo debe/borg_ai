@@ -109,6 +109,8 @@ pub fn alerts(home: &Path, g: &goal::Goal, b: &board::Board) -> Vec<String> {
     }
     // A clone that lacks the goal's origin: its drones would sit idle without saying why (start.rs).
     out.extend(super::start::not_here(home, &g.id).into_iter().map(|(repo, why)| format!("no work starts in {repo} on this node: {why}")));
+    // A drone's scope ask (scope.rs): its task waits for the engineer's amend.
+    out.extend(super::scope::waiting(home, g, b));
     out
 }
 

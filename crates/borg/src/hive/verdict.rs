@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 use super::TaskId;
-use super::board::{Board, Ev, Event, Role, Task};
+use super::board::{Board, Ev, Event, Role};
 use super::guard::{self, Class};
 use super::{Goal, board};
 use crate::outcome::{self, Outcome};
@@ -507,6 +507,13 @@ pub fn protected(d: &Diff, files: &[String], oracle_files: &[String]) -> Vec<Pro
     out
 }
 
+/// What the verifier flags in `changed` (from the repo at `root`) under task `files`: [`protected`]
+/// with the goal's visible-check files. One judge for the verdict and the done's precheck (mod.rs
+/// `scope_refusal`), so no done is written that the verdict would reject for its scope (S-done).
+pub fn flagged(g: &Goal, root: &Path, changed: &Diff, files: &[String]) -> Vec<Protected> {
+    protected(changed, files, &guard::oracle_files(g, root))
+}
+
 /// What a verdict credits: a final verdict, or (with a hidden oracle) one deferred to its score, with
 /// whether the board said verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,7 +818,6 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
     if b.judges_own(s, board::Actor::new(&here, &drone, session), (&a.node, &a.author, &a.drone)) {
         return Err("the author cannot verify its own work".into());
     }
-    let work: Option<&Task> = b.tasks.get(&a.work).map(|w| &w.task);
     // From a subdirectory as from the top: the visible check's files are named from there.
     let top = toplevel(Path::new(cwd), Instant::now() + GIT_TIMEOUT);
     let root = top.as_deref().map_or(Path::new(cwd), Path::new);
@@ -829,7 +835,9 @@ pub fn record(home: &Path, g: &Goal, verify: &str, said: &Said, session: &str, c
         })?,
         false => Diff::default(),
     };
-    let prot = protected(&changed, work.map_or(&[][..], |w| &w.files), &guard::oracle_files(g, root));
+    // The files of the definition the done was made under, which its verify task carries (S-judge):
+    // the work's live one may hold an amend another node took before the done and this one after it.
+    let prot = flagged(g, root, &changed, &s.task.files);
     let oracle_flags: Vec<String> =
         guard::flags_of(home, &g.id, &a.author, a.claim_ms, a.done_ms).into_iter().filter(|f| f.class == Class::Oracle).map(|f| f.path).collect();
     // Its start, recomputed from what its claim names: a base that is not it is no pass (start.rs).
@@ -1114,6 +1122,7 @@ pub fn verifications(home: &Path) -> Vec<Verification> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hive::board::Task;
 
     #[test]
     fn the_last_verdict_line_counts_and_a_reject_needs_a_reason() {
@@ -1616,6 +1625,62 @@ mod tests {
 
     fn git_ok(dir: &Path, args: &[&str]) {
         assert!(std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap().status.success(), "git {args:?}");
+    }
+
+    /// scope-request S-judge: a verdict judges a done against the definition its verify task carries,
+    /// written in the done's batch, never the work task's live one: an engineer's amend stamped before
+    /// the done that reached the verifier's node after it gives the two nodes different live
+    /// definitions, but the same verify task. Fails with a verdict that reads the work's files.
+    #[test]
+    fn a_verdict_judges_the_files_its_verify_task_carries() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-verdict-carried-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (home, repo) = (dir.join("home"), dir.join("repo"));
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("tests/a.py"), "assert 1\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["-c", "user.email=e@x", "-c", "user.name=e", "commit", "-qm", "init"]);
+        let base = snapshot(&repo, SNAPSHOT_TIMEOUT).unwrap();
+        std::fs::remove_file(repo.join("tests/a.py")).unwrap();
+        let head = snapshot(&repo, SNAPSHOT_TIMEOUT).unwrap();
+        let g = Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+            held_out: false,
+            origin: Vec::new(),
+        };
+        super::super::goal::create(&home, &g).unwrap();
+        let t1 = Task {
+            id: "t1".into(),
+            role: Role::Work,
+            title: "t".into(),
+            repo: String::new(),
+            files: vec!["src/*".into()],
+            deps: vec![],
+            accept: vec![],
+            of: None,
+            not_by: vec![],
+            flags: vec![],
+            from: None,
+            group: None,
+        };
+        let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s1".into()], files: vec!["tests/*".into()], ..t1.clone() };
+        let claim = Event { base, ..Event::new(Ev::Claim, "t1", "s1", 10).with_drone("d1") };
+        let done = Event { head, claim: Some(10), ..Event::new(Ev::Done, "t1", "s1", 20) };
+        let lines = [Event::open(t1, "engineer:e", 1), claim, done, Event::open(v1, "s1", 20), Event::new(Ev::Claim, "t1.v1", "s2", 30).with_drone("d2")];
+        board::append(&super::super::tasks_path(&home, "g"), &lines).unwrap();
+        let got = record(&home, &g, "t1.v1", &Said::Pass, "s2", &repo.display().to_string(), 31).unwrap();
+        assert_eq!(got.decision.ev, Ev::Verified, "{}", got.decision.note);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

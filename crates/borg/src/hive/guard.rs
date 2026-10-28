@@ -145,18 +145,32 @@ fn package_runner_part(text: &str) -> String {
     if part.is_empty() { String::new() } else { Value::Object(part).to_string() }
 }
 
-/// The repo files the goal's visible checks run (a `grade.sh`): a command word that is a file under
-/// `root`, repo-relative. Editing one is editing CI.
+/// The repo files the goal's visible checks run (a `grade.sh`): in each command of a check, its program
+/// (`./grade.sh`), or the script an interpreter runs (`bash grade.sh`, `python3 check.py`), when it is a
+/// file under `root`, repo-relative. Editing one is editing CI. A file a check only reads (`test -f out`,
+/// `grep -q x out.txt`) is not one: making it is often the task.
 pub fn oracle_files(g: &Goal, root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = g
-        .oracle
-        .iter()
-        .flat_map(|c| c.cmd.split(|ch: char| ch.is_whitespace() || ";&|()<>'\"`".contains(ch)))
-        .map(|w| w.trim_start_matches("./"))
-        .filter(|w| !w.is_empty() && !w.starts_with('-') && !Path::new(w).is_absolute() && !w.contains(".."))
-        .filter(|w| root.join(w).is_file())
-        .map(String::from)
-        .collect();
+    const INTERPRETERS: [&str; 9] = ["sh", "bash", "zsh", "python", "python3", "node", "perl", "ruby", "deno"];
+    let mut out: Vec<String> = Vec::new();
+    for c in &g.oracle {
+        for command in c.cmd.split(|ch: char| ";&|()\n".contains(ch)) {
+            let mut words = command
+                .split(|ch: char| ch.is_whitespace() || "<>'\"`".contains(ch))
+                .filter(|w| !w.is_empty())
+                .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+            let Some(program) = words.next() else { continue };
+            let name = program.rsplit('/').next().unwrap_or(program);
+            let script = INTERPRETERS.contains(&name).then(|| words.find(|w| !w.starts_with('-'))).flatten();
+            out.extend(
+                [Some(program), script]
+                    .into_iter()
+                    .flatten()
+                    .map(|w| w.trim_start_matches("./"))
+                    .filter(|w| !w.is_empty() && !w.starts_with('-') && !Path::new(w).is_absolute() && !w.contains("..") && root.join(w).is_file())
+                    .map(String::from),
+            );
+        }
+    }
     out.sort();
     out.dedup();
     out
@@ -631,6 +645,38 @@ mod tests {
         assert_eq!(class_of("x", Path::new("/held/out/../out/x"), &guard, &[]), Some(Class::Oracle), "lexically normal");
         assert_eq!(class_of("x", Path::new("/held/outside/x"), &guard, &[]), None, "whole components only");
         assert_eq!(class_of("o", Path::new("/s/hive/g/oracle.jsonl"), &guard, &[]), Some(Class::Oracle));
+    }
+
+    #[test]
+    fn a_checks_files_are_what_it_runs_never_what_it_only_reads() {
+        let dir = std::env::temp_dir().join(format!("borg-hive-guard-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["grade.sh", "check.py", "ok", "out.txt", "lint"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let checks = ["a=./grade.sh --fast", "b=FOO=1 python3 -u check.py && test -f ok", "c=grep -q done out.txt | lint", "d=bash -c 'test -s ok'"];
+        let oracle = checks.iter().map(|c| goal::Check::parse(c, 60).unwrap()).collect();
+        let g = Goal { oracle, ..goal_for_files() };
+        assert_eq!(oracle_files(&g, &dir), ["check.py", "grade.sh", "lint"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn goal_for_files() -> Goal {
+        Goal {
+            v: 1,
+            id: "g".into(),
+            spec: "s".into(),
+            oracle: vec![],
+            budget_usd: 1.0,
+            repos: vec![],
+            author: String::new(),
+            created_ms: 0,
+            sig: String::new(),
+            hidden: None,
+            held_out: false,
+            origin: Vec::new(),
+        }
     }
 
     #[test]

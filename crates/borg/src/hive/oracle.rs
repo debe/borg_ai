@@ -212,6 +212,137 @@ fn exec(goal: &Goal, task: &Task, cwd: &Path, budget: Option<Duration>) -> Verdi
     Verdict::Pass
 }
 
+/// What one run of a check on the tree as it stands says of the check itself (`probe`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// It ran: passed or failed as a check does.
+    Ran,
+    /// It cannot pass on any tree: not valid shell, or it failed by its own usage (`unusable`); why.
+    Unusable(String),
+    /// Still running at the bound: nothing said of it.
+    Unknown,
+}
+
+/// Runs check `c` once from the root of the worktree `cwd` is in, as `exec` does, within `within`:
+/// a syntax check (`sh -n`), then the check itself. `Unusable` only when no change to the tree makes
+/// it pass (a task never opens with such a check, and never fails to open with any other):
+/// - exit 127 whose output says the check's command word (`word`) is not found, the word no path and
+///   no command here: a task cannot install a system command (`bash scripts/x.sh` naming a script the
+///   task creates exits 127 too, and opens);
+/// - exit 2, 4, 64, 126, 128 or 129 with a usage error at the head of its output (`usage_error`), from
+///   a system tool that reads no option from the tree (`foreign`, `FIXED_USAGE`), with no script of the
+///   repo named: its own usage, which no tree changes (`git check-ignore -q a b` exits 128 on any tree;
+///   `git show HEAD:new`, a repo script's flag the task adds, and a test runner's flag a conftest.py
+///   the task writes registers, open).
+///
+/// A check still running at the bound is `Unknown`, never a refusal: a slow suite is a good check.
+pub fn probe(c: &Check, cwd: &Path, within: Duration) -> Probe {
+    let root = root_of(cwd);
+    // Stderr joins stdout (run_bounded reads stdout alone), so the refusal shows the shell's words.
+    let mut syntax = Command::new("sh");
+    syntax.args(["-c", "exec 2>&1; sh -n -c \"$1\"", "probe", &c.cmd]).current_dir(&root);
+    match crate::runner::run_capped_status(syntax, None, within) {
+        Some((s, out)) if !s.success() => return Probe::Unusable(format!("not valid shell: {}", tail(&String::from_utf8_lossy(&out), 300).trim())),
+        Some(_) => {}
+        None => return Probe::Unknown,
+    }
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(format!("exec 2>&1\n{}", c.cmd)).current_dir(dir_of(c, &root)).env("BORG_LEARN", "off").env(super::ENV, "").env_remove(super::DRONE_ENV);
+    let Some((status, out)) = crate::runner::run_capped_status(cmd, None, within) else { return Probe::Unknown };
+    let text = crate::notes::redact(&String::from_utf8_lossy(&out));
+    let code = status.code();
+    let dir = dir_of(c, &root);
+    let words = words(&c.cmd);
+    let first = words.first().map_or("", String::as_str);
+    let unusable = match code {
+        Some(127) => !first.contains('/') && not_found(&text, first) && resolve(first, &dir).is_none(),
+        Some(2 | 4 | 64 | 126 | 128 | 129) => usage_error(&text) && foreign(&words, &dir, &root),
+        _ => false,
+    };
+    match unusable {
+        true => Probe::Unusable(format!("exit {}: {}", code.unwrap_or_default(), tail(&text, 300).trim())),
+        false => Probe::Ran,
+    }
+}
+
+/// The words of a check's first simple command, its leading `NAME=value` assignments skipped (quotes
+/// are not read: a quoted word with a space is two, which only makes `foreign` see a script less).
+fn words(cmd: &str) -> Vec<String> {
+    let head = cmd.split(['\n', ';', '|', '&']).next().unwrap_or_default();
+    let assign = |w: &str| w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    head.split_whitespace().skip_while(|w| assign(w)).map(|w| w.trim_matches(['\'', '"']).to_string()).collect()
+}
+
+/// Whether the shell's own words in `out` say `word` was not found (`sh: 1: x: not found`, `bash: x:
+/// command not found`), not some later command or a script's missing file.
+fn not_found(out: &str, word: &str) -> bool {
+    !word.is_empty() && out.lines().any(|l| l.contains(&format!("{word}: not found")) || l.contains(&format!("{word}: command not found")))
+}
+
+/// Where `word` runs from in `dir` (`command -v`): an absolute path, or the word itself for a shell
+/// builtin; None when no such command is here.
+fn resolve(word: &str, dir: &Path) -> Option<String> {
+    let mut c = Command::new("sh");
+    c.args(["-c", "command -v \"$1\"", "probe", word]).current_dir(dir);
+    let (s, out) = crate::runner::run_capped_status(c, None, Duration::from_secs(2))?;
+    let got = String::from_utf8_lossy(&out).trim().to_string();
+    (s.success() && !got.is_empty()).then_some(got)
+}
+
+/// System tools whose options no file of a repo's tree adds to: a test runner or a build tool reads
+/// plugins and config from the tree (pytest's `pytest_addoption`, npm's scripts), so its usage error is
+/// never taken for one no change fixes.
+const FIXED_USAGE: &[&str] = &["git", "grep", "egrep", "fgrep", "diff", "cmp", "find", "ls", "cat", "head", "tail", "wc", "sort", "sed", "awk", "jq"];
+
+/// Whether a check's usage error is its command's own, from outside the repo at `root`: its command
+/// word resolves to a program outside the repo (never a builtin, never one the tree holds) that reads
+/// no option from the tree (`FIXED_USAGE`), and no later word names a script or `-m` module of the tree
+/// (an interpreter's script owns the usage).
+fn foreign(words: &[String], dir: &Path, root: &Path) -> bool {
+    let Some(first) = words.first() else { return false };
+    let Some(at) = resolve(first, dir).filter(|p| p.starts_with('/')) else { return false };
+    if !Path::new(&at).file_name().and_then(|n| n.to_str()).is_some_and(|n| FIXED_USAGE.contains(&n)) {
+        return false;
+    }
+    let inside = |p: &Path| {
+        let (p, r) = (std::fs::canonicalize(p).unwrap_or(p.to_path_buf()), std::fs::canonicalize(root).unwrap_or(root.to_path_buf()));
+        p.starts_with(r)
+    };
+    if inside(Path::new(&at)) {
+        return false;
+    }
+    let script = |w: &str| {
+        let p = dir.join(w);
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        p.is_file() && (["py", "sh", "bash", "js", "mjs", "cjs", "ts", "rb", "pl", "php", "lua"].contains(&ext) || executable(&p))
+    };
+    let module = |m: &str| {
+        let p = dir.join(m.replace('.', "/"));
+        p.is_dir() || p.with_extension("py").is_file()
+    };
+    !words.iter().skip(1).enumerate().any(|(i, w)| script(w) || (w == "-m" && words.get(i + 2).is_some_and(|m| module(m))))
+}
+
+#[cfg(unix)]
+fn executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn executable(_: &Path) -> bool {
+    false
+}
+
+/// Whether the head of a check's output is a usage error: what a tool prints for a flag it does not
+/// take, not a failing test's report (that comes later in the output, and with another exit).
+fn usage_error(out: &str) -> bool {
+    out.lines().take(3).any(|l| {
+        let l = l.to_lowercase();
+        ["usage:", "only valid with", "unknown option", "unrecognized option", "invalid option"].iter().any(|p| l.contains(p))
+    })
+}
+
 /// Keeps a failed verdict's tail in the goal's oracle logs (the newest `KEEP_LOGS`); returns the file.
 pub fn log(home: &Path, goal: &str, task: &str, v: &Verdict, ms: i64) -> Option<PathBuf> {
     let text = match v {

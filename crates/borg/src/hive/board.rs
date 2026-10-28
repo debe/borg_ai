@@ -1738,8 +1738,44 @@ fn apply(b: &mut Board, f: &mut Fold, e: &Event) {
                     };
                     b.tasks.insert(e.task.clone(), s);
                 }
-                // `borg hive open --again`: an engineer reopens a blocked task.
-                Some(s) if matches!(s.status, Status::Blocked { .. }) => s.status = Status::Open,
+                // `borg hive open --again`, the engineer's amend (S-def): its title, files and checks
+                // replace the task's while no done of it was taken, a blocked task opens again, and a held
+                // one keeps its claim (holder, since, renewal, span, rework, attempts). Its deps change
+                // only on a task no one holds: a claim's start brought in the deps it had (start.rs).
+                // Only an engineer's `--again` line (its `AMENDED` note) amends: a session's open of an
+                // existing id (a verify or fix task's batch), and a plain open of an id another node
+                // opened before the logs met, change nothing (the first open wins; on a blocked task,
+                // the arm below). A done or verified
+                // task keeps the definition its done was made under, which its verify task carries
+                // (S-judge).
+                Some(s)
+                    if by_engineer(&e.by)
+                        && e.note.starts_with(AMENDED)
+                        && def.role == s.task.role
+                        && def.of.is_none()
+                        && s.task.of.is_none()
+                        && matches!(s.status, Status::Open | Status::Claimed { .. } | Status::Blocked { .. }) =>
+                {
+                    s.task.title = def.title.clone();
+                    s.task.files = def.files.clone();
+                    s.task.accept = def.accept.clone();
+                    match s.status {
+                        Status::Claimed { .. } => {}
+                        Status::Blocked { .. } => {
+                            s.status = Status::Open;
+                            s.task.deps = def.deps.clone();
+                        }
+                        _ => s.task.deps = def.deps.clone(),
+                    }
+                }
+                // A `--again` a borg before the `AMENDED` note wrote (the engineer's open, no note)
+                // reopens a blocked task with the definition it gives, as the fold did then: a log on
+                // disk and an older peer's lines fold as they did. So does an engineer's plain open of
+                // an id another node blocked before the logs met.
+                Some(s) if by_engineer(&e.by) && !e.note.starts_with(AMENDED) && matches!(s.status, Status::Blocked { .. }) => {
+                    s.status = Status::Open;
+                    s.task = def.clone();
+                }
                 Some(_) => {}
             }
         }
@@ -2283,9 +2319,15 @@ pub fn render(b: &Board, now: i64, width: usize) -> String {
     out
 }
 
+/// The note of an engineer's amend (`borg hive open --again`): what it changed follows.
+pub const AMENDED: &str = "amended: ";
+
 /// One board change as a drone's prompt context shows it.
 pub fn render_change(e: &Event) -> String {
     let who = if by_engineer(&e.by) { e.by.clone() } else { format!("drone {}", short(&e.by)) };
+    if let (Ev::Open, Some(what)) = (&e.ev, e.note.strip_prefix(AMENDED)) {
+        return format!("{who} amended {}: {}", e.task, cut(what, 200));
+    }
     let mut s = match (&e.ev, &e.def) {
         (Ev::Open, Some(t)) => format!("{} opened {} ({}) {}", who, e.task, t.role.name(), cut(&t.title, 80)),
         _ => format!("{who} {} {}", e.ev.name(), e.task),
@@ -2911,10 +2953,105 @@ mod tests {
         let blocked = vec![open.clone(), ev(Ev::Claim, "t1", "sa", 1), ev(Ev::Blocked, "t1", "sa", 2).with_note("needs a key")];
         let b = fold(&[blocked.clone(), vec![ev(Ev::Claim, "t1", "sb", 3)]].concat());
         assert!(matches!(&b.tasks["t1"].status, Status::Blocked { note, .. } if note == "needs a key"));
-        let mut again = open;
+        let mut again = open.with_note(&format!("{AMENDED}unchanged"));
         again.ms = 4;
         let b = fold(&[blocked, vec![again, ev(Ev::Claim, "t1", "sb", 5)]].concat());
         assert_eq!(holder_of(&b, "t1").as_deref(), Some("sb"), "an open again reopens it");
+    }
+
+    /// A `--again` line a borg before scope-request wrote (the engineer's, no `AMENDED` note) reopens a
+    /// blocked task with its definition as it did then, on a log on disk and from an older peer: the
+    /// claim, done and verdict after it take effect. Fails with a fold that needs the note to reopen.
+    #[test]
+    fn an_engineers_noteless_open_of_a_blocked_task_reopens_it_as_before() {
+        let mut fixed = task("t1");
+        fixed.files = vec!["src/**".into()];
+        let lines = [
+            Event::open(task("t1"), "engineer:e", 1),
+            ev(Ev::Claim, "t1", "sa", 2),
+            ev(Ev::Blocked, "t1", "sa", 3),
+            Event::open(fixed.clone(), "engineer:e", 4),
+            ev(Ev::Claim, "t1", "sb", 5),
+            Event { claim: Some(5), ..ev(Ev::Done, "t1", "sb", 6) },
+        ];
+        let b = fold(&lines);
+        assert!(matches!(&b.tasks["t1"].status, Status::Done { by, .. } if by == "sb"), "{:?}", b.tasks["t1"].status);
+        assert_eq!(b.tasks["t1"].task.files, fixed.files, "with the definition it gave");
+    }
+
+    /// S-def: only `open --again` (its `AMENDED` note) amends. A plain engineer's open of an id another
+    /// node opened before the logs met is first-wins, even on a held task. Fails with a fold that takes
+    /// any engineer's open of an existing id as an amend.
+    #[test]
+    fn a_plain_open_of_an_existing_id_changes_nothing() {
+        let mut other = task("t1");
+        other.files = vec!["**".into()];
+        let b = fold(&[Event::open(task("t1"), "engineer:e", 1), ev(Ev::Claim, "t1", "sa", 2), Event::open(other, "engineer:f", 3)]);
+        assert!(b.tasks["t1"].task.files.is_empty(), "the first open wins");
+    }
+
+    /// scope-request S-def: an engineer's open of a held task amends it in place (its title, files and
+    /// checks; never its deps, which its claim's start brought in) and keeps the claim, which renews as
+    /// before. Fails with a fold that ignores an open of a claimed task.
+    #[test]
+    fn an_engineers_open_amends_a_claimed_task_in_place_and_keeps_the_claim() {
+        let mut wider = task("t1");
+        wider.files = vec!["src/**".into(), "tests/cli.rs".into()];
+        wider.deps = vec!["t0".into()];
+        wider.accept = vec![Check::parse("ok=true", 600).unwrap()];
+        let amend = Event::open(wider.clone(), "engineer:e", 3).with_note(&format!("{AMENDED}files +src/**"));
+        let lines = [Event::open(task("t1"), "engineer:e", 1), ev(Ev::Claim, "t1", "sb", 2), amend];
+        let b = fold(&lines);
+        let s = &b.tasks["t1"];
+        assert!(matches!(&s.status, Status::Claimed { by, since: 2, .. } if by == "sb"), "{:?}", s.status);
+        assert_eq!((&s.task.files, &s.task.accept), (&wider.files, &wider.accept));
+        assert!(s.task.deps.is_empty(), "deps change only on a task no one holds");
+        let b = fold(&[lines.to_vec(), vec![ev(Ev::Heartbeat, "t1", "sb", 4)]].concat());
+        assert!(matches!(&b.tasks["t1"].status, Status::Claimed { renewed: 4, .. }), "the claim renews: {:?}", b.tasks["t1"].status);
+    }
+
+    /// S-def: a session's open of an existing id (a verify or fix task's batch, a drone's open) never
+    /// replaces a task's definition, nor reopens a blocked one. Fails with a fold that takes any open
+    /// line's definition onto a blocked task.
+    #[test]
+    fn a_sessions_open_never_replaces_a_tasks_definition() {
+        let mut wider = task("t1");
+        wider.files = vec!["**".into()];
+        let blocked = vec![Event::open(task("t1"), "engineer:e", 1), ev(Ev::Claim, "t1", "sa", 2), ev(Ev::Blocked, "t1", "sa", 3)];
+        let b = fold(&[blocked, vec![Event::open(wider, "sa", 4)]].concat());
+        assert!(matches!(b.tasks["t1"].status, Status::Blocked { .. }));
+        assert!(b.tasks["t1"].task.files.is_empty());
+    }
+
+    /// S-def and S-judge: a done or verified task keeps the definition its done was made under, in every
+    /// arrival order of the lines, with the holder's heartbeat and a rival's done among them: an amend
+    /// stamped before the done amends the claim, one after it changes nothing, the rival's done is no
+    /// done, and the verify task carries what the done held.
+    #[test]
+    fn an_amend_after_a_done_changes_nothing_in_any_order() {
+        let amend = |files: &str, ms| {
+            let mut t = task("t1");
+            t.files = vec![files.into()];
+            Event::open(t, "engineer:e", ms).with_note(&format!("{AMENDED}files +{files}"))
+        };
+        let check = Task { files: vec!["a/**".into()], ..verify("t1", "sa", 5) };
+        let done = Event { claim: Some(2), ..ev(Ev::Done, "t1", "sa", 5) };
+        let lines = vec![
+            Event::open(task("t1"), "engineer:e", 1),
+            ev(Ev::Claim, "t1", "sa", 2),
+            amend("a/**", 3),
+            ev(Ev::Heartbeat, "t1", "sa", 4),
+            Event { claim: Some(2), ..ev(Ev::Done, "t1", "sb", 4) },
+            done.clone(),
+            Event::open(check, "sa", 5),
+            amend("b/**", 6),
+        ];
+        for p in permutations(&lines) {
+            let b = fold(&p);
+            assert!(matches!(&b.tasks["t1"].status, Status::Done { by, .. } if by == "sa"), "{:?}", b.tasks["t1"].status);
+            assert_eq!(b.tasks["t1"].task.files, ["a/**"], "an amend after the done changes nothing");
+            assert_eq!(b.tasks["t1.v1"].task.files, ["a/**"], "the verify task carries the done's definition");
+        }
     }
 
     #[test]

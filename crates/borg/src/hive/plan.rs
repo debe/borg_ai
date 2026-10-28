@@ -467,7 +467,13 @@ pub fn planner_prompt(home: &Path, session: &str) -> Option<(String, Vec<Shown>)
         let lines: Vec<String> = new[..new.len() - more]
             .iter()
             .map(|m| {
-                let reply = format!("borg hive tell \"<answer>\" --goal {goal} --re {} --to {}", queen::sh_quote(&m.id), queen::sh_quote(&m.by));
+                // A scope ask is the engineer's to answer (scope.rs `answer`): the planner tells the
+                // drone, never replies to the ask.
+                let re = match m.cmd.is_empty() {
+                    true => format!(" --re {}", queen::sh_quote(&m.id)),
+                    false => String::new(),
+                };
+                let reply = format!("borg hive tell \"<answer>\" --goal {goal}{re} --to {}", queen::sh_quote(&m.by));
                 format!("- {}", super::message::render(m, &here, &reply, false))
             })
             .collect();

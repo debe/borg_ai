@@ -153,7 +153,9 @@ fn setup(name: &str) -> PathBuf {
     std::fs::write(w.join("README"), "orion\n").unwrap();
     git(&w, &["add", "."]);
     git(&w, &["commit", "-q", "-m", "start"]);
-    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f ok", "--budget", "5"], &[]);
+    // `ok` by its path: a file the goal's check names is one the verifier protects (verdict.rs
+    // `protected`), and the done's precheck with it; here it is the work itself.
+    ok(&root, &["init", "g1", "--spec", "Ship the parser", "--oracle", "ok=test -f \"$PWD/ok\"", "--budget", "5"], &[]);
     root
 }
 
@@ -1853,6 +1855,10 @@ fn the_engineers_commands_refuse_inside_any_session() {
         assert!(code == 1 && err.contains("never inside a session"), "{cmd:?}: {out}{err}");
     }
     assert_eq!(hive(&root, &["approve", "g1"], &[]).2, 0);
+    // The engineer's amend too: a session's model reads its drones' scope asks, each with this command.
+    open_task(&root, "t1");
+    let (out, err, code) = hive(&root, &["open", "g1", "--id", "t1", "--again", "--files", "src/**"], &s);
+    assert!(code == 1 && err.contains("`borg hive open --again` runs in the engineer's own terminal"), "{out}{err}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2181,5 +2187,180 @@ fn a_codex_waiter_follows_a_reinstall_and_a_stop_during_it_ends_it() {
     assert_eq!(code, 128 + libc::SIGTERM, "{out}");
     assert_eq!(starts(&root, pid), 2, "one re-exec, in place: {out}");
     assert!(out.contains("runs the reinstalled borg"), "{out}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// scope-request liveness: a drone whose scope ask waits for the engineer, its stop held up only by
+/// the asked change, ends its turn holding its claim; the waiter holds on (no task handed, no timer)
+/// and wakes the drone once the engineer's amend of its task lands, the claim kept; its next stop
+/// runs the amended task's checks and the done lands. Fails while the waiter returns at once for a
+/// drone that holds a task, leaving an idle holder no amend reaches.
+#[test]
+fn a_drone_waiting_on_its_scope_ask_is_woken_by_the_engineers_amend() {
+    let root = setup("hive-i-scope-wake");
+    let s = "sess-scope-wake-1";
+    let _ = ask_and_wait(&root, s);
+    let mut w = spawn_wait(&root, s, &[]);
+    // The turn ends: its stop lists the running wait.
+    assert!(!continues(&stop(&root, s, true, wait_task(&root, s))));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(w.running(), "it holds t1 and waits for the amend");
+    ok(&root, &["open", "g1", "--id", "t1", "--again", "--files", "tests/conftest.py"], &[]);
+    let (code, text) = w.ended(20);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("[borg hive g1] the engineer amended t1 (your scope ask): files tests/conftest.py"), "{text}");
+    assert!(held_by(&root, "t1", s), "the amend kept the claim");
+    prompt(&root, s);
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.starts_with("[borg hive] t1 done"), "{r}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A drone of t1 that added a test runner config (protected outside any scope) and asked for it: the
+/// stop runs t1's checks and its done's precheck; the precheck alone failing on a waiting ask ends the
+/// turn waiting (no attempt counted), naming `done` and `block`. The id of its ask.
+fn ask_and_wait(root: &Path, s: &str) -> (PathBuf, String) {
+    open_task(root, "t1");
+    ok(root, &["join", "g1"], &inside(s));
+    let tree = PathBuf::from(hs(root, s)["worktree"].as_str().unwrap());
+    ok(root, &["claim"], &inside(s));
+    prompt(root, s);
+    std::fs::create_dir_all(tree.join("tests")).unwrap();
+    std::fs::write(tree.join("tests/conftest.py"), "collect_ignore = ['test_parse.py']\n").unwrap();
+    std::fs::write(tree.join("ok"), "").unwrap();
+    let out = ok(root, &["scope", "--files", "+tests/conftest.py", "the parser's tests need a fixture"], &inside(s));
+    let id = out.split_whitespace().nth(2).unwrap().to_string();
+    let r = reason(&stop(root, s, false, json!([])));
+    assert!(r.contains("t1 waits for the engineer's answer to your scope ask") && r.contains("tests/conftest.py"), "{r}");
+    assert!(r.contains("hive done --session") && r.contains("hive block --session") && r.contains("hive wait --session"), "{r}");
+    assert_eq!(task_state(root, "t1").0, "claimed", "no done, no block");
+    assert_eq!(hs(root, s)["oracle_blocks"], 0, "a wait on the ask is no attempt");
+    (tree, id)
+}
+
+/// scope-request liveness without an answer: an unanswered ask holds no lock. The drone drops the
+/// out-of-scope change and ends its turn: the checks and the precheck pass, and the done lands with no
+/// amend. Fails while a waiting ask skips the stop's checks (its done never written).
+#[test]
+fn a_drone_that_drops_its_asked_change_finishes_without_an_answer() {
+    let root = setup("hive-i-scope-drop");
+    let s = "sess-scope-drop-1";
+    let (tree, _) = ask_and_wait(&root, s);
+    std::fs::remove_file(tree.join("tests/conftest.py")).unwrap();
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.starts_with("[borg hive] t1 done"), "{r}");
+    let amends = events(&root).iter().filter(|e| e.ev == board::Ev::Open && e.task == "t1").count();
+    assert_eq!(amends, 1, "no amend");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The engineer's no: a reply to the ask (`borg hive tell --re`) wakes the drone idle on it, and from
+/// then on the precheck blocks its stop as a failing check does, so it finishes in scope or blocks.
+/// Fails while no answer but an amend reaches an idle drone (its claim held for ever).
+#[test]
+fn the_engineers_no_to_a_scope_ask_wakes_the_drone_and_its_stop_blocks_on_the_precheck() {
+    let root = setup("hive-i-scope-no");
+    let s = "sess-scope-no-1";
+    let (tree, id) = ask_and_wait(&root, s);
+    let mut w = spawn_wait(&root, s, &[]);
+    assert!(!continues(&stop(&root, s, true, wait_task(&root, s))));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(w.running(), "it holds t1 and waits for the answer");
+    assert!(ok(&root, &["board", "g1"], &[]).contains("a scope ask waits"));
+    ok(&root, &["tell", "no: keep the runner config as it is", "--goal", "g1", "--re", &id], &[]);
+    let (code, text) = w.ended(20);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("answered your scope ask on t1: no: keep the runner config as it is"), "{text}");
+    assert!(!ok(&root, &["board", "g1"], &[]).contains("a scope ask waits"), "answered");
+    prompt(&root, s);
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.contains("t1 is not done: scope failed (attempt 1 of"), "{r}");
+    std::fs::remove_file(tree.join("tests/conftest.py")).unwrap();
+    prompt(&root, s);
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.starts_with("[borg hive] t1 done"), "{r}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A waiting ask holds up only what it asks for: a stop whose precheck flags a file the ask would not
+/// admit (here a runner config, while the ask is for a doc) counts as a failing check, as without the
+/// ask. Fails while any precheck failure waits on any unanswered ask.
+#[test]
+fn a_scope_ask_holds_up_no_stop_on_a_change_it_did_not_ask_for() {
+    let root = setup("hive-i-scope-other");
+    let s = "sess-scope-other-1";
+    open_task(&root, "t1");
+    ok(&root, &["join", "g1"], &inside(s));
+    let tree = PathBuf::from(hs(&root, s)["worktree"].as_str().unwrap());
+    ok(&root, &["claim"], &inside(s));
+    prompt(&root, s);
+    std::fs::create_dir_all(tree.join("tests")).unwrap();
+    std::fs::write(tree.join("tests/conftest.py"), "collect_ignore = ['test_parse.py']\n").unwrap();
+    std::fs::write(tree.join("ok"), "").unwrap();
+    ok(&root, &["scope", "--files", "+docs/parser.md", "the parser's docs change with it"], &inside(s));
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.contains("t1 is not done: scope failed (attempt 1 of") && r.contains("tests/conftest.py"), "{r}");
+    assert_eq!(hs(&root, s)["oracle_blocks"], 1, "counted");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Only the engineer answers a scope ask: a planner session's reply to it (an acknowledgement, a "hold
+/// on") is no "no". The ask still waits in monitoring, the drone's stop still waits on it, and the
+/// planner is shown the ask with a reply hint that names no `--re`. Fails while any `tell --re` of the
+/// ask counts as the engineer's no.
+#[test]
+fn a_planners_reply_to_a_scope_ask_is_not_the_engineers_no() {
+    let root = setup("hive-i-scope-planner");
+    let s = "sess-scope-planner-1";
+    let q = "sess-scope-planner-q";
+    let (_, id) = ask_and_wait(&root, s);
+    ok(&root, &["tell", "passing this to the engineer, hold on", "--goal", "g1", "--re", &id], &inside(q));
+    assert!(ok(&root, &["board", "g1"], &[]).contains("a scope ask waits"), "a planner's reply answers nothing");
+    prompt(&root, s);
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.contains("t1 waits for the engineer's answer to your scope ask"), "{r}");
+    assert_eq!(hs(&root, s)["oracle_blocks"], 0, "still no attempt counted");
+    let ctx = prompt(&root, q);
+    assert!(ctx.contains("asks to amend t1") && ctx.contains("The engineer amends it"), "{ctx}");
+    assert!(!ctx.contains("--re "), "the planner's hint for an ask names no reply to it: {ctx}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The terminal's board shows a scope ask to the planner with the amend and an explicit no: its plain
+/// reply names no `--re` (any terminal reply to the ask is the engineer's no, scope.rs `answer`), and
+/// only the "say no" form does. Fails while the board offers the generic `--re` reply for an ask, so an
+/// engineer's "ok, amending it" refuses the ask.
+#[test]
+fn the_board_offers_a_scope_ask_its_amend_and_an_explicit_no() {
+    let root = setup("hive-i-scope-board");
+    let s = "sess-scope-board-1";
+    let (_, id) = ask_and_wait(&root, s);
+    let board = ok(&root, &["board", "g1"], &[]);
+    assert!(board.contains("asks to amend t1") && board.contains("The engineer amends it"), "{board}");
+    assert!(board.contains(&format!("(reply: `borg hive tell \"<answer>\" --goal g1 --to '{s}'`)")), "{board}");
+    assert!(board.contains(&format!("To say no: `borg hive tell \"no: <why>\" --goal g1 --re '{id}' --to '{s}'`")), "{board}");
+    let mail = board.split("To the planner, unread here:").nth(1).unwrap();
+    assert_eq!(mail.matches("--re ").count(), 1, "only the no replies to the ask: {mail}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A check wrong on any tree is the engineer's to change: a failing check's block, and the cap that
+/// blocks the task, name the ask for it (`borg hive scope --accept`), not only fix-it-or-block.
+#[test]
+fn a_failing_check_names_the_ask_for_a_check_that_is_wrong() {
+    let root = setup("hive-i-scope-accept");
+    let s = "sess-scope-accept-1";
+    open_task(&root, "t1");
+    ok(&root, &["join", "g1"], &inside(s));
+    ok(&root, &["claim"], &inside(s));
+    prompt(&root, s);
+    let ask = "borg hive scope --accept NAME=CMD";
+    for attempt in 1..=3 {
+        let r = reason(&stop(&root, s, attempt > 1, json!([])));
+        assert!(r.contains(&format!("ok failed (attempt {attempt} of 3)")) && r.contains(ask), "{r}");
+    }
+    prompt(&root, s);
+    let r = reason(&stop(&root, s, false, json!([])));
+    assert!(r.contains("t1 is blocked on the board") && r.contains(ask), "{r}");
     let _ = std::fs::remove_dir_all(root);
 }

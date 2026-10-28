@@ -59,6 +59,7 @@ pub mod rework;
 pub mod run;
 #[cfg(test)]
 mod scenario;
+mod scope;
 mod sim_drone;
 mod start;
 pub mod verdict;
@@ -572,6 +573,10 @@ pub fn joined(home: &Path, cwd: &str) -> Option<Join> {
 pub fn may_claim(g: &Goal, t: &Task, repo: &str) -> bool {
     t.role != Role::Integrate && (goal::in_scope(g, repo) || t.repo.is_empty() || t.repo.eq_ignore_ascii_case(repo))
 }
+
+/// Why `borg hive open --again` refuses a drone (hive_cli.rs holds it to this text).
+pub const AGAIN_REFUSED: &str =
+    "a task's definition is amended by the engineer, never by a drone of a hive goal: ask with `borg hive scope --files +a \"why\"` (or `--accept NAME=CMD`)";
 
 /// Why integrate tasks are refused to a drone's claim.
 const INTEGRATE_REFUSED: &str = "integrate tasks are run by `borg hive integrate` or `borg debug hive run`";
@@ -1169,7 +1174,7 @@ fn around_bound(
     let Ok(g) = goal::load(home, &hs.goal) else {
         // An interactive drone of every open goal with none to work on yet still waits for one.
         return match hs.interactive && event == "stop" {
-            true => interactive::after_stop(home, &mut hs, session, &cwd, input, inner(), interactive::Wake::of(h.name(), false), now),
+            true => interactive::after_stop(home, &mut hs, session, &cwd, input, inner(), interactive::Wake::of(h.name(), false), false, now),
             false if hs.interactive && event == "end" => {
                 let out = inner();
                 interactive::ended(home, &hs, session, &cwd, input, now);
@@ -1205,7 +1210,7 @@ fn around_bound(
             // What the conscience (and the rest of `inner`) said, so the hive's own words are told apart.
             let theirs = std::cell::RefCell::new(None);
             let held = board::holding(&b, &node(home), session, now).cloned();
-            let out = ctx.stop(&mut hs, &b, &events, input, started, || {
+            let (out, asks) = ctx.stop(&mut hs, &b, &events, input, started, || {
                 let o = inner();
                 *theirs.borrow_mut() = Some(o.clone());
                 o
@@ -1216,7 +1221,7 @@ fn around_bound(
             }
             let hive = reason_of(&out) != theirs.borrow().as_ref().and_then(reason_of);
             match hs.interactive {
-                true => interactive::after_stop(home, &mut hs, session, cwd, input, out, interactive::Wake::of(h.name(), hive), now),
+                true => interactive::after_stop(home, &mut hs, session, cwd, input, out, interactive::Wake::of(h.name(), hive), asks, now),
                 false => out,
             }
         }
@@ -1495,12 +1500,23 @@ impl Ctx<'_> {
             let globs: Vec<regex::Regex> = held.task.files.iter().map(|g| crate::assimilate_dir::glob(g)).collect();
             let warned = hook::listed(state, SCOPE_MARKER);
             let outside: Vec<&str> = refs.iter().copied().filter(|f| !globs.iter().any(|g| g.is_match(f)) && !warned.contains(f) && !f.contains(',')).collect();
+            // What the verifier protects comes first (verdict.rs `protected`): a file the goal's check
+            // reads (guard.rs files it under CI too) no scope admits; a test or CI file only the
+            // engineer's amend does; any other file outside is the drone's call.
+            let oracle = guard::oracle_files(self.g, top);
             for f in &outside {
-                parts.push(format!(
-                    "{f} is outside {}'s scope ({}): fine if the task needs it, but another drone may own it.",
-                    held.task.id,
-                    held.task.files.join(", ")
-                ));
+                let id = &held.task.id;
+                parts.push(match guard::class_of(f, &top.join(f), &[], &oracle) {
+                    _ if oracle.iter().any(|o| o == f) => format!(
+                        "{f} is a file the goal's check reads: no scope admits a change to it, and the verifier rejects one. Leave it; if the check is wrong, tell the planner: `borg hive tell \"...\" --to planner`."
+                    ),
+                    Some(c) => format!(
+                        "{f} is a {} file outside {id}'s scope ({}): the verifier rejects a change that removes or reshapes what is in it. If {id} needs it, ask the engineer: `borg hive scope --files +{f} \"why\"`, and keep working on what is in scope meanwhile. Never reshape a test to get past the guard.",
+                        c.name(),
+                        held.task.files.join(", ")
+                    ),
+                    None => format!("{f} is outside {id}'s scope ({}): fine if the task needs it, but another drone may own it.", held.task.files.join(", ")),
+                });
             }
             if !outside.is_empty() {
                 marks.push(format!("{SCOPE_MARKER}{}", outside.join(",")));
@@ -1519,6 +1535,9 @@ impl Ctx<'_> {
     /// (phase f F5) and no end of the engineer's own turn is held up by hive work; the waiter hands it.
     /// Nor is a claim a codex wake handed that the turn ending here was not started by (the engineer's
     /// turn, ahead of the wake in codex's queue, interactive.rs `not_in_hand`): its own turn comes next.
+    ///
+    /// With what it says, whether the turn ends waiting on a scope ask: the claim kept and nothing in
+    /// hand until the amend or the engineer's no wakes the drone (interactive.rs `after_stop`).
     fn stop(
         &self,
         hs: &mut HiveSession,
@@ -1527,7 +1546,7 @@ impl Ctx<'_> {
         input: &Value,
         started: Instant,
         inner: impl FnOnce() -> Option<Value>,
-    ) -> Option<Value> {
+    ) -> (Option<Value>, bool) {
         let first_round = input.get("stop_hook_active").and_then(Value::as_bool) != Some(true);
         let waiting = std::fs::read_to_string(wait_path(self.session)).unwrap_or_default();
         let _ = std::fs::remove_file(wait_path(self.session));
@@ -1540,7 +1559,7 @@ impl Ctx<'_> {
             if !lost.is_empty() {
                 text.push_str(&format!("{} {}", self.head(), lost.join("\n")));
             }
-            return with_reason(&text, inner(), first_round);
+            return (with_reason(&text, inner(), first_round), false);
         };
         let task = &held.task;
         let claim = format!("{}@{}", task.id, held.live(self.now).map_or(0, |l| l.2));
@@ -1570,7 +1589,7 @@ impl Ctx<'_> {
             hs.blocks_for.clear();
             save(self.session, hs);
             pass_budget(left());
-            return with_reason(&text, inner(), first_round || handed);
+            return (with_reason(&text, inner(), first_round || handed), false);
         }
         let verdict = if task.role == Role::Verify {
             oracle::Verdict::Fail {
@@ -1590,6 +1609,40 @@ impl Ctx<'_> {
                 false => oracle::run(self.home, self.g, task, Path::new(self.cwd), Some(budget)),
             }
         };
+        // The done's precheck (S-done) on the snapshot the done would carry blocks as a failing check
+        // does: the drone undoes it or asks.
+        let (mut head, mut asked) = (String::new(), false);
+        let verdict = match verdict {
+            oracle::Verdict::Pass if task.role != Role::Verify => {
+                head = verdict::snapshot(Path::new(self.cwd), left()).unwrap_or_default();
+                let admit = scope::waiting_for(self.home, &self.g.id, self.session, held);
+                match scope_refusal(self.home, self.g, held, self.session, Path::new(self.cwd), &head, admit.as_deref()) {
+                    Some((why, admitted)) => {
+                        asked = admitted;
+                        oracle::Verdict::Fail { check: SCOPE_CHECK.into(), tail: why }
+                    }
+                    None => oracle::Verdict::Pass,
+                }
+            }
+            v => v,
+        };
+        // An unanswered scope ask (scope.rs) holds up only what it asks for: a stop whose one failure is
+        // the precheck, on paths the asked files would all admit, ends the turn waiting, no attempt
+        // counted; the amend or the engineer's no wakes the drone. Every other stop runs as without the
+        // ask, so dropping the change finishes the task.
+        if let oracle::Verdict::Fail { tail, .. } = &verdict
+            && asked
+        {
+            let text = format!(
+                "{waiting}[borg hive] {} waits for the engineer's answer to your scope ask: {}\nThe amend or the engineer's no wakes you; nothing is counted meanwhile. To finish {} as it is, undo those changes and end your turn (or run `{}`); if you are stuck, `{} \"why\"`.\n\n",
+                task.id,
+                tail.trim_end(),
+                task.id,
+                command("done", self.session, self.cwd),
+                command("block", self.session, self.cwd)
+            );
+            return (with_reason(&text, inner(), first_round), true);
+        }
         if verdict != oracle::Verdict::Pass && hs.oracle_blocks < MAX_ORACLE_BLOCKS {
             hs.oracle_blocks += 1;
             save(self.session, hs);
@@ -1604,14 +1657,17 @@ impl Ctx<'_> {
                 ),
                 oracle::Verdict::Pass => String::new(),
             };
-            let reason = format!(
+            let mut reason = format!(
                 "{waiting}[borg hive] {} is not done: {what}\nFix it, or run `{}` (no hook time limit), or `{} \"why\"` if you are stuck.",
                 task.id,
                 command("done", self.session, self.cwd),
                 command("block", self.session, self.cwd)
             );
+            if matches!(&verdict, oracle::Verdict::Fail { check, .. } if check != SCOPE_CHECK) && task.role != Role::Verify {
+                reason.push_str(&format!(" {WRONG_CHECK}"));
+            }
             // No conscience round on unfinished work: its model call would judge work still changing.
-            return Some(json!({"decision": "block", "reason": reason}));
+            return (Some(json!({"decision": "block", "reason": reason})), false);
         }
         // An interactive drone hears what became of its task before anything else (`done`).
         let (mut text, after) = match hs.interactive {
@@ -1623,18 +1679,26 @@ impl Ctx<'_> {
             // At the cap: the drone may stop; the board says why the task stands still.
             let (ev, note) = match task.role {
                 Role::Verify => (Ev::Released, format!("no verdict after {MAX_ORACLE_BLOCKS} stops")),
+                _ if check == SCOPE_CHECK => (
+                    Ev::Blocked,
+                    format!("its diff changed protected files outside its scope at {MAX_ORACLE_BLOCKS} stops: the engineer amends its files or it is undone"),
+                ),
                 _ => (Ev::Blocked, format!("oracle failed {MAX_ORACLE_BLOCKS} times at stop: {check}")),
             };
             let _ = write(self.home, &self.g.id, vec![Event::new(ev, &task.id, self.session, self.now).with_note(&note)]);
+            let wrong = match task.role != Role::Verify && check != SCOPE_CHECK {
+                true => format!(" {WRONG_CHECK}"),
+                false => String::new(),
+            };
             text.push_str(&format!(
-                "[borg hive] {} is {} on the board ({note}); an engineer reopens it with `borg hive open {} --id {} --again`.\n\n",
+                "[borg hive] {} is {} on the board ({note}); an engineer reopens it with `borg hive open {} --id {} --again`.{wrong}\n\n",
                 task.id,
                 ev.name(),
                 self.g.id,
                 task.id
             ));
         } else {
-            let (said, next) = self.done(hs.interactive, held, input, &path, &left);
+            let (said, next) = self.done(hs.interactive, held, head, input, &path, &left);
             text.push_str(&said);
             if next {
                 handed = true;
@@ -1647,7 +1711,7 @@ impl Ctx<'_> {
         save(self.session, hs);
         pass_budget(left());
         // A new claim reaches the drone on any round: it must not stop holding a task it never heard of.
-        with_reason(&text, inner(), first_round || handed)
+        (with_reason(&text, inner(), first_round || handed), false)
     }
 
     /// The oracle passed at the stop: the done (`finish`), then the next open task claimed for this
@@ -1659,11 +1723,11 @@ impl Ctx<'_> {
     /// wrote its last message before the checks ran, so without it the model would report a state that
     /// was never true (the live probe: "I didn't tell borg the task is done"). Its done's note is the
     /// stop's own summary (`Note::Stop`), never that message. A runner's drone is told as before.
-    fn done(&self, interactive: bool, held: &TaskState, input: &Value, path: &Path, left: &dyn Fn() -> Duration) -> (String, bool) {
+    fn done(&self, interactive: bool, held: &TaskState, head: String, input: &Value, path: &Path, left: &dyn Fn() -> Duration) -> (String, bool) {
         let task = &held.task;
         let message = crate::harness::plan(self.h.caps(), input);
         let note = if interactive { Note::Stop } else { Note::Said(&message) };
-        match finish(self.home, self.g, held, self.session, Path::new(self.cwd), &note, left()) {
+        match finish(self.home, self.g, held, self.session, Path::new(self.cwd), head, &note, left()) {
             Ok(vid) => {
                 let said = format!("[borg hive] {} done: {}; verify task {vid} is open for another drone.", task.id, passed(self.g, task));
                 match self.hand_next(path, left()) {
@@ -1714,11 +1778,10 @@ impl Ctx<'_> {
     }
 }
 
-/// The `done` of the claim `held` (claimed at `since`) by `session` in `dir`, with a snapshot of the
-/// work (`head`, verdict.rs, `within` that time), and the verify task it opens, listing the guard's
-/// flags of the claim. The done is stamped once its snapshot is taken: the line lands at its ms.
-fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, since: i64, within: Duration) -> (Event, Task) {
-    let head = verdict::snapshot(dir, within).unwrap_or_default();
+/// The `done` of the claim `held` (claimed at `since`) by `session`, with the snapshot of the work its
+/// caller took (`head`, verdict.rs `snapshot`; empty: none), and the verify task it opens, listing the
+/// guard's flags of the claim. The done is stamped once its snapshot is taken: the line lands at its ms.
+fn done_events(home: &Path, g: &Goal, held: &TaskState, session: &str, head: String, since: i64) -> (Event, Task) {
     let now = learn::now_ms();
     let mut done = Event::new(Ev::Done, &held.task.id, session, now);
     done.head = head;
@@ -1774,6 +1837,63 @@ fn stop_note(g: &Goal, t: &Task, base: &str, head: &str, dir: &Path, within: Dur
     note
 }
 
+/// The done's precheck (S-done): what the verifier would flag in the attempt `held` has in `dir`, its
+/// diff from its claim's start to `head` (the snapshot the done would carry) judged by the verifier's
+/// own rule under the definition it holds (verdict.rs `flagged`), as the text that refuses the done:
+/// each path, why, and how to go on. None when nothing is flagged; also when the diff cannot be read
+/// (no snapshot, git failed: said on stderr), as the verifier still judges it. With the refusal,
+/// whether the files of a waiting scope ask (`admit`) would admit every flagged path.
+fn scope_refusal(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, head: &str, admit: Option<&[String]>) -> Option<(String, bool)> {
+    // A done as a borg before this check wrote it (a test of the verifier's own guard, tests only).
+    if std::env::var_os(crate::harness::TEST_ENV).is_some() && std::env::var_os("BORG_HIVE_UNCHECKED_DONE").is_some() {
+        return None;
+    }
+    let id = &held.task.id;
+    let Status::Claimed { since, .. } = held.status else { return None };
+    let here = node(home);
+    let base = board::read(&tasks_path(home, &g.id))
+        .into_iter()
+        .rev()
+        .find(|e| e.ev == Ev::Claim && e.task == *id && e.by == session && e.ms == since && board::of_node(&e.node, &here))
+        .map(|e| e.base)
+        .filter(|b| !b.is_empty());
+    let Some(base) = base else {
+        eprintln!("borg hive: {id}'s claim names no start commit: its done is not prechecked (its verifier still judges it)");
+        return None;
+    };
+    let root = repo_top(dir);
+    let read = Some(head).filter(|h| !h.is_empty()).and_then(|head| verdict::diff(root, &base, head));
+    let Some(changed) = read else {
+        eprintln!("borg hive: the diff of {id} could not be read before its done: not prechecked (its verifier still judges it)");
+        return None;
+    };
+    let flagged = verdict::flagged(g, root, &changed, &held.task.files);
+    if flagged.is_empty() {
+        return None;
+    }
+    let admitted = admit.is_some_and(|files| verdict::flagged(g, root, &changed, files).is_empty());
+    let oracle = guard::oracle_files(g, root);
+    let lines: Vec<String> = flagged
+        .iter()
+        .map(|p| match oracle.contains(&p.path) {
+            true => format!("- {} ({}): the goal's check runs it, so no scope admits it: undo it, and tell the planner if the check is wrong: `borg hive tell \"...\" --to planner`", p.path, p.why),
+            false => format!("- {} ({}): undo it, or ask the engineer to widen {id}: `borg hive scope --files +{} \"why\"`", p.path, p.why, p.path),
+        })
+        .collect();
+    let why = format!(
+        "the verifier would reject it: it changes files outside {id}'s scope that the verifier protects:\n{}\nNever reshape a test to get past this. Keep working on what is in scope meanwhile.",
+        lines.join("\n")
+    );
+    Some((why, admitted))
+}
+
+/// The name a stop's block gives the done's precheck (`scope_refusal`), as a failed check's.
+const SCOPE_CHECK: &str = "scope";
+
+/// What a failing check's block and its cap add: a check no tree passes is the engineer's to change
+/// (scope.rs), never the drone's to work around.
+const WRONG_CHECK: &str = "If the check itself is wrong on any tree, ask the engineer: `borg hive scope --accept NAME=CMD \"why\"`.";
+
 /// Why a `done` took no effect.
 enum Unfinished {
     /// The board could not be written.
@@ -1782,15 +1902,17 @@ enum Unfinished {
     Lost(String),
 }
 
-/// Publishes the `done` of the claim `held` by `session` in `dir` (`done_events`, `within` that time)
-/// and the verify task it opens in one write, written only while the board as it stands under the file's
+/// Publishes the `done` of the claim `held` by `session` in `dir`, with the snapshot `head` its caller
+/// took and prechecked (`scope_refusal`; `done_events`, its note's git calls `within` that time), and
+/// the verify task it opens in one write, written only while the board as it stands under the file's
 /// lock still gives the session that claim (`write_if`): the done names it (`Event::claim`) and is then
 /// an attempt for good (phase f F5, board.rs `Fold::permanent`), which no claim that arrives later voids.
 /// A claim that passed to another drone meanwhile (a suite that ran past the lease, a rival's earlier
 /// claim from a suspected node) writes nothing: nothing is counted and the drone is told who holds the
 /// task. The verify task's id when it took. `borg hive done` and the stop share it; the done's note is
 /// `note` (`Note`).
-fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, note: &Note, within: Duration) -> Result<TaskId, Unfinished> {
+#[allow(clippy::too_many_arguments)]
+fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, head: String, note: &Note, within: Duration) -> Result<TaskId, Unfinished> {
     let path = tasks_path(home, &g.id);
     let id = &held.task.id;
     let since = match held.status {
@@ -1798,7 +1920,7 @@ fn finish(home: &Path, g: &Goal, held: &TaskState, session: &str, dir: &Path, no
         _ => i64::MIN,
     };
     let started = Instant::now();
-    let (done, check) = done_events(home, g, held, session, dir, since, within);
+    let (done, check) = done_events(home, g, held, session, head, since);
     let (vid, ms) = (check.id.clone(), done.ms);
     let here = node(home);
     let note = match note {
@@ -2724,12 +2846,18 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   leave [--here]                                            the drone leaves (its claim is released), a session that only
                                                             plans stops planning; --here: new sessions here join no more
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
-       [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one, its given title, files, deps or checks replacing the old;
-                                                            --group K: K attempts ID.g1.. by different drones, the
-                                                            best integrated, `borg learn --group <goal>/ID` compares them)
+       [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (a directory in --files is its tree; a file
+                                                            the goal's check reads, or a check that cannot pass on any tree, is
+                                                            refused); --again amends an open, claimed or blocked one from a
+                                                            terminal, its given title, files, deps (not on a claimed one) or
+                                                            checks replacing the old, a claim kept; --group K: K attempts
+                                                            ID.g1.. by different drones, the best integrated, `borg learn
+                                                            --group <goal>/ID` compares them)
   drone commands (the goal is the session's):
   claim [TASK] | progress \"note\" | release | block \"why\" | done [--note N]
   verify --pass | --reject \"why\" (or end the turn with `VERDICT: pass|reject <why>`) | contract \"text\" --scope a,b [--supersedes ID]
+  scope [--files +a,-b] [--accept NAME=CMD]... \"why\"     the holder asks the engineer to amend its task's files or checks: a
+                                                            message to the planner with the `open --again` line to run
   ask \"text\" [--to TASK|DRONE|SESSION|planner] | tell \"text\" [--to ...] [--re ID]   a message to the goal's drones or its planner
   ask|tell \"text\" --goal G [--to ...] [--re ID]          the planning session (or the engineer's terminal) sends into goal G
                                                             without joining it, and hears its drones' messages to the planner";
@@ -3102,6 +3230,7 @@ fn cli(args: &[&str], debug: bool) -> i32 {
                 2
             }
         },
+        ("scope", [_, ..]) => scope::ask_cmd(&here, session, &a, &rest.join(" ")),
         ("contract", [_, ..]) => contract_cmd(&here, session, &rest.join(" "), a.list("--scope"), a.value("--supersedes")),
         ("ask" | "tell", [_, ..]) => message_cmd(&here, session, a.value("--goal"), cmd, &rest.join(" "), a.value("--to"), a.value("--re")),
         _ => {
@@ -3146,7 +3275,7 @@ fn init(here: &Here, a: &Args, id: &str) -> i32 {
         })
         .collect();
     let tasks: Result<Vec<Task>, String> = a.all("--task").into_iter().map(parse_task).collect();
-    let tasks = match tasks.and_then(|t| check_deps(&t, |_| false).map(|()| t)) {
+    let mut tasks = match tasks.and_then(|t| check_deps(&t, |_| false).map(|()| t)) {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
@@ -3187,8 +3316,19 @@ fn init(here: &Here, a: &Args, id: &str) -> i32 {
         held_out: false,
         origin,
     };
+    // Plan-time checks before anything is written (scope.rs): a task no change could ever pass is no plan.
+    let mut notes = Vec::new();
+    for t in &mut tasks {
+        match scope::validate(&g, t, &here.cwd, false, |_| true) {
+            Ok(n) => notes.extend(n),
+            Err(e) => return fail(e),
+        }
+    }
     if let Err(e) = goal::create(&here.home, &g) {
         return fail(e);
+    }
+    for n in &notes {
+        println!("{n}");
     }
     let by = format!("engineer:{author}");
     let opens: Vec<Event> = tasks.into_iter().map(|t| Event::open(t, &by, here.now)).collect();
@@ -3311,7 +3451,7 @@ fn board_cmd(here: &Here, g: &Goal, a: &Args) -> i32 {
                     Status::Open => (String::new(), 0),
                 };
                 json!({"id": s.task.id, "role": s.task.role, "title": s.task.title, "status": s.shown_status(now), "by": by, "renewed": renewed,
-                    "rework": s.rework, "deps": s.task.deps})
+                    "rework": s.rework, "deps": s.task.deps, "files": s.task.files})
             })
             .collect();
         println!("{}", Value::Array(rows));
@@ -3338,7 +3478,8 @@ fn board_cmd(here: &Here, g: &Goal, a: &Args) -> i32 {
 }
 
 /// The engineer's terminal reads goal `g`'s messages to the planner not read on this node before, each
-/// with the command that answers it, and marks them read (message.rs `read_here`): a goal opened from
+/// with the command that answers it (a scope ask: its amend, a reply that is no answer to it, and the
+/// `--re` reply that is the engineer's no), and marks them read (message.rs `read_here`): a goal opened from
 /// a terminal, or planned by a session gone, has no planning session whose prompt shows them. Empty
 /// with none.
 fn planner_mail(here: &Here, g: &Goal) -> String {
@@ -3352,8 +3493,16 @@ fn planner_mail(here: &Here, g: &Goal) -> String {
     let lines: Vec<String> = new
         .iter()
         .map(|m| {
-            let reply = format!("borg hive tell \"<answer>\" --goal {} --re {} --to {}", g.id, queen::sh_quote(&m.id), queen::sh_quote(&m.by));
-            format!("- {}\n", message::render(m, &here_node, &reply, false))
+            let (re, to) = (queen::sh_quote(&m.id), queen::sh_quote(&m.by));
+            // Any terminal reply to a scope ask is the engineer's no (scope.rs `answer`): its plain
+            // reply names no `--re`, and the no is said as one.
+            if m.cmd.is_empty() {
+                let reply = format!("borg hive tell \"<answer>\" --goal {} --re {re} --to {to}", g.id);
+                return format!("- {}\n", message::render(m, &here_node, &reply, false));
+            }
+            let reply = format!("borg hive tell \"<answer>\" --goal {} --to {to}", g.id);
+            let no = format!("borg hive tell \"no: <why>\" --goal {} --re {re} --to {to}", g.id);
+            format!("- {} To say no: `{no}`\n", message::render(m, &here_node, &reply, false))
         })
         .collect();
     message::mark_read(&here.home, &g.id, &new.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
@@ -3487,10 +3636,55 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
         eprintln!("borg hive open: --again reopens one blocked task (a group's member by its id), never a group");
         return 2;
     }
+    // The engineer's amend (S-def): a convention gate as `ratify` and `approve` are, since every open
+    // line is written as the engineer's (the fold cannot tell who ran it). A drone asks instead
+    // (`borg hive scope`); a session's model reads its drones' asks, each with this very command.
+    if a.on("--again") && drone_here(here) {
+        return fail(AGAIN_REFUSED);
+    }
+    if a.on("--again")
+        && let Some(why) = in_session("borg hive open --again")
+    {
+        return fail(why);
+    }
+    let mut old: Option<Task> = None;
     let task = if a.on("--again") {
         match here.board(&g).tasks.get(id) {
-            Some(s) if matches!(s.status, Status::Blocked { .. }) => s.task.clone(),
-            Some(s) => return fail(format!("{id} is {}, not blocked: nothing to reopen", s.status.name())),
+            // An amend may fix what is wrong with the task: a new title, files, deps or checks replace the
+            // old ones; a blocked task opens again, a held one keeps its claim (board.rs `apply`).
+            Some(s) if s.task.of.is_none() && matches!(s.status, Status::Blocked { .. } | Status::Open | Status::Claimed { .. }) => {
+                if a.value("--deps").is_some() && matches!(s.status, Status::Claimed { .. }) {
+                    return fail(format!(
+                        "{id} is claimed: deps change only on a task no one holds (its claim started from the deps it had); block or release it first"
+                    ));
+                }
+                old = Some(s.task.clone());
+                let mut t = s.task.clone();
+                if let Some(title) = a.value("--title").map(str::trim).filter(|t| !t.is_empty()) {
+                    t.title = title.into();
+                }
+                if a.value("--files").is_some() {
+                    t.files = a.list("--files");
+                }
+                if a.value("--deps").is_some() {
+                    t.deps = a.list("--deps");
+                    let b = here.board(&g);
+                    if let Err(e) = check_deps(std::slice::from_ref(&t), |d| d != id && b.tasks.contains_key(d)) {
+                        return fail(e);
+                    }
+                }
+                if !a.all("--accept").is_empty() {
+                    match a.all("--accept").into_iter().map(|c| Check::parse(c, 600)).collect() {
+                        Ok(acc) => t.accept = acc,
+                        Err(e) => return fail(e),
+                    }
+                }
+                t
+            }
+            Some(s) if s.task.of.is_some() => return fail(format!("{id} is a verify task: its definition is its work's")),
+            Some(s) => {
+                return fail(format!("{id} is {}: it keeps the definition its done was judged under; open a new task for more work", s.status.name()));
+            }
             None => return fail(format!("no task {id} in goal {goal_id}")),
         }
     } else {
@@ -3504,7 +3698,7 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
         });
         let b = here.board(&g);
         match made.and_then(|t| check_deps(std::slice::from_ref(&t), |d| b.tasks.contains_key(d)).map(|()| t)) {
-            Ok(t) if b.tasks.contains_key(&t.id) => return fail(format!("task {} exists already (reopen a blocked one with --again)", t.id)),
+            Ok(t) if b.tasks.contains_key(&t.id) => return fail(format!("task {} exists already (the engineer amends it from a terminal with --again)", t.id)),
             Ok(t) if b.tasks.values().any(|s| s.task.group.as_ref() == Some(&t.id)) => return fail(format!("group {} exists already", t.id)),
             // Only a group's best member is integrated (group.rs `merged`): work built on another member
             // would be merged onto a tree without it.
@@ -3515,6 +3709,13 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
             Ok(t) => t,
             Err(e) => return fail(e),
         }
+    };
+    // Plan-time checks (scope.rs): a directory is its tree, a file the goal's check reads and a check
+    // that cannot pass on any tree are refused; an amend probes only the checks it changes.
+    let mut task = task;
+    let notes = match scope::validate(&g, &mut task, &here.cwd, false, |c| old.as_ref().is_none_or(|o| !o.accept.contains(c))) {
+        Ok(n) => n,
+        Err(e) => return fail(e),
     };
     let tasks = match a.value("--group").map(str::parse::<usize>) {
         None | Some(Ok(0 | 1)) => vec![task],
@@ -3527,12 +3728,25 @@ fn open(here: &Here, a: &Args, goal_id: &str) -> i32 {
             return 2;
         }
     };
-    let opens: Vec<Event> = tasks.iter().map(|t| Event::open(t.clone(), &here.engineer(), here.now)).collect();
+    let note = old.as_ref().map(|o| format!("{}{}", board::AMENDED, scope::amended(o, &tasks[0])));
+    let opens: Vec<Event> = tasks.iter().map(|t| Event::open(t.clone(), &here.engineer(), here.now).with_note(note.as_deref().unwrap_or_default())).collect();
     if let Err(e) = write(&here.home, goal_id, opens) {
         return fail(e);
     }
+    for n in &notes {
+        println!("{n}");
+    }
     for task in &tasks {
-        println!("opened {} ({}) {} in goal {goal_id}", task.id, task.role.name(), task.title);
+        match &old {
+            // A claim from another node that sorts before this line keeps the deps it started from.
+            Some(o) if o.deps != task.deps => println!(
+                "amended {} in goal {goal_id}: {} (the deps apply unless a claim of it from another node lands first)",
+                task.id,
+                scope::amended(o, task)
+            ),
+            Some(o) => println!("amended {} in goal {goal_id}: {}", task.id, scope::amended(o, task)),
+            None => println!("opened {} ({}) {} in goal {goal_id}", task.id, task.role.name(), task.title),
+        }
     }
     if let [first, ..] = tasks.as_slice()
         && let Some(gr) = &first.group
@@ -3699,7 +3913,12 @@ fn done_cmd(here: &Here, named: Option<&str>, note: &str) -> i32 {
     let dir = Path::new(&here.cwd);
     match renewing(&here.home, &g.id, &s.task.id, &session, HEARTBEAT, || oracle::run(&here.home, &g, &s.task, dir, None)) {
         oracle::Verdict::Pass => {
-            let vid = match finish(&here.home, &g, &s, &session, dir, &Note::Said(note), verdict::SNAPSHOT_TIMEOUT) {
+            let head = verdict::snapshot(dir, verdict::SNAPSHOT_TIMEOUT).unwrap_or_default();
+            if let Some((why, _)) = scope_refusal(&here.home, &g, &s, &session, dir, &head, None) {
+                println!("{} is not done: {why}", s.task.id);
+                return 1;
+            }
+            let vid = match finish(&here.home, &g, &s, &session, dir, head, &Note::Said(note), verdict::SNAPSHOT_TIMEOUT) {
                 Ok(vid) => vid,
                 Err(Unfinished::Io(e)) => return fail(e),
                 Err(Unfinished::Lost(why)) => {
@@ -4523,7 +4742,7 @@ mod tests {
         let dir = home.display().to_string();
         let ctx =
             Ctx { h: &crate::harness::sim::Sim, home: &home, g: &g, session: &session, cwd: &dir, repo: "app", now: learn::now_ms(), started: Instant::now() };
-        let out = ctx.stop(&mut hs, &b, &lines, &json!({"stop_hook_active": false}), Instant::now(), || None);
+        let (out, _) = ctx.stop(&mut hs, &b, &lines, &json!({"stop_hook_active": false}), Instant::now(), || None);
         assert_eq!(out, None, "no block, nothing handed");
         assert!(!board::read(&path).iter().any(|e| e.ev == Ev::Done), "no done");
         assert!(board::holding(&board::fold_on(&board::read(&path), &here), &here, &session, learn::now_ms()).is_some(), "still held for the waiter");
