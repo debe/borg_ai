@@ -69,6 +69,11 @@ pub const STEER_ISSUED: &str = "steer_issued";
 pub const STEER_DELIVERED: &str = "steer_delivered";
 pub const STEER_DROPPED: &str = "steer_dropped";
 pub const PAUSE_REFUSED: &str = "pause_refused";
+/// Messages between sessions (msg.rs): one sent (`why`: tell/ask), shown to a session (`why`: its kind),
+/// and dropped (`why`: `rate`, the sender's limit; `bounds`, `n` lines the log's `KEEP` cut).
+pub const MSG_SENT: &str = "msg_sent";
+pub const MSG_DELIVERED: &str = "msg_delivered";
+pub const MSG_DROPPED: &str = "msg_dropped";
 /// The queen's queue: a question queued, handed to a drone, answered (`dur_ms`: time to answer),
 /// skipped, dismissed.
 pub const QUEEN_QUEUED: &str = "queen_queued";

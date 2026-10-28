@@ -172,6 +172,9 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "playbook_shown" => ("playbooks shown", "var(--c-teal)", "☰"),
         "playbook_proposed" => ("playbook edits proposed", "var(--c-violet)", "☰"),
         "playbook_promoted" => ("playbook edits promoted", "var(--c-good)", "☰"),
+        "msg_sent" => ("messages sent", "var(--c-sky)", "✉"),
+        "msg_delivered" => ("messages shown", "var(--c-teal)", "✉"),
+        "msg_dropped" => ("messages dropped", "var(--c-heat)", "⨯"),
         _ => ("other", "var(--c-muted)", "•"),
     }
 }

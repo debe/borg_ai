@@ -407,6 +407,8 @@ pub struct Drone {
     pub started: f64,
     pub ms: f64,
     pub remote: bool,
+    /// Messages not shown to it yet; `None` for a remote drone (its reads are claimed on its node).
+    pub unread: Option<f64>,
 }
 
 pub fn parse_drones(v: &Value) -> Vec<Drone> {
@@ -426,6 +428,47 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
             started: f(&d["started"]),
             ms: f(&d["ms"]),
             remote: !s(&d["node"]).is_empty(),
+            unread: d["unread"].as_f64(),
+        })
+        .collect()
+}
+
+/// A message between sessions (borg msg.rs), as `/api/messages` lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Message {
+    pub id: String,
+    /// `tell` or `ask`.
+    pub kind: String,
+    /// The sender and recipient as `borg top` names them (a designation, `all`, the engineer); a sender
+    /// from another node with that node's short key.
+    pub from: String,
+    pub to: String,
+    /// What the recipient is, as borg msg.rs `Address` parses it: `all`, `engineer` or `session`.
+    pub to_kind: String,
+    pub harness: String,
+    pub re: String,
+    pub ms: f64,
+    pub text: String,
+    /// How many sessions on this node it was shown to.
+    pub shown_to: f64,
+}
+
+pub fn parse_messages(v: &Value) -> Vec<Message> {
+    v["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| Message {
+            id: s(&m["id"]),
+            kind: s(&m["kind"]),
+            from: s(&m["from"]),
+            to: s(&m["to_name"]),
+            to_kind: s(&m["to_kind"]),
+            harness: s(&m["harness"]),
+            re: s(&m["re"]),
+            ms: f(&m["ms"]),
+            text: s(&m["text"]),
+            shown_to: f(&m["shown_to"]),
         })
         .collect()
 }
@@ -528,7 +571,7 @@ pub struct Data {
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
     /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source.
-    pub sources: [Source; 7],
+    pub sources: [Source; 8],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -538,6 +581,9 @@ pub struct Data {
     pub drones: Memo<Vec<Drone>>,
     /// The collective's L1 playbooks; empty without one (or on a server without `/api/playbooks`).
     pub playbooks: Memo<Vec<Playbook>>,
+    /// Messages between sessions, newest first, and how many wait unread on this node.
+    pub messages: Memo<Vec<Message>>,
+    pub unread: Memo<f64>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -574,8 +620,9 @@ pub fn provide() -> Data {
         Source::new("drones"),
         Source::new("playbooks"),
         Source::new("learning"),
+        Source::new("messages"),
     ];
-    let [st, le, fe, qu, dr, pb, _] = sources;
+    let [st, le, fe, qu, dr, pb, _, me] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -588,6 +635,8 @@ pub fn provide() -> Data {
         attention: Memo::new(move |_| parse_attention(&qu.raw.get())),
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
         playbooks: Memo::new(move |_| parse_playbooks(&pb.raw.get())),
+        messages: Memo::new(move |_| parse_messages(&me.raw.get())),
+        unread: Memo::new(move |_| f(&me.raw.get()["unread"])),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

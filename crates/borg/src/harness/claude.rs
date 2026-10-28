@@ -50,6 +50,7 @@ impl Harness for Claude {
             // margin too.
             stop_budget: None,
             session_env: Some("CLAUDE_CODE_SESSION_ID"),
+            pid_env: None,
             drone_wake: DroneWake::Model,
         }
     }

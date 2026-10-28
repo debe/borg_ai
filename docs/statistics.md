@@ -85,6 +85,7 @@ one lesson can get on top of either, as on the Conscience tab.
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
 | `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
 | `steer_issued`, `steer_delivered`, `steer_dropped` | A signed directive sent, shown to a drone, or refused on receipt |
+| `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: rate` when the rate limit refused it, `why: bounds` when the 500-line cap cut it. Lines that expire are not counted |
 | `pause_refused` | A tool call refused because its drone was paused |
 | `queen_queued`, `queen_delivered`, `queen_answered`, `queen_skipped`, `queen_dismissed` | The queen's questions; an answer carries the time it took |
 | `assimilated` | One imported chunk of team documents and the lessons it gave |

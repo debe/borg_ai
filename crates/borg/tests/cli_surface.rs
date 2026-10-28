@@ -85,6 +85,9 @@ const PROBES: &[(&str, &[&str])] = &[
     ("web", &["--help"]),
     ("mesh", &["--help"]),
     ("steer", &[]),
+    ("tell", &["--re"]),
+    ("ask", &["--re"]),
+    ("inbox", &["--re"]),
 ];
 
 const DEBUG_PROBES: &[(&str, &[&str])] = &[

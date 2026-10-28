@@ -204,7 +204,9 @@ pub fn prune(home: &Path, now: i64) {
             .is_some_and(|d| now - d.as_millis() as i64 > PRUNE_MS);
         if old {
             let _ = std::fs::remove_file(e.path());
-            // Its steering delivery claims go with it (the file stem is the safe session id).
+            // Its steering claims go with it (the file stem is the safe session id). Its message claims
+            // stay: a resumed session keeps its id, and they must outlive the messages they cover (msg.rs
+            // drops them past the TTL).
             if let Some(session) = e.path().file_stem().and_then(|s| s.to_str()).filter(|s| !s.starts_with('.')) {
                 crate::steer::forget_session(home, session);
             }
@@ -543,6 +545,27 @@ mod tests {
         let r = remote(&home, 40);
         assert_eq!(r.iter().map(|r| (r.key.as_str(), r.p.ms)).collect::<Vec<_>>(), [("k1", 30), ("k2", 5)]);
         assert!(remote(&home, 40 + PRUNE_MS).is_empty(), "a day old: gone");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session resumed a day later keeps its id: the prune of its presence does not show its direct
+    /// messages again.
+    #[test]
+    fn a_resumed_session_is_not_shown_its_messages_again() {
+        let home = tmp("resume");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let input = json!({"session_id": "s2"});
+        write(&home, &update(None, "corp", "claude", "prompt", &input, now, who)).unwrap();
+        let from = crate::msg::Sender { by: "s1".into(), name: "Two of Five".into(), harness: "claude".into(), node: "n1".into() };
+        crate::msg::send(&home, crate::msg::Message::new(crate::msg::TELL, &from, "s2", None, now, "the API is stable"), now).unwrap();
+        let caps = crate::harness::by_name("claude").expect("a harness").caps();
+        assert!(crate::msg::deliver(&home, caps, "prompt", &input, Some(now), now, None).is_some(), "shown");
+
+        let later = now + PRUNE_MS + 60_000;
+        prune(&home, later);
+        assert!(read(&home, "s2").is_none(), "the presence is pruned");
+        write(&home, &update(None, "corp", "claude", "prompt", &input, later, who)).unwrap();
+        assert_eq!(crate::msg::deliver(&home, caps, "prompt", &input, Some(later), later, None), None, "not shown again");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

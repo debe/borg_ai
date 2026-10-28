@@ -156,6 +156,24 @@ What syncs and what stays is under [Privacy](#privacy). `borg top` is a live scr
 `borg steer` sends them a signed instruction. Set up: `borg setup --team <name>` or `--join <ticket>`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 
+## Talking to other sessions
+
+Sessions in one collective can message each other, whatever harness runs them and whichever member's
+machine they are on. A session or the engineer's terminal sends:
+
+```sh
+borg tell Two "the schema change is merged, rebase before you touch migrations"
+borg ask all "is anyone editing crates/borg/src/hook.rs?"
+borg inbox      # in a session: its messages; in a terminal: every message of the last 7 days
+```
+
+The recipient is a drone as `borg top` names it, a session id, `all` (the sessions running when it was
+sent) or `engineer`. The message is shown once, at the recipient's next prompt or tool call, marked as
+peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
+Text is redacted and cut to 1,000 characters, and one sender may send a recipient one message per 10
+minutes. A session that is idle sees it when it next runs; waking it comes later.
+[Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
+
 ## Monitoring
 
 ```sh
@@ -192,7 +210,7 @@ per-session state.
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
 lessons (with author emails and repo names); redacted reasoning excerpts of landed commits, each held by
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
-of your latest prompt, touched paths); steering and the signed member list; daily usage counts per
+of your latest prompt, touched paths); redacted messages between sessions; steering and the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
 ratified constraints (the invariant, its lesson and who ratified it, never the veto's words); and promoted
 playbook edits.

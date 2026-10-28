@@ -690,6 +690,30 @@ test("opencode 2: borg's tool context is steered into the session; the tool resu
   await cleanup()
 })
 
+test("opencode 2: a prompt context whose synthetic insert fails is not lost: the next tool call carries it", async () => {
+  process.env.BORG_BIN = contextBorg()
+  const f = fakeCtx(() => PLAN)
+  const insert = f.ctx.session.synthetic
+  let fail = true
+  f.ctx.session.synthetic = async (input: any) => {
+    if (fail) throw new Error("synthetic refused")
+    return insert(input)
+  }
+  const cleanup = await plugin.setup(f.ctx)
+  process.env.PROMPT_CTX = "[borg] message from a peer"
+  try {
+    await f.hooks["session.prompt"]({ sessionID: SESSION, messageID: "msg_1", prompt: { text: "Fix the relay race" }, delivery: "steer" })
+  } finally {
+    delete process.env.PROMPT_CTX
+  }
+  assert.equal(f.synthetics.length, 0)
+  fail = false
+  const result = { content: [{ type: "text", text: "ok" }] }
+  await f.hooks["tool.execute.after"]({ tool: "read", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c1", input: { path: "/work/repo/a.rs" }, status: "completed", result })
+  assert.deepEqual(f.synthetics.map((x) => x.text), ["[borg] message from a peer"])
+  await cleanup()
+})
+
 test("a tool context slower than POST_MS is never lost: it comes with the next tool call or the next prompt", async () => {
   process.env.BORG_BIN = contextBorg()
   const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))

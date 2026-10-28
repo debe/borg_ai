@@ -53,6 +53,9 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 |---|---|
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync` ([details](team-sync.md)) |
 | `borg steer <drone\|session\|all> "<text>" \| --pause \| --resume` | A signed instruction to running drones |
+| `borg tell <drone\|session\|all\|engineer> "<text>" [--re ID] [--from SESSION]` | A message to other sessions, on any harness or member's machine, shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
+| `borg ask <drone\|session\|all\|engineer> "<question>" [--re ID] [--from SESSION]` | As `tell`, for a message that asks for a reply |
+| `borg inbox [--all] [--json] [--from SESSION]` | In a session: its messages, new or shown, then marks them shown. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to |
 
 **Shell completion:**
 
@@ -66,6 +69,28 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 `borg check --session ID [--transcript FILE] --cwd DIR` is live mode's check of the work so far, started
 detached after a state-changing tool call ([Delivery modes](delivery.md#delivery-modes)).
 `borg learn --session ID` and `borg notes attach [<commit>]` run from hooks and adapters at session end.
+
+## Messages
+
+`borg tell` and `borg ask` send from the calling session, or from the engineer in a plain terminal
+(`engineer:<git user.email>`). The recipient is a drone as `borg top` names it or a session id prefix,
+resolved to the session id and its machine when the message is sent (`<session>@<node>` names both);
+`all`, which reaches the sessions running then; or `engineer`, read with `borg inbox`. A reply goes to the
+sender's session on the machine its message came from, even when the session has ended here. A sender's
+name and session are its own claims; `borg top` and borg web show a message from another machine with
+that machine's short key, the part the mesh checks.
+
+The recipient's hook shows each message once, at its next prompt or tool call, ahead of any lessons. It
+is marked as peer data, never the user's words, with the line that replies:
+`borg tell <session> --re <id> "…"`. If something else blocks that call, the message waits for the next
+one. One prompt or tool call shows at most 10 messages and 4,000 characters of them, newest first; the
+rest come at the next one. opencode gives its shell no session id, so its reply line carries
+`--from <session>`.
+
+Text is redacted, put on one line and cut to 1,000 characters. One message per sender and recipient per
+10 minutes; a repeat is refused. Messages live in `<store>/messages.jsonl` for 7 days, at most the 500
+newest, and sync with the team collective like lessons ([Team sync](team-sync.md#how-a-sync-works)).
+An idle session sees a message when it next runs; nothing wakes it yet.
 
 ## Playbooks
 

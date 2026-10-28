@@ -146,6 +146,10 @@ pub struct Caps {
     /// The variable the harness sets to its session's id in every command its model runs; None: the
     /// harness gives its shell no id (opencode).
     pub session_env: Option<&'static str>,
+    /// The variable the harness sets to its own pid in every command its model runs, for a harness
+    /// whose shell has no session id: its events carry that pid (`sends_pid`), so presence names the
+    /// session (opencode's `OPENCODE_PID`, set by its CLI).
+    pub pid_env: Option<&'static str>,
     /// How an idle session of the harness can be woken with a message.
     pub drone_wake: DroneWake,
 }
@@ -274,6 +278,13 @@ pub fn session_vars() -> Vec<(&'static str, &'static str)> {
 pub fn env_sessions() -> Vec<(String, &'static str)> {
     let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     session_vars().into_iter().filter_map(|(k, h)| var(k).map(|v| (v, h))).collect()
+}
+
+/// Every harness pid set in this process's environment (`Caps::pid_env`), each with its harness, in
+/// [`ALL`]'s order.
+pub fn env_pids() -> Vec<(u32, &'static str)> {
+    let pid = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u32>().ok());
+    ALL.iter().filter_map(|h| h.caps().pid_env.and_then(pid).map(|p| (p, h.name()))).collect()
 }
 
 /// The event's transcript, when the harness writes one and the event names it.

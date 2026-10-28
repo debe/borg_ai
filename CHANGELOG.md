@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Messages between sessions: `borg tell <to> "<text>"`, `borg ask <to> "<question>"` and `borg inbox`.
+  A session on any harness, or the engineer's terminal, writes to a drone, a session, `all` or the
+  engineer; the recipient sees it once at its next prompt or tool call, as peer data with the command
+  that replies. Messages are redacted, rate limited, kept 7 days and synced with the team collective.
+  Stats count `msg_sent`, `msg_delivered` and `msg_dropped`. Waking an idle session comes later.
+
 ### Removed
 
 - The hive: `borg hive` and `borg debug hive`, interactive drones, and goals with their boards, claims,

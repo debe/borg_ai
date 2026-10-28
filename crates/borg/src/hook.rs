@@ -1578,7 +1578,8 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Vec<&co
 }
 
 /// `borg hook <harness> <event>`, the event on stdin: routes the repo to its collective (an off repo
-/// leaves no trace), records presence, then answers through steering, the experts and [`dispatch`].
+/// leaves no trace), records presence, then answers through steering, the experts and [`dispatch`],
+/// with the messages from other sessions (msg.rs).
 /// An unknown harness, like any failure here, lets the drone continue untouched.
 pub fn main(name: &str, event: &str) {
     let Some(h) = harness::by_name(name) else { return };
@@ -1633,9 +1634,12 @@ pub fn main(name: &str, event: &str) {
     };
     // Signed steering (steer.rs) wraps the answer: shown once, and a pause holds tools and the stop.
     // At a stop, the routed collective's experts join the conscience's block (expert_route.rs).
-    if let Some(out) = crate::steer::around(&home, h.caps().steer_in_context, event, &input, me.map(|p| p.started), now, || {
+    let started = me.map(|p| p.started);
+    let out = crate::steer::around(&home, h.caps().steer_in_context, event, &input, started, now, || {
         crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input))
-    }) {
+    });
+    // Messages from other sessions (msg.rs) join a prompt's or tool call's context, each once.
+    if let Some(out) = crate::msg::deliver(&home, h.caps(), event, &input, started, now, out) {
         println!("{out}");
     }
 }

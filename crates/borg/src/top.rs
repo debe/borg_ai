@@ -6,13 +6,19 @@
 //! otherwise every collective on this machine that has drones. On a terminal it is a live screen until
 //! `q` (top_live.rs); piped, or with `--once`, it prints the text once; `--json` prints the same data
 //! for scripts.
+//!
+//! Messages (msg.rs): each local drone's unread count (what its next prompt or tool call shows), and
+//! the collective's last few messages, one line each. A remote drone's reads are claimed on its node.
+//! A sender is named by what its line claims, with the node the mesh checked it against (`sender`).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::collective::{self, Route, Share};
+use crate::msg::{self, Address, Message};
 use crate::presence::{self, Presence, State};
 use crate::{install, learn, steer};
 
@@ -30,6 +36,25 @@ pub struct Drone {
     #[serde(flatten)]
     pub p: Presence,
 }
+
+/// The messages side of a collective's screen.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Inbox {
+    /// Per local drone's session, the messages not shown to it yet.
+    pub unread: BTreeMap<String, usize>,
+    /// The newest `RECENT` messages, newest first.
+    pub recent: Vec<Message>,
+    /// The messages sent in the last day.
+    pub day: usize,
+    /// This node as messages name it (msg.rs `node`).
+    #[serde(skip)]
+    pub here: String,
+}
+
+/// How many messages the screen lists.
+pub const RECENT: usize = 5;
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 const NUMBERS: [&str; 20] = [
     "One",
@@ -87,6 +112,82 @@ pub fn drones(home: &Path, may_sync: bool, now: i64) -> Vec<Drone> {
     assemble(presence::local(home, now), remote, now, presence::alive, |p| steer::pending(home, &p.session, p.started, now).paused.is_some())
 }
 
+/// The messages of the store at `home` for its `drones` as of `now` (one read of the log, one
+/// directory listing per local drone that has a message).
+pub fn inbox(home: &Path, drones: &[Drone], now: i64) -> Inbox {
+    if std::fs::metadata(msg::path(home)).is_err() {
+        return Inbox::default();
+    }
+    let all: Vec<Message> = msg::read(home).into_iter().filter(|m| now - m.ms <= msg::TTL_MS).collect();
+    let here = msg::node(home);
+    let unread = unread_of(home, drones, &here, &all, now);
+    let day = all.iter().filter(|m| now - m.ms <= DAY_MS).count();
+    let mut recent = all;
+    recent.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
+    recent.truncate(RECENT);
+    Inbox { unread, recent, day, here }
+}
+
+/// Per live local drone's session, how many of the already-read `all` messages were not shown to it
+/// (`here`: this node, msg.rs `node`).
+pub fn unread_of(home: &Path, drones: &[Drone], here: &str, all: &[Message], now: i64) -> BTreeMap<String, usize> {
+    drones
+        .iter()
+        .filter(|d| d.node.is_empty() && d.state != State::Ended)
+        .map(|d| (d.p.session.clone(), msg::unread(home, all, here, &d.p.session, d.p.started, now)))
+        .collect()
+}
+
+/// The drone of `drones` that is `session` on `node` (`here`: this node).
+fn drone_at<'a>(drones: &'a [Drone], here: &str, node: &str, session: &str) -> Option<&'a Drone> {
+    drones.iter().find(|d| d.p.session == session && if d.node.is_empty() { node == here } else { d.node == node })
+}
+
+/// Who sent `m`, as the screen says it: the drone its (node, `by`) pair is, else the name it was sent
+/// under, else the start of `by`; the engineer by email. Every part but the node is the sender's claim,
+/// so a line from another node than `here` carries that node's short key (as msg.rs `line`).
+pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
+    let name = match Address::parse(&m.by) {
+        Some(Address::Engineer { email }) if email.is_empty() => msg::ENGINEER.into(),
+        Some(Address::Engineer { email }) => collective::aliases().display(&email),
+        _ => match drone_at(drones, here, &m.node, &m.by) {
+            Some(d) => d.designation.clone(),
+            None if !m.name.is_empty() => m.name.clone(),
+            None => m.by.chars().take(8).collect(),
+        },
+    };
+    if m.node == here { name } else { format!("{name} @{}", m.node.get(..12).unwrap_or(&m.node)) }
+}
+
+/// Whom `to` names, as the screen says it: `all`, the engineer, the drone it is, else the start of the
+/// session id.
+pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
+    match Address::parse(to) {
+        Some(Address::Engineer { email }) if !email.is_empty() => collective::aliases().display(&email),
+        Some(Address::Session { id, node }) => {
+            let d = match node {
+                Some(n) => drone_at(drones, here, &n, &id),
+                None => drones.iter().find(|d| d.p.session == id),
+            };
+            d.map_or_else(|| id.chars().take(8).collect(), |d| d.designation.clone())
+        }
+        Some(a) => a.to_string(),
+        None => to.chars().take(8).collect(),
+    }
+}
+
+/// One message as one screen line (without its age): `sender -> recipient: text` (msg.rs keeps the
+/// text on one line, its whitespace collapsed).
+pub fn message_line(drones: &[Drone], here: &str, m: &Message) -> String {
+    let ask = if m.asks() { " asks" } else { "" };
+    format!("{}{ask} -> {}: {}", sender(drones, here, m), recipient(drones, here, &m.to), m.text)
+}
+
+/// A drone's unread count as the screen shows it: `-` where this node cannot tell (a remote or ended one).
+pub fn unread_cell(inbox: &Inbox, d: &Drone) -> String {
+    inbox.unread.get(&d.p.session).map_or_else(|| "-".into(), usize::to_string)
+}
+
 /// Which drone `target` names: "all", a designation ("Two", "Two of Five", "2") or a session id
 /// (or a unique prefix of at least 4 characters). `Ok(None)` is every drone.
 pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone>, String> {
@@ -121,7 +222,7 @@ fn cut(s: &str, n: usize) -> String {
 }
 
 /// One collective's screen.
-pub fn render(name: &str, share: Share, drones: &[Drone], now: i64) -> String {
+pub fn render(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, now: i64) -> String {
     let working = drones.iter().filter(|d| matches!(d.state, State::Working | State::Waiting)).count();
     let remote = drones.iter().filter(|d| !d.node.is_empty()).count();
     let share = match share {
@@ -129,21 +230,35 @@ pub fn render(name: &str, share: Share, drones: &[Drone], now: i64) -> String {
         Share::Local => "local, never leaves this machine",
     };
     let mut s = format!("{name} ({share}): {} drone(s), {working} active, {remote} remote\n", drones.len());
-    if drones.is_empty() {
-        return s;
+    if !drones.is_empty() {
+        s.push_str(&drone_table(drones, inbox, now));
     }
-    s.push_str(&format!("  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6}  {:<40} {}\n", "DRONE", "SESSION", "ENGINEER", "REPO", "STATE", "IDLE", "DOING", "FILES"));
+    if !inbox.recent.is_empty() {
+        s.push_str(&format!("  messages: {} in the last day, {} unread\n", inbox.day, inbox.unread.values().sum::<usize>()));
+        for m in &inbox.recent {
+            s.push_str(&format!("  {:>6}  {}\n", ago(now - m.ms), cut(&message_line(drones, &inbox.here, m), 120)));
+        }
+    }
+    s
+}
+
+fn drone_table(drones: &[Drone], inbox: &Inbox, now: i64) -> String {
+    let mut s = format!(
+        "  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6} {:>6}  {:<40} {}\n",
+        "DRONE", "SESSION", "ENGINEER", "REPO", "STATE", "IDLE", "UNREAD", "DOING", "FILES"
+    );
     for d in drones {
         let state = if d.paused { "paused" } else { d.state.name() };
         let engineer = if d.node.is_empty() { d.p.engineer.clone() } else { format!("{} @{}", d.p.engineer, d.node.get(..6).unwrap_or(&d.node)) };
         let line = format!(
-            "  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6}  {:<40} {}",
+            "  {:<18} {:<8} {:<24} {:<14} {:<8} {:>6} {:>6}  {:<40} {}",
             d.designation,
             cut(&d.p.session, 8),
             cut(if engineer.is_empty() { "?" } else { &engineer }, 24),
             cut(&d.p.repo, 14),
             state,
             ago(now - d.p.ms),
+            unread_cell(inbox, d),
             cut(&d.p.prompt, 40),
             d.p.files.join(", ")
         );
@@ -155,6 +270,20 @@ pub fn render(name: &str, share: Share, drones: &[Drone], now: i64) -> String {
 
 pub fn to_json(name: &str, share: Share, drones: &[Drone]) -> Value {
     json!({"collective": name, "share": if share == Share::Team { "team" } else { "local" }, "drones": drones})
+}
+
+/// `to_json` with the messages side: each local drone's `unread`, and the collective's `messages`.
+pub fn to_json_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox) -> Value {
+    let mut v = to_json(name, share, drones);
+    if let Some(ds) = v["drones"].as_array_mut() {
+        for (o, d) in ds.iter_mut().zip(drones) {
+            if let Some(n) = inbox.unread.get(&d.p.session) {
+                o["unread"] = json!(n);
+            }
+        }
+    }
+    v["messages"] = json!({"day": inbox.day, "recent": inbox.recent});
+    v
 }
 
 /// The collectives to show: the one `dir` routes to, or every one on this machine.
@@ -177,10 +306,11 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>,
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
-        if ds.is_empty() && dir.is_none() {
+        let inbox = inbox(home, &ds, now);
+        if ds.is_empty() && inbox.recent.is_empty() && dir.is_none() {
             continue;
         }
-        out.push(crate::top_live::Coll { name: name.clone(), share: *share, drones: ds });
+        out.push(crate::top_live::Coll { name: name.clone(), share: *share, drones: ds, inbox });
     }
     Ok(out)
 }
@@ -196,10 +326,11 @@ fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String>
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
+        let inbox = inbox(home, &ds, now);
         if json_out {
-            all.push(to_json(name, *share, &ds));
-        } else if !ds.is_empty() || dir.is_some() {
-            text.push_str(&render(name, *share, &ds, now));
+            all.push(to_json_with(name, *share, &ds, &inbox));
+        } else if !ds.is_empty() || !inbox.recent.is_empty() || dir.is_some() {
+            text.push_str(&render(name, *share, &ds, &inbox, now));
             text.push('\n');
         }
     }
@@ -253,6 +384,11 @@ pub(crate) fn tests_fixture() -> Vec<Drone> {
 }
 
 #[cfg(test)]
+pub(crate) fn tests_inbox() -> Inbox {
+    tests::inbox_fixture()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -287,23 +423,92 @@ mod tests {
         assemble(local, remote, NOW, |_| true, |p| p.session.starts_with("aaaa"))
     }
 
+    fn message(by: &str, name: &str, to: &str, kind: &str, ms: i64, text: &str) -> Message {
+        message_on("n1", by, name, to, kind, ms, text)
+    }
+
+    fn message_on(node: &str, by: &str, name: &str, to: &str, kind: &str, ms: i64, text: &str) -> Message {
+        let from = msg::Sender { by: by.into(), name: name.into(), harness: "claude".into(), node: node.into() };
+        Message::new(kind, &from, to, None, ms, text)
+    }
+
+    pub(crate) fn inbox_fixture() -> Inbox {
+        Inbox {
+            unread: [("aaaa1111-x".to_string(), 2), ("cccc3333-x".to_string(), 0)].into_iter().collect(),
+            recent: vec![
+                message("cccc3333-x", "Three of Three", "aaaa1111-x", msg::ASK, NOW - 60_000, "which   test\nflakes?"),
+                message("engineer:alice@x", "alice@x", msg::ALL, msg::TELL, NOW - 120_000, "release at five"),
+                message_on(&"feed".repeat(16), "gone-session", "Six of Six", "zzzz9999-q", msg::TELL, NOW - 180_000, "done"),
+            ],
+            day: 3,
+            here: "n1".into(),
+        }
+    }
+
     #[test]
     fn renders_one_screen_per_collective() {
-        let out = render("corp", Share::Team, &fixture(), NOW);
+        let out = render("corp", Share::Team, &fixture(), &inbox_fixture(), NOW);
         let expected = "\
 corp (team): 3 drone(s), 2 active, 1 remote
-  DRONE              SESSION  ENGINEER                 REPO           STATE      IDLE  DOING                                    FILES
-  One of Three       aaaa111… alice@x                  borg-ai        paused       5s  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
-  Two of Three       bbbb222… bob@y @beefca            borg-ai        waiting      2m  review PR 42                             README.md
-  Three of Three     cccc333… alice@x                  borg-ai        idle        31m  write the release notes for the mesh da…
+  DRONE              SESSION  ENGINEER                 REPO           STATE      IDLE UNREAD  DOING                                    FILES
+  One of Three       aaaa111… alice@x                  borg-ai        paused       5s      2  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
+  Two of Three       bbbb222… bob@y @beefca            borg-ai        waiting      2m      -  review PR 42                             README.md
+  Three of Three     cccc333… alice@x                  borg-ai        idle        31m      0  write the release notes for the mesh da…
+  messages: 3 in the last day, 2 unread
+      1m  Three of Three asks -> One of Three: which test flakes?
+      2m  alice@x -> all: release at five
+      3m  Six of Six @feedfeedfeed -> zzzz9999: done
 ";
         assert_eq!(out, expected, "\n{out}");
-        assert_eq!(render("private", Share::Local, &[], NOW), "private (local, never leaves this machine): 0 drone(s), 0 active, 0 remote\n");
+        let none = Inbox::default();
+        assert_eq!(render("private", Share::Local, &[], &none, NOW), "private (local, never leaves this machine): 0 drone(s), 0 active, 0 remote\n");
+    }
+
+    /// The unread count is what the next prompt would show: a message shown once no longer counts,
+    /// broadcasts only to drones running when sent, never its own; no log costs no read.
+    #[test]
+    fn unread_counts_follow_the_shown_once_claims() {
+        let home = std::env::temp_dir().join(format!("borg-top-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let ds = fixture();
+        assert!(inbox(&home, &ds, NOW).recent.is_empty());
+        let here = msg::node(&home);
+        msg::send(&home, message_on(&here, "cccc3333-x", "Three of Three", "aaaa1111-x", msg::TELL, NOW - 3_000, "look at recon"), NOW).unwrap();
+        msg::send(&home, message_on(&here, "cccc3333-x", "Three of Three", msg::ALL, msg::TELL, NOW - 2_000, "lunch"), NOW).unwrap();
+        let i = inbox(&home, &ds, NOW);
+        assert_eq!(i.unread.get("aaaa1111-x"), Some(&2), "{i:?}");
+        assert_eq!(i.unread.get("cccc3333-x"), Some(&0), "its own broadcast");
+        assert!(!i.unread.contains_key(&ds[1].p.session), "remote: claimed on its node");
+        assert_eq!((i.day, i.recent[0].text.as_str()), (2, "lunch"));
+        let caps = crate::harness::by_name("claude").expect("a harness").caps();
+        let ev = json!({"session_id": "aaaa1111-x"});
+        assert!(msg::deliver(&home, caps, "prompt", &ev, Some(100), NOW, None).is_some());
+        assert_eq!(inbox(&home, &ds, NOW).unread.get("aaaa1111-x"), Some(&0));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A line's `by` and `name` are its sender's claims: one from another node that names a local drone's
+    /// session is not shown as that drone, and carries its node's key.
+    #[test]
+    fn a_sender_is_tied_to_the_node_its_line_names() {
+        let ds = fixture();
+        let own = message("aaaa1111-x", "anything", msg::ALL, msg::TELL, NOW, "hi");
+        assert_eq!(sender(&ds, "n1", &own), "One of Three", "this node's drone");
+        let forged = message_on("evil0123456789", "aaaa1111-x", "One of Three", msg::ALL, msg::TELL, NOW, "hi");
+        assert_eq!(sender(&ds, "n1", &forged), "One of Three @evil01234567", "the claim, with the node it came from");
+        let remote = message_on(&"beefcafe".repeat(8), &ds[1].p.session, "x", msg::ALL, msg::TELL, NOW, "hi");
+        assert_eq!(sender(&ds, "n1", &remote), "Two of Three @beefcafebeef", "the remote drone on its own node");
+        assert_eq!(recipient(&ds, "n1", "aaaa1111-x@n1"), "One of Three");
+        assert_eq!(recipient(&ds, "n1", "aaaa1111-x@evil"), "aaaa1111", "not the local drone of that id");
+        assert_eq!((recipient(&ds, "n1", "engineer"), recipient(&ds, "n1", msg::ALL)), ("engineer".into(), "all".into()));
     }
 
     #[test]
     fn json_for_scripts() {
-        let v = to_json("corp", Share::Team, &fixture());
+        let v = to_json_with("corp", Share::Team, &fixture(), &inbox_fixture());
+        assert_eq!((v["drones"][0]["unread"].as_u64(), v["drones"][1].get("unread")), (Some(2), None));
+        assert_eq!((v["messages"]["day"].as_u64(), v["messages"]["recent"][0]["kind"].as_str()), (Some(3), Some("ask")));
         assert_eq!(v["collective"], "corp");
         let d = &v["drones"];
         assert_eq!(d.as_array().unwrap().len(), 3);

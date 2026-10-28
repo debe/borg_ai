@@ -273,6 +273,7 @@ fn main() {
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
+        [cmd @ ("tell" | "ask" | "inbox"), rest @ ..] => std::process::exit(borg::msg::main(cmd, rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),

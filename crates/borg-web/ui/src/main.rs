@@ -13,16 +13,17 @@ use leptos::prelude::*;
 
 use crate::drawer::Drawer;
 use crate::views::{
-    conscience::Conscience, cost::Cost, drones::Drones, knowledge::Knowledge, learning::Learning, overview::Overview, playbooks::Playbooks, queen::Queen,
-    steering::Steering,
+    conscience::Conscience, cost::Cost, drones::Drones, knowledge::Knowledge, learning::Learning, messages::Messages, overview::Overview, playbooks::Playbooks,
+    queen::Queen, steering::Steering,
 };
 
-const TABS: [(&str, &str); 9] = [
+const TABS: [(&str, &str); 10] = [
     ("overview", "Overview"),
     ("knowledge", "Knowledge"),
     ("conscience", "Conscience"),
     ("learning", "Learning"),
     ("steering", "Steering"),
+    ("messages", "Messages"),
     ("queen", "Queen"),
     ("cost", "Cost"),
     ("drones", "Drones"),
@@ -83,6 +84,7 @@ fn App() -> impl IntoView {
                 "conscience" => view! { <Conscience /> }.into_any(),
                 "learning" => view! { <Learning /> }.into_any(),
                 "steering" => view! { <Steering /> }.into_any(),
+                "messages" => view! { <Messages /> }.into_any(),
                 "queen" => view! { <Queen /> }.into_any(),
                 "cost" => view! { <Cost /> }.into_any(),
                 "drones" => view! { <Drones /> }.into_any(),

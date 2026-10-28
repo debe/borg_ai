@@ -139,7 +139,9 @@ with the session, repo and regret hashed, so every member derives the same lesso
 quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
 (`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Ratified constraints (`borg no`, `borg queen`) sync
 too, signed and quarantined like lessons, holding the invariant, its lesson and who ratified it, never the
-veto's words; every member's sessions get them as standing lessons. Peers on `borg/mesh/11` and earlier
+veto's words; every member's sessions get them as standing lessons. Messages between sessions (`borg tell`, `borg ask`)
+sync like lessons: a union of `messages.jsonl`, each line authenticated by the machine it came from and
+checked on read, its text already redacted. Peers on `borg/mesh/11` and earlier
 do not sync with this version: upgrade every member. A session with a
 member on another version ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
 ("peer <key> speaks borg/mesh/5, this node borg/mesh/12: nothing syncs with it; upgrade it") until a session with

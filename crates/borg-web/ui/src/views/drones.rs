@@ -29,6 +29,7 @@ pub fn Drones() -> impl IntoView {
                                 <span class=format!("badge {}", x.state)>{x.state.clone()}</span>
                                 {x.paused.then(|| view! { <span class="badge paused">"paused"</span> })}
                                 {x.remote.then(|| view! { <span class="badge remote">"remote"</span> })}
+                                {x.unread.filter(|n| *n > 0.0).map(|n| view! { <span class="badge waiting" title="messages its next prompt or tool call shows (borg inbox)">{format!("{n} unread")}</span> })}
                                 <span class=move || format!("badge mode-{}", d.mode()) title="the collective's delivery mode">{move || d.mode()}</span>
                             </div>
                             <div class="drone-who">{format!("{} · {} · {}", who(&x.engineer), if x.repo.is_empty() { "?" } else { &x.repo }, x.harness)}</div>

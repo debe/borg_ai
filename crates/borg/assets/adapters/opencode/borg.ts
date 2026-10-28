@@ -572,6 +572,8 @@ async function setup(ctx: any) {
       await ctx.session.synthetic({ sessionID: id, text: context, delivery: e.delivery, resume: false })
       note(`${id}: borg's prompt context added (${context.length} chars)`)
     } catch (err) {
+      // borg already counts it shown (a message's seen claim): the next call or prompt carries it.
+      d.get(id).late.unshift(context)
       note(`adding borg's prompt context to ${id} failed: ${err}`)
     }
   })

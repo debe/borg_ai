@@ -39,6 +39,7 @@ pub fn caps_of(list: &str) -> Caps {
         sends_pid: on("pid"),
         stop_budget: None,
         session_env: None,
+        pid_env: None,
         drone_wake: DroneWake::Model,
     }
 }

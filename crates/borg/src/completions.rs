@@ -106,6 +106,14 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 &["--collective", "--apply", "--paths", "--role", "--expires", "--uses", "--png", "--revoke"],
             ),
             cmd(
+                "tell",
+                &[("<session|drone|all|engineer> <text> [--re ID]", "a message to other sessions, on any harness or node")],
+                &["all"],
+                crate::msg::FLAGS,
+            ),
+            cmd("ask", &[("<session|drone|all|engineer> <question> [--re ID]", "a message that asks for a reply")], &["all"], crate::msg::FLAGS),
+            cmd("inbox", &[("[--all] [--json]", "this session's messages; from a terminal, every recent one")], &[], crate::msg::INBOX_FLAGS),
+            cmd(
                 "steer",
                 &[("<drone|all> <text> | --pause | --resume", "a signed instruction to running drones")],
                 &["all"],

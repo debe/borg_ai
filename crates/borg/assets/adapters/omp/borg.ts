@@ -231,8 +231,15 @@ export default function borg(pi: any): void {
 	// if one does start an agent run (a prompt template, a skill), its expansion arrives through
 	// before_agent_start instead.
 	let command = false;
-	// borg's context for the prompt seen at `input`, handed to the turn at its before_agent_start.
-	let context: ReturnType<typeof contextMessage>;
+	// borg's context from `input`s, handed over at the next before_agent_start, or at the next
+	// tool_result when the input was a steer into a running turn (omp emits `input` mid-turn too, and
+	// a steer starts no agent run). Only added to: borg counts a message shown once it answers.
+	const pending: string[] = [];
+	const keep = (out: Json | null) => {
+		const m = contextMessage(out);
+		if (m) pending.push(m.content);
+	};
+	const take = () => pending.splice(0).join("\n\n");
 
 	pi.on(
 		"input",
@@ -241,7 +248,7 @@ export default function borg(pi: any): void {
 			inputSeen = true;
 			const said = ev.text.trim();
 			command = isCommand(said);
-			context = said && !command ? contextMessage(await runBorg("prompt", promptEvent(ctx, ev.text), FAST_MS)) : undefined;
+			if (said && !command) keep(await runBorg("prompt", promptEvent(ctx, ev.text), FAST_MS));
 		}),
 	);
 
@@ -251,11 +258,10 @@ export default function borg(pi: any): void {
 			const fromCommand = command;
 			command = false;
 			if ((!inputSeen || fromCommand) && typeof ev.prompt === "string" && ev.prompt.trim() && ev.prompt.trim() !== asked) {
-				context = contextMessage(await runBorg("prompt", promptEvent(ctx, ev.prompt), FAST_MS)) ?? context;
+				keep(await runBorg("prompt", promptEvent(ctx, ev.prompt), FAST_MS));
 			}
-			const message = context;
-			context = undefined;
-			return message ? { message } : undefined;
+			const content = take();
+			return content ? { message: { customType: "borg", content, display: false } } : undefined;
 		}),
 	);
 
@@ -281,8 +287,10 @@ export default function borg(pi: any): void {
 			const [event, payload] = toolEvent(ctx, ev);
 			// A live check's questions (or graded lessons) waiting since an earlier call reach the model
 			// before its next step, as a hidden message; the tool output stays as it is.
-			const c = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
-			return typeof c === "string" && c.trim() ? { additionalContext: c } : undefined;
+			// Context kept from a mid-turn steer goes first.
+			const out = ((await runBorg(event, payload, FAST_MS)) as any)?.hookSpecificOutput?.additionalContext;
+			const c = [take(), typeof out === "string" ? out.trim() : ""].filter(Boolean).join("\n\n");
+			return c ? { additionalContext: c } : undefined;
 		}),
 	);
 

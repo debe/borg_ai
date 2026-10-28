@@ -40,7 +40,12 @@ use serde_json::Value;
 /// (conscience.rs `standing`), lines holding what a lesson does (the redacted invariant, its lesson,
 /// who ratified it). Plain lines (no `version`); the conscience keeps the earliest ratification per id,
 /// so arrival order does not matter.
-pub const SYNCED: [&str; 5] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE, borg::veto::FILE];
+///
+/// And the messages between sessions (borg msg.rs): plain lines, each naming its author's node. That
+/// name is a claim, so a message travels only under an origin of the key it names (`travels`), and
+/// only while it is fresh: a line one node pruned would otherwise come back from every peer. Last in
+/// the list: a 0.3.0 peer (`borg/mesh/12`) reconciles the five before it and never this one.
+pub const SYNCED: [&str; 6] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::playbook::FILE, borg::veto::FILE, borg::msg::FILE];
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).
@@ -54,6 +59,20 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = SYNCED.iter().map(|f| home.join(f)).collect();
     out.push(home.join(REASONING));
     out
+}
+
+/// Whether `line` of the log `file` may be offered or stored under an origin of `key`, at `now`. Any
+/// line but a message's. A message must be one borg msg.rs could have written (`well_formed`), name
+/// `key` as its node (the member key its sender wrote, as `borg top` names a remote node), and be
+/// fresh (msg.rs `fresh`: neither past `TTL_MS` nor stamped further ahead of this clock than
+/// `SKEW_MS`): a member's forged node, or a far-future line that would outlive every prune, never
+/// reaches another member.
+pub fn travels(file: &str, line: &str, key: &str, now: i64) -> bool {
+    if file != borg::msg::FILE {
+        return true;
+    }
+    let Ok(m) = serde_json::from_str::<borg::msg::Message>(line) else { return false };
+    m.well_formed() && m.node == key && borg::msg::fresh(&m, now)
 }
 
 pub fn hash(line: &str) -> Hash {

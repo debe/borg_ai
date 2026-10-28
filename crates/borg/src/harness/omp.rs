@@ -31,6 +31,7 @@ impl Harness for Omp {
             // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
             stop_budget: None,
             session_env: Some("PI_SESSION_ID"),
+            pid_env: None,
             drone_wake: DroneWake::Plugin,
         }
     }

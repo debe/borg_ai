@@ -61,6 +61,7 @@ impl Harness for Codex {
             // Also inside its sandbox; equal to the hooks' `session_id` and to `codex queue --thread`'s
             // thread (0.153.2, against a local mock model).
             session_env: Some("CODEX_THREAD_ID"),
+            pid_env: None,
             drone_wake: DroneWake::Queue,
         }
     }

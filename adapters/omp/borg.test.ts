@@ -282,6 +282,30 @@ test("tool_result hands borg's context (a live check's questions) to omp as addi
 	delete process.env.ASK;
 });
 
+test("context from mid-turn inputs is kept: a later input does not drop it; the next tool_result or turn carries it", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "borg-omp-pending-"));
+	const bin = join(dir, "borg-msg");
+	// Answers a prompt that names a message with it (as a shown-once session message would be).
+	writeFileSync(bin, `#!/bin/sh\nin=$(cat)\ncase "$in" in *msg-*) m=$(printf %s "$in" | grep -o 'msg-[a-z]*');; *) exit 0;; esac\n[ "$3" = prompt ] && echo "{\\"hookSpecificOutput\\":{\\"hookEventName\\":\\"UserPromptSubmit\\",\\"additionalContext\\":\\"[borg] $m\\"}}"\nexit 0\n`);
+	chmodSync(bin, 0o755);
+	process.env.BORG_BIN = bin;
+	const h = load();
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const input = (t: string) => h.input({ type: "input", text: t, source: "interactive" }, ctx);
+	const result = () => h.tool_result({ type: "tool_result", toolName: "read", toolCallId: "c1", input: { path: "a.rs" }, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
+	const turn = (p: string) => h.before_agent_start({ type: "before_agent_start", prompt: p, systemPrompt: [] }, ctx);
+	// Two steers and a /command while the agent streams (no before_agent_start between them).
+	await input("steer msg-one");
+	await input("/model x");
+	await input("steer msg-two");
+	assert.deepEqual(await result(), { additionalContext: "[borg] msg-one\n\n[borg] msg-two" });
+	assert.equal(await result(), undefined, "handed over once");
+	await input("steer msg-three");
+	await input("plain words");
+	assert.deepEqual(await turn("plain words"), { message: { customType: "borg", content: "[borg] msg-three", display: false } });
+	assert.equal(await turn("again"), undefined);
+});
+
 test("session_stop: when omp gives up on the handler (its signal aborts), borg is killed and nothing is returned", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "borg-omp-abort-"));
 	const bin = join(dir, "borg-slow");

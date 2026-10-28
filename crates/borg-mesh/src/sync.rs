@@ -13,11 +13,15 @@
 //!    same way everywhere). The peer must still be a member under the result, and revocations are
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
-//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl` (lines.rs `SYNCED`), each in turn:
+//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl`, `messages.jsonl`
+//!    (lines.rs `SYNCED`; a 0.3.0 peer's `borg/mesh/12` session stops before the messages), each in turn:
 //!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
 //!    changed. Then `Lines`: what the other side lacks, each line with its
-//!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
-//!    and the membership admits its origin key at its stamp time.
+//!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies,
+//!    the membership admits its origin key at its stamp time, and it may travel under that key
+//!    (lines.rs `travels`: a message names its origin key as its node, and is fresh). Messages also
+//!    travel only within a `window` (one per sender and recipient per rate slot, a share of `KEEP` per
+//!    node, the `KEEP` newest), on offer and on receipt, and what the window cuts is pruned (`prune`).
 //!
 //!    3b. `Goals`: the removed hive's step, still spoken so a 0.3.0 peer keeps syncing on
 //!    `borg/mesh/12`. This node names no goal; for each valid goal id the peer names it follows the
@@ -72,17 +76,38 @@ use crate::{live, steer};
 
 mod vectors;
 
-/// The session protocol. 12 is kept since the hive's removal: its steps (`Goals`, the beats of `Live`)
-/// are still spoken empty, so a 0.3.0 peer syncs the lessons with this node. 11: `constraints.jsonl` is
-/// a fifth synced log (lines.rs `SYNCED`); the logs reconcile in a fixed list, so a peer on 10 would
-/// reconcile another file at the same step and is refused at the handshake instead.
-pub const ALPN: &[u8] = b"borg/mesh/12";
+/// The session protocol. 13: `messages.jsonl` is a sixth synced log (lines.rs `SYNCED`). The logs
+/// reconcile in a fixed list, so a peer on another list would reconcile another file at the same step;
+/// 11 added `constraints.jsonl` and refused 10 at the handshake for that reason.
+pub const ALPN: &[u8] = b"borg/mesh/13";
+/// 0.3.0's protocol, still spoken whole: the session of `ALPN` without the messages (`synced`). 12
+/// already outlived the hive: its steps (`Goals`, the beats of `Live`) are spoken empty.
+pub const LEGACY_ALPN: &[u8] = b"borg/mesh/12";
 /// The protocols of older nodes (`borg/mesh/11` down to `/1`), offered and accepted beside `ALPN` only to
 /// tell a mismatch: without them the handshake fails and nothing says why. A session on one is closed at
 /// once and the peer recorded (`mismatch`). A newer node does the same with this one's `ALPN`.
 fn older() -> Vec<Vec<u8>> {
-    let ours = version(ALPN).unwrap_or(0);
-    (1..ours).rev().map(|v| format!("borg/mesh/{v}").into_bytes()).collect()
+    let below = version(LEGACY_ALPN).unwrap_or(0);
+    (1..below).rev().map(|v| format!("borg/mesh/{v}").into_bytes()).collect()
+}
+
+/// The other side of a session, as the handshake left it: its member key and the protocol it speaks.
+#[derive(Clone, Copy)]
+struct Peer<'a> {
+    key: &'a str,
+    alpn: &'a [u8],
+}
+
+/// Whether a session on `alpn` syncs with this node: `ALPN`, or a 0.3.0 peer's `LEGACY_ALPN`.
+fn spoken(alpn: &[u8]) -> bool {
+    alpn == ALPN || alpn == LEGACY_ALPN
+}
+
+/// The logs a session on `alpn` reconciles, in order: all of `SYNCED`, or on `LEGACY_ALPN` the five a
+/// 0.3.0 peer knows.
+fn synced(alpn: &[u8]) -> impl Iterator<Item = &'static str> {
+    let legacy = alpn == LEGACY_ALPN;
+    SYNCED.into_iter().filter(move |f| !legacy || *f != borg::msg::FILE)
 }
 
 /// The number of a session protocol (`borg/mesh/<n>`).
@@ -335,7 +360,7 @@ impl Node {
         };
         let mut builder = builder
             .secret_key(me.iroh_secret())
-            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec()], older()].concat())
+            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat())
             .clear_ip_transports()
             .ca_tls_config(ca_trust());
         if let Some(a) = addr {
@@ -498,9 +523,10 @@ impl Node {
             return Err(format!("{} is not a member of {name}: refusing to connect", t.key));
         }
         let started = borg::learn::now_ms();
-        let connecting = self.endpoint.connect_with_opts(t.endpoint_addr(&self.relay)?, ALPN, ConnectOptions::new().with_additional_alpns(older()));
+        let alpns = [vec![LEGACY_ALPN.to_vec()], older()].concat();
+        let connecting = self.endpoint.connect_with_opts(t.endpoint_addr(&self.relay)?, ALPN, ConnectOptions::new().with_additional_alpns(alpns));
         let conn = connecting.await.map_err(|e| format!("connect {target}: {e}"))?.await.map_err(|e| format!("connect {target}: {e}"))?;
-        if conn.alpn() != ALPN {
+        if !spoken(conn.alpn()) {
             return Err(self.mismatch(&conn, &t.key));
         }
         let result = async {
@@ -513,7 +539,7 @@ impl Node {
             if collective != name {
                 return Err(format!("peer answered for collective {collective:?}, not {name:?}"));
             }
-            let report = self.exchange(true, &mut tx, &mut rx, membership, &remote, commits).await?;
+            let report = self.exchange(Peer { key: &remote, alpn: conn.alpn() }, true, &mut tx, &mut rx, membership, commits).await?;
             let _ = tx.finish();
             self.synced(&remote, started);
             Ok(report)
@@ -610,7 +636,7 @@ impl Node {
         };
         let started = borg::learn::now_ms();
         let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
-        if conn.alpn() != ALPN && conn.alpn() != JOIN_ALPN {
+        if !spoken(conn.alpn()) && conn.alpn() != JOIN_ALPN {
             let (name, home) = self.gate()?;
             let remote = authorise(&conn, &members(&home)?, &name)?;
             return Err(self.mismatch(&conn, &remote));
@@ -629,7 +655,7 @@ impl Node {
             }
             heard(home, &remote, listen, relay, observed);
             send(&mut tx, &Msg::Hello { collective: name.into(), listen: self.listen(), relay: self.announced() }).await?;
-            let report = self.exchange(false, &mut tx, &mut rx, membership, &remote, &[]).await?;
+            let report = self.exchange(Peer { key: &remote, alpn: conn.alpn() }, false, &mut tx, &mut rx, membership, &[]).await?;
             let _ = tx.finish();
             conn.closed().await; // the dialler closes once it has read everything
             self.synced(&remote, started);
@@ -646,16 +672,17 @@ impl Node {
         self.endpoint.close().await;
     }
 
-    /// The session after both sides know who they talk to (module doc, steps 2–4).
+    /// The session with `peer` after both sides know who they talk to (module doc, steps 2–6).
     async fn exchange(
         &self,
+        peer: Peer<'_>,
         dialler: bool,
         tx: &mut SendStream,
         rx: &mut RecvStream,
         mine: Membership,
-        remote: &str,
         ask: &[String],
     ) -> Result<Report, String> {
+        let Peer { key: remote, alpn } = peer;
         let home = self.home.as_path();
         let mut report = Report::default();
         let Msg::Membership { docs } = swap(dialler, tx, rx, Msg::Membership { docs: Membership::history(home) }).await? else {
@@ -674,8 +701,8 @@ impl Node {
         self.stamp()?;
         let origins = origin::load(home);
 
-        // Lessons: reconcile with everyone.
-        for file in SYNCED {
+        // Lessons, and the other synced logs: reconcile with everyone.
+        for file in synced(alpn) {
             self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
         }
 
@@ -759,7 +786,7 @@ impl Node {
         mine: &Membership,
         report: &mut Report,
     ) -> Result<(), String> {
-        let set = origin::admitted(lines::read(path), origins, mine);
+        let set = offered(path, origins, mine, borg::learn::now_ms());
         self.gate()?; // read first, then gate: a line written after a switch to local is never sent
         let mut r = Recon::new(&set);
         loop {
@@ -818,7 +845,8 @@ impl Node {
     }
 
     /// Stores the lines that were asked for, whose origin verifies and is admitted (and, for
-    /// replicas, is the peer itself): origin records first, so a line is never re-stamped as ours.
+    /// replicas, is the peer itself), and that may travel under it (lines.rs `travels`): origin
+    /// records first, so a line is never re-stamped as ours.
     fn store_lines(
         &self,
         path: &Path,
@@ -828,10 +856,15 @@ impl Node {
         author: Option<&str>,
         report: &mut Report,
     ) -> Result<(), String> {
+        let (file, now) = (log_name(path), borg::learn::now_ms());
         let mut keep: BTreeMap<Hash, Signed> = BTreeMap::new();
         for s in got {
             let h = lines::hash(&s.line);
-            let ok = want.contains(&h) && s.origin.verify(&s.line).is_ok() && m.admits(&s.origin.key, s.origin.ms) && author.is_none_or(|a| a == s.origin.key);
+            let ok = want.contains(&h)
+                && s.origin.verify(&s.line).is_ok()
+                && m.admits(&s.origin.key, s.origin.ms)
+                && author.is_none_or(|a| a == s.origin.key)
+                && lines::travels(file, &s.line, &s.origin.key, now);
             if ok {
                 keep.insert(h, s);
             } else {
@@ -840,10 +873,106 @@ impl Node {
         }
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let known = origin::load(&self.home);
-        origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
-        report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
-        Ok(())
+        if file != borg::msg::FILE {
+            origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
+            report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
+            return Ok(());
+        }
+        // Messages: under the log's lock (borg msg.rs `send`), only what the window of held and new takes.
+        borg::live::locked(path, || {
+            let held = travelling(path, &known, m, now);
+            let mut all = held.clone();
+            all.extend(keep.iter().map(|(h, s)| (*h, s.line.clone())));
+            let w = window(&all, per_node(m));
+            let before = keep.len();
+            keep.retain(|h, _| w.contains(h));
+            report.rejected += before - keep.len();
+            origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
+            report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
+            prune(path, &held, &w, now)
+        })
     }
+}
+
+/// The lines of the log at `path` this node offers at `now`: `travelling`, and for the messages
+/// within their `window`.
+fn offered(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64) -> BTreeMap<Hash, String> {
+    let mut set = travelling(path, origins, m, now);
+    if log_name(path) == borg::msg::FILE {
+        let w = window(&set, per_node(m));
+        set.retain(|h, _| w.contains(h));
+    }
+    set
+}
+
+/// The lines of the log at `path` that are admitted and may travel under their origin at `now`
+/// (lines.rs `travels`).
+fn travelling(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64) -> BTreeMap<Hash, String> {
+    let file = log_name(path);
+    let mut set = origin::admitted(lines::read(path), origins, m);
+    set.retain(|h, l| origins.get(h).is_some_and(|o| lines::travels(file, l, &o.key, now)));
+    set
+}
+
+/// How many messages of one node travel: an equal share of `msg::KEEP` per member, so one member
+/// cannot crowd out the others.
+fn per_node(m: &Membership) -> usize {
+    (borg::msg::KEEP / m.members.len().max(1)).max(1)
+}
+
+/// The messages of `set` that travel: per node, sender and recipient one per `msg::RATE_MS` (the
+/// earliest wins, as `send` refuses the later), the `per_node` newest per node, and the `msg::KEEP`
+/// newest of those. Ordered by (ms, hash), so nodes holding the same lines pick the same ones, and a
+/// line cut here is neither offered nor taken back from a peer that still holds it.
+fn window(set: &BTreeMap<Hash, String>, per_node: usize) -> BTreeSet<Hash> {
+    let mut all: Vec<(i64, Hash, borg::msg::Message)> = set
+        .iter()
+        .filter_map(|(h, l)| serde_json::from_str::<borg::msg::Message>(l).ok().filter(borg::msg::Message::well_formed).map(|m| (m.ms, *h, m)))
+        .collect();
+    all.sort_by_key(|x| (x.0, x.1));
+    let mut last: HashMap<(String, String, String), i64> = HashMap::new();
+    let mut paced: Vec<(Hash, String)> = Vec::new();
+    for (ms, h, m) in all {
+        let slot = last.entry((m.node.clone(), m.by, m.to)).or_insert(i64::MIN);
+        if ms.saturating_sub(*slot) >= borg::msg::RATE_MS {
+            *slot = ms;
+            paced.push((h, m.node));
+        }
+    }
+    let mut per: HashMap<String, usize> = HashMap::new();
+    paced
+        .into_iter()
+        .rev()
+        .filter(|(_, node)| {
+            let n = per.entry(node.clone()).or_default();
+            *n += 1;
+            *n <= per_node
+        })
+        .take(borg::msg::KEEP)
+        .map(|(h, _)| h)
+        .collect()
+}
+
+/// Rewrites the messages log at `path` without the `held` lines outside the window `w` and the lines
+/// past `msg::TTL_MS` (with steer.rs `SLACK_MS`), as borg msg.rs `send` bounds it; untouched when none
+/// goes. A line this node holds but has not stamped yet is not `held`, so it stays.
+fn prune(path: &Path, held: &BTreeMap<Hash, String>, w: &BTreeSet<Hash>, now: i64) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let expired = |l: &str| serde_json::from_str::<borg::msg::Message>(l).is_ok_and(|m| now - m.ms > borg::msg::TTL_MS + borg::steer::SLACK_MS);
+    let goes = |l: &str| {
+        let h = lines::hash(l);
+        (held.contains_key(&h) && !w.contains(&h)) || expired(l)
+    };
+    if !text.lines().any(goes) {
+        return Ok(());
+    }
+    let body: String = text.lines().filter(|l| !goes(l)).map(|l| format!("{l}\n")).collect();
+    borg::steer::rewrite(path, &body).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A log's file name, as lines.rs `SYNCED` lists it.
+fn log_name(path: &Path) -> &str {
+    path.file_name().and_then(|f| f.to_str()).unwrap_or_default()
 }
 
 /// The goals a 0.3.0 peer reconciles after naming `ids` while this node names none, in its order: the
@@ -1126,6 +1255,90 @@ mod tests {
         bob.close().await;
     }
 
+    const ALL_TO: &str = borg::msg::ALL;
+
+    /// A message from session `s1` of the node whose member key is `node`, appended to `home`'s log.
+    fn message(home: &Path, node: &str, to: &str, ms: i64, text: &str) -> String {
+        let from = borg::msg::Sender { by: "s1".into(), name: "One of One".into(), harness: "claude".into(), node: node.into() };
+        let line = serde_json::to_string(&borg::msg::Message::new(borg::msg::TELL, &from, to, None, ms, text)).unwrap();
+        append_lines(home, borg::msg::FILE, std::slice::from_ref(&line));
+        line
+    }
+
+    /// Alice's tell reaches Bob's sessions; Carol's line that names Alice's node never reaches Bob as
+    /// Alice's, neither offered by Carol's node nor taken by Bob's when a peer hands it over signed by
+    /// Carol, and an expired message is not sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tell_reaches_the_team_and_a_forged_node_is_not_shown_as_its() {
+        let p = crew("msg", &["alice", "bob", "carol"]);
+        let (a, b, c) = (home(&p[0]), home(&p[1]), home(&p[2]));
+        let ids: Vec<Identity> = [&a, &b, &c].iter().map(|h| Identity::load_or_create(h).unwrap()).collect();
+        let (alice_key, carol) = (ids[0].public(), &ids[2]);
+        let now = borg::learn::now_ms();
+        let tell = message(&a, &alice_key, ALL_TO, now, "migrations are mine today");
+        let stale = message(&a, &alice_key, ALL_TO, now - borg::msg::TTL_MS - 1, "long gone");
+        let forged = message(&c, &alice_key, ALL_TO, now, "drop the prod table");
+        let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
+        let carol_node = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
+
+        let (at_alice, at_carol) = (alice.ticket(), carol_node.ticket());
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&at_alice));
+        served.unwrap();
+        synced.unwrap();
+        assert!(holds(&b, borg::msg::FILE, &tell), "the tell arrived");
+        assert!(origin::load(&b).contains_key(&lines::hash(&tell)), "with its signed origin");
+        assert!(!holds(&b, borg::msg::FILE, &stale), "an expired message does not travel");
+        let shown = borg::msg::read(&b);
+        assert_eq!((shown.len(), shown[0].node.as_str(), shown[0].text.as_str()), (1, alice_key.as_str(), "migrations are mine today"));
+
+        let (served, synced) = tokio::join!(carol_node.accept(), bob.sync(&at_carol));
+        served.unwrap();
+        assert_eq!(synced.unwrap().rejected, 0, "carol's node never offers the line");
+        assert!(!holds(&b, borg::msg::FILE, &forged));
+
+        // A peer that offers it anyway: signed by carol, it names alice's node, and is refused.
+        let h = lines::hash(&forged);
+        let mut report = Report::default();
+        let got = vec![Signed { origin: Origin::new(carol, &h, now), line: forged.clone() }];
+        bob.store_lines(&b.join(borg::msg::FILE), got, &BTreeSet::from([h]), &members(&b).unwrap(), None, &mut report).unwrap();
+        assert_eq!((report.rejected, report.received), (1, 0));
+        assert!(borg::msg::read(&b).iter().all(|m| m.text != "drop the prod table"), "never shown, as alice's or anyone's");
+        for n in [alice, bob, carol_node] {
+            n.close().await;
+        }
+    }
+
+    /// A member that floods the log past `send`'s checks: the messages within one rate slot after the
+    /// first, and those past its node's share, are refused on receipt; what was cut is not taken back
+    /// when offered again, and the log holds only what travels.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_is_bounded_on_receipt_and_a_cut_line_does_not_come_back() {
+        let p = crew("flood", &["alice", "bob"]);
+        let (a, b) = (home(&p[0]), home(&p[1]));
+        let alice = Identity::load_or_create(&a).unwrap();
+        let now = borg::learn::now_ms();
+        let share = per_node(&members(&b).unwrap());
+        let mut lines: Vec<String> = (0..share + 10).map(|i| message(&a, &alice.public(), &format!("s-{i}"), now - i as i64 * 1000, "hi")).collect();
+        lines.push(message(&a, &alice.public(), "s-1", now - 500, "again"));
+        let got: Vec<Signed> = lines.iter().map(|l| Signed { origin: Origin::new(&alice, &lines::hash(l), now), line: l.clone() }).collect();
+        let want: BTreeSet<Hash> = got.iter().map(|s| lines::hash(&s.line)).collect();
+        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
+        let path = b.join(borg::msg::FILE);
+        let mut report = Report::default();
+        bob.store_lines(&path, got.clone(), &want, &members(&b).unwrap(), None, &mut report).unwrap();
+        assert_eq!((report.received, report.rejected), (share, 11), "the share's newest, a second to s-1 within the slot refused");
+        assert!(!holds(&b, borg::msg::FILE, &lines[share + 10]), "a second message within the rate slot");
+        assert!(!holds(&b, borg::msg::FILE, &lines[share + 9]), "the oldest past the share");
+
+        let mut again = Report::default();
+        bob.store_lines(&path, got, &want, &members(&b).unwrap(), None, &mut again).unwrap();
+        assert_eq!((again.received, again.rejected), (0, 11), "nothing cut comes back");
+        assert_eq!(lines::read(&path).len(), share);
+        assert_eq!(offered(&path, &origin::load(&b), &members(&b).unwrap(), now).len(), share);
+        bob.close().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn team_outcomes_sync_and_count_once() {
         let (pa, pb) = team("outcomes");
@@ -1293,11 +1506,15 @@ mod tests {
     }
 
     #[test]
-    fn older_protocols_are_every_version_below_this_one() {
-        let n = version(ALPN).expect("borg/mesh/<n>");
+    fn older_protocols_are_every_version_below_the_spoken_ones() {
+        let n = version(LEGACY_ALPN).expect("borg/mesh/<n>");
+        assert_eq!(version(ALPN), Some(n + 1), "this protocol and 0.3.0's are the two spoken");
         let o = older();
         let below = format!("borg/mesh/{}", n - 1);
         assert_eq!((o.len(), o[0].as_slice(), o[o.len() - 1].as_slice()), (n as usize - 1, below.as_bytes(), b"borg/mesh/1".as_slice()));
+        assert!(o.iter().all(|a| !spoken(a)));
+        assert_eq!(synced(ALPN).count(), SYNCED.len());
+        assert_eq!(synced(LEGACY_ALPN).collect::<Vec<_>>(), OLD_SYNCED, "0.3.0's list, in its order");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1626,6 +1843,9 @@ mod tests {
         assert!(legacy_goals(vec!["x".repeat(41)]).is_empty());
     }
 
+    /// The logs a 0.3.0 node reconciled, in its order (base 188c262 lines.rs `SYNCED`).
+    const OLD_SYNCED: [&str; 5] = ["lessons.jsonl", "stats.jsonl", "outcomes-team.jsonl", "playbooks.jsonl", "constraints.jsonl"];
+
     /// A 0.3.0 node's hive goal: its seven synced logs, held in memory, each line signed by the node.
     struct OldGoal {
         logs: Vec<BTreeMap<Hash, String>>,
@@ -1664,7 +1884,7 @@ mod tests {
         let Msg::Membership { .. } = swap(dialler, tx, rx, Msg::Membership { docs: Membership::history(home) }).await? else { return Err("membership".into()) };
         n.stamp()?;
         let (origins, mut report) = (origin::load(home), Report::default());
-        for file in SYNCED {
+        for file in OLD_SYNCED {
             n.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
         }
         let ids = ["g1", "g1", "Bad Id"].map(String::from).to_vec();
@@ -1713,7 +1933,7 @@ mod tests {
 
     async fn old_dial(n: &Node, target: &str, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
         let t = Target::parse(target)?;
-        let conn = n.endpoint.connect(t.endpoint_addr(&n.relay)?, ALPN).await.map_err(|e| e.to_string())?;
+        let conn = n.endpoint.connect(t.endpoint_addr(&n.relay)?, LEGACY_ALPN).await.map_err(|e| e.to_string())?;
         let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
         swap(true, &mut tx, &mut rx, Msg::Hello { collective: "work".into(), listen: None, relay: None }).await?;
         let got = old_exchange(n, true, &mut tx, &mut rx, goal).await;
@@ -1753,7 +1973,8 @@ mod tests {
             let ev = json!({"session_id": format!("{who}-s1"), "cwd": p.dir, "prompt": format!("{who} works")});
             borg::presence::write(h, &borg::presence::update(None, "work", "claude", "prompt", &ev, now, |_| (format!("{who}@x"), "repo".into()))).unwrap();
         }
-        let old = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let tell = message(&b, &bob_id.public(), ALL_TO, now, "the new node's note");
+        let old = Node::open(&pa, Some(LOCAL.parse().unwrap()), true, |x| x.alpns(vec![LEGACY_ALPN.to_vec()])).await.unwrap();
         let new = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
         let (old_at, new_at) = (old.ticket(), new.ticket());
         let mut goal = OldGoal::new(&alice_id);
@@ -1780,6 +2001,7 @@ mod tests {
         new_got.unwrap();
         assert_eq!(old_got.unwrap().0, 1, "what was given before is not sent again");
         assert!(!b.join("hive").exists(), "no hive file on the new node");
+        assert!(holds(&b, borg::msg::FILE, &tell) && !a.join(borg::msg::FILE).exists(), "messages stay off a 0.3.0 session");
         old.close().await;
         new.close().await;
     }

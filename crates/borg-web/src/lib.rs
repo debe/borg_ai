@@ -21,7 +21,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use borg::collective::{self, Route, Share};
-use borg::{conscience, install, learn, memory, outcome, presence, stats, top};
+use borg::{conscience, install, learn, memory, msg, outcome, presence, stats, top};
 use futures_util::{Stream, StreamExt};
 
 pub mod learning;
@@ -184,7 +184,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 29] = [
+const NOTABLE: [&str; 31] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -214,6 +214,10 @@ const NOTABLE: [&str; 29] = [
     stats::PLAYBOOK_SHOWN,
     stats::PLAYBOOK_PROPOSED,
     stats::PLAYBOOK_PROMOTED,
+    // Messages between sessions: each one sent, and each refused. A delivery is one row per recipient
+    // (a broadcast many): `/api/messages` says whom each was shown to instead.
+    stats::MSG_SENT,
+    stats::MSG_DROPPED,
 ];
 
 #[derive(Deserialize)]
@@ -256,7 +260,38 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
     for d in &mut ds {
         d.p.engineer = collective::aliases().display(&d.p.engineer);
     }
-    Json(top::to_json(&m.name, m.share, &ds)).into_response()
+    let inbox = top::inbox(&m.home, &ds, now);
+    Json(top::to_json_with(&m.name, m.share, &ds, &inbox)).into_response()
+}
+
+/// Messages between sessions (borg msg.rs) on this node, newest first: who sent each to whom, as `borg
+/// top` names them (a sender from another node with that node's short key: the one part the mesh
+/// checked), what the recipient is (`to_kind`: `all`, `engineer` or `session`, from msg.rs `Address`),
+/// and how many sessions here it was shown to.
+async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
+    let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
+    let now = learn::now_ms();
+    let ds = top::drones(&m.home, m.share == Share::Team, now);
+    let shown = msg::seen_by(&m.home);
+    let here = msg::node(&m.home);
+    let mut all: Vec<msg::Message> = msg::read(&m.home).into_iter().filter(|x| now - x.ms <= msg::TTL_MS).collect();
+    let unread: usize = top::unread_of(&m.home, &ds, &here, &all, now).values().sum();
+    all.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
+    all.truncate(q.limit.unwrap_or(200).min(msg::KEEP));
+    let out: Vec<Value> = all
+        .iter()
+        .map(|x| {
+            let to = shown.get(&presence::safe(&x.id)).map_or(0, Vec::len);
+            let to_kind = match msg::Address::parse(&x.to) {
+                Some(msg::Address::All) => "all",
+                Some(msg::Address::Engineer { .. }) => "engineer",
+                _ => "session",
+            };
+            json!({"id": x.id, "kind": x.kind, "by": x.by, "from": top::sender(&ds, &here, x), "harness": x.harness, "node": x.node,
+                "to": x.to, "to_name": top::recipient(&ds, &here, &x.to), "to_kind": to_kind, "re": x.re, "ms": x.ms, "text": x.text, "shown_to": to})
+        })
+        .collect();
+    Json(json!({"collective": m.name, "messages": out, "unread": unread})).into_response()
 }
 
 /// The collective's L1 playbooks (playbook.rs `view`): steps, each shown version's belief, edits
@@ -297,7 +332,9 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
             vec![home.join("lessons.jsonl"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE), home.join("stats.jsonl"), stats::events_path(home)],
         ),
         ("stats", vec![home.join("stats.jsonl"), stats::events_path(home)]),
-        ("drones", vec![home.join("presence"), presence::remote_path(home)]),
+        // A drone's unread count moves with the log and the shown-once claims.
+        ("drones", vec![home.join("presence"), presence::remote_path(home), msg::path(home), msg::seen_path(home)]),
+        ("messages", vec![msg::path(home), msg::seen_path(home)]),
         ("feed", vec![stats::events_path(home)]),
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
         // Playbooks: their edits, the queue that proposes them, the outcomes that credit them.
@@ -369,6 +406,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
         .route("/api/playbooks", get(playbooks))
+        .route("/api/messages", get(messages))
         .route("/api/learning", get(learning_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))

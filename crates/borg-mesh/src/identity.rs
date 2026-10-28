@@ -23,19 +23,41 @@ pub fn path(home: &Path) -> PathBuf {
     dir(home).join("node.key")
 }
 
+/// `<store>/mesh/node.pub`: the public key, hex, for borg itself, which signs nothing: its messages
+/// name their node by it (borg msg.rs), and the mesh carries a message only under that key's origin
+/// (lines.rs `travels`). borg owns the path, since it reads the key.
+pub fn public_path(home: &Path) -> PathBuf {
+    borg::msg::node_pub_path(home)
+}
+
 impl Identity {
     /// The node's key for the collective stored at `home`, created on first use.
+    /// Also writes `public_path` when it is missing.
     pub fn load_or_create(home: &Path) -> Result<Identity, String> {
         let p = path(home);
-        match std::fs::read_to_string(&p) {
-            Ok(t) => Ok(Identity { key: SigningKey::from_bytes(&from_hex::<32>(&t).map_err(|e| format!("{}: {e}", p.display()))?) }),
+        let me = match std::fs::read_to_string(&p) {
+            Ok(t) => Identity { key: SigningKey::from_bytes(&from_hex::<32>(&t).map_err(|e| format!("{}: {e}", p.display()))?) },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let seed = iroh::SecretKey::generate().to_bytes();
                 write_private(&p, &to_hex(&seed))?;
-                Ok(Identity { key: SigningKey::from_bytes(&seed) })
+                Identity { key: SigningKey::from_bytes(&seed) }
             }
-            Err(e) => Err(format!("{}: {e}", p.display())),
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        };
+        me.publish(home)?;
+        Ok(me)
+    }
+
+    /// Writes `public_path` unless it already names this key: whole, through a rename, so a reader
+    /// never sees half a key.
+    fn publish(&self, home: &Path) -> Result<(), String> {
+        let (p, key) = (public_path(home), self.public());
+        if std::fs::read_to_string(&p).is_ok_and(|t| t.trim() == key) {
+            return Ok(());
         }
+        let tmp = p.with_extension(format!("pub.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, format!("{key}\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).map_err(|e| format!("{}: {e}", p.display()))
     }
 
     /// The public key, hex: what `borg mesh id` prints and an admin invites.
@@ -85,6 +107,7 @@ mod tests {
         let a = Identity::load_or_create(&home).unwrap();
         let b = Identity::load_or_create(&home).unwrap();
         assert_eq!(a.public(), b.public(), "the key is created once");
+        assert_eq!(std::fs::read_to_string(public_path(&home)).unwrap().trim(), a.public(), "published for borg");
         assert_eq!(std::fs::metadata(path(&home)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(to_hex(a.iroh_secret().public().as_bytes()), a.public(), "iroh id == membership key");
         let sig = a.sign(b"hello");

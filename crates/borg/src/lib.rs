@@ -27,6 +27,7 @@ pub(crate) mod jsonl;
 pub mod learn;
 pub mod live;
 pub mod memory;
+pub mod msg;
 pub mod notes;
 pub(crate) mod notify;
 pub mod ope;

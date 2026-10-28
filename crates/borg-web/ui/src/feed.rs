@@ -57,6 +57,12 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
         "playbook_shown" => format!("A drone was shown {} team playbook{}", num(e.n.max(1.0)), if e.n > 1.0 { "s" } else { "" }),
         "playbook_proposed" => format!("Work whose tests went green proposed a playbook edit ({})", if e.why.is_empty() { "add" } else { &e.why }),
         "playbook_promoted" => format!("{w} promoted a playbook edit ({})", if e.why.is_empty() { "add" } else { &e.why }),
+        "msg_sent" if e.why == "ask" => "A session asked another for a reply".into(),
+        "msg_sent" if e.engineer.is_empty() => "A message was sent between sessions".into(),
+        "msg_sent" => format!("{w} sent a message"),
+        "msg_delivered" => "A session was shown a message".into(),
+        "msg_dropped" if e.why == "rate" => "A message was refused: one per sender and recipient every 10 minutes".into(),
+        "msg_dropped" => format!("{} old message{} left the bounded log", num(e.n.max(1.0)), if e.n > 1.0 { "s" } else { "" }),
         other => kind(other).0.to_string(),
     };
     let detail = if detail.is_empty() && e.kind == "steer_dropped" { e.why.clone() } else { detail };

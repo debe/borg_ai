@@ -2,7 +2,7 @@
 //! alternate screen, fits the window, and quits on `q`, Esc or Ctrl-C with the terminal as it was.
 //!
 //! The screen per collective: a header with the drones by state, then the drones as a table with what
-//! each is doing. `frame` is pure over its inputs (`Coll`); `run` is the terminal around it. Piped or
+//! each is doing and its unread messages, then the collective's last few messages. `frame` is pure over its inputs (`Coll`); `run` is the terminal around it. Piped or
 //! with `--once` / `--json`, `borg top` prints once instead (top.rs).
 
 use std::io::Write;
@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use crate::collective::Share;
 use crate::presence::State;
-use crate::top::Drone;
+use crate::top::{self, Drone, Inbox};
 
 /// One collective's data for a frame.
 pub struct Coll {
     pub name: String,
     pub share: Share,
     pub drones: Vec<Drone>,
+    pub inbox: Inbox,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -164,10 +165,10 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
         lines.push(Ln::default());
         let share = if c.share == Share::Team { "team" } else { "local" };
         lines.push(Ln::default().add(St::Head, format!(" {} ", c.name)).add(St::Head, format!("· {share} · {} drone(s)", c.drones.len())));
-        lines.push(
-            Ln::default()
-                .add(St::Bold, format!("  {}{}{}{}{}", pad("DRONE", 16), pad("HARNESS", 9), pad("NODE", 8), pad("STATE", 13), pad("IDLE", 6)) + "DOING"),
-        );
+        lines.push(Ln::default().add(
+            St::Bold,
+            format!("  {}{}{}{}{}{}", pad("DRONE", 16), pad("HARNESS", 9), pad("NODE", 8), pad("STATE", 13), pad("IDLE", 6), pad("MSG", 5)) + "DOING",
+        ));
         let mut rows: Vec<&Drone> = c.drones.iter().collect();
         rows.sort_by_key(|d| (d.state == State::Ended, d.number));
         for d in rows {
@@ -182,8 +183,16 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> Vec<Stri
                     .add(St::Dim, pad(&node, 8))
                     .add(state_style(word), pad(&format!("● {word}"), 13))
                     .add(St::Dim, pad(&ago(now - d.p.ms), 6))
+                    .add(if c.inbox.unread.get(&d.p.session).is_some_and(|n| *n > 0) { St::Cyan } else { St::Dim }, pad(&top::unread_cell(&c.inbox, d), 5))
                     .add(if ended { St::Dim } else { St::Plain }, doing(&d.p.prompt)),
             );
+        }
+        if !c.inbox.recent.is_empty() {
+            lines.push(Ln::default().add(St::Bold, "  MESSAGES").add(St::Dim, format!("  {} in the last day", c.inbox.day)));
+            for m in &c.inbox.recent {
+                let st = if m.asks() { St::Cyan } else { St::Plain };
+                lines.push(Ln::default().add(St::Plain, "  ").add(St::Dim, pad(&ago(now - m.ms), 6)).add(st, top::message_line(&c.drones, &c.inbox.here, m)));
+            }
         }
     }
     lines.truncate(h);
@@ -313,7 +322,7 @@ mod tests {
 
     #[test]
     fn the_screen_fits_the_window_and_counts_the_drones() {
-        let cs = vec![Coll { name: "corp".into(), share: Share::Team, drones: crate::top::tests_fixture() }];
+        let cs = vec![Coll { name: "corp".into(), share: Share::Team, drones: crate::top::tests_fixture(), inbox: crate::top::tests_inbox() }];
         let f = frame(&cs, 10_000_000, 100, 6, false);
         assert_eq!(f.len(), 6, "{f:#?}");
         assert!(f.iter().all(|l| l.chars().count() <= 100), "{f:#?}");
@@ -322,6 +331,11 @@ mod tests {
         assert!(f[2].starts_with(" corp · team · 3 drone(s)"), "{}", f[2]);
         assert!(f[4].contains("One of Three") && f[4].contains("● paused"), "{}", f[4]);
         assert!(f[5].contains("Two of Three") && !f[5].contains('@') && f[5].contains("beefca"), "{}", f[5]);
+        assert!(f[4].contains(" 2    fix"), "the unread count: {}", f[4]);
+        let full = frame(&cs, 10_000_000, 100, 40, false);
+        let at = full.iter().position(|l| l.starts_with("  MESSAGES  3 in the last day")).expect("the messages section");
+        assert!(full[at + 1].contains("1m") && full[at + 1].ends_with("Three of Three asks -> One of Three: which test flakes?"), "{}", full[at + 1]);
+        assert_eq!(full.len(), at + 4, "{full:#?}");
         let empty = frame(&[], 0, 60, 10, false);
         assert!(empty[2].starts_with("no drones yet"), "{empty:#?}");
     }

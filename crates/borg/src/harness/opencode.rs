@@ -35,6 +35,7 @@ impl Harness for Opencode {
             // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
             stop_budget: None,
             session_env: None,
+            pid_env: Some("OPENCODE_PID"),
             drone_wake: DroneWake::Plugin,
         }
     }
