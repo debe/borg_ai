@@ -10,13 +10,17 @@ planning session, turns what the engineer wants built into the goal. That sessio
 1. **Read enough of the repo to plan.** Know which files each piece touches and which checks prove it
    works. Ask the engineer only when the goal itself is unclear.
 2. **Split the work into small, independent tasks.** Each task fits one drone's session. Give each task
-   its own files where possible, so two drones never edit the same file.
+   its own files where possible, so two drones never edit the same file. List every file the change
+   must touch, including the existing tests and the callers of an interface it renames or removes: a
+   test edited outside the task's files is judged hacked, so the task cannot pass honestly.
 3. **Put contracts before their dependants.** When tasks share an interface (a type, an API, a file
    format), one task defines it first. Every task that uses it lists that task as a dep. The task that
    defines the interface publishes it with `borg hive contract "<the interface>" --scope <files>`.
 4. **Give every task a check.** A check is a shell command that passes only when the task is done. It
    is the task's own oracle, the sixth field of `--task` (`NAME=CMD`, which may contain `|`). Prefer a
-   test that names the task's behaviour over "the whole suite passes".
+   test that names the task's behaviour over "the whole suite passes". Run each check once before
+   opening the goal: a check that fails on any tree (a wrong flag, a typo) blocks its task until it is
+   reopened with a corrected check (`--again --accept`).
 5. **Open the goal**:
 
    ```sh
@@ -30,7 +34,9 @@ planning session, turns what the engineer wants built into the goal. That sessio
    `--task` is `ID|role|title|files,..|deps,..|NAME=CMD`. The role is `work`: borg opens the verify,
    fix and integrate tasks itself, and a verify task opened by hand waits for the approval like any
    other. To add tasks to an open goal, use
-   `borg hive open <goal> --id ID --title T --files a,b --deps x --accept NAME=CMD`.
+   `borg hive open <goal> --id ID --title T --files a,b --deps x --accept NAME=CMD`. `--again` reopens
+   a blocked task; pass `--accept NAME=CMD` (and `--title`, `--files` or `--deps`) with it to replace
+   what blocked it, such as a wrong check.
 6. **Put the plan to the engineer.** `init` and `open` print the plan, one card per task, and the queen
    question it waits on. Show the engineer the cards and ask them to answer **at their own prompt**:
    `yes` approves the plan, `no, because <why>` refuses it. No drone takes a task before the yes.

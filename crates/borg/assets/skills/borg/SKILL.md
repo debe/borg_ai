@@ -1,6 +1,6 @@
 ---
 name: borg
-description: How borg works and how to run it for the engineer. Use when the engineer mentions borg, a collective, a lesson, a drone, the queen, a hive goal or its board, the mesh, team sync, vectors or collectives.json, asks why borg blocked or asked something, which later commit fixed a decision, wants to set up borg, add or keep a repo out of a collective, share lessons with a team or company, or fix what borg doctor reports.
+description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, hive, mesh or vectors, asks why borg blocked or asked, or wants to set up, share or fix borg.
 ---
 
 # borg
@@ -23,6 +23,10 @@ on this machine unless the collective they belong to is synced with a team over 
 | mesh | Peer-to-peer sync of a `share: "team"` collective between members' machines (`borg mesh`, a separate `borg-mesh` binary) |
 | link | A decision → fix pair: an earlier commit with borg reasoning whose lines a later session's commit changed. A *fix* link (revert, fix-shaped subject, test failed then passed, the engineer named a bug) can become a `regret` lesson; a *revisited* link never does |
 | vectors | A local embedding index that finds lessons sharing no word with the work (paraphrases, other languages) |
+| episode | A captured correction, veto, regret or review finding, waiting for `borg learn` to turn it into a lesson |
+| assimilate | Importing lessons from past sessions or a team's documents (`borg assimilate`) |
+| live / hook | The delivery modes: `hook` checks the work at the turn's end; `live` (the default) also checks it during the turn, after state-changing tool calls |
+| hive | Several drones working one goal: a board of tasks, each gated by its own check and verified by another drone, planned by a session and approved by the engineer |
 
 ## What to run when
 
@@ -47,24 +51,8 @@ on this machine unless the collective they belong to is synced with a team over 
 | The board of a goal, or the engineer approving a plan from a terminal | `borg hive board <goal>`, `borg hive ratify <goal>` |
 | Every command | `borg help`, `borg mesh --help` |
 
-**Hive.** When the engineer says what the drones should build, this session plans it. Follow
-[hive](references/hive.md) step by step:
-- Split the work into small, independent tasks, with contracts before their dependants and a check for
-  every task.
-- Open the goal with `borg hive init <goal> --spec ... --oracle NAME=CMD --budget USD --task
-  "ID|role|title|files|deps|NAME=CMD"`.
-- Show the engineer the plan it prints. They answer at their own prompt: `yes`, or `no, because ...`.
-  Never answer it yourself. No drone takes a task before the yes.
-- Once approved, tell the engineer "N drones on M nodes waiting", as the context says.
-
-Other hive commands:
-- `borg hive join` makes this session a drone that waits for work.
-- `borg hive board` shows the tasks and who holds them.
-- `borg hive open <goal> --id ID --again` reopens a blocked task.
-
-A drone finds its own commands (claim, done, verify, contract) in its hook context. Subagents and
-workflows may help inside a task, but never run `borg hive claim` or `borg hive done`. Details:
-`docs/commands.md#hive`.
+**Hive.** When the engineer says what the drones should build, this session plans the goal and the
+engineer approves it at their own prompt: follow [hive](references/hive.md) step by step.
 
 ## Safety rules
 
@@ -73,22 +61,18 @@ workflows may help inside a task, but never run `borg hive claim` or `borg hive 
    add `--apply` only after they agree. `--apply` backs up every file it changes. `borg setup` asks
    before it writes, but `borg setup --yes` does not: from a drone, tell the engineer what the flags
    will set up and get a yes first.
-2. **Never edit hook files by hand** (`~/.claude/settings.json` hooks, `~/.codex/hooks.json`, the omp
-   and opencode `borg.ts` adapters, this skill). `borg install` owns them; a hand edit is overwritten or
-   breaks the wiring. Codex re-asks for trust (`/hooks`) whenever its hooks change.
-3. **collectives.json is the engineer's.** Show the full new file and the diff before writing it, keep
+2. **collectives.json is the engineer's.** Show the full new file and the diff before writing it, keep
    every key you were not asked to change, and run `borg doctor` afterwards: an invalid file routes
    every repo off. Details: [collectives](references/collectives.md).
-4. **`share: "local"` never syncs.** Put private and client work in a `local` collective or under
+3. **`share: "local"` never syncs.** Put private and client work in a `local` collective or under
    `off`. Never move a repo into a `team` collective without the engineer saying so: its lessons then
    reach everyone in that team.
-5. **Learning from fixes is the engineer's call.** `BORG_REGRESS` defaults to `links`: links are
-   recorded, nothing is learned. Before suggesting `BORG_REGRESS=learn`, run
-   `borg regress --replay <A..B> --explain` on their history and `borg regress --session ID --explain`
-   on a few real sessions, and let them check the fix links: a replay cannot see test runs or prompts,
-   so a live run makes fix links the replay never showed.
-6. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg reach` and
-   `borg assimilate --from-dir` spend model calls; say roughly how many before running them.
+4. **Learning from fixes is the engineer's call.** `BORG_REGRESS` defaults to `links`: nothing is
+   learned. Before suggesting `BORG_REGRESS=learn`, run `borg regress --replay <A..B> --explain` on
+   their history and `borg regress --session ID --explain` on a few real sessions, and let them check
+   the fix links: their precision on real repos is not measured yet.
+5. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg assimilate --from-dir` and
+   `borg reach` spend a model call per item; say roughly how many before running them.
 
 ## Setting up
 
@@ -98,6 +82,9 @@ workflows may help inside a task, but never run `borg hive claim` or `borg hive 
   and keeps `borg mesh serve` running; everyone else joins with an invite ticket. Relays, a
   self-hosted `iroh-relay`, LAN-only mode and corporate networks: [team](references/team.md).
 - **Vectors** are on by default once the model is fetched: [vectors](references/vectors.md).
+- `borg install` writes the hook files, the adapters and this skill; rerun it rather than editing them
+  (codex asks to trust its hooks again in `/hooks` whenever they change).
+- Every command and flag: [commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md).
 
 ## References
 
