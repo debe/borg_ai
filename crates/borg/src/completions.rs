@@ -40,7 +40,7 @@ pub const GROUPS: &[(&str, &[Command])] = &[
     (
         "Learning",
         &[
-            cmd("learn", &[("[--group GOAL/TASK]", "turn waiting corrections (or a hive group's winners vs losers) into lessons now")], &[], &["--group"]),
+            cmd("learn", &[("", "turn waiting corrections into lessons now")], &[], &[]),
             cmd(
                 "no",
                 &[("[--session ID] <reason>", "say no to a drone's work: shown lessons lose credit, the reason becomes a lesson")],
@@ -113,43 +113,6 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             ),
         ],
     ),
-    (
-        "Hive",
-        &[cmd(
-            "hive",
-            &[
-                ("init <goal> --spec T --oracle N=CMD --budget USD", "many drones, one goal: its plan, checks and budget"),
-                ("ratify <goal>", "approve the goal's plan from a terminal"),
-                ("board [<goal>] [--json]", "the tasks, who holds them, rework"),
-                ("join [<goal>] | leave", "this session becomes a drone that waits for work, or stops being one"),
-                ("open <goal> --id ID ... [--again]", "open a task, or amend one from a terminal"),
-                ("integrate <goal> | approve <goal>", "merge the accepted work; run the checks other nodes wrote"),
-                ("claim|progress|release|block|done|verify|contract|ask|tell|scope", "a drone's own commands (its context names them)"),
-            ],
-            &[
-                "init",
-                "board",
-                "join",
-                "leave",
-                "wait",
-                "open",
-                "claim",
-                "progress",
-                "release",
-                "block",
-                "done",
-                "verify",
-                "integrate",
-                "approve",
-                "ratify",
-                "contract",
-                "ask",
-                "tell",
-                "scope",
-            ],
-            crate::hive::FLAGS,
-        )],
-    ),
 ];
 
 /// `borg debug <command>`: evaluation and debugging tools, out of the main help.
@@ -164,16 +127,6 @@ pub const DEBUG: &[Command] = &[
     },
     cmd("vectors", &[("--query [--store LESSONS]", "the vector shortlist for a context on stdin")], &[], &["--query", "--store"]),
     cmd("ope", &[("[--dir DIR | --file FILE] [--json]", "off-policy estimates of the belief's hand-set weights")], &[], &["--dir", "--file", "--json"]),
-    cmd(
-        "hive",
-        &[
-            ("run <goal> --drones N [--harness H] [--yes]", "headless drones in worktrees, each with a share of the budget"),
-            ("score <goal>", "the hidden oracle scores the judged tasks not scored yet"),
-            ("init <goal> ... --hidden-dir DIR --hidden CMD", "a goal with held-out checks outside the repo"),
-        ],
-        &["run", "score", "init"],
-        crate::hive::DEBUG_FLAGS,
-    ),
 ];
 
 /// What hooks and drones run, never listed: dispatched, not shown.
@@ -190,7 +143,7 @@ pub fn known(name: &str) -> bool {
 }
 
 /// The completions' commands: the main help's, then `debug` with the debug commands as subcommands and
-/// all their flags (`--yes` of `debug hive run` among them).
+/// all their flags.
 fn completed() -> Vec<(&'static str, Vec<&'static str>, Vec<&'static str>, bool)> {
     let mut out: Vec<_> = commands().map(|c| (c.name, subs_of(c.subs), c.flags.to_vec(), c.path)).collect();
     let mut flags: Vec<&str> = DEBUG.iter().flat_map(|c| c.flags.iter().copied()).collect();
@@ -200,9 +153,8 @@ fn completed() -> Vec<(&'static str, Vec<&'static str>, Vec<&'static str>, bool)
     out
 }
 
-/// The debug commands that take subcommands of their own (`borg debug hive run`): (name, its
-/// subcommands and flags). Completed by the third word, so `borg debug hive` offers run, score and
-/// init rather than the debug commands again.
+/// The debug commands that take subcommands of their own: (name, its subcommands and flags). Completed
+/// by the third word, so such a command offers its own subcommands rather than the debug commands again.
 fn nested() -> Vec<(&'static str, String)> {
     DEBUG.iter().filter(|c| !c.subs.is_empty()).map(|c| (c.name, [subs_of(c.subs).as_slice(), c.flags].concat().join(" "))).collect()
 }
@@ -295,7 +247,7 @@ _borg "$@"
 pub fn fish() -> String {
     let mut out =
         format!("# fish completion for borg (borg completions fish)\ncomplete -c borg -f\ncomplete -c borg -n __fish_use_subcommand -a '{}'\n", names());
-    // fish sees every word: `borg debug hive` has also seen `hive`, so a command a debug one shares a
+    // fish sees every word: `borg debug vectors` has also seen `vectors`, so a command a debug one shares a
     // name with completes only outside `debug`, and a nested debug command's subcommands only inside it.
     for (cmd, subs, flags, path) in completed() {
         let when = if DEBUG.iter().any(|d| d.name == cmd) {
@@ -339,12 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn debug_hive_completes_its_own_subcommands() {
-        assert!(bash().contains("            hive) COMPREPLY=($(compgen -W \"run score init --drones"), "{}", bash());
-        assert!(zsh().contains("            hive) compadd -- run score init --drones"), "{}", zsh());
+    fn a_command_shared_with_debug_completes_outside_debug_only() {
         let fish = fish();
-        assert!(fish.contains("-n '__fish_seen_subcommand_from debug; and __fish_seen_subcommand_from hive' -a 'run score init'"), "{fish}");
-        assert!(fish.contains("-n '__fish_seen_subcommand_from hive; and not __fish_seen_subcommand_from debug' -a 'init board"), "{fish}");
         assert!(fish.contains("-n '__fish_seen_subcommand_from vectors; and not __fish_seen_subcommand_from debug' -l fetch"), "{fish}");
         assert!(fish.contains("-n '__fish_seen_subcommand_from debug' -a 'recall"), "{fish}");
     }

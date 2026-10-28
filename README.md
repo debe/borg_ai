@@ -16,7 +16,6 @@ each teammate makes it again.
 - **Drone:** one agent session wired to Borg.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
-- **Hive:** many drones on one goal, each task checked and verified by another drone.
 
 **Status:** 0.3.0. In daily use, with lessons syncing between engineers' machines over the mesh, across
 NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
@@ -24,7 +23,6 @@ NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits
 - [Quick start](#quick-start)
 - [How it works in one session](#how-it-works-in-one-session)
 - [The team](#the-team)
-- [The hive](#the-hive)
 - [Monitoring](#monitoring)
 - [Cost](#cost)
 - [Privacy](#privacy)
@@ -80,7 +78,7 @@ Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/do
 
 ## How it works in one session
 
-Everything in this section works in one plain interactive session, with no team and no hive.
+Everything in this section works in one plain interactive session, with no team.
 
 ```mermaid
 flowchart LR
@@ -129,8 +127,7 @@ constraint you can ratify. [Saying no](https://github.com/debe/borg_ai/blob/main
 never deleted. The clock counts sessions, not days. [Memory](https://github.com/debe/borg_ai/blob/main/docs/learning.md#memory)
 
 **The queen** holds decisions no lesson answers (open decisions from documents, proposed constraints,
-playbook edits). The drone asks you one at a session's first prompt, the session's own before any hive
-question; `borg queen` lists them. Playbooks, the team's steps for a kind of task, are also learned from
+playbook edits). The drone asks you one at a session's first prompt; `borg queen` lists them. Playbooks, the team's steps for a kind of task, are also learned from
 plain sessions that end clean. [The queen](https://github.com/debe/borg_ai/blob/main/docs/learning.md#the-queen) ·
 [Playbooks](https://github.com/debe/borg_ai/blob/main/docs/commands.md#playbooks)
 
@@ -155,57 +152,9 @@ flowchart LR
 
 Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
-What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones and hive goals, like Unix `top`;
+What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones, like Unix `top`;
 `borg steer` sends them a signed instruction. Set up: `borg setup --team <name>` or `--join <ticket>`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
-
-## The hive
-
-A hive is many drones on one goal: a board of tasks, each claimed with a lease, finished only when its
-checks pass, verified by another drone, and merged into one combined tree that must pass the goal's
-oracle. Built as preparation: it works, and no value metric has been shown yet.
-
-```mermaid
-flowchart LR
-  G["goal: spec, oracle, budget"] --> BD["board"]
-  BD -->|"claim"| D["drones"]
-  D -->|"done: checks pass"| V["verify: another drone"]
-  V -->|"rejected"| BD
-  V -->|"verified"| I["integrate: merge, run the oracle"]
-  I -->|"conflict or failure: fix task"| BD
-  I -->|"passes"| R["refs/heads/hive/goal/integrated"]
-```
-
-**Drones are interactive sessions you open.** Claude Code, omp, opencode (1.x and 2.x) and codex, in
-any mix, on one machine or several:
-
-1. Keep `borg mesh serve` running on each machine (in a team collective it also syncs the board). It
-   beats for the node, integrates the verified work and says when the goal is finished, while every
-   drone idles.
-2. Open the sessions yourself and ask each one to "join the hive". Its model runs `borg hive join`
-   from inside it, so only that session becomes a drone, in a worktree of its own. A session that never
-   joins sees no change.
-3. Tell one session what to build. Its borg skill opens the goal: small tasks, contracts first, a check
-   per task. It shows you the plan and leaves the answer to you: say `yes` at that session's prompt, or
-   `no, because ...` and it revises. No drone takes a task before your yes. A goal you open from a
-   terminal is approved with `borg hive ratify <goal>`.
-4. The drones wake by themselves. A drone with nothing to do waits at no token cost and is woken by
-   its harness's own path when a task opens to it; a task is never handed into your own turn in that
-   session. Each finished task is verified by another drone, the verified work is merged into
-   `hive/<goal>/integrated` and run against the goal's oracle, and the drones become plain sessions
-   again.
-5. Watch it with `borg top` (a live screen, like Unix `top`) or the Hive tab of `borg web`.
-
-<p align="center"><img src="docs/img/hive-demo.gif" width="900" alt="tmux: a planning Claude Code session opens a goal, two Claude Code drones wake on yes and work it, borg top shows the tasks turn verified and the goal finish"></p>
-
-Lessons apply and sync as in a plain session; verdicts, reworks and groups of attempts credit and teach
-them like any outcome. Claude Code drones' claims are metered from their transcripts, and new claims
-stop at the goal's budget until you raise it (answer the session's question with the new budget,
-or run `borg hive ratify <goal> --budget USD`). Proven with real sessions: Claude Code and omp on one node, opencode and codex on a
-second node on the same machine, one 4-task goal approved at the prompt, every task verified and integrated once, no model call
-while the drones waited, wake-ups in 0.1 to 4.6 s. Headless drones in worktrees
-(`borg debug hive run`) exist for the evals.
-[Hive commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#hive) · [Design and status](https://github.com/debe/borg_ai/blob/main/docs/design/hive.md)
 
 ## Monitoring
 
@@ -216,8 +165,7 @@ borg web        # http://127.0.0.1:7979/, the collective of the current director
 A live page on 127.0.0.1 with tabs for the Overview, Knowledge (every lesson, its belief and state),
 Conscience (checks, questions and what they led to per channel), Drones, the Queen (open questions, the
 queen's attention score), Learning (week by week: lessons per source, the share of asked lessons that
-changed the work, repeated vetoes, hive mistakes caught, playbook versions), Hive (each goal's tasks over time, its nodes, and its interactive drones: working,
-busy, waiting or gone, with their wake latency) and Cost. It reads the
+changed the work, repeated vetoes, playbook versions) and Cost. It reads the
 same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
@@ -246,9 +194,8 @@ lessons (with author emails and repo names); redacted reasoning excerpts of land
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
 of your latest prompt, touched paths); steering and the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
-ratified constraints (the invariant, its lesson and who ratified it, never the veto's words); promoted
-playbook edits; and hive goals with their boards, contracts, messages, guard flags, spend and commit bundles (task
-text redacted; hidden checks stay local).
+ratified constraints (the invariant, its lesson and who ratified it, never the veto's words); and promoted
+playbook edits.
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content; run your own to keep even
 that in-house ([Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh), [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md)).
@@ -256,7 +203,7 @@ that in-house ([Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/d
 episode being learned.
 
 Redaction (`redact` in `crates/borg/src/notes.rs`) strips tokens, keys, passwords and `.env` values from
-excerpts, presence and hive text. Lessons skip it: the model writes them as general questions, but read
+excerpts and presence. Lessons skip it: the model writes them as general questions, but read
 `lessons.jsonl` before you share a collective that handled secrets.
 
 **Hooks fail open.** A missing binary, a crash, an invalid config, an unreachable model or a locked index
@@ -276,8 +223,7 @@ sessions, so the data is not here):
   memory model;
 - the system gate cut wrong-system deliveries from 83 to 0;
 - live mode: not worse than hook (+0.38 criteria per task [0, +0.88], 8 pairs, p = 0.50, directional
-  only: 2 pairs differ; 0 redo rounds);
-- the hive finished every board and passed every held-out check in 6 acceptance runs.
+  only: 2 pairs differ; 0 redo rounds).
 
 **On although its rule was not met:** review → fix lessons, +6.3 points of later bugs avoided
 [−5.1, +17.9]; the pre-registered rule (an interval excluding 0) failed, and the engineer turned it on so
@@ -289,10 +235,7 @@ pre-registered lower bound of −0.5.
 
 **Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit
-improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests;
-whether a hive beats one session with subagents (one pilot probe run per arm, before the bug fixes:
-one session 5 of 5, the hive 2 of 5; no fair comparison since); whether the hive's learning helps (the
-test stopped undecided, and its kill criterion was not applied); the hive across real machines. omp,
+improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests. omp,
 opencode and Codex get no early delivery of ordinary lessons, and there a live check sees tool calls,
 not prose.
 Full table, the regret check and every known limit: [Evidence and limits](https://github.com/debe/borg_ai/blob/main/docs/evidence.md).
@@ -339,7 +282,7 @@ python3 scripts/figures.py                    # regenerates the figures in docs/
 
 | Path | What |
 |---|---|
-| `crates/borg` | The product (crate `borg-ai`, binary and library `borg`): CLI, hooks, learning, checks, memory, collectives, hive, install, vectors. `assets/` holds the skill and the TS adapters it compiles in |
+| `crates/borg` | The product (crate `borg-ai`, binary and library `borg`): CLI, hooks, learning, checks, memory, collectives, install, vectors. `assets/` holds the skill and the TS adapters it compiles in |
 | `crates/borg-mesh` | Peer sync, membership, presence, steering (iroh); separate so the hook binary stays small |
 | `crates/borg-trace` | Parses Claude Code and omp transcripts |
 | `crates/borg-web` | `borg web`, the live page; `dist/` is its built Leptos client (`ui/`), committed |

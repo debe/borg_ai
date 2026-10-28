@@ -15,6 +15,7 @@
 //! see [`home_overrides`]), so a test can never reach a real config or store.
 
 pub mod change;
+mod orphans;
 pub mod setup;
 pub mod skill;
 
@@ -361,6 +362,13 @@ fn hook_checks(h: &dyn Harness, k: &Hooks, t: &Targets) -> Vec<(Level, String)> 
     if !missing.is_empty() {
         out.push((Level::Warn, format!("{name}: hooks missing for {} (borg install {name})", missing.join(", "))));
     }
+    let leftover = k.leftover(text.as_deref());
+    if !leftover.is_empty() {
+        out.push((
+            Level::Warn,
+            format!("{name}: an older borg's hooks for {} are still wired (borg install {name} --apply removes them)", leftover.join(", ")),
+        ));
+    }
     for (ev, bin) in &wired {
         if !executable(bin) {
             out.push((
@@ -435,6 +443,15 @@ pub fn collective_checks(cfg: &Result<Option<collective::Config>, String>, base:
             && let Some(why) = crate::live::unsupported()
         {
             out.push((Level::Warn, format!("collective {name}: live mode is off while {why} is set; its drones check at the turn end only (hook mode)")));
+        }
+        // The hive's goals and drone registry (0.3.0 and before): nothing reads them now, and borg never
+        // deletes a store's data on its own.
+        let hive = home.join("hive");
+        if hive.is_dir() {
+            out.push((
+                Level::Warn,
+                format!("store {name}: {} is a removed feature's data (the hive), unused now; remove it with: rm -r '{}'", hive.display(), hive.display()),
+            ));
         }
         let probe = home.join(".borg-doctor-probe");
         let ok = std::fs::create_dir_all(home).and_then(|_| std::fs::write(&probe, b"ok")).and_then(|_| std::fs::remove_file(&probe));
@@ -552,6 +569,9 @@ fn doctor(t: &Targets) -> i32 {
     checks.extend(wiring_checks(t, borg_found));
     let cfg = collective::load();
     checks.extend(collective_checks(&cfg, &learn::home()));
+    if let Ok(cwd) = std::env::current_dir() {
+        checks.extend(orphans::hive_worktree_checks(&cwd));
+    }
     if let Ok(c) = &cfg {
         let routes = collectives(c.as_ref(), &learn::home());
         checks.extend(crate::vectors::doctor::checks(&routes));
@@ -1012,6 +1032,25 @@ mod tests {
         assert_eq!(bad.len(), 1);
         assert!(bad[0].0 == Level::Fail && bad[0].1.contains("EVERY repo routes OFF"));
         assert!(collective_checks(&Ok(None), &home.join("store")).iter().all(|(l, _)| *l == Level::Ok));
+    }
+
+    #[test]
+    fn doctor_names_a_leftover_hive_and_its_removal_but_leaves_it() {
+        let base = tmp("hive-orphan");
+        let store = collectives(None, &base)
+            .into_iter()
+            .find_map(|r| match r {
+                Route::Collective { home, .. } => Some(home),
+                Route::Off => None,
+            })
+            .unwrap();
+        std::fs::create_dir_all(store.join("hive/g1")).unwrap();
+        let warn: Vec<String> = collective_checks(&Ok(None), &base).into_iter().filter(|(l, _)| *l == Level::Warn).map(|(_, m)| m).collect();
+        assert!(
+            matches!(warn.as_slice(), [m] if m.contains("removed feature") && m.contains(&format!("rm -r '{}'", store.join("hive").display()))),
+            "{warn:?}"
+        );
+        assert!(store.join("hive/g1").is_dir(), "never deleted by doctor");
     }
 
     #[cfg(unix)]

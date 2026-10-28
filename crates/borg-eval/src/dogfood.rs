@@ -327,7 +327,7 @@ pub(crate) fn prepare_home_bare(home: &Path, borg: &Path, settings: &str, collec
     fs::create_dir_all(home.join(".config/borg")).map_err(|e| e.to_string())?;
     fs::write(home.join(".config/borg/collectives.json"), collectives).map_err(|e| e.to_string())?;
     fs::create_dir_all(home.join("bin")).map_err(|e| e.to_string())?;
-    // Idempotent: a HOME prepared again (a hive chain's, goal after goal) gets the link anew.
+    // Idempotent: a HOME prepared again gets the link anew.
     let link = home.join("bin/borg");
     let _ = fs::remove_file(&link);
     std::os::unix::fs::symlink(borg, link).map_err(|e| e.to_string())

@@ -431,7 +431,7 @@ pub fn run_capped(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Opti
 
 /// The exit status and stdout of `cmd` (fed `input` on stdin), or None when it cannot start or fails
 /// to finish within `timeout` (then killed). Stderr is discarded: a caller that wants it merges it
-/// into stdout in the command itself (hive/oracle.rs runs `sh -c` with `exec 2>&1`). `run_bounded`
+/// into stdout in the command itself (`sh -c` with `exec 2>&1`). `run_bounded`
 /// that drops a run cut off at the cap.
 pub fn run_capped_status(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<(std::process::ExitStatus, Vec<u8>)> {
     let b = run_bounded(cmd, input, timeout)?;
@@ -453,13 +453,12 @@ impl Bounded {
 }
 
 /// `cmd` (fed `input` on stdin) run to its end or to `timeout`, whichever comes first; None only when
-/// it cannot start. A run cut off at the cap keeps what it printed so far (a hive drone's iteration,
-/// hive/run.rs).
+/// it cannot start. A run cut off at the cap keeps what it printed so far.
 ///
 /// `cmd` runs in a process group of its own, and the whole group is killed when the cap passes or
 /// `cmd` exits (nothing it started, such as an MCP server, outlives it). The group also dies with this
 /// process, on every platform ([`Watchdog`]): a harness that kills `borg` (its own hook timeout) never
-/// leaves a model call running and spending, and a killed `borg debug hive run` leaves no drone at work.
+/// leaves a model call running and spending.
 pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Option<Bounded> {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
@@ -527,7 +526,7 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
 /// A thread of `run_bounded` that may outlive it (a straggler holds the pipe): it starts with SIGINT,
 /// SIGHUP and SIGTERM blocked (a new thread inherits its spawner's mask, held so only around the spawn),
 /// so a stop always reaches a thread that may trap it, and one sent while that thread holds them blocked
-/// (hive/reexec.rs, across an exec) stays pending for the process.
+/// (reexec.rs, across an exec) stays pending for the process.
 fn helper(f: impl FnOnce() + Send + 'static) {
     // SAFETY: sigemptyset(3)/sigaddset(3) initialise the zeroed sets; pthread_sigmask(3) on this thread,
     // its old mask restored right after the spawn.
@@ -628,7 +627,7 @@ mod tests {
     }
 
     /// A helper thread holds the stop signals blocked from its first instruction, its spawner's mask
-    /// as it was: a stop reaches only a thread that may trap it (a hive waiter's re-exec loses none).
+    /// as it was: a stop reaches only a thread that may trap it (a re-exec, reexec.rs, loses none).
     #[test]
     #[cfg(target_os = "linux")]
     fn a_helper_thread_never_takes_a_stop() {

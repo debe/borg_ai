@@ -11,9 +11,8 @@
 //! applies `drift/before-NN-*.sh` scripts. Results go to
 //! `target/eval-runs/<run>/results.jsonl`; `summary.md` is printed.
 //!
-//! Subcommands: `report`, `sandbox-exec`, `sandbox-probe`, `dogfood` (dogfood.rs), `hive` (hive.rs:
-//! the hive pilot's arms A, B, D3 and F, `hive validate` and `hive report`), and the replay evals
-//! when their private modules are present (build.rs).
+//! Subcommands: `report`, `sandbox-exec`, `sandbox-probe`, `dogfood` (dogfood.rs), and the replay
+//! evals when their private modules are present (build.rs).
 
 use std::fs;
 use std::io::Write;
@@ -25,8 +24,6 @@ use borg_trace::{Kind, claude};
 use serde_json::{Value, json};
 
 mod dogfood;
-mod hive;
-mod hive_seq;
 // Replay evals over private data: optional, see build.rs. rustfmt cannot resolve absent module files, so
 // `cargo fmt` skips these; scripts/check.sh checks them with rustfmt directly when they are present.
 #[cfg(replay_evals)]
@@ -152,7 +149,7 @@ pub(crate) struct Extra {
     /// Variables set inside a sandbox with its own HOME (`sandbox_home`), after the environment is
     /// cleared; ignored otherwise.
     pub env: Vec<(String, String)>,
-    /// No network inside (`--unshare-net`): the hive scorer runs agent-written code.
+    /// No network inside (`--unshare-net`): for a scorer that runs agent-written code.
     pub unshare_net: bool,
     /// A PID namespace of its own (`--unshare-pid`): every process started inside (a Gradle daemon an
     /// agent left, a build's orphan) is killed when the sandboxed command ends, and the host's
@@ -441,7 +438,6 @@ fn main() {
         #[cfg(replay_evals)]
         Some("expert-hook") => return preempt::expert_hook(),
         Some("dogfood") => return dogfood::main(&raw[1..]),
-        Some("hive") => return hive::main(&raw[1..]),
         Some("sandbox-probe") => return sandbox_probe(raw.get(1).map(PathBuf::from).expect("sandbox-probe <cwd>")),
         _ => {}
     }

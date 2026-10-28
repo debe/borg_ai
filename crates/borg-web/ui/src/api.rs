@@ -186,11 +186,6 @@ pub struct Lesson {
     pub vetoed: f64,
     /// The weighted share of later fixes (or review findings) of decisions it was asked before.
     pub regretted: f64,
-    /// Hive tasks it was shown in, by verdict: verified, rejected, hacked (protected tests or CI
-    /// changed, or the oracle touched).
-    pub verified: f64,
-    pub rejected: f64,
-    pub hacked: f64,
     /// Sessions whose own tests went green after it was asked.
     pub tested: f64,
     pub dormant: bool,
@@ -210,11 +205,11 @@ impl Lesson {
         if self.area.is_empty() { "other".into() } else { self.area.clone() }
     }
 
-    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed + verified + ½ tested, 1 + ignored + 2 corrected
-    /// + 3 vetoed + regretted + rejected + 3 hacked)).
+    /// Mean of the usefulness belief (memory.rs: Beta(1 + changed + ½ tested, 1 + ignored + 2 corrected
+    /// + 3 vetoed + regretted)).
     pub fn usefulness(&self) -> f64 {
-        let a = 1.0 + self.changed + self.verified + 0.5 * self.tested;
-        let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted + self.rejected + 3.0 * self.hacked;
+        let a = 1.0 + self.changed + 0.5 * self.tested;
+        let b = 1.0 + self.ignored + 2.0 * self.corrected + 3.0 * self.vetoed + self.regretted;
         a / (a + b)
     }
 
@@ -261,9 +256,6 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             corrected: f(&l["corrected"]),
             vetoed: f(&l["vetoed"]),
             regretted: f(&l["regretted"]),
-            verified: f(&l["verified"]),
-            rejected: f(&l["rejected"]),
-            hacked: f(&l["hacked"]),
             tested: f(&l["tested"]),
             dormant: l["dormant"].as_bool().unwrap_or(false),
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
@@ -438,399 +430,12 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
         .collect()
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveTask {
-    pub id: String,
-    pub role: String,
-    pub title: String,
-    pub status: String,
-    pub holder: String,
-    pub lease_left_ms: f64,
-    pub files: Vec<String>,
-    /// The holder's node: empty on this node.
-    pub node: String,
-    /// Where its newest claim started (borg hive/start.rs): the start, the deps' work in it, the reset.
-    pub start: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveDrone {
-    pub drone: String,
-    pub usd: f64,
-    pub share: f64,
-    pub iters: f64,
-    pub last_exit: String,
-    pub unmetered: bool,
-    /// An interactive drone's: no share of a run, its claims charged to the goal's budget.
-    pub interactive: bool,
-}
-
-/// One hive goal (borg hive/view.rs `HiveView`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveGoal {
-    pub goal: String,
-    pub spec: String,
-    pub budget_usd: f64,
-    pub spent_usd: f64,
-    pub finished: bool,
-    /// `integrated <commit>`, or why the newest integration failed; empty before any.
-    pub integration: String,
-    pub tasks: Vec<HiveTask>,
-    pub drones: Vec<HiveDrone>,
-    /// (task, text, scope) of the newest contracts, newest last.
-    pub contracts: Vec<(String, String, Vec<String>)>,
-    /// (kind, sender drone or session, its node, to, text) of the newest messages between drones,
-    /// newest last.
-    pub messages: Vec<(String, String, String, String, String)>,
-    /// Other nodes whose lines are on the board.
-    pub nodes: f64,
-    /// What stops the goal on this node: conflicting definitions, checks waiting for `borg hive approve`.
-    pub alerts: Vec<String>,
-    /// Its groups of attempts (borg hive/group.rs `Row`).
-    pub groups: Vec<HiveGroup>,
-    /// Its tasks verified after a rejection (borg hive/rework.rs `Row`).
-    pub reworks: Vec<HiveRework>,
-    /// The newest bundles of attempts' commits (borg hive/commits.rs `Row`).
-    pub commits: Vec<HiveCommit>,
-    /// The plan's intent cards and the engineer's decision (borg hive/plan.rs `Row`); None without a
-    /// work task.
-    pub plan: Option<HivePlan>,
-    /// Interactive monitoring (borg hive/monitor.rs, phase g G6), backfilled from the board.
-    pub monitor: HiveMonitor,
-}
-
-/// The board at one moment: its tasks by state (borg hive/monitor.rs `Point`).
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct HivePoint {
-    pub ms: f64,
-    pub open: f64,
-    pub claimed: f64,
-    pub done: f64,
-    pub verified: f64,
-    pub blocked: f64,
-    pub stuck: f64,
-}
-
-/// One node of a goal (borg hive/monitor.rs `NodeRow`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveNode {
-    pub node: String,
-    pub here: bool,
-    /// `in`, `left` or `not joined`.
-    pub state: String,
-    pub joined_ms: f64,
-    pub left_ms: f64,
-    /// Its newest beat's age on this node's clock; None without a beat.
-    pub beat_age_ms: Option<f64>,
-    pub line_age_ms: Option<f64>,
-    pub takers: Vec<String>,
-    /// This node's: `daemon`, `waiter <drone>`, `a process` or `none`.
-    pub worker: String,
-}
-
-/// One wake of an interactive drone: hand to take-up, or a wake no turn took up.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveWake {
-    pub task: String,
-    pub ms: f64,
-    pub latency_ms: f64,
-    pub taken: bool,
-}
-
-/// One interactive drone of this node (borg hive/monitor.rs `DroneRow`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveMember {
-    pub drone: String,
-    pub harness: String,
-    pub session: String,
-    /// `working`, `busy`, `waiting`, `waiting (old borg, restarting)`, `not waiting` or `gone`.
-    pub state: String,
-    pub task: String,
-    pub since_ms: f64,
-    pub done: f64,
-    pub judged: f64,
-    pub wakes: Vec<HiveWake>,
-    pub usd: f64,
-    pub unmetered: bool,
-}
-
-/// A stuck line or a decline, with its reason.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveLine {
-    pub task: String,
-    pub node: String,
-    pub ms: f64,
-    pub why: String,
-}
-
-/// One integration and how it ended.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveIntegration {
-    pub task: String,
-    pub status: String,
-    pub result: String,
-    pub opened_ms: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct HiveMonitor {
-    pub history: Vec<HivePoint>,
-    pub members: Vec<HiveNode>,
-    pub interactive: Vec<HiveMember>,
-    pub stuck: Vec<HiveLine>,
-    pub declines: Vec<HiveLine>,
-    pub integrations: Vec<HiveIntegration>,
-    pub integrate_log: Vec<String>,
-    pub metered_usd: f64,
-    pub unmetered: f64,
-    /// This node's planner sessions and the messages for them their prompts have not shown.
-    pub planners: Vec<(String, f64)>,
-    /// The goal's messages to the planner and those no planning session of this node showed, on the
-    /// goal's home node and a node with a planning session.
-    pub planner_mail: Option<(f64, f64)>,
-}
-
-fn arr(v: &Value) -> impl Iterator<Item = &Value> {
-    v.as_array().into_iter().flatten()
-}
-
-fn parse_monitor(g: &Value) -> HiveMonitor {
-    let line = |l: &Value| HiveLine { task: s(&l["task"]), node: s(&l["node"]), ms: f(&l["ms"]), why: s(&l["why"]) };
-    HiveMonitor {
-        history: arr(&g["history"])
-            .map(|p| HivePoint {
-                ms: f(&p["ms"]),
-                open: f(&p["open"]),
-                claimed: f(&p["claimed"]),
-                done: f(&p["done"]),
-                verified: f(&p["verified"]),
-                blocked: f(&p["blocked"]),
-                stuck: f(&p["stuck"]),
-            })
-            .collect(),
-        members: arr(&g["members"])
-            .map(|n| HiveNode {
-                node: s(&n["node"]),
-                here: n["here"].as_bool().unwrap_or(false),
-                state: s(&n["state"]),
-                joined_ms: f(&n["joined_ms"]),
-                left_ms: f(&n["left_ms"]),
-                beat_age_ms: n["beat_age_ms"].as_f64(),
-                line_age_ms: n["line_age_ms"].as_f64(),
-                takers: strs(&n["takers"]),
-                worker: s(&n["worker"]),
-            })
-            .collect(),
-        interactive: arr(&g["interactive"])
-            .map(|d| HiveMember {
-                drone: s(&d["drone"]),
-                harness: s(&d["harness"]),
-                session: s(&d["session"]),
-                state: s(&d["state"]),
-                task: s(&d["task"]),
-                since_ms: f(&d["since_ms"]),
-                done: f(&d["done"]),
-                judged: f(&d["judged"]),
-                wakes: arr(&d["wakes"])
-                    .map(|w| HiveWake { task: s(&w["task"]), ms: f(&w["ms"]), latency_ms: f(&w["latency_ms"]), taken: w["taken"].as_bool().unwrap_or(false) })
-                    .collect(),
-                usd: f(&d["usd"]),
-                unmetered: d["unmetered"].as_bool().unwrap_or(false),
-            })
-            .collect(),
-        stuck: arr(&g["stuck"]).map(line).collect(),
-        declines: arr(&g["declines"]).map(line).collect(),
-        integrations: arr(&g["integrations"])
-            .map(|i| HiveIntegration { task: s(&i["task"]), status: s(&i["status"]), result: s(&i["result"]), opened_ms: f(&i["opened_ms"]) })
-            .collect(),
-        integrate_log: strs(&g["integrate_log"]),
-        metered_usd: f(&g["metered_usd"]),
-        unmetered: f(&g["unmetered"]),
-        planners: arr(&g["planners"]).map(|p| (s(&p["session"]), f(&p["unread"]))).collect(),
-        planner_mail: g["planner_mail"].is_object().then(|| (f(&g["planner_mail"]["sent"]), f(&g["planner_mail"]["unshown"]))),
-    }
-}
-
-/// A goal's plan as the engineer approves it before any drone takes one of its tasks.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HivePlan {
-    /// `approved`, `refused`, `waiting` or `not asked`.
-    pub state: String,
-    pub by: String,
-    /// `queen`, `yes` (`--yes`) or `ratify` (`borg hive ratify`).
-    pub via: String,
-    pub question: String,
-    pub answer: String,
-    pub cards: Vec<HiveCard>,
-    /// An interactive goal's plan: answered at the planning session's prompt or with `borg hive ratify`.
-    pub interactive: bool,
-}
-
-/// One task's intent card.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveCard {
-    pub task: String,
-    pub intent: String,
-    pub files: Vec<String>,
-    pub deps: Vec<String>,
-    /// `low`, `normal` or `high`.
-    pub risk: String,
-    pub why: String,
-}
-
-/// One attempt's commits carried as a bundle between nodes, and what this node did with it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveCommit {
-    pub task: String,
-    pub head: String,
-    /// The node it came from: empty for this one.
-    pub node: String,
-    pub bytes: f64,
-    /// `made here`, `carried`, `unbundled`, `refused: …` or `waiting: …`.
-    pub state: String,
-}
-
-/// A task the verifier rejected and a later attempt passed, and what reflection made of it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveRework {
-    pub task: String,
-    pub rejections: f64,
-    /// The rejected drones, then the accepted one's.
-    pub drones: Vec<String>,
-    /// `lesson <id>`, `not a lesson`, `learning`, `to reflect` or `waiting`.
-    pub reflection: String,
-}
-
-/// One group of K attempts at a task by different drones, and what reflection made of it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HiveGroup {
-    pub group: String,
-    pub members: f64,
-    pub attempts: f64,
-    pub won: Vec<String>,
-    pub lost: Vec<String>,
-    pub decided_by: String,
-    /// The member an integration merges; empty before one is accepted.
-    pub integrates: String,
-    /// `lesson <id>`, `not a lesson`, `learning`, `to reflect`, `no spread` or `waiting`.
-    pub reflection: String,
-}
-
-pub fn parse_hive(v: &Value) -> Vec<HiveGoal> {
-    v["goals"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|g| HiveGoal {
-            goal: s(&g["goal"]),
-            spec: s(&g["spec"]),
-            budget_usd: f(&g["budget_usd"]),
-            spent_usd: f(&g["spent_usd"]),
-            finished: g["finished"].as_bool().unwrap_or(false),
-            integration: s(&g["integration"]),
-            tasks: g["tasks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|t| HiveTask {
-                    id: s(&t["id"]),
-                    role: s(&t["role"]),
-                    title: s(&t["title"]),
-                    status: s(&t["status"]),
-                    holder: s(&t["holder"]),
-                    lease_left_ms: f(&t["lease_left_ms"]),
-                    files: strs(&t["files"]),
-                    node: s(&t["node"]),
-                    start: s(&t["start"]),
-                })
-                .collect(),
-            drones: g["drones"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|d| HiveDrone {
-                    drone: s(&d["drone"]),
-                    usd: f(&d["usd"]),
-                    share: f(&d["share"]),
-                    iters: f(&d["iters"]),
-                    last_exit: s(&d["last_exit"]),
-                    unmetered: d["unmetered"].as_bool().unwrap_or(false),
-                    interactive: d["interactive"].as_bool().unwrap_or(false),
-                })
-                .collect(),
-            contracts: g["contracts"].as_array().into_iter().flatten().map(|c| (s(&c["task"]), s(&c["text"]), strs(&c["scope"]))).collect(),
-            messages: g["messages"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|m| {
-                    let who = if s(&m["drone"]).is_empty() { s(&m["by"]).chars().take(8).collect() } else { s(&m["drone"]) };
-                    (s(&m["kind"]), who, s(&m["node"]), s(&m["to"]), s(&m["text"]))
-                })
-                .collect(),
-            nodes: f(&g["nodes"]),
-            alerts: strs(&g["alerts"]),
-            groups: g["groups"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|r| HiveGroup {
-                    group: s(&r["group"]),
-                    members: f(&r["members"]),
-                    attempts: f(&r["attempts"]),
-                    won: strs(&r["won"]),
-                    lost: strs(&r["lost"]),
-                    decided_by: s(&r["decided_by"]),
-                    integrates: s(&r["integrates"]),
-                    reflection: s(&r["reflection"]),
-                })
-                .collect(),
-            reworks: g["reworks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|r| HiveRework { task: s(&r["task"]), rejections: f(&r["rejections"]), drones: strs(&r["drones"]), reflection: s(&r["reflection"]) })
-                .collect(),
-            commits: g["commits"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|c| HiveCommit { task: s(&c["task"]), head: s(&c["head"]), node: s(&c["node"]), bytes: f(&c["bytes"]), state: s(&c["state"]) })
-                .collect(),
-            plan: g["plan"].is_object().then(|| HivePlan {
-                state: s(&g["plan"]["state"]),
-                by: s(&g["plan"]["by"]),
-                via: s(&g["plan"]["via"]),
-                question: s(&g["plan"]["question"]),
-                answer: s(&g["plan"]["answer"]),
-                interactive: g["plan"]["interactive"].as_bool().unwrap_or(false),
-                cards: g["plan"]["cards"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|c| HiveCard {
-                        task: s(&c["task"]),
-                        intent: s(&c["intent"]),
-                        files: strs(&c["files"]),
-                        deps: strs(&c["deps"]),
-                        risk: s(&c["risk"]),
-                        why: s(&c["why"]),
-                    })
-                    .collect(),
-            }),
-            monitor: parse_monitor(g),
-        })
-        .collect()
-}
-
 /// One version of a playbook that was shown, with its usefulness belief (borg memory.rs).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybookVersion {
     pub key: String,
     pub mean: f64,
-    pub verified: f64,
-    pub rejected: f64,
-    pub hacked: f64,
+    pub corrected: f64,
     pub vetoed: f64,
     pub regretted: f64,
 }
@@ -872,9 +477,7 @@ pub fn parse_playbooks(v: &Value) -> Vec<Playbook> {
                 .map(|x| PlaybookVersion {
                     key: s(&x["key"]),
                     mean: f(&x["mean"]),
-                    verified: f(&x["verified"]),
-                    rejected: f(&x["rejected"]),
-                    hacked: f(&x["hacked"]),
+                    corrected: f(&x["corrected"]),
                     vetoed: f(&x["vetoed"]),
                     regretted: f(&x["regretted"]),
                 })
@@ -933,9 +536,7 @@ pub struct Data {
     /// The queen's attention reward (served with the queue).
     pub attention: Memo<Attention>,
     pub drones: Memo<Vec<Drone>>,
-    /// The collective's hive goals; empty without a hive (or on a server without `/api/hive`).
-    pub hive: Memo<Vec<HiveGoal>>,
-    /// The collective's L1 playbooks (served with the hive).
+    /// The collective's L1 playbooks; empty without one (or on a server without `/api/playbooks`).
     pub playbooks: Memo<Vec<Playbook>>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
@@ -971,10 +572,10 @@ pub fn provide() -> Data {
         Source::new("feed"),
         Source::new("queen"),
         Source::new("drones"),
-        Source::new("hive"),
+        Source::new("playbooks"),
         Source::new("learning"),
     ];
-    let [st, le, fe, qu, dr, hi, _] = sources;
+    let [st, le, fe, qu, dr, pb, _] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -986,8 +587,7 @@ pub fn provide() -> Data {
         queen: Memo::new(move |_| parse_queen(&qu.raw.get())),
         attention: Memo::new(move |_| parse_attention(&qu.raw.get())),
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
-        hive: Memo::new(move |_| parse_hive(&hi.raw.get())),
-        playbooks: Memo::new(move |_| parse_playbooks(&hi.raw.get())),
+        playbooks: Memo::new(move |_| parse_playbooks(&pb.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

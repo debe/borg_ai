@@ -14,14 +14,40 @@ use super::change::{Action, Change, read};
 use crate::harness::{Harness, Level};
 
 /// The skill's files, relative to its directory, and their content.
-pub const FILES: [(&str, &str); 6] = [
+pub const FILES: [(&str, &str); 5] = [
     ("SKILL.md", include_str!("../../assets/skills/borg/SKILL.md")),
     ("references/collectives.md", include_str!("../../assets/skills/borg/references/collectives.md")),
     ("references/team.md", include_str!("../../assets/skills/borg/references/team.md")),
     ("references/vectors.md", include_str!("../../assets/skills/borg/references/vectors.md")),
     ("references/troubleshooting.md", include_str!("../../assets/skills/borg/references/troubleshooting.md")),
-    ("references/hive.md", include_str!("../../assets/skills/borg/references/hive.md")),
 ];
+
+/// Files an older borg's skill had and this one has not, with the blake3 of each text a release
+/// shipped: install and uninstall remove one only when it is exactly such a text; anything else is
+/// the engineer's, left alone.
+const RETIRED: [(&str, &[&str]); 1] = [(
+    "references/hive.md",
+    &[
+        "e489258ae65ce54c7b30b8d30e18754424946420a39cb03e45daa1cadb602380",
+        "e5f0eff3bddbfc883290fbefc781bcee3286562f06d95a64496514c97b686d94",
+        "c305e7b93c700d7f38c9b7968116fc4ece56a4f5b2f05f6bc47dadeecab84741",
+        "15f4dc8013f7584988d7ce035af1589917ad9e2b52f744792b5a42973f41c939",
+        "d11ef6672729f9d669a708e7439ef653da14eed88e908dcaed7d2dbb94e65fbb",
+        "23e607385e63f7b202e6bebf3dc8617023ec632f88958073354e9d6c0629be10",
+    ],
+)];
+
+/// The retired files in `dir` that are an older borg's exact text, with that text.
+fn retired(dir: &Path) -> Vec<(PathBuf, String)> {
+    RETIRED
+        .iter()
+        .filter_map(|(rel, known)| {
+            let path = dir.join(rel);
+            let text = read(&path).ok().flatten()?;
+            known.contains(&blake3::hash(text.as_bytes()).to_hex().as_str()).then_some((path, text))
+        })
+        .collect()
+}
 
 /// Where `h` loads the `borg` skill from: `skills/borg` in its config directory, the one holding its hook
 /// config or its adapter's directory (Claude Code, codex-cli 0.154.0, omp 17.3.5, opencode.ai/docs/skills);
@@ -80,6 +106,9 @@ pub fn plan(action: Action, dir: Option<&Path>) -> Result<(Vec<Change>, Vec<Stri
             _ => {}
         }
     }
+    for (path, text) in retired(dir) {
+        changes.push(Change { path, before: Some(text), after: None, through_links: false, backup: false });
+    }
     let notes = foreign.into_iter().map(|p| format!("{p}: left alone, its content is not this borg's skill (yours, or an older borg's)")).collect();
     Ok((changes, notes))
 }
@@ -105,7 +134,7 @@ pub fn state(dir: &Path) -> State {
         Ok(found) if found.iter().all(Option::is_none) => State::Absent,
         Ok(found) => {
             let same = FILES.iter().zip(&found).all(|((_, text), f)| f.as_deref() == Some(*text));
-            if same { State::Current } else { State::Stale }
+            if same && retired(dir).is_empty() { State::Current } else { State::Stale }
         }
     }
 }
@@ -215,6 +244,29 @@ mod tests {
         assert_eq!(run(Action::Install, &dir, "i").0, FILES.len());
         assert_eq!(std::fs::read_to_string(dir.join("references/team.md.borg-backup-i")).unwrap(), "my notes", "backed up");
         assert_eq!(state(&dir), State::Current);
+    }
+
+    #[test]
+    fn an_older_borgs_retired_file_goes_and_an_edited_one_stays() {
+        let dir = tmp("retired").join("borg");
+        run(Action::Install, &dir, "a");
+        let old = dir.join("references/hive.md");
+        let shipped = std::process::Command::new("git")
+            .args(["show", "188c262:crates/borg/assets/skills/borg/references/hive.md"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success());
+        if let Some(o) = shipped {
+            std::fs::write(&old, &o.stdout).unwrap();
+            assert_eq!(state(&dir), State::Stale, "a leftover of an older borg asks for a reinstall");
+            assert_eq!(run(Action::Install, &dir, "b").0, 1);
+            assert!(!old.exists());
+        }
+        std::fs::write(&old, "my notes").unwrap();
+        assert_eq!(state(&dir), State::Current, "the engineer's own file is not borg's");
+        assert_eq!(run(Action::Install, &dir, "c").0, 0);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "my notes");
     }
 
     #[cfg(unix)]

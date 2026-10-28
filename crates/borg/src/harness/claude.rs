@@ -6,13 +6,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
-pub const EVENTS: [(&str, &str); 7] = [
-    // Only an interactive hive drone's session answers here (its `/clear` rebound, its wait re-armed,
-    // hive/interactive.rs `session_start`); any other session after one failed open.
-    ("SessionStart", "start"),
+pub const EVENTS: [(&str, &str); 6] = [
     ("UserPromptSubmit", "prompt"),
     // Only a paused drone's tool calls are refused here (steer.rs); otherwise a stat and out.
     ("PreToolUse", "pre_tool"),
@@ -22,11 +19,12 @@ pub const EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "end"),
 ];
 
+/// Hooks an older borg installed: `SessionStart` served the hive's drones (0.3.0 and before).
+pub const RETIRED: [(&str, &str); 1] = [("SessionStart", "start")];
+
 /// Seconds Claude Code gives borg's Stop hook. Its own default for a command hook is 600 s now (its hooks
 /// docs, checked 2026-10-27; earlier versions gave 60 s): 90 s bounds how long a stuck stop can hold the
-/// engineer's turn, and no wait for hive work runs inside the hook (an interactive drone waits in a
-/// background `borg hive wait`, hive/wait.rs; the stop's own claim confirm keeps within
-/// `interactive::HAND_CAP`). The expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow
+/// engineer's turn. The expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow
 /// drone never costs the conscience's answer.
 pub const STOP_TIMEOUT_S: u64 = 90;
 
@@ -51,15 +49,13 @@ impl Harness for Claude {
             // so an install that predates that timeout, on a Claude Code whose default was 60 s, keeps a
             // margin too.
             stop_budget: None,
-            headless_budget: true,
             session_env: Some("CLAUDE_CODE_SESSION_ID"),
             drone_wake: DroneWake::Model,
-            one_session_per_process: true,
         }
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], through_links: true }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], retired: &RETIRED, through_links: true }
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
@@ -76,36 +72,6 @@ impl Harness for Claude {
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
         let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".claude"), PathBuf::from);
         project_runs(&config.join("projects"), session, since)
-    }
-
-    /// `claude -p` with the engineer's settings (so borg's hooks run in the drone) and every permission
-    /// granted inside the drone's worktree; `--max-budget-usd` stops it at the drone's share (checked
-    /// against `claude --help` of 2.1.308: it works only with `--print`).
-    fn headless(&self, run: &Headless) -> Option<std::process::Command> {
-        let mut cmd = std::process::Command::new("claude");
-        cmd.args(["-p", run.prompt, "--output-format", "json", "--permission-mode", "bypassPermissions", "--no-session-persistence"]);
-        if !run.session.is_empty() {
-            cmd.args(["--session-id", run.session]);
-        }
-        if let Some(b) = run.budget_usd {
-            cmd.args(["--max-budget-usd", &format!("{b:.2}")]);
-        }
-        if let Some(m) = run.model {
-            cmd.args(["--model", m]);
-        }
-        cmd.current_dir(run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
-        Some(cmd)
-    }
-
-    /// The one JSON object `--output-format json` prints.
-    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
-        let Ok(v) = serde_json::from_slice::<Value>(out) else { return HeadlessEnd::default() };
-        HeadlessEnd {
-            usd: v["total_cost_usd"].as_f64(),
-            session: v["session_id"].as_str().unwrap_or_default().into(),
-            text: v["result"].as_str().unwrap_or_default().into(),
-            error: v["is_error"].as_bool().unwrap_or(false),
-        }
     }
 }
 

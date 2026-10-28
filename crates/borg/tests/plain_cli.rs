@@ -1,8 +1,7 @@
-//! A plain interactive session, no hive, end to end through the binary and every harness's hooks, in
-//! both delivery modes: its prompt, edit, stop and end answer exactly the same in a store that also holds a hive goal synced from another node (with that
-//! node's runner joined to it and an open task in this repo), the session joins nothing and learns the
-//! same; and a store without playbooks shows none. The model is the fake `claude` of `common`: no test
-//! makes a real model call.
+//! A plain interactive session, end to end through the binary and every harness's hooks, in both
+//! delivery modes: its prompt gets its lessons where the harness delivers them early, its stop a
+//! verdict, and it leaves outcomes; and a store without playbooks shows none. The model is the fake
+//! `claude` of `common`: no test makes a real model call.
 
 mod common;
 
@@ -15,25 +14,6 @@ use serde_json::{Value, json};
 const ON: [(&str, &str); 1] = [("BORG_LEARN", "on")];
 /// And the stop always asks the model (no free gate), so it has a verdict to compare.
 const ASKED: [(&str, &str); 2] = [("BORG_LEARN", "on"), ("BORG_PREFILTER", "off")];
-
-/// A goal another node made and synced here: its projection (no goal.json), its board with an open task
-/// in this session's repo, and that node's runner joined to it.
-fn add_foreign_goal(root: &Path) {
-    let dir = root.join("store/collectives/corp/hive/peerg");
-    std::fs::create_dir_all(&dir).unwrap();
-    let goal = json!({"v": 1, "id": "peerg", "spec": "Tidy the Orion net's budget handling", "oracle": [], "budget_usd": 5.0,
-        "repos": [], "author": "peer@x", "created_ms": 1});
-    std::fs::write(dir.join("goal.jsonl"), format!("{goal}\n")).unwrap();
-    let open = json!({"v": 1, "ev": "open", "task": "t1", "ms": 2, "by": "engineer:peer@x", "node": "peer-node",
-        "def": {"id": "t1", "role": "work", "title": "drain the Orion budget place", "repo": "harbor_orion"}});
-    let join = json!({"v": 1, "ev": "heartbeat", "task": "", "ms": 3, "by": "runner", "node": "peer-node", "note": "join"});
-    std::fs::write(dir.join("tasks.jsonl"), format!("{open}\n{join}\n")).unwrap();
-    // A goal the hive itself takes: it loads, its task is open and the peer's node is in it.
-    let store = root.join("store/collectives/corp");
-    assert!(borg::hive::goal::load(&store, "peerg").is_ok());
-    let b = borg::hive::board::fold(&borg::hive::board::read(&borg::hive::tasks_path(&store, "peerg")));
-    assert!(b.tasks.contains_key("t1") && b.members["peer-node"].0 == 3, "{b:?}");
-}
 
 /// The harnesses whose hooks run a plain session, and the delivery modes: `hook` judges at the turn's
 /// end, `live` (the default, live.rs) also checks during the turn, through `borg check`.
@@ -87,36 +67,17 @@ fn session(root: &Path, harness: &str, mode: &str) -> (Vec<(String, String)>, Ve
 }
 
 #[test]
-fn a_synced_foreign_goal_changes_nothing_in_a_plain_session() {
+fn a_plain_session_gets_its_lessons_and_a_verdict_in_every_harness() {
     for harness in HARNESSES {
         for mode in MODES {
-            let plain = setup(&format!("plain-alone-{harness}-{mode}"));
-            let hived = setup(&format!("plain-hived-{harness}-{mode}"));
-            add_foreign_goal(&hived);
-            let (a, a_kinds) = session(&plain, harness, mode);
-            let (b, b_kinds) = session(&hived, harness, mode);
+            let root = setup(&format!("plain-{harness}-{mode}"));
+            let (a, kinds) = session(&root, harness, mode);
             // Only Claude Code delivers a scope's lessons at the prompt (harness caps `early_delivery`).
             let early = harness == "claude";
             assert_eq!(!context(&a[0].1).is_empty(), early, "{harness} {mode}: the plain session's prompt got its lessons: {a:?}");
-            assert!(a.iter().any(|(_, out)| out.contains("[G0]")), "{harness} {mode}: and a verdict to compare: {a:?}");
-            for ((event, alone), (_, beside)) in a.iter().zip(&b) {
-                assert_eq!(alone, beside, "{harness} {mode} {event}: the foreign goal changed the hook's answer");
-            }
-            assert!(!a_kinds.is_empty(), "{harness} {mode}: the session left outcomes");
-            assert_eq!(a_kinds, b_kinds, "{harness} {mode}: the same outcomes");
-            for root in [&plain, &hived] {
-                let hive_files: Vec<_> = std::fs::read_dir(root.join("store/collectives/corp/state"))
-                    .unwrap()
-                    .flatten()
-                    .filter(|e| e.path().extension().and_then(|x| x.to_str()).is_some_and(|x| x.starts_with("hive")))
-                    .collect();
-                assert!(hive_files.is_empty(), "{harness} {mode}: the session joined no goal: {hive_files:?}");
-                let ctx = state(root, "plain1", "ctx");
-                assert!(!ctx.contains("#borg-hive"), "{harness} {mode}: {ctx}");
-            }
-            for root in [plain, hived] {
-                let _ = std::fs::remove_dir_all(root);
-            }
+            assert!(a.iter().any(|(_, out)| out.contains("[G0]")), "{harness} {mode}: and a verdict: {a:?}");
+            assert!(!kinds.is_empty(), "{harness} {mode}: the session left outcomes");
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 }

@@ -126,15 +126,6 @@ pub fn Overview() -> impl IntoView {
                 tone: "h",
             });
         }
-        let judged = tt.n("task_verified") + tt.n("task_rejected") + tt.n("task_hacked");
-        if judged > 0.0 {
-            out.push(Fact {
-                big: pct(tt.n("task_hacked"), judged),
-                text: format!("of {} judged hive tasks were hacked: they changed protected tests or CI, or touched the oracle. The goal is zero.", num(judged)),
-                lesson: None,
-                tone: "h",
-            });
-        }
         if let Some(e) = s.engineers.iter().max_by(|a, b| a.t.n("turn_end").total_cmp(&b.t.n("turn_end"))).filter(|e| e.t.n("turn_end") > 0.0) {
             out.push(Fact {
                 big: who(&e.name),

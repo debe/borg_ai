@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use borg::collective::Route;
-use borg::hive::reexec::{self, Image};
+use borg::reexec::{self, Image};
 use borg_mesh::addr::Relay;
 use borg_mesh::daemon::{self, Event, Options};
 use borg_mesh::identity::Identity;
@@ -265,16 +265,8 @@ async fn run(args: &[String]) -> Result<(), String> {
                 eprintln!("borg mesh: no relay connection yet ({}): members behind another NAT may not reach this node until it has one", relay.setting());
             }
             let opts = Options { interval: Duration::from_secs(interval.max(1)), ..Options::default() };
-            // The node's goal work for its interactive drones (borg hive/node.rs, phase g G4) on a thread
-            // of its own, so no merge or board read holds up a sync round; stopped with the daemon, it
-            // writes nothing on the way out (no leave of any goal).
-            // Its code replaced by a reinstall of borg-mesh (borg hive/reexec.rs): the worker stops ticking
-            // at once, the daemon stops as on Ctrl-C, and `main` runs the new borg-mesh in this process.
-            let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let worker = {
-                let (home, quit, image) = (node.home().to_path_buf(), quit.clone(), image.watch());
-                std::thread::spawn(move || borg::hive::node::serve(&home, || quit.load(std::sync::atomic::Ordering::SeqCst) || image.stale()))
-            };
+            // Its code replaced by a reinstall of borg-mesh (borg reexec.rs): the daemon stops as on
+            // Ctrl-C, and `main` runs the new borg-mesh in this process.
             let reinstalled = std::sync::atomic::AtomicBool::new(false);
             let shutdown = async { reinstalled.store(stop(&image).await, std::sync::atomic::Ordering::SeqCst) };
             daemon::serve(node, opts, shutdown, |e| match e {
@@ -287,8 +279,6 @@ async fn run(args: &[String]) -> Result<(), String> {
                 Event::Gate(Err(e)) => eprintln!("borg mesh: {e}; paused until the config allows it"),
             })
             .await;
-            quit.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
             match reinstalled.into_inner() {
                 true => {
                     println!("borg-mesh was reinstalled: stopped to run the new one in this process");
@@ -370,7 +360,7 @@ fn steer_cmd(place: &Place, r: &Route, args: &[String]) -> Result<String, String
     borg_mesh::steer::issue(&home, &name, borg::collective::may_sync(r), &engineer, target, kind, &text, borg::learn::now_ms())
 }
 
-/// Until Ctrl-C or SIGTERM (borg hive/reexec.rs `trap_stops`, from `main`): false; or until `image`'s
+/// Until Ctrl-C or SIGTERM (borg reexec.rs `trap_stops`, from `main`): false; or until `image`'s
 /// borg-mesh was replaced by one that can run: true.
 async fn stop(image: &Image) -> bool {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -431,7 +421,7 @@ fn help() -> String {
 }
 
 fn main() {
-    // A daemon about to run this borg-mesh in its process asks first (borg hive/reexec.rs `restart`).
+    // A daemon about to run this borg-mesh in its process asks first (borg reexec.rs `restart`).
     if reexec::probed() {
         return;
     }
@@ -447,15 +437,6 @@ fn main() {
             println!("stopped");
             return;
         }
-    }
-    // The daemon's node worker reads its drones' scratch state where their hooks and `borg hive` keep it
-    // (borg hook.rs `main`, hive/mod.rs `Here::locate`): the store's `state` unless BORG_STATE names one.
-    if args.first().map(String::as_str) == Some("serve")
-        && std::env::var_os("BORG_STATE").is_none()
-        && let Route::Collective { home, .. } = place(&args).route()
-    {
-        // SAFETY: single-threaded: the runtime and its threads start below.
-        unsafe { std::env::set_var("BORG_STATE", home.join("state")) };
     }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,

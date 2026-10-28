@@ -21,9 +21,9 @@ pub mod expert;
 pub(crate) mod expert_route;
 pub mod facets;
 pub mod harness;
-pub mod hive;
 pub mod hook;
 pub mod install;
+pub(crate) mod jsonl;
 pub mod learn;
 pub mod live;
 pub mod memory;
@@ -38,6 +38,7 @@ pub mod prefilter;
 pub mod presence;
 pub mod queen;
 pub mod reach;
+pub mod reexec;
 pub mod review_fix;
 #[doc(hidden)]
 pub mod runner;

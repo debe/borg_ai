@@ -1,7 +1,7 @@
 # borg-web
 
 A local, live page of a collective's knowledge and usage statistics on 127.0.0.1: lessons and their
-belief, checks and questions, drones, hive goals and cost. `borg web` forwards to this binary; it is
+belief, checks and questions, drones, playbooks and cost. `borg web` forwards to this binary; it is
 separate so the web stack stays out of `borg hook`. The page is built and embedded, so installing it
 needs no wasm toolchain.
 

@@ -450,6 +450,7 @@ All are optional.
 | `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
 | `BORG_TEST_CREDIT` | on | `off`: a session's own tests going green after a lesson was asked no longer credit it (`tested` outcomes; [Green tests credit the question](learning.md#outcomes-and-the-usefulness-belief)). For an eval's frozen arm. Also off with `BORG_LEARN=off` |
 | `BORG_SHARE_OUTCOMES` | on | `off`: publish no outcomes for the team and read none (lesson usefulness and trust from this machine only); lines already synced stay |
+| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a session, and `borg learn` proposes no playbook edit from a clean session ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
 | `BORG_VETO` | on | `off`: a prompt starting "borg no" is an ordinary prompt (the `borg no` command still works; [Saying no](commands.md#saying-no)) |
 | `BORG_ASSIMILATE_JOBS` | `4` | Parallel model calls in `assimilate --from-dir` |
 | `BORG_ASSIMILATE_SKIP` | none | Comma-separated words; matching episodes and documents are skipped |
@@ -507,17 +508,6 @@ project.
 |---|---|---|
 | `BORG_QUEEN_ASK` | on | `off`: the drone asks no queued question at a session's first prompt (also off with `BORG_LEARN=off`) |
 | `BORG_NOTIFY` | on | `off`: no desktop notification (`notify-send`) for new questions |
-
-**Hive** (local spike; [Hive](commands.md#hive))
-
-| Variable | Default | Effect |
-|---|---|---|
-| `BORG_HIVE` | unset | A goal id: the session joins that hive goal at its first hook (the goal must exist in the routed store; anything else is ignored). Unset: a join record of the session's directory decides (`borg hive join --here`, `borg debug hive run`'s worktrees). Empty: no goal at all |
-| `BORG_HIVE_DRONE` | unset | Set by `borg debug hive run`: the drone a session is an iteration of. A verify task is barred to every session of the drone that did the work |
-| `BORG_HIVE_CREDIT` | on | `off`: hive verdicts credit no lessons (`verified`, `rejected`, `hacked` outcomes); the board, the flags and the `task_*` statistics still record. For an eval's frozen arm. Also off with `BORG_LEARN=off` |
-| `BORG_PLAYBOOKS` | on | `off`: no playbook is shown to a drone or a session, and `borg learn` proposes no playbook edit from verified hive work or a clean plain session ([Playbooks](commands.md#playbooks)). Promoted edits stay in `playbooks.jsonl` and still sync. For an eval arm without L1 |
-| `BORG_GROUP_REFLECT` | on | `off`: `borg learn` no longer turns settled hive groups into reflection episodes ([Groups](commands.md#groups-of-attempts)); `borg learn --group` still does. For an eval arm without group reflection. Also off with `BORG_LEARN=off` |
-| `BORG_REWORK_REFLECT` | on | `off`: `borg learn` no longer turns hive tasks the verifier rejected and a rework passed into rework episodes ([Reworks](commands.md#reworks)). For an eval arm without them. Also off with `BORG_LEARN=off` |
 
 **Experimental**, off by default. Most failed a pre-registered test and stay for further experiments.
 

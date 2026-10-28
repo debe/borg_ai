@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::runner;
 
-use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
 
 pub const ADAPTER: &str = include_str!("../../assets/adapters/opencode/borg.ts");
 
@@ -34,38 +34,8 @@ impl Harness for Opencode {
             sends_pid: true,
             // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
             stop_budget: None,
-            headless_budget: false,
             session_env: None,
             drone_wake: DroneWake::Plugin,
-            one_session_per_process: false,
-        }
-    }
-
-    /// 1.x: `opencode run --format json --dir <worktree> --auto`, with the engineer's config and plugins
-    /// (borg's adapter among them), checked against `opencode run --help` of 1.19.0. 2.x: None until a
-    /// live check: a drone must load borg's plugin, so it cannot run `--standalone`, and the background
-    /// service ignores the call's env, so its sessions would join the goal only through the worktree's
-    /// join record (hive/mod.rs `bind_from_env`). opencode takes no budget: the runner checks it
-    /// between iterations.
-    fn headless(&self, run: &Headless) -> Option<std::process::Command> {
-        if crate::runner::opencode() != crate::runner::Opencode::V1 {
-            return None;
-        }
-        let mut cmd = std::process::Command::new("opencode");
-        cmd.args(["run", "--format", "json", "--auto"]).arg("--dir").arg(run.cwd);
-        if let Some(m) = run.model {
-            cmd.args(["-m", m]);
-        }
-        // opencode files the session under PWD, which current_dir does not change.
-        cmd.arg(run.prompt).current_dir(run.cwd).env("PWD", run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
-        Some(cmd)
-    }
-
-    /// The last step's text and the summed step costs (runner.rs `opencode_answer`); none: an error.
-    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
-        match crate::runner::opencode_answer(out) {
-            Some((text, usd)) => HeadlessEnd { usd, session: String::new(), text, error: false },
-            None => HeadlessEnd { error: true, ..HeadlessEnd::default() },
         }
     }
 

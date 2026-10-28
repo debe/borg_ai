@@ -33,9 +33,6 @@ pub fn Drawer() -> impl IntoView {
             ("vetoed", l.vetoed, "var(--c-heat)"),
             ("regretted later", l.regretted, "var(--c-pink)"),
             ("tests green after", l.tested, "var(--c-good)"),
-            ("hive task verified", l.verified, "var(--c-good)"),
-            ("hive task rejected", l.rejected, "var(--c-slate)"),
-            ("hive task hacked", l.hacked, "var(--c-heat)"),
             ("early, free", l.usage.get("early").copied().unwrap_or(0.0), "var(--c-teal)"),
         ];
         let umax = usage.iter().map(|u| u.1).fold(0.0, f64::max).max(1.0);

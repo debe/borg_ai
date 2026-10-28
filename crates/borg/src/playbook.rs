@@ -1,6 +1,5 @@
-//! L1 playbooks: the team's procedure for a kind of task (docs/design/hive.md "Learning in
-//! four layers", L5). Where a lesson is one question, a playbook is a short list of steps for a task
-//! shape ("add a database migration with a backfill"), learned from verified hive work and from plain
+//! L1 playbooks: the team's procedure for a kind of task. Where a lesson is one question, a playbook is
+//! a short list of steps for a task shape ("add a database migration with a backfill"), learned from
 //! sessions that ended clean.
 //!
 //! **Store.** `playbooks.jsonl` (`FILE`) in the collective's store holds edits, never whole playbooks
@@ -16,26 +15,23 @@
 //! nodes learning the same shape edit one playbook. Its version ([`Playbook::key`], `<id>@<n>.<hash>`)
 //! names the exact set of edits it folds.
 //!
-//! **Proposed, then promoted.** After a verified hive attempt that won (verified and not hacked, or the
-//! hidden oracle's pass; of a group, only the attempt the integration merges, which beat its rivals),
-//! or a plain session (no hive) that ended clean ([`plain_win`]: it landed commits, its own last test
-//! run passed, and the engineer neither corrected nor vetoed it), `borg learn` asks the model once for
-//! at most one edit to the playbook of that task's shape ([`reflect_pending`]): the reflector and
+//! **Proposed, then promoted.** After a session that ended clean ([`plain_win`]: it landed commits,
+//! its own last test run passed, and the engineer neither corrected nor vetoed it),
+//! `borg learn` asks the model once for at most one edit to the playbook of that task's shape
+//! ([`reflect_pending`]): the reflector and
 //! curator of ACE in one call, shown the matching playbooks' steps. The edit is never applied by learning: it is queued as a queen question (`queen::Kind::Playbook`,
 //! [`propose`]), and only an engineer's "promote" answer appends it, with the question's id as `ok_by`
 //! ([`ratify`]). Lines without `ok_by` never fold. A step's text is one line of at most [`STEP_MAX`]
 //! characters, and the question shows all of it: what the engineer promotes is what drones are shown.
-//! Once per attempt or session (`REFLECTED`, local).
+//! Once per session (`REFLECTED`, local).
 //!
-//! **Shown.** A hive drone's claim is matched to playbooks by its task's title and files ([`matching`]):
-//! a playbook of the task's repo (or of none) whose shape's significant words the task names, at least
-//! `queen::STATED` of them, the share at which the queen deems a text to state something. A normal
-//! session's prompt is held to the same bar: a prompt is how a plain session states its task, and a
-//! plain session's win is matched by its task alone. A playbook learned from a goal without repos is of
-//! no repo and fits every repo. Each version is shown once per session (`MARKER`), and logged as an outcome
-//! (`outcome::PLAYBOOK`, its key in `lessons`), so the veto, the regret and the hive verdict credit reach
-//! the version that was shown exactly as they reach lessons (veto.rs `shown_between`, outcome.rs
-//! `regretted`), and memory.rs derives its usefulness belief ([`beliefs`]).
+//! **Shown.** A session's prompt is matched to playbooks ([`matching`]): a playbook of the session's
+//! repo (or of none) whose shape's significant words the prompt names, at least `queen::STATED` of
+//! them, the share at which the queen deems a text to state something. A session's win is matched by
+//! its task alone. Each version is shown once per session (`MARKER`), and logged as an outcome
+//! (`outcome::PLAYBOOK`, its key in `lessons`), so the veto and the regret reach the version that was
+//! shown exactly as they reach lessons (veto.rs `shown`, outcome.rs `regretted`), and memory.rs
+//! derives its usefulness belief ([`beliefs`]).
 //!
 //! On by default; `BORG_PLAYBOOKS=off` neither shows nor proposes (an eval arm without L1).
 
@@ -45,16 +41,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::hive::board::{self, Ev, Role};
-use crate::hive::{goal, group, verdict};
 use crate::{memory, outcome, queen, stats};
 
 /// The edits, in the collective's store; synced by the mesh.
 pub const FILE: &str = "playbooks.jsonl";
-/// The attempts reflected on already, one `<goal>/<verify task>` per line; local, never synced.
+/// The sessions reflected on already, one `session/<id>` per line; local, never synced.
 pub const REFLECTED: &str = "playbooks-reflected.txt";
 /// The clean plain sessions whose reflection has not answered yet, one session per line; local, never
-/// synced. A session ends once, so its win waits here for a later run, as a hive win waits on the board.
+/// synced. A session ends once, so its win waits here for a later run.
 pub const PLAIN: &str = "playbooks-plain.txt";
 /// The state-file marker of the playbook versions a session was shown.
 pub const MARKER: &str = "#borg-playbook ";
@@ -112,7 +106,8 @@ pub struct Edit {
     pub repo: String,
     /// When it was promoted (proposed, in a queen question's payload).
     pub ms: i64,
-    /// The attempt it was learned from: `<goal>/<verify task>`.
+    /// The session it was learned from: `session/<id>` (`<goal>/<verify task>` in a 0.3.0 line, from
+    /// the removed hive).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
     /// The queen question whose answer promoted it, and the engineer who answered. Empty: not promoted,
@@ -252,7 +247,7 @@ pub fn fold(edits: &[Edit]) -> Vec<Playbook> {
 
 /// The edits in the store `home`.
 pub fn edits(home: &Path) -> Vec<Edit> {
-    crate::hive::read_lines(&home.join(FILE))
+    crate::jsonl::read_lines(&home.join(FILE))
 }
 
 /// The playbooks of the store `home`.
@@ -322,12 +317,9 @@ pub fn fresh(home: &Path, state: &str, repo: &str, text: &str, need: f64) -> Opt
 }
 
 /// A normal session's prompt (hook.rs `on_prompt`): the playbooks of `repo` (or of no repo) whose shape
-/// words the prompt names, at least `queen::STATED` of them, as for a task; each version once, marked and logged as shown. Not in a hive drone's
-/// session (the hive's context shows its claim's playbooks).
+/// words the prompt names, at least `queen::STATED` of them, as for a task; each version once, marked
+/// and logged as shown.
 pub fn for_prompt(home: &Path, session: &str, repo: &str, prompt: &str, now: i64) -> Option<String> {
-    if crate::hive::bound(session).is_some() {
-        return None;
-    }
     let state = std::fs::read_to_string(crate::hook::state_file(session)).unwrap_or_default();
     let (text, keys) = fresh(home, &state, repo, prompt, queen::STATED)?;
     crate::hook::append(session, &format!("{MARKER}{}", keys.join(",")));
@@ -336,7 +328,7 @@ pub fn for_prompt(home: &Path, session: &str, repo: &str, prompt: &str, now: i64
 }
 
 /// Each shown playbook version's usefulness belief (memory.rs), by key, from the team's outcomes: what
-/// the vetoes, regrets and verdicts of the sessions it was shown in credited it.
+/// the vetoes and regrets of the sessions it was shown in credited it.
 pub fn beliefs(home: &Path) -> HashMap<String, memory::Memory> {
     let outcomes = outcome::read_team(&home.join("lessons.jsonl"));
     let mut keys: Vec<&str> = outcomes.iter().flat_map(|o| o.lessons.iter().map(String::as_str)).filter(|l| is_key(l)).collect();
@@ -372,10 +364,7 @@ pub fn view(home: &Path) -> Vec<Value> {
             let versions: Vec<Value> = mem
                 .iter()
                 .filter(|(k, _)| k.split('@').next() == Some(p.id.as_str()))
-                .map(|(k, m)| {
-                    json!({"key": k, "mean": m.mean(), "verified": m.verified, "rejected": m.rejected, "hacked": m.hacked,
-                        "vetoed": m.vetoed, "regretted": m.regretted, "corrected": m.corrected})
-                })
+                .map(|(k, m)| json!({"key": k, "mean": m.mean(), "vetoed": m.vetoed, "regretted": m.regretted, "corrected": m.corrected}))
                 .collect();
             let waiting = waiting(&p.id);
             (
@@ -500,7 +489,7 @@ pub fn ratify(store: &Path, e: &queen::Entry, answer: &str, author: &str, now: i
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Reflecting on verified work.
+// Reflecting on work that ended clean.
 
 /// How the reflection prompt opens; learn.rs `schema_for` picks [`schema`] by it.
 pub const OPENING: &str = "A coding agent's task was checked and passed. You curate the team's playbooks: for each \
@@ -524,112 +513,42 @@ pub fn schema() -> Value {
         "required": ["shape", "op", "step", "text"]})
 }
 
-/// A verified attempt that won, to reflect on.
+/// A session that ended clean, to reflect on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Win {
-    /// `<goal>/<verify task>`: the attempt, the once-only key.
-    pub cause: String,
+    pub session: String,
     pub title: String,
-    pub files: Vec<String>,
     pub repo: String,
-    /// The reward was the hidden oracle's pass (else the verifier's).
-    pub hidden: bool,
     pub done: String,
-    pub note: String,
-    /// Its change (`group::change`), read only when it is reflected on, from the snapshots: a directory
-    /// of the repo, base and head.
+    /// Its change (`change`), read only when it is reflected on, from `dir` (a directory of the repo)
+    /// between `base` and `head`.
     pub change: String,
-    pub snapshots: Option<(PathBuf, String, String)>,
-    pub author: String,
-    /// Of a group: the attempts it beat, each `drone verdict: note`.
-    pub beat: Vec<String>,
-    /// Of a plain session's win (`plain_win`): the commits it landed; 0 for a hive attempt.
+    pub dir: PathBuf,
+    pub base: String,
+    pub head: String,
+    /// The commits it landed.
     pub landed: usize,
 }
 
-/// The attempts on this node's goals that won and are reflected on: work done on this node, verified
-/// and not hacked; under a hidden oracle, passed by it (waiting while unscored); of a group, the
-/// accepted attempt of its integrated member (`group::best`) once the group is settled. Those in `skip`
-/// (reflected already) are left out before anything about them is read.
-pub fn wins(home: &Path, skip: &HashSet<String>) -> Vec<Win> {
-    if std::fs::metadata(home.join("hive")).is_err() {
-        return Vec::new();
+impl Win {
+    /// `session/<id>`: the once-only key.
+    pub fn cause(&self) -> String {
+        session_cause(&self.session)
     }
-    let mut out = Vec::new();
-    for id in goal::list(home) {
-        let Ok(g) = goal::load(home, &id) else { continue };
-        let events = board::read(&crate::hive::tasks_path(home, &id));
-        let b = board::fold(&events);
-        let scores = group::scores(home, &id);
-        let groups = group::of_board(&g, &events, &b, &scores);
-        let members = group::groups(&b);
-        let joins = crate::hive::read_lines::<crate::hive::Join>(&crate::hive::joins_path(home, &id));
-        for (e, a) in verdict::judged_events(&events, &b) {
-            let Some(s) = b.tasks.get(&a.work).filter(|s| s.task.role == Role::Work) else { continue };
-            let cause = format!("{id}/{}", e.task);
-            if skip.contains(&cause) || !crate::hive::is_local(home, &a.node) || e.hacked == Some(true) {
-                continue;
-            }
-            let won = match scores.get(&e.task) {
-                Some(pass) => *pass,
-                None if g.hidden.is_some() => false,
-                None => e.ev == Ev::Verified,
-            };
-            if !won {
-                continue;
-            }
-            let beat = match &s.task.group {
-                None => Vec::new(),
-                Some(gid) => {
-                    let Some(gr) = groups.iter().find(|x| &x.id == gid).filter(|x| x.settled()) else { continue };
-                    let best = members.get(gid.as_str()).and_then(|m| group::best(m, |v| scores.get(v).copied()));
-                    if best.and_then(|x| x.accepted.as_deref()) != Some(e.task.as_str()) {
-                        continue;
-                    }
-                    gr.tries
-                        .iter()
-                        .filter(|t| t.win == Some(false))
-                        .map(|t| format!("drone {} {}: {}", t.drone, t.verdict, group::cut(t.note.trim())))
-                        .collect()
-                }
-            };
-            let done = events.iter().find(|x| x.ev == Ev::Done && x.task == a.work && x.by == a.author && x.ms == a.done_ms).map(|x| x.note.clone());
-            let snapshots = group::repo_dir(&joins, &a.author).map(|d| (d, a.base.clone(), a.head.clone()));
-            let repo = if s.task.repo.is_empty() { g.repos.first().map(|r| r.name.clone()).unwrap_or_default() } else { s.task.repo.clone() };
-            out.push(Win {
-                cause,
-                title: s.task.title.clone(),
-                files: s.task.files.clone(),
-                repo,
-                hidden: scores.contains_key(&e.task),
-                done: done.unwrap_or_default(),
-                note: e.note.clone(),
-                change: String::new(),
-                snapshots,
-                author: a.author.clone(),
-                beat,
-                landed: 0,
-            });
-        }
-    }
-    out
 }
 
-/// The `REFLECTED` key of a plain session's win: never a `<goal>/<verify task>`, whose goal is a hex id.
+/// The `REFLECTED` key of a session's win.
 fn session_cause(session: &str) -> String {
     format!("session/{session}")
 }
 
-/// A plain session (no hive) that ended clean, as a win to reflect on: it landed commits (notes.rs
+/// A session that ended clean, as a win to reflect on: it landed commits (notes.rs
 /// `landed`, from where it started in `state`, the hook's state dir), its own last test run passed
 /// (hook.rs `capture_test`), and `outcomes` hold no correction or veto of it. The caller passes only
 /// sessions without an episode (a correction or a veto, learn.rs). Its task is the session's first task
 /// prompt (hook.rs `first_task_file`), not its latest ("commit it"); its change runs from where it
-/// started to its newest commit. None for a hive drone's session: its claim's verdict decides (`wins`).
+/// started to its newest commit.
 pub fn plain_win(state: &Path, session: &str, outcomes: &[outcome::Outcome]) -> Option<Win> {
-    if crate::hive::bound(session).is_some() {
-        return None;
-    }
     if outcomes.iter().any(|o| o.session == session && (o.kind == outcome::CORRECTED || o.kind == outcome::VETOED)) {
         return None;
     }
@@ -651,45 +570,45 @@ pub fn plain_win(state: &Path, session: &str, outcomes: &[outcome::Outcome]) -> 
     let commits = crate::notes::landed(Path::new(&start.repo), &start, &crate::notes::windows(state, session, &start));
     let head = commits.first()?.clone();
     Some(Win {
-        cause: session_cause(session),
+        session: session.into(),
         title,
         repo: queen::repo_name(&start.repo),
         done: read("proposal"),
-        snapshots: Some((PathBuf::from(&start.repo), start.head.clone(), head)),
-        author: session.into(),
+        dir: PathBuf::from(&start.repo),
+        base: start.head.clone(),
+        head,
         landed: commits.len(),
         ..Win::default()
     })
 }
 
-impl Win {
-    /// What matching reads of the task: its title and files.
-    fn text(&self) -> String {
-        format!("{} {}", self.title, self.files.join(" "))
+/// The change of a win, `base` to `head`: its stat and patch, empty when git cannot say (the commits
+/// are gone).
+fn change(dir: &Path, base: &str, head: &str) -> String {
+    if base.is_empty() || head.is_empty() {
+        return String::new();
     }
+    crate::notes::git(dir, &["diff", "--stat", "--patch", "-U2", "--no-color", "--no-ext-diff", "--no-textconv", base, head]).unwrap_or_default()
+}
+
+/// At most `regret::CAP` characters of `s`.
+fn cut(s: &str) -> String {
+    s.chars().take(crate::learn::regret::CAP).collect()
 }
 
 /// The reflection prompt for `w`, the playbooks its task matches listed with their step ids.
 fn prompt(w: &Win, listed: &[&Playbook]) -> String {
-    let result = match (w.landed, w.hidden) {
-        (0, true) => "It passed the held-out tests.".to_string(),
-        (0, false) => "An independent verifier passed it.".to_string(),
-        (n, _) => format!("The session landed {n} commit(s), its own last test run passed, and the engineer neither corrected nor vetoed it."),
-    };
     let mut s = format!("{OPENING}\n\n{FIELDS}\n\n## The task\n{}", crate::notes::redact(&w.title));
-    if !w.files.is_empty() {
-        s.push_str(&format!("\nfiles: {}", w.files.join(", ")));
-    }
     if !w.repo.is_empty() {
         s.push_str(&format!("\nrepo: {}", w.repo));
     }
-    s.push_str(&format!("\n\n## The result\n{result}"));
-    if !w.beat.is_empty() {
-        s.push_str(&format!(" It beat {} other attempt(s) at the same task by other agents, which did not pass:\n- {}", w.beat.len(), w.beat.join("\n- ")));
-    }
-    for (head, body) in [("The agent's account", &w.done), ("The verifier's note", &w.note), ("Its change (excerpt)", &w.change)] {
+    s.push_str(&format!(
+        "\n\n## The result\nThe session landed {} commit(s), its own last test run passed, and the engineer neither corrected nor vetoed it.",
+        w.landed
+    ));
+    for (head, body) in [("The agent's account", &w.done), ("Its change (excerpt)", &w.change)] {
         if !body.trim().is_empty() {
-            s.push_str(&format!("\n\n## {head}\n{}", crate::notes::redact(&group::cut(body.trim()))));
+            s.push_str(&format!("\n\n## {head}\n{}", crate::notes::redact(&cut(body.trim()))));
         }
     }
     s.push_str("\n\n## Playbooks for this kind of task\n");
@@ -744,18 +663,18 @@ fn edit_of(v: &Value, w: &Win, listed: &[&Playbook], now: i64) -> Result<Option<
         shape,
         repo,
         ms: now,
-        from: w.cause.clone(),
+        from: w.cause(),
         ..Edit::default()
     };
     e.edit = edit_id(&e);
     Ok(Some((e, before)))
 }
 
-/// Reflects on every winning attempt (`wins`) and every clean session of `ended` or still waiting in
-/// `PLAIN` (`plain_win`, read from `state` and `outcomes`) not reflected yet, one model call each: a
-/// proposed edit is queued for the engineer (`propose`), and the attempt or session is marked reflected
-/// once the model answered. Stops at the first call without a usable answer: the rest wait for a later
-/// run, the plain sessions among them in `PLAIN`. What `borg learn` runs (learn.rs), under its lock.
+/// Reflects on every clean session of `ended` or still waiting in `PLAIN` (`plain_win`, read from
+/// `state` and `outcomes`) not reflected yet, one model call each: a proposed edit is queued for the
+/// engineer (`propose`), and the session is marked reflected once the model answered. Stops at the
+/// first call without a usable answer: the rest wait for a later run, the plain sessions among them in
+/// `PLAIN`. What `borg learn` runs (learn.rs), under its lock.
 /// Returns how many edits were queued.
 pub fn reflect_pending(home: &Path, ask: &dyn Fn(&str) -> Option<Value>, now: i64, ended: &[&str], state: &Path, outcomes: &[outcome::Outcome]) -> usize {
     if !on() {
@@ -763,7 +682,7 @@ pub fn reflect_pending(home: &Path, ask: &dyn Fn(&str) -> Option<Value>, now: i6
     }
     let path = home.join(REFLECTED);
     let done: HashSet<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
-    let mut todo = wins(home, &done);
+    let mut todo = Vec::new();
     let plain_path = home.join(PLAIN);
     let waiting = std::fs::read_to_string(&plain_path).unwrap_or_default();
     // A waiting session that is no win any more (its commits are gone) leaves `PLAIN` with the rest.
@@ -785,20 +704,18 @@ pub fn reflect_pending(home: &Path, ask: &dyn Fn(&str) -> Option<Value>, now: i6
     let pbs = read(home);
     let mut queued = 0;
     for mut w in todo {
-        if let Some((dir, base, head)) = &w.snapshots {
-            w.change = group::change(dir, base, head);
-        }
-        let listed: Vec<&Playbook> = matching(&pbs, &w.repo, &w.text(), queen::STATED).into_iter().map(|(p, _)| p).collect();
+        w.change = change(&w.dir, &w.base, &w.head);
+        let listed: Vec<&Playbook> = matching(&pbs, &w.repo, &w.title, queen::STATED).into_iter().map(|(p, _)| p).collect();
         let Some(v) = ask(&prompt(&w, &listed)) else { break };
         let Ok(edit) = edit_of(&v, &w, &listed, now) else { break };
         if let Some((e, before)) = edit {
-            let evidence = vec![format!("from: {} (\"{}\")", w.cause, stats::excerpt(&w.title, 120))];
-            if propose(home, &e, before.as_ref(), &w.author, "", &evidence).unwrap_or(false) {
+            let evidence = vec![format!("from: {} (\"{}\")", w.cause(), stats::excerpt(&w.title, 120))];
+            if propose(home, &e, before.as_ref(), &w.session, "", &evidence).unwrap_or(false) {
                 queued += 1;
             }
         }
-        let _ = crate::learn::append_line(&path, &w.cause);
-        left.retain(|s| session_cause(s) != w.cause);
+        let _ = crate::learn::append_line(&path, &w.cause());
+        left.retain(|s| *s != w.session);
     }
     let _ = match left.is_empty() {
         true => std::fs::remove_file(&plain_path),
@@ -970,7 +887,7 @@ mod tests {
     }
 
     fn win() -> Win {
-        Win { cause: "g/t1.v1".into(), title: "add the orders migration with backfill".into(), repo: "app".into(), author: "s1".into(), ..Win::default() }
+        Win { session: "s1".into(), title: "add the orders migration with backfill".into(), repo: "app".into(), ..Win::default() }
     }
 
     #[test]
@@ -980,7 +897,7 @@ mod tests {
         let (e, _) = edit_of(&add("add a database migration with backfill", "backfill in batches"), &w, &[], 7).unwrap().unwrap();
         assert_eq!(
             (e.pb.clone(), e.op, e.repo.as_str(), e.from.as_str()),
-            (playbook_id("app", "add a database migration with backfill"), Op::Add, "app", "g/t1.v1")
+            (playbook_id("app", "add a database migration with backfill"), Op::Add, "app", "session/s1")
         );
         assert_eq!(e.step, bullet_id(&e.pb, "backfill in batches"));
         let p = Playbook {

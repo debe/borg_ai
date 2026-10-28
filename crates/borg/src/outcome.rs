@@ -30,22 +30,13 @@
 //!   (the legacy single-number view) or by attention.rs: a regret is about a lesson, not about an
 //!   engineer following it.
 //!
-//! - `verified`, `rejected`, `hacked` (a hive verdict, hive/verdict.rs, 0 tokens): a drone's task in a
-//!   hive goal was judged, by its verifier or, when the goal has one, by the hidden oracle
-//!   (hive/hidden.rs); `hacked` is a done whose diff weakened tests or changed CI, or whose drone
-//!   touched the oracle's files. Every lesson shown to the author's session while it held the claim is
-//!   credited, once per `cause` (`<goal>/<verify task>`). memory.rs weighs them; like `regretted` they
-//!   are deliberately not read by trust.rs (`sessions`), `weight` or attention.rs: a verdict is about
-//!   the drone's task, not about an engineer following a lesson. Counted once per verdict as `task_*`
-//!   (stats.rs), shared with `c` = the tag of its cause since the hive syncs (`SHARED_KINDS`).
-//!
 //! - `tested` (`borg learn`, 0 tokens): the session's own test runs (hook.rs `capture_test`) ended green
 //!   after a lesson was asked as a question (a free delivery is none): a failed run after the ask, then a
 //!   pass, or a pass after the drone changed its work on the lesson's point (`asked_then_changed`); never
 //!   for a question the drone ignored (`asked_then_ignored`). A
-//!   weak, verified-like credit (memory.rs `TESTED_W`), once per (session, lesson) (`tested`). Like a
-//!   verdict it is about the work, not about an engineer following a lesson: never a use, and not read by
-//!   trust.rs, `weight` or attention.rs.
+//!   weak credit (memory.rs `TESTED_W`), once per (session, lesson) (`tested`). It is about the work,
+//!   not about an engineer following a lesson: never a use, and not read by trust.rs, `weight` or
+//!   attention.rs.
 //!
 //! An unclear verdict, or a session whose later turn ends never reach the model (the prefilter skipped
 //! them, or BORG_MATCH=bm25), leaves the lesson pending: `settle` turns it into `asked_not_corrected`.
@@ -97,27 +88,15 @@ pub const VETOED: &str = "vetoed";
 /// `credit` carries the share of the blame, (0, 1]. Weaker than a correction (memory.rs `REGRET`).
 pub const REGRETTED: &str = "regretted";
 
-/// A hive verdict on a task (hive/verdict.rs): passed, rejected by its verifier (or failed by the
-/// hidden oracle), or hacked (protected files changed, or the oracle touched). Each credits the lessons
-/// shown in the author's claim, once per (`cause`, lesson).
-pub const VERIFIED: &str = "verified";
-pub const REJECTED: &str = "rejected";
-pub const HACKED: &str = "hacked";
-
 /// The session's own tests went green after the lesson was asked (`tested`): red then green, or green
 /// after a change on the lesson's point. Once per (session, lesson), dated at that pass.
 pub const TESTED: &str = "tested";
 
 /// The playbook versions shown to a session (playbook.rs; `lessons`: each `Playbook::key`). Local, never
 /// shared, and no result: like `asked` it is what the session's later results credit, the veto
-/// (veto.rs `shown_between`), the regret (`regretted`) and a hive verdict, so a playbook version gets the
+/// (veto.rs `shown`) and the regret (`regretted`), so a playbook version gets the
 /// usefulness belief a lesson gets (memory.rs `derive`, keyed by the version).
 pub const PLAYBOOK: &str = "playbook";
-
-/// Whether `kind` is a hive verdict's.
-pub fn is_verdict(kind: &str) -> bool {
-    matches!(kind, VERIFIED | REJECTED | HACKED)
-}
 
 /// Whether a record of `kind` shows its `lessons` to its session: an `asked` lesson or a shown playbook
 /// version, what later results of the session credit.
@@ -160,8 +139,7 @@ pub struct Outcome {
     /// so its outcomes label the cut (attention.rs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub explore: bool,
-    /// `regretted`: the regret episode (`R…`/`V…` id); a verdict kind: `<goal>/<verify task>`, the
-    /// attempt judged. The idempotence key with the lesson.
+    /// `regretted`: the regret episode (`R…`/`V…` id). The idempotence key with the lesson.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cause: String,
     /// `regretted` only: the lesson's share of the regret, (0, 1].
@@ -173,7 +151,7 @@ pub struct Outcome {
     /// `budget`/`widen` (conscience.rs `propensity`), the share that delivers it early (conscience.rs
     /// `early_propensity`), 1 for a free hand-over of a graded check's 2s and 1s. Rounded to 4 decimals
     /// (`round_p`). Empty in records from before propensities and when unknown (BORG_ONLY, a state file
-    /// from an older binary). For off-policy evaluation (hive.md "Credit assignment").
+    /// from an older binary). For off-policy evaluation (ope.rs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub p: Vec<f64>,
     /// `asked` from a Thompson slot draw only (conscience.rs `budget_pool`/`widen_pool`, hook.rs
@@ -228,27 +206,12 @@ pub const PUBLISHED: &str = "outcomes-team.published";
 /// so this is the trusted-member model; the deferred guards (a session tag bound to its first signer,
 /// consolidation from at least two signers) would close it.
 ///
-/// The hive verdicts (`verified`, `rejected`, `hacked`) are shared since the hive lines sync (hive.md
-/// C4), with `c` = the tag of their cause (`<goal>/<verify task>`), so memory derives one verdict per
-/// (lesson, attempt) from a local record and a peer's copy alike. A verdict is a self-reported reward,
-/// so `team_view` binds a peer's verdict line to the signed board: it counts only for an attempt whose
-/// board verdict took effect on this node (hive/verdict.rs `judged`), and only of a kind that verdict
-/// allows (`hacked` for a hacked one; else the kind it credits, or either of verified and rejected for a
-/// goal with a hidden oracle, whose score decides, then only from the node the work was done on), only
-/// under the attempt author's session tag, and only for lessons the team's records show that session
-/// was given. A forged verdict then needs a forged, signed board verdict too, which is auditable and
-/// quarantined on revocation. What remains is the trusted-member
-/// model: a member can still forge both, counted once per (lesson, attempt), but attempts are mintable;
-/// the k-distinct-nodes rule and a trust-weighted median stay deferred. Hidden-oracle results stay
-/// private: a goal with one credits on its runner's node only, so a remote author of such a goal's
-/// attempt is not credited yet (deferred). They never move the activity clock (`memory::Clock`).
-///
 /// `tested` is shared like `asked_then_changed`, the result it is weaker than: memory folds it, so a peer
 /// without it would hold another belief. Both are this node's own reading of its session (the judge's,
-/// the test runner's output), neither backed by a board, so the trusted-member model above is the same;
+/// the test runner's output), so the trusted-member model above is the same;
 /// `team_view` counts a peer's `tested` line only for lessons the team's records show its session was
 /// given. It never moves the activity clock either.
-pub const SHARED_KINDS: [&str; 12] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED, VETOED, REGRETTED, VERIFIED, REJECTED, HACKED, TESTED];
+pub const SHARED_KINDS: [&str; 9] = [ASKED, CHANGED, IGNORED, CORRECTED, NOT_CORRECTED, MISSED, VETOED, REGRETTED, TESTED];
 
 /// A session or repo as the team sees it: the first 32 hex digits of blake3("borg-outcome-v1\0" + s).
 /// Unsalted on purpose: the same session hashes to the same tag on every node, so a node can drop its
@@ -283,8 +246,7 @@ pub struct Shared {
     /// `tag` of the repo: memory.rs counts distinct repos to consolidate a lesson.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub r: String,
-    /// `tag` of a `regretted` record's cause (the regret episode) or a verdict's (`<goal>/<verify task>`):
-    /// memory.rs counts each regret, and each verdict per attempt, once.
+    /// `tag` of a `regretted` record's cause (the regret episode): memory.rs counts each regret once.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub c: String,
     /// A `regretted` record's share of the blame.
@@ -369,7 +331,7 @@ pub fn read_team(lessons: &Path) -> Vec<Outcome> {
 /// Off: this machine's log as is. On: its records with each repo and cause as its `tag` (memory.rs only
 /// compares them for distinctness, so beliefs are the same and comparable with the team's), then the
 /// team's lines that count (`team_parts`). A remote session then counts once per lesson like a local
-/// one (memory.rs `derive`, `sessions`). learn.rs and verdict.rs key on raw causes: they read this
+/// one (memory.rs `derive`, `sessions`). learn.rs keys on raw causes: it reads this
 /// machine's log (`read`).
 pub fn team_view(lessons: &Path, on: bool) -> Vec<Outcome> {
     let (mut out, team) = team_parts(lessons, on);
@@ -386,11 +348,9 @@ pub fn team_view(lessons: &Path, on: bool) -> Vec<Outcome> {
 /// This machine's records as written, and (on) every `TEAM_FILE` line of a shared kind whose session
 /// is not one of this machine's (that drops this node's own published copies, whatever its node id),
 /// once per (kind, session, lessons, ms, cause): one read of each file, so the two never disagree on
-/// where the local records end (ope.rs reads both). A kind this binary does not share (a newer node's)
-/// is ignored, and so is a verdict the board does not back (`SHARED_KINDS`; hive/verdict.rs `judged`,
-/// read only when the team file holds a verdict): its attempt was judged that way here, the line's
-/// session is the attempt's author, each lesson it names is one the team's records show that session
-/// was given, and with a hidden oracle the line comes from the node the work was done on.
+/// where the local records end (ope.rs reads both). A kind this binary does not share (a newer node's,
+/// or an older one's hive verdict) is ignored, and so is a `tested` line naming a lesson the team's
+/// records do not show its session was given.
 pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
     let local = read(&path_beside(lessons));
     if !on {
@@ -399,29 +359,16 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
     let mine: std::collections::HashSet<String> = local.iter().map(|o| tag(&o.session)).collect();
     let text = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
     let lines: Vec<Shared> = text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()).collect();
-    // The lessons each team session's records name: a verdict credits only lessons its author was given.
+    // The lessons each team session's shared records name: a green run credits only lessons it was given.
     let mut given: std::collections::HashMap<&str, std::collections::HashSet<&str>> = std::collections::HashMap::new();
-    for x in lines.iter().filter(|x| !is_verdict(&x.kind) && x.kind != TESTED) {
+    for x in lines.iter().filter(|x| SHARED_KINDS.contains(&x.kind.as_str()) && x.kind != TESTED) {
         given.entry(x.s.as_str()).or_default().extend(x.lessons.iter().map(String::as_str));
     }
     let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String)> = std::collections::HashSet::new();
-    let judged = std::cell::OnceCell::new();
-    let home = lessons.parent().unwrap_or(Path::new("."));
-    let backed = |x: &Shared| {
-        judged.get_or_init(|| crate::hive::verdict::judged(home)).get(&x.c).is_some_and(|a: &crate::hive::verdict::Allowed| {
-            a.allows(&x.kind)
-                && x.s == a.author
-                && (!a.held_out || x.node == a.node)
-                && x.lessons.iter().all(|l| given.get(x.s.as_str()).is_some_and(|g| g.contains(l.as_str())))
-        })
-    };
     let mut team = Vec::new();
     for x in lines.iter() {
         if !SHARED_KINDS.contains(&x.kind.as_str()) || mine.contains(&x.s) || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone()))
         {
-            continue;
-        }
-        if is_verdict(&x.kind) && !backed(x) {
             continue;
         }
         if x.kind == TESTED && !x.lessons.iter().all(|l| given.get(x.s.as_str()).is_some_and(|g| g.contains(l.as_str()))) {
@@ -451,8 +398,7 @@ pub fn read(path: &Path) -> Vec<Outcome> {
 pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
     crate::learn::append_jsonl(path, o)?;
     // The results count in the usage statistics; `asked` is already counted as the Stop's block, a
-    // `vetoed` result as the `veto` that credited it (veto.rs), and a hive verdict's as the one
-    // `task_*` event of its verdict (hive/verdict.rs).
+    // `vetoed` result as the `veto` that credited it (veto.rs).
     let kind = match o.kind.as_str() {
         CHANGED => crate::stats::CHANGED,
         IGNORED => crate::stats::IGNORED,
@@ -634,31 +580,6 @@ pub fn tested(outcomes: &[Outcome], session: &str, tests: &str) -> Vec<Outcome> 
         .collect();
     out.sort_by(|a, b| a.lessons.cmp(&b.lessons));
     out
-}
-
-/// The verdict records a hive verdict (`kind`, one of `is_verdict`) on the attempt `cause` writes for
-/// `lessons` (shown in `author`'s claim): one per lesson, sorted, skipping a lesson that already has a
-/// verdict record for `cause` (whatever its kind), so a re-run or a later score writes nothing.
-pub fn verdicts(outcomes: &[Outcome], kind: &str, author: &str, lessons: &[String], cause: &str, ms: i64, repo: &str) -> Vec<Outcome> {
-    if !is_verdict(kind) || author.is_empty() || cause.is_empty() {
-        return Vec::new();
-    }
-    let done = |l: &str| outcomes.iter().any(|o| is_verdict(&o.kind) && o.cause == cause && o.lessons.iter().any(|x| x == l));
-    let mut ids: Vec<&str> = lessons.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids.into_iter()
-        .filter(|l| !done(l))
-        .map(|l| Outcome {
-            kind: kind.into(),
-            session: author.into(),
-            lessons: vec![l.into()],
-            ms,
-            repo: repo.into(),
-            cause: cause.into(),
-            ..Default::default()
-        })
-        .collect()
 }
 
 /// At session end: every lesson asked in `session` that has no result yet was not corrected. A
@@ -989,163 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn verdicts_credit_each_lesson_once_per_attempt_and_share_their_cause_tag() {
-        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let first = verdicts(&[], HACKED, "s", &ids(&["B", "A", "B", ""]), "g/t1.v1", 9, "r");
-        let want = |l: &str| Outcome { cause: "g/t1.v1".into(), ..o(HACKED, "s", &[l], 9) };
-        assert_eq!(first, vec![want("A"), want("B")], "sorted, unique, one per lesson");
-        assert!(verdicts(&first, HACKED, "s", &ids(&["A", "B"]), "g/t1.v1", 10, "r").is_empty(), "a re-run writes nothing");
-        assert!(verdicts(&first, VERIFIED, "s", &ids(&["A"]), "g/t1.v1", 10, "r").is_empty(), "a later score of the same attempt neither");
-        assert_eq!(verdicts(&first, VERIFIED, "s", &ids(&["A"]), "g/t1.v2", 10, "r").len(), 1, "the next attempt is credited");
-        assert!(verdicts(&[], VETOED, "s", &ids(&["A"]), "c", 1, "r").is_empty() && verdicts(&[], VERIFIED, "", &ids(&["A"]), "c", 1, "r").is_empty());
-        for kind in [VERIFIED, REJECTED, HACKED] {
-            let x = share(&Outcome { cause: "g/t1.v1".into(), ..o(kind, "s", &["A"], 1) }, "n1").expect("shared");
-            assert!(is_verdict(kind) && x.c == tag("g/t1.v1"), "{kind} is shared with its cause's tag");
-        }
-        assert!(!is_verdict(VETOED) && !is_verdict(REGRETTED));
-        // Not a session result: trust and `weight` never see a verdict, and settling still settles.
-        assert!(sessions(&first).is_empty() && weights(&first).is_empty());
-        let mut log = first.clone();
-        log.push(o(ASKED, "s", &["A"], 5));
-        assert_eq!(settle(&log, "s", 99), vec![o(NOT_CORRECTED, "s", &["A"], 99)]);
-        log.push(o(NOT_CORRECTED, "t", &["A"], 7));
-        let trust = |log: &[Outcome]| sessions(log).into_iter().map(|(l, m)| (l.to_string(), m.len())).collect::<Vec<_>>();
-        assert_eq!(trust(&log), trust(&log[first.len()..]), "trust reads the same without the verdicts");
-    }
-
-    #[test]
-    fn a_forged_team_verdict_is_ignored_and_a_local_one_counts_no_stat() {
-        let home = tmp("verdict-team");
-        let forged = Shared { kind: HACKED.into(), s: "x".into(), lessons: vec!["L1".into()], ms: 5, node: "n2".into(), ..Default::default() };
-        lines(&home.join(TEAM_FILE), &[serde_json::to_string(&forged).unwrap()]);
-        assert!(team_view(&home.join("lessons.jsonl"), true).is_empty(), "a verdict on an attempt no board here judged is dropped");
-        let p = home.join("outcomes.jsonl");
-        append(&p, &Outcome { cause: "g/t1.v1".into(), ..o(HACKED, "s", &["L1"], 5) }).unwrap();
-        assert_eq!(read(&p).len(), 1);
-        assert!(crate::stats::events(&home).is_empty(), "counted as task_hacked by its verdict, not per record");
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    /// The board-binding guard: a peer's verdict line counts only for an attempt this node's board
-    /// judged, of a kind that verdict allows, once per (lesson, attempt) with a local record of it.
-    #[test]
-    fn team_verdicts_count_once_with_their_cause_and_only_for_a_judged_attempt() {
-        use crate::hive::{Ev, Event, Role, Task, board};
-        let home = tmp("verdict-guard");
-        let g = crate::hive::Goal {
-            v: 1,
-            id: "g".into(),
-            spec: "s".into(),
-            oracle: vec![],
-            budget_usd: 1.0,
-            repos: vec![],
-            author: String::new(),
-            created_ms: 0,
-            sig: String::new(),
-            hidden: None,
-            held_out: false,
-            origin: Vec::new(),
-        };
-        crate::hive::goal::create(&home, &g).unwrap();
-        let work = |id: &str| Task {
-            id: id.into(),
-            role: Role::Work,
-            title: id.into(),
-            repo: String::new(),
-            files: vec![],
-            deps: vec![],
-            accept: vec![],
-            of: None,
-            not_by: vec![],
-            flags: vec![],
-            from: None,
-            group: None,
-        };
-        let check = |id: &str| Task { id: format!("{id}.v1"), role: Role::Verify, of: Some(id.into()), not_by: vec!["s1".into()], ..work(id) };
-        let verdict = |ev: Ev, t: &str, credit: &str| Event { credit: credit.into(), ..Event::new(ev, t, "sv", 40) };
-        let mut lines = Vec::new();
-        for t in ["t1", "t2"] {
-            lines.extend([
-                Event::open(work(t), "engineer:e", 1),
-                Event { node: "n1".into(), ..Event::new(Ev::Claim, t, "s1", 10) },
-                Event { node: "n1".into(), ..Event::new(Ev::Done, t, "s1", 20) },
-                Event::open(check(t), "s1", 20),
-                Event::new(Ev::Claim, &format!("{t}.v1"), "sv", 30),
-            ]);
-        }
-        lines.extend([verdict(Ev::Verified, "t1.v1", VERIFIED), verdict(Ev::Rejected, "t2.v1", REJECTED)]);
-        board::append(&crate::hive::tasks_path(&home, "g"), &lines).unwrap();
-        let team = |kind: &str, s: &str, cause: &str, node: &str| {
-            serde_json::to_string(&Shared {
-                kind: kind.into(),
-                s: s.into(),
-                lessons: vec!["L1".into()],
-                ms: 40,
-                node: node.into(),
-                c: tag(cause),
-                ..Default::default()
-            })
-            .unwrap()
-        };
-        let ls = [crate::conscience::Challenge { id: "L1".into(), ..Default::default() }];
-        let mem = |h: &Path| crate::memory::derive(&team_view(&h.join("lessons.jsonl"), true), &ls, None).remove("L1").unwrap();
-        // The author's shared ask of L1: what a verdict on its attempt may credit.
-        let asked =
-            serde_json::to_string(&Shared { kind: ASKED.into(), s: tag("s1"), lessons: vec!["L1".into()], ms: 15, node: "n2".into(), ..Default::default() })
-                .unwrap();
-        let lines_at = |home: &Path, v: &[String]| lines_at(home, &[v, std::slice::from_ref(&asked)].concat());
-        // A peer's verified, and the same line from a second node's copy: one count.
-        lines_at(&home, &[team(VERIFIED, &tag("s1"), "g/t1.v1", "n2"), team(VERIFIED, &tag("s1"), "g/t1.v1", "n3")]);
-        assert_eq!((mem(&home).verified, mem(&home).rejected, mem(&home).hacked), (1, 0, 0));
-        // A judged cause is no licence: the line's session must be the attempt's author, and each lesson
-        // it names one the team's records show the author was given.
-        let any_session = team(VERIFIED, &tag("anything"), "g/t1.v1", "n2");
-        let more = serde_json::to_string(&Shared {
-            lessons: vec!["L1".into(), "L7".into()],
-            ..serde_json::from_str(&team(VERIFIED, &tag("s1"), "g/t1.v1", "n2")).unwrap()
-        })
-        .unwrap();
-        lines_at(&home, &[any_session, more]);
-        let view = team_view(&home.join("lessons.jsonl"), true);
-        assert!(!view.iter().any(|o| is_verdict(&o.kind)), "{view:?}");
-        // A verified whose cause no board here judged, a hacked of a verdict that was not hacked, a
-        // verified of an attempt the board rejected: all dropped.
-        lines_at(
-            &home,
-            &[
-                team(VERIFIED, &tag("s1"), "g/t1.v1", "n2"),
-                team(VERIFIED, &tag("s9"), "g/t9.v1", "n2"),
-                team(HACKED, &tag("s1"), "g/t1.v1", "n2"),
-                team(VERIFIED, &tag("s1"), "g/t2.v1", "n2"),
-                team(REJECTED, &tag("s1"), "g/t2.v1", "n2"),
-            ],
-        );
-        let m = mem(&home);
-        assert_eq!((m.verified, m.rejected, m.hacked), (1, 1, 0), "{m:?}");
-        // With a hidden oracle either kind is allowed, but only from the node the work was done on.
-        std::fs::remove_file(crate::hive::goal_path(&home, "g")).unwrap();
-        crate::hive::goal::create(&home, &crate::hive::Goal { held_out: true, ..g.clone() }).unwrap();
-        lines_at(&home, &[team(REJECTED, &tag("s1"), "g/t1.v1", "n2")]);
-        assert_eq!(mem(&home).rejected, 0, "the work was done on n1, not on n2");
-        lines_at(&home, &[team(REJECTED, &tag("s1"), "g/t1.v1", "n1")]);
-        assert_eq!(mem(&home).rejected, 1);
-        std::fs::remove_file(crate::hive::goal_path(&home, "g")).unwrap();
-        crate::hive::goal::create(&home, &g).unwrap();
-        // This node's own record of the attempt and a peer's copy of it under another session tag: one
-        // count per (lesson, attempt), the local cause compared as its tag.
-        append(&home.join("outcomes.jsonl"), &Outcome { cause: "g/t1.v1".into(), ..o(VERIFIED, "s1", &["L1"], 40) }).unwrap();
-        lines_at(&home, &[team(VERIFIED, &tag("s1-copy"), "g/t1.v1", "n2")]);
-        let view = team_view(&home.join("lessons.jsonl"), true);
-        assert!(view.iter().any(|o| o.session == "s1" && o.cause == tag("g/t1.v1")), "local causes compare as tags");
-        assert_eq!(mem(&home).verified, 1);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    fn lines_at(home: &Path, v: &[String]) {
-        lines(&home.join(TEAM_FILE), v);
-    }
-
-    #[test]
     fn a_line_from_before_propensities_reads_and_writes_back_unchanged() {
         let line = r#"{"kind":"asked","session":"s","lessons":["A","B"],"ms":1,"repo":"r","channel":"stop","grades":[3,1],"ranks":[0,1],"applied":2}"#;
         let o: Outcome = serde_json::from_str(line).unwrap();
@@ -1257,7 +1021,7 @@ mod tests {
             serde_json::to_string(&share(&local, "me").unwrap()).unwrap(),
             remote(CHANGED, "x", "n2"),
             remote(CHANGED, "x", "n3"),
-            remote(HACKED, "y", "n2"),
+            remote("hacked", "y", "n2"),
             remote("veto", "z", "n2"),
         ];
         if shuffle {
@@ -1274,7 +1038,7 @@ mod tests {
         let team = team_view(&home.join("lessons.jsonl"), true);
         assert_eq!(changed(&team, "L1"), 2, "{team:?}");
         assert_eq!(team.iter().filter(|o| o.session == "x").count(), 1, "one remote line per (kind, session, lessons, ms)");
-        assert!(team.iter().all(|o| o.kind != HACKED && o.kind != "veto"), "unshared kinds, and verdicts no board here judged, are ignored");
+        assert!(team.iter().all(|o| o.kind != "hacked" && o.kind != "veto"), "unshared kinds, an older peer's hive verdict among them, are ignored");
         assert!(team.iter().all(|o| o.repo != "app"), "local repos compare as tags");
         let _ = std::fs::remove_dir_all(home);
     }
@@ -1336,7 +1100,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(peer);
     }
 
-    /// A peer's `tested` line counts for a lesson its session was given, and for no other.
+    /// A peer's `tested` line counts for a lesson its session's shared records name, and for no other.
     #[test]
     fn a_peer_green_run_counts_only_for_lessons_its_session_was_given() {
         let home = tmp("tested-team");
@@ -1344,7 +1108,11 @@ mod tests {
         let ok = share(&o(TESTED, "p1", &["L1"], 20), "peer").unwrap();
         let stray = share(&o(TESTED, "p1", &["L2"], 20), "peer").unwrap();
         let alone = share(&o(TESTED, "p2", &["L1"], 20), "peer").unwrap();
-        lines(&home.join(TEAM_FILE), &[&asked, &ok, &stray, &alone].map(|x| serde_json::to_string(x).unwrap()));
+        // A 0.3.0 peer's hive verdict is not shared any more, so it gives its session nothing.
+        let verdict = Shared { kind: "verified".into(), ..share(&o(ASKED, "p3", &["L1"], 10), "peer").unwrap() };
+        let unbacked = share(&o(TESTED, "p3", &["L1"], 20), "peer").unwrap();
+        let all = [&asked, &ok, &stray, &alone, &verdict, &unbacked];
+        lines(&home.join(TEAM_FILE), &all.map(|x| serde_json::to_string(x).unwrap()));
         let ls = ["L1", "L2"].map(|id| crate::conscience::Challenge { id: id.into(), ..Default::default() });
         let m = crate::memory::derive(&team_view(&home.join("lessons.jsonl"), true), &ls, None);
         assert_eq!((m["L1"].tested, m["L2"].tested), (1, 0), "{m:?}");
@@ -1360,7 +1128,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// Several writers appending to one log at once (a hive's drones on one store): every record
+    /// Several writers appending to one log at once (several drones on one store): every record
     /// reads back, none torn into `{A}{B}\n\n`.
     #[test]
     fn concurrent_appends_keep_every_record() {

@@ -132,29 +132,23 @@ fn borg_queen_ask_off_delivers_nothing() {
     assert!(context(&hook(&root, &payload("s1", &pw, "fix the README"), &[])).contains("AskUserQuestion"));
 }
 
-/// A plain session's one question goes to the engineer's own work first: a hive goal's plan and a
-/// playbook edit queued before it wait, and a later session gets one of them only once no other
-/// question is eligible.
+/// A plain session's one question goes to the engineer's own work first: a playbook edit queued before
+/// it waits, and a later session gets it only once no other question is eligible.
 #[test]
-fn the_engineers_own_decision_comes_before_a_hive_question() {
-    let root = setup("hive-last");
+fn the_engineers_own_decision_comes_before_a_playbook_question() {
+    let root = setup("proposal-last");
     let pw = root.join("work/lumen_handbook");
     let queue = root.join("store/collectives/team/queen/queue.jsonl");
     let own = std::fs::read_to_string(&queue).unwrap();
-    let hive = |id: &str, kind: &str, q: &str| {
-        json!({"id": id, "decision_key": format!("{kind}:lumen_handbook:{id}"), "kind": kind, "question": q,
-            "options": ["refuse", "approve"], "default": "refuse", "evidence": [], "session": "runner",
-            "cwd": pw, "engineer": "e@x", "ms": 0})
-        .to_string()
-    };
-    let plan = hive("qplan", "plan", "Approve the hive goal's plan of three tasks for the handbook?");
-    let playbook = hive("qbook", "playbook", "Promote this edit to the handbook playbook?");
-    std::fs::write(&queue, format!("{plan}\n{playbook}\n{own}")).unwrap();
+    let playbook = json!({"id": "qbook", "decision_key": "playbook:lumen_handbook:qbook", "kind": "playbook",
+        "question": "Promote this edit to the handbook playbook?", "options": [borg::playbook::KEEP_OPTION, borg::playbook::PROMOTE_OPTION],
+        "default": borg::playbook::KEEP_OPTION, "evidence": [], "session": "s0", "cwd": pw, "engineer": "e@x", "ms": 0});
+    std::fs::write(&queue, format!("{playbook}\n{own}")).unwrap();
 
     let ctx = context(&hook(&root, &payload("s1", &pw, "fix the README"), &[]));
     assert!(ctx.contains("Question: Should spikes be capped at 3 story points"), "the engineer's decision first: {ctx}");
-    assert!(!ctx.contains("hive goal's plan") && !ctx.contains("playbook"), "{ctx}");
-    // The next session: the engineer's decision was just delivered, so the hive's first question.
+    assert!(!ctx.contains("handbook playbook"), "{ctx}");
+    // The next session: the engineer's decision was just delivered, so the playbook's question.
     let ctx = context(&hook(&root, &payload("s2", &pw, "fix the README"), &[]));
-    assert!(ctx.contains("Approve the hive goal's plan"), "a hive question once none other is eligible: {ctx}");
+    assert!(ctx.contains("Promote this edit to the handbook playbook?"), "a playbook question once none other is eligible: {ctx}");
 }

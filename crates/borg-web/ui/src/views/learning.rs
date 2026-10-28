@@ -1,14 +1,13 @@
 //! Learning: is learning working in this collective? Week by week, backfilled from the logs Borg keeps
 //! (borg-web learning.rs): lessons written per source, the share of asked lessons that changed the work,
-//! the share of vetoes that repeated an earlier "no", per hive goal the mistakes its guards caught and
-//! the rework lessons learned from them, and the playbook versions with their beliefs. Each panel says
+//! the share of vetoes that repeated an earlier "no", and the playbook versions with their beliefs. Each panel says
 //! whether its numbers are the team's (synced logs) or this machine's.
 
 use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::api::data;
-use crate::charts::{HBars, Row, Series, StackedChart, Tile};
+use crate::charts::{Row, Series, StackedChart, Tile};
 use crate::util::{day_num, num, palette, pct, short_day, trunc};
 
 fn nums(v: &Value) -> Vec<f64> {
@@ -17,25 +16,6 @@ fn nums(v: &Value) -> Vec<f64> {
 
 fn s(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
-}
-
-/// One hive goal's weekly verdicts and the lessons its reworks taught.
-#[derive(Clone, Debug, PartialEq)]
-struct Goal {
-    id: String,
-    verified: Vec<f64>,
-    rejected: Vec<f64>,
-    integration_failed: Vec<f64>,
-    hacked: Vec<f64>,
-    integrated: Vec<f64>,
-    /// (lesson id, question).
-    rework: Vec<(String, String)>,
-}
-
-impl Goal {
-    fn caught(&self) -> f64 {
-        self.rejected.iter().chain(&self.integration_failed).chain(&self.hacked).sum()
-    }
 }
 
 /// `/api/learning`, parsed.
@@ -61,9 +41,7 @@ struct Learning {
     veto: Vec<f64>,
     repeat: Vec<f64>,
     veto_scope: String,
-    goals: Vec<Goal>,
-    hive_scope: String,
-    /// (playbook shape, version key, belief mean, verified, rejected, hacked).
+    /// (playbook shape, version key, belief mean, corrected, vetoed, regretted).
     versions: Vec<(String, String, f64, f64, f64, f64)>,
     playbooks_scope: String,
 }
@@ -78,20 +56,6 @@ fn parse(v: &Value) -> Learning {
         w.push_str(" (so far)");
     }
     let l = &v["lessons"];
-    let goals = v["hive"]["goals"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|g| Goal {
-            id: s(&g["goal"]),
-            verified: nums(&g["verified"]),
-            rejected: nums(&g["rejected"]),
-            integration_failed: nums(&g["integration_failed"]),
-            hacked: nums(&g["hacked"]),
-            integrated: nums(&g["integrated"]),
-            rework: g["rework_lessons"].as_array().into_iter().flatten().map(|x| (s(&x["id"]), s(&x["question"]))).collect(),
-        })
-        .collect();
     let versions = v["playbooks"]["list"]
         .as_array()
         .into_iter()
@@ -100,7 +64,7 @@ fn parse(v: &Value) -> Learning {
             let shape = s(&p["shape"]);
             p["versions"].as_array().cloned().unwrap_or_default().into_iter().map(move |x| {
                 let n = |k: &str| x[k].as_f64().unwrap_or(0.0);
-                (shape.clone(), s(&x["key"]), n("mean"), n("verified"), n("rejected"), n("hacked"))
+                (shape.clone(), s(&x["key"]), n("mean"), n("corrected"), n("vetoed"), n("regretted"))
             })
         })
         .collect();
@@ -120,8 +84,6 @@ fn parse(v: &Value) -> Learning {
         veto: nums(&v["vetoes"]["veto"]),
         repeat: nums(&v["vetoes"]["repeat"]),
         veto_scope: s(&v["vetoes"]["scope"]),
-        goals,
-        hive_scope: s(&v["hive"]["scope"]),
         versions,
         playbooks_scope: s(&v["playbooks"]["scope"]),
     }
@@ -248,7 +210,6 @@ pub fn Learning() -> impl IntoView {
     let d = data();
     let src = d.source("learning");
     let lr = Memo::new(move |_| parse(&src.raw.get()));
-    let picked = RwSignal::new(None::<String>);
     let weeks = Signal::derive(move || lr.with(|l| l.weeks.clone()));
 
     // Lessons written per source.
@@ -271,7 +232,13 @@ pub fn Learning() -> impl IntoView {
                 (
                     Series::new("repeat", "vetoes that repeated an earlier no", "var(--c-pink)"),
                     // Before live counting began whether a veto repeated is unknown: a gap, never 0%.
-                    l.repeat.iter().copied().zip(l.veto.clone()).enumerate().map(|(i, (r, v))| if i < l.live { (0.0, 0.0) } else { (r, v) }).collect::<Vec<_>>(),
+                    l.repeat
+                        .iter()
+                        .copied()
+                        .zip(l.veto.clone())
+                        .enumerate()
+                        .map(|(i, (r, v))| if i < l.live { (0.0, 0.0) } else { (r, v) })
+                        .collect::<Vec<_>>(),
                 ),
             ]
         })
@@ -290,40 +257,17 @@ pub fn Learning() -> impl IntoView {
         })
     });
 
-    // Hive: goals ranked by mistakes caught; one picked for its weekly verdicts and rework lessons.
-    let goal_bars = Signal::derive(move || lr.with(|l| l.goals.iter().map(|g| (g.id.clone(), g.caught())).collect::<Vec<_>>()));
-    let goal = Memo::new(move |_| {
-        lr.with(|l| {
-            let p = picked.get();
-            l.goals.iter().find(|g| Some(&g.id) == p.as_ref()).or_else(|| l.goals.iter().max_by(|a, b| a.caught().total_cmp(&b.caught()))).cloned()
-        })
-    });
-    let hive_series = vec![
-        Series::new("rejected", "rejected by the verifier", "var(--c-amber)"),
-        Series::new("integration_failed", "integration failed", "var(--c-violet)"),
-        Series::new("hacked", "hacked (caught by the guards)", "var(--c-heat)"),
-        Series::new("verified", "verified", "var(--c-good)"),
-    ];
-    let hive_rows = Signal::derive(move || {
-        let Some(g) = goal.get() else { return Vec::new() };
-        lr.with(|l| rows(&l.weeks, &[&g.rejected, &g.integration_failed, &g.hacked, &g.verified]))
-    });
-
     // Headline tiles: the last four weeks against the four before.
     let last4 = move |v: &[f64]| window(v, 0, 4);
     let tiles = move || {
         let l = lr.get();
         let j = judged(&l);
         let written: f64 = l.team_new.iter().sum();
-        let caught: f64 = l.goals.iter().map(Goal::caught).sum();
-        let rework: usize = l.goals.iter().map(|g| g.rework.len()).sum();
-        let integrated: f64 = l.goals.iter().flat_map(|g| g.integrated.iter()).sum();
         let ch = trend(&l.changed, &j);
         let rp = trend(&l.repeat, &l.veto);
         let written_4 = format!("{} in the last 4 weeks · {} merged into one", num(last4(&l.team_new)), num(last4(&l.team_merged)));
         let changed_4 = pct(last4(&l.changed), last4(&j));
         let repeat_4 = pct(last4(&l.repeat), last4(&l.veto));
-        let caught_sub = format!("{rework} rework lesson(s) · {} integration(s) passed", num(integrated));
         let fixed = |t: String| Signal::derive(move || t.clone());
         view! {
             <Tile label="Lessons written" value=fixed(num(written)) sub=fixed(written_4) color="var(--c-good)" />
@@ -331,7 +275,6 @@ pub fn Learning() -> impl IntoView {
                 delta=Signal::derive(move || ch) color="var(--c-good)" />
             <Tile label="Repeated vetoes" value=fixed(repeat_4) sub=fixed("of vetoes, last 4 weeks: should fall".into())
                 delta=Signal::derive(move || rp) up_is_good=false color="var(--c-pink)" />
-            <Tile label="Mistakes caught" value=fixed(num(caught)) sub=fixed(caught_sub) color="var(--c-amber)" />
         }
     };
 
@@ -364,31 +307,8 @@ pub fn Learning() -> impl IntoView {
                 <StackedChart rows=veto_rows series=veto_series width=600.0 />
             </div>
         </section>
-        {move || (!lr.with(|l| l.goals.is_empty())).then(|| view! {
-            <section class="two">
-                <div class="panel">
-                    <h2>"Mistakes caught per goal"<small>"click a goal "</small>{move || scope(lr.with(|l| l.hive_scope.clone()))}</h2>
-                    <HBars items=goal_bars color="var(--c-amber)" on_pick=Callback::new(move |g: String| picked.set(Some(g))) />
-                </div>
-                <div class="panel">
-                    <h2>{move || format!("Goal {}", goal.get().map(|g| g.id).unwrap_or_default())}<small>"verdicts per week"</small></h2>
-                    <StackedChart rows=hive_rows series=hive_series.clone() width=600.0 />
-                    <h3>"Rework lessons"<small>" learned from a rejection the rework fixed"</small></h3>
-                    {move || {
-                        let rw = goal.get().map(|g| g.rework).unwrap_or_default();
-                        if rw.is_empty() {
-                            return view! { <p class="empty">"None yet."</p> }.into_any();
-                        }
-                        rw.into_iter().map(|(id, q)| {
-                            let open = id.clone();
-                            view! { <button class="rank" on:click=move |_| d.open.set(Some(open.clone()))><span class="rank-q">{trunc(&q, 140)}</span><span class="rank-v">{id}</span></button> }
-                        }).collect_view().into_any()
-                    }}
-                </div>
-            </section>
-        })}
         <section class="panel">
-            <h2>"Playbook versions"<small>"each shown version's belief: does following it get work verified? "</small>{move || scope(lr.with(|l| l.playbooks_scope.clone()))}</h2>
+            <h2>"Playbook versions"<small>"each shown version's belief: does following it get the work through without a correction? "</small>{move || scope(lr.with(|l| l.playbooks_scope.clone()))}</h2>
             {move || {
                 let vs = lr.with(|l| l.versions.clone());
                 if vs.is_empty() {
@@ -396,9 +316,9 @@ pub fn Learning() -> impl IntoView {
                 }
                 view! {
                     <table class="mono">
-                        <tr><th>"playbook"</th><th>"version"</th><th>"useful"</th><th>"verified"</th><th>"rejected"</th><th>"hacked"</th></tr>
-                        {vs.into_iter().map(|(shape, key, mean, v, r, h)| view! {
-                            <tr><td>{trunc(&shape, 60)}</td><td>{key}</td><td>{pct(mean, 1.0)}</td><td>{num(v)}</td><td>{num(r)}</td><td>{num(h)}</td></tr>
+                        <tr><th>"playbook"</th><th>"version"</th><th>"useful"</th><th>"corrected"</th><th>"vetoed"</th><th>"regretted"</th></tr>
+                        {vs.into_iter().map(|(shape, key, mean, c, v, r)| view! {
+                            <tr><td>{trunc(&shape, 60)}</td><td>{key}</td><td>{pct(mean, 1.0)}</td><td>{num(c)}</td><td>{num(v)}</td><td>{format!("{r:.2}")}</td></tr>
                         }).collect_view()}
                     </table>
                 }.into_any()

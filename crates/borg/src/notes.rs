@@ -717,14 +717,14 @@ mod tests {
     /// The veto's "after merge" (escalation.rs `merged`): a session that landed a commit of its own.
     #[test]
     fn landed_by_reads_the_sessions_recorded_start() {
-        let (repo, dir, store) = repo("landed-by");
+        let (repo, dir, _) = repo("landed-by");
         assert!(landed_by(&dir, "s-3").is_empty(), "no start recorded");
         remember_start(&dir, "s-3", &repo.display().to_string());
         assert!(landed_by(&dir, "s-3").is_empty(), "nothing landed yet");
-        assert!(!crate::escalation::merged(&store, &dir, "s-3", i64::MAX));
+        assert!(!crate::escalation::merged(&dir, "s-3"));
         sh(&repo, &["commit", "-q", "--allow-empty", "-m", "landed"]);
         assert_eq!(landed_by(&dir, "s-3"), vec![sh(&repo, &["rev-parse", "HEAD"])]);
-        assert!(crate::escalation::merged(&store, &dir, "s-3", i64::MAX));
+        assert!(crate::escalation::merged(&dir, "s-3"));
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
 

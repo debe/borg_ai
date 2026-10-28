@@ -2,27 +2,23 @@
 //! anyway (no state of its own, so the history is there from the first view).
 //!
 //! Each section says where its numbers come from: `team` when they fold synced logs (stats.jsonl
-//! rollups, outcomes, lessons.jsonl, the hive boards, playbooks) in a team collective, `this machine`
+//! rollups, outcomes, lessons.jsonl, playbooks) in a team collective, `this machine`
 //! when they fold the local event log (stats/events.jsonl, which keeps the lesson sources) or the
 //! collective is local.
-//! - lessons written per source (session, review, regret, veto, group, rework, queen, import, ...), and
+//! - lessons written per source (session, review, regret, veto, queen, import, ...), and
 //!   the team's lessons written (from lessons.jsonl, each lesson once) and merged;
 //! - asked lessons' verdicts: changed the work, ignored, corrected anyway (the asked→changed rate);
 //! - vetoes and repeated vetoes (the same "no" said twice: a lesson that did not hold);
-//! - per hive goal, the mistakes its guards caught (verifier rejections, failed integrations, hacked
-//!   attempts) next to the verified ones, and the rework lessons learned from them;
 //! - the playbooks with each shown version's belief (playbook.rs `view`).
 //!
 //! The weeks run from the first counted one to the current one (`partial_week`). The history before
 //! live counting began (stats.rs `backfill`) derives no merges, repeated vetoes or lesson sources:
 //! those series are null before `live_from`, unknown rather than zero.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use borg::collective::Share;
-use borg::hive::board::{self, Ev, Role};
-use borg::hive::verdict;
 use borg::{learn, stats};
 use serde_json::{Value, json};
 
@@ -67,55 +63,6 @@ impl Weekly {
         let w = self.0.get(series);
         weeks.iter().map(|k| w.and_then(|w| w.get(k)).copied().unwrap_or(0)).collect()
     }
-}
-
-/// One hive goal's verdicts per week, from its board (tasks.jsonl, synced).
-struct Goal {
-    id: String,
-    weekly: Weekly,
-    rework: Vec<Value>,
-}
-
-/// The verdicts on goal `id`'s board: `verified` and `rejected` work (an unchecked rejection, no
-/// snapshot or a dependency missing, says nothing about the work and is left out), `hacked` attempts
-/// (whatever the verifier said), and integrations that passed or failed. Only the verdicts the fold
-/// took count (each closed its holder's tenure: a stale verifier's line, a second verdict on a judged
-/// task or one without a claim is ignored, each identical line once), and only those whose credit
-/// is the kind `record` writes (`verdict::consistent`).
-fn goal(home: &Path, id: &str, lessons: &[learn::Lesson]) -> Goal {
-    let events = board::read(&borg::hive::tasks_path(home, id));
-    let b = board::fold(&events);
-    let integrate = |t: &str| b.tasks.get(t).is_some_and(|s| s.task.role == Role::Integrate);
-    let mut taken: HashSet<(&str, &str, i64, Ev)> = b
-        .spans
-        .iter()
-        .filter_map(|s| match (s.end, s.to_ms) {
-            (Some(ev @ (Ev::Verified | Ev::Rejected)), Some(ms)) => Some((s.task.as_str(), s.by.as_str(), ms, ev)),
-            _ => None,
-        })
-        .collect();
-    let mut weekly = Weekly::default();
-    for e in events.iter().filter(|e| verdict::consistent(e) && taken.remove(&(e.task.as_str(), e.by.as_str(), e.ms, e.ev))) {
-        let w = week(e.ms);
-        match e.ev {
-            Ev::Rejected if e.hacked == Some(true) => weekly.add("hacked", w, 1),
-            Ev::Rejected if integrate(&e.task) => weekly.add("integration_failed", w, 1),
-            Ev::Rejected if e.note == verdict::UNCHECKED || e.note.starts_with(verdict::NO_DEPS) => {}
-            Ev::Rejected => weekly.add("rejected", w, 1),
-            Ev::Verified if integrate(&e.task) => weekly.add("integrated", w, 1),
-            Ev::Verified => weekly.add("verified", w, 1),
-            _ => {}
-        }
-    }
-    // Lessons learned from this goal's reworks (hive/rework.rs: episode `rework-<goal>.<task>`), written
-    // or merged into.
-    let prefix = format!("{}-{id}.", borg::hive::rework::KIND);
-    let rework = lessons
-        .iter()
-        .filter(|l| l.episodes.iter().any(|e| e.starts_with(&prefix)))
-        .map(|l| json!({"id": l.id, "question": l.question, "origin_ms": l.origin_ms, "version": l.version}))
-        .collect();
-    Goal { id: id.to_string(), weekly, rework }
 }
 
 /// Monday day numbers from the first week any series counted to the week of `now` (the newest is
@@ -172,24 +119,10 @@ fn view_at(name: &str, home: &Path, share: Share, now: i64) -> Value {
     for ms in first.values().filter(|ms| **ms > 0) {
         team.add(stats::LESSON_NEW, week(*ms), 1);
     }
-    let goals: Vec<Goal> = borg::hive::view::goals(home).iter().map(|id| goal(home, id, &lessons)).collect();
-    let mut all: Vec<&Weekly> = vec![&sources, &team];
-    all.extend(goals.iter().map(|g| &g.weekly));
-    let weeks = span(&all, now);
+    let weeks = span(&[&sources, &team], now);
     let mut names: Vec<(&String, u64)> = sources.0.iter().map(|(k, w)| (k, w.values().sum())).collect();
     names.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let by_source: Vec<Value> = names.iter().map(|(s, n)| json!({"source": s, "total": n, "weeks": known(sources.of(s, &weeks), &weeks, live_week)})).collect();
-    let goals: Vec<Value> = goals
-        .iter()
-        .map(|g| {
-            let series = ["verified", "rejected", "integration_failed", "hacked", "integrated"];
-            let mut row = json!({"goal": g.id, "rework_lessons": g.rework});
-            for s in series {
-                row[s] = json!(g.weekly.of(s, &weeks));
-            }
-            row
-        })
-        .collect();
     let t = |k: &str| team.of(k, &weeks);
     let since = |k: &str| known(t(k), &weeks, live_week);
     json!({
@@ -205,7 +138,6 @@ fn view_at(name: &str, home: &Path, share: Share, now: i64) -> Value {
         "asked": {"scope": synced, "changed": t(stats::CHANGED), "ignored": t(stats::IGNORED), "corrected": t(stats::CORRECTED),
             "not_corrected": t(stats::NOT_CORRECTED)},
         "vetoes": {"scope": synced, "veto": t(stats::VETO), "repeat": since(stats::VETO_REPEAT)},
-        "hive": {"scope": synced, "goals": goals},
         "playbooks": {"scope": synced, "list": borg::playbook::view(home)},
     })
 }

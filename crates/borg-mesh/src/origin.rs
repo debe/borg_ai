@@ -77,13 +77,12 @@ pub fn append(home: &Path, records: &[Origin]) -> Result<(), String> {
 }
 
 /// Stamps every line of `logs` that has no record yet as this node's, at `now`; returns how many.
-/// A line that stays on this node (`lines::local`) is never stamped, so never offered.
 pub fn stamp(home: &Path, me: &Identity, logs: &[PathBuf], now: i64) -> Result<usize, String> {
     let mut known: std::collections::HashSet<Hash> = load(home).into_keys().collect();
     let mut new = Vec::new();
     for log in logs {
-        for (h, line) in lines::read(log) {
-            if !lines::local(log, &line) && known.insert(h) {
+        for h in lines::read(log).into_keys() {
+            if known.insert(h) {
                 new.push(Origin::new(me, &h, now));
             }
         }
@@ -104,7 +103,7 @@ pub fn quarantine(home: &Path, log: &Path, m: &Membership) -> Result<usize, Stri
     let origins = load(home);
     let refused = |l: &str| origins.get(&lines::hash(l)).is_some_and(|o| !m.admits(&o.key, o.ms));
     // Read to rename under the log's lock, which its writers take for each append (borg live.rs
-    // `locked`: the hive's `append_bytes`, the lessons' learn): a line appended meanwhile is never lost.
+    // `locked`: the lessons' learn, the jsonl appends): a line appended meanwhile is never lost.
     let moved = borg::live::locked(log, || -> Result<usize, String> {
         let text = std::fs::read_to_string(log).unwrap_or_default();
         let (out, keep): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| refused(l));
@@ -117,11 +116,6 @@ pub fn quarantine(home: &Path, log: &Path, m: &Membership) -> Result<usize, Stri
         let tmp = log.with_extension("jsonl.quarantine-tmp");
         std::fs::write(&tmp, keep.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, log).map_err(|e| format!("{}: {e}", log.display()))?;
-        // A hive board's receive index speaks of the file before (borg hive/board.rs `held_path`): it
-        // starts afresh, under this lock, its lines held from now, later than they arrived, never earlier.
-        if log.file_name().is_some_and(|f| f == "tasks.jsonl") {
-            borg::hive::board::reset_held(log);
-        }
         Ok(out.len())
     })?;
     if moved > 0 {
@@ -213,15 +207,6 @@ mod tests {
         std::fs::write(&log, "{\"a\":1}\n{\"b\":2}\n").unwrap();
         assert_eq!(stamp(&home, &me, std::slice::from_ref(&log), 7).unwrap(), 2);
         assert_eq!(stamp(&home, &me, &[log], 8).unwrap(), 0, "stamped once");
-        // A goal's spend line that names no node is from before spend synced: it stays here.
-        let spend = home.join("hive/g/spend.jsonl");
-        std::fs::create_dir_all(spend.parent().unwrap()).unwrap();
-        std::fs::write(
-            &spend,
-            "{\"drone\":\"d1\",\"usd\":1.0}\n{\"drone\":\"d1\",\"node\":\"\",\"usd\":2.0}\n{\"drone\":\"d1\",\"node\":\"n1\",\"usd\":3.0}\n",
-        )
-        .unwrap();
-        assert_eq!(stamp(&home, &me, &[spend], 9).unwrap(), 1, "only the line that names its node");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -261,19 +246,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A quarantine rewrites a hive log while drones append to it: both take the log's lock, so the
-    /// rewrite waits for a writer and a writer for the rewrite, and the line appended is kept.
+    /// A quarantine rewrites a log while a hook appends to it: both take the log's lock, so the
+    /// rewrite waits for the writer, and the line appended is kept.
     #[test]
-    fn quarantine_and_hive_appends_share_the_log_lock() {
+    fn quarantine_and_appends_share_the_log_lock() {
         let home = std::env::temp_dir().join(format!("borg-mesh-origin-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let (admin, carol) = (Identity::load_or_create(&home).unwrap(), Identity::load_or_create(&home.join("carol")).unwrap());
         let mut m = Membership::found("work", &admin);
         m.invite(&admin, &carol.public(), "member").unwrap();
-        let log = home.join("hive/g1/tasks.jsonl");
-        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let bad = r#"{"v":1,"ev":"claim","task":"t1","ms":2,"by":"carol"}"#;
+        let log = home.join("lessons.jsonl");
+        let bad = &lesson("L1", 1, "carol's");
         std::fs::write(&log, format!("{bad}\n")).unwrap();
         append(&home, &[Origin::new(&carol, &lines::hash(bad), 50)]).unwrap();
         m.revoke(&admin, &carol.public(), 10).unwrap();
@@ -284,29 +268,13 @@ mod tests {
             let t = std::thread::spawn(move || quarantine(&h, &l, &m).unwrap());
             std::thread::sleep(wait);
             assert!(!t.is_finished(), "the rewrite waits for the writer");
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&log)
-                .unwrap()
-                .write_all(b"{\"v\":1,\"ev\":\"progress\",\"task\":\"t1\",\"ms\":3,\"by\":\"s\"}\n")
-                .unwrap();
+            std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(format!("{}\n", lesson("L2", 1, "kept")).as_bytes()).unwrap();
             t
         })
         .join()
         .unwrap();
         assert_eq!(moved, 1);
-        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(), [r#"{"v":1,"ev":"progress","task":"t1","ms":3,"by":"s"}"#]);
-        // The hive's appends take the same lock.
-        borg::live::locked(&log, || {
-            let l = log.clone();
-            let t = std::thread::spawn(move || borg::hive::board::append(&l, &[borg::hive::Event::new(borg::hive::Ev::Progress, "t1", "s", 4)]).unwrap());
-            std::thread::sleep(wait);
-            assert!(!t.is_finished(), "an append waits for a rewrite in progress");
-            t
-        })
-        .join()
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(), [lesson("L2", 1, "kept")]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

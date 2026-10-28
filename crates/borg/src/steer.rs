@@ -410,15 +410,6 @@ pub fn around(
                 return out;
             }
             let steer = render(&won);
-            // An interactive drone's stop goes as Stop feedback (hive/interactive.rs `feedback`): its
-            // handover (a done's result, the next task, the wait to start) is that text, kept after the
-            // steering in the same shape.
-            let theirs =
-                out.as_ref().filter(|o| o.get("reason").is_none()).and_then(|o| o.pointer("/hookSpecificOutput/additionalContext")).and_then(Value::as_str);
-            if let (Some(mut o), Some(text)) = (out.clone(), theirs.map(|t| format!("{steer}\n\n{t}"))) {
-                o["hookSpecificOutput"]["additionalContext"] = Value::String(text);
-                return Some(o);
-            }
             let reason = match out.as_ref().and_then(|o| o.get("reason")).and_then(Value::as_str) {
                 Some(r) => format!("{steer}\n\n{r}"),
                 None => steer,
@@ -552,21 +543,6 @@ mod tests {
         let r = out["reason"].as_str().unwrap();
         assert!(r.starts_with("[borg] Steering from alice@x [key abababababab] (signed, role steer): use the staging db") && r.ends_with("\n\nQ1"), "{r}");
         assert_eq!(around(&home, false, "stop", &ev("s1"), Some(0), 300, || None), None);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn an_interactive_drones_handover_survives_a_steer_at_its_stop() {
-        // An interactive drone's stop is Stop feedback (hive/interactive.rs `feedback`), no `reason`: the
-        // steering goes before its handover, in the same shape, and the handover is kept.
-        let home = tmp("steer-feedback");
-        accept(&home, &directive("d1", SAY, "s1", "use the staging db", 100), 0).unwrap();
-        let handover = json!({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": "Done: t1 verified.\n\nNext: t2"}});
-        let out = around(&home, true, "stop", &ev("s1"), Some(0), 200, || Some(handover.clone())).unwrap();
-        assert!(out.get("decision").is_none() && out.get("reason").is_none(), "{out}");
-        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "Stop");
-        let text = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert!(text.contains("use the staging db") && text.ends_with("\n\nDone: t1 verified.\n\nNext: t2"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

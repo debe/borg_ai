@@ -1,4 +1,4 @@
-//! The queen's attention reward (docs/design/hive.md "The engineer's role", L7b): did
+//! The queen's attention reward: did
 //! an escalation spend the engineer's minutes well?
 //!
 //! ```text
@@ -13,14 +13,12 @@
 //!   (`Kind::proceeds`), or a bare yes.
 //! - `queen_missed` (−β): a "no" that came after the work merged, from a session with no escalation:
 //!   a veto (veto.rs `record`, any of its three ways in) of a session whose work landed (a commit of its
-//!   own still on HEAD, notes.rs `landed_by`) or was integrated in the hive (`merged`: work an
-//!   integration merges, a group's best attempt only, verified before an integration that passed by
-//!   then), or a strong regress link (notes/regress_learn.rs: a later fix of a committed decision) of
-//!   a deciding session.
+//!   own still on HEAD, notes.rs `landed_by`), or a strong regress link (notes/regress_learn.rs: a later
+//!   fix of a committed decision) of a deciding session.
 //!
 //! Escalations are the questions the queen chooses to raise: the four checkpoint kinds
 //! (`Kind::escalates`). The other queue kinds are proposals or gates an engineer must answer whatever
-//! the queen thinks (constraints, contracts, playbooks, reach, open decisions), so they earn nothing.
+//! the queen thinks (constraints, playbooks, reach, open decisions), so they earn nothing.
 //! "No escalation" is judged against this node's queue: the queue is local, and so are the sessions it
 //! names.
 //!
@@ -38,7 +36,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::queen::{self, Entry};
-use crate::{hive, notes, stats};
+use crate::{notes, stats};
 
 /// α: what a rubber stamp costs.
 pub const STAMP_W: f64 = 1.0;
@@ -60,7 +58,7 @@ pub fn stamp(e: &Entry, answer: &str) -> bool {
     (!plan.is_empty() && a.starts_with(&plan)) || yes(answer)
 }
 
-/// Whether `answer` says only yes: every word of it is a plain yes (hive/plan.rs approves a plan by it too).
+/// Whether `answer` says only yes: every word of it is a plain yes.
 pub fn yes(answer: &str) -> bool {
     let a = norm(answer);
     !a.is_empty() && a.split(' ').all(|w| YES.contains(&w))
@@ -89,26 +87,10 @@ pub fn escalated(store: &Path, session: &str) -> bool {
     !session.is_empty() && queen::entries(store).iter().any(|e| e.session == session && e.kind.escalates())
 }
 
-/// Whether `session`'s work had merged by `at`: a hive task it authored is work an integration merges
-/// (hive/group.rs `merged`: of a group, only its best attempt) and some integration that passed no later
-/// than `at` came after its verification, on a board in `home`; or the session landed a commit of its
-/// own that is still on HEAD (notes.rs `landed_by`, from the hook's state in `state`).
-pub fn merged(home: &Path, state: &Path, session: &str, at: i64) -> bool {
-    integrated(home, session, at) || !notes::landed_by(state, session).is_empty()
-}
-
-fn integrated(home: &Path, session: &str, at: i64) -> bool {
-    hive::goal::list(home).into_iter().any(|g| {
-        let b = hive::board::fold(&hive::board::read(&hive::tasks_path(home, &g)));
-        if b.integrations.is_empty() {
-            return false;
-        }
-        let scores = hive::group::scores(home, &g);
-        hive::group::merged(&b, |v| scores.get(v).copied()).iter().any(|t| {
-            t.author.as_deref() == Some(session)
-                && matches!(t.status, hive::board::Status::Verified { ms, .. } if b.integrations.iter().any(|i| ms <= i.ms && i.ms <= at))
-        })
-    })
+/// Whether `session`'s work merged: it landed a commit of its own that is still on HEAD (notes.rs
+/// `landed_by`, from the hook's state in `state`).
+pub fn merged(state: &Path, session: &str) -> bool {
+    !notes::landed_by(state, session).is_empty()
 }
 
 /// Logs a missed escalation once per `id` (a veto episode, a regress link): `cause` `veto` or
@@ -241,73 +223,13 @@ mod tests {
         let mut e = entry("q1", Kind::PublicApi, "s1");
         assert_eq!(answered(&store, &e, "keep the old contract working", "ann@x", 10), Some(stats::QUEEN_NO));
         assert_eq!(answered(&store, &e, "proceed as planned", "ann@x", 11), Some(stats::QUEEN_STAMP));
-        for k in [Kind::Constraint, Kind::Contract, Kind::Playbook, Kind::Reach, Kind::OpenDecision, Kind::Plan] {
+        for k in [Kind::Constraint, Kind::Playbook, Kind::Reach, Kind::OpenDecision] {
             e.kind = k;
             assert_eq!(answered(&store, &e, "anything", "ann@x", 12), None, "{k:?} is a gate, not the queen's choice");
         }
         let y = team(&store);
         assert_eq!((y.no, y.stamps), (1, 1));
         let _ = std::fs::remove_dir_all(&store);
-    }
-
-    #[test]
-    fn work_merged_is_what_some_integration_by_then_took_and_of_a_group_only_its_best() {
-        use crate::hive::board::{self, Ev, Event, Role, Task};
-        let home = tmp("merged");
-        let task = |id: &str, role: Role, of: Option<&str>, group: Option<&str>| Task {
-            id: id.into(),
-            role,
-            title: id.into(),
-            repo: String::new(),
-            files: vec![],
-            deps: vec![],
-            accept: vec![],
-            of: of.map(String::from),
-            not_by: vec![],
-            flags: vec![],
-            from: None,
-            group: group.map(String::from),
-        };
-        let dir = hive::dir(&home, "g");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("goal.jsonl"), "").unwrap();
-        // `w` by `s`, verified at `ms`.
-        let work = |w: &str, s: &str, ms: i64, group: Option<&str>| {
-            let v = format!("{w}.v1");
-            vec![
-                Event::open(task(w, Role::Work, None, group), "engineer:a@x", 1),
-                Event::new(Ev::Claim, w, s, ms - 3),
-                Event::new(Ev::Done, w, s, ms - 2),
-                Event::open(task(&v, Role::Verify, Some(w), None), s, ms - 2),
-                Event::new(Ev::Claim, &v, "ver", ms - 1),
-                Event::new(Ev::Verified, &v, "ver", ms),
-            ]
-        };
-        let integration = |n: u32, ms: i64| {
-            let id = format!("integrate.{n}");
-            vec![
-                Event::open(task(&id, Role::Integrate, None, None), "i", ms - 2),
-                Event::new(Ev::Claim, &id, "i", ms - 1),
-                Event::new(Ev::Verified, &id, "i", ms),
-            ]
-        };
-        let mut ev = work("w1", "s1", 5, None);
-        // A group: t.g2 verified first is its best; t.g1 is verified too, but never integrated.
-        ev.extend(work("t.g2", "s6", 6, Some("t")));
-        ev.extend(work("t.g1", "s5", 8, Some("t")));
-        ev.extend(integration(1, 10));
-        ev.extend(work("w2", "s3", 20, None));
-        ev.extend(integration(2, 25));
-        ev.extend(work("w3", "s4", 30, None));
-        board::append(&hive::tasks_path(&home, "g"), &ev).unwrap();
-        let state = home.join("state");
-        let m = |s: &str, at: i64| merged(&home, &state, s, at);
-        assert!(m("s1", 22), "integrate.1 merged it, though a later integration passed after the veto");
-        assert!(!m("s1", 9), "no integration yet");
-        assert!(!m("s3", 22) && m("s3", 25), "integrate.2 merged w2 only at 25");
-        assert!(!m("s4", i64::MAX), "verified after every integration: not merged yet");
-        assert!(m("s6", 22) && !m("s5", i64::MAX), "of a group, only the best attempt merged");
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

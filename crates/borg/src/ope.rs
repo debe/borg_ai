@@ -1,9 +1,9 @@
-//! `borg debug ope`: off-policy estimates of the usefulness belief's hand-set weights (hive.md
-//! L6), from the outcome log alone. Reports, never applies: no constant changes.
+//! `borg debug ope`: off-policy estimates of the usefulness belief's hand-set weights, from the
+//! outcome log alone. Reports, never applies: no constant changes.
 //!
 //! **What is estimated.** The per-ask change rate under a candidate policy: of the lessons a check
 //! asks, the share the drone then changed its work on. The candidates differ from the policy in force
-//! in one weight of the belief (memory.rs `Weights`, learn.rs `VERIFIER_REGRET`), the others held.
+//! in one weight of the belief (memory.rs `Weights`), the others held.
 //!
 //! **Which records count.** The weights reach a logged propensity on one path only: the Thompson slot
 //! draw over a pool (conscience.rs `budget_pool`/`widen_pool` and `propensity`, the bm25 and the
@@ -47,22 +47,15 @@ pub struct Knob {
     pub name: &'static str,
     pub current: f64,
     pub kinds: &'static [&'static str],
-    /// Only `regretted` records of a verifier (cause ending `/verify`, learn.rs `credit_regrets`).
-    pub verify: bool,
-    pub set: fn(&mut Candidate, f64),
+    pub set: fn(&mut Weights, f64),
 }
 
-/// The seven hand-set weights: the veto's (`VETOED_W`), the hive verdicts' (`VERIFIED_W`, `REJECTED_W`,
-/// `HACKED_W`), a regret's (`REGRET`), the verifier's share of a regret (learn.rs `VERIFIER_REGRET`) and
-/// a green test run's (`TESTED_W`).
-pub const KNOBS: [Knob; 7] = [
-    Knob { name: "veto", current: memory::VETOED_W as f64, kinds: &[outcome::VETOED], verify: false, set: |c, v| c.weights.vetoed = v },
-    Knob { name: "verified", current: memory::VERIFIED_W as f64, kinds: &[outcome::VERIFIED], verify: false, set: |c, v| c.weights.verified = v },
-    Knob { name: "rejected", current: memory::REJECTED_W as f64, kinds: &[outcome::REJECTED], verify: false, set: |c, v| c.weights.rejected = v },
-    Knob { name: "hacked", current: memory::HACKED_W as f64, kinds: &[outcome::HACKED], verify: false, set: |c, v| c.weights.hacked = v },
-    Knob { name: "regret", current: memory::REGRET, kinds: &[outcome::REGRETTED], verify: false, set: |c, v| c.weights.regret = v },
-    Knob { name: "verifier_regret", current: learn::VERIFIER_REGRET, kinds: &[outcome::REGRETTED], verify: true, set: |c, v| c.verifier = v },
-    Knob { name: "tested", current: memory::TESTED_W, kinds: &[outcome::TESTED], verify: false, set: |c, v| c.weights.tested = v },
+/// The three hand-set weights: the veto's (`VETOED_W`), a regret's (`REGRET`) and a green test run's
+/// (`TESTED_W`).
+pub const KNOBS: [Knob; 3] = [
+    Knob { name: "veto", current: memory::VETOED_W as f64, kinds: &[outcome::VETOED], set: |w, v| w.vetoed = v },
+    Knob { name: "regret", current: memory::REGRET, kinds: &[outcome::REGRETTED], set: |w, v| w.regret = v },
+    Knob { name: "tested", current: memory::TESTED_W, kinds: &[outcome::TESTED], set: |w, v| w.tested = v },
 ];
 
 /// Candidates around a weight: half, itself, double. Derived from the current value, never hand-picked;
@@ -71,15 +64,8 @@ pub fn grid(current: f64) -> [f64; 3] {
     [current / 2.0, current, current * 2.0]
 }
 
-/// A policy to replay: the belief's weights and the verifier's share of a regret.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Candidate {
-    pub weights: Weights,
-    pub verifier: f64,
-}
-
 /// The policy in force.
-pub const CURRENT: Candidate = Candidate { weights: memory::WEIGHTS, verifier: learn::VERIFIER_REGRET };
+pub const CURRENT: Weights = memory::WEIGHTS;
 
 /// One logged Thompson check: its `asked` record's index in the log, ms and session, the asked lessons
 /// with their logged p and reward, and the pool (id, base, scoped).
@@ -172,23 +158,6 @@ pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
     (out, skipped)
 }
 
-/// `outcomes` with each verifier regret's credit rescaled to the candidate's share: × `verifier` /
-/// `VERIFIER_REGRET`, at most 1 (outcome.rs `regretted` caps a credit at 1).
-fn rescaled(outcomes: &[Outcome], verifier: f64) -> Vec<Outcome> {
-    let k = verifier / learn::VERIFIER_REGRET;
-    outcomes
-        .iter()
-        .map(|o| match is_verifier_regret(o) {
-            true => Outcome { credit: (o.credit * k).min(1.0), ..o.clone() },
-            false => o.clone(),
-        })
-        .collect()
-}
-
-fn is_verifier_regret(o: &Outcome) -> bool {
-    o.kind == outcome::REGRETTED && o.cause.ends_with("/verify")
-}
-
 /// The pool's lessons as `derive` needs them: their ids.
 fn pool_lessons(d: &Decision) -> Vec<Challenge> {
     d.pool.iter().map(|(id, _, _)| Challenge { id: id.clone(), ..Default::default() }).collect()
@@ -223,18 +192,11 @@ fn slot_p(mem: &HashMap<String, Memory>, d: &Decision, w: &Weights) -> HashMap<S
 
 /// Each pooled lesson's chance of a slot under `cand`, as of the decision: beliefs from memory::derive
 /// over the records of `log` before `d.ms` (the cut is made here: nothing at or after the decision
-/// reaches it) with the candidate weights (verifier regrets' credit rescaled by cand.verifier /
-/// VERIFIER_REGRET, at most 1), then conscience::propensity on the logged pool with s = base × (0.5 +
-/// mean) and the decision's session.
-pub fn replay(log: &[Outcome], d: &Decision, cand: &Candidate) -> HashMap<String, f64> {
+/// reaches it) with the candidate weights, then conscience::propensity on the logged pool with s =
+/// base × (0.5 + mean) and the decision's session.
+pub fn replay(log: &[Outcome], d: &Decision, cand: &Weights) -> HashMap<String, f64> {
     let prefix: Vec<Outcome> = log.iter().filter(|o| o.ms < d.ms).cloned().collect();
-    let prefix = prefix.as_slice();
-    let lessons = pool_lessons(d);
-    let mem = match cand.verifier != learn::VERIFIER_REGRET && prefix.iter().any(is_verifier_regret) {
-        true => memory::derive(&rescaled(prefix, cand.verifier), &lessons, None),
-        false => memory::derive(prefix, &lessons, None),
-    };
-    slot_p(&mem, d, &cand.weights)
+    slot_p(&memory::derive(&prefix, &pool_lessons(d), None), d, cand)
 }
 
 /// One estimate of a policy's per-ask change rate.
@@ -351,7 +313,7 @@ pub fn evaluate(outcomes: &[Outcome]) -> Report {
         }
     }
     // Every (knob, value), and the distinct candidates behind them (the current one once).
-    let mut cands: Vec<Candidate> = vec![CURRENT];
+    let mut cands: Vec<Weights> = vec![CURRENT];
     let mut grid_rows: Vec<(usize, f64, usize)> = Vec::new();
     for (k, knob) in KNOBS.iter().enumerate() {
         for v in grid(knob.current) {
@@ -374,25 +336,10 @@ pub fn evaluate(outcomes: &[Outcome]) -> Report {
         at.sort_unstable();
         at.dedup();
         let prefix: Vec<Outcome> = at.into_iter().map(|i| sorted[i].clone()).collect();
-        let lessons = pool_lessons(d);
-        let mem = memory::derive(&prefix, &lessons, None);
-        let verify = prefix.iter().any(is_verifier_regret);
-        let mut by_verifier: Vec<(f64, HashMap<String, Memory>)> = Vec::new();
+        let mem = memory::derive(&prefix, &pool_lessons(d), None);
         let s = sessions.len();
         let s = *sessions.entry(d.session.as_str()).or_insert(s);
-        let ps: Vec<HashMap<String, f64>> = cands
-            .iter()
-            .map(|c| match verify && c.verifier != learn::VERIFIER_REGRET {
-                true => {
-                    if !by_verifier.iter().any(|(v, _)| *v == c.verifier) {
-                        by_verifier.push((c.verifier, memory::derive(&rescaled(&prefix, c.verifier), &lessons, None)));
-                    }
-                    let m = &by_verifier.iter().find(|(v, _)| *v == c.verifier).expect("derived above").1;
-                    slot_p(m, d, &c.weights)
-                }
-                false => slot_p(&mem, d, &c.weights),
-            })
-            .collect();
+        let ps: Vec<HashMap<String, f64>> = cands.iter().map(|c| slot_p(&mem, d, c)).collect();
         // The current weights (candidate 0) must reproduce the logged draw.
         let mut same = true;
         for (id, logged, _) in &d.asked {
@@ -415,7 +362,7 @@ pub fn evaluate(outcomes: &[Outcome]) -> Report {
     }
     let estimates: Vec<Estimate> = units.iter().map(|u| snips(u, SEED)).collect();
     let last = ds.iter().map(|d| d.ms).max().unwrap_or(i64::MAX);
-    let evidence = |k: &Knob| outcomes.iter().filter(|o| o.ms < last && k.kinds.contains(&o.kind.as_str()) && (!k.verify || is_verifier_regret(o))).count();
+    let evidence = |k: &Knob| outcomes.iter().filter(|o| o.ms < last && k.kinds.contains(&o.kind.as_str())).count();
     let rows: Vec<Row> =
         grid_rows.iter().map(|&(k, v, u)| Row { knob: KNOBS[k].name, value: v, est: estimates[u].clone(), evidence: evidence(&KNOBS[k]) }).collect();
     let current = estimates[0].clone();
@@ -501,7 +448,7 @@ pub fn render(r: &Report) -> String {
 }
 
 /// The outcomes beliefs were derived from live (outcome.rs `read_team`), with this machine's records
-/// as written: the team view tags their causes, and a verifier regret is known by its raw cause.
+/// as written.
 fn store_view(lessons: &Path) -> Vec<Outcome> {
     // One read of each file: the local records and the team's beside them never overlap.
     let (mut out, team) = outcome::team_parts(lessons, outcome::on());
@@ -617,7 +564,7 @@ mod tests {
             .collect();
         write(&lessons, &ls);
         let outcomes = home.join("outcomes.jsonl");
-        // History: changes, ignores, a veto, a regret and hive verdicts.
+        // History: changes, ignores, a veto and a regret.
         write(
             &outcomes,
             &[
@@ -628,8 +575,6 @@ mod tests {
                 o(VETOED, "h1", &["U3", "S2"], 210),
                 o(ASKED, "h2", &["U4"], 300),
                 Outcome { cause: "R1".into(), credit: 0.5, ..o(outcome::REGRETTED, "h2", &["U4"], 310) },
-                Outcome { cause: "g/t1.v1".into(), ..o(outcome::VERIFIED, "h3", &["S3"], 400) },
-                Outcome { cause: "g/t2.v1".into(), ..o(outcome::HACKED, "h3", &["U2"], 410) },
             ]
             .map(|x| json(&x)),
         );
@@ -723,9 +668,9 @@ mod tests {
         assert_eq!(pick.best, 6.0);
         assert!(rows(&r, "veto").iter().all(|x| x.est.ess > 0.0 && x.evidence == 3));
         // A knob without evidence cannot tell its candidates apart.
-        let hacked: Vec<&Estimate> = rows(&r, "hacked").iter().map(|x| &x.est).collect();
-        assert!(hacked.iter().all(|e| *e == hacked[0]) && rows(&r, "hacked")[0].evidence == 0);
-        assert_eq!(r.picks.iter().find(|p| p.knob == "hacked").unwrap().best, memory::HACKED_W as f64, "a tie keeps the current value");
+        let tested: Vec<&Estimate> = rows(&r, "tested").iter().map(|x| &x.est).collect();
+        assert!(tested.iter().all(|e| *e == tested[0]) && rows(&r, "tested")[0].evidence == 0);
+        assert_eq!(r.picks.iter().find(|p| p.knob == "tested").unwrap().best, memory::TESTED_W, "a tie keeps the current value");
         // The mirror world, where the vetoed lessons are the helpful ones: a lighter veto ranks first.
         let r = evaluate(&veto_world(40, true));
         let veto: Vec<f64> = rows(&r, "veto").iter().map(|x| x.est.value.unwrap()).collect();
@@ -788,18 +733,7 @@ mod tests {
     fn grid_halves_and_doubles() {
         assert_eq!(grid(3.0), [1.5, 3.0, 6.0]);
         let current: Vec<f64> = KNOBS.iter().map(|k| k.current).collect();
-        assert_eq!(
-            current,
-            [
-                memory::VETOED_W as f64,
-                memory::VERIFIED_W as f64,
-                memory::REJECTED_W as f64,
-                memory::HACKED_W as f64,
-                memory::REGRET,
-                learn::VERIFIER_REGRET,
-                memory::TESTED_W
-            ]
-        );
+        assert_eq!(current, [memory::VETOED_W as f64, memory::REGRET, memory::TESTED_W]);
         // Each knob sets its own weight.
         for k in &KNOBS {
             let mut c = CURRENT;
@@ -852,17 +786,6 @@ mod tests {
         assert_eq!((r.decisions, r.drifted, r.units), (1, 1, 0), "{:?}", r.agree);
         assert!(r.agree.0 < r.agree.1 && r.current.value.is_none());
         assert!(render(&r).contains("left out: 1 decision(s)"), "{}", render(&r));
-    }
-
-    #[test]
-    fn verifier_regrets_are_rescaled_and_others_kept() {
-        let log = vec![
-            Outcome { cause: "R1/verify".into(), credit: 0.25, ..o(outcome::REGRETTED, "v", &["A"], 1) },
-            Outcome { cause: "R1".into(), credit: 0.5, ..o(outcome::REGRETTED, "a", &["A"], 1) },
-            Outcome { cause: "R2/verify".into(), credit: 0.75, ..o(outcome::REGRETTED, "v", &["A"], 1) },
-        ];
-        let credits: Vec<f64> = rescaled(&log, 2.0 * learn::VERIFIER_REGRET).iter().map(|x| x.credit).collect();
-        assert_eq!(credits, [0.5, 0.5, 1.0], "doubled, capped at 1; the author's own regret unchanged");
     }
 
     #[test]

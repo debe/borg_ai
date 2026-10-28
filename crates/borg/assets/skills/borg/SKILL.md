@@ -1,6 +1,6 @@
 ---
 name: borg
-description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, hive, mesh or vectors, asks why borg blocked or asked, or wants to set up, share or fix borg.
+description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, mesh or vectors, asks why borg blocked or asked, or wants to set up, share or fix borg.
 ---
 
 # borg
@@ -26,7 +26,6 @@ on this machine unless the collective they belong to is synced with a team over 
 | episode | A captured correction, veto, regret or review finding, waiting for `borg learn` to turn it into a lesson |
 | assimilate | Importing lessons from past sessions or a team's documents (`borg assimilate`) |
 | live / hook | The delivery modes: `hook` checks the work at the turn's end; `live` (the default) also checks it during the turn, after state-changing tool calls |
-| hive | Several drones working one goal: a board of tasks, each gated by its own check and verified by another drone, planned by a session and approved by the engineer |
 
 ## What to run when
 
@@ -46,13 +45,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
 | Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` |
-| To have drones build something (a hive goal: tasks, checks, plan approval) | this session plans it: `borg hive init <goal> ... --task ...`, then the engineer's yes ([hive](references/hive.md)) |
-| This session to become a drone that waits for hive work | `borg hive join` (every open goal of the repo), `borg hive leave` |
-| The board of a goal, or the engineer approving a plan from a terminal | `borg hive board <goal>`, `borg hive ratify <goal>` |
 | Every command | `borg help`, `borg mesh --help` |
-
-**Hive.** When the engineer says what the drones should build, this session plans the goal and the
-engineer approves it at their own prompt: follow [hive](references/hive.md) step by step.
 
 ## Safety rules
 
@@ -93,5 +86,3 @@ engineer approves it at their own prompt: follow [hive](references/hive.md) step
 - [references/team.md](references/team.md): admin and joiner steps, relays, proxies, mesh problems.
 - [references/vectors.md](references/vectors.md): fetch, rebuild, mirrors, turning them off.
 - [references/troubleshooting.md](references/troubleshooting.md): `borg doctor` lines and their fixes.
-- [references/hive.md](references/hive.md): planning a hive goal (tasks, contracts, checks), the
-  engineer's approval at their prompt, the budget.

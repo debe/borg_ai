@@ -253,19 +253,6 @@ pub fn locked<T>(file: &Path, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// `locked` for a caller whose correctness rests on the lock (a check-and-append, hive/mod.rs
-/// `write_if`): when the lock cannot be taken (the lock file cannot be opened, `flock` fails, as with
-/// ENOLCK on some network filesystems) `f` does not run and the error is returned.
-///
-/// # Errors
-/// When the lock cannot be taken.
-pub fn try_locked<T>(file: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
-    let held = lock_of(file)?;
-    let out = f();
-    let _ = held.unlock();
-    Ok(out)
-}
-
 /// `<file>.lock`, opened and locked exclusively.
 fn lock_of(file: &Path) -> std::io::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
@@ -435,18 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_that_cannot_be_taken_runs_nothing_for_a_caller_that_needs_it() {
-        // The lock file cannot be opened (a directory in its place): `try_locked` reports it and does
-        // not run `f`; `locked` runs it unlocked, as before.
+    fn a_lock_that_cannot_be_taken_still_runs_f_unlocked() {
+        // The lock file cannot be opened (a directory in its place): `locked` runs `f` unlocked.
         let d = tmp("try-locked");
         let file = d.join("tasks.jsonl");
         std::fs::create_dir_all(d.join("tasks.jsonl.lock")).unwrap();
-        let mut ran = false;
-        assert!(try_locked(&file, || ran = true).is_err());
-        assert!(!ran);
         assert!(locked(&file, || true));
-        std::fs::remove_dir_all(d.join("tasks.jsonl.lock")).unwrap();
-        assert_eq!(try_locked(&file, || 7).unwrap(), 7);
         let _ = std::fs::remove_dir_all(d);
     }
 

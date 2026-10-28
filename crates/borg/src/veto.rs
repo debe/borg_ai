@@ -1,5 +1,4 @@
-//! `borg no`: the engineer's veto, the strongest negative signal (docs/design/hive.md "The
-//! engineer's role", L7b).
+//! `borg no`: the engineer's veto, the strongest negative signal.
 //!
 //! An engineer says no to a drone's work, with a reason: `borg no <reason>` from a terminal (the drone
 //! of the current repo, or the one `--session` names), or a prompt that starts with "borg no" inside the
@@ -9,7 +8,7 @@
 //! - **A lesson.** The reason is an episode of kind `veto`; `borg learn` generalises it with its own
 //!   prompt at the end of any session, so a veto from a terminal never waits for its session. A veto
 //!   merged into a lesson an earlier veto made is counted as `veto_repeat`: the same "no" said twice,
-//!   the rate the hive learns to bring to zero (H5b).
+//!   the rate learning is to bring to zero.
 //! - **A proposed constraint.** When the reason names an invariant of the system, `borg learn` queues it
 //!   as a queen question (`Kind::Constraint`). Only an engineer's answer ratifies it into
 //!   `<store>/constraints.jsonl`; learning never applies a constraint. A ratified constraint is a
@@ -78,20 +77,9 @@ pub fn reason_in(prompt: &str) -> Option<String> {
 /// or live), the playbook versions shown to it (`outcome::PLAYBOOK`, playbook.rs), and its stats events
 /// of the delivering kinds (early, queued, live asks, blocks).
 pub fn shown(home: &Path, session: &str) -> Vec<String> {
-    shown_between(home, session, i64::MIN, i64::MAX)
-}
-
-/// `shown`, of the records and events at `from_ms..=to_ms` only: what a hive drone was shown while it
-/// held a claim (hive/verdict.rs credits them with the task's verdict).
-pub fn shown_between(home: &Path, session: &str, from_ms: i64, to_ms: i64) -> Vec<String> {
     const DELIVERED: [&str; 4] = [stats::EARLY, stats::QUEUED_FREE, stats::LIVE_ASK, stats::BLOCK];
-    let within = |ms: i64| (from_ms..=to_ms).contains(&ms);
-    let asked = outcome::read(&home.join("outcomes.jsonl"))
-        .into_iter()
-        .filter(|o| outcome::shows(&o.kind) && o.session == session && within(o.ms))
-        .flat_map(|o| o.lessons);
-    let delivered =
-        stats::events(home).into_iter().filter(|e| e.session == session && within(e.ms) && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
+    let asked = outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| outcome::shows(&o.kind) && o.session == session).flat_map(|o| o.lessons);
+    let delivered = stats::events(home).into_iter().filter(|e| e.session == session && DELIVERED.contains(&e.kind.as_str())).flat_map(|e| e.lessons);
     let mut out: Vec<String> = asked.chain(delivered).filter(|l| !l.is_empty()).collect();
     out.sort();
     out.dedup();
@@ -162,7 +150,7 @@ pub fn record(home: &Path, s: &Said) -> std::io::Result<Veto> {
         ev.why = s.via.into();
         ev.text = stats::excerpt(s.reason, 160);
     });
-    let missed = escalation::merged(home, &crate::notes::state_dir(), s.session, s.ms) && escalation::missed(home, s.session, KIND, &e.id, s.repo, s.ms);
+    let missed = escalation::merged(&crate::notes::state_dir(), s.session) && escalation::missed(home, s.session, KIND, &e.id, s.repo, s.ms);
     Ok(Veto { episode: e.id, credited, missed })
 }
 
@@ -296,8 +284,7 @@ pub fn propose(home: &Path, lesson: &learn::Lesson, invariant: &str, e: &learn::
 pub const FILE: &str = "constraints.jsonl";
 
 /// The constraints file of a store. Written on ratification, read with the lessons as standing ones
-/// (conscience.rs `load`) and synced by the mesh (borg-mesh lines.rs `SYNCED`); blocking on a
-/// constraint at pre_tool and at the stop is a later hive step.
+/// (conscience.rs `load`) and synced by the mesh (borg-mesh lines.rs `SYNCED`).
 pub fn constraints_path(store: &Path) -> PathBuf {
     store.join(FILE)
 }
@@ -447,25 +434,6 @@ mod tests {
         assert_eq!(reason_in("borg no"), None);
         assert_eq!(reason_in("borg no: ok"), None, "too short a reason");
         assert_eq!(reason_in(&format!("borg no {}", "x".repeat(2000))).map(|r| r.chars().count()), Some(1500));
-    }
-
-    #[test]
-    fn shown_between_keeps_the_window_inclusive() {
-        let home = temp("window");
-        for (ms, l) in [(10, "A"), (20, "B"), (30, "C")] {
-            let o = Outcome { kind: outcome::ASKED.into(), session: "s".into(), lessons: vec![l.into()], ms, repo: "r".into(), ..Default::default() };
-            outcome::append(&home.join("outcomes.jsonl"), &o).unwrap();
-        }
-        let mut early = stats::Event::new(stats::EARLY, 25);
-        early.session = "s".into();
-        early.lessons = vec!["E".into()];
-        stats::record(&home, &early);
-        assert_eq!(shown_between(&home, "s", 20, 30), ["B", "C", "E"], "both bounds are in");
-        assert_eq!(shown_between(&home, "s", 11, 19), Vec::<String>::new());
-        assert_eq!(shown_between(&home, "s", i64::MIN, 10), ["A"]);
-        assert_eq!(shown(&home, "s"), ["A", "B", "C", "E"]);
-        assert!(shown_between(&home, "t", i64::MIN, i64::MAX).is_empty());
-        let _ = std::fs::remove_dir_all(home);
     }
 
     fn drone(session: &str, repo: &str, state: State, ms: i64, node: &str, number: usize) -> top::Drone {
@@ -624,52 +592,6 @@ mod tests {
         nodeless.d.target.node.clear();
         assert_eq!(apply(&home, &nodeless).unwrap(), None);
         assert_eq!(std::fs::read_to_string(home.join("episodes.jsonl")).unwrap().lines().count(), 2);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn a_veto_of_integrated_hive_work_never_escalated_is_a_missed_escalation() {
-        use crate::hive::board::{self, Ev, Event, Role, Task};
-        let home = temp("missed");
-        let task = |id: &str, role: Role, of: Option<&str>| Task {
-            id: id.into(),
-            role,
-            title: id.into(),
-            repo: String::new(),
-            files: vec![],
-            deps: vec![],
-            accept: vec![],
-            of: of.map(String::from),
-            not_by: vec![],
-            flags: vec![],
-            from: None,
-            group: None,
-        };
-        let goal = crate::hive::dir(&home, "g");
-        std::fs::create_dir_all(&goal).unwrap();
-        std::fs::write(goal.join("goal.jsonl"), "").unwrap();
-        let events = [
-            Event::open(task("w", Role::Work, None), "engineer:a@x", 1),
-            Event::new(Ev::Claim, "w", "s1", 2),
-            Event::new(Ev::Done, "w", "s1", 3),
-            Event::open(task("w.v1", Role::Verify, Some("w")), "s1", 3),
-            Event::new(Ev::Claim, "w.v1", "s2", 4),
-            Event::new(Ev::Verified, "w.v1", "s2", 5),
-            Event::open(task("integrate.1", Role::Integrate, None), "s2", 5),
-            Event::new(Ev::Claim, "integrate.1", "i", 6),
-            Event::new(Ev::Verified, "integrate.1", "i", 7),
-        ];
-        board::append(&crate::hive::tasks_path(&home, "g"), &events).unwrap();
-        let state = home.join("state");
-        assert!(!escalation::merged(&home, &state, "s1", 6), "not integrated yet at 6");
-        assert!(escalation::merged(&home, &state, "s1", 7));
-        assert!(!escalation::merged(&home, &state, "s2", 7), "the verifier authored nothing");
-        let v = record(&home, &said("s1", "this broke the public schema", 50)).unwrap();
-        assert!(v.missed, "merged and never escalated");
-        let during = record(&home, &said("s2", "never skip the migration", 50)).unwrap();
-        assert!(!during.missed, "work that never merged: the veto caught it in time");
-        let y = escalation::team(&home);
-        assert_eq!((y.missed, y.reward), (1, -escalation::MISSED_W));
         let _ = std::fs::remove_dir_all(home);
     }
 

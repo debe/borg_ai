@@ -112,17 +112,13 @@ the three model files of the pinned revision ([Vectors](configuration.md#vectors
 
 ![One sync session between two peers in six steps](img/mesh-sync.svg)
 
-Each peer dials the members it knows every 60 seconds, and at once after a local change: the logs of
-a hive goal being worked on (a drone's claim, done or message; a goal with a change in the last 30
-minutes) are looked at every 25 ms, the rest of the store every 2 s. Between two nodes on loopback a
-claim was at the peer within 50 ms (p95); the 2 s poll took 2.4 s. Each member is dialled on its own, so
+Each peer dials the members it knows every 60 seconds, and at once after a local change: the store is
+looked at every 2 s. Each member is dialled on its own, so
 one that does not answer (a laptop asleep) holds up no other. A failed dial is tried again 2 s later,
 then after 2, 4, 8 … minutes (at most 30), and carries what the failed one missed. Whatever B learned
 from A reaches C in B's next round. After each session that completed, dialled or
 answered, a peer notes when it started in `mesh/synced.json` (per member key, local only): what it held
-then has reached that member; a failed dial removes the member from it. A hive claim beside another
-machine's drones, and `borg debug hive run` at its start, wait on this file for a round with each member
-synced in the last 2 minutes (at most 1 s and 3 s).
+then has reached that member; a failed dial removes the member from it.
 
 **Membership.** Each machine holds one ed25519 key per collective; the key is also its network address,
 so a connection proves who is on the other end. The member list is a JSON document signed by an admin.
@@ -141,19 +137,10 @@ were captured, so each is learned exactly once. Outcome lines say which lesson w
 (including a veto, and a later regret's share of the blame), when, and the probability it was asked,
 with the session, repo and regret hashed, so every member derives the same lesson usefulness. They are signed and
 quarantined on revocation like lessons, and every member's lesson usefulness and trust count them
-(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Hive goals travel too (without their
-hidden checks), with their boards, contracts, messages between drones and guard flags, signed and
-quarantined the same way, so drones on several machines work one board; the commits they make travel as git bundles
-beside the board (at most 1 MiB per attempt, refused unless they hold exactly the attempt's commits),
-and a hive verdict counts on a peer only for an attempt its own synced board judged
-([commands: Across machines](commands.md#across-machines)). A goal's or task's checks written on
-another machine never run on yours until you approve them (`borg hive approve <goal>`). The hive across machines is built and
-proven on two loopback nodes, not measured across real machines yet. A goal's spend syncs too, so the
-drones of every machine split and stop on the goal's one budget (spend recorded before this version
-names no machine and stays on the machine that spent it). Ratified constraints (`borg no`, `borg queen`) sync
+(`BORG_SHARE_OUTCOMES=off` keeps a machine's outcomes local). Ratified constraints (`borg no`, `borg queen`) sync
 too, signed and quarantined like lessons, holding the invariant, its lesson and who ratified it, never the
 veto's words; every member's sessions get them as standing lessons. Peers on `borg/mesh/11` and earlier
-do not sync with this version (`borg/mesh/12` carries each goal's beats in the live exchange, 11 adds the constraints, 10 the goal's spend, 9 the bundles): upgrade every member. A session with a
+do not sync with this version: upgrade every member. A session with a
 member on another version ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
 ("peer <key> speaks borg/mesh/5, this node borg/mesh/12: nothing syncs with it; upgrade it") until a session with
 it completes or it leaves the member list; the old node's log gets the same line from its side ("… upgrade this node"). Reasoning excerpts go to two peers chosen by hash,

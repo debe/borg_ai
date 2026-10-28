@@ -32,9 +32,9 @@ Intervals are 95% paired-bootstrap confidence intervals unless the row names ano
 | Review → fix findings as lessons, 14 sealed cases × 6 seeds from recurring real findings | later bugs avoided 42% → 48%, +6.3 [−5.1, +17.9] (9 cases won, 1 tied, 4 lost); a lesson handed over directly +7.3 [−4.0, +19.3]; 89% of lessons faithful to their finding, 9% add a claim it does not make. The pre-registered rule (borg beats a plain agent, interval excluding 0) was **not met**; the engineer turned it on anyway, since a user who never configures would otherwise never get it | internal |
 | How many lessons a check asks, learned from outcomes by an earlier policy, since retired (cold start: no outcomes yet), same 14 cases × 6 seeds | questions per run 19 → 5, but later bugs avoided −3 points [−9, +2] against the fixed rule and the right lesson asked in 18% of runs instead of 67%: missed its bar. `BORG_STOP_ATTENTION=on` now runs a conformal cut on the model's rank instead | internal |
 | That conformal cut on the model's rank (cold start: the dated prior asks ranks 0–10), same 14 cases × 6 seeds | questions per run −5.7 [−9, −3] against the fixed rule, later bugs avoided +1 point [−7, +9], +8 [+1, +15] against no borg; the right lesson asked in 59% of runs instead of 67%. Missed its bar (lower bound −5), so it stays opt-in | internal |
-| Hive acceptance, two private production codebases, 3 drones, 3 seeds each | every held-out check passed in all 6 runs ($8.48 in total, 7–11 minutes per run), no false hacked verdict | internal |
-| Hive pilot probe, the same two workloads, one run per arm, before the bug fixes listed for the acceptance run | on the cross-repo workload (W2) one session, one session with subagents and best-of-N each solved 5 of 5, the hive 2 of 5 at about 4× one session's cost ($0.80 against $0.19). After the fixes the hive passed W2 5 of 5 in 3 seeds (the acceptance row); no fair comparison has run since ([design](design/hive.md#proof)) | internal |
-| Hive learning, 8 goals × 3 arms (frozen, L0, L0+L1), stopped at 50 of 90 runs | mistakes per goal on positions 5–8 of the goal sequence (order rotated per seed): 0.80, 0.75, 0.60, but the gate read 5 of 12 pairs with a range of [0, 1]: no decision. Its pre-set kill criterion (stop at L0 if this test fails) was not applied: the engineer kept learning on and judges it in production through monitoring | internal |
+| Hive acceptance (history: the hive was removed in 0.4), two private production codebases, 3 drones, 3 seeds each | every held-out check passed in all 6 runs ($8.48 in total, 7–11 minutes per run), no false hacked verdict | internal |
+| Hive pilot probe (history: removed in 0.4), the same two workloads, one run per arm, before the bug fixes listed for the acceptance run | on the cross-repo workload (W2) one session, one session with subagents and best-of-N each solved 5 of 5, the hive 2 of 5 at about 4× one session's cost ($0.80 against $0.19). After the fixes the hive passed W2 5 of 5 in 3 seeds (the acceptance row); no fair comparison ran before its removal | internal |
+| Hive learning (history: removed in 0.4), 8 goals × 3 arms (frozen, L0, L0+L1), stopped at 50 of 90 runs | mistakes per goal on positions 5–8 of the goal sequence (order rotated per seed): 0.80, 0.75, 0.60, but the gate read 5 of 12 pairs with a range of [0, 1]: no decision. Its pre-set kill criterion (stop at L0 if this test fails) was not applied: the engineer kept learning on until the hive's removal | internal |
 
 Also in reports/: a test set of engineering corrections drawn from SWE-chat
 ([swe-chat-engineering](../reports/swe-chat-engineering.md)), the pre-registration of a cross-repo transfer test on it
@@ -61,8 +61,8 @@ wrong fix links; that replay has not run, so `BORG_REGRESS` stays `links`.
 - Most measurements come from the author's and a few colleagues' sessions, not from a broad user base.
 - Small samples (16 negative and 51 positive turn-end cases; 10 sessions for memory quality). The
   intervals are wide.
-- The weights of a veto (3), a regret (at most half a correction) and green tests (half a verified hive
-  task) are design choices. `borg debug ope` can replay them offline, but no logged decision has the support
+- The weights of a veto (3), a regret (at most half a correction) and green tests (0.5) are design
+  choices. `borg debug ope` can replay them offline, but no logged decision has the support
   for it yet.
 - Turn-end asking of the engineer (`BORG_QUEEN=on`) failed its test and is off.
 - omp, opencode and Codex get no early delivery of ordinary lessons yet; standing lessons (ratified
@@ -88,5 +88,3 @@ wrong fix links; that replay has not run, so `BORG_REGRESS` stays `links`.
 - Decision → fix links have been measured only on a scripted repo, not on real notes, and only for the
   subject and revert signals: check `borg regress --replay` on your own history and
   `borg regress --session ID --explain` on a few real sessions before `BORG_REGRESS=learn`.
-- The hive across machines is proven on two loopback nodes with scripted drones, and accepted with two
-  nodes on one machine; it is not measured across real machines.

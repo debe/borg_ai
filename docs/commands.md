@@ -4,8 +4,8 @@
 
 ## Overview
 
-The commands of borg 0.3.0, grouped as `borg help` shows them; the hive's are under [Hive](#hive), and
-evaluation and debugging tools under `borg debug` ([appendix](#borg-debug)).
+The commands of borg, grouped as `borg help` shows them, and evaluation and debugging tools under
+`borg debug` ([appendix](#borg-debug)).
 
 ### Setup
 
@@ -23,8 +23,7 @@ evaluation and debugging tools under `borg debug` ([appendix](#borg-debug)).
 
 | Command | Shows or does |
 |---|---|
-| `borg learn` | Turn waiting episodes into lessons now (normally at session end). It also counts each learned regret against the lessons asked before its decision, and first records settled hive groups ([Groups](#groups-of-attempts)) and reworks ([Reworks](#reworks)) of this node |
-| `borg learn --group <goal>/<task>` | Reflect on one hive group now: what its winning attempts did that the losing ones did not |
+| `borg learn` | Turn waiting episodes into lessons now (normally at session end). It also counts each learned regret against the lessons asked before its decision |
 | `borg no [--session ID\|DRONE] [--dir DIR] [--json] <reason>` | Say no to a drone's work: the lessons it was shown lose credit, the reason becomes a lesson ([Saying no](#saying-no)) |
 | `borg assimilate ...` | Import past Claude Code, omp and opencode sessions, or team documents with `--from-dir` ([details](configuration.md#import-what-you-already-have)) |
 | `borg reach [--plan FILE] [--apply] [--jobs N]` | Sort existing lessons into team, repo-only and personal ([details](configuration.md#who-hears-a-lesson)) |
@@ -45,8 +44,8 @@ evaluation and debugging tools under `borg debug` ([appendix](#borg-debug)).
 
 | Command | Shows or does |
 |---|---|
-| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each hive goal with its tasks, plan and nodes, and the newest board events. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
-| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: knowledge, checks, the queen, learning week by week and the hive ([details](statistics.md)) |
+| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote). Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
+| `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: knowledge, checks, the queen, learning week by week and cost ([details](statistics.md)) |
 
 ### Team
 
@@ -66,198 +65,9 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 **Internal, not in `borg help`:** `borg hook <harness> <event>` is what the harnesses run.
 `borg check --session ID [--transcript FILE] --cwd DIR` is live mode's check of the work so far, started
 detached after a state-changing tool call ([Delivery modes](delivery.md#delivery-modes)).
-`borg learn --session ID`, `borg notes attach [<commit>]`, `borg hive wait` and
-`borg hive join --bind --session ID` run from hooks and adapters at session end or for drones.
+`borg learn --session ID` and `borg notes attach [<commit>]` run from hooks and adapters at session end.
 
-## Hive
-
-Many drones work on one goal. The goal has an oracle (shell checks) that decides when a task is done.
-Drones claim tasks from a shared board, publish contracts for each other, and finish a task only when
-its checks pass; a different drone verifies every finished task. Everything is in files under
-`<store>/hive/<goal>/`, and in a collective shared over the mesh the goal, board, contracts, messages,
-flags and spend sync to every member as signed lines ([Across machines](#across-machines)). How the
-board stays the same on every node is the [protocol](design/hive.md#protocol).
-
-```console
-$ borg hive init parser --spec "Ship the parser" --oracle "unit=cargo test -q" --budget 20 \
-    --task "t1|work|Add the parser|src/parse/*.rs" --task "t2|work|Use it|src/main.rs|t1"
-$ borg hive board
-```
-
-| Command | Effect |
-|---|---|
-| `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,..\|NAME=CMD"]...` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes |
-| `borg hive ratify <goal> [--budget USD]` | The engineer approves the goal's plan from a terminal; `--budget` raises the budget once its spend stopped new claims. Refused inside a harness session ([The planning session](#the-planning-session)) |
-| `borg hive board [<goal>] [--json]` | The tasks by status, with holders, age, rework and dependencies; in your terminal, then the drones' messages to the planner not read on this machine, marked read, each with the reply that answers it (a scope ask: its amend, a reply without `--re`, and `--re` only on the explicit no) |
-| `borg hive join [<goal>]` · `borg hive leave` | Inside a session: it becomes an interactive drone of the goal (or of every open goal of this repo) in a worktree of its own, or stops being one ([Interactive drones](#interactive-drones)) |
-| `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
-| `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task. A directory in `--files` is its tree; a file the goal's check reads, or a check that cannot pass on any tree (each runs once, 5 s at most: a command not installed, or a usage error of a tool no repo configures, such as git; a script, or a flag the task adds to a script or test runner, opens), is refused. `--again` amends an open, claimed or blocked task: `--title`, `--files`, `--deps` (not while it is claimed) or `--accept` given with it replace those parts, a blocked task opens again and a claimed one keeps its claim. `--again` is refused to a drone and inside a harness session ([Scope asks](#scope-asks)). `--group K` opens K attempts ([Groups](#groups-of-attempts)) |
-| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts into `refs/heads/hive/<goal>/integrated` and run the oracle and every task's checks on it. A failure opens a fix task. Needs git 2.40+. Refused to a drone and inside a harness session |
-| `borg hive approve <goal>` | Run the checks another node wrote (a synced goal's oracle, a task opened elsewhere with `--accept`) on this machine; prints each command. Refused to a drone and inside a harness session |
-| `borg hive claim [TASK]` · `progress "<note>"` · `release` · `block "<why>"` | A drone claims a task (exit 3 when another drone won it), reports on it, gives it back or blocks it |
-| `borg hive done [--note N]` | Run the task's checks with their own timeouts; on a pass publish done and open its verify task. Refused (exit 1) when its diff changes files the verifier protects outside the task's files, listing each with the `borg hive scope` line that would admit it |
-| `borg hive scope [--files +a,-b] [--accept NAME=CMD]... "<why>"` | The holder of a work task asks the engineer to amend its files or checks ([Scope asks](#scope-asks)) |
-| `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the turn with `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note |
-| `borg hive contract "<text>" --scope a,b [--supersedes ID]` | Publish a contract scoped to files (globs), `id:NAME` or `repo:NAME`, shown to drones whose edits touch it |
-| `borg hive ask "<text>" [--to TASK\|DRONE\|SESSION\|planner]` · `tell "<text>" [--to …] [--re ID]` | A message to the goal's drones, or with `--to planner` to the sessions that planned it, shown once at each recipient's next prompt |
-| `borg hive ask\|tell "<text>" --goal G [--to …] [--re ID]` | The planning session (or your terminal) sends into goal G without joining it, and is G's planner from then on: its prompts show the drones' messages to the planner. `borg hive leave` there ends its planning |
-
-Drone commands take `--session ID` (the hook's context prints the exact command) and `--dir DIR`.
-
-- **Dependencies.** A task is claimable once every dep is verified. A claim starts from the goal's
-  origin (the commit `borg hive init` ran on; in another repo, its HEAD when the goal's first claim
-  there was made) with each dep's verified change applied, so the work's diff starts after its deps.
-  Commits the engineer makes after that reach drone trees only through a task. A drone's own worktree is reset to that start when the claim wins; what
-  it held before is kept in a pinned commit that `borg top`, the Hive tab and the drone are told. A
-  rework gets the drone's previous attempt back on top, uncommitted. Any other checkout claims only
-  where its tree is the start already (the refusal names the commit to check out). Deps whose changes
-  conflict block the task with the paths, once.
-- **Claims are leases.** Hooks renew a claim every 10 minutes; it expires after 30 without one. Of two
-  claims on one task, the lowest (stamp, hash) wins on every node; the loser hears it at its next hook,
-  its edits are refused and its worktree is set back, the lost work kept in a snapshot commit.
-- **In the harness.** At a prompt the drone sees its claim, the board's changes and the contracts in
-  its scope. At the stop the task's checks run: while they fail the stop blocks (at most 3 times, then
-  the task is blocked); when they pass, done is published and the next task handed over. A suite slower
-  than the stop hook needs `borg hive done`.
-
-Nothing changes for a session that never joined a goal.
-
-### The planning session
-
-Tell any session what the drones should build. Its borg skill turns the request into a goal: small,
-independent tasks, a contract task before the tasks that use its interface, and a check for every task.
-`borg hive init` prints the plan, one card per task (intent, files, checks, risk).
-
-- **You approve at your own prompt** in that session: `yes`, or `no, because <why>`. A no is a veto
-  that borg learns from, and the session revises the plan with you.
-- **No drone takes a task of a plan you have not approved.** The approval is a `ratified` line of the
-  board, so every node reads it. Once approved, the session tells you how many drones are waiting.
-- **The model cannot approve.** `borg queen answer`, `borg hive ratify`, `approve`, `integrate` and
-  `borg debug hive score` refuse inside a harness session. A goal opened from your own terminal is
-  approved there with `borg hive ratify <goal>`.
-- **The drones report back.** A drone that finds the plan wrong (a check that tests nothing, a missing
-  task) tells the planner: `borg hive tell "<what>" --to planner`. The message, and each drone's
-  message to everyone, shows once at the planning session's next prompt, however long it was idle, with
-  the command that answers it; messages to the planner come before a backlog of broadcasts. The
-  session stays the goal's planner after the approval, and sends to the drones with `borg hive tell
-  "<text>"` without joining. `borg top` and the Hive tab show each planning session of this machine
-  with its unread messages: a harness that takes no prompt context leaves them unread there.
-- **Messages to the planner reach planning sessions only.** `borg hive tell` from your terminal sends
-  as you, the engineer, never as the repo's one drone, and a drone's answer to it goes to the planner.
-  Your terminal reads no prompt, so a goal opened and approved from a terminal has no session reading
-  those messages: `borg top` and the Hive tab count them on the goal's home node (where it was first
-  opened) and on any machine with a planning session (`to the planner: N message(s), M unread here`).
-  `borg hive board <goal>` in your terminal lists the ones not read on this machine, each with the
-  command that answers it, and marks them read there.
-- **Subagents and workflows** may help inside a task under the drone's claim; they never claim or finish.
-
-### Scope asks
-
-A task's files and checks are the engineer's. When the work needs a test file outside them, or the
-check itself is wrong, the drone asks instead of working around the guard:
-
-- **The hook says so first.** An edit of a test or CI file outside the task's files tells the drone to
-  ask; a file the goal's check reads is never in any task's scope. A `done` whose diff the verifier
-  would reject is refused with each path, and so is the stop. A failing check's block names the ask
-  for a check that is wrong on any tree.
-- **The ask** is `borg hive scope --files +tests/cli.rs "why"` (or `--accept NAME=CMD`), from the
-  holder only, at most 8 new files, never the whole repo or deps. It writes nothing on the board: it
-  is a message to the planner with the exact amend to run, and `borg top`, `borg hive board` and the
-  Hive tab alert it until you answer.
-- **While it waits** the drone keeps its claim and works in scope. A stop held up only by files the
-  ask would admit ends its turn waiting, with no attempt counted; any other stop runs as usual, so a
-  drone that drops the change finishes the task without an answer.
-- **You answer** yes by running that line in your own terminal, `borg hive open <goal> --id <task>
-  --again --files ...`, or no by replying to the ask from your terminal, `borg hive tell "why not"
-  --goal <goal> --re <ask id>` (both shown with the alert). A planning session's reply is no answer.
-  Either answer wakes a drone idle on its ask. After a no, the asked change blocks its stop like a
-  failing check: it undoes the change and finishes, or the task is blocked after 3 stops.
-- **Budget.** Each claim of a Claude Code drone adds its transcript's metered spend to `spend.jsonl`;
-  omp, opencode and codex report no usage (`unmetered`). At the budget no drone claims, and you are
-  asked once to raise it, at the planning session's prompt or with `borg hive ratify <goal> --budget USD`.
-
-### Interactive drones
-
-A session becomes a drone when its model runs `borg hive join` (ask it to "join the hive"). It works in
-its own worktree (`.worktrees/hive-i-<drone>`) and, with nothing open, ends each turn on
-`Drone idle: waiting for hive work, which starts here by itself when a task opens.` The next task starts
-a turn on its own; waiting costs no tokens. It stays a drone until you ask it to leave.
-
-| Harness | How the drone waits and is woken |
-|---|---|
-| Claude Code | Its stop asks it to run `borg hive wait` in the background; the wait's output starts the next turn |
-| omp | The adapter keeps a waiter (`borg hive wait --stream`) for the session's life and wakes it with `pi.sendMessage` |
-| opencode 1.x / 2.x | The plugin binds the session (`borg hive join --bind`) and wakes it with `session.promptAsync` (1.x) or a queued `session.prompt` (2.x) once idle |
-| codex | Its stop starts `borg hive wait --queue`, which wakes the thread with `codex queue` (codex 0.149+). In the default sandbox the join must run outside it |
-
-- No task is handed into your own turn. A wake no turn takes up within 60 s is released, and the
-  drone claims nothing until its session speaks again.
-- A stop that finishes a task says the result first (`t1 done: its checks passed ...`), then hands over
-  the next task or the idle line. The done's note is the stop's own summary of checks, files and commits.
-- Ending the session (`/exit`, a closed terminal, a crash) releases its claim and leaves the hive;
-  `/clear` and compact keep the same drone.
-- Reinstalling borg (`cargo install`) needs no session restart: a waiter whose borg was replaced
-  claims nothing more and runs the new borg in the same process within half a second, or after a
-  failed `codex queue`'s retry; a borg that cannot run leaves it claiming nothing and beating for no
-  one until borg is installed again (peers then take the node's claims over unless a daemon serves
-  it). `borg mesh serve` restarts in place on a reinstalled borg-mesh (same process); one that
-  cannot run, or one built before it could restart so (a downgrade), stops it with a message and
-  exit code 1.
-- **The node's worker.** `borg mesh serve` (or, without a daemon, one drone's waiter) beats for the
-  node, keeps its roster of drones, reaps drones whose session is gone, says what is stuck and runs
-  `borg hive integrate` once every task is verified. A restart ends no claim.
-- **A repo in no collective** refuses `init` and `join` and prints the `borg setup` that adds it.
-- **The first wake after 5 idle minutes** reads the conversation again without Claude Code's prompt
-  cache (about 42,000 tokens in the live probe); waiting itself is free.
-- **Watching.** `borg top` and the Hive tab of `borg web` show per goal its tasks over time, spend
-  against the budget, each node and who does its work, each drone's state (`working`, `busy`,
-  `waiting`, `waiting (old borg, restarting)`, `not waiting`, `left`, `gone`) with its wake latency, stuck tasks and integrations.
-
-### Guardrails and the hidden oracle
-
-A drone can pass a visible check by changing it. The hive lets that happen, records it and makes it
-useless ([design](design/hive.md#learning)):
-
-- **Snapshots.** A claim records its start, and its done a commit of the drone's tree; the verdict
-  diffs the two, after it recomputed the start from the deps the claim names.
-- **Hacked.** The verdict is `rejected` with `hacked`, whatever the verifier said, when the diff
-  changes a file the goal's oracle runs; or, outside the task's own `--files`, changes CI config or a
-  test runner's config, deletes or renames a test, or weakens one: a removed line no added line matches
-  in shape (names, strings and numbers as holes), fewer test declarations, an added skip or focus
-  marker. Tests may grow but never shrink: added tests and changed names and values pass. The work
-  reopens with each path to restore, e.g. `tests/test_parse.py (line 4 removed or reshaped: ...)`.
-- **Flags.** The paths a drone writes to tests, CI or oracle files, and reads of the hidden oracle, are
-  logged in `flags.jsonl` and listed for the verifier: a flag, never a refusal.
-- **Rewards.** Every lesson shown during the claim is credited with the verdict (`verified`, `rejected`
-  or `hacked`); a hacked task weighs on a lesson as much as a veto.
-- **The author never judges its own work.**
-- **Hidden oracle.** `borg debug hive init ... --hidden-dir DIR --hidden CMD` keeps held-out checks
-  outside the repo. After a verdict they run on the done's snapshot, and their score decides the
-  credit; their output is never shown to a drone. `borg debug hive score <goal>` scores any time.
-
-`BORG_HIVE_CREDIT=off` records verdicts without crediting lessons.
-
-### Groups of attempts
-
-`borg hive open <goal> --id ID --group K` opens K attempts `ID.g1`..`ID.gK` of one work task. Each is an
-ordinary task, and each is another drone's: a drone that held or verified one member gets no other, and
-none is judged by a rival. The integration takes the group's best attempt: the one the hidden oracle
-passed, else the one with the fewest rejections, then the earliest verified.
-
-Once every member is verified, the group is settled. A settled group with a winner and a loser becomes
-one episode, and `borg learn` asks the model once what the winners did that the losers did not and
-writes it as a lesson; one node learns each group. `borg learn --group <goal>/<task>` reflects on one
-now. `BORG_GROUP_REFLECT=off` or `BORG_LEARN=off` stops it. A task cannot depend on a group.
-
-### Reworks
-
-A work task the verifier rejected on its merits and a later attempt passed is the hive's own lesson
-source. `borg learn` records it once as an episode (every rejection's note, each attempt's change, what
-the accepted rework changed) and asks the model what mistake the first attempt made, writing a lesson
-that prevents it. A hacked or unchecked rejection does not count; with a hidden oracle, the episode waits
-for its score. `BORG_REWORK_REFLECT=off` or `BORG_LEARN=off` stops it.
-
-### Playbooks
+## Playbooks
 
 A playbook is the team's procedure for a kind of task: its shape ("fix the parser") and a short list of
 steps. `playbooks.jsonl` holds edits (add, change or remove one step), never whole playbooks, so it syncs
@@ -270,35 +80,11 @@ app (1)
 $ borg queen answer 1 b
 ```
 
-After a hive attempt wins, or a plain session ends clean (it landed commits, its last test run passed,
-and you neither corrected nor vetoed it), `borg learn` asks the model once for at most one edit. The edit
-is never applied by learning: it is queued as a queen question, and only your `promote` answer appends
-it. A drone sees the playbooks its task's title and files name, a session those its prompt names; each
-version shown is credited like a lesson. `BORG_PLAYBOOKS=off` shows and proposes nothing.
-
-### Across machines
-
-In a collective shared over the mesh, every goal's `goal.jsonl`, `tasks.jsonl`, `contracts.jsonl`,
-`messages.jsonl`, `flags.jsonl`, `bundles.jsonl` and `spend.jsonl` sync like lessons: signed by their
-writer, quarantined when the writer is revoked, caught up after time offline. The rules that make every
-node fold the same board (claim races, causal clocks, failure detection, final claims, termination) are
-the [protocol](design/hive.md#protocol). What a member sees of it:
-
-- **Claims** are provisional until a sync round; the earlier one wins on both machines, and the loser
-  hears it at its next hook. Keep the machines' clocks well within the 30-minute lease.
-- **Which task a drone takes:** its own repo first, then verify before integrate before work; machines
-  start on different tasks (rendezvous hashing), and `borg top` names a holder's node.
-- **Commits travel as bundles** of each attempt's two snapshots (at most 1 MiB). A node without an
-  attempt's commits is not offered its verify task and says which node holds the work.
-- **Secrets stay home.** Titles, notes, contracts, messages and the synced spec are redacted; check
-  commands are kept, so keep secrets in the environment.
-- **Checks from another machine** run only after `borg hive approve <goal>` there.
-- **One goal per id.** Two definitions of one id stop the goal everywhere.
-- **One budget.** Every drone stops once the goal's total, over every node, reaches its budget.
-- Every member must run the same mesh protocol version; `borg doctor` names who has to upgrade.
-
-Not yet: goal signatures, multi-repo goals, moving a failed integration's tree between machines, and
-crediting verifiers by whether the hidden oracle agreed with them.
+After a session ends clean (it landed commits, its last test run passed, and you neither corrected nor
+vetoed it), `borg learn` asks the model once for at most one edit. The edit is never applied by
+learning: it is queued as a queen question, and only your `promote` answer appends it. A session sees
+the playbooks its prompt names; each version shown is credited like a lesson. `BORG_PLAYBOOKS=off`
+shows and proposes nothing.
 
 ## Saying no
 
@@ -337,7 +123,7 @@ With `BORG_LEARN=off` the command records nothing and says so.
 ## Answering the queen
 
 The queen's queue holds decisions no lesson answers: open decisions found in team documents
-(`borg assimilate --from-dir`), proposed constraints, playbook edits, contract changes and, with
+(`borg assimilate --from-dir`), proposed constraints, playbook edits and, with
 `BORG_QUEEN=on`, questions raised at a turn end. Similar questions are queued once.
 
 ```console
@@ -390,13 +176,3 @@ Evaluation and debugging tools, out of the main help (`borg debug help`):
 | `borg debug expert <repo> --at <commit> --q <text>` | At most 3 cited claims from an expert repo |
 | `borg debug vectors --query [--store LESSONS]` | The vector shortlist for a context on stdin |
 | `borg debug ope [--dir DIR \| --file FILE] [--json]` | Off-policy estimates of the belief's hand-set weights; reports, never changes them |
-| `borg debug hive run <goal> --drones N [--harness H] [--model M] [--base REF] [--iter-timeout S] [--dry-run] [--yes]` | Headless drones for evals (below) |
-| `borg debug hive score <goal>` | The hidden oracle scores the judged tasks not scored yet |
-| `borg debug hive init <goal> ... --hidden-dir DIR --hidden CMD [--hidden-timeout S]` | A goal with held-out checks outside the repo |
-
-**Headless drones.** `borg debug hive run` makes one worktree per drone (`.worktrees/hive-<goal>-<n>`)
-and runs headless sessions of the harness one after another with `BORG_HIVE=<goal>`, each drone with an
-equal share of what is left of the goal's budget, until the board is finished and integrated. It asks
-for the plan's approval first, at its terminal or through the queen; `--yes` approves it on the command
-line, for evals. Drones run with every permission inside their worktree. It is refused while an
-interactive drone serves the goal; engineers use [interactive drones](#interactive-drones).

@@ -24,18 +24,8 @@
 //! an earlier veto made counts as `veto_repeat`; an invariant of a lesson placed in this store becomes
 //! a proposed constraint in the queen's queue (`veto::propose`), never a constraint.
 //!
-//! **Groups** (hive/group.rs): a settled hive group of K attempts with a winner and a loser is an
-//! episode of kind `group`, recorded first by every run (once per group, on the node that opened it) or
-//! by `borg learn --group`, asked with its own prompt (`group::HEAD`): what the winners did that the
-//! losers did not. Learned at the end of any session, never counted against one.
-//!
-//! **Reworks** (hive/rework.rs): a hive task the verifier rejected and a later attempt verified is an
-//! episode of kind `rework`, recorded first by every run (once per task, on the node whose verdict
-//! verified it), asked with its own prompt (`rework::HEAD`): what mistake the verifier caught, as a
-//! lesson that prevents it. Learned at the end of any session, never counted against one.
-//!
-//! **Playbooks** (playbook.rs): every run with `track` then reflects once on each verified hive attempt
-//! of this node that won, and queues at most one playbook edit per attempt for the engineer to promote.
+//! **Playbooks** (playbook.rs): every run with `track` then reflects once on the session that just
+//! ended clean, and queues at most one playbook edit for the engineer to promote.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -170,7 +160,7 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, v: &T) -> std::io::Result<
 }
 
 /// Appends `line` and its newline in one write. Under O_APPEND one write lands whole; `writeln!` makes
-/// two (the record, then "\n"), so two writers at once (a hive's drones on one store) can leave
+/// two (the record, then "\n"), so two writers at once (two drones on one store) can leave
 /// `{A}{B}\n\n`, and every reader drops both unparseable records without a word.
 pub(crate) fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(d) = path.parent() {
@@ -285,8 +275,7 @@ If this correction contradicts or replaces a listed lesson (in the same situatio
 opposite, e.g. the engineer reversed an earlier correction), list that lesson's id in supersedes; never the same_as lesson. \
 Otherwise supersedes is empty.";
 
-/// The prompt for one episode: a correction's, a veto's (veto.rs), a regret's (regret.rs), a hive
-/// group's reflection (hive/group.rs) or a hive rework (hive/rework.rs).
+/// The prompt for one episode: a correction's, a veto's (veto.rs) or a regret's (regret.rs).
 fn episode_prompt(e: &Episode, listed: &[String]) -> String {
     let existing = if listed.is_empty() { "(none)".into() } else { listed.join("\n") };
     if e.kind == crate::veto::KIND {
@@ -297,26 +286,6 @@ fn episode_prompt(e: &Episode, listed: &[String]) -> String {
             crate::veto::INVARIANT,
             e.task.chars().take(1500).collect::<String>(),
             e.correction,
-        );
-    }
-    if e.kind == crate::hive::rework::KIND {
-        use crate::hive::rework::{FIELDS, HEAD};
-        let (reach, merge) = (regret::neutral(REACH_RULES), regret::neutral(MERGE_RULES));
-        return format!(
-            "{HEAD}\n\n{reach}\n\n{FIELDS}\n{AREA}\n\n{merge}\n\n## The task\n{}\n\n## The rejection\n{}\n\n## The rejected attempt(s) and the accepted rework\n{}\n\n## Existing lessons\n{existing}\n",
-            e.task.chars().take(regret::CAP).collect::<String>(),
-            e.correction,
-            e.agent,
-        );
-    }
-    if e.kind == crate::hive::group::KIND {
-        use crate::hive::group::{FIELDS, HEAD};
-        let (reach, merge) = (regret::neutral(REACH_RULES), regret::neutral(MERGE_RULES));
-        return format!(
-            "{HEAD}\n\n{reach}\n\n{FIELDS}\n{AREA}\n\n{merge}\n\n## The task every attempt had\n{}\n\n## The result\n{}\n\n## The attempts, winners first\n{}\n\n## Existing lessons\n{existing}\n",
-            e.task.chars().take(regret::CAP).collect::<String>(),
-            e.correction,
-            e.agent,
         );
     }
     if let Some(r) = e.regret.as_ref().filter(|_| e.kind == regret::KIND) {
@@ -630,12 +599,6 @@ pub fn test_credit() -> bool {
 /// Indexed once per run, so a run costs one pass over the log and the library plus each deciding
 /// session's own records: `regretted` reads only the deciding session's records, and a regret's credits
 /// carry that session too.
-///
-/// The regret reaches back to a hive verifier too (hive/verdict.rs `verifications`): when the decision
-/// lies in a work claim of the deciding session that a verifier passed, the lessons asked in the
-/// verifier's claim of that verify task share `VERIFIER_REGRET` of the strength, under a cause of their
-/// own (`<episode>/verify`), so a lesson shown to both drones is credited once per role. Nothing without
-/// a hive.
 fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<outcome::Outcome>, path: &Path) {
     let mut holder: HashMap<&str, &Lesson> = HashMap::new();
     for l in library {
@@ -643,10 +606,7 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
             holder.entry(id.as_str()).or_insert(l);
         }
     }
-    let mut deciding: HashSet<&str> = regrets.iter().filter_map(|e| e.regret.as_ref()).map(|r| r.decision_session.as_str()).collect();
-    let verifications = path.parent().map(crate::hive::verdict::verifications).unwrap_or_default();
-    let verifiers: Vec<&str> = verifications.iter().filter(|v| deciding.contains(v.author.as_str())).map(|v| v.verifier.as_str()).collect();
-    deciding.extend(verifiers);
+    let deciding: HashSet<&str> = regrets.iter().filter_map(|e| e.regret.as_ref()).map(|r| r.decision_session.as_str()).collect();
     let mut by_session: HashMap<String, Vec<outcome::Outcome>> = HashMap::new();
     for o in outcomes.iter().filter(|o| deciding.contains(o.session.as_str())) {
         by_session.entry(o.session.clone()).or_default().push(o.clone());
@@ -661,28 +621,11 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
             records.push(o.clone());
             outcomes.push(o);
         }
-        for v in verifications.iter().filter(|v| v.author == r.decision_session && (v.work_from..=v.work_to).contains(&r.decision_ms)) {
-            let records = by_session.entry(v.verifier.clone()).or_default();
-            let strength = regret::strength(r) * VERIFIER_REGRET;
-            // Only what the verifier was asked while it held the verify task.
-            let tenure: Vec<outcome::Outcome> = records.iter().filter(|o| o.kind != outcome::ASKED || o.ms >= v.from).cloned().collect();
-            for o in outcome::regretted(&tenure, &v.verifier, v.ms, &format!("{}/verify", e.id), &[], strength, e.ms, &e.repo) {
-                let _ = outcome::append(path, &o);
-                records.push(o.clone());
-                outcomes.push(o);
-            }
-        }
     }
 }
 
-/// The share of a regret's strength that reaches the drone that verified the regretted work
-/// (design-chosen, to be tuned by hive.md L6): it passed the work, it did not decide it.
-pub const VERIFIER_REGRET: f64 = 0.5;
-
-/// An episode the hive made, a group's reflection or a rework: no session of its own, no correction.
-fn hive_kind(e: &Episode) -> bool {
-    e.kind == crate::hive::group::KIND || e.kind == crate::hive::rework::KIND
-}
+/// Episode kinds the removed hive made (a group's reflection, a rework), skipped where an older store has them.
+const RETIRED: [&str; 2] = ["group", "rework"];
 
 /// `learn_in`, calling `report` after every model call (the CLI prints it; the hooks pass a no-op).
 ///
@@ -710,14 +653,6 @@ fn learn_unlocked(
     report: &mut dyn FnMut(Step),
 ) -> (usize, usize, usize) {
     let (ep_path, lessons_path) = (home.join("episodes.jsonl"), home.join("lessons.jsonl"));
-    // Settled hive groups opened here become reflection episodes first (hive/group.rs), once each.
-    if track && crate::hive::group::on() {
-        crate::hive::group::record_pending(home);
-    }
-    // So do hive tasks verified after a rejection, verified on this node (hive/rework.rs), once each.
-    if track && crate::hive::rework::on() {
-        crate::hive::rework::record_pending(home);
-    }
     let outcomes_path = outcome::path_beside(&lessons_path);
     let mut outcomes = if track { outcome::read(&outcomes_path) } else { Vec::new() };
     let mut library = lessons(&lessons_path);
@@ -728,11 +663,11 @@ fn learn_unlocked(
     // Newest episode per session, and sessions with episodes this run left pending (--session).
     let mut last_episode: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let episodes = read_jsonl::<Episode>(&ep_path);
+    // `RETIRED` kinds an older store holds are never learned.
+    let episodes: Vec<Episode> = read_jsonl::<Episode>(&ep_path).into_iter().filter(|e| !RETIRED.contains(&e.kind.as_str())).collect();
     let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
     // A veto is learned at the end of any session (veto.rs): a terminal veto may name one already ended.
-    // So are a group's reflection and a rework: no session of their own ends.
-    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND || hive_kind(e);
+    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND;
     let vetoes: HashSet<String> = episodes.iter().filter(|e| e.kind == crate::veto::KIND).map(|e| e.id.clone()).collect();
     let total = episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && mine(e)).count();
     let mut asked = 0;
@@ -780,8 +715,6 @@ fn learn_unlocked(
                     Some(r) if regret::is_review(r) => "review",
                     Some(_) => "regret",
                     None if e.kind == crate::veto::KIND => "veto",
-                    None if e.kind == crate::hive::group::KIND => "group",
-                    None if e.kind == crate::hive::rework::KIND => "rework",
                     None => "session",
                 };
                 let (kind, why, counted_in) = match &placed {
@@ -799,7 +732,7 @@ fn learn_unlocked(
                     ev.why = why.into();
                 });
                 if e.kind == crate::veto::KIND {
-                    // The same "no" said twice: merged into a lesson an earlier veto made (H5b's numerator).
+                    // The same "no" said twice: merged into a lesson an earlier veto made.
                     let earlier = library.iter().find(|x| x.id == l.id);
                     if l.version > 1 && earlier.is_some_and(|o| o.episodes.iter().any(|id| id != &e.id && vetoes.contains(id))) {
                         // Dated when the engineer said it, the week of its own `veto`, not when it was
@@ -818,9 +751,8 @@ fn learn_unlocked(
                 }
                 let target = (l.version > 1).then_some(l.id.as_str());
                 // A veto credited the lessons shown before it already (veto.rs): it never doubles as a
-                // correction, nor as a missed question (`applied_then_corrected`). A group's reflection
-                // or a rework is no correction of any session: its verdicts credited the lessons shown (verdict.rs).
-                let track_results = track && e.kind != crate::veto::KIND && !hive_kind(&e);
+                // correction, nor as a missed question (`applied_then_corrected`).
+                let track_results = track && e.kind != crate::veto::KIND;
                 let contradicted = match track_results {
                     true => outcome::contradicted(&outcomes, &e.session, e.ms, target, &l.supersedes),
                     false => Vec::new(),
@@ -872,9 +804,9 @@ fn learn_unlocked(
             ended.push(s.to_string());
         }
         let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
-        // Verified hive work that won, and the session that just ended (its end hook's `--session`, never
-        // an idle one: that may still be open) without a correction or veto (no episode) that ended
-        // clean, propose playbook edits to the engineer (playbook.rs), once each.
+        // The session that just ended (its end hook's `--session`, never an idle one: that may still be
+        // open) without a correction or veto (no episode) that ended clean proposes playbook edits to the
+        // engineer (playbook.rs), once each.
         let clean: Vec<&str> = session.filter(|s| !last_episode.contains_key(*s)).into_iter().collect();
         crate::playbook::reflect_pending(home, ask, now, &clean, &state, &outcomes);
         for s in &ended {
@@ -998,90 +930,6 @@ mod tests {
         assert_eq!((l.id.as_str(), inv.as_str()), ("Lno-s-3", "lookups go through the review API"));
         let (_, none) = generalise_with(&ep("e2", "no, the lock merge:x"), &[], &fake_ask).unwrap().unwrap();
         assert!(none.is_empty());
-    }
-
-    #[test]
-    fn a_groups_reflection_is_asked_with_its_own_prompt_at_any_sessions_end_and_keeps_its_provenance() {
-        let home = temp_home("group");
-        let e = Episode {
-            id: "group-g.t".into(),
-            ms: 5,
-            session: "group-g.t".into(),
-            task: "write x.txt\n(goal: the spec)".into(),
-            agent: "### WON: the held-out tests pass (drone d2, attempt t.g2, verdict verified)\n\n### LOST: the held-out tests fail (drone d1, attempt t.g1, verdict verified)".into(),
-            correction: "group g/t: 2 attempt(s) by 2 drone(s); won: d2; lost: d1; decided by the hidden oracle".into(),
-            kind: crate::hive::group::KIND.into(),
-            ..Episode::default()
-        };
-        let p = episode_prompt(&e, &[]);
-        assert!(p.starts_with(crate::hive::group::HEAD), "{p}");
-        for part in
-            [crate::hive::group::FIELDS, "## The task every attempt had\nwrite x.txt", "## The result\ngroup g/t", "## The attempts, winners first\n### WON"]
-        {
-            assert!(p.contains(part), "{part}: {p}");
-        }
-        assert!(!p.contains(OPENING) && !p.contains("## Engineer's correction"));
-        assert_eq!(schema_for(&p), schema());
-        append_jsonl(&home.join("episodes.jsonl"), &e).unwrap();
-        // Another session's end learns it: the group has no session of its own to end.
-        asked(&home, "s1", 1, &["L0"]);
-        let seen = std::cell::RefCell::new(String::new());
-        let ask = |p: &str| {
-            *seen.borrow_mut() = p.to_string();
-            Some(json!({"is_lesson": true, "question": "Did you run the held-out cases before done?", "situations": [], "consequence": "c",
-                "same_as": "", "supersedes": [], "area": "verification", "reach": "team"}))
-        };
-        assert_eq!(learn_in(&home, Some("s1"), &ask, true, 10), (1, 0, 0));
-        assert!(seen.borrow().starts_with(crate::hive::group::HEAD));
-        let l = &lessons(&home.join("lessons.jsonl"))[0];
-        assert_eq!((l.id.as_str(), l.episodes.as_slice()), ("Lgroup-g.t", &["group-g.t".to_string()][..]), "provenance names the group");
-        assert!(l.engineers.is_empty(), "no engineer said it: the reward did");
-        // No correction of any session, and the feed names its source.
-        let kinds: Vec<String> = outcome::read(&home.join("outcomes.jsonl")).into_iter().map(|o| o.kind).collect();
-        assert!(!kinds.iter().any(|k| k == outcome::CORRECTED || k == outcome::MISSED), "{kinds:?}");
-        assert!(crate::stats::events(&home).iter().any(|e| e.kind == crate::stats::LESSON_NEW && e.why == "group"));
-        assert_eq!(learn_in(&home, None, &ask, true, 11), (0, 0, 0), "learned once");
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn a_rework_is_asked_with_its_own_prompt_at_any_sessions_end_and_counts_against_no_session() {
-        let home = temp_home("rework");
-        let e = Episode {
-            id: "rework-g.t".into(),
-            ms: 5,
-            session: "rework-g.t".into(),
-            task: "write x.txt\n(goal: the spec)".into(),
-            agent: "### REJECTED attempt 1 (drone d1, t.v1)\nThe verifier's note: misses the empty input\n\n### ACCEPTED rework (drone d1, t.v2): the verifier passed it".into(),
-            correction: "rework g/t: rejected 1 time(s), then verified; drones: d1\nThe verifier's why:\n1. misses the empty input".into(),
-            kind: crate::hive::rework::KIND.into(),
-            ..Episode::default()
-        };
-        let p = episode_prompt(&e, &[]);
-        assert!(p.starts_with(crate::hive::rework::HEAD), "{p}");
-        for part in [
-            crate::hive::rework::FIELDS,
-            "## The task\nwrite x.txt",
-            "## The rejection\nrework g/t",
-            "## The rejected attempt(s) and the accepted rework\n### REJECTED",
-        ] {
-            assert!(p.contains(part), "{part}: {p}");
-        }
-        assert!(!p.contains(OPENING) && !p.contains(crate::hive::group::HEAD));
-        append_jsonl(&home.join("episodes.jsonl"), &e).unwrap();
-        asked(&home, "s1", 1, &["L0"]);
-        let ask = |_: &str| {
-            Some(json!({"is_lesson": true, "question": "Did you try the empty input before done?", "situations": [], "consequence": "c",
-                "same_as": "", "supersedes": [], "area": "verification", "reach": "team"}))
-        };
-        assert_eq!(learn_in(&home, Some("s1"), &ask, true, 10), (1, 0, 0));
-        let l = &lessons(&home.join("lessons.jsonl"))[0];
-        assert_eq!((l.id.as_str(), l.episodes.as_slice()), ("Lrework-g.t", &["rework-g.t".to_string()][..]));
-        let kinds: Vec<String> = outcome::read(&home.join("outcomes.jsonl")).into_iter().map(|o| o.kind).collect();
-        assert!(!kinds.iter().any(|k| k == outcome::CORRECTED || k == outcome::MISSED), "{kinds:?}");
-        assert!(crate::stats::events(&home).iter().any(|e| e.kind == crate::stats::LESSON_NEW && e.why == "rework"));
-        assert_eq!(learn_in(&home, None, &ask, true, 11), (0, 0, 0), "learned once");
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1410,91 +1258,6 @@ mod tests {
         let home = setup("regret-untracked", regret_at("R1", 20));
         learn_in(&home, None, &regret_ask(true), false, 200);
         assert!(regretted(&home).is_empty(), "BORG_LEARN=off writes nothing");
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    /// A hive goal in `home` whose work t1 was claimed by `s-dec` at 11, done at `done` and verified by
-    /// `s-ver` (claimed at `verified - 3`) at `verified`.
-    fn verified_by(home: &Path, done: i64, verified: i64) {
-        use crate::hive::{Event, Role, Task, board, goal};
-        let g = goal::Goal {
-            v: 1,
-            id: "g".into(),
-            spec: "s".into(),
-            oracle: vec![],
-            budget_usd: 1.0,
-            repos: vec![],
-            author: String::new(),
-            created_ms: 0,
-            sig: String::new(),
-            hidden: None,
-            held_out: false,
-            origin: Vec::new(),
-        };
-        goal::create(home, &g).unwrap();
-        let t1 = Task {
-            id: "t1".into(),
-            role: Role::Work,
-            title: "t".into(),
-            repo: String::new(),
-            files: vec![],
-            deps: vec![],
-            accept: vec![],
-            of: None,
-            not_by: vec![],
-            flags: vec![],
-            from: None,
-            group: None,
-        };
-        let v1 = Task { id: "t1.v1".into(), role: Role::Verify, of: Some("t1".into()), not_by: vec!["s-dec".into()], ..t1.clone() };
-        let ev = |kind, task: &str, by: &str, ms| Event::new(kind, task, by, ms);
-        use crate::hive::Ev::*;
-        let lines = [
-            Event::open(t1, "engineer:e", 1),
-            ev(Claim, "t1", "s-dec", 11),
-            ev(Done, "t1", "s-dec", done),
-            Event::open(v1, "s-dec", done),
-            ev(Claim, "t1.v1", "s-ver", verified - 3),
-            ev(Verified, "t1.v1", "s-ver", verified),
-        ];
-        board::append(&crate::hive::tasks_path(home, "g"), &lines).unwrap();
-    }
-
-    #[test]
-    fn a_regret_reaches_the_verifier_of_the_attempt_that_holds_the_decision_at_half_strength() {
-        let blamed = |home: &Path| -> Vec<(String, String, f64, String)> {
-            let mut v: Vec<_> = outcome::read(&home.join("outcomes.jsonl"))
-                .into_iter()
-                .filter(|o| o.kind == outcome::REGRETTED)
-                .map(|o| (o.lessons.join(","), o.session, o.credit, o.cause))
-                .collect();
-            v.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-            v
-        };
-        let setup = |name: &str, done: i64, verified: i64| {
-            let home = temp_home(name);
-            asked(&home, "s-dec", 10, &["Le0"]);
-            // Before its verify claim (its own work, say), in it, and after its verdict.
-            asked(&home, "s-ver", verified - 4, &["Lpre"]);
-            asked(&home, "s-ver", verified - 2, &["Lv"]);
-            asked(&home, "s-ver", verified + 10, &["Lw"]);
-            append_jsonl(&home.join("episodes.jsonl"), &regret_at("R1", 20)).unwrap();
-            verified_by(&home, done, verified);
-            home
-        };
-        // The decision (20) lies in the verified attempt (11..=25): only the verify claim's lesson.
-        let home = setup("regret-verifier", 25, 30);
-        learn_in(&home, None, &regret_ask(true), true, 200);
-        // The regret's strength is 0.5 (one signal): the author's lesson takes it all, the verifier's half.
-        assert_eq!(blamed(&home), [("Le0".into(), "s-dec".into(), 0.5, "R1".into()), ("Lv".into(), "s-ver".into(), 0.25, "R1/verify".into())]);
-        let before = std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap();
-        learn_in(&home, None, &regret_ask(true), true, 300);
-        assert_eq!(std::fs::read_to_string(home.join("outcomes.jsonl")).unwrap(), before, "credited once");
-        let _ = std::fs::remove_dir_all(home);
-        // The decision came after the verified attempt (11..=14): the verifier passed other work.
-        let home = setup("regret-verifier-early", 14, 18);
-        learn_in(&home, None, &regret_ask(true), true, 200);
-        assert_eq!(blamed(&home), [("Le0".into(), "s-dec".into(), 0.5, "R1".into())]);
         let _ = std::fs::remove_dir_all(home);
     }
 

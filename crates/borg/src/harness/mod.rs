@@ -58,38 +58,6 @@ pub trait Harness: Sync {
     fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
         Vec::new()
     }
-    /// The command that runs one headless drone session (`borg debug hive run`, hive/run.rs), with the
-    /// engineer's hooks on so borg's own hooks run in it; None: the harness's CLI cannot.
-    fn headless(&self, _run: &Headless) -> Option<std::process::Command> {
-        None
-    }
-    /// What a headless session's stdout says it cost and answered. Default: nothing known.
-    fn headless_end(&self, _out: &[u8]) -> HeadlessEnd {
-        HeadlessEnd::default()
-    }
-}
-
-/// One headless drone session the hive runner starts (hive/run.rs).
-pub struct Headless<'a> {
-    pub prompt: &'a str,
-    pub cwd: &'a Path,
-    pub model: Option<&'a str>,
-    /// The session id to run under, where the CLI takes one (a UUID); else the CLI picks its own and
-    /// [`HeadlessEnd::session`] names it.
-    pub session: &'a str,
-    /// The drone's dollars left: a harness that stops itself (`Caps::headless_budget`) gets it.
-    pub budget_usd: Option<f64>,
-    pub env: &'a [(&'a str, String)],
-}
-
-/// What one headless session reported.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct HeadlessEnd {
-    /// Its cost in dollars; None where the CLI reports none (codex reports tokens only).
-    pub usd: Option<f64>,
-    pub session: String,
-    pub text: String,
-    pub error: bool,
 }
 
 /// One sub-agent of a [`Run`], as its transcript shows it.
@@ -175,31 +143,23 @@ pub struct Caps {
     /// `stop_budget`). None: the expert drone keeps inside [`DEFAULT_STOP_BUDGET`], the model call
     /// inside the model's own limit.
     pub stop_budget: Option<Duration>,
-    /// A headless session stops itself at a dollar budget it is given ([`Headless::budget_usd`]);
-    /// without it the hive runner checks the budget between iterations only (hive/run.rs).
-    pub headless_budget: bool,
-    /// The variable the harness sets to its session's id in every command its model runs, which `borg
-    /// hive join` binds the session by (hive/interactive.rs `env_session_of`); None: the harness gives
-    /// its shell no id (opencode: its plugin binds the session).
+    /// The variable the harness sets to its session's id in every command its model runs; None: the
+    /// harness gives its shell no id (opencode).
     pub session_env: Option<&'static str>,
-    /// How an idle interactive hive drone of the harness gets its next task (hive/interactive.rs `Wake`).
+    /// How an idle session of the harness can be woken with a message.
     pub drone_wake: DroneWake,
-    /// One harness process runs one session at a time, so a later id under the process a drone joined
-    /// in is that drone's session (Claude Code's `--continue`, `/clear`: hive/interactive.rs `adopt`,
-    /// `rebind`); false where one process runs several (omp, opencode, codex's threads).
-    pub one_session_per_process: bool,
 }
 
-/// How an idle interactive hive drone of a harness is woken with work (phase g G3, docs/design/hive.md).
+/// How an idle session of a harness is woken with a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DroneWake {
-    /// Its stop asks the model to run `borg hive wait` in the background, whose end starts the next turn
+    /// Its stop asks the model to run a waiter in the background, whose end starts the next turn
     /// (Claude Code).
     Model,
-    /// Its adapter keeps the waiter from the join for the session's life and wakes the session by the
-    /// harness's own path (omp `pi.sendMessage`, opencode `session.promptAsync`/`prompt`).
+    /// Its adapter keeps a waiter for the session's life and wakes the session by the harness's own
+    /// path (omp `pi.sendMessage`, opencode `session.promptAsync`/`prompt`).
     Plugin,
-    /// No hook can wake an idle session: its stop starts the waiter detached, which wakes the session
+    /// No hook can wake an idle session: its stop starts a waiter detached, which wakes the session
     /// through the harness's CLI (codex `codex queue --thread`). Its hooks run as children of the harness
     /// process, which sends no pid of its own.
     Queue,
@@ -219,9 +179,15 @@ pub enum Transcript {
 pub enum Wiring {
     /// Command hooks merged into a JSON file: one hook group per native event (native name, canonical
     /// event), each running `<borg> hook <name> <event>`; `timeouts` gives a canonical event's hook a
-    /// `timeout` in seconds (the others get the harness's own default). `through_links`: the file is
-    /// often a symlink into a dotfiles repo, written through.
-    CommandHooks { events: &'static [(&'static str, &'static str)], timeouts: &'static [(&'static str, u64)], through_links: bool },
+    /// `timeout` in seconds (the others get the harness's own default). `retired`: the hooks an older
+    /// borg installed and this one does not, which install and uninstall remove. `through_links`: the
+    /// file is often a symlink into a dotfiles repo, written through.
+    CommandHooks {
+        events: &'static [(&'static str, &'static str)],
+        timeouts: &'static [(&'static str, u64)],
+        retired: &'static [(&'static str, &'static str)],
+        through_links: bool,
+    },
     /// A compiled-in adapter copied whole; a symlink is replaced, never written through, and uninstall
     /// removes only a file with exactly this content.
     AdapterFile { source: &'static str },
@@ -291,6 +257,25 @@ pub fn named_current() -> Option<&'static dyn Harness> {
     std::env::var("BORG_HARNESS").ok().and_then(|n| by_name(&n))
 }
 
+/// The variables harnesses set to their session's id in every command their model runs and every hook
+/// they run (`Caps::session_env`), each with its harness, in [`ALL`]'s order: Claude Code's
+/// (`CLAUDE_CODE_SESSION_ID`) equals the hook input's `session_id` and follows `/clear`, but under
+/// `--continue` or `--resume` without an id it may be the startup id instead (its env-vars docs); omp's
+/// (`PI_SESSION_ID`) is its session manager's id, the one its extension sends; codex's
+/// (`CODEX_THREAD_ID`, 0.153.2, also inside its sandbox) is the thread id its hooks carry as
+/// `session_id` and `codex queue --thread` takes. opencode gives its shell no session id.
+pub fn session_vars() -> Vec<(&'static str, &'static str)> {
+    ALL.iter().filter_map(|h| h.caps().session_env.map(|v| (v, h.name()))).collect()
+}
+
+/// Every session id set in this process's environment (`session_vars`, trimmed, non-empty), each with
+/// its harness, in `session_vars`' order. More than one when a harness runs inside another's shell (omp
+/// in a Claude Code session): it inherits the outer one's variable too.
+pub fn env_sessions() -> Vec<(String, &'static str)> {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    session_vars().into_iter().filter_map(|(k, h)| var(k).map(|v| (v, h))).collect()
+}
+
 /// The event's transcript, when the harness writes one and the event names it.
 pub fn transcript(caps: Caps, ev: &Value) -> Option<&str> {
     match caps.transcript {
@@ -343,23 +328,13 @@ mod tests {
     fn caps_are_todays() {
         let row = |n: &str| {
             let c = by_name(n).unwrap().caps();
-            (
-                c.prompt_context,
-                c.tool_context,
-                c.early_delivery,
-                c.steer_in_context,
-                c.question_dialog,
-                c.transcript,
-                c.deny_capture,
-                c.sends_pid,
-                c.headless_budget,
-            )
+            (c.prompt_context, c.tool_context, c.early_delivery, c.steer_in_context, c.question_dialog, c.transcript, c.deny_capture, c.sends_pid)
         };
-        assert_eq!(row("claude"), (true, true, true, true, true, Transcript::Claude, true, false, true));
+        assert_eq!(row("claude"), (true, true, true, true, true, Transcript::Claude, true, false));
         for n in ["omp", "opencode"] {
-            assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true, false), "{n}");
+            assert_eq!(row(n), (true, true, false, false, false, Transcript::None, true, true), "{n}");
         }
-        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false, false));
+        assert_eq!(row("codex"), (true, true, false, false, false, Transcript::None, false, false));
         // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; codex: its
         // stop hook's timeout.
         let budgets = [("claude", None), ("omp", None), ("opencode", None), ("codex", Some(90)), ("sim", None)];
@@ -367,48 +342,6 @@ mod tests {
         assert_eq!(got, budgets, "every harness's stop budget");
         let Wiring::CommandHooks { timeouts, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
         assert_eq!((timeouts, through_links), (&[("stop", 90)][..], true), "a timeout on the stop only");
-    }
-
-    fn args(cmd: &std::process::Command) -> Vec<String> {
-        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
-    }
-
-    fn headless_run(budget: Option<f64>) -> std::process::Command {
-        let env = [("BORG_HIVE", "g".to_string())];
-        let run = Headless { prompt: "go", cwd: Path::new("/w/app"), model: Some("sonnet"), session: "u-1", budget_usd: budget, env: &env };
-        by_name("claude").unwrap().headless(&run).unwrap()
-    }
-
-    #[test]
-    fn claude_runs_a_headless_drone_with_the_engineers_hooks_and_its_budget() {
-        let cmd = headless_run(Some(0.5));
-        let a = args(&cmd);
-        for want in [["-p", "go"], ["--permission-mode", "bypassPermissions"], ["--max-budget-usd", "0.50"], ["--session-id", "u-1"], ["--model", "sonnet"]] {
-            assert!(a.windows(2).any(|w| w == want), "{want:?} in {a:?}");
-        }
-        assert!(!a.iter().any(|x| x == "--setting-sources" || x == "--strict-mcp-config"), "borg's hooks must run in the drone: {a:?}");
-        assert_eq!(cmd.get_current_dir(), Some(Path::new("/w/app")));
-        assert!(cmd.get_envs().any(|(k, v)| k == "BORG_HIVE" && v == Some("g".as_ref())));
-        assert!(!args(&headless_run(None)).iter().any(|x| x == "--max-budget-usd"));
-        let h = by_name("claude").unwrap();
-        let out = br#"{"type":"result","subtype":"success","is_error":false,"result":"t1 done","session_id":"abc","total_cost_usd":0.4213}"#;
-        assert_eq!(h.headless_end(out), HeadlessEnd { usd: Some(0.4213), session: "abc".into(), text: "t1 done".into(), error: false });
-        assert_eq!(h.headless_end(b"not json"), HeadlessEnd::default());
-    }
-
-    #[test]
-    fn every_headless_command_runs_in_the_worktree_and_codex_keeps_its_hooks() {
-        let run = Headless { prompt: "go", cwd: Path::new("/w/app"), model: None, session: "", budget_usd: None, env: &[] };
-        let codex = by_name("codex").unwrap().headless(&run).unwrap();
-        let a = args(&codex);
-        assert!(a.windows(2).any(|w| w == ["-s", "workspace-write"]) && a.windows(2).any(|w| w == ["-C", "/w/app"]), "{a:?}");
-        assert!(!a.iter().any(|x| x.contains("features.hooks") || x == "--ignore-user-config"), "the drone's hooks stay on: {a:?}");
-        let end = by_name("codex").unwrap().headless_end(
-            b"{\"type\":\"thread.started\",\"thread_id\":\"th1\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n",
-        );
-        assert_eq!(end, HeadlessEnd { usd: None, session: "th1".into(), text: "ok".into(), error: false }, "codex reports tokens, never dollars");
-        let omp = args(&by_name("omp").unwrap().headless(&run).unwrap());
-        assert!(omp.contains(&"--auto-approve".to_string()) && omp.contains(&"--cwd=/w/app".to_string()), "{omp:?}");
     }
 
     #[test]

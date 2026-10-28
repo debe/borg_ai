@@ -167,7 +167,7 @@ fn routes(dir: Option<&str>) -> Result<Vec<Route>, String> {
     })
 }
 
-/// Every collective to show with its drones, hive goals and their board events (top_live.rs).
+/// Every collective to show with its drones (top_live.rs).
 pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>, String> {
     let mut out = Vec::new();
     for r in routes(dir)? {
@@ -177,21 +177,10 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>,
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
-        let hives = crate::hive::view::all(home, now);
-        if ds.is_empty() && hives.is_empty() && dir.is_none() {
+        if ds.is_empty() && dir.is_none() {
             continue;
         }
-        let events = hives
-            .iter()
-            .flat_map(|v| {
-                crate::hive::board::read(&crate::hive::tasks_path(home, &v.goal))
-                    .into_iter()
-                    .filter(|e| !crate::hive::board::is_beat(e))
-                    .map(|e| (v.goal.clone(), e))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        out.push(crate::top_live::Coll { name: name.clone(), share: *share, drones: ds, hives, events });
+        out.push(crate::top_live::Coll { name: name.clone(), share: *share, drones: ds });
     }
     Ok(out)
 }
@@ -207,19 +196,10 @@ fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String>
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
-        // The collective's hive goals (hive/view.rs): nothing at all for a store without a hive.
-        let hives = crate::hive::view::all(home, now);
         if json_out {
-            let mut v = to_json(name, *share, &ds);
-            if !hives.is_empty() {
-                v["hive"] = serde_json::to_value(&hives).unwrap_or_default();
-            }
-            all.push(v);
-        } else if !ds.is_empty() || dir.is_some() || !hives.is_empty() {
+            all.push(to_json(name, *share, &ds));
+        } else if !ds.is_empty() || dir.is_some() {
             text.push_str(&render(name, *share, &ds, now));
-            for h in &hives {
-                text.push_str(&crate::hive::view::render(h));
-            }
             text.push('\n');
         }
     }

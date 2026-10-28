@@ -171,7 +171,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
                 "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
                 "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
                 "regretted": mm.map_or(0.0, |x| x.regretted),
-                "verified": mm.map_or(0, |x| x.verified), "rejected": mm.map_or(0, |x| x.rejected), "hacked": mm.map_or(0, |x| x.hacked), "tested": mm.map_or(0, |x| x.tested),
+                "tested": mm.map_or(0, |x| x.tested),
                 "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
                 "usage": usage.get(&c.id).cloned().unwrap_or_default(),
                 "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
@@ -184,7 +184,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 32] = [
+const NOTABLE: [&str; 29] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -195,9 +195,6 @@ const NOTABLE: [&str; 32] = [
     stats::CORRECTED,
     stats::REGRETTED,
     stats::TESTED,
-    stats::TASK_VERIFIED,
-    stats::TASK_REJECTED,
-    stats::TASK_HACKED,
     stats::LESSON_NEW,
     stats::LESSON_MERGED,
     stats::NOT_A_LESSON,
@@ -262,14 +259,11 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
     Json(top::to_json(&m.name, m.share, &ds)).into_response()
 }
 
-/// The collective's hive goals (hive/view.rs): board, budget and spend per drone, newest contracts;
-/// `goals` is empty for a store without a hive. And its L1 playbooks (playbook.rs `view`): steps, each
-/// shown version's belief, edits waiting for the engineer.
-async fn hive(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+/// The collective's L1 playbooks (playbook.rs `view`): steps, each shown version's belief, edits
+/// waiting for the engineer.
+async fn playbooks(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
-    let goals = borg::hive::view::all(&m.home, learn::now_ms());
-    let playbooks = borg::playbook::view(&m.home);
-    Json(json!({"collective": m.name, "goals": goals, "playbooks": playbooks})).into_response()
+    Json(json!({"collective": m.name, "playbooks": borg::playbook::view(&m.home)})).into_response()
 }
 
 /// Whether learning works in the collective, week by week (learning.rs), backfilled from its logs.
@@ -306,25 +300,19 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("drones", vec![home.join("presence"), presence::remote_path(home)]),
         ("feed", vec![stats::events_path(home)]),
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
-        // The goal dirs are nested: their files by name, and the hive dir for a new goal.
-        // Playbooks show with the hive: their edits, the queue that proposes them, the outcomes that credit them.
-        (
-            "hive",
-            [
-                vec![home.join("hive"), home.join(borg::playbook::FILE), home.join("queen"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE)],
-                borg::hive::view::files(home),
-            ]
-            .concat(),
-        ),
-        // Learning health folds the lessons, the rollups, the local events, the boards and the playbooks.
+        // Playbooks: their edits, the queue that proposes them, the outcomes that credit them.
+        ("playbooks", vec![home.join(borg::playbook::FILE), home.join("queen"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE)]),
+        // Learning health folds the lessons, the rollups, the local events and the playbooks.
         (
             "learning",
-            [
-                vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home), home.join("hive"), home.join(borg::playbook::FILE)],
-                vec![home.join(outcome::TEAM_FILE), home.join("outcomes.jsonl")],
-                borg::hive::view::files(home),
-            ]
-            .concat(),
+            vec![
+                home.join("lessons.jsonl"),
+                home.join("stats.jsonl"),
+                stats::events_path(home),
+                home.join(borg::playbook::FILE),
+                home.join(outcome::TEAM_FILE),
+                home.join("outcomes.jsonl"),
+            ],
         ),
     ]
 }
@@ -380,7 +368,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/drones", get(drones))
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
-        .route("/api/hive", get(hive))
+        .route("/api/playbooks", get(playbooks))
         .route("/api/learning", get(learning_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))
@@ -390,7 +378,7 @@ pub fn router(app: Arc<App>) -> Router {
 /// Answers only a request whose Host names this machine's loopback. The 127.0.0.1 bind keeps other
 /// machines out but not a page in the engineer's browser whose name re-resolves to 127.0.0.1 (DNS
 /// rebinding): to the browser the port is then that page's own origin, CORS does not apply, and its
-/// script could read the goals, contracts, spend and lessons. Such a request carries that name.
+/// script could read the lessons, playbooks and spend. Such a request carries that name.
 async fn loopback_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(loopback) {
         true => next.run(req).await,

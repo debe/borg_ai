@@ -70,7 +70,7 @@ const PROBES: &[(&str, &[&str])] = &[
     ("collective", &["."]),
     ("vectors", &[]),
     ("completions", &[]),
-    ("learn", &["--group"]),
+    ("learn", &[]),
     ("no", &[]),
     ("assimilate", &["--zz-probe"]),
     ("reach", &["--zz-probe"]),
@@ -85,7 +85,6 @@ const PROBES: &[(&str, &[&str])] = &[
     ("web", &["--help"]),
     ("mesh", &["--help"]),
     ("steer", &[]),
-    ("hive", &[]),
 ];
 
 const DEBUG_PROBES: &[(&str, &[&str])] = &[
@@ -96,7 +95,6 @@ const DEBUG_PROBES: &[(&str, &[&str])] = &[
     ("expert", &["missing-repo"]),
     ("vectors", &["--query", "--store", "missing.jsonl"]),
     ("ope", &["--zz-probe"]),
-    ("hive", &[]),
 ];
 
 #[test]
@@ -109,7 +107,7 @@ fn help_completions_and_dispatch_name_the_same_commands() {
     let mut top = completed(&bash, "");
     assert!(top.remove("debug"), "debug completes: {top:?}");
     assert_eq!(main, top, "borg help and the completions list the same commands");
-    for group in ["Setup", "Learning", "Decisions", "Watching", "Team", "Hive"] {
+    for group in ["Setup", "Learning", "Decisions", "Watching", "Team"] {
         assert!(help.lines().any(|l| l == group), "group {group} in borg help:\n{help}");
     }
     assert!(help.contains("borg debug help"), "the main help points at the debug tools");
@@ -154,7 +152,6 @@ fn removed_and_moved_commands_exit_non_zero_at_their_old_names() {
     let gone: &[(&[&str], &str)] = &[
         (&["top", "--watch"], "borg top: unknown flag --watch"),
         (&["top", "--once", "--watch"], "borg top: unknown flag --watch"),
-        (&["hive", "board", "--watch"], "borg hive: unknown flag --watch"),
         (&["queen", "next", "--json"], "usage: borg queen"),
         (&["queen", "notify"], "usage: borg queen"),
         (&["recall", "missing.jsonl"], "borg: unknown command recall"),
@@ -164,13 +161,7 @@ fn removed_and_moved_commands_exit_non_zero_at_their_old_names() {
         (&["expert", "missing-repo", "--at", "HEAD", "--q", "x"], "borg: unknown command expert"),
         (&["ope"], "borg: unknown command ope"),
         (&["vectors", "--query"], "borg vectors: unknown flag --query"),
-        (&["hive", "run", "g", "--drones", "1"], "borg hive: unknown flag --drones"),
-        (&["hive", "run", "g"], "borg hive: unknown command run"),
-        (&["hive", "score", "g"], "borg hive: unknown command score"),
-        (
-            &["hive", "init", "g", "--spec", "s", "--oracle", "ok=true", "--budget", "1", "--hidden-dir", "/tmp", "--hidden", "true"],
-            "borg hive: unknown flag --hidden-dir",
-        ),
+        (&["hive", "join"], "borg: unknown command hive"),
         (&["nope"], "borg: unknown command nope"),
     ];
     for (args, refusal) in gone {
@@ -180,7 +171,7 @@ fn removed_and_moved_commands_exit_non_zero_at_their_old_names() {
         assert!(err.starts_with(refusal), "borg {args:?} is not refused as gone ({refusal}): {err}");
     }
     // The usage refusals show the command's usage.
-    for args in [&["queen", "next", "--json"][..], &["queen", "notify"], &["hive", "score", "g"]] {
+    for args in [&["queen", "next", "--json"][..], &["queen", "notify"]] {
         let (_, err, _) = borg(&root, args);
         assert!(err.contains("usage: borg "), "borg {args:?}: {err}");
     }
@@ -188,17 +179,15 @@ fn removed_and_moved_commands_exit_non_zero_at_their_old_names() {
 }
 
 #[test]
-fn completions_name_the_hive_wait_and_the_debug_runs_yes() {
+fn completions_leave_out_the_removed_commands() {
     let root = tmp("completions");
     let (bash, _, _) = borg(&root, &["completions", "bash"]);
-    let hive = bash.lines().find(|l| l.trim_start().starts_with("hive) words=")).unwrap();
-    assert!(hive.contains(" wait ") && hive.contains(" scope") && !hive.contains(" run ") && !hive.contains(" score ") && !hive.contains("--watch"), "{hive}");
+    assert!(!bash.lines().any(|l| l.trim_start().starts_with("hive) words=")), "borg hive is gone");
     assert!(!bash.lines().find(|l| l.trim_start().starts_with("top) words=")).unwrap().contains("--watch"));
     assert!(!bash.lines().find(|l| l.trim_start().starts_with("queen) words=")).unwrap().contains("next"));
     let debug = completed(&bash, "debug");
-    assert!(debug.contains("hive") && debug.contains("recall"), "{debug:?}");
+    assert!(!debug.contains("hive") && debug.contains("recall"), "{debug:?}");
     let (fish, _, _) = borg(&root, &["completions", "fish"]);
-    assert!(fish.contains("-n '__fish_seen_subcommand_from debug' -l yes"), "{fish}");
-    assert!(!fish.contains("-n '__fish_seen_subcommand_from hive' -l yes"), "`borg hive` takes no --yes");
+    assert!(!fish.contains("__fish_seen_subcommand_from hive"), "{fish}");
     let _ = std::fs::remove_dir_all(root);
 }

@@ -2,11 +2,9 @@
 
 [← README](../README.md)
 
-Everything on this page works in one plain interactive session, with no team and no hive. A team adds
-other people's lessons ([Team sync](team-sync.md)); a hive adds verdicts on tasks ([Hive](commands.md#hive)).
-Neither changes what a plain session does: a session that never joins a goal answers its prompts, edits,
-stops and end exactly as without one, on every harness and in both [delivery modes](delivery.md), even in
-a store that holds a teammate's synced goal (`crates/borg/tests/plain_cli.rs`).
+Everything on this page works in one plain interactive session, with no team. A team adds other
+people's lessons ([Team sync](team-sync.md)) and changes nothing else a session does, on every harness and
+in both [delivery modes](delivery.md) (`crates/borg/tests/plain_cli.rs`).
 
 A **drone** is one agent session. A **lesson** is what a correction becomes: a question the agent should
 ask itself, the situations where it applies, and the consequence it prevents. A **collective** is one
@@ -73,7 +71,7 @@ with their asking probability, and reports; it never changes them.
 | a correction after the lesson was asked | 2 | design |
 | `vetoed` | 3 | design, no eval yet |
 | `regretted` | at most half a correction | design; on while its offline check is inconclusive, see [Evidence](evidence.md#regret-credit) |
-| `tested` | half a verified hive task (`VERIFIED_W / 2`) | design, not evaluated |
+| `tested` | 0.5 (`TESTED_W`) | design, not evaluated |
 
 **Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
 against the lessons asked in the deciding session before the decision: asking them did not prevent it.
@@ -86,8 +84,7 @@ so a decision made on another machine finds no asks here. `borg debug memory` an
 `regretted`; `BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by a pre-registered
 offline check: the belief with the regret term must predict later outcomes at least as well as without it.
 
-**Green tests credit the question.** A session's own test runs count too, in a plain session as in a
-hive. When a lesson was asked and the session's tests then failed and passed again, or passed after the
+**Green tests credit the question.** A session's own test runs count too. When a lesson was asked and the session's tests then failed and passed again, or passed after the
 drone changed its work on the lesson's point, `borg learn` gives that lesson a `tested` result at session
 end, once per session and lesson, at 0 tokens. The last run must pass; a pass before the question, a
 question the drone ignored, or a lesson only handed over as context earns nothing, and a correction or a
@@ -147,10 +144,9 @@ A session reads only its own collective's lessons.
 ## The queen
 
 The queen holds the decisions no lesson answers: open decisions from team documents, proposed
-constraints, playbook edits, reach questions and, in a hive, plans and contracts. At the first prompt of a
-session the drone asks you one question of that session's repo: Claude Code in its question dialog, the
-other harnesses at the start of the reply. A plain session's own questions come first; a hive question
-(a goal's plan, a task, a contract change, a playbook edit) only when none of its own is eligible. Answer
+constraints, playbook edits and reach questions. At the first prompt of a session the drone asks you one
+question of that session's repo: Claude Code in its question dialog, the other harnesses at the start of
+the reply. Answer
 in the terminal with `borg queen` and `borg queen ask`. See [Answering the queen](commands.md#answering-the-queen).
 
 When memory cannot answer, the design escalates. Steps 1, 2 and 4 are built; step 3 (a live drone) is

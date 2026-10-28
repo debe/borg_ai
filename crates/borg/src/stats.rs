@@ -84,38 +84,12 @@ pub const QUEEN_STAMP: &str = "queen_stamp";
 pub const QUEEN_MISSED: &str = "queen_missed";
 /// One imported chunk of team documents (`n`: lessons, `usd`).
 pub const ASSIMILATED: &str = "assimilated";
-/// The hive (hive/mod.rs; `why`: the goal, `text`: the task): a claim taken, a task's oracle passed and
-/// its `done` published, a stop blocked because the oracle failed, a claim released at the session's
-/// end, and board context shown to a drone (`lessons`: the contract ids shown).
-pub const HIVE_CLAIM: &str = "hive_claim";
 /// L1 playbooks (playbook.rs): versions shown to a drone (`lessons`: their keys, `n`), an edit proposed
-/// to the engineer from verified work, and one promoted by an engineer's answer (`lessons`: the
+/// to the engineer from a session that ended clean, and one promoted by an engineer's answer (`lessons`: the
 /// playbook, `why`: add/modify/remove, `text`: the step).
 pub const PLAYBOOK_SHOWN: &str = "playbook_shown";
 pub const PLAYBOOK_PROPOSED: &str = "playbook_proposed";
 pub const PLAYBOOK_PROMOTED: &str = "playbook_promoted";
-pub const HIVE_DONE: &str = "hive_done";
-pub const HIVE_ORACLE_FAIL: &str = "hive_oracle_fail";
-pub const HIVE_RELEASED: &str = "hive_released";
-pub const HIVE_SHOWN: &str = "hive_shown";
-/// A message between hive drones sent (`borg hive ask|tell`, hive/message.rs; `why`: the goal, `text`:
-/// the kind, recipient and an excerpt).
-pub const HIVE_MESSAGE: &str = "hive_message";
-/// An integration of a hive goal (hive/integrate.rs; `why`: the goal, `text`: the integrate task and its
-/// note): the accepted attempts merged and the oracle run on the combined tree, `n` 1 on a pass, 0 on a
-/// failure.
-pub const HIVE_INTEGRATE: &str = "hive_integrate";
-/// A hive goal's plan decided (hive/plan.rs; `why`: the goal, `n` 1 approved or 0 refused, `text` how
-/// and the answer): by the engineer's answer to its queen question, or `--yes`.
-pub const HIVE_PLAN: &str = "hive_plan";
-/// A hive task's verdict, once per attempt (hive/verdict.rs; `why`: the goal, `text`: the task and an
-/// excerpt of the note, `lessons`: the lessons credited with it, `n` their number): verified, rejected
-/// (by its verifier or the hidden oracle), or hacked (weakened tests or changed CI, or the oracle
-/// touched). With a hidden oracle, counted when it scored. `task_hacked` over all three is the hacked
-/// rate (borg-web's overview).
-pub const TASK_VERIFIED: &str = "task_verified";
-pub const TASK_REJECTED: &str = "task_rejected";
-pub const TASK_HACKED: &str = "task_hacked";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -662,8 +636,8 @@ mod tests {
 
     #[test]
     fn concurrent_first_calls_agree_on_one_node() {
-        // Board lines are stamped with the node and only this node's claims are released after a
-        // killed run: a runner and a drone's hook creating the id at once must not get two.
+        // The node id stamps the outcomes and stats that sync: two hooks creating it at once must
+        // agree on one.
         for round in 0..20 {
             let home = std::env::temp_dir().join(format!("borg-stats-node-{}-{round}", std::process::id()));
             let _ = std::fs::remove_dir_all(&home);

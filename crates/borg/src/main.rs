@@ -102,29 +102,10 @@ fn challenges_and_stdin(path: &str, rest: &[&str]) -> (Vec<conscience::Challenge
     (challenges, context)
 }
 
-/// `borg learn [--session ID | --group <goal>/<task>]`.
+/// `borg learn [--session ID]`.
 fn learn_cmd(rest: &[&str]) {
     borg::stats::set_purpose("learn");
     let session = rest.iter().position(|a| *a == "--session").and_then(|i| rest.get(i + 1)).copied();
-    // A hive group's reflection (hive/group.rs): its episode first, then learned like any waiting one.
-    if let Some(i) = rest.iter().position(|a| *a == "--group") {
-        let Some(spec) = rest.get(i + 1) else {
-            eprintln!("borg learn: --group needs <goal>/<task>");
-            std::process::exit(2);
-        };
-        match borg::hive::group::reflect(&learn::home(), spec) {
-            Ok(borg::hive::group::Reflected::Recorded(id)) => println!("group {spec}: reflection {id} recorded"),
-            Ok(borg::hive::group::Reflected::Already(id)) => println!("group {spec}: reflected before ({id})"),
-            Ok(borg::hive::group::Reflected::Nothing(why)) => {
-                println!("group {spec}: nothing to reflect: {why}");
-                return;
-            }
-            Err(e) => {
-                eprintln!("borg learn: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
     // Unless BORG_REVIEW_FIX=off: the ended session's review → fix findings (its harness's sub-agent
     // runs) become episodes first, each in the store its repo routes to; a store other than this one
     // is learned here too, for this session.
@@ -188,7 +169,7 @@ fn memory_cmd(path: &str, rest: &[&str]) {
         println!(
             "{}",
             json!({"id": c.id, "activation": m.activation, "changed": m.changed, "ignored": m.ignored, "corrected": m.corrected,
-                "vetoed": m.vetoed, "regretted": m.regretted, "verified": m.verified, "rejected": m.rejected, "hacked": m.hacked, "tested": m.tested, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
+                "vetoed": m.vetoed, "regretted": m.regretted, "tested": m.tested, "mean": m.mean(), "weight": m.weight(&c.id, session), "consolidated": m.consolidated, "dormant": m.dormant,
                 "outcome_weight": weights.get(&c.id).copied().unwrap_or(1.0)})
         );
     }
@@ -228,7 +209,6 @@ fn debug_cmd(args: &[&str]) {
         ["expert", repo, rest @ ..] => std::process::exit(expert::main(repo, rest)),
         ["vectors", rest @ ..] if rest.contains(&"--query") => std::process::exit(borg::vectors::main(rest)),
         ["ope", rest @ ..] => std::process::exit(borg::ope::main(rest)),
-        ["hive", rest @ ..] => std::process::exit(borg::hive::debug(rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), true)),
         _ => {
             eprint!("{}", help(atty(2), true));
@@ -293,7 +273,6 @@ fn main() {
         ["trust", rest @ ..] => std::process::exit(borg::trust::main(rest)),
         ["top", rest @ ..] => std::process::exit(borg::top::main(rest)),
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
-        ["hive", rest @ ..] => std::process::exit(borg::hive::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),

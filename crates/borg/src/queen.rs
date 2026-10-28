@@ -68,18 +68,10 @@ pub enum Kind {
     /// collective. Queued by `borg learn`, not a checkpoint; only an engineer's answer ratifies it, and
     /// the default keeps it a lesson only.
     Constraint,
-    /// A drone's change to another drone's hive contract (hive/contract.rs `publish`). Queued by the
-    /// drone's `borg hive contract --supersedes`, not a checkpoint; only an engineer's answer lets it
-    /// supersede, and the default keeps the current contract.
-    Contract,
-    /// An edit to an L1 playbook learned from verified hive work (playbook.rs `propose`). Queued by `borg
-    /// learn`, not a checkpoint; only an engineer's answer promotes it, and the default keeps the
-    /// playbook as it is.
+    /// An edit to an L1 playbook learned from a session that ended clean (playbook.rs `propose`).
+    /// Queued by `borg learn`, not a checkpoint; only an engineer's answer promotes it, and the
+    /// default keeps the playbook as it is.
     Playbook,
-    /// A hive goal's plan, one intent card per task (hive/plan.rs `gate`). Raised by `borg debug hive run`
-    /// before its drones start, not a checkpoint; only an engineer's approval starts them, and the
-    /// default starts nothing.
-    Plan,
 }
 
 impl Kind {
@@ -110,9 +102,7 @@ impl Kind {
             Kind::OpenDecision => "a decision the team's documents leave open",
             Kind::Reach => "who should hear a lesson",
             Kind::Constraint => "an invariant proposed as a constraint",
-            Kind::Contract => "a change to another drone's contract",
             Kind::Playbook => "an edit to a team playbook",
-            Kind::Plan => "a hive goal's plan",
         }
     }
 
@@ -127,9 +117,7 @@ impl Kind {
             Kind::OpenDecision => ("keep the documented interim rule", "decide it now"),
             Kind::Reach => (crate::reach::TEAM_OPTION, crate::reach::PERSONAL_OPTION),
             Kind::Constraint => (crate::veto::KEEP_OPTION, crate::veto::RATIFY_OPTION),
-            Kind::Contract => (crate::hive::contract::KEEP_OPTION, crate::hive::contract::SUPERSEDE_OPTION),
             Kind::Playbook => (crate::playbook::KEEP_OPTION, crate::playbook::PROMOTE_OPTION),
-            Kind::Plan => (crate::hive::plan::REFUSE_OPTION, crate::hive::plan::APPROVE_OPTION),
         }
     }
 }
@@ -338,13 +326,6 @@ fn near(d: &Decision, earlier: &str) -> bool {
     overlap(&words(&d.sentence), &have, 4) >= STATED
 }
 
-/// Whether an earlier question `e` may stand for a reworded decision in `repo` (`near`): a hive plan's
-/// question packs every task title into one bag of words and decides no move, and a hive task's
-/// escalation is about its own goal's repo, so neither masks a move anywhere else.
-fn masks(e: &Entry, repo: &str) -> bool {
-    !hive_question(e) || (e.kind != Kind::Plan && same_repo(&self::repo(e), repo))
-}
-
 /// Two decisions of one plan that are one move: the same key, either sentence a reworded duplicate of
 /// the other, or the same kind on the same named ref ("`git push -u origin main`" and "they push to
 /// the remote `origin` and the branch `main`"). One message asks each move once.
@@ -426,8 +407,8 @@ pub struct Entry {
     pub dismissed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_ms: Option<i64>,
-    /// What answering acts on, for a kind that carries more than its question (a `Contract`: the goal
-    /// and the proposed contract); None on every other kind and on older lines.
+    /// What answering acts on, for a kind that carries more than its question (a `Playbook`: the
+    /// proposed edit); None on every other kind and on older lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
 }
@@ -478,18 +459,6 @@ pub fn open_decision_key(repo: &str, question: &str) -> String {
 /// The key of a constraint proposed from a veto: its repo and normalised invariant.
 pub fn constraint_key(repo: &str, text: &str) -> String {
     decision_key(Kind::Constraint, repo, &norm(&text.to_lowercase()))
-}
-
-/// Queue `e` unless its decision was ever queued in this collective, whatever its wording: a hive plan
-/// or a hive task's escalation (hive/plan.rs), whose questions differ only in a task or two and are
-/// still different decisions. Returns whether it was added.
-pub fn ask_once(store: &Path, e: &Entry) -> std::io::Result<bool> {
-    if entries(store).iter().any(|x| x.decision_key == e.decision_key) {
-        return Ok(false);
-    }
-    append_line(&queue_path(store), e)?;
-    counted(store, crate::stats::QUEEN_QUEUED, e, e.ms, |_| {});
-    Ok(true)
 }
 
 /// Queue `e` (an imported open decision) unless its decision, or a near-duplicate question of its repo
@@ -555,7 +524,7 @@ pub fn within_budget(store: &Path, engineer: &str, session: &str) -> bool {
 /// questions and proposed constraints use none.
 pub fn budget_allows(asked: &[Entry], seen: &[Seen], engineer: &str, session: &str, aliases: &collective::Aliases) -> bool {
     let me = aliases.canon(engineer);
-    let sent = asked.iter().filter(|e| !matches!(e.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook | Kind::Plan));
+    let sent = asked.iter().filter(|e| e.kind.escalates());
     let Some(last) = sent.filter(|e| aliases.canon(&e.engineer) == me).max_by_key(|e| e.ms) else { return true };
     if last.session == session {
         return false; // one message per session at most
@@ -656,7 +625,8 @@ pub fn decide(cp: &Checkpoint, asked: &[Entry], budget: impl FnOnce() -> bool, l
     let ever: HashSet<&str> = asked.iter().map(|e| e.decision_key.as_str()).collect();
     let mut candidates: Vec<(Decision, Vec<String>)> = Vec::new();
     for d in classify(cp.plan, &repo) {
-        if ever.contains(d.key.as_str()) || stated(&d, cp.inputs) || asked.iter().any(|e| masks(e, &repo) && near(&d, &e.question)) {
+        let masks = |e: &Entry| !legacy_hive(e) || same_repo(&self::repo(e), &repo);
+        if ever.contains(d.key.as_str()) || stated(&d, cp.inputs) || asked.iter().any(|e| masks(e) && near(&d, &e.question)) {
             continue;
         }
         // Criterion 2, L1 side: the lessons the conscience asked that are about this move. Agreeing,
@@ -833,20 +803,13 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     if e.dismissed.is_some() {
         return Err(format!("{id} was dismissed"));
     }
-    if hive_question(&e) && crate::hive::drone(store, &std::env::current_dir().unwrap_or_default().display().to_string()) {
-        return Err(format!("{id} is the engineer's to answer, never a hive drone's"));
-    }
     // The lesson first: a question marked answered without its lesson would be lost. A reach question
     // writes none: its answer moves the lesson it is about (reach.rs). Nor does a proposed constraint:
     // its veto is a lesson already, and ratifying it writes the constraint (veto.rs).
     if e.kind == Kind::Constraint {
         crate::veto::ratify(store, &e, text, author, now)?;
-    } else if e.kind == Kind::Contract {
-        crate::hive::contract::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Playbook {
         crate::playbook::ratify(store, &e, text, author, now)?;
-    } else if e.kind == Kind::Plan {
-        crate::hive::plan::ratify(store, &e, text, author, now)?;
     } else if e.kind == Kind::Reach {
         crate::reach::answer(store, &e, text)?;
     } else {
@@ -863,7 +826,7 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
         ev.text = crate::stats::excerpt(text, 160);
     });
     crate::escalation::answered(store, &e, text, author, now);
-    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook | Kind::Plan) {
+    if !matches!(e.kind, Kind::Reach | Kind::Constraint | Kind::Playbook) {
         counted(store, crate::stats::LESSON_NEW, &e, now, |ev| {
             ev.engineer = author.into();
             ev.why = "queen".into();
@@ -1031,13 +994,11 @@ pub fn option_answer(e: &Entry, text: &str) -> Result<String, String> {
 }
 
 /// Open questions that near-duplicate an earlier, not dismissed question of their repo (`duplicate`):
-/// (later id, earlier id) in asking order, hive questions left out. A duplicate found here is never the earlier side.
+/// (later id, earlier id) in asking order. A duplicate found here is never the earlier side.
 pub fn duplicates(all: &[Entry]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    // A hive plan's or task's question is never a duplicate: a changed plan, or a group's attempts at one
-    // task, read alike, and a dismissal would refuse the run that waits for it (hive/plan.rs).
-    for (j, e) in all.iter().enumerate().filter(|(_, e)| e.is_open() && !hive_question(e)) {
-        let first = all[..j].iter().find(|x| x.dismissed.is_none() && !hive_question(x) && !out.iter().any(|(d, _)| *d == x.id) && duplicate(x, e));
+    for (j, e) in all.iter().enumerate().filter(|(_, e)| e.is_open()) {
+        let first = all[..j].iter().find(|x| x.dismissed.is_none() && !out.iter().any(|(d, _)| *d == x.id) && duplicate(x, e));
         if let Some(x) = first {
             out.push((e.id.clone(), x.id.clone()));
         }
@@ -1133,9 +1094,9 @@ pub fn ask_on(value: Option<&str>) -> bool {
 /// The question to deliver in `session`, pure. None once `delivered` has one for this session (one per
 /// session). Else an open question of one of `repos` (never another repo's), not skipped within
 /// `SKIP_MS`, and, if delivered before, only once more than `REOFFER_SESSIONS` sessions of `visits`
-/// (first-seen order) began since. The engineer's decisions about the work come first: a hive question
-/// (`about_hive`) only when none of them is eligible. Then never-delivered questions first, then asking
-/// order. The index is into `open`.
+/// (first-seen order) began since. The engineer's decisions about the work come first: a playbook edit
+/// or a 0.3.0 hive task's question (`legacy_hive`) only when none of them is eligible. Then
+/// never-delivered questions first, then asking order. The index is into `open`.
 pub fn eligible<'a>(
     open: &'a [Entry],
     skips: &[Mark],
@@ -1153,23 +1114,23 @@ pub fn eligible<'a>(
         .enumerate()
         .filter(|(_, e)| repos.iter().any(|r| same_repo(r, &repo(e))) && !skipped(skips, &e.id, now))
         .filter_map(|(i, e)| {
-            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((about_hive(e), false, i, e)) };
+            let Some(last) = delivered.iter().filter(|d| d.id == e.id).max_by_key(|d| d.ms) else { return Some((later(e), false, i, e)) };
             let since = match (at(&last.session), at(session)) {
                 (Some(t), Some(n)) => n.saturating_sub(t),
                 // The delivering session's record is gone: count sessions first seen after the delivery.
                 _ => visits.iter().filter(|v| v.ms > last.ms).count(),
             };
-            (since > REOFFER_SESSIONS).then_some((about_hive(e), true, i, e))
+            (since > REOFFER_SESSIONS).then_some((later(e), true, i, e))
         })
-        .min_by_key(|&(hive, again, i, _)| (hive, again, i))
+        .min_by_key(|&(proposal, again, i, _)| (proposal, again, i))
         .map(|(_, _, i, e)| (i, e))
 }
 
-/// The prompt hook's call (0 model calls): the one question to ask in `session` (in `cwd`), whose work is in
+/// The prompt hook's call (0 model calls): the one question to ask in `session`, whose work is in
 /// `repos` (computed only once the session has none delivered and the queue has open questions),
 /// recorded as delivered (delivered.jsonl). Its commands end with `scope`. None when nothing is
 /// eligible (`eligible`) or the store cannot record it: fails open. `BORG_QUEEN_ASK` is the caller's.
-pub fn deliver(store: &Path, session: &str, cwd: &str, repos: impl FnOnce() -> Vec<String>, scope: &str, now: i64) -> Option<Question> {
+pub fn deliver(store: &Path, session: &str, repos: impl FnOnce() -> Vec<String>, scope: &str, now: i64) -> Option<Question> {
     if session.is_empty() {
         return None;
     }
@@ -1191,28 +1152,23 @@ pub fn deliver(store: &Path, session: &str, cwd: &str, repos: impl FnOnce() -> V
         append_line(&visits_path(store), &v).ok()?;
         visits.push(v);
     }
-    // A hive drone is never asked the engineer's questions about its own goal's plan and tasks; an
-    // interactive goal's plan or budget only in the session that opened it, at the engineer's own prompt
-    // (hive/plan.rs `at_prompt`), never as a question another session's model records.
-    let offer: Vec<Entry> =
-        open.iter().filter(|e| !(hive_question(e) && crate::hive::drone(store, cwd)) && !crate::hive::plan::at_own_prompt(e)).cloned().collect();
-    let (_, e) = eligible(&offer, &skips(store), &delivered, &visits, session, &repos, now)?;
+    let (_, e) = eligible(&open, &skips(store), &delivered, &visits, session, &repos, now)?;
     let n = open.iter().position(|o| o.id == e.id).unwrap_or_default() + 1;
     append_line(&delivered_path(store), &Mark { id: e.id.clone(), session: session.into(), ms: now }).ok()?;
     counted(store, crate::stats::QUEEN_DELIVERED, e, now, |ev| ev.session = session.into());
     Some(Question::of(e, n, scope))
 }
 
-/// A question about a hive goal's plan or one of its tasks (hive/plan.rs): the engineer's alone.
-fn hive_question(e: &Entry) -> bool {
-    e.kind == Kind::Plan || (e.kind.escalates() && e.payload.as_ref().is_some_and(|p| p["goal"].is_string() && p["task"].is_string()))
+/// A question a 0.3.0 hive task escalated (its payload names the goal and task), still open in an older
+/// queue: nothing acts on it any more, so it masks a move only in its own repo (`decide`) and comes after
+/// a session's own work (`eligible`).
+fn legacy_hive(e: &Entry) -> bool {
+    e.kind.escalates() && e.payload.as_ref().is_some_and(|p| p["goal"].is_string() && p["task"].is_string())
 }
 
-/// A question the hive raised rather than a session's own work: a goal's plan or task (`hive_question`),
-/// a drone's contract change or a playbook edit learned from hive work. A plain session's one question
-/// goes to its own work first (`eligible`).
-fn about_hive(e: &Entry) -> bool {
-    hive_question(e) || matches!(e.kind, Kind::Contract | Kind::Playbook)
+/// Whether `e` waits until a session's own decisions are answered: a playbook edit or a `legacy_hive` question.
+fn later(e: &Entry) -> bool {
+    e.kind == Kind::Playbook || legacy_hive(e)
 }
 
 /// At most five words of an option, up to its first ':' or ',': its label in a dialog.
@@ -1240,15 +1196,11 @@ pub fn render_delivery(q: &Question, dialog: bool) -> String {
     // Queued in an earlier session (or imported from a document): the drone must not take a checkpoint
     // question's quoted plan for its own.
     let (question, origin) = match q.question.strip_prefix("The drone's plan says: ") {
-        Some(rest) if !matches!(q.kind, Kind::OpenDecision | Kind::Reach | Kind::Constraint | Kind::Contract | Kind::Playbook | Kind::Plan) => {
-            (format!("An earlier session's plan said: {rest}"), "queued by an earlier session")
-        }
+        Some(rest) if q.kind.escalates() => (format!("An earlier session's plan said: {rest}"), "queued by an earlier session"),
         _ if q.kind == Kind::OpenDecision => (q.question.clone(), "found open in the team's documents"),
         _ if q.kind == Kind::Reach => (q.question.clone(), "queued by a cleanup of the team's lessons"),
         _ if q.kind == Kind::Constraint => (q.question.clone(), "proposed from an engineer's veto"),
-        _ if q.kind == Kind::Contract => (q.question.clone(), "proposed by a drone of a hive goal"),
-        _ if q.kind == Kind::Playbook => (q.question.clone(), "learned from verified hive work"),
-        _ if q.kind == Kind::Plan => (q.question.clone(), "raised by `borg debug hive run`, whose drones wait for it"),
+        _ if q.kind == Kind::Playbook => (q.question.clone(), "learned from a session that ended clean"),
         _ => (q.question.clone(), "queued by an earlier session"),
     };
     let day = crate::install::utc(q.ms);
@@ -1570,22 +1522,7 @@ pub fn main(args: &[&str]) -> i32 {
         }
         ["answer", key, text @ ..] if !text.is_empty() => {
             let author = learn::engineer(&cwd);
-            // `--dir` names the session's directory, which may be a drone's worktree the process is not in.
-            let drone = |e: &Entry| hive_question(e) && crate::hive::drone(&store, &cwd);
-            // An interactive goal's plan or budget (hive/plan.rs `at_own_prompt`): the engineer's own prompt
-            // answers it in the session that opened it, never a command that session's model runs.
-            let in_session = |e: &Entry| {
-                crate::hive::plan::at_own_prompt(e) && (crate::hive::interactive::env_session().is_some() || crate::hive::interactive::plugin_binds())
-            };
-            let checked = find(key).and_then(|e| match () {
-                _ if drone(&e) => Err(format!("{} is the engineer's to answer, never a hive drone's", e.id)),
-                _ if in_session(&e) => Err(format!(
-                    "{} is answered by the engineer at their own prompt (`yes`, or `no, because ...`), or from their terminal: never by a command run inside a session",
-                    e.id
-                )),
-                _ => Ok(e),
-            });
-            match checked.and_then(|e| answer(&store, &e.id, &option_answer(&e, &text.join(" "))?, &author, now)) {
+            match find(key).and_then(|e| answer(&store, &e.id, &option_answer(&e, &text.join(" "))?, &author, now)) {
                 Ok(e) if e.kind == Kind::Reach => {
                     println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
                     0
@@ -1601,24 +1538,6 @@ pub fn main(args: &[&str]) -> i32 {
                     match e.answer.as_deref().is_some_and(crate::playbook::promotes) {
                         true => println!("{} answered: the edit is promoted into {}", e.id, store.join(crate::playbook::FILE).display()),
                         false => println!("{} answered: the playbook stays as it is", e.id),
-                    }
-                    0
-                }
-                Ok(e) if e.kind == Kind::Plan && e.payload.as_ref().is_some_and(|p| p["budget"].is_number()) => {
-                    println!("{} answered: {}", e.id, e.answer.as_deref().unwrap_or_default());
-                    0
-                }
-                Ok(e) if e.kind == Kind::Plan => {
-                    match e.answer.as_deref().is_some_and(crate::hive::plan::approves) {
-                        true => println!("{} answered: the plan is approved; its run starts the drones", e.id),
-                        false => println!("{} answered: the plan is refused; its run stops with nothing claimed", e.id),
-                    }
-                    0
-                }
-                Ok(e) if e.kind == Kind::Contract => {
-                    match e.answer.as_deref().is_some_and(crate::hive::contract::supersedes_answer) {
-                        true => println!("{} answered: the drone's contract supersedes the other one", e.id),
-                        false => println!("{} answered: the current contract stays", e.id),
                     }
                     0
                 }
@@ -2163,15 +2082,15 @@ mod tests {
         assert!(answer(&store, "qa", "x", "lead@x", 6).unwrap_err().contains("dismissed"));
         assert!(dismiss(&store, "qa", "", 6).is_err() && skip(&store, "qa", "s1", 6).is_err());
         // A dismissed question is never delivered.
-        assert_eq!(deliver(&store, "s1", "", || vec!["app".into()], "", 7), None);
+        assert_eq!(deliver(&store, "s1", || vec!["app".into()], "", 7), None);
 
         skip(&store, "qb", "cli", 100).unwrap();
         assert_eq!(open_ids(&store), ["qb"], "a skipped question stays open");
         let sk = skips(&store);
         assert_eq!(sk, [Mark { id: "qb".into(), session: "cli".into(), ms: 100 }]);
         assert!(skipped(&sk, "qb", 100 + SKIP_MS - 1) && !skipped(&sk, "qb", 100 + SKIP_MS) && !skipped(&sk, "qa", 100));
-        assert_eq!(deliver(&store, "s2", "", || vec!["lib".into()], "", 100 + SKIP_MS - 1), None);
-        assert_eq!(deliver(&store, "s3", "", || vec!["lib".into()], "", 100 + SKIP_MS).map(|q| q.id), Some("qb".into()));
+        assert_eq!(deliver(&store, "s2", || vec!["lib".into()], "", 100 + SKIP_MS - 1), None);
+        assert_eq!(deliver(&store, "s3", || vec!["lib".into()], "", 100 + SKIP_MS).map(|q| q.id), Some("qb".into()));
     }
 
     #[test]
@@ -2197,32 +2116,6 @@ mod tests {
         let q = |plan: &str| Entry { question: question(&classify(plan, "app").remove(0)), ..open_q("x", "/w/app", "", &[]) };
         assert!(!duplicate(&q("Drop the audit table."), &q("Drop the users table.")));
         assert!(duplicate(&q("Drop the audit table."), &q("Then drop the audit table.")));
-    }
-
-    #[test]
-    fn hive_questions_are_never_duplicates_and_mask_no_move_elsewhere() {
-        let plan = |id: &str, more: &str| Entry {
-            kind: Kind::Plan,
-            question: format!(
-                "Hive goal g: approve its plan before drones start? 2 task(s): t1 \"drop the users table and rebuild it\" (high); t2 \"write docs\" (low){more}"
-            ),
-            ..open_q(id, "/w/app", "", &[])
-        };
-        let (p1, p2) = (plan("p1", ""), plan("p2", "; t3 \"add a test\" (low)"));
-        assert!(duplicate(&p1, &p2), "a changed plan reads like the old one");
-        assert!(duplicates(&[p1.clone(), p2.clone()]).is_empty(), "dedupe leaves the waiting run's question alone");
-        let task = |id: &str| Entry {
-            kind: Kind::Irreversible,
-            payload: Some(serde_json::json!({"goal": "g", "task": id})),
-            question: "Hive task drops the users table and rebuilds it: go ahead?".into(),
-            ..open_q(id, "/w/app", "", &[])
-        };
-        assert!(duplicates(&[task("t1.g1"), task("t1.g2")]).is_empty(), "a group's attempts each keep their question");
-        let d = classify("Drop the users table and rebuild it.", "lib").remove(0);
-        assert!(near(&d, &p1.question));
-        assert!(!masks(&p1, "lib") && !masks(&p1, "app"), "a plan masks no move");
-        assert!(!masks(&task("t1"), "lib") && masks(&task("t1"), "app"), "an escalation masks only its own repo's");
-        assert!(masks(&open_q("q", "/w/app", "", &[]), "lib"));
     }
 
     #[test]
@@ -2263,23 +2156,23 @@ mod tests {
     fn delivery_is_one_question_per_session_of_the_sessions_own_repos() {
         let store = queue("deliver");
         let app = ["app".to_string()];
-        assert_eq!(deliver(&store, "s1", "", || vec!["other".into()], "", 10), None, "never another repo's question");
+        assert_eq!(deliver(&store, "s1", || vec!["other".into()], "", 10), None, "never another repo's question");
         assert!(!visits_path(&store).exists(), "a session without questions of its repos is not counted");
-        let q = deliver(&store, "s1", "", || app.to_vec(), "", 10).unwrap();
+        let q = deliver(&store, "s1", || app.to_vec(), "", 10).unwrap();
         assert_eq!((q.id.as_str(), q.n, q.answer_cmd.as_str()), ("qa", 1, "borg queen answer 'qa' '<answer>'"));
-        assert_eq!(deliver(&store, "s1", "", || app.to_vec(), "", 11), None, "once per session");
-        assert_eq!(deliver(&store, "s1", "", || unreachable!("settled before the work's repos"), "", 11), None);
-        assert_eq!(deliver(&store, "s1", "", || vec!["lib".into()], "", 11), None, "once per session, whatever the repo");
+        assert_eq!(deliver(&store, "s1", || app.to_vec(), "", 11), None, "once per session");
+        assert_eq!(deliver(&store, "s1", || unreachable!("settled before the work's repos"), "", 11), None);
+        assert_eq!(deliver(&store, "s1", || vec!["lib".into()], "", 11), None, "once per session, whatever the repo");
         assert_eq!(deliveries(&store), [Mark { id: "qa".into(), session: "s1".into(), ms: 10 }]);
         // The next session gets the never-delivered one first; then qa waits for 3 more sessions.
-        assert_eq!(deliver(&store, "s2", "", || app.to_vec(), "", 20).map(|q| q.id), Some("qc".into()));
+        assert_eq!(deliver(&store, "s2", || app.to_vec(), "", 20).map(|q| q.id), Some("qc".into()));
         answer(&store, "qc", "never", "lead@x", 21).unwrap();
         for s in ["s3", "s4"] {
-            assert_eq!(deliver(&store, s, "", || app.to_vec(), "", 30), None, "{s}");
+            assert_eq!(deliver(&store, s, || app.to_vec(), "", 30), None, "{s}");
         }
-        assert_eq!(deliver(&store, "s5", "", || app.to_vec(), "", 40).map(|q| q.id), Some("qa".into()), "after 3 more sessions");
+        assert_eq!(deliver(&store, "s5", || app.to_vec(), "", 40).map(|q| q.id), Some("qa".into()), "after 3 more sessions");
         // The work's repo matches by name, case aside, and a touched repo counts.
-        assert_eq!(deliver(&store, "s6", "", || vec!["x".into(), "LIB".into()], "", 50).map(|q| q.id), Some("qb".into()));
+        assert_eq!(deliver(&store, "s6", || vec!["x".into(), "LIB".into()], "", 50).map(|q| q.id), Some("qb".into()));
         assert!(ask_on(None) && ask_on(Some("on")) && !ask_on(Some("off")) && !ask_on(Some(" OFF ")));
     }
 
@@ -2298,6 +2191,25 @@ mod tests {
         assert_eq!(at("s5", &sk, 45 + SKIP_MS), Some((0, "qa".into())));
         // An unknown session: sessions first seen after the delivery count.
         assert_eq!(at("s9", &[], 60), Some((0, "qa".into())));
+    }
+
+    #[test]
+    fn an_old_hive_tasks_open_question_waits_and_masks_only_its_own_repo() {
+        let drop = "Drop the users table and rebuild it.";
+        let task = Entry {
+            kind: Kind::Irreversible,
+            payload: Some(serde_json::json!({"goal": "g", "task": "t1"})),
+            question: question(&classify(drop, "app").remove(0)),
+            ..open_q("t1", "/w/app", "", &[])
+        };
+        let open = vec![task.clone(), open_q("qa", "/w/app", RETRY, &[])];
+        let app = ["app".to_string()];
+        let first = eligible(&open, &[], &[], &[], "s1", &app, 1).map(|(_, e)| e.id.clone());
+        assert_eq!(first.as_deref(), Some("qa"), "the session's own decision first");
+        let lib = Checkpoint { cwd: "/w/lib", ..cp(Path::new("/nonexistent"), "s1", drop, TASK) };
+        assert_eq!(decide(&lib, std::slice::from_ref(&task), || true, Vec::new).len(), 1, "another repo's move is asked");
+        let app_cp = cp(Path::new("/nonexistent"), "s1", drop, TASK);
+        assert!(decide(&app_cp, &[task], || true, Vec::new).is_empty(), "its own repo's reworded move is masked");
     }
 
     #[test]

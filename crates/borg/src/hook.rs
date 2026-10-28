@@ -17,23 +17,8 @@ use crate::harness::{self, Harness};
 use crate::learn::learning;
 use crate::{collective, conscience, learn, live, outcome, predict, prefilter};
 
-thread_local! {
-    /// The state directory a reader of a collective's sessions uses on this thread (`in_state`).
-    static STATE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-/// `f` with `dir` as this thread's state directory unless `BORG_STATE` names one: a reader of a
-/// collective's drones (monitoring: `borg top`, borg-web) finds their session files where the hooks and
-/// hive commands keep them, the collective's own `state` (`main`), though it never set `BORG_STATE`.
-pub(crate) fn in_state<R>(dir: PathBuf, f: impl FnOnce() -> R) -> R {
-    let before = STATE.with(|s| s.replace(Some(dir)));
-    let out = f();
-    STATE.with(|s| *s.borrow_mut() = before);
-    out
-}
-
 pub(crate) fn state_file(session: &str) -> PathBuf {
-    let dir = std::env::var_os("BORG_STATE").map(PathBuf::from).or_else(|| STATE.with(|s| s.borrow().clone())).unwrap_or_else(|| PathBuf::from("/tmp/borg"));
+    let dir = std::env::var_os("BORG_STATE").map_or_else(|| PathBuf::from("/tmp/borg"), PathBuf::from);
     let _ = std::fs::create_dir_all(&dir);
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
     dir.join(format!("{safe}.ctx"))
@@ -828,7 +813,7 @@ fn queen_ask(h: &dyn Harness, session: &str, cwd: &str) -> Option<String> {
         repos
     };
     let scope = if cwd.is_empty() { String::new() } else { format!(" --dir {}", crate::queen::sh_quote(cwd)) };
-    let mut q = crate::queen::deliver(&learn::home(), session, cwd, repos, &scope, learn::now_ms())?;
+    let mut q = crate::queen::deliver(&learn::home(), session, repos, &scope, learn::now_ms())?;
     if let Ok(exe) = std::env::current_exe() {
         q = q.run_by(&crate::queen::sh_quote(&exe.display().to_string()));
     }
@@ -1631,31 +1616,14 @@ pub fn main(name: &str, event: &str) {
     }
     // Who is working where (presence.rs, for `borg top`): one small atomic write per hook.
     let now = learn::now_ms();
-    // A session's start answers only for an interactive hive drone (hive/interactive.rs): nothing else of
-    // a plain session's start is read or written, after one failed open.
-    if event == "start" {
-        if let Some(out) = crate::hive::interactive::session_start(h, &home, &input, now) {
-            println!("{out}");
-        }
+    // A session's start and a halted turn (hooks of an older install) read and write nothing.
+    if matches!(event, "start" | "halted") {
         return;
     }
-    // A turn halted with no stop (opencode's plugin, codex's Interrupt, for an interactive hive drone
-    // only): its engineer's turn is over (hive/interactive.rs `halted`); nothing else is read or written.
-    if event == "halted" {
-        crate::hive::interactive::halted(input.get("session_id").and_then(Value::as_str).unwrap_or_default());
-        return;
-    }
-    // Not at pre_tool (every tool call): there only the hive's refusal of a lost claim's edits
-    // (hive/mod.rs `pre_tool`), its guard flags (hive/guard.rs: one failed open for a session in no
-    // goal; a refused edit never runs, so it flags nothing) and steering reads, only once someone steered.
+    // Not at pre_tool (every tool call): there only steering reads, once someone steered.
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let me = match event {
         "pre_tool" => {
-            if let Some(deny) = crate::hive::pre_tool(h, &home, &input, now) {
-                println!("{deny}");
-                return;
-            }
-            crate::hive::guard::pre_tool(&home, &input, now);
             if !crate::steer::inbox(&home).exists() {
                 return;
             }
@@ -1663,14 +1631,10 @@ pub fn main(name: &str, event: &str) {
         }
         _ => crate::presence::touch(&home, &name, h.name(), event, &input, now),
     };
-    // A drone launched into a hive goal (BORG_HIVE) joins it at its first hook (hive/mod.rs).
-    crate::hive::bind_from_env(&home, session, cwd);
     // Signed steering (steer.rs) wraps the answer: shown once, and a pause holds tools and the stop.
-    // Inside it the hive (hive/mod.rs): the drone's claim and board at a prompt, its oracle at the stop;
-    // nothing for a session in no hive goal. At a stop, the routed collective's experts join the
-    // conscience's block (expert_route.rs).
+    // At a stop, the routed collective's experts join the conscience's block (expert_route.rs).
     if let Some(out) = crate::steer::around(&home, h.caps().steer_in_context, event, &input, me.map(|p| p.started), now, || {
-        crate::hive::around(h, &home, event, &input, now, || crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input)))
+        crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input))
     }) {
         println!("{out}");
     }

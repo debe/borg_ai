@@ -19,17 +19,10 @@
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies
 //!    and the membership admits its origin key at its stamp time.
 //!
-//!    3b. The hive (borg hive/mod.rs `SYNCED`): `Goals` swaps the ids of the goals each side holds an
-//!    admitted hive line of, both sides keep the valid ids (an id names a directory) and take the
-//!    sorted union, then reconcile each goal's goal.jsonl, tasks.jsonl, contracts.jsonl,
-//!    messages.jsonl, flags.jsonl, bundles.jsonl and spend.jsonl in that order, exactly as the logs
-//!    above (a spend line that names no node stays on its node: lines.rs `local`). Receiving a
-//!    goal writes its logs only, never goal.json (the hidden oracle stays on the node that made the goal).
-//!    bundles.jsonl carries each attempt's commits as a git bundle (borg hive/commits.rs): a line over its
-//!    cap (lines.rs `cap`) is neither offered nor stored, and the receiving node unbundles a line only
-//!    once its board needs those commits and they are exactly the attempt the board names. Before each
-//!    session the node credits the verdicts that arrived on work done here and publishes its goals'
-//!    projections (`Node::stamp`).
+//!    3b. `Goals`: the removed hive's step, still spoken so a 0.3.0 peer keeps syncing on
+//!    `borg/mesh/12`. This node names no goal; for each valid goal id the peer names it follows the
+//!    peer's reconciliation of that goal's `LEGACY_GOAL_LOGS` logs and stores nothing (`skip`). What
+//!    a peer gave is remembered in memory (`Node::legacy`), so it is not sent again every session.
 //!
 //! One `Lines` frame carries at most `MAX_GIVE` bytes of lines; the rest go at the next session (the
 //! sets still differ, so its reconciliation finds them again).
@@ -41,13 +34,12 @@
 //!    an admitted excerpt for one (or a link record with it on either side) answers with it, author
 //!    or replica, so the "why" can be read back while its author is offline.
 //! 6. `Live`: ephemeral, never reconciled into a log: presence (live.rs: which drones run where,
-//!    latest per member and session, a day at most), signed steering directives (steer.rs:
-//!    checked against the membership on receipt; refused ones are dropped and logged) and each hive
-//!    goal's newest beat per node (beats.rs: signed by its node, kept only when newer).
+//!    latest per member and session, a day at most) and signed steering directives (steer.rs:
+//!    checked against the membership on receipt; refused ones are dropped and logged). A 0.3.0
+//!    peer's hive beats in it are ignored.
 //!
 //! A completed session, dialled or served, is recorded on each side by when it started, per member
-//! (`mesh/synced.json`, borg presence.rs `synced_path`): a hive claim made before that ms has reached
-//! the member, and so have the member's own claims up to its reading of the logs.
+//! (`mesh/synced.json`, borg presence.rs `synced_path`).
 //!
 //! Addressing is by key (addr.rs): a peer is dialled at its node id, with direct addresses and
 //! relay URLs as optional hints. How the endpoint reaches it across NAT is the collective's relay
@@ -80,12 +72,10 @@ use crate::{live, steer};
 
 mod vectors;
 
-/// The session protocol. 12: a hive goal's beats are no board lines but each node's newest in the live
-/// exchange (beats.rs); a peer on 11 would hear no beat of this node and suspect its drones, and its own
-/// beats would grow every board, so it is refused at the handshake. 11: `constraints.jsonl` is a fifth synced log (lines.rs `SYNCED`); the logs
-/// reconcile in a fixed list, so a peer on 10 would reconcile another file at the same step and is
-/// refused at the handshake instead. 10: a goal's `spend.jsonl` is a seventh synced hive log (borg
-/// hive/run.rs `ledger`).
+/// The session protocol. 12 is kept since the hive's removal: its steps (`Goals`, the beats of `Live`)
+/// are still spoken empty, so a 0.3.0 peer syncs the lessons with this node. 11: `constraints.jsonl` is
+/// a fifth synced log (lines.rs `SYNCED`); the logs reconcile in a fixed list, so a peer on 10 would
+/// reconcile another file at the same step and is refused at the handshake instead.
 pub const ALPN: &[u8] = b"borg/mesh/12";
 /// The protocols of older nodes (`borg/mesh/11` down to `/1`), offered and accepted beside `ALPN` only to
 /// tell a mismatch: without them the handshake fails and nothing says why. A session on one is closed at
@@ -103,13 +93,16 @@ fn version(alpn: &[u8]) -> Option<u32> {
 pub const JOIN_ALPN: &[u8] = b"borg/join/1";
 /// Largest frame accepted; a lessons log is far smaller, a bigger frame is a broken or hostile peer.
 const MAX_FRAME: usize = 256 << 20;
-/// Most bytes of lines one `Lines` frame gives (well within `MAX_FRAME`): a goal's many bundles go over
+/// Most bytes of lines one `Lines` frame gives (well within `MAX_FRAME`): a big difference goes over
 /// several sessions, never in a frame the peer refuses.
 const MAX_GIVE: usize = 64 << 20;
 /// How many members hold a replica of each reasoning excerpt besides its author.
 pub const REPLICAS: usize = 2;
 /// Most commits one `Ask` names, and most excerpts one answer carries.
 const MAX_ASK: usize = 1000;
+/// How many logs per goal a 0.3.0 peer reconciles in step 3b (its hive's synced logs: goal, tasks,
+/// contracts, messages, flags, bundles, spend).
+const LEGACY_GOAL_LOGS: usize = 7;
 
 /// Where a node finds its collective. Kept instead of a fixed `Route` so every session re-reads the
 /// config: setting the collective to `share: local`, adding the repo to `off` or breaking the file
@@ -216,8 +209,6 @@ pub struct Report {
     pub answered: usize,
     /// Remote presence records that were new or newer (live.rs).
     pub presence: usize,
-    /// Hive goal beats of other nodes that were new or newer (beats.rs).
-    pub beats: usize,
     /// Steering directives newly filed / refused (steer.rs).
     pub steered: usize,
     pub dropped: usize,
@@ -263,7 +254,7 @@ enum Msg {
     Lines {
         lines: Vec<Signed>,
     },
-    /// The hive goals a side holds an admitted line of (3b).
+    /// The hive goals a side holds (3b): none from this node, a 0.3.0 peer's are skipped.
     Goals {
         ids: Vec<String>,
     },
@@ -279,9 +270,6 @@ enum Msg {
     Live {
         presence: Vec<borg::presence::Remote>,
         directives: Vec<borg::steer::Directive>,
-        /// Each hive goal's newest beat per node (beats.rs, `borg/mesh/12`).
-        #[serde(default)]
-        beats: Vec<crate::beats::Beat>,
     },
 }
 
@@ -310,6 +298,9 @@ pub struct Node {
     announce: bool,
     /// How peers are reached (addr.rs), fixed when the endpoint was built.
     relay: Relay,
+    /// The hashes each 0.3.0 peer gave per hive goal log (3b), by (peer, goal, log): never stored, so
+    /// the next dial reconciles against them and the peer gives only what is new.
+    legacy: Mutex<HashMap<(String, String, usize), BTreeSet<Hash>>>,
 }
 
 impl Node {
@@ -351,7 +342,7 @@ impl Node {
             builder = builder.bind_addr(a).map_err(|e| e.to_string())?;
         }
         let endpoint = tweak(builder).bind().await.map_err(|e| format!("bind {}: {e}", addr.map(|a| a.to_string()).unwrap_or("relay".into())))?;
-        Ok(Node { place: place.clone(), home, me, endpoint, store: Mutex::new(()), announce: true, relay })
+        Ok(Node { place: place.clone(), home, me, endpoint, store: Mutex::new(()), announce: true, relay, legacy: Mutex::default() })
     }
 
     /// Waits until the endpoint holds a connection to its home relay (at most `within`); true if
@@ -449,12 +440,7 @@ impl Node {
     /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
     pub fn stamp(&self) -> Result<usize, String> {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        // Verdicts that arrived on this node's work are credited first, so their outcomes publish in the
-        // same step; then the goals made here, then fresh outcomes, all stamped in the same step. The
-        // work is this node's only where no other member stamped its claim or done line.
-        let (origins, me) = (origin::load(&self.home), self.me.public());
-        borg::hive::verdict::credit_synced(&self.home, |line| origins.get(&lines::hash(line)).is_none_or(|o| o.key == me));
-        borg::hive::publish(&self.home);
+        // Fresh outcomes first, so they are stamped in the same step.
         borg::outcome::publish(&self.home);
         origin::stamp(&self.home, &self.me, &logs(&self.home), borg::learn::now_ms())
     }
@@ -485,8 +471,7 @@ impl Node {
         line
     }
 
-    /// Forgets `remote`'s last completed session (presence.rs `forget_synced`): a dial to it failed, so
-    /// no hive claim here waits on it until a session with it completes again.
+    /// Forgets `remote`'s last completed session (presence.rs `forget_synced`): a dial to it failed.
     pub(crate) fn unreachable(&self, remote: &str) {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let _ = borg::presence::forget_synced(&self.home, remote);
@@ -694,15 +679,13 @@ impl Node {
             self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
         }
 
-        // The hive: every goal either side holds, each of its logs in turn (3b).
-        let held: Vec<String> = goal_ids(home, &origins, &mine);
-        self.gate()?;
-        let Msg::Goals { ids } = swap(dialler, tx, rx, Msg::Goals { ids: held.clone() }).await? else {
+        // A 0.3.0 peer's hive goals (3b): followed, nothing kept.
+        let Msg::Goals { ids } = swap(dialler, tx, rx, Msg::Goals { ids: Vec::new() }).await? else {
             return Err("protocol: expected goals".into());
         };
-        for id in &goals_to_sync(held, ids) {
-            for path in lines::hive_files(home, id) {
-                self.reconcile(dialler, tx, rx, &path, &origins, &mine, &mut report).await?;
+        for goal in legacy_goals(ids) {
+            for log in 0..LEGACY_GOAL_LOGS {
+                self.skip(dialler, tx, rx, (remote.to_string(), goal.clone(), log)).await?;
             }
         }
 
@@ -750,18 +733,13 @@ impl Node {
 
         // Live: presence and steering, ephemeral (live.rs, steer.rs).
         let now = borg::learn::now_ms();
-        let live = Msg::Live {
-            presence: live::outgoing(home, &self.me, now),
-            directives: steer::outgoing(home, now),
-            beats: crate::beats::outgoing(home, &self.me, now),
-        };
+        let live = Msg::Live { presence: live::outgoing(home, &self.me, now), directives: steer::outgoing(home, now) };
         self.gate()?; // again just before anything leaves
-        let Msg::Live { presence, directives, beats } = swap(dialler, tx, rx, live).await? else {
+        let Msg::Live { presence, directives } = swap(dialler, tx, rx, live).await? else {
             return Err("protocol: expected live".into());
         };
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         report.presence += live::receive(home, &mine, &me, presence, now)?;
-        report.beats += crate::beats::receive(home, &mine, &me, beats, borg::learn::now_ms())?;
         let (new, dropped) = steer::receive(home, &mine, &me, &directives, now);
         (report.steered, report.dropped) = (report.steered + new, report.dropped + dropped);
         borg::veto::apply_inbox(home); // a veto for a drone of this node: its credit and episode, once
@@ -803,6 +781,42 @@ impl Node {
         self.store_lines(path, got, &r.want, mine, None, report)
     }
 
+    /// One log of a 0.3.0 peer's hive goal (3b), followed in step with it and kept nowhere. The listener
+    /// answers the peer's first round with that round itself, which closes it with nothing to give
+    /// either way. The dialler speaks first, so it reconciles the hashes this peer gave before (`legacy`)
+    /// and remembers the ones it gives now: the peer sends each line once per process, not per session.
+    async fn skip(&self, dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, log: (String, String, usize)) -> Result<(), String> {
+        let mut want = BTreeSet::new();
+        if dialler {
+            let given = self.legacy.lock().unwrap_or_else(|e| e.into_inner()).get(&log).cloned().unwrap_or_default();
+            let given: BTreeMap<Hash, ()> = given.into_iter().map(|h| (h, ())).collect();
+            let mut r = Recon::new(&given);
+            loop {
+                let m = r.message();
+                let Msg::Round { round } = swap(true, tx, rx, Msg::Round { round: m.clone() }).await? else {
+                    return Err("protocol: expected a reconciliation round".into());
+                };
+                if r.absorb(&m, round)? {
+                    break;
+                }
+            }
+            want = r.want;
+        } else {
+            let Msg::Round { round } = recv(rx).await? else {
+                return Err("protocol: expected a reconciliation round".into());
+            };
+            send(tx, &Msg::Round { round }).await?;
+        }
+        let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: Vec::new() }).await? else {
+            return Err("protocol: expected lines".into());
+        };
+        let got: Vec<Hash> = got.iter().map(|s| lines::hash(&s.line)).filter(|h| want.contains(h)).collect();
+        if !got.is_empty() {
+            self.legacy.lock().unwrap_or_else(|e| e.into_inner()).entry(log).or_default().extend(got);
+        }
+        Ok(())
+    }
+
     /// Stores the lines that were asked for, whose origin verifies and is admitted (and, for
     /// replicas, is the peer itself): origin records first, so a line is never re-stamped as ours.
     fn store_lines(
@@ -817,11 +831,7 @@ impl Node {
         let mut keep: BTreeMap<Hash, Signed> = BTreeMap::new();
         for s in got {
             let h = lines::hash(&s.line);
-            let ok = want.contains(&h)
-                && s.line.len() <= lines::cap(path)
-                && s.origin.verify(&s.line).is_ok()
-                && m.admits(&s.origin.key, s.origin.ms)
-                && author.is_none_or(|a| a == s.origin.key);
+            let ok = want.contains(&h) && s.origin.verify(&s.line).is_ok() && m.admits(&s.origin.key, s.origin.ms) && author.is_none_or(|a| a == s.origin.key);
             if ok {
                 keep.insert(h, s);
             } else {
@@ -836,23 +846,11 @@ impl Node {
     }
 }
 
-/// The goals both sides reconcile, the same list on both: the union of the ids each offered, sorted,
-/// keeping only valid goal ids (an id names a directory: "../x" or "A B" never becomes one).
-fn goals_to_sync(mine: Vec<String>, theirs: Vec<String>) -> BTreeSet<String> {
-    mine.into_iter().chain(theirs).filter(|id| borg::hive::goal::valid_id(id)).collect()
-}
-
-/// The hive goals of `home` with at least one admitted line in a synced hive log, sorted: what a node
-/// offers in `Goals`. A goal only made here and not yet stamped is offered at the next session.
-fn goal_ids(home: &Path, origins: &HashMap<Hash, Origin>, m: &Membership) -> Vec<String> {
-    let mut ids: BTreeSet<String> = BTreeSet::new();
-    for path in lines::hive_logs(home) {
-        let id = path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).unwrap_or_default().to_string();
-        if !ids.contains(&id) && !origin::admitted(lines::read(&path), origins, m).is_empty() {
-            ids.insert(id);
-        }
-    }
-    ids.into_iter().collect()
+/// The goals a 0.3.0 peer reconciles after naming `ids` while this node names none, in its order: the
+/// distinct valid goal ids (its `goal::valid_id`: `[a-z0-9-]{1,40}`), sorted.
+fn legacy_goals(ids: Vec<String>) -> BTreeSet<String> {
+    let valid = |id: &String| (1..=40).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ids.into_iter().filter(valid).collect()
 }
 
 /// Where a dialler that announced `listen` can be reached: the IP its packets came from (what
@@ -1450,7 +1448,6 @@ mod tests {
         let opts = Options {
             interval: Duration::from_millis(300),
             poll: Duration::from_millis(50),
-            hive_poll: Duration::from_millis(50),
             backoff_max: Duration::from_millis(600),
             timeout: Duration::from_secs(5),
             grace: Duration::from_secs(1),
@@ -1546,103 +1543,25 @@ mod tests {
         }
     }
 
-    /// Goal g1 with task t0 open, in alice's hive: the line, and where the goal lives at alice and bob.
-    fn hive_goal(a: &Path, b: &Path) -> (String, PathBuf, PathBuf) {
-        let (ga, gb) = (a.join("hive/g1"), b.join("hive/g1"));
-        std::fs::create_dir_all(&ga).unwrap();
-        let open = json!({"v": 1, "ev": "open", "task": "t0", "ms": 1, "by": "engineer:alice@x",
-            "def": {"id": "t0", "role": "work", "title": "do t0"}})
-        .to_string();
-        write(&ga, "tasks.jsonl", std::slice::from_ref(&open));
-        (open, ga, gb)
-    }
-
-    /// Appends claim `i` to alice's board (`ga`) and waits for it in bob's (`gb`): how long it took, in ms.
-    async fn claim_trip(ga: &Path, gb: &Path, i: u64, failed: &std::sync::Mutex<Vec<String>>) -> f64 {
-        let claim = json!({"v": 1, "ev": "claim", "task": "t0", "ms": borg::learn::now_ms(), "by": format!("s{i}")}).to_string();
+    /// Appends a stats line `i` to alice's store (`a`) and waits for it in bob's (`b`): how long it took, in
+    /// ms. Not a lesson: a received lesson re-indexes bob's vectors before the session ends (vectors.rs
+    /// `reindexed`), which times the embedding model, not the dials.
+    async fn stat_trip(a: &Path, b: &Path, i: u64, failed: &std::sync::Mutex<Vec<String>>) -> f64 {
+        let l = rollup(&format!("n{i}"), 1, i);
         let at = std::time::Instant::now();
-        append_lines(ga, "tasks.jsonl", std::slice::from_ref(&claim));
-        while !holds(gb, "tasks.jsonl", &claim) {
-            assert!(
-                at.elapsed() < std::time::Duration::from_secs(10),
-                "timed out waiting for alice's claim {i} at bob; failures: {:?}",
-                failed.lock().unwrap()
-            );
+        append_lines(a, "stats.jsonl", std::slice::from_ref(&l));
+        while !holds(b, "stats.jsonl", &l) {
+            assert!(at.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for alice's line {i} at bob; failures: {:?}", failed.lock().unwrap());
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         at.elapsed().as_secs_f64() * 1000.0
     }
 
-    /// Two `serve` loops with `opts`: 24 claims appended to alice's board, each timed until it is in
-    /// bob's (sorted, ms); each side records when its last completed session with the other started.
-    async fn claim_trips(tag: &str, opts: crate::daemon::Options) -> Vec<f64> {
-        use std::sync::Arc;
-        use std::time::Duration;
-        let p = crew(tag, &["alice", "bob"]);
-        let (a, b) = (home(&p[0]), home(&p[1]));
-        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
-        let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
-        assert!(peers::remember(&b, &alice.public(), &addr_of(&alice)).unwrap());
-        let (open, ga, gb) = hive_goal(&a, &b);
-        let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
-        // Bob dials at start: the goal reaches him and alice learns where he is.
-        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
-        eventually("bob's address at alice", Duration::from_secs(10), || peers::load(&a).contains_key(&bob.public())).await;
-        let mut took = Vec::new();
-        for i in 1..=24u64 {
-            // Off any beat of the loops' ticks.
-            tokio::time::sleep(Duration::from_millis(40 + (i * 37) % 160)).await;
-            let ms = borg::learn::now_ms();
-            took.push(claim_trip(&ga, &gb, i, &serve.failed).await);
-            // Bob's served session wrote it, so it started after the claim; alice's dial reports a moment later.
-            eventually("alice's session recorded at bob", Duration::from_secs(5), || borg::presence::synced(&b).get(&alice.public()).is_some_and(|&s| s >= ms))
-                .await;
-            eventually("bob's session recorded at alice", Duration::from_secs(5), || borg::presence::synced(&a).get(&bob.public()).is_some_and(|&s| s >= ms))
-                .await;
-        }
-        took.sort_by(f64::total_cmp);
-        println!(
-            "claim at the peer: p50 {:.0} ms, p95 {:.0} ms, max {:.0} ms over {} trials",
-            took[took.len() / 2],
-            p95(&took),
-            took[took.len() - 1],
-            took.len()
-        );
-        serve.stop().await;
-        took
-    }
-
-    fn p95(took: &[f64]) -> f64 {
-        took[(took.len() * 95).div_ceil(100) - 1]
-    }
-
-    /// Two `serve` loops with the shipped options: a claim appended to alice's board is in bob's well
-    /// before the 2 s poll of the whole store (p95 under 1 s here, on any machine running the suite;
-    /// before E3 the median alone was 1.9 s), and each side records its sessions with the other.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn serve_carries_a_claim_to_the_peer_at_once() {
-        use std::time::Duration;
-        let opts = crate::daemon::Options { timeout: Duration::from_secs(5), grace: Duration::from_secs(1), ..Default::default() };
-        let took = claim_trips("claim", opts).await;
-        assert!(p95(&took) < 1000.0, "a claim reaches the peer within 1 s at p95, took {took:?}");
-    }
-
-    /// Phase e E3's pre-registered bar, p95 under 300 ms over 24 trials: a timing measured on an idle
-    /// machine (`cargo test -p borg-mesh -- --ignored a_claim_reaches`), not in the default suite.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "timing bar for an idle machine"]
-    async fn a_claim_reaches_the_peer_within_300_ms_at_p95() {
-        use std::time::Duration;
-        let opts = crate::daemon::Options { timeout: Duration::from_secs(5), grace: Duration::from_secs(1), ..Default::default() };
-        let took = claim_trips("claim-bar", opts).await;
-        assert!(p95(&took) < 300.0, "a claim reaches the peer within 300 ms at p95, took {took:?}");
-    }
-
     /// Carol is a member alice dials, but her endpoint is gone: her dials wait out their `timeout`
-    /// (and come back after the first retry), and alice's claims still reach bob at once. Carol's
-    /// session record from before goes with her first failed dial, so no claim waits on her.
+    /// (and come back after the first retry), and alice's lines still reach bob a `poll` later.
+    /// Carol's session record from before goes with her first failed dial.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_peer_that_does_not_answer_holds_no_claim_back() {
+    async fn a_peer_that_does_not_answer_holds_no_line_back() {
         use std::sync::Arc;
         use std::time::Duration;
         let p = crew("deaf", &["alice", "bob", "carol"]);
@@ -1655,25 +1574,29 @@ mod tests {
         assert!(peers::remember(&a, &key, &at).unwrap());
         assert!(peers::remember(&b, &alice.public(), &addr_of(&alice)).unwrap());
         borg::presence::note_synced(&a, &key, borg::learn::now_ms()).unwrap();
-        let (open, ga, gb) = hive_goal(&a, &b);
-        let opts = crate::daemon::Options { timeout: Duration::from_secs(3), grace: Duration::from_secs(1), ..Default::default() };
+        let opts =
+            crate::daemon::Options { poll: Duration::from_millis(100), timeout: Duration::from_secs(3), grace: Duration::from_secs(1), ..Default::default() };
         let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
-        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
         eventually("bob's address at alice", Duration::from_secs(10), || peers::load(&a).contains_key(&bob.public())).await;
         // Over 6 s: carol's first dial, its retry a `poll` after it failed, and the one after.
         let mut took = Vec::new();
         for i in 1..=15u64 {
-            took.push(claim_trip(&ga, &gb, i, &serve.failed).await);
+            took.push(stat_trip(&a, &b, i, &serve.failed).await);
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
         let failed = serve.failed.lock().unwrap().clone();
         assert!(failed.iter().any(|f| f.contains(&key)), "carol's dials failed: {failed:?}");
         assert!(!borg::presence::synced(&a).contains_key(&key), "a failed dial drops carol's record");
         serve.stop().await;
-        assert!(took.iter().all(|&t| t < 1000.0), "every claim reaches bob within 1 s, took {took:?}");
+        // A line carol held back would wait out her 3 s `timeout`; a lost handshake packet costs one
+        // trip about a second now and then (the transport's retransmit), so the bar is the median.
+        assert!(took.iter().all(|&t| t < 3000.0), "no line waits for carol's dial, took {took:?}");
+        let mut sorted = took.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert!(sorted[sorted.len() / 2] < 500.0, "lines reach bob a `poll` or two later, took {took:?}");
     }
 
-    /// Alice's first dial to bob fails (his node runs no `serve` yet); the claim it was to carry reaches
+    /// Alice's first dial to bob fails (his node runs no `serve` yet); the lesson it was to carry reaches
     /// him a `poll` later, with no new change and bob never dialling in: not after a 2-minute backoff.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_dial_is_retried_soon_with_what_it_missed() {
@@ -1684,42 +1607,181 @@ mod tests {
         let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
         let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
         assert!(peers::remember(&a, &bob.public(), &addr_of(&bob)).unwrap());
-        let (open, _, gb) = hive_goal(&a, &b);
+        let l1 = lesson("L1", 1, "who owns the lock?");
+        append_lines(&a, "lessons.jsonl", std::slice::from_ref(&l1));
         let opts = crate::daemon::Options { timeout: Duration::from_secs(1), grace: Duration::from_secs(1), ..Default::default() };
         let mut serve = serving(vec![("alice", alice.clone())], opts);
         eventually("alice's dial to bob failed", Duration::from_secs(10), || !serve.failed.lock().unwrap().is_empty()).await;
         serve.add("bob", bob.clone(), opts);
-        eventually("the goal at bob", Duration::from_secs(10), || holds(&gb, "tasks.jsonl", &open)).await;
+        eventually("alice's lesson at bob", Duration::from_secs(10), || holds(&b, "lessons.jsonl", &l1)).await;
         serve.stop().await;
     }
 
-    /// One idle node holding 2000 goals nobody works on: the hive's 25 ms look stats none of them, so
-    /// the loop costs a small part of a core (it took a whole one when it statted every goal's logs).
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_idle_node_with_many_old_goals_stays_idle() {
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
-        // This thread's CPU time (user + system), in clock ticks: the runtime and `serve` run on it.
-        fn cpu() -> u64 {
-            let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
-            let f: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
-            f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+    /// A 0.3.0 peer's goal ids (3b) count once each and only when valid, so both sides follow the
+    /// same number of reconciliations: "../evil" or "A B" never names a goal.
+    #[test]
+    fn legacy_goals_count_the_valid_distinct_ids() {
+        let ids = ["g1", "../evil", "A B", "g0", "g1", "/abs", ""].map(String::from).to_vec();
+        assert_eq!(legacy_goals(ids).into_iter().collect::<Vec<_>>(), ["g0", "g1"], "sorted, as the peer walks them");
+        assert!(legacy_goals(vec!["x".repeat(41)]).is_empty());
+    }
+
+    /// A 0.3.0 node's hive goal: its seven synced logs, held in memory, each line signed by the node.
+    struct OldGoal {
+        logs: Vec<BTreeMap<Hash, String>>,
+        origins: HashMap<Hash, Origin>,
+    }
+
+    impl OldGoal {
+        fn new(me: &Identity) -> OldGoal {
+            let mut g = OldGoal { logs: vec![BTreeMap::new(); LEGACY_GOAL_LOGS], origins: HashMap::new() };
+            for log in 0..LEGACY_GOAL_LOGS {
+                g.add(me, log, &json!({"log": log, "n": 0}).to_string());
+            }
+            g
         }
-        let p = crew("idle", &["alice"]);
-        let a = home(&p[0]);
-        for i in 0..2000 {
-            std::fs::create_dir_all(a.join(format!("hive/g{i}"))).unwrap();
+
+        fn add(&mut self, me: &Identity, log: usize, line: &str) {
+            let h = lines::hash(line);
+            self.origins.insert(h, Origin::new(me, &h, 1));
+            self.logs[log].insert(h, line.into());
         }
-        let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
-        let serve = serving(vec![("alice", alice)], crate::daemon::Options { grace: Duration::from_secs(1), ..Default::default() });
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let (t0, c0) = (Instant::now(), cpu());
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let share = (cpu() - c0) as f64 / 100.0 / t0.elapsed().as_secs_f64();
-        serve.stop().await;
-        println!("idle serve with 2000 goals: {:.0}% of a core", share * 100.0);
-        assert!(share < 0.25, "an idle serve took {:.0}% of a core", share * 100.0);
+    }
+
+    async fn send_raw(tx: &mut SendStream, v: &serde_json::Value) -> Result<(), String> {
+        let body = serde_json::to_vec(v).map_err(|e| e.to_string())?;
+        tx.write_all(&(body.len() as u32).to_be_bytes()).await.map_err(|e| e.to_string())?;
+        tx.write_all(&body).await.map_err(|e| e.to_string())
+    }
+
+    /// What a 0.3.0 node said after the hello, step by step (base 188c262 `exchange`): its goal ids
+    /// (a duplicate and an invalid one among them), a full reconciliation of each valid goal's logs,
+    /// and `Live` with its hive beats. Returns the hive lines it gave and the presence and directives
+    /// it took in.
+    async fn old_exchange(n: &Node, dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+        let home = n.home.as_path();
+        let mine = members(home)?;
+        let Msg::Membership { .. } = swap(dialler, tx, rx, Msg::Membership { docs: Membership::history(home) }).await? else { return Err("membership".into()) };
+        n.stamp()?;
+        let (origins, mut report) = (origin::load(home), Report::default());
+        for file in SYNCED {
+            n.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, &mut report).await?;
+        }
+        let ids = ["g1", "g1", "Bad Id"].map(String::from).to_vec();
+        let Msg::Goals { ids: theirs } = swap(dialler, tx, rx, Msg::Goals { ids }).await? else { return Err("goals".into()) };
+        assert!(theirs.is_empty(), "a new node names no goal");
+        let mut gave = 0;
+        for set in &goal.logs {
+            let mut r = Recon::new(set);
+            loop {
+                let m = r.message();
+                let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else { return Err("round".into()) };
+                if r.absorb(&m, round)? {
+                    break;
+                }
+            }
+            let give = within_budget(signed(set, &goal.origins, r.give.iter()));
+            gave += give.len();
+            let Msg::Lines { lines } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else { return Err("lines".into()) };
+            assert!(lines.is_empty(), "a new node gives no hive line");
+        }
+        for m in [
+            Msg::Offer { hashes: vec![] },
+            Msg::Want { hashes: vec![] },
+            Msg::Lines { lines: vec![] },
+            Msg::Ask { commits: vec![] },
+            Msg::Lines { lines: vec![] },
+        ] {
+            swap(dialler, tx, rx, m).await?;
+        }
+        let now = borg::learn::now_ms();
+        let live = json!({"t": "live", "presence": live::outgoing(home, &n.me, now), "directives": steer::outgoing(home, now),
+            "beats": [{"goal": "g1", "line": "{}", "key": n.me.public(), "sig": "00"}]});
+        let theirs = if dialler {
+            send_raw(tx, &live).await?;
+            recv(rx).await?
+        } else {
+            let theirs = recv(rx).await?;
+            send_raw(tx, &live).await?;
+            theirs
+        };
+        let Msg::Live { presence, directives } = theirs else { return Err("live".into()) };
+        let me = n.me.public();
+        let presence = live::receive(home, &mine, &me, presence, now)?;
+        Ok((gave, presence, steer::receive(home, &mine, &me, &directives, now).0))
+    }
+
+    async fn old_dial(n: &Node, target: &str, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+        let t = Target::parse(target)?;
+        let conn = n.endpoint.connect(t.endpoint_addr(&n.relay)?, ALPN).await.map_err(|e| e.to_string())?;
+        let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
+        swap(true, &mut tx, &mut rx, Msg::Hello { collective: "work".into(), listen: None, relay: None }).await?;
+        let got = old_exchange(n, true, &mut tx, &mut rx, goal).await;
+        let _ = tx.finish();
+        conn.close(0u32.into(), b"done");
+        got
+    }
+
+    async fn old_serve(n: &Node, goal: &OldGoal) -> Result<(usize, usize, usize), String> {
+        let conn = n.incoming().await.ok_or("closed")?.await.map_err(|e| e.to_string())?;
+        let (mut tx, mut rx) = conn.accept_bi().await.map_err(|e| e.to_string())?;
+        let Msg::Hello { .. } = recv(&mut rx).await? else { return Err("hello".into()) };
+        send(&mut tx, &Msg::Hello { collective: "work".into(), listen: None, relay: None }).await?;
+        let got = old_exchange(n, false, &mut tx, &mut rx, goal).await;
+        let _ = tx.finish();
+        conn.closed().await;
+        got
+    }
+
+    /// A 0.3.0 peer (it names hive goals, reconciles their logs and sends beats in `Live`) keeps
+    /// syncing with this node in both roles: lessons, presence and directives arrive both ways, no
+    /// hive file is written, and a hive line it gave once is not sent again when this node dials.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_0_3_0_peer_syncs_in_both_roles_and_its_hive_lines_come_once() {
+        let (pa, pb) = team("legacy");
+        let (a, b) = (home(&pa), home(&pb));
+        let (alice_id, bob_id) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&b).unwrap());
+        let mut m = Membership::load(&a).unwrap().unwrap();
+        m.invite(&alice_id, &bob_id.public(), "steer").unwrap();
+        m.save(&a).unwrap();
+        m.save(&b).unwrap();
+        let (l1, l2) = (lesson("L1", 1, "lock order?"), lesson("L2", 1, "retry budget?"));
+        write(&a, "lessons.jsonl", std::slice::from_ref(&l1));
+        write(&b, "lessons.jsonl", std::slice::from_ref(&l2));
+        let now = borg::learn::now_ms();
+        for (h, p, who) in [(&a, &pa, "alice"), (&b, &pb, "bob")] {
+            let ev = json!({"session_id": format!("{who}-s1"), "cwd": p.dir, "prompt": format!("{who} works")});
+            borg::presence::write(h, &borg::presence::update(None, "work", "claude", "prompt", &ev, now, |_| (format!("{who}@x"), "repo".into()))).unwrap();
+        }
+        let old = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let new = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let (old_at, new_at) = (old.ticket(), new.ticket());
+        let mut goal = OldGoal::new(&alice_id);
+
+        // The new node dials: every hive line comes once and is dropped.
+        let (old_got, new_got) = tokio::join!(old_serve(&old, &goal), new.sync(&old_at));
+        let (new_got, (gave, presence, _)) = (new_got.unwrap(), old_got.unwrap());
+        assert_eq!((gave, presence, new_got.presence), (LEGACY_GOAL_LOGS, 1, 1));
+        assert!(holds(&a, "lessons.jsonl", &l2) && holds(&b, "lessons.jsonl", &l1), "lessons both ways");
+
+        // The old node dials: directives both ways, and the listener's echo moves no hive line.
+        for (h, id, who) in [(&a, &alice_id, "alice@x"), (&b, &bob_id, "bob@x")] {
+            let d = crate::steer::sign(id, crate::steer::new("work", who, borg::steer::Target::default(), borg::steer::SAY, "run the tests", now));
+            let held = std::fs::read_to_string(crate::steer::outbox(h)).unwrap_or_default();
+            std::fs::write(crate::steer::outbox(h), format!("{held}{}\n", serde_json::to_string(&d).unwrap())).unwrap();
+        }
+        let (old_got, new_got) = tokio::join!(old_dial(&old, &new_at, &goal), new.accept());
+        let (new_got, (gave, _, steered)) = (new_got.unwrap(), old_got.unwrap());
+        assert_eq!((gave, steered, new_got.steered), (0, 1, 1));
+
+        // The new node dials again: only the line added since comes.
+        goal.add(&alice_id, 5, "{\"bundle\":\"new\"}");
+        let (old_got, new_got) = tokio::join!(old_serve(&old, &goal), new.sync(&old_at));
+        new_got.unwrap();
+        assert_eq!(old_got.unwrap().0, 1, "what was given before is not sent again");
+        assert!(!b.join("hive").exists(), "no hive file on the new node");
+        old.close().await;
+        new.close().await;
     }
 
     /// A revokes C; B, which has not heard yet, still takes a lesson C wrote after its revocation.
@@ -1767,55 +1829,6 @@ mod tests {
         for n in [alice, bob, carol] {
             n.close().await;
         }
-    }
-
-    /// A board line carol wrote after her revocation reaches bob before he hears of it; his next sync
-    /// with alice quarantines it before any data moves, and his fold drops it. Her earlier line stays.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn hive_lines_of_a_revoked_member_are_quarantined() {
-        let p = crew("hive-revoke", &["alice", "bob", "carol"]);
-        let (a, b, c) = (home(&p[0]), home(&p[1]), home(&p[2]));
-        let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
-        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
-        let carol = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
-        let (ta, tb) = (alice.ticket(), bob.ticket());
-        std::fs::create_dir_all(c.join("hive/g1")).unwrap();
-        let open = json!({"v": 1, "ev": "open", "task": "t1", "ms": 1, "by": "engineer:carol@x",
-            "def": {"id": "t1", "role": "work", "title": "do t1"}})
-        .to_string();
-        write(&c.join("hive/g1"), "tasks.jsonl", std::slice::from_ref(&open));
-        let (s, r) = tokio::join!(bob.accept(), carol.sync(&tb));
-        assert_eq!((s.unwrap().received, r.unwrap().sent), (1, 1), "a goal bob never held arrives whole");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let mut m = Membership::load(&a).unwrap().unwrap();
-        m.revoke(&Identity::load_or_create(&a).unwrap(), &carol.public(), borg::learn::now_ms()).unwrap();
-        m.save(&a).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let claim = json!({"v": 1, "ev": "claim", "task": "t1", "ms": 2, "by": "carol-session"}).to_string();
-        append_lines(&c.join("hive/g1"), "tasks.jsonl", std::slice::from_ref(&claim));
-        let (s, r) = tokio::join!(bob.accept(), carol.sync(&tb));
-        assert_eq!((s.unwrap().received, r.unwrap().sent), (1, 1), "bob has not heard of the revocation yet");
-        let board = |h: &Path| borg::hive::board::fold(&borg::hive::board::read(&h.join("hive/g1/tasks.jsonl")));
-        assert!(matches!(board(&b).tasks["t1"].status, borg::hive::Status::Claimed { .. }));
-        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ta));
-        let (served, synced) = (served.unwrap(), synced.unwrap());
-        assert_eq!(synced.quarantined, 1, "carol's late claim is set aside before any data moves");
-        assert!(holds(&b.join("mesh"), "quarantine.jsonl", &claim) && !holds(&b.join("hive/g1"), "tasks.jsonl", &claim));
-        assert_eq!(board(&b).tasks["t1"].status, borg::hive::Status::Open, "the fold drops it");
-        assert_eq!(served.received, 1, "alice gets carol's earlier open only");
-        assert_eq!(board(&a), board(&b));
-        for n in [alice, bob, carol] {
-            n.close().await;
-        }
-    }
-
-    /// Goal ids name directories: what a peer offers is kept only as a valid id, so "../evil" or "A B"
-    /// never becomes a path (both sides compute the same list, so the session stays in lockstep).
-    #[test]
-    fn goal_ids_are_path_checked() {
-        let got = goals_to_sync(vec!["g1".into(), "../evil".into()], vec!["A B".into(), "g0".into(), "g1".into(), "/abs".into(), String::new()]);
-        assert_eq!(got.into_iter().collect::<Vec<_>>(), ["g0", "g1"]);
-        assert_eq!(goals_to_sync(vec!["b".into()], vec!["a".into()]), goals_to_sync(vec!["a".into()], vec!["b".into()]), "the same on both sides");
     }
 
     /// After days apart, two nodes holding 2000 common lessons and 5 new ones between them move

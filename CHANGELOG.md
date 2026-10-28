@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- The hive: `borg hive` and `borg debug hive`, interactive drones, and goals with their boards, claims,
+  verify tasks, oracles, integration, contracts and plans. The Hive tab of `borg web`, the goal sections
+  of `borg top`, and the `BORG_HIVE*`, `BORG_GROUP_REFLECT` and `BORG_REWORK_REFLECT` variables go with
+  it. Messages between sessions, across harnesses and machines, will replace it. Plain sessions,
+  lessons, playbooks, `borg steer`, `borg no` and team sync work as before. `borg install` removes
+  the hooks only the hive used (Claude Code `SessionStart`, codex `Interrupt`). An old store's `hive/`
+  directory is no longer read; `borg doctor` offers to remove it.
+
 ## 0.3.0 (unreleased)
 
 The first release meant for crates.io: a smaller, consistent command line, a library marked internal,
@@ -140,7 +152,7 @@ between engineers' machines over the mesh, across NATs; tested on Linux and macO
 - Many drones on one goal: a board of tasks, each finished only when its checks pass, verified by
   another drone and merged into one tree that must pass the goal's oracle, across machines over the
   mesh. Drones are interactive sessions you open on any of the four harnesses; they wait at no token
-  cost, and no drone takes a task before you approve the plan. [Hive commands](docs/commands.md#hive)
+  cost, and no drone takes a task before you approve the plan. Removed again in the next release.
 
 ### Off by default (experimental)
 

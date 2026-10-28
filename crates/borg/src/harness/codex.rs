@@ -15,28 +15,20 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::wiring::Hooks;
-use super::{Caps, DroneWake, Harness, Headless, HeadlessEnd, Level, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Level, Probe, Run, SubAgent, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
-/// tool call fires no PostToolUse at all), so denials are not captured. `Interrupt` (an Esc during a
-/// turn, which then has no Stop; 0.153.2 sends the session, turn and cwd) is `halted`: an interactive
-/// hive drone's engineer turn is over (hive/interactive.rs `halted`), and nothing else is read or written
-/// for it (hook.rs).
-pub const EVENTS: [(&str, &str); 6] = [
-    ("UserPromptSubmit", "prompt"),
-    ("PreToolUse", "pre_tool"),
-    ("PostToolUse", "post_tool"),
-    ("Stop", "stop"),
-    ("SessionEnd", "end"),
-    ("Interrupt", "halted"),
-];
+/// tool call fires no PostToolUse at all), so denials are not captured.
+pub const EVENTS: [(&str, &str); 5] =
+    [("UserPromptSubmit", "prompt"), ("PreToolUse", "pre_tool"), ("PostToolUse", "post_tool"), ("Stop", "stop"), ("SessionEnd", "end")];
 
-/// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd
-/// and Interrupt, which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one
-/// here makes every engineer trust borg's hooks again (a hook added, `halted`, asks for its own trust
-/// only; until then codex skips it, and a drone's quiet turn ends a minute after its last event instead,
-/// hive/interactive.rs `QUEUE_BUSY_IDLE_MS`).
-pub const TIMEOUTS: [(&str, u64); 6] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3), ("halted", 3)];
+/// Hooks an older borg installed: `Interrupt` served the hive's drones (0.3.0 and before).
+pub const RETIRED: [(&str, &str); 1] = [("Interrupt", "halted")];
+
+/// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd,
+/// which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one here makes every
+/// engineer trust borg's hooks again.
+pub const TIMEOUTS: [(&str, u64); 5] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3)];
 
 /// The stop's timeout, and so its budget: the live wait, the stop's model call and the expert drone keep
 /// inside it.
@@ -66,45 +58,15 @@ impl Harness for Codex {
             deny_capture: false,
             sends_pid: false,
             stop_budget: Some(Duration::from_secs(STOP_TIMEOUT_S)),
-            headless_budget: false,
             // Also inside its sandbox; equal to the hooks' `session_id` and to `codex queue --thread`'s
             // thread (0.153.2, against a local mock model).
             session_env: Some("CODEX_THREAD_ID"),
             drone_wake: DroneWake::Queue,
-            // A codex process runs its threads' sub-agents too.
-            one_session_per_process: false,
         }
-    }
-
-    /// `codex exec --json` in the drone's worktree, sandboxed to it (`-s workspace-write`), with the
-    /// engineer's config and hooks on (unlike borg's own model calls, runner.rs `codex_command`), checked
-    /// against `codex exec --help` of 0.153.2. Codex takes no budget and reports tokens, not dollars.
-    fn headless(&self, run: &Headless) -> Option<Command> {
-        let mut cmd = Command::new("codex");
-        cmd.args(["exec", "--json", "-s", "workspace-write"]).arg("-C").arg(run.cwd);
-        if let Some(m) = run.model {
-            cmd.args(["-m", m]);
-        }
-        cmd.arg(run.prompt).current_dir(run.cwd).envs(run.env.iter().map(|(k, v)| (*k, v.as_str())));
-        Some(cmd)
-    }
-
-    /// The thread id, the last agent message and whether the turn failed; never a cost (tokens only).
-    fn headless_end(&self, out: &[u8]) -> HeadlessEnd {
-        let mut end = HeadlessEnd::default();
-        for e in out.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Value>(l).ok()) {
-            match e["type"].as_str() {
-                Some("thread.started") => end.session = e["thread_id"].as_str().unwrap_or_default().into(),
-                Some("item.completed") if e["item"]["type"] == "agent_message" => end.text = e["item"]["text"].as_str().unwrap_or_default().into(),
-                Some("turn.failed" | "error") => end.error = true,
-                _ => {}
-            }
-        }
-        end
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &TIMEOUTS, through_links: true }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &TIMEOUTS, retired: &RETIRED, through_links: true }
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
@@ -491,9 +453,8 @@ mod tests {
         let k = Hooks::of(&Codex).unwrap();
         let v: Value = serde_json::from_str(&k.install(None, Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         let timeout = |native: &str| v["hooks"][native][0]["hooks"][0]["timeout"].as_u64();
-        let got: Vec<Option<u64>> = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "Interrupt"].iter().map(|n| timeout(n)).collect();
-        assert_eq!(got, [Some(30), Some(10), Some(30), Some(90), Some(3), Some(3)]);
-        assert_eq!(v["hooks"]["Interrupt"][0]["hooks"][0]["command"], "/b/borg hook codex halted");
+        let got: Vec<Option<u64>> = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"].iter().map(|n| timeout(n)).collect();
+        assert_eq!(got, [Some(30), Some(10), Some(30), Some(90), Some(3)]);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "/b/borg hook codex stop");
         assert_eq!(Codex.caps().stop_budget, Some(Duration::from_secs(90)), "the stop's budget is its timeout");
         let none = |_: &str| None;

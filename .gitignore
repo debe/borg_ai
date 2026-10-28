@@ -13,7 +13,7 @@ node_modules/
 /PLAN.md
 /tasks/
 /target-probe/
-# hive drones work in worktrees under the repo (`borg hive join`)
+# worktrees the removed hive (0.3.0 and before) left under the repo
 /.worktrees/
 # Eval suites and reports are local unless published: each published one is re-included by name, so a
 # new one is published by adding its line here, never by a stray `git add`.

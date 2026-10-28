@@ -384,15 +384,6 @@ fn within(cwd: &str) -> impl Fn(&str) -> Option<usize> {
     }
 }
 
-/// Whether `cwd` lies inside one of `cfg`'s `off` paths: kept out of every collective, whatever else
-/// the config says (`route` checks them first).
-pub fn kept_off(cfg: &Config, cwd: &str) -> bool {
-    !cwd.trim().is_empty() && {
-        let within = within(cwd);
-        cfg.off.iter().any(|p| within(p).is_some())
-    }
-}
-
 /// Which collective `cwd` belongs to. `base` is the root store (`BORG_HOME`).
 pub fn route(cfg: Option<&Config>, cwd: &str, base: &Path) -> Route {
     let Some(cfg) = cfg else {
