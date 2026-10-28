@@ -249,7 +249,7 @@ fn short(session: &str) -> String {
 pub fn target<'a>(drones: &'a [top::Drone], repo: &str, named: Option<&str>) -> Result<&'a top::Drone, String> {
     if let Some(n) = named {
         return match top::resolve(drones, n)? {
-            None => Err("a veto names one drone, not all".into()),
+            None => Err("a veto names one drone, not local, collective or all".into()),
             Some(d) => Ok(d),
         };
     }
@@ -492,7 +492,7 @@ mod tests {
         assert!(err.contains("2 drones work in app") && err.contains("aaaa1111") && err.contains("cccc3333") && err.contains("One of Five"), "{err}");
         assert_eq!(target(&two, "app", Some("Two")).unwrap().p.session, "cccc3333");
         assert_eq!(target(&two, "app", Some("aaaa")).unwrap().p.session, "aaaa1111");
-        assert!(target(&two, "app", Some("all")).is_err());
+        assert!(["all", "collective", "local"].iter().all(|w| target(&two, "app", Some(w)).is_err()), "a veto names one drone");
         // Only ended ones: the most recently seen (a veto right after the session ended).
         let ended = vec![drone("aaaa1111", "app", State::Ended, 50, "", 1), drone("cccc3333", "app", State::Ended, 40, "", 2)];
         assert_eq!(target(&ended, "app", None).unwrap().p.session, "aaaa1111");

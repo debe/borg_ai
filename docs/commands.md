@@ -18,6 +18,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | `borg collective [DIR]` | Which collective a directory belongs to and whether it may sync |
 | `borg vectors [--fetch\|--rebuild] [--store FILE]` | The vector model and index; on by default once the model is fetched ([details](configuration.md#vectors)) |
 | `borg completions <bash\|zsh\|fish>` | A shell completion script (below) |
+| `borg version` | borg's version, one line (also `borg --version` and `borg -V`; `borg mesh --version` and `borg web --version` print theirs) |
 
 ### Learning
 
@@ -52,11 +53,11 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | Command | Shows or does |
 |---|---|
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync`, `fetch` ([details](team-sync.md)) |
-| `borg tell <drone\|session\|all\|engineer> "<text>" [--re ID] [--from SESSION] [--dir DIR]` | A message to other sessions, on any harness or member's machine, shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
-| `borg ask <drone\|session\|all\|engineer> "<question>" [--re ID] [--from SESSION] [--dir DIR]` | As `tell`, for a message that asks for a reply |
+| `borg tell <drone\|session\|local\|collective\|engineer> "<text>" [--re ID] [--from SESSION] [--dir DIR]` | A message to other sessions, on any harness: `local` is this machine's sessions, `collective` (or `all`) every session of the collective. Shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
+| `borg ask <drone\|session\|local\|collective\|engineer> "<question>" [--re ID] [--from SESSION] [--dir DIR]` | As `tell`, for a message that asks for a reply |
 | `borg inbox [--all] [--json] [--from SESSION] [--dir DIR]` | In a session: its messages, new or shown, then marks them shown. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to |
-| `borg pause <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
-| `borg resume <drone\|session\|all> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Lets a paused session's tool calls run again |
+| `borg pause <drone\|session\|local\|collective> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
+| `borg resume <drone\|session\|local\|collective> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Lets a paused session's tool calls run again |
 | `borg listen [--off] [--session S] [--dir DIR]` | Wakes this session when a message arrives while it is idle, until `--off` or the session's end ([Waking a session](#waking-a-session)) |
 
 **Shell completion:**
@@ -75,12 +76,26 @@ detached after a state-changing tool call ([Delivery modes](delivery.md#delivery
 ## Messages
 
 `borg tell` and `borg ask` send from the calling session, or from the engineer in a plain terminal
-(`engineer:<git user.email>`). The recipient is a drone as `borg top` names it or a session id prefix,
-resolved to the session id and its machine when the message is sent (`<session>@<node>` names both);
-`all`, which reaches the sessions running then; or `engineer`, read with `borg inbox`. A reply goes to the
-sender's session on the machine its message came from, even when the session has ended here. A sender's
-name and session are its own claims; `borg top` and borg web show a message from another machine with
-that machine's short key, the part the mesh checks.
+(`engineer:<git user.email>`). The recipient is one of:
+
+- a drone as `borg top` names it, or a session id prefix, resolved to the session id and its machine when
+  the message is sent. This machine comes first: a prefix that matches a session here and one on a
+  member's machine names the one here. A member's session is reached when nothing here matches, or by
+  `<session>@<node>`, which names both;
+- `local`: the sessions running on this machine then. Its line never leaves this machine;
+- `collective`, or its synonym `all`: every session of the collective running then, on every member's
+  machine. It reaches, and may wake, sessions on colleagues' machines, so it is for what concerns their
+  work;
+- `engineer`, read with `borg inbox`.
+
+A reply goes to the sender's session on the machine its message came from, even when the session has
+ended here. A sender's name and session are its own claims; `borg top` and borg web show a message from
+another machine with that machine's short key, the part the mesh checks.
+
+`collective` and `all` are written `all` in the log, as 0.4.0 wrote `all`, so a line from 0.4.0 or an
+older peer means the same. `local` is written `local@<node>` and counts only on a line from that node:
+no machine broadcasts into another's sessions. 0.4.0 reads `local@<node>` as a session named `local`,
+which no session is, so it reaches nobody there.
 
 The recipient's hook shows each message once, at its next prompt or tool call, ahead of any lessons. It
 is marked as peer data, never the user's words, with the line that replies:
@@ -91,16 +106,19 @@ rest come at the next one. opencode gives its shell no session id, so its reply 
 
 Text is redacted, put on one line and cut to 1,000 characters. One message per sender and recipient per
 10 minutes; a repeat is refused. Messages live in `<store>/messages.jsonl` for 7 days, at most the 500
-newest, and sync with the team collective like lessons ([Team sync](team-sync.md#how-a-sync-works)).
+newest. Those to `collective`, to a session on another machine and replies sync with the team collective
+like lessons ([Team sync](team-sync.md#how-a-sync-works)); one to `local` stays on this machine.
 An idle session sees a message when it next runs, unless it listens ([Waking a session](#waking-a-session)).
 
-**Seen in monitoring.** `borg top` shows each drone's unread messages and the last day's messages;
+**Seen in monitoring.** `borg top` shows each drone's unread messages and the last day's messages, a
+broadcast as `local` or `collective` (`borg inbox` and borg web's Messages page say it so too);
 borg web's Messages page counts messages sent, shown and dropped (a rate-limit refusal or the 500 cap).
 
 ### Pause and resume
 
 `borg pause` and `borg resume` are messages of their own kind; a veto from `borg no` to a drone on
-another machine is one too. They go to a drone, a session or `all`, never to `engineer`; a pause or
+another machine is one too. They go to a drone, a session, `local` (this machine's sessions) or
+`collective` (or `all`: every member's, each machine admitting it by the sender's role), never to `engineer`; a pause or
 resume may have no text. A veto names exactly one session on one machine (`<session>@<node>`). They are not
 rate limited, so a resume can follow a pause at once.
 

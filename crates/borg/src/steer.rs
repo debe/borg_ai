@@ -470,6 +470,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// `borg pause local`: this node's own `local@<node>` pause holds for its running sessions; one that
+    /// names another node, or comes from another node naming this one, never does.
+    #[test]
+    fn a_local_pause_holds_only_for_this_nodes_sessions() {
+        let home = tmp("local");
+        let here = msg::node(&home);
+        let local = format!("{}@{here}", msg::LOCAL);
+        arrive(&home, &steer(Kind::Pause, PEER, &local, "", 100), Some(Role::Steer));
+        arrive(&home, &steer(Kind::Pause, &here, &format!("{}@{PEER}", msg::LOCAL), "", 100), Some(Role::Local));
+        assert_eq!(around(&home, "pre_tool", &ev("s1"), Some(0), 200, || None), None, "a peer's local@<this node>, or this node's local@<a peer>");
+        arrive(&home, &steer(Kind::Pause, &here, &local, "hold", 300), Some(Role::Local));
+        assert!(around(&home, "pre_tool", &ev("s1"), Some(0), 400, || None).is_some(), "this node's own local pause");
+        arrive(&home, &steer(Kind::Resume, &here, &local, "", 500), Some(Role::Local));
+        assert_eq!(around(&home, "pre_tool", &ev("s1"), Some(0), 600, || None), None, "resumed with local");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_pause_past_the_ttl_no_longer_holds() {
         let home = tmp("ttl");

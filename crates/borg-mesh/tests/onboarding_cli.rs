@@ -93,3 +93,12 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
     let members = ok(&admin, &["members"]);
     assert_eq!(members.lines().filter(|l| l.ends_with(" steer")).count(), 1, "{members}");
 }
+
+#[test]
+fn version_prints_one_line() {
+    for spelling in ["--version", "-V"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_borg-mesh")).arg(spelling).stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "borg-mesh {spelling}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("borg-mesh {}\n", env!("CARGO_PKG_VERSION")));
+    }
+}

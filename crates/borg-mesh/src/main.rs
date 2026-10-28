@@ -393,6 +393,10 @@ fn main() {
         print!("{}", help());
         return;
     }
+    if matches!(args.first().map(String::as_str), Some("-V" | "--version")) {
+        println!("borg-mesh {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.first().map(String::as_str) == Some("serve") {
         // Its stops trapped while one thread runs; one held across a restart (`RESTART`) ends it here.
         reexec::trap_stops();

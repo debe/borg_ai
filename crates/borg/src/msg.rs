@@ -1,6 +1,12 @@
 //! Messages between sessions: `<store>/messages.jsonl`, one line per `borg tell` or `borg ask`, from a
-//! session on any harness (or the engineer's terminal) to every session (`all`), one session on one
-//! node (`<session>@<node>`), or the engineer (`engineer[:<email>]`): an `Address`, parsed in one place.
+//! session on any harness (or the engineer's terminal) to the sessions on this machine (`local`, written
+//! `local@<node>`), every session of the collective on every member's machine (`collective`, or its
+//! synonym `all`, written `all` as it always was), one session on one node (`<session>@<node>`), or the
+//! engineer (`engineer[:<email>]`): an `Address`, parsed in one place. Local first: a `local` line never
+//! leaves this machine (borg-mesh lines.rs `travels` keeps it here), and a drone named on the command
+//! line is this machine's when one here matches; a colleague's session is reached by its node, by
+//! `collective`, or as the sender of what a reply answers. A 0.4.0 reader parses `local@<node>` as the
+//! session `local` of that node, which no session is: it reaches nobody there.
 //! Plain lines, each naming its node, so the mesh can union them like the other synced logs; on one
 //! machine they need no mesh. A `borg pause`, `borg resume` or a remote `borg no` is a message too, of
 //! a privileged `Kind` that counts only under an admitted role (steer.rs).
@@ -47,8 +53,13 @@ pub const FILE: &str = "messages.jsonl";
 pub const TELL: Kind = Kind::Tell;
 /// A message that asks for a reply.
 pub const ASK: Kind = Kind::Ask;
-/// The address of every session.
+/// Every session of the collective on every member's machine (`Address::All`): the command word, a
+/// synonym of `COLLECTIVE`, and how a line writes it.
 pub const ALL: &str = "all";
+/// The command word for every session of the collective (`Address::All`, written `all`).
+pub const COLLECTIVE: &str = "collective";
+/// The command word for the sessions on this machine (`Address::Local`, written `local@<node>`).
+pub const LOCAL: &str = "local";
 /// The engineer's terminal as sender and address: `engineer:<git user.email>`, or this alone.
 pub const ENGINEER: &str = "engineer";
 /// A message is conversation: shown and kept for a week.
@@ -147,7 +158,7 @@ pub struct Message {
     /// The sender's node (`node`): the one field the mesh checks.
     #[serde(default)]
     pub node: String,
-    /// An `Address`: `all`, `<session>@<node>`, or `engineer[:<email>]`.
+    /// An `Address`: `all` (the collective), `local@<node>`, `<session>@<node>`, or `engineer[:<email>]`.
     pub to: String,
     /// The message this one answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,17 +200,17 @@ fn token(s: &str) -> bool {
 /// Whom a message is for, as its `to` says it (`parse`; `Display` writes it back).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
+    /// Every session of the collective on every member's machine: `all`, as `collective` or `all` on
+    /// the command line.
     All,
+    /// The sessions of one node, `local@<node>`: `local` on the command line, for this node. It counts
+    /// only on a line of that node (`Message::well_formed`), and it never travels (`Message::stays_here`).
+    Local { node: String },
     /// `engineer`, or `engineer:<email>`; `email` is empty for the former.
-    Engineer {
-        email: String,
-    },
+    Engineer { email: String },
     /// `<session>@<node>`. A line written without the node (by hand) reaches that session on any node;
     /// `address` never writes one.
-    Session {
-        id: String,
-        node: Option<String>,
-    },
+    Session { id: String, node: Option<String> },
 }
 
 impl Address {
@@ -218,6 +229,7 @@ impl Address {
         }
         match s.rsplit_once('@') {
             Some((id, node)) if id.is_empty() || node.is_empty() || id == ALL => None,
+            Some((LOCAL, node)) => Some(Address::Local { node: node.into() }),
             Some((id, node)) => Some(Address::Session { id: id.into(), node: Some(node.into()) }),
             None => Some(Address::Session { id: s.into(), node: None }),
         }
@@ -228,10 +240,18 @@ impl Address {
         matches!(self, Address::Session { id, node } if id == session && node.as_deref().is_none_or(|n| n == here))
     }
 
-    /// As a terminal names the recipient: `Display` without the node.
+    /// Whether it is a broadcast: to the collective or to the sessions of one node (`applies` checks it).
+    pub fn broadcast(&self) -> bool {
+        matches!(self, Address::All | Address::Local { .. })
+    }
+
+    /// As a terminal names the recipient, the word a command takes back: `local`, `collective`, the
+    /// session without its node, the engineer.
     pub fn name(&self) -> String {
         match self {
             Address::Session { id, .. } => id.clone(),
+            Address::All => COLLECTIVE.into(),
+            Address::Local { .. } => LOCAL.into(),
             a => a.to_string(),
         }
     }
@@ -241,6 +261,7 @@ impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Address::All => f.write_str(ALL),
+            Address::Local { node } => write!(f, "{LOCAL}@{node}"),
             Address::Engineer { email } if email.is_empty() => f.write_str(ENGINEER),
             Address::Engineer { email } => write!(f, "{ENGINEER}:{email}"),
             Address::Session { id, node: None } => f.write_str(id),
@@ -294,13 +315,21 @@ impl Message {
         self.kind == Kind::Ask
     }
 
+    /// Whether it is for the sessions of its own node only (`local`): it never travels to another
+    /// member (borg-mesh lines.rs `travels`).
+    pub fn stays_here(&self) -> bool {
+        matches!(Address::parse(&self.to), Some(Address::Local { .. }))
+    }
+
     /// Whether the line is one `new` could have written: its id is the hash of its fields, its names are
     /// tokens, its label and text are as `new` cleans them, `re` is a message id, its kind may go where
-    /// it goes (`Kind::may_address`), and only a pause or resume goes without a text.
+    /// it goes (`Kind::may_address`), a `local@<node>` names its own node (its `to` is a claim, its node
+    /// is checked: no node broadcasts into another's sessions), and only a pause or resume goes without
+    /// a text.
     pub fn well_formed(&self) -> bool {
         self.v == 1
             && [&self.by, &self.harness, &self.node].into_iter().all(|f| token(f))
-            && Address::parse(&self.to).is_some_and(|a| self.kind.may_address(&a))
+            && Address::parse(&self.to).is_some_and(|a| self.kind.may_address(&a) && !matches!(&a, Address::Local { node } if *node != self.node))
             && self.re.as_deref().is_none_or(is_id)
             && self.name == label(&self.name)
             && (!self.text.is_empty() || self.kind.switch())
@@ -459,8 +488,10 @@ pub fn send(home: &Path, m: Message, now: i64) -> Result<Message, SendError> {
         return Err(SendError::Empty);
     }
     let to = match Address::parse(&m.to) {
-        None => return Err(SendError::Address(format!("{:?} names no session: give a session, a drone, all or engineer", m.to))),
-        Some(a) if !m.kind.may_address(&a) => return Err(SendError::Address(format!("a {} goes to a session, a drone or all, not {a}", m.kind))),
+        None => return Err(SendError::Address(format!("{:?} names no session: give a session, a drone, local, collective (or all) or engineer", m.to))),
+        Some(a) if !m.kind.may_address(&a) => {
+            return Err(SendError::Address(format!("a {} goes to a session, a drone, local or collective, not {}", m.kind, a.name())));
+        }
         Some(a) => a,
     };
     if !m.well_formed() {
@@ -567,20 +598,21 @@ fn bound<T>(v: &mut Vec<T>, now: i64, ms: impl Fn(&T) -> i64, steers: impl Fn(&T
     gone.len()
 }
 
-/// Whether `m` is addressed to `session` of the node `here` (started at `started`): to it, or to all
-/// while it ran.
+/// Whether `m` is addressed to `session` of the node `here` (started at `started`): to it, or, while
+/// it ran, to the collective or to this node's sessions (on a line of this node).
 fn to_session(m: &Message, here: &str, session: &str, started: i64) -> bool {
     match Address::parse(&m.to) {
         // `m.ms` is the sender's clock, `started` this node's: a peer up to `SKEW_MS` behind still
         // reaches a session that ran when it sent.
         Some(Address::All) => started.saturating_sub(SKEW_MS) <= m.ms,
+        Some(Address::Local { node }) => node == here && m.node == here && started.saturating_sub(SKEW_MS) <= m.ms,
         Some(a) => a.reaches(here, session),
         None => false,
     }
 }
 
 /// Whether `m` is for `session` of the node `here` (started at `started`) at `now`: fresh, to it or to
-/// all while it ran, and not its own.
+/// a broadcast that reaches it while it ran, and not its own.
 pub(crate) fn applies(m: &Message, here: &str, session: &str, started: i64, now: i64) -> bool {
     fresh(m, now) && to_session(m, here, session, started) && !(m.by == session && m.node == here)
 }
@@ -828,11 +860,14 @@ pub fn render(msgs: &[&Message], shows: &Shows) -> String {
     s
 }
 
-pub const USAGE: &str = "usage: borg tell <session|drone|all|engineer> <text> [--re ID]
-       borg ask <session|drone|all|engineer> <question> [--re ID]
-       borg pause <session|drone|all> [note]
-       borg resume <session|drone|all> [note]
-       borg inbox [--all] [--json]";
+pub const USAGE: &str = "usage: borg tell <session|drone|local|collective|engineer> <text> [--re ID]
+       borg ask <session|drone|local|collective|engineer> <question> [--re ID]
+       borg pause <session|drone|local|collective> [note]
+       borg resume <session|drone|local|collective> [note]
+       borg inbox [--all] [--json]
+  local: the sessions on this machine; collective (or all): every session of the collective,
+  on every member's machine; a drone or session id prefix: this machine's when one here
+  matches, else a member's; <session>@<node>: that session of that node";
 /// `borg tell` and `borg ask`'s flags (completions.rs).
 pub const FLAGS: &[&str] = &["--re", "--from", "--dir"];
 /// `borg pause` and `borg resume`'s flags.
@@ -946,19 +981,32 @@ pub fn sender(home: &Path, drones: &[top::Drone], from: Option<&str>, cwd: &str)
     Ok(Sender { by, name: if email.is_empty() { ENGINEER.into() } else { email }, harness: "terminal".into(), node })
 }
 
-/// The address `raw` names, `here` being this node: `all`, the engineer, `<session>@<node>` of a node
-/// this one knows, the sender of the message `re` answers, a drone `borg top` lists (its exact session
-/// before a sender's), else a sender of `msgs` (a reply: its session may be unknown to presence here).
-/// A session always goes with its node, a sender's the node of its line: `by` is the sender's claim,
-/// so a reply to another node's line that names a local session reaches that node, never this one.
+/// The address `raw` names, `here` being this node: `local` (this node's sessions), `collective` or
+/// `all` (every member's), the engineer, `<session>@<node>` of a node this one knows, the sender of the message
+/// `re` answers, a drone `borg top` lists (its exact session before a sender's; this machine's before
+/// a member's, top.rs `resolve`), else a sender of `msgs` (a reply: its session may be unknown to
+/// presence here). A session always goes with its node, a sender's the node of its line: `by` is the
+/// sender's claim, so a reply to another node's line that names a local session reaches that node,
+/// never this one.
 ///
 /// # Errors
 /// What names no one, or more than one.
 fn address(drones: &[top::Drone], msgs: &[Message], here: &str, raw: &str, re: Option<&str>) -> Result<Address, SendError> {
     let t = raw.trim();
     let at = |id: &str, node: &str| Address::Session { id: id.into(), node: Some(node.into()) };
+    let this = || Address::Local { node: here.into() };
+    if t.eq_ignore_ascii_case(LOCAL) {
+        return Ok(this());
+    }
+    if t.eq_ignore_ascii_case(ALL) || t.eq_ignore_ascii_case(COLLECTIVE) {
+        return Ok(Address::All);
+    }
     match Address::parse(t) {
-        Some(a @ (Address::All | Address::Engineer { .. })) => return Ok(a),
+        Some(a @ Address::Engineer { .. }) => return Ok(a),
+        Some(Address::Local { node }) if node == here => return Ok(this()),
+        Some(Address::Local { node }) => {
+            return Err(SendError::Address(format!("{t:?}: local reaches this machine's sessions only; give collective, or <session>@{node}")));
+        }
         Some(Address::Session { id, node: Some(n) }) => {
             let known = n == here || drones.iter().any(|d| d.node == n) || msgs.iter().any(|m| m.node == n);
             return if known { Ok(at(&id, &n)) } else { Err(SendError::Address(format!("{t:?}: no drone or message here names node {n}"))) };
@@ -1041,6 +1089,11 @@ fn tell(home: &Path, kind: Kind, a: &Args, drones: &[top::Drone], cwd: &str, now
             if let Some(why) = here_only(home, &m) {
                 println!("  only on this machine: {why}, so the other nodes drop it");
             }
+            if collective_pause_left(home, &read(home), &m) {
+                println!(
+                    "  only on this machine: a collective pause sent from here still holds on the members' machines; `borg resume collective` lifts it there"
+                );
+            }
             0
         }
         Err(e) => {
@@ -1050,13 +1103,30 @@ fn tell(home: &Path, kind: Kind, a: &Args, drones: &[top::Drone], cwd: &str, now
     }
 }
 
-/// Why a steer for `all` holds only on this node: it is in a team (holds a membership) whose other
-/// nodes refuse this node's steers (`steer_right`). `None` when it holds wherever it reaches.
+/// Why a steer for the collective holds only on this node: it is in a team (holds a membership) whose
+/// other nodes refuse this node's steers (`steer_right`). `None` when it holds wherever it reaches
+/// (`local` reaches this node alone).
 fn here_only(home: &Path, m: &Message) -> Option<NoSteer> {
     if !m.kind.privileged() || Address::parse(&m.to) != Some(Address::All) {
         return None;
     }
     steer_right(home, &m.node).err().filter(|why| *why != NoSteer::NoMembership)
+}
+
+/// Whether `m`, a resume for this node's sessions (`local@<node>`), leaves a collective pause in force
+/// elsewhere: the latest pause or resume for the collective (`all`) that this node sent within the
+/// steer TTL is a pause, and the members admitted it (this node may steer them, `steer_right`; with no
+/// membership there are no members, and without the role they dropped it, as `here_only` said). The
+/// members never see `m`, so their sessions stay paused.
+fn collective_pause_left(home: &Path, lines: &[Message], m: &Message) -> bool {
+    if m.kind != Kind::Resume || !m.stays_here() || steer_right(home, &m.node).is_err() {
+        return false;
+    }
+    lines
+        .iter()
+        .filter(|x| x.kind.switch() && x.node == m.node && Address::parse(&x.to) == Some(Address::All) && (0..steer::TTL_MS).contains(&(m.ms - x.ms)))
+        .max_by(|a, b| (a.ms, &a.id).cmp(&(b.ms, &b.id)))
+        .is_some_and(|x| x.kind == Kind::Pause)
 }
 
 /// `borg inbox`: in a session, its messages, marked shown when the session has a hook record here
@@ -1120,7 +1190,7 @@ fn inbox(home: &Path, a: &Args, drones: &[top::Drone], now: i64) -> i32 {
 fn read_state(m: &Message, to: Option<&Vec<String>>, local: bool) -> String {
     let n = to.map_or(0, Vec::len);
     match Address::parse(&m.to) {
-        Some(Address::All) => format!("shown to {n}"),
+        Some(a) if a.broadcast() => format!("shown to {n}"),
         Some(Address::Engineer { .. }) => "to the engineer".into(),
         _ if n > 0 => "shown".into(),
         _ if local => "unread".into(),
@@ -1295,6 +1365,7 @@ mod tests {
     fn an_address_parses_in_one_place_and_writes_back() {
         let cases = [
             ("all", Address::All),
+            ("local@n1", Address::Local { node: "n1".into() }),
             ("engineer", Address::Engineer { email: String::new() }),
             ("engineer:e@x", Address::Engineer { email: "e@x".into() }),
             ("s1", Address::Session { id: "s1".into(), node: None }),
@@ -1305,12 +1376,73 @@ mod tests {
             assert_eq!(Address::parse(raw).as_ref(), Some(&want), "{raw}");
             assert_eq!(want.to_string(), raw);
         }
-        for bad in ["", "s1@", "@n1", "all@n1", "a b", "-x", "s1;id"] {
+        for bad in ["", "s1@", "@n1", "all@n1", "local@", "a b", "-x", "s1;id"] {
             assert_eq!(Address::parse(bad), None, "{bad}");
         }
         let a = Address::Session { id: "s1".into(), node: Some("n1".into()) };
         assert!(a.reaches("n1", "s1") && !a.reaches("n2", "s1") && !a.reaches("n1", "s2"));
         assert_eq!(a.name(), "s1");
+        assert_eq!((Address::All.name(), Address::Local { node: "n1".into() }.name()), (COLLECTIVE.into(), LOCAL.into()), "the words a command takes back");
+    }
+
+    /// 0.4.0's `parse` and `reaches`, kept to check the claim: it reads `local@<node>` as the session
+    /// `local` of that node, which no session (a harness's id) is, so the line reaches nobody there.
+    #[test]
+    fn a_0_4_0_reader_reaches_nobody_with_a_local_line() {
+        let old = |s: &str| match s.rsplit_once('@') {
+            Some((id, node)) if id.is_empty() || node.is_empty() || id == ALL => None,
+            Some((id, node)) => Some((id.to_string(), Some(node.to_string()))),
+            None => Some((s.to_string(), None)),
+        };
+        let old_reaches = |to: &str, here: &str, session: &str| old(to).is_some_and(|(id, node)| id == session && node.is_none_or(|n| n == here));
+        assert_eq!(old("local@n1"), Some((LOCAL.to_string(), Some("n1".to_string()))), "a session address, not a broadcast");
+        assert!(!old_reaches("local@n1", "n1", "0b7d6c1e-2f4a-4c55-9a51-6d1e2c3b4a59") && !old_reaches("local@n1", "n1", "s2"));
+        assert_eq!(old(ALL), Some((ALL.to_string(), None)), "0.4.0 matched the word `all` before this: it is the collective there too");
+    }
+
+    /// The addressing table: `local@<node>` reaches the sessions of that node, and only on a line of
+    /// that node; `all` (written by `collective` or `all`, and every 0.4.0 `all` line) every session of
+    /// the collective on every node; a line's `to` is a claim, its node is what counts.
+    #[test]
+    fn local_reaches_this_machine_and_all_the_collective() {
+        let on = |node: &str, by: &str, to: &str, ms: i64| Message::new(TELL, &from(by, node), to, None, ms, "freeze merges");
+        let msgs = [on("n1", "s1", "local@n1", 100), on("n2", "t1", "local@n2", 200), on("n2", "t1", ALL, 300), on("n1", "s1", ALL, 400)];
+        let ms = |v: Vec<&Message>| v.iter().map(|x| x.ms).collect::<Vec<_>>();
+        assert_eq!(ms(for_session(&msgs, "n1", "s2", 50, 1000)), [100, 300, 400], "this node's local, and the collective's from any node (an old line too)");
+        assert_eq!(ms(for_session(&msgs, "n2", "t2", 50, 1000)), [200, 300, 400], "another node's local is not delivered here");
+        assert_eq!(ms(for_session(&msgs, "n1", "s2", 100 + SKEW_MS + 1, 1000)), [300, 400], "a local broadcast before it started is not its");
+        assert_eq!(ms(for_session(&msgs, "n1", "s1", 50, 1000)), [300], "never to its sender");
+        assert!(msgs.iter().all(Message::well_formed));
+        assert!(msgs[0].stays_here() && msgs[1].stays_here() && !msgs[2].stays_here());
+        let forged = [on("n2", "t1", "local@n1", 500), on("n2", "t1", "all@n1", 500)];
+        assert!(forged.iter().all(|m| !m.well_formed()), "only n1 broadcasts into n1's sessions; all@<node> is no address");
+        assert!(for_session(&forged, "n1", "s2", 50, 1000).is_empty(), "another node's local@n1 or all@n1 is not delivered here");
+        let pause = Message::new(Kind::Pause, &from("engineer:a@x", "n1"), "local@n1", None, 600, "");
+        assert!(pause.well_formed() && !Message::new(Kind::Veto, &from("e", "n1"), "local@n1", None, 600, "no").well_formed(), "a veto names one session");
+        assert_eq!(read_state(&msgs[0], Some(&vec!["a".into()]), false), "shown to 1");
+    }
+
+    /// `local` on the command line is this node's sessions, `collective` and `all` every member's; a
+    /// drone or prefix that matches here and on a member is the one here; a reply still goes to the
+    /// node it answers.
+    #[test]
+    fn the_command_line_prefers_this_machine() {
+        let remote = |s: &str| top::Drone { node: "n2".into(), ..drone(s, "claude", None, 100) };
+        let ds = [drone("aaaa1111-x", "claude", None, 100), remote("aaaa1111-x"), remote("bbbb2222-y")];
+        let to = |raw: &str, msgs: &[Message], re: Option<&str>| address(&ds, msgs, "here", raw, re).map(|a| a.to_string()).map_err(|e| e.to_string());
+        assert_eq!(to("local", &[], None).as_deref(), Ok("local@here"));
+        assert_eq!(to("LOCAL", &[], None).as_deref(), Ok("local@here"));
+        assert_eq!(to("local@here", &[], None).as_deref(), Ok("local@here"));
+        assert!(to("local@n2", &[], None).is_err(), "another node's local is that node's to send");
+        for word in ["all", "ALL", "collective", "Collective"] {
+            assert_eq!(to(word, &[], None).as_deref(), Ok(ALL), "{word}: the whole collective, written all");
+        }
+        assert_eq!(to("aaaa", &[], None).as_deref(), Ok("aaaa1111-x@here"), "the drone here, not the member's");
+        assert_eq!(to("aaaa1111-x", &[], None).as_deref(), Ok("aaaa1111-x@here"));
+        assert_eq!(to("bbbb", &[], None).as_deref(), Ok("bbbb2222-y@n2"), "nothing here matches: the member's");
+        assert_eq!(to("aaaa1111-x@n2", &[], None).as_deref(), Ok("aaaa1111-x@n2"), "explicitly the member's");
+        let asked = Message::new(ASK, &from("aaaa1111-x", "n2"), ALL, None, 5, "who owns it?");
+        assert_eq!(to("aaaa1111-x", std::slice::from_ref(&asked), Some(&asked.id)).as_deref(), Ok("aaaa1111-x@n2"), "a reply goes back to its node");
     }
 
     #[test]
@@ -1442,7 +1574,8 @@ mod tests {
         assert_eq!(to("aaaa1111-x").as_deref(), Some("aaaa1111-x@n1"), "with the node its line names");
         assert_eq!(to("engineering-42").as_deref(), Some("engineering-42@n1"));
         assert_eq!(to("engineer:e@x").as_deref(), Some("engineer:e@x"));
-        assert_eq!(to("all").as_deref(), Some(ALL));
+        assert_eq!(to("local").as_deref(), Some("local@here"));
+        assert_eq!((to("all").as_deref(), to("collective").as_deref()), (Some(ALL), Some(ALL)));
         assert_eq!(to("s9@n1").as_deref(), Some("s9@n1"), "a node a message names");
         assert!(matches!(address(&[], &known, "here", "zzzz", None), Err(SendError::Address(_))));
         assert!(matches!(address(&[], &known, "here", "s9@nowhere", None), Err(SendError::Address(_))), "a node nothing here names");
@@ -1656,6 +1789,38 @@ mod tests {
         assert_eq!(here_only(&home, &all), None);
         std::fs::write(membership_path(&home), "{").expect("garbled");
         assert!(matches!(refused(Kind::Pause, 1_600), Some(NoSteer::Unreadable(_))));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A resume for this machine alone warns while a collective pause from here still holds elsewhere.
+    #[test]
+    fn a_local_resume_warns_of_a_collective_pause_it_leaves() {
+        let here = "ab".repeat(32);
+        let local = format!("{LOCAL}@{here}");
+        let at = |kind: Kind, to: &str, ms: i64| steer_from(&here, kind, to, "", ms);
+        let resume = at(Kind::Resume, &local, 5_000);
+        let home = tmp("pause-left");
+        std::fs::create_dir_all(home.join("mesh")).expect("mesh dir");
+        let role = |role: &str| {
+            let doc = json!({"members": [{"key": here, "role": role}], "revoked": []});
+            std::fs::write(membership_path(&home), doc.to_string()).expect("membership");
+        };
+        let all = at(Kind::Pause, ALL, 1_000);
+        assert!(!collective_pause_left(&home, std::slice::from_ref(&all), &resume), "no membership: no members to hold it");
+        role("member");
+        assert!(!collective_pause_left(&home, std::slice::from_ref(&all), &resume), "no steering role: the members dropped it");
+        role("steer");
+        let collective_pause_left = |lines: &[Message], m: &Message| collective_pause_left(&home, lines, m);
+        assert!(!collective_pause_left(&[], &resume), "no collective pause");
+        assert!(collective_pause_left(std::slice::from_ref(&all), &resume), "a collective pause");
+        assert!(!collective_pause_left(&[all.clone(), at(Kind::Resume, ALL, 2_000)], &resume), "already lifted with `resume collective`");
+        assert!(
+            !collective_pause_left(&[steer_from(&"cd".repeat(32), Kind::Pause, ALL, "", 1_000)], &resume),
+            "another node's pause is not this one's to lift"
+        );
+        assert!(!collective_pause_left(std::slice::from_ref(&all), &at(Kind::Resume, ALL, 5_000)), "a collective resume lifts it everywhere");
+        assert!(!collective_pause_left(std::slice::from_ref(&all), &at(Kind::Resume, "s1", 5_000)), "a session's resume");
+        assert!(!collective_pause_left(std::slice::from_ref(&all), &at(Kind::Resume, &local, 1_000 + steer::TTL_MS)), "lapsed");
         let _ = std::fs::remove_dir_all(&home);
     }
 

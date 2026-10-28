@@ -35,6 +35,7 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             Command { path: true, ..cmd("collective", &[("[DIR]", "which collective a directory belongs to")], &[], &[]) },
             cmd("vectors", &[("[--fetch|--rebuild] [--store LESSONS]", "the vector model and index")], &[], &["--fetch", "--rebuild", "--store"]),
             cmd("completions", &[("<bash|zsh|fish>", "a shell completion script")], &["bash", "zsh", "fish"], &[]),
+            cmd("version", &[("", "borg's version (also --version, -V)")], &[], &[]),
         ],
     ),
     (
@@ -107,11 +108,19 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             ),
             cmd(
                 "tell",
-                &[("<session|drone|all|engineer> <text> [--re ID]", "a message to other sessions, on any harness or node")],
-                &["all"],
+                &[(
+                    "<session|drone|local|collective|engineer> <text> [--re ID]",
+                    "a message to other sessions: local is this machine's, collective (or all) every member's",
+                )],
+                &["local", "collective", "all"],
                 crate::msg::FLAGS,
             ),
-            cmd("ask", &[("<session|drone|all|engineer> <question> [--re ID]", "a message that asks for a reply")], &["all"], crate::msg::FLAGS),
+            cmd(
+                "ask",
+                &[("<session|drone|local|collective|engineer> <question> [--re ID]", "a message that asks for a reply")],
+                &["local", "collective", "all"],
+                crate::msg::FLAGS,
+            ),
             cmd("inbox", &[("[--all] [--json]", "this session's messages; from a terminal, every recent one")], &[], crate::msg::INBOX_FLAGS),
             cmd(
                 "listen",
@@ -119,8 +128,18 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 &[],
                 crate::listen::FLAGS,
             ),
-            cmd("pause", &[("<session|drone|all> [note]", "refuse a session's tool calls until it is resumed")], &["all"], crate::msg::STEER_FLAGS),
-            cmd("resume", &[("<session|drone|all> [note]", "let a paused session's tool calls run again")], &["all"], crate::msg::STEER_FLAGS),
+            cmd(
+                "pause",
+                &[("<session|drone|local|collective> [note]", "refuse a session's tool calls until it is resumed")],
+                &["local", "collective", "all"],
+                crate::msg::STEER_FLAGS,
+            ),
+            cmd(
+                "resume",
+                &[("<session|drone|local|collective> [note]", "let a paused session's tool calls run again")],
+                &["local", "collective", "all"],
+                crate::msg::STEER_FLAGS,
+            ),
         ],
     ),
 ];
@@ -147,9 +166,10 @@ pub fn commands() -> impl Iterator<Item = &'static Command> {
     GROUPS.iter().flat_map(|(_, cmds)| cmds.iter())
 }
 
-/// Whether `name` is a top-level borg command (dispatched by main.rs): listed, `debug`, `help` or internal.
+/// Whether `name` is a top-level borg command (dispatched by main.rs): listed, `debug`, `help`, the
+/// version flags or internal.
 pub fn known(name: &str) -> bool {
-    commands().any(|c| c.name == name) || INTERNAL.contains(&name) || matches!(name, "debug" | "help" | "-h" | "--help")
+    commands().any(|c| c.name == name) || INTERNAL.contains(&name) || matches!(name, "debug" | "help" | "-h" | "--help" | "-V" | "--version")
 }
 
 /// The completions' commands: the main help's, then `debug` with the debug commands as subcommands and

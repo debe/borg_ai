@@ -13,6 +13,10 @@ async fn main() {
         println!("{USAGE}");
         return;
     }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("borg-web {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let port: u16 = match flag("--port").map(|p| p.parse()) {
         None => 7979,
         Some(Ok(p)) => p,

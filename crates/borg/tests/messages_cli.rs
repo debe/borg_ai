@@ -1,6 +1,7 @@
 //! Messages between sessions through the binary (msg.rs): `borg tell` and `borg ask` from a session on
 //! one harness reach a session on another at its next prompt or tool call, once, even across hooks
-//! running at the same moment; `all` reaches every live session but the sender; an ask carries the
+//! running at the same moment; `local` reaches every live session on this machine but the sender,
+//! and `collective` and `all` are written `all` (every session of the collective); an ask carries the
 //! command that answers it, `--re` threads the answer, and `borg inbox` lists both sides. The recorded
 //! hook payloads of tests/fixtures/<harness> drive Claude Code, Codex and the simulated harness; omp and
 //! opencode, whose adapters call the hook with canonical input, get it inline. No model call.
@@ -145,14 +146,14 @@ fn a_tell_to_a_presence_name_is_shown_once_even_to_parallel_tool_calls() {
 }
 
 #[test]
-fn all_reaches_every_live_session_but_the_sender() {
-    let (root, work) = setup("all");
+fn local_reaches_every_live_session_here_but_the_sender() {
+    let (root, work) = setup("local");
     hook(&root, "claude", "prompt", &fixture("claude", "prompt", "s-claude", &work));
     hook(&root, "codex", "prompt", &fixture("codex", "prompt", "s-codex", &work));
     hook(&root, "sim", "prompt", &fixture("sim", "prompt", "s-sim", &work));
     hook(&root, "omp", "prompt", &plain("s-omp", &work, json!({"prompt": "docs", "pid": 1})));
     hook(&root, "opencode", "prompt", &prompt("s-oc", &work));
-    let id = send(&root, &work, "tell", &["all", "freeze", "merges"], &[("CODEX_THREAD_ID", "s-codex")], "all");
+    let id = send(&root, &work, "tell", &["local", "freeze", "merges"], &[("CODEX_THREAD_ID", "s-codex")], "local");
     std::thread::sleep(std::time::Duration::from_millis(5));
     hook(&root, "opencode", "prompt", &prompt("s-late", &work));
 
@@ -171,6 +172,22 @@ fn all_reaches_every_live_session_but_the_sender() {
 
     let r = borg(&root, &work, &["inbox"], &[], "");
     assert!(r.out.contains(&id) && r.out.contains("[shown to 5]"), "{}", r.out);
+    assert!(r.out.lines().any(|l| l.contains(&id) && l.contains("-> local [")), "{}", r.out);
+
+    // `local` is written for this machine's node; `collective` and its synonym `all` as `all`.
+    let collective = send(&root, &work, "tell", &["collective", "staging", "is", "down"], &[], "collective");
+    let all = send(&root, &work, "tell", &["all", "staging", "is", "back"], &[("CODEX_THREAD_ID", "s-codex")], "collective");
+    let v: Value = serde_json::from_str(&borg(&root, &work, &["inbox", "--json"], &[], "").out).unwrap();
+    let to = |id: &str| v.as_array().unwrap().iter().find(|m| m["id"] == id).map(|m| m["to"].as_str().unwrap_or_default().to_string()).unwrap();
+    assert!(to(&id).starts_with("local@") && to(&id).len() > 6, "{v}");
+    assert_eq!((to(&collective), to(&all)), ("all".into(), "all".into()), "{v}");
+    let c = context(&hook(&root, "claude", "prompt", &fixture("claude", "prompt", "s-claude", &work)));
+    assert!(
+        c.contains(&format!("[{collective}]: staging is down")) && c.contains(&format!("[{all}]: staging is back")),
+        "the collective includes this machine: {c}"
+    );
+    let r = borg(&root, &work, &["inbox"], &[], "");
+    assert!(r.out.lines().any(|l| l.contains(&collective) && l.contains("-> collective [")), "{}", r.out);
     let _ = std::fs::remove_dir_all(&root);
 }
 

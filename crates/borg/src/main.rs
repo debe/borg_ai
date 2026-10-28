@@ -273,6 +273,7 @@ fn main() {
         ["listen", rest @ ..] => std::process::exit(borg::listen::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
+        ["version" | "--version" | "-V"] => println!("borg {}", env!("CARGO_PKG_VERSION")),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),
         _ => {
             eprint!("{}", help(atty(2), false));

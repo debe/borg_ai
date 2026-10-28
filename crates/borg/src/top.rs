@@ -177,11 +177,15 @@ pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
     if m.node == here { name } else { format!("{name} @{}", m.node.get(..12).unwrap_or(&m.node)) }
 }
 
-/// Whom `to` names, as the screen says it: `all`, the engineer, the drone it is, else the start of the
-/// session id.
+/// Whom `to` names, as the screen says it: `local` (this machine's sessions), `collective` (every
+/// member's), the engineer, the drone it is, else the start of the session id. Another node's `local`
+/// (it never travels, msg.rs `stays_here`) is named with that node's short key.
 pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
     match Address::parse(to) {
         Some(Address::Engineer { email }) if !email.is_empty() => collective::aliases().display(&email),
+        Some(Address::Local { node }) if node == here => msg::LOCAL.into(),
+        Some(Address::Local { node }) => format!("{} @{}", msg::LOCAL, node.get(..12).unwrap_or(&node)),
+        Some(Address::All) => msg::COLLECTIVE.into(),
         Some(Address::Session { id, node }) => {
             let d = match node {
                 Some(n) => drone_at(drones, here, &n, &id),
@@ -206,11 +210,14 @@ pub fn unread_cell(inbox: &Inbox, d: &Drone) -> String {
     inbox.unread.get(&d.p.session).map_or_else(|| "-".into(), usize::to_string)
 }
 
-/// Which drone `target` names: "all", a designation ("Two", "Two of Five", "2") or a session id
-/// (or a unique prefix of at least 4 characters). `Ok(None)` is every drone.
+/// Which drone `target` names: "local", "collective" or "all", a designation ("Two", "Two of Five", "2") or a session
+/// id (or a unique prefix of at least 4 characters). `Ok(None)` is every drone. Live first, then local:
+/// an id or prefix that matches a running drone names it over an ended one (which never reads a message),
+/// and among those one on this machine over one on another node; a remote drone is named only when
+/// none here matches as well (or by its number, which names one drone of all).
 pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone>, String> {
     let t = target.trim();
-    if t.eq_ignore_ascii_case("all") {
+    if [msg::ALL, msg::COLLECTIVE, msg::LOCAL].iter().any(|w| t.eq_ignore_ascii_case(w)) {
         return Ok(None);
     }
     let first = t.split_whitespace().next().unwrap_or_default();
@@ -218,7 +225,13 @@ pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone
     if let Some(n) = number {
         return drones.iter().find(|d| d.number == n).map(Some).ok_or_else(|| format!("no drone {target}: there are {} (`borg top`)", drones.len()));
     }
-    let hits: Vec<&Drone> = drones.iter().filter(|d| d.p.session == t || (t.len() >= 4 && d.p.session.starts_with(t))).collect();
+    let mut hits: Vec<&Drone> = drones.iter().filter(|d| d.p.session == t || (t.len() >= 4 && d.p.session.starts_with(t))).collect();
+    if hits.iter().any(|d| d.state != State::Ended) {
+        hits.retain(|d| d.state != State::Ended);
+    }
+    if hits.iter().any(|d| d.node.is_empty()) {
+        hits.retain(|d| d.node.is_empty());
+    }
     match hits.as_slice() {
         [d] => Ok(Some(d)),
         [] => Err(format!("no drone or session {target:?} (`borg top`)")),
@@ -481,7 +494,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
   Three of Three     cccc333… alice@x                  borg-ai        idle     on        31m      0  write the release notes for the mesh da…
   messages: 3 in the last day, 2 unread
       1m  Three of Three asks -> One of Three: which test flakes?
-      2m  alice@x -> all: release at five
+      2m  alice@x -> collective: release at five
       3m  Six of Six @feedfeedfeed -> zzzz9999: done
 ";
         assert_eq!(out, expected, "\n{out}");
@@ -526,7 +539,9 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(sender(&ds, "n1", &remote), "Two of Three @beefcafebeef", "the remote drone on its own node");
         assert_eq!(recipient(&ds, "n1", "aaaa1111-x@n1"), "One of Three");
         assert_eq!(recipient(&ds, "n1", "aaaa1111-x@evil"), "aaaa1111", "not the local drone of that id");
-        assert_eq!((recipient(&ds, "n1", "engineer"), recipient(&ds, "n1", msg::ALL)), ("engineer".into(), "all".into()));
+        assert_eq!((recipient(&ds, "n1", "engineer"), recipient(&ds, "n1", msg::ALL)), ("engineer".into(), "collective".into()), "an `all` line");
+        assert_eq!(recipient(&ds, "n1", "local@n1"), "local");
+        assert_eq!(recipient(&ds, "n1", "local@beefcafebeefcafe00"), "local @beefcafebeef");
     }
 
     #[test]
@@ -547,6 +562,36 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(d[2]["files"], json!([]));
     }
 
+    /// Local first: a prefix or id that matches a drone here and one of a member names the one here.
+    #[test]
+    fn a_name_matching_here_and_on_a_member_names_the_drone_here() {
+        let local = vec![p("aaaa1111-x", "alice@x", 100, NOW - 5_000, "post_tool", "a", &[])];
+        let remote = ["aaaa1111-x", "aaaa2222-z"].map(|s| presence::Remote {
+            p: p(s, "bob@y", 50, NOW - 5_000, "post_tool", "b", &[]),
+            key: "beefcafe".repeat(8),
+            sig: String::new(),
+        });
+        let ds = assemble(local, remote.into(), NOW, |_| true, |_| false);
+        for t in ["aaaa", "aaaa1111", "aaaa1111-x"] {
+            let d = resolve(&ds, t).unwrap().unwrap();
+            assert!(d.node.is_empty() && d.p.session == "aaaa1111-x", "{t}");
+        }
+        assert_eq!(resolve(&ds, "aaaa2").unwrap().unwrap().node, "beefcafe".repeat(8), "only a member's matches");
+        assert!(!resolve(&ds, "One").unwrap().unwrap().node.is_empty(), "a number names one drone of all, wherever it runs");
+    }
+
+    /// An ended session here does not shadow a live one on a member's machine: it would never read the message.
+    #[test]
+    fn a_name_matching_an_ended_drone_here_and_a_live_member_names_the_live_one() {
+        let local = vec![p("aaaa1111-x", "alice@x", 100, NOW - 5_000, "end", "a", &[])];
+        let remote =
+            vec![presence::Remote { p: p("aaaa2222-z", "bob@y", 50, NOW - 5_000, "post_tool", "b", &[]), key: "beefcafe".repeat(8), sig: String::new() }];
+        let ds = assemble(local, remote, NOW, |_| true, |_| false);
+        let d = resolve(&ds, "aaaa").unwrap().unwrap();
+        assert_eq!((d.p.session.as_str(), d.node.as_str()), ("aaaa2222-z", "beefcafe".repeat(8).as_str()), "the live one, though remote");
+        assert!(resolve(&ds, "aaaa1111").unwrap().unwrap().node.is_empty(), "an ended drone is still named by its own id");
+    }
+
     #[test]
     fn resolves_drones_by_designation_or_session() {
         let ds = fixture();
@@ -558,6 +603,8 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert!(resolve(&ds, "Four").is_err());
         assert!(resolve(&ds, "zzzz").is_err());
         assert!(resolve(&ds, "aa").is_err(), "too short a prefix");
+        assert!(["collective", "local"].iter().all(|w| resolve(&ds, w).unwrap().is_none()));
+        assert_eq!(resolve(&ds, "bbbb").unwrap().unwrap().p.session, "bbbb2222-y", "nothing here matches: the member's");
         assert_eq!(word(21), "21");
     }
 }

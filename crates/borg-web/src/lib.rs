@@ -263,7 +263,8 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
 
 /// Messages between sessions (borg msg.rs) on this node, newest first: who sent each to whom, as `borg
 /// top` names them (a sender from another node with that node's short key: the one part the mesh
-/// checked), what the recipient is (`to_kind`: `all`, `engineer` or `session`, from msg.rs `Address`),
+/// checked), what the recipient is (`to_kind`: `all` for a broadcast, `local` or `collective`,
+/// `engineer` or `session`, from msg.rs `Address`; `to_name`, top.rs `recipient`, tells them apart),
 /// and how many sessions here it was shown to.
 async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
@@ -280,7 +281,7 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
         .map(|x| {
             let to = shown.get(&presence::safe(&x.id)).map_or(0, Vec::len);
             let to_kind = match msg::Address::parse(&x.to) {
-                Some(msg::Address::All) => "all",
+                Some(a) if a.broadcast() => "all",
                 Some(msg::Address::Engineer { .. }) => "engineer",
                 _ => "session",
             };

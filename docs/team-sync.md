@@ -147,7 +147,9 @@ machine is revoked:
 - **Ratified constraints** (`borg no`, `borg queen`): the invariant, its lesson and who ratified it,
   never the veto's words. Every member's sessions get them as standing lessons.
 - **Messages between sessions** (`borg tell`, `borg ask`, and `borg pause`, `borg resume` or a
-  `borg no` aimed at another machine), already redacted, checked on read, and kept for 7 days. A pause,
+  `borg no` aimed at another machine), already redacted, checked on read, and kept for 7 days. A
+  message to `local` (written `local@<node>`) is for this machine's sessions and never syncs;
+  `collective` (or `all`), `<session>@<node>` and replies do. A pause,
   resume or veto from another machine counts only when the membership gives that machine the `steer`
   or `admin` role; any other is refused and counted as `steer_dropped`.
 

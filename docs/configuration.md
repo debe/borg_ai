@@ -32,7 +32,7 @@ into `~/.local/bin` and runs `borg setup`; options go after `sh -s --`
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh
-curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.4.0 --dir ~/bin --no-setup
+curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh -s -- --version v0.5.0 --dir ~/bin --no-setup
 ```
 
 From crates.io (the package is `borg-ai`; the binary is `borg`), or from a checkout:

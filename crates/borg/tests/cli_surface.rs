@@ -70,6 +70,7 @@ const PROBES: &[(&str, &[&str])] = &[
     ("collective", &["."]),
     ("vectors", &[]),
     ("completions", &[]),
+    ("version", &[]),
     ("learn", &[]),
     ("no", &[]),
     ("assimilate", &["--zz-probe"]),
@@ -144,6 +145,17 @@ fn help_completions_and_dispatch_name_the_same_commands() {
         assert!(!main.contains(internal) && !top.contains(internal), "{internal} is internal");
         let (_, err, _) = borg(&root, &[internal]);
         assert!(!err.contains("borg: unknown command"), "{internal}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn version_prints_one_line_at_each_spelling() {
+    let root = tmp("version");
+    for spelling in ["version", "--version", "-V"] {
+        let (out, err, code) = borg(&root, &[spelling]);
+        assert_eq!(code, Some(0), "borg {spelling}: {err}");
+        assert_eq!(out, format!("borg {}\n", env!("CARGO_PKG_VERSION")), "borg {spelling}");
     }
     let _ = std::fs::remove_dir_all(root);
 }

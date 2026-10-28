@@ -65,13 +65,14 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
 /// `key` as its node (the member key its sender wrote, as `borg top` names a remote node), and be
 /// fresh (msg.rs `fresh`: neither past `TTL_MS` nor stamped further ahead of this clock than
 /// `SKEW_MS`): a member's forged node, or a far-future line that would outlive every prune, never
-/// reaches another member.
+/// reaches another member. A message to the sessions of its own node (`local`, msg.rs `stays_here`)
+/// never travels: it is for that machine alone.
 pub fn travels(file: &str, line: &str, key: &str, now: i64) -> bool {
     if file != borg::msg::FILE {
         return true;
     }
     let Ok(m) = serde_json::from_str::<borg::msg::Message>(line) else { return false };
-    m.well_formed() && m.node == key && borg::msg::fresh(&m, now)
+    m.well_formed() && m.node == key && borg::msg::fresh(&m, now) && !m.stays_here()
 }
 
 pub fn hash(line: &str) -> Hash {
@@ -157,6 +158,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// `local` is this machine's sessions: its line never travels; `collective` (written `all`) does.
+    #[test]
+    fn a_local_broadcast_never_travels() {
+        let key = "ab".repeat(32);
+        let from = borg::msg::Sender { by: "s1".into(), name: "One of Two".into(), harness: "claude".into(), node: key.clone() };
+        let line = |to: &str| serde_json::to_string(&borg::msg::Message::new(borg::msg::TELL, &from, to, None, 1_000, "freeze merges")).unwrap();
+        assert!(!travels(borg::msg::FILE, &line(&format!("{}@{key}", borg::msg::LOCAL)), &key, 1_000));
+        assert!(travels(borg::msg::FILE, &line(borg::msg::ALL), &key, 1_000));
+        assert!(travels(borg::msg::FILE, &line(&format!("s2@{}", "cd".repeat(32))), &key, 1_000));
     }
 
     #[test]

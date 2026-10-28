@@ -17,7 +17,7 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.4.0, the first release on crates.io. It removed the hive and playbooks: sessions now message each other instead. In daily use, with
+**Status:** 0.5.0, the first release on crates.io. It removed the hive and playbooks: sessions now message each other instead. In daily use, with
 lessons syncing between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
@@ -163,15 +163,20 @@ machine they are on. A session or the engineer's terminal sends:
 
 ```sh
 borg tell Two "the schema change is merged, rebase before you touch migrations"
-borg ask all "is anyone editing crates/borg/src/hook.rs?"
+borg ask local "is anyone editing crates/borg/src/hook.rs?"        # the sessions on this machine
+borg tell collective "the staging database is down until noon"     # every session, every member's machine
 borg inbox      # in a session: its messages; in a terminal: every message of the last 7 days
 ```
 
-The recipient is a drone as `borg top` names it, a session id (`<session>@<node>` on another machine),
-`all` (the sessions running when it was sent) or `engineer`. The message is shown once, at the recipient's next prompt or tool call, marked as
+The recipient is a drone as `borg top` names it, a session id, `local`, `collective` (or `all`, the
+same) or `engineer`. Local first: `local` reaches the sessions running on this machine, and a drone or
+session id that matches one here names it. A colleague's session is reached by `<session>@<node>`, when
+nothing here matches, or as the sender a reply answers; `collective` reaches every session of the
+collective on every member's machine and may wake them, so it is for what concerns their work. The message is shown once, at the recipient's next prompt or tool call, marked as
 peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
 Text is redacted and cut to 1,000 characters, and one sender may send a recipient one message per 10
-minutes. Messages are kept 7 days and sync to the team collective's members.
+minutes. Messages are kept 7 days. One to `local` stays on this machine; one to `collective`, to
+`<session>@<node>` or a reply syncs to the team collective's members.
 
 The engineer can also hold a session, or every one:
 
@@ -181,6 +186,7 @@ borg resume Two
 borg no --session Two "never look merges up in the commit log"   # a veto, on this or another machine
 ```
 
+`borg pause local` holds this machine's sessions; `borg pause collective` (or `all`) every member's.
 These are messages too, shown at the next prompt or tool call on every harness, and never rate limited.
 From another member's machine they count only if that member has the `admin` or `steer` role. A pause
 lapses after a day.

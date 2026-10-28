@@ -1,15 +1,17 @@
 # Changelog
 
-## 0.4.0 (2026-10-28)
+## 0.5.0 (unreleased)
 
-The first release on crates.io (0.3.0 and 0.2.0 were never published, so their notes below are
-history). borg keeps the shared memory: lessons from corrections, checked against the work and
-shared with a team. The hive and playbooks are gone; sessions talk to each other instead, on any
-harness and across machines, and steering is part of that channel. Every crate is 0.4.0 and pins the
-others `=0.4.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
+The first release on crates.io (0.4.0, 0.3.0 and 0.2.0 were never published: 0.4.0's notes are
+part of this section, and those of 0.3.0 and 0.2.0 below are history). borg keeps the shared memory:
+lessons from corrections, checked against the work and shared with a team. The hive and playbooks are gone; sessions talk to each other instead, on any
+harness and across machines, and steering is part of that channel. Every crate is 0.5.0 and pins the
+others `=0.5.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 
 ### Added
 
+- `borg --version`, `borg -V` and `borg version` print `borg <version>`; `borg-mesh` and `borg-web` take
+  `--version` and `-V` too (`borg-web` no longer starts its server on an unknown `--version`).
 - Messages between sessions: `borg tell <to> "<text>"`, `borg ask <to> "<question>"` and `borg inbox`.
   A session on any harness, or the engineer's terminal, writes to a drone (as `borg top` names it), a
   session (`<session>@<node>` across machines), `all` or the engineer. The recipient sees each message
@@ -26,6 +28,14 @@ others `=0.4.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#rele
 
 ### Changed
 
+- `borg tell`, `borg ask`, `borg pause` and `borg resume local` reach this machine's sessions;
+  `collective` (or `all`) the whole collective; a name prefers a session on this machine. `local` is
+  written `local@<node>`, never syncs and counts only on a line of that node; `collective` and `all`
+  are written `all`, as before. A drone or session prefix that matches here and on a member's machine
+  names the one here; a member's session is reached when nothing here matches, by `<session>@<node>`,
+  or as the sender a reply answers. A `borg resume local` warns when a collective pause sent from here
+  still holds on the members' machines. `borg top`, `borg inbox` and borg web name the recipient
+  `local` or `collective`, and the borg skill asks this machine's sessions first.
 - Steering is now messages: `borg pause <to> [note]` and `borg resume <to> [note]`, and `borg no` to a
   drone on another machine sends a veto message. Every harness shows them at the next prompt or tool
   call, not only Claude Code. One from another machine counts only when the mesh admits its sender as
@@ -56,7 +66,7 @@ others `=0.4.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#rele
 
 ## 0.3.0 (never published)
 
-Meant as the first release for crates.io; 0.4.0 took its place: a smaller, consistent command line, a library marked internal,
+Meant as the first release for crates.io; 0.5.0 took its place: a smaller, consistent command line, a library marked internal,
 and documentation whose claims match their reports. The release steps are in
 [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 

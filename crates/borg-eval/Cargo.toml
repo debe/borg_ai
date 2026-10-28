@@ -13,8 +13,8 @@ description = "Run drone arms on eval workloads and measure cost per solved task
 publish = false
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.4.0" }
-borg = { package = "borg-ai", path = "../borg", version = "=0.4.0" }
+borg-trace = { path = "../borg-trace", version = "=0.5.0" }
+borg = { package = "borg-ai", path = "../borg", version = "=0.5.0" }
 serde_json.workspace = true
 regex.workspace = true
 # the research binaries in src/bin scan transcripts in parallel
