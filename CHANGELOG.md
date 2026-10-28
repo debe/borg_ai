@@ -45,6 +45,15 @@ and documentation whose claims match their reports. The release steps are in
   mesh daemon or another drone's waiter, beating only for its own drone so peers keep its claims.
 - `borg mesh serve` follows a reinstall of borg-mesh the same way: it stops serving the old code and
   runs the new borg-mesh in the same process, so a terminal or a service keeps one daemon.
+- Drones report plan problems to the session that planned the goal (`borg hive tell "..." --to
+  planner`), which sees them at its next prompt, even after the approval, and tells the drones without
+  joining; `borg top` and `borg web` show its unread messages. `approve`, `integrate` and `score` now
+  refuse inside a harness session like `ratify`, and `borg hive tell` from a terminal sends as the
+  engineer, no longer as the repo's one drone.
+- A goal opened from a terminal has no planning session, so `borg top` and `borg web` count its drones'
+  messages to the planner on the goal's home node, and `borg hive board` in a terminal lists the ones
+  not read on that machine and marks them read. `borg hive leave` in a session that only plans ends its
+  planning.
 
 ### Documentation
 

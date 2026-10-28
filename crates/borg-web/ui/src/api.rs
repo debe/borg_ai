@@ -581,6 +581,11 @@ pub struct HiveMonitor {
     pub integrate_log: Vec<String>,
     pub metered_usd: f64,
     pub unmetered: f64,
+    /// This node's planner sessions and the messages for them their prompts have not shown.
+    pub planners: Vec<(String, f64)>,
+    /// The goal's messages to the planner and those no planning session of this node showed, on the
+    /// goal's home node and a node with a planning session.
+    pub planner_mail: Option<(f64, f64)>,
 }
 
 fn arr(v: &Value) -> impl Iterator<Item = &Value> {
@@ -639,6 +644,8 @@ fn parse_monitor(g: &Value) -> HiveMonitor {
         integrate_log: strs(&g["integrate_log"]),
         metered_usd: f(&g["metered_usd"]),
         unmetered: f(&g["unmetered"]),
+        planners: arr(&g["planners"]).map(|p| (s(&p["session"]), f(&p["unread"]))).collect(),
+        planner_mail: g["planner_mail"].is_object().then(|| (f(&g["planner_mail"]["sent"]), f(&g["planner_mail"]["unshown"]))),
     }
 }
 

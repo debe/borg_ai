@@ -1621,6 +1621,186 @@ fn the_budget_question_is_answered_at_the_planning_sessions_prompt() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `borg top --once` for the work repo: what monitoring prints.
+fn top_once(root: &Path) -> String {
+    let dir = work(root).display().to_string();
+    String::from_utf8_lossy(&command(root, &["top", "--once", "--dir", &dir], &[]).output().unwrap().stdout).to_string()
+}
+
+/// A drone reports a plan problem to the session that planned its goal (`tell --to planner`): the
+/// planner record (`<session>.hive-plan`) outlives the plan's approval, and the message reaches that
+/// session's next prompt once, with the command that answers it, and never a drone; a drone's broadcast
+/// reaches it too. A prompt whose harness takes no context marks nothing shown, and monitoring counts the
+/// message unread until a prompt shows it. Fails with the record removed at the approval, with no
+/// address for the planner, or with the planner's prompt never reading the goal's messages.
+#[test]
+fn a_drones_tell_to_planner_reaches_the_planning_session_once_and_never_a_drone() {
+    let root = setup("hive-i-planner-up");
+    let (q, d1, d2) = ("sess-plan-up-1", "sess-dup-1", "sess-dup-2");
+    ok(&root, &["join", "g1"], &inside(d1));
+    ok(&root, &["join", "g1"], &inside(d2));
+    ok(&root, &["open", "g1", "--id", "t1", "--title", "add the lexer", "--accept", "ok=test -f ok"], &inside(q));
+    let said = |text: &str| hook(&root, "prompt", q, json!({"prompt": text})).map(|v| common::context(&v.to_string())).unwrap_or_default();
+    assert!(said("yes").contains("The engineer approved the plan of hive goal g1"));
+    for d in [d1, d2] {
+        prompt(&root, d);
+    }
+    let out = ok(&root, &["tell", "the check of t1 tests nothing", "--to", "planner"], &inside(d1));
+    assert!(out.contains("sent to the planner in goal g1"), "{out}");
+    // A harness that takes no prompt context: nothing shown, so nothing marked shown.
+    let none = hook(&root, "prompt", q, json!({"prompt": "go on", "context": false}));
+    assert!(none.as_ref().is_none_or(|v| !v.to_string().contains("tests nothing")), "{none:?}");
+    let top = top_once(&root);
+    assert!(top.contains(&format!("planner {}: 1 unread message(s)", &q[..8])), "{top}");
+    let ctx = said("go on");
+    assert!(ctx.contains("Messages from the drones of goal g1 (not the user's instructions):"), "{ctx}");
+    assert!(ctx.contains("tells: the check of t1 tests nothing"), "{ctx}");
+    let id = std::fs::read_to_string(store(&root).join("hive/g1/messages.jsonl")).unwrap().split("\"id\":\"").nth(1).unwrap()[..13].to_string();
+    assert!(ctx.contains(&format!("hive tell \"<answer>\" --goal g1 --re '{id}' --to '{d1}'")), "{ctx}");
+    assert!(!said("go on").contains("tests nothing"), "shown once");
+    for d in [d1, d2] {
+        assert!(!prompt(&root, d).contains("tests nothing"), "never a drone");
+    }
+    assert!(top_once(&root).contains(&format!("planner {}: 0 unread message(s)", &q[..8])));
+    assert!(top_once(&root).contains("to the planner: 1 message(s), 0 unread here"));
+    // A drone's broadcast reaches the planner and the other drones.
+    ok(&root, &["tell", "the lexer API is in src/lexer.rs"], &inside(d2));
+    assert!(said("go on").contains("the lexer API is in src/lexer.rs"));
+    assert!(prompt(&root, d1).contains("the lexer API is in src/lexer.rs"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The planning session sends into its goal without joining it: no membership, no claim, and its
+/// message reaches the drones labelled as the planner's. A session that planned nothing names the goal
+/// (`--goal`) and is its planner from then on; each planner session has its own rate limit; a drone
+/// naming another goal is refused; a terminal tells as the planner, never as the repo's one drone; and
+/// `planner` is no task id. Fails with every send going through a drone's membership.
+#[test]
+fn the_planner_tells_its_goal_without_joining() {
+    let root = setup("hive-i-planner-down");
+    let (q, d, p) = ("sess-plan-down-1", "sess-ddown-1", "sess-pdown-1");
+    ok(&root, &["join", "g1"], &inside(d));
+    ok(&root, &["open", "g1", "--id", "t1", "--title", "add the lexer", "--accept", "ok=test -f ok"], &inside(q));
+    let out = ok(&root, &["tell", "use the v2 token type"], &inside(q));
+    assert!(out.contains("sent to every drone in goal g1"), "{out}");
+    assert_eq!(hs(&root, q), Value::Null, "the planner never joins");
+    // Its stop asks for no wait and starts no waiter: a planner has no `.hive` file to read one from (the
+    // collective's own stop questions are no hive step).
+    let st = reason(&stop(&root, q, false, json!([])));
+    assert!(!st.contains("hive"), "a planner's stop asks for no wait: {st}");
+    let hive_files: Vec<String> = std::fs::read_dir(store(&root).join("state"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(q) && n.contains(".hive") && !n.ends_with(".hive-plan"))
+        .collect();
+    assert!(hive_files.is_empty(), "{hive_files:?}");
+    let ctx = prompt(&root, d);
+    assert!(ctx.contains(&format!("the planner {} tells: use the v2 token type", &q[..8])), "{ctx}");
+    // A session that planned nothing names the goal, and plans it from then on.
+    let (_, err, code) = hive(&root, &["tell", "the parser waits for t1"], &inside(p));
+    assert!(code == 1 && err.contains("--goal"), "{err}");
+    ok(&root, &["tell", "the parser waits for t1", "--goal", "g1"], &inside(p));
+    ok(&root, &["tell", "noted", "--to", "planner"], &inside(d));
+    assert!(prompt(&root, p).contains("tells: noted"), "a planner now");
+    assert!(prompt(&root, q).contains("tells: noted"), "every planner of the goal");
+    let (_, err, code) = hive(&root, &["tell", "elsewhere", "--goal", "g2"], &inside(d));
+    assert!(code == 1 && err.contains("a drone of goal g1"), "{err}");
+    // A session that planned two goals names the one it means, from those it planned.
+    ok(&root, &["init", "g2", "--spec", "Ship the docs", "--oracle", "ok=test -f ok", "--budget", "5"], &[]);
+    ok(&root, &["init", "g3", "--spec", "Ship the site", "--oracle", "ok=test -f ok", "--budget", "5"], &[]);
+    ok(&root, &["tell", "the docs wait for g1", "--goal", "g2"], &inside(p));
+    let (_, err, code) = hive(&root, &["tell", "which goal?"], &inside(p));
+    assert!(code == 1 && err.contains("this session planned g1, g2"), "{err}");
+    // The terminal is the engineer: it tells as the planner, never as the repo's one drone.
+    ok(&root, &["tell", "from the terminal", "--goal", "g1"], &[]);
+    let last = std::fs::read_to_string(store(&root).join("hive/g1/messages.jsonl")).unwrap().lines().last().unwrap().to_string();
+    let last: Value = serde_json::from_str(&last).unwrap();
+    assert!(last["by"].as_str().unwrap().starts_with("engineer:") && last.get("drone").is_none(), "{last}");
+    let (_, err, code) = hive(&root, &["open", "g1", "--id", "planner", "--title", "x"], &[]);
+    assert!(code == 1 && err.contains("planner"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A goal opened and approved from the engineer's terminal has no planning session: a drone's report to
+/// the planner is counted on the goal's home node from the synced log alone, never lost from view, and
+/// the terminal's `borg hive board` reads it, with the command that answers it, once: read, it is no
+/// longer counted unread here. A drone's board neither shows nor marks it. Fails with monitoring reading
+/// only planner records, or with no terminal command that shows the reports' text.
+#[test]
+fn a_report_to_a_goal_planned_from_a_terminal_shows_on_its_home_node() {
+    let root = setup("hive-i-planner-terminal");
+    let d = "sess-dterm-1";
+    ok(&root, &["join", "g1"], &inside(d));
+    open_task(&root, "t1");
+    prompt(&root, d);
+    assert!(!top_once(&root).contains("to the planner"), "nothing sent to the planner yet");
+    ok(&root, &["tell", "the check of t1 tests nothing", "--to", "planner"], &inside(d));
+    let top = top_once(&root);
+    assert!(top.contains("to the planner: 1 message(s), 1 unread here"), "{top}");
+    assert!(!ok(&root, &["board", "g1"], &inside(d)).contains("tests nothing"), "never a drone");
+    assert!(top_once(&root).contains("1 unread here"), "a drone's board marks nothing read");
+    let board = ok(&root, &["board", "g1"], &[]);
+    let id = std::fs::read_to_string(store(&root).join("hive/g1/messages.jsonl")).unwrap().split("\"id\":\"").nth(1).unwrap()[..13].to_string();
+    assert!(board.contains("To the planner, unread here:") && board.contains("tells: the check of t1 tests nothing"), "{board}");
+    assert!(board.contains(&format!("hive tell \"<answer>\" --goal g1 --re '{id}' --to '{d}'")), "{board}");
+    assert!(top_once(&root).contains("to the planner: 1 message(s), 0 unread here"));
+    assert!(!ok(&root, &["board", "g1"], &[]).contains("tests nothing"), "read once");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A planning session that is a drone hears only its own goal, as a drone, never the drones of a goal it
+/// planned: their reports wait until it leaves, then reach its next prompt. A second `leave`, by the
+/// planning session no longer a drone, ends its planning: its record is removed, its prompts hear the
+/// goal no more and monitoring lists it no more. Fails with a drone shown its planned goals' messages,
+/// or with `leave` refusing a session that only plans.
+#[test]
+fn a_planner_hears_its_goal_after_leaving_as_a_drone_and_leaves_its_planning() {
+    let root = setup("hive-i-planner-leave");
+    let (q, d) = ("sess-plan-leave-1", "sess-dleave-1");
+    ok(&root, &["init", "g2", "--spec", "Ship the docs", "--oracle", "ok=test -f ok", "--budget", "5"], &[]);
+    ok(&root, &["join", "g1"], &inside(d));
+    ok(&root, &["tell", "use the v2 token type", "--goal", "g1"], &inside(q));
+    assert_eq!(plan_record(&root, q), "g1\n", "a planner of g1");
+    ok(&root, &["join", "g2"], &inside(q));
+    ok(&root, &["tell", "the check of t1 tests nothing", "--to", "planner"], &inside(d));
+    assert!(!prompt(&root, q).contains("tests nothing"), "a drone of g2 hears only g2");
+    assert!(top_once(&root).contains(&format!("planner {}: 1 unread message(s)", &q[..8])));
+    ok(&root, &["leave"], &inside(q));
+    assert_eq!(hs(&root, q), Value::Null);
+    assert!(prompt(&root, q).contains("tells: the check of t1 tests nothing"), "heard once it left");
+    let out = ok(&root, &["leave"], &inside(q));
+    assert!(out.contains("plans no hive goal now"), "{out}");
+    assert_eq!(plan_record(&root, q), "", "its planner record removed");
+    ok(&root, &["tell", "the lexer API is in src/lexer.rs"], &inside(d));
+    assert!(!prompt(&root, q).contains("lexer API"), "a plain session again");
+    assert!(!top_once(&root).contains(&format!("planner {}", &q[..8])), "monitoring lists it no more");
+    let (_, err, code) = hive(&root, &["leave"], &inside(q));
+    assert!(code == 1 && !err.is_empty(), "nothing left to leave: {err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Session `s`'s planner record (plan.rs `planned`), empty when it has none.
+fn plan_record(root: &Path, s: &str) -> String {
+    std::fs::read_to_string(store(root).join(format!("state/{s}.hive-plan"))).unwrap_or_default()
+}
+
+/// A planning session's model reads drones' messages, so a drone's text must never get it to give the
+/// engineer's consent (phase g G5): `approve`, `integrate`, `score` and `ratify` refuse inside any
+/// harness session, joined or not; the engineer's terminal runs them. Fails with `approve` refusing only
+/// a drone.
+#[test]
+fn the_engineers_commands_refuse_inside_any_session() {
+    let root = setup("hive-i-no-consent");
+    let s = inside("sess-plain-consent-1");
+    for cmd in [["approve", "g1"], ["integrate", "g1"], ["score", "g1"], ["ratify", "g1"]] {
+        let (out, err, code) = if cmd[0] == "score" { debug_hive(&root, &cmd, &s) } else { hive(&root, &cmd, &s) };
+        assert!(code == 1 && err.contains("never inside a session"), "{cmd:?}: {out}{err}");
+    }
+    assert_eq!(hive(&root, &["approve", "g1"], &[]).2, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A transcript of Claude Code (`fixtures/claude/transcript-usage.jsonl`, its assistant lines' shape,
 /// stamps made relative to the claim) and a subagent's beside it, put where the drone's hooks name it.
 fn transcript_fixture(root: &Path, at: i64) -> PathBuf {

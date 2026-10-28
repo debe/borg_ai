@@ -191,7 +191,8 @@ const SET_ASIDE_MARKER: &str = "#borg-hive-set-aside ";
 pub const INOCULATION: &str = "The oracle gates done: your task counts as done only when its checks pass, and a verifier drone checks the work after you. \
 Every change to tests, CI config or oracle files is recorded and shown to the verifier; gaming a check is visible, allowed to happen, and useless: \
 the task counts as failed. Adding tests, also inside an existing test file, is fine; outside your task's files an existing test may change only in names and values, \
-never lose a line, an assertion or gain a skip. If a check looks wrong, say so in your done note instead of changing it.";
+never lose a line, an assertion or gain a skip. If a check or the plan looks wrong, say so in your done note instead of changing it, \
+and tell the planner: `borg hive tell \"<what is wrong>\" --to planner`.";
 /// Added for a goal with a hidden oracle.
 pub const INOCULATION_HIDDEN: &str = "This goal is also scored by held-out checks you cannot see.";
 
@@ -1074,14 +1075,27 @@ fn with_reason(text: &str, out: Option<Value>, may_block: bool) -> Option<Value>
 /// The hook's hive step, inside steering and around everything else it answers (`inner`). A session in
 /// no goal (or a goal gone) gets `inner()` untouched.
 pub fn around(h: &dyn Harness, home: &Path, event: &str, input: &Value, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
-    // The engineer's answer to a plan this session opened (phase g G5, plan.rs `at_prompt`): read from
-    // their own prompt, first in its context. One failed stat for a session that opened none.
+    // A planner session (plan.rs `planned`): the engineer's answer to a plan it opened (phase g G5,
+    // `at_prompt`), read from their own prompt, and its drones' messages to it (`planner_prompt`), first
+    // in its context. One failed open for a session that planned nothing.
     if event == "prompt" {
         let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
         let prompt = input.get("prompt").and_then(Value::as_str).unwrap_or_default();
-        if let Some(text) = plan::at_prompt(home, session, prompt, now) {
-            let allowed = h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false));
-            return with_context(session, "UserPromptSubmit", text, allowed, around_session(h, home, event, input, now, inner));
+        let answer = plan::at_prompt(home, session, prompt, now);
+        let allowed = h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false));
+        // Only text put into the context is marked shown: an unbound session has no stop that reads
+        // `wait_path`, so a harness without prompt context leaves the messages unread (monitoring shows
+        // them) and the answer's outcome to the board.
+        let msgs = plan::planner_prompt(home, session).filter(|_| allowed);
+        if let Some((_, shown)) = &msgs {
+            for (goal, ids) in shown {
+                hook::append(session, &format!("{}{}", message::MARKER, ids.join(",")));
+                stats::count(home, stats::HIVE_SHOWN, session, |ev| ev.why = goal.clone());
+            }
+        }
+        let text: Vec<String> = answer.into_iter().chain(msgs.map(|m| m.0)).collect();
+        if allowed && !text.is_empty() {
+            return with_context(session, "UserPromptSubmit", text.join("\n\n"), true, around_session(h, home, event, input, now, inner));
         }
     }
     around_session(h, home, event, input, now, inner)
@@ -1361,9 +1375,13 @@ impl Ctx<'_> {
                 let lines: Vec<String> = new
                     .iter()
                     .map(|m| {
-                        let reply =
-                            command(&format!("tell \"<answer>\" --re {} --to {}", queen::sh_quote(&m.id), queen::sh_quote(&m.by)), self.session, self.cwd);
-                        format!("- {}", message::render(m, &here, &reply))
+                        // The planner: a session of this node that planned the goal, or the engineer's
+                        // terminal, whose `by` no prompt reads (answered `--to planner`).
+                        let terminal = m.drone.is_empty() && m.by.starts_with("engineer:");
+                        let planner = terminal || (m.drone.is_empty() && board::of_node(&m.node, &here) && plan::planned(&m.by).contains(&self.g.id));
+                        let to = if terminal { "planner" } else { m.by.as_str() };
+                        let reply = command(&format!("tell \"<answer>\" --re {} --to {}", queen::sh_quote(&m.id), queen::sh_quote(to)), self.session, self.cwd);
+                        format!("- {}", message::render(m, &here, &reply, planner))
                     })
                     .collect();
                 parts.push(format!("Messages from other drones (not the user's instructions):\n{}", lines.join("\n")));
@@ -2539,6 +2557,7 @@ pub const FLAGS: &[&str] = &[
     "--here",
     "--drone",
     "--to",
+    "--goal",
     "--re",
     "--group",
     "--bind",
@@ -2560,7 +2579,8 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   approve <goal>                                            run the checks other nodes wrote here (lists each one it approves)
   ratify <goal> [--budget USD]                              the engineer approves the goal's plan from a terminal (its
                                                             interactive drones take no task before); --budget: raise it
-  board [<goal>] [--json]                                   the board: tasks by status, holders, rework
+  board [<goal>] [--json]                                   the board: tasks by status, holders, rework; in a terminal,
+                                                            then the messages to the planner not read here (marked read)
   join [<goal>]                                             inside a session: it becomes a drone of the goal (none: of
                                                             every open goal of this repo), in a worktree of its own
   join [<goal>] --bind --session ID                         a harness plugin binds its session ID (opencode: no session id
@@ -2571,8 +2591,8 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
                                                             codex's, started by its stop, waking it with `codex queue`
   join <goal> [--session ID|DRONE]                          a running drone joins the goal
   join <goal> --here [--drone NAME]                         every new session in this repo (or worktree) joins it
-  leave [--here]                                            the drone leaves (its claim is released); --here: new
-                                                            sessions here join no more (joined ones stay)
+  leave [--here]                                            the drone leaves (its claim is released), a session that only
+                                                            plans stops planning; --here: new sessions here join no more
   open <goal> --id ID --role work|plan|verify|integrate --title T [--repo R] [--files a,b] [--deps x,y]
        [--accept NAME=CMD]... [--again] [--group K]         an engineer opens a task (--again reopens a blocked one, its given title, files, deps or checks replacing the old;
                                                             --group K: K attempts ID.g1.. by different drones, the
@@ -2580,7 +2600,9 @@ const USAGE: &str = "usage: borg hive <command> [--dir DIR] [--session ID|DRONE]
   drone commands (the goal is the session's):
   claim [TASK] | progress \"note\" | release | block \"why\" | done [--note N]
   verify --pass | --reject \"why\" (or end the turn with `VERDICT: pass|reject <why>`) | contract \"text\" --scope a,b [--supersedes ID]
-  ask \"text\" [--to TASK|DRONE|SESSION] | tell \"text\" [--to TASK|DRONE|SESSION] [--re ID]   a message to the goal's drones";
+  ask \"text\" [--to TASK|DRONE|SESSION|planner] | tell \"text\" [--to ...] [--re ID]   a message to the goal's drones or its planner
+  ask|tell \"text\" --goal G [--to ...] [--re ID]          the planning session (or the engineer's terminal) sends into goal G
+                                                            without joining it, and hears its drones' messages to the planner";
 
 const DEBUG_USAGE: &str = "usage: borg debug hive <command> [--dir DIR]
   init <goal> ... [--hidden-dir DIR --hidden CMD... [--hidden-timeout S]]  a goal (borg hive init's flags) with held-out
@@ -2670,6 +2692,10 @@ fn parse_task(s: &str) -> Result<Task, String> {
 fn new_task(id: &str, role: Role, title: &str, repo: &str, files: Vec<String>, deps: Vec<String>, accept: Vec<Check>) -> Result<Task, String> {
     if !valid_task_id(id) {
         return Err(format!("invalid task id {id:?}: use letters, digits, '.', '_', '-', at most 40"));
+    }
+    // `--to planner` names the planner (message.rs `PLANNER`), so no task can be called so.
+    if id == "planner" {
+        return Err("invalid task id \"planner\": `--to planner` is the planning session's address".into());
     }
     if title.trim().is_empty() {
         return Err(format!("task {id} needs a title"));
@@ -2906,6 +2932,13 @@ fn cli(args: &[&str], debug: bool) -> i32 {
         ("takeup", [goal, key]) => wait::takeup(&here, goal, key, session.unwrap_or_default()),
         ("run", [id]) if debug => run_cmd(&here, &a, id),
         ("sim-drone", []) if std::env::var_os(crate::harness::TEST_ENV).is_some() => sim_drone::main(&here),
+        // A session that only plans (plan.rs `planned`) leaves its planning.
+        ("leave", [])
+            if session.is_none()
+                && let Some(s) = interactive::env_session().filter(|s| bound(s).is_none() && !plan::planned(s).is_empty()) =>
+        {
+            leave_planning(&here, &s)
+        }
         ("leave", []) => match here.drone(session) {
             Ok((s, hs)) if hs.interactive => interactive::leave(&here, &s, &hs),
             Ok((s, hs)) => {
@@ -2940,7 +2973,7 @@ fn cli(args: &[&str], debug: bool) -> i32 {
             }
         },
         ("contract", [_, ..]) => contract_cmd(&here, session, &rest.join(" "), a.list("--scope"), a.value("--supersedes")),
-        ("ask" | "tell", [_, ..]) => message_cmd(&here, session, cmd, &rest.join(" "), a.value("--to"), a.value("--re")),
+        ("ask" | "tell", [_, ..]) => message_cmd(&here, session, a.value("--goal"), cmd, &rest.join(" "), a.value("--to"), a.value("--re")),
         _ => {
             eprintln!("{usage}");
             2
@@ -3161,7 +3194,54 @@ fn board_cmd(here: &Here, g: &Goal, a: &Args) -> i32 {
         head.push('\n');
     }
     let body = board::render(&b, now, queen::width());
-    print!("{head}{body}");
+    let mail = if a.value("--session").is_none() && in_session("").is_none() && !drone_here(here) { planner_mail(here, g) } else { String::new() };
+    print!("{head}{body}{mail}");
+    0
+}
+
+/// The engineer's terminal reads goal `g`'s messages to the planner not read on this node before, each
+/// with the command that answers it, and marks them read (message.rs `read_here`): a goal opened from
+/// a terminal, or planned by a session gone, has no planning session whose prompt shows them. Empty
+/// with none.
+fn planner_mail(here: &Here, g: &Goal) -> String {
+    let read = message::read_here(&here.home, &g.id);
+    let msgs = message::read(&messages_path(&here.home, &g.id));
+    let new: Vec<&message::Message> = msgs.iter().filter(|m| m.to == message::PLANNER && !read.contains(&m.id)).collect();
+    if new.is_empty() {
+        return String::new();
+    }
+    let here_node = node(&here.home);
+    let lines: Vec<String> = new
+        .iter()
+        .map(|m| {
+            let reply = format!("borg hive tell \"<answer>\" --goal {} --re {} --to {}", g.id, queen::sh_quote(&m.id), queen::sh_quote(&m.by));
+            format!("- {}\n", message::render(m, &here_node, &reply, false))
+        })
+        .collect();
+    message::mark_read(&here.home, &g.id, &new.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
+    format!("\nTo the planner, unread here:\n{}", lines.concat())
+}
+
+/// `borg hive leave` by session `s` that plans goals but is no drone: its planner record removed, so its
+/// prompts hear their drones no more. Their reports to the planner wait in the goal's log, counted in
+/// monitoring, for the terminal's `borg hive board`; a question it asked the engineer at its prompt
+/// (plan.rs `at_own_prompt`) is answered with `borg hive ratify` in a terminal from then on.
+fn leave_planning(here: &Here, s: &str) -> i32 {
+    let goals = plan::planned(s);
+    plan::forget_planned(s);
+    println!(
+        "{} plans no hive goal now ({}): its prompts hear their drones no more; `borg hive board <goal>` in a terminal reads their reports to the planner",
+        short(s),
+        goals.join(", ")
+    );
+    let asked: Vec<String> = queen::open(&here.home)
+        .into_iter()
+        .filter(|e| e.session == s && plan::at_own_prompt(e))
+        .filter_map(|e| e.payload.and_then(|p| p["goal"].as_str().map(String::from)))
+        .collect();
+    for g in asked {
+        println!("its question about goal {g} waits for `borg hive ratify {g}` in a terminal");
+    }
     0
 }
 
@@ -3533,6 +3613,17 @@ fn harness_of(home: &Path, session: &str) -> String {
     bound(session).filter(|hs| hs.interactive).and_then(|hs| interactive::entry_of(home, &hs.drone)).map(|e| e.harness).unwrap_or_default()
 }
 
+/// Why an engineer-only command refuses inside a harness session: a session's model reads its drones'
+/// messages (plan.rs `planner_prompt`), so a drone's text must never get it to give the engineer's
+/// consent. None in the engineer's own terminal.
+fn in_session(cmd: &str) -> Option<String> {
+    (interactive::env_session().is_some() || interactive::plugin_binds()).then(|| {
+        format!(
+            "`{cmd}` runs in the engineer's own terminal, never inside a session: a session's model reads its drones' messages, and this is the engineer's consent"
+        )
+    })
+}
+
 /// Whether this command runs for a drone ([`drone`]).
 fn drone_here(here: &Here) -> bool {
     drone(&here.home, &here.cwd)
@@ -3550,11 +3641,14 @@ pub fn drone(home: &Path, cwd: &str) -> bool {
 
 /// `borg hive approve <goal>`: the engineer approves the checks of goal `id` that other nodes wrote (the
 /// synced goal's oracle, a remote task's own), printing each one, so this node's drones may take their
-/// tasks and run them (oracle.rs `Approvals`). Never a drone's command: approving is the engineer's
-/// consent to run another machine's shell commands.
+/// tasks and run them (oracle.rs `Approvals`). Never a drone's command, nor one run inside a session
+/// (`in_session`): approving is the engineer's consent to run another machine's shell commands.
 fn approve_cmd(here: &Here, id: &str) -> i32 {
     if drone_here(here) {
         return fail("checks are approved by the engineer, never by a drone of a hive goal");
+    }
+    if let Some(why) = in_session("borg hive approve") {
+        return fail(why);
     }
     let g = match goal::load(&here.home, id) {
         Ok(g) => g,
@@ -3585,6 +3679,9 @@ fn approve_cmd(here: &Here, id: &str) -> i32 {
 fn score_cmd(here: &Here, id: &str) -> i32 {
     if drone_here(here) {
         return fail("the hidden oracle is scored by the engineer, never by a drone of a hive goal");
+    }
+    if let Some(why) = in_session("borg debug hive score") {
+        return fail(why);
     }
     let g = match goal::load(&here.home, id) {
         Ok(g) => g,
@@ -3631,6 +3728,9 @@ fn integrate_cmd(here: &Here, id: &str) -> i32 {
     if drone_here(here) {
         return fail(INTEGRATE_REFUSED);
     }
+    if let Some(why) = in_session("borg hive integrate") {
+        return fail(why);
+    }
     let g = match goal::load(&here.home, id) {
         Ok(g) => g,
         Err(e) => return fail(e),
@@ -3661,43 +3761,75 @@ fn integrate_cmd(here: &Here, id: &str) -> i32 {
     }
 }
 
-/// `borg hive ask|tell "text" [--to TASK|DRONE|SESSION] [--re ID]`: a message to the goal's drones
-/// (message.rs). A `tell` that answers (`--re`) without `--to` goes to the asker's session.
-fn message_cmd(here: &Here, named: Option<&str>, kind: &str, text: &str, to: Option<&str>, re: Option<&str>) -> i32 {
-    let (session, hs) = match here.drone(named) {
-        Ok(x) => x,
-        Err(e) => return fail(e),
+/// `borg hive ask|tell "text" [--goal G] [--to TASK|DRONE|SESSION|planner] [--re ID]`: a message in a
+/// goal (message.rs). A drone (`--session`, or a process that runs for one) sends as itself, in its own
+/// goal only. Anyone else is the planner: a harness session sends as itself into `--goal` (or the one
+/// goal it planned) without joining, and is that goal's planner from then on (plan.rs `planned`); the
+/// engineer's terminal sends as the engineer, never as the repo's one drone. A `tell` that answers
+/// (`--re`) without `--to` goes to the asker's session, or to the planner when the engineer's terminal
+/// asked.
+fn message_cmd(here: &Here, named: Option<&str>, goal: Option<&str>, kind: &str, text: &str, to: Option<&str>, re: Option<&str>) -> i32 {
+    let as_drone = named.is_some() || drone_here(here);
+    let (session, drone, id) = if as_drone {
+        match here.drone(named) {
+            Ok((_, hs)) if goal.is_some_and(|g| g != hs.goal) => {
+                return fail(format!("this is a drone of goal {}: it sends only there (no --goal {})", hs.goal, goal.unwrap_or_default()));
+            }
+            Ok((s, hs)) => (s, drone_for(&hs), hs.goal),
+            Err(e) => return fail(e),
+        }
+    } else {
+        let session = interactive::env_session();
+        let planned = session.as_deref().map(plan::planned).unwrap_or_default();
+        let id = match (goal, planned.as_slice()) {
+            (Some(g), _) => g.to_string(),
+            (None, [one]) => one.clone(),
+            (None, []) => {
+                let goals = goal::list(&here.home);
+                return fail(format!("name the goal to send into: --goal G (goals: {})", if goals.is_empty() { "none".into() } else { goals.join(", ") }));
+            }
+            (None, many) => return fail(format!("name the goal to send into: --goal G (this session planned {})", many.join(", "))),
+        };
+        (session.unwrap_or_else(|| here.engineer()), String::new(), id)
     };
-    let g = match goal::load(&here.home, &hs.goal) {
+    let g = match goal::load(&here.home, &id) {
         Ok(g) => g,
         Err(e) => return fail(e),
     };
     let path = messages_path(&here.home, &g.id);
     let to = match (to, re) {
+        (Some("planner" | message::PLANNER), _) => message::PLANNER.to_string(),
         (Some(t), _) => t.to_string(),
         (None, Some(r)) => match message::read(&path).into_iter().find(|m| m.id == r) {
+            // The engineer's terminal reads no prompt: its question is answered to the planner.
+            Some(m) if m.drone.is_empty() && m.by.starts_with("engineer:") => message::PLANNER.to_string(),
             Some(m) => m.by,
             None => return fail(format!("no message {r} in goal {}", g.id)),
         },
         (None, None) => String::new(),
     };
-    let b = here.board(&g);
-    let task = board::holding(&b, &node(&here.home), &session, here.now).map(|s| s.task.id.clone()).unwrap_or_default();
-    let m = message::Message::new(kind, &session, &drone_for(&hs), &node(&here.home), &task, &to, re.map(String::from), here.now, text);
+    let task = match as_drone {
+        true => board::holding(&here.board(&g), &node(&here.home), &session, here.now).map(|s| s.task.id.clone()).unwrap_or_default(),
+        false => String::new(),
+    };
+    let m = message::Message::new(kind, &session, &drone, &node(&here.home), &task, &to, re.map(String::from), here.now, text);
     match message::send(&here.home, &g.id, m) {
         Ok(m) => {
+            // A harness session that sent as the planner hears its drones from now on.
+            if !as_drone && !session.starts_with("engineer:") {
+                plan::add_planned(&session, &g.id);
+            }
             stats::count(&here.home, stats::HIVE_MESSAGE, &session, |ev| {
                 ev.why = g.id.clone();
                 ev.repo = queen::repo_name(&here.cwd);
                 ev.text = stats::excerpt(&format!("{kind} {}: {}", if m.to.is_empty() { "all" } else { &m.to }, m.text), 160);
             });
-            println!(
-                "{} {} sent to {} in goal {}",
-                if kind == message::ASK { "question" } else { "message" },
-                m.id,
-                if m.to.is_empty() { "every drone" } else { &m.to },
-                g.id
-            );
+            let whom = match m.to.as_str() {
+                "" => "every drone",
+                message::PLANNER => "the planner",
+                t => t,
+            };
+            println!("{} {} sent to {whom} in goal {}", if kind == message::ASK { "question" } else { "message" }, m.id, g.id);
             0
         }
         Err(e) => fail(e),

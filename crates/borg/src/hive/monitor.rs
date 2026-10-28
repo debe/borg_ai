@@ -14,7 +14,14 @@
 //!   lines, and the wakes no turn took up, released on the board), the tasks it did and judged;
 //! - the stuck and declines lines that stand (`stuck`, `declines`), each with its reason;
 //! - every integration of the goal (`integrations`) and the tail of the node's integration log;
-//! - spend against the budget split into metered and unmetered claims (`Spend::usd` none).
+//! - spend against the budget split into metered and unmetered claims (`Spend::usd` none);
+//! - each planner session of this node (`planners`, plan.rs `planned`) and the messages for it its
+//!   prompts have not shown yet: a drone's report no prompt took in (a harness without prompt context, a
+//!   session gone) stays visible;
+//! - the messages to the planner (`planner_mail`) and how many no planning session of this node showed,
+//!   on the goal's home node (its first open's) and on a node with a planning session: a goal opened
+//!   from a terminal, planned in a harness that leaves no record (opencode) or by a session gone has no
+//!   planner record, and its drones' reports are seen there.
 //!
 //! A store with no registry and no interactive line pays one failed open per file; a goal of `borg hive
 //! run` drones shows its history and integrations, the rest stays empty.
@@ -142,6 +149,73 @@ pub struct Monitor {
     /// interactive claim whose harness reports no usage, or a runner's iteration charged its estimate.
     pub metered_usd: f64,
     pub unmetered: usize,
+    pub planners: Vec<PlannerRow>,
+    pub planner_mail: Option<PlannerMail>,
+}
+
+/// The goal's messages to the planner (message.rs `PLANNER`), from the synced log alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlannerMail {
+    pub sent: usize,
+    /// Those no planning session of this node has shown (its `MARKER` lines) and the engineer's terminal
+    /// has not read here (message.rs `read_here`, `borg hive board`).
+    pub unshown: usize,
+}
+
+impl PlannerMail {
+    pub fn line(&self) -> String {
+        let read = if self.unshown > 0 { " (`borg hive board` reads them)" } else { "" };
+        format!("to the planner: {} message(s), {} unread here{read}", self.sent, self.unshown)
+    }
+}
+
+/// `msgs`' messages to the planner, `shown` the ids this node's planning sessions were shown or its
+/// terminal read; None but
+/// on the goal's home node (the node of its first open, the same on every node's fold) or a node with a
+/// planning session (`planners`), so one node of a mesh alerts where none plans, and none when no drone
+/// wrote to the planner.
+fn planner_mail(msgs: &[super::message::Message], events: &[Event], here: &str, shown: &BTreeSet<&str>, planners: bool) -> Option<PlannerMail> {
+    let up: Vec<&super::message::Message> = msgs.iter().filter(|m| m.to == super::message::PLANNER).collect();
+    let home = events.iter().filter(|e| e.ev == Ev::Open).min_by_key(|e| (e.ms, &e.node, &e.task)).is_some_and(|e| board::of_node(&e.node, here));
+    (!up.is_empty() && (home || planners)).then(|| PlannerMail { sent: up.len(), unshown: up.iter().filter(|m| !shown.contains(m.id.as_str())).count() })
+}
+
+/// A session of this node that planned the goal (plan.rs `planned`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannerRow {
+    /// Its first 8 characters.
+    pub session: String,
+    /// The messages for it (message.rs `unshown`) its prompts have not shown.
+    pub unread: usize,
+}
+
+/// This node's planner sessions of `goal` (in the collective's state) and their unread messages, and the
+/// goal's messages to the planner (`planner_mail`). A session that is a drone of the goal is left out: a
+/// drone hears its goal as a drone, which never shows a message to the planner, so those wait until it
+/// leaves (plan.rs `planner_prompt`), counted in the goal's `planner_mail`.
+fn planners(home: &Path, goal: &str, events: &[Event]) -> (Vec<PlannerRow>, Option<PlannerMail>) {
+    let msgs = super::message::read(&super::messages_path(home, goal));
+    let here = super::node(home);
+    let states: Vec<(String, String)> = super::plan::planners(goal)
+        .into_iter()
+        .filter(|s| super::bound(s).is_none_or(|hs| hs.goal != goal))
+        .map(|s| {
+            let state = std::fs::read_to_string(crate::hook::state_file(&s)).unwrap_or_default();
+            (s, state)
+        })
+        .collect();
+    let read = super::message::read_here(home, goal);
+    let mut shown: BTreeSet<&str> = read.iter().map(String::as_str).collect();
+    let rows = states
+        .iter()
+        .map(|(s, state)| {
+            let told = crate::hook::listed(state, super::message::MARKER);
+            shown.extend(told.iter().copied());
+            PlannerRow { session: short(s), unread: super::message::unshown(&msgs, s, &here, &told).len() }
+        })
+        .collect::<Vec<_>>();
+    let mail = planner_mail(&msgs, events, &here, &shown, !rows.is_empty());
+    (rows, mail)
 }
 
 fn short(s: &str) -> String {
@@ -375,6 +449,7 @@ pub fn integrate_log(home: &Path, goal: &str) -> Vec<String> {
 pub fn of(home: &Path, g: &super::Goal, events: &[Event], b: &Board, spend: &[Spend], now: i64) -> Monitor {
     let here = super::node(home);
     let (stuck, declines) = lines(home, g, b, &here);
+    let (planners, planner_mail) = crate::hook::in_state(home.join("state"), || planners(home, &g.id, events));
     Monitor {
         history: history(events, &here),
         members: members(home, b, events, &here, now),
@@ -386,6 +461,8 @@ pub fn of(home: &Path, g: &super::Goal, events: &[Event], b: &Board, spend: &[Sp
         integrate_log: integrate_log(home, &g.id),
         metered_usd: super::run::distinct(spend).iter().filter_map(|s| s.usd).map(|u| u.max(0.0)).sum(),
         unmetered: super::run::distinct(spend).iter().filter(|s| s.usd.is_none()).count(),
+        planners,
+        planner_mail,
     }
 }
 
@@ -474,6 +551,25 @@ mod tests {
         assert!(h.len() <= POINTS && h.len() > POINTS / 2, "{}", h.len());
         assert_eq!((h[0].ms, h.last().unwrap().ms, h.last().unwrap().open), (10, 299, b.tasks.len() - 1));
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A drone's report to the planner shows, unshown or shown, on the goal's home node (its first open's,
+    /// whoever wrote later opens) and on a node with a planning session; elsewhere, and with no report,
+    /// nothing. A goal opened from a terminal has no planner record and is seen there.
+    #[test]
+    fn the_planner_mail_shows_on_the_goals_home_node_only() {
+        use super::super::message::{Message, PLANNER, TELL};
+        let open = |id: &str, node: &str, ms: i64| Event { node: node.into(), ..Event::open(task(id, Role::Work), "engineer:e", ms) };
+        let events = [open("t2", "B", 20), open("t1", "A", 10)];
+        let msgs =
+            [Message::new(TELL, "s1", "d1", "B", "", PLANNER, None, 30, "t1 tests nothing"), Message::new(TELL, "s1", "d1", "B", "", "", None, 31, "hi")];
+        let none = BTreeSet::new();
+        assert_eq!(planner_mail(&msgs, &events, "A", &none, false), Some(PlannerMail { sent: 1, unshown: 1 }), "the home node");
+        assert_eq!(planner_mail(&msgs, &events, "B", &none, false), None, "no alert on every node");
+        let shown = BTreeSet::from([msgs[0].id.as_str()]);
+        assert_eq!(planner_mail(&msgs, &events, "B", &shown, true), Some(PlannerMail { sent: 1, unshown: 0 }), "a node that plans");
+        assert_eq!(planner_mail(&msgs[1..], &events, "A", &none, false), None, "nothing to the planner");
+        assert_eq!(PlannerMail { sent: 2, unshown: 1 }.line(), "to the planner: 2 message(s), 1 unread here (`borg hive board` reads them)");
     }
 
     /// Each node shows its membership, its last beat's age on this node's clock (when it was held here,

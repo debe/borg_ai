@@ -190,6 +190,22 @@ fn monitor_view(m: HiveMonitor, budget: f64, spent: f64) -> impl IntoView {
                 }).collect_view()}
             </table>
         })}
+        {(!m.planners.is_empty()).then(|| view! {
+            <h3 title="sessions of this node that planned the goal: its drones report plan problems to them (`borg hive tell --to planner`)">"Planning sessions"</h3>
+            <table class="mono">
+                <tr><th>"session"</th><th>"unread messages"</th></tr>
+                {m.planners.iter().map(|(session, unread)| view! {
+                    <tr><td>{session.clone()}</td><td><span class={if *unread > 0.0 { "badge paused" } else { "badge" }}>{format!("{unread}")}</span></td></tr>
+                }).collect_view()}
+            </table>
+        })}
+        {m.planner_mail.map(|(sent, unshown)| view! {
+            <p title="the drones' reports to the planner (`borg hive tell --to planner`), from the synced log: unread here until a planning session of this node is shown them or `borg hive board` in a terminal reads them">
+                "To the planner: "{format!("{sent}")}" message(s), "
+                <span class={if unshown > 0.0 { "badge paused" } else { "badge" }}>{format!("{unshown}")}</span>
+                " unread here"
+            </p>
+        })}
         {(!m.interactive.is_empty()).then(|| {
             let mut ds = m.interactive.clone();
             ds.sort_by_key(|d| (DRONE_STATES.iter().position(|s| *s == d.state).unwrap_or(DRONE_STATES.len()), d.drone.clone()));

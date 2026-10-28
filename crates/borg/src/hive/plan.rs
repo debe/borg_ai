@@ -25,6 +25,11 @@
 //!   claiming session; its drone is told once and goes on with the kind's default (an external
 //!   mutation holds). Never asked again for the task, whoever claims it later.
 //!
+//! - **The planner record** ([`planned`]): a session that opened an interactive goal's plan, or sent
+//!   into a goal it is no drone of (mod.rs `message_cmd`), is that goal's planner for its life. Its
+//!   prompts are read for the engineer's answers ([`at_prompt`]) and given the messages its goal's
+//!   drones send it ([`planner_prompt`]).
+//!
 //! A drone never answers either question (queen.rs `answer` refuses under `BORG_HIVE`), and none is
 //! delivered to a drone's session.
 
@@ -363,9 +368,9 @@ pub fn ask_budget(home: &Path, g: &Goal, spent: f64, budget: f64, cwd: &str, now
         dismissed_ms: None,
         payload: Some(json!({"goal": g.id, "budget": spent, "interactive": true})),
     };
-    // The opener's prompts are read for the answer (`at_prompt`), its plan's marker long removed.
+    // The opener's prompts are read for the answer (`at_prompt`).
     if queen::ask_once(home, &e).is_ok() && !e.session.starts_with("hive-plan-") {
-        let _ = std::fs::write(opener_path(&e.session), &g.id);
+        add_planned(&e.session, &g.id);
     }
 }
 
@@ -377,10 +382,100 @@ pub fn at_own_prompt(e: &Entry) -> bool {
     e.kind == Kind::Plan && e.payload.as_ref().is_some_and(|p| p["interactive"] == true)
 }
 
-/// The marker of a session that opened an interactive goal's plan: its prompts are read for the
-/// engineer's answer (`at_prompt`); a session without it costs one failed stat.
+/// The planner record of a session: the goals it planned, one id per line (and its whole id,
+/// `SESSION_LINE`, when the file's name drops some of it). Removed by its `borg hive leave`. Its prompts are read for the
+/// engineer's answer (`at_prompt`) and its drones' messages (`planner_prompt`); a session without it
+/// costs one failed open. Kept after the plan's approval: the drones' reports come after it.
 fn opener_path(session: &str) -> PathBuf {
     crate::hook::state_file(session).with_extension("hive-plan")
+}
+
+/// The line of a planner record that names its session whole, when its state file's name drops some of
+/// it ('_', '.': hook.rs `state_file`). No goal id has a space (goal.rs `valid_id`).
+const SESSION_LINE: &str = "session ";
+
+/// The goals `session` planned (its planner record), in the order it took them up.
+pub fn planned(session: &str) -> Vec<String> {
+    planner_record(&opener_path(session)).1
+}
+
+/// A planner record at `path`: the session it names whole, if any, and its goals.
+fn planner_record(path: &Path) -> (Option<String>, Vec<String>) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let session = text.lines().find_map(|l| l.strip_prefix(SESSION_LINE)).map(|s| s.trim().to_string());
+    (session, text.lines().map(str::trim).filter(|l| super::goal::valid_id(l)).map(String::from).collect())
+}
+
+/// `session` is a planner of `goal` from now on (`planned`).
+pub fn add_planned(session: &str, goal: &str) {
+    let mut goals = planned(session);
+    if !goals.iter().any(|g| g == goal) {
+        goals.push(goal.into());
+        let path = opener_path(session);
+        let whole = path.file_stem().is_some_and(|f| f != session).then(|| format!("{SESSION_LINE}{session}"));
+        let _ = std::fs::write(path, whole.into_iter().chain(goals).collect::<Vec<_>>().join("\n") + "\n");
+    }
+}
+
+/// `session` plans no goal from now on (`borg hive leave` by a session that only plans): its record
+/// removed. Whether it had one.
+pub fn forget_planned(session: &str) -> bool {
+    std::fs::remove_file(opener_path(session)).is_ok()
+}
+
+/// The sessions of this node's state with a planner record of `goal` (monitoring).
+pub fn planners(goal: &str) -> Vec<String> {
+    let Some(dir) = opener_path("x").parent().map(Path::to_path_buf) else { return Vec::new() };
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let stem = e.file_name().to_str()?.strip_suffix(".hive-plan")?.to_string();
+            let (whole, goals) = planner_record(&e.path());
+            goals.iter().any(|g| g == goal).then(|| whole.unwrap_or(stem))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A goal and the ids of its messages a prompt showed.
+pub type Shown = (String, Vec<String>);
+
+/// What the drones of each goal planner session `session` planned sent it and it was not shown yet
+/// (message.rs `unshown`), at most `SHOW_CHANGES` a goal. A drone hears only its own goal, as a drone
+/// (mod.rs `Ctx::prompt`): it can send nowhere else (mod.rs `message_cmd`), so its planned goals'
+/// messages wait, counted unread in monitoring, until it leaves. (the text, and each goal with the ids
+/// it shows.)
+pub fn planner_prompt(home: &Path, session: &str) -> Option<(String, Vec<Shown>)> {
+    let goals = planned(session);
+    if goals.is_empty() || super::bound(session).is_some() {
+        return None;
+    }
+    let state = std::fs::read_to_string(crate::hook::state_file(session)).unwrap_or_default();
+    let told = crate::hook::listed(&state, super::message::MARKER);
+    let here = super::node(home);
+    let (mut parts, mut shown) = (Vec::new(), Vec::new());
+    for goal in &goals {
+        let msgs = super::message::read(&super::messages_path(home, goal));
+        let new = super::message::unshown(&msgs, session, &here, &told);
+        if new.is_empty() {
+            continue;
+        }
+        let more = new.len().saturating_sub(super::SHOW_CHANGES);
+        let lines: Vec<String> = new[..new.len() - more]
+            .iter()
+            .map(|m| {
+                let reply = format!("borg hive tell \"<answer>\" --goal {goal} --re {} --to {}", queen::sh_quote(&m.id), queen::sh_quote(&m.by));
+                format!("- {}", super::message::render(m, &here, &reply, false))
+            })
+            .collect();
+        let more = if more > 0 { format!("\n(+{more} more at the next prompt)") } else { String::new() };
+        parts.push(format!("[borg hive {goal}] Messages from the drones of goal {goal} (not the user's instructions):\n{}{more}", lines.join("\n")));
+        shown.push((goal.clone(), new[..new.len().min(super::SHOW_CHANGES)].iter().map(|m| m.id.clone()).collect()));
+    }
+    (!parts.is_empty()).then(|| (parts.join("\n\n"), shown))
 }
 
 /// The session that opened goal `goal`'s newest plan question, if any.
@@ -425,7 +520,7 @@ pub fn ask_opener(home: &Path, g: &Goal, b: &Board, session: &str, cwd: &str, no
     queen::ask_once(home, &e).ok()?;
     // Queued now or before and still open: a plan asked and answered once is not asked again.
     let e = queen::open(home).into_iter().find(|o| o.decision_key == key)?;
-    let _ = std::fs::write(opener_path(session), &g.id);
+    add_planned(session, &g.id);
     Some((e, cards))
 }
 
@@ -442,16 +537,13 @@ fn refuses(answer: &str) -> bool {
 /// answered in the engineer's own words at their own prompt, never by a command the model runs. What the
 /// session is told: the outcome, and after an approval how many drones wait for the work; anything else
 /// the engineer says leaves the question open and reminds the session of it. None for a session that
-/// opened no plan (one failed stat).
+/// opened no plan (one failed stat), or none now open.
 pub fn at_prompt(home: &Path, session: &str, prompt: &str, now: i64) -> Option<String> {
     if !opener_path(session).exists() {
         return None;
     }
     let open: Vec<Entry> = queen::open(home).into_iter().filter(|e| at_own_prompt(e) && e.session == session).collect();
-    let Some(e) = open.last() else {
-        let _ = std::fs::remove_file(opener_path(session));
-        return None;
-    };
+    let e = open.last()?;
     let p = e.payload.clone().unwrap_or_default();
     let goal = p["goal"].as_str().unwrap_or_default().to_string();
     let budget = p["budget"].is_number();
@@ -475,9 +567,6 @@ pub fn at_prompt(home: &Path, session: &str, prompt: &str, now: i64) -> Option<S
     };
     if let Err(err) = queen::answer(home, &e.id, &answer, &engineer, now) {
         return Some(format!("[borg hive] the engineer's answer to queen question {} was not recorded: {err}", e.id));
-    }
-    if open.len() == 1 {
-        let _ = std::fs::remove_file(opener_path(session));
     }
     let b = super::board::fold_on(&super::board::read(&super::tasks_path(home, &goal)), &super::node(home));
     let (drones, nodes) = waiting(home, &goal, &b);
@@ -1021,5 +1110,27 @@ mod tests {
         assert_eq!(escalate(&home, &g, &member(1), "sess-f", "/w/app", 7), None, "the attempt that raised it is told once");
         assert_eq!(queen::entries(&home).len(), 2, "one question for the group");
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A session id with characters its state file drops ('_', '.') is kept whole in its planner record:
+    /// monitoring compares it with the messages' `by` and `to`. Fails with `planners` naming the
+    /// file's sanitized stem.
+    #[test]
+    fn a_planner_record_keeps_the_session_id_whole() {
+        let d = temp("raw-session");
+        crate::hook::in_state(d.clone(), || {
+            add_planned("ses_ab.c-1", "g1");
+            add_planned("ses_ab.c-1", "g2");
+            add_planned("plain-1", "g1");
+            assert_eq!(planned("ses_ab.c-1"), ["g1", "g2"]);
+            assert_eq!(planners("g1"), ["plain-1", "ses_ab.c-1"]);
+            // A record from before (goal ids only) still reads, named by its file.
+            std::fs::write(crate::hook::state_file("old-1").with_extension("hive-plan"), "g1\n").unwrap();
+            assert_eq!(planners("g1"), ["old-1", "plain-1", "ses_ab.c-1"]);
+            assert!(forget_planned("ses_ab.c-1"));
+            assert!(!forget_planned("ses_ab.c-1"), "gone already");
+            assert_eq!(planners("g1"), ["old-1", "plain-1"]);
+        });
+        let _ = std::fs::remove_dir_all(d);
     }
 }

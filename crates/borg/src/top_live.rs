@@ -400,6 +400,19 @@ fn goal_lines(lines: &mut Vec<Ln>, v: &HiveView, now: i64) {
         info = info.add(st, "● ").add(St::Plain, format!("{}{}{beat}{worker}   ", short(&n.node), if n.here { " (here)" } else { "" }));
     }
     lines.push(info);
+    // This node's planning sessions: a drone's report none of its prompts showed yet stands out.
+    if !v.monitor.planners.is_empty() {
+        let mut ln = Ln::default().add(St::Dim, "    planner ");
+        for p in &v.monitor.planners {
+            let st = if p.unread > 0 { St::Yellow } else { St::Dim };
+            ln = ln.add(St::Plain, format!("{} ", p.session)).add(st, format!("{} unread   ", p.unread));
+        }
+        lines.push(ln);
+    }
+    // The drones' reports to the planner, seen on the goal's home node even where no session plans it.
+    if let Some(mail) = &v.monitor.planner_mail {
+        lines.push(Ln::default().add(if mail.unshown > 0 { St::Yellow } else { St::Dim }, format!("    {}", mail.line())));
+    }
     if let Some(i) = v.monitor.integrations.last() {
         let st = if i.status == "verified" { St::Green } else { St::Yellow };
         lines.push(

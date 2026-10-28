@@ -6,10 +6,11 @@
 //! roles, and addresses nodes or sessions, not tasks or drones.
 //!
 //! A message goes to everyone (`to` empty), a task (whoever holds it), a drone (that name on the
-//! sender's node: names repeat on every node) or a session. The hook shows each to its recipients once
-//! per session at a prompt (`MARKER`), never to its sender, and only while it is fresh (`LEASE_MS`: an
-//! ask older than a lease outlived the claim it was about). One message per sender and recipient per
-//! `HEARTBEAT_MS`, against the status noise that drowns a team's channel.
+//! sender's node: names repeat on every node), a session, or the planner (`PLANNER`: every session that
+//! planned the goal, plan.rs `planned`). The hook shows each to its recipients once per session at a
+//! prompt (`MARKER`), never to its sender; to a drone only while it is fresh (`LEASE_MS`: an ask older
+//! than a lease outlived the claim it was about), to a planner however old (`unshown`). One message per
+//! sender and recipient per `HEARTBEAT_MS`, against the status noise that drowns a team's channel.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,6 +24,9 @@ pub const ASK: &str = "ask";
 pub const TELL: &str = "tell";
 /// The `.ctx` marker of a message shown to a session (hook.rs `listed`).
 pub const MARKER: &str = "#borg-hive-msg ";
+/// The address of the sessions that planned a goal (`borg hive tell --to planner`). '@' is in no task
+/// id, session or drone name, so no reader of any version shows a message to it to a drone.
+pub const PLANNER: &str = "@planner";
 /// What a message keeps of its text: what a board change shows of a note (board.rs `render_change`).
 const TEXT: usize = 160;
 
@@ -44,7 +48,7 @@ pub struct Message {
     /// The sender's claim when it sent it (empty: none).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub task: TaskId,
-    /// Empty: every drone of the goal; else a task id, a drone name or a session.
+    /// Empty: every drone of the goal; else a task id, a drone name, a session or `PLANNER`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub to: String,
     /// The message this one answers.
@@ -90,10 +94,13 @@ impl Message {
         }
     }
 
-    /// Who sent it, as a recipient reads it: the drone (or the session's prefix), with its node when it
-    /// is not `here`.
-    fn sender(&self, here: &str) -> String {
-        let who = if self.drone.is_empty() { self.by.chars().take(8).collect() } else { self.drone.clone() };
+    /// Who sent it, as a recipient reads it: the drone (or the session's prefix; `planner`: named the
+    /// planner), with its node when it is not `here`.
+    fn sender(&self, here: &str, planner: bool) -> String {
+        let mut who = if self.drone.is_empty() { self.by.chars().take(8).collect() } else { self.drone.clone() };
+        if planner {
+            who = format!("the planner {who}");
+        }
         match super::board::of_node(&self.node, here) {
             true => who,
             false => format!("{who} (node {})", self.node.chars().take(8).collect::<String>()),
@@ -121,12 +128,10 @@ pub fn read(path: &Path) -> Vec<Message> {
     super::read_lines::<Message>(path).into_iter().filter(|m| m.v <= 1 && m.well_formed()).collect()
 }
 
-/// Who a message counts against for the rate limit: the drone on its node, else the session.
+/// Who a message counts against for the rate limit: the drone, else the session (or the engineer's
+/// terminal, `engineer:<email>`), on its node.
 fn sender_key(m: &Message) -> (String, String) {
-    match m.drone.is_empty() {
-        true => (String::new(), m.by.clone()),
-        false => (m.node.clone(), m.drone.clone()),
-    }
+    (m.node.clone(), if m.drone.is_empty() { m.by.clone() } else { m.drone.clone() })
 }
 
 /// Sends `m` in goal `goal` of the store `home`: stamped with this node when it names none, refused
@@ -144,7 +149,7 @@ pub fn send(home: &Path, goal: &str, m: Message) -> Result<Message, String> {
     }
     let m = Message { node: if m.node.is_empty() { super::node(home) } else { m.node.clone() }, ..m };
     if !token(&m.to) {
-        return Err(format!("--to {:?}: give a task id, a drone name or a session", m.to));
+        return Err(format!("--to {:?}: give a task id, a drone name, a session or planner", m.to));
     }
     if !m.well_formed() {
         return Err("a message's fields hold no whitespace or control characters, and --re names a message id".into());
@@ -178,12 +183,39 @@ pub fn fresh<'a>(msgs: &'a [Message], session: &str, drone: &str, node: &str, he
     out
 }
 
-/// One message as a drone's prompt shows it, with the command that answers it (`reply`).
-pub fn render(m: &Message, here: &str, reply: &str) -> String {
+/// The messages for planner session `session` on `node` it was not shown yet (`told`): to the planner
+/// or to its session, then to everyone, each oldest first; never its own. No lease: a planning session
+/// may be idle for hours, and a drone's report outlives the claim it was sent from. Addressed first: a
+/// prompt shows `SHOW_CHANGES` of them, and a backlog of broadcasts must not hold a report back.
+pub fn unshown<'a>(msgs: &'a [Message], session: &str, node: &str, told: &HashSet<&str>) -> Vec<&'a Message> {
+    let mut out: Vec<&Message> = for_session(msgs, session, "", node, PLANNER).into_iter().filter(|m| !told.contains(m.id.as_str())).collect();
+    out.sort_by_key(|m| (m.to.is_empty(), m.ms, m.id.clone()));
+    out
+}
+
+/// The ids of goal `goal`'s messages to the planner the engineer's terminal read on this node (mod.rs
+/// `board_cmd`): `<store>/hive/<goal>/planner-read`, one id a line, never synced (mod.rs `SYNCED`), so
+/// each node counts what was read there, as it counts its planning sessions' `MARKER` lines.
+pub fn read_here(home: &Path, goal: &str) -> HashSet<String> {
+    std::fs::read_to_string(super::dir(home, goal).join(READ)).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// The terminal read `ids` of goal `goal`'s messages to the planner on this node (`read_here`).
+pub fn mark_read(home: &Path, goal: &str, ids: &[&str]) {
+    if !ids.is_empty() {
+        let _ = super::append_bytes(&super::dir(home, goal).join(READ), ids.iter().map(|i| format!("{i}\n")).collect::<String>().as_bytes());
+    }
+}
+
+const READ: &str = "planner-read";
+
+/// One message as a prompt shows it, with the command that answers it (`reply`); `planner`: its sender
+/// planned the goal.
+pub fn render(m: &Message, here: &str, reply: &str, planner: bool) -> String {
     let verb = if m.kind == ASK { "asks" } else { "tells" };
     let about = if m.task.is_empty() { String::new() } else { format!(" about {}", m.task) };
     let re = m.re.as_ref().map_or_else(String::new, |r| format!(" (re {r})"));
-    format!("{} {verb}{about}{re}: {} (reply: `{reply}`)", m.sender(here), m.text)
+    format!("{} {verb}{about}{re}: {} (reply: `{reply}`)", m.sender(here, planner), m.text)
 }
 
 #[cfg(test)]
@@ -212,8 +244,12 @@ mod tests {
         send(&home, "g", m("s1", "d1", "A", "t3", 61_000)).expect("another recipient");
         send(&home, "g", m("s9", "d1", "B", "t2", 61_000)).expect("d1 of another node is another drone");
         send(&home, "g", m("s1", "d1", "A", "t2", 1_000 + HEARTBEAT_MS)).expect("after a heartbeat");
+        // The engineer's terminals: one limit per node, as a drone's name is.
+        send(&home, "g", m("engineer:e@x", "", "A", "t4", 1_000)).unwrap();
+        assert!(send(&home, "g", m("engineer:e@x", "", "A", "t4", 2_000)).is_err());
+        send(&home, "g", m("engineer:e@x", "", "B", "t4", 2_000)).expect("the engineer's terminal on another node");
         assert!(send(&home, "g", Message::new(ASK, "s1", "", "A", "", "", None, 5, "  ")).is_err(), "no empty text");
-        assert_eq!(read(&super::super::messages_path(&home, "g")).len(), 4);
+        assert_eq!(read(&super::super::messages_path(&home, "g")).len(), 6);
         let long = Message::new(TELL, "s1", "", "A", "", "", None, 5, &"x".repeat(500));
         assert!(long.text.chars().count() <= TEXT + 3, "cut like a board note");
         let _ = std::fs::remove_dir_all(&home);
@@ -272,7 +308,48 @@ mod tests {
         let told = HashSet::from([all[0].id.as_str()]);
         assert_eq!(ids(fresh(&all, "s2", "d2", "A", "", &told, 10)), [3, 5, 6]);
         assert!(fresh(&all, "s2", "d2", "A", "", &HashSet::new(), 7 + LEASE_MS).is_empty());
-        let r = render(&all[5], "A", "borg hive tell \"…\" --re x --to s8");
+        let r = render(&all[5], "A", "borg hive tell \"…\" --re x --to s8", false);
         assert_eq!(r, "d1 (node B) asks about t1: is the API stable? (reply: `borg hive tell \"…\" --re x --to s8`)");
+        let r = render(&Message::new(TELL, "planner1", "", "A", "", "", None, 1, "use v2"), "A", "x", true);
+        assert_eq!(r, "the planner planner1 tells: use v2 (reply: `x`)");
+    }
+
+    /// '@' is in no task id, session or drone name any reader of any version compares `to` with, so a
+    /// message to the planner reaches no drone, whatever it holds or is named; a drone named like the
+    /// CLI word `planner` neither.
+    #[test]
+    fn a_planner_message_reaches_no_drone_of_any_version() {
+        let up = [m("s1", "d1", "A", PLANNER, 1)];
+        for (session, drone, held) in [("s2", "d2", "t1"), ("s3", "", ""), ("planner", "planner", "planner")] {
+            assert!(for_session(&up, session, drone, "A", held).is_empty(), "{session} {drone} {held}");
+        }
+        assert!(Message::new(TELL, "s1", "d1", "A", "", PLANNER, None, 1, "x").well_formed(), "every reader keeps it");
+    }
+
+    /// A planner is shown every message for it not shown yet, however old (no lease: a planning session
+    /// may be idle for hours), oldest first, never its own; to the planner, to its session or to everyone.
+    #[test]
+    fn the_planner_sees_every_unshown_message_however_old() {
+        let all =
+            [m("s1", "d1", "A", PLANNER, 1), m("s1", "d1", "B", "", 2), m("s2", "d2", "A", "q1", 3), m("q1", "", "A", "", 4), m("s2", "d2", "A", "t1", 5)];
+        let ids = |v: Vec<&Message>| v.iter().map(|x| x.ms).collect::<Vec<_>>();
+        let late = 100 * LEASE_MS;
+        assert_eq!(ids(unshown(&all, "q1", "A", &HashSet::new())), [1, 3, 2], "addressed to it first");
+        assert!(fresh(&all, "q1", "", "A", PLANNER, &HashSet::new(), late).is_empty(), "a drone's lease would have dropped them");
+        assert_eq!(ids(unshown(&all, "q1", "A", &HashSet::from([all[0].id.as_str()]))), [3, 2], "each once");
+        assert_eq!(ids(unshown(&all, "q2", "B", &HashSet::new())), [1, 2, 4], "another node's planner: a session id is its own");
+    }
+
+    /// A planner idle through more broadcasts than a prompt shows (`SHOW_CHANGES`) still gets a report
+    /// to it at its next prompt: what is addressed to it comes before the broadcasts, each oldest first.
+    #[test]
+    fn a_report_to_the_planner_comes_before_a_backlog_of_broadcasts() {
+        let n = super::super::SHOW_CHANGES as i64 + 3;
+        let mut all: Vec<Message> = (1..=n).map(|ms| m("s1", "d1", "A", "", ms)).collect();
+        all.push(m("s2", "d2", "A", PLANNER, n + 1));
+        all.push(m("s2", "d2", "A", "q1", n + 2));
+        let got: Vec<i64> = unshown(&all, "q1", "A", &HashSet::new()).iter().map(|x| x.ms).collect();
+        assert_eq!(got[..3], [n + 1, n + 2, 1]);
+        assert_eq!(got.len(), all.len());
     }
 }

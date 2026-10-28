@@ -322,6 +322,12 @@ pub fn render(v: &HiveView) -> String {
         }
     }
     let m = &v.monitor;
+    for p in &m.planners {
+        s.push_str(&format!("  planner {}: {} unread message(s)\n", p.session, p.unread));
+    }
+    if let Some(mail) = &m.planner_mail {
+        s.push_str(&format!("  {}\n", mail.line()));
+    }
     for r in m.stuck.iter().map(|r| ("stuck", r)).chain(m.declines.iter().map(|r| ("declines", r))) {
         let why = if r.1.why.is_empty() { String::new() } else { format!(": {}", r.1.why) };
         s.push_str(&format!("  {}\n", cut(&format!("{} {} @{}{why}", r.0, r.1.task, r.1.node), 200)));
@@ -503,7 +509,9 @@ hive g: $0.75 of $3.00 · 2 task(s) (1 claimed, 1 open) · 0 contract(s)
         // Every goal file a view reads, its beats, confirms and node integration log included; no
         // registry, so no drone file.
         assert_eq!(files(&home).len(), 15);
-        for k in ["history", "members", "interactive", "stuck", "declines", "integrations", "integrate_log", "metered_usd", "unmetered"] {
+        for k in
+            ["history", "members", "interactive", "stuck", "declines", "integrations", "integrate_log", "metered_usd", "unmetered", "planners", "planner_mail"]
+        {
             assert!(j.get(k).is_some(), "{k}");
         }
         assert_eq!((j["plan"]["state"].as_str(), j["plan"]["cards"][0]["risk"].as_str()), (Some("not asked"), Some("normal")));

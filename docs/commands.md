@@ -88,17 +88,18 @@ $ borg hive board
 |---|---|
 | `borg hive init <goal> --spec TEXT\|--spec-file F --oracle NAME=CMD... --budget USD [--timeout S] [--repo NAME[@NODE]]... [--task "ID\|role\|title\|files,..\|deps,..\|NAME=CMD"]...` | A goal, its oracle and its first tasks. Without `--oracle` it refuses: done means the oracle passes |
 | `borg hive ratify <goal> [--budget USD]` | The engineer approves the goal's plan from a terminal; `--budget` raises the budget once its spend stopped new claims. Refused inside a harness session ([The planning session](#the-planning-session)) |
-| `borg hive board [<goal>] [--json]` | The tasks by status, with holders, age, rework and dependencies |
+| `borg hive board [<goal>] [--json]` | The tasks by status, with holders, age, rework and dependencies; in your terminal, then the drones' messages to the planner not read on this machine, marked read |
 | `borg hive join [<goal>]` · `borg hive leave` | Inside a session: it becomes an interactive drone of the goal (or of every open goal of this repo) in a worktree of its own, or stops being one ([Interactive drones](#interactive-drones)) |
 | `borg hive join <goal> --here [--drone NAME]` · `borg hive leave --here` | Every new session in this repo (or worktree) joins the goal, or no longer does |
 | `borg hive open <goal> --id ID --role work\|plan\|verify\|integrate --title T [--repo R] [--files a,b] [--deps x,y] [--accept NAME=CMD]... [--again] [--group K]` | An engineer opens a task; `--again` reopens a blocked one, and `--title`, `--files`, `--deps` or `--accept` given with it replace those parts (a wrong check, say); `--group K` opens K attempts ([Groups](#groups-of-attempts)) |
-| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts into `refs/heads/hive/<goal>/integrated` and run the oracle and every task's checks on it. A failure opens a fix task. Needs git 2.40+. Refused to a drone |
-| `borg hive approve <goal>` | Run the checks another node wrote (a synced goal's oracle, a task opened elsewhere with `--accept`) on this machine; prints each command. Refused to a drone |
+| `borg hive integrate <goal>` | Once every task is verified: merge the accepted attempts into `refs/heads/hive/<goal>/integrated` and run the oracle and every task's checks on it. A failure opens a fix task. Needs git 2.40+. Refused to a drone and inside a harness session |
+| `borg hive approve <goal>` | Run the checks another node wrote (a synced goal's oracle, a task opened elsewhere with `--accept`) on this machine; prints each command. Refused to a drone and inside a harness session |
 | `borg hive claim [TASK]` · `progress "<note>"` · `release` · `block "<why>"` | A drone claims a task (exit 3 when another drone won it), reports on it, gives it back or blocks it |
 | `borg hive done [--note N]` | Run the task's checks with their own timeouts; on a pass publish done and open its verify task |
 | `borg hive verify --pass\|--reject "<why>"` | The verdict on a verify task (or end the turn with `VERDICT: pass` or `VERDICT: reject <why>`); a rejection reopens the work with the note |
 | `borg hive contract "<text>" --scope a,b [--supersedes ID]` | Publish a contract scoped to files (globs), `id:NAME` or `repo:NAME`, shown to drones whose edits touch it |
-| `borg hive ask "<text>" [--to TASK\|DRONE\|SESSION]` · `tell "<text>" [--to …] [--re ID]` | A message to the goal's drones, shown once at each recipient's next prompt |
+| `borg hive ask "<text>" [--to TASK\|DRONE\|SESSION\|planner]` · `tell "<text>" [--to …] [--re ID]` | A message to the goal's drones, or with `--to planner` to the sessions that planned it, shown once at each recipient's next prompt |
+| `borg hive ask\|tell "<text>" --goal G [--to …] [--re ID]` | The planning session (or your terminal) sends into goal G without joining it, and is G's planner from then on: its prompts show the drones' messages to the planner. `borg hive leave` there ends its planning |
 
 Drone commands take `--session ID` (the hook's context prints the exact command) and `--dir DIR`.
 
@@ -124,8 +125,23 @@ independent tasks, a contract task before the tasks that use its interface, and 
   that borg learns from, and the session revises the plan with you.
 - **No drone takes a task of a plan you have not approved.** The approval is a `ratified` line of the
   board, so every node reads it. Once approved, the session tells you how many drones are waiting.
-- **The model cannot approve.** `borg queen answer` and `borg hive ratify` refuse inside a harness
-  session. A goal opened from your own terminal is approved there with `borg hive ratify <goal>`.
+- **The model cannot approve.** `borg queen answer`, `borg hive ratify`, `approve`, `integrate` and
+  `borg debug hive score` refuse inside a harness session. A goal opened from your own terminal is
+  approved there with `borg hive ratify <goal>`.
+- **The drones report back.** A drone that finds the plan wrong (a check that tests nothing, a missing
+  task) tells the planner: `borg hive tell "<what>" --to planner`. The message, and each drone's
+  message to everyone, shows once at the planning session's next prompt, however long it was idle, with
+  the command that answers it; messages to the planner come before a backlog of broadcasts. The
+  session stays the goal's planner after the approval, and sends to the drones with `borg hive tell
+  "<text>"` without joining. `borg top` and the Hive tab show each planning session of this machine
+  with its unread messages: a harness that takes no prompt context leaves them unread there.
+- **Messages to the planner reach planning sessions only.** `borg hive tell` from your terminal sends
+  as you, the engineer, never as the repo's one drone, and a drone's answer to it goes to the planner.
+  Your terminal reads no prompt, so a goal opened and approved from a terminal has no session reading
+  those messages: `borg top` and the Hive tab count them on the goal's home node (where it was first
+  opened) and on any machine with a planning session (`to the planner: N message(s), M unread here`).
+  `borg hive board <goal>` in your terminal lists the ones not read on this machine, each with the
+  command that answers it, and marks them read there.
 - **Subagents and workflows** may help inside a task under the drone's claim; they never claim or finish.
 - **Budget.** Each claim of a Claude Code drone adds its transcript's metered spend to `spend.jsonl`;
   omp, opencode and codex report no usage (`unmetered`). At the budget no drone claims, and you are

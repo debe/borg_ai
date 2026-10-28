@@ -63,7 +63,17 @@ are kept.
   `refs/heads/hive/<goal>/integrated` and runs the oracle and every task's checks on the result. A
   failure opens a fix task from the combined tree. No model session ever integrates.
 - **Contracts** (`contracts.jsonl`) and **messages** (`messages.jsonl`, `borg hive ask` and `tell`),
-  shown once per session at a prompt or an edit in scope.
+  shown once per session at a prompt or an edit in scope. A message goes to everyone, a task, a drone,
+  a session or the planner (`@planner`): every session with a planner record of the goal, the
+  session that opened its plan or sent into it without joining. '@' is in no task, session or drone
+  name, so no drone of any version is shown a message to the planner. A planner is shown each message
+  for it once, however old, and only when the text went into its context, those to it before the
+  broadcasts; it never claims or waits. Monitoring counts the messages to the planner from the synced
+  log alone on the goal's home node (its first open's) and on a node with a planner session, so a goal
+  opened from a terminal, which no session plans, still shows its drones' reports; the engineer's
+  terminal reads them with `borg hive board`, which marks them read on that node only (`planner-read`,
+  never synced). A planner that is a drone hears only its own goal, as a drone; `borg hive leave` in a
+  session that only plans removes its planner record.
 - **Commits travel** (`bundles.jsonl`): each attempt's two snapshots as a git bundle line, so a
   verifier or integrator on another node gets the work while its author is offline. A node takes a
   bundle only if it holds exactly that attempt's commits.
@@ -112,7 +122,10 @@ fast, never whether.
 - **Plan.** One session opens the goal through the borg skill and shows the plan. The engineer
   answers at that session's prompt: `yes`, or `no, because ...` and it revises. The approval is an
   engineer's `ratified` board line; every claim path checks it, and the model can never approve.
-  `borg hive ratify <goal>` approves from a terminal.
+  `borg hive ratify <goal>` approves from a terminal. The planning session stays the goal's planner:
+  drones report plan problems to it (`tell --to planner`), and since its model reads their text,
+  every command that is the engineer's consent (`ratify`, `approve`, `integrate`, `score`) refuses
+  inside any harness session.
 - **Wait and wake.** A drone with nothing in hand waits at no token cost and is woken by its
   harness's own path: Claude Code by a background `borg hive wait` whose output starts the next turn;
   omp by `sendMessage` from its adapter; opencode by `promptAsync` (1.x) or a queued `prompt` (2.x);
