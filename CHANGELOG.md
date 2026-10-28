@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-28)
+
+The first release on crates.io (0.3.0 and 0.2.0 were never published, so their notes below are
+history). borg keeps the shared memory: lessons from corrections, checked against the work and
+shared with a team. The hive and playbooks are gone; sessions talk to each other instead, on any
+harness and across machines, and steering is part of that channel. Every crate is 0.4.0 and pins the
+others `=0.4.0`. The release steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 
 ### Added
 
@@ -26,8 +32,11 @@
   an `admin` or `steer` member. The rate limit never holds them back. `borg steer` is removed: use
   `borg pause`, `borg resume`, or `borg tell` for an instruction. Stats keep `steer_issued`,
   `steer_delivered`, `steer_dropped` and `pause_refused`.
-- The mesh protocol is `borg/mesh/13`. A 0.3.0 member (`borg/mesh/12`) still syncs everything except
-  messages; older members do not sync, and `borg doctor` names them.
+- The mesh protocol is `borg/mesh/13`. A member built from 0.3.0 sources (`borg/mesh/12`) still syncs
+  everything except messages; older members do not sync, and `borg doctor` names them.
+- The documentation was checked against the code: the README, the command, configuration, harness,
+  team and statistics references, the adapter READMEs and the borg skill describe messages, pause and
+  `borg listen`, and the mesh figures no longer show the old steering.
 
 ### Removed
 
@@ -43,11 +52,11 @@
   `BORG_PLAYBOOKS` go with them. An old store's `playbooks.jsonl`, `playbooks-reflected.txt` and
   `playbooks-plain.txt` are no longer read or synced, and an old queued playbook question is skipped;
   `borg doctor` names the files and the command that removes them. The mesh protocol stays `borg/mesh/13`: a session still steps
-  through the playbooks' log and keeps nothing a 0.3.0 or 0.4.0 member offers there.
+  through the playbooks' log and keeps nothing an older member offers there.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (never published)
 
-The first release meant for crates.io: a smaller, consistent command line, a library marked internal,
+Meant as the first release for crates.io; 0.4.0 took its place: a smaller, consistent command line, a library marked internal,
 and documentation whose claims match their reports. The release steps are in
 [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 

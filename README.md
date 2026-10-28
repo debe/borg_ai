@@ -17,7 +17,7 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.4.0, which removed the hive: sessions now message each other instead. In daily use, with
+**Status:** 0.4.0, the first release on crates.io. It removed the hive and playbooks: sessions now message each other instead. In daily use, with
 lessons syncing between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
@@ -299,7 +299,7 @@ borg doctor
 Hooks call the binary by path, so a reinstall needs no rewiring. Codex trusts each hook's command and
 timeout: after an upgrade that moves borg or changes a timeout, trust them again with `/hooks`
 (`borg doctor` says so). Stores are append-only JSONL and need no migration. The mesh protocol is
-now `borg/mesh/13`. A 0.3.0 member (`borg/mesh/12`) still syncs everything except messages; nothing syncs
+now `borg/mesh/13`. A member built from 0.3.0 sources (`borg/mesh/12`) still syncs everything except messages; nothing syncs
 with an older one, and `borg doctor` names that member and which side has to upgrade.
 
 ```sh
