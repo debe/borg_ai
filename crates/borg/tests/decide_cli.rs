@@ -96,10 +96,11 @@ fn a_learned_check_whose_record_cannot_reach_its_gate_takes_the_fixed_rule() {
     let root = setup("decide-recorded");
     fitted(&store(&root).join("lessons.jsonl"));
     learned_live_check(&root, "r1", &[("BORG_LEARN", "on")]);
-    assert_eq!(selected(&root, "r1"), "policy=learned source=learned");
+    assert_eq!(selected(&root, "r1"), format!("policy=learned source={}", policy::EVIDENCE));
     let g = graded(&store(&root).join("outcomes.jsonl"));
     assert_eq!((g.len(), g[0]["free"].clone(), g[0]["reason"].clone()), (1, json!(["Mdrain"]), Value::Null), "{g:?}");
-    assert!(state(&root, "r1", "queued").starts_with("Mdrain @"), "handed over free: {}", state(&root, "r1", "queued"));
+    // In place of the question the fixed rule asks: the evidence rule's hand-over (hook.rs `INSTEAD_NEXT`).
+    assert!(state(&root, "r1", "queued").starts_with("instead-next Mdrain @"), "handed over free: {}", state(&root, "r1", "queued"));
     let _ = std::fs::remove_dir_all(&root);
 
     // Learning off: nothing is recorded, so nothing would debit the gate; the fixed rule asks the 3.

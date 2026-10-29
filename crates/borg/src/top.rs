@@ -398,8 +398,8 @@ pub fn to_json_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox) -
 /// priced only under a budget an engineer set for the collective (`budget`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Selection {
-    /// The policy a hook started from this environment runs under (select.rs `Policy::name`): `fixed`,
-    /// `learned` (opt-in: `BORG_SELECT=learned`), `cap` or `attention` under an evaluation switch.
+    /// The policy a hook started from this environment runs under (select.rs `Policy::name`): `learned`
+    /// (the default), `fixed` (`BORG_SELECT=fixed`), `cap` or `attention` under an evaluation switch.
     pub policy: &'static str,
     /// The policy a hook runs under when no switch is set (select.rs `precedence` without one): the
     /// fixed rule until the pre-registered checks pass (tasks/todo.md, amendment 2026-10-29).
@@ -408,8 +408,9 @@ pub struct Selection {
     /// beyond the gate's share and put the fixed rule back (sticky).
     pub source: &'static str,
     /// The conservative gate's budget (select.rs `Log::gate`): the replayed quality (mistakes avoided)
-    /// the learned policy may still risk below the fixed rule. Not money. 0 at cold start, where every
-    /// decision is the fixed rule's.
+    /// the learned policy may still risk below the fixed rule, at the collective's risk share (`Test::risk`,
+    /// select/policy.rs `remaining_at`). Not money. 0 at cold start, where every decision is the fixed
+    /// rule's.
     pub gate: f64,
     /// The fit decisions draw from (select/policy.rs `Fit::key`); empty: the prior.
     pub fit: String,
@@ -419,8 +420,9 @@ pub struct Selection {
     pub checks: u64,
     pub sessions: u64,
     /// Per decision type the summary counts, the decisions that differed from the fixed rule's (`part`)
-    /// of those made (`whole`): `route`, the learned checks under the current fit whose routes did
-    /// (select/summary.rs `Gate`). The pool's size and early delivery are not counted yet.
+    /// of those made (`whole`): `route`, the learned checks under the current fit whose routes did, on
+    /// evidence or by a played draw of the question-count test (select/summary.rs `Gate`; the test's
+    /// own draws, all-time, are in `test`). The pool's size and early delivery are not counted yet.
     pub deviations: Vec<Count>,
     /// Per reason a learned decision fell back to the fixed rule (select/summary.rs `FELL_BACK`, named as
     /// the record's `reason`: `lock_busy`, `lock_failed`, `unrecorded`), the graded checks it did
@@ -454,6 +456,104 @@ pub struct Selection {
     pub pool: Vec<Yield>,
     /// Stop check latency per harness against its stop budget.
     pub latency: Vec<Latency>,
+    /// The learned policy's randomised question-count test; None under another policy while the
+    /// summary counts none of its checks.
+    pub test: Option<Test>,
+}
+
+/// The randomised question-count test of the learned policy (select/policy.rs `choose`; docs/delivery.md
+/// "The question-count test"), all-time as the summary counts it (select/summary.rs `Experiment`), never
+/// recounted from the log. On a live check, of the k lessons below grade 3 the fixed rule delivers and
+/// that may go free, s drawn uniformly in 0..=k are asked and the rest handed over: nothing is withheld.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Test {
+    /// The share of the fixed rule's value the gate may risk on it: the collective's `risk` in
+    /// collectives.json (select.rs `risk_of`), else select/policy.rs `ALPHA`. 0: the test is off.
+    pub risk: f64,
+    /// Whether the collective sets `risk` (false: the default `ALPHA`).
+    pub set: bool,
+    /// Checks the test drew a count for (played or refused by the gate), and of them the control arm's
+    /// (`experiment_control`: s is the fixed rule's own count, so it routed as the fixed rule).
+    pub ran: u64,
+    pub control: u64,
+    /// Of them, checks the gate refused it: the draw's risk did not fit what the gate may still risk, so
+    /// the fixed rule decided (source `gate`).
+    pub refused: u64,
+    /// The sessions with a check the test drew a count for.
+    pub sessions: u64,
+    /// Of `ran`, the drawn checks the summary still holds, which the readout's estimates read
+    /// (select/replay.rs `TestReadout::kept`): compaction drops the oldest checks, never the counts.
+    pub kept: u64,
+    /// Per k, how often each s was drawn (`draws[s]`, s from 0 to k) and the checks refused at that k.
+    pub by_k: Vec<Draws>,
+    /// The pre-registered readout (select/replay.rs `test_readout`): due after `TEST_CHECKS` checks drawn
+    /// or `TEST_SESSIONS` sessions with one, and only then estimated, each with its session-bootstrap
+    /// 95% interval: per number m ≥ 2 of the test's questions asked, the test's top lesson's change rate
+    /// against asked alone (`dilution`, unit `points changed`), and asking a grade 2 against handing it
+    /// over (`ask_free`, unit `points changed`). Empty and None until due, or with no drawn check.
+    pub due: bool,
+    pub due_checks: u64,
+    pub due_sessions: u64,
+    pub dilution: Vec<Estimate>,
+    pub ask_free: Option<Estimate>,
+}
+
+/// The test's checks at one k (`Test::by_k`): uniform draws give each s about `ran / (k + 1)`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Draws {
+    pub k: u32,
+    pub draws: Vec<u64>,
+    pub refused: u64,
+}
+
+impl Test {
+    /// The summary's counts (select/summary.rs `Experiment`) and its readout (select/replay.rs
+    /// `test_readout`), under the risk share `risk` the collective sets (None: `ALPHA`).
+    #[must_use]
+    pub fn of(summary: &select::summary::Summary, risk: Option<f64>) -> Test {
+        use select::replay::{TEST_CHECKS, TEST_SESSIONS, test_readout};
+        let e = &summary.experiment;
+        let (ran, refused) = e.totals();
+        let r = test_readout(summary);
+        // An estimate as a share of 1 scaled to percent, named; none without a value.
+        let estimate = |name: String, unit: &str, x: &crate::ope::Estimate| {
+            x.value.map(|v| Estimate { name, unit: unit.into(), mean: 100.0 * v, lo: 100.0 * x.lo, hi: 100.0 * x.hi, n: x.n as u64 })
+        };
+        let mut by_k: Vec<Draws> = Vec::new();
+        let at = |by_k: &mut Vec<Draws>, k: u32| match by_k.iter().position(|d| d.k == k) {
+            Some(i) => i,
+            None => {
+                by_k.push(Draws { k, draws: vec![0; k as usize + 1], refused: 0 });
+                by_k.len() - 1
+            }
+        };
+        for &(k, s, n) in &e.ran {
+            let i = at(&mut by_k, k);
+            if let Some(c) = by_k[i].draws.get_mut(s as usize) {
+                *c += n;
+            }
+        }
+        for &(k, n) in &e.refused {
+            let i = at(&mut by_k, k);
+            by_k[i].refused += n;
+        }
+        by_k.sort_by_key(|d| d.k);
+        Test {
+            risk: risk.unwrap_or(select::policy::ALPHA),
+            set: risk.is_some(),
+            ran,
+            control: e.control,
+            refused,
+            sessions: u64::from(e.sessions),
+            kept: r.kept,
+            by_k,
+            due: r.due,
+            due_checks: TEST_CHECKS,
+            due_sessions: u64::from(TEST_SESSIONS),
+            dilution: r.by_asked.iter().filter_map(|(m, x)| estimate(format!("{m} asked − 1 asked"), "points changed", x)).collect(),
+            ask_free: r.ask_free.as_ref().and_then(|x| estimate("grade 2 asked − handed over".into(), "points changed", x)),
+        }
+    }
 }
 
 /// `part` of `whole` (a share), named.
@@ -490,7 +590,9 @@ pub struct Budget {
 pub struct Estimate {
     pub name: String,
     /// `points` (percentage points of P(changed and avoids)), `coefficient` (a value-model coefficient,
-    /// on the logit scale) or `logit` (a spread's standard deviation).
+    /// on the logit scale), `logit` (a spread's standard deviation), or the question-count test's
+    /// readout's `percent changed` (the share of judged lessons that changed the work) and `points
+    /// changed` (a difference of such shares).
     pub unit: String,
     pub mean: f64,
     pub lo: f64,
@@ -572,10 +674,11 @@ fn quantile(sorted: &[u64], q: f64) -> u64 {
 }
 
 impl Selection {
-    /// What `summary` says, under `policy`: copied from the summary, its fit and its monitor, never
-    /// refitted. What it does not hold yet stays empty: not measured.
+    /// What `summary` says, under `policy` and the risk share `risk` its collective sets (select.rs
+    /// `risk_of`; None: the default): copied from the summary, its fit and its monitor, never refitted.
+    /// What it does not hold yet stays empty: not measured.
     #[must_use]
-    pub fn of(summary: &select::summary::Summary, policy: select::Policy) -> Selection {
+    pub fn of(summary: &select::summary::Summary, policy: select::Policy, risk: Option<f64>) -> Selection {
         use select::summary::{LIVE, Label, STOP};
         let s = summary;
         let learned = policy == select::Policy::Learned;
@@ -687,7 +790,7 @@ impl Selection {
             policy: policy.name(),
             default,
             source: if reverted { select::REVERTED_SOURCE } else { policy.name() },
-            gate: if learned && !reverted { select::policy::remaining(&s.gate).max(0.0) } else { 0.0 },
+            gate: if learned && !reverted { select::policy::remaining_at(&s.gate, risk.unwrap_or(select::policy::ALPHA)) } else { 0.0 },
             fit: s.fit.key.clone(),
             at: s.at,
             checks,
@@ -705,6 +808,7 @@ impl Selection {
             measurement,
             pool,
             latency,
+            test: (learned || s.experiment.totals() != (0, 0)).then(|| Test::of(s, risk)),
         }
     }
 
@@ -748,13 +852,14 @@ fn effects(m: &select::policy::Model, n: u32) -> Vec<Estimate> {
 /// The selection of the store whose lessons file is `lessons`, under `policy` (select.rs `policy`).
 #[must_use]
 pub fn selection(lessons: &Path, policy: select::Policy) -> Selection {
-    Selection::of(&select::summary::load(lessons), policy)
+    Selection::of(&select::summary::load(lessons), policy, select::risk_of(lessons))
 }
 
 /// `s` as one line (`borg status`, `borg top`): what decides (the default named as such, a policy
 /// opted into by its switch), then the checks folded, how often the policy deviated from the fixed
-/// rule, the learned decisions the fixed rule took over per reason (only those that happened), what
-/// the checks measure for the learned policy (placebos), the monitor's reading (the
+/// rule, the learned decisions the fixed rule took over per reason (only those that happened), the
+/// question-count test (`test_line`), what the checks measure for the learned policy (placebos), the
+/// monitor's reading (the
 /// auto-revert's evidence) with its weights' effective number and largest weight, the stops' latency
 /// per harness against its stop budget, and what selection spent per session; a budget and its price
 /// only where an engineer set one.
@@ -787,6 +892,9 @@ pub fn selection_line(s: &Selection) -> String {
     let fell: Vec<String> = s.fallbacks.iter().filter(|c| c.part > 0).map(|c| format!("{} {}", c.name, c.part)).collect();
     if !fell.is_empty() {
         parts.push(format!("learned decisions the fixed rule took over: {}", fell.join(", ")));
+    }
+    if let Some(t) = &s.test {
+        parts.push(test_line(t));
     }
     if let Some(m) = &s.measurement {
         parts.push(format!("placebos {} drawn, {} judged", m.placebos, m.judged));
@@ -825,6 +933,27 @@ pub fn selection_line(s: &Selection) -> String {
     parts.join(" · ")
 }
 
+/// The question-count test as one part of the selection line: the checks it ran, its controls, those
+/// the gate refused, those the summary still holds once compaction dropped some (`kept`, what the
+/// readout reads), the risk share in force (`set` names the collective's own; 0 says it is off), and
+/// the readout: when it is due, and once due its ask-against-free estimate.
+fn test_line(t: &Test) -> String {
+    let risk = if t.set { format!("risk {:.2} (the collective's)", t.risk) } else { format!("risk {:.2}", t.risk) };
+    match (t.ran, t.risk <= 0.0) {
+        (0, true) => return "question-count test off (risk 0)".into(),
+        (0, false) => return format!("question-count test: no check yet, {risk}"),
+        _ => {}
+    }
+    let kept = if t.kept < t.ran { format!(", {} still in the summary", t.kept) } else { String::new() };
+    let head =
+        format!("question-count test {} drawn ({} control, {} refused by the gate{kept}) in {} sessions, {risk}", t.ran, t.control, t.refused, t.sessions);
+    match (&t.ask_free, t.due) {
+        (Some(e), true) => format!("{head}; readout: grade 2 asked − handed over {:+.1} [{:+.1}, {:+.1}] points changed", e.mean, e.lo, e.hi),
+        (None, true) => format!("{head}; readout due, no judged grade 2 on both routes yet"),
+        (_, false) => format!("{head}; readout after {} checks or {} sessions", t.due_checks, t.due_sessions),
+    }
+}
+
 /// `render` with the collective's selection line under it, when `borg top` shows one (`Selection::shown`).
 #[must_use]
 pub fn render_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, select: Option<&Selection>, now: i64) -> String {
@@ -861,8 +990,9 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>,
         }
         // Every frame: the cache and its tail, never a rebuild of the whole log (select/summary.rs `peek`);
         // the checks' hooks keep the cache current.
-        let summary = select::summary::peek(&home.join("lessons.jsonl"));
-        let select = Some(Selection::of(&summary, select::policy())).filter(Selection::shown).map(|s| selection_line(&s));
+        let lessons = home.join("lessons.jsonl");
+        let summary = select::summary::peek(&lessons);
+        let select = Some(Selection::of(&summary, select::policy(), select::risk_of(&lessons))).filter(Selection::shown).map(|s| selection_line(&s));
         out.push(crate::top_live::Coll { name: name.clone(), home: home.clone(), share: *share, drones: ds, inbox, select });
     }
     Ok(out)
@@ -1066,6 +1196,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
             spend: vec![spend("stop", 4, 3.0), spend("live", 0, 2.04)],
             evaluation: Some(evaluation),
             measurement: Some(Measurement { placebos: 40, judged: 31, tail_shown: 12, tail_applied: 3 }),
+            test: Some(Test { risk: 0.1, ran: 30, control: 9, refused: 4, sessions: 6, kept: 30, due_checks: 300, due_sessions: 30, ..Test::default() }),
             ..Selection::default()
         }
     }
@@ -1074,7 +1205,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
     fn the_selection_line_says_what_decides_and_prices_spend_only_under_a_budget() {
         use select::Policy;
         use select::summary::Summary;
-        let fresh = |policy, default| Selection { default, ..Selection::of(&Summary::default(), policy) };
+        let fresh = |policy, default| Selection { default, ..Selection::of(&Summary::default(), policy, None) };
         // The fixed rule as the default names itself so and the opt-in; the learned policy opted into says so.
         let fixed = fresh(Policy::Fixed, "fixed");
         assert_eq!(selection_line(&fixed), "the fixed rule (the default; BORG_SELECT=learned opts in to the learned policy) · no graded check folded yet");
@@ -1089,13 +1220,13 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(selection_line(&fresh(Policy::Fixed, "learned")), "the fixed rule (BORG_SELECT=fixed) · no graded check folded yet");
         assert!(!fresh(Policy::Learned, "learned").shown() && fresh(Policy::Fixed, "learned").shown());
         let d = select::precedence(None, None, false);
-        assert_eq!(Selection::of(&Summary::default(), Policy::Cap(2)).default, d.name(), "the default is select.rs's, no switch set");
-        assert!(!Selection::of(&Summary::default(), d).shown());
+        assert_eq!(Selection::of(&Summary::default(), Policy::Cap(2), None).default, d.name(), "the default is select.rs's, no switch set");
+        assert!(!Selection::of(&Summary::default(), d, None).shown());
         let mut s = learned();
         let line = selection_line(&s);
         assert_eq!(
             line,
-            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · placebos 40 drawn, 31 judged · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
+            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · question-count test 30 drawn (9 control, 4 refused by the gate) in 6 sessions, risk 0.10; readout after 300 checks or 30 sessions · placebos 40 drawn, 31 judged · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
         );
         assert!(!line.contains("budget") && !line.contains("price"), "no budget set: spend measured, never priced: {line}");
         let mut early = learned();
@@ -1139,7 +1270,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let (ds, inbox) = (fixture(), inbox_fixture());
         let plain = render("corp", Share::Team, &ds, &inbox, NOW);
         assert_eq!(render_with("corp", Share::Team, &ds, &inbox, None, NOW), plain);
-        let cold = Selection::of(&select::summary::Summary::default(), select::precedence(None, None, false));
+        let cold = Selection::of(&select::summary::Summary::default(), select::precedence(None, None, false), None);
         assert_eq!(render_with("corp", Share::Team, &ds, &inbox, Some(&cold), NOW), plain, "the default at cold start: no line");
         let s = learned();
         assert_eq!(render_with("corp", Share::Team, &ds, &inbox, Some(&s), NOW), format!("{plain}  selection: {}\n", selection_line(&s)));
@@ -1151,13 +1282,17 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let v = serde_json::to_value(learned()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let want = "at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life labels latency measurement policy pool sessions source spend";
+        let want = "at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life labels latency measurement policy pool sessions source spend test";
         assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
         assert_eq!((&v["budget"], &v["spend"][0]["source"], &v["deviations"][0]["whole"]), (&Value::Null, &json!("stop"), &json!(400)));
         let mut keys: Vec<&str> = v["evaluation"].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["ess", "max_weight", "mean", "sessions", "truncated", "ucb", "units"]);
         assert_eq!((&v["default"], &v["measurement"]), (&json!("fixed"), &json!({"placebos": 40, "judged": 31, "tail_shown": 12, "tail_applied": 3})));
+        let mut keys: Vec<&str> = v["test"].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let want = "ask_free by_k control dilution due due_checks due_sessions kept ran refused risk sessions set";
+        assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
     }
 
     /// Label health's judged share of a route counts the applies a verdict can come of: a free apply of
@@ -1203,7 +1338,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
         let s = fold(&text, Summary::default());
         assert_eq!(s.applies.iter().map(|a| a.had).collect::<Vec<_>>(), [false, true, true], "c2's A was handed over at c1, c3's B early");
-        let sel = Selection::of(&s, select::Policy::Fixed);
+        let sel = Selection::of(&s, select::Policy::Fixed, None);
         let row = |name: &str| sel.labels.iter().find(|c| c.name == name).map(|c| (c.part, c.whole));
         assert_eq!(row("judged, free"), Some((1, 1)), "c1's delivered and judged; c2's had, out: {:?}", sel.labels);
         assert_eq!(row("judged, asked"), Some((1, 1)), "c3's question of what B's session had, judged: {:?}", sel.labels);
@@ -1260,10 +1395,10 @@ corp (team): 3 drone(s), 2 active, 1 remote
             Outcome { judge: 2, ..rec(outcome::CHANGED, &["C"], "c1", "queued", 13) },
         ];
         let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
-        let sel = Selection::of(&fold(&text, Summary::default()), select::Policy::Fixed);
+        let sel = Selection::of(&fold(&text, Summary::default()), select::Policy::Fixed, None);
         assert_eq!(sel.measurement, Some(Measurement { placebos: 2, judged: 1, tail_shown: 2, tail_applied: 1 }), "{sel:?}");
         assert!(selection_line(&sel).contains(" · 2 checks · placebos 2 drawn, 1 judged · tail 2 shown past the pool, 1 applied"), "{}", selection_line(&sel));
-        assert_eq!(Selection::of(&Summary::default(), select::Policy::Fixed).measurement, None, "nothing folded: not measured");
+        assert_eq!(Selection::of(&Summary::default(), select::Policy::Fixed, None).measurement, None, "nothing folded: not measured");
     }
 
     /// The learned decisions the fixed rule took over, per reason, as the summary folds them from the
@@ -1296,15 +1431,15 @@ corp (team): 3 drone(s), 2 active, 1 remote
             graded("c4", "fixed", outcome::DECIDED_BUSY, 4),
         ];
         let lines = |log: &[Outcome]| log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect::<String>();
-        let sel = Selection::of(&fold(&lines(&log), Summary::default()), select::Policy::Learned);
+        let sel = Selection::of(&fold(&lines(&log), Summary::default()), select::Policy::Learned, None);
         let rows: Vec<(&str, u64, u64)> = sel.fallbacks.iter().map(|c| (c.name.as_str(), c.part, c.whole)).collect();
         assert_eq!(rows, [("lock_busy", 2, 4), ("lock_failed", 0, 4), ("unrecorded", 1, 4)]);
         let line = selection_line(&sel);
         assert!(line.contains(" · 4 checks · learned decisions the fixed rule took over: lock_busy 2, unrecorded 1 · "), "{line}");
-        let none = Selection::of(&fold(&lines(&log[..1]), Summary::default()), select::Policy::Learned);
+        let none = Selection::of(&fold(&lines(&log[..1]), Summary::default()), select::Policy::Learned, None);
         assert!(none.fallbacks.iter().all(|c| c.part == 0) && none.fallbacks.len() == 3, "{none:?}");
         assert!(!selection_line(&none).contains("took over"), "{}", selection_line(&none));
-        assert!(Selection::of(&Summary::default(), select::Policy::Learned).fallbacks.is_empty(), "nothing folded: not measured");
+        assert!(Selection::of(&Summary::default(), select::Policy::Learned, None).fallbacks.is_empty(), "nothing folded: not measured");
     }
 
     /// The sections the summary holds are filled from it: per known harness its stops' latency against
@@ -1345,7 +1480,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         };
         s.fit.key = "fit".into();
         s.fit.rates = select::policy::Rates { free_stop: 0.6, free_live: 0.8, later: 0.4, wait: 0.25, ask_live: 1.0 };
-        let sel = Selection::of(&s, select::Policy::Learned);
+        let sel = Selection::of(&s, select::Policy::Learned, None);
         let budget = |h: &str| crate::harness::ALL.iter().find(|x| x.name() == h).and_then(|x| x.caps().stop_budget).map(|b| b.as_millis() as u64);
         assert!(budget("codex").is_some() && budget("claude").is_none(), "codex names a stop budget, claude none");
         let want = vec![
@@ -1359,11 +1494,156 @@ corp (team): 3 drone(s), 2 active, 1 remote
         // Guard: a harness's newest `LATENCY_KEEP` stops are kept, the cache never grows past them.
         let keep = select::summary::LATENCY_KEEP as u64;
         let many: String = (1..=keep + 1).map(|k| call("claude", "stop", k, false)).collect();
-        let kept = Selection::of(&fold(&many, Summary::default()), select::Policy::Learned);
+        let kept = Selection::of(&fold(&many, Summary::default()), select::Policy::Learned, None);
         assert_eq!((kept.latency[0].checks, kept.latency[0].p50_ms), (keep, 1 + keep / 2), "the oldest call dropped");
-        let cold = Selection::of(&Summary::default(), select::Policy::Learned);
+        let cold = Selection::of(&Summary::default(), select::Policy::Learned, None);
         assert!(cold.latency.is_empty() && cold.evaluation.is_none() && cold.delivery.is_none(), "{cold:?}");
         assert_eq!((quantile(&[], 0.95), quantile(&[7], 0.5)), (0, 7));
+    }
+
+    /// A learned live check of the question-count test, as hook.rs logs it: lessons A (grade 2) and B
+    /// (grade 1), its `source`, k and s.
+    fn tested(check: &str, session: &str, ms: i64, source: &str, xk: Option<u32>, xs: Option<u32>) -> crate::outcome::Outcome {
+        crate::outcome::Outcome {
+            kind: crate::outcome::GRADED.into(),
+            session: session.into(),
+            lessons: vec!["A".into(), "B".into()],
+            grades: vec![2, 1],
+            ranks: vec![0, 1],
+            applied: 2,
+            check: check.into(),
+            channel: "live".into(),
+            policy: "learned".into(),
+            source: source.into(),
+            xk,
+            xs,
+            ms,
+            ..Default::default()
+        }
+    }
+
+    /// The test's section is the summary's fold of the graded records (select/summary.rs `Experiment`),
+    /// never a recount: drawn counts by k and s, played or refused, the controls, the gate's refusals
+    /// by k (each also drawn), the sessions with a drawn count; an evidence check, a refused evidence
+    /// deviation and another policy's record count nowhere. The risk share is the collective's when set, else `ALPHA`; the section shows
+    /// under the learned policy, and under another only while the summary counts some of its checks.
+    #[test]
+    fn the_test_section_is_the_summarys_fold_of_its_checks() {
+        use select::policy::{ALPHA, EVIDENCE, EXPERIMENT, EXPERIMENT_CONTROL, GATE};
+        use select::summary::{Summary, fold};
+        let log = [
+            tested("c1", "s1", 1, EXPERIMENT, Some(2), Some(1)),
+            tested("c2", "s1", 2, EXPERIMENT_CONTROL, Some(2), Some(0)),
+            tested("c3", "s2", 3, EXPERIMENT, Some(2), Some(1)),
+            tested("c4", "s2", 4, GATE, Some(2), Some(1)),
+            tested("c5", "s2", 5, GATE, Some(1), Some(0)),
+            tested("c6", "s3", 6, EVIDENCE, None, None),
+            tested("c7", "s3", 7, GATE, None, None),
+            crate::outcome::Outcome { policy: "fixed".into(), ..tested("c8", "s3", 8, EXPERIMENT, Some(2), Some(2)) },
+        ];
+        let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        let t = Selection::of(&s, select::Policy::Learned, Some(0.2)).test.expect("the learned policy shows its test");
+        let draws = |k: u32, draws: Vec<u64>, refused: u64| Draws { k, draws, refused };
+        assert_eq!((t.ran, t.control, t.refused, t.sessions), (5, 1, 2, 2), "{t:?}");
+        assert_eq!(t.by_k, vec![draws(1, vec![1, 0], 1), draws(2, vec![1, 3, 0], 1)]);
+        assert_eq!((t.risk, t.set), (0.2, true), "the collective's risk");
+        assert!(!t.due && t.dilution.is_empty() && t.ask_free.is_none(), "5 checks, 2 sessions: not due, nothing estimated");
+        assert_eq!((t.due_checks, t.due_sessions), (select::replay::TEST_CHECKS, u64::from(select::replay::TEST_SESSIONS)));
+        let line = selection_line(&Selection::of(&s, select::Policy::Learned, Some(0.2)));
+        assert!(
+            line.contains(" · question-count test 5 drawn (1 control, 2 refused by the gate) in 2 sessions, risk 0.20 (the collective's); readout after 300 checks or 30 sessions · "),
+            "{line}"
+        );
+        assert_eq!(t.kept, t.ran, "every drawn check still held: {t:?}");
+        // Compaction dropped the oldest drawn check: the counts stay, the line says what the readout reads.
+        let mut compacted = s.clone();
+        compacted.checks.remove(0);
+        let c = Selection::of(&compacted, select::Policy::Learned, Some(0.2)).test.unwrap();
+        assert_eq!((c.ran, c.kept), (5, 4), "{c:?}");
+        assert!(
+            test_line(&c).starts_with("question-count test 5 drawn (1 control, 2 refused by the gate, 4 still in the summary) in 2 sessions"),
+            "{}",
+            test_line(&c)
+        );
+        let default = Selection::of(&s, select::Policy::Learned, None).test.unwrap();
+        assert_eq!((default.risk, default.set), (ALPHA, false), "unset: the policy's ALPHA");
+        // Off: said so while nothing ran.
+        let cold = Selection::of(&Summary::default(), select::Policy::Learned, Some(0.0));
+        assert_eq!(cold.test.as_ref().map(|t| (t.ran, t.risk)), Some((0, 0.0)));
+        assert_eq!(test_line(cold.test.as_ref().unwrap()), "question-count test off (risk 0)");
+        let none = Selection::of(&Summary::default(), select::Policy::Learned, None).test.unwrap();
+        assert_eq!(test_line(&none), "question-count test: no check yet, risk 0.10");
+        // Another policy: shown only while the summary counts the test's checks.
+        assert!(Selection::of(&Summary::default(), select::Policy::Fixed, None).test.is_none());
+        assert_eq!(Selection::of(&s, select::Policy::Fixed, None).test.map(|t| t.ran), Some(5), "an earlier opt-in's checks");
+    }
+
+    /// The gate shown is the one in force: the ledger's allowance at the collective's risk share
+    /// (select/policy.rs `remaining_at`, which `choose` decides by), the default `ALPHA`'s unless set,
+    /// and 0 at `risk` 0 with nothing gained.
+    #[test]
+    fn the_gate_shown_is_the_one_in_force_at_the_collectives_risk() {
+        use select::summary::{Gate, Summary};
+        let s = Summary { gate: Gate { gain: vec![0.0; select::policy::DRAWS], allowance: 0.3, ..Gate::default() }, ..Summary::default() };
+        let gate = |risk: Option<f64>| Selection::of(&s, select::Policy::Learned, risk).gate;
+        assert!((gate(None) - 0.3).abs() < 1e-12, "{}", gate(None));
+        assert!((gate(Some(0.2)) - 0.6).abs() < 1e-12, "twice ALPHA: twice the allowance, {}", gate(Some(0.2)));
+        assert_eq!(gate(Some(0.0)), 0.0, "risk 0");
+    }
+
+    /// Once due, the readout's estimates are the replay's (select/replay.rs `test_readout`) in percent:
+    /// a grade 2 asked against handed over, which the line says, and no dilution at k = 1.
+    #[test]
+    fn the_test_readout_shows_the_replays_estimates_once_due() {
+        use crate::outcome::{self, Outcome};
+        use select::policy::EXPERIMENT;
+        use select::summary::{Summary, fold};
+        let sessions = u64::from(select::replay::TEST_SESSIONS);
+        let mut text = String::new();
+        let mut line = |o: &Outcome| text.push_str(&format!("{}\n", serde_json::to_string(o).unwrap()));
+        for i in 0..sessions {
+            let (session, check, ms) = (format!("s{i}"), format!("{i:012x}"), 10 * i as i64);
+            // k = 1: A asked (s = 1) in even sessions, handed over (s = 0) in odd ones, each at 1/2.
+            let asked = i % 2 == 0;
+            let g = Outcome {
+                lessons: vec!["A".into()],
+                grades: vec![2],
+                ranks: vec![0],
+                applied: 1,
+                chosen: if asked { vec!["A".into()] } else { Vec::new() },
+                free: if asked { Vec::new() } else { vec!["A".into()] },
+                p: vec![0.5],
+                pf: vec![0.5],
+                ..tested(&check, &session, ms, EXPERIMENT, Some(1), Some(u32::from(asked)))
+            };
+            line(&g);
+            let rec = |kind: &str, ms: i64| Outcome {
+                kind: kind.into(),
+                session: session.clone(),
+                lessons: vec!["A".into()],
+                check: check.clone(),
+                ms,
+                ..Default::default()
+            };
+            let route = if asked { outcome::ROUTE_ASKED } else { outcome::ROUTE_FREE };
+            line(&Outcome { route: route.into(), ..rec(outcome::DELIVERY, ms + 1) });
+            // Every question changed the work, every hand-over was ignored.
+            let verdict = if asked { outcome::CHANGED } else { outcome::IGNORED };
+            line(&Outcome { judge: 2, channel: if asked { "live" } else { "queued" }.into(), ..rec(verdict, ms + 2) });
+        }
+        let s = fold(&text, Summary::default());
+        let t = Selection::of(&s, select::Policy::Learned, None).test.unwrap();
+        assert!(t.due && t.sessions == sessions, "{t:?}");
+        let r = select::replay::test_readout(&s);
+        let want = r.ask_free.as_ref().and_then(|x| x.value).expect("judged 2s on both routes");
+        let e = t.ask_free.as_ref().expect("estimated once due");
+        assert_eq!((e.mean, e.unit.as_str()), (100.0 * want, "points changed"));
+        assert!(e.mean > 0.0, "asking changed the work, handing over did not: {e:?}");
+        // At k = 1 no second question can dilute the first: dilution starts at 2 asked against 1.
+        assert!(t.dilution.is_empty() && r.by_asked.is_empty(), "{t:?}");
+        let line = selection_line(&Selection::of(&s, select::Policy::Learned, None));
+        assert!(line.contains(&format!("; readout: grade 2 asked − handed over {:+.1} [", e.mean)), "{line}");
     }
 
     /// The unread count is what the next prompt would show: a message shown once no longer counts,

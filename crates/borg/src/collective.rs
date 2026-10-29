@@ -91,6 +91,14 @@ pub struct Entry {
     /// is not a positive number counts as none (`budget`) and cannot invalidate the whole config.
     #[serde(default)]
     pub budget: Option<serde_json::Value>,
+    /// The engineer's optional tolerance for learning in lesson selection (select.rs `risk_of`): the
+    /// share of the fixed rule's value, 0 to 1, the learned policy's gate may risk, for deviations on
+    /// evidence and the randomised question-count test alike; 0 turns the test off and admits an
+    /// evidence deviation only where the gate's past gains cover it. Absent (the default):
+    /// select/policy.rs `ALPHA`. Kept as written like `budget`: a value that is not a number from 0
+    /// to 1 counts as none (`risk`).
+    #[serde(default)]
+    pub risk: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -98,6 +106,12 @@ impl Entry {
     #[must_use]
     pub fn budget(&self) -> Option<f64> {
         self.budget.as_ref()?.as_f64().filter(|b| *b > 0.0)
+    }
+
+    /// `risk` when it is a number from 0 to 1.
+    #[must_use]
+    pub fn risk(&self) -> Option<f64> {
+        self.risk.as_ref()?.as_f64().filter(|r| (0.0..=1.0).contains(r))
     }
 }
 

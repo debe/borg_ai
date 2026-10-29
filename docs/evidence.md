@@ -44,9 +44,10 @@ Also in reports/: a test set of engineering corrections drawn from SWE-chat
 
 ## Lesson selection
 
-The fixed rule is the default. The learned selection policy ([Which lessons are
-asked](delivery.md#which-lessons-are-asked)) is opt-in (`BORG_SELECT=learned`) until its
-pre-registered checks P0–P4 pass: their first run failed P2 and P4, and the one rerun failed P4.
+The learned selection policy ([Which lessons are asked](delivery.md#which-lessons-are-asked)) is the
+default, and `BORG_SELECT=fixed` keeps the fixed rule. Its first design was held to the pre-registered
+checks P0–P4: their first run failed P2 and P4, and the one rerun failed P4. The policy was then
+redesigned under the dated Rules v2 below, which decide its default; their one run passed (Run v2).
 Quality (mistakes avoided) is the objective; there is no cost bar. What holds it:
 
 - **It starts as the fixed rule.** The conservative gate admits a deviation only while the policy's
@@ -157,11 +158,82 @@ evidence than a first-run pass.
 P2 passed only by the pruned model, so the report says so ("PASS by the pruned model"); the learned
 policy itself decides with the full model.
 
-**In use**, under `BORG_SELECT=learned`, a monitor estimates the policy's value against the fixed rule
+**Rules v2** (2026-10-29, written after the decisive rerun and before the policy below is built; any
+change is a dated amendment below them). The rerun showed a design fault, not a calibration one: the
+policy played one Thompson draw, so two effects the fixed rule's history cannot identify (how much
+each extra question dilutes the others, and what a lesson not delivered still changes) decided from
+their priors alone; the prior-only arm (−3.77) and the posterior arm (−3.53) failed alike. The policy
+v2 changes the design, not the bars:
+
+- **It deviates only on evidence.** A check plays the routes that are best under the posterior mean
+  only when they beat the fixed rule at the 5% quantile over the joint draws; else the fixed rule. No
+  Thompson play.
+- **It learns the question count by a randomised test.** On live checks (never at the stop, and never
+  a grade 3), the number of the fixed rule's other delivered lessons that are asked rather than handed
+  over is drawn uniformly, the rest handed over: nothing is withheld. The gate rations the test by the
+  engineer's tolerance (α, 10% unless the collective sets `risk`).
+- **Dilution is not assumed.** Its prior has its mode at 0 (the 2026-10-22 estimate's interval
+  included 0).
+
+| Check | Bar (v2) |
+|---|---|
+| P0, P1, P2, P3 | As above; P1 also replays the test's draws and propensities; P3 also holds the test's charged risk within the gate's allowance |
+| P4a identity at n = 0 | Under the n = 0 prior, the decision rule without the test equals the fixed rule on every check of the P4 runs: 0 differences |
+| P4b recall under the posterior | As P4 above, for the decision rule without the test; NOT TESTED when it deviates nowhere, which then makes it the fixed rule |
+| P4c the test keeps recall | The randomised test's recall equals the fixed rule's (it withholds nothing) |
+
+The default becomes the learned policy iff P0, P1, P2, P3, P4a and P4c pass and P4b passes or is NOT
+TESTED; otherwise the fixed rule stays. Same store copy and the same 84 runs, so the P4 cases are seen
+a third time: identity checks are unaffected, P4b would be weak evidence and says so. Online readout
+after 300 randomised checks or 30 sessions: each question's chance of changing the work by the number
+asked (dilution), and asking against handing over a grade 2, with session-bootstrap 95% intervals.
+
+**Run v2** (2026-10-29): run once on the policy v2 tree after the release checks passed, with the
+same store copy (887 graded checks, all under the fixed rule) and the same 84 runs, so the P4 cases
+were seen a third time. No code changed for its numbers. P0, P1, P2, P3, P4a and P4c passed and P4b
+was NOT TESTED, so **the learned policy is the default** (`BORG_SELECT=fixed` keeps the fixed rule).
+
+| Check | Result |
+|---|---|
+| P0 | PASS: 887 of 887 checks at gate budget 0 decide as the fixed rule |
+| P1 | PASS: 887 of 887 checks replayed with their decision and propensities, max \|Δ\| 0.0000; the piece-by-piece fold equals the whole one |
+| P2 | PASS by the pruned model. The full model missed: log-loss 0.5258 against the grade alone's 0.5457, mean difference −0.020 [−0.036, +0.013], upper bound > 0.005. The pre-registered rerun pruned to grade, route and dilution passed: 0.5420 against 0.5457, mean difference −0.004 [−0.008, +0.003]. 406 judged lessons in 13 sessions |
+| P3 | PASS: cold start, 10 refits, 92 of 887 checks deviated from the fixed rule (the 92 drawn by the question-count test), the first check was the fixed rule's, 0 over the gate's budget; decided by 83 evidence, 92 experiment, 119 experiment_control, 16 fixed and 577 gate. Spend: 566 questions, 6 blocks at the stop, 3,478 free against the fixed rule's 540, 6 and 3,504 (pool tokens not logged) |
+| P4a | PASS: under the n = 0 prior the decision rule without the test equals the fixed rule on all 228 checks of the 84 runs (0 differences), recall 76.2%, Δ +0.000 |
+| P4b | NOT TESTED: under the store's posterior (405 labels) the decision rule deviates on none of the 228 checks, so there it is the fixed rule |
+| P4c | PASS: the test, ungated on every live check, drew 83 checks off the fixed rule and kept the fixed rule's recall in 84 of 84 runs (76.2%, Δ +0.000); 8.12 questions and 2.29 free per check against 8.49 and 1.92 |
+| P5 | the learned policy, doubly robust: +0.007 [−0.016, +0.023], coverage 87.1%, ESS 376; non-decisive |
+
+What the default changes today: on the P4 checks the evidence rule found no deviation worth playing,
+so the learned default differs from the fixed rule by the question-count test on live checks, rationed
+by the gate (`risk`, 10% unless the collective sets it), which withholds no lesson. Its readout is
+due after 300 checks that drew a count or 30 sessions with one.
+
+**Amendment 2026-10-29** (to Rules v2, written after Run v2): the evidence rule's candidate, the
+routes best "under the posterior mean" in the first rule (W1, *It deviates only on evidence*), is
+solved at the posterior centre: the Laplace posterior's mean, with the dilution slopes, which are
+bounded at 0, at their mode (0 under the n = 0 prior, not the half-normal's mean). This is a
+wording correction of W1, not a change of any bar: the candidate must still beat the fixed rule at
+the 5% quantile over the joint draws.
+
+**After Run v2** (2026-10-29): the review of the delivery fixes found that a hand-over the stop asks
+never reached its free route in the summary, and that live questions which never block were pooled
+with those that do. Both are fixed in the fold, not in any bar or prior. The same replay on the fixed
+tree gives the same verdict for every check; only counts moved: P3 118 deviations (all draws of the
+test), 0 over the gate's budget, 598 questions and 3,446 free against the fixed rule's 540 and 3,504;
+P5 doubly robust +0.010 [−0.012, +0.028], coverage 87.0%. P4a, P4b and P4c are unchanged.
+
+**In use**, under the learned policy, a monitor estimates the policy's value against the fixed rule
 per session and reverts the store to the fixed rule for good if its bound shows harm beyond 10% of the
 fixed rule's value. After 300 judged lessons whose route was randomised, or 30 sessions under the
 learned policy, a readout compares asking against handing over, and handing over against not
-delivering, per grade, with session-bootstrap intervals. The policy stays on unless the monitor fired.
+delivering, per grade, with session-bootstrap intervals. The question-count test's own readout (Rules
+v2) is due after 300 checks that drew a count (played or refused by the gate) or 30 sessions with one.
+It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
+rate asked with m against it asked alone, and asking against handing over a grade 2 as a
+Horvitz–Thompson mean, each with session-bootstrap 95% intervals. `borg debug select`, `borg status`, `borg top` and
+the Conscience page of `borg web` show both from the selection summary. The policy stays on unless the
+monitor fired.
 
 Not built yet: a learned rule for early delivery (it keeps today's; the early records now carry `rel`
 for one, though only of delivered lessons, every plain one at or above today's bar, so they can show

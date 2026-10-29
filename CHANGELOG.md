@@ -4,9 +4,9 @@
 
 Messages are paced by acknowledgements instead of a fixed rate and keep their full text; the mesh
 speaks `borg/mesh/14`. Lesson selection is measured end to end: what a check delivered, how it was
-judged, and what not delivering would have changed. The fixed rule stays the default: the learned
-selection policy is opt-in (`BORG_SELECT=learned`) until its pre-registered checks pass, since its
-recall check (P4) failed both the first run and the one rerun
+judged, and what not delivering would have changed. The learned selection policy is the default
+(`BORG_SELECT=fixed` keeps the fixed rule): its first design failed its recall check (P4) on the first
+run and the one rerun, and its second design passed the checks written before it was built (Rules v2)
 ([docs/evidence.md](docs/evidence.md#lesson-selection)). Quality is the objective: there is no cost
 cap, and cost is measured and shown. Every numeric constant says what kind of number it is
 ([docs/design/constants.md](docs/design/constants.md)). Every crate is 0.6.0 and pins the others
@@ -22,35 +22,57 @@ cap, and cost is measured and shown. Every numeric constant says what kind of nu
   a message whose line is cut before its text.
 - `borg inbox --show <id>` prints a message whole. A message longer than what a prompt or tool call has
   room for shows its head and that command.
-- A learned lesson selection policy, opt-in with `BORG_SELECT=learned`. Per check it chooses, for each
-  lesson the model graded as applying, between asking, handing it over free and not now, by the
+- A learned lesson selection policy, the default (`BORG_SELECT=fixed` is the way back). Per check it
+  chooses, for each lesson the model graded as applying, between asking, handing it over free and not now, by the
   mistakes it expects each to avoid, from one Bayesian model of the logged outcomes; a free lesson's
-  and a live question's value is weighed by its learned chance of arriving. A conservative gate keeps it
-  on the fixed rule until the replayed outcomes support a deviation (at most 10% of the fixed rule's
-  quality at risk), so a new store starts exactly as the fixed rule; a stop's grade 3 is always asked. A
-  monitor reverts a store to the fixed rule for good when it sees harm beyond that share
-  (`<store>/select-reverted`; deleting that file alone lets it learn again). `borg learn` refits the
-  model at its end; a hook only reads it. It stays opt-in until its pre-registered checks pass: on
-  their first run its right-lesson recall on the review → fix eval was −4.02 points [−7.28, −1.24]
-  against the fixed rule, past the bar's −5 (P4), and its calibration missed its bar (P2). The one
-  rerun on the fixed tree passed P0, P1, P3 and P2 (by the pruned model) and failed P4 again: −3.53
-  points [−6.74, −0.98] under the store's posterior, −3.77 [−6.89, −1.18] under the n = 0 prior.
-  `BORG_SELECT=fixed` wins over `BORG_STOP_ASK_CAP`, which wins over `BORG_STOP_ATTENTION=on` (both
-  evaluation switches now), and each over `BORG_SELECT=learned`.
+  and a live question's value is weighed by its learned chance of arriving. It deviates from the fixed
+  rule only on evidence: the routes best under the posterior mean play only when they beat the fixed
+  rule at the 5% quantile over 512 joint draws (`evidence`), so an effect the outcomes do not pin down
+  never decides from its prior, and the logged route chances are exact. On live checks it learns how
+  many lessons to ask by a randomised test: of the k lessons below grade 3 that the fixed rule
+  delivers and that may go free, s drawn uniformly from 0 to k are asked in the fixed rule's order and
+  the rest handed over, grade 3s always asked and never at the stop. Its hand-overs on a check with a 3
+  are carried whatever the free delivery's character bound and asked at the stop when the stop comes
+  first; a question it draws on a check without a 3 never blocks the stop and arrives with the next
+  prompt instead. The evidence rule's hand-overs of lessons the fixed rule asks are carried whatever
+  the bound too (`instead-next`). The test never withholds a lesson,
+  so recall is the fixed rule's; the fixed rule's own count is its control (`experiment`,
+  `experiment_control`). The dilution prior assumes none (mode 0). A conservative gate keeps it on the
+  fixed rule until the replayed outcomes support a deviation or a draw (at most 10% of the fixed
+  rule's quality at risk, or the collective's `risk`), so a new store starts exactly as the fixed rule;
+  a stop's grade 3 is always asked. A monitor reverts a store to the fixed rule for good when it sees
+  harm beyond that share (`<store>/select-reverted`; deleting that file alone lets it learn again).
+  `borg learn` refits the model at its end; a hook only reads it. The first design played one random draw of the model per check and
+  failed: on the checks' first run its right-lesson recall on the review → fix eval was −4.02 points
+  [−7.28, −1.24] against the fixed rule, past the bar's −5 (P4), and its calibration missed its bar
+  (P2); the one rerun on the fixed tree passed P0, P1, P3 and P2 (by the pruned model) and failed P4
+  again: −3.53 points [−6.74, −0.98] under the store's posterior, −3.77 [−6.89, −1.18] under the n = 0
+  prior. The second design above is held to Rules v2, written before it was built: P4a (no outcomes:
+  the rule without the test is the fixed rule on every evaluation check), P4b (recall under the
+  posterior, or NOT TESTED when it deviates nowhere) and P4c (the test keeps the fixed rule's recall).
+  Their one run (2026-10-29, the P4 cases seen a third time) passed P0–P3, P4a and P4c, and P4b was
+  NOT TESTED (under the store's posterior the rule deviated on none of the evaluation's checks), so by
+  those rules the learned policy became the default. Today it differs from the fixed rule by the
+  question-count test on live checks, which withholds no lesson. `BORG_SELECT=fixed` wins over `BORG_STOP_ASK_CAP`, which wins over `BORG_STOP_ATTENTION=on` (both
+  evaluation switches now), and each over the learned policy.
 - `borg debug select [--replay] [--rebuild] [--dir DIR | --file FILE] [--json] [--eval RUNS_DIR
   --qrels FILE]` shows the policy's state and replays the logged checks against the pre-registered
-  checks P0–P5 under the learned policy, at 0 tokens. It prints the dates of the rules and of their
-  latest amendment; after a P2 FAIL it reruns P2 once with the model pruned to grade, route and
+  checks P0–P5 under the learned policy, at 0 tokens. It prints the dates of the rules, of their
+  latest amendment and of rules v2, and reports P4 as its parts P4a, P4b and P4c (`--json`: `p4a`,
+  `p4b`, `p4c`); after a P2 FAIL it reruns P2 once with the model pruned to grade, route and
   dilution, whose verdict is P2's. A check that ran on data that could not have failed it says NOT
-  TESTED, never PASS, and the command exits 1 when P0–P4 has a FAIL or a NOT TESTED.
+  TESTED, never PASS, and the command exits 1 when P0–P4 has a FAIL or a NOT TESTED (P4b's NOT TESTED
+  meets P4: it is then the fixed rule).
 - Selection is measured: a check id on every graded record and delivery marker, the route each lesson
   actually took (`asked`, `free`, `placebo`, `dropped_done`, `dropped_chars`, `never_delivered`) and why,
   checks that apply nothing, pool tokens, model, prompt hash, harness, version, latency and failures,
   the call's cost in dollars as the CLI reported it, the propensity of each free delivery (`pf`), the
   applies the session already had or had waiting in its queue (`nofree`), the summary the decision read
   (`seen`), each run of a session's end hook (`ended`), and on an early delivery each lesson's score
-  relative to the best on-topic match (`rel`), for a learned early rule. Older records read as the
-  fixed rule.
+  relative to the best on-topic match (`rel`), for a learned early rule; under the learned policy, what
+  set the routes (`source`) and the question-count test's k and s (`xk`, `xs`); under every policy, the
+  collective's `risk` the check was decided under (`alpha`), which a replay decides it under. Older
+  records read as the fixed rule.
 - A placebo arm, under the fixed rule too: of the applies a check delivers neither way (under the fixed
   rule, those past its 10), up to two are judged blindly at the point a free delivery would be, never
   a lesson the session already had, with their chance of the draw (`psi`). Their rate is the judge's
@@ -63,9 +85,14 @@ cap, and cost is measured and shown. Every numeric constant says what kind of nu
   the default, spend and extra rounds per session, effects with their intervals, label health, the
   placebos drawn and judged, the tail lessons shown and applied, the fitted delivery rates, pool yield
   and stop latency per harness against its stop budget with its failed calls, and the learned
-  decisions a guard gave the fixed rule, per reason; under the learned policy also its gate,
-  deviations from the fixed rule and the monitor's reading and bound with its weights' health (ESS,
-  largest weight). What is not measured yet says so.
+  decisions a guard gave the fixed rule, per reason; under the learned policy also its gate, the
+  checks it deviated on evidence, the question-count test (checks run, controls, refused by the gate,
+  the draws of s, the risk share in force and the readout once due), and the monitor's reading and
+  bound with its weights' health (ESS, largest weight). What is not measured yet says so.
+- An optional per-collective `risk` in `collectives.json`, the engineer's tolerance for learning: the
+  share of the fixed rule's quality the learned policy's gate may risk, for deviations on evidence and
+  the question-count test alike (default 0.1; `0` turns the test off and admits an evidence deviation
+  only where the gate's past gains cover it). A value that is not a number from 0 to 1 counts as none and never invalidates the config.
 - An optional per-collective `budget` in `collectives.json` (pool tokens per session on average), off
   by default: only an engineer who sets one puts a price on spend, and only the learned policy reads
   it, from its first fit that knows it. A value that is not a positive number counts as none and never

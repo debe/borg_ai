@@ -4,9 +4,9 @@
 //!
 //! **Policies** (`policy`, the first that applies): `BORG_SELECT=fixed` the fixed rule;
 //! `BORG_STOP_ASK_CAP=N` the fixed rule asking only the first `N` 3s (evaluation only);
-//! `BORG_STOP_ATTENTION=on` attention.rs's learned cut (evaluation only); `BORG_SELECT=learned` the
-//! learned policy (`Learned`, select/policy.rs); otherwise the fixed rule, the default until the
-//! pre-registered checks P0–P4 pass (tasks/todo.md, amendment 2026-10-29: P4 failed its first run).
+//! `BORG_STOP_ATTENTION=on` attention.rs's learned cut (evaluation only); otherwise the learned policy
+//! (`Learned`, select/policy.rs), the default since its pre-registered checks passed under Rules v2
+//! (docs/evidence.md#lesson-selection: P4 had failed its first run and the rerun under the v1 design).
 //!
 //! **The fixed rule** (conscience.rs `graded_without`, no cap) asks every 3 and 2 and the 1s up to
 //! `conscience::CAP` when a check has a 3, else hands over the 2s and 1s free, up to `CAP`; a lesson the
@@ -16,9 +16,12 @@
 //! shown, so what not delivering is worth gets labels at no cost to quality. Those are the labels the
 //! learned policy cannot get from the fixed rule's history, which asks and hands over by grade alone.
 //!
-//! **The learned policy** (select/policy.rs `choose`) routes by a fitted value model under a
-//! conservative gate; cold start (no fit, or a gate that may risk nothing yet) is exactly the fixed
-//! rule, and so is a store the monitor reverted (select/summary.rs `REVERTED`). It draws its placebos
+//! **The learned policy** (select/policy.rs `choose`, policy v2) leaves the fixed rule only on evidence
+//! from a fitted value model, and on live checks runs a randomised test of how many of the fixed
+//! rule's delivered lessons to ask rather than hand over (nothing withheld), both under a
+//! conservative gate rationed by the collective's tolerance (`alpha`); cold start (no fit, or a gate
+//! that may risk nothing yet) is exactly the fixed rule, and so is a store the monitor reverted
+//! (select/summary.rs `REVERTED`). It draws its placebos
 //! among the applies it leaves for later, as the fixed rule does. The evaluation switches decide
 //! exactly as the hook did before this module (0.5.0's attention.rs `graded`) and draw no placebo.
 //!
@@ -45,13 +48,13 @@ use crate::outcome;
 /// The policy in force for a graded check (module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
-    /// The default, and `BORG_SELECT=fixed` whatever else is set: the fixed rule (module doc).
+    /// `BORG_SELECT=fixed` whatever else is set: the fixed rule (module doc), the way back from the default.
     Fixed,
     /// `BORG_STOP_ASK_CAP=N`: a block asks only the first `N` 3s (conscience.rs `ask_cap`).
     Cap(usize),
     /// `BORG_STOP_ATTENTION=on`: attention.rs's conformal cut on the model's rank.
     Attention,
-    /// `BORG_SELECT=learned`: the learned policy (select/policy.rs), opt-in until P0–P4 pass.
+    /// The default, no switch set: the learned policy (select/policy.rs), since P0–P4 passed under Rules v2.
     Learned,
 }
 
@@ -77,16 +80,17 @@ pub fn policy() -> Policy {
 /// `policy` over its three switches: `select` (`BORG_SELECT`), `cap` (`BORG_STOP_ASK_CAP` as
 /// conscience.rs `ask_cap` reads it) and `attention` (`BORG_STOP_ATTENTION=on`). `fixed` wins over
 /// both evaluation switches, the cap over attention, both over `learned`; any other `BORG_SELECT`,
-/// or none, is the default, the fixed rule. Whatever evaluates the learned policy (select/replay.rs,
-/// the monitoring of what it would do) names `Policy::Learned` and never reads this.
+/// or none, is the default, the learned policy: its pre-registered checks passed under Rules v2
+/// (docs/evidence.md#lesson-selection, run v2 2026-10-29), and `BORG_SELECT=fixed` is the way back.
+/// Whatever evaluates the learned policy (select/replay.rs, the monitoring of what it would do) names
+/// `Policy::Learned` and never reads this.
 #[must_use]
 pub fn precedence(select: Option<&str>, cap: Option<usize>, attention: bool) -> Policy {
     match (select, cap) {
         (Some("fixed"), _) => Policy::Fixed,
         (_, Some(n)) => Policy::Cap(n),
         _ if attention => Policy::Attention,
-        (Some("learned"), _) => Policy::Learned,
-        _ => Policy::Fixed,
+        _ => Policy::Learned,
     }
 }
 
@@ -171,6 +175,11 @@ pub struct Ctx<'a> {
     /// applies count (`nofree`, what the graded record logs), so a replay passes the record's `nofree`;
     /// empty for a record from before it, whose hook decided without.
     pub had: &'a [String],
+    /// The collective's tolerance in force at the check (`alpha`: its `risk` in collectives.json, else
+    /// `policy::ALPHA`), read once by the hook and logged on the graded record (`Log::alpha`), so a
+    /// replay decides under the α the hook had (`alpha_of` the record's), not whatever the config says
+    /// for the replayed path now (a store copy maps to no collective).
+    pub alpha: f64,
 }
 
 /// The pool tokens of a check whose model call was shown `shown` (hook.rs `Call::order`): whole.rs
@@ -195,6 +204,20 @@ pub fn nofree(applied: &[(&Challenge, u8)], had: &[String]) -> Vec<String> {
     out
 }
 
+/// `Log::alpha` of a check decided under the tolerance `alpha`: None at `policy::ALPHA`. What the hook
+/// logs and `alpha_of` reads back, from one definition so the two never part.
+#[must_use]
+pub fn logged_alpha(alpha: f64) -> Option<f64> {
+    (alpha != policy::ALPHA).then_some(alpha)
+}
+
+/// The tolerance a graded record's check was decided under, from its logged `alpha` (`logged_alpha`):
+/// `policy::ALPHA` when none is logged, as on every record from before `risk`.
+#[must_use]
+pub fn alpha_of(logged: Option<f64>) -> f64 {
+    logged.unwrap_or(policy::ALPHA)
+}
+
 /// What a decision logs: the graded record's `policy` and `fit`, and the `#borg-select` line.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Log {
@@ -203,9 +226,19 @@ pub struct Log {
     /// What set this check's routes: `fixed` (the fixed rule: under `Fixed`, `Attention` on a check
     /// without a 3, and `Learned` at cold start), `cap`, attention's cut source (`prior`, `crc`,
     /// `explore`; an `explore` check's outcomes label the cut, outcome.rs `explore`), or the learned
-    /// policy's (select/policy.rs `Decision::source`: `learned`, `gate` when the gate kept the fixed
-    /// rule, `size` past `policy::SOLVE_MAX`; `reverted` when the monitor reverted the store).
+    /// policy's (select/policy.rs `Decision::source`: `evidence`, `experiment`, `experiment_control`,
+    /// `gate` when the gate kept the fixed rule, `size` past `policy::SOLVE_MAX`, 0.6.0's `learned`;
+    /// `reverted` when the monitor reverted the store).
     pub source: &'static str,
+    /// The randomised question-count test's k and s at this check (select/policy.rs `Decision::xk`,
+    /// `xs`), logged as the graded record's `xk` and `xs`; None outside the test and under every other
+    /// policy.
+    pub xk: Option<u32>,
+    pub xs: Option<u32>,
+    /// The tolerance the check was decided under (`Ctx::alpha`), under every policy so a cold start
+    /// replays the learned policy at the collective's α too; None at `policy::ALPHA`, so the record of a
+    /// collective without `risk` stays as before (`logged_alpha`, read back by `alpha_of`).
+    pub alpha: Option<f64>,
     /// The fit the decision used (select/policy.rs `Fit::key`); empty for the prior.
     pub fit: String,
     /// The conservative gate's budget at this check: how much replayed quality (mistakes avoided) the
@@ -269,7 +302,7 @@ impl Routed<'_> {
 /// its choice (attention.rs `fixed_p`); `Attention` on a check with a 3 by the learned cut on the
 /// outcomes beside `ctx.lessons`, with the explore mixture's propensities, and by the fixed rule
 /// otherwise; `Learned` on every check by select/policy.rs `choose` (the fixed rule at cold start or
-/// while the store is reverted), with the shares of its draws as the propensities (`learned`). `Fixed`
+/// while the store is reverted), with its exact propensities (`learned`). `Fixed`
 /// and `Learned` draw placebos among the applies they deliver neither way (`draw_placebo`); the asked
 /// and free lists never depend on that draw, so the fixed rule's decision is the same with or without
 /// it (P0).
@@ -287,13 +320,15 @@ pub fn graded_under<'a>(policy: Policy, applied: &[(&'a Challenge, u8)], ctx: &C
             log: Log { policy: policy.name(), source, fit: ctx.summary.fit.key.clone(), psi, ..Log::default() },
         }
     };
-    match policy {
+    let mut r = match policy {
         Policy::Attention if three => by_cut(applied, ctx),
         Policy::Cap(n) => fixed("cap", false, conscience::graded_without(applied, Some(n), ctx.had)),
         Policy::Learned => learned(applied, ctx),
         Policy::Fixed => fixed("fixed", true, conscience::graded_without(applied, None, ctx.had)),
         Policy::Attention => fixed("fixed", false, conscience::graded_without(applied, None, ctx.had)),
-    }
+    };
+    r.log.alpha = logged_alpha(ctx.alpha);
+    r
 }
 
 /// Placebo slots per check: of the applies a check delivers neither way, at most this many are judged
@@ -331,9 +366,11 @@ fn draw_placebo<'a>(applied: &[(&'a Challenge, u8)], ask: &[&Challenge], free: &
 /// revert the hook saw (select/replay.rs).
 pub const REVERTED_SOURCE: &str = "reverted";
 
-/// `Learned`: select/policy.rs `choose` on the summary's fit and gate at the check's pool tokens, never
-/// handing over free a lesson the session had (`Ctx::had`; the fixed rule while the store is reverted),
-/// then the placebo draw among the applies it delivers neither way (`draw_placebo`).
+/// `Learned`: select/policy.rs `choose` on the summary's fit and gate at the check's pool tokens under
+/// the collective's tolerance in force (`Ctx::alpha`), never handing over free a lesson the session had (`Ctx::had`;
+/// the fixed rule while the store is reverted), then the placebo draw among the applies it delivers
+/// neither way (`draw_placebo`). The randomised question-count test's k and s go to the log (`Log::xk`,
+/// `xs`), which the graded record carries.
 fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
     let us = units(applied);
     let s = ctx.summary;
@@ -342,9 +379,9 @@ fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
         true => {
             let base = policy::fixed_routes(&us, ctx.had);
             let p = |r: Route| base.iter().map(|x| f64::from(u8::from(*x == r))).collect();
-            policy::Decision { p: p(Route::Ask), pf: p(Route::Free), routes: base, source: REVERTED_SOURCE, gate: 0.0, risk: 0.0 }
+            policy::Decision { p: p(Route::Ask), pf: p(Route::Free), routes: base, source: REVERTED_SOURCE, gate: 0.0, risk: 0.0, xk: None, xs: None }
         }
-        false => policy::choose(&us, &check, &s.fit, &s.gate, seed(ctx), ctx.had),
+        false => policy::choose(&us, &check, &s.fit, &s.gate, ctx.alpha, seed(ctx), ctx.had),
     };
     let (ask, free) = ordered(applied, &d.routes);
     let (placebo, psi) = draw_placebo(applied, &ask, &free, ctx);
@@ -354,7 +391,19 @@ fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
         placebo,
         p: d.p,
         pf: d.pf,
-        log: Log { policy: Policy::Learned.name(), source: d.source, fit: s.fit.key.clone(), gate: d.gate, risk: d.risk, attention: None, psi },
+        log: Log {
+            policy: Policy::Learned.name(),
+            source: d.source,
+            fit: s.fit.key.clone(),
+            gate: d.gate,
+            risk: d.risk,
+            xk: d.xk,
+            xs: d.xs,
+            // `graded_under` sets it, for every policy.
+            alpha: None,
+            attention: None,
+            psi,
+        },
     }
 }
 
@@ -458,9 +507,36 @@ pub fn budget_of(lessons: &Path) -> Option<f64> {
 
 /// `budget_of` in the config `cfg`.
 fn budget_in(cfg: &crate::collective::Config, lessons: &Path) -> Option<f64> {
+    entry_in(cfg, lessons)?.budget()
+}
+
+/// The engineer's tolerance for learning in the collective whose store holds `lessons`: its `risk` in
+/// collectives.json (collective.rs `Entry::risk`: the share of the fixed rule's value the randomised
+/// question-count test may risk, 0 to 1, 0 turning it off), None when unset (the default, under which
+/// the policy uses `policy::ALPHA`), not a number in range, or the config does not load.
+#[must_use]
+pub fn risk_of(lessons: &Path) -> Option<f64> {
+    risk_in(&crate::collective::load().ok().flatten()?, lessons)
+}
+
+/// `risk_of` in the config `cfg`.
+fn risk_in(cfg: &crate::collective::Config, lessons: &Path) -> Option<f64> {
+    entry_in(cfg, lessons)?.risk()
+}
+
+/// The learned policy's α for the store that holds `lessons`: the collective's `risk` (`risk_of`),
+/// `policy::ALPHA` unless it sets one. What the hook reads into `Ctx::alpha` at the check; a replay
+/// reads the record's instead (`alpha_of`).
+#[must_use]
+pub fn alpha(lessons: &Path) -> f64 {
+    risk_of(lessons).unwrap_or(policy::ALPHA)
+}
+
+/// The collective of `cfg` whose store holds `lessons`.
+fn entry_in<'a>(cfg: &'a crate::collective::Config, lessons: &Path) -> Option<&'a crate::collective::Entry> {
     let store = lessons.parent()?;
     let base = crate::collective::root_of(store);
-    cfg.collectives.iter().find(|c| crate::collective::store(&base, &c.name) == store)?.budget()
+    cfg.collectives.iter().find(|c| crate::collective::store(&base, &c.name) == store)
 }
 
 /// Hex digits of a check id. Protocol: the length of the `@<check>` tags hook.rs already writes
@@ -502,7 +578,7 @@ mod tests {
     }
 
     fn ctx<'a>(lessons: &'a Path, s: &'a summary::Summary) -> Ctx<'a> {
-        Ctx { session: "s", check: "0123456789ab", channel: "stop", lessons, summary: s, tokens: 0, had: &[] }
+        Ctx { session: "s", check: "0123456789ab", channel: "stop", lessons, summary: s, tokens: 0, had: &[], alpha: policy::ALPHA }
     }
 
     /// Every grade sequence of up to `n` applies over {1, 2, 3}.
@@ -524,13 +600,14 @@ mod tests {
 
     #[test]
     fn the_switches_take_precedence_in_order() {
-        assert_eq!(precedence(None, None, false), Policy::Fixed, "the default is the fixed rule");
-        assert_eq!(precedence(Some("learned"), None, false), Policy::Learned, "the learned policy is opt-in");
+        assert_eq!(precedence(None, None, false), Policy::Learned, "the default is the learned policy");
+        assert_eq!(precedence(Some("learned"), None, false), Policy::Learned, "naming it changes nothing");
         assert_eq!(precedence(Some("fixed"), Some(2), true), Policy::Fixed, "fixed wins over both evaluation switches");
         assert_eq!(precedence(Some("learned"), Some(2), true), Policy::Cap(2), "the cap wins over attention and learned");
         assert_eq!(precedence(Some("learned"), None, true), Policy::Attention, "attention wins over learned");
-        assert_eq!(precedence(Some("nonsense"), None, false), Policy::Fixed, "an unknown BORG_SELECT is the default, the fixed rule");
-        assert_eq!(precedence(Some("Learned"), None, false), Policy::Fixed, "the value is exact");
+        assert_eq!(precedence(Some("nonsense"), None, false), Policy::Learned, "an unknown BORG_SELECT is the default, the learned policy");
+        assert_eq!(precedence(Some("Fixed"), None, false), Policy::Learned, "the value is exact");
+        assert_eq!(precedence(Some("fixed"), None, false), Policy::Fixed, "BORG_SELECT=fixed is the way back");
         assert_eq!([Policy::Fixed, Policy::Cap(1), Policy::Attention, Policy::Learned].map(Policy::name), ["fixed", "cap", "attention", "learned"]);
     }
 
@@ -702,12 +779,84 @@ mod tests {
         let r = graded_under(Policy::Learned, &applied, &live);
         assert!(r.ask.is_empty(), "asking loses under this fit: {:?}", ids(&r.ask));
         assert_eq!(ids(&r.free), ["L00", "L02", "L01", "L03"], "higher grade first, then the model's order");
-        assert_eq!((r.log.policy, r.log.source, r.log.fit.as_str()), ("learned", "learned", "9-abcdef01"));
+        assert_eq!((r.log.policy, r.log.source, r.log.fit.as_str()), ("learned", policy::EVIDENCE, "9-abcdef01"));
+        assert_eq!((r.log.xk, r.log.xs), (None, None), "on evidence the test does not run");
         assert!(r.log.gate > 0.0);
-        assert!(r.pf.iter().all(|p| *p > 0.9) && r.p.iter().all(|p| *p < 0.1), "{:?} {:?}", r.p, r.pf);
+        assert!(r.pf.iter().all(|p| *p == 1.0) && r.p.iter().all(|p| *p == 0.0), "exact: {:?} {:?}", r.p, r.pf);
         // At the stop the 3 is asked whatever the fit says.
         let r = graded_under(Policy::Learned, &applied, &ctx(&none, &s));
         assert_eq!((ids(&r.ask), r.p[0]), (vec!["L00".to_string()], 1.0));
+    }
+
+    /// A live check under the randomised question-count test, through the hook's call: the drawn s of
+    /// the fixed rule's k delivered lessons asked (the first s in its order, 2s before 1s), the rest
+    /// handed over, k and s in the log for the graded record; s = 0, the fixed rule, is the control.
+    /// The fit knows asking and handing over to be worth the same, so no evidence moves it.
+    #[test]
+    fn a_live_check_under_the_test_asks_the_drawn_count_and_logs_it() {
+        let ls = lessons(4);
+        let applied: Vec<(&Challenge, u8)> = ls.iter().zip([2, 1, 2, 1]).collect();
+        let mut s = deviating();
+        if let Some(m) = s.fit.model.as_mut() {
+            m.beta = vec![0.0; policy::P];
+            m.beta[policy::NAMES.iter().position(|n| *n == "not").unwrap()] = -1.0;
+        }
+        let none = std::path::PathBuf::from("/nonexistent/borg-select/lessons.jsonl");
+        let order = ["L00", "L02", "L01", "L03"];
+        let mut seen = std::collections::BTreeSet::new();
+        for c in 0..40u32 {
+            let check = format!("{c:012x}");
+            let r = graded_under(Policy::Learned, &applied, &Ctx { channel: "live", check: &check, ..ctx(&none, &s) });
+            let (Some(k), Some(x)) = (r.log.xk, r.log.xs) else { panic!("check {c}: the test ran: {:?}", r.log) };
+            let x = x as usize;
+            assert_eq!(k, 4, "every lesson the fixed rule hands over is tested");
+            let named = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            assert_eq!((ids(&r.ask), ids(&r.free)), (named(&order[..x]), named(&order[x..])), "check {c}");
+            assert_eq!(r.log.source, if x == 0 { policy::EXPERIMENT_CONTROL } else { policy::EXPERIMENT }, "check {c}");
+            assert_eq!(
+                (r.p.as_slice(), r.pf.as_slice()),
+                ([0.8, 0.4, 0.6, 0.2].as_slice(), [0.2, 0.6, 0.4, 0.8].as_slice()),
+                "each unit's share of the five counts"
+            );
+            seen.insert(x);
+        }
+        assert!(seen.len() > 2, "the count varies with the check: {seen:?}");
+        // At the stop the test never runs: the fixed rule, nothing logged.
+        let r = graded_under(Policy::Learned, &applied, &ctx(&none, &s));
+        assert_eq!((r.log.source, r.log.xk, r.log.xs, r.ask.len()), (policy::EVIDENCE, None, None, 0));
+    }
+
+    /// The tolerance is the check's (`Ctx::alpha`, which the hook reads and a replay takes from the
+    /// record), never the config's for the path decided on: here a path no collective maps, whose config
+    /// α is `policy::ALPHA`. At 0 the test is off and the live check keeps the fixed rule; the α is
+    /// logged under every policy unless it is the default, and reads back as it was decided.
+    #[test]
+    fn a_check_decides_and_logs_under_the_tolerance_in_its_ctx() {
+        let ls = lessons(4);
+        let applied: Vec<(&Challenge, u8)> = ls.iter().zip([2, 1, 2, 1]).collect();
+        let mut s = deviating();
+        if let Some(m) = s.fit.model.as_mut() {
+            m.beta = vec![0.0; policy::P];
+            m.beta[policy::NAMES.iter().position(|n| *n == "not").unwrap()] = -1.0;
+        }
+        let none = std::path::PathBuf::from("/nonexistent/borg-select/lessons.jsonl");
+        assert_eq!(alpha(&none), policy::ALPHA, "the config's α for this path");
+        let live = Ctx { channel: "live", ..ctx(&none, &s) };
+        let at = |alpha: f64| graded_under(Policy::Learned, &applied, &Ctx { alpha, ..live });
+        let default = at(policy::ALPHA);
+        assert_eq!((default.log.xk, default.log.alpha), (Some(4), None), "the test runs; the default is not logged");
+        let off = at(0.0);
+        assert_eq!((off.log.source, off.log.xk, off.log.xs, off.log.alpha), (policy::EVIDENCE, None, None, Some(0.0)), "{:?}", off.log);
+        assert_eq!((off.ask.len(), off.free.len()), (0, 4), "the fixed rule");
+        let wider = at(0.3);
+        assert_eq!((wider.log.xk, wider.log.alpha), (Some(4), Some(0.3)));
+        let fixed = graded_under(Policy::Fixed, &applied, &Ctx { alpha: 0.0, ..live });
+        assert_eq!(fixed.log.alpha, Some(0.0), "logged under every policy, for the cold start");
+        for a in [0.0, 0.3, policy::ALPHA] {
+            assert_eq!(alpha_of(logged_alpha(a)), a);
+            let replayed = at(alpha_of(at(a).log.alpha));
+            assert_eq!((replayed.log, replayed.p, replayed.pf), (at(a).log, at(a).p, at(a).pf), "α {a} replays as decided");
+        }
     }
 
     /// Guard: a store the monitor reverted keeps the fixed rule, whatever its fit and gate say.
@@ -753,12 +902,13 @@ mod tests {
         let block: Vec<(&Challenge, u8)> = ls.iter().take(3).zip([3, 2, 1]).collect();
         let ask = |had: &[String]| ids(&conscience::graded_without(&block, None, had).0);
         assert_eq!(ask(&["L01".to_string()]), ask(&[]), "may still be asked");
-        // The learned policy under a fit that hands everything over during the turn: not the one it had.
+        // The learned policy under a fit that hands everything over, at the stop (no test): not the one
+        // it had.
         let open = deviating();
         let applied: Vec<(&Challenge, u8)> = ls.iter().take(4).zip([2, 1, 2, 1]).collect();
-        let live = Ctx { channel: "live", ..ctx(&none, &open) };
+        let live = ctx(&none, &open);
         let all = graded_under(Policy::Learned, &applied, &live);
-        assert_eq!((all.log.source, all.route("L01")), ("learned", Route::Free), "the scenario: without it, L01 goes free");
+        assert_eq!((all.log.source, all.route("L01")), (policy::EVIDENCE, Route::Free), "the scenario: without it, L01 goes free");
         let had = ["L01".to_string()];
         let r = graded_under(Policy::Learned, &applied, &Ctx { had: &had, ..live });
         assert_eq!((r.route("L01"), r.pf[1]), (Route::Not, 0.0), "{:?}", r.pf);
@@ -872,7 +1022,8 @@ mod tests {
         for (name, b) in [("intercept", -0.5), ("ask", -0.4), ("not", -0.3), ("ask_dilution", -0.1), ("free_dilution", -0.1), ("pool", -1.0)] {
             beta[at(name)] = b;
         }
-        // Wide on asking, so Thompson's draws deviate often; the pool slope drawn ≤ 0.
+        // Wide on asking, so the test's counts risk much and the evidence rule never deviates; the pool
+        // slope drawn ≤ 0.
         let mut chol = vec![0.0; policy::P * policy::P];
         for k in 0..policy::P {
             chol[k * policy::P + k] = if k == at("ask") {
@@ -897,7 +1048,16 @@ mod tests {
             let (session, check, stop) = (format!("t{}", c / 10), format!("{c:012x}"), c % 5 == 0);
             // Every other check's session already had one of the ten lessons.
             let had: Vec<String> = if c % 2 == 0 { vec![ls[(rng.next_u64() % 10) as usize].id.clone()] } else { Vec::new() };
-            let ctx = Ctx { session: &session, check: &check, channel: if stop { "stop" } else { "live" }, lessons: &none, summary: &s, tokens, had: &had };
+            let ctx = Ctx {
+                session: &session,
+                check: &check,
+                channel: if stop { "stop" } else { "live" },
+                lessons: &none,
+                summary: &s,
+                tokens,
+                had: &had,
+                alpha: policy::ALPHA,
+            };
             let r = graded_under(Policy::Learned, &applied, &ctx);
             let us = units(&applied);
             let routes: Vec<Route> = applied.iter().map(|(l, _)| r.route(&l.id)).collect();
@@ -960,6 +1120,22 @@ mod tests {
     }
 
     #[test]
+    fn a_risk_is_read_for_the_collective_whose_store_it_is_and_only_as_a_share() {
+        let base = Path::new("/home/x/.local/share/borg");
+        let lessons = crate::collective::store(base, "team").join("lessons.jsonl");
+        let cfg = |entry: &str| {
+            serde_json::from_str::<crate::collective::Config>(&format!(r#"{{"collectives":[{{"name":"other","paths":[],"risk":0.5}},{entry}]}}"#)).unwrap()
+        };
+        assert_eq!(risk_in(&cfg(r#"{"name":"team","paths":[],"risk":0.2}"#), &lessons), Some(0.2));
+        assert_eq!(risk_in(&cfg(r#"{"name":"team","paths":[],"risk":0}"#), &lessons), Some(0.0), "0 turns the test off");
+        assert_eq!(risk_in(&cfg(r#"{"name":"team","paths":[],"risk":1}"#), &lessons), Some(1.0));
+        assert_eq!(risk_in(&cfg(r#"{"name":"team","paths":[]}"#), &lessons), None, "unset: the policy's ALPHA");
+        for bad in ["-0.1", "1.5", "\"lots\"", "null"] {
+            assert_eq!(risk_in(&cfg(&format!(r#"{{"name":"team","paths":[],"risk":{bad}}}"#)), &lessons), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn a_check_id_is_short_stable_hex_and_differs_per_check() {
         let id = check_id("s", "stop", 1_000, 42);
         assert_eq!(id.len(), CHECK_HEX);
@@ -974,7 +1150,7 @@ mod tests {
     #[test]
     fn a_seed_depends_on_session_channel_and_check() {
         let (s, none) = (summary::Summary::default(), std::path::PathBuf::new());
-        let at = |session, channel, check| seed(&Ctx { session, check, channel, lessons: &none, summary: &s, tokens: 0, had: &[] });
+        let at = |session, channel, check| seed(&Ctx { session, check, channel, lessons: &none, summary: &s, tokens: 0, had: &[], alpha: policy::ALPHA });
         assert_eq!(at("s", "stop", "a1"), at("s", "stop", "a1"));
         assert_ne!(at("s", "stop", "a1"), at("s", "live", "a1"));
         assert_ne!(at("s", "stop", "a1"), at("s", "stop", "a2"));

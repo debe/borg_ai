@@ -1,7 +1,8 @@
 //! What a hook needs to decide, folded from the outcome log once and cached, so no check parses the
 //! whole log: every graded apply with its route and what became of it, the delivery tallies, the
 //! pool's yield and latency, the gate's ledger, the monitor, the checks whose learned decision fell
-//! back to the fixed rule, and the fit (select/policy.rs).
+//! back to the fixed rule, the randomised question-count test's checks, and the fit
+//! (select/policy.rs).
 //!
 //! **The cache** `<store>/select-summary.json` sits beside the lessons file, local and never synced.
 //! `load` reads it and folds only the log's new tail (from `at`); a missing, corrupt or older cache, or
@@ -57,6 +58,18 @@
 //! never one of the newest `policy::FIT_SESSIONS` (the sessions a fit reads). What the dropped
 //! sessions' readers need stays in `Past`, and the kept ones' ticks shift down by as many, so every
 //! age stays as it was. A session that logs again after its drop starts a new one.
+//!
+//! **The question-count test** (select/policy.rs `choose`, rules v2): a graded record of the learned
+//! policy that logs k (outcome.rs `xk`) was considered by the test, and one that also logs s (`xs`)
+//! drew its count: played (source `EXPERIMENT`, or `EXPERIMENT_CONTROL` when s is the fixed rule's own
+//! count), or refused by the gate (`GATE`), which then plays the fixed rule. Every drawn check is one
+//! of the test's randomised checks: its routes, as played, and its propensities, over the k + 1 equally
+//! likely counts with the refused ones' routes the fixed rule's, are what the draw made them, so the
+//! readout reads refused draws too. The fold counts them all-time by k and s (`Summary::experiment`,
+//! which compaction keeps) and marks a drawn one's check (`Check::xk`, `xs`), whose applies hold the
+//! verdicts of what it asked and handed over: what the readout reads (select/replay.rs `test_readout`),
+//! never a recount of the log. A record whose k or s cannot be its own (no s, s past k, k past its
+//! applies) counts nowhere. Like every learned check, a drawn one is on the gate's ledger.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
@@ -71,8 +84,10 @@ use crate::outcome::{self, Outcome};
 /// The cache's format. Protocol: a summary of another version is rebuilt, never read (2: `spend`;
 /// 3: `Pool::stops`, the monitor's weights; 4: `Past`, `LATER` a live check's, tallies at `ENDED`;
 /// 5: `ASK_LIVE`, what a session had (`Session::had`, `Apply::had`, `Apply::nofree`, `Summary::fresh`),
-/// tail yields and counts; 6: `Summary::fell_back`).
-pub const SV: u32 = 6;
+/// tail yields and counts; 6: `Summary::fell_back`; 7: the question-count test, `Summary::experiment`,
+/// `Check::xk`, `xs`, `Session::tested`; 8: a stop's results on a live check's hand-overs it asked
+/// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`).
+pub const SV: u32 = 8;
 /// The cache beside the lessons file. Protocol.
 pub const CACHE: &str = "select-summary.json";
 /// The monitor's auto-revert mark beside the lessons file: while it exists the store keeps the fixed
@@ -223,11 +238,18 @@ pub struct Check {
     /// Counted into its session's delivery tallies (at the session's end, module doc).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tallied: bool,
+    /// A check whose question-count test drew its count (module doc), played or refused: k, the fixed
+    /// rule's delivered non-3 lessons that may go free, and s, the drawn number of them to ask
+    /// (outcome.rs `xk`, `xs`). None on every other check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xk: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xs: Option<u32>,
 }
 
 /// The delivery tallies of a session, (applies, delivered), counted when it ends (`counted`): a stop's
-/// free lessons, a live check's, a live check's lessons left for later, its questions waiting for the
-/// stop, its questions delivered. Protocol: the indices of `Session::tally`, part of the cache's layout
+/// free lessons, a live check's, a live check's lessons left for later, and of a live check with a 3
+/// its questions waiting for the stop and its questions delivered. Protocol: the indices of `Session::tally`, part of the cache's layout
 /// (`SV`).
 pub const FREE_STOP: usize = 0;
 pub const FREE_LIVE: usize = 1;
@@ -255,6 +277,9 @@ pub struct Session {
     /// The lessons shown to it so far (`Summary::lessons`), sorted (module doc: what a session had).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub had: Vec<u32>,
+    /// A check of it drew the question-count test's count: counted once in `Experiment::sessions`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tested: bool,
 }
 
 /// What a session not in the table yet was shown (`Summary::fresh`), until its first graded check or
@@ -320,6 +345,31 @@ pub const LIVE: usize = 1;
 /// (outcome.rs `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD`). Protocol: the indices of
 /// `Summary::fell_back`, part of the cache's layout (`SV`).
 pub const FELL_BACK: [&str; 3] = [outcome::DECIDED_BUSY, outcome::DECIDED_NO_LOCK, outcome::DECIDED_NO_RECORD];
+
+/// The randomised question-count test's checks (module doc), all-time: per (k, s) the checks the test
+/// ran, each having drawn count s of k, played or refused, sorted (`ran`); of them the control arm's (`EXPERIMENT_CONTROL`: s the
+/// fixed rule's own count) and, per k, those the gate refused (`GATE`), sorted, each also in `ran`;
+/// the sessions with a drawn check. What `borg top` and the readout count
+/// (select/replay.rs `test_readout`), never a recount of the log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Experiment {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ran: Vec<(u32, u32, u64)>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub control: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<(u32, u64)>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub sessions: u32,
+}
+
+impl Experiment {
+    /// Checks that drew a count, and those the gate refused.
+    #[must_use]
+    pub fn totals(&self) -> (u64, u64) {
+        (self.ran.iter().map(|c| c.2).sum(), self.refused.iter().map(|c| c.1).sum())
+    }
+}
 
 /// Signals beside the judge, counted before (`Summary::signals[0]`) and after (`[1]`) the first check
 /// of the learned policy: sessions, corrections, vetoes, regrets, green test runs.
@@ -440,6 +490,9 @@ pub struct Summary {
     /// applies or none: a guard that binds often shows (top.rs `Selection::fallbacks`).
     #[serde(default, skip_serializing_if = "is_default")]
     pub fell_back: [u64; FELL_BACK.len()],
+    /// The question-count test's checks (module doc).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub experiment: Experiment,
     /// A check of the learned policy was folded: the signals count as after.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub era: bool,
@@ -474,6 +527,7 @@ impl Default for Summary {
             signals: Default::default(),
             spend: Default::default(),
             fell_back: Default::default(),
+            experiment: Experiment::default(),
             era: false,
             gate: Gate::default(),
             monitor: Monitor::default(),
@@ -814,7 +868,12 @@ impl Summary {
             m_q: count(Route::Ask),
             m_f: count(Route::Free),
             tallied: false,
+            xk: None,
+            xs: None,
         });
+        if learned {
+            self.count_test(o, ci as usize, tick);
+        }
         if !o.check.is_empty() {
             ix.checks.insert(o.check.clone(), ci);
         }
@@ -831,6 +890,35 @@ impl Summary {
         }
     }
 
+    /// The question-count test at the learned check `ci` of record `o` (module doc): a drawn count
+    /// counted by its k and s and marked on the check, its session counted once; a refusal also by its k.
+    fn count_test(&mut self, o: &Outcome, ci: usize, tick: u32) {
+        let Some(k) = o.xk.filter(|k| *k as usize <= o.lessons.len()) else { return };
+        let source = o.source.as_str();
+        if ![policy::EXPERIMENT, policy::EXPERIMENT_CONTROL, policy::GATE].contains(&source) {
+            return;
+        }
+        // Every source of the test logs its draw's s (select/policy.rs `choose`): a record without one
+        // is not the test's.
+        let Some(s) = o.xs.filter(|s| *s <= k) else { return };
+        let e = &mut self.experiment;
+        if source == policy::GATE {
+            match e.refused.binary_search_by_key(&k, |c| c.0) {
+                Ok(i) => e.refused[i].1 += 1,
+                Err(i) => e.refused.insert(i, (k, 1)),
+            }
+        }
+        match e.ran.binary_search_by_key(&(k, s), |c| (c.0, c.1)) {
+            Ok(i) => e.ran[i].2 += 1,
+            Err(i) => e.ran.insert(i, (k, s, 1)),
+        }
+        e.control += u64::from(source == policy::EXPERIMENT_CONTROL);
+        (self.checks[ci].xk, self.checks[ci].xs) = (Some(k), Some(s));
+        let x = &mut self.sessions[tick as usize];
+        e.sessions += u32::from(!x.tested);
+        x.tested = true;
+    }
+
     /// The apply of `lesson` that a result in `o` belongs to: in its check by id, else (an older
     /// record) the session's last graded check before it that graded the lesson on one of `routes`.
     fn apply_of(&self, o: &Outcome, lesson: &str, routes: &[Route], ix: &Index) -> Option<usize> {
@@ -844,6 +932,23 @@ impl Summary {
             let a = &self.applies[i];
             routes.contains(&a.route) && self.checks[a.check as usize].ms < o.ms
         })
+    }
+
+    /// The routes a result on channel stop names in its check: a stop check's questions; a live check's
+    /// questions waiting for the stop, and its hand-overs in place of questions the stop asked in their
+    /// stead (hook.rs `stop_ask`: `#borg-routed`, a delivery with the reason "in place of a hand-over"),
+    /// whose apply stays the free one its check decided, as the question-count test drew it (its
+    /// verdict and delivery land there: intent to treat). A lesson is on one route in its check.
+    fn stop_routes(&self, o: &Outcome, ix: &Index) -> &'static [Route] {
+        let live = ix.checks.get(&o.check).is_some_and(|&ci| self.checks.get(ci as usize).is_some_and(|c| !c.stop));
+        if live { &[Route::Ask, Route::Free] } else { &[Route::Ask] }
+    }
+
+    /// Whether check `ci` graded a 3: a stop may ask its live questions while they wait (hook.rs
+    /// `Verdict::Ask`), and without one no stop does.
+    fn three(&self, ci: usize) -> bool {
+        let Some(c) = self.checks.get(ci) else { return false };
+        self.applies.get(c.first as usize..c.first as usize + usize::from(c.n)).is_some_and(|a| a.iter().any(|a| a.grade == 3))
     }
 
     /// Sets apply `i`'s label to `next` when it yields to it, keeping the session's open count.
@@ -873,7 +978,8 @@ impl Summary {
         }
         let routes: &[Route] = match o.channel.as_str() {
             outcome::PLACEBO => &[Route::Placebo],
-            "stop" | "live" => &[Route::Ask],
+            "stop" => self.stop_routes(o, ix),
+            "live" => &[Route::Ask],
             "queued" => &[Route::Free],
             _ => &[Route::Ask, Route::Free],
         };
@@ -914,12 +1020,13 @@ impl Summary {
 
     /// Counts check `ci`'s applies into its session's delivery tallies (`counted`).
     fn tally(&mut self, ci: usize) {
+        let three = self.three(ci);
         let c = &mut self.checks[ci];
         c.tallied = true;
         let (tick, stop, range) = (c.tick as usize, c.stop, c.first as usize..c.first as usize + usize::from(c.n));
         for i in range {
             let Some(a) = self.applies.get(i) else { continue };
-            for (which, hit) in counted(a, stop).into_iter().flatten() {
+            for (which, hit) in counted(a, stop, three).into_iter().flatten() {
                 let t = &mut self.sessions[tick].tally[which];
                 t.0 += 1;
                 t.1 += u32::from(hit);
@@ -930,11 +1037,12 @@ impl Summary {
     /// Changes apply `i` by `set` (its delivery, never its route or `had`); when its check is tallied
     /// already (its session ended, then resumed), its counts in the tallies move with it.
     fn update(&mut self, i: usize, set: impl FnOnce(&mut Apply)) {
-        let Some(c) = self.applies.get(i).and_then(|a| self.checks.get(a.check as usize)) else { return };
-        let (tallied, stop, tick) = (c.tallied, c.stop, c.tick as usize);
-        let before = counted(&self.applies[i], stop);
+        let Some(ci) = self.applies.get(i).map(|a| a.check as usize) else { return };
+        let Some(c) = self.checks.get(ci) else { return };
+        let (tallied, stop, tick, three) = (c.tallied, c.stop, c.tick as usize, self.three(ci));
+        let before = counted(&self.applies[i], stop, three);
         set(&mut self.applies[i]);
-        let after = counted(&self.applies[i], stop);
+        let after = counted(&self.applies[i], stop, three);
         let Some(x) = self.sessions.get_mut(tick).filter(|_| tallied) else { return };
         for (b, a) in before.into_iter().zip(after) {
             if let (Some((which, was)), Some((_, is))) = (b, a)
@@ -975,12 +1083,14 @@ impl Summary {
     /// `never_delivered` one ends the session.
     fn delivered(&mut self, o: &Outcome, ix: &mut Index) {
         let (fate, routes): (Delivered, &[Route]) = match (o.kind.as_str(), o.route.as_str()) {
+            (outcome::DELIVERY, outcome::ROUTE_ASKED) if o.channel == "stop" => (Delivered::Yes, self.stop_routes(o, ix)),
             (outcome::DELIVERY, outcome::ROUTE_ASKED) => (Delivered::Yes, &[Route::Ask]),
             (outcome::DELIVERY, outcome::ROUTE_FREE) => (Delivered::Yes, &[Route::Free]),
             (outcome::DELIVERY, outcome::ROUTE_PLACEBO) => (Delivered::Yes, &[Route::Placebo]),
             (outcome::DELIVERY, _) => (Delivered::Dropped, &[Route::Ask, Route::Free, Route::Placebo]),
             (_, _) if o.channel == "queued" => (Delivered::Yes, &[Route::Free]),
-            (_, _) if o.channel == "stop" || o.channel == "live" => (Delivered::Yes, &[Route::Ask]),
+            (_, _) if o.channel == "stop" => (Delivered::Yes, self.stop_routes(o, ix)),
+            (_, _) if o.channel == "live" => (Delivered::Yes, &[Route::Ask]),
             _ => (Delivered::Yes, &[]),
         };
         // A placebo is judged, never shown: not had, and no later delivery of anything.
@@ -1077,19 +1187,21 @@ impl Summary {
 /// The delivery tallies an apply of a stop's (else a live) check counts into, each with whether it
 /// counts as delivered: a free lesson, by its check's channel; a lesson left for later, at a live check
 /// only (ρ, select/policy.rs `Rates::later`, is shown only and is a lesson left for later during the
-/// turn: a stop's arrives later only if a next prompt brings it again); a live question, whether it
-/// reached the drone (during the turn, or waiting for the stop and asked in its block) and whether it
-/// waited for the stop. None for an apply of a lesson its session had (`Apply::had`; module doc: the
-/// rates are those of a lesson the session lacks, and a question of it may still be delivered and
-/// judged), an ask at the stop (it blocks: certain) and a placebo.
-fn counted(a: &Apply, stop: bool) -> [Option<(usize, bool)>; 2] {
+/// turn: a stop's arrives later only if a next prompt brings it again); a live question of a check
+/// with a 3 (`three`), whether it reached the drone (during the turn, or waiting for the stop and asked
+/// in its block) and whether it waited for the stop. None for an apply of a lesson its session had
+/// (`Apply::had`; module doc: the rates are those of a lesson the session lacks, and a question of it
+/// may still be delivered and judged), an ask at the stop (it blocks: certain), a live question of a
+/// check without a 3 (no stop asks it: it arrives at a tool call or the next prompt, as a hand-over
+/// does, and is valued at the free rate, select/policy.rs `Valuer::ask`) and a placebo.
+fn counted(a: &Apply, stop: bool, three: bool) -> [Option<(usize, bool)>; 2] {
     if a.had {
         return [None; 2];
     }
     match a.route {
         Route::Free => [Some((if stop { FREE_STOP } else { FREE_LIVE }, a.delivered == Delivered::Yes)), None],
         Route::Not if !stop => [Some((LATER, a.later)), None],
-        Route::Ask if !stop => [Some((ASK_LIVE, a.delivered == Delivered::Yes)), Some((WAIT, a.waited))],
+        Route::Ask if !stop && three => [Some((ASK_LIVE, a.delivered == Delivered::Yes)), Some((WAIT, a.waited))],
         _ => [None; 2],
     }
 }
@@ -1677,6 +1789,54 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_over_the_stop_asked_in_place_is_its_free_applys_delivery_and_verdict() {
+        // What hook.rs `stop_ask` writes for a live check's question-count test draw: H handed over in
+        // place of a question, and the stop came before any delivery took it, so it asked H in its block
+        // with A, the check's waiting question.
+        let at_stop = |o: Outcome| Outcome { channel: "stop".into(), ..o };
+        let log = [
+            graded("s", "k1", &["A", "H"], &[3, 2], &["A"], &["H"], 1),
+            stop("s", "k2", &[], &[], &[], &[], 2),
+            at_stop(Outcome { check: "k1".into(), ..rec(outcome::ASKED, "s", &["A"], 3) }),
+            Outcome { reason: "at the stop".into(), ..at_stop(delivery("s", "A", "k1", outcome::ROUTE_ASKED, 3)) },
+            at_stop(Outcome { check: "k1".into(), ..rec(outcome::ASKED, "s", &["H"], 3) }),
+            Outcome { reason: "in place of a hand-over".into(), ..at_stop(delivery("s", "H", "k1", outcome::ROUTE_ASKED, 3)) },
+            // `#borg-routed H=k1`: the verdict names H's check, on channel stop.
+            verdict(outcome::CHANGED, "s", "H", "k1", "stop", 4),
+            verdict(outcome::IGNORED, "s", "A", "k1", "stop", 4),
+            Outcome { reason: outcome::UNJUDGED_NONE.into(), check: "k1".into(), ..rec(outcome::NOT_CORRECTED, "s", &["A", "H"], 5) },
+            rec(outcome::ENDED, "s", &[], 6),
+        ];
+        let s = fold(&lines(&log), Summary::default());
+        assert_eq!(label_of(&s, "k1", "H"), (Route::Free, Label::Changed, Delivered::Yes), "the draw's free apply, delivered and judged");
+        assert_eq!(label_of(&s, "k1", "A"), (Route::Ask, Label::Ignored, Delivered::Yes));
+        assert_eq!(s.sessions[0].tally[FREE_LIVE], (1, 1), "H arrived");
+        assert_eq!((s.sessions[0].tally[ASK_LIVE], s.sessions[0].tally[WAIT]), ((1, 1), (1, 1)));
+        // A stop check's own result stays on its questions.
+        let log = [stop("t", "t1", &["F", "G"], &[3, 2], &["F"], &["G"], 1), verdict(outcome::CHANGED, "t", "G", "t1", "stop", 2)];
+        assert_eq!(label_of(&fold(&lines(&log), Summary::default()), "t1", "G").1, Label::Open, "a stop's free lesson is judged on channel queued");
+    }
+
+    #[test]
+    fn a_live_question_of_a_check_without_a_3_is_no_question_that_waits_for_the_stop() {
+        let log = [
+            // A check with a 3: its question waits for the stop and is asked there.
+            graded("t", "t1", &["A"], &[3], &["A"], &[], 1),
+            Outcome { channel: "stop".into(), ..delivery("t", "A", "t1", outcome::ROUTE_ASKED, 2) },
+            // Without a 3 (`live-next`): no stop asks B, and the session ends before a tool call.
+            graded("t", "t2", &["B", "C"], &[2, 1], &["B"], &[], 3),
+            Outcome { channel: "queued".into(), ..never("t", "t2", &["B"], 4) },
+            rec(outcome::ENDED, "t", &[], 5),
+        ];
+        let s = fold(&lines(&log), Summary::default());
+        assert_eq!((s.sessions[0].tally[ASK_LIVE], s.sessions[0].tally[WAIT]), ((1, 1), (1, 1)), "t1's A alone");
+        assert_eq!(label_of(&s, "t2", "B"), (Route::Ask, Label::Open, Delivered::Dropped), "its apply still says what came of it");
+        // Resumed, a tool call asks B after all: no tally moves.
+        let s = fold(&lines(&[delivery("t", "B", "t2", outcome::ROUTE_ASKED, 6)]), s);
+        assert_eq!((s.sessions[0].tally[ASK_LIVE], s.sessions[0].tally[WAIT]), ((1, 1), (1, 1)));
+    }
+
+    #[test]
     fn a_tail_sample_teaches_the_yield_past_the_pool() {
         // A pool of four (positions 0 to 3) and a tail of two the budget dropped, at positions 9 and 20 of
         // the whole fill order; T1 applied.
@@ -1797,6 +1957,55 @@ mod tests {
             let at = text[..at].rfind('\n').unwrap() + 1;
             assert_eq!(fold(&text[at..], fold(&text[..at], Summary::default())), s, "split after byte {at}");
         }
+    }
+
+    /// The question-count test's checks (module doc): a drawn count, played or refused, counts by its k
+    /// and s and marks its check, its control arm apart, its session once; a refusal also counts by its
+    /// k; a record whose k or s cannot be its own (a refusal without its s among them), one outside the
+    /// test and one not of the learned policy count nowhere. The
+    /// counts are all-time: compaction drops the checks, never them.
+    #[test]
+    fn the_question_count_tests_checks_count_by_k_and_s_and_mark_their_check() {
+        let x = |session: &str, check: &str, source: &str, k: Option<u32>, s: Option<u32>, ms| Outcome {
+            source: source.into(),
+            xk: k,
+            xs: s,
+            ..graded(session, check, &["A", "B", "C"], &[2, 2, 1], &["A"], &["B", "C"], ms)
+        };
+        let text = lines(&[
+            x("x", "e1", policy::EXPERIMENT, Some(3), Some(1), 10),
+            x("x", "e2", policy::EXPERIMENT, Some(3), Some(1), 20),
+            x("x", "e3", policy::EXPERIMENT_CONTROL, Some(3), Some(0), 30),
+            // No s: no source of the test writes it.
+            x("x", "g1", policy::GATE, Some(3), None, 40),
+            // Refused after its draw: randomised, the fixed rule played.
+            x("x", "g2", policy::GATE, Some(3), Some(2), 45),
+            // s past k, k past the check's applies.
+            x("x", "bad", policy::EXPERIMENT, Some(3), Some(4), 50),
+            x("x", "big", policy::EXPERIMENT, Some(9), Some(1), 60),
+            x("x", "ev", policy::EVIDENCE, None, None, 70),
+            Outcome { policy: "fixed".into(), ..x("x", "f1", policy::EXPERIMENT, Some(3), Some(2), 80) },
+            x("y", "y1", policy::EXPERIMENT, Some(2), Some(2), 90),
+        ]);
+        let s = fold(&text, Summary::default());
+        let e = &s.experiment;
+        assert_eq!(
+            (e.ran.as_slice(), e.control, e.refused.as_slice(), e.sessions),
+            (&[(2, 2, 1), (3, 0, 1), (3, 1, 2), (3, 2, 1)][..], 1, &[(3, 1)][..], 2),
+            "{e:?}"
+        );
+        assert_eq!(e.totals(), (5, 1));
+        let marked: Vec<(&str, Option<u32>, Option<u32>)> = s.checks.iter().map(|c| (c.id.as_str(), c.xk, c.xs)).filter(|c| c.1.is_some()).collect();
+        assert_eq!(marked, [("e1", Some(3), Some(1)), ("e2", Some(3), Some(1)), ("e3", Some(3), Some(0)), ("g2", Some(3), Some(2)), ("y1", Some(2), Some(2))]);
+        assert!(s.sessions.iter().all(|x| x.tested));
+        // The fold every count shares: a prefix, then the rest, is the whole.
+        let at = text[..text.len() / 2].rfind('\n').unwrap() + 1;
+        assert_eq!(fold(&text[at..], fold(&text[..at], Summary::default())), s);
+        // Compaction takes the checks, not the counts.
+        let mut compacted = s.clone();
+        let mut ix = Index::of(&compacted);
+        compacted.compact(&mut ix, s.applies.len(), 0);
+        assert_eq!((compacted.checks.len(), &compacted.experiment), (0, &s.experiment));
     }
 
     #[test]

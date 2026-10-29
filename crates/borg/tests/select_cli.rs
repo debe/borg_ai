@@ -3,9 +3,11 @@
 //! of every check that called the model (one without applies and a failed one included), the free route's
 //! propensity carried to the free delivery, a `delivery` record per check and lesson with the route it
 //! actually took (asked, free, placebo, dropped and why), a live grade 3 on a lesson handed over earlier
-//! asked and never dropped, and a placebo judged blindly that no belief, no statistic and no team line
-//! reads. The fake `claude` of tests/common: no test makes a real model call. Every check here is run
-//! to its end in the foreground (`borg check` is called, never spawned), so no test waits on a clock.
+//! asked and never dropped, a placebo judged blindly that no belief, no statistic and no team line
+//! reads, and a learned live check under the question-count test whose asks and hand-overs make the
+//! whole round trip with its draw on the record. The fake `claude` of tests/common: no test makes a
+//! real model call. Every check here is run to its end in the foreground (`borg check` is called, never
+//! spawned), so no test waits on a clock.
 
 mod common;
 
@@ -69,6 +71,11 @@ fn stop(root: &Path, session: &str, last: &str, env: &[(&str, &str)]) -> String 
 /// One live check of `session`'s work so far, run to its end (live.rs): the change a tool call counted in
 /// live mode, then `borg check` as the hook would spawn it, with the collective's store and state.
 fn live_check(root: &Path, session: &str) {
+    live_check_under(root, session, "fixed");
+}
+
+/// `live_check` under the selection policy `select` (`BORG_SELECT`).
+fn live_check_under(root: &Path, session: &str, select: &str) {
     let state = store(root).join("state");
     std::fs::OpenOptions::new()
         .create(true)
@@ -88,7 +95,7 @@ fn live_check(root: &Path, session: &str) {
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_HARNESS", "claude")
         .env("BORG_MODE", "live")
-        .env("BORG_SELECT", "fixed")
+        .env("BORG_SELECT", select)
         .env("BORG_STOP_ATTENTION", "off")
         .env("BORG_QUEEN", "off")
         .env("BORG_VECTORS", "off")
@@ -620,4 +627,403 @@ fn select_summary(root: &Path) -> Value {
         .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     v["report"]["summary"].clone()
+}
+
+/// A selection summary beside the store's lessons whose fit has no evidence either way (asking and
+/// handing over are worth the same, every coefficient but the intercept 0, each drawn tightly around
+/// it), with a gate open wide: the learned policy keeps the fixed rule on evidence, and the gate admits
+/// its randomised question-count test on a live check (select/policy.rs `choose`).
+fn neutral_fit(root: &Path) {
+    fit_beside(root, false);
+}
+
+/// `neutral_fit`, or (`sure`) a fit sure that handing over beats asking, as hook.rs's unit tests'
+/// `decide_store` has it: the learned policy then deviates on evidence (select/policy.rs `EVIDENCE`).
+fn fit_beside(root: &Path, sure: bool) {
+    use borg::select::{policy, summary};
+    let lessons = store(root).join("lessons.jsonl");
+    let at = |name: &str| policy::NAMES.iter().position(|n| *n == name).unwrap();
+    let mut beta = vec![0.0; policy::P];
+    beta[at("intercept")] = -0.5;
+    if sure {
+        beta[at("ask")] = -3.0;
+        beta[at("not")] = -1.0;
+    }
+    let mut chol = vec![0.0; policy::P * policy::P];
+    for k in 0..policy::P {
+        chol[k * policy::P + k] = 0.05;
+    }
+    let model = policy::Model { beta, chol, sd: vec![1.0; policy::P], spread: [0.1; 3], ..policy::Model::default() };
+    let rates = policy::Rates { free_stop: 1.0, free_live: 1.0, later: 0.0, wait: 0.0, ask_live: 1.0 };
+    let fit = policy::Fit { key: "9-abcdef01".into(), model: Some(model), rates, ..policy::Fit::default() };
+    let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: 5.0, ..summary::Gate::default() };
+    std::fs::write(lessons.with_file_name("outcomes.jsonl"), "").unwrap();
+    summary::save(&lessons, &summary::Summary { fit, gate, ..summary::Summary::default() }).unwrap();
+}
+
+/// The randomised question-count test (select/policy.rs `choose`, plan W2) end to end on live checks of
+/// the learned policy: a check with a 3 (Mdrain) and two lessons the fixed rule asks beside it (G0 a 2,
+/// G1 a 1, both free to go free) draws s of k = 2 to ask, 2s before 1s, and hands the rest over; the 3
+/// is always asked. Its `graded` record logs k and s (`xk`, `xs`), its source (`experiment`, or
+/// `experiment_control` when s is the fixed rule's own count, which then routes as the fixed rule) and
+/// each lesson's exact chance of each route under the uniform draw. The next tool call delivers both
+/// routes, marked with the check like any live ask and free delivery, each with its `delivery` record;
+/// the next judge call's verdicts land on the route's channel with the check, and beliefs (memory.rs)
+/// count each once like any ask or free delivery. The draw is seeded by the check, whose id is new each
+/// run: sessions repeat until both an experiment and a control check have made the round trip (a bound
+/// of 32 misses a control at (2/3)^32 < 3e-6). With the collective's `risk` at 0 the test is off.
+#[test]
+fn a_live_check_under_the_question_count_test_asks_s_and_hands_over_the_rest_end_to_end() {
+    let root = setup("select-experiment");
+    neutral_fit(&root);
+    let learned = [("BORG_SELECT", "learned")];
+    let others = ["G0".to_string(), "G1".to_string()];
+    let (mut experiment, mut control) = (0, 0);
+    // Per lesson, the sessions whose judge call found it changed after a delivery (memory.rs below).
+    let mut judged: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut sessions = 0;
+    while (experiment == 0 || control == 0) && sessions < 32 {
+        let session = format!("x{sessions}");
+        sessions += 1;
+        prompt(&root, &session, PROMPT, &learned);
+        edit(&root, &session, "/x/net.rs", "drop the budget token with a reset arc");
+        answer(&root, &[("Mdrain", 3), ("G0", 2), ("G1", 1)]);
+        live_check_under(&root, &session, "learned");
+        let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == session.as_str() && g["channel"] == "live").unwrap();
+        let check = g["check"].as_str().unwrap().to_string();
+        let (k, s) = (g["xk"].as_u64(), g["xs"].as_u64());
+        assert_eq!((g["policy"].as_str(), k), (Some("learned"), Some(2)), "{g}");
+        let s = usize::try_from(s.unwrap_or_else(|| panic!("no draw logged: {g}"))).unwrap();
+        assert!(s <= 2, "{g}");
+        // The top s in the fixed rule's order are asked beside the 3, the rest handed over free.
+        let asked: Vec<String> = std::iter::once("Mdrain".to_string()).chain(others[..s].iter().cloned()).collect();
+        let free: Vec<String> = others[s..].to_vec();
+        let source = if s == 2 { "experiment_control" } else { "experiment" };
+        assert_eq!((g["source"].as_str(), strings(&g["chosen"]), strings(&g["free"])), (Some(source), asked.clone(), free.clone()), "{g}");
+        // Exact propensities of the uniform draw of s in 0..=2: G0 is asked unless s = 0, G1 only at s = 2.
+        assert_eq!((g["p"].clone(), g["pf"].clone()), (json!([1.0, 0.6667, 0.3333]), json!([0.0, 0.3333, 0.6667])), "{g}");
+        let queue = state(&root, &session, "queued");
+        let mut lines = vec![format!("live {} @{check}", asked.join(","))];
+        if !free.is_empty() {
+            // Handed over in place of questions the fixed rule asks (hook.rs `INSTEAD`).
+            lines.insert(0, format!("instead {} @{check}", free.join(",")));
+        }
+        assert_eq!(queue.lines().collect::<Vec<_>>(), lines, "the check's free lessons, then its asks (hook.rs `live_check`)");
+        let ctx = state(&root, &session, "ctx");
+        assert!(ctx.contains(&format!("#borg-select policy=learned source={source} ")), "{ctx}");
+
+        // The next tool call delivers both: the asks as live questions, the rest as a free delivery.
+        let out = context(&edit(&root, &session, "/x/other.rs", "unrelated"));
+        assert!(out.contains("explicit consumer") && out.contains("websocket") && out.contains("tomatoes"), "every lesson reaches the drone: {out}");
+        // Each route's lessons as a set: a live delivery orders its questions itself (hook.rs `ask_live`).
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        let ctx = state(&root, &session, "ctx");
+        let marked = |prefix: &str| -> Vec<String> {
+            let tag = format!(" @{check}");
+            let line = ctx.lines().filter_map(|l| l.strip_prefix(prefix)?.strip_suffix(tag.as_str())).next();
+            sorted(&line.map(|l| l.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default())
+        };
+        assert_eq!((marked("#borg-asked "), marked("#borg-queued ")), (sorted(&asked), free.clone()), "{ctx}");
+        let mut want = vec![(check.clone(), "asked".to_string(), String::new(), sorted(&asked))];
+        if !free.is_empty() {
+            want.push((check.clone(), "free".to_string(), String::new(), free.clone()));
+        }
+        let got: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check).map(|(c, r, w, l)| (c, r, w, sorted(&l))).collect();
+        assert_eq!(got, want);
+
+        // The next judge call: every delivered lesson changed the work; each verdict on its route's
+        // channel, with the check that routed it.
+        let resolved: Vec<Value> = asked.iter().chain(&free).map(|id| json!({"id": id, "verdict": "changed", "avoids_consequence": true})).collect();
+        verdicts(&root, &[], json!(resolved));
+        stop(&root, &session, "Done with the net.", &learned);
+        let on = |channel: &str| -> Vec<String> {
+            let mut v: Vec<String> = of(&root, "asked_then_changed")
+                .iter()
+                .filter(|o| o["session"] == session.as_str() && o["channel"] == channel && o["check"] == check.as_str())
+                .flat_map(lessons)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!((on("live"), on("queued")), (sorted(&asked), free.clone()), "{:?}", outcomes(&root));
+        for id in asked.iter().chain(&free) {
+            *judged.entry(id.clone()).or_default() += 1;
+        }
+        match s {
+            2 => control += 1,
+            _ => experiment += 1,
+        }
+    }
+    assert!(experiment > 0 && control > 0, "{experiment} experiment and {control} control checks in {sessions} sessions");
+    // Beliefs: each delivery's change counts once, whichever route the test drew (nothing excluded,
+    // nothing counted twice).
+    let mem = memory(&root);
+    for (id, n) in &judged {
+        let m = mem.iter().find(|m| m["id"] == id.as_str()).unwrap_or_else(|| panic!("{id}: {mem:?}"));
+        assert_eq!(m["changed"].as_u64(), Some(*n), "{id}: {m}");
+    }
+
+    // The collective's `risk` at 0 turns the test off: the same check routes without a draw.
+    let config = root.join("collectives.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    cfg["collectives"][0]["risk"] = json!(0);
+    std::fs::write(&config, cfg.to_string()).unwrap();
+    prompt(&root, "off", PROMPT, &learned);
+    edit(&root, "off", "/x/net.rs", "drop the budget token with a reset arc");
+    answer(&root, &[("Mdrain", 3), ("G0", 2), ("G1", 1)]);
+    live_check_under(&root, "off", "learned");
+    let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == "off").unwrap();
+    assert!(g.get("xk").is_none() && g.get("xs").is_none() && !g["source"].as_str().unwrap_or_default().starts_with("experiment"), "{g}");
+    assert_eq!(
+        (strings(&g["chosen"]), strings(&g["free"])),
+        (vec!["Mdrain".to_string(), "G0".into(), "G1".into()], Vec::<String>::new()),
+        "the fixed rule: {g}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The lessons G0.. (one per word of `words`) rewritten long, their ids: each free line clipped at its
+/// question's and consequence's limits, so one free delivery's budget (`conscience::EARLY_CHARS`) holds
+/// three of them.
+fn lengthen(root: &Path, words: &[&str]) -> Vec<String> {
+    let path = store(root).join("lessons.jsonl");
+    let others: Vec<String> = (0..words.len()).map(|i| format!("G{i}")).collect();
+    let text: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if let Some(i) = others.iter().position(|id| v["id"] == id.as_str()) {
+                let w = words[i];
+                v["question"] = json!(format!("Did I check the {w} handling: {}?", format!("the {w} limits and edge cases ").repeat(12)));
+                v["consequence"] = json!(format!("{w} {}", "breaks badly ".repeat(16)));
+            }
+            format!("{v}\n")
+        })
+        .collect();
+    std::fs::write(&path, text).unwrap();
+    others
+}
+
+/// The question-count test withholds nothing even where one free delivery's budget
+/// (`conscience::EARLY_CHARS`) holds three of its lines: a live check with a 3 (Mdrain) and five long
+/// 2s the fixed rule asks beside it draws s of k = 5, and the next tool call delivers every lesson of
+/// every count, the 5 − s handed over (hook.rs `INSTEAD`) though four or five of them are past the
+/// budget, with no `dropped_chars` record. Sessions repeat until a count of 0 or 1 has made the round
+/// trip (a bound of 32 misses one at (2/3)^32 < 3e-6).
+#[test]
+fn the_question_count_test_hands_over_every_lesson_the_fixed_rule_asks_past_the_free_budget() {
+    let root = setup("select-instead");
+    neutral_fit(&root);
+    let words = ["websocket", "tomatoes", "invoices", "telescope", "glaciers"];
+    let others = lengthen(&root, &words);
+    let learned = [("BORG_SELECT", "learned")];
+    let mut applies = vec![("Mdrain", 3)];
+    applies.extend(others.iter().map(|id| (id.as_str(), 2)));
+    let (mut past, mut sessions) = (0, 0);
+    while past == 0 && sessions < 32 {
+        let session = format!("i{sessions}");
+        sessions += 1;
+        prompt(&root, &session, PROMPT, &learned);
+        edit(&root, &session, "/x/net.rs", "drop the budget token with a reset arc");
+        answer(&root, &applies);
+        live_check_under(&root, &session, "learned");
+        let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == session.as_str() && g["channel"] == "live").unwrap();
+        let check = g["check"].as_str().unwrap().to_string();
+        assert_eq!(g["xk"].as_u64(), Some(5), "{g}");
+        let s = usize::try_from(g["xs"].as_u64().unwrap_or_else(|| panic!("no draw logged: {g}"))).unwrap();
+        assert_eq!(strings(&g["free"]), others[s..], "{g}");
+        let out = context(&edit(&root, &session, "/x/other.rs", "unrelated"));
+        for w in std::iter::once("explicit consumer").chain(words) {
+            assert!(out.contains(w), "s {s}: {w} never reached the drone: {out}");
+        }
+        let cut: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check && r.1 == "dropped_chars").collect();
+        assert!(cut.is_empty(), "s {s}: {cut:?}");
+        past += usize::from(s <= 1);
+    }
+    assert!(past > 0, "no count of 0 or 1 in {sessions} sessions");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The question-count test on a live check without a 3 (G0 a 2, G1 a 1; k = 2), when the turn ends
+/// before a tool call delivers what it asks: neither arm blocks the stop, as the fixed rule would not
+/// (a stop blocks only for a 3), so the stop's channel never lands in one arm alone. A draw that asks
+/// (s ≥ 1, `experiment`) waits as a `live-next` line, which the stop leaves in the queue (hook.rs
+/// `take_live`); the next prompt asks it live, on the live check's route, beside what it handed over.
+/// The draw is seeded by the check, new each run: sessions repeat until a draw asks (a bound of 32
+/// misses one at (1/3)^32 < 1e-15).
+#[test]
+fn a_live_tests_asks_without_a_three_never_block_the_stop_and_arrive_with_the_next_prompt() {
+    let root = setup("select-experiment-stop");
+    neutral_fit(&root);
+    let learned = [("BORG_SELECT", "learned")];
+    let at_stop = [("BORG_SELECT", "learned"), ("BORG_MODE", "live")];
+    let others = ["G0".to_string(), "G1".to_string()];
+    let (mut experiment, mut sessions) = (0, 0);
+    while experiment == 0 && sessions < 32 {
+        let session = format!("n{sessions}");
+        sessions += 1;
+        prompt(&root, &session, PROMPT, &learned);
+        edit(&root, &session, "/x/net.rs", "drop the budget token with a reset arc");
+        answer(&root, &[("G0", 2), ("G1", 1)]);
+        live_check_under(&root, &session, "learned");
+        let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == session.as_str() && g["channel"] == "live").unwrap();
+        let check = g["check"].as_str().unwrap().to_string();
+        assert_eq!(g["xk"].as_u64(), Some(2), "{g}");
+        let s = usize::try_from(g["xs"].as_u64().unwrap_or_else(|| panic!("no draw logged: {g}"))).unwrap();
+        let (asked, free) = (others[..s].to_vec(), others[s..].to_vec());
+        assert_eq!((strings(&g["chosen"]), strings(&g["free"])), (asked.clone(), free.clone()), "{g}");
+
+        // The stop, no tool call in between: the live check covered the turn, and nothing blocks.
+        let out = stop(&root, &session, LAST, &at_stop);
+        assert!(!out.contains("block"), "s = {s}: {out}");
+        assert!(state(&root, &session, "ctx").ends_with("#borg-skip live_covered\n"), "{}", state(&root, &session, "ctx"));
+        if s == 0 {
+            continue;
+        }
+        experiment += 1;
+        assert_eq!(g["source"].as_str(), Some("experiment"), "{g}");
+        let queue = state(&root, &session, "queued");
+        assert!(queue.lines().any(|l| l == format!("live-next {} @{check}", asked.join(","))), "still waiting: {queue}");
+        assert!(routes(&root).iter().all(|r| r.0 != check), "nothing of the check delivered or dropped yet: {:?}", routes(&root));
+
+        // The next prompt asks them live, with the check's own markers and `delivery` records.
+        let out = context(&prompt(&root, &session, "and the retries?", &learned));
+        assert!(out.starts_with("[borg] borg check of your work so far:"), "{out}");
+        assert!(out.contains("websocket") && out.contains("tomatoes"), "every lesson reaches the drone: {out}");
+        // Each route's lessons as a set: a live delivery orders its questions itself (hook.rs `ask_live`).
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let got: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check).map(|(_, r, w, l)| (r, w, sorted(l))).collect();
+        let mut want = vec![("asked".to_string(), String::new(), asked.clone())];
+        if !free.is_empty() {
+            want.push(("free".to_string(), String::new(), free.clone()));
+        }
+        assert_eq!(got, want, "{:?}", routes(&root));
+        let ctx = state(&root, &session, "ctx");
+        let marked = ctx.lines().find_map(|l| l.strip_prefix("#borg-asked ")?.strip_suffix(format!(" @{check}").as_str()).map(String::from));
+        assert_eq!(marked.map(|l| sorted(l.split(',').map(String::from).collect())), Some(asked.clone()), "{ctx}");
+        assert!(!store(&root).join(format!("state/{session}.queued")).exists(), "delivered once");
+    }
+    assert!(experiment > 0, "no draw asked in {sessions} sessions");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The question-count test withholds nothing when the turn ends first: a live check with a 3 (Mdrain)
+/// and two lessons the fixed rule asks beside it (G0 a 2, G1 a 1; k = 2) draws s < 2, so it hands
+/// G1 (and G0 at s = 0) over in place of questions (an `instead` line); the stop comes before any tool
+/// call, and its block asks every lesson the fixed rule's block would have, the waiting asks and the
+/// hand-overs alike, so nothing waits in the queue to be recorded never delivered. Each hand-over's
+/// `delivery` record is the route that happened (asked, on channel stop, with the check that routed it)
+/// and says why (in place of a hand-over); its `asked` record carries no p and no pool (its check chose
+/// no question), while the waiting asks keep theirs. Sessions repeat until a draw handed over (a bound
+/// of 32 misses one at (1/3)^32 < 1e-15).
+#[test]
+fn a_live_tests_hand_overs_on_a_check_with_a_three_are_asked_by_a_stop_that_comes_first() {
+    let root = setup("select-instead-stop");
+    neutral_fit(&root);
+    let learned = [("BORG_SELECT", "learned")];
+    let at_stop = [("BORG_SELECT", "learned"), ("BORG_MODE", "live")];
+    let others = ["G0".to_string(), "G1".to_string()];
+    let (mut experiment, mut sessions) = (0, 0);
+    while experiment == 0 && sessions < 32 {
+        let session = format!("h{sessions}");
+        sessions += 1;
+        prompt(&root, &session, PROMPT, &learned);
+        edit(&root, &session, "/x/net.rs", "drop the budget token with a reset arc");
+        answer(&root, &[("Mdrain", 3), ("G0", 2), ("G1", 1)]);
+        live_check_under(&root, &session, "learned");
+        let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == session.as_str() && g["channel"] == "live").unwrap();
+        let check = g["check"].as_str().unwrap().to_string();
+        assert_eq!(g["xk"].as_u64(), Some(2), "{g}");
+        let s = usize::try_from(g["xs"].as_u64().unwrap_or_else(|| panic!("no draw logged: {g}"))).unwrap();
+        let asked: Vec<String> = std::iter::once("Mdrain".to_string()).chain(others[..s].iter().cloned()).collect();
+        let free: Vec<String> = others[s..].to_vec();
+        assert_eq!((strings(&g["chosen"]), strings(&g["free"])), (asked.clone(), free.clone()), "{g}");
+        if free.is_empty() {
+            continue;
+        }
+        experiment += 1;
+        assert!(state(&root, &session, "queued").lines().any(|l| l == format!("instead {} @{check}", free.join(","))), "{}", state(&root, &session, "queued"));
+
+        // The stop, no tool call in between: the live check covered the turn, and its block asks all.
+        let out = stop(&root, &session, LAST, &at_stop);
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("s = {s}: {out}"));
+        assert_eq!(v["decision"], "block", "s = {s}: {out}");
+        let block = v["reason"].as_str().unwrap_or_default();
+        assert!(block.contains("explicit consumer") && block.contains("websocket") && block.contains("tomatoes"), "s = {s}: every lesson asked: {block}");
+        assert!(state(&root, &session, "queued").trim().is_empty(), "nothing left to be never delivered: {}", state(&root, &session, "queued"));
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let got: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check).map(|(_, r, w, l)| (r, w, sorted(l))).collect();
+        let want = vec![
+            ("asked".to_string(), "at the stop".to_string(), sorted(asked.clone())),
+            ("asked".to_string(), "in place of a hand-over".to_string(), free.clone()),
+        ];
+        assert_eq!(got, want, "{:?}", routes(&root));
+        let at = |o: &Value| o["session"] == session.as_str() && o["channel"] == "stop" && o["check"] == check.as_str();
+        let records: Vec<(Vec<String>, Value, bool)> =
+            of(&root, "asked").iter().filter(|o| at(o)).map(|o| (sorted(lessons(o)), o["p"].clone(), o.get("pool").is_some())).collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!((&records[0].0, records[0].1.as_array().map(Vec::len)), (&sorted(asked.clone()), Some(asked.len())), "the asks keep their p: {records:?}");
+        assert_eq!((&records[1].0, &records[1].1, records[1].2), (&free, &Value::Null, false), "a hand-over: no p, no pool: {records:?}");
+        let ctx = state(&root, &session, "ctx");
+        for id in &free {
+            assert!(ctx.contains(&format!("{id}={check}")), "routed by the live check: {ctx}");
+        }
+    }
+    assert!(experiment > 0, "no draw handed over in {sessions} sessions");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The evidence rule's hand-overs of lessons the fixed rule asks are never cut by the free budget
+/// either (hook.rs `INSTEAD_NEXT`): under a fit sure that handing over beats asking, a live check with
+/// a 3 (Mdrain) and five long 2s the fixed rule asks beside it deviates on evidence and hands lessons
+/// over in place of questions, more than one free delivery's budget (`conscience::EARLY_CHARS`) holds.
+/// They stay free, as the evidence rule valued them: the stop leaves them in the queue, and the next
+/// prompt delivers every one of them, with no `dropped_chars` record.
+#[test]
+fn the_evidence_rules_hand_overs_of_lessons_the_fixed_rule_asks_are_never_cut_by_the_free_budget() {
+    let root = setup("select-evidence-instead");
+    fit_beside(&root, true);
+    let words = ["websocket", "tomatoes", "invoices", "telescope", "glaciers"];
+    let others = lengthen(&root, &words);
+    let learned = [("BORG_SELECT", "learned")];
+    let at_stop = [("BORG_SELECT", "learned"), ("BORG_MODE", "live")];
+    let mut applies = vec![("Mdrain", 3)];
+    applies.extend(others.iter().map(|id| (id.as_str(), 2)));
+    prompt(&root, "e1", PROMPT, &learned);
+    edit(&root, "e1", "/x/net.rs", "drop the budget token with a reset arc");
+    answer(&root, &applies);
+    live_check_under(&root, "e1", "learned");
+    let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == "e1" && g["channel"] == "live").unwrap();
+    let check = g["check"].as_str().unwrap().to_string();
+    let free = strings(&g["free"]);
+    let long: Vec<&String> = free.iter().filter(|id| others.contains(id)).collect();
+    assert_eq!(g["source"].as_str(), Some("evidence"), "{g}");
+    assert!(long.len() > 3, "more hand-overs than one free delivery holds: {g}");
+    assert!(state(&root, "e1", "queued").lines().any(|l| l == format!("instead-next {} @{check}", free.join(","))), "{}", state(&root, "e1", "queued"));
+
+    // The stop asks none of them; the next prompt hands over every one.
+    let out = stop(&root, "e1", LAST, &at_stop);
+    for (i, id) in others.iter().enumerate() {
+        assert!(!free.contains(id) || !out.contains(words[i]), "{id} asked at the stop: {out}");
+    }
+    let out = context(&prompt(&root, "e1", "and the retries?", &learned));
+    for (i, id) in others.iter().enumerate().filter(|(_, id)| free.contains(id)) {
+        assert!(out.contains(words[i]), "{id} never reached the drone: {out}");
+    }
+    let cut: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check && r.1 == "dropped_chars").collect();
+    assert!(cut.is_empty(), "{cut:?}");
+    let handed: Vec<_> = routes(&root).into_iter().filter(|r| r.0 == check && r.1 == "free").flat_map(|r| r.3).collect();
+    assert_eq!(handed, free, "{:?}", routes(&root));
+    let _ = std::fs::remove_dir_all(root);
 }

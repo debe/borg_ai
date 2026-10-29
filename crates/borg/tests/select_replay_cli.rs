@@ -1,8 +1,9 @@
 //! `borg debug select`: the selection policy's pre-registered checks replayed from a log, through the
 //! CLI: a fixed-rule log reproduced, a changed decision caught, predictions without the future, the
 //! value model's calibration passed and failed, a planted world ranked, an evaluation's recall kept and
-//! lost, the learned policy whatever the environment, the routed store, and bad usage. A check that
-//! tested nothing says NOT TESTED and, when decisive, fails the command.
+//! lost, P4a–P4c by the rules v2, the question-count test's readout, the learned policy whatever the
+//! environment, the routed store, and bad usage. A check that tested nothing says NOT TESTED and, when
+//! decisive, fails the command.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -50,7 +51,7 @@ fn result(kind: &str, session: &str, lesson: &str, ms: i64, channel: &str) -> Va
 }
 
 /// The command's exit code for a JSON report: 1 when a decisive check (P0–P4) failed or tested
-/// nothing, else 0.
+/// nothing, else 0. P4's verdict is P4a–P4c's by the rules v2's default rule (select/replay.rs `P4`).
 fn exit_of(v: &Value) -> Option<i32> {
     let c = &v["report"]["checks"];
     Some(i32::from(["p0", "p1", "p2", "p3", "p4"].iter().any(|p| c[p]["verdict"] == "fail" || c[p]["verdict"] == "not_tested")))
@@ -95,7 +96,7 @@ fn a_fixed_rule_log_is_reproduced_with_its_propensities() {
     let (text, v, code) = run(&root, &fixed_log(), &[]);
     assert_eq!(code, exit_of(&v), "{text}");
     assert!(
-        text.starts_with("file ") && text.contains("\nrules 2026-10-28, amendment 2026-10-29 (docs/evidence.md#lesson-selection: "),
+        text.starts_with("file ") && text.contains("\nrules 2026-10-28, amendment 2026-10-29, rules v2 2026-10-29 (docs/evidence.md#lesson-selection: "),
         "the rules it checked, where to read them: {text}"
     );
     assert!(text.contains(" here, the checks replay the learned policy; summary v"), "{text}");
@@ -116,11 +117,18 @@ fn a_fixed_rule_log_is_reproduced_with_its_propensities() {
     assert!(text.contains("no budget set for the collective: spend reported, not gated; the policy's pools spend 18000 tokens per session"), "{text}");
     assert!(text.contains("spend, policy: 3 checks, 2 questions, 1 blocks at the stop, 4 free, pool tokens not logged"), "{text}");
     assert!(text.contains("no check has judged units of one grade on two routes yet"), "{text}");
+    assert!(
+        text.contains("question-count test readout (rules v2): not due (0 of 300 checks that drew a count, 0 of 30 sessions with one; 0 of them the control arm, 0 refused by the gate)\n"),
+        "{text}"
+    );
     assert!(text.contains("P4 full-information recall: NOT RUN: pass --eval RUNS_DIR --qrels FILE"), "{text}");
     assert!(text.contains("P5 off-policy: REPORTED (non-decisive): 2 judged units"), "{text}");
     let c = &v["report"]["checks"];
     assert_eq!((c["p1"]["replayed"].as_u64(), c["p1"]["max_delta"].as_f64(), c["p0"]["differ"].as_u64()), (Some(3), Some(0.0), Some(0)), "{v}");
-    assert_eq!((&v["report"]["rules"], &v["report"]["amendment"]), (&json!("2026-10-28"), &json!("2026-10-29")));
+    assert_eq!(
+        (&v["report"]["rules"], &v["report"]["amendment"], &v["report"]["rules_v2"]),
+        (&json!("2026-10-28"), &json!("2026-10-29"), &json!("2026-10-29"))
+    );
     // Without --replay: the state only, under the policy this process decides by.
     let out = borg(&["debug", "select", "--file", root.join("outcomes.jsonl").to_str().unwrap()], &root);
     let state = String::from_utf8_lossy(&out.stdout);
@@ -327,18 +335,20 @@ fn harmful(sessions: usize) -> String {
     lines(&log)
 }
 
-/// P4 on the same evaluation (every run four stop checks, each with the right lesson R as a 1) under
-/// two stores: fitted on `planted` the learned policy keeps R and P4 passes; fitted on `harmful` it
-/// leaves the stop's 1s undelivered, P4 fails, and so does the command, while the fixed rule hands R
-/// over in every run and the n = 0 prior's arm passes under both. The harmful store passes P0–P3 on
-/// its own, so its exit is P4's.
+/// P4 on the same evaluation (every run two stop and two live checks, each with the right lesson R as
+/// a 1 beside another 1) under two stores, by the rules v2: fitted on `planted` the decision rule keeps
+/// R (P4b passes or, deciding as the fixed rule, is NOT TESTED), the n = 0 prior decides as the fixed
+/// rule (P4a) and the question-count test on the live checks keeps every run's recall (P4c), so P4
+/// passes; fitted on `harmful` the decision rule leaves the 1s undelivered, P4b fails, and so does the
+/// command, while the fixed rule hands R over in every run. The harmful store passes P0–P3 on its
+/// own, so its exit is P4's.
 #[test]
 fn p4_fails_the_command_when_the_stores_posterior_loses_the_right_lesson() {
     let root = tmp("harm");
     let runs = root.join("runs");
     for case in ["rf01", "rf02"] {
         for seed in 0..2 {
-            eval_run(&runs, case, seed, &[("R:1:0,X:1:1", false); 4]);
+            eval_run(&runs, case, seed, &[("R:1:0,X:1:1", false), ("R:1:0,X:1:1", true), ("R:1:0,X:1:1", false), ("R:1:0,X:1:1", true)]);
         }
     }
     let qrels = root.join("qrels.jsonl");
@@ -346,8 +356,14 @@ fn p4_fails_the_command_when_the_stores_posterior_loses_the_right_lesson() {
     let eval = ["--eval", runs.to_str().unwrap(), "--qrels", qrels.to_str().unwrap()];
     let (text, v, _) = run(&root, &planted(60), &eval);
     let p4 = &v["report"]["checks"]["p4"];
-    assert_eq!(p4["verdict"], "pass", "a posterior that keeps the right lesson: {text}");
-    assert!(p4["posterior"]["deviations"].as_u64().unwrap() > 0 && p4["prior"]["pass"] == true, "{p4}");
+    assert_eq!((&p4["verdict"], &p4["p4a"]["verdict"], &p4["p4c"]["verdict"]), (&json!("pass"), &json!("pass"), &json!("pass")), "{text}");
+    assert!(matches!(p4["p4b"]["verdict"].as_str(), Some("pass" | "not_tested")), "a posterior that keeps the right lesson: {text}");
+    assert!(p4["p4c"]["arm"]["deviations"].as_u64().unwrap() > 0 && p4["p4c"]["arm"]["same"] == 4, "the test moves routes, never recall: {p4}");
+    assert!(
+        text.contains("  P4a identity at n = 0, the decision rule without the test under the n = 0 prior: PASS (bar: 0 differences from the fixed rule)"),
+        "{text}"
+    );
+    assert!(text.contains("  P4c the test keeps recall, ungated on every live check (4 of 4 runs recall as the fixed rule): PASS (bar: every run)"), "{text}");
     let log = harmful(8);
     let (text, v, code) = run(&root, &log, &[]);
     for p in ["p0", "p1", "p2", "p3"] {
@@ -356,11 +372,10 @@ fn p4_fails_the_command_when_the_stores_posterior_loses_the_right_lesson() {
     assert_eq!(code, Some(0), "P4 not run decides nothing: {text}");
     let (text, v, code) = run(&root, &log, &eval);
     let p4 = &v["report"]["checks"]["p4"];
-    assert_eq!((p4["verdict"].as_str(), code), (Some("fail"), Some(1)), "{text}");
-    assert!(text.contains("P4 full-information recall: FAIL\n") && text.contains("fixed rule: recall 100.0%"), "{text}");
-    let post = &p4["posterior"];
+    assert_eq!((p4["verdict"].as_str(), p4["p4b"]["verdict"].as_str(), code), (Some("fail"), Some("fail"), Some(1)), "{text}");
+    assert!(text.contains("P4 full-information recall: FAIL: P4b FAIL\n") && text.contains("fixed rule: recall 100.0%"), "{text}");
+    let post = &p4["p4b"]["arm"];
     assert!(post["recall"].as_f64().unwrap() < 0.5 && post["pass"] == false && post["deviations"].as_u64().unwrap() > 0, "{post}");
-    assert_eq!(p4["prior"]["pass"], true, "the n = 0 prior keeps the right lesson: {}", p4["prior"]);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -402,13 +417,16 @@ fn p4_compares_recall_on_an_evaluations_graded_lines() {
     )
     .unwrap();
     let (text, v, code) = run(&root, &fixed_log(), &["--eval", runs.to_str().unwrap(), "--qrels", qrels.to_str().unwrap()]);
-    // Decided either way (the learned core's recall is its own); the fixed rule's is the log's.
+    // The store is the fixed rule's own log: the n = 0 prior decides as the fixed rule (P4a), the posterior
+    // decides as it at every check, so P4b tests nothing (NOT TESTED), and the test on the live checks keeps
+    // every run's recall (P4c); P4 passes on P4a and P4c.
     let p4 = &v["report"]["checks"]["p4"];
-    assert!(matches!(p4["verdict"].as_str(), Some("pass" | "fail")), "{p4}");
+    let verdicts = [&p4["verdict"], &p4["p4a"]["verdict"], &p4["p4b"]["verdict"], &p4["p4c"]["verdict"]].map(|x| x.as_str());
+    assert_eq!(verdicts, [Some("pass"), Some("pass"), Some("not_tested"), Some("pass")], "P4, P4a, P4b, P4c: {text}");
     assert_eq!(code, exit_of(&v), "{text}");
-    assert!(text.contains("2 of 2 cases, 4 runs (2–2 per case), 5 checks, $0.1000 per check"), "{text}");
+    assert!(text.contains("2 of 2 cases, 4 runs (2–2 per case), 5 checks (5 apply a lesson), $0.1000 per check"), "{text}");
     assert!(text.contains("fixed rule: recall 75.0%; per check 1.00 questions, 0.40 free, 0.40 blocks at the stop"), "{text}");
-    for arm in ["learned, n = 0 prior: recall ", "learned, store posterior (fit "] {
+    for arm in ["  P4a identity at n = 0, ", "  P4b recall under the store posterior (fit ", "  P4c the test keeps recall, ungated on every live check ("] {
         assert!(text.contains(arm) && text.contains(" points (case-paired 95% CI); per check "), "{arm}: {text}");
     }
     assert_eq!((p4["runs"].as_u64(), p4["checks"].as_u64()), (Some(4), Some(5)), "{p4}");

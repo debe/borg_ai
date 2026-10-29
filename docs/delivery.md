@@ -46,7 +46,8 @@ question with the next tool call during the turn), **free** (context with the ne
 **not now** (it stays eligible for a later check). The selection policy chooses the routes. Its
 objective is quality, the mistakes the lessons help avoid; there is no cost cap.
 
-**The fixed rule** is the default, and the reference everything else is measured against. With a
+**The fixed rule** is the reference everything else is measured against, and the way back
+(`BORG_SELECT=fixed`). With a
 grade 3, ask every 3 and 2, and the 1s while the block has fewer than 10 lessons. Without one, hand
 over the 2s and then the 1s, at most 10. A lesson the session already had delivered may still be
 asked, but never takes a free slot, since delivery would drop it as given before: the next 2 or 1
@@ -77,22 +78,77 @@ yield. The checks therefore also collect, at no cost to the fixed rule's quality
 `borg status`, `borg top` and the Conscience page of `borg web` count the placebos drawn and judged and
 the tail lessons shown and applied.
 
-**The learned policy** is opt-in (`BORG_SELECT=learned`) until its pre-registered checks pass (see
-*Why the fixed rule is the default*, below). It fits one model of what each route is worth from the
+**The learned policy** is the default, since its pre-registered checks passed (see *Why the
+learned policy is the default*, below). It fits one model of what each route is worth from the
 logged outcomes: the chance that a lesson changes the work and avoids its consequence, by grade, rank,
 channel, a 3 in the check, route and how many lessons share the route (more questions, or more free
-context, make each one less likely to land), with an effect per session, per lesson and per judge
+context, may make each one less likely to land), with an effect per session, per lesson and per judge
 version. A free lesson's value is weighed by its learned chance of
 arriving, and so is a live question's (a stop's question blocks, so it always arrives); a lesson left
-for later earns its value at the check that delivers it, not here. Each check takes the routes that
-avoid the most mistakes under one draw of that model, seeded by the check, so a replay gives the same
-routes; a lesson the session already had is never handed over free. A conservative gate keeps the
-fixed rule's routes unless the policy has room: a deviation is admitted only while the replayed
-quality of the policy's checks stays at most 10% of the fixed rule's own replayed value below the
-fixed rule, at the 5% quantile. A new store has no room, so it starts exactly as the fixed rule, and
-exploration is rationed by quality, never by a fixed rate. A grade 3 at the stop is always asked, and
-a check with more than 16 lessons that apply takes the fixed rule. It draws its placebos as the fixed
-rule does, among the applies it leaves for later.
+for later earns its value at the check that delivers it, not here.
+
+**It deviates only on evidence.** Each check finds the routes that avoid the most mistakes under the
+model's posterior mean, and plays them only when they beat the fixed rule's routes at the 5% quantile
+over 512 joint draws of the model; otherwise it keeps the fixed rule's (`evidence` when it deviates).
+An effect the outcomes do not pin down keeps a wide posterior, and a wide posterior beats the fixed
+rule at no quantile, so no prior decides alone. That matters because the fixed rule's history cannot
+identify two effects: how much each further question dilutes the others, and what a lesson not
+delivered still changes. The dilution prior assumes none (its mode is 0). A new store, with no
+outcomes, decides exactly as the fixed rule. Nothing in this decision is drawn at random, so each
+lesson's logged chance of its route is exact: 1 or 0. A lesson the session already had is never handed
+over free. A conservative gate keeps the fixed rule's routes unless the policy has room: a deviation
+is admitted only while the replayed quality of the policy's checks stays at most 10% of the fixed
+rule's own replayed value below the fixed rule, at the 5% quantile. The 10% is the engineer's
+tolerance for learning, the collective's `risk` in `collectives.json` when it sets one
+([Collectives](configuration.md#collectives)). Exploration is rationed by quality, never by a fixed
+rate. A grade 3 at the stop is always asked, and a check with more than 16
+lessons that apply takes the fixed rule. It draws its placebos as the fixed rule does, among the
+applies it leaves for later.
+
+**The question-count test.** The fixed rule never varies how many lessons a check asks: with a grade
+3 it asks every lesson it delivers, without one it asks none and hands the 2s and 1s over. Whether
+asking a 2 beats handing it over is therefore the decision its history cannot inform. The learned
+policy learns it by a randomised test on the live checks where the evidence keeps the fixed rule:
+
+1. Of the lessons the fixed rule delivers, asked or handed over, take the k that are not grade 3 and
+   may go free (not one the session already had). With k = 0 there is nothing to test.
+2. Draw s uniformly from 0 to k, seeded by the check, so a replay draws the same s.
+3. Ask the first s of them in the fixed rule's order (2s before 1s, then by rank), and hand the rest
+   over free. Grade 3s are asked, as the fixed rule asks them.
+
+The fixed rule is one of the draws, s = 0 without a 3 and s = k with one: such a check is the test's
+control (`experiment_control`), every other draw an `experiment`. Each s has the chance 1/(k + 1), so
+each lesson's logged chance of being asked or handed over (`p`, `pf`) is its exact share of the k + 1
+counts, and the graded record logs k and s (`xk`, `xs`).
+
+The test never withholds a lesson. Every lesson the fixed rule delivers is still delivered, asked or
+handed over, and every lesson it leaves out stays out: only the route changes, so the right lesson
+reaches the agent as often as under the fixed rule (P4c checks it). On a check with a grade 3, the
+lessons the test hands over are ones the fixed rule would have asked, so they wait in the queue marked
+as handed over in place of questions (an `instead` line). The free delivery carries them whatever its
+character bound (2,000 characters), as the questions they replace would have been carried, and what
+else waits free keeps that bound without them. When the stop comes before the next prompt or touch,
+the stop asks them, as the check's own block would have, recorded as asked at the stop for the
+check's hand-over (reason `in place of a hand-over`) and counted on its free route. The evidence rule's
+hand-overs of lessons the fixed rule asks wait the same way, as `instead-next` lines carried whatever
+the bound; no stop asks those, since the evidence rule valued them as hand-overs. What a draw can cost is the
+quality of a delivery: a lesson handed over instead of asked may land less often, and a further
+question may dilute the others. The gate charges that risk as it charges any deviation: a draw plays
+only when its loss against the fixed rule at the 5% quantile fits what the gate may still risk, else
+the check takes the fixed rule (`gate`, its k and drawn s still logged), and a count the gate refuses
+counts as the fixed rule's routes in the logged chances. The share the gate may risk is the
+collective's `risk` (10% by default); `0` turns the test off. The test never runs at the stop: a
+stop's question blocks the turn, and a lesson handed over at the stop arrives only if another prompt
+comes. A live question blocks the stop only when its check graded a 3, as that check's block at the
+stop would have. A question the test draws on a live check without a 3 never blocks it: if no tool
+call delivered it by the stop, it arrives with the next prompt (a `live-next` line in the queue), and it is valued at a hand-over's
+arrival rate (`free_live`), since the same events bring it; the live-question rate (`ask_live`) is a
+check with a 3's.
+
+`borg status`, `borg top` and the Conscience page of `borg web` show the test: the checks it drew a
+count for, of them its controls and those the gate refused, how often each s was drawn, the risk share
+in force, and, once due, the readout below. They also count the checks whose routes differ from the
+fixed rule's under the current fit, on evidence or by a played draw.
 
 The model is refitted at the end of `borg learn`, which every session end starts, never in a hook. A
 hook reads a summary of the outcome log cached beside the lessons (`select-summary.json`, local, never
@@ -131,7 +187,7 @@ per session on average. The learned policy then weighs a larger pool against the
 keeps the replayed spend within the budget, from the first fit that knows the budget, gate open or
 not. The fixed rule reads no budget.
 
-**Why the fixed rule is the default.** The learned policy's checks were written before it was built
+**Why the learned policy is the default.** The learned policy's checks were written before it was built
 (P0–P5, `borg debug select --replay`, 0 tokens): that a closed gate decides exactly as the fixed rule,
 that a replay reproduces every decision, that the model predicts no worse than the grade alone, that
 the gate never risks more than its share, and that recall of the right lesson holds on an evaluation's
@@ -140,13 +196,28 @@ upper bound of the difference was +0.012 against the bar's 0.005 (P2). On the re
 the right lesson's recall under the store's posterior was −4.02 points [−7.28, −1.24] against the fixed
 rule, a lower bound past the bar's −5 (P4). The one rerun the amendment to the rules allows, on the
 fixed tree, passed P2 only by the pruned model and failed P4 again: −3.53 points [−6.74, −0.98] under
-the store's posterior, −3.77 [−6.89, −1.18] under the n = 0 prior. The fixed rule stays the default
-([Evidence](evidence.md#lesson-selection)). Under `BORG_SELECT=learned` the monitor guards it, and
-after 300 judged lessons whose route was randomised, or 30 sessions, a readout compares asking,
-handing over and not delivering per grade.
+the store's posterior, −3.77 [−6.89, −1.18] under the n = 0 prior. The prior-only arm failed as the
+posterior arm did, so the fault was the design, not the data: the policy played one random draw of the
+model, and the two effects the fixed rule's history cannot identify decided from their priors alone.
+The policy as described above (it deviates only on evidence, and learns the question count by the
+randomised test) is the second design, under rules written before it was built (Rules v2): with no
+outcomes, the decision rule without the test must equal the fixed rule on every check of the
+evaluation's runs (P4a), its recall under the store's posterior must hold within 5 points, or it
+deviates nowhere and is the fixed rule (P4b), and the test's recall must equal the fixed rule's
+(P4c). Their one run (2026-10-29, the P4 cases seen a third time) passed P0–P3, P4a and P4c, and
+P4b was NOT TESTED: under the store's posterior the decision rule deviated on none of the
+evaluation's checks, so there it is the fixed rule. That made the learned policy the default, as the
+rules say. Today it differs from the fixed rule by the question-count test on live checks, which
+withholds no lesson and which the gate rations by `risk`; it leaves the fixed rule on evidence only
+once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
 
-**Switches.** `BORG_SELECT=learned` opts in to the learned policy, `BORG_SELECT=fixed` keeps the fixed
-rule whatever else is set. `BORG_STOP_ASK_CAP` and `BORG_STOP_ATTENTION=on` are evaluation arms.
+**Readout.** Under the learned policy the monitor guards the policy, and after 300 randomised
+checks or 30 sessions a readout reports dilution (for each number m ≥ 2 of the test's questions
+asked, how often the top tested lesson changed the work against it asked alone) and asking against
+handing over a grade 2, with session-bootstrap 95% intervals ([Evidence](evidence.md#lesson-selection)).
+
+**Switches.** The learned policy decides with no switch set (`BORG_SELECT=learned` names it);
+`BORG_SELECT=fixed` keeps the fixed rule whatever else is set. `BORG_STOP_ASK_CAP` and `BORG_STOP_ATTENTION=on` are evaluation arms.
 `BORG_SELECT=fixed` wins over the cap, the cap over attention, and both over `BORG_SELECT=learned`
 ([Environment variables](configuration.md#environment-variables)).
 
@@ -164,7 +235,7 @@ the same questions. They differ in *when* the call runs.
 |---|---|---|
 | Prompt | Early delivery and waiting free lessons (grades 2 and 1 under the fixed rule) | The same, plus questions from a live check that finished since |
 | Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background; a later tool call starts one while changes wait unchecked. A live check has no word gate: a turn half done has too few words for it. The lessons it asks (under the fixed rule: with a grade 3, every 3 and 2 and the 1s up to 10) arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Its free lessons arrive as at the turn end |
-| Turn end | The free gate, then one graded call; a stop that asks blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's question that no tool call delivered yet blocks the stop, as in hook mode. Lessons asked live are not asked again |
+| Turn end | The free gate, then one graded call; a stop that asks blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's question that no tool call delivered yet blocks the stop only when its check graded a 3, as the stop's own grade 3 does; else it arrives with the next prompt. Lessons asked live are not asked again |
 | Model calls | At most one per turn end; the gate skips most | One per burst of changes (at most one running at a time, at most one start per 45 s), plus the turn end when changes came after the last check |
 | Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s (omp: 7 s) for a check still running |
 | Harnesses | Claude Code, omp, opencode 1.x/2.x, Codex | Claude Code, omp (≥18.4.4), opencode 1.x/2.x, Codex |

@@ -900,8 +900,10 @@ fn by_check<'a>(routed: &[(&'a conscience::Challenge, &'a str)]) -> Vec<(&'a str
 /// Graded Stop (default): what a graded check left for later, one line per check, waiting for the
 /// session's next prompt or touch (`queued`): `<ids> @<check>`, the 2s and 1s of a check that did not
 /// block, to hand over free; `placebo <ids> @<check>`, a check's placebo draws (select.rs `Routed`); and
-/// in live mode `live <ids> @<check>`, a live check's asks (`live_check`). A line of an older binary has
-/// no tag.
+/// in live mode `live <ids> @<check>`, a live check's asks a stop asks while they wait (its check graded a
+/// 3), and `live-next <ids> @<check>`, those it never asks (`live_check`, `take_live`); `instead <ids>
+/// @<check>` and `instead-next <ids> @<check>`, a check's free lessons handed over in place of questions
+/// the fixed rule asks (`INSTEAD`, `INSTEAD_NEXT`). A line of an older binary has no tag.
 fn queued_file(session: &str) -> PathBuf {
     state_file(session).with_extension("queued")
 }
@@ -910,15 +912,43 @@ fn queued_file(session: &str) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Queued {
     Ask,
+    /// Free, in place of a question the fixed rule asks (`INSTEAD`).
+    Instead,
     Free,
     Placebo,
 }
 
+/// Protocol: the prefix of a live check's free lessons that the fixed rule would have asked, drawn by
+/// the question-count test on a check with a 3 (select/policy.rs `test_routes`; `queued_file`). A free
+/// delivery carries them whatever its budget (`queued`, conscience.rs `render_owing`), as the questions
+/// they replace would have been carried, and what else waits free keeps the budget it had without them;
+/// a stop that comes before a delivery took them asks them in its block (`take_live`), as the check's
+/// own block there would have. So the test withholds nothing.
+const INSTEAD: &str = "instead ";
+
+/// Protocol: the prefix of the other free lessons a check hands over in place of questions the fixed
+/// rule asks (`queued_file`): the evidence rule's on a check with a 3 (select/policy.rs `EVIDENCE`),
+/// which valued them as hand-overs (their chance of arriving included), and any of a stop's. A free
+/// delivery carries them whatever its budget, as `INSTEAD`'s; no stop asks them.
+const INSTEAD_NEXT: &str = "instead-next ";
+
+/// Protocol: the prefix of a live check's asks no stop asks (`queued_file`): a tool call or the next
+/// prompt asks them, as it asks a `live` line's.
+const LIVE_NEXT: &str = "live-next ";
+
+/// Protocol: the `delivery` record's reason (outcome.rs `DELIVERY`) for a live check's hand-over in place
+/// of a question (`INSTEAD`) that a stop asked in its block because no delivery took it first
+/// (`stop_ask`): its route is the one that happened, `asked` on channel stop, not the check's `free`.
+const ASKED_INSTEAD: &str = "in place of a hand-over";
+
 /// A queue line's route, ids and check (empty on an older binary's line).
 fn queue_line(line: &str) -> (Queued, Vec<&str>, &str) {
-    let (route, list) = match (line.strip_prefix("live "), line.strip_prefix("placebo ")) {
-        (Some(l), _) => (Queued::Ask, l),
-        (_, Some(l)) => (Queued::Placebo, l),
+    let ask = line.strip_prefix("live ").or_else(|| line.strip_prefix(LIVE_NEXT));
+    let instead = line.strip_prefix(INSTEAD).or_else(|| line.strip_prefix(INSTEAD_NEXT));
+    let (route, list) = match (ask, line.strip_prefix("placebo "), instead) {
+        (Some(l), _, _) => (Queued::Ask, l),
+        (_, Some(l), _) => (Queued::Placebo, l),
+        (_, _, Some(l)) => (Queued::Instead, l),
         _ => (Queued::Free, line),
     };
     (route, ids_in(list).collect(), tagged(list).1.unwrap_or_default())
@@ -944,20 +974,37 @@ fn take_queue(session: &str) -> Option<String> {
     Some(text)
 }
 
-/// Live mode, at the stop: the live checks' asks still waiting in the `.queued` file (`live <ids>`), each
-/// with its check, taken out of it; the 2s and 1s and the placebos stay for the next prompt or touch.
-fn take_live(session: &str) -> Vec<(String, String)> {
-    let Some(text) = take_queue(session) else { return Vec::new() };
-    let (live, rest): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.starts_with("live "));
-    for line in rest {
-        enqueue(session, line);
-    }
-    let mut out = Vec::new();
-    for line in live {
+/// Live mode, at the stop: what the stop asks of the `.queued` file, each lesson with its check, taken out
+/// of it: the live checks' asks still waiting (`live <ids>`), and the question-count test's hand-overs
+/// in place of questions the fixed rule asks (`instead <ids>`, `INSTEAD`), which the fixed rule's block
+/// would have asked here. The 2s and 1s, the asks of a check without a 3 (`live-next <ids>`,
+/// `live_check`), the evidence rule's hand-overs (`INSTEAD_NEXT`) and the placebos stay for the next
+/// prompt or touch.
+fn take_live(session: &str) -> Taken {
+    let Some(text) = take_queue(session) else { return Taken::default() };
+    let mut taken = Taken::default();
+    for line in text.lines() {
+        let to = match (line.starts_with("live "), line.starts_with(INSTEAD)) {
+            (true, _) => &mut taken.asks,
+            (_, true) => &mut taken.instead,
+            _ => {
+                enqueue(session, line);
+                continue;
+            }
+        };
         let (_, ids, check) = queue_line(line);
-        out.extend(ids.into_iter().map(|i| (i.to_string(), check.to_string())));
+        to.extend(ids.into_iter().map(|i| (i.to_string(), check.to_string())));
     }
-    out
+    taken
+}
+
+/// What a stop took out of the `.queued` file to ask (`take_live`), each lesson with its check.
+#[derive(Default)]
+struct Taken {
+    /// Live checks' asks.
+    asks: Vec<(String, String)>,
+    /// The question-count test's hand-overs in place of questions the fixed rule asks (`INSTEAD`).
+    instead: Vec<(String, String)>,
 }
 
 /// The lessons a `.queued` file's `text` holds to be asked or handed over (every line but a placebo's):
@@ -976,7 +1023,7 @@ fn note_never_delivered(session: &str, input: &Value) {
         let (route, ids, check) = queue_line(line);
         let channel = match route {
             Queued::Ask => "live",
-            Queued::Free => "queued",
+            Queued::Instead | Queued::Free => "queued",
             Queued::Placebo => outcome::PLACEBO,
         };
         record_route(session, input, check, ids.into_iter().map(String::from).collect(), channel, outcome::ROUTE_NEVER, "session ended");
@@ -1011,8 +1058,9 @@ type Drop<'a> = (&'a str, &'static str, &'static str, &'static str);
 /// The waiting graded lessons, once (`queued_file`): a live check's asks first, whatever order their
 /// checks finished in, as questions to answer (`ask_live`), unless done (`done_in`, the definition its
 /// check's pool used: a grade 3 on a lesson handed over but not acted on is asked, never dropped); then
-/// the free lessons not asked or handed over in the session yet (`had_in`), as many as one early
-/// delivery fits (`conscience::render_early`); and last the placebos not shown meanwhile (asked or handed
+/// the free lessons not asked or handed over in the session yet (`had_in`), those in place of a
+/// question (`INSTEAD`) all and first, the others as many as one early delivery fits beside them
+/// (`conscience::render_owing`); and last the placebos not shown meanwhile (asked or handed
 /// over, now or before; one the budget cut stays a placebo), never shown but marked for the judge
 /// (`#borg-placebo`, judged as a free delivery is). Free deliveries are marked `#borg-queued <ids>
 /// @<check>` in the state and .edits files (after the work so far, `WORK`), so neither this queue nor
@@ -1027,11 +1075,14 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
     let had = had_in(&state);
     let mut done: Option<std::collections::HashSet<&str>> = None;
     let mut lines: Vec<(Queued, Vec<&str>, &str)> = text.lines().map(queue_line).collect();
-    // Asks, then free lessons, then placebos (`Queued`'s order), each in its lines' order.
+    // Asks, then free lessons in place of questions, then the other free ones, then placebos
+    // (`Queued`'s order), each in its lines' order.
     lines.sort_by_key(|l| l.0);
     let placebos = lines.iter().position(|l| l.0 == Queued::Placebo).unwrap_or(lines.len());
     let (mut firm, mut wanted, mut placebo): (Pairs, Pairs, Pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut dropped: Vec<(Drop, &str)> = Vec::new();
+    // The first `owed` of `wanted`: the free lessons in place of questions, which sort first.
+    let mut owed = 0;
     for (route, ids, check) in &lines[..placebos] {
         let channel = if *route == Queued::Ask { "live" } else { "queued" };
         for &id in ids {
@@ -1049,12 +1100,15 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
             match why {
                 Some(why) => dropped.push(((check, channel, outcome::ROUTE_DROPPED_DONE, why), id)),
                 None if *route == Queued::Ask => firm.push((c, check)),
-                None => wanted.push((c, check)),
+                None => {
+                    owed += usize::from(*route == Queued::Instead);
+                    wanted.push((c, check));
+                }
             }
         }
     }
     let free: Vec<&conscience::Challenge> = wanted.iter().map(|(c, _)| *c).collect();
-    let shown = conscience::render_early(&free, &[]);
+    let shown = conscience::render_owing(&free, &[], owed);
     let n = shown.as_ref().map_or(0, |(_, n)| *n);
     dropped.extend(wanted[n..].iter().map(|(c, check)| ((*check, "queued", outcome::ROUTE_DROPPED_CHARS, "budget"), c.id.as_str())));
     // A placebo is a lesson the drone was not shown: decided against what this delivery shows (the asks,
@@ -1271,8 +1325,12 @@ enum Verdict {
     Skip(String),
     /// The model gave no answer: fail open.
     Failed,
-    /// The ids to ask: in a block at the stop, with the next prompt or tool call in live mode.
-    Ask(Vec<String>),
+    /// The ids to ask: in a block at the stop, with the next prompt or tool call in live mode; and
+    /// whether a stop may ask them in its block while they wait: the check graded a 3, so the fixed
+    /// rule's block there would have asked them too. Without a 3, a live check's asks (the randomised
+    /// question-count test's, or the evidence rule's, valued at a hand-over's arrival rate, as live questions no stop asks,
+    /// select/policy.rs `Valuer::ask`) wait for a tool call or the next prompt (`live_check`).
+    Ask(Vec<String>, bool),
 }
 
 /// The work a check judges, as the stop or a live check read it.
@@ -1487,12 +1545,24 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
         let queue = !r.free.is_empty();
         log_cost(session, &format!("graded applied={} ask={} free={} {}", applied.len(), r.ask.len(), r.free.len(), if queue { "queued" } else { "dropped" }));
         if queue {
-            enqueue(session, &format!("{}{}", ids(&r.free).join(","), tag(w.check)));
+            // The learned policy's hand-overs of lessons the fixed rule asks (on a check with a 3: the
+            // question-count test's, or the evidence rule's) are marked, so the free delivery's budget
+            // never cuts what a question would have carried; and a live check's test draws are asked by
+            // a stop that comes first (`INSTEAD`), the rest are not (`INSTEAD_NEXT`).
+            let asks = if r.log.policy == crate::select::Policy::Learned.name() { conscience::graded_without(&applied, None, &[]).0 } else { Vec::new() };
+            let (owed, rest): (Vec<&conscience::Challenge>, Vec<&conscience::Challenge>) = r.free.iter().partition(|c| asks.iter().any(|a| a.id == c.id));
+            if !owed.is_empty() {
+                let prefix = if live && r.log.source == crate::select::policy::EXPERIMENT { INSTEAD } else { INSTEAD_NEXT };
+                enqueue(session, &format!("{prefix}{}{}", ids(&owed).join(","), tag(w.check)));
+            }
+            if !rest.is_empty() {
+                enqueue(session, &format!("{}{}", ids(&rest).join(","), tag(w.check)));
+            }
         }
         if !r.placebo.is_empty() {
             enqueue(session, &format!("placebo {}{}", ids(&r.placebo).join(","), tag(w.check)));
         }
-        Verdict::Ask(ids(&r.ask))
+        Verdict::Ask(ids(&r.ask), applied.iter().any(|(_, g)| *g == 3))
     } else {
         // R3b: the model decides whether to ask (at the stop, an extra round); once it does, the questions
         // also carry every other lesson over the low bar (conscience.rs `widen`).
@@ -1501,7 +1571,8 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
         let widened: Vec<&conscience::Challenge> =
             conscience::in_scope_first(conscience::explored(pool.iter().copied())).into_iter().filter(|c| w.challenges.iter().any(|x| x.id == c.id)).collect();
         append_p_of(session, &pool, &widened, w.check);
-        Verdict::Ask(ids(&widened))
+        // Ungraded, the stop asks whatever it widens to: so it would have asked these.
+        Verdict::Ask(ids(&widened), true)
     }
 }
 
@@ -1590,9 +1661,12 @@ fn decide<'a>(
     let mut had: Vec<String> = had_in(&state).into_iter().chain(waiting_in(&queue)).map(str::to_string).collect();
     had.sort_unstable();
     had.dedup();
+    // The collective's tolerance, read once: every way below decides and logs under it (select.rs `Ctx::alpha`).
+    let alpha = crate::select::alpha(at.lessons);
     // Decided under `policy` on `summary` and recorded with `why`; whether the record landed.
     let mut on = |summary: &crate::select::summary::Summary, policy: Policy, why: &'static str| {
-        let ctx = crate::select::Ctx { session: at.session, check: at.check, channel: at.channel, lessons: at.lessons, summary, tokens: at.tokens, had: &had };
+        let ctx =
+            crate::select::Ctx { session: at.session, check: at.check, channel: at.channel, lessons: at.lessons, summary, tokens: at.tokens, had: &had, alpha };
         let r = crate::select::graded_under(policy, applied, &ctx);
         let landed = record(&r, &Basis { summary, had: &had, why });
         (r, landed)
@@ -1633,7 +1707,8 @@ fn graded_log() -> PathBuf {
 /// `seed`, which reads only the session, channel and check; the tag spells "tailpool").
 fn tail_seed(session: &str, check: &str, live: bool, summary: &crate::select::summary::Summary) -> u64 {
     let channel = if live { "live" } else { "stop" };
-    let ctx = crate::select::Ctx { session, check, channel, lessons: std::path::Path::new(""), summary, tokens: 0, had: &[] };
+    let ctx =
+        crate::select::Ctx { session, check, channel, lessons: std::path::Path::new(""), summary, tokens: 0, had: &[], alpha: crate::select::policy::ALPHA };
     crate::select::seed(&ctx) ^ u64::from_be_bytes(*b"tailpool")
 }
 
@@ -1662,9 +1737,10 @@ fn record_graded(
 /// (`Call::order`; a tail lesson's past the budget's, `Call::tail`), propensities to be asked (`p`) and
 /// handed over free (`pf`); the routes (`chosen`, `free`, `placebo`, and ψ, each apply's chance of the
 /// placebo draw among those routed nowhere, select.rs `Log::psi`); the applies that could not go free
-/// because the session had them (`nofree`); the tail sample (`tail`, `pt`, and after the applies'
-/// fill positions each tail lesson's, outcome.rs `fill`); the policy, its fit, the
-/// summary the decision read (`Basis`) and why it fell back to the fixed rule (`reason`); and the call.
+/// because the session had them (`nofree`); the question-count test's k and s on a check it considered
+/// (`xk`, `xs`, select.rs `Log::xk`); the tail sample (`tail`, `pt`, and after the applies' fill
+/// positions each tail lesson's, outcome.rs `fill`); the policy, its fit, the summary the decision read
+/// (`Basis`) and why it fell back to the fixed rule (`reason`); and the call.
 #[allow(clippy::too_many_arguments)] // reason: one record of a check, from the parts the check holds apart
 fn graded_outcome(
     session: &str,
@@ -1705,6 +1781,11 @@ fn graded_outcome(
         placebo: routed.map(|r| ids(&r.placebo)).unwrap_or_default(),
         psi: routed.map_or(0.0, |r| r.log.psi),
         nofree: basis.map(|b| crate::select::nofree(applied, b.had)).unwrap_or_default(),
+        // The question-count test's k and s (select.rs `Log::xk`, `xs`): None outside it.
+        xk: routed.and_then(|r| r.log.xk),
+        xs: routed.and_then(|r| r.log.xs),
+        // The tolerance it was decided under (select.rs `Log::alpha`): None at the default.
+        alpha: routed.and_then(|r| r.log.alpha),
         tail: call.tail.iter().map(|(_, c)| c.id.clone()).collect(),
         pt: call.pt,
         reason: basis.map(|b| b.why).unwrap_or_default().into(),
@@ -1768,7 +1849,9 @@ fn live_trigger(session: &str, input: &Value, tool: &str, changed: bool) {
 
 /// `borg check` (live.rs): one check of the session's work so far, in the background. Takes the
 /// session's lock (or leaves: a check runs), decides again under it, then runs the stop's check on this
-/// turn so far: the 3s wait in the `.queued` file as a `live <ids>` line, the 2s and 1s as at the stop.
+/// turn so far: its asks wait in the `.queued` file as a `live <ids>` line when it graded a 3, which a stop
+/// asks while they wait as its own block would have, else as a `live-next <ids>` line, which no stop
+/// asks (`Verdict::Ask`); the free lessons as at the stop.
 /// It writes no `#borg-asked` (that happens at delivery, `ask_live`) and no `#borg-skip` (that closes a
 /// stop's turn): a gate skip is `#borg-live-skip`. The mark records the changes a completed check covered.
 pub fn live_check(h: &dyn Harness, session: &str, input: &Value) {
@@ -1819,9 +1902,10 @@ pub fn live_check(h: &dyn Harness, session: &str, input: &Value) {
             before
         }
         Verdict::Failed => before,
-        Verdict::Ask(ids) => {
+        Verdict::Ask(ids, blocks) => {
             if !ids.is_empty() {
-                enqueue(session, &format!("live {}{}", ids.join(","), tag(&check_id)));
+                let prefix = if blocks { "live " } else { LIVE_NEXT };
+                enqueue(session, &format!("{prefix}{}{}", ids.join(","), tag(&check_id)));
             }
             n
         }
@@ -2005,9 +2089,13 @@ struct StopLive {
     budget: Option<std::time::Duration>,
     lock: live::Lock,
     guard: Option<live::Guard>,
-    /// A live check's 3s that no tool call delivered yet, each with its check: this stop asks them (it
-    /// would have).
+    /// The asks of a live check that graded a 3 which no tool call delivered yet, each with its check:
+    /// this stop asks them (its block would have). A check's asks without a 3 never block a stop: they
+    /// stay in the queue for the next prompt or touch (`take_live`).
     waiting: Vec<(String, String)>,
+    /// A live check's hand-overs in place of questions the fixed rule asks (`INSTEAD`) that no tool call
+    /// delivered yet, each with its check: this stop asks them too, as the fixed rule's block would have.
+    instead: Vec<(String, String)>,
 }
 
 impl StopLive {
@@ -2017,8 +2105,8 @@ impl StopLive {
         let lock = if on { live::wait_free(&state_file(session), live::stop_wait(budget).as_millis() as u64) } else { live::Lock::Free };
         let guard = if on && lock != live::Lock::Held { live::acquire(&state_file(session), learn::now_ms()) } else { None };
         let lock = if on && guard.is_none() { live::Lock::Held } else { lock };
-        let waiting = if on { take_live(session) } else { Vec::new() };
-        StopLive { on, budget, lock, guard, waiting }
+        let Taken { asks: waiting, instead } = if on { take_live(session) } else { Taken::default() };
+        StopLive { on, budget, lock, guard, waiting, instead }
     }
 }
 
@@ -2056,14 +2144,14 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     let acted = early_acted(session, &all, &proposal);
     let only = std::env::var_os("BORG_ONLY").is_some();
     let done = if only { std::collections::HashSet::new() } else { done_in(&state, &acted) };
-    // What still waits is decided already: a live check's asks (`stop_check` asks them unless done
-    // since) and the free lessons of a check whose line no delivery took yet (a live check that finished
+    // What still waits is decided already: a live check's asks and its test's hand-overs in place of
+    // questions (`stop_check` asks them unless done since) and the free lessons of a check whose line no delivery took yet (a live check that finished
     // during the turn's last change, an earlier stop's at a harness without prompt context; `queued`
     // hands them over). Out of this stop's pool, as a live check leaves them out of its own
     // (`waiting_in`), so one check decides each.
     let queue = if only { String::new() } else { std::fs::read_to_string(queued_file(session)).unwrap_or_default() };
     let waiting: std::collections::HashSet<&str> =
-        if only { Default::default() } else { live.waiting.iter().map(|(id, _)| id.as_str()).chain(waiting_in(&queue)).collect() };
+        if only { Default::default() } else { live.waiting.iter().chain(&live.instead).map(|(id, _)| id.as_str()).chain(waiting_in(&queue)).collect() };
     // Lessons of other systems (systems.rs) are neither shortlisted nor asked.
     let challenges: Vec<conscience::Challenge> =
         all.iter().filter(|c| !done.contains(c.id.as_str()) && !waiting.contains(c.id.as_str()) && !c.off_system).cloned().collect();
@@ -2090,7 +2178,7 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
         summary: &summary,
     };
     match stop_select(h, session, input, &work, &live) {
-        Ok(selected) => stop_ask(h, session, input, selected, &check_id),
+        Ok(selected) => stop_ask(h, session, input, selected, &check_id, &live.instead),
         Err(out) => out,
     }
 }
@@ -2124,9 +2212,10 @@ fn stop_select<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, 
 }
 
 /// The consequence model's verdict at the stop, unless a live check covered the turn; a live check's
-/// waiting asks join it, each with its own check (the stop's pool left them out, `on_stop`, so its own
-/// asks never hold one). A waiting ask the stop finds done since, or not deliverable, is dropped with its
-/// `delivery` record (`dropped_done`), never silently.
+/// waiting asks and its test's hand-overs in place of questions (`StopLive::instead`) join it, each with
+/// its own check (the stop's pool left them out, `on_stop`, so its own asks never hold one). A waiting
+/// ask the stop finds done since, or not deliverable, is dropped with its `delivery` record
+/// (`dropped_done`), never silently.
 fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, live: &StopLive) -> Result<Asks<'a>, Option<Value>> {
     let skip = |why: &str| {
         append(session, &format!("#borg-skip {why}"));
@@ -2135,7 +2224,10 @@ fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, l
         Err(crate::queen::stop(session, input, &|| harness::plan(h.caps(), input), &prompts, &[]))
     };
     let mut waiting: Vec<(&conscience::Challenge, String)> = Vec::new();
-    for (id, check) in &live.waiting {
+    // The waiting asks, then the hand-overs in place of questions: each judged done as an ask is, since
+    // the stop asks it as the fixed rule's block would have; a drop on the channel it waited for.
+    let instead = live.instead.iter().map(|(id, check)| (id, check, "queued"));
+    for (id, check, channel) in live.waiting.iter().map(|(id, check)| (id, check, "live")).chain(instead) {
         let why = match w.all.iter().find(|c| &c.id == id).filter(|c| !c.off_system) {
             Some(_) if waiting.iter().any(|(c, _)| &c.id == id) => "queued twice",
             Some(_) if w.done.contains(id.as_str()) => "done at the stop",
@@ -2145,10 +2237,10 @@ fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, l
             }
             None => "not deliverable",
         };
-        record_route(session, input, check, vec![id.clone()], "live", outcome::ROUTE_DROPPED_DONE, why);
+        record_route(session, input, check, vec![id.clone()], channel, outcome::ROUTE_DROPPED_DONE, why);
     }
     // Live mode: a check that started in this turn covered every change and none came since: its
-    // verdict stands (its waiting asks are asked now), and this stop costs no model call (live.rs `covered`).
+    // verdict stands (its waiting asks and hand-overs in place of questions are asked now), and this stop costs no model call (live.rs `covered`).
     let ctx = state_file(session);
     if live.on && live::covered(live.lock, live::count(&ctx), live::read_mark(&ctx), turn_id(session)) {
         return if waiting.is_empty() { skip("live_covered") } else { Ok(waiting) };
@@ -2157,7 +2249,7 @@ fn stop_check<'a>(h: &dyn Harness, session: &str, input: &Value, w: &Work<'a>, l
         Verdict::Skip(_) | Verdict::Failed if !waiting.is_empty() => Vec::new(),
         Verdict::Skip(score) => return skip(&score),
         Verdict::Failed => return Err(None),
-        Verdict::Ask(ids) => ids.iter().filter_map(|i| w.challenges.iter().find(|c| &c.id == i)).map(|c| (c, w.check.to_string())).collect(),
+        Verdict::Ask(ids, _) => ids.iter().filter_map(|i| w.challenges.iter().find(|c| &c.id == i)).map(|c| (c, w.check.to_string())).collect(),
     };
     // Disjoint: the stop's own asks come from its pool, which holds no waiting ask.
     asked.extend(waiting);
@@ -2283,9 +2375,11 @@ fn graded_of(session: &str, ids: &[String]) -> (Vec<u8>, Vec<u16>, u16) {
 
 /// The stop asks `selected`, each with the check that routed it: one block (the queen's, when it asks
 /// too), `#borg-asked <ids> @<check>` with this stop's `check`, and right after it `#borg-routed
-/// <id>=<check>,…` for the lessons another check routed (a live check's waiting ask); per routing
-/// check its `asked` record and its `delivery` record.
-fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Asks, check: &str) -> Option<Value> {
+/// <id>=<check>,…` for the lessons another check routed (a live check's waiting ask, or its hand-over
+/// in place of a question, `instead`); per routing check its `asked` record and its `delivery` record,
+/// a hand-over's apart: its check chose no question, so its record carries no p and no pool (unknown,
+/// never another draw's), and its delivery says it was asked in place of a hand-over (`ASKED_INSTEAD`).
+fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Asks, check: &str, instead: &[(String, String)]) -> Option<Value> {
     // Shown in an order stable within the session but different across sessions: no lesson always
     // sits first (position bias; memory.rs `shuffle`).
     crate::memory::shuffle(&mut selected, session);
@@ -2321,12 +2415,18 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Asks, c
         // The block's disagreements, on each record holding one of their sides (outcome.rs `contradicted`
         // reads them across the session's records).
         let disagree = conscience::disagreement_ids(&lessons);
-        let routed: Vec<(&conscience::Challenge, &str)> = selected.iter().map(|(c, k)| (*c, k.as_str())).collect();
-        for (k, members) in by_check(&routed) {
+        let (handed, routed): (Vec<(&conscience::Challenge, &str)>, Vec<_>) =
+            selected.iter().map(|(c, k)| (*c, k.as_str())).partition(|(c, k)| instead.iter().any(|(id, at)| *id == c.id && at == k));
+        let groups = by_check(&routed).into_iter().map(|g| (g, false)).chain(by_check(&handed).into_iter().map(|g| (g, true)));
+        for ((k, members), handed) in groups {
             let ids: Vec<String> = members.iter().map(|i| (*i).to_string()).collect();
             let (grades, ranks, applied) = graded_of(session, &ids);
-            let p = if k.is_empty() { propensity_in(&state, &ids) } else { tagged_p(&state, "#borg-p ", k, &members) };
-            let (pool, base, scoped) = pool_in(&state, &ids);
+            let p = match handed {
+                true => Vec::new(),
+                false if k.is_empty() => propensity_in(&state, &ids),
+                false => tagged_p(&state, "#borg-p ", k, &members),
+            };
+            let (pool, base, scoped) = if handed { Default::default() } else { pool_in(&state, &ids) };
             let asked = outcome::Outcome {
                 kind: outcome::ASKED.into(),
                 session: session.into(),
@@ -2346,7 +2446,11 @@ fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut selected: Asks, c
                 ..Default::default()
             };
             let _ = outcome::append(&learn::home().join("outcomes.jsonl"), &asked);
-            let reason = if k == check { "" } else { "at the stop" };
+            let reason = match (handed, k == check) {
+                (true, _) => ASKED_INSTEAD,
+                (false, true) => "",
+                (false, false) => "at the stop",
+            };
             record_route(session, input, k, ids, "stop", outcome::ROUTE_ASKED, reason);
         }
     }
@@ -2498,9 +2602,12 @@ mod tests {
         assert_eq!(queue_line(&format!("A,B @{c}")), (Queued::Free, vec!["A", "B"], c));
         assert_eq!(queue_line(&format!("live A @{c}")), (Queued::Ask, vec!["A"], c));
         assert_eq!(queue_line(&format!("placebo X,Y @{c}")), (Queued::Placebo, vec!["X", "Y"], c));
+        assert_eq!(queue_line(&format!("instead G0,G1 @{c}")), (Queued::Instead, vec!["G0", "G1"], c));
+        assert_eq!(queue_line(&format!("instead-next G2 @{c}")), (Queued::Instead, vec!["G2"], c));
         // An older binary's lines: no check.
         assert_eq!(queue_line("A,B"), (Queued::Free, vec!["A", "B"], ""));
         assert_eq!(queue_line("live A"), (Queued::Ask, vec!["A"], ""));
+        assert_eq!(queue_line(&format!("live-next A,B @{c}")), (Queued::Ask, vec!["A", "B"], c));
         assert_eq!(listed(&format!("#borg-asked A,B @{c}\n#borg-asked C\n"), "#borg-asked "), ["A", "B", "C"].into_iter().collect());
     }
 
@@ -2670,8 +2777,15 @@ mod tests {
 
     /// A store for `decide`: its lessons file (empty) and outcomes beside it, and a saved selection summary
     /// whose fit is sure that handing over beats asking, with a gate open wide: a learned live check
-    /// deviates, and its record moves the gate's ledger.
+    /// deviates on evidence, and its record moves the gate's ledger.
     fn decide_store(name: &str) -> std::path::PathBuf {
+        decide_store_with(name, true)
+    }
+
+    /// `decide_store`, its fit `sure` that handing over beats asking, or (not `sure`) with no evidence
+    /// either way, asking and handing over worth the same: a learned live check then keeps the fixed rule
+    /// on evidence and runs the question-count test, which the open gate admits.
+    fn decide_store_with(name: &str, sure: bool) -> std::path::PathBuf {
         use crate::select::{policy, summary};
         let d = std::env::temp_dir().join(format!("borg-decide-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -2682,8 +2796,10 @@ mod tests {
         let at = |name: &str| policy::NAMES.iter().position(|n| *n == name).unwrap();
         let mut beta = vec![0.0; policy::P];
         beta[at("intercept")] = -0.5;
-        beta[at("ask")] = -3.0;
-        beta[at("not")] = -1.0;
+        if sure {
+            beta[at("ask")] = -3.0;
+            beta[at("not")] = -1.0;
+        }
         let mut chol = vec![0.0; policy::P * policy::P];
         for k in 0..policy::P {
             chol[k * policy::P + k] = 0.05;
@@ -2705,6 +2821,35 @@ mod tests {
         outcome::append(&outcome::path_beside(lessons), &o).is_ok()
     }
 
+    /// The question-count test's k and s reach the graded record from the decision's log, the s = 0
+    /// draw included; a check outside the test and a failed one log neither.
+    #[test]
+    fn the_graded_record_carries_the_question_count_tests_draw() {
+        use crate::select::{Log, Routed, policy, summary};
+        let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
+        let ls = [c("A"), c("B")];
+        let applied: Vec<(&conscience::Challenge, u8)> = ls.iter().zip([2, 1]).collect();
+        let order: Vec<&conscience::Challenge> = ls.iter().collect();
+        let call = Call { eligible: 2, order: &order, tail: &[], pt: 0.0, model: "", prompt_hash: String::new(), dur_ms: 1, usd: 0.0 };
+        let s = summary::Summary::default();
+        let basis = Basis { summary: &s, had: &[], why: "" };
+        let routed = |source: &'static str, xk: Option<u32>, xs: Option<u32>| Routed {
+            ask: Vec::new(),
+            free: vec![&ls[0], &ls[1]],
+            placebo: Vec::new(),
+            p: vec![0.0, 0.0],
+            pf: vec![1.0, 1.0],
+            log: Log { policy: "learned", source, xk, xs, ..Log::default() },
+        };
+        let record = |r: Option<&Routed>| graded_outcome("s", "r", "0123456789ab", true, &applied, r.map(|r| (r, &basis)), &s, &call);
+        let drawn = record(Some(&routed(policy::EXPERIMENT_CONTROL, Some(2), Some(0))));
+        assert_eq!((drawn.source.as_str(), drawn.xk, drawn.xs), (policy::EXPERIMENT_CONTROL, Some(2), Some(0)));
+        let outside = record(Some(&routed(policy::EVIDENCE, None, None)));
+        assert_eq!((outside.source.as_str(), outside.xk, outside.xs), (policy::EVIDENCE, None, None));
+        let failed = record(None);
+        assert_eq!((failed.failed, failed.xk, failed.xs), (true, None, None));
+    }
+
     fn graded_records(lessons: &std::path::Path) -> Vec<outcome::Outcome> {
         outcome::read(&outcome::path_beside(lessons)).into_iter().filter(|o| o.kind == outcome::GRADED).collect()
     }
@@ -2721,9 +2866,11 @@ mod tests {
         let ls = [c("A"), c("B"), c("C"), c("D")];
         let applied: Vec<(&conscience::Challenge, u8)> = ls.iter().zip([3, 1, 2, 1]).collect();
         let mut gates = Vec::new();
+        // One after the other, with the hook's own wait: a process spawned by another test while the
+        // first held the lock keeps a copy of its descriptor, so the flock, until it execs.
         for check in ["0000000000a1", "0000000000b2"] {
             let at = Decide { session: "decide-fresh", check, channel: "live", lessons: &lessons, tokens: 0, recorded: true };
-            let r = decide(Policy::Learned, &applied, &at, &stale, std::time::Duration::ZERO, |r, b| record_beside(&lessons, &applied, check, r, b));
+            let r = decide(Policy::Learned, &applied, &at, &stale, DECIDE_WAIT, |r, b| record_beside(&lessons, &applied, check, r, b));
             gates.push(r.log.gate);
         }
         let g = graded_records(&lessons);
@@ -2743,39 +2890,47 @@ mod tests {
 
     /// Two checks deciding at once take turns: while one holds the store's decision lock (deciding and
     /// recording), the other, past its wait, takes the fixed rule, which reads no gate, and says why;
-    /// never both against the same gate. A lock that cannot be taken at all is the fixed rule too.
+    /// never both against the same gate. So for a deviation on evidence and for the question-count test
+    /// alike (its draw logged on the learned record only). A lock that cannot be taken at all is the
+    /// fixed rule too.
     #[test]
     fn two_checks_deciding_at_once_never_both_take_the_gate() {
         use crate::select::{Policy, policy, summary};
-        let lessons = decide_store("race");
-        let stale = summary::refresh(&lessons);
         let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
         let ls = [c("A"), c("B"), c("C"), c("D")];
         let applied: Vec<(&conscience::Challenge, u8)> = ls.iter().zip([3, 1, 2, 1]).collect();
-        // Each records only once both have decided: the first to take the lock holds it until the other
-        // decided without it.
-        let both = std::sync::Barrier::new(2);
-        std::thread::scope(|s| {
-            for check in ["0000000000c1", "0000000000c2"] {
-                let (applied, lessons, stale, both) = (&applied, &lessons, &stale, &both);
-                s.spawn(move || {
-                    let at = Decide { session: "decide-race", check, channel: "live", lessons, tokens: 0, recorded: true };
-                    decide(Policy::Learned, applied, &at, stale, std::time::Duration::ZERO, |r, b| {
-                        both.wait();
-                        record_beside(lessons, applied, check, r, b)
+        let mut stores = Vec::new();
+        for (name, sure, sources) in [("race", true, &[policy::EVIDENCE][..]), ("race-test", false, &[policy::EXPERIMENT, policy::EXPERIMENT_CONTROL][..])] {
+            let lessons = decide_store_with(name, sure);
+            let stale = summary::refresh(&lessons);
+            // Each records only once both have decided: the first to take the lock holds it until the
+            // other decided without it.
+            let both = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                for check in ["0000000000c1", "0000000000c2"] {
+                    let (applied, lessons, stale, both) = (&applied, &lessons, &stale, &both);
+                    s.spawn(move || {
+                        let at = Decide { session: "decide-race", check, channel: "live", lessons, tokens: 0, recorded: true };
+                        decide(Policy::Learned, applied, &at, stale, std::time::Duration::ZERO, |r, b| {
+                            both.wait();
+                            record_beside(lessons, applied, check, r, b)
+                        });
                     });
-                });
-            }
-        });
-        let mut got: Vec<(String, String, String)> = graded_records(&lessons).into_iter().map(|o| (o.policy, o.source, o.reason)).collect();
-        got.sort();
-        assert_eq!(
-            got,
-            [("fixed".to_string(), "fixed".to_string(), outcome::DECIDED_BUSY.to_string()), ("learned".into(), "learned".into(), String::new())],
-            "one decided under the lock, the other took the fixed rule"
-        );
-        assert!(policy::remaining(&summary::refresh(&lessons).gate) >= -1e-9, "the gate never overspent");
+                }
+            });
+            let mut got: Vec<(String, String, String, bool)> =
+                graded_records(&lessons).into_iter().map(|o| (o.policy, o.source, o.reason, o.xk.is_some())).collect();
+            got.sort();
+            assert_eq!(got.len(), 2, "{name}: {got:?}");
+            assert_eq!(got[0], ("fixed".to_string(), "fixed".to_string(), outcome::DECIDED_BUSY.to_string(), false), "{name}: the other took the fixed rule");
+            let (policy, source, reason, drawn) = &got[1];
+            assert!(policy == "learned" && sources.contains(&source.as_str()) && reason.is_empty(), "{name}: one decided under the lock: {got:?}");
+            assert_eq!(*drawn, !sure, "{name}: the test's draw on its record alone");
+            assert!(policy::remaining(&summary::refresh(&lessons).gate) >= -1e-9, "{name}: the gate never overspent");
+            stores.push(lessons);
+        }
         // No lock to be had (the store's directory is gone): the fixed rule, and why.
+        let stale = summary::refresh(&stores[0]);
         let gone = std::path::Path::new("/nonexistent/borg-decide/lessons.jsonl");
         let at = Decide { session: "decide-race", check: "0000000000c3", channel: "live", lessons: gone, tokens: 0, recorded: true };
         let mut why = "";
@@ -2784,7 +2939,9 @@ mod tests {
             true
         });
         assert_eq!((r.log.policy, why), ("fixed", outcome::DECIDED_NO_LOCK));
-        let _ = std::fs::remove_dir_all(lessons.parent().unwrap());
+        for lessons in stores {
+            let _ = std::fs::remove_dir_all(lessons.parent().unwrap());
+        }
     }
 
     /// The fixed rule and the evaluation switches read no gate: while another check holds the store's
@@ -2802,7 +2959,16 @@ mod tests {
         let held = lock_within(&decide_lock(&lessons), std::time::Duration::ZERO).unwrap();
         let check = "0000000000e1";
         let at = Decide { session: "decide-nolock", check, channel: "stop", lessons: &lessons, tokens: 0, recorded: true };
-        let ctx = Ctx { session: at.session, check, channel: at.channel, lessons: &lessons, summary: &stale, tokens: 0, had: &[] };
+        let ctx = Ctx {
+            session: at.session,
+            check,
+            channel: at.channel,
+            lessons: &lessons,
+            summary: &stale,
+            tokens: 0,
+            had: &[],
+            alpha: crate::select::alpha(&lessons),
+        };
         let fixed = ids(&graded_under(Policy::Fixed, &applied, &ctx).ask);
         for policy in [Policy::Fixed, Policy::Cap(1), Policy::Attention] {
             let own = graded_under(policy, &applied, &ctx);
@@ -2832,7 +2998,7 @@ mod tests {
     /// so checks one after another never each risk the whole allowance of a gate none of them debited.
     #[test]
     fn a_learned_decision_whose_record_cannot_land_takes_the_fixed_rule() {
-        use crate::select::{Ctx, Policy, graded_under, summary};
+        use crate::select::{Ctx, Policy, graded_under, policy, summary};
         let lessons = decide_store("unrecorded");
         let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
         let ls = [c("A"), c("B"), c("C"), c("D")];
@@ -2840,7 +3006,16 @@ mod tests {
         let ids = |cs: &[&conscience::Challenge]| cs.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
         let at = |check: &'static str, recorded: bool| Decide { session: "decide-unrecorded", check, channel: "live", lessons: &lessons, tokens: 0, recorded };
         let fixed = |check: &str, s: &summary::Summary| {
-            let ctx = Ctx { session: "decide-unrecorded", check, channel: "live", lessons: &lessons, summary: s, tokens: 0, had: &[] };
+            let ctx = Ctx {
+                session: "decide-unrecorded",
+                check,
+                channel: "live",
+                lessons: &lessons,
+                summary: s,
+                tokens: 0,
+                had: &[],
+                alpha: crate::select::alpha(&lessons),
+            };
             let r = graded_under(Policy::Fixed, &applied, &ctx);
             (ids(&r.ask), ids(&r.free), ids(&r.placebo))
         };
@@ -2849,7 +3024,7 @@ mod tests {
         let r = decide(Policy::Learned, &applied, &at("0000000000f1", true), &stale, std::time::Duration::ZERO, |r, b| {
             record_beside(&lessons, &applied, "0000000000f1", r, b)
         });
-        assert_eq!(r.log.source, "learned", "{:?}", r.log);
+        assert_eq!(r.log.source, policy::EVIDENCE, "{:?}", r.log);
         let (ask, free, _) = fixed("0000000000f1", &stale);
         assert_ne!((ids(&r.ask), ids(&r.free)), (ask, free), "it deviated");
         let gate = summary::refresh(&lessons).gate;
@@ -2868,7 +3043,8 @@ mod tests {
         // carried out; the store's log and its gate are as they were.
         let stale = summary::refresh(&lessons);
         let mut tried = Vec::new();
-        let r = decide(Policy::Learned, &applied, &at("0000000000f4", true), &stale, std::time::Duration::ZERO, |r, b| {
+        // After the first check's lock, so with the hook's wait (as in the test above).
+        let r = decide(Policy::Learned, &applied, &at("0000000000f4", true), &stale, DECIDE_WAIT, |r, b| {
             tried.push((r.log.policy, b.why));
             false
         });

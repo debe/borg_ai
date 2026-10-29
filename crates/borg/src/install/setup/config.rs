@@ -156,7 +156,16 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, paths: &[&str], share: Share) -> Entry {
-        Entry { name: name.into(), paths: paths.iter().map(|p| (*p).to_string()).collect(), share, experts: Vec::new(), relay: None, mode: None, budget: None }
+        Entry {
+            name: name.into(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            share,
+            experts: Vec::new(),
+            relay: None,
+            mode: None,
+            budget: None,
+            risk: None,
+        }
     }
 
     fn tmp(name: &str) -> PathBuf {

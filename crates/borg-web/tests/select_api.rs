@@ -27,8 +27,9 @@ async fn the_selection_is_the_monitors_own_reading_of_the_summary() {
         std::fs::create_dir_all(home).unwrap();
         std::fs::write(home.join("lessons.jsonl"), "").unwrap();
     }
-    // Two graded checks of one session, the second asking its 3, and a third whose learned decision the
-    // fixed rule took over (another check held the decision lock): what the summary folds.
+    // Two graded checks of one session, the second asking its 3, a third whose learned decision the
+    // fixed rule took over (another check held the decision lock), and a check of the question-count
+    // test: what the summary folds.
     let lines = [
         json!({"kind": "graded", "session": "s", "lessons": ["A", "B"], "grades": [2, 1], "applied": 2, "channel": "live", "ms": 1, "repo": "r",
             "policy": "learned", "check": "0123456789ab", "free": ["A", "B"], "pf": [1.0, 1.0]}),
@@ -36,6 +37,9 @@ async fn the_selection_is_the_monitors_own_reading_of_the_summary() {
             "repo": "r", "policy": "learned", "check": "ba9876543210"}),
         json!({"kind": "graded", "session": "s", "lessons": ["C"], "grades": [3], "applied": 1, "chosen": ["C"], "p": [1.0], "channel": "live", "ms": 3,
             "repo": "r", "policy": "fixed", "reason": "lock_busy", "check": "a1b2c3d4e5f6"}),
+        // A live check of the question-count test whose draw asked none of its one 2 (k 1, s 0).
+        json!({"kind": "graded", "session": "s", "lessons": ["D"], "grades": [2], "applied": 1, "free": ["D"], "p": [0.5], "pf": [0.5], "channel": "live",
+            "ms": 4, "repo": "r", "policy": "learned", "source": "experiment", "xk": 1, "xs": 0, "check": "0a1b2c3d4e5f"}),
     ];
     std::fs::write(corp.join("outcomes.jsonl"), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     let (_tx, stop) = tokio::sync::watch::channel(false);
@@ -54,11 +58,17 @@ async fn the_selection_is_the_monitors_own_reading_of_the_summary() {
     assert_eq!(v["selection"]["policy"], borg::select::policy().name());
     // Each reason a learned decision fell back to the fixed rule, of the graded checks folded.
     let rows = json!([
-        {"name": "lock_busy", "part": 1, "whole": 3},
-        {"name": "lock_failed", "part": 0, "whole": 3},
-        {"name": "unrecorded", "part": 0, "whole": 3},
+        {"name": "lock_busy", "part": 1, "whole": 4},
+        {"name": "lock_failed", "part": 0, "whole": 4},
+        {"name": "unrecorded", "part": 0, "whole": 4},
     ]);
     assert_eq!(v["selection"]["fallbacks"], rows, "{v}");
+    // The question-count test as the summary folded it, under any policy once it counts a check: one
+    // played draw at k 1, s 0, no control, none refused, still in the summary, and the risk share in force.
+    let t = &v["selection"]["test"];
+    assert_eq!((&t["ran"], &t["control"], &t["refused"], &t["sessions"], &t["kept"]), (&json!(1), &json!(0), &json!(0), &json!(1), &json!(1)), "{v}");
+    assert_eq!(t["by_k"], json!([{"k": 1, "draws": [1, 0], "refused": 0}]), "{v}");
+    assert_eq!((t["due"].as_bool(), t["risk"].as_f64()), (Some(false), borg::select::risk_of(&lessons).or(Some(borg::select::policy::ALPHA))));
     // No engineer set a budget: spend is measured, never priced.
     assert_eq!(v["selection"]["budget"], Value::Null, "{v}");
 

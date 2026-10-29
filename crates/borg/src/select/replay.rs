@@ -4,14 +4,17 @@
 //!
 //! **The rules.** docs/evidence.md "Lesson selection" (`RULES_AT`): the pre-registered checks P0–P5,
 //! dated `RULES`; a later change is a dated amendment, and `AMENDMENT` names the latest one this file
-//! implements. Every report prints both.
+//! implements; `RULES_V2` the rules v2, written for policy v2 (it deviates only on evidence and learns
+//! the question count by a randomised test) with the same bars, P4 split into P4a–P4c. Every report
+//! prints all three.
 //!
 //! **Verdicts.** PASS or FAIL against the bar; NOT RUN when there is nothing to run it on (no
 //! evaluation given, or one still incomplete); NOT TESTED when it ran on data that could not have
 //! failed it (no check that applies a lesson, since a check none applied to and a failed call decide
 //! nothing under any policy; no deviation from the fixed rule; an arm that is the fixed rule
 //! everywhere; no label to learn from; every prediction 1/2), never a pass. The command exits 1 when a
-//! decisive check (P0–P4) fails or is NOT TESTED (`unmet`); P5 only reports.
+//! decisive check fails or is NOT TESTED (`unmet`): by the rules v2's default rule, P0–P3, P4a and
+//! P4c, and P4b when it fails (NOT TESTED there means it is the fixed rule); P5 only reports.
 //!
 //! **Two passes over the log, in file order** (the order the hook appended it), each folding it into the
 //! selection summary with select/summary.rs `fold`, so every decision sees only the lines before it,
@@ -23,14 +26,16 @@
 //!   gate closed the learned policy decides as the fixed rule (conscience.rs `graded_without`, no cap),
 //!   which is also the logged decision of every check logged under the fixed rule. P1: the logged
 //!   policy, fit key, summary, revert (outcome.rs `source`), session, channel and check id (its seed)
-//!   give the logged decision, its source and propensities within `ope::AGREE`, and folding piece by
-//!   piece equals folding the whole log.
+//!   give the logged decision, its source, the question-count test's k and s (outcome.rs `xk`, `xs`:
+//!   its draw is the check's seed) and propensities within `ope::AGREE`, and folding piece by piece
+//!   equals folding the whole log.
 //! - *cold start*: the same log, the learned policy deciding from the prior on, each graded record
 //!   replaced by the replayed decision before it is folded (`decided`), so the gate's state is the
 //!   policy's own, and the summary refitted where production refits it (`borg learn` when a session
-//!   ends), so the policy has a model to deviate by. P3: no decision risks more than the gate's budget,
-//!   the first one is the fixed rule's, and with an engineer's budget for the collective the policy's
-//!   pools stay within it; spend is reported.
+//!   ends), so the policy has a model to deviate by. P3: no decision risks more than the gate's budget
+//!   (the question-count test's charged risk among them), the first one is the fixed rule's, and with an
+//!   engineer's budget for the collective the policy's pools stay within it; spend and the decisions'
+//!   sources are reported.
 //!
 //! **Labels** (P2, P5, the readout): a judge's verdict (`asked_then_changed`, `asked_ignored`) joined to
 //! the graded check that routed its delivery: by check id, or for older records the session's last
@@ -51,19 +56,35 @@
 //!   outcome model; non-decisive.
 //!
 //! **P4** reads an evaluation's graded lines (`#borg-graded` in each run's state files) and the case's
-//! relevant lessons (qrels), and compares the right-lesson recall of the fixed rule with the learned
-//! policy's, ungated, expected over `conscience::P_DRAWS` seeded draws, under the n = 0 prior's model
-//! (select/policy.rs `prior`) and under the store's posterior (the whole log fitted as `borg learn`
-//! fits it). Neither arm is the fixed rule unless the model says so, and an arm that is (no draw off it
-//! at any check) is NOT TESTED.
+//! relevant lessons (qrels), and compares the right-lesson recall of the fixed rule with three arms,
+//! each expected over `conscience::P_DRAWS` seeded draws (rules v2):
+//! - P4a: the decision rule without the test (select/policy.rs `decide_on_evidence`) under the n = 0
+//!   prior (`prior`) decides as the fixed rule at every check: 0 differences, else FAIL. It fails if
+//!   any deviation the prior alone drives survives.
+//! - P4b: the same rule under the store's posterior (the whole log fitted as `borg learn` fits it),
+//!   against P4's recall bar; NOT TESTED when it deviates nowhere, which then makes it the fixed rule.
+//! - P4c: the question-count test, ungated (`choose` under the prior with a gate that admits every
+//!   draw), keeps every run's recall at the fixed rule's: it hands over what it does not ask, so it
+//!   withholds nothing. NOT TESTED when no draw leaves the fixed rule (no live check with a lesson that
+//!   may go free).
+//!
+//! **The question-count test's readout** (`test_readout`, rules v2), from the summary's fold of the
+//! log (select/summary.rs `Experiment`, `Check::xk`; never a recount): due after `TEST_CHECKS` checks
+//! that drew a count (played or refused by the gate) or `TEST_SESSIONS` sessions with one, and only
+//! then estimated over the drawn checks the summary still holds (compaction drops the oldest, never
+//! the counts): dilution, the test's top lesson's change rate with m of its questions asked against
+//! asked alone (the same lesson across the uniform draws), and asking a 2 against handing it over (a
+//! Horvitz–Thompson difference by the logged propensities), each verdict weighed by its chance of one,
+//! session-bootstrap 95% intervals.
 //!
 //! **Where it meets the policy core.** Every decision is select.rs `graded_under` with the full `Ctx`
-//! (session, check id, channel, lessons file, summary, logged pool tokens, had), the learned policy
+//! (session, check id, channel, lessons file, summary, logged pool tokens, had, logged tolerance α), the learned policy
 //! named explicitly whatever this process's `policy`; every fold summary.rs `fold`; every pool select.rs
 //! `pool_tokens_under` the learned policy, per check as the hook calls it; the cold start's refits
 //! summary.rs `with_fit`; P0's reference conscience.rs `graded_without`; P2 policy.rs `fit`,
-//! `fit_pruned`, `predict`, `prior`, `prior_pruned`; P3 policy.rs `Decision::risk`; P4 policy.rs `ungated`, `prior`,
-//! `fit` and its baseline policy.rs `fixed_routes`. Where the replay still differs from what production ran:
+//! `fit_pruned`, `predict`, `prior`, `prior_pruned`; P3 policy.rs `Decision::risk`; P4 policy.rs
+//! `decide_on_evidence`, `choose`, `prior`, `fit` and its baseline policy.rs `fixed_routes`. Where the
+//! replay still differs from what production ran:
 //! - The refit is `with_fit`, the pure part of the summary.rs `refit` that main.rs `learn_store` calls:
 //!   `refit` loads the cache plus the log's tail (equal to the replay's fold, which P1's fold check
 //!   shows), adds the revert mark beside the store (the replay keeps the revert in memory, sticky as
@@ -84,10 +105,10 @@
 //!   then and each label's verdict at its value then, without the delivery records, settles and other
 //!   lines of the real log, so the judge's missingness model sees fewer fates than production's fit at
 //!   that check; no budget (it prices only pools).
-//! - P4 draws `ungated` (the play of `choose` with a gate that admits every deviation), at pool tokens
-//!   0 (the state files log none), with no had (the state lines log no `nofree`, and the hook that ran
-//!   the evaluation decided without), from a stand-in check id per check, each check independent of the
-//!   run's earlier draws.
+//! - P4 draws its arms at pool tokens 0 (the state files log none), with no had (the state lines log
+//!   no `nofree`, and the hook that ran the evaluation decided without), from a stand-in check id per
+//!   check, each check independent of the run's earlier draws; P4c's gate admits every draw (`OPEN`)
+//!   at the default tolerance (`policy::ALPHA`).
 //! - P1 compares the asked and free lists, propensities and source, not the placebo draw or its chance
 //!   (`psi`): the pre-registered measure.
 
@@ -112,6 +133,10 @@ pub const RULES: &str = "2026-10-28";
 /// The latest dated amendment of `RULES` this file implements (2026-10-29: P2's prune-and-rerun once;
 /// the bars unchanged). Protocol: printed with every report beside `RULES`.
 pub const AMENDMENT: &str = "2026-10-29";
+/// The rules v2 this file implements, by the date they were written (2026-10-29, after the decisive
+/// rerun: P4a–P4c, P1 and P3 on the question-count test, its readout, the default rule). Protocol:
+/// printed with every report beside `RULES` and `AMENDMENT`.
+pub const RULES_V2: &str = "2026-10-29";
 /// Where the rules and their dated amendments are written: a tracked file of this repository, so a
 /// reader of the report can open them. Protocol: printed with every report.
 pub const RULES_AT: &str = "docs/evidence.md#lesson-selection";
@@ -128,6 +153,21 @@ pub const RECALL_MARGIN: f64 = 0.05;
 /// strictly between 0 and 1) or this many sessions under the learned policy. Method: pre-registered.
 pub const READOUT_UNITS: usize = 300;
 pub const READOUT_SESSIONS: usize = 30;
+
+/// The question-count test's readout (`test_readout`) is due after this many checks that drew a count
+/// (randomised: played or refused) or this many sessions with one. Method: pre-registered (rules v2, 2026-10-29).
+pub const TEST_CHECKS: u64 = 300;
+pub const TEST_SESSIONS: u32 = 30;
+
+/// How far an arm's recall of a run may lie from the fixed rule's and still be equal (P4c). Method:
+/// float slack of summing `conscience::P_DRAWS` draw shares of 1/`P_DRAWS`, far below any one draw's
+/// share.
+const SAME: f64 = 1e-9;
+
+/// The allowance of the gate P4c's test arm decides against: more than any check's charged risk (a
+/// check's value is a sum of per-lesson chances, at most a few units), so every draw is admitted.
+/// Guard: finite, so the gate's arithmetic stays exact.
+const OPEN: f64 = 1e12;
 
 /// A probability a log-loss reads is kept this far from 0 and 1. Guard: a model's 0 or 1 would make
 /// one unit's log-loss infinite and the mean meaningless.
@@ -227,7 +267,7 @@ fn had_of(o: &Outcome) -> Vec<String> {
 
 /// The production decision's context for the graded record `o` with its session's `had` (`had_of`).
 fn ctx<'a>(o: &'a Outcome, had: &'a [String], lessons: &'a Path, s: &'a Summary) -> Ctx<'a> {
-    Ctx { session: &o.session, check: &o.check, channel: channel(o), lessons, summary: s, tokens: o.tokens, had }
+    Ctx { session: &o.session, check: &o.check, channel: channel(o), lessons, summary: s, tokens: o.tokens, had, alpha: super::alpha_of(o.alpha) }
 }
 
 /// The policy a graded record can be replayed under: the fixed rule or the learned policy. The
@@ -286,11 +326,26 @@ fn gate_closed<T>(s: &mut Summary, f: impl FnOnce(&Summary) -> T) -> T {
     out
 }
 
-/// One draw of the learned policy without its gate (P4): select/policy.rs `ungated` (the play of
-/// `choose` with a gate that admits every deviation) on `fit` at the evaluation's check `c`, whose
-/// state file logs no pool tokens (the baseline's).
-fn ungated(units: &[Unit], c: &EvalCheck, fit: &Fit, seed: u64) -> Vec<Route> {
-    policy::ungated(units, &policy::Check { session: &c.session, stop: c.channel == "stop", tokens: 0 }, fit, seed)
+/// The evaluation's check `c` as the policy sees it: its state file logs no pool tokens (the
+/// baseline's).
+fn eval_check(c: &EvalCheck) -> policy::Check<'_> {
+    policy::Check { session: &c.session, stop: c.channel == "stop", tokens: 0 }
+}
+
+/// The decision rule without the question-count test (P4a, P4b): select/policy.rs
+/// `decide_on_evidence` on `fit` at the evaluation's check `c`, for a session that had none of its
+/// lessons (the state lines log no `nofree`). It draws nothing, so it takes no seed.
+fn evidence(units: &[Unit], c: &EvalCheck, fit: &Fit) -> Vec<Route> {
+    policy::decide_on_evidence(units, &eval_check(c), fit, &[])
+}
+
+/// One draw of the question-count test, ungated (P4c): select/policy.rs `choose` on `fit` (the n = 0
+/// prior, under which the decision rule deviates nowhere when P4a passes) at the evaluation's check
+/// `c`, against a gate that admits every draw (`OPEN`) at the default tolerance (`policy::ALPHA`), for
+/// a session that had none of its lessons.
+fn tested(units: &[Unit], c: &EvalCheck, fit: &Fit, seed: u64) -> Vec<Route> {
+    let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: OPEN, ..summary::Gate::default() };
+    policy::choose(units, &eval_check(c), fit, &gate, policy::ALPHA, seed, &[]).routes
 }
 
 /// The quality `r` risks below the fixed rule at the gate's 5% quantile (P3): select/policy.rs
@@ -431,6 +486,9 @@ pub struct P1 {
     /// Replayed checks whose record names the summary its decision read (`Outcome::seen`); the others
     /// (older records) are replayed on every line before them.
     pub seen: usize,
+    /// Of the replayed checks, those whose record logs the question-count test (outcome.rs `xk`): their
+    /// draw and its propensities are replayed from the check's seed.
+    pub tests: usize,
     /// Checks under an evaluation switch (cap, learned cut): counted, not replayed.
     pub switches: usize,
     /// The largest |Δ| between a replayed and a logged propensity (p or pf).
@@ -511,7 +569,8 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
     let mut checks = Vec::new();
     let mut malformed = 0;
     let mut p0 = P0 { verdict: Verdict::Pass, checks: 0, empty: 0, differ: 0, first: Vec::new() };
-    let mut p1 = P1 { verdict: Verdict::Pass, replayed: 0, reproduced: 0, empty: 0, seen: 0, switches: 0, max_delta: 0.0, fold: true, first: Vec::new() };
+    let mut p1 =
+        P1 { verdict: Verdict::Pass, replayed: 0, reproduced: 0, empty: 0, seen: 0, tests: 0, switches: 0, max_delta: 0.0, fold: true, first: Vec::new() };
     let mut start = 0;
     for line in lines(text) {
         let here = start;
@@ -556,6 +615,7 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
                 p1.replayed += 1;
                 p1.empty += usize::from(applied.is_empty());
                 p1.seen += usize::from(!check.o.seen.is_empty());
+                p1.tests += usize::from(check.o.xk.is_some());
                 let found = match seen_at(&check.o, text, here) {
                     Err(e) => Err(e),
                     // The prior has no model: its decision is the fixed rule whatever else the summary holds.
@@ -580,18 +640,27 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
                         at.monitor.reverted = kept;
                         let delta = r.p.iter().zip(&check.p).chain(r.pf.iter().zip(&check.pf)).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
                         p1.max_delta = p1.max_delta.max(delta);
-                        let decided = ids(&r.ask) == check.asked && ids(&r.free) == check.free && (!logged || r.log.source == check.o.source);
+                        // The test's draw: k and s as logged (None outside the test, and on every record
+                        // from before it).
+                        let drawn = (r.log.xk, r.log.xs) == (check.o.xk, check.o.xs);
+                        let decided = ids(&r.ask) == check.asked && ids(&r.free) == check.free && (!logged || (r.log.source == check.o.source && drawn));
                         let aligned = r.p.len() == check.p.len() && r.pf.len() == check.pf.len();
+                        let x = |k: Option<u32>, s: Option<u32>| match (k, s) {
+                            (None, None) => String::new(),
+                            (k, s) => format!(" k {} s {}", k.map_or("-".into(), |k| k.to_string()), s.map_or("-".into(), |s| s.to_string())),
+                        };
                         (!decided || !aligned || delta > ope::AGREE).then(|| {
                             format!(
-                                "{}: replay asks {:?} free {:?} by {} (|Δp| {delta:.4}); logged {:?} free {:?} by {}",
+                                "{}: replay asks {:?} free {:?} by {}{} (|Δp| {delta:.4}); logged {:?} free {:?} by {}{}",
                                 check.line(),
                                 ids(&r.ask),
                                 ids(&r.free),
                                 r.log.source,
+                                x(r.log.xk, r.log.xs),
                                 check.asked,
                                 check.free,
-                                if logged { check.o.source.as_str() } else { "-" }
+                                if logged { check.o.source.as_str() } else { "-" },
+                                x(check.o.xk, check.o.xs)
                             )
                         })
                     }
@@ -672,6 +741,9 @@ pub struct P3 {
     pub pool: f64,
     /// The refits the replay made, one wherever a session had ended since the last (`cold_start`).
     pub refits: usize,
+    /// The replayed decisions per source (select/policy.rs `Decision::source`): how many the evidence
+    /// rule, the question-count test (its control arm apart) and the gate's refusals set.
+    pub sources: BTreeMap<String, usize>,
     pub policy: Spend,
     pub fixed: Spend,
     pub first: Vec<String>,
@@ -694,7 +766,7 @@ fn conduct(steps: &[Step], policy: Spend, fixed: Spend, budget: Option<f64>, poo
         (Verdict::NotTested, _) => "no decision left the fixed rule, so the gate never had to hold one back".to_string(),
         _ => String::new(),
     };
-    P3 { verdict, why, checks: steps.len(), deviations, cold, over: bad.len(), budget, pool, refits: 0, policy, fixed, first }
+    P3 { verdict, why, checks: steps.len(), deviations, cold, over: bad.len(), budget, pool, refits: 0, sources: BTreeMap::new(), policy, fixed, first }
 }
 
 /// A check's propensities of asking (`p`) and of handing over free (`pf`), aligned with its applies.
@@ -714,7 +786,8 @@ fn pool_of(s: &Summary, session: &str) -> usize {
 
 /// The graded record `o` as the decision `r` would have logged it (hook.rs `record_graded`): its
 /// routes, its own propensities (the placebo's `psi` weighs the monitor's estimate, select/policy.rs
-/// `monitor`), policy, fit and source; its applies, had lessons (`nofree`), pool and tail stay the
+/// `monitor`), policy, fit, source and the question-count test's k and s (select/summary.rs counts
+/// them); its applies, had lessons (`nofree`), pool and tail stay the
 /// logged check's.
 fn decided(o: Outcome, r: &Routed) -> Outcome {
     let round = |v: &[f64]| v.iter().map(|p| outcome::round_p(*p)).collect();
@@ -728,6 +801,8 @@ fn decided(o: Outcome, r: &Routed) -> Outcome {
         policy: r.log.policy.into(),
         fit: r.log.fit.clone(),
         source: r.log.source.into(),
+        xk: r.log.xk,
+        xs: r.log.xs,
         explore: false,
         ..o
     }
@@ -748,8 +823,9 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
     let (mut steps, mut targets) = (Vec::new(), Vec::new());
     let (mut spent, mut fixed) = (Spend::default(), Spend::default());
     let (mut ended, mut refits) = (0, 0);
-    // Pool tokens per session.
+    // Pool tokens per session; decisions per source.
     let mut pools: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sources: BTreeMap<String, usize> = BTreeMap::new();
     for line in lines(text) {
         let Some((o, cs)) = line.o.filter(|o| o.kind == outcome::GRADED).and_then(|o| challenges(&o).map(|cs| (o, cs))) else {
             chunk.push_str(line.text);
@@ -774,6 +850,7 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
         fixed.add(&o, fa.len(), ff.len());
         let pool = pool_of(&s, &o.session);
         *pools.entry(o.session.clone()).or_default() += pool as u64;
+        *sources.entry(r.log.source.to_string()).or_default() += 1;
         steps.push(Step { deviates, gate: r.log.gate, risk: risk(&r, deviates), at: format!("session {} ms {}", o.session, o.ms) });
         targets.push((r.p.clone(), r.pf.clone()));
         // The policy's own decision is what the summary folds next.
@@ -786,7 +863,7 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
         }
     }
     let pool = if pools.is_empty() { 0.0 } else { pools.values().sum::<u64>() as f64 / pools.len() as f64 };
-    let p3 = P3 { refits, ..conduct(&steps, spent, fixed, budget, pool) };
+    let p3 = P3 { refits, sources, ..conduct(&steps, spent, fixed, budget, pool) };
     (p3, targets)
 }
 
@@ -1243,9 +1320,119 @@ pub struct Readout {
     pub randomised: usize,
     pub sessions: usize,
     pub contrasts: Vec<Contrast>,
+    /// The question-count test's own readout (rules v2, `test_readout`).
+    pub test: TestReadout,
 }
 
-fn readout(checks: &[Check], labels: &[Label]) -> Readout {
+/// The question-count test's readout (module doc), from the summary's fold (select/summary.rs
+/// `Experiment`, `Check::xk`): its checks that drew a count (randomised), of them the control arm's,
+/// those the gate refused (the fixed rule played) and the sessions with a drawn one, all-time; once
+/// due (`TEST_CHECKS`, `TEST_SESSIONS`), and only then, its estimates over the drawn checks the summary
+/// still holds (`kept`: compaction drops the oldest checks, select/summary.rs `compact`, never the
+/// counts), refused ones included, each with its session's bootstrap 95% interval (`ope::snips`).
+/// Each a Horvitz–Thompson mean over every unit that could go either way, so a unit's outcome y·ω
+/// (`unit_outcome`) counts even when it is 0: a verdict weighed by its inverse chance of one (policy.rs
+/// `judged`, the monitor's), a lesson never delivered 0 (it changed nothing), one closed without a
+/// verdict 0 (its route's judged ones stand in for it), one still open out until it closes.
+/// - `by_asked`, dilution, per m ≥ 2: the test's top lesson (the first of select/policy.rs `tested`,
+///   asked at every s ≥ 1) asked with m of the test's questions against asked alone, over the drawn
+///   checks with k ≥ m: Σ (k + 1)·([s = m] − [s = 1])·y·ω / n. s is uniform in 0..=k, so the same
+///   lesson's two draws differ in the number asked alone (grade mix, the 3s and k do not enter); by the
+///   drawn s, a count the gate refused played as the fixed rule (intention to treat).
+/// - `ask_free`, asking a 2 against handing it over: Σ([asked]·y·ω/p − [free]·y·ω/pf)/n over the 2s
+///   that could go either way (0 < p, pf; the logged propensities are the draw's, a refused count's
+///   routes the fixed rule's, select/policy.rs `choose`), a difference of change rates.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TestReadout {
+    pub due: bool,
+    pub checks: u64,
+    pub control: u64,
+    pub refused: u64,
+    pub sessions: u32,
+    /// The drawn checks the summary still holds, which the estimates read.
+    pub kept: u64,
+    pub by_asked: Vec<(u16, Estimate)>,
+    pub ask_free: Option<Estimate>,
+}
+
+/// The outcome of apply `i` of `s` as a Horvitz–Thompson term (`TestReadout`): a verdict's y over its
+/// chance of one (`judged`, floored at 1/`MAX_IPW` as the monitor floors it), 0 for a lesson never
+/// delivered (dropped: outside `judged`'s fit, as policy.rs `model_route` leaves it) or closed without
+/// a verdict, None while open.
+fn unit_outcome(s: &Summary, judged: &HashMap<usize, f64>, i: usize) -> Option<f64> {
+    use summary::{Delivered, Label};
+    let a = s.applies.get(i)?;
+    let never = a.delivered == Delivered::Dropped;
+    let y = match a.label {
+        Label::Changed => 1.0,
+        Label::Ignored => 0.0,
+        _ if never => return Some(0.0),
+        Label::Open => return None,
+        Label::Unclear | Label::Censored => return Some(0.0),
+    };
+    // A lesson never delivered is known to be so: its verdict, if any, stands for itself.
+    let p = if never { 1.0 } else { judged.get(&i).copied().unwrap_or(1.0).max(1.0 / policy::MAX_IPW) };
+    Some(y / p)
+}
+
+/// The question-count test's readout of `s` (`TestReadout`): what `borg debug select` reports, and
+/// what the monitoring can show from the summary it loads.
+#[must_use]
+pub fn test_readout(s: &Summary) -> TestReadout {
+    let e = &s.experiment;
+    let (checks, refused) = e.totals();
+    let due = checks >= TEST_CHECKS || e.sessions >= TEST_SESSIONS;
+    let drawn: Vec<&summary::Check> = s.checks.iter().filter(|c| c.xs.is_some()).collect();
+    let kept = drawn.len() as u64;
+    let mut out = TestReadout { due, checks, control: e.control, refused, sessions: e.sessions, kept, by_asked: Vec::new(), ask_free: None };
+    if !due {
+        return out;
+    }
+    let judged = policy::judged(s);
+    let mut by: BTreeMap<u16, Vec<(f64, f64, usize)>> = BTreeMap::new();
+    let mut both: Vec<(f64, f64, usize)> = Vec::new();
+    for c in drawn {
+        let session = c.tick as usize;
+        let first = c.first as usize;
+        let applies = s.applies.get(first..first + usize::from(c.n)).unwrap_or_default();
+        for (j, a) in applies.iter().enumerate() {
+            if a.grade != 2 || a.p <= 0.0 || a.pf <= 0.0 {
+                continue;
+            }
+            let Some(y) = unit_outcome(s, &judged, first + j) else { continue };
+            let r = match a.route {
+                Route::Ask => y / a.p,
+                Route::Free => -y / a.pf,
+                _ => 0.0,
+            };
+            both.push((1.0, r, session));
+        }
+        // The test's lessons as its decision ordered them: the fixed rule's for what the session had
+        // (`nofree`, the `had` the decision read), as select/policy.rs `choose` calls them.
+        let units: Vec<Unit> = applies
+            .iter()
+            .map(|a| Unit { lesson: s.lessons.get(a.lesson as usize).map_or("", String::as_str), grade: a.grade, rank: usize::from(a.rank) })
+            .collect();
+        let had: Vec<String> = applies.iter().filter(|a| a.nofree).filter_map(|a| s.lessons.get(a.lesson as usize).cloned()).collect();
+        let order = policy::tested(&units, &policy::fixed_routes(&units, &had), &had);
+        let (Some(k), Some(drew), Some(&top)) = (c.xk, c.xs, order.first()) else { continue };
+        // A check whose applies do not give its logged k is no draw over them.
+        if order.len() != k as usize {
+            continue;
+        }
+        let Some(y) = unit_outcome(s, &judged, first + top) else { continue };
+        for m in 2..=k {
+            let Ok(key) = u16::try_from(m) else { break };
+            let r = (f64::from(k) + 1.0) * (f64::from(u8::from(drew == m)) - f64::from(u8::from(drew == 1))) * y;
+            by.entry(key).or_default().push((1.0, r, session));
+        }
+    }
+    out.by_asked = by.into_iter().map(|(m, units)| (m, ope::snips(&units, ope::SEED))).collect();
+    out.ask_free = Some(ope::snips(&both, ope::SEED));
+    out
+}
+
+fn readout(checks: &[Check], labels: &[Label], s: &Summary) -> Readout {
     let randomised = labels.iter().filter(|l| l.mu[l.route] > 0.0 && l.mu[l.route] < 1.0).count();
     let learned: BTreeSet<&str> = checks.iter().filter(|c| outcome::policy_of(&c.o) == "learned").map(|c| c.o.session.as_str()).collect();
     let ss = sessions(labels);
@@ -1268,7 +1455,7 @@ fn readout(checks: &[Check], labels: &[Label]) -> Readout {
             contrasts.push(Contrast { grade, routes: format!("{}−{}", ROUTE_NAMES[a], ROUTE_NAMES[b]), est: ope::snips(&units, ope::SEED) });
         }
     }
-    Readout { due: randomised >= READOUT_UNITS || learned.len() >= READOUT_SESSIONS, randomised, sessions: learned.len(), contrasts }
+    Readout { due: randomised >= READOUT_UNITS || learned.len() >= READOUT_SESSIONS, randomised, sessions: learned.len(), contrasts, test: test_readout(s) }
 }
 
 // --- P4: full-information recall from an evaluation -----------------------------------------------
@@ -1386,9 +1573,10 @@ fn qrels(path: &Path) -> BTreeMap<String, BTreeSet<String>> {
 
 /// One policy's right-lesson recall (the share of runs in which a check delivers a right lesson,
 /// expected over its draws), its change against the fixed rule (per case, case-paired bootstrap), per
-/// check its expected questions, free deliveries and blocks at the stop, and the checks at which a
-/// draw of it routes otherwise than the fixed rule: with none it is the fixed rule, and its comparison
-/// tests nothing.
+/// check its expected questions, free deliveries and blocks at the stop, the checks at which a draw of
+/// it routes otherwise than the fixed rule (with none it is the fixed rule, and its comparison tests
+/// nothing) and the first of them, the runs whose recall equals the fixed rule's (`SAME`), and whether
+/// it meets P4's recall bar (`RECALL_MARGIN`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Arm {
     pub recall: f64,
@@ -1397,7 +1585,18 @@ pub struct Arm {
     pub free: f64,
     pub blocks: f64,
     pub deviations: usize,
+    pub first: Vec<String>,
+    pub same: usize,
     pub pass: bool,
+}
+
+/// One of P4's arms against its own bar (rules v2): P4a identity at n = 0, P4b recall under the
+/// posterior, P4c the test keeps recall; `why` says what failed or why it tested nothing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Part {
+    pub verdict: Verdict,
+    pub why: String,
+    pub arm: Arm,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1413,13 +1612,20 @@ pub struct P4 {
     pub seeds: (usize, usize),
     /// What a check's model call cost, on average: the same call under every policy.
     pub usd: f64,
-    /// The store's posterior the posterior arm draws from (select/policy.rs `Fit::key`, empty for the
-    /// prior) and the labels it read.
+    /// Of the checks, those that apply a lesson: P4a tests nothing without one, as every policy
+    /// decides nothing there.
+    pub applying: usize,
+    /// The store's posterior P4b draws from (select/policy.rs `Fit::key`, empty for the prior) and the
+    /// labels it read.
     pub fit: String,
     pub labels: u32,
     pub baseline: Option<Arm>,
-    pub prior: Option<Arm>,
-    pub posterior: Option<Arm>,
+    /// P4a, P4b and P4c (module doc); None until the evaluation is complete. `verdict` is theirs by
+    /// the rules v2's default rule: PASS when P4a and P4c pass and P4b passes or is NOT TESTED, FAIL
+    /// when one of them fails, NOT TESTED otherwise.
+    pub p4a: Option<Part>,
+    pub p4b: Option<Part>,
+    pub p4c: Option<Part>,
 }
 
 impl P4 {
@@ -1433,11 +1639,13 @@ impl P4 {
             checks: 0,
             seeds: (0, 0),
             usd: 0.0,
+            applying: 0,
             fit: String::new(),
             labels: 0,
             baseline: None,
-            prior: None,
-            posterior: None,
+            p4a: None,
+            p4b: None,
+            p4c: None,
         }
     }
 }
@@ -1451,20 +1659,21 @@ struct Recalls {
     per_run: Vec<f64>,
     /// Per check, expected questions, free deliveries and blocks at the stop.
     spend: [f64; 3],
-    /// Checks at which some draw routes otherwise than the fixed rule.
+    /// Checks at which some draw routes otherwise than the fixed rule, and the first `SHOW` of them.
     deviations: usize,
+    first: Vec<String>,
 }
 
 /// The policy `draw` on `runs` (`Recalls`). `draw` None is the fixed rule (select/policy.rs
-/// `fixed_routes`: by position, P0's conscience.rs `graded_without` with no cap); otherwise
-/// `conscience::P_DRAWS` draws of the policy seeded per check (a stand-in check id from the session and
-/// the check's place in it: the run logged none), independent across checks. The evaluation's state
-/// lines log no `nofree`: every check is decided with an empty had, as the hook that ran it decided
-/// (module doc).
-fn recalls(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, draw: Option<&Draw>, lessons: &Path) -> Recalls {
+/// `fixed_routes`: by position, P0's conscience.rs `graded_without` with no cap); otherwise `n` draws
+/// of the policy seeded per check (a stand-in check id from the session and the check's place in it:
+/// the run logged none), independent across checks. The evaluation's state lines log no `nofree`:
+/// every check is decided with an empty had, as the hook that ran it decided (module doc).
+fn recalls(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, draw: Option<&Draw>, n_draws: usize, lessons: &Path) -> Recalls {
     let none = BTreeSet::new();
     let prior = Summary::default();
-    let (mut per_run, mut spend, mut n, mut deviations) = (Vec::new(), [0.0; 3], 0.0, 0);
+    let (mut per_run, mut spend, mut n, mut deviations, mut first) = (Vec::new(), [0.0; 3], 0.0, 0, Vec::new());
+    let names = |rs: &[Route]| rs.iter().map(|r| r.name()).collect::<Vec<_>>().join(",");
     for run in runs {
         let right = right.get(&run.case).unwrap_or(&none);
         let mut missed = 1.0;
@@ -1478,12 +1687,33 @@ fn recalls(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, draw: O
                 Some(draw) => {
                     let check = super::check_id(&c.session, c.channel, k as i64, 0);
                     // Only the seed: the evaluation's state file logs no pool tokens.
-                    let seed = super::seed(&Ctx { session: &c.session, check: &check, channel: c.channel, lessons, summary: &prior, tokens: 0, had: &[] });
+                    let seed = super::seed(&Ctx {
+                        session: &c.session,
+                        check: &check,
+                        channel: c.channel,
+                        lessons,
+                        summary: &prior,
+                        tokens: 0,
+                        had: &[],
+                        alpha: policy::ALPHA,
+                    });
                     let mut rng = memory::Rng::new(seed);
-                    (0..conscience::P_DRAWS).map(|_| draw(&units, c, rng.next_u64())).collect()
+                    (0..n_draws.max(1)).map(|_| draw(&units, c, rng.next_u64())).collect()
                 }
             };
-            deviations += usize::from(draws.iter().any(|d| *d != fixed));
+            if let Some(off) = draws.iter().find(|d| **d != fixed) {
+                deviations += 1;
+                if first.len() < SHOW {
+                    first.push(format!(
+                        "case {} session {} check {k} ({}): {} against the fixed rule's {}",
+                        run.case,
+                        c.session,
+                        c.channel,
+                        names(off),
+                        names(&fixed)
+                    ));
+                }
+            }
             let share = 1.0 / draws.len() as f64;
             let mut hit = 0.0;
             for routes in &draws {
@@ -1499,12 +1729,12 @@ fn recalls(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, draw: O
         }
         per_run.push(1.0 - missed);
     }
-    Recalls { per_run, spend: spend.map(|x| if n > 0.0 { x / n } else { 0.0 }), deviations }
+    Recalls { per_run, spend: spend.map(|x| if n > 0.0 { x / n } else { 0.0 }), deviations, first }
 }
 
-/// P4 on the runs under `dir` with the qrels at `qrels_path`: the learned policy, ungated, under the
-/// n = 0 prior (select/policy.rs `prior`: its draws are the prior's) and under `posterior`, the store's
-/// fit (`evaluate`).
+/// P4 on the runs under `dir` with the qrels at `qrels_path` (module doc): the decision rule without
+/// the test under the n = 0 prior (select/policy.rs `prior`, P4a) and under `posterior`, the store's
+/// fit (`evaluate`, P4b), and the test ungated (P4c).
 fn recall(dir: &Path, qrels_path: &Path, posterior: &Fit, lessons: &Path) -> P4 {
     let right = qrels(qrels_path);
     let runs = eval_runs(dir);
@@ -1515,12 +1745,26 @@ fn recall(dir: &Path, qrels_path: &Path, posterior: &Fit, lessons: &Path) -> P4 
         return P4::not_run(&format!("no runs with graded lines under {}", dir.display()));
     }
     let prior = policy::prior();
-    let p4 = against_baseline(&runs, &right, &|u, c, s| ungated(u, c, &prior, s), &|u, c, s| ungated(u, c, posterior, s), lessons);
+    let p4 = against_baseline(
+        &runs,
+        &right,
+        Arms { prior: &|u, c, _| evidence(u, c, &prior), posterior: &|u, c, _| evidence(u, c, posterior), test: &|u, c, s| tested(u, c, &prior, s) },
+        lessons,
+    );
     P4 { fit: posterior.key.clone(), labels: posterior.labels, ..p4 }
 }
 
-/// P4's comparison of two policies (the prior's and the posterior's) with the fixed rule on `runs`.
-fn against_baseline(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, prior: &Draw, posterior: &Draw, lessons: &Path) -> P4 {
+/// P4's three arms (module doc): the decision rule without the test under the n = 0 prior (P4a) and
+/// under the store's posterior (P4b), each deterministic (one draw per check), and the question-count
+/// test ungated (P4c), drawn `conscience::P_DRAWS` times per check.
+struct Arms<'a> {
+    prior: &'a Draw<'a>,
+    posterior: &'a Draw<'a>,
+    test: &'a Draw<'a>,
+}
+
+/// P4's comparison of its three arms (`Arms`) with the fixed rule on `runs`, each against its bar.
+fn against_baseline(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, arms: Arms, lessons: &Path) -> P4 {
     let mut per_case: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, r) in runs.iter().enumerate() {
         per_case.entry(r.case.as_str()).or_default().push(i);
@@ -1536,34 +1780,70 @@ fn against_baseline(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>
         checks: checks.len(),
         seeds: (seeds.clone().min().unwrap_or(0), seeds.max().unwrap_or(0)),
         usd: if checks.is_empty() { 0.0 } else { checks.iter().map(|c| c.usd).sum::<f64>() / checks.len() as f64 },
+        applying: checks.iter().filter(|c| !c.applies.is_empty()).count(),
         fit: String::new(),
         labels: 0,
         baseline: None,
-        prior: None,
-        posterior: None,
+        p4a: None,
+        p4b: None,
+        p4c: None,
     };
-    let base = recalls(runs, right, None, lessons);
+    let base = recalls(runs, right, None, 1, lessons);
     let case_mean = |v: &[f64], idx: &[usize]| idx.iter().map(|&i| v[i]).sum::<f64>() / idx.len() as f64;
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-    let arm = |draw: &Draw| {
-        let rec = recalls(runs, right, Some(draw), lessons);
+    let arm = |draw: &Draw, n: usize| {
+        let rec = recalls(runs, right, Some(draw), n, lessons);
         let units: Vec<(f64, f64, usize)> =
             per_case.values().enumerate().map(|(k, idx)| (1.0, case_mean(&rec.per_run, idx) - case_mean(&base.per_run, idx), k)).collect();
         let delta = ope::snips(&units, ope::SEED);
         let pass = delta.value.is_some_and(|v| v >= -RECALL_MARGIN) && delta.lo > -RECALL_MARGIN;
         let [questions, free, blocks] = rec.spend;
-        Arm { recall: mean(&rec.per_run), delta: Some(delta), questions, free, blocks, deviations: rec.deviations, pass }
+        let same = rec.per_run.iter().zip(&base.per_run).filter(|(a, b)| (*a - *b).abs() <= SAME).count();
+        Arm { recall: mean(&rec.per_run), delta: Some(delta), questions, free, blocks, deviations: rec.deviations, first: rec.first, same, pass }
     };
-    let (prior, post) = (arm(prior), arm(posterior));
+    // The decision rule draws nothing of its own (select/policy.rs `decide_on_evidence`): one draw is
+    // its expectation. The test draws its count from the seed: `conscience::P_DRAWS` of them.
+    let (prior, post, test) = (arm(arms.prior, 1), arm(arms.posterior, 1), arm(arms.test, conscience::P_DRAWS));
     // The pre-registered design is every case at the same seeds: a run still going, or a seed that
     // failed, leaves it incomplete.
     p4.verdict = match (p4.cases == p4.of, p4.seeds.0 == p4.seeds.1) {
         (true, true) => {
-            let same: Vec<&str> = [("n = 0 prior", &prior), ("store posterior", &post)].iter().filter(|(_, a)| a.deviations == 0).map(|(n, _)| *n).collect();
-            let verdict = Verdict::tested(prior.pass && post.pass, same.is_empty());
-            if verdict == Verdict::NotTested {
-                p4.why = format!("the {} arm decides as the fixed rule at every check, so it tests nothing", same.join(" and the "));
-            }
+            let (applying, runs) = (p4.applying, p4.runs);
+            // P4a: 0 differences from the fixed rule under the n = 0 prior.
+            let verdict = Verdict::tested(prior.deviations == 0, applying > 0);
+            let why = match verdict {
+                Verdict::Fail => format!("{} of {applying} checks that apply a lesson decide otherwise than the fixed rule", prior.deviations),
+                Verdict::NotTested => "no check applies a lesson".to_string(),
+                _ => String::new(),
+            };
+            let a = Part { verdict, why, arm: prior };
+            // P4b: P4's recall bar; NOT TESTED where it is the fixed rule.
+            let (verdict, why) = match (post.deviations, post.pass) {
+                (0, _) => (Verdict::NotTested, "it decides as the fixed rule at every check, so it is the fixed rule".to_string()),
+                (_, true) => (Verdict::Pass, String::new()),
+                (_, false) => (Verdict::Fail, format!("recall Δ {} points misses the bar", post.delta.as_ref().map_or("-".into(), |d| ci(d, 100.0)))),
+            };
+            let b = Part { verdict, why, arm: post };
+            // P4c: every run's recall the fixed rule's, tested only where a draw leaves it.
+            let verdict = Verdict::tested(test.same == runs, test.deviations > 0);
+            let why = match verdict {
+                Verdict::Fail => format!("{} of {runs} runs recall otherwise than the fixed rule", runs - test.same),
+                Verdict::NotTested => "no draw leaves the fixed rule: no live check has a lesson the test may hand over or ask".to_string(),
+                _ => String::new(),
+            };
+            let c = Part { verdict, why, arm: test };
+            let unmet: Vec<String> = [("P4a", &a), ("P4b", &b), ("P4c", &c)]
+                .iter()
+                .filter(|(n, p)| p.verdict != Verdict::Pass && !(*n == "P4b" && p.verdict == Verdict::NotTested))
+                .map(|(n, p)| format!("{n} {}", p.verdict.label()))
+                .collect();
+            let verdict = match unmet.is_empty() {
+                true => Verdict::Pass,
+                false if [&a, &b, &c].iter().any(|p| p.verdict == Verdict::Fail) => Verdict::Fail,
+                false => Verdict::NotTested,
+            };
+            p4.why = unmet.join(", ");
+            (p4.p4a, p4.p4b, p4.p4c) = (Some(a), Some(b), Some(c));
             verdict
         }
         (false, _) => {
@@ -1576,9 +1856,8 @@ fn against_baseline(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>
         }
     };
     let [questions, free, blocks] = base.spend;
-    p4.baseline = Some(Arm { recall: mean(&base.per_run), delta: None, questions, free, blocks, deviations: 0, pass: true });
-    p4.prior = Some(prior);
-    p4.posterior = Some(post);
+    p4.baseline =
+        Some(Arm { recall: mean(&base.per_run), delta: None, questions, free, blocks, deviations: 0, first: Vec::new(), same: runs.len(), pass: true });
     p4
 }
 
@@ -1599,6 +1878,7 @@ pub struct Checks {
 pub struct Report {
     pub rules: &'static str,
     pub amendment: &'static str,
+    pub rules_v2: &'static str,
     /// The policy this process would decide under (select.rs `policy`). The checks evaluate the
     /// learned policy (and P1 each record's logged policy) whatever it is.
     pub policy: &'static str,
@@ -1633,6 +1913,7 @@ pub fn evaluate(input: Input) -> Report {
     let mut report = Report {
         rules: RULES,
         amendment: AMENDMENT,
+        rules_v2: RULES_V2,
         policy: super::policy().name(),
         summary: input.summary,
         records: log.len(),
@@ -1659,7 +1940,7 @@ pub fn evaluate(input: Input) -> Report {
     report.checks = Some(Checks {
         p2: calibration(&labels, unjoined, &|value, past, at| model(&pass.checks, past, at, value)),
         p5: off_policy(&pass.checks, &labels, &targets),
-        readout: readout(&pass.checks, &labels),
+        readout: readout(&pass.checks, &labels, &pass.posterior),
         p0: pass.p0,
         p1: pass.p1,
         p3,
@@ -1668,8 +1949,10 @@ pub fn evaluate(input: Input) -> Report {
     report
 }
 
-/// A decisive check (P0–P4) that failed or tested nothing (`Verdict::NotTested`): the command then
-/// exits 1. One not run (P4 without an evaluation) is no verdict either way.
+/// A decisive check that failed or tested nothing (`Verdict::NotTested`), by the rules v2's default
+/// rule: P0–P3, and P4 (`P4::verdict`: P4a and P4c, and P4b failed; P4b NOT TESTED is the fixed rule
+/// and meets it). The command then exits 1. One not run (P4 without an evaluation) is no verdict
+/// either way.
 pub fn unmet(r: &Report) -> bool {
     r.checks
         .as_ref()
@@ -1699,9 +1982,10 @@ pub fn render(r: &Report) -> String {
     let fit = if r.summary.fit.key.is_empty() { "the prior" } else { r.summary.fit.key.as_str() };
     let by: Vec<String> = r.policies.iter().map(|(p, n)| format!("{n} {p}")).collect();
     let mut out = format!(
-        "rules {}, amendment {} ({RULES_AT}: pre-registered checks)\npolicy: {}{}; summary v{} at byte {}, fit {fit}\nrecords: {}, graded checks: {} ({}){}\n",
+        "rules {}, amendment {}, rules v2 {} ({RULES_AT}: pre-registered checks)\npolicy: {}{}; summary v{} at byte {}, fit {fit}\nrecords: {}, graded checks: {} ({}){}\n",
         r.rules,
         r.amendment,
+        r.rules_v2,
         r.policy,
         if r.checks.is_some() { " here, the checks replay the learned policy" } else { "" },
         r.summary.sv,
@@ -1730,7 +2014,7 @@ pub fn render(r: &Report) -> String {
     ));
     list(&mut out, &c.p0.first);
     out.push_str(&format!(
-        "P1 determinism: {}: {} of {} replayed checks reproduce their decision and propensities within {} (max |Δ| {:.4}), {} from the summary their record names{}; {} under an evaluation switch not replayed; incremental fold {} the whole fold\n",
+        "P1 determinism: {}: {} of {} replayed checks reproduce their decision and propensities within {} (max |Δ| {:.4}), {} from the summary their record names{}{}; {} under an evaluation switch not replayed; incremental fold {} the whole fold\n",
         c.p1.verdict.label(),
         c.p1.reproduced,
         c.p1.replayed,
@@ -1738,6 +2022,7 @@ pub fn render(r: &Report) -> String {
         c.p1.max_delta,
         c.p1.seen,
         empty(c.p1.empty, "only the summary and source they name"),
+        if c.p1.tests > 0 { format!("; {} of them the question-count test's, its draw replayed", c.p1.tests) } else { String::new() },
         c.p1.switches,
         if c.p1.fold { "=" } else { "≠" }
     ));
@@ -1793,6 +2078,10 @@ pub fn render(r: &Report) -> String {
             None => format!("no budget set for the collective: spend reported, not gated; the policy's pools spend {:.0} tokens per session", p3.pool),
         }
     ));
+    if !p3.sources.is_empty() {
+        let by: Vec<String> = p3.sources.iter().map(|(s, n)| format!("{n} {s}")).collect();
+        out.push_str(&format!("  decided by: {}\n", by.join(", ")));
+    }
     out.push_str(&format!("  spend, policy: {}\n  spend, fixed rule: {}\n", spend(&p3.policy), spend(&p3.fixed)));
     list(&mut out, &p3.first);
     let p4 = &c.p4;
@@ -1800,24 +2089,47 @@ pub fn render(r: &Report) -> String {
     if !p4.why.is_empty() {
         out.push_str(&format!(": {}", p4.why));
     }
-    if let (Some(b), Some(pr), Some(po)) = (&p4.baseline, &p4.prior, &p4.posterior) {
+    if let Some(b) = &p4.baseline {
         out.push_str(&format!(
-            "\n  {} of {} cases, {} runs ({}–{} per case), {} checks, ${:.4} per check (one model call under every policy; bar: Δ ≥ −{} points and lower bound > −{})\n  fixed rule: {}\n  learned, n = 0 prior: {}\n  learned, store posterior (fit {}, {} labels): {}",
+            "\n  {} of {} cases, {} runs ({}–{} per case), {} checks ({} apply a lesson), ${:.4} per check (one model call under every policy)\n  fixed rule: {}",
             p4.cases,
             p4.of,
             p4.runs,
             p4.seeds.0,
             p4.seeds.1,
             p4.checks,
+            p4.applying,
             p4.usd,
-            100.0 * RECALL_MARGIN,
-            100.0 * RECALL_MARGIN,
-            arm(b),
-            arm(pr),
-            if p4.fit.is_empty() { "the prior" } else { p4.fit.as_str() },
-            p4.labels,
-            arm(po)
+            arm(b)
         ));
+    }
+    let part = |out: &mut String, name: &str, bar: &str, p: &Part| {
+        let why = if p.why.is_empty() { String::new() } else { format!(": {}", p.why) };
+        out.push_str(&format!(
+            "\n  {name}: {}{why} (bar: {bar})\n    {}; {} checks drawn off the fixed rule",
+            p.verdict.label(),
+            arm(&p.arm),
+            p.arm.deviations
+        ));
+        for f in &p.arm.first {
+            out.push_str(&format!("\n    {f}"));
+        }
+    };
+    if let (Some(a), Some(b), Some(c)) = (&p4.p4a, &p4.p4b, &p4.p4c) {
+        part(&mut out, "P4a identity at n = 0, the decision rule without the test under the n = 0 prior", "0 differences from the fixed rule", a);
+        let bar = format!(
+            "Δ ≥ −{0} points and lower bound > −{0}; NOT TESTED where it deviates nowhere; a pass on runs seen before is weaker evidence than a first-run pass",
+            100.0 * RECALL_MARGIN
+        );
+        let name =
+            format!("P4b recall under the store posterior (fit {}, {} labels)", if p4.fit.is_empty() { "the prior" } else { p4.fit.as_str() }, p4.labels);
+        part(&mut out, &name, &bar, b);
+        part(
+            &mut out,
+            &format!("P4c the test keeps recall, ungated on every live check ({} of {} runs recall as the fixed rule)", c.arm.same, p4.runs),
+            "every run",
+            c,
+        );
     }
     out.push('\n');
     let p5 = &c.p5;
@@ -1850,6 +2162,28 @@ pub fn render(r: &Report) -> String {
     }
     for x in shown {
         out.push_str(&format!("  grade {} {}: {} over {} checks (within-check, session 95% CI)\n", x.grade, x.routes, ci(&x.est, 1.0), x.est.n));
+    }
+    let t = &ro.test;
+    out.push_str(&format!(
+        "question-count test readout (rules v2): {} ({} of {TEST_CHECKS} checks that drew a count, {} of {TEST_SESSIONS} sessions with one; {} of them the control arm, {} refused by the gate)\n",
+        if t.due { "due" } else { "not due" },
+        t.checks,
+        t.sessions,
+        t.control,
+        t.refused
+    ));
+    if t.due {
+        out.push_str(&format!("  estimated over the {} drawn checks the summary still holds (compaction drops the oldest, never the counts)\n", t.kept));
+    }
+    for (m, e) in &t.by_asked {
+        out.push_str(&format!(
+            "  dilution, {m} asked − 1 asked: the test's top lesson's change rate {} over {} checks with k ≥ {m} (Horvitz–Thompson by the uniform draw, session 95% CI)\n",
+            ci(e, 1.0),
+            e.n
+        ));
+    }
+    if let Some(e) = &t.ask_free {
+        out.push_str(&format!("  grade 2 asked − handed over: {} over {} 2s (Horvitz–Thompson by the logged propensities, session 95% CI)\n", ci(e, 1.0), e.n));
     }
     out
 }
@@ -2051,10 +2385,11 @@ mod tests {
         let mut log = labelled(6, 12, 11);
         let fitted = summary::with_fit(summary::fold(&text(&log), Summary::default()), None);
         assert!(fitted.fit.model.is_some() && fitted.gate.allowance == 0.0, "a model, and no learned check on its ledger: {:?}", fitted.gate);
-        // A hook's decision on the summary `s` it read, logged as hook.rs `record_graded` logs it.
-        let decide = |o: Outcome, s: &Summary| {
+        // A hook's decision on the summary `s` it read under the collective's tolerance `alpha` (hook.rs
+        // `decide`), logged as hook.rs `record_graded` logs it.
+        let decide_at = |o: Outcome, s: &Summary, alpha: f64| {
             let cs = challenges(&o).unwrap();
-            let r = crate::select::graded_under(Policy::Learned, &applied(&cs, &o), &ctx(&o, &had_of(&o), none, s));
+            let r = crate::select::graded_under(Policy::Learned, &applied(&cs, &o), &Ctx { alpha, ..ctx(&o, &had_of(&o), none, s) });
             let round = |v: &[f64]| v.iter().map(|p| outcome::round_p(*p)).collect();
             Outcome {
                 chosen: ids(&r.ask),
@@ -2067,9 +2402,13 @@ mod tests {
                 fit: r.log.fit.clone(),
                 seen: s.key(),
                 source: r.log.source.into(),
+                xk: r.log.xk,
+                xs: r.log.xs,
+                alpha: r.log.alpha,
                 ..o
             }
         };
+        let decide = |o: Outcome, s: &Summary| decide_at(o, s, policy::ALPHA);
         let check =
             |ms: i64, lessons: &[&str], grades: &[u8]| Outcome { check: crate::select::check_id("t", "live", ms, 1), ..graded("t", ms, lessons, grades) };
         // x and b read the refit; a reads it after x; then x's, a's and b's records land in that order.
@@ -2087,6 +2426,28 @@ mod tests {
         log.extend([x, a, b, c]);
         let pass = as_logged(&text(&log), none);
         assert_eq!((pass.p1.verdict, pass.p1.reproduced, pass.p1.seen), (Verdict::Pass, pass.p1.replayed, 4), "{:?}", pass.p1.first);
+        // a's hook under a collective's `risk` 0, which the replay's path maps to no collective: the
+        // record's α decides, not the config's then (c goes: a's other line would change c's summary).
+        let a_at = log.len() - 3;
+        assert!(log[a_at].xk.is_some(), "at the default α a is tested: {:?}", log[a_at]);
+        let mut off = log[..log.len() - 1].to_vec();
+        off[a_at] = decide_at(check(100_002, &["L4", "L5"], &[1, 2]), &after_x, 0.0);
+        assert_eq!((off[a_at].alpha, off[a_at].xk), (Some(0.0), None), "{:?}", off[a_at]);
+        let pass = as_logged(&text(&off), none);
+        assert_eq!((pass.p1.verdict, pass.p1.reproduced), (Verdict::Pass, pass.p1.replayed), "{:?}", pass.p1.first);
+        // Without the α on its record, it replays at the default and is not the decision its hook made.
+        off[a_at].alpha = None;
+        let pass = as_logged(&text(&off), none);
+        assert_eq!((pass.p1.verdict, pass.p1.reproduced + 1), (Verdict::Fail, pass.p1.replayed), "{:?}", pass.p1.first);
+        // The question-count test's draw (k, s) is the check's seed's too: a record logging another s, its
+        // routes and propensities unchanged, is not the decision its hook made (c goes: a's other line
+        // would change the summary c's record names).
+        let mut drawn = log[..log.len() - 1].to_vec();
+        let a_at = drawn.len() - 2;
+        drawn[a_at].xs = Some(drawn[a_at].xs.map_or(1, |s| s + 1));
+        let pass = as_logged(&text(&drawn), none);
+        assert_eq!((pass.p1.verdict, pass.p1.reproduced + 1), (Verdict::Fail, pass.p1.replayed), "{:?}", pass.p1.first);
+        assert!(pass.p1.first[0].contains("ms 100002") && pass.p1.first[0].contains(" s "), "{:?}", pass.p1.first);
         // Replayed on every line before it instead, b's decision is not the one its hook made (c goes:
         // b's shorter line would move the byte c's summary names).
         log.pop();
@@ -2274,6 +2635,7 @@ mod tests {
         let text = render(&Report {
             rules: RULES,
             amendment: AMENDMENT,
+            rules_v2: RULES_V2,
             policy: "fixed",
             summary: Summary::default(),
             records: 0,
@@ -2282,12 +2644,23 @@ mod tests {
             policies: BTreeMap::new(),
             checks: Some(Checks {
                 p0: P0 { verdict: Verdict::Pass, checks: 1, empty: 0, differ: 0, first: Vec::new() },
-                p1: P1 { verdict: Verdict::Pass, replayed: 1, reproduced: 1, empty: 0, seen: 0, switches: 0, max_delta: 0.0, fold: true, first: Vec::new() },
+                p1: P1 {
+                    verdict: Verdict::Pass,
+                    replayed: 1,
+                    reproduced: 1,
+                    empty: 0,
+                    seen: 0,
+                    tests: 0,
+                    switches: 0,
+                    max_delta: 0.0,
+                    fold: true,
+                    first: Vec::new(),
+                },
                 p2,
                 p3: conduct(&[], Spend::default(), Spend::default(), None, 0.0),
                 p4: P4::not_run("x"),
                 p5: off_policy(&[], &[], &[]),
-                readout: readout(&[], &[]),
+                readout: readout(&[], &[], &Summary::default()),
             }),
         });
         assert!(text.contains("P2 calibration: PASS by the pruned model: leave-future-out log-loss model "), "{text}");
@@ -2489,7 +2862,7 @@ mod tests {
     }
 
     /// The cold start folds the replayed decision as the hook would have logged it: its own routes,
-    /// propensities, placebo chance and source, on the logged check's applies and had lessons.
+    /// propensities, placebo chance, source and question-count draw, on the logged check's applies and had lessons.
     #[test]
     fn the_cold_start_folds_the_replayed_decision_with_its_own_propensities() {
         let mut o = graded("s", 1, &["A", "B", "C"], &[2, 1, 1]);
@@ -2501,11 +2874,20 @@ mod tests {
             placebo: vec![&ls[2]],
             p: vec![0.0, 1.0, 0.0],
             pf: vec![0.0; 3],
-            log: crate::select::Log { policy: "learned", source: "learned", fit: "9-abcdef01".into(), psi: 1.0, ..crate::select::Log::default() },
+            log: crate::select::Log {
+                policy: "learned",
+                source: policy::EXPERIMENT,
+                fit: "9-abcdef01".into(),
+                psi: 1.0,
+                xk: Some(2),
+                xs: Some(1),
+                ..crate::select::Log::default()
+            },
         };
         let d = decided(o.clone(), &r);
         assert_eq!((d.chosen, d.free, d.placebo, d.p, d.psi), (vec!["B".to_string()], Vec::new(), vec!["C".to_string()], vec![0.0, 1.0, 0.0], 1.0));
-        assert_eq!((d.policy.as_str(), d.source.as_str(), d.fit.as_str()), ("learned", "learned", "9-abcdef01"));
+        assert_eq!((d.policy.as_str(), d.source.as_str(), d.fit.as_str()), ("learned", "experiment", "9-abcdef01"));
+        assert_eq!((d.xk, d.xs), (Some(2), Some(1)), "the test's k and s, which the summary folds");
         assert_eq!((d.lessons, d.grades, d.nofree, d.check), (o.lessons, o.grades, o.nofree, o.check), "the logged check's");
     }
 
@@ -2584,36 +2966,80 @@ mod tests {
         let right: BTreeMap<String, BTreeSet<String>> =
             [("c1".to_string(), BTreeSet::from(["R".to_string()])), ("c2".to_string(), BTreeSet::from(["R2".to_string()]))].into();
         let none = Path::new("/nonexistent/lessons.jsonl");
-        let base = recalls(&runs, &right, None, none);
+        let base = recalls(&runs, &right, None, 1, none);
         assert_eq!((base.per_run.as_slice(), base.deviations), (&[1.0, 0.0, 1.0, 1.0][..], 0));
         assert_eq!(base.spend, [3.0 / 5.0, 3.0 / 5.0, 2.0 / 5.0], "questions, free and blocks per check");
         // Expected over draws: a policy that delivers on half its seeds recalls a one-check run half the time.
         let coin = |u: &[Unit], _: &EvalCheck, seed: u64| vec![if seed.is_multiple_of(2) { Route::Free } else { Route::Not }; u.len()];
-        let half = recalls(&runs, &right, Some(&coin), none);
+        let half = recalls(&runs, &right, Some(&coin), conscience::P_DRAWS, none);
         assert!(half.per_run.iter().zip(&base.per_run).all(|(h, b)| (h - 0.5 * b).abs() < 0.1), "half of each run the fixed rule recalls: {:?}", half.per_run);
         assert_eq!(half.deviations, 5, "every check has a draw off the fixed rule");
-        // The bar: a policy that delivers nothing loses every recall and fails; one that delivers all passes.
+        // A case short of a seed: not decided, no arm judged.
+        let all = |u: &[Unit], _: &EvalCheck, _: u64| vec![Route::Ask; u.len()];
+        let short = against_baseline(&runs[..3], &right, Arms { prior: &all, posterior: &all, test: &all }, none);
+        assert_eq!((short.verdict, short.p4a.is_none()), (Verdict::NotRun, true), "{short:?}");
+    }
+
+    /// P4's three arms (rules v2), each against its own bar on planted draws where it can fail: P4a
+    /// fails on any deviation under the prior and tests nothing without an apply; P4b fails below the
+    /// recall bar and is NOT TESTED where it is the fixed rule, which still meets the default rule; P4c
+    /// fails when a run's recall moves and is NOT TESTED when no draw leaves the fixed rule. `verdict`
+    /// is theirs by the default rule.
+    #[test]
+    fn p4_judges_each_arm_against_its_own_bar() {
+        let check = |applies: &[(&str, u8)]| EvalCheck {
+            session: "s".into(),
+            channel: "live",
+            applies: applies.iter().map(|(i, g)| (i.to_string(), *g)).collect(),
+            usd: 0.0,
+        };
+        let runs = vec![
+            EvalRun { case: "c1".into(), checks: vec![check(&[("X", 1)]), check(&[("R", 2)])] },
+            EvalRun { case: "c1".into(), checks: vec![check(&[("X", 3)])] },
+            EvalRun { case: "c2".into(), checks: vec![check(&[("R2", 3), ("X", 1)])] },
+            EvalRun { case: "c2".into(), checks: vec![check(&[("R2", 1)])] },
+        ];
+        let right: BTreeMap<String, BTreeSet<String>> =
+            [("c1".to_string(), BTreeSet::from(["R".to_string()])), ("c2".to_string(), BTreeSet::from(["R2".to_string()]))].into();
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        let fixed = |u: &[Unit], _: &EvalCheck, _: u64| policy::fixed_routes(u, &[]);
         let never = |u: &[Unit], _: &EvalCheck, _: u64| vec![Route::Not; u.len()];
         let all = |u: &[Unit], _: &EvalCheck, _: u64| vec![Route::Ask; u.len()];
-        let lost = against_baseline(&runs, &right, &never, &all, none);
-        assert_eq!((lost.verdict, lost.cases, lost.of, lost.seeds), (Verdict::Fail, 2, 2, (2, 2)));
-        assert!(!lost.prior.as_ref().unwrap().pass && lost.posterior.as_ref().unwrap().pass, "{lost:?}");
-        assert_eq!(lost.prior.as_ref().unwrap().delta.as_ref().unwrap().value, Some(-0.75));
-        let pass = against_baseline(&runs, &right, &all, &all, none);
-        assert_eq!(
-            (pass.verdict, pass.prior.as_ref().map(|a| a.deviations)),
-            (Verdict::Pass, Some(3)),
-            "the fixed rule asks both checks with a 3 too: {pass:?}"
-        );
-        // An arm that decides as the fixed rule everywhere tests nothing, and says so; a failing arm
-        // still fails.
-        let fixed = |u: &[Unit], _: &EvalCheck, _: u64| policy::fixed_routes(u, &[]);
-        let same = against_baseline(&runs, &right, &all, &fixed, none);
-        assert_eq!((same.verdict, same.posterior.as_ref().map(|a| (a.deviations, a.pass))), (Verdict::NotTested, Some((0, true))), "{same:?}");
-        assert!(same.why.contains("store posterior arm decides as the fixed rule at every check"), "{}", same.why);
-        assert_eq!(against_baseline(&runs, &right, &never, &fixed, none).verdict, Verdict::Fail);
-        // A case short of a seed: not decided.
-        assert_eq!(against_baseline(&runs[..3], &right, &all, &all, none).verdict, Verdict::NotRun);
+        // As the test: what the fixed rule hands over is asked on odd seeds, so nothing is withheld.
+        let test = |u: &[Unit], _: &EvalCheck, seed: u64| {
+            policy::fixed_routes(u, &[]).into_iter().map(|r| if r == Route::Free && seed % 2 == 1 { Route::Ask } else { r }).collect()
+        };
+        let parts = |p: &P4| [&p.p4a, &p.p4b, &p.p4c].map(|x| x.as_ref().map(|x| x.verdict));
+        // The decision rule is the fixed rule under both fits, the test moves routes but no recall.
+        let met = against_baseline(&runs, &right, Arms { prior: &fixed, posterior: &fixed, test: &test }, none);
+        assert_eq!(parts(&met), [Some(Verdict::Pass), Some(Verdict::NotTested), Some(Verdict::Pass)], "{met:?}");
+        assert_eq!((met.verdict, met.why.as_str(), met.applying), (Verdict::Pass, "", 5), "P4b NOT TESTED meets the default rule: {met:?}");
+        let c = met.p4c.as_ref().unwrap();
+        assert_eq!((c.arm.deviations, c.arm.same), (3, 4), "the three checks that hand a lesson over: {c:?}");
+        assert!(met.p4b.as_ref().unwrap().why.contains("so it is the fixed rule"), "{met:?}");
+        // P4a: a deviation under the prior fails it and the default rule, and is listed.
+        let a = against_baseline(&runs, &right, Arms { prior: &all, posterior: &fixed, test: &test }, none);
+        assert_eq!((a.verdict, parts(&a)[0], a.why.as_str()), (Verdict::Fail, Some(Verdict::Fail), "P4a FAIL"), "{a:?}");
+        let pa = a.p4a.as_ref().unwrap();
+        assert_eq!((pa.arm.deviations, pa.why.as_str()), (3, "3 of 5 checks that apply a lesson decide otherwise than the fixed rule"), "{pa:?}");
+        assert!(pa.arm.first[0].starts_with("case c1 session s check 0 (live): ask against the fixed rule's free"), "{:?}", pa.arm.first);
+        // P4b: losing the right lessons misses the bar; keeping them passes.
+        let b = against_baseline(&runs, &right, Arms { prior: &fixed, posterior: &never, test: &test }, none);
+        assert_eq!((b.verdict, parts(&b)[1]), (Verdict::Fail, Some(Verdict::Fail)), "{b:?}");
+        assert_eq!(b.p4b.as_ref().unwrap().arm.delta.as_ref().unwrap().value, Some(-0.75));
+        let b = against_baseline(&runs, &right, Arms { prior: &fixed, posterior: &all, test: &test }, none);
+        assert_eq!((b.verdict, parts(&b)[1]), (Verdict::Pass, Some(Verdict::Pass)), "{b:?}");
+        // P4c: a test that withholds fails; one that never leaves the fixed rule tests nothing, and the
+        // default rule is not met.
+        let c = against_baseline(&runs, &right, Arms { prior: &fixed, posterior: &fixed, test: &never }, none);
+        assert_eq!((c.verdict, parts(&c)[2]), (Verdict::Fail, Some(Verdict::Fail)), "{c:?}");
+        assert_eq!(c.p4c.as_ref().unwrap().why, "3 of 4 runs recall otherwise than the fixed rule");
+        let c = against_baseline(&runs, &right, Arms { prior: &fixed, posterior: &fixed, test: &fixed }, none);
+        assert_eq!((c.verdict, parts(&c)[2], c.why.as_str()), (Verdict::NotTested, Some(Verdict::NotTested), "P4c NOT TESTED"), "{c:?}");
+        // No check applies a lesson: P4a tests nothing.
+        let bare: Vec<EvalRun> = runs.iter().map(|r| EvalRun { case: r.case.clone(), checks: vec![check(&[])] }).collect();
+        let n = against_baseline(&bare, &right, Arms { prior: &fixed, posterior: &fixed, test: &fixed }, none);
+        assert_eq!((n.applying, parts(&n)[0], n.verdict), (0, Some(Verdict::NotTested), Verdict::NotTested), "{n:?}");
     }
 
     /// P4's baseline (`recalls` without a policy: select/policy.rs `fixed_routes`) is P0's reference
@@ -2673,7 +3099,7 @@ mod tests {
         let right: BTreeMap<String, BTreeSet<String>> = [("c".to_string(), BTreeSet::from([lessons[11].clone()]))].into();
         let p0 = |_: &[Unit], c: &EvalCheck, _: u64| reference(&applied(&challenges(&c.applies), &c.applies), &[]);
         let none = Path::new("/nonexistent/lessons.jsonl");
-        let (base, same) = (recalls(&runs, &right, None, none), recalls(&runs, &right, Some(&p0), none));
+        let (base, same) = (recalls(&runs, &right, None, 1, none), recalls(&runs, &right, Some(&p0), conscience::P_DRAWS, none));
         assert_eq!((same.deviations, &same.per_run, same.spend), (0, &base.per_run, base.spend));
     }
 
@@ -2730,6 +3156,187 @@ mod tests {
         log
     }
 
+    /// How a planted question-count test's lessons fare (`tested_log`): lesson j (A and B 2s, C a 1)
+    /// at the drawn count s changes the work with chance `change(j, s, asked)`; handed over, it is
+    /// delivered with chance `delivered` (else dropped at delivery, never judged); delivered, the judge
+    /// gives a verdict with chance `seen(asked)` (else it could not tell).
+    struct Plant {
+        change: fn(usize, usize, bool) -> f64,
+        delivered: f64,
+        seen: fn(bool) -> f64,
+    }
+
+    /// No dilution: an asked 2 changes the work 0.8 of the time at every count, a free 2 0.2, a 1
+    /// never; every lesson delivered and judged.
+    const UNDILUTED: Plant = Plant {
+        change: |j, _, ask| {
+            if j == 2 {
+                0.0
+            } else if ask {
+                0.8
+            } else {
+                0.2
+            }
+        },
+        delivered: 1.0,
+        seen: |_| 1.0,
+    };
+
+    /// A planted question-count test: `sessions` sessions of two live checks of two 2s and a 1 (no 3,
+    /// so k = 3), the draw s the check's number mod 4, the top s asked in the fixed rule's order and the
+    /// rest handed over, with the draw's propensities (position i asked with chance (k − i)/(k + 1)),
+    /// each lesson faring as `plant` says, drawn from `seed`.
+    fn tested_log(sessions: usize, plant: &Plant, seed: u64) -> Vec<Outcome> {
+        let (lessons, grades) = (["A", "B", "C"], [2u8, 2, 1]);
+        let (mut log, mut n, mut ms) = (Vec::new(), 0usize, 0);
+        let mut rng = memory::Rng::new(seed);
+        for x in 0..sessions {
+            let session = format!("t{x}");
+            for _ in 0..2 {
+                let s = n % 4;
+                n += 1;
+                ms += 10;
+                let check = format!("{n:012x}");
+                let owned = |v: &[&str]| v.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+                log.push(Outcome {
+                    chosen: owned(&lessons[..s]),
+                    free: owned(&lessons[s..]),
+                    check: check.clone(),
+                    policy: "learned".into(),
+                    source: if s == 0 { policy::EXPERIMENT_CONTROL } else { policy::EXPERIMENT }.into(),
+                    xk: Some(3),
+                    xs: Some(s as u32),
+                    p: vec![0.75, 0.5, 0.25],
+                    pf: vec![0.25, 0.5, 0.75],
+                    ..graded(&session, ms, &lessons, &grades)
+                });
+                for (j, l) in lessons.iter().enumerate() {
+                    let ask = j < s;
+                    let (changed, delivered, seen) =
+                        (rng.unit() < (plant.change)(j, s, ask), ask || rng.unit() < plant.delivered, rng.unit() < (plant.seen)(ask));
+                    let channel = if ask { "live" } else { "queued" };
+                    if !delivered {
+                        let route = outcome::ROUTE_DROPPED_CHARS.into();
+                        log.push(Outcome { check: check.clone(), route, ..result(outcome::DELIVERY, &session, l, ms + 1, channel) });
+                        continue;
+                    }
+                    let kind = match (seen, changed) {
+                        (false, _) => outcome::UNCLEAR,
+                        (true, true) => outcome::CHANGED,
+                        (true, false) => outcome::IGNORED,
+                    };
+                    log.push(Outcome { check: check.clone(), judge: 2, ..result(kind, &session, l, ms + 1, channel) });
+                }
+            }
+        }
+        log
+    }
+
+    fn readout_of(log: &[Outcome]) -> TestReadout {
+        test_readout(&summary::fold(&text(log), Summary::default()))
+    }
+
+    /// The question-count test's readout (rules v2) reads the summary's fold: not due, and then no
+    /// estimate, before `TEST_SESSIONS` sessions with a drawn check (or `TEST_CHECKS` checks); due,
+    /// dilution against one asked for each m up to k, and asking a 2 against handing it over by the
+    /// logged propensities, which finds the planted gain of asking; over the drawn checks the summary
+    /// still holds, which it says.
+    #[test]
+    fn the_question_count_readout_waits_until_due_and_then_finds_the_planted_gain_of_asking() {
+        let early = readout_of(&tested_log(TEST_SESSIONS as usize - 1, &UNDILUTED, 7));
+        assert_eq!((early.due, early.checks, early.control, early.sessions), (false, 58, 15, 29), "{early:?}");
+        assert!(early.by_asked.is_empty() && early.ask_free.is_none(), "nothing read before it is due: {early:?}");
+        let log = tested_log(TEST_SESSIONS as usize, &UNDILUTED, 7);
+        let s = summary::fold(&text(&log), Summary::default());
+        let r = test_readout(&s);
+        assert_eq!((r.due, r.checks, r.control, r.refused, r.sessions, r.kept), (true, 60, 15, 0, 30, 60), "{r:?}");
+        // k = 3 at every check: m of 2 and 3 against 1, each over all 60 drawn checks.
+        let by: Vec<(u16, usize)> = r.by_asked.iter().map(|(m, e)| (*m, e.n)).collect();
+        assert_eq!(by, [(2, 60), (3, 60)], "{r:?}");
+        // Asked, a 2 changes the work 0.8 of the time, handed over 0.2: a gain of about 0.6.
+        let gain = r.ask_free.as_ref().unwrap();
+        assert_eq!(gain.n, 120, "every 2: {gain:?}");
+        assert!(gain.value.is_some_and(|v| (v - 0.6).abs() < 0.15) && gain.lo > 0.0, "{gain:?}");
+        // A draw the gate refused is randomised too, its routes as logged: read with the others.
+        let mut refused = log.clone();
+        let g = refused.iter_mut().find(|o| o.kind == outcome::GRADED && o.xs == Some(3)).unwrap();
+        g.source = policy::GATE.into();
+        let rr = readout_of(&refused);
+        assert_eq!((rr.checks, rr.refused, rr.by_asked.iter().map(|(m, e)| (*m, e.n)).collect::<Vec<_>>()), (60, 1, by.clone()), "{rr:?}");
+        // Compaction drops the oldest checks, never the counts: due on all 60, estimated over the rest.
+        let mut compacted = s.clone();
+        compacted.checks.drain(..10);
+        let rc = test_readout(&compacted);
+        assert_eq!(
+            (rc.due, rc.checks, rc.kept, rc.by_asked.iter().map(|(m, e)| (*m, e.n)).collect::<Vec<_>>()),
+            (true, 60, 50, vec![(2, 50), (3, 50)]),
+            "{rc:?}"
+        );
+        let shown = render(&evaluate(Input {
+            text: &text(&log),
+            lessons: Path::new("/nonexistent/lessons.jsonl"),
+            summary: Summary::default(),
+            replay: true,
+            eval: None,
+        }));
+        assert!(
+            shown.contains("question-count test readout (rules v2): due (60 of 300 checks that drew a count, 30 of 30 sessions with one; 15 of them the control arm, 0 refused by the gate)\n")
+                && shown.contains("  estimated over the 60 drawn checks the summary still holds ")
+                && shown.contains("  dilution, 2 asked − 1 asked: the test's top lesson's change rate ")
+                && shown.contains("  grade 2 asked − handed over: "),
+            "{shown}"
+        );
+    }
+
+    /// Asking a 2 against handing it over is a Horvitz–Thompson difference over every 2 that could go
+    /// either way: a verdict the judge gives the asked more often than the handed over is weighed by
+    /// its chance (select/policy.rs `judged`), so equal change rates read as no gain; a hand-over never
+    /// delivered changed nothing, so it counts as 0, not out.
+    #[test]
+    fn asking_against_handing_over_weighs_verdicts_by_their_chance_and_counts_what_was_never_delivered() {
+        let sessions = 1000;
+        // Both routes change the work every time; the asked are judged 9 times in 10, the free 4.
+        let judging = Plant { change: |j, _, _| if j == 2 { 0.0 } else { 1.0 }, delivered: 1.0, seen: |ask| if ask { 0.9 } else { 0.4 } };
+        let even = readout_of(&tested_log(sessions, &judging, 11));
+        let gain = even.ask_free.as_ref().unwrap();
+        assert_eq!(gain.n, 4 * sessions, "every 2, judged or not: {gain:?}");
+        assert!(gain.value.is_some_and(|v| v.abs() < 0.1) && gain.lo < 0.0 && gain.hi > 0.0, "equal rates, no gain: {gain:?}");
+        // Every delivered lesson changes the work and is judged; half the hand-overs are never
+        // delivered, so handing over changes the work half the time: a gain of 0.5.
+        let dropped = Plant { change: |j, _, _| if j == 2 { 0.0 } else { 1.0 }, delivered: 0.5, seen: |_| 1.0 };
+        let gain = readout_of(&tested_log(sessions, &dropped, 13)).ask_free.unwrap();
+        assert!(gain.value.is_some_and(|v| (v - 0.5).abs() < 0.08), "{gain:?}");
+    }
+
+    /// Dilution compares the same lesson across the uniform draws: with none planted, a 1 asked
+    /// beside the 2s does not read as dilution; planted, the top lesson's falling rate is found.
+    #[test]
+    fn dilution_compares_the_same_lesson_across_draws_and_finds_only_what_is_planted() {
+        let sessions = 600;
+        let none = readout_of(&tested_log(sessions, &UNDILUTED, 17));
+        let rows: Vec<u16> = none.by_asked.iter().map(|x| x.0).collect();
+        assert_eq!(rows, [2, 3], "{none:?}");
+        for (m, e) in &none.by_asked {
+            assert!(e.value.is_some_and(|v| v.abs() < 0.15) && e.lo < 0.0 && e.hi > 0.0, "{m} asked, no dilution planted: {e:?}");
+        }
+        // The top lesson asked changes the work 0.9 of the time alone, 0.6 with 2 asked, 0.3 with 3.
+        let diluted = Plant {
+            change: |j, s, ask| match (j, ask) {
+                (0, true) => [0.0, 0.9, 0.6, 0.3][s],
+                (2, _) => 0.0,
+                (_, true) => 0.8,
+                _ => 0.2,
+            },
+            delivered: 1.0,
+            seen: |_| 1.0,
+        };
+        let r = readout_of(&tested_log(sessions, &diluted, 19));
+        for (m, want) in [(2u16, -0.3), (3, -0.6)] {
+            let e = &r.by_asked.iter().find(|x| x.0 == m).unwrap().1;
+            assert!(e.value.is_some_and(|v| (v - want).abs() < 0.15) && e.hi < 0.0, "{m} asked, {want} planted: {e:?}");
+        }
+    }
+
     /// The cold-start replay decides as the hooks would: with the fit `borg learn` makes when a session
     /// ends, the gate's ledger over the policy's own checks. Until the first end it is the fixed rule;
     /// after, the learned policy leaves it within the gate's budget. Without the refits it has no model,
@@ -2743,6 +3350,8 @@ mod tests {
         assert_eq!((p3.verdict, p3.over, p3.cold, p3.checks), (Verdict::Pass, 0, true, sessions * checks), "{p3:?}");
         assert!(p3.deviations > 0, "the learned policy decides: {p3:?}");
         assert_ne!(p3.policy, p3.fixed, "its own spend: {p3:?}");
+        assert_eq!(p3.sources.values().sum::<usize>(), p3.checks, "every decision by its source: {:?}", p3.sources);
+        assert!(p3.sources.get(policy::FIXED).is_some_and(|n| *n >= checks), "the first session's at least: {:?}", p3.sources);
         // The first session is decided before any fit: the fixed rule, its choice as the propensities.
         let pass = as_logged(&text(&log), Path::new("/nonexistent/lessons.jsonl"));
         for (c, t) in pass.checks.iter().zip(&targets).take(checks) {
@@ -2791,7 +3400,11 @@ mod tests {
             policy::predict(fit, &policy::Feat::of(&units, o.channel == "stop", o.tokens)[l.j], route, m, &o.session, &o.lessons[l.j]).unwrap()
         };
         assert!(ls.iter().all(|l| pruned(l) == by(&policy::prior_pruned(), l)), "the pruned prior");
-        assert!(ls.iter().any(|l| pruned(l) != by(&policy::prior(), l)), "not the full model's prior");
+        // Every prior mean but not now's is 0 (select/policy.rs `NOT_PRIOR`), so an asked or free unit is
+        // ½ under either prior: the two part where a unit was not delivered.
+        let not: Vec<Label> = ls.iter().map(|l| Label { route: NOT, ..l.clone() }).collect();
+        assert!(not.iter().all(|l| pruned(l) == by(&policy::prior_pruned(), l)), "the pruned prior, not delivered");
+        assert!(not.iter().any(|l| pruned(l) != by(&policy::prior(), l)), "not the full model's prior");
     }
 
     /// An evaluation's run directory: per run `<case>-s<seed>/borg-state/<session>.ctx` with its graded
@@ -2809,28 +3422,43 @@ mod tests {
         d
     }
 
-    /// P4's arms are the learned policy's: the posterior arm draws from the whole log's fit (what `borg
-    /// learn` would fit, not the folded summary's prior), the prior arm from the n = 0 prior's model,
-    /// whose draws leave the fixed rule. Either one being the fixed rule would pass P4 on nothing.
+    /// P4's arms are the production functions' (rules v2): P4a select/policy.rs `decide_on_evidence`
+    /// under the n = 0 prior, P4b the same under the whole log's fit (what `borg learn` would fit, not
+    /// the folded summary's prior), P4c `choose` under the prior with an open gate, whose draws leave the
+    /// fixed rule on a live check with lessons it may hand over or ask. A posterior arm on the prior, or
+    /// a test arm on no live check, would pass on nothing.
     #[test]
-    fn p4_draws_from_the_stores_posterior_and_from_the_prior() {
+    fn p4_draws_its_arms_from_the_production_rule_the_posterior_and_the_test() {
         let log = labelled(6, 12, 7);
-        let checks = "#borg-graded n=4 R:2:0,X:1:1,Y:1:2,Z:2:3\n#borg-graded n=3 W:3:0,R:1:1,V:2:2\n";
+        // A stop check, and a live one (its question delivered live) with two 2s and a 1 the test may move.
+        let checks = "#borg-graded n=4 R:2:0,X:1:1,Y:1:2,Z:2:3\n#borg-graded n=3 W:3:0,R:1:1,V:2:2\n#borg-live W ms=5\n";
         let d = eval_dir("p4", &[("c1", checks), ("c1", checks)], &[("c1", "R")]);
-        let report = evaluate(Input {
-            text: &text(&log),
-            lessons: Path::new("/nonexistent/lessons.jsonl"),
-            summary: Summary::default(),
-            replay: true,
-            eval: Some((&d.join("runs"), &d.join("qrels.jsonl"))),
-        });
+        let (runs, qrels) = (d.join("runs"), d.join("qrels.jsonl"));
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        let report = evaluate(Input { text: &text(&log), lessons: none, summary: Summary::default(), replay: true, eval: Some((&runs, &qrels)) });
         let p4 = report.checks.map(|c| c.p4).unwrap();
         let whole = policy::fit(&summary::fold(&text(&log), Summary::default()), None);
         assert!(whole.model.is_some() && whole.labels > 0);
         assert_eq!((&p4.fit, p4.labels), (&whole.key, whole.labels), "the store's posterior: {p4:?}");
-        let (base, prior) = (p4.baseline.unwrap(), p4.prior.unwrap());
-        assert_eq!((p4.runs, p4.checks), (2, 4));
-        assert!((prior.questions, prior.free) != (base.questions, base.free), "the prior's draws leave the fixed rule: {prior:?} {base:?}");
+        assert_eq!((p4.runs, p4.checks, p4.applying), (2, 4, 4));
+        // Each arm is its production function's, drawn as `recalls` draws.
+        let (runs, right) = (eval_runs(&runs), super::qrels(&qrels));
+        assert_eq!(runs[0].checks.iter().map(|c| c.channel).collect::<Vec<_>>(), ["stop", "live"]);
+        let prior = policy::prior();
+        // Each at `P_DRAWS` draws: the decision rule's one draw is its expectation only if it draws nothing.
+        let arm = |draw: &Draw| {
+            let r = recalls(&runs, &right, Some(draw), conscience::P_DRAWS, none);
+            (r.deviations, r.first, r.spend)
+        };
+        let of = |p: &Option<Part>| p.as_ref().map(|p| (p.arm.deviations, p.arm.first.clone(), [p.arm.questions, p.arm.free, p.arm.blocks])).unwrap();
+        let a = |u: &[Unit], c: &EvalCheck, _: u64| policy::decide_on_evidence(u, &eval_check(c), &prior, &[]);
+        let b = |u: &[Unit], c: &EvalCheck, _: u64| policy::decide_on_evidence(u, &eval_check(c), &whole, &[]);
+        let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: OPEN, ..summary::Gate::default() };
+        let t = |u: &[Unit], c: &EvalCheck, s: u64| policy::choose(u, &eval_check(c), &prior, &gate, policy::ALPHA, s, &[]).routes;
+        assert_eq!(of(&p4.p4a), arm(&a), "P4a");
+        assert_eq!(of(&p4.p4b), arm(&b), "P4b");
+        assert_eq!(of(&p4.p4c), arm(&t), "P4c");
+        assert!(p4.p4c.as_ref().unwrap().arm.deviations > 0, "the test's draws leave the fixed rule on the live check: {p4:?}");
         let _ = std::fs::remove_dir_all(d);
     }
 }

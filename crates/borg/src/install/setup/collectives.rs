@@ -96,7 +96,7 @@ fn personal(o: &Opts, ask: &mut Prompt, want: &mut Want) -> Result<(), String> {
 }
 
 fn entry(name: &str, paths: Vec<String>, share: Share) -> Entry {
-    Entry { name: name.into(), paths, share, experts: Vec::new(), relay: None, mode: None, budget: None }
+    Entry { name: name.into(), paths, share, experts: Vec::new(), relay: None, mode: None, budget: None, risk: None }
 }
 
 /// A team collective: founded here (its entry goes into the config, then `mesh init`) or joined with a

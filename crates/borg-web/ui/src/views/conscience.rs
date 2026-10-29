@@ -141,7 +141,7 @@ fn decides(s: &Selection) -> (String, String) {
     let opt = if default { "" } else { "opt-in (BORG_SELECT=learned) · " };
     let (v, note) = match s.source.as_str() {
         "reverted" => ("reverted", "the monitor saw harm beyond the gate's share: the fixed rule decides (sticky)".to_string()),
-        "learned" if s.gate > 0.0 => ("learned", format!("{opt}deviates where the gate admits it · fit {}", if s.fit.is_empty() { "prior" } else { &s.fit })),
+        "learned" if s.gate > 0.0 => ("learned", format!("{opt}deviates on evidence, and tests the question count, where the gate admits it · fit {}", if s.fit.is_empty() { "prior" } else { &s.fit })),
         "learned" => ("learned", format!("{opt}cold start: every decision the fixed rule's until the gate has budget")),
         "fixed" if default => ("fixed rule", "the default · the learned policy is opt-in: BORG_SELECT=learned".into()),
         "fixed" => ("fixed rule", "BORG_SELECT=fixed".into()),
@@ -175,7 +175,11 @@ fn fell_back_why(reason: &str) -> &'static str {
 
 /// An estimate in its unit: signed points, or a spread's standard deviation.
 fn est(v: f64, unit: &str) -> String {
-    if unit == "points" { format!("{v:+.1}") } else { format!("{v:.2}") }
+    match unit {
+        "points" | "points changed" => format!("{v:+.1}"),
+        "percent changed" => format!("{v:.1}%"),
+        _ => format!("{v:.2}"),
+    }
 }
 
 fn unit_label(unit: &str) -> String {
@@ -183,6 +187,8 @@ fn unit_label(unit: &str) -> String {
         "points" => "percentage points of P(changed and avoids)".into(),
         "logit" => "standard deviation, logit scale".into(),
         "coefficient" => "the value model's coefficients, logit scale".into(),
+        "percent changed" => "share of the judged questions that changed the work, by how many its check asked".into(),
+        "points changed" => "percentage points of the judged share that changed the work".into(),
         other => other.into(),
     }
 }
@@ -261,7 +267,8 @@ fn Intervals(#[prop(into)] rows: Signal<Vec<Estimate>>) -> impl IntoView {
                         <line x1=format!("{zero:.1}") x2=format!("{zero:.1}") y1="0" y2=format!("{:.1}", h - axis) class="grid" />
                         {marks}
                         <text x=format!("{left}") y=format!("{:.1}", h - 6.0) class="axis">{est(lo, &unit)}</text>
-                        <text x=format!("{zero:.1}") y=format!("{:.1}", h - 6.0) text-anchor="middle" class="axis">"0"</text>
+                        // The 0 mark only where it does not sit on an end's label.
+                        {(lo < 0.0 && hi > 0.0).then(|| view! { <text x=format!("{zero:.1}") y=format!("{:.1}", h - 6.0) text-anchor="middle" class="axis">"0"</text> })}
                         <text x=format!("{}", w - right) y=format!("{:.1}", h - 6.0) text-anchor="end" class="axis">{est(hi, &unit)}</text>
                     </svg>
                 </div>
@@ -460,6 +467,93 @@ fn LessonSelection() -> impl IntoView {
             .collect_view()
             .into_any()
     };
+    // The question-count test: the checks it drew a count for, those the gate refused, those the summary
+    // still holds once compaction dropped some, and the risk share in force.
+    let test_facts = move || {
+        let Some(t) = sel.with(|s| s.test.clone()) else {
+            return view! { <p class="empty">"Not running: the test is the learned policy's (BORG_SELECT=learned), on live checks only."</p> }.into_any();
+        };
+        let risk = if t.risk <= 0.0 {
+            "0: the test is off".to_string()
+        } else {
+            format!("{} of the fixed rule's quality{}", pct(t.risk, 1.0), if t.set { ", the collective's risk" } else { ", the default" })
+        };
+        // Once compaction dropped some, the drawn checks the readout's estimates still read.
+        let kept = (t.kept < t.ran).then(|| {
+            view! {
+                <dt>"of them still in the summary"</dt>
+                <dd>{format!("{} (compaction drops the oldest checks, never the counts; the readout reads these)", num(t.kept))}</dd>
+            }
+        });
+        view! {
+            <dl class="facts-dl">
+                <dt>"risk share in force"</dt><dd>{risk}</dd>
+                <dt>"checks drawn"</dt><dd>{format!("{} in {} sessions (played or refused by the gate)", num(t.ran), num(t.sessions))}</dd>
+                <dt>"of them controls"</dt><dd>{format!("{} (s the fixed rule's own count)", num(t.control))}</dd>
+                <dt>"of them refused by the gate"</dt><dd>{format!("{} (the draw's risk did not fit what the gate may still risk)", num(t.refused))}</dd>
+                {kept}
+            </dl>
+            <p class="empty">"Of the lessons below grade 3 the fixed rule delivers on a live check, s drawn uniformly from 0 to k are asked and the rest handed over: nothing is withheld."</p>
+        }
+        .into_any()
+    };
+    // Per k, each s's share of its draws against the uniform 1 / (k + 1) the test draws by.
+    let test_draws = move || {
+        let ks = sel.with(|s| s.test.as_ref().map(|t| t.by_k.clone()).unwrap_or_default());
+        // A refused draw is counted in `draws` too: a k with none drew nothing.
+        let ks: Vec<_> = ks.into_iter().filter(|d| d.draws.iter().sum::<f64>() > 0.0).collect();
+        if ks.is_empty() {
+            return view! { <p class="empty">"Not measured yet."</p> }.into_any();
+        }
+        ks.into_iter()
+            .flat_map(|d| {
+                let n: f64 = d.draws.iter().sum();
+                let uniform = 1.0 / (d.k + 1.0);
+                d.draws
+                    .iter()
+                    .enumerate()
+                    .map(|(s, &c)| {
+                        let share = c / n;
+                        let title = format!("k = {}: s = {s} drawn {} of {} times (uniform: {}); {} refused at this k", num(d.k), num(c), num(n), pct(uniform, 1.0), num(d.refused));
+                        bar(format!("k {} · s {s}", num(d.k)), share, pct(c, n), title, "var(--c-violet)").into_any()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect_view()
+            .into_any()
+    };
+    // The readout: when it is due, and once due its estimates with their session-bootstrap intervals.
+    let test_readout = move || {
+        let Some(t) = sel.with(|s| s.test.clone()) else {
+            return view! { <p class="empty">"Not measured yet."</p> }.into_any();
+        };
+        if !t.due {
+            return view! {
+                <p class="empty">{format!(
+                    "Due after {} checks drawn or {} sessions with one: {} and {} so far.",
+                    num(t.due_checks), num(t.due_sessions), num(t.ran), num(t.sessions)
+                )}</p>
+            }
+            .into_any();
+        }
+        let ask_free = match t.ask_free.clone() {
+            None => "Grade 2 asked against handed over: no judged 2 on both routes yet.".to_string(),
+            Some(e) => format!(
+                "Grade 2 asked against handed over: {} [{}, {}] {} ({} 2s).",
+                est(e.mean, &e.unit),
+                est(e.lo, &e.unit),
+                est(e.hi, &e.unit),
+                unit_label(&e.unit),
+                num(e.n)
+            ),
+        };
+        let dilution = Signal::derive(move || sel.with(|s| s.test.as_ref().map(|t| t.dilution.clone()).unwrap_or_default()));
+        view! {
+            <Intervals rows=dilution />
+            <p class="empty">{ask_free}</p>
+        }
+        .into_any()
+    };
     let measured = move || sel.with(|s| s.checks > 0.0);
     let state = move || {
         let s = sel.get();
@@ -496,7 +590,7 @@ fn LessonSelection() -> impl IntoView {
                 </section>
                 <section class="two">
                     <div class="panel">
-                        <h2>"Deviations from the fixed rule"<small>"per decision type"</small></h2>
+                        <h2>"Deviations from the fixed rule"<small>"per decision type, under the current fit: on evidence and by the question-count test's draws"</small></h2>
                         {move || if sel.with(|s| s.policy == "learned") {
                             view! { <Shares rows=Signal::derive(move || sel.with(|s| s.deviations.clone())) color="var(--c-violet)" /> }.into_any()
                         } else {
@@ -509,6 +603,18 @@ fn LessonSelection() -> impl IntoView {
                         <h2>"Label health"<small>"judged share per route, unclear share, placebo rate"</small></h2>
                         <Shares rows=Signal::derive(move || sel.with(|s| s.labels.clone())) color="var(--c-good)" />
                         <p class="empty">{declaration}</p>
+                    </div>
+                </section>
+                <section class="two">
+                    <div class="panel">
+                        <h2>"Question-count test"<small>"how many lessons a live check asks, randomised, rationed by the gate"</small></h2>
+                        {test_facts}
+                        <h2>"Readout"<small>"dilution and asking against handing over, session-bootstrap 95% intervals"</small></h2>
+                        {test_readout}
+                    </div>
+                    <div class="panel">
+                        <h2>"Draws of s"<small>"per k, each count's share of its checks; uniform by design"</small></h2>
+                        {test_draws}
                     </div>
                 </section>
                 <section class="two">

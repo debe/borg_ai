@@ -17,8 +17,8 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.6.0. Lesson selection is measured end to end; the fixed rule stays the default and the
-learned policy is opt-in until its pre-registered checks pass. Messages between sessions are paced by
+**Status:** 0.6.0. Lesson selection is measured end to end, and the learned policy is the default
+since its pre-registered checks passed (`BORG_SELECT=fixed` keeps the fixed rule). Messages between sessions are paced by
 acknowledgements instead of a fixed rate. In daily use, with lessons syncing
 between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
@@ -107,14 +107,17 @@ grade 3 blocks the stop for one more round. The same call judges whether what wa
 changed the work. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
 
 **Which lessons are asked.** Per check, a selection policy decides for each graded lesson whether to
-ask it, hand it over free or leave it for later. The default is 0.5.0's fixed rule, by grade (it no
-longer hands over free a lesson the session already had). Under it every check also measures what a
-learned policy needs and the fixed rule's history cannot show: a placebo arm judges blindly up to two
-lessons the check does not deliver, a tail sample grades up to two lessons past the pool's budget, and
-the records say which lessons the session already had. The learned policy (`BORG_SELECT=learned`,
-opt-in) routes by the mistakes it expects each route to avoid, learned from the logged outcomes; a
-conservative gate keeps it on the fixed rule until the outcomes support a deviation, and a monitor
-puts the fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+ask it, hand it over free or leave it for later. The reference is 0.5.0's fixed rule, by grade (it no
+longer hands over free a lesson the session already had; `BORG_SELECT=fixed`). Every check also
+measures what a learned policy needs and the fixed rule's history cannot show: a placebo arm judges
+blindly up to two lessons the check does not deliver, a tail sample grades up to two lessons past the
+pool's budget, and the records say which lessons the session already had. The learned policy, the
+default, routes by the mistakes it expects each route to avoid, learned from the logged outcomes, and
+deviates from the fixed rule only where the outcomes show it gains. On live checks it learns how many
+lessons to ask by a randomised test that moves lessons between asked and handed over, never withholding
+one. A conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
+by default), keeps it on the fixed rule until the outcomes support a deviation, and a monitor puts the
+fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
 
 **Outcomes and belief.** Every delivery is logged with the check that routed it and its probability,
 and what followed (changed, ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's
@@ -244,8 +247,9 @@ The Conscience tab also shows lesson selection: the policy and the default, what
 for the learned policy (placebos drawn and judged, tail lessons shown and applied), spend per session,
 effects with their intervals, label health, the fitted delivery rates, pool yield and stop latency per
 harness against its stop budget, and the learned decisions a guard gave the fixed rule; under the
-learned policy also its gate, deviations from the fixed rule and the monitor's reading with the health
-of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, lesson selection, what is wired,
+learned policy also its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test (checks drawn,
+refused by the gate, the draws, the risk share in force, the readout once due) and the monitor's reading
+with the health of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, lesson selection, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
@@ -316,13 +320,19 @@ that users who never configure get it.
 (comparison runs not concurrent), but against a hand-written skill +0.11 [−0.56, +0.78], short of the
 pre-registered lower bound of −0.5.
 
-**Opt-in until its checks pass:** learned lesson selection. Its checks were written before it was
-built and run at 0 tokens (`borg debug select --replay`). P4 failed on their first run and again on the
-one rerun their amended rules allow: on the review → fix eval the right lesson's recall against the
-fixed rule was −3.53 points [−6.74, −0.98] under the store's posterior and −3.77 [−6.89, −1.18] under
-the n = 0 prior (first run −4.02 [−7.28, −1.24] under the posterior), both lower bounds past the bar's
-−5. Calibration (P2) failed the first run and passed the rerun only by the pruned model. The fixed rule
-stays the default and `BORG_SELECT=learned` opts in ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
+**Shown, the default since:** learned lesson selection. Its checks were written before it was built
+and run at 0 tokens (`borg debug select --replay`). The first design failed P4 on their first run and
+again on the one rerun their amended rules allow: on the review → fix eval the right lesson's recall
+against the fixed rule was −3.53 points [−6.74, −0.98] under the store's posterior and −3.77 [−6.89,
+−1.18] under the n = 0 prior (first run −4.02 [−7.28, −1.24] under the posterior), both lower bounds
+past the bar's −5. The failure was the design (one random draw of the model let unidentified effects
+decide from their priors), so the policy was redesigned to deviate only on evidence and to learn the
+question count by a randomised test, under checks written before the rebuild (Rules v2). Their one run
+passed P0–P3 (P2 by the pruned model), P4a (with no outcomes it is the fixed rule on every evaluation
+check) and P4c (the test keeps the fixed rule's recall, 76.2%); P4b was NOT TESTED, since under the
+store's posterior it deviated on none of the evaluation's checks, and the P4 cases had been seen a third
+time. So the learned policy is the default; today it differs from the fixed rule by the question-count
+test on live checks, and `BORG_SELECT=fixed` keeps the fixed rule ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
 
 **Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit

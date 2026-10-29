@@ -730,7 +730,7 @@ pub fn pool_base(s: f64, c: &Challenge) -> f64 {
 /// At most this many lessons per early delivery (`early`). Baseline: today's early rule, as `RELATIVE`.
 pub const EARLY_CAP: usize = 5;
 /// An early delivery's text stops before this many characters (about 500 tokens), a free hand-over's
-/// too (hook.rs `queued`). Guard: bounds the context one delivery adds to the drone's turn; what it
+/// too (hook.rs `queued`), less the lines handed over in place of questions (`render_owing`). Guard: bounds the context one delivery adds to the drone's turn; what it
 /// cuts is logged (`dropped_chars`, outcome.rs `DELIVERY`), so its hit rate is measured.
 pub const EARLY_CHARS: usize = 2000;
 /// The characters of a lesson's question an early delivery's line shows at most, then `…`
@@ -816,6 +816,14 @@ pub const ANY: &str = "*";
 /// consequence), within `EARLY_CHARS`, and how many of `selected` it shows (the first ones). `None` when
 /// not even one line fits.
 pub fn render_early(selected: &[&Challenge], topics: &[String]) -> Option<(String, usize)> {
+    render_owing(selected, topics, 0)
+}
+
+/// `render_early` whose first `owed` lessons are shown whatever the budget and count nothing toward
+/// it: a free delivery's hand-overs in place of questions the fixed rule asks (hook.rs `INSTEAD`, the
+/// question-count test's, and `INSTEAD_NEXT`, the evidence rule's), which the asks they replace would
+/// have carried without a bound. The rest fit `EARLY_CHARS` as they would without them.
+pub fn render_owing(selected: &[&Challenge], topics: &[String], owed: usize) -> Option<(String, usize)> {
     let clip = |s: &str, n: usize| -> String {
         let s = s.trim();
         match s.char_indices().nth(n) {
@@ -836,7 +844,7 @@ instructions: where one applies to this task, check it against the code and keep
             }
         }
     );
-    let mut shown = 0;
+    let (mut shown, mut owing) = (0, 0);
     for c in selected {
         let mut line = format!("\n- {}", clip(&c.question, EARLY_QUESTION_CHARS));
         if c.standing() {
@@ -848,7 +856,9 @@ instructions: where one applies to this task, check it against the code and keep
         if !c.overrides.trim().is_empty() {
             line.push_str(&format!(" (This team rule replaces: {})", clip(&c.overrides, EARLY_OVERRIDES_CHARS)));
         }
-        if out.len() + line.len() > EARLY_CHARS {
+        if shown < owed {
+            owing += line.len();
+        } else if out.len() - owing + line.len() > EARLY_CHARS {
             break;
         }
         out.push_str(&line);

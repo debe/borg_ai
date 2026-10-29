@@ -51,7 +51,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | File | Name | Value | Meaning |
 |---|---|---|---|
 | `borg/src/select.rs` | `CHECK_HEX` | 12 hex digits (48 bits) | A graded check's id, the ` @<check>` tag on its record and on every delivery marker |
-| `borg/src/select/summary.rs` | `SV` | 6 | The selection summary cache's format; a summary of another version is rebuilt, never read (2: `spend`; 3: the stops' latency per harness, the monitor's weights; 4: `Past`, "left for later" counted at live checks, tallies at a session's end; 5: the live question's tally, what a session had, tail yields and counts; 6: the learned decisions that fell back to the fixed rule, per reason) |
+| `borg/src/select/summary.rs` | `SV` | 8 | The selection summary cache's format; a summary of another version is rebuilt, never read (2: `spend`; 3: the stops' latency per harness, the monitor's weights; 4: `Past`, "left for later" counted at live checks, tallies at a session's end; 5: the live question's tally, what a session had, tail yields and counts; 6: the learned decisions that fell back to the fixed rule, per reason; 7: the question-count test's checks by k and s; 8: a live check's hand-over a stop asked is its free apply's delivery and verdict, and the live question's tally counts only checks with a 3) |
 | `borg/src/select/summary.rs` | `STOP`, `LIVE`; `FREE_STOP`, `FREE_LIVE`, `LATER`, `WAIT`, `ASK_LIVE`; `TALLIES` | 0, 1; 0 to 4; 5 | Indices of `Summary::spend` and of a session's delivery tallies, and the tallies' width (checked at compile time): part of the cache's layout |
 | `borg/src/select/summary.rs` | `FELL_BACK` | `lock_busy` 0, `lock_failed` 1, `unrecorded` 2 | Indices of `Summary::fell_back`, by the graded record's `reason` (outcome.rs `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD`): part of the cache's layout |
 | `borg/src/select.rs` | `ARMS`, `Route::arm` | 3: ask 0, free 1, not now and placebo 2 | The length and order of every per-arm array (select/policy.rs `monitor`, select/replay.rs) |
@@ -59,6 +59,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/select/replay.rs` | `ASK`, `FREE`, `NOT`, `ROUTES`; `GRADES` | select.rs `Route::arm` and `ARMS`; 4 | Route and grade indices of the replay's tables |
 | `borg/src/select/replay.rs` | `RULES` | 2026-10-28 | The pre-registration the checks implement; printed with every report, changed only by a dated amendment |
 | `borg/src/select/replay.rs` | `AMENDMENT` | 2026-10-29 | The latest dated amendment of the rules the checks implement; printed beside `RULES` |
+| `borg/src/select/replay.rs` | `RULES_V2` | 2026-10-29 | The rules v2 the checks implement (P4a–P4c, the question-count test in P1 and P3, its readout, the default rule); printed beside `RULES` |
 | `borg/src/outcome.rs` | `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD` | `lock_busy`, `lock_failed`, `unrecorded` | A graded record's `reason` when its learned check fell back to the fixed rule: another check held the store's decision lock past hook.rs `DECIDE_WAIT`, the lock could not be taken, or the learned decision's record cannot land in the log its gate is folded from |
 | `borg/src/msg.rs` | `STAMP` | `v3` | The format of a session's `.scanned` stamp, this node's alone: a stamp of another format (0.5.0's, an earlier 0.6.0 build's) makes the session read the log once |
 | `borg/src/listen.rs` | `WAKE` | `w` | The first word of a wake's turn mark, `w <ms> [<tool start>]`, this node's alone: every reader takes it as a running turn, and a waiter undoes the mark of a refused wake |
@@ -86,7 +87,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | File | Name | Value | Runaway it stops |
 |---|---|---|---|
 | `borg/src/attention.rs` | `RAIL` | 20 | The most lessons one round asks under the learned policy (its solver's limit) and the attention cut; the fixed rule asks at most `CAP`. Stops one question per lesson of a large pool |
-| `borg/src/conscience.rs` | `EARLY_CHARS` | 2,000 chars (about 500 tokens) | The context one early or free delivery adds; a free lesson it cuts is logged `dropped_chars`, so its hit rate is measured |
+| `borg/src/conscience.rs` | `EARLY_CHARS` | 2,000 chars (about 500 tokens) | The context one early or free delivery adds, less the lines handed over in place of questions (the question-count test's `instead` and the evidence rule's `instead-next` hand-overs of lessons the fixed rule asks, `render_owing`), which it never cuts; a free lesson it cuts is logged `dropped_chars`, so its hit rate is measured |
 | `borg/src/hook.rs` | `MAX_EARLY_DELIVERIES` | 3 per session | A long session naming many systems getting a delivery at every touch (standing lessons are exempt) |
 | `borg/src/hook.rs` | `MAX_PENDING` | conscience.rs `CAP` (10) | Pending lessons one judge call sees: an unbounded judge section. What it leaves out is logged (`#borg-unjudged … why=slots`) |
 | `borg/src/hook.rs` | `MAX_JUDGE_TRIES` | 2 | A lesson the judge never settles riding on every later call; what stays unjudged is censored with its reason |
@@ -104,6 +105,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/select/summary.rs` | `MAX_SESSIONS` | 4,096 sessions | The session table, which `MAX_APPLIES` does not bound when sessions grade few applies; a compaction keeps at least `policy::FIT_SESSIONS` (checked at compile time) |
 | `borg/src/select/summary.rs` | `MAX_FRESH` | 1,024 sessions | Sessions shown lessons before any graded check (an early delivery at a prompt) that never reach one; past it the oldest quarter go |
 | `borg/src/select/replay.rs` | `CLAMP` | 10⁻⁹ | A model's 0 or 1 making one unit's log-loss infinite |
+| `borg/src/select/replay.rs` | `OPEN` | 10¹² | The allowance of the gate P4c's test arm decides against: above any check's charged risk, so every draw is admitted, and finite, so the gate's arithmetic stays exact |
 | `borg/src/whole.rs` | `QUESTION_CHARS`, `CONSEQUENCE_CHARS` | 240, 160 chars | One long lesson taking the share of the pool many short ones would fill |
 | `borg/src/vectors.rs` | `OVER_FETCH` | 30 | A vector search coming back short once done, out-of-scope and listed hits are dropped |
 | `borg/src/predict.rs` | `timeout` | 45 s (`BORG_PREDICT_TIMEOUT_S`) | One consequence-model call, under Claude Code's former 60 s hook limit |
@@ -223,7 +225,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/escalation.rs` | `MISSED_W` | 3 | memory.rs `VETOED_W` |
 | `borg/src/memory.rs`, `borg/src/ope.rs` | `WEIGHTS`, `CURRENT` | veto 3, regret 1, tested 0.5 | `VETOED_W`, `REGRET`, `TESTED_W`: the weights in force |
 | `borg/src/ope.rs` | `RESAMPLES` | 512 | conscience.rs `P_DRAWS` |
-| `borg/src/select/policy.rs` | `DRAWS` | 512 | conscience.rs `P_DRAWS`: the joint draws behind the gate's quantile and each propensity |
+| `borg/src/select/policy.rs` | `DRAWS` | 512 | conscience.rs `P_DRAWS`: the joint draws behind the gate's quantile and the evidence rule's (a deviation plays only when it beats the fixed rule at their `DELTA` quantile) |
 | `borg/src/select/policy.rs` | `pool_grid` | 6,000 to 24,000 tokens | whole.rs `TOKENS` × 2^(i/2), i from `POOL_STEPS` |
 | `borg/src/whole.rs` | `CHARS_PER_TOKEN` | 4 | borg-trace `CHARS_PER_TOKEN` (re-exported) |
 | `borg-eval/src/preempt.rs` | `EXPERT_WAIT_S` | `EXPERT_TIMEOUT_S` + 60 s | The broker's answer wait |
@@ -235,8 +237,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/prefilter.rs` | `THRESHOLD` | 8.0 (`BORG_PREFILTER`) | Pre-registered in an internal evaluation (stop-prefilter): 0.9 × the lowest score of any labelled checkpoint with a relevant lesson in its shortlist (9.28), rounded down |
 | `borg/src/select/policy.rs` | `ASK_PRIOR` | N(0, 0.35²) | Ask against free: the review→fix evaluation of 2026-10 (asked +6.3, handed over +7.3 points against the plain agent), wide |
 | `borg/src/select/policy.rs` | `NOT_PRIOR` | N(−0.3, 0.25²) | Not now against free: the same evaluation, a lesson not delivered changes less than one handed over |
-| `borg/src/select/policy.rs` | `DILUTION_PRIOR` | N(−0.1, 0.1²), at most 0 | Per ln(m) of asks or free lessons: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question, log-odds). Keeps its sd: automatic relevance never shrinks a dated prior |
-| `borg/src/select/policy.rs` | the value model | fitted at `borg learn` | One logistic model of "changed the work and avoids the consequence" by grade, rank, channel, a 3 in the check, a 3 at the stop, pool size, route and dilution, with session, lesson and judge effects (empirical Bayes) and automatic relevance for the terms without a dated prior (rank, pool, the interactions). Decides only under `BORG_SELECT=learned` |
+| `borg/src/select/policy.rs` | `DILUTION_PRIOR` | N(0, 0.1²), at most 0 (a half-normal) | Per ln(m) of asks or free lessons. Dated 2026-10-29 (Rules v2): the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question, log-odds) has an interval that includes 0, so no dilution is assumed (mode 0) and its width sets the scale. 0.6.0's first design centred it at −0.1. Keeps its sd: automatic relevance never shrinks a dated prior |
+| `borg/src/select/policy.rs` | the value model | fitted at `borg learn` | One logistic model of "changed the work and avoids the consequence" by grade, rank, channel, a 3 in the check, a 3 at the stop, pool size, route and dilution, with session, lesson and judge effects (empirical Bayes) and automatic relevance for the terms without a dated prior (rank, pool, the interactions). Decides under the learned policy, the default (`BORG_SELECT=fixed` keeps the fixed rule) |
 | `borg/src/select/policy.rs` | delivery rates | Beta(1, 1), with the forgetting | Whether a stop's free lesson arrives, a live check's free lesson arrives, and a live question reaches the agent (1 until one is tallied; a stop's question blocks, so it is certain): these weigh a route's value. Whether a lesson left for later is delivered later and whether a waiting live question blocks are shown only. Applies of a lesson the session already had count in none |
 | `borg/src/select/policy.rs` | the forgetting | a half-life from `HALF_LIVES` | Chosen by prequential likelihood over whole sessions; ties go to the longer |
 | `borg/src/select/policy.rs` | `pool_tokens` | whole.rs `TOKENS` until the yield by fill position has data | Under the learned policy once its gate is open or a budget is set (select.rs `pool_active`), the pool budget a session's draw values most among those whose gain over the baseline is ≥ 0 at the gate's quantile; never past the baseline without the yield of the added positions (the tail sample's) and a latency within the stop budget. The fixed rule keeps `TOKENS` |
@@ -250,8 +252,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 
 | File | Name | Value | Why it is enough, or its citation |
 |---|---|---|---|
-| `borg/src/select/policy.rs` | `ALPHA` | 0.10 | The share of the fixed rule's replayed quality (mistakes avoided) the learned policy may risk below it while it learns, at the gate and in the monitor; a quality bound, not a cost |
-| `borg/src/select/policy.rs` | `DELTA` | 0.05 | The gate's quantile and the monitor's error probability: the conventional 95% |
+| `borg/src/select/policy.rs` | `ALPHA` | 0.10 | The share of the fixed rule's replayed quality (mistakes avoided) the learned policy may risk below it while it learns, at the gate and in the monitor; a quality bound, not a cost. The default of a collective's `risk` (collectives.json, select.rs `risk_of`), the engineer's tolerance: the gate's allowance in a decision is the ledger's (accrued at `ALPHA`) scaled by `risk` / `ALPHA`, for deviations on evidence and the question-count test alike; `risk` 0 turns the test off. The monitor keeps `ALPHA` |
+| `borg/src/select/policy.rs` | `DELTA` | 0.05 | The gate's quantile, the evidence rule's (a deviation must beat the fixed rule at it) and the monitor's error probability: the conventional 95% |
 | `borg/src/select/policy.rs` | `PRIOR_SD` | 2.5 | The weakly informative default for logistic coefficients (Gelman et al. 2008); also the ceiling of every learned spread |
 | `borg/src/select/policy.rs` | `ARD_START`, `LEVEL_START`, `SD_FLOOR` | 1.0, 0.5, 0.01 | Starting sd of a term without a dated prior (rank, pool, the interactions), starting spread of the session, lesson and judge effects (EM moves both), and the floor of every spread (0.01 on the log-odds scale is no effect) |
 | `borg/src/select/policy.rs` | `PSI_FLOOR` | 10⁻³ | The least chance a drawn placebo is weighed at (the monitor, the replay's P5): a logged ψ of 0 is rounding, so such a label weighs at most a thousand sure ones |
@@ -266,6 +268,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/select/replay.rs` | `CALIBRATION` | 0.005 | P2's pre-registered bar on the log-loss difference |
 | `borg/src/select/replay.rs` | `RECALL_MARGIN` | 0.05 | P4's pre-registered margin: 5 points of right-lesson recall |
 | `borg/src/select/replay.rs` | `READOUT_UNITS`, `READOUT_SESSIONS` | 300, 30 | The pre-registered online readout: randomised labelled units, or sessions under the learned policy |
+| `borg/src/select/replay.rs` | `TEST_CHECKS`, `TEST_SESSIONS` | 300, 30 | The question-count test's pre-registered readout (rules v2): due after this many checks that drew a count (played or refused by the gate), or sessions with one, and only then estimated |
+| `borg/src/select/replay.rs` | `SAME` | 10⁻⁹ | P4c's float slack: an arm's recall of a run equals the fixed rule's within the rounding of summing `P_DRAWS` shares, far below one draw's share |
 | `borg/src/select/replay.rs` | `COIN` | 10⁻⁹ | A prediction this close to 1/2 is a coin's: P2 is NOT TESTED when every prediction of both models is one |
 | `borg/src/select/replay.rs` | `LOOSEST` | `Some(u64::MAX)` ms | The latency limit the replay chooses pools under, as the budget's `price` replays them: P3's pool spend is the most any hook's limit allows (none at all would forbid every pool above the baseline) |
 | `borg/src/hook.rs` | `DECIDE_POLL` | 5 ms | How often a check waiting for the store's decision lock tries it again |
@@ -291,7 +295,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 
 ## Baseline
 
-The fixed selection rule, the default (and the learned policy's while its gate admits no deviation).
+The fixed selection rule, the default (and the learned policy's wherever it has no evidence to deviate and its gate admits no test).
 For a session that had none of the lessons already, these values decide exactly as 0.5.0 did. They are
 the reference the learned policy is measured against, not knobs to tune.
 
@@ -365,7 +369,7 @@ later value would be compared against.
 | `borg-search/src/bin/hs-vectors.rs` | `SHORT`, `WIDE`, `VECTOR_TOP` | 20, 30, 60 | Vector shortlist arms |
 | `borg-search/src/bin/hs-whole.rs` | `BM25_N` | 30 | Whole-pool arms |
 | `borg-search/src/seek.rs` | `CHUNK` | 1,000 | Model2Vec's chunk size, SeekStorm's README example |
-| eval switches | `BORG_STOP_ASK_CAP`, `BORG_STOP_ATTENTION=on` | | Eval arms; `BORG_SELECT=fixed` wins over the cap, which wins over attention, and both over `BORG_SELECT=learned` |
+| eval switches | `BORG_STOP_ASK_CAP`, `BORG_STOP_ATTENTION=on` | | Eval arms; `BORG_SELECT=fixed` wins over the cap, which wins over attention, and both over the learned policy |
 | `eval/` | each script | | Each evaluation's parameters stay with its scripts and README |
 
 ## Values that share a number
@@ -386,7 +390,8 @@ labelled.
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
 | 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method) | A window's ceiling; the gaps a hold reads |
 | 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor) | 0.5.0's message rate; a tool call's hold |
-| 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` (method) | A probability kept off 0 and 1; a prediction that is 1/2 |
+| 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` and `SAME` (method) | A probability kept off 0 and 1; a prediction that is 1/2; two recalls that are equal |
+| 300 and 30 | select/replay.rs `READOUT_UNITS`, `READOUT_SESSIONS`; `TEST_CHECKS`, `TEST_SESSIONS` (method) | The online readout's labelled units and sessions; the question-count test's checks and sessions |
 | 0.6 and 0.8 | queen.rs `STATED` and `DUPLICATE`; conscience.rs `STRONG` and `BLOCK` | Same value, different bars |
 | Shortlist sizes | vectors.rs `SHORTLIST` 30; borg-search `SHORT` 20, `TOP` 20, `BM25_N` 30 | Production is baseline, the binaries are experiment |
 | codex hook timeouts | harness/codex.rs `TIMEOUTS`, `adapters/codex/smoke.sh` | The smoke test checks what install writes |
@@ -402,10 +407,14 @@ labelled.
   opencode adapter's `WAKE_RETRY_MS` and `WAKE_TRIES` (the retry is `borg listen --stream`'s `backoff`)
   and the omp adapter's `FAST_MS`, `PRE_MS`, `STOP_MS`, `END_MS` (now borg's `BUDGETS`).
 - **Learned now:** listen.rs's holds (`TURN_IDLE_MS`, `QUEUE_IDLE_MS`, `TOOL_MS` are floors, learned
-  upward); under `BORG_SELECT=learned`, opt-in, which graded lessons are asked, free or not now (the
-  value model under the gate) and the pool size. The fixed rule stays the default, so `CAP`, `TOKENS`
-  and the rest of the baseline decide; the placebo and the tail sample measure what the learned values
-  need under it.
+  upward); under the learned policy, the default since Rules v2 passed, which graded lessons are
+  asked, free or not now (the value model under the gate: a deviation only where it beats the fixed
+  rule at `DELTA`'s quantile) and the pool size, and on live checks the question count, by a randomised test the gate rations by
+  the collective's `risk` (default `ALPHA`). Until the gate admits a deviation the fixed rule's `CAP`,
+  `TOKENS` and the rest of the baseline decide, and `BORG_SELECT=fixed` keeps them; the placebo and the
+  tail sample measure what the learned values need under it.
+- **Changed prior:** select/policy.rs `DILUTION_PRIOR` from N(−0.1, 0.1²) to N(0, 0.1²), both at most
+  0 (Rules v2, 2026-10-29: the dated estimate's interval includes 0).
 - **Derived now:** steer.rs `SLACK_MS` and borg-mesh live.rs's presence freshness from `SKEW_MS`; every
   day from clock.rs `DAY_MS`; the stop budgets of omp and opencode in `Caps`; listen.rs `stop_ms` from
   the longest stop; hook.rs `MAX_PENDING` from `CAP`; the excerpt bounds from learn.rs's.

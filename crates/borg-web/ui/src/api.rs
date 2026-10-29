@@ -580,6 +580,40 @@ pub struct Latency {
     pub over: f64,
 }
 
+/// The learned policy's randomised question-count test (borg top.rs `Test`), all-time as the summary
+/// counts it: the risk share in force (`set`: the collective's own, else the default), the checks the
+/// test drew a count for (played or refused by the gate), of them the controls (s the fixed rule's own
+/// count) and those the gate refused, the sessions with one, and per k the draws of each s.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Test {
+    pub risk: f64,
+    pub set: bool,
+    pub ran: f64,
+    pub control: f64,
+    pub refused: f64,
+    pub sessions: f64,
+    /// Of `ran`, the drawn checks the summary still holds, which the readout's estimates read:
+    /// compaction drops the oldest checks, never the counts.
+    pub kept: f64,
+    pub by_k: Vec<Draws>,
+    /// The readout: due after `due_checks` checks drawn or `due_sessions` sessions with one, and only then
+    /// estimated: per number asked, the share of judged questions that changed the work (`percent
+    /// changed`), and a grade 2 asked against handed over (`points changed`).
+    pub due: bool,
+    pub due_checks: f64,
+    pub due_sessions: f64,
+    pub dilution: Vec<Estimate>,
+    pub ask_free: Option<Estimate>,
+}
+
+/// The test's checks at one k: how often each s from 0 to k was drawn, and those refused at that k.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Draws {
+    pub k: f64,
+    pub draws: Vec<f64>,
+    pub refused: f64,
+}
+
 /// Lesson selection as borg's monitor reads it from the store's selection summary (`/api/select`, borg
 /// top.rs `Selection`). An empty section is not measured yet, never a 0.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -613,6 +647,8 @@ pub struct Selection {
     pub measurement: Option<Measurement>,
     pub pool: Vec<Yield>,
     pub latency: Vec<Latency>,
+    /// None under another policy while the summary counts none of the test's checks.
+    pub test: Option<Test>,
 }
 
 fn list<T>(v: &Value, one: impl Fn(&Value) -> T) -> Vec<T> {
@@ -676,6 +712,24 @@ pub fn parse_select(v: &Value) -> Selection {
             p95_ms: f(&l["p95_ms"]),
             budget_ms: l["budget_ms"].as_f64(),
             over: f(&l["over"]),
+        }),
+        test: x["test"].as_object().map(|_| {
+            let t = &x["test"];
+            Test {
+                risk: f(&t["risk"]),
+                set: t["set"].as_bool().unwrap_or(false),
+                ran: f(&t["ran"]),
+                control: f(&t["control"]),
+                refused: f(&t["refused"]),
+                sessions: f(&t["sessions"]),
+                kept: f(&t["kept"]),
+                by_k: list(&t["by_k"], |d| Draws { k: f(&d["k"]), draws: list(&d["draws"], f), refused: f(&d["refused"]) }),
+                due: t["due"].as_bool().unwrap_or(false),
+                due_checks: f(&t["due_checks"]),
+                due_sessions: f(&t["due_sessions"]),
+                dilution: list(&t["dilution"], estimate),
+                ask_free: t["ask_free"].as_object().map(|_| estimate(&t["ask_free"])),
+            }
         }),
     }
 }

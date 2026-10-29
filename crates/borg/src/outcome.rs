@@ -280,6 +280,20 @@ pub struct Outcome {
     /// record alone holds every `had` that bears on its decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nofree: Vec<String>,
+    /// `graded`, a check of the randomised question-count test (select/policy.rs `Decision::xk`,
+    /// sources `experiment`, `experiment_control` and `gate`): `xk` the fixed rule's delivered non-3
+    /// lessons that may go free (k), `xs` how many of them it asked (s, drawn uniformly in 0..=k; 0 is
+    /// logged). None on every other record, so older lines and checks outside the test write back
+    /// unchanged. Local like the rest of a graded record (`share`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xk: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xs: Option<u32>,
+    /// `graded`: the collective's tolerance the check was decided under (select.rs `Log::alpha`, its
+    /// `risk`), so a replay decides under it whatever the config says then; None at the default
+    /// (select/policy.rs `ALPHA`), so older lines and default collectives write back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
     /// `graded`: the lessons the pool budget dropped from the model call that a tail sample showed
     /// anyway (whole.rs `tail`, under every policy), and each one's chance of being sampled (one chance
     /// for all of the check's tail: k drawn uniformly of the `eligible` − `shown` dropped, unrounded).
@@ -1406,6 +1420,7 @@ mod tests {
         ] {
             let o: Outcome = serde_json::from_str(line).unwrap();
             assert!(o.nofree.is_empty() && o.tail.is_empty() && o.pt == 0.0 && o.rel.is_empty(), "{line}");
+            assert_eq!((o.xk, o.xs), (None, None), "{line}");
             assert_eq!(serde_json::to_string(&o).unwrap(), line);
         }
     }
@@ -1421,6 +1436,8 @@ mod tests {
             placebo: vec!["C".into()],
             psi: 0.5,
             nofree: vec!["N9".into()],
+            xk: Some(2),
+            xs: Some(0),
             tail: vec!["T9".into()],
             pt: 0.125,
             eligible: 40,
@@ -1439,15 +1456,19 @@ mod tests {
         let judged = Outcome { check: "0123456789ab".into(), judge: 2, stripped: true, ..o(CHANGED, "s", &["A"], 7) };
         let early = Outcome { channel: "early".into(), rel: vec![0.75], ..o(ASKED, "s", &["D"], 8) };
         // Shareable kinds carrying every per-check field, so `share` is put to the test on each.
-        let carried = Outcome { nofree: g.nofree.clone(), tail: g.tail.clone(), pt: g.pt, rel: vec![0.75], ..judged.clone() };
+        let carried = Outcome { nofree: g.nofree.clone(), xk: g.xk, xs: g.xs, tail: g.tail.clone(), pt: g.pt, rel: vec![0.75], ..judged.clone() };
         for x in [&g, &delivered, &judged, &early, &carried] {
             let line = serde_json::to_string(x).unwrap();
             assert_eq!(&serde_json::from_str::<Outcome>(&line).unwrap(), x, "round trip");
         }
+        // The test's s = 0 is logged, not skipped: it is a draw, not an absent field.
+        assert!(serde_json::to_string(&g).unwrap().contains(r#""xk":2,"xs":0"#));
         assert!(share(&g, "n1").is_none(), "graded stays local");
         for x in [&delivered, &judged, &early, &carried] {
             let shared = serde_json::to_string(&share(x, "n1").unwrap()).unwrap();
-            for field in ["check", "0123456789ab", "route", "reason", "judge", "stripped", "nofree", "N9", "tail", "T9", "pt", "0.125", "rel", "0.75"] {
+            for field in
+                ["check", "0123456789ab", "route", "reason", "judge", "stripped", "nofree", "N9", "xk", "xs", "tail", "T9", "pt", "0.125", "rel", "0.75"]
+            {
                 assert!(!shared.contains(field), "{field}: {shared}");
             }
         }

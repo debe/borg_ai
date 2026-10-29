@@ -34,21 +34,39 @@
 //! end starts detached), never in a hook. `fit_pruned` is P2's pre-registered pruned model, for
 //! evaluation only.
 //!
-//! **The decision** (`choose`). The value of route a for apply j is
-//! τ_j(a, m) = π_a·[P(changed | a, m) − P(changed | D)], with the learned delivery rate π (a stop's free
-//! lesson arrives only if a next prompt comes, a live question only if it reaches the drone; a stop's
-//! question always does, it blocks) (`Rates`). Not now is worth 0, at
-//! the stop and during the turn alike: a lesson left for later earns its value at the check that
-//! delivers it, and crediting it here too would count that delivery twice in the gate's ledger. A
-//! check's routes maximise Σ_j τ_j (`solve`, exact) under a Thompson draw of the model seeded by the
-//! check (`theta`), a lesson the session already had never handed over free (its delivery would drop
-//! it). The conservative gate (in `choose`) keeps the fixed rule unless the deviation leaves the
-//! replayed value of the policy's checks, at the `DELTA` quantile over `DRAWS` joint draws, at most
-//! `ALPHA` × the fixed rule's own replayed value below the fixed rule (select/summary.rs `Gate`): cold
-//! start is exactly the fixed rule, and exploration is rationed by quality, not by an ε. A stop's
-//! grade 3 is always asked (`forced`). Propensities are the share of `DRAWS` seeded draws that route
-//! each apply each way. Spend is not an objective: only the pool's size has a price, and only under a
-//! budget an engineer set for the collective (`price`); without one the price is 0.
+//! **The decision** (`choose`, policy v2: docs/evidence.md, Rules v2). The value of route a for apply
+//! j is τ_j(a, m) = π_a·[P(changed | a, m) − P(changed | D)], with the learned delivery rate π (a stop's
+//! free lesson arrives only if a next prompt comes, a live question only if it reaches the drone; a
+//! stop's question always does, it blocks) (`Rates`). Not now is worth 0, at the stop and during the
+//! turn alike: a lesson left for later earns its value at the check that delivers it, and crediting it
+//! here too would count that delivery twice in the gate's ledger. A check takes one of three routings:
+//! - **On evidence** (`evident`): the routes maximising Σ_j τ_j (`solve`, exact) under the posterior
+//!   mean (`theta_mean`: the coefficients' and every level's mean, no draw), played only when they
+//!   beat the fixed rule at the `DELTA` quantile over the `DRAWS` joint draws (`gate_seed`, the ledger's
+//!   draws), a lesson the session already had never handed over free (its delivery would drop it).
+//!   Without evidence nothing passes the quantile, so the prior alone never leaves the fixed rule: the
+//!   effects the fixed rule's history cannot identify (how much each question dilutes the others, what
+//!   a lesson not delivered still changes) cannot decide from their priors. No Thompson play.
+//! - **The randomised question-count test**, on a live check (never the stop) whose evidence keeps the
+//!   fixed rule: of the fixed rule's k delivered non-3 lessons that may go free (`tested`), the first s
+//!   in its order are asked and the rest handed over, s uniform in 0..=k drawn from the check's seed
+//!   (`draw_count`). Nothing is withheld and every 3 is asked as the fixed rule asks it, so recall is
+//!   the fixed rule's: on a check with a 3 the hand-overs replace questions, and the free delivery
+//!   carries them past its character budget as the questions would have been carried (hook.rs
+//!   `INSTEAD`). The fixed rule is s = 0 without a 3 and s = k with one (`EXPERIMENT_CONTROL`).
+//!   It measures what the fixed rule's history never varies: how many questions to ask.
+//! - **The fixed rule** otherwise.
+//!
+//! The conservative gate (in `choose`) keeps the fixed rule unless the deviation leaves the replayed
+//! value of the policy's checks, at the `DELTA` quantile over `DRAWS` joint draws, at most α × the
+//! fixed rule's own replayed value below the fixed rule (select/summary.rs `Gate`), α the engineer's
+//! tolerance (`ALPHA` unless the collective sets `risk`, select.rs `risk_of`; 0 turns the test off):
+//! cold start is exactly the fixed rule, and the test is rationed by quality, not by an ε. A stop's
+//! grade 3 is always asked (`forced`). Propensities are exact: 0 or 1 on evidence and under the fixed
+//! rule, and under the test each unit's share of the k + 1 values of s that ask it or hand it over (a
+//! value the gate refuses counting as the fixed rule's routes). Spend is not an objective: only the
+//! pool's size has a price, and only under a budget an engineer set for the collective (`price`);
+//! without one the price is 0.
 //!
 //! **The monitor** (`monitor`) estimates, per session, the policy's value against the fixed rule
 //! (doubly robust, cross-fitted by session, truncated self-normalised weights) and keeps a time-uniform
@@ -65,17 +83,20 @@ use crate::conscience::{self, Challenge};
 use crate::memory::Rng;
 
 /// The share of the fixed rule's replayed quality (mistakes avoided) the learned policy may risk below
-/// it while it learns, at the gate (`choose`) and in the monitor (`monitor`). Method: a bound on
-/// quality, not on cost; the engineer's tolerance for learning, stated once.
+/// it while it learns, at the gate (`choose`, unless the collective sets `risk`, select.rs `risk_of`)
+/// and in the monitor (`monitor`), and the share the gate's ledger accrues (`ledger_add_without`).
+/// Method: a bound on quality, not on cost; the engineer's tolerance for learning, stated once.
 pub const ALPHA: f64 = 0.10;
-/// The gate's quantile and the monitor's error probability. Method: the conventional 95% confidence.
+/// The gate's and the evidence rule's quantile, and the monitor's error probability. Method: the
+/// conventional 95% confidence.
 pub const DELTA: f64 = 0.05;
-/// Joint posterior draws behind the gate's quantile and behind each propensity: conscience.rs
-/// `P_DRAWS` (method, its standard error ≤ 0.022).
+/// Joint posterior draws behind the gate's and the evidence rule's quantile: conscience.rs `P_DRAWS`
+/// (method, its standard error ≤ 0.022).
 pub const DRAWS: usize = conscience::P_DRAWS;
 /// Applies a check may have for the learned decision; a larger check takes the fixed rule (source
-/// `size`). Guard: bounds the exact solver's time per check (O(n³ log n) per draw, `DRAWS` + 1 draws);
-/// its hit rate is the share of `size` checks.
+/// `size`). Guard: bounds the exact solver's time per check (O(n³ log n), on the posterior mean's
+/// table) and the valuing of the evidence rule's and the test's routes (O(n) per draw, `DRAWS` draws,
+/// k + 2 routings); its hit rate is the share of `size` checks.
 pub const SOLVE_MAX: usize = 16;
 
 /// Prior sd of every identified effect (intercept, grades, channel, a 3 in the check, a 3 at the
@@ -88,9 +109,10 @@ pub const ASK_PRIOR: (f64, f64) = (0.0, 0.35);
 /// Not now against free, N(−0.3, 0.25²). Learned, dated prior: the same evaluation, a lesson not
 /// delivered changes less than one handed over.
 pub const NOT_PRIOR: (f64, f64) = (-0.3, 0.25);
-/// Dilution slope per ln(m) of asks or free lessons, N(−0.1, 0.1²) truncated ≤ 0. Learned, dated
-/// prior: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question on the log-odds scale).
-pub const DILUTION_PRIOR: (f64, f64) = (-0.1, 0.1);
+/// Dilution slope per ln(m) of asks or free lessons, N(0, 0.1²) truncated ≤ 0 (half-normal, its mode
+/// at 0). Learned, dated prior: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question on the
+/// log-odds scale) has an interval that includes 0, so no dilution is assumed; its width sets the scale.
+pub const DILUTION_PRIOR: (f64, f64) = (0.0, 0.1);
 /// Starting sd of an ARD term, every term without a dated prior (rank, interactions, pool). Method: EM
 /// moves it.
 pub const ARD_START: f64 = 1.0;
@@ -689,10 +711,11 @@ pub struct Rates {
     pub later: f64,
     /// A live question was still waiting at the stop and asked there in a block: shown, not used.
     pub wait: f64,
-    /// A live question of a lesson its session lacked reached the drone, during the turn or waiting for
-    /// the stop and asked in its block (select/summary.rs `ASK_LIVE`): a live ask's rate in its value
-    /// (`Valuer::ask`; a stop's is 1, it blocks). 1 until one is tallied (baseline: the fixed rule
-    /// takes every question as delivered, as a stop's is).
+    /// A live question of a check with a 3, of a lesson its session lacked, reached the drone, during
+    /// the turn or waiting for the stop and asked in its block (select/summary.rs `ASK_LIVE`): such an
+    /// ask's rate in its value (`Valuer::ask`; a stop's is 1, it blocks; one of a live check without a
+    /// 3 no stop asks, so it arrives as a hand-over does, at `free_live`). 1 until one is tallied
+    /// (baseline: the fixed rule takes every question as delivered, as a stop's is).
     pub ask_live: f64,
 }
 
@@ -949,7 +972,7 @@ impl Data {
 /// the judge gave it a verdict: a logistic fit on its route, channel, the session's applies waiting
 /// for a verdict at its check, and whether its check was the session's last. Unclear counts as not
 /// judged.
-fn judged(s: &Summary) -> HashMap<usize, f64> {
+pub(crate) fn judged(s: &Summary) -> HashMap<usize, f64> {
     // Derived: the fit's features (intercept, asked, free, stop, log pending, last check).
     const K: usize = 6;
     let mut last: HashMap<u32, usize> = HashMap::new();
@@ -1250,15 +1273,99 @@ impl<'a> Levels<'a> {
     }
 }
 
-/// Draw `seed` of `m`'s coefficients: β̂ + L z, the bounded slopes held ≤ 0.
+/// Draw `seed` of `m`'s coefficients: β̂ + L z, coordinate by coordinate, each bounded slope drawn
+/// from its normal given the coordinates before it truncated at 0 (`below_zero`: the same z mapped by
+/// its inverse CDF, never a clamp, which would put half the mass of a slope whose mode is 0 on 0 itself)
+/// and the later coordinates conditioned on the value it took. Under the n = 0 prior (the slopes
+/// independent of the rest) each is exactly its prior, `DILUTION_PRIOR`'s half-normal; with data it is
+/// the sequential (GHK) approximation of the truncated joint posterior.
 fn draw_beta(m: &Model, seed: u64) -> [f64; P] {
     let mut rng = Rng::new(seed);
-    let z: [f64; P] = std::array::from_fn(|_| normal(&mut rng));
+    let mut z: [f64; P] = std::array::from_fn(|_| normal(&mut rng));
     let spec = coefs();
-    std::array::from_fn(|i| {
-        let x = m.beta.get(i).copied().unwrap_or(0.0) + (0..=i).map(|k| m.chol.get(i * P + k).copied().unwrap_or(0.0) * z[k]).sum::<f64>();
-        if spec[i].nonpos { x.min(0.0) } else { x }
-    })
+    let l = |i: usize, k: usize| m.chol.get(i * P + k).copied().unwrap_or(0.0);
+    let mut x = [0.0; P];
+    for i in 0..P {
+        let given = m.beta.get(i).copied().unwrap_or(0.0) + (0..i).map(|k| l(i, k) * z[k]).sum::<f64>();
+        x[i] = given + l(i, i) * z[i];
+        if spec[i].nonpos {
+            x[i] = below_zero(given, l(i, i), z[i]);
+            // The z that gives the truncated value: what the later coordinates are conditioned on.
+            if l(i, i) > 0.0 {
+                z[i] = (x[i] - given) / l(i, i);
+            }
+        }
+    }
+    x
+}
+
+/// The draw of N(`mean`, `sd`²) truncated to ≤ 0 at the standard normal draw `z`: Φ⁻¹ of Φ(z) scaled
+/// into the mass below 0, in logs so a bound far below the mean neither underflows nor leaves the
+/// half-line. Monotone in z; `mean` held ≤ 0 when `sd` is 0.
+fn below_zero(mean: f64, sd: f64, z: f64) -> f64 {
+    if sd <= 0.0 || !sd.is_finite() {
+        return mean.min(0.0);
+    }
+    let bound = -mean / sd;
+    // The draw's lower tail Φ(z)·Φ(bound) and its upper 1 − that, each without cancellation.
+    let ln_lower = ln_phi(z) + ln_phi(bound);
+    let upper = phi(-z) + phi(z) * phi(-bound);
+    (mean + sd * probit(ln_lower, upper)).min(0.0)
+}
+
+/// The standard normal CDF Φ(x): O(1), relative error below 1.2e-7 (`erfc`).
+fn phi(x: f64) -> f64 {
+    0.5 * erfc(-x / std::f64::consts::SQRT_2)
+}
+
+/// ln Φ(x), finite far into the lower tail (`erfcx`, the factor exp(−x²/2) taken out).
+fn ln_phi(x: f64) -> f64 {
+    if x < 0.0 { 0.5f64.ln() - 0.5 * x * x + erfcx(-x / std::f64::consts::SQRT_2).ln() } else { (-0.5 * erfc(x / std::f64::consts::SQRT_2)).ln_1p() }
+}
+
+/// erfc(x) (`erfcx` for x ≥ 0, reflected below).
+fn erfc(x: f64) -> f64 {
+    let a = x.abs();
+    let tail = (-a * a).exp() * erfcx(a);
+    if x >= 0.0 { tail } else { 2.0 - tail }
+}
+
+/// exp(x²)·erfc(x) for x ≥ 0: the Chebyshev fit of Numerical Recipes' `erfcc` (Press et al. 2007,
+/// §6.2), its relative error below 1.2e-7 everywhere. Method: the coefficients are the fit's.
+fn erfcx(x: f64) -> f64 {
+    const C: [f64; 10] =
+        [-1.265_512_23, 1.000_023_68, 0.374_091_96, 0.096_784_18, -0.186_288_06, 0.278_868_07, -1.135_203_98, 1.488_515_87, -0.822_152_23, 0.170_872_77];
+    let t = 1.0 / (1.0 + 0.5 * x);
+    t * C.iter().rev().fold(0.0, |acc, c| acc * t + c).exp()
+}
+
+/// Φ⁻¹ of the probability whose lower tail is exp(`ln_lower`) and upper tail `upper` (both given, so
+/// neither tail loses its digits): Acklam's rational approximation, relative error below 1.15e-9.
+/// Method: the coefficients and the tails' breakpoint (0.02425) are Acklam's.
+fn probit(ln_lower: f64, upper: f64) -> f64 {
+    const A: [f64; 6] =
+        [-3.969_683_028_665_376e1, 2.209_460_984_245_205e2, -2.759_285_104_469_687e2, 1.383_577_518_672_69e2, -3.066_479_806_614_716e1, 2.506_628_277_459_239];
+    const B: [f64; 5] = [-5.447_609_879_822_406e1, 1.615_858_368_580_409e2, -1.556_989_798_598_866e2, 6.680_131_188_771_972e1, -1.328_068_155_288_572e1];
+    const C: [f64; 6] =
+        [-7.784_894_002_430_293e-3, -3.223_964_580_411_365e-1, -2.400_758_277_161_838, -2.549_732_539_343_734, 4.374_664_141_464_968, 2.938_163_982_698_783];
+    const D: [f64; 4] = [7.784_695_709_041_462e-3, 3.224_671_290_700_398e-1, 2.445_134_137_142_996, 3.754_408_661_907_416];
+    const LOW: f64 = 0.02425;
+    let poly = |c: &[f64], x: f64| c.iter().fold(0.0, |acc, k| acc * x + k);
+    // The tail from its log: q = √(−2 ln p).
+    let tail = |ln_p: f64| {
+        let q = (-2.0 * ln_p).sqrt();
+        poly(&C, q) / (poly(&D, q) * q + 1.0)
+    };
+    let lower = ln_lower.exp();
+    if lower < LOW {
+        tail(ln_lower)
+    } else if upper < LOW {
+        -tail(upper.ln())
+    } else {
+        let q = lower - 0.5;
+        let r = q * q;
+        poly(&A, r) * q / (poly(&B, r) * r + 1.0)
+    }
 }
 
 /// Draw `seed` of `m` for a check, its coefficients `b` (`draw_beta` of the same seed): each level
@@ -1266,16 +1373,33 @@ fn draw_beta(m: &Model, seed: u64) -> [f64; P] {
 /// The levels are drawn apart from β: wider than the joint posterior where a level and the intercept
 /// trade off, so the gate errs cautious.
 fn theta_with(m: &Model, b: [f64; P], feats: &[Feat], units: &[Unit], lv: &Levels, seed: u64) -> Theta {
-    let level = |map: &BTreeMap<String, (f64, f64)>, name: &str, spread: f64, h: u64| -> f64 {
-        let (mean, sd) = map.get(name).copied().unwrap_or((0.0, spread));
-        mean + sd * normal(&mut Rng::new(mix(seed, h)))
-    };
-    let shared = level(&m.sessions, lv.name, m.spread[SESSION], lv.session) + level(&m.judges, &m.judge, m.spread[JUDGE], lv.judge);
+    theta_by(m, b, feats, units, lv, |(mean, sd), h| mean + sd * normal(&mut Rng::new(mix(seed, h))))
+}
+
+/// `m` for a check at its posterior centre (`choose`'s evidence rule): the coefficients at β̂, the
+/// Laplace posterior's mean, which for a bounded slope is its mode (held ≤ 0; at the n = 0 prior 0,
+/// not the half-normal's mean −0.08: dilution is not assumed, docs/evidence.md Rules v2), and each
+/// level at its mean (an unseen one at 0). Not a draw: the draws (`draw_beta`) carry the truncated
+/// spread the quantile is taken over.
+fn theta_mean(m: &Model, feats: &[Feat], units: &[Unit], lv: &Levels) -> Theta {
+    let spec = coefs();
+    let b = std::array::from_fn(|i| {
+        let x = m.beta.get(i).copied().unwrap_or(0.0);
+        if spec[i].nonpos { x.min(0.0) } else { x }
+    });
+    theta_by(m, b, feats, units, lv, |(mean, _), _| mean)
+}
+
+/// `m` for a check under the coefficients `b`, each level's effect from `level` (its posterior mean
+/// and sd, an unseen level's (0, its family's spread), and its seed in `lv`).
+fn theta_by(m: &Model, b: [f64; P], feats: &[Feat], units: &[Unit], lv: &Levels, level: impl Fn((f64, f64), u64) -> f64) -> Theta {
+    let effect = |map: &BTreeMap<String, (f64, f64)>, name: &str, spread: f64, h: u64| level(map.get(name).copied().unwrap_or((0.0, spread)), h);
+    let shared = effect(&m.sessions, lv.name, m.spread[SESSION], lv.session) + effect(&m.judges, &m.judge, m.spread[JUDGE], lv.judge);
     let base = feats
         .iter()
         .zip(units)
         .zip(&lv.lessons)
-        .map(|((f, u), h)| dot(&b, &design(f, Route::Free, 1)) + shared + level(&m.lessons, u.lesson, m.spread[LESSON], *h))
+        .map(|((f, u), h)| dot(&b, &design(f, Route::Free, 1)) + shared + effect(&m.lessons, u.lesson, m.spread[LESSON], *h))
         .collect();
     Theta { b, base }
 }
@@ -1314,8 +1438,15 @@ impl Valuer<'_> {
             + b[ASK_M] * (m.max(1) as f64).ln()
             + b[ASK_STOP] * f64::from(u8::from(f.stop))
             + b[ASK_G3] * f64::from(u8::from(f.grade == 3));
-        // A stop's question blocks, so it arrives; a live one only if it reaches the drone.
-        let rate = if self.stop() { 1.0 } else { self.rates.ask_live };
+        // A stop's question blocks, so it arrives; a live one of a check with a 3 only if it reaches the
+        // drone, during the turn or waiting for the stop, which asks it; one of a check without a 3 no
+        // stop asks (hook.rs `live_check`): like a hand-over it arrives only at a tool call or the next
+        // prompt, at the free rate.
+        let rate = match (self.stop(), f.three) {
+            (true, _) => 1.0,
+            (false, true) => self.rates.ask_live,
+            (false, false) => self.rates.free_live,
+        };
         rate * (sigmoid(eta) - self.p_not(j))
     }
 
@@ -1379,7 +1510,9 @@ impl Table {
         Table { n, ask, free, forced: v.feats.iter().map(forced).collect(), nofree: (0..n).map(|j| nofree.get(j).copied().unwrap_or(false)).collect() }
     }
 
-    /// The check's value under `routes` (`Valuer::value`).
+    /// The check's value under `routes` (`Valuer::value`), read from the table: the tests' check that
+    /// the solver's entries value as the model does.
+    #[cfg(test)]
     fn value(&self, routes: &[Route]) -> f64 {
         let m_q = routes.iter().filter(|r| **r == Route::Ask).count();
         let m_f = routes.iter().filter(|r| **r == Route::Free).count();
@@ -1540,12 +1673,36 @@ pub struct Check<'a> {
     pub tokens: u32,
 }
 
+/// `Decision::source` values. Protocol: logged as the graded record's `source` (outcome.rs), which the
+/// summary fold, `borg debug select`, `borg top` and the web's Selection view read back.
+/// `FIXED`: the fixed rule because the policy cannot decide yet (cold start, an empty gate, no model).
+pub const FIXED: &str = "fixed";
+/// `SIZE`: the fixed rule past `SOLVE_MAX` applies.
+pub const SIZE: &str = "size";
+/// `GATE`: the gate kept the fixed rule, its allowance too short for the deviation's risk (the
+/// evidence rule's, or the randomised test's).
+pub const GATE: &str = "gate";
+/// `EVIDENCE`: the evidence rule's routes (`evident`): the routes best under the posterior mean where
+/// they beat the fixed rule at the `DELTA` quantile over the `DRAWS` joint draws, else, when the
+/// randomised test does not run (the stop, no lesson to test, α 0), the fixed rule's.
+pub const EVIDENCE: &str = "evidence";
+/// `EXPERIMENT`: a check of the randomised question-count test whose draw s routes differently from
+/// the fixed rule (`Decision::xk`, `xs`).
+pub const EXPERIMENT: &str = "experiment";
+/// `EXPERIMENT_CONTROL`: a check of the test whose draw s is the fixed rule's own count (s = 0
+/// without a 3, s = k with one), so it routes as the fixed rule: the test's control arm.
+pub const EXPERIMENT_CONTROL: &str = "experiment_control";
+
 /// A check's decision: a route per unit, each unit's chance of being asked (`p`) and handed over free
-/// (`pf`), what set the routes (`fixed`: cold start, an empty gate or no model; `size`: past
-/// `SOLVE_MAX`; `gate`: the gate kept the fixed rule; `learned`: the drawn optimum), the quality the
-/// gate may still risk after the ledger's past (`Gate`), at its `DELTA` quantile, and how much of it
-/// this decision takes (`risk`: how far its routes lower that quantile, 0 for the fixed rule's). The
-/// gate admits a deviation exactly when `risk` ≤ `gate`, which `borg debug select` P3 checks.
+/// (`pf`), what set the routes (`source`: `FIXED`, `SIZE`, `GATE`, `EVIDENCE`, `EXPERIMENT`,
+/// `EXPERIMENT_CONTROL`), the quality the gate may still risk
+/// after the ledger's past (`Gate`), at its `DELTA` quantile, and how much of it this decision takes
+/// (`risk`: how far its routes lower that quantile, 0 for the fixed rule's). The gate admits a
+/// deviation exactly when `risk` ≤ `gate`, which `borg debug select` P3 checks. A check the randomised
+/// question-count test considered (sources `EXPERIMENT`, `EXPERIMENT_CONTROL`, and `GATE` when the
+/// gate refused its draw) carries `xk`, the fixed rule's delivered non-3 lessons that may go free, and
+/// `xs`, the drawn number of them to ask (on `GATE` the draw the gate refused: the routes are the fixed
+/// rule's); both None on every other check (outcome.rs `xk`, `xs`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub routes: Vec<Route>,
@@ -1554,6 +1711,8 @@ pub struct Decision {
     pub source: &'static str,
     pub gate: f64,
     pub risk: f64,
+    pub xk: Option<u32>,
+    pub xs: Option<u32>,
 }
 
 /// The `DELTA` quantile of `v` (the ⌈δ·n⌉-th smallest: the lower side, cautious).
@@ -1565,17 +1724,99 @@ fn lower_quantile(v: &mut [f64]) -> f64 {
     v[((DELTA * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1]
 }
 
-/// The quality `gate` may still risk below the fixed rule: its allowance plus the ledger's `DELTA`
-/// quantile (`Decision::gate` before a decision; the monitoring shows it).
+/// The quality `gate` may still risk below the fixed rule at `ALPHA`: its allowance plus the ledger's
+/// `DELTA` quantile, not held at 0 (`remaining_at` is), so a test can see an overspend as a negative.
+#[cfg(test)]
 #[must_use]
-pub fn remaining(gate: &Gate) -> f64 {
+pub(crate) fn remaining(gate: &Gate) -> f64 {
     gate.allowance + lower_quantile(&mut gate.gain.clone())
+}
+
+/// `gate`'s allowance at the risk share `alpha` (select.rs `risk_of`): `choose`'s, for the evidence
+/// rule's deviations and the randomised test's alike.
+fn allowance_at(gate: &Gate, alpha: f64) -> f64 {
+    // Derived: the ledger accrues `ALPHA` × the fixed rule's value per check (`add_with`), so its
+    // allowance scaled by alpha / `ALPHA` is exactly alpha's; 0 stays 0 whatever the ledger holds.
+    if alpha > 0.0 { gate.allowance * (alpha / ALPHA) } else { 0.0 }
+}
+
+/// What `gate` may still risk below the fixed rule at the risk share `alpha`, never below 0: the gate
+/// in force (`Decision::gate`), which the monitoring shows.
+#[must_use]
+pub fn remaining_at(gate: &Gate, alpha: f64) -> f64 {
+    (allowance_at(gate, alpha) + lower_quantile(&mut gate.gain.clone())).max(0.0)
 }
 
 /// The seed of the gate's draw `k` under `fit`: shared by every check, so the ledger and a decision
 /// re-value with the same joint draws.
 fn gate_seed(fit: &Fit, k: usize) -> u64 {
     mix(hash(&[b"gate", fit.key.as_bytes()]), k as u64)
+}
+
+/// A check's joint draws of the model (`gate_seed`: the ledger's, so a decision and its ledger entry
+/// re-value with the same draws) and the fixed rule's value under each.
+struct Draws<'a> {
+    thetas: Vec<Theta>,
+    feats: Vec<Feat>,
+    rates: &'a Rates,
+    base: Vec<f64>,
+}
+
+impl<'a> Draws<'a> {
+    fn of(model: &Model, fit: &'a Fit, units: &[Unit], check: &Check, lv: &Levels, base: &[Route]) -> Draws<'a> {
+        let feats = Feat::of(units, check.stop, check.tokens);
+        let thetas: Vec<Theta> = (0..DRAWS).map(|k| theta(model, &feats, units, lv, gate_seed(fit, k))).collect();
+        let mut d = Draws { thetas, feats, rates: &fit.rates, base: Vec::new() };
+        d.base = (0..DRAWS).map(|k| d.value(k, base)).collect();
+        d
+    }
+
+    /// Draw `k`'s value of `routes` (`Valuer::value`).
+    fn value(&self, k: usize, routes: &[Route]) -> f64 {
+        Valuer { t: &self.thetas[k], feats: &self.feats, rates: self.rates }.value(routes)
+    }
+
+    /// Per draw, the value of `routes` minus the fixed rule's.
+    fn gains(&self, routes: &[Route]) -> Vec<f64> {
+        self.base.iter().enumerate().map(|(k, b)| self.value(k, routes) - b).collect()
+    }
+}
+
+/// The evidence rule (module doc): the routes best under the posterior mean (`theta_mean`, `solve`),
+/// when they are not the fixed rule's `base` and gain on it at the `DELTA` quantile over the joint
+/// draws `d`; else None (the fixed rule). The units in `nofree` never go free.
+fn evident(model: &Model, d: &Draws, units: &[Unit], lv: &Levels, base: &[Route], nofree: &[bool]) -> Option<Vec<Route>> {
+    let t = theta_mean(model, &d.feats, units, lv);
+    let best = solve(&Table::of(&Valuer { t: &t, feats: &d.feats, rates: d.rates }, nofree), crate::attention::RAIL, conscience::CAP);
+    (best != base && lower_quantile(&mut d.gains(&best)) > 0.0).then_some(best)
+}
+
+/// The randomised question-count test's lessons (module doc), by position: the applies the fixed rule
+/// delivers (`base`: asks or hands over) that are not a 3 and whose lesson the session never had
+/// (`had`: such a lesson may not go free, so it keeps the fixed rule's route), in the fixed rule's order
+/// (the higher grade first, then the model's: select.rs `ordered`). Their number is the test's k.
+pub(crate) fn tested(units: &[Unit], base: &[Route], had: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> =
+        (0..units.len()).filter(|&j| units[j].grade != 3 && matches!(base[j], Route::Ask | Route::Free) && !had.iter().any(|h| h == units[j].lesson)).collect();
+    order.sort_by_key(|&j| std::cmp::Reverse(units[j].grade));
+    order
+}
+
+/// The test's routes for the count `s`: `base` with the first `s` of `order` (`tested`) asked and the
+/// rest of it handed over.
+fn test_routes(base: &[Route], order: &[usize], s: usize) -> Vec<Route> {
+    let mut routes = base.to_vec();
+    for (i, &j) in order.iter().enumerate() {
+        routes[j] = if i < s { Route::Ask } else { Route::Free };
+    }
+    routes
+}
+
+/// The test's count at the check whose seed is `seed`: s uniform in 0..=k, on the test's own stream
+/// of the seed (apart from the placebo's, select.rs `draw_placebo`). The modulo's bias is below
+/// (k + 1)/2⁶⁴.
+fn draw_count(seed: u64, k: usize) -> usize {
+    (hash(&[b"question-count", &seed.to_le_bytes()]) % (k as u64 + 1)) as usize
 }
 
 /// The routes of `units` at `check` for a session that already had the lessons `had` (module doc: the
@@ -1586,8 +1827,15 @@ fn gate_seed(fit: &Fit, k: usize) -> u64 {
 /// (`ledger_add_without`, with the same `had`): two checks deciding against the same `gate` could each
 /// take all it may still risk, so a caller whose checks run at once decides and records each under one
 /// lock.
+///
+/// `alpha` is the share of the fixed rule's value the engineer tolerates risking for learning (select.rs
+/// `risk_of`, `ALPHA` unless the collective sets `risk`): the gate's allowance in this decision is the
+/// ledger's (accrued at `ALPHA`) scaled to it, for the evidence rule's deviations and the test's alike.
+/// The randomised question-count test runs on a live check (`check.stop` false) whose evidence keeps
+/// the fixed rule (an evidence deviation the gate refuses is not tested either), only while `alpha` is
+/// above 0, its count drawn from `seed`.
 #[must_use]
-pub fn choose(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, seed: u64, had: &[String]) -> Decision {
+pub fn choose(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, alpha: f64, seed: u64, had: &[String]) -> Decision {
     let base = fixed_routes(units, had);
     let fixed = |source: &'static str| Decision {
         p: share(&[&base], Route::Ask),
@@ -1596,84 +1844,104 @@ pub fn choose(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, seed: u64, 
         source,
         gate: 0.0,
         risk: 0.0,
+        xk: None,
+        xs: None,
     };
-    let Some(model) = fit.model.as_ref().filter(|m| m.current()) else { return fixed("fixed") };
+    let Some(model) = fit.model.as_ref().filter(|m| m.current()) else { return fixed(FIXED) };
     if gate.allowance <= 0.0 || gate.gain.len() != DRAWS || units.is_empty() {
-        return fixed("fixed");
+        return fixed(FIXED);
     }
     if units.len() > SOLVE_MAX {
-        return fixed("size");
+        return fixed(SIZE);
     }
-    let feats = Feat::of(units, check.stop, check.tokens);
     let lv = Levels::of(check.session, &model.judge, units);
-    let nofree = nofree_of(units, had);
-    let table = |t: &Theta| Table::of(&Valuer { t, feats: &feats, rates: &fit.rates }, &nofree);
-    let draws: Vec<Table> = (0..DRAWS).map(|k| table(&theta(model, &feats, units, &lv, gate_seed(fit, k)))).collect();
-    let base_v: Vec<f64> = draws.iter().map(|t| t.value(&base)).collect();
-    let remaining = remaining(gate);
-    let held = remaining - gate.allowance;
-    let mut admitted: HashMap<Vec<Route>, bool> = HashMap::new();
-    let mut one = |s: u64| -> (Vec<Route>, bool) {
-        let Some(best) = played(&table(&theta(model, &feats, units, &lv, s)), &base) else { return (base.clone(), false) };
-        let ok = *admitted.entry(best.clone()).or_insert_with(|| {
-            let mut gains: Vec<f64> = draws.iter().zip(&base_v).zip(&gate.gain).map(|((t, b), g)| g + t.value(&best) - b).collect();
-            lower_quantile(&mut gains) >= -gate.allowance
-        });
-        if ok { (best, false) } else { (base.clone(), true) }
-    };
-    let (routes, refused) = one(play_seed(seed));
-    let all: Vec<Vec<Route>> = (0..DRAWS).map(|i| one(mix(seed, i as u64)).0).collect();
-    let refs: Vec<&Vec<Route>> = all.iter().collect();
-    // What this decision takes of the remaining budget: admitted iff allowance + q(gain + its gain) ≥ 0,
-    // that is iff `risk` = q(gain) − q(gain + its gain) ≤ `remaining`.
-    let risk = match routes == base {
-        true => 0.0,
-        false => {
-            let mut after: Vec<f64> = draws.iter().zip(&base_v).zip(&gate.gain).map(|((t, b), g)| g + t.value(&routes) - b).collect();
-            (held - lower_quantile(&mut after)).max(0.0)
+    let d = Draws::of(model, fit, units, check, &lv, &base);
+    let allowance = allowance_at(gate, alpha);
+    let held = lower_quantile(&mut gate.gain.clone());
+    let remaining = remaining_at(gate, alpha);
+    // What `routes` take of the remaining budget, None when the gate refuses them: admitted iff
+    // allowance + q(gain + their gain) ≥ 0, that is iff `risk` = q(gain) − q(gain + their gain) ≤
+    // allowance + q(gain).
+    let admit = |routes: &[Route]| -> Option<f64> {
+        if routes == base {
+            return Some(0.0);
         }
+        let mut after: Vec<f64> = d.gains(routes).iter().zip(&gate.gain).map(|(x, g)| g + x).collect();
+        let q = lower_quantile(&mut after);
+        (q >= -allowance).then_some((held - q).max(0.0))
     };
+    if let Some(best) = evident(model, &d, units, &lv, &base, &nofree_of(units, had)) {
+        return match admit(&best) {
+            Some(risk) => Decision {
+                p: share(&[&best], Route::Ask),
+                pf: share(&[&best], Route::Free),
+                routes: best,
+                source: EVIDENCE,
+                gate: remaining,
+                risk,
+                xk: None,
+                xs: None,
+            },
+            None => Decision { gate: remaining, ..fixed(GATE) },
+        };
+    }
+    let order = tested(units, &base, had);
+    if check.stop || alpha <= 0.0 || order.is_empty() {
+        return Decision { gate: remaining, ..fixed(EVIDENCE) };
+    }
+    // Every count's routes as played (a count the gate refuses plays the fixed rule's), so each unit's
+    // propensity is its exact share over the k + 1 equally likely counts.
+    let k = order.len();
+    let arms: Vec<(Vec<Route>, Option<f64>)> = (0..=k)
+        .map(|s| {
+            let routes = test_routes(&base, &order, s);
+            let risk = admit(&routes);
+            (if risk.is_some() { routes } else { base.clone() }, risk)
+        })
+        .collect();
+    let played: Vec<&Vec<Route>> = arms.iter().map(|(r, _)| r).collect();
+    let s = draw_count(seed, k);
+    let (routes, risk) = &arms[s];
+    let source = match risk {
+        None => GATE,
+        Some(_) if *routes == base => EXPERIMENT_CONTROL,
+        Some(_) => EXPERIMENT,
+    };
+    let count = |x: usize| Some(u32::try_from(x).unwrap_or(u32::MAX));
     Decision {
-        p: share(&refs, Route::Ask),
-        pf: share(&refs, Route::Free),
-        routes,
-        source: if refused { "gate" } else { "learned" },
-        gate: remaining.max(0.0),
-        risk,
+        p: share(&played, Route::Ask),
+        pf: share(&played, Route::Free),
+        routes: routes.clone(),
+        source,
+        gate: remaining,
+        risk: risk.unwrap_or(0.0),
+        xk: count(k),
+        xs: count(s),
     }
 }
 
-/// The seed of the draw a check plays (`choose`), apart from the `DRAWS` behind its propensities.
-fn play_seed(seed: u64) -> u64 {
-    mix(seed, u64::MAX)
-}
-
-/// The routes one draw's table `t` values most (`solve`), when they are not the fixed rule's `base`
-/// and that draw values them strictly above it; else None (the draw plays `base`).
-fn played(t: &Table, base: &[Route]) -> Option<Vec<Route>> {
-    let best = solve(t, crate::attention::RAIL, conscience::CAP);
-    (best != base && t.value(&best) > t.value(base)).then_some(best)
-}
-
-/// `choose`'s play with a gate that admits every deviation, its propensities aside: `borg debug
-/// select` P4's ungated policy, one draw per call (`choose` under an open gate would also value each
-/// deviation at every one of the gate's `DRAWS` draws, which an open gate never reads). The fixed rule
-/// where `choose` keeps it whatever the gate: no model, no applies, past `SOLVE_MAX`. For a session
-/// that had none of the lessons (`choose` with `had` empty): an evaluation's lines log none.
+/// The decision rule without the randomised question-count test, for a session that already had `had`
+/// (none of those handed over free, gated against `fixed_routes` with the same `had`): `borg debug
+/// select` P4a (under the n = 0 prior it must be the fixed rule on every check) and P4b (recall under
+/// the store's posterior). The evidence rule (`evident`): the routes best under the posterior mean,
+/// played only when they beat the fixed rule at the `DELTA` quantile over the `DRAWS` joint draws, else
+/// the fixed rule; `choose`'s routes with α 0 under a gate that admits them. Deterministic: it draws
+/// nothing of its own (its joint draws are the gate's, `gate_seed`), so it takes no seed. The fixed
+/// rule whatever the evidence: no model, no applies, past `SOLVE_MAX`.
 #[must_use]
-pub fn ungated(units: &[Unit], check: &Check, fit: &Fit, seed: u64) -> Vec<Route> {
-    let base = fixed_routes(units, &[]);
+pub fn decide_on_evidence(units: &[Unit], check: &Check, fit: &Fit, had: &[String]) -> Vec<Route> {
+    let base = fixed_routes(units, had);
     let Some(model) = fit.model.as_ref().filter(|m| m.current()) else { return base };
     if units.is_empty() || units.len() > SOLVE_MAX {
         return base;
     }
-    let feats = Feat::of(units, check.stop, check.tokens);
     let lv = Levels::of(check.session, &model.judge, units);
-    let t = theta(model, &feats, units, &lv, play_seed(seed));
-    played(&Table::of(&Valuer { t: &t, feats: &feats, rates: &fit.rates }, &[]), &base).unwrap_or(base)
+    let d = Draws::of(model, fit, units, check, &lv, &base);
+    evident(model, &d, units, &lv, &base, &nofree_of(units, had)).unwrap_or(base)
 }
 
-/// Per unit, the share of `draws` that give it `route`, rounded (outcome.rs `round_p`).
+/// Per unit, the share of the equally likely routings `draws` that give it `route`, rounded (outcome.rs
+/// `round_p`): one routing's 0 or 1, the test's k + 1 counts' exact shares.
 fn share(draws: &[&Vec<Route>], route: Route) -> Vec<f64> {
     let n = draws.first().map_or(0, |d| d.len());
     (0..n).map(|j| crate::outcome::round_p(draws.iter().filter(|d| d[j] == route).count() as f64 / draws.len() as f64)).collect()
@@ -1681,8 +1949,9 @@ fn share(draws: &[&Vec<Route>], route: Route) -> Vec<f64> {
 
 /// `gate` with one more check of the learned policy, decided for a session that already had `had`
 /// (the graded record's `nofree`): per joint draw k, the value of the routes it took (`routes`) minus
-/// the fixed rule's with the same `had` (the rule `choose` gated it against), and α × the fixed rule's
-/// value at its draws' mean (≥ 0). The prior fit adds nothing: the ledger opens with a model.
+/// the fixed rule's with the same `had` (the rule `choose` gated it against), and `ALPHA` × the fixed
+/// rule's value at its draws' mean (≥ 0; `choose` scales it to the collective's α). The prior fit adds
+/// nothing: the ledger opens with a model.
 pub fn ledger_add_without(fit: &Fit, gate: &mut Gate, check: &Check, units: &[Unit], routes: &[Route], had: &[String]) {
     let Some(model) = fit.model.as_ref().filter(|m| m.current()) else { return };
     let betas: Vec<[f64; P]> = (0..DRAWS).map(|k| draw_beta(model, gate_seed(fit, k))).collect();
@@ -2290,7 +2559,8 @@ mod tests {
         }
         assert_eq!((pm.spread, fm.spread), ([0.0; FAMILIES], [LEVEL_START; FAMILIES]));
         let f = Feat { grade: 2, rank: 3, stop: true, three: false, pool: 0.5 };
-        let at = |fit: &Fit| predict(fit, &f, Route::Free, 2, "unseen", "L99").expect("a prediction");
+        // Not now, whose prior mean is off 0 (`NOT_PRIOR`): at a mean of 0 every variance predicts ½.
+        let at = |fit: &Fit| predict(fit, &f, Route::Not, 1, "unseen", "L99").expect("a prediction");
         assert_ne!(at(&pruned), at(&full), "the full prior's rank, pool and level variance are not the pruned model's");
         assert_eq!(pruned.rates, full.rates);
     }
@@ -2477,6 +2747,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_live_question_without_a_3_arrives_as_a_hand_over_does() {
+        let mut b = [0.0; P];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = 0.1 * i as f64 - 0.6;
+        }
+        let t = Theta { b, base: vec![0.25] };
+        let rates = Rates { free_stop: 0.5, free_live: 0.3, later: 0.4, wait: 0.0, ask_live: 0.9 };
+        let ask = |three: bool| {
+            let f = Feat { grade: 2, rank: 0, stop: false, three, pool: 0.0 };
+            Valuer { t: &t, feats: std::slice::from_ref(&f), rates: &rates }.ask(0, 1)
+        };
+        // The lift of asking a 2, which the check's 3 does not change.
+        let lift = sigmoid(0.25 + b[ASK]) - sigmoid(0.25 + b[NOT]);
+        assert!(lift.abs() > 0.01);
+        // On a check with a 3 the question waits for the stop, which asks it.
+        assert!((ask(true) - 0.9 * lift).abs() < 1e-12);
+        // Without one no stop asks it (hook.rs `live_check`): a tool call or the next prompt brings it,
+        // as it brings a hand-over.
+        assert!((ask(false) - 0.3 * lift).abs() < 1e-12);
+    }
+
     /// A gate that may risk plenty: the learned policy decides.
     fn open_gate() -> Gate {
         Gate { gain: vec![0.0; DRAWS], allowance: 5.0, ..Gate::default() }
@@ -2495,7 +2787,7 @@ mod tests {
             let want = fixed_routes(&units, &[]);
             for (fit, gate) in [(&Fit::default(), &open_gate()), (&fit_model, &Gate::default()), (&fit_model, &wrong_len)] {
                 for stop in [true, false] {
-                    let d = choose(&units, &Check { session: "s", stop, tokens: 0 }, fit, gate, 7, &[]);
+                    let d = choose(&units, &Check { session: "s", stop, tokens: 0 }, fit, gate, ALPHA, 7, &[]);
                     assert_eq!(d.routes, want, "{g:?}");
                     assert_eq!(d.p, want.iter().map(|r| f64::from(u8::from(*r == Route::Ask))).collect::<Vec<_>>());
                     assert_eq!(d.pf, want.iter().map(|r| f64::from(u8::from(*r == Route::Free))).collect::<Vec<_>>());
@@ -2517,24 +2809,29 @@ mod tests {
         assert_eq!(f.labels, 1);
         assert!(m.beta.iter().chain(&m.chol).all(|x| x.is_finite()), "{m:?}");
         let gate = open_gate();
-        assert!(choose(&[], &Check { session: "s", stop: true, tokens: 0 }, &f, &gate, 1, &[]).routes.is_empty());
+        assert!(choose(&[], &Check { session: "s", stop: true, tokens: 0 }, &f, &gate, ALPHA, 1, &[]).routes.is_empty());
         for g in 1..=3 {
-            let d = choose(&[unit("A", g, 0)], &Check { session: "s", stop: true, tokens: 0 }, &f, &gate, 1, &[]);
+            let d = choose(&[unit("A", g, 0)], &Check { session: "s", stop: true, tokens: 0 }, &f, &gate, ALPHA, 1, &[]);
             assert_eq!(d.routes.len(), 1);
             assert!((d.p[0] + d.pf[0]) <= 1.0 + 1e-9);
         }
     }
 
+    /// A decision is a function of its inputs; the seed moves only the randomised test's count, so at
+    /// the stop, where the test never runs, no seed changes it.
     #[test]
-    fn decisions_are_deterministic_and_draws_vary() {
+    fn decisions_are_deterministic_and_only_the_test_varies() {
         let f = fit(&planted(8, 20, 3), None);
         let gate = open_gate();
         let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 3, 2)];
         let check = Check { session: "new", stop: false, tokens: 0 };
-        let a = choose(&units, &check, &f, &gate, 42, &[]);
-        assert_eq!(a, choose(&units, &check, &f, &gate, 42, &[]));
-        let plays: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &check, &f, &gate, s, &[]).routes).collect();
-        assert!(plays.len() > 1, "a posterior this wide explores: {plays:?}");
+        let a = choose(&units, &check, &f, &gate, ALPHA, 42, &[]);
+        assert_eq!(a, choose(&units, &check, &f, &gate, ALPHA, 42, &[]));
+        let plays: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &check, &f, &gate, ALPHA, s, &[]).routes).collect();
+        assert!(plays.len() > 1, "the test's count varies with the check: {plays:?}");
+        let stop = Check { stop: true, ..check };
+        let at_stop: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &stop, &f, &gate, ALPHA, s, &[]).routes).collect();
+        assert_eq!(at_stop.len(), 1, "no Thompson play: {at_stop:?}");
     }
 
     #[test]
@@ -2547,7 +2844,7 @@ mod tests {
         let (mut asked, mut free) = ([0.0; 3], [0.0; 3]);
         let (mut p, mut pf) = ([0.0; 3], [0.0; 3]);
         for seed in 0..n {
-            let d = choose(&units, &check, &f, &gate, seed, &[]);
+            let d = choose(&units, &check, &f, &gate, ALPHA, seed, &[]);
             for j in 0..3 {
                 asked[j] += f64::from(u8::from(d.routes[j] == Route::Ask)) / n as f64;
                 free[j] += f64::from(u8::from(d.routes[j] == Route::Free)) / n as f64;
@@ -2582,10 +2879,10 @@ mod tests {
         let f = free_beats_ask();
         let gate = open_gate();
         let units = [unit("L1", 3, 0), unit("L2", 1, 1)];
-        let live = choose(&units, &Check { session: "n", stop: false, tokens: 0 }, &f, &gate, 1, &[]);
+        let live = choose(&units, &Check { session: "n", stop: false, tokens: 0 }, &f, &gate, ALPHA, 1, &[]);
         assert_eq!(live.routes[0], Route::Free, "during the turn the model hands it over: {live:?}");
         for seed in 0..20 {
-            let d = choose(&units, &Check { session: "n", stop: true, tokens: 0 }, &f, &gate, seed, &[]);
+            let d = choose(&units, &Check { session: "n", stop: true, tokens: 0 }, &f, &gate, ALPHA, seed, &[]);
             assert_eq!((d.routes[0], d.p[0], d.pf[0]), (Route::Ask, 1.0, 0.0), "{d:?}");
         }
     }
@@ -2601,18 +2898,18 @@ mod tests {
         let had = ["L2".to_string()];
         let check = Check { session: "n", stop: false, tokens: 0 };
         assert_eq!(fixed_routes(&units, &had), [Route::Free, Route::Not, Route::Free]);
-        let cold = choose(&units, &check, &Fit::default(), &gate, 1, &had);
+        let cold = choose(&units, &check, &Fit::default(), &gate, ALPHA, 1, &had);
         assert_eq!((cold.routes, cold.pf[1], cold.source), (fixed_routes(&units, &had), 0.0, "fixed"));
         let mut freed = 0;
         for seed in 0..20 {
-            freed += usize::from(choose(&units, &check, &f, &gate, seed, &[]).routes[1] == Route::Free);
-            let d = choose(&units, &check, &f, &gate, seed, &had);
+            freed += usize::from(choose(&units, &check, &f, &gate, ALPHA, seed, &[]).routes[1] == Route::Free);
+            let d = choose(&units, &check, &f, &gate, ALPHA, seed, &had);
             assert!(d.routes[1] != Route::Free && d.pf[1] == 0.0, "{d:?}");
         }
         assert!(freed > 0, "the scenario: without `had` the model hands L2 over");
         // A stop's 3 the session had is still asked.
         let block = [unit("L2", 3, 0), unit("L1", 1, 1)];
-        let d = choose(&block, &Check { stop: true, ..check }, &f, &gate, 3, &had);
+        let d = choose(&block, &Check { stop: true, ..check }, &f, &gate, ALPHA, 3, &had);
         assert_eq!((d.routes[0], d.p[0]), (Route::Ask, 1.0));
     }
 
@@ -2626,10 +2923,10 @@ mod tests {
         // A 3 and 2s: the fixed rule asks them all.
         let units: Vec<Unit> = ids.iter().enumerate().map(|(r, l)| unit(l, if r == 0 { 3 } else { 2 }, r)).collect();
         let check = Check { session: "n", stop: false, tokens: 0 };
-        let at = choose(&units[..SOLVE_MAX], &check, &f, &gate, 1, &[]);
-        assert_eq!(at.source, "learned", "{at:?}");
+        let at = choose(&units[..SOLVE_MAX], &check, &f, &gate, ALPHA, 1, &[]);
+        assert_eq!(at.source, EVIDENCE, "{at:?}");
         assert_ne!(at.routes, fixed_routes(&units[..SOLVE_MAX], &[]), "at the size the model hands them over: {at:?}");
-        let past = choose(&units, &check, &f, &gate, 1, &[]);
+        let past = choose(&units, &check, &f, &gate, ALPHA, 1, &[]);
         let base = fixed_routes(&units, &[]);
         assert_eq!((&past.routes, past.source, past.risk), (&base, "size", 0.0));
         assert_eq!(past.p, base.iter().map(|r| f64::from(u8::from(*r == Route::Ask))).collect::<Vec<_>>(), "its choice is its propensity");
@@ -2648,7 +2945,7 @@ mod tests {
         let f = fit(&s, None);
         let gate = open_gate();
         for seed in 0..10 {
-            let d = choose(&[unit("L1", 3, 0), unit("L2", 2, 1)], &Check { session: "n", stop: true, tokens: 0 }, &f, &gate, seed, &[]);
+            let d = choose(&[unit("L1", 3, 0), unit("L2", 2, 1)], &Check { session: "n", stop: true, tokens: 0 }, &f, &gate, ALPHA, seed, &[]);
             assert_eq!((d.routes[0], d.p[0]), (Route::Ask, 1.0));
         }
     }
@@ -2674,7 +2971,7 @@ mod tests {
     /// The fixed rule asks exactly when a check has a 3, so a lift of the stop's checks with a 3 and
     /// asking at the stop are one cell of its history. The lift goes to its non-route twin
     /// (`three_stop`), not to asking at the stop: a stop without a 3 is asked as often as in the same
-    /// history without the lift, by the prior's exploration, never by a learned certainty.
+    /// history without the lift (on evidence alone, so not at all), never by a learned certainty.
     #[test]
     fn a_lift_of_the_stops_with_a_three_is_not_taken_for_asking() {
         let (lifted, plain) = (three_stop_world(1.5), three_stop_world(0.0));
@@ -2685,7 +2982,7 @@ mod tests {
             let seeds = 20u32;
             (0..seeds)
                 .map(|seed| {
-                    let d = choose(&units, &Check { session: "new", stop: true, tokens: 0 }, &s.fit, &s.gate, u64::from(seed), &[]);
+                    let d = choose(&units, &Check { session: "new", stop: true, tokens: 0 }, &s.fit, &s.gate, ALPHA, u64::from(seed), &[]);
                     assert_ne!(d.source, "fixed", "{d:?}");
                     d.p[0]
                 })
@@ -2705,11 +3002,12 @@ mod tests {
 
     /// The gate's invariant over a run of checks: the replayed value of what the policy did, at the
     /// `DELTA` quantile, never falls more than α × the fixed rule's replayed value below the fixed
-    /// rule. The same run ungated breaks it, so the gate, not the scenario, holds it.
+    /// rule. The same run ungated (every draw of the test admitted) breaks it, so the gate, not the
+    /// scenario, holds it.
     #[test]
     fn the_gate_never_risks_more_than_its_alpha_share() {
-        // A wide posterior whose mean says asking is a little worse than handing over: Thompson's
-        // draws ask often, and most of those asks lose under the posterior.
+        // A wide posterior whose mean says asking is a little worse than handing over: no evidence for
+        // a deviation, and most of the test's asks lose under the posterior.
         let spec = coefs();
         let mut beta: Vec<f64> = spec.iter().map(|c| c.mean).collect();
         beta[ASK] = -0.4;
@@ -2721,7 +3019,6 @@ mod tests {
         let model = Model { beta, chol, sd: spec.iter().map(|c| c.sd).collect(), spread: [0.3; FAMILIES], ..Model::default() };
         let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
         let f = Fit { key: "test".into(), model: Some(model), rates, ..Fit::default() };
-        let model = f.model.as_ref().unwrap();
         let ids: Vec<String> = (0..10).map(|i| format!("L{i}")).collect();
         let mut refused = 0;
         let mut run = |gated: bool, rng: &mut Rng| -> (bool, usize) {
@@ -2736,26 +3033,24 @@ mod tests {
                 let routes = if c < 10 {
                     fixed_routes(&units, &[])
                 } else if gated {
-                    let d = choose(&units, &check, &f, &gate, c as u64, &[]);
+                    let d = choose(&units, &check, &f, &gate, ALPHA, c as u64, &[]);
                     // A deviation is admitted exactly when its risk fits what the gate may still risk; a
                     // refused one keeps the fixed rule and says so.
                     match d.source {
-                        "gate" => {
+                        GATE => {
                             assert_eq!((&d.routes, d.risk), (&fixed_routes(&units, &[]), 0.0), "{d:?}");
                             refused += 1;
                         }
                         _ if d.routes != fixed_routes(&units, &[]) => {
-                            assert_eq!(d.source, "learned", "{d:?}");
+                            assert_eq!(d.source, EXPERIMENT, "{d:?}");
                             assert!(d.risk <= d.gate + 1e-12, "{d:?}");
                         }
                         _ => {}
                     }
                     d.routes
                 } else {
-                    let feats = Feat::of(&units, check.stop, 0);
-                    let lv = Levels::of(check.session, &model.judge, &units);
-                    let t = theta(model, &feats, &units, &lv, mix(c as u64, u64::MAX));
-                    solve(&Table::of(&Valuer { t: &t, feats: &feats, rates: &f.rates }, &[]), crate::attention::RAIL, conscience::CAP)
+                    let open = Gate { allowance: f64::INFINITY, ..gate.clone() };
+                    choose(&units, &check, &f, &open, ALPHA, c as u64, &[]).routes
                 };
                 deviated += usize::from(routes != fixed_routes(&units, &[]));
                 ledger_add_without(&f, &mut gate, &check, &units, &routes, &[]);
@@ -2965,11 +3260,12 @@ mod tests {
         assert_eq!(serde_json::from_str::<Fit>("{}").unwrap(), Fit::default());
     }
 
-    /// `borg debug select` P4's ungated policy is `choose`'s play under a gate that admits everything,
-    /// draw for draw; without a model it is the fixed rule.
+    /// `borg debug select` P4's policy (`decide_on_evidence`) is `choose`'s routes without the test (α
+    /// 0) under a gate that admits every deviation, whatever `choose`'s seed; without a model it is the
+    /// fixed rule.
     #[test]
-    fn the_ungated_play_is_chooses_under_an_open_gate() {
-        let f = fit(&planted(8, 20, 3), None);
+    fn the_evidence_rule_is_chooses_without_the_test() {
+        let f = free_beats_ask();
         let open = Gate { gain: vec![0.0; DRAWS], allowance: f64::INFINITY, ..Gate::default() };
         let ids: Vec<String> = (0..6).map(|i| format!("L{i}")).collect();
         let mut left = 0;
@@ -2977,15 +3273,265 @@ mod tests {
             let units: Vec<Unit> = (0..n).map(|r| unit(&ids[r], g[r], r)).collect();
             for stop in [false, true] {
                 let check = Check { session: "new", stop, tokens: 0 };
-                for seed in 0..30 {
-                    let routes = ungated(&units, &check, &f, seed);
-                    assert_eq!(routes, choose(&units, &check, &f, &open, seed, &[]).routes, "{g:?} stop {stop} seed {seed}");
-                    left += usize::from(routes != fixed_routes(&units, &[]));
+                let routes = decide_on_evidence(&units, &check, &f, &[]);
+                for seed in 0..5 {
+                    let d = choose(&units, &check, &f, &open, 0.0, seed, &[]);
+                    assert_eq!((&routes, d.xk), (&d.routes, None), "{g:?} stop {stop} seed {seed}");
                 }
-                assert_eq!(ungated(&units, &check, &Fit::default(), 1), fixed_routes(&units, &[]), "no model: the fixed rule");
+                left += usize::from(routes != fixed_routes(&units, &[]));
+                assert_eq!(decide_on_evidence(&units, &check, &Fit::default(), &[]), fixed_routes(&units, &[]), "no model: the fixed rule");
             }
         }
         assert!(left > 0, "the scenario leaves the fixed rule");
+    }
+
+    /// P4a's rule, here on every grade table: under the n = 0 prior the evidence rule is the fixed rule,
+    /// at the stop and during the turn, for a session that had a lesson or none, and so is `choose`
+    /// without the test (its source `evidence`, the prior's deviations refused by no gate but by the
+    /// evidence). A Thompson play of the prior leaves the fixed rule on such tables.
+    #[test]
+    fn under_the_prior_the_evidence_rule_is_the_fixed_rule_on_every_grade_table() {
+        let p = prior();
+        let open = Gate { gain: vec![0.0; DRAWS], allowance: f64::INFINITY, ..Gate::default() };
+        let ids: Vec<String> = (0..8).map(|i| format!("L{i}")).collect();
+        let mut grades = tables(5);
+        grades.extend([vec![2; 8], vec![1; 8], [vec![3], vec![2; 7]].concat()]);
+        for g in &grades {
+            let units: Vec<Unit> = ids.iter().zip(g).enumerate().map(|(r, (l, g))| unit(l, *g, r)).collect();
+            for had in [Vec::new(), vec!["L1".to_string()]] {
+                let want = fixed_routes(&units, &had);
+                for stop in [true, false] {
+                    let check = Check { session: "s", stop, tokens: 0 };
+                    assert_eq!(decide_on_evidence(&units, &check, &p, &had), want, "{g:?} stop {stop} had {had:?}");
+                    let d = choose(&units, &check, &p, &open, 0.0, 7, &had);
+                    assert_eq!((&d.routes, d.source), (&want, if units.is_empty() { FIXED } else { EVIDENCE }), "{g:?} stop {stop} had {had:?}");
+                }
+            }
+        }
+    }
+
+    /// A fit certain that every question dilutes the others (`ask_dilution` −1, tight): asking the nine
+    /// a check with a 3 asks loses to asking few and handing over the rest, and the evidence rule
+    /// deviates, exactly (0/1 propensities, no test). A fit whose mode dilutes but whose posterior,
+    /// truncated at 0 as every draw is (`draw_beta`), still reaches no dilution at the `DELTA` quantile
+    /// (`ask_dilution` −0.2, sd 0.5), or a fit without dilution, keeps the fixed rule.
+    #[test]
+    fn a_fit_with_evidence_of_dilution_deviates() {
+        let world = |dilution: f64, sd: f64| {
+            let mut beta = vec![0.0; P];
+            beta[ASK] = 0.2;
+            beta[NOT] = -1.0;
+            beta[ASK_M] = dilution;
+            let mut chol = vec![0.0; P * P];
+            for k in 0..P {
+                chol[k * P + k] = if k == ASK_M { sd } else { 0.01 };
+            }
+            let model = Model { beta, chol, sd: vec![1.0; P], spread: [0.01; FAMILIES], ..Model::default() };
+            let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
+            Fit { key: "dilution".into(), model: Some(model), rates, ..Fit::default() }
+        };
+        let ids: Vec<String> = (0..9).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().enumerate().map(|(r, l)| unit(l, if r == 0 { 3 } else { 2 }, r)).collect();
+        let base = fixed_routes(&units, &[]);
+        assert_eq!(base, [Route::Ask; 9], "the scenario: the fixed rule asks all nine");
+        let gate = open_gate();
+        for stop in [false, true] {
+            let check = Check { session: "n", stop, tokens: 0 };
+            let d = choose(&units, &check, &world(-1.0, 0.01), &gate, ALPHA, 1, &[]);
+            assert_eq!((d.source, d.xk, d.xs), (EVIDENCE, None, None), "{d:?}");
+            assert_ne!(d.routes, base, "{d:?}");
+            assert!(d.routes.contains(&Route::Free) && d.routes.contains(&Route::Ask), "asks few, hands over the rest: {d:?}");
+            assert_eq!(d.p, d.routes.iter().map(|r| f64::from(u8::from(*r == Route::Ask))).collect::<Vec<_>>(), "exact");
+            assert_eq!(d.pf, d.routes.iter().map(|r| f64::from(u8::from(*r == Route::Free))).collect::<Vec<_>>(), "exact");
+            // The wide fit's mode would deviate: only the quantile keeps it on the fixed rule.
+            let wide = world(-0.2, 0.5);
+            let m = wide.model.as_ref().expect("a model");
+            let feats = Feat::of(&units, stop, 0);
+            let t = theta_mean(m, &feats, &units, &Levels::of(check.session, &m.judge, &units));
+            let at_mode = solve(&Table::of(&Valuer { t: &t, feats: &feats, rates: &wide.rates }, &[false; 9]), crate::attention::RAIL, conscience::CAP);
+            assert_ne!(at_mode, base, "stop {stop}");
+            for f in [wide, world(0.0, 0.01)] {
+                assert_eq!(decide_on_evidence(&units, &check, &f, &[]), base, "stop {stop}");
+            }
+        }
+    }
+
+    /// The test's lessons and order for `units` at a live check under the n = 0 prior (no evidence) and
+    /// a gate that admits every count: `choose` at many seeds.
+    fn tested_at(units: &[Unit], had: &[String], seeds: u64) -> Vec<Decision> {
+        let p = prior();
+        let open = Gate { gain: vec![0.0; DRAWS], allowance: 1e9, ..Gate::default() };
+        (0..seeds).map(|seed| choose(units, &Check { session: "s", stop: false, tokens: 0 }, &p, &open, ALPHA, seed, had)).collect()
+    }
+
+    /// The randomised test draws s uniformly in 0..=k (each count's frequency over seeds within four
+    /// standard errors of 1/(k + 1)), asks the first s in the fixed rule's order (2s before 1s, then
+    /// the model's) and hands over the rest, its propensities each unit's exact share of the k + 1
+    /// counts, s = 0 (the fixed rule without a 3) the control.
+    #[test]
+    fn the_tests_count_is_uniform_and_its_propensities_exact() {
+        let ids: Vec<String> = (0..5).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().zip([1, 2, 1, 2, 1]).enumerate().map(|(r, (l, g))| unit(l, g, r)).collect();
+        let order = [1, 3, 0, 2, 4];
+        let n = 1200;
+        let mut counts = [0usize; 6];
+        for d in tested_at(&units, &[], n) {
+            let (Some(5), Some(s)) = (d.xk, d.xs) else { panic!("{d:?}") };
+            let s = s as usize;
+            counts[s] += 1;
+            for (i, &j) in order.iter().enumerate() {
+                assert_eq!(d.routes[j], if i < s { Route::Ask } else { Route::Free }, "{d:?}");
+                assert_eq!((d.p[j], d.pf[j]), (outcome::round_p((5 - i) as f64 / 6.0), outcome::round_p((i + 1) as f64 / 6.0)), "{d:?}");
+            }
+            assert_eq!(d.source, if s == 0 { EXPERIMENT_CONTROL } else { EXPERIMENT }, "{d:?}");
+        }
+        let q = 1.0 / 6.0;
+        let se = (q * (1.0 - q) / n as f64).sqrt();
+        for (s, c) in counts.iter().enumerate() {
+            let freq = *c as f64 / n as f64;
+            assert!((freq - q).abs() <= 4.0 * se, "s = {s}: {freq:.4} against {q:.4} ({counts:?})");
+        }
+    }
+
+    /// The test never runs at the stop, and never moves a 3: with a 3 during the turn the 3 is asked on
+    /// every draw (p 1), and the control is s = k, the fixed rule asking everything.
+    #[test]
+    fn the_test_never_touches_the_stop_or_a_three() {
+        let ids: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().zip([2, 3, 1]).enumerate().map(|(r, (l, g))| unit(l, g, r)).collect();
+        let base = fixed_routes(&units, &[]);
+        let p = prior();
+        let open = Gate { gain: vec![0.0; DRAWS], allowance: 1e9, ..Gate::default() };
+        for seed in 0..40 {
+            let d = choose(&units, &Check { session: "s", stop: true, tokens: 0 }, &p, &open, ALPHA, seed, &[]);
+            assert_eq!((&d.routes, d.source, d.xk, d.xs), (&base, EVIDENCE, None, None), "{d:?}");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for d in tested_at(&units, &[], 60) {
+            assert_eq!((d.routes[1], d.p[1], d.pf[1], d.xk), (Route::Ask, 1.0, 0.0, Some(2)), "{d:?}");
+            let s = d.xs.unwrap_or(9);
+            assert_eq!(d.source == EXPERIMENT_CONTROL, s == 2, "{d:?}");
+            seen.insert(s);
+        }
+        assert_eq!(seen.len(), 3, "every count drawn: {seen:?}");
+    }
+
+    /// A lesson the session already had is not among the test's lessons: it keeps the fixed rule's
+    /// route on every draw (not now without a 3, asked with one), never free.
+    #[test]
+    fn the_test_never_hands_over_a_lesson_the_session_had() {
+        let ids: Vec<String> = (0..4).map(|i| format!("L{i}")).collect();
+        let had = ["L2".to_string()];
+        let soft: Vec<Unit> = ids.iter().zip([2, 1, 2, 1]).enumerate().map(|(r, (l, g))| unit(l, g, r)).collect();
+        let block: Vec<Unit> = ids.iter().zip([2, 3, 2, 1]).enumerate().map(|(r, (l, g))| unit(l, g, r)).collect();
+        for (units, kept) in [(&soft, Route::Not), (&block, Route::Ask)] {
+            let mut moved = 0;
+            for d in tested_at(units, &had, 60) {
+                assert_eq!((d.routes[2], d.pf[2], d.xk), (kept, 0.0, Some(if kept == Route::Not { 3 } else { 2 })), "{d:?}");
+                moved += usize::from(d.source == EXPERIMENT);
+            }
+            assert!(moved > 0, "the scenario: the test ran");
+        }
+    }
+
+    /// The gate rations the test: with nothing left to risk, every count that leaves the fixed rule is
+    /// refused (source `gate`, the fixed rule's routes, k and the refused s logged, nothing taken), so
+    /// the propensities are the fixed rule's; and α 0 (`risk` 0 in collectives.json) turns it off.
+    #[test]
+    fn the_gate_refuses_the_test_when_short_and_risk_zero_turns_it_off() {
+        let ids: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().zip([2, 1, 1]).enumerate().map(|(r, (l, g))| unit(l, g, r)).collect();
+        let base = fixed_routes(&units, &[]);
+        let exact = |r: Route| base.iter().map(|x| f64::from(u8::from(*x == r))).collect::<Vec<_>>();
+        let p = prior();
+        let short = Gate { gain: vec![0.0; DRAWS], allowance: 1e-12, ..Gate::default() };
+        let check = Check { session: "s", stop: false, tokens: 0 };
+        let (mut refused, mut control) = (0, 0);
+        for seed in 0..40 {
+            let d = choose(&units, &check, &p, &short, ALPHA, seed, &[]);
+            assert_eq!((&d.routes, &d.p, &d.pf, d.risk, d.xk), (&base, &exact(Route::Ask), &exact(Route::Free), 0.0, Some(3)), "{d:?}");
+            match d.xs {
+                Some(0) => control += usize::from(d.source == EXPERIMENT_CONTROL),
+                _ => refused += usize::from(d.source == GATE),
+            }
+            let off = choose(&units, &check, &p, &open_gate(), 0.0, seed, &[]);
+            assert_eq!((&off.routes, off.source, off.xk, off.xs), (&base, EVIDENCE, None, None), "{off:?}");
+        }
+        assert!(refused > 0 && control > 0 && refused + control == 40, "refused {refused}, control {control}");
+        // The same gate under a larger α (the collective's `risk`) has room: the share scales the
+        // allowance the ledger accrued at `ALPHA`.
+        let room = Gate { allowance: 1e9 * ALPHA, ..short };
+        assert!((0..40).any(|seed| choose(&units, &check, &p, &room, ALPHA, seed, &[]).source == EXPERIMENT));
+        assert!((0..40).all(|seed| choose(&units, &check, &p, &room, 1e-12, seed, &[]).source != EXPERIMENT), "α scales it down");
+    }
+
+    /// α scales the evidence rule's room too: a ledger that holds no gains, only a loss it already
+    /// took, admits an evident deviation at `ALPHA` from the allowance alone, and α 0 (`risk` 0 in
+    /// collectives.json) refuses the same deviation (source `gate`, the fixed rule's routes, nothing
+    /// taken), though the ledger's allowance is unchanged.
+    #[test]
+    fn risk_zero_refuses_an_evidence_deviation_the_allowance_alone_would_cover() {
+        let f = free_beats_ask();
+        // A 3 and 2s during the turn: the fixed rule asks them all, the model hands them over.
+        let ids: Vec<String> = (0..4).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().enumerate().map(|(r, l)| unit(l, if r == 0 { 3 } else { 2 }, r)).collect();
+        let base = fixed_routes(&units, &[]);
+        let check = Check { session: "n", stop: false, tokens: 0 };
+        // Guard: the loss outweighs any gain the deviation's own value can make (a value is a sum of
+        // per-apply chances, so it gains less than one per apply), and the allowance covers the loss.
+        let loss = 2.0 * units.len() as f64;
+        let gate = Gate { gain: vec![-loss; DRAWS], allowance: 2.0 * loss, ..Gate::default() };
+        let at = choose(&units, &check, &f, &gate, ALPHA, 1, &[]);
+        assert_eq!(at.source, EVIDENCE, "the scenario: the allowance admits the deviation at ALPHA: {at:?}");
+        assert_ne!(at.routes, base, "{at:?}");
+        let off = choose(&units, &check, &f, &gate, 0.0, 1, &[]);
+        assert_eq!((&off.routes, off.source, off.risk, off.gate, off.xk), (&base, GATE, 0.0, 0.0, None), "{off:?}");
+    }
+
+    /// Dilution is not assumed: its prior's mode is 0, so under the n = 0 prior's mean the value of a
+    /// question does not depend on how many are asked with it.
+    #[test]
+    fn the_dilution_prior_has_its_mode_at_zero() {
+        let c = coefs();
+        for k in [ASK_M, FREE_M] {
+            assert_eq!((c[k].mean, c[k].sd, c[k].nonpos, c[k].ard), (0.0, 0.1, true, false), "{}", NAMES[k]);
+        }
+        let p = prior();
+        let m = p.model.as_ref().expect("the prior is a model");
+        let units = [unit("A", 2, 0), unit("B", 2, 1), unit("C", 2, 2)];
+        let feats = Feat::of(&units, false, 0);
+        let t = theta_mean(m, &feats, &units, &Levels::of("s", &m.judge, &units));
+        let v = Valuer { t: &t, feats: &feats, rates: &p.rates };
+        assert!(v.ask(0, 1) > 0.0 && (v.ask(0, 1) - v.ask(0, 3)).abs() < 1e-12, "{} vs {}", v.ask(0, 1), v.ask(0, 3));
+        assert!((v.free(0, 1) - v.free(0, 3)).abs() < 1e-12);
+    }
+
+    /// The gate's and the evidence rule's draws of a bounded slope are its prior truncated at 0, not
+    /// clamped: under the n = 0 prior `DILUTION_PRIOR`'s half-normal, every draw below 0 (no point mass
+    /// at 0) with the mean −0.1·√(2/π); the unbounded coefficients keep their plain draw β̂ + L z.
+    #[test]
+    fn a_bounded_slope_is_drawn_from_its_truncated_prior() {
+        let p = prior();
+        let m = p.model.as_ref().expect("the prior is a model");
+        const N: u64 = 4000;
+        let draws: Vec<[f64; P]> = (0..N).map(|k| draw_beta(m, gate_seed(&p, k as usize))).collect();
+        let half = -DILUTION_PRIOR.1 * (2.0 / std::f64::consts::PI).sqrt();
+        // Its sd 0.1·√(1 − 2/π) ≈ 0.060 over 4000 draws: a standard error of 0.001.
+        for k in [ASK_M, FREE_M] {
+            assert!(draws.iter().all(|b| b[k] < 0.0), "{}: a draw at 0", NAMES[k]);
+            let mean = draws.iter().map(|b| b[k]).sum::<f64>() / N as f64;
+            assert!((mean - half).abs() < 0.005, "{}: mean {mean} against {half}", NAMES[k]);
+        }
+        let ask = draws.iter().map(|b| b[ASK]).sum::<f64>() / N as f64;
+        assert!((ask - ASK_PRIOR.0).abs() < 0.03, "ask {ask}");
+        // A bound far above the mean leaves the draw as it was; one far below it, never past 0.
+        for z in [-2.0, -0.3, 0.0, 1.0, 2.5] {
+            assert!((below_zero(-1.0, 0.1, z) - (-1.0 + 0.1 * z)).abs() < 1e-6, "z {z}");
+            let x = below_zero(50.0, 0.1, z);
+            assert!(x <= 0.0 && x > -0.01, "z {z}: {x}");
+        }
+        assert!(below_zero(0.0, 0.1, -1.0) < below_zero(0.0, 0.1, 1.0), "monotone in z");
+        assert!((phi(1.959_964) - 0.975).abs() < 1e-6 && (probit(0.975f64.ln(), 0.025) - 1.959_964).abs() < 1e-5);
     }
 
     /// The n = 0 prior is a model at the priors (means, sds, the families' starting spreads) with

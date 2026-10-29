@@ -210,6 +210,35 @@ fn a_placebo_of_a_lesson_the_budget_cut_stays_a_placebo() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Free lessons handed over in place of questions the fixed rule asks (hook.rs `INSTEAD`: the
+/// question-count test's on a check with a 3) all reach the drone, though four of their lines are past
+/// what one free delivery's budget (`conscience::EARLY_CHARS`) holds; another check's free lessons
+/// waiting beside them keep the budget they had alone, the three it holds, and the fourth is cut and
+/// says so.
+#[test]
+fn hand_overs_in_place_of_questions_are_never_cut_by_the_free_budget() {
+    let root = setup("routes-instead");
+    let long = |id: &str| json!({"id": id, "origin_ms": 1, "question": format!("Did I check {id}: {}?", "the long handling ".repeat(17)), "consequence": format!("{id} {}", "breaks badly ".repeat(16))});
+    let ids = ["T1", "T2", "T3", "T4", "F1", "F2", "F3", "F4"];
+    let lessons: String = ids.iter().map(|id| format!("{}\n", long(id))).collect();
+    std::fs::write(root.join("store/collectives/corp/lessons.jsonl"), lessons).unwrap();
+    hook(&root, "i1", "prompt", json!({"prompt": "Tidy the handling"}), &HOOK);
+    let (test, other) = (check(0xd1), check(0xd2));
+    // The other check's line first: the queue's order is the checks', delivery's is the route's.
+    queue(&root, "i1", &format!("F1,F2,F3,F4 @{other}\ninstead T1,T2,T3,T4 @{test}\n"));
+    let out = context(&read(&root, "i1", json!({}), &HOOK));
+    let shown: Vec<&str> = ids.iter().copied().filter(|id| out.contains(&format!("Did I check {id}:"))).collect();
+    assert_eq!(shown, ["T1", "T2", "T3", "T4", "F1", "F2", "F3"], "{out}");
+    let ctx = state(&root, "i1", "ctx");
+    assert!(ctx.contains(&format!("#borg-queued T1,T2,T3,T4 @{test}")) && ctx.contains(&format!("#borg-queued F1,F2,F3 @{other}")), "{ctx}");
+    for id in ["T1", "T4"] {
+        assert_eq!(routes(&root, id), [(test.clone(), "free".to_string(), String::new())], "{id}: {:?}", outcomes(&root));
+        assert_eq!(asked(&root, id), [("queued".to_string(), test.clone())], "{id}");
+    }
+    assert_eq!(routes(&root, "F4"), [(other, "dropped_chars".to_string(), "budget".to_string())], "{:?}", outcomes(&root));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn transcript(root: &Path, texts: &[&str]) {
     let mut lines = vec![json!({"type": "user", "message": {"role": "user", "content": "Tidy the budget handling"}})];
     lines.extend(texts.iter().map(|t| json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}})));
