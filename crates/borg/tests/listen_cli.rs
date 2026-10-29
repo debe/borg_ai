@@ -2,7 +2,7 @@
 //! arrives, a busy one only once its turn ends, and a plain one never. The hooks run as the harnesses
 //! call them (`borg hook <harness> <event>`, the recorded payloads of tests/fixtures for Claude Code and
 //! codex, canonical input for opencode); the waiters run as the real processes, `codex` is a fake on
-//! PATH. Every wait is on an event (an exit, a line, a file the waiter writes) under a generous guard,
+//! PATH; the hooks name a stand-in harness process tied to the test's life (`host`). Every wait is on an event (an exit, a line, a file the waiter writes) under a generous guard,
 //! never a sleep as the assertion; every waiter ends on a signal a user sends, or by itself. No model call.
 
 use std::io::{BufRead, BufReader, Write};
@@ -75,7 +75,27 @@ fn borg(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], stdin: &st
 }
 
 /// The hook of `harness` for canonical `event`: its answer (Null: none). Always exits 0.
+/// The stand-in for the harness process the hooks name (their `pid`): a `cat` reading a pipe only this
+/// test process holds. A waiter ends once the harness process it names is gone (listen.rs `look`), so
+/// one this test leaves behind, as a test killed before its guards ran would, ends with the test: the
+/// pipe closes, `cat` exits. Never an ancestor of a command the test runs, so a `borg tell` from the
+/// test stays the engineer's.
+fn host() -> u32 {
+    static HOST: std::sync::OnceLock<(Child, std::process::ChildStdin)> = std::sync::OnceLock::new();
+    let (child, _) = HOST.get_or_init(|| {
+        let mut c = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let pipe = c.stdin.take().unwrap();
+        (c, pipe)
+    });
+    child.id()
+}
+
+/// `borg hook <harness> <event>` with `input`, naming `host` as its harness process unless it names one.
 fn hook(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&str, &str)]) -> Value {
+    let mut input = input.clone();
+    if let Some(o) = input.as_object_mut() {
+        o.entry("pid").or_insert_with(|| json!(host()));
+    }
     let r = borg(root, root, &["hook", harness, event], env, &input.to_string());
     assert_eq!(r.code, Some(0), "{harness} {event}: {}", r.err);
     if r.out.trim().is_empty() { Value::Null } else { serde_json::from_str(r.out.trim()).unwrap_or_else(|_| panic!("not JSON: {}", r.out)) }

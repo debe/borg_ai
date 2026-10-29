@@ -493,3 +493,21 @@ fn select_reads_the_routed_store_and_refuses_bad_usage() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `--bench` times the hook's selection over the log's checks that apply a lesson, in a temp copy, and
+/// leaves the log as it was: no cache is written beside it.
+#[test]
+fn the_bench_times_each_check_that_applies_a_lesson_and_writes_nothing_beside_the_log() {
+    let root = tmp("bench");
+    let file = root.join("outcomes.jsonl");
+    std::fs::write(&file, fixed_log()).unwrap();
+    let out = borg(&["debug", "select", "--bench", "--file", file.to_str().unwrap(), "--json"], &root);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let b = &v["bench"];
+    assert_eq!(b["checks"], json!(3), "{v}");
+    assert!(["load", "decide", "total"].iter().all(|k| b[k]["p95"].as_f64().is_some_and(|x| x >= 0.0)), "{v}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), fixed_log(), "the log is untouched");
+    assert!(!root.join("select-summary.json").exists(), "no cache beside the log");
+    let _ = std::fs::remove_dir_all(&root);
+}

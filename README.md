@@ -77,7 +77,7 @@ Intel Macs, the macOS C++ header workaround and source builds: [Install](https:/
 Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/docs/learning.md) · [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md) ·
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md) · [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md) · [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md) ·
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md) · [Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) · [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md) ·
-[Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports)
+[Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md) · [Roadmap](https://github.com/debe/borg_ai/blob/main/docs/roadmap.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports)
 
 ## How it works in one session
 

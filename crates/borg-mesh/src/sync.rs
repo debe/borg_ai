@@ -26,7 +26,7 @@
 //!    pruning never takes a held line out of it), on offer and on receipt, and the log stays bounded as
 //!    `send` bounds it (msg.rs `bound`, bytes per member and class): a new line the bound would cut is
 //!    refused, so it is not taken again. What the log takes is decided before its lock and written
-//!    under it (`stored`, `Node::store_messages`), so a hook's acknowledgement never waits on it. A
+//!    under it (`stored`, `Store::store_messages`), so a hook's acknowledgement never waits on it. A
 //!    `borg/mesh/13` peer is offered only what 0.5.0 takes (`v1_window`).
 //!    A pause, resume or veto from another node counts only once admitted under its node's role
 //!    (steer.rs `admit`), when it is stored.
@@ -532,12 +532,14 @@ impl Node {
         origin::apply_if_new(&self.home, &m)
     }
 
-    /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
+    /// Stamps the lines this node's hooks wrote since the last call as its own (`Store::stamp`).
     pub fn stamp(&self) -> Result<usize, String> {
-        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        // Fresh outcomes first, so they are stamped in the same step.
-        borg::outcome::publish(&self.home);
-        origin::stamp(&self.home, &self.me, &logs(&self.home), borg::learn::now_ms())
+        self.local().stamp()
+    }
+
+    /// This node's store, as a merge writes it (`Store`).
+    fn local(&self) -> Store<'_> {
+        Store { home: &self.home, lock: &self.store, me: &self.me }
     }
 
     /// Records a completed session with `remote` on `alpn` that started at `started` (borg presence.rs
@@ -879,7 +881,7 @@ impl Node {
             }
         }
         (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
-        let give = within_budget(signed(&set, origins, r.give.iter()));
+        let give = frame(&set, origins, r.give.iter());
         report.sent += give.len();
         self.gate()?; // again just before lines leave
         let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
@@ -926,10 +928,60 @@ impl Node {
         Ok(())
     }
 
+    /// Stores what a peer gave (`Store::store_lines`).
+    fn store_lines(
+        &self,
+        path: &Path,
+        got: Vec<Signed>,
+        want: &BTreeSet<Hash>,
+        m: &Membership,
+        author: Option<&str>,
+        report: &mut Report,
+    ) -> Result<(), String> {
+        self.local().store_lines(path, got, want, m, author, report)
+    }
+
+    /// Writes what `stored` decided (`Store::store_messages`).
+    #[cfg(test)]
+    fn store_messages(
+        &self,
+        path: &Path,
+        keep: BTreeMap<Hash, Signed>,
+        decided: (&str, Stored),
+        m: &Membership,
+        now: i64,
+        report: &mut Report,
+    ) -> Result<steer::Admitted, String> {
+        self.local().store_messages(path, keep, decided, m, now, report)
+    }
+}
+
+/// One node's store as a session reads and writes it: where it is, the lock its writes take, and the
+/// key that stamps its lines. `Node` stamps and merges through it alone; built over a store directly,
+/// it does the same without an endpoint, for simulation and tests (tests/two_nodes_cli.rs), so they
+/// run the merge a session runs.
+pub struct Store<'a> {
+    /// The collective's store.
+    pub home: &'a Path,
+    /// Serialises the writes to the store (`Node`'s, shared by the concurrent sessions of `serve`).
+    pub lock: &'a Mutex<()>,
+    /// This node's key: its own lines are stamped with it, and steering it receives admitted under it.
+    pub me: &'a Identity,
+}
+
+impl Store<'_> {
+    /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
+    pub fn stamp(&self) -> Result<usize, String> {
+        let _w = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Fresh outcomes first, so they are stamped in the same step.
+        borg::outcome::publish(self.home);
+        origin::stamp(self.home, self.me, &logs(self.home), borg::learn::now_ms())
+    }
+
     /// Stores the lines that were asked for, whose origin verifies and is admitted (and, for
     /// replicas, is the peer itself), and that may travel under it (lines.rs `travels`): origin
     /// records first, so a line is never re-stamped as ours.
-    fn store_lines(
+    pub fn store_lines(
         &self,
         path: &Path,
         got: Vec<Signed>,
@@ -953,10 +1005,10 @@ impl Node {
                 report.rejected += 1;
             }
         }
-        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let _w = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if file != borg::msg::FILE {
-            let known = origin::load(&self.home);
-            origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
+            let known = origin::load(self.home);
+            origin::append(self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
             report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
             return Ok(());
         }
@@ -969,7 +1021,7 @@ impl Node {
         drop(_w);
         // Outside both locks: it rereads the log and the outcomes, and a `send` must not wait on it.
         if a.new > 0 {
-            borg::veto::apply_messages(&self.home, now);
+            borg::veto::apply_messages(self.home, now);
         }
         Ok(())
     }
@@ -995,14 +1047,14 @@ impl Node {
             report.rejected += first.refused;
             return Ok(steer::Admitted::default());
         }
-        let known = origin::load(&self.home);
+        let known = origin::load(self.home);
         borg::live::locked(path, || {
             let text = std::fs::read_to_string(path).unwrap_or_default();
             let d = if text == read { first } else { stored(&text, &keep, now) };
             keep.retain(|h, _| d.taken.contains(h));
             report.rejected += d.refused;
             let new: Vec<borg::msg::Message> = keep.values().filter_map(|s| serde_json::from_str(&s.line).ok()).collect();
-            origin::append(&self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
+            origin::append(self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
             let io = |e: std::io::Error| format!("{}: {e}", path.display());
             let before = borg::msg::mark_of(path);
             let talk = keep.values().any(|s| !matches!(Line::parse(&s.line), Some(Line::Seen(_))));
@@ -1027,7 +1079,7 @@ impl Node {
             }
             report.received += keep.len();
             // After the write: a hook that sees the line before its admission shows it at its next call.
-            steer::admit(&self.home, m, &self.me.public(), &new, now).map_err(|e| format!("admissions: {e}"))
+            steer::admit(self.home, m, &self.me.public(), &new, now).map_err(|e| format!("admissions: {e}"))
         })
     }
 }
@@ -1043,7 +1095,7 @@ struct Stored {
 }
 
 /// What the message log holding `text` takes at `now` of `keep`, the lines a peer offered that verified
-/// (`Node::store_lines`): of those it lacks, the ones within the window over held and new together
+/// (`Store::store_lines`): of those it lacks, the ones within the window over held and new together
 /// (`window`), and of those what the log's bound keeps (borg msg.rs `bound`). A new line the bound cuts
 /// is refused, so it is not taken again when offered again; a held line it cuts goes. Pure: nodes that
 /// hold the same lines and are offered the same take the same.
@@ -1068,8 +1120,8 @@ fn stored(text: &str, keep: &BTreeMap<Hash, Signed>, now: i64) -> Stored {
 
 /// The lines of the log at `path` this node offers at `now`: `travelling`, and for the messages those
 /// within their `window`; to a `V13_ALPN` peer (`v1`) only what 0.5.0's window takes of them
-/// (`v1_window`).
-fn offered(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64, v1: bool) -> BTreeMap<Hash, String> {
+/// (`v1_window`). Public for simulation and tests: it is the set a session reconciles (step 3).
+pub fn offered(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64, v1: bool) -> BTreeMap<Hash, String> {
     let mut set = travelling(path, origins, m, now);
     if log_name(path) == borg::msg::FILE {
         let w = window(&lines::read(path));
@@ -1203,6 +1255,14 @@ fn about(commits: &[String], line: &str) -> bool {
 /// Whether `commit` is one of `asked` (full ids, or abbreviations of at least 7 characters).
 fn asked(asked: &[String], commit: &str) -> bool {
     asked.iter().any(|a| a == commit || (a.len() >= 7 && commit.starts_with(a.as_str())))
+}
+
+/// The `Lines` frame a session gives of a log after its reconciliation (step 3): the lines of `set`
+/// (`offered`) named by `hashes`, the ones the peer lacks (`Recon::give`), each with its signed origin,
+/// as many as the frame's budget takes (`within_budget`). Public for simulation and tests, which hand
+/// it to the peer instead of a stream.
+pub fn frame<'a>(set: &BTreeMap<Hash, String>, origins: &HashMap<Hash, Origin>, hashes: impl Iterator<Item = &'a Hash>) -> Vec<Signed> {
+    within_budget(signed(set, origins, hashes))
 }
 
 /// The first of `lines` whose sizes add up to at most `MAX_GIVE` (at least one).

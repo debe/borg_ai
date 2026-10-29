@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-10-29)
 
 Messages are paced by acknowledgements instead of a fixed rate and keep their full text; the mesh
 speaks `borg/mesh/14`. Lesson selection is measured end to end: what a check delivered, how it was
@@ -14,6 +14,9 @@ cap, and cost is measured and shown. Every numeric constant says what kind of nu
 
 ### Added
 
+- `borg debug select --bench` times the hook's selection after its model call on each logged check
+  (the summary cache's load, the learned decision with its gate open), in a temp copy, and exits 1 when
+  its 95th percentile reaches 50 ms. On a 15,579-line outcome log (887 checks): p95 3.9 ms.
 - Message acknowledgements: the recipient's hook, or `borg inbox` for the engineer, acknowledges the
   messages it showed with a `seen` line (synced, never shown, never paced); a reply acknowledges what it
   answers. `borg top`, printed or live, and borg web's Messages view acknowledge the messages to the

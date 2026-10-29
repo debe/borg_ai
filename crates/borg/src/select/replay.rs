@@ -2191,12 +2191,106 @@ pub fn render(r: &Report) -> String {
 /// `borg debug select …` (module doc): the store of the collective DIR routes to (the working directory
 /// by default), or one outcomes file alone. Exits 1 when a decisive check fails or tests nothing
 /// (`unmet`), 2 on bad usage.
+/// The hook's budget for selection after its model call, in ms at the 95th percentile. Guard: what
+/// the shortest harness limit leaves beside the call (omp's 30 s stop with its 18 s call; codex's 10 s
+/// tool hook), with room to spare; `--bench` exits 1 past it.
+pub const BENCH_MS: f64 = 50.0;
+
+/// Milliseconds of one part of the hook's selection over the log's checks.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Times {
+    pub p50: f64,
+    pub p95: f64,
+    pub max: f64,
+}
+
+impl Times {
+    fn of(mut ms: Vec<f64>) -> Times {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms.get(((q * ms.len() as f64).ceil() as usize).saturating_sub(1)).copied().unwrap_or(0.0);
+        Times { p50: at(0.5), p95: at(0.95), max: ms.last().copied().unwrap_or(0.0) }
+    }
+}
+
+/// `borg debug select --bench`: per graded check of the log that applies a lesson, the time the hook
+/// spends selecting after its model call. `load` is select/summary.rs `refresh` of a cache that holds the
+/// whole log, as a hook finds it; `decide` is select.rs `graded_under` under the learned policy with the
+/// log's fit and its gate open (allowance and ledger set), so every path a check can take runs: the
+/// evidence test over the joint draws, the question-count test's admission. The worst case, not the
+/// store's state.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Bench {
+    pub checks: usize,
+    pub load: Times,
+    pub decide: Times,
+    pub total: Times,
+    /// Whether the fit had a model: without one the decision is the fixed rule's and costs nothing.
+    pub model: bool,
+}
+
+impl Bench {
+    fn line(&self) -> String {
+        let t = |x: &Times| format!("p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms", x.p50, x.p95, x.max);
+        let verdict = if self.total.p95 < BENCH_MS { "within" } else { "OVER" };
+        let model = if self.model { "" } else { " (no model fitted: the fixed rule decides)" };
+        format!(
+            "selection cost per check, {} checks{model}\n  load    {}\n  decide  {}\n  total   {}: {verdict} the {BENCH_MS} ms budget\n",
+            self.checks,
+            t(&self.load),
+            t(&self.decide),
+            t(&self.total)
+        )
+    }
+}
+
+/// `Bench` of `text` (the outcome log beside `lessons`): a copy of it with its refitted summary cached,
+/// in a temp store, so nothing of the store is written.
+fn bench(text: &str, lessons: &Path) -> Bench {
+    let store = std::env::temp_dir().join(format!("borg-select-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    if std::fs::create_dir_all(&store).is_err() {
+        return Bench::default();
+    }
+    let at = store.join("lessons.jsonl");
+    let mut s = summary::with_fit(summary::fold(text, Summary::default()), super::budget_of(lessons));
+    // The gate open: what a check can risk is never the bound, and the ledger has its draws.
+    s.gate.allowance = f64::MAX / 4.0;
+    if s.gate.gain.len() != policy::DRAWS {
+        s.gate.gain = vec![0.0; policy::DRAWS];
+    }
+    let saved = std::fs::write(outcome::path_beside(&at), text).is_ok() && summary::save(&at, &s).is_ok();
+    let model = s.fit.model.is_some();
+    let (mut load, mut decide, mut total) = (Vec::new(), Vec::new(), Vec::new());
+    for o in lines(text).into_iter().filter_map(|l| l.o).filter(|o| o.kind == outcome::GRADED && !o.lessons.is_empty()) {
+        let Some(cs) = challenges(&o) else { continue };
+        if !saved {
+            break;
+        }
+        let applied = applied(&cs, &o);
+        let check = Check::new(o, &applied);
+        let t0 = std::time::Instant::now();
+        let s = summary::refresh(&at);
+        let t1 = std::time::Instant::now();
+        let r = super::graded_under(Policy::Learned, &applied, &ctx(&check.o, &check.had, &at, &s));
+        let t2 = std::time::Instant::now();
+        std::hint::black_box(r);
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        load.push(ms(t1 - t0));
+        decide.push(ms(t2 - t1));
+        total.push(ms(t2 - t0));
+    }
+    let _ = std::fs::remove_dir_all(&store);
+    Bench { checks: total.len(), load: Times::of(load), decide: Times::of(decide), total: Times::of(total), model }
+}
+
 pub fn main(args: &[&str]) -> i32 {
     let usage = || {
-        eprintln!("usage: borg debug select [--replay] [--rebuild] [--dir DIR | --file OUTCOMES.jsonl] [--json] [--eval RUNS_DIR --qrels QRELS.jsonl]");
+        eprintln!(
+            "usage: borg debug select [--replay | --bench] [--rebuild] [--dir DIR | --file OUTCOMES.jsonl] [--json] [--eval RUNS_DIR --qrels QRELS.jsonl]"
+        );
         2
     };
-    let (mut replay, mut rebuild, mut json) = (false, false, false);
+    let (mut replay, mut rebuild, mut json, mut timed) = (false, false, false, false);
     let (mut dir, mut file, mut eval, mut qrels_path): (Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -2211,6 +2305,10 @@ pub fn main(args: &[&str]) -> i32 {
             }
             "--json" => {
                 json = true;
+                continue;
+            }
+            "--bench" => {
+                timed = true;
                 continue;
             }
             "--dir" if file.is_none() => &mut dir,
@@ -2246,6 +2344,14 @@ pub fn main(args: &[&str]) -> i32 {
     };
     let outcomes = file.map_or_else(|| outcome::path_beside(&lessons), PathBuf::from);
     let text = std::fs::read_to_string(&outcomes).unwrap_or_default();
+    if timed {
+        let b = bench(&text, &lessons);
+        match json {
+            true => println!("{}", serde_json::json!({ "source": source, "bench": b })),
+            false => print!("{source}\n{}", b.line()),
+        }
+        return i32::from(b.total.p95 >= BENCH_MS);
+    }
     // A file alone has no store whose cache a hook would load: its summary is the file folded.
     let summary = match (file, rebuild) {
         (Some(_), _) => summary::fold(&text, Summary::default()),
@@ -2308,6 +2414,13 @@ mod tests {
 
     fn checks_of(log: &[Outcome]) -> Vec<Check> {
         as_logged(&text(log), Path::new("/nonexistent/lessons.jsonl")).checks
+    }
+
+    #[test]
+    fn the_bench_reports_nearest_rank_percentiles() {
+        let t = Times::of((1..=20).rev().map(f64::from).collect());
+        assert_eq!((t.p50, t.p95, t.max), (10.0, 19.0, 20.0));
+        assert_eq!((Times::of(Vec::new()).p95, Times::of(vec![4.0]).p95), (0.0, 4.0));
     }
 
     #[test]
