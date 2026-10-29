@@ -58,6 +58,11 @@ pub trait Harness: Sync {
     fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
         Vec::new()
     }
+    /// What its adapter waits for each answer ([`Budgets`]); None where the harness runs borg's hooks
+    /// itself, under the `timeout` borg installs or its own default (Claude Code, Codex). Default: None.
+    fn budgets(&self) -> Option<Budgets> {
+        None
+    }
 }
 
 /// One sub-agent of a [`Run`], as its transcript shows it.
@@ -136,11 +141,15 @@ pub struct Caps {
     /// Events carry the harness's pid, so a gone process reads as ended (presence.rs `state`); without
     /// it an event's `pid` is dropped (hook.rs `main`).
     pub sends_pid: bool,
-    /// The stop's budget when the event names none (`BORG_STOP_BUDGET_MS`, which an adapter sets): the
-    /// live wait, the stop's model call and the expert drone keep inside it (expert_route.rs
-    /// `stop_budget`). None: the expert drone keeps inside [`DEFAULT_STOP_BUDGET`], the model call
-    /// inside the model's own limit.
+    /// The stop's budget when the event names none (`BORG_STOP_BUDGET_MS`, which an adapter sets to its
+    /// [`Budgets::stop`]): the live wait, the stop's model call and the expert drone keep inside it
+    /// (expert_route.rs `stop_budget`). None: the expert drone keeps inside [`DEFAULT_STOP_BUDGET`], the
+    /// model call inside the model's own limit.
     pub stop_budget: Option<Duration>,
+    /// The characters of context one hook answer may inject into the harness's model and have it
+    /// arrive whole, shared by everything delivered in that event (messages, lessons). Derived: the
+    /// harness's own limit where it has one (cited in its module), else [`CONTEXT_GUARD`].
+    pub context_chars: usize,
     /// The variable the harness sets to its session's id in every command its model runs; None: the
     /// harness gives its shell no id (opencode).
     pub session_env: Option<&'static str>,
@@ -150,6 +159,89 @@ pub struct Caps {
     pub pid_env: Option<&'static str>,
     /// How an idle session of the harness can be woken with a message.
     pub drone_wake: DroneWake,
+}
+
+impl Caps {
+    /// [`Caps::context_chars`], for callers that read it as a method.
+    #[must_use]
+    pub const fn context_chars(self) -> usize {
+        self.context_chars
+    }
+}
+
+/// Guard: the context one hook answer injects into a harness that sets no limit of its own (omp,
+/// opencode), so one event (a flood of messages, a long pool of lessons) cannot fill the model's
+/// context. Derived: the strictest limit a harness does set ([`claude::CONTEXT_CHARS`],
+/// [`codex::CONTEXT_CHARS`]), so every harness gets at most what any of them would take whole.
+pub const CONTEXT_GUARD: usize = if claude::CONTEXT_CHARS < codex::CONTEXT_CHARS { claude::CONTEXT_CHARS } else { codex::CONTEXT_CHARS };
+
+/// Guard: the seconds borg gives a stop where it sets the limit itself (Claude Code's and Codex's Stop
+/// hook `timeout`, opencode's adapter budget, which opencode does not limit): it bounds how long a stuck
+/// stop can hold the engineer's turn, and leaves room for the live wait (live.rs `stop_wait`), the
+/// model call (`BORG_PREDICT_TIMEOUT_S`, 45 s) and an expert drone. Changing it makes every Codex
+/// engineer trust borg's hooks again (codex.rs `TIMEOUTS`).
+pub const STOP_TIMEOUT_S: u64 = 90;
+
+/// Guard: the characters of a shell call's output an adapter sends borg (its end, where a test run's
+/// summary is, which is what borg reads it for: hook.rs `capture_test`), so a build log of megabytes
+/// is never piped through every hook.
+pub const OUTPUT_TAIL: usize = 4000;
+
+/// How long an adapter waits for borg's answer at each event before it fails open (borg is killed and
+/// the harness carries on as if it said nothing), for a harness whose hooks are an adapter's. borg's
+/// answer carries them to an adapter that asks ([`with_budgets`]), so this table is their one
+/// definition: the adapter's own copy is only its fallback until such an answer came (a test here keeps
+/// the two equal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// The engineer's prompt: how long it waits for borg's context.
+    pub prompt: Duration,
+    /// Before every tool call (only steering reads there: a stat when nobody steers).
+    pub pre_tool: Duration,
+    /// After a tool call: how long its result waits for borg's context.
+    pub post_tool: Duration,
+    /// The stop, the one hook that may call a model: also its [`Caps::stop_budget`].
+    pub stop: Duration,
+    /// The session's end.
+    pub end: Duration,
+}
+
+impl Budgets {
+    /// As the answer carries them: milliseconds, and the output tail ([`OUTPUT_TAIL`]) in characters.
+    #[must_use]
+    pub fn json(self) -> Value {
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        serde_json::json!({
+            "prompt_ms": ms(self.prompt),
+            "pre_ms": ms(self.pre_tool),
+            "post_ms": ms(self.post_tool),
+            "stop_ms": ms(self.stop),
+            "end_ms": ms(self.end),
+            "tail_chars": OUTPUT_TAIL,
+        })
+    }
+}
+
+/// `out` with `"budgets"` ([`Budgets::json`]) when the event asked for them (`"budgets": true`, which an
+/// adapter sends until an answer carried them) and `h`'s hooks are an adapter's; anything else as it
+/// was. hook.rs `main` passes every answer it prints through this, so an adapter learns its budgets
+/// from its first answer.
+pub fn with_budgets(h: &dyn Harness, input: &Value, out: Option<Value>) -> Option<Value> {
+    let Some(b) = h.budgets().filter(|_| input.get("budgets") == Some(&Value::Bool(true))) else { return out };
+    let mut o = out.filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    o["budgets"] = b.json();
+    Some(o)
+}
+
+/// The longest a stop hook of any harness may run: the largest stop budget borg keeps inside
+/// ([`Caps::stop_budget`], else [`DEFAULT_STOP_BUDGET`]) and the largest stop `timeout` it installs
+/// ([`Wiring::CommandHooks`]).
+pub fn longest_stop() -> Duration {
+    let stop_timeout = |h: &dyn Harness| match h.wiring() {
+        Wiring::CommandHooks { timeouts, .. } => timeouts.iter().filter(|(e, _)| *e == "stop").map(|(_, s)| Duration::from_secs(*s)).max(),
+        Wiring::AdapterFile { .. } => None,
+    };
+    ALL.iter().flat_map(|h| [Some(h.caps().stop_budget.unwrap_or(DEFAULT_STOP_BUDGET)), stop_timeout(*h)]).flatten().max().unwrap_or(DEFAULT_STOP_BUDGET)
 }
 
 /// How an idle session of a harness is woken with a message.
@@ -221,9 +313,10 @@ pub enum Level {
     Fail,
 }
 
-/// The stop's budget assumed where a harness names none: 60 s, Claude Code's default command-hook timeout
-/// before it became 600 s (claude.rs `STOP_TIMEOUT_S`), so a hook installed with no `timeout` on an older
-/// Claude Code is never cut off. A safe floor, not a measured limit: `borg install` gives the Stop hook 90 s.
+/// Guard: the stop's budget assumed where a harness names none: 60 s, Claude Code's default command-hook
+/// timeout before it became 600 s (claude.rs), so a hook installed with no `timeout` on an older Claude
+/// Code is never cut off. A safe floor, not a measured limit: `borg install` gives the Stop hook
+/// [`STOP_TIMEOUT_S`].
 pub const DEFAULT_STOP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Set (to anything) by the conformance suites: only then are the hidden harnesses found by name, so
@@ -344,13 +437,90 @@ mod tests {
             assert_eq!(row(n), (true, true, false, false, Transcript::None, true, true), "{n}");
         }
         assert_eq!(row("codex"), (true, true, false, false, Transcript::None, false, false));
-        // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; codex: its
-        // stop hook's timeout.
-        let budgets = [("claude", None), ("omp", None), ("opencode", None), ("codex", Some(90)), ("sim", None)];
+        // None: the expert drone keeps inside Claude Code's 60 s, the model call its own limit; omp: its
+        // 30 s handler limit less the adapter's margin; opencode and codex: the stop timeout borg sets.
+        let budgets = [("claude", None), ("omp", Some(28)), ("opencode", Some(90)), ("codex", Some(90)), ("sim", None)];
         let got: Vec<(&str, Option<u64>)> = ALL.iter().map(|h| (h.name(), h.caps().stop_budget.map(|d| d.as_secs()))).collect();
         assert_eq!(got, budgets, "every harness's stop budget");
         let Wiring::CommandHooks { timeouts, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
         assert_eq!((timeouts, through_links), (&[("stop", 90)][..], true), "a timeout on the stop only");
+        // Claude Code's and Codex's own limit; omp and opencode set none: the guard, the strictest of those.
+        let chars: Vec<(&str, usize)> = ALL.iter().map(|h| (h.name(), h.caps().context_chars())).collect();
+        assert_eq!(chars, [("claude", 10_000), ("omp", 10_000), ("opencode", 10_000), ("codex", 10_000), ("sim", 10_000)]);
+    }
+
+    /// An adapter's stop budget is the one its budgets name, and only adapters have budgets.
+    #[test]
+    fn only_an_adapters_harness_has_budgets_and_its_stop_is_its_caps_budget() {
+        for h in ALL {
+            let adapter = matches!(h.wiring(), Wiring::AdapterFile { .. });
+            assert_eq!(h.budgets().is_some(), adapter, "{}", h.name());
+            if let Some(b) = h.budgets() {
+                assert_eq!(h.caps().stop_budget, Some(b.stop), "{}", h.name());
+                assert!(b.stop <= Duration::from_secs(STOP_TIMEOUT_S) && b.pre_tool <= b.prompt, "{}: {b:?}", h.name());
+            }
+        }
+    }
+
+    #[test]
+    fn budgets_join_an_answer_only_when_an_adapter_asked() {
+        let omp = by_name("omp").unwrap();
+        let asked = serde_json::json!({"session_id": "s", "budgets": true});
+        let b = omp.budgets().unwrap();
+        let want = serde_json::json!({"prompt_ms": 5000, "pre_ms": 2000, "post_ms": 5000, "stop_ms": 28_000, "end_ms": 1500, "tail_chars": 4000});
+        assert_eq!(b.json(), want);
+        assert_eq!(with_budgets(omp, &asked, None), Some(serde_json::json!({"budgets": want})), "an answer of its own when borg says nothing");
+        let block = serde_json::json!({"decision": "block", "reason": "r"});
+        let both = with_budgets(omp, &asked, Some(block.clone())).unwrap();
+        assert_eq!((&both["decision"], &both["reason"], &both["budgets"]), (&block["decision"], &block["reason"], &want), "added to the answer");
+        let plain = serde_json::json!({"session_id": "s"});
+        assert_eq!(with_budgets(omp, &plain, Some(block.clone())), Some(block.clone()), "not asked: as it was");
+        assert_eq!(with_budgets(omp, &plain, None), None);
+        assert_eq!(with_budgets(by_name("claude").unwrap(), &asked, None), None, "no adapter, no budgets");
+    }
+
+    /// The adapter's budgets before borg's first answer (its `FALLBACK`) are the ones that answer carries.
+    #[test]
+    fn each_adapters_fallback_budgets_are_its_harness_budgets() {
+        for h in ALL {
+            let Some(b) = h.budgets() else { continue };
+            let src = h.wiring().adapter();
+            let line = src.lines().find(|l| l.starts_with("const FALLBACK")).unwrap_or_else(|| panic!("{}: no `const FALLBACK` line", h.name()));
+            let body = line.split_once('{').and_then(|(_, r)| r.split_once('}')).map(|(b, _)| b).unwrap_or_default();
+            let pairs = body
+                .split(',')
+                .filter_map(|kv| kv.split_once(':'))
+                .map(|(k, v)| (k.trim().to_string(), serde_json::json!(v.trim().replace('_', "").parse::<u64>().unwrap())));
+            assert_eq!(Value::Object(pairs.collect()), b.json(), "{}'s adapter", h.name());
+        }
+    }
+
+    /// No budget an answer carries is dead: each adapter's code (comments aside) reads every one, as the
+    /// `within` of a call (`"end_ms"`) or off its budgets (`budgets.tail_chars`).
+    #[test]
+    fn each_adapter_reads_every_budget_borg_sends_it() {
+        let mut adapters = 0;
+        for h in ALL {
+            let Some(b) = h.budgets() else { continue };
+            adapters += 1;
+            let code: String = h.wiring().adapter().lines().filter(|l| !["//", "/*", "*"].iter().any(|c| l.trim_start().starts_with(c))).collect();
+            let sent = b.json();
+            let keys: Vec<&String> = sent.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+            assert!(!keys.is_empty(), "{sent}");
+            for k in keys {
+                assert!(code.contains(&format!("\"{k}\"")) || code.contains(&format!("budgets.{k}")), "{}'s adapter never reads {k}", h.name());
+            }
+        }
+        assert_eq!(adapters, 2, "omp and opencode");
+    }
+
+    /// The stop mark of a listening session (listen.rs) outlives every stop: it is sized from this.
+    #[test]
+    fn the_longest_stop_is_the_largest_budget_or_installed_timeout() {
+        assert_eq!(longest_stop(), Duration::from_secs(STOP_TIMEOUT_S));
+        for h in ALL {
+            assert!(h.caps().stop_budget.unwrap_or(DEFAULT_STOP_BUDGET) <= longest_stop(), "{}", h.name());
+        }
     }
 
     #[test]

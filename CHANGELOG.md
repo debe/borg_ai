@@ -1,5 +1,168 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Messages are paced by acknowledgements instead of a fixed rate and keep their full text; the mesh
+speaks `borg/mesh/14`. Lesson selection is measured end to end: what a check delivered, how it was
+judged, and what not delivering would have changed. The fixed rule stays the default: the learned
+selection policy is opt-in (`BORG_SELECT=learned`) until its pre-registered checks pass, since its
+recall check (P4) failed both the first run and the one rerun
+([docs/evidence.md](docs/evidence.md#lesson-selection)). Quality is the objective: there is no cost
+cap, and cost is measured and shown. Every numeric constant says what kind of number it is
+([docs/design/constants.md](docs/design/constants.md)). Every crate is 0.6.0 and pins the others
+`=0.6.0`.
+
+### Added
+
+- Message acknowledgements: the recipient's hook, or `borg inbox` for the engineer, acknowledges the
+  messages it showed with a `seen` line (synced, never shown, never paced); a reply acknowledges what it
+  answers. `borg top`, printed or live, and borg web's Messages view acknowledge the messages to the
+  engineer they show (`POST /api/messages/seen`, JSON only); `borg top --json`, and `borg top` in a
+  drone's shell (printed or live, also on a pseudo-terminal), acknowledge nothing; neither screen counts
+  a message whose line is cut before its text.
+- `borg inbox --show <id>` prints a message whole. A message longer than what a prompt or tool call has
+  room for shows its head and that command.
+- A learned lesson selection policy, opt-in with `BORG_SELECT=learned`. Per check it chooses, for each
+  lesson the model graded as applying, between asking, handing it over free and not now, by the
+  mistakes it expects each to avoid, from one Bayesian model of the logged outcomes; a free lesson's
+  and a live question's value is weighed by its learned chance of arriving. A conservative gate keeps it
+  on the fixed rule until the replayed outcomes support a deviation (at most 10% of the fixed rule's
+  quality at risk), so a new store starts exactly as the fixed rule; a stop's grade 3 is always asked. A
+  monitor reverts a store to the fixed rule for good when it sees harm beyond that share
+  (`<store>/select-reverted`; deleting that file alone lets it learn again). `borg learn` refits the
+  model at its end; a hook only reads it. It stays opt-in until its pre-registered checks pass: on
+  their first run its right-lesson recall on the review → fix eval was −4.02 points [−7.28, −1.24]
+  against the fixed rule, past the bar's −5 (P4), and its calibration missed its bar (P2). The one
+  rerun on the fixed tree passed P0, P1, P3 and P2 (by the pruned model) and failed P4 again: −3.53
+  points [−6.74, −0.98] under the store's posterior, −3.77 [−6.89, −1.18] under the n = 0 prior.
+  `BORG_SELECT=fixed` wins over `BORG_STOP_ASK_CAP`, which wins over `BORG_STOP_ATTENTION=on` (both
+  evaluation switches now), and each over `BORG_SELECT=learned`.
+- `borg debug select [--replay] [--rebuild] [--dir DIR | --file FILE] [--json] [--eval RUNS_DIR
+  --qrels FILE]` shows the policy's state and replays the logged checks against the pre-registered
+  checks P0–P5 under the learned policy, at 0 tokens. It prints the dates of the rules and of their
+  latest amendment; after a P2 FAIL it reruns P2 once with the model pruned to grade, route and
+  dilution, whose verdict is P2's. A check that ran on data that could not have failed it says NOT
+  TESTED, never PASS, and the command exits 1 when P0–P4 has a FAIL or a NOT TESTED.
+- Selection is measured: a check id on every graded record and delivery marker, the route each lesson
+  actually took (`asked`, `free`, `placebo`, `dropped_done`, `dropped_chars`, `never_delivered`) and why,
+  checks that apply nothing, pool tokens, model, prompt hash, harness, version, latency and failures,
+  the call's cost in dollars as the CLI reported it, the propensity of each free delivery (`pf`), the
+  applies the session already had or had waiting in its queue (`nofree`), the summary the decision read
+  (`seen`), each run of a session's end hook (`ended`), and on an early delivery each lesson's score
+  relative to the best on-topic match (`rel`), for a learned early rule. Older records read as the
+  fixed rule.
+- A placebo arm, under the fixed rule too: of the applies a check delivers neither way (under the fixed
+  rule, those past its 10), up to two are judged blindly at the point a free delivery would be, never
+  a lesson the session already had, with their chance of the draw (`psi`). Their rate is the judge's
+  floor, and under the fixed default they collect the not-now labels its own history cannot give.
+  Placebo results never reach beliefs, trust, stats, the team file or the offline estimates.
+- A tail sample: when the pool's budget leaves lessons out, up to two of them, drawn uniformly, are
+  graded after the pool under every policy (`tail`, their chance `pt`), so the yield past the budget is
+  measured; the pool line of the session's `.cost` file reads `tail=<n>`.
+- `borg status`, `borg top` and `borg web` (`/api/select`, on the Conscience page) show the policy and
+  the default, spend and extra rounds per session, effects with their intervals, label health, the
+  placebos drawn and judged, the tail lessons shown and applied, the fitted delivery rates, pool yield
+  and stop latency per harness against its stop budget with its failed calls, and the learned
+  decisions a guard gave the fixed rule, per reason; under the learned policy also its gate,
+  deviations from the fixed rule and the monitor's reading and bound with its weights' health (ESS,
+  largest weight). What is not measured yet says so.
+- An optional per-collective `budget` in `collectives.json` (pool tokens per session on average), off
+  by default: only an engineer who sets one puts a price on spend, and only the learned policy reads
+  it, from its first fit that knows it. A value that is not a positive number counts as none and never
+  invalidates the config.
+- [docs/design/constants.md](docs/design/constants.md): every numeric constant by kind (protocol,
+  guard, derived, learned, method, baseline, display, experiment).
+
+### Changed
+
+- A sender may have a window of unacknowledged messages to a recipient instead of one message per 10
+  minutes: it starts at 1, doubles per acknowledgement up to 64 and halves when one expires unread.
+  An ask leaves the window once it is shown or answered, as a tell does. A refusal says how many are
+  unread (`msg_dropped` with `why: window`). Pause, resume and veto are never held back. Where no
+  acknowledgement may come, nobody is paced more strictly than 0.5.0: a broadcast or a message to the
+  engineer may also go 10 minutes after the sender's previous one, and a session on another machine is
+  paced at that rate alone until its machine acknowledges one of the sender's messages to it. `borg
+  tell` also refuses a message that would push one of its sender's unread messages to the same
+  recipient out of the log, and a text past 1,000 characters to a session on a 0.4 or 0.5 machine; a
+  broadcast says how many member machines will not show it. The mesh carries every message within the
+  bound any window keeps (acknowledged, or at most 64 unread from one sender to one recipient within
+  10 minutes), which reads no earlier line, so pruning old lines never stops a message once sent.
+- Acknowledgements no longer make a hook or `borg listen` read the message log again:
+  `<store>/messages/generation` (local) moves only when a tell, ask or steer is written.
+- A message keeps its whole text up to 16,384 characters (was 1,000). What one prompt or tool call
+  shows fits the harness's context budget, shared with the lessons of that event (was at most 10
+  messages and 4,000 characters).
+- The message log keeps, of each member's lines, the newest of each class (conversation, steers,
+  acknowledgements, and apart from them those to `local`) within 1 MiB, instead of the newest 500
+  lines; a cut is counted (`msg_dropped`, `why: bounds`). A line, an answered ask too, stays until it
+  is 7 days old or cut.
+- The mesh protocol is `borg/mesh/14`. Members on `/13` and `/12` still sync; a `/13` member is offered
+  only what 0.5.0 reads: messages of at most 1,000 characters, no `seen` line, paced as 0.5.0 paced them.
+- Each harness's capabilities carry its context budget (10,000 characters: Claude Code's and Codex's
+  own limits, and for omp and opencode, which set none, the stricter of those) and its stop budget (omp
+  28 s, opencode and Codex 90 s); there is one stop timeout, 90 s. The omp and opencode adapters read
+  their budgets and the shell-output tail from borg's first answer; borg's answer names the messages
+  it showed (`"shown_ids"`, which Claude Code and Codex never get), and a held wake is dropped only once
+  the model was handed all its messages (opencode: also a context that came too late for its call; omp:
+  also a steer's, kept for the next agent start). A wake the harness
+  refused is retried by `borg listen --stream` itself, after 10 s, doubling up to 5 minutes (the
+  opencode adapter's own 5 s × 5 retry and `BORG_WAKE_RETRY_MS` are gone). opencode's session end waits
+  borg's end budget instead of the stop's (both 90 s). `borg listen` learns each session's idle and
+  tool holds from its own gaps (the 95th percentile of its latest 64, never below today's 5 minutes, a
+  minute on Codex and 10 minutes).
+- The judge is route-blind (judge v2, logged): a free delivery gets the same evidence as a question, a
+  live check judges free deliveries and placebos at once, and a random half of questions are judged
+  without the agent's own declaration.
+- `asked_not_corrected` is censored, not counted as ignored, in the beliefs and in `borg debug ope`;
+  regret blame from one session is capped at that session's corrections; settling runs only for
+  sessions that ended.
+- The fixed rule never hands over free a lesson the session already had, which delivery dropped as
+  given before; the next 2 or 1 takes its slot. Such a lesson may still be asked.
+- `BORG_STOP_POOL_TOKENS` fixes the pool for every check; unset, the fixed rule keeps 12,000 tokens and
+  the learned policy chooses it, 12,000 until it has evidence for another size.
+- The live check and the stop fold only the outcome log's new tail into the selection summary and save
+  it beside the lessons file (`select-summary.json`, never synced); the first check after the upgrade
+  builds it from the whole log. A store's learned checks decide and record one at a time under
+  `<store>/select-summary.json.lock`; the fixed rule and the evaluation switches take no lock. A
+  learned check kept waiting more than 1 s, or whose record cannot reach the log its gate is folded
+  from (learning off, `BORG_CONSCIENCE` at another store's lessons, a failed append), takes the fixed
+  rule, and a record it writes says why (`reason: lock_busy`, `lock_failed` or `unrecorded`).
+- Relative times read `3h05m` under a day and `2d` from a day on, in `borg inbox`, `borg top` and its
+  live screen alike.
+- Every numeric constant's doc comment says its kind and why, the adapters' too (the conformance suite
+  checks omp's and opencode's). Values that were defined in several places are defined once (clock
+  skew, the day, BM25's parameters, characters per token, the failed-call limit, the job count, the
+  correction weight, the excerpt lengths, the id labels).
+- The documentation describes the 0.6.0 messages, selection, budgets and statistics; every number it
+  states was checked against the code.
+
+### Fixed
+
+- A live check's grade 3 on a lesson handed over earlier was logged as asked and then dropped. It is
+  now asked, or kept out of the pool.
+- Free lessons past the early-delivery character bound were dropped without a record; they are logged
+  as `dropped_chars`.
+- A lesson still waiting in the queue to be asked or handed over is decided already: the stop leaves
+  it out of its pool, as a live check does, and a check that graded it meanwhile never hands it over
+  free or draws it as a placebo (`nofree` names it). It used to take a free slot from the next lesson
+  with a copy that delivery dropped as queued twice.
+- omp and opencode: a held wake whose messages the turn's hooks showed over several hooks, or before
+  the wake arrived, still went in as a turn for messages the model had read. It is dropped now, by the
+  ids the turn's hooks handed the model (`"shown_ids"`).
+- The attention cut (`BORG_STOP_ATTENTION=on`) read the outcomes of the routed collective, so evals
+  read the real store; selection reads the outcomes beside the lessons file.
+- `borg reach` stops asking a model that failed three times before its first answer, as the facets and
+  `borg assimilate --from-dir` batches do, instead of making one failed call per lesson.
+- The committed web page (`crates/borg-web/dist`) named the build machine's home directory in its
+  panic locations; `scripts/ui.sh` writes those paths relative to `~` now.
+
+### Removed
+
+- The fixed message rate (`msg::RATE_MS`, a third of the presence idle time) and the 500-line message
+  cap (`msg::KEEP`).
+- The expert drone's $0.50 spend limit (`--max-budget-usd`): its time limit bounds a runaway drone,
+  and its cost is measured, never capped.
+
 ## 0.5.0 (2026-10-28)
 
 The first release on crates.io (0.4.0, 0.3.0 and 0.2.0 were never published: 0.4.0's notes are

@@ -47,12 +47,19 @@ that apply, most consequential first; return none if none apply.";
 const GRADE: &str = "Grade each lesson you return: 3 = this work clearly runs into the consequence unless the lesson \
 is followed; 2 = probably relevant; 1 = loosely related, worth a thought.";
 
-const JUDGE: &str = "## Questions asked earlier in this session\n\
-Earlier in this session the agent was given each question below, at a turn end or as context while it worked; each \
-group shows its work before the questions and after them. Judge by meaning, not by shared words, comparing the two: did the agent change its work on the question's point (changed), keep \
-it as it was (unchanged), or does the evidence not tell (unclear)? Set avoids_consequence true only if the work after \
-the question no longer leads to the consequence. A declaration (applies / skip) is the agent's claim, not proof: judge \
-the work. Put one verdict per id in `resolved`.";
+/// The judge's instructions (judge v2, `JUDGE_VERSION`): route-blind, one template for a lesson asked
+/// at a stop or live, handed over free, or never shown (a placebo, hook.rs `#borg-placebo`): the judge
+/// sees the same evidence for each and is never told how, or whether, the agent was given it.
+const JUDGE: &str = "## Lessons from earlier in this session\n\
+Each group below shows the agent's work at one point in this session (before) and its work since (after), then lessons \
+that may bear on it. Judge by meaning, not by shared words, comparing the two: did the agent change its work on the \
+lesson's point (changed), keep it as it was (unchanged), or does the evidence not tell (unclear)? Set avoids_consequence \
+true only if the work after no longer leads to the consequence. A declaration (applies / skip) is the agent's claim, not \
+proof: judge the work. Put one verdict per id in `resolved`.";
+
+/// The judge template's version, logged on every judge result (outcome.rs `judge`). Protocol: 0 is the
+/// template before versions were logged (it told questions from free deliveries); 2 is `JUDGE`.
+pub const JUDGE_VERSION: u8 = 2;
 
 fn schema(judging: bool, graded: bool) -> Value {
     let mut s = json!({"type": "object", "additionalProperties": false, "properties": {
@@ -74,20 +81,29 @@ fn schema(judging: bool, graded: bool) -> Value {
     s
 }
 
-/// A lesson asked at an earlier Stop of this session whose effect is not judged yet (main.rs
-/// `pending`): the drone's work before the question (the blocked message) and after it (its answer,
-/// edits since, this turn's message), and its own `<id>: applies|skip` if it gave one.
+/// A lesson delivered earlier in this session (asked, handed over free, or a placebo never shown) whose
+/// effect is not judged yet (hook.rs `pending`): the drone's work before the delivery and after it (its
+/// answer to a question, edits since, this turn's message), and its own `<id>: applies|skip` if it gave
+/// one and the judge sees it.
 #[derive(Debug, Clone)]
 pub struct Pending<'a> {
     pub lesson: &'a Challenge,
     pub before: String,
     pub after: String,
     pub declared: Option<bool>,
+    /// The check that routed this delivery (select.rs `check_id`; empty before checks had ids) and the
+    /// channel its result is recorded under (`stop`, `live`, `early`, `queued`, outcome.rs `PLACEBO`).
+    pub check: String,
+    pub channel: &'static str,
+    /// The drone's declaration was taken out of the evidence (hook.rs `stripped`): a random half of
+    /// the questions, to measure what the declaration adds to the verdict.
+    pub stripped: bool,
 }
 
-/// The evidence cap per block of pending lessons: `before` keeps this many characters, `after` three
-/// times as many (main.rs builds it from three parts of `JUDGE_PART` each). Lessons asked at the same
-/// block share their evidence in the prompt (`judge_section`).
+/// The evidence cap per delivery of pending lessons: `before` keeps this many characters, `after` three
+/// times as many (hook.rs `pending` builds it from "work since", two parts, and this turn, one).
+/// Lessons delivered together share their evidence in the prompt (`judge_section`). Guard: bounds the
+/// judge section of a call, whatever the drone wrote.
 pub const JUDGE_PART: usize = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +156,9 @@ pub fn clip(s: &str, n: usize) -> String {
 
 /// The section added to the prompt for pending lessons; empty without any. Its length is the extra
 /// prompt cost of judging (logged per call in the session's .cost file). Consecutive lessons with the
-/// same evidence (asked at the same block) share one before/after.
+/// same evidence (delivered together) share one before/after. Route-blind (`JUDGE`): a lesson shows a
+/// declaration only when the drone gave one and the judge may see it, so a question with its
+/// declaration stripped reads like a free delivery or a placebo.
 pub fn judge_section(pending: &[Pending]) -> String {
     if pending.is_empty() {
         return String::new();
@@ -148,24 +166,37 @@ pub fn judge_section(pending: &[Pending]) -> String {
     let mut out = format!("\n{JUDGE}\n");
     for (i, p) in pending.iter().enumerate() {
         if i == 0 || (&pending[i - 1].before, &pending[i - 1].after) != (&p.before, &p.after) {
-            out.push_str(&format!("\n### Asked together\nbefore: {}\nafter: {}\n", clip(&p.before, JUDGE_PART), clip(&p.after, 3 * JUDGE_PART)));
+            out.push_str(&format!("\n### Work\nbefore: {}\nafter: {}\n", clip(&p.before, JUDGE_PART), clip(&p.after, 3 * JUDGE_PART)));
         }
         let declared = match p.declared {
-            Some(true) => "applies",
-            Some(false) => "skip",
-            None => "none",
+            Some(true) => " (declared: applies)",
+            Some(false) => " (declared: skip)",
+            None => "",
         };
-        out.push_str(&format!("[{}] question: {} -> consequence: {} (declared: {declared})\n", p.lesson.id, p.lesson.question, p.lesson.consequence));
+        out.push_str(&format!("[{}] lesson: {} -> consequence: {}{declared}\n", p.lesson.id, p.lesson.question, p.lesson.consequence));
     }
     out
 }
 
-/// The model reads the last this many characters of the work.
+/// The model reads the last this many characters of the work. Guard: bounds the work part of a call's
+/// prompt in a long session.
 pub const TAIL: usize = 24_000;
 
 /// The instructions, with the grading sentence appended when graded.
 fn instructions(base: &str, graded: bool) -> String {
     if graded { format!("{base} {GRADE}") } else { base.to_string() }
+}
+
+/// The prompt template a check's call used (`prompt_whole` when `compact`, else `prompt`), as 12 hex
+/// digits of blake3 over its instructions and the judge's: logged with every graded check (outcome.rs
+/// `prompt_hash`), so a change of wording resets what was learned of the grader and the judge.
+pub fn template_hash(compact: bool, graded: bool) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"borg-prompt-v1\0");
+    h.update(instructions(if compact { WHOLE } else { PROMPT }, graded).as_bytes());
+    h.update(b"\0");
+    h.update(JUDGE.as_bytes());
+    h.finalize().to_hex()[..crate::select::CHECK_HEX].to_string()
 }
 
 /// The prompt for one checkpoint: the work (tail-truncated), the shortlist, and the pending lessons.
@@ -297,7 +328,7 @@ mod tests {
     }
 
     fn pending(c: &Challenge) -> Pending<'_> {
-        Pending { lesson: c, before: "b".into(), after: "a".into(), declared: None }
+        Pending { lesson: c, before: "b".into(), after: "a".into(), declared: None, check: String::new(), channel: "stop", stripped: false }
     }
 
     #[test]
@@ -346,15 +377,34 @@ mod tests {
         assert!(!prompt("work", &[&a], &[], false).contains("asked earlier"));
         assert!(schema(false, false)["properties"].get("resolved").is_none());
         assert_eq!(schema(true, false)["required"], json!(["moves", "applies", "resolved"]));
-        let long = Pending { lesson: &a, before: "x".repeat(10_000), after: "y".repeat(10_000), declared: Some(false) };
+        let long = Pending { before: "x".repeat(10_000), after: "y".repeat(10_000), declared: Some(false), ..pending(&a) };
         let s = judge_section(&[long]);
-        assert!(s.contains("[La] question: Q? -> consequence: C") && s.contains("declared: skip"), "{s}");
+        assert!(s.contains("[La] lesson: Q? -> consequence: C (declared: skip)\n"), "{s}");
         assert!(s.len() < JUDGE.len() + 4 * JUDGE_PART + 200, "{}", s.len());
         assert!(prompt("work", &[&a], &[pending(&a)], false).ends_with(&judge_section(&[pending(&a)])));
         // Lessons asked at one block share their evidence; another block gets its own.
         let b = Challenge { id: "Lb".into(), ..Default::default() };
         let other = Pending { before: "other".into(), ..pending(&b) };
         let s = judge_section(&[pending(&a), pending(&b), other]);
-        assert_eq!(s.matches("### Asked together").count(), 2, "{s}");
+        assert_eq!(s.matches("### Work").count(), 2, "{s}");
+    }
+
+    /// Judge v2 is route-blind: a question without a declaration (none given, or stripped), a free
+    /// delivery and a placebo read the same; nothing in the section names how the lesson came.
+    #[test]
+    fn the_judge_section_reads_the_same_for_every_route() {
+        let a = Challenge { id: "La".into(), question: "Q?".into(), consequence: "C".into(), ..Default::default() };
+        let as_route = |channel: &'static str, stripped: bool| judge_section(&[Pending { channel, stripped, check: "c".into(), ..pending(&a) }]);
+        let question = as_route("stop", true);
+        for (channel, stripped) in [("live", false), ("queued", false), ("early", false), (crate::outcome::PLACEBO, false)] {
+            assert_eq!(as_route(channel, stripped), question, "{channel}");
+        }
+        for word in ["asked", "question", "free", "placebo", "context", "declared"] {
+            assert!(!question.to_lowercase().contains(word), "{word}: {question}");
+        }
+        assert_eq!(JUDGE_VERSION, 2);
+        let hashes = [template_hash(true, true), template_hash(true, false), template_hash(false, true), template_hash(false, false)];
+        assert!(hashes.iter().all(|h| h.len() == 12) && hashes.iter().collect::<std::collections::HashSet<_>>().len() == 4, "{hashes:?}");
+        assert_eq!(template_hash(true, true), hashes[0], "stable");
     }
 }

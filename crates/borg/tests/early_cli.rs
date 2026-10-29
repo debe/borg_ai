@@ -46,12 +46,16 @@ fn borg(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&str, &s
     c.args(["hook", harness, event])
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
+        // CLI on PATH (runner.rs `pick`), a real call.
+        .env("BORG_PREDICT_MODEL", "claude:")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_HOME", root.join("store"))
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_MATCH", "bm25")
         .env("BORG_LEARN", "off")
+        .env("BORG_SELECT", "fixed")
         .envs(env.iter().copied())
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -94,7 +98,10 @@ fn a_named_scope_brings_its_lessons_early_once_and_stop_does_not_ask_them_again(
     assert!(st.contains("#borg-topic Beacon\n"), "{st}");
     let early: Vec<&str> = st.lines().filter_map(|l| l.strip_prefix("#borg-early ")).collect();
     assert_eq!(early.len(), 1, "{st}");
-    let mut ids: Vec<&str> = early[0].split(',').collect();
+    // `<ids> @<check>`: the early delivery's own id ties its marker to its record.
+    let (list, check) = early[0].split_once(" @").unwrap_or_else(|| panic!("{st}"));
+    assert!(check.len() == 12 && check.bytes().all(|b| b.is_ascii_hexdigit()), "{check}");
+    let mut ids: Vec<&str> = list.split(',').collect();
     ids.sort();
     assert_eq!(ids, ["Ajudge", "Alive"]);
 
@@ -175,8 +182,15 @@ fn budget_store(name: &str, scoped: usize, generic: usize) -> PathBuf {
     root
 }
 
+/// The asked ids, without each line's ` @<check>` tag.
 fn asked(root: &Path, session: &str) -> Vec<String> {
-    state(root, session).lines().filter_map(|l| l.strip_prefix("#borg-asked ")).flat_map(|l| l.split(',')).filter(|i| !i.is_empty()).map(String::from).collect()
+    state(root, session)
+        .lines()
+        .filter_map(|l| l.strip_prefix("#borg-asked "))
+        .flat_map(|l| l.split(" @").next().unwrap_or_default().split(','))
+        .filter(|i| !i.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[test]
@@ -223,10 +237,14 @@ fn the_consequence_model_path_asks_every_predicted_lesson_in_scope_first() {
     c.args(["hook", "claude", "stop"])
         .env_clear()
         .env("PATH", path)
+        // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
+        // CLI on PATH (runner.rs `pick`), a real call.
+        .env("BORG_PREDICT_MODEL", "claude:")
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store"))
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_LEARN", "off")
+        .env("BORG_SELECT", "fixed")
         .env("BORG_PREFILTER", "off")
         .env("BORG_STOP_GRADED", "off")
         .env("BORG_STOP_POOL", "shortlist")

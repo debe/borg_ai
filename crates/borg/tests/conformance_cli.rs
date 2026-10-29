@@ -248,6 +248,11 @@ fn fixture_dir(harness: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(harness)
 }
 
+/// A `.queued` file's lines without the check each names (` @<check>`, hook.rs `tag`): what is queued.
+fn queued(text: &str) -> String {
+    text.lines().map(|l| l.rsplit_once(" @").map_or(l, |(head, _)| head).to_string() + "\n").collect()
+}
+
 fn context(v: &Value) -> String {
     v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
 }
@@ -435,7 +440,7 @@ fn a_change_is_checked_live_and_its_ask_arrives_on_the_next_call_the_harness_rea
         let started = Instant::now();
         let out = d.step("post_tool", "edit");
         assert!(started.elapsed() < Duration::from_secs(5) && context(&out).is_empty(), "{tag}: {out}");
-        assert_eq!(d.wait_for("queued", |q| q.contains("live ")), "live Mdrain\n", "{tag}: the ask is queued");
+        assert_eq!(queued(&d.wait_for("queued", |q| q.contains("live "))), "live Mdrain\n", "{tag}: the ask is queued");
         d.wait_for("live.mark", |m| !m.is_empty());
         // The check read the turn so far: the transcript's prose, or the logged tool calls.
         let checked = &prompts(&d.root)[0];
@@ -463,7 +468,7 @@ fn a_change_is_checked_live_and_its_ask_arrives_on_the_next_call_the_harness_rea
             continue;
         }
         assert_eq!(at_prompt, "", "{tag}: no prompt context");
-        assert_eq!(d.state("queued"), "live Mdrain\n", "{tag}: still waiting");
+        assert_eq!(queued(&d.state("queued")), "live Mdrain\n", "{tag}: still waiting");
         // Read nowhere before: the stop asks it, never lost.
         let stop = d.step("stop", "stop");
         assert!(stop["reason"].as_str().unwrap_or_default().contains("[Mdrain]"), "{tag}: late context is not lost: {stop}");

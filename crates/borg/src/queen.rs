@@ -42,13 +42,21 @@ use serde_json::{Value, json};
 use crate::conscience::Challenge;
 use crate::{collective, conscience, learn};
 
-/// At most one queen message per engineer per this many sessions.
+/// At most one queen message per engineer per this many sessions. Guard: the engineer's attention, not
+/// money; a queen that finds something in every session cannot interrupt every session.
+/// Design-chosen, not tuned (escalation.rs measures what the messages yield).
 pub const BUDGET_SESSIONS: usize = 5;
-/// At most this many questions in one message (one message per checkpoint).
+/// At most this many questions in one message (one message per checkpoint). Guard: as
+/// `BUDGET_SESSIONS`, one message stays short enough to answer.
 pub const MAX_QUESTIONS: usize = 2;
 /// Of a decision's significant words, this share already in the engineer's prompts means the inputs
-/// state the decision (criterion 3).
+/// state the decision (criterion 3). Baseline: design-chosen, not tuned; the same 0.6 as
+/// `DUPLICATE` by coincidence, a different question.
 pub(crate) const STATED: f64 = 0.6;
+/// Display: the characters of the text a queen question quotes (a plan's sentence here, a lesson's
+/// question in reach.rs, an invariant in veto.rs): one sentence whole in nearly every case, short
+/// enough that the question still reads as one on the queen's screen and in borg web's queue.
+pub const QUOTE_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,7 +297,7 @@ pub fn classify(plan: &str, repo: &str) -> Vec<Decision> {
         }
         let key = decision_key(kind, repo, &what);
         if seen.insert(key.clone()) {
-            let sentence: String = sentence.chars().take(300).collect();
+            let sentence: String = sentence.chars().take(QUOTE_CHARS).collect();
             out.push(Decision { kind, sentence, what, key });
         }
     }
@@ -473,7 +481,7 @@ fn counted(store: &Path, kind: &str, e: &Entry, ms: i64, fill: impl FnOnce(&mut 
         ev.engineer = e.engineer.clone();
         ev.repo = e.repo.clone();
         ev.lessons = vec![e.id.clone()];
-        ev.text = crate::stats::excerpt(&e.question, 160);
+        ev.text = crate::stats::excerpt(&e.question, crate::stats::FEED_CHARS);
         fill(ev);
     });
 }
@@ -815,7 +823,7 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
     counted(store, crate::stats::QUEEN_ANSWERED, &e, now, |ev| {
         ev.engineer = author.into();
         ev.dur_ms = u64::try_from(now - e.ms).unwrap_or(0);
-        ev.text = crate::stats::excerpt(text, 160);
+        ev.text = crate::stats::excerpt(text, crate::stats::FEED_CHARS);
     });
     crate::escalation::answered(store, &e, text, author, now);
     if !matches!(e.kind, Kind::Reach | Kind::Constraint) {
@@ -831,12 +839,15 @@ pub fn answer(store: &Path, id: &str, text: &str, author: &str, now: i64) -> Res
 // Answering the queue: numbering, dismissing, skipping, deduplicating, the machine interface and the
 // in-harness delivery (one question per session, in the session's own repo).
 
-/// A skipped question is not delivered again for this long (3 days).
-pub const SKIP_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+/// A skipped question is not delivered again for this long (3 days). Guard: a skip is respected, and
+/// the question still comes back while its decision may matter. Derived from clock.rs `DAY_MS`.
+pub const SKIP_MS: i64 = 3 * crate::clock::DAY_MS;
 /// A question delivered but neither answered nor skipped is offered again only once more than this many
-/// sessions (with open questions of their repos) began after the delivering one.
+/// sessions (with open questions of their repos) began after the delivering one. Guard: an ignored
+/// question does not come back at every session.
 pub const REOFFER_SESSIONS: usize = 3;
 /// Two questions of one repo whose significant words overlap this much (Jaccard) are one question.
+/// Method: a dedupe threshold, design-chosen.
 pub const DUPLICATE: f64 = 0.6;
 
 fn skips_path(store: &Path) -> PathBuf {

@@ -12,7 +12,7 @@ pub const KIND: &str = "regress";
 pub const FIX: &str = "fix";
 pub const REVISITED: &str = "revisited";
 
-/// A note lists at most this many commits per section.
+/// A note lists at most this many commits per section. Display: a git note stays readable.
 const MAX_LISTED: usize = 10;
 
 const FIXED_IN: &str = "\n\nborg fixed in:\n";

@@ -27,7 +27,7 @@ async fn the_queen_view_shows_the_teams_attention_reward() {
     std::fs::write(home.join("stats.jsonl"), format!("{peer}\n")).unwrap();
     let (_tx, stop) = tokio::sync::watch::channel(false);
     let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team, mode: "hook" };
-    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
     let res = router(app).oneshot(Request::get("/api/queen?c=corp").header("host", "127.0.0.1:7979").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();

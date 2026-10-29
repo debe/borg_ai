@@ -27,8 +27,8 @@ Options:
   -h, --help    Show this help
 
 Example:
-  $(basename "$0") --dry-run 0.5.0
-  $(basename "$0") 0.5.0
+  $(basename "$0") --dry-run 0.6.0
+  $(basename "$0") 0.6.0
 EOF
 }
 
@@ -68,6 +68,10 @@ grep -q "^## $VERSION " CHANGELOG.md || error "CHANGELOG.md has no \"## $VERSION
 if [[ "$DRY_RUN" == false ]]; then
     [[ -f ~/.cargo/credentials.toml ]] || error "no cargo credentials. Run 'cargo login' first."
     gh auth status >/dev/null 2>&1 || error "GitHub CLI not authenticated. Run 'gh auth login' first."
+    # The release is created after the crates are published, so check the right to create it first.
+    perm=$(gh repo view --json viewerPermission --jq .viewerPermission 2>/dev/null || true)
+    [[ "$perm" =~ ^(ADMIN|MAINTAIN|WRITE)$ ]] \
+        || error "the active gh account cannot create releases here (permission: ${perm:-none}); gh auth switch"
 fi
 # A tag pushed before the release must be on HEAD: it is the commit the crates are published from.
 TAGGED=false

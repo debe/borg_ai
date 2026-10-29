@@ -37,10 +37,12 @@ function caps(harness: string): Record<string, boolean> {
   return Object.fromEntries([...src.matchAll(/^\s*(\w+): (true|false),/gm)].map((m) => [m[1], m[2] === "true"]))
 }
 
-/** A number constant of the adapter (`const STOP_MS = 28_000`): what the host itself is given. */
-function adapterConst(harness: string, name: string): number {
-  const m = new RegExp(`^const ${name} = ([\\d_]+)`, "m").exec(readFileSync(join(REPO, `adapters/${harness}/borg.ts`), "utf8"))
-  assert.ok(m, `adapters/${harness}/borg.ts: const ${name}`)
+/** One of the adapter's budgets before borg's answer names them (`const FALLBACK = { stop_ms: 28_000, … }`,
+ *  harness/<name>.rs `BUDGETS`, which a Rust test keeps equal): what the host itself is given. */
+function adapterBudget(harness: string, name: string): number {
+  const line = /^const FALLBACK\b.*$/m.exec(readFileSync(join(REPO, `adapters/${harness}/borg.ts`), "utf8"))?.[0] ?? ""
+  const m = new RegExp(`\\b${name}: ([\\d_]+)`).exec(line)
+  assert.ok(m, `adapters/${harness}/borg.ts: FALLBACK.${name}`)
   return Number(m[1].replaceAll("_", ""))
 }
 
@@ -106,6 +108,11 @@ type Host = {
   deny(call: Call, id: string): Promise<void>
   /** The turn ends with `last`: the continuation the host injects ("" for none). */
   stop(last: string): Promise<string>
+  /** The model runs `borg listen` in the session's shell, as the host gives it one; the adapter binds
+   *  the session where the host's shell cannot, and starts its waiter. */
+  listen(): Promise<void>
+  /** The waiter's wakes the adapter sent into the session, in order. */
+  wakes(): string[]
   end(): Promise<void>
   close(): Promise<void>
 }
@@ -113,7 +120,7 @@ type Host = {
 type Profile = {
   name: string
   harness: "omp" | "opencode"
-  /** The stop's time the adapter gives borg, in ms (its own constant). */
+  /** The stop's time the adapter gives borg, in ms (its fallback budget). */
   stopMs: number
   installed: (home: string) => string; host: (mod: any, cwd: string, session: string) => Promise<Host> }
 
@@ -136,11 +143,12 @@ const PROFILES: Profile[] = [
   {
     name: "omp",
     harness: "omp",
-    stopMs: adapterConst("omp", "STOP_MS"),
+    stopMs: adapterBudget("omp", "stop_ms"),
     installed: (home) => join(home, ".omp/agent/extensions/borg.ts"),
     host: async (mod, cwd, session) => {
       const h: Record<string, (ev: any, ctx: any) => Promise<any>> = {}
-      mod.default({ on: (name: string, fn: any) => (h[name] = fn) })
+      const sent: any[] = []
+      mod.default({ on: (name: string, fn: any) => (h[name] = fn), sendMessage: (m: any) => sent.push(m) })
       const ctx = { cwd, sessionManager: { getSessionId: () => session } }
       // omp sets stop_hook_active on the stop after a continuation it injected.
       let active = false
@@ -169,6 +177,14 @@ const PROFILES: Profile[] = [
           active = out?.decision === "block"
           return active ? out.reason : ""
         },
+        listen: async () => {
+          // omp gives its shell PI_SESSION_ID: the model's own `borg listen` binds the session.
+          const said = execFileSync("borg", ["listen"], { cwd, encoding: "utf8", env: { ...process.env, PI_SESSION_ID: session } })
+          const input = { command: "borg listen" }
+          await h.tool_call({ type: "tool_call", toolName: "bash", toolCallId: "listen", input }, ctx)
+          await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "listen", input, content: [{ type: "text", text: said }], isError: false }, ctx)
+        },
+        wakes: () => sent.filter((m) => m.customType === "borg-listen").map((m) => m.content),
         end: async () => void (await h.session_shutdown({ type: "session_shutdown" }, ctx)),
         close: async () => {},
       }
@@ -177,7 +193,7 @@ const PROFILES: Profile[] = [
   {
     name: "opencode 1.x",
     harness: "opencode",
-    stopMs: adapterConst("opencode", "TIMEOUT_MS"),
+    stopMs: adapterBudget("opencode", "stop_ms"),
     installed: (home) => join(home, ".config/opencode/plugins/borg.ts"),
     host: async (mod, cwd, session) => {
       let last = ""
@@ -217,6 +233,14 @@ const PROFILES: Profile[] = [
           if (reason) await say(reason, { borg: true })
           return reason
         },
+        listen: async () => {
+          const args = { command: "borg listen" }
+          await hooks["tool.execute.before"]({ tool: "bash", sessionID: session, callID: "listen" }, { args })
+          // opencode's shell names no session, only opencode's pid; the plugin binds (BORG_LISTEN_BINDER).
+          const said = execFileSync("borg", ["listen"], { cwd, encoding: "utf8", env: { ...process.env, OPENCODE_PID: String(process.pid) } })
+          await hooks["tool.execute.after"]({ tool: "bash", sessionID: session, callID: "listen", args }, { title: "", output: said, metadata: { exit: 0 } })
+        },
+        wakes: () => prompts.map((p) => p.body.parts[0].text).filter((t: string) => t.startsWith("[borg listen]")),
         end: async () => void (await hooks.event({ event: { type: "session.deleted", properties: { info: { id: session } } } })),
         close: async () => void (await hooks.dispose?.()),
       }
@@ -225,7 +249,7 @@ const PROFILES: Profile[] = [
   {
     name: "opencode 2.x",
     harness: "opencode",
-    stopMs: adapterConst("opencode", "TIMEOUT_MS"),
+    stopMs: adapterBudget("opencode", "stop_ms"),
     installed: (home) => join(home, ".config/opencode/plugins/borg.ts"),
     host: async (mod, cwd, session) => {
       let last = ""
@@ -263,6 +287,13 @@ const PROFILES: Profile[] = [
           if (reason) await say(reason, { borg: true })
           return reason
         },
+        listen: async () => {
+          const input = { command: "borg listen" }
+          await f.hooks["tool.execute.before"]({ tool: "shell", sessionID: session, id: "listen", input })
+          const said = execFileSync("borg", ["listen"], { cwd, encoding: "utf8", env: { ...process.env, OPENCODE_PID: String(process.pid) } })
+          await f.hooks["tool.execute.after"]({ tool: "shell", sessionID: session, id: "listen", input, status: "completed", result: { output: said, metadata: { exit: 0 } } })
+        },
+        wakes: () => f.prompts.map((p: any) => p.text).filter((t: string) => t.startsWith("[borg listen]")),
         end: async () => {
           await f.emit("session.deleted", { sessionID: session })
           await settle()
@@ -291,6 +322,105 @@ async function until(done: () => boolean, ms = 20_000) {
   const end = Date.now() + ms
   while (!done() && Date.now() < end) await new Promise((r) => setTimeout(r, 50))
 }
+
+/** borg on the world's PATH, but for the session's waiter (`borg listen --stream`), which prints what is
+ *  written to `wake`, each line once, and notes each print: the test says when a wake comes. borg's own
+ *  waiter holds its wakes off while a turn runs; the adapter's hold is for one that comes anyway. All
+ *  else, the hooks and their answers above all, is borg itself. */
+function fakeWaiter(w: ReturnType<typeof world>) {
+  const [wake, printed, streams] = ["wake", "printed", "streams"].map((f) => join(w.root, f))
+  const bin = join(w.root, "bin/borg")
+  rmSync(bin)
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+if [ "$1 $2" = "listen --stream" ]; then
+  printf '%s\\n' "$*" >> "${streams}"
+  # Until the adapter stops it (SIGTERM), or its host process is gone.
+  while kill -0 "$PPID" 2>/dev/null; do
+    if [ -s "${wake}" ]; then cat "${wake}"; : > "${wake}"; printf 'printed\\n' >> "${printed}"; fi
+    sleep 0.05
+  done
+fi
+exec "${BORG}" "$@"
+`,
+  )
+  chmodSync(bin, 0o755)
+  const count = (f: string) => (existsSync(f) ? readFileSync(f, "utf8").split("\n").filter(Boolean).length : 0)
+  return { wake, prints: () => count(printed), streams: () => count(streams) }
+}
+
+/** An adapter's code as it runs: comments, strings and regex literals blanked (a template's `${…}`
+ *  kept), each line where it was. */
+function codeOf(src: string): string[] {
+  let out = ""
+  // What is open: "`" a template's text, "${" an expression in it, "{" a block or an object.
+  const open: string[] = []
+  // The last code character: a `/` after an operand divides, anywhere else starts a regex literal.
+  let last = ""
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    const blank = (to: number) => {
+      out += src.slice(i, to).replace(/[^\n]/g, " ")
+      i = to - 1
+    }
+    if (open.at(-1) === "`") {
+      if (c === "\\") blank(i + 2)
+      else if (c === "`") (open.pop(), (out += c), (last = c))
+      else if (c === "$" && src[i + 1] === "{") (open.push("${"), (out += "${"), i++, (last = "{"))
+      else out += c === "\n" ? c : " "
+      continue
+    }
+    const eol = src.indexOf("\n", i) < 0 ? src.length : src.indexOf("\n", i)
+    if (c === "/" && src[i + 1] === "/") blank(eol)
+    else if (c === "/" && src[i + 1] === "*") blank(src.indexOf("*/", i) + 2)
+    else if (c === '"' || c === "'") {
+      let j = i + 1
+      while (j < eol && src[j] !== c) j += src[j] === "\\" ? 2 : 1
+      blank(j + 1)
+      last = c
+    } else if (c === "/" && (last === "" || "(,=:[!&|?{};+-*%<>~^".includes(last) || /\b(return|typeof)\s*$/.test(out))) {
+      let j = i + 1
+      for (let cls = false; j < eol && (cls || src[j] !== "/"); j++) {
+        if (src[j] === "\\") j++
+        else if (src[j] === "[") cls = true
+        else if (src[j] === "]") cls = false
+      }
+      while (/[a-z]/.test(src[j + 1] ?? "")) j++
+      blank(j + 1)
+      last = "/"
+    } else {
+      if (c === "`" || c === "{") open.push(c)
+      else if (c === "}") open.pop()
+      out += c
+      if (!/\s/.test(c)) last = c
+    }
+  }
+  return out.split("\n")
+}
+
+test("every adapter's numbers are named constants, each with its kind in the comment above it", () => {
+  // The kinds of docs/design/constants.md; a guard's comment also says what runaway it stops.
+  const KIND = /\b(protocol|guard|derived|learned|method|baseline|display):/i
+  for (const harness of ["omp", "opencode"]) {
+    const src = readFileSync(join(REPO, `adapters/${harness}/borg.ts`), "utf8")
+    const lines = src.split("\n")
+    const unlabelled: string[] = []
+    const bare: string[] = []
+    codeOf(src).forEach((line, i) => {
+      const named = /^(?:export )?const ([A-Z][A-Z0-9_]*)\b/.exec(line)
+      // An index (`m[2]`, a capture group's) counts nothing; 0 and 1 start, step and test.
+      const numbers = line.replace(/(?<=[\w\])])\[\d+\]/g, "").match(/(?<![\w$.])\d[\d_]*(?:\.\d+)?/g)?.filter((n) => n !== "0" && n !== "1") ?? []
+      if (!numbers.length) return
+      if (!named) return void bare.push(`${i + 1}: ${lines[i].trim()}`)
+      const comment: string[] = []
+      for (let j = i - 1; j >= 0 && /^\s*(\/\/|\/\*\*|\*)/.test(lines[j]); j--) comment.unshift(lines[j])
+      if (!KIND.test(comment.join(" "))) unlabelled.push(named[1])
+    })
+    assert.deepEqual(unlabelled, [], `${harness}: a comment above each starts its reason with its kind (Guard:, Baseline:, ...)`)
+    assert.deepEqual(bare, [], `${harness}: a number in code is a named constant`)
+  }
+})
 
 for (const p of PROFILES) {
   test(`${p.name}: install is a dry run first, then idempotent and reversible`, () => {
@@ -398,6 +528,35 @@ for (const p of PROFILES) {
     rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
+  test(`${p.name}: a held wake whose message the turn's hooks showed is dropped by borg's ids; one they did not show goes in`, async () => {
+    const w = world("wake")
+    const waiter = fakeWaiter(w)
+    const s = `conf-wake-${p.harness}`
+    const h = await drone(w, p, s)
+    try {
+      await h.prompt("Look at the parser")
+      await h.listen()
+      await until(() => waiter.streams() === 1)
+      assert.equal(waiter.streams(), 1, "the adapter started the session's waiter")
+      // A message for the session while its turn runs, its wake, and a wake for a message no hook shows.
+      const told = JSON.parse(execFileSync("borg", ["tell", "--json", s, "the parser is merged"], { cwd: w.cwd, encoding: "utf8", env: process.env }))
+      const wake = (who: string) => `[borg listen] 1 message from other sessions waits for you (${who}).`
+      const line = (id: string, who: string) => JSON.stringify({ wake: wake(who), n: 1, ids: [id] })
+      writeFileSync(waiter.wake, `${line(told.id, "engineer tells")}\n${line("m00000000beef", "nobody shows it")}\n`)
+      await until(() => waiter.prints() === 1)
+      // The next tool call (by which the adapter has read the waiter's lines) shows the message.
+      assert.match(await h.tool({ kind: "read", path: join(w.cwd, "src/net.rs") }, "c1"), new RegExp(`\\[${told.id}\\]: the parser is merged`))
+      // The turn ends (a stop that blocks once keeps it running): what is held goes in.
+      for (let i = 0; i < 2 && !h.wakes().length; i++) await h.stop(PLAN)
+      assert.deepEqual(h.wakes(), [wake("nobody shows it")], "only the wake whose message the model has not read (borg's answer names it, `shown_ids`)")
+    } finally {
+      // The session's end stops its waiter.
+      await h.end()
+      await h.close()
+    }
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  })
+
   test(`${p.name}: a change is checked live and its ask arrives with the next tool call`, async () => {
     const w = world("live")
     process.env.BORG_MODE = "live"
@@ -412,7 +571,7 @@ for (const p of PROFILES) {
     assert.equal(await h.tool({ kind: "edit", path: net }, "c2"), "")
     assert.ok(Date.now() - started < 5_000)
     await until(() => w.state(s, "queued").includes("live ") && w.state(s, "live.mark") !== "")
-    assert.equal(w.state(s, "queued"), "live Mdrain\n", "the ask is queued")
+    assert.match(w.state(s, "queued"), /^live Mdrain @[0-9a-f]{12}\n$/, "the ask is queued, with the check that asked it")
     const checked = readFileSync(join(w.root, "prompts/0.txt"), "utf8")
     assert.ok(checked.includes("[Edit] ") && checked.includes(NEW_TEXT), `the check read the turn's tool calls: ${checked}`)
     const next = await h.tool({ kind: "read", path: join(w.cwd, "src/budget.rs") }, "c3")

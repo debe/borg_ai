@@ -15,6 +15,8 @@ use std::time::Instant;
 use borg_search::seek::{self, Embedder, Mode};
 use borg_search::{load, read_queries};
 
+/// Experiment parameter: the depth every arm's ranking is recorded to, so the eval's recall@k reads
+/// any k up to it.
 const TOP: usize = 20;
 const MODELS: [(&str, &str); 2] = [("8", "potion-base-8M"), ("ML", "potion-multilingual-128M")];
 

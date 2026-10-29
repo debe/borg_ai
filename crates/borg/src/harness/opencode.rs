@@ -1,6 +1,7 @@
 //! opencode 1.x and 2.x: the TS plugin `adapters/opencode/borg.ts`, compiled in and copied to
 //! `~/.config/opencode/plugins/borg.ts` (`$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`). The plugin
-//! translates both ways, sends opencode's pid, emulates the stop's second round and sets its budget.
+//! translates both ways, sends opencode's pid, emulates the stop's second round and gives borg the
+//! stop's budget (`BUDGETS`, which borg's first answer tells it).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,24 @@ use serde_json::Value;
 
 use crate::runner;
 
-use super::{Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Budgets, CONTEXT_GUARD, Caps, DroneWake, Harness, Probe, Run, STOP_TIMEOUT_S, SubAgent, Transcript, Wiring};
 
 pub const ADAPTER: &str = include_str!("../../assets/adapters/opencode/borg.ts");
+
+/// What the plugin waits for each of borg's answers. opencode limits no plugin hook, so each is a guard
+/// against a hung borg holding the engineer's turn: a prompt waits 5 s and a tool result 2 s for borg's
+/// context (file appends; a later answer is kept for the next call), a tool call 2 s before it runs (a
+/// stat when nobody steers); the stop, and every call queued behind it, borg's stop timeout. The
+/// session's end, queued too, gets the same as its own `end` (the plugin's end waits `end_ms`, the other
+/// queued calls `stop_ms`): a hung end holds the session's queue and the plugin's cleanup, which ends
+/// every session.
+pub const BUDGETS: Budgets = Budgets {
+    prompt: Duration::from_secs(5),
+    pre_tool: Duration::from_secs(2),
+    post_tool: Duration::from_secs(2),
+    stop: Duration::from_secs(STOP_TIMEOUT_S),
+    end: Duration::from_secs(STOP_TIMEOUT_S),
+};
 
 pub struct Opencode;
 
@@ -31,8 +47,11 @@ impl Harness for Opencode {
             transcript: Transcript::None,
             deny_capture: true,
             sends_pid: true,
-            // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
-            stop_budget: None,
+            // The plugin names it too (`BORG_STOP_BUDGET_MS`), as borg's answer told it.
+            stop_budget: Some(BUDGETS.stop),
+            // No limit (1.19.0): a tool's output is cut before tool.execute.after, never the text the
+            // plugin appends there, and a prompt's synthetic part goes in whole. 2.x unverified here.
+            context_chars: CONTEXT_GUARD,
             session_env: None,
             pid_env: Some("OPENCODE_PID"),
             drone_wake: DroneWake::Plugin,
@@ -41,6 +60,10 @@ impl Harness for Opencode {
 
     fn wiring(&self) -> Wiring {
         Wiring::AdapterFile { source: ADAPTER }
+    }
+
+    fn budgets(&self) -> Option<Budgets> {
+        Some(BUDGETS)
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {
@@ -67,7 +90,8 @@ impl Harness for Opencode {
 
 // ---------------------------------------------------------------- the CLI
 
-/// How long one opencode CLI call (the query, a listing, one export) may take.
+/// Guard: how long one opencode CLI call (the query, a listing, one export) may take, so a hung CLI
+/// never stalls `borg assimilate` or a session's end.
 const CLI_CAP: Duration = Duration::from_secs(30);
 
 /// `opencode <args>` in `dir`, the `opencode` on `path` (None: this process's PATH), capped like a
@@ -128,7 +152,8 @@ pub type Query<'a> = &'a dyn Fn(&str) -> Option<Vec<Value>>;
 /// A guard, not a tuning knob: at most this many children of one session are exported, the rest read
 /// from the parent's copy of their final text.
 pub const CHILDREN: usize = 20;
-/// All of one session's exports stop after this long; the remaining children are read from the parent.
+/// Guard: all of one session's exports stop after this long; the remaining children are read from the
+/// parent.
 const SESSION_BUDGET: Duration = Duration::from_secs(120);
 
 /// An opencode session id (`ses_` and alphanumerics), the only thing passed to its CLI.

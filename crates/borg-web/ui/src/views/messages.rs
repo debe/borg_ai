@@ -1,15 +1,22 @@
 //! Messages: what sessions told and asked each other (borg msg.rs), whom each was shown to on this
-//! node, what waits unread, and the sends, deliveries and refusals per day.
+//! node, what waits unread, and the sends, deliveries and refusals per day. The messages to the
+//! engineer it lists are acknowledged as theirs, as `borg inbox` acknowledges what it lists.
+
+use std::collections::HashSet;
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
+use serde_json::json;
 
-use crate::api::{Message, data};
+use crate::api::{Message, data, post};
 use crate::charts::{StackedChart, Tile};
 use crate::feed::FeedList;
 use crate::util::{ago, num, trunc};
 use crate::views::overview::{day_rows, kind_series};
 
 const KINDS: [&str; 3] = ["msg_sent", "msg_delivered", "msg_dropped"];
+/// Display: the messages the conversation lists, newest first: a week's talk of a few sessions.
+const SHOWN: usize = 60;
 
 fn message_row(m: Message) -> impl IntoView {
     let ask = m.kind == "ask";
@@ -43,6 +50,22 @@ pub fn Messages() -> impl IntoView {
     let t = move || st.with(|s| s.totals.clone());
     let timeline = Memo::new(move |_| d.feed.with(|f| f.iter().filter(|e| KINDS.contains(&e.kind.as_str())).cloned().collect::<Vec<_>>()));
     let asks = move || d.messages.with(|ms| ms.iter().filter(|m| m.kind == "ask").count());
+    // The list shows the engineer the messages to them: acknowledged once each (borg-web
+    // `/api/messages/seen`), which opens their senders' windows again. Only while this view is open.
+    let told = StoredValue::new(HashSet::<String>::new());
+    Effect::new(move |_| {
+        let ids: Vec<String> = d.messages.with(|ms| ms.iter().take(SHOWN).filter(|m| m.to_kind == "engineer").map(|m| m.id.clone()).collect());
+        let new: Vec<String> = told.with_value(|t| ids.into_iter().filter(|i| !t.contains(i)).collect());
+        if new.is_empty() {
+            return;
+        }
+        told.update_value(|t| t.extend(new.iter().cloned()));
+        // The collective these messages came from, which the picker may already have left.
+        let c = d.source("messages").raw.with_untracked(|v| v["collective"].as_str().unwrap_or_default().to_string());
+        spawn_local(async move {
+            let _ = post(format!("/api/messages/seen?c={c}"), &json!({"ids": new})).await;
+        });
+    });
 
     view! {
         <section class="tiles">
@@ -52,7 +75,7 @@ pub fn Messages() -> impl IntoView {
             }) color="var(--c-sky)" />
             <Tile label="Shown to sessions" value=Signal::derive(move || num(t().n("msg_delivered"))) sub=Signal::derive(|| "each once, at its next prompt or tool call".to_string()) color="var(--c-teal)" />
             <Tile label="Unread now" value=Signal::derive(move || num(d.unread.get())) sub=Signal::derive(|| "waiting for a running session here".to_string()) color="var(--c-violet)" />
-            <Tile label="Dropped" value=Signal::derive(move || num(t().n("msg_dropped"))) sub=Signal::derive(|| "refused by the rate limit, or cut by the log's bound".to_string()) color="var(--c-heat)" up_is_good=false />
+            <Tile label="Dropped" value=Signal::derive(move || num(t().n("msg_dropped"))) sub=Signal::derive(|| "refused while their recipient had not read the ones before, or cut by the log's bound".to_string()) color="var(--c-heat)" up_is_good=false />
         </section>
         <section class="panel">
             <h2>"Messages"<small>"per day"</small></h2>
@@ -80,7 +103,7 @@ borg inbox                             # what was sent, and whom it was shown to
                         if ms.is_empty() {
                             return view! { <p class="empty">"No message in the last 7 days."</p> }.into_any();
                         }
-                        ms.into_iter().take(60).map(message_row).collect_view().into_any()
+                        ms.into_iter().take(SHOWN).map(message_row).collect_view().into_any()
                     }}
                 </div>
             </div>

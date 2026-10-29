@@ -62,16 +62,25 @@ pub const RATIFY_OPTION: &str = "ratify: make it a constraint (only an engineer 
 
 static PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*borg\s+no\b[\s:,.-]*(.*)$").unwrap());
 
+/// The most characters of a veto's reason that its episode keeps. Guard: bounds the episode, as a
+/// correction's text is bounded where the hook captures it (hook.rs `capture_prompt`): the same bound.
+pub const REASON_CHARS: usize = crate::learn::EXCERPT_CHARS;
+/// A shorter reason is no veto (a stray "borg no"). Guard: an accidental prompt does not become one.
+const REASON_MIN: usize = 4;
+/// Display: the characters of the veto's words a proposed constraint shows as its evidence, beside the
+/// invariant quoted whole: enough to recognise the veto, the episode keeps it all (`REASON_CHARS`).
+const EVIDENCE_CHARS: usize = 200;
+
 /// False when BORG_VETO=off: a prompt starting "borg no" is an ordinary prompt.
 pub fn enabled() -> bool {
     std::env::var("BORG_VETO").as_deref() != Ok("off")
 }
 
-/// The reason of a prompt that is a veto ("borg no: never …"), trimmed, at most 1500 characters; None
-/// when it is not a veto or its reason is shorter than 4 characters.
+/// The reason of a prompt that is a veto ("borg no: never …"), trimmed, at most `REASON_CHARS`; None
+/// when it is not a veto or its reason is shorter than `REASON_MIN` characters.
 pub fn reason_in(prompt: &str) -> Option<String> {
     let reason = PREFIX.captures(prompt)?.get(1)?.as_str().trim();
-    (reason.chars().count() >= 4).then(|| reason.chars().take(1500).collect())
+    (reason.chars().count() >= REASON_MIN).then(|| reason.chars().take(REASON_CHARS).collect())
 }
 
 /// The lessons the drone was shown in `session` so far, sorted and unique: its `asked` outcomes (stop
@@ -148,7 +157,7 @@ pub fn record(home: &Path, s: &Said) -> std::io::Result<Veto> {
         ev.lessons = credited.clone();
         ev.n = credited.len() as u64;
         ev.why = s.via.into();
-        ev.text = stats::excerpt(s.reason, 160);
+        ev.text = stats::excerpt(s.reason, stats::FEED_CHARS);
     });
     let missed = escalation::merged(&crate::notes::state_dir(), s.session) && escalation::missed(home, s.session, KIND, &e.id, s.repo, s.ms);
     Ok(Veto { episode: e.id, credited, missed })
@@ -195,7 +204,7 @@ pub fn apply(home: &Path, m: &Message, here: &str) -> std::io::Result<Option<Vet
     }
     let repo = p.as_ref().map(|p| p.repo.clone()).unwrap_or_default();
     let task = task_of(home, session, p.as_ref().map_or("", |p| p.prompt.as_str()));
-    let reason: String = m.text.trim().chars().take(1500).collect();
+    let reason: String = m.text.trim().chars().take(REASON_CHARS).collect();
     // The engineer's email when an engineer sent it, else the sending session's name.
     let engineer = match Address::parse(&m.by) {
         Some(Address::Engineer { email }) if !email.is_empty() => email,
@@ -234,8 +243,9 @@ pub fn render(reason: &str) -> String {
     )
 }
 
+/// A session as the terminal names it beside its drone: its first characters (msg.rs `short_session`).
 fn short(session: &str) -> String {
-    session.chars().take(8).collect()
+    crate::msg::short_session(session)
 }
 
 /// The drone a terminal veto names (pure). `named`: a designation, number or session id (prefix), as
@@ -277,10 +287,10 @@ pub fn propose(home: &Path, lesson: &learn::Lesson, invariant: &str, e: &learn::
         id: format!("q{}", &key[..8]),
         decision_key: key,
         kind: queen::Kind::Constraint,
-        question: format!("Make this a constraint of the collective? \"{}\"", stats::excerpt(invariant, 300)),
+        question: format!("Make this a constraint of the collective? \"{}\"", stats::excerpt(invariant, queen::QUOTE_CHARS)),
         options: vec![KEEP_OPTION.into(), RATIFY_OPTION.into()],
         default: KEEP_OPTION.into(),
-        evidence: vec![format!("invariant: {invariant}"), format!("lesson {}", lesson.id), format!("veto: {}", stats::excerpt(&e.correction, 200))],
+        evidence: vec![format!("invariant: {invariant}"), format!("lesson {}", lesson.id), format!("veto: {}", stats::excerpt(&e.correction, EVIDENCE_CHARS))],
         session: e.session.clone(),
         cwd: String::new(),
         repo: lesson.repo.clone(),

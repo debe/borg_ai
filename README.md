@@ -17,8 +17,10 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.5.0, the first release on crates.io. It removed the hive and playbooks: sessions now message each other instead. In daily use, with
-lessons syncing between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
+**Status:** 0.6.0. Lesson selection is measured end to end; the fixed rule stays the default and the
+learned policy is opt-in until its pre-registered checks pass. Messages between sessions are paced by
+acknowledgements instead of a fixed rate. In daily use, with lessons syncing
+between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
 - [How it works in one session](#how-it-works-in-one-session)
@@ -104,8 +106,19 @@ the stop*, a free word gate skips most turns; otherwise one model call grades th
 grade 3 blocks the stop for one more round. The same call judges whether what was handed over earlier
 changed the work. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
 
-**Outcomes and belief.** Every delivery is logged with its probability, and what followed (changed,
-ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's usefulness belief. The
+**Which lessons are asked.** Per check, a selection policy decides for each graded lesson whether to
+ask it, hand it over free or leave it for later. The default is 0.5.0's fixed rule, by grade (it no
+longer hands over free a lesson the session already had). Under it every check also measures what a
+learned policy needs and the fixed rule's history cannot show: a placebo arm judges blindly up to two
+lessons the check does not deliver, a tail sample grades up to two lessons past the pool's budget, and
+the records say which lessons the session already had. The learned policy (`BORG_SELECT=learned`,
+opt-in) routes by the mistakes it expects each route to avoid, learned from the logged outcomes; a
+conservative gate keeps it on the fixed rule until the outcomes support a deviation, and a monitor
+puts the fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+
+**Outcomes and belief.** Every delivery is logged with the check that routed it and its probability,
+and what followed (changed, ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's
+usefulness belief; a lesson nobody judged counts as unknown, not as ignored. The
 Knowledge tab of `borg web` shows it. [Outcomes](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
 
 **Review → fix.** A reviewer sub-agent finds a bug and a fix step fixes it before any commit. `borg
@@ -174,9 +187,17 @@ session id that matches one here names it. A colleague's session is reached by `
 nothing here matches, or as the sender a reply answers; `collective` reaches every session of the
 collective on every member's machine and may wake them, so it is for what concerns their work. The message is shown once, at the recipient's next prompt or tool call, marked as
 peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
-Text is redacted and cut to 1,000 characters, and one sender may send a recipient one message per 10
-minutes. Messages are kept 7 days. One to `local` stays on this machine; one to `collective`, to
-`<session>@<node>` or a reply syncs to the team collective's members.
+Text is redacted and kept whole; a message longer than one prompt or tool call has room for shows its
+head and `borg inbox --show <id>`. A sender may have a window of unread messages to one recipient: it
+starts at one and doubles each time the recipient reads one, so sessions that read their messages
+converse without waiting, and a flood into a session that is gone stops at one. Where an
+acknowledgement may never come, nobody is paced more strictly than 0.5.0 paced them, one message per 10
+minutes: a broadcast or a message to the engineer may go at that rate whatever the window holds, and a
+session on another machine is paced by that rate alone until its machine acknowledges one of the
+sender's messages (a 0.5 machine never does). `borg inbox`, `borg top` and borg web's Messages page
+acknowledge the messages to the engineer they show. Messages are kept 7 days. One to `local` stays on
+this machine; one to `collective`, to `<session>@<node>` or a reply syncs to the team collective's
+members.
 
 The engineer can also hold a session, or every one:
 
@@ -187,7 +208,8 @@ borg no --session Two "never look merges up in the commit log"   # a veto, on th
 ```
 
 `borg pause local` holds this machine's sessions; `borg pause collective` (or `all`) every member's.
-These are messages too, shown at the next prompt or tool call on every harness, and never rate limited.
+These are messages too, shown at the next prompt or tool call on every harness, and never held back
+by a sender's window.
 From another member's machine they count only if that member has the `admin` or `steer` role. A pause
 lapses after a day.
 
@@ -218,7 +240,12 @@ Conscience (checks, questions and what they led to per channel), Learning (week 
 source, the share of asked lessons that changed the work, repeated vetoes), Steering
 (corrections, rejected tool calls, pauses and vetoes, the tool calls a pause refused), Messages (the last
 7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost and Drones.
-It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, what is wired,
+The Conscience tab also shows lesson selection: the policy and the default, what the checks measure
+for the learned policy (placebos drawn and judged, tail lessons shown and applied), spend per session,
+effects with their intervals, label health, the fitted delivery rates, pool yield and stop latency per
+harness against its stop budget, and the learned decisions a guard gave the fixed rule; under the
+learned policy also its gate, deviations from the fixed rule and the monitor's reading with the health
+of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, lesson selection, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
@@ -234,7 +261,11 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66). `assimilate --from-dir` makes one call per chunk and
   prints its cost. Messages, `borg no`, review → fix, regrets and green tests are found at 0 tokens; a
   veto's reason or a fixed finding is then learned like any correction.
-- There is no cost cap: `borg status` and the Cost tab show what each mode spent.
+- There is no cost cap. Quality is what selection optimises; `borg status`, `borg top` and the Cost and
+  Conscience tabs show what each mode and each check spent. An engineer who wants spend priced sets an
+  optional `budget` for a collective, which prices the learned policy's pools ([Collectives](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#collectives)); none is set by default.
+- **The tail sample** adds at most two lessons to a turn-end call whose pool (12,000 tokens) left
+  lessons out, so the yield past the budget is measured.
 
 ## Privacy
 
@@ -245,7 +276,7 @@ per-session state.
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
 lessons (with author emails and repo names); redacted reasoning excerpts of landed commits, each held by
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
-of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them; the signed member list; daily usage counts per
+of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them, and which messages a session was shown (the acknowledgements that pace them); the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
 and ratified constraints (the invariant, its lesson and who ratified it, never the veto's words).
 
@@ -285,6 +316,14 @@ that users who never configure get it.
 (comparison runs not concurrent), but against a hand-written skill +0.11 [−0.56, +0.78], short of the
 pre-registered lower bound of −0.5.
 
+**Opt-in until its checks pass:** learned lesson selection. Its checks were written before it was
+built and run at 0 tokens (`borg debug select --replay`). P4 failed on their first run and again on the
+one rerun their amended rules allow: on the review → fix eval the right lesson's recall against the
+fixed rule was −3.53 points [−6.74, −0.98] under the store's posterior and −3.77 [−6.89, −1.18] under
+the n = 0 prior (first run −4.02 [−7.28, −1.24] under the posterior), both lower bounds past the bar's
+−5. Calibration (P2) failed the first run and passed the rerun only by the pruned model. The fixed rule
+stays the default and `BORG_SELECT=learned` opts in ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
+
 **Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit
 improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests. omp,
@@ -304,9 +343,13 @@ borg doctor
 
 Hooks call the binary by path, so a reinstall needs no rewiring. Codex trusts each hook's command and
 timeout: after an upgrade that moves borg or changes a timeout, trust them again with `/hooks`
-(`borg doctor` says so). Stores are append-only JSONL and need no migration. The mesh protocol is
-now `borg/mesh/13`. A member built from 0.3.0 sources (`borg/mesh/12`) still syncs everything except messages; nothing syncs
-with an older one, and `borg doctor` names that member and which side has to upgrade.
+(`borg doctor` says so). Stores are append-only JSONL and need no migration; the first check after an
+upgrade rebuilds the selection summary from the outcome log. The mesh protocol is now `borg/mesh/14`.
+A 0.4 or 0.5 member (`borg/mesh/13`) still syncs everything, but gets only the messages it can read
+(those of at most 1,000 characters, paced as 0.5.0 paced them): `borg tell` refuses a longer text to
+a session there and says why, and a broadcast says how many member machines will not show it. A member
+built from 0.3.0 sources (`borg/mesh/12`) syncs everything except messages; nothing syncs with an older
+one, and `borg doctor` names that member and which side has to upgrade.
 
 ```sh
 borg uninstall all --apply    # removes only what install added; keeps a backup

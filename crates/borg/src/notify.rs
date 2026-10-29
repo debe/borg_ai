@@ -7,7 +7,8 @@ use std::process::{Command, Stdio};
 
 use crate::queen::{self, Entry};
 
-/// Longest question shown in a notification body, in characters.
+/// Longest question shown in a notification body, in characters. Display: what a desktop
+/// notification shows without cutting it itself.
 const BODY_CHARS: usize = 120;
 
 /// Notifications can be shown: not a unit test, `BORG_NOTIFY` is not "off", a graphical session

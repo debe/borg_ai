@@ -36,14 +36,19 @@ use crate::notes::regress_signals as signals;
 use crate::notes::{self, Excerpt, redact};
 use crate::{collective, learn};
 
-/// Free text in a link (a task's first line, a subject) is cut to this many characters.
+/// Free text in a link (a task's first line, a subject) is cut to this many characters. Guard: bounds
+/// a note's line whatever the task said.
 const TEXT_CAP: usize = 240;
-/// At most this many lines of one file are blamed.
+/// At most this many lines of one file are blamed. Guard: a fix that rewrote a whole file costs one
+/// bounded `git blame`, not one per line of it.
 const SPAN_CAP: usize = 400;
-/// A link lists at most this many files, each with at most this many line ranges.
+/// A link lists at most this many files. Guard: a sweeping fix (a rename, a reformat) still writes a
+/// short link.
 const FILES_CAP: usize = 10;
+/// At most this many line ranges per file of a link. Guard, as `FILES_CAP`.
 const RANGES_CAP: usize = 20;
-const DAY: i64 = 86_400;
+/// A day in seconds (git's commit times). Derived: clock.rs `DAY_MS`.
+const DAY: i64 = crate::clock::DAY_MS / 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -588,7 +593,8 @@ pub struct Replayed {
     pub shallow: bool,
 }
 
-/// At most this many commits of a replayed range are scanned.
+/// At most this many commits of a replayed range are scanned. Guard: `borg notes regress --replay`
+/// over a long history ends in bounded time; a longer range says it was cut.
 pub const REPLAY_CAP: usize = 500;
 
 /// Every non-merge commit of `range` taken for a fix (dry run: nothing is written). Each commit

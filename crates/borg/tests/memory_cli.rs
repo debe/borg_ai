@@ -79,12 +79,17 @@ fn borg(root: &Path, args: &[&str], stdin: &str, model: bool, env: &[(&str, &str
     c.args(args)
         .env_clear()
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
+        // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
+        // CLI on PATH (runner.rs `pick`), a real call.
+        .env("BORG_PREDICT_MODEL", "claude:")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_HOME", root.join("store"))
         .env("BORG_CONFIG", root.join("collectives.json"))
         .env("BORG_VECTORS", "off")
         .env("BORG_EARLY", "off")
+        // The fixed rule's delivery (select.rs `Policy::Fixed`), as tests/common pins it.
+        .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -120,6 +125,13 @@ fn outcomes(root: &Path) -> Vec<Value> {
     store_file(root, "outcomes.jsonl").lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
+/// Whether the judge's result of kind `k` for `lesson` was judged without its declaration (hook.rs
+/// `stripped`, a seeded coin per check and lesson).
+fn stripped(root: &Path, k: &str, lesson: &str) -> bool {
+    let o = outcomes(root).into_iter().find(|o| o["kind"] == k && o["lessons"].as_array().unwrap().iter().any(|l| l == lesson));
+    o.unwrap_or_else(|| panic!("no {k} for {lesson}"))["stripped"].as_bool().unwrap_or(false)
+}
+
 fn kind(root: &Path, k: &str) -> Vec<String> {
     let mut v: Vec<String> = outcomes(root)
         .iter()
@@ -131,11 +143,12 @@ fn kind(root: &Path, k: &str) -> Vec<String> {
     v
 }
 
+/// The asked ids, without each line's ` @<check>` tag.
 fn asked(root: &Path, session: &str) -> Vec<String> {
     store_file(root, &format!("state/{session}.ctx"))
         .lines()
         .filter_map(|l| l.strip_prefix("#borg-asked "))
-        .flat_map(|l| l.split(','))
+        .flat_map(|l| l.split(" @").next().unwrap_or_default().split(','))
         .filter(|i| !i.is_empty())
         .map(String::from)
         .collect()
@@ -162,7 +175,7 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     let ids = blocked_and_answered(&root, "s1", "Revised: no lock across the await.\nLlock: applies\n- Ldrain: skip\n");
     let first = calls(&root);
     assert_eq!(first.len(), 1, "the answer turn makes no model call");
-    assert!(!first[0].0.contains("asked earlier") && !first[0].1.contains("resolved"), "nothing pending yet");
+    assert!(!first[0].0.contains("from earlier in this session") && !first[0].1.contains("resolved"), "nothing pending yet");
     // The declaration alone labels nothing.
     assert!(kind(&root, "asked_then_changed").is_empty() && kind(&root, "asked_ignored").is_empty(), "{:?}", outcomes(&root));
 
@@ -181,17 +194,25 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     let all = calls(&root);
     assert_eq!(all.len(), 2, "no extra call: the judge rides on the consequence model's call");
     let (prompt, schema) = &all[1];
-    assert!(prompt.contains("## Questions asked earlier in this session") && schema.contains("\"resolved\""), "{schema}");
-    assert!(
-        prompt.contains("[Llock] question: Is the websocket send lock") && prompt.contains("a slow client stalls every sender (declared: applies)"),
-        "{prompt}"
-    );
-    assert!(prompt.contains("frames interleave on the socket (declared: skip)"), "{prompt}");
+    assert!(prompt.contains("## Lessons from earlier in this session") && schema.contains("\"resolved\""), "{schema}");
+    assert!(prompt.contains("[Llock] lesson: Is the websocket send lock"), "{prompt}");
     assert!(prompt.contains("before: Plan: hold the websocket send lock"), "{prompt}");
     assert!(prompt.contains("one writer thread drains the delivery queue") && prompt.contains("this turn: Done: the writer thread"), "{prompt}");
-    assert_eq!(prompt.matches("### Asked together").count(), 1, "one block, one shared evidence");
+    assert_eq!(prompt.matches("### Work").count(), 1, "one block, one shared evidence");
     assert_eq!(kind(&root, "asked_then_changed"), ["Llock"]);
     assert_eq!(kind(&root, "asked_ignored"), ["Ldrain"]);
+    // Each declaration reaches the judge unless its question's coin stripped it (the result says which):
+    // then neither the annotation nor the answer's line shows it.
+    for (k, id, end, word) in [
+        ("asked_then_changed", "Llock", "a slow client stalls every sender", "applies"),
+        ("asked_ignored", "Ldrain", "frames interleave on the socket", "skip"),
+    ] {
+        let shown = format!("{end} (declared: {word})");
+        match stripped(&root, k, id) {
+            true => assert!(!prompt.contains(&shown) && !prompt.contains(&format!("{id}: {word}")), "{id} stripped: {prompt}"),
+            false => assert!(prompt.contains(&shown), "{id}: {prompt}"),
+        }
+    }
     let state = store_file(&root, "state/s1.ctx");
     assert!(state.contains("#borg-judged Llock=changed") && state.contains("#borg-judged Ldrain=ignored"), "{state}");
     if ids.contains(&"Lspec".to_string()) {
@@ -207,7 +228,7 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     // Judged once: later calls do not send them again (an unclear one may come back once more).
     answer(&root, &[], json!([{"id": "Llock", "verdict": "unchanged", "avoids_consequence": false}]));
     stop(&root, "s1", false, "Anything else?", true, &[]);
-    assert!(!calls(&root)[2].0.contains("[Llock] question"));
+    assert!(!calls(&root)[2].0.contains("[Llock] lesson"));
     assert_eq!(kind(&root, "asked_then_changed"), ["Llock"]);
 
     // `borg debug memory`: the changed lesson now weighs more than the ignored one, and more than a new one (1).
@@ -265,6 +286,8 @@ fn unclear_or_missing_verdicts_stay_pending_and_are_sent_twice_at_most() {
     );
     stop(&root, "s1", false, "Another step done.", true, &[]);
     assert!(kind(&root, "asked_then_changed").is_empty() && kind(&root, "asked_ignored").is_empty(), "{:?}", outcomes(&root));
+    // Measured, not a result: the unclear verdicts are `asked_unclear` (a missing one writes nothing).
+    assert_eq!(kind(&root, "asked_unclear"), ["Ldrain", "Llock"], "{:?}", outcomes(&root));
     let state = store_file(&root, "state/s1.ctx");
     assert_eq!(state.matches("#borg-judged Llock=pending").count(), 2, "{state}");
     // Twice sent without a verdict: not sent again (borg learn settles it as asked_not_corrected).
@@ -272,7 +295,7 @@ fn unclear_or_missing_verdicts_stay_pending_and_are_sent_twice_at_most() {
     stop(&root, "s1", false, "Last step.", true, &[]);
     let c = calls(&root);
     assert_eq!(c.len(), 4);
-    assert!(c[1].0.contains("[Llock] question") && c[2].0.contains("[Llock] question") && !c[3].0.contains("asked earlier"), "{}", c[3].0);
+    assert!(c[1].0.contains("[Llock] lesson") && c[2].0.contains("[Llock] lesson") && !c[3].0.contains("from earlier in this session"), "{}", c[3].0);
     assert!(kind(&root, "asked_then_changed").is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -286,7 +309,7 @@ fn a_turn_end_the_prefilter_skips_leaves_questions_pending() {
     stop(&root, "s1", false, "Renamed a CSS token.", true, &[("BORG_PREFILTER", "1000000")]);
     assert_eq!(calls(&root).len(), 1);
     assert!(store_file(&root, "state/s1.ctx").contains("#borg-skip"));
-    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked" || o["kind"] == "graded"), "nothing judged: {:?}", outcomes(&root));
+    assert!(outcomes(&root).iter().all(|o| ["asked", "graded", "delivery"].contains(&o["kind"].as_str().unwrap())), "nothing judged: {:?}", outcomes(&root));
     assert!(!store_file(&root, "state/s1.cost").contains("judge "));
     // The next turn end that reaches the model judges them.
     stop(&root, "s1", false, "Wired the writer thread.", true, &[]);
@@ -308,7 +331,7 @@ fn the_word_rule_and_a_declaration_alone_write_no_outcome() {
     assert_eq!(stop(&root, "s1", true, "Revised: no lock across the await.\nLlock: applies\nLdrain: skip\n", false, &[]).trim(), "");
     stop(&root, "s1", false, "Done.", false, &[]);
     assert!(calls(&root).is_empty());
-    assert!(outcomes(&root).iter().all(|o| o["kind"] == "asked" || o["kind"] == "graded"), "nothing judged: {:?}", outcomes(&root));
+    assert!(outcomes(&root).iter().all(|o| ["asked", "graded", "delivery"].contains(&o["kind"].as_str().unwrap())), "nothing judged: {:?}", outcomes(&root));
     let edits = store_file(&root, "state/s1.edits");
     assert!(edits.contains("#borg-asked Llock") || edits.contains(",Llock"), "{edits}");
     assert_eq!(edits.matches("#borg-answer ").count(), 1, "one answer per block: {edits}");

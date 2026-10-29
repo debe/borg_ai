@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Caps, DroneWake, Harness, Probe, Transcript, Wiring};
+use super::{CONTEXT_GUARD, Caps, DroneWake, Harness, Probe, STOP_TIMEOUT_S, Transcript, Wiring};
 
 /// Native names unlike any real harness's: the event table, not a name, decides the canonical event.
 pub const EVENTS: [(&str, &str); 6] = [
@@ -37,6 +37,8 @@ pub fn caps_of(list: &str) -> Caps {
         deny_capture: on("deny"),
         sends_pid: on("pid"),
         stop_budget: None,
+        // A harness of no one's: it sets no limit of its own.
+        context_chars: CONTEXT_GUARD,
         session_env: None,
         pid_env: None,
         drone_wake: DroneWake::Model,
@@ -53,7 +55,7 @@ impl Harness for Sim {
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", 90)], retired: &[], through_links: false }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], retired: &[], through_links: false }
     }
 
     fn target(&self, home: &Path, _var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {

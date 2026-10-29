@@ -96,15 +96,25 @@ pub fn unsupported() -> Option<&'static str> {
     }
 }
 
-/// The least time between the starts of two checks of a session: `BORG_LIVE_DEBOUNCE_S`, default 45 s.
+/// Baseline: the least time between the starts of two checks of a session when `BORG_LIVE_DEBOUNCE_S`
+/// is unset, the value live mode passed the live-vs-hook eval with (docs/delivery.md, "Why live is the
+/// default"). It also guards against a check per tool call.
+pub const DEBOUNCE_S: i64 = 45;
+
+/// The least time between the starts of two checks of a session: `BORG_LIVE_DEBOUNCE_S`, else
+/// [`DEBOUNCE_S`].
 pub fn debounce_ms() -> i64 {
-    std::env::var("BORG_LIVE_DEBOUNCE_S").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(45).max(0) * 1000
+    std::env::var("BORG_LIVE_DEBOUNCE_S").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(DEBOUNCE_S).max(0) * 1000
 }
 
+/// Guard: what a lock may outlive its check's longest model call by (the check's own reading and
+/// writing), before it is taken for a crashed check's.
+const STALE_SLACK_MS: i64 = 30_000;
+
 /// A lock older than this belongs to a check that cannot still be waiting for its model (or to a pid
-/// that was reused): twice the predict timeout plus 30 s.
+/// that was reused): derived, twice the predict timeout plus [`STALE_SLACK_MS`].
 pub fn stale_ms() -> i64 {
-    2 * crate::predict::timeout().as_millis() as i64 + 30_000
+    i64::try_from(crate::predict::timeout().as_millis()).unwrap_or(i64::MAX).saturating_mul(2).saturating_add(STALE_SLACK_MS)
 }
 
 fn beside(ctx: &Path, ext: &str) -> PathBuf {
@@ -289,6 +299,9 @@ pub fn covered(lock: Lock, count: u64, mark: Option<Mark>, turn: u64) -> bool {
     lock != Lock::Held && count > 0 && mark.is_some_and(|m| m.covered == count && m.turn == Some(turn))
 }
 
+/// Method: how often a stop waiting for a running check looks at its lock.
+const WAIT_POLL: Duration = Duration::from_millis(200);
+
 /// Waits up to `max_ms` for a running check to finish; the lock's state after.
 pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
     let until = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
@@ -297,25 +310,35 @@ pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
         if l != Lock::Held || std::time::Instant::now() >= until {
             return l;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(WAIT_POLL);
     }
 }
 
-/// How long a stop in live mode waits for a running check.
-pub const STOP_WAIT_MS: u64 = 15_000;
+/// Guard: the most of the stop's budget its wait for a running check may take (a quarter), so a slow
+/// check never starves the stop's own model call, which gets the rest ([`call_limit`]).
+pub const WAIT_SHARE: u32 = 4;
+
+/// How long a stop in live mode waits for a running check at most. Derived: the share [`WAIT_SHARE`] of
+/// the budget a stop gets where the harness names none (`harness::DEFAULT_STOP_BUDGET`, 60 s: 15 s), so
+/// a harness with a longer budget does not keep the engineer waiting longer for a check.
+pub const STOP_WAIT: Duration = Duration::from_millis(crate::harness::DEFAULT_STOP_BUDGET.as_millis() as u64 / WAIT_SHARE as u64);
+
+/// Guard: what the stop's model call leaves of the budget for the rest of the hook (its records and its
+/// answer), so the answer is out before the harness kills the hook.
+pub const AFTER_CALL: Duration = Duration::from_secs(3);
 
 /// The stop's wait for a running check, inside the harness's budget (expert_route.rs `stop_budget`; none:
-/// Claude Code's): at most a quarter of it. omp's 28 s gives 7 s.
+/// Claude Code's): at most [`STOP_WAIT`], and at most its [`WAIT_SHARE`]. omp's 28 s gives 7 s.
 pub fn stop_wait(budget: Option<Duration>) -> Duration {
-    let wait = Duration::from_millis(STOP_WAIT_MS);
-    budget.map_or(wait, |b| wait.min(b / 4))
+    budget.map_or(STOP_WAIT, |b| STOP_WAIT.min(b / WAIT_SHARE))
 }
 
-/// The stop's model call's limit, `spent` into the hook: what the harness's budget leaves but 3 s for the
-/// rest of the hook, never over the model's own limit. omp's 28 s gives at most 18 s, after a 7 s wait.
+/// The stop's model call's limit, `spent` into the hook: what the harness's budget leaves but
+/// [`AFTER_CALL`] for the rest of the hook, never over the model's own limit. omp's 28 s gives at most
+/// 18 s, after a 7 s wait.
 pub fn call_limit(budget: Option<Duration>, spent: Duration) -> Duration {
     let Some(b) = budget else { return crate::predict::timeout() };
-    crate::predict::timeout().min(b.saturating_sub(spent).saturating_sub(Duration::from_secs(3)))
+    crate::predict::timeout().min(b.saturating_sub(spent).saturating_sub(AFTER_CALL))
 }
 
 #[cfg(test)]
@@ -413,6 +436,7 @@ mod tests {
     #[test]
     fn the_stop_fits_its_wait_and_model_call_into_the_harness_budget() {
         let s = Duration::from_secs;
+        assert_eq!(STOP_WAIT, s(15), "a quarter of the 60 s a stop gets where the harness names none");
         assert_eq!((stop_wait(None), call_limit(None, s(30))), (s(15), s(45)), "Claude Code: unchanged");
         assert_eq!((stop_wait(Some(s(90))), call_limit(Some(s(90)), s(15))), (s(15), s(45)), "opencode: room for both");
         assert_eq!((stop_wait(Some(s(28))), call_limit(Some(s(28)), s(7))), (s(7), s(18)), "omp");

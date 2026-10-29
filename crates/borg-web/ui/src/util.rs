@@ -1,12 +1,18 @@
 //! Formatting, dates and the vocabulary of event kinds (labels, colours, glyphs).
 
+/// A day in milliseconds. Derived: 24 h of 60 min of 60 s of 1000 ms, a unit (borg's clock.rs
+/// `DAY_MS`; this page is a wasm workspace of its own and cannot share it).
 pub const DAY_MS: f64 = 86_400_000.0;
+/// A day in seconds, for the formats below (derived from `DAY_MS`).
+const DAY_S: f64 = DAY_MS / 1000.0;
 
 pub fn now_ms() -> f64 {
     js_sys::Date::now()
 }
 
-/// Days since 1970-01-01 of a civil date (Howard Hinnant's days_from_civil).
+/// Days since 1970-01-01 of a civil date (Howard Hinnant's days_from_civil): the page's one calendar
+/// routine, with `civil`, the same as borg-trace's. The numbers are the calendar's (method): 146 097
+/// days in a 400-year era, 719 468 days from 0000-03-01 to 1970-01-01.
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -54,17 +60,17 @@ pub fn long_day(n: i64) -> String {
     format!("{} {d}, {y}", MONTHS[(m - 1) as usize])
 }
 
-/// "3m ago", "5h ago", "Oct 12".
+/// "3m ago", "5h ago", "Oct 12": the page's one "ago". Display: a date from 30 days on.
 pub fn ago(ms: f64) -> String {
     let s = ((now_ms() - ms) / 1000.0).max(0.0);
     if s < 60.0 {
         "just now".into()
     } else if s < 3600.0 {
         format!("{:.0}m ago", (s / 60.0).floor())
-    } else if s < 86_400.0 {
+    } else if s < DAY_S {
         format!("{:.0}h ago", (s / 3600.0).floor())
-    } else if s < 30.0 * 86_400.0 {
-        format!("{:.0}d ago", (s / 86_400.0).floor())
+    } else if s < 30.0 * DAY_S {
+        format!("{:.0}d ago", (s / DAY_S).floor())
     } else {
         short_day(day_of_ms(ms))
     }
@@ -77,10 +83,10 @@ pub fn duration(ms: f64) -> String {
         format!("{s:.1} s")
     } else if s < 3600.0 {
         format!("{:.0} min", s / 60.0)
-    } else if s < 86_400.0 {
+    } else if s < DAY_S {
         format!("{:.1} h", s / 3600.0)
     } else {
-        format!("{:.1} d", s / 86_400.0)
+        format!("{:.1} d", s / DAY_S)
     }
 }
 

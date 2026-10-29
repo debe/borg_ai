@@ -34,6 +34,8 @@ use borg::conscience::{self, Challenge};
 use borg::{predict, prefilter, vectors, whole};
 use serde_json::{Value, json};
 
+/// Experiment parameter: arm A's shortlist, BM25's top this many (the product's
+/// `vectors::SHORTLIST` when the eval ran).
 const BM25_N: usize = 30;
 
 fn main() {

@@ -57,8 +57,13 @@ fn borg(root: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> String
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        // The fixed rule's delivery (select.rs `Policy::Fixed`), as tests/common pins it.
+        .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")
         .env("PATH", path)
+        // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
+        // CLI on PATH (runner.rs `pick`), a real call.
+        .env("BORG_PREDICT_MODEL", "claude:")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_HOME", root.join("store"))

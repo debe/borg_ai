@@ -61,7 +61,8 @@ use crate::learn::{self, Lesson};
 use crate::queen::{self, Entry, Kind};
 use crate::trust;
 
-/// A knowledge file longer than this is split at `## ` headings.
+/// A knowledge file longer than this is split at `## ` headings. Guard: one model call reads one
+/// chunk, so a long file is asked about in parts instead of overflowing, or diluting, one prompt.
 const CHUNK_LINES: usize = 150;
 
 /// The model call: (prompt, JSON schema) -> (answer, cost in USD). `learn::ask_model` in production.
@@ -793,7 +794,7 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: Ask, now: i64
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(c) = ask_for.get(i) else { break };
                     // The model is unavailable (quota, login): stop asking instead of burning the queue.
-                    if failures.load(Ordering::SeqCst) >= 3 && successes.load(Ordering::SeqCst) == 0 {
+                    if failures.load(Ordering::SeqCst) >= crate::runner::MAX_FAILURES && successes.load(Ordering::SeqCst) == 0 {
                         results.lock().unwrap().push((i, Err(())));
                         continue;
                     }
@@ -972,7 +973,7 @@ pub const USAGE: &str = "usage: borg assimilate --from-dir DIR [--apply] [--plan
 pub fn main(args: &[&str], ask: Ask) -> i32 {
     let mut spec = Spec::default();
     let mut given: HashSet<&str> = HashSet::new();
-    let (mut dir, mut plan, mut jobs) = (None, None, std::env::var("BORG_ASSIMILATE_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or(4));
+    let (mut dir, mut plan, mut jobs) = (None, None, std::env::var("BORG_ASSIMILATE_JOBS").ok().and_then(|j| j.parse().ok()).unwrap_or(crate::runner::JOBS));
     let mut target = Target::Source;
     let mut it = args.iter();
     while let Some(a) = it.next() {

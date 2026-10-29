@@ -38,8 +38,20 @@
 //!   not about an engineer following a lesson: never a use, and not read by trust.rs, `weight` or
 //!   attention.rs.
 //!
-//! An unclear verdict, or a session whose later turn ends never reach the model (the prefilter skipped
-//! them, or BORG_MATCH=bm25), leaves the lesson pending: `settle` turns it into `asked_not_corrected`.
+//! An unclear verdict (`asked_unclear`, measured, never a result), or a session whose later turn ends
+//! never reach the model (the prefilter skipped them, or BORG_MATCH=bm25), leaves the lesson pending:
+//! `settle` turns it into `asked_not_corrected` with the reason it had no verdict (`reason`). That is
+//! censored for beliefs (memory.rs): no correction followed, but whether the drone acted on the lesson
+//! is unknown.
+//!
+//! - `delivery` (hook, local): per graded check and lesson, the route delivery actually took (`route`:
+//!   asked, free, placebo, dropped because done or over the character budget, never delivered) and why,
+//!   so what a check decided (`graded`) and what reached the drone never disagree unseen.
+//! - A placebo (hook.rs `#borg-placebo`): an apply the check routed nowhere, judged blindly where a free
+//!   delivery would be. Its results carry channel `placebo` (`PLACEBO`): the judge's floor, no result for
+//!   any reader that learns from results (`is_result`), never shared. One the judge never gave a verdict
+//!   settles as `asked_not_corrected` on that channel with its reason (`settle_with`), as an unjudged ask
+//!   does: the selection summary censors it (select/summary.rs `settled`).
 //!
 //! `asked` and `graded` records carry `p`, each lesson's probability of being asked under the policy in
 //! force at that check (its propensity), for off-policy evaluation of another policy from this log. An
@@ -92,8 +104,73 @@ pub const REGRETTED: &str = "regretted";
 /// after a change on the lesson's point. Once per (session, lesson), dated at that pass.
 pub const TESTED: &str = "tested";
 
-/// A session without asks or episodes for this long is treated as ended (24h).
-pub const IDLE_MS: i64 = 24 * 60 * 60 * 1000;
+/// The judge saw the lesson's delivery but could not tell (an `unclear` verdict), or found a change that
+/// still leads to the consequence (predict.rs `Judged::label` gives neither a use nor an ignore): the
+/// lesson stays pending for another try. A label-health measurement only: no belief, trust, statistic,
+/// team line or off-policy decision reads it (`counts`).
+pub const UNCLEAR: &str = "asked_unclear";
+
+/// What delivery did with a graded check's decision, per check and lesson (hook.rs): `route` (one of
+/// `ROUTES`), `reason`, `check` the check that decided it. The latest record per (check, lesson) is
+/// the route it took (a session that ends with a lesson queued gets `never_delivered`; resumed, its
+/// later delivery supersedes that). Local and never a result: the denominator of what each route led
+/// to, read by the selection replay (select.rs), not by beliefs.
+pub const DELIVERY: &str = "delivery";
+
+/// The session's end hook ran (hook.rs `on_end`), after its `never_delivered` records: one per end, a
+/// resumed session's again at its next. Local and never a result: where the selection summary counts a
+/// session's delivery tallies (select/summary.rs), whatever else the session logged, so a session with
+/// nothing queued and no ask left open counts too.
+pub const ENDED: &str = "ended";
+
+/// The channel of a placebo's judge results (`asked_then_changed`, `asked_ignored`, `asked_unclear`): a
+/// graded apply never delivered, judged blindly where a free delivery would be (hook.rs `#borg-placebo`).
+/// Its "changed" rate is the judge's own false positives plus what the drone would have done anyway, so
+/// it is never a result about the lesson (`is_result`).
+pub const PLACEBO: &str = "placebo";
+
+/// Whether `o` is evidence about its lessons for the readers that learn from results (memory.rs, trust.rs,
+/// the statistics, the team file): not a placebo's result (`PLACEBO`) and not an unclear verdict
+/// (`UNCLEAR`).
+#[must_use]
+pub fn is_result(o: &Outcome) -> bool {
+    o.channel != PLACEBO && o.kind != UNCLEAR
+}
+
+/// Why a lesson settled as `asked_not_corrected` had no verdict (`reason`, `settle_why`). Protocol: the
+/// judge gave one (`UNJUDGED_NONE`, the settle only says no correction followed); its tries ran out on
+/// unclear or missing verdicts (hook.rs `MAX_JUDGE_TRIES`); a fuller judge call left it out
+/// (hook.rs `MAX_PENDING`); its last judge call failed; no model call came after its delivery; or (a
+/// placebo) a later delivery of the lesson in the session took its place in the judge's queue
+/// (`UNJUDGED_LATER`, hook.rs `pending`).
+pub const UNJUDGED_NONE: &str = "judged";
+pub const UNJUDGED_TRIES: &str = "tries";
+pub const UNJUDGED_SLOTS: &str = "slots";
+pub const UNJUDGED_FAILED: &str = "failed";
+pub const UNJUDGED_NO_CALL: &str = "no_call";
+pub const UNJUDGED_LATER: &str = "later";
+
+/// Why a `graded` record's check took the fixed rule instead of the learned policy in force (`reason`;
+/// empty when it decided by the policy in force, hook.rs `decide`). Protocol: another check held the
+/// store's decision lock past hook.rs `DECIDE_WAIT`, the lock could not be taken at all, or the learned
+/// decision's record would not or did not land in the log its gate is folded from (learning off, a
+/// `BORG_CONSCIENCE` outside the store the hook records to, a failed append), so its gate would never be
+/// debited for it. Only the learned policy reads the gate and takes the lock; such a record carries
+/// `policy` fixed and is replayed as the fixed rule.
+pub const DECIDED_BUSY: &str = "lock_busy";
+pub const DECIDED_NO_LOCK: &str = "lock_failed";
+pub const DECIDED_NO_RECORD: &str = "unrecorded";
+
+/// What one correction adds against a lesson, in units of an ignore: a correction of the same concern
+/// right after asking is strong evidence the question did not help, a session without one weak evidence
+/// (the engineer may not have looked). Baseline: design-chosen (no evaluation behind the 2), used by
+/// `weight` and memory.rs `Memory::beta_with` alike; `borg debug ope` (ope.rs) estimates other belief
+/// weights offline, never applies them.
+pub const CORRECTED_W: u32 = 2;
+
+/// A session without asks or episodes for this long is treated as ended (24h). Guard: a session whose
+/// `end` hook never ran would otherwise never settle; its state file must be as quiet (learn.rs).
+pub const IDLE_MS: i64 = crate::clock::DAY_MS;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
@@ -106,8 +183,9 @@ pub struct Outcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
     /// How the lessons were asked (`asked` and the judge's results): `stop` (a turn-end block), `live`
-    /// (a live check during the turn, live.rs), `early` (early delivery, conscience.rs `early`) or
-    /// `queued` (a graded check's 2s and 1s, handed over free). Empty in records from before delivery modes.
+    /// (a live check during the turn, live.rs), `early` (early delivery, conscience.rs `early`),
+    /// `queued` (a graded check's 2s and 1s, handed over free) or `placebo` (`PLACEBO`: never shown,
+    /// judged blindly where a free delivery would be). Empty in records from before delivery modes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
     /// `graded` and `asked`: each lesson's grade (3 certain, 2 likely, 1 worth a thought) and its rank in
@@ -153,6 +231,173 @@ pub struct Outcome {
     pub base: Vec<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scoped: Vec<bool>,
+    // The selection fields (select.rs). Every one is left out when empty, so a record without them
+    // writes the line an older binary wrote, and an older line reads with them empty. Local: `share`
+    // copies none of them.
+    /// The graded check (select.rs `check_id`): on `graded`, and on every record of a lesson that check
+    /// routed (its delivery, the judge's result, a placebo's), so a result joins the decision that made
+    /// it. Empty in records from before checks had ids.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check: String,
+    /// `graded`: the selection policy in force (select.rs `Policy::name`: fixed, cap, attention,
+    /// learned). Empty in records from before select.rs, which read as the fixed rule (`policy_of`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub policy: String,
+    /// `graded`: the fit the policy decided with (select/policy.rs `Fit::key`); empty for the prior.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fit: String,
+    /// `graded`: the selection summary the decision read (select/summary.rs `Summary::key`: the bytes
+    /// folded and their hash), and what set its routes (select.rs `Log::source`). A learned check reads
+    /// the summary again under the store's decision lock after its model call (hook.rs `decide`), so
+    /// every learned decision recorded before it is in it; a check by a policy that reads no gate, and
+    /// one that fell back to the fixed rule (`reason`), names the summary it read at its start, which
+    /// records of checks that decided meanwhile may follow. Records other than decisions (a delivery, a
+    /// verdict) may still land between that read and this record; `borg debug select` P1 replays from
+    /// the logged state.
+    /// Empty in older records and for a failed call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seen: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// `graded`: the lessons the check handed over free, in delivery order (`free_of` for older records).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free: Vec<String>,
+    /// `graded`: per lesson (aligned with `lessons`), its probability of being handed over free under
+    /// the policy in force, as `p` is of being asked; rounded like `p`. Empty in older records, where
+    /// a free lesson's was 1 under the fixed rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pf: Vec<f64>,
+    /// `graded`: the applies the check did not deliver and drew for the placebo arm (judged blindly
+    /// where a free delivery would be, never shown), and each undelivered apply's chance of that draw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placebo: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub psi: f64,
+    /// `graded`: the graded applies that could not go free at this check because the session already
+    /// had them delivered (select.rs `Ctx::had`, conscience.rs `graded_without`), in the applies' order:
+    /// the applies among the session's deliveries when the check decided, and among the lessons waiting
+    /// in its queue to be asked or handed over by another check (hook.rs `decide`, `waiting_in`), so the
+    /// record alone holds every `had` that bears on its decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nofree: Vec<String>,
+    /// `graded`: the lessons the pool budget dropped from the model call that a tail sample showed
+    /// anyway (whole.rs `tail`, under every policy), and each one's chance of being sampled (one chance
+    /// for all of the check's tail: k drawn uniformly of the `eligible` − `shown` dropped, unrounded).
+    /// Not in `shown` or `tokens`; each has its place past the budget's in `fill`, after the applies'
+    /// (and, if it applies, among them too), so every place from `shown` to `eligible` − 1 is one
+    /// dropped lesson, shown with chance `pt`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub pt: f64,
+    /// An early delivery's record: per lesson (aligned with `lessons`), its score as a share of the best
+    /// on-topic match, done or not (conscience.rs `early_pool`, the share `RELATIVE` bars; hook.rs
+    /// `early_rel`), rounded as `p` is, for a learned early rule. A standing lesson has one too, though
+    /// no score gates it; empty when no plain lesson was on topic to scale by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rel: Vec<f64>,
+    /// A delivery's actual route for every lesson of the record (one of `ROUTES`), and why: a drop's
+    /// cause, or why a delivered lesson stayed unjudged (no later call, the judge's slots, its tries);
+    /// on `graded`, why its check fell back to the fixed rule (`DECIDED_BUSY`, `DECIDED_NO_LOCK`,
+    /// `DECIDED_NO_RECORD`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// `graded`, the pool the model graded: lessons eligible for it, lessons its budget showed, their
+    /// size in tokens (the tail sample beside them in `tail`), and per lesson (aligned with `lessons`)
+    /// its fill position among the shown (0 first), so the yield of each position can be learned from
+    /// every check, a check without applies included; then, past the applies', one position per tail
+    /// lesson (aligned with `tail`), so the yield past the budget is learned from the lessons a tail
+    /// showed that did not apply too (select/summary.rs `tail_of`). A tail lesson's position goes on
+    /// past the budget's: `shown` + its place among the lessons the budget dropped, in the order the
+    /// fill met them (whole.rs `Filled::dropped`), so it is never below `shown`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub eligible: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub shown: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tokens: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fill: Vec<u16>,
+    /// `graded`, the model call: the model (empty: the CLI's default), a hash of the prompt template,
+    /// the harness, borg's version, the call's duration, and whether it failed (the check then asked
+    /// nothing: fail open); then its cost (`usd`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub dur_ms: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// `graded`: the call's cost in dollars as the harness's CLI reported it (0: it reported none).
+    /// Measured and shown (`borg debug select` P3), never a limit.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub usd: f64,
+    /// The judge's results (`asked_then_changed`, `asked_ignored`): the judge template's version, 0 for
+    /// the template before versions were logged; and whether the judge saw the question without the
+    /// drone's `<id>: applies|skip` declaration (a random half are, to measure what it adds).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub judge: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stripped: bool,
+}
+
+/// `route` values. Protocol: what a check decided for a lesson, then what delivery did with it.
+/// Asked, handed over free, or judged as a placebo, as decided; or dropped at delivery because the
+/// session had the lesson already (`ROUTE_DROPPED_DONE`) or the delivery budget was spent
+/// (`ROUTE_DROPPED_CHARS`); or never delivered because the session ended first (`ROUTE_NEVER`).
+pub const ROUTE_ASKED: &str = "asked";
+pub const ROUTE_FREE: &str = "free";
+pub const ROUTE_PLACEBO: &str = "placebo";
+pub const ROUTE_DROPPED_DONE: &str = "dropped_done";
+pub const ROUTE_DROPPED_CHARS: &str = "dropped_chars";
+pub const ROUTE_NEVER: &str = "never_delivered";
+pub const ROUTES: [&str; 6] = [ROUTE_ASKED, ROUTE_FREE, ROUTE_PLACEBO, ROUTE_DROPPED_DONE, ROUTE_DROPPED_CHARS, ROUTE_NEVER];
+
+/// The policy a `graded` record was decided under: its `policy`; for a record from before select.rs,
+/// the fixed rule (`fixed`), unless it shows the one other policy an older binary logged,
+/// `BORG_STOP_ATTENTION=on`'s learned cut (`attention`): it explored, or a propensity lies strictly
+/// between 0 and 1 (attention.rs `propensities`). A learned cut that asked every apply up to its rail
+/// logged only 0s and 1s, and an evaluation's `BORG_STOP_ASK_CAP` logged nothing of its cap: both read
+/// as the fixed rule.
+#[must_use]
+pub fn policy_of(o: &Outcome) -> &str {
+    match o.policy.as_str() {
+        "" if o.explore || o.p.iter().any(|p| *p > 0.0 && *p < 1.0) => "attention",
+        "" => "fixed",
+        p => p,
+    }
+}
+
+/// The lessons a `graded` record handed over free: its `free`; for a record from before select.rs
+/// (`policy` empty), its policy's rule (`policy_of`) replayed on its grades: the fixed rule's 2s, then
+/// 1s, at most `conscience::CAP`, when no lesson is a 3 (conscience.rs `graded_capped`), else none; the
+/// learned cut's lessons after the ones it asked, at most `conscience::CAP` (attention.rs `split`).
+#[must_use]
+pub fn free_of(o: &Outcome) -> Vec<String> {
+    use crate::conscience::{self, Challenge};
+    if !o.policy.is_empty() || o.grades.len() != o.lessons.len() {
+        return o.free.clone();
+    }
+    if o.grades.contains(&3) {
+        return match policy_of(o) {
+            "attention" => o.lessons.iter().filter(|l| !o.chosen.contains(l)).take(conscience::CAP).cloned().collect(),
+            _ => Vec::new(),
+        };
+    }
+    let ls: Vec<Challenge> = o.lessons.iter().map(|id| Challenge { id: id.clone(), ..Default::default() }).collect();
+    let applied: Vec<(&Challenge, u8)> = ls.iter().zip(o.grades.iter().copied()).collect();
+    conscience::graded_capped(&applied, None).1.into_iter().map(|c| c.id.clone()).collect()
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// A propensity rounded to 4 decimals, so lines stay deterministic and short.
@@ -242,9 +487,10 @@ pub struct Shared {
     pub credit: f64,
 }
 
-/// `o` as the team sees it, or None for a kind not in `SHARED_KINDS`.
+/// `o` as the team sees it, or None for a kind not in `SHARED_KINDS` and for a placebo's result
+/// (`is_result`): the judge's floor on this node, never a result a peer folds.
 pub fn share(o: &Outcome, node: &str) -> Option<Shared> {
-    SHARED_KINDS.contains(&o.kind.as_str()).then(|| Shared {
+    (SHARED_KINDS.contains(&o.kind.as_str()) && is_result(o)).then(|| Shared {
         kind: o.kind.clone(),
         s: tag(&o.session),
         lessons: o.lessons.clone(),
@@ -382,11 +628,25 @@ pub fn read(path: &Path) -> Vec<Outcome> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
-/// Appends `o` in one write (learn.rs `append_line`: concurrent writers never tear a record).
+/// Appends `o` in one write (learn.rs `append_line`: concurrent writers never tear a record), and
+/// counts it in the usage statistics (`count_result`).
 pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
     crate::learn::append_jsonl(path, o)?;
-    // The results count in the usage statistics; `asked` is already counted as the Stop's block, a
-    // `vetoed` result as the `veto` that credited it (veto.rs).
+    if let Some(home) = path.parent() {
+        count_result(home, o);
+    }
+    Ok(())
+}
+
+/// `o` in the usage statistics of the store `home`: one event of its result kind with its lessons and
+/// channel. `asked` is already counted as the Stop's block, a `vetoed` result as the `veto` that
+/// credited it (veto.rs); a placebo's result is no result (`is_result`): its "changed" never joins the
+/// deliveries' counts. The judge (hook.rs) writes one record per routing check but counts the lessons
+/// of a call's channel as one event, as before checks had ids.
+pub fn count_result(home: &Path, o: &Outcome) {
+    if !is_result(o) {
+        return;
+    }
     let kind = match o.kind.as_str() {
         CHANGED => crate::stats::CHANGED,
         IGNORED => crate::stats::IGNORED,
@@ -394,16 +654,13 @@ pub fn append(path: &Path, o: &Outcome) -> std::io::Result<()> {
         NOT_CORRECTED => crate::stats::NOT_CORRECTED,
         REGRETTED => crate::stats::REGRETTED,
         TESTED => crate::stats::TESTED,
-        _ => return Ok(()),
+        _ => return,
     };
-    if let Some(home) = path.parent() {
-        crate::stats::count(home, kind, &o.session, |e| {
-            e.repo = o.repo.clone();
-            e.lessons = o.lessons.clone();
-            e.channel = o.channel.clone();
-        });
-    }
-    Ok(())
+    crate::stats::count(home, kind, &o.session, |e| {
+        e.repo = o.repo.clone();
+        e.lessons = o.lessons.clone();
+        e.channel = o.channel.clone();
+    });
 }
 
 /// Did the conscience ask `lesson` in `session` before `ms`?
@@ -557,51 +814,167 @@ pub fn tested(outcomes: &[Outcome], session: &str, tests: &str) -> Vec<Outcome> 
     out
 }
 
-/// At session end: every lesson asked in `session` that has no result yet was not corrected. A
-/// vetoed lesson already has its result.
-/// Sorted by lesson id so the appended lines are deterministic.
-/// One pass over the log, whatever the number of asks.
+/// At session end: every lesson asked in `session` that has no result yet was not corrected, and every
+/// placebo of it without a verdict is closed. A vetoed lesson already has its result. `settle_with`,
+/// every unjudged lesson's reason `no_call`.
 pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
-    let mine = outcomes.iter().filter(|o| o.session == session);
-    let resolved: std::collections::HashSet<&str> = mine.clone().filter(|o| resolves(&o.kind)).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
-    let mut asked: Vec<(&str, &str)> = mine
-        .filter(|o| o.kind == ASKED)
-        .flat_map(|o| o.lessons.iter().map(move |l| (l.as_str(), o.repo.as_str())))
-        .filter(|(l, _)| !resolved.contains(l))
-        .collect();
-    asked.sort();
-    asked.dedup_by_key(|(l, _)| *l);
-    asked
+    settle_with(outcomes, session, ms, &|_| UNJUDGED_NO_CALL)
+}
+
+/// `settle`, each record with its `reason`: `judged` when the judge gave the lesson's latest ask in the
+/// session a verdict (`asked_then_changed`, `asked_ignored`), else `unjudged(lesson)` (one of the
+/// `UNJUDGED_*`, from the session's state file, hook.rs `unjudged`); and its `check`, the check behind
+/// that latest `asked` record. A verdict on an earlier delivery says nothing of a later question: a
+/// stop that judges a lesson handed over free and then asks it writes the verdict first, and no judge
+/// call need follow the answer.
+/// Then every placebo of the session (a `delivery` routed `placebo`, which writes no `asked`) that no
+/// verdict and no earlier settle closed (`open_placebos`): `asked_not_corrected` on channel `placebo`
+/// (no result, `is_result`; it ends no ask's wait, `resolves`) with the placebo's check and repo, and
+/// the reason `unjudged(lesson)` when it is the lesson's latest delivery in the session, else
+/// `UNJUDGED_LATER`. So the selection summary censors an unjudged placebo as it does an unjudged ask
+/// (select/summary.rs `settled`), and the judge-missingness fit sees both.
+/// Not a result: memory.rs reads `asked_not_corrected` as censored, so a verdict recorded after it (a
+/// resumed session) counts once, alone.
+/// The asks first, sorted by lesson id, then the placebos by lesson id and check, so the appended lines
+/// are deterministic. A few passes over the session's records, whatever the number of asks.
+pub fn settle_with(outcomes: &[Outcome], session: &str, ms: i64, unjudged: &dyn Fn(&str) -> &'static str) -> Vec<Outcome> {
+    let mine: Vec<&Outcome> = outcomes.iter().filter(|o| o.session == session).collect();
+    let resolved: std::collections::HashSet<&str> = mine.iter().filter(|o| resolves(o)).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
+    // Per lesson: its verdicts' (ms, check).
+    let mut verdicts: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
+    for o in mine.iter().filter(|o| (o.kind == CHANGED || o.kind == IGNORED) && is_result(o)) {
+        for l in &o.lessons {
+            verdicts.entry(l.as_str()).or_default().push((o.ms, o.check.as_str()));
+        }
+    }
+    // Per lesson: the first of its asks' repos in sort order (as before checks were kept), and the
+    // ms and check of its latest ask.
+    let mut asked: std::collections::BTreeMap<&str, (&str, i64, &str)> = std::collections::BTreeMap::new();
+    // Per lesson: the ms of its latest delivery, an `asked` for every one the drone sees and a
+    // placebo's `delivery`.
+    let mut latest: HashMap<&str, i64> = HashMap::new();
+    for o in mine.iter().filter(|o| o.kind == ASKED || is_placebo(o)) {
+        for l in o.lessons.iter().map(String::as_str) {
+            let t = latest.entry(l).or_insert(o.ms);
+            *t = (*t).max(o.ms);
+            if o.kind != ASKED || resolved.contains(l) {
+                continue;
+            }
+            let e = asked.entry(l).or_insert((o.repo.as_str(), o.ms, o.check.as_str()));
+            e.0 = e.0.min(o.repo.as_str());
+            if o.ms >= e.1 {
+                (e.1, e.2) = (o.ms, o.check.as_str());
+            }
+        }
+    }
+    // A verdict on the latest ask came after it (the judge sees a delivery in a later call), or names
+    // its check. Time first: an older binary's stop wrote one `asked` naming the stop's check also for a
+    // lesson another check routed (hook.rs `#borg-routed`), whose verdict names that check; a stop now
+    // writes one `asked` per routing check (hook.rs `stop_ask`).
+    let judged = |l: &str, at: i64, check: &str| verdicts.get(l).is_some_and(|v| v.iter().any(|&(t, c)| t > at || (!check.is_empty() && c == check)));
+    let mut out: Vec<Outcome> = asked
         .into_iter()
-        .map(|(l, repo)| Outcome { kind: NOT_CORRECTED.into(), session: session.into(), lessons: vec![l.into()], ms, repo: repo.into(), ..Default::default() })
+        .map(|(l, (repo, at, check))| Outcome {
+            kind: NOT_CORRECTED.into(),
+            session: session.into(),
+            lessons: vec![l.into()],
+            ms,
+            repo: repo.into(),
+            check: check.into(),
+            reason: if judged(l, at, check) { UNJUDGED_NONE } else { unjudged(l) }.into(),
+            ..Default::default()
+        })
+        .collect();
+    let mut placebos: Vec<Outcome> = open_placebos(&mine)
+        .into_iter()
+        .map(|(l, d)| Outcome {
+            kind: NOT_CORRECTED.into(),
+            session: session.into(),
+            lessons: vec![l.into()],
+            ms,
+            repo: d.repo.clone(),
+            channel: PLACEBO.into(),
+            check: d.check.clone(),
+            // Delivered again later, the lesson's later delivery is the one the judge saw.
+            reason: if latest.get(l).is_some_and(|&t| t > d.ms) { UNJUDGED_LATER } else { unjudged(l) }.into(),
+            ..Default::default()
+        })
+        .collect();
+    placebos.sort_by(|a, b| (&a.lessons, &a.check).cmp(&(&b.lessons, &b.check)));
+    out.extend(placebos);
+    out
+}
+
+/// Does `o` end an ask's wait for its result (`settle`)? A placebo's settle record ends none: a
+/// placebo is never asked, and the lesson may be asked later in the session.
+fn resolves(o: &Outcome) -> bool {
+    matches!(o.kind.as_str(), CORRECTED | NOT_CORRECTED | VETOED) && o.channel != PLACEBO
+}
+
+/// A placebo's delivery (`delivery` routed `placebo`, hook.rs `queued`): judged blindly, never shown,
+/// so it writes no `asked`.
+fn is_placebo(o: &Outcome) -> bool {
+    o.kind == DELIVERY && o.route == ROUTE_PLACEBO
+}
+
+/// Does `r`, a placebo channel's verdict (`asked_then_changed`, `asked_ignored`) or settle record
+/// (`asked_not_corrected`), close placebo delivery `d` of its lesson? A settle record names the
+/// placebo's own check, so it closes exactly that one, and settling again writes nothing. A verdict
+/// names the check it judged (a check routes a lesson once), or, a record from before check ids, came
+/// after the placebo. An unclear verdict closes nothing, as it leaves an ask pending.
+fn closes(r: &Outcome, d: &Outcome) -> bool {
+    match r.kind.as_str() {
+        NOT_CORRECTED => r.check == d.check,
+        CHANGED | IGNORED if r.check.is_empty() || d.check.is_empty() => r.ms > d.ms,
+        CHANGED | IGNORED => r.check == d.check,
+        _ => false,
+    }
+}
+
+/// The open placebos among `mine` (one session's records), in log order: per placebo delivery
+/// (`is_placebo`) and lesson, none of the session's placebo records `closes` it.
+fn open_placebos<'a>(mine: &[&'a Outcome]) -> Vec<(&'a str, &'a Outcome)> {
+    let mut closers: HashMap<&str, Vec<&Outcome>> = HashMap::new();
+    for &o in mine.iter().filter(|o| o.channel == PLACEBO && !is_placebo(o)) {
+        for l in &o.lessons {
+            closers.entry(l.as_str()).or_default().push(o);
+        }
+    }
+    mine.iter()
+        .copied()
+        .filter(|o| is_placebo(o))
+        .flat_map(|d| d.lessons.iter().map(move |l| (l.as_str(), d)))
+        .filter(|&(l, d)| !closers.get(l).is_some_and(|rs| rs.iter().any(|r| closes(r, d))))
         .collect()
 }
 
-/// Does a `kind` record end an ask's wait for its result (`settle`)?
-fn resolves(kind: &str) -> bool {
-    matches!(kind, CORRECTED | NOT_CORRECTED | VETOED)
-}
-
-/// Sessions with asks that are idle at `now`: their newest ask and newest episode
-/// (`last_episode`, newest episode ms per session) are at least `IDLE_MS` old. Sorted. Only sessions
-/// with an ask still without its result, so `borg learn` (under the store lock) settles what is new,
-/// not every session it ever settled: one pass over the log.
+/// Sessions with asks or placebos that are idle at `now`: their newest ask or placebo and newest
+/// episode (`last_episode`, newest episode ms per session) are at least `IDLE_MS` old. Sorted. Only
+/// sessions with an ask still without its result or an open placebo (`open_placebos`), so `borg learn`
+/// (under the store lock) settles what is new, not every session it ever settled: one pass over the
+/// log.
 pub fn idle_sessions<'a>(outcomes: &'a [Outcome], last_episode: &HashMap<String, i64>, now: i64) -> Vec<&'a str> {
     let mut newest: HashMap<&str, i64> = HashMap::new();
     let (mut asked, mut resolved) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    // Per session, its placebo channel's records: deliveries, verdicts and settles.
+    let mut placebos: HashMap<&str, Vec<&Outcome>> = HashMap::new();
     for o in outcomes {
-        let into = match o.kind.as_str() {
-            ASKED => &mut asked,
-            k if resolves(k) => &mut resolved,
-            _ => continue,
-        };
-        into.extend(o.lessons.iter().map(|l| (o.session.as_str(), l.as_str())));
-        if o.kind == ASKED {
+        if o.channel == PLACEBO || is_placebo(o) {
+            placebos.entry(o.session.as_str()).or_default().push(o);
+        }
+        if o.kind == ASKED || is_placebo(o) {
             let m = newest.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).max(o.ms);
         }
+        let into = match o.kind.as_str() {
+            ASKED => &mut asked,
+            _ if resolves(o) => &mut resolved,
+            _ => continue,
+        };
+        into.extend(o.lessons.iter().map(|l| (o.session.as_str(), l.as_str())));
     }
-    let open: std::collections::HashSet<&str> = asked.difference(&resolved).map(|(s, _)| *s).collect();
+    let mut open: std::collections::HashSet<&str> = asked.difference(&resolved).map(|(s, _)| *s).collect();
+    open.extend(placebos.iter().filter(|(_, rs)| !open_placebos(rs).is_empty()).map(|(s, _)| *s));
     let mut idle: Vec<&str> = newest
         .into_iter()
         .filter(|&(s, ms)| open.contains(s) && ms.max(last_episode.get(s).copied().unwrap_or(i64::MIN)) <= now - IDLE_MS)
@@ -623,7 +996,7 @@ pub fn idle_sessions<'a>(outcomes: &'a [Outcome], last_episode: &HashMap<String,
 /// what is on topic. One corrected session gives 1/3; one corrected and one not gives 1/2.
 pub fn weight(not_corrected: u32, corrected: u32) -> f64 {
     let (n, c) = (not_corrected as f64, corrected as f64);
-    (1.0 + n) / (1.0 + n + 2.0 * c)
+    (1.0 + n) / (1.0 + n + f64::from(CORRECTED_W) * c)
 }
 
 /// The weight of every lesson that has outcomes. Each (session, lesson) counts once; corrected wins.
@@ -643,7 +1016,8 @@ pub fn counts(outcomes: &[Outcome]) -> HashMap<String, (u32, u32)> {
 /// (as heavy as a correction; only memory.rs weighs it above one).
 pub fn sessions(outcomes: &[Outcome]) -> HashMap<&str, HashMap<&str, (bool, i64)>> {
     let mut out: HashMap<&str, HashMap<&str, (bool, i64)>> = HashMap::new();
-    for o in outcomes {
+    // A placebo's record is no result (`is_result`).
+    for o in outcomes.iter().filter(|o| is_result(o)) {
         let corrected = match o.kind.as_str() {
             CORRECTED | VETOED => true,
             NOT_CORRECTED => false,
@@ -777,8 +1151,113 @@ mod tests {
     fn settle_marks_only_unresolved_asks_of_this_session() {
         let all = vec![o(ASKED, "s1", &["B", "A"], 10), o(ASKED, "s1", &["A", "C"], 15), o(CORRECTED, "s1", &["A"], 20), o(ASKED, "s2", &["D"], 10)];
         let settled = settle(&all, "s1", 99);
-        assert_eq!(settled, vec![o(NOT_CORRECTED, "s1", &["B"], 99), o(NOT_CORRECTED, "s1", &["C"], 99)]);
+        assert_eq!(settled, vec![unjudged("s1", "B", UNJUDGED_NO_CALL), unjudged("s1", "C", UNJUDGED_NO_CALL)]);
         assert!(asked_before(&all, "s1", "A", 11) && !asked_before(&all, "s1", "C", 15) && !asked_before(&all, "s2", "A", 99));
+    }
+
+    fn unjudged(session: &str, lesson: &str, reason: &str) -> Outcome {
+        Outcome { reason: reason.into(), ..o(NOT_CORRECTED, session, &[lesson], 99) }
+    }
+
+    #[test]
+    fn a_settled_lesson_says_why_it_had_no_verdict_and_names_its_latest_check() {
+        let ask = |lessons: &[&str], ms: i64, check: &str| Outcome { check: check.into(), ..o(ASKED, "s", lessons, ms) };
+        let placebo = Outcome { channel: PLACEBO.into(), ..o(CHANGED, "s", &["C"], 30) };
+        let all = vec![ask(&["A", "B", "C"], 10, "c1"), ask(&["B"], 20, "c2"), o(IGNORED, "s", &["A"], 25), placebo];
+        let why = |l: &str| if l == "B" { UNJUDGED_TRIES } else { UNJUDGED_SLOTS };
+        let got = settle_with(&all, "s", 99, &why);
+        let want = |l: &str, reason: &str, check: &str| Outcome { check: check.into(), ..unjudged("s", l, reason) };
+        assert_eq!(got, vec![want("A", UNJUDGED_NONE, "c1"), want("B", UNJUDGED_TRIES, "c2"), want("C", UNJUDGED_SLOTS, "c1")], "a placebo's verdict is none");
+    }
+
+    /// A verdict on an earlier delivery of the lesson is none for its later question: handed over free,
+    /// judged ignored by a stop that then asks it, and the session ends after the answer, so no judge
+    /// saw the question. A verdict after the question, or on its check, is its own.
+    #[test]
+    fn a_verdict_on_an_earlier_delivery_leaves_the_later_question_unjudged() {
+        let ask = |channel: &str, ms: i64, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(ASKED, "s", &["L"], ms) };
+        let verdict = |channel: &str, ms: i64, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(IGNORED, "s", &["L"], ms) };
+        let why = |log: &[Outcome]| settle_with(log, "s", 99, &|_| UNJUDGED_NO_CALL).into_iter().map(|x| (x.reason, x.check)).collect::<Vec<_>>();
+        let said = |reason: &str, check: &str| vec![(reason.to_string(), check.to_string())];
+        // The stop writes its verdict on the free delivery, then the question, in the same millisecond.
+        let free_then_asked = vec![ask("queued", 10, "cF"), verdict("queued", 20, "cF"), ask("stop", 20, "cS")];
+        assert_eq!(why(&free_then_asked), said(UNJUDGED_NO_CALL, "cS"));
+        let answered = [free_then_asked, vec![verdict("stop", 30, "cS")]].concat();
+        assert_eq!(why(&answered), said(UNJUDGED_NONE, "cS"));
+        // A lesson another check routed, asked at the stop: its verdict names the routing check.
+        assert_eq!(why(&[ask("stop", 20, "cS"), verdict("stop", 30, "cL")]), said(UNJUDGED_NONE, "cS"));
+        // On the question's check, though its clock stepped back.
+        assert_eq!(why(&[ask("stop", 20, "cS"), verdict("stop", 15, "cS")]), said(UNJUDGED_NONE, "cS"));
+    }
+
+    fn placebo(lessons: &[&str], check: &str, ms: i64) -> Outcome {
+        Outcome { channel: PLACEBO.into(), check: check.into(), route: ROUTE_PLACEBO.into(), ..o(DELIVERY, "s", lessons, ms) }
+    }
+
+    /// A placebo writes no `asked`, only its `delivery`: one the judge gave no verdict settles too, on the
+    /// placebo channel (no result, and no ask's end), with its own check and reason. Delivered again
+    /// later, the later delivery took its place in the judge's queue.
+    #[test]
+    fn an_unjudged_placebo_settles_on_its_own_channel() {
+        let on = |kind: &str, lesson: &str, check: &str, ms: i64| Outcome { channel: PLACEBO.into(), check: check.into(), ..o(kind, "s", &[lesson], ms) };
+        let log = vec![
+            placebo(&["A", "B"], "p1", 10),
+            on(IGNORED, "A", "p1", 15),
+            on(UNCLEAR, "B", "p1", 15),
+            placebo(&["C"], "p2", 20),
+            Outcome { channel: "queued".into(), check: "c3".into(), ..o(ASKED, "s", &["C"], 30) },
+            Outcome { route: ROUTE_DROPPED_DONE.into(), ..placebo(&["D"], "p4", 40) },
+        ];
+        let why = |l: &str| if l == "B" { UNJUDGED_TRIES } else { UNJUDGED_NO_CALL };
+        let got = settle_with(&log, "s", 99, &why);
+        let closed = |l: &str, check: &str, reason: &str| Outcome { channel: PLACEBO.into(), check: check.into(), ..unjudged("s", l, reason) };
+        let asked = Outcome { check: "c3".into(), ..unjudged("s", "C", UNJUDGED_NO_CALL) };
+        let want = vec![asked, closed("B", "p1", UNJUDGED_TRIES), closed("C", "p2", UNJUDGED_LATER)];
+        assert_eq!(got, want, "A has its verdict; D never reached the judge's queue");
+        assert!(got[1..].iter().all(|x| !is_result(x) && share(x, "n1").is_none()), "no result, never shared");
+        // Settled once: the same records close their placebos, so settling again writes nothing.
+        let mut resumed = [log, got].concat();
+        assert!(settle_with(&resumed, "s", 120, &why).is_empty());
+        // Resumed: B asked, E a new placebo. B's placebo settle ended no ask's wait.
+        resumed.extend([Outcome { channel: "stop".into(), check: "c5".into(), ..o(ASKED, "s", &["B"], 110) }, placebo(&["E"], "p6", 111)]);
+        let again: Vec<(String, String, String)> =
+            settle_with(&resumed, "s", 120, &why).into_iter().map(|x| (x.lessons.join(","), x.channel, x.check)).collect();
+        assert_eq!(again, [("B".to_string(), String::new(), "c5".to_string()), ("E".to_string(), PLACEBO.to_string(), "p6".to_string())]);
+    }
+
+    /// An open placebo keeps its session waiting to settle when its `end` hook never ran, as an open ask
+    /// does; its settle closes it.
+    #[test]
+    fn idle_sessions_wait_for_open_placebos() {
+        let only = vec![placebo(&["A"], "p1", 0)];
+        assert_eq!(idle_sessions(&only, &HashMap::new(), IDLE_MS + 10), ["s"]);
+        assert!(idle_sessions(&only, &HashMap::new(), IDLE_MS - 10).is_empty(), "the placebo is the session's newest activity");
+        let settled = [only.clone(), settle(&only, "s", 5)].concat();
+        assert!(idle_sessions(&settled, &HashMap::new(), IDLE_MS + 10).is_empty());
+    }
+
+    /// The selection summary reads a placebo's settle as its censoring (select/summary.rs `settled`), so
+    /// the judge-missingness fit (select/policy.rs `judged`) counts the placebo as not judged instead of
+    /// leaving it out.
+    #[test]
+    fn the_selection_summary_censors_a_settled_placebo() {
+        use crate::select::summary::{Label, Summary, fold};
+        let graded = Outcome {
+            grades: vec![1, 1],
+            ranks: vec![0, 1],
+            applied: 2,
+            channel: "stop".into(),
+            check: "p1".into(),
+            policy: "learned".into(),
+            placebo: vec!["A".into(), "B".into()],
+            ..o(GRADED, "s", &["A", "B"], 5)
+        };
+        let mut log = vec![graded, placebo(&["A", "B"], "p1", 10), Outcome { channel: PLACEBO.into(), check: "p1".into(), ..o(IGNORED, "s", &["A"], 15) }];
+        log.extend(settle(&log, "s", 99));
+        let text: String = log.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        let label = |l: &str| s.applies.iter().find(|a| s.lessons[a.lesson as usize] == l).map(|a| a.label);
+        assert_eq!((label("A"), label("B")), (Some(Label::Ignored), Some(Label::Censored)));
     }
 
     #[test]
@@ -800,9 +1279,32 @@ mod tests {
     }
 
     #[test]
+    fn a_placebo_or_unclear_result_is_no_result_for_any_reader() {
+        let placebo = |kind: &str| Outcome { channel: PLACEBO.into(), ..o(kind, "s", &["A"], 5) };
+        let unclear = Outcome { channel: "stop".into(), ..o(UNCLEAR, "s", &["A"], 5) };
+        for x in [placebo(CHANGED), placebo(IGNORED), placebo(UNCLEAR), unclear.clone()] {
+            assert!(!is_result(&x), "{x:?}");
+            assert!(share(&x, "n1").is_none(), "never shared: {x:?}");
+        }
+        assert!(is_result(&Outcome { channel: "queued".into(), ..o(CHANGED, "s", &["A"], 5) }));
+        assert!(!SHARED_KINDS.contains(&UNCLEAR) && !SHARED_KINDS.contains(&DELIVERY));
+        // trust's view (`sessions`): a placebo result moves nothing, whatever its kind.
+        let all = [placebo(CORRECTED), placebo(NOT_CORRECTED), o(NOT_CORRECTED, "t", &["A"], 6)];
+        assert_eq!(tally(sessions(&all)["A"].values(), i64::MIN), (1, 0));
+        // The statistics count no placebo result (`append`).
+        let d = tmp("placebo-stats");
+        append(&d.join("outcomes.jsonl"), &placebo(CHANGED)).unwrap();
+        append(&d.join("outcomes.jsonl"), &unclear).unwrap();
+        append(&d.join("outcomes.jsonl"), &Outcome { channel: "stop".into(), ..o(CHANGED, "s", &["B"], 7) }).unwrap();
+        let kinds: Vec<String> = crate::stats::events(&d).into_iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [crate::stats::CHANGED], "{kinds:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn a_vetoed_lesson_is_not_settled_and_counts_as_corrected() {
         let all = vec![o(ASKED, "s1", &["A", "B"], 10), o(VETOED, "s1", &["A"], 20)];
-        assert_eq!(settle(&all, "s1", 99), vec![o(NOT_CORRECTED, "s1", &["B"], 99)]);
+        assert_eq!(settle(&all, "s1", 99), vec![unjudged("s1", "B", UNJUDGED_NO_CALL)]);
         assert_eq!(sessions(&all)["A"]["s1"], (true, 20));
         assert_eq!(weights(&all)["A"], weight(0, 1));
     }
@@ -888,6 +1390,96 @@ mod tests {
         assert_eq!(serde_json::to_string(&o).unwrap(), line);
         let with = Outcome { p: vec![round_p(1.0), round_p(1.0 / 3.0)], ..o };
         assert!(serde_json::to_string(&with).unwrap().ends_with(r#""applied":2,"p":[1.0,0.3333]}"#));
+    }
+
+    #[test]
+    fn a_graded_line_from_before_select_reads_and_writes_back_unchanged() {
+        let line = r#"{"kind":"graded","session":"s","lessons":["A","B"],"ms":1,"repo":"r","channel":"live","grades":[3,1],"ranks":[0,1],"applied":2,"chosen":["A","B"],"explore":true,"p":[1.0,0.1]}"#;
+        let o: Outcome = serde_json::from_str(line).unwrap();
+        assert!(o.check.is_empty() && o.policy.is_empty() && o.free.is_empty() && o.pf.is_empty() && o.judge == 0 && !o.failed);
+        assert!(o.nofree.is_empty() && o.tail.is_empty() && o.pt == 0.0 && o.rel.is_empty());
+        assert_eq!(serde_json::to_string(&o).unwrap(), line);
+        // A 0.6.0 graded line and an early delivery's from before `nofree`, `tail`, `pt` and `rel`.
+        for line in [
+            r#"{"kind":"graded","session":"s","lessons":["A","B","C"],"ms":1,"repo":"r","channel":"stop","grades":[2,1,1],"ranks":[0,1,2],"applied":3,"p":[0.0,0.0,0.0],"check":"0123456789ab","policy":"learned","fit":"120-ab12","seen":"9-abcdef01","source":"fixed","free":["A","B"],"pf":[1.0,1.0,0.0],"placebo":["C"],"psi":1.0,"eligible":40,"shown":30,"tokens":12000,"fill":[0,4,7],"model":"m","version":"0.6.0","dur_ms":9000,"usd":0.01}"#,
+            r#"{"kind":"asked","session":"s","lessons":["A","B"],"ms":2,"repo":"r","channel":"early","p":[1.0,0.5],"route":"asked"}"#,
+        ] {
+            let o: Outcome = serde_json::from_str(line).unwrap();
+            assert!(o.nofree.is_empty() && o.tail.is_empty() && o.pt == 0.0 && o.rel.is_empty(), "{line}");
+            assert_eq!(serde_json::to_string(&o).unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn the_selection_fields_round_trip_and_stay_local() {
+        let g = Outcome {
+            check: "0123456789ab".into(),
+            policy: "learned".into(),
+            fit: "120-ab12".into(),
+            free: vec!["B".into()],
+            pf: vec![0.0, 1.0, 0.0],
+            placebo: vec!["C".into()],
+            psi: 0.5,
+            nofree: vec!["N9".into()],
+            tail: vec!["T9".into()],
+            pt: 0.125,
+            eligible: 40,
+            shown: 30,
+            tokens: 12_000,
+            fill: vec![0, 4, 7],
+            model: "m".into(),
+            prompt_hash: "ph".into(),
+            harness: "claude".into(),
+            version: "0.6.0".into(),
+            dur_ms: 9_000,
+            failed: true,
+            ..o(GRADED, "s", &["A", "B", "C"], 5)
+        };
+        let delivered = Outcome { check: "0123456789ab".into(), route: ROUTE_DROPPED_CHARS.into(), reason: "budget".into(), ..o(ASKED, "s", &["B"], 6) };
+        let judged = Outcome { check: "0123456789ab".into(), judge: 2, stripped: true, ..o(CHANGED, "s", &["A"], 7) };
+        let early = Outcome { channel: "early".into(), rel: vec![0.75], ..o(ASKED, "s", &["D"], 8) };
+        // Shareable kinds carrying every per-check field, so `share` is put to the test on each.
+        let carried = Outcome { nofree: g.nofree.clone(), tail: g.tail.clone(), pt: g.pt, rel: vec![0.75], ..judged.clone() };
+        for x in [&g, &delivered, &judged, &early, &carried] {
+            let line = serde_json::to_string(x).unwrap();
+            assert_eq!(&serde_json::from_str::<Outcome>(&line).unwrap(), x, "round trip");
+        }
+        assert!(share(&g, "n1").is_none(), "graded stays local");
+        for x in [&delivered, &judged, &early, &carried] {
+            let shared = serde_json::to_string(&share(x, "n1").unwrap()).unwrap();
+            for field in ["check", "0123456789ab", "route", "reason", "judge", "stripped", "nofree", "N9", "tail", "T9", "pt", "0.125", "rel", "0.75"] {
+                assert!(!shared.contains(field), "{field}: {shared}");
+            }
+        }
+        assert!(ROUTES.iter().all(|r| !r.is_empty() && !r.contains(' ')), "one word each");
+    }
+
+    #[test]
+    fn an_older_graded_record_is_the_fixed_rule_unless_it_shows_the_cut() {
+        let graded = |grades: &[u8], chosen: &[&str], p: &[f64]| Outcome {
+            lessons: (0..grades.len()).map(|i| format!("L{i:02}")).collect(),
+            grades: grades.to_vec(),
+            chosen: chosen.iter().map(|c| c.to_string()).collect(),
+            p: p.to_vec(),
+            ..o(GRADED, "s", &[], 1)
+        };
+        // No 3: the fixed rule hands over the 2s, then the 1s, at most CAP.
+        let soft: Vec<u8> = [vec![1; 6], vec![2; 6]].concat();
+        let old = graded(&soft, &[], &[0.0; 12]);
+        assert_eq!(policy_of(&old), "fixed");
+        let want: Vec<String> = (6..12).chain(0..4).map(|i| format!("L{i:02}")).collect();
+        assert_eq!(free_of(&old), want);
+        // A 3: the fixed rule asks, hands over nothing.
+        let block = graded(&[3, 1], &["L00", "L01"], &[1.0, 1.0]);
+        assert_eq!((policy_of(&block), free_of(&block)), ("fixed", Vec::<String>::new()));
+        // The learned cut: a propensity between 0 and 1, or an explored check; the rest go free.
+        let cut = graded(&[3, 1, 1, 1], &["L00", "L01"], &[1.0, 1.0, 0.1, 0.1]);
+        assert_eq!((policy_of(&cut), free_of(&cut)), ("attention", vec!["L02".to_string(), "L03".into()]));
+        let explored = Outcome { explore: true, ..graded(&[3, 1, 1], &["L00", "L01", "L02"], &[1.0, 1.0, 1.0]) };
+        assert_eq!((policy_of(&explored), free_of(&explored)), ("attention", Vec::<String>::new()));
+        // A record that names its policy is taken at its word, its free list as logged.
+        let named = Outcome { policy: "learned".into(), free: vec!["L01".into()], ..graded(&[3, 1], &["L00"], &[1.0, 0.0]) };
+        assert_eq!((policy_of(&named), free_of(&named)), ("learned", vec!["L01".to_string()]));
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {

@@ -43,7 +43,7 @@ async fn every_harness_drone_shows_with_its_harness_and_state() {
 
     let (_tx, stop) = tokio::sync::watch::channel(false);
     let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
-    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
 
     let (status, v) = get(app.clone(), "/api/collectives").await;
     assert_eq!(status, StatusCode::OK);
@@ -82,7 +82,7 @@ async fn a_veto_shows_in_the_feed_and_on_the_lessons_it_credited() {
 
     let (_tx, stop) = tokio::sync::watch::channel(false);
     let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
-    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), stop });
+    let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
     let (status, v) = get(app.clone(), "/api/feed?c=corp").await;
     assert_eq!(status, StatusCode::OK);
     let veto = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "veto").unwrap_or_else(|| panic!("{v}"));

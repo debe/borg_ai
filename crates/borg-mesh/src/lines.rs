@@ -37,10 +37,11 @@ use serde_json::Value;
 /// who ratified it). Plain lines (no `version`); the conscience keeps the earliest ratification per id,
 /// so arrival order does not matter.
 ///
-/// And the messages between sessions (borg msg.rs): plain lines, each naming its author's node. That
-/// name is a claim, so a message travels only under an origin of the key it names (`travels`), and
-/// only while it is fresh: a line one node pruned would otherwise come back from every peer. Last in
-/// the list: a 0.3.0 peer (`borg/mesh/12`) never reconciles this one.
+/// And the messages between sessions (borg msg.rs): plain lines, each naming its author's node, and the
+/// `seen` lines their recipients write (msg.rs `Seen`, which pace the senders). That name is a claim,
+/// so a line travels only under an origin of the key it names (`travels`), and only while it is fresh:
+/// a line one node pruned would otherwise come back from every peer. Last in the list: a 0.3.0 peer
+/// (`borg/mesh/12`) never reconciles this one.
 ///
 /// The removed playbooks' log is not listed: a session still steps through it after the outcomes
 /// and keeps nothing (sync.rs `PLAYBOOKS`).
@@ -61,18 +62,19 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Whether `line` of the log `file` may be offered or stored under an origin of `key`, at `now`. Any
-/// line but a message's. A message must be one borg msg.rs could have written (`well_formed`), name
-/// `key` as its node (the member key its sender wrote, as `borg top` names a remote node), and be
-/// fresh (msg.rs `fresh`: neither past `TTL_MS` nor stamped further ahead of this clock than
-/// `SKEW_MS`): a member's forged node, or a far-future line that would outlive every prune, never
-/// reaches another member. A message to the sessions of its own node (`local`, msg.rs `stays_here`)
-/// never travels: it is for that machine alone.
+/// line but a message's. A message or a seen line must be one borg msg.rs could have written
+/// (`Line::parse`), name `key` as its node (the member key its sender or reader wrote, as `borg top`
+/// names a remote node), and be fresh (msg.rs `fresh_at`: neither past `TTL_MS` nor stamped further
+/// ahead of this clock than `SKEW_MS`): a member's forged node, or a far-future line that would outlive
+/// every prune, never reaches another member, and no node acknowledges for another's sessions. A
+/// message to the sessions of its own node (`local`, msg.rs `stays_here`) never travels: it is for
+/// that machine alone.
 pub fn travels(file: &str, line: &str, key: &str, now: i64) -> bool {
     if file != borg::msg::FILE {
         return true;
     }
-    let Ok(m) = serde_json::from_str::<borg::msg::Message>(line) else { return false };
-    m.well_formed() && m.node == key && borg::msg::fresh(&m, now) && !m.stays_here()
+    let Some(l) = borg::msg::Line::parse(line) else { return false };
+    l.node() == key && borg::msg::fresh_at(l.ms(), now) && l.message().is_none_or(|m| !m.stays_here())
 }
 
 pub fn hash(line: &str) -> Hash {
@@ -169,6 +171,18 @@ mod tests {
         assert!(!travels(borg::msg::FILE, &line(&format!("{}@{key}", borg::msg::LOCAL)), &key, 1_000));
         assert!(travels(borg::msg::FILE, &line(borg::msg::ALL), &key, 1_000));
         assert!(travels(borg::msg::FILE, &line(&format!("s2@{}", "cd".repeat(32))), &key, 1_000));
+    }
+
+    /// A seen line travels under its own node's key while fresh: no node acknowledges for another's
+    /// sessions, and a malformed one never travels.
+    #[test]
+    fn a_seen_line_travels_only_under_its_node() {
+        let (key, other) = ("ab".repeat(32), "cd".repeat(32));
+        let seen = |node: &str, ms: i64, ids: &[&str]| serde_json::to_string(&borg::msg::Seen::new("s2", node, ms, ids)).unwrap();
+        assert!(travels(borg::msg::FILE, &seen(&key, 1_000, &["m0123456789ab"]), &key, 1_000));
+        assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["m0123456789ab"]), &other, 1_000), "signed by another node");
+        assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["m0123456789ab"]), &key, 1_000 + borg::msg::TTL_MS + 1), "expired");
+        assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["not an id"]), &key, 1_000), "malformed");
     }
 
     #[test]

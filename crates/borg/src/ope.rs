@@ -95,23 +95,27 @@ pub struct Skipped {
     pub graded: usize,
 }
 
-/// A result's rank, as memory.rs folds a session: vetoed > corrected > changed > ignored.
-fn rank(kind: &str) -> Option<u8> {
+/// A result's rank, as memory.rs folds a session: vetoed > corrected > changed > ignored. A lesson
+/// settled without a verdict (`asked_not_corrected`) has none: censored, as memory.rs reads it (the
+/// judge never said whether the drone acted on it), so its ask waits as pending.
+pub(crate) fn rank(kind: &str) -> Option<u8> {
     match kind {
         outcome::VETOED => Some(3),
         outcome::CORRECTED => Some(2),
         outcome::CHANGED => Some(1),
-        outcome::IGNORED | outcome::NOT_CORRECTED => Some(0),
+        outcome::IGNORED => Some(0),
         _ => None,
     }
 }
 
 /// The logged Thompson checks of `outcomes`, in log order, and what was skipped. A lesson's reward is
 /// 1 when the strongest result of its session at or after the ask is a change, else 0: a correction or
-/// a veto after the ask means asking did not help.
+/// a veto after the ask means asking did not help. A placebo's result (outcome.rs `PLACEBO`: judged
+/// where a free delivery would be, never shown) is no result about the lesson, and an unclear verdict
+/// (`UNCLEAR`) has no rank: neither rewards anything.
 pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
     let mut results: HashMap<(&str, &str), Vec<(i64, u8)>> = HashMap::new();
-    for o in outcomes {
+    for o in outcomes.iter().filter(|o| o.channel != outcome::PLACEBO) {
         if let Some(r) = rank(&o.kind) {
             for l in &o.lessons {
                 results.entry((o.session.as_str(), l.as_str())).or_default().push((o.ms, r));
@@ -213,15 +217,15 @@ pub struct Estimate {
     pub n: usize,
 }
 
-/// How far a replayed p may lie from the logged one and still count as the same draw: the logged p is
+/// Method: how far a replayed p may lie from the logged one and still count as the same draw: the logged p is
 /// rounded (outcome.rs `round_p`), and the draw's estimate is Monte Carlo (conscience::P_DRAWS).
 pub const AGREE: f64 = 0.01;
 
-/// Resamples behind a CI: precision, not a knob (as conscience::P_DRAWS).
+/// Method: the resamples behind a CI: precision, not a knob (as conscience::P_DRAWS).
 pub const RESAMPLES: usize = conscience::P_DRAWS;
 
-/// The bootstrap's seed: fixed, so a run is deterministic.
-const SEED: u64 = 0x006f_7065;
+/// Method: the bootstrap's seed, fixed so a run is deterministic (also select/replay.rs's).
+pub(crate) const SEED: u64 = 0x006f_7065;
 
 /// Self-normalised IPS over units (w = p_cand / p_logged, reward, session): Σwr/Σw; None when Σw = 0.
 /// ESS = (Σw)²/Σw². CI: the 2.5th and 97.5th percentiles of `RESAMPLES` bootstrap resamples of whole
@@ -699,6 +703,19 @@ mod tests {
         let r = evaluate(&log);
         assert_eq!((r.units, r.current.value, r.asked), (0, None, 4));
         assert!(render(&r).contains("too thin"), "{}", render(&r));
+    }
+
+    #[test]
+    fn a_placebo_unclear_or_censored_result_rewards_no_ask() {
+        let log = |result: Outcome| vec![ask("d", &["A"], &[0.5], &["A", "B"], 1), result];
+        let changed = o(CHANGED, "d", &["A"], 2);
+        let (ds, skipped) = decisions(&log(changed.clone()));
+        assert_eq!((ds.len(), skipped.pending), (1, 0), "a plain change rewards the ask");
+        let censored = Outcome { kind: outcome::NOT_CORRECTED.into(), ..changed.clone() };
+        for x in [Outcome { channel: outcome::PLACEBO.into(), ..changed.clone() }, Outcome { kind: outcome::UNCLEAR.into(), ..changed }, censored] {
+            let (ds, skipped) = decisions(&log(x.clone()));
+            assert_eq!((ds.len(), skipped.pending), (0, 1), "{x:?} leaves the ask without a result");
+        }
     }
 
     #[test]

@@ -54,10 +54,13 @@ shell profile, after showing the engineer the change.
 | `borg vectors` says `model: missing` | | `borg vectors --fetch`, then `borg vectors --rebuild`; see [vectors](vectors.md) |
 | `index: none at ...` or `built with another model` | | `borg vectors --rebuild` in a repo of that collective |
 | A drone is paused and refuses tool calls | `borg top` lists the drones | `borg resume <drone>`; a pause lapses by itself after 24 hours |
-| A message never shows in the other session | `borg inbox --all` from a terminal | It shows at that session's next prompt or tool call. `borg tell` refuses a second message to one recipient within 10 minutes. On another machine, both must route the repo to one `team` collective with `borg mesh serve` running |
+| A message never shows in the other session | `borg inbox --all` from a terminal | It shows at that session's next prompt or tool call. `borg tell` refuses a message while the recipient has not read the ones before it ("N unread by …"): wait until it is shown one or answers. On another machine, both must route the repo to one `team` collective with `borg mesh serve` running; a member on borg 0.4 or 0.5 gets only messages of at most 1,000 characters, one on 0.3 none |
+| A message shows only its start | | The rest did not fit that prompt's context: `borg inbox --show <id>` prints it whole |
+| `borg tell` says the recipient's node "has acknowledged no message yet" | | A session on another machine gets one message per 10 minutes from each sender until that machine acknowledges one (a machine on borg 0.5 never does): send again when it says, put everything into one message, or upgrade that machine |
 | An idle session is not woken by a message | Run `borg listen` inside that session | Claude Code starts a background waiter at its next stop; omp and opencode need the current adapter (`borg install <harness> --apply`, then restart); Codex is woken through `codex queue` |
 | A pause or veto from another member does nothing | That member's role: `borg mesh members` | Only an `admin` or `steer` role steers other members' sessions; the admin re-invites with `borg mesh invite <key> --role steer` |
-| Too many questions or blocks | `borg status` (cost and stop gate lines) | `"mode": "hook"` for that collective (about an eighth of live's cost) |
+| Too many questions or blocks | `borg status` (cost, stop gate and selection lines) | `"mode": "hook"` for that collective (about an eighth of live's cost). The selection line says whether the fixed rule (the default) or the learned policy (`BORG_SELECT=learned`) decides; `BORG_SELECT=fixed` keeps the fixed rule whatever else is set |
+| The selection line says `REVERTED to the fixed rule` | `borg status` | The monitor saw the learned policy do worse than the fixed rule and put the fixed rule back for good. Tell the engineer; only they decide to delete `<store>/select-reverted` to let it learn again |
 | After upgrading borg | `borg doctor` | `borg install all` (dry run), then `borg install all --apply`; for Codex, `/hooks` again |
 
 ## Undo

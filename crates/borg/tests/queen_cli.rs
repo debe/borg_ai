@@ -23,6 +23,9 @@ fn borg_queen(root: &Path, base: &Path, args: &[&str], stdin: &str, dir: &Path, 
     c.args(args)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
+        .env("BORG_PREDICT_MODEL", "off")
+        .env("BORG_LEARN_MODEL", "off")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_HOME", base)

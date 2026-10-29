@@ -13,6 +13,15 @@ use serde_json::Value;
 
 use crate::{Harness, fingerprint, parse_ts};
 
+/// The most characters of a command a touch keeps when it names no file it read. Protocol: the
+/// live hook records the same head (borg hook.rs `touched`), and a replay must see what it saw.
+pub const TOUCH_CHARS: usize = 200;
+/// The most characters of a refused tool call's error text a step keeps. Guard: bounds a step
+/// whatever the harness printed; the engineer's words of a worded rejection come first.
+const REFUSAL_CHARS: usize = 2000;
+/// The most characters of a refused tool call's input a step keeps. Display: names the call.
+const TOOL_CHARS: usize = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// A prompt the engineer typed (harness meta, slash commands and interrupts dropped).
@@ -99,7 +108,7 @@ fn touched(tool: &str, input: &Value) -> String {
         "bash" => {
             let cmd = s("command");
             let paths = fingerprint::bash_read_paths(&cmd);
-            if paths.is_empty() { cmd.chars().take(200).collect() } else { paths.join(" ") }
+            if paths.is_empty() { cmd.chars().take(TOUCH_CHARS).collect() } else { paths.join(" ") }
         }
         "grep" => format!("{} {}", s("pattern"), s("path")),
         "glob" => s("pattern"),
@@ -124,12 +133,12 @@ fn ts(v: &Value) -> i64 {
 fn result(steps: &mut Vec<Step>, ts: i64, tool: Option<&(String, Value)>, is_error: bool, content: &Value) {
     let Some((name, input)) = tool else { return };
     if is_error {
-        let first: String = text_of(content).trim_start().lines().next().unwrap_or_default().chars().take(2000).collect();
+        let first: String = text_of(content).trim_start().lines().next().unwrap_or_default().chars().take(REFUSAL_CHARS).collect();
         let full = text_of(content);
         let lower = full.to_lowercase();
         if lower.contains("want to proceed with this tool use") || lower.contains("denied by user") || lower.contains("rejected by user") {
-            let error = if first.to_lowercase().contains("want to proceed") { full.chars().take(2000).collect() } else { first };
-            steps.push(Step::Refused { ts, tool: format!("{name} {}", input.to_string().chars().take(300).collect::<String>()), error });
+            let error = if first.to_lowercase().contains("want to proceed") { full.chars().take(REFUSAL_CHARS).collect() } else { first };
+            steps.push(Step::Refused { ts, tool: format!("{name} {}", input.to_string().chars().take(TOOL_CHARS).collect::<String>()), error });
         }
         return;
     }

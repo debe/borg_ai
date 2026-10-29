@@ -137,10 +137,14 @@ def run_hook(c, store=None):
         name = re.sub(r"[^A-Za-z0-9-]", "", session)
         ctx = sdir / f"{name}.ctx"
         lines = ctx.read_text().splitlines() if ctx.exists() else []
-        tag = lambda p: [l[len(p):].strip() for l in lines if l.startswith(p)]
+        # Markers and queue lines end in the check that routed them (` @<check>`); older ones have none.
+        untag = lambda s: s.split(" @")[0].strip()
+        tag = lambda p: [untag(l[len(p):]) for l in lines if l.startswith(p)]
         asked = [x for x in ",".join(tag("#borg-asked ")).split(",") if x]
         queued_f = sdir / f"{name}.queued"
-        queued = [x for x in ",".join(queued_f.read_text().split()).split(",") if x] if queued_f.exists() else []
+        # A queue line is `[live ]<ids> @<check>`; a placebo line is judged, never handed over.
+        queue = [untag(l).split()[-1] for l in queued_f.read_text().splitlines() if untag(l) and not l.startswith("placebo ")] if queued_f.exists() else []
+        queued = [x for x in ",".join(queue).split(",") if x]
         cost_f = sdir / f"{name}.cost"
         block = json.loads(out) if out.strip() else None
         ls = lessons_by_id(store)

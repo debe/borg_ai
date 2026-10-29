@@ -114,6 +114,9 @@ pub fn tombstone(l: &Lesson) -> Lesson {
 /// The answers a reach question offers (queen.rs `Kind::Reach`).
 pub const TEAM_OPTION: &str = "team: everyone working on this code should hear it";
 pub const PERSONAL_OPTION: &str = "personal: move it to my private collective";
+/// Display: the characters of a lesson's question on a line of `borg reach`'s plan, after its id and
+/// before the model's reason: about one wide terminal line.
+const PLAN_CHARS: usize = 110;
 
 fn repo_option(repo: &str) -> String {
     format!("repo: only in {}", if repo.is_empty() { "the repo it was learned in" } else { repo })
@@ -190,17 +193,27 @@ pub fn candidates(home: &Path) -> Vec<Lesson> {
 pub type Ask = dyn Fn(&str, &serde_json::Value) -> Option<(serde_json::Value, Option<f64>)> + Sync;
 
 /// Classifies `lessons` with one model call each (`jobs` at a time). Returns the verdicts and the cost.
+/// After `runner::MAX_FAILURES` failed calls before the first answer the model is unavailable: the
+/// rest are not asked (they stay candidates for the next run).
 pub fn classify(lessons: &[Lesson], jobs: usize, ask: &Ask) -> (Vec<Verdict>, f64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let out = std::sync::Mutex::new((Vec::new(), 0.0));
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (next, failures, answers) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     std::thread::scope(|s| {
         for _ in 0..jobs.max(1) {
             s.spawn(|| {
                 loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if failures.load(Ordering::SeqCst) >= crate::runner::MAX_FAILURES && answers.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(l) = lessons.get(i) else { break };
                     let prompt = format!("{PROMPT}\n\nLesson (learned in repo {}):\nQuestion: {}\nConsequence: {}\n", l.repo, l.question, l.consequence);
-                    let Some((v, cost)) = ask(&prompt, &schema()) else { continue };
+                    let Some((v, cost)) = ask(&prompt, &schema()) else {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    };
+                    answers.fetch_add(1, Ordering::SeqCst);
                     let reach = v["reach"].as_str().filter(|r| [REPO, PERSONAL].contains(r)).unwrap_or_default();
                     let verdict = Verdict {
                         id: l.id.clone(),
@@ -258,7 +271,7 @@ pub fn apply(home: &Path, plan: &[Verdict], cfg: Option<&crate::collective::Conf
                     id: format!("q{}", &key[..8]),
                     decision_key: key,
                     kind: crate::queen::Kind::Reach,
-                    question: format!("Who should hear this lesson? \"{}\"", crate::stats::excerpt(&l.question, 300)),
+                    question: format!("Who should hear this lesson? \"{}\"", crate::stats::excerpt(&l.question, crate::queen::QUOTE_CHARS)),
                     options: vec![TEAM_OPTION.into(), repo_option(&l.repo), PERSONAL_OPTION.into()],
                     default,
                     evidence: vec![format!("lesson {}", l.id), format!("model: {}", v.why)],
@@ -324,20 +337,20 @@ pub fn main(args: &[&str]) -> i32 {
         };
     }
     let todo = candidates(&home);
-    let jobs = flag("--jobs").and_then(|j| j.parse().ok()).unwrap_or(4);
+    let jobs = flag("--jobs").and_then(|j| j.parse().ok()).unwrap_or(crate::runner::JOBS);
     eprintln!("borg reach: classifying {} lessons of {name} (one model call each, {jobs} at a time)", todo.len());
     let (plan, cost) = classify(&todo, jobs, &|p: &str, s: &serde_json::Value| crate::learn::ask_model(p, s));
     for (label, pick) in [("personal: move to the private collective", PERSONAL), ("repo: deliver only in its repo", REPO)] {
         let hits: Vec<&Verdict> = plan.iter().filter(|v| v.confident && v.reach == pick).collect();
         println!("\n{label} ({})", hits.len());
         for v in hits {
-            println!("  {}  {}  ({})", v.id, crate::stats::excerpt(&v.question, 110), v.why);
+            println!("  {}  {}  ({})", v.id, crate::stats::excerpt(&v.question, PLAN_CHARS), v.why);
         }
     }
     let unsure: Vec<&Verdict> = plan.iter().filter(|v| !v.confident).collect();
     println!("\nunsure: a question for the queen ({})", unsure.len());
     for v in unsure {
-        println!("  {}  [{}?]  {}", v.id, if v.reach.is_empty() { "team" } else { &v.reach }, crate::stats::excerpt(&v.question, 110));
+        println!("  {}  [{}?]  {}", v.id, if v.reach.is_empty() { "team" } else { &v.reach }, crate::stats::excerpt(&v.question, PLAN_CHARS));
     }
     let team = plan.iter().filter(|v| v.confident && v.reach.is_empty()).count();
     println!("\nteam: unchanged ({team}); {} of {} classified, ${cost:.2}", plan.len(), todo.len());
@@ -467,6 +480,30 @@ mod tests {
         apply_one(&team, &l, verdict(&q.options[2]), Some(&cfg)).unwrap();
         assert_eq!(latest(&team, "Ld").unwrap().reach, PERSONAL);
         assert_eq!((verdict(&q.options[0]), verdict(&q.options[1])), ("", REPO));
+    }
+
+    /// The guard: a model that never answers is asked `runner::MAX_FAILURES` times, not once per lesson.
+    #[test]
+    fn a_dead_model_is_asked_only_until_the_failure_guard() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lessons: Vec<Lesson> = (0..10).map(|i| Lesson { id: format!("L{i}"), ..Lesson::default() }).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let dead = move |_: &str, _: &serde_json::Value| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+        assert!(classify(&lessons, 1, &dead).0.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), crate::runner::MAX_FAILURES);
+        // One answer first: the model is there, a later failure stops nothing.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let flaky = move |_: &str, _: &serde_json::Value| {
+            (counted.fetch_add(1, Ordering::SeqCst) == 0).then(|| (serde_json::json!({"reach": "team", "confident": true, "why": "w"}), None))
+        };
+        assert_eq!(classify(&lessons, 1, &flaky).0.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), lessons.len(), "every lesson asked");
     }
 
     #[test]

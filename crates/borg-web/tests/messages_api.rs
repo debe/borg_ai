@@ -1,6 +1,7 @@
 //! The page's messages API over a seeded store, in process (no port): `/api/messages` lists the
 //! messages between sessions newest first with whom each was shown to, `/api/drones` gives each local
-//! drone its unread count, and the feed shows a send and a refusal. Written through msg.rs's own API.
+//! drone its unread count, the feed shows a send and a refusal, and `/api/messages/seen` acknowledges
+//! what the messages view showed the engineer. Written through msg.rs's own API.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +23,30 @@ async fn get(app: Arc<App>, uri: &str) -> (StatusCode, Value) {
 }
 
 fn app(name: &str, home: PathBuf) -> Arc<App> {
+    app_in(name, home, String::new())
+}
+
+/// `app` started in `cwd`, whose git identity is the engineer's.
+fn app_in(name: &str, home: PathBuf, cwd: String) -> Arc<App> {
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    Arc::new(App { first: name.into(), minds: vec![Mind { name: name.into(), home, share: Share::Local, mode: "hook" }], stop })
+    Arc::new(App { first: name.into(), minds: vec![Mind { name: name.into(), home, share: Share::Local, mode: "hook" }], cwd, stop })
+}
+
+/// A POST of `body` with `content_type`, as the page sends it.
+async fn post(app: Arc<App>, uri: &str, content_type: &str, body: &str) -> StatusCode {
+    let req = Request::post(uri).header("host", "127.0.0.1:7979").header("content-type", content_type).body(Body::from(body.to_string())).unwrap();
+    router(app).oneshot(req).await.unwrap().status()
+}
+
+/// The acknowledgements (`by`, ids) in the store's messages log.
+fn seen(home: &std::path::Path) -> Vec<(String, Vec<String>)> {
+    msg::lines(home)
+        .into_iter()
+        .filter_map(|l| match l {
+            msg::Line::Seen(s) => Some((s.by, s.ids)),
+            msg::Line::Message(_) => None,
+        })
+        .collect()
 }
 
 fn presence(session: &str, started: i64, ms: i64) -> borg::presence::Presence {
@@ -43,8 +66,8 @@ fn presence(session: &str, started: i64, ms: i64) -> borg::presence::Presence {
 }
 
 /// One tell and one ask between two live sessions: the list names both ends by designation, the ask
-/// once shown counts as shown and leaves the tell unread, and a repeat inside the rate limit is a
-/// refusal in the feed.
+/// once shown counts as shown and leaves the tell unread, a second tell while the first is unread is a
+/// refusal in the feed, and the acknowledgement the delivery wrote is neither listed nor counted.
 #[tokio::test]
 async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     let base = std::env::temp_dir().join(format!("borg-web-messages-{}", std::process::id()));
@@ -65,11 +88,14 @@ async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     msg::send(&corp, tell.clone(), now).unwrap();
     msg::send(&corp, ask.clone(), now).unwrap();
     let again = Message::new(msg::TELL, &from("aaaa1111-web"), "bbbb2222-web", None, now - 1_000, "and the lexer");
-    assert!(matches!(msg::send(&corp, again, now), Err(msg::SendError::Rate { .. })));
+    let refused = msg::send(&corp, again, now).expect_err("the tell is unread");
+    assert!(matches!(refused, msg::SendError::Window { outstanding: 1, window: 1, .. }), "{refused:?}");
+    assert!(refused.to_string().starts_with("1 unread by bbbb2222-web:"), "{refused}");
     // The ask reaches its recipient's next prompt: shown once.
     let caps = borg::harness::by_name("claude").unwrap().caps();
     let started = Some(now - 60_000);
     assert!(msg::deliver(&corp, caps, "prompt", &json!({"session_id": "aaaa1111-web"}), started, now, None).is_some());
+    assert!(msg::lines(&corp).iter().any(|l| matches!(l, msg::Line::Seen(s) if s.ids == [ask.id.clone()])), "acknowledged in the log");
 
     let (_, v) = get(app("corp", corp.clone()), "/api/messages?c=corp").await;
     let ms = v["messages"].as_array().unwrap();
@@ -91,7 +117,7 @@ async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     let kinds: Vec<(&str, &str)> =
         v["events"].as_array().unwrap().iter().filter_map(|e| Some((e["kind"].as_str()?, e["why"].as_str().unwrap_or_default()))).collect();
     assert_eq!(kinds.iter().filter(|k| k.0 == "msg_sent").count(), 2, "{kinds:?}");
-    assert!(kinds.contains(&("msg_dropped", "rate")), "{kinds:?}");
+    assert!(kinds.contains(&("msg_dropped", "window")), "{kinds:?}");
     assert!(!kinds.iter().any(|k| k.0 == "msg_delivered"), "a delivery is in the list, not the feed: {kinds:?}");
 
     // A line from another node that names a local session is that node's claim: shown with its key.
@@ -100,5 +126,40 @@ async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     let (_, v) = get(app("corp", corp), "/api/messages?c=corp").await;
     let m0 = &v["messages"][0];
     assert_eq!((m0["from"].as_str(), m0["to_kind"].as_str()), (Some("One of Two @eeeeeeeeeeee"), Some("all")), "{v}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The messages view shows the engineer a message to them: its POST acknowledges it as the engineer of
+/// the directory borg web started in, as `borg inbox` does, which opens the sender's window again. An
+/// id of a message to a session is not the engineer's to acknowledge, and a body that is not JSON (a
+/// cross-site form) acknowledges nothing.
+#[tokio::test]
+async fn the_messages_view_acknowledges_what_it_showed_the_engineer() {
+    let base = std::env::temp_dir().join(format!("borg-web-messages-seen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (corp, work) = (base.join("corp"), base.join("work"));
+    std::fs::create_dir_all(&corp).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let git = |a: &[&str]| std::process::Command::new("git").arg("-C").arg(&work).args(a).output().is_ok_and(|o| o.status.success());
+    assert!(git(&["init", "-q"]) && git(&["config", "user.email", "ann@x"]));
+    let now = borg::learn::now_ms();
+    let here = msg::node(&corp);
+    let from = |by: &str| Sender { by: by.into(), name: "One of Two".into(), harness: "claude".into(), node: here.clone() };
+    let to_me = Message::new(msg::TELL, &from("aaaa1111-web"), msg::ENGINEER, None, now - 3_000, "the build is green");
+    let to_drone = Message::new(msg::TELL, &from("aaaa1111-web"), "bbbb2222-web", None, now - 2_000, "the parser test is flaky");
+    msg::send(&corp, to_me.clone(), now).unwrap();
+    msg::send(&corp, to_drone.clone(), now).unwrap();
+    let again = Message::new(msg::TELL, &from("aaaa1111-web"), msg::ENGINEER, None, now - 1_000, "and the docs");
+    assert!(matches!(msg::send(&corp, again.clone(), now), Err(msg::SendError::Window { .. })), "the engineer has not seen the first");
+    let app = app_in("corp", corp.clone(), work.display().to_string());
+    let body = json!({"ids": [to_me.id, to_drone.id]}).to_string();
+    assert_eq!(post(app.clone(), "/api/messages/seen?c=corp", "text/plain", &body).await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(seen(&corp).is_empty(), "no JSON, nothing acknowledged");
+    assert_eq!(post(app.clone(), "/api/messages/seen?c=nope", "application/json", &body).await, StatusCode::NOT_FOUND);
+    assert_eq!(post(app.clone(), "/api/messages/seen?c=corp", "application/json", &body).await, StatusCode::OK);
+    assert_eq!(seen(&corp), [("engineer:ann@x".to_string(), vec![to_me.id.clone()])], "the engineer's message only, as theirs");
+    assert_eq!(post(app, "/api/messages/seen?c=corp", "application/json", &body).await, StatusCode::OK);
+    assert_eq!(seen(&corp).len(), 1, "acknowledged once");
+    msg::send(&corp, again, now).expect("seen: the sender's window is open again");
     let _ = std::fs::remove_dir_all(&base);
 }

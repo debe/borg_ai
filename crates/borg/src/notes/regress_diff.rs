@@ -70,6 +70,7 @@ fn starts(header: &str) -> Option<(u32, u32)> {
     Some((start(f.next()?)?, start(f.next()?.strip_prefix('+')?)?))
 }
 
+/// ASCII `\` and `"`, the two bytes git's C-style path quoting escapes with. Protocol: git's.
 const BACKSLASH: u8 = 0x5c;
 const QUOTE: char = '\u{22}';
 

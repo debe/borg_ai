@@ -38,10 +38,15 @@ use serde::Serialize;
 use crate::queen::{self, Entry};
 use crate::{notes, stats};
 
-/// α: what a rubber stamp costs.
+/// α: what a rubber stamp costs. Baseline: defines the reward (a wasted answer costs what a useful
+/// one earns); design-chosen, not tuned, read by monitoring only.
 pub const STAMP_W: f64 = 1.0;
-/// β: what a missed escalation costs.
+/// β: what a missed escalation costs. Derived: memory.rs `VETOED_W`, what the missed veto weighs in a
+/// lesson's belief.
 pub const MISSED_W: f64 = crate::memory::VETOED_W as f64;
+/// Display: the characters of the engineer's answer a feed line shows after the entry's id, so the
+/// line stays within a feed excerpt (stats.rs `FEED_CHARS`); `borg queen show` prints it whole.
+const ANSWER_CHARS: usize = 120;
 
 /// Words an answer that only says "yes, fine" is made of.
 const YES: [&str; 11] = ["yes", "y", "ok", "okay", "fine", "sure", "go", "ahead", "proceed", "approved", "lgtm"];
@@ -76,7 +81,7 @@ pub fn answered(store: &Path, e: &Entry, answer: &str, author: &str, now: i64) -
         ev.engineer = author.into();
         ev.repo = e.repo.clone();
         ev.why = format!("{:?}", e.kind);
-        ev.text = format!("{} {}", e.id, stats::excerpt(answer, 120));
+        ev.text = format!("{} {}", e.id, stats::excerpt(answer, ANSWER_CHARS));
     });
     Some(kind)
 }

@@ -12,6 +12,9 @@
 #   M9   CCN of the hook's per-event functions (hook.rs)               <= 15 (lizard)
 #   M10  functions in install.rs, tests aside                          < 40 (cargo-coupling)
 #
+# The bars are baselines: design-chosen when the harness trait landed (docs/harnesses.md), not tuned;
+# 0 for M1, M2 and M5 is the definition of the abstraction, the CCN and size bars a ceiling on regress.
+#
 # M1 and M2 need nothing but grep and awk (crates/borg/tests/harness_arch.rs runs them in cargo test too).
 # A missing tool (lizard, cargo-coupling, rust-code-analysis-cli) skips its rows with a note. 0 tokens.
 #

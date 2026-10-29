@@ -13,6 +13,10 @@
 //!
 //! Subcommands: `report`, `sandbox-exec`, `sandbox-probe`, `dogfood` (dogfood.rs), and the replay
 //! evals when their private modules are present (build.rs).
+//!
+//! Every number in this crate is an experiment parameter (or a display width): chosen for an eval,
+//! stated in its report, never a product default. A per-task `--budget-usd` and `--timeout-s` are
+//! the eval's guards against a runaway arm, recorded with each run, not a cost bar the product meets.
 
 use std::fs;
 use std::io::Write;

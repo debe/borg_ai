@@ -9,9 +9,9 @@ use serde::Serialize;
 use crate::notes::links::{self, FIX, Link, LinkRef};
 use crate::notes::{Excerpt, redact};
 
-/// At most this many links per direction in the compact form.
+/// At most this many links per direction in the compact form. Display, as why.rs `MAX_LESSONS`.
 const MAX_LINKS: usize = 3;
-const TASK_CAP: usize = 240;
+use super::TASK_CAP;
 
 /// The other commit of a link.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

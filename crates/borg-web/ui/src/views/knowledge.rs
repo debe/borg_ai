@@ -283,7 +283,7 @@ pub fn Knowledge() -> impl IntoView {
             m.entry(if by_area { l.area() } else { l.system() }).or_default().push(l);
         }
         let mut groups: Vec<(String, Vec<Lesson>)> = m.into_iter().collect();
-        groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
         let single = groups.len() == 1;
         groups
             .into_iter()

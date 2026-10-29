@@ -70,7 +70,8 @@ pub const STEER_DELIVERED: &str = "steer_delivered";
 pub const STEER_DROPPED: &str = "steer_dropped";
 pub const PAUSE_REFUSED: &str = "pause_refused";
 /// Messages between sessions (msg.rs): one sent (`why`: tell/ask), shown to a session (`why`: its kind),
-/// and dropped (`why`: `rate`, the sender's limit; `bounds`, `n` lines the log's `KEEP` cut).
+/// and dropped (`why`: `window`, the sender's window to its recipient was full, msg.rs `window_for`;
+/// events before 0.6.0 say `rate`; `bounds`, `n` lines the log's bound, msg.rs `MEMBER_BYTES`, cut).
 pub const MSG_SENT: &str = "msg_sent";
 pub const MSG_DELIVERED: &str = "msg_delivered";
 pub const MSG_DROPPED: &str = "msg_dropped";
@@ -228,7 +229,10 @@ pub fn count(home: &Path, kind: &str, session: &str, fill: impl FnOnce(&mut Even
     record(home, &ev);
 }
 
-/// The first `max` characters of `text` on one line (a feed excerpt).
+/// Display: the characters of a feed excerpt (`excerpt`): one line of borg web's activity feed.
+pub const FEED_CHARS: usize = 160;
+
+/// The first `max` characters of `text` on one line (a feed excerpt, `FEED_CHARS`).
 pub fn excerpt(text: &str, max: usize) -> String {
     let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match one.char_indices().nth(max) {
@@ -313,7 +317,7 @@ fn derive_history(home: &Path) -> Vec<Event> {
         if !s(&e, "engineer").is_empty() {
             who.insert(s(&e, "session"), s(&e, "engineer"));
         }
-        let snippet = excerpt(&s(&e, "correction"), 160);
+        let snippet = excerpt(&s(&e, "correction"), FEED_CHARS);
         // A veto (veto.rs) is counted as one, never as a correction.
         if s(&e, "kind") == crate::veto::KIND {
             out.push(Event {
@@ -339,7 +343,15 @@ fn derive_history(home: &Path) -> Vec<Event> {
         });
     }
     let engineer = |session: &str| who.get(session).cloned().unwrap_or_default();
+    // One call writes one record per routing check (a stop's block, a live ask, the judge's verdicts of
+    // a kind) and counts them live as one event: such records of one session, kind, channel and stamp
+    // are one event here too, their lessons joined.
+    let mut call: std::collections::HashMap<(String, &str, String, i64), usize> = std::collections::HashMap::new();
     for o in lines(&home.join("outcomes.jsonl")) {
+        // A placebo's result is no result (outcome.rs `is_result`), as live counting leaves it out.
+        if o["channel"] == crate::outcome::PLACEBO {
+            continue;
+        }
         let live = o["channel"] == "live";
         let kind = match o["kind"].as_str().unwrap_or_default() {
             // A free delivery counts once, as its own event (`early`, `queued_free`), never as a block.
@@ -356,13 +368,27 @@ fn derive_history(home: &Path) -> Vec<Event> {
         };
         let lessons = ids(&o, "lessons");
         let session = s(&o, "session");
+        let asks = kind == BLOCK || kind == LIVE_ASK;
+        let key = (session.clone(), kind, s(&o, "channel"), ms(&o, "ms"));
+        let merges = [BLOCK, LIVE_ASK, CHANGED, IGNORED].contains(&kind);
+        if merges
+            && let Some(&i) = call.get(&key)
+            && let Some(e) = out.get_mut(i)
+        {
+            e.n += if asks { lessons.len() as u64 } else { 0 };
+            e.lessons.extend(lessons);
+            continue;
+        }
+        if merges {
+            call.insert(key, out.len());
+        }
         out.push(Event {
             ms: ms(&o, "ms"),
             kind: kind.into(),
             engineer: engineer(&session),
             session,
             repo: s(&o, "repo"),
-            n: if kind == BLOCK || kind == LIVE_ASK { lessons.len() as u64 } else { 0 },
+            n: if asks { lessons.len() as u64 } else { 0 },
             lessons,
             channel: s(&o, "channel"),
             ..Default::default()
@@ -392,10 +418,17 @@ fn derive_history(home: &Path) -> Vec<Event> {
     }
     for q in queen.values() {
         let base = || Event { engineer: s(q, "engineer"), session: s(q, "session"), repo: s(q, "repo"), lessons: vec![s(q, "id")], ..Default::default() };
-        out.push(Event { ms: ms(q, "ms"), kind: QUEEN_QUEUED.into(), text: excerpt(&s(q, "question"), 160), ..base() });
+        out.push(Event { ms: ms(q, "ms"), kind: QUEEN_QUEUED.into(), text: excerpt(&s(q, "question"), FEED_CHARS), ..base() });
         if let Some(at) = q["answered_ms"].as_i64() {
             let dur = u64::try_from(at - ms(q, "ms")).unwrap_or(0);
-            out.push(Event { ms: at, kind: QUEEN_ANSWERED.into(), dur_ms: dur, engineer: s(q, "answered_by"), text: excerpt(&s(q, "answer"), 160), ..base() });
+            out.push(Event {
+                ms: at,
+                kind: QUEEN_ANSWERED.into(),
+                dur_ms: dur,
+                engineer: s(q, "answered_by"),
+                text: excerpt(&s(q, "answer"), FEED_CHARS),
+                ..base()
+            });
         }
         if let Some(at) = q["dismissed_ms"].as_i64() {
             out.push(Event { ms: at, kind: QUEEN_DISMISSED.into(), text: s(q, "dismissed"), ..base() });
@@ -441,7 +474,7 @@ fn derive_history(home: &Path) -> Vec<Event> {
                 kind: kind.into(),
                 engineer: s(&d, "engineer"),
                 why: s(&d, "kind"),
-                text: excerpt(&s(&d, "text"), 160),
+                text: excerpt(&s(&d, "text"), FEED_CHARS),
                 ..Default::default()
             });
         }
@@ -528,19 +561,39 @@ pub fn day(ms: i64) -> String {
 /// Every `YYYY-MM-DD` from `first` to `last` (UTC), both included; empty if either is malformed.
 pub fn days_between(first: &str, last: &str) -> Vec<String> {
     let (Some(a), Some(b)) = (day_number(first), day_number(last)) else { return Vec::new() };
-    (a..=b).map(|d| day(d * 86_400_000)).collect()
+    (a..=b).map(|d| day(d * crate::clock::DAY_MS)).collect()
 }
 
-/// Days since 1970-01-01 of a `YYYY-MM-DD` date (Howard Hinnant's days_from_civil).
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date (clock.rs `days_from_civil`).
 fn day_number(date: &str) -> Option<i64> {
     let mut it = date.split('-').map(|p| p.parse::<i64>().ok());
     let (y, m, d) = (it.next()??, it.next()??, it.next()??);
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
+    Some(crate::clock::days_from_civil(y, m, d))
+}
+
+/// One session's corrections and vetoes (`per_session`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Said {
+    /// The engineer's corrections: a rejected tool call or a pushback (`CORRECTION`, a regret aside:
+    /// a regret is a later fix, counted in the session that fixed, not by the engineer in this one).
+    pub corrections: u64,
+    /// `borg no` vetoes (`VETO`).
+    pub vetoes: u64,
+}
+
+/// Per session, what the engineer said against its work: every correction and veto, whether or not
+/// `borg learn` merged it into a lesson (a merge is what outcome.rs sees; most corrections merge
+/// into none). The denominator for how often a mistake was seen at all, beside the results.
+pub fn per_session(events: &[Event]) -> BTreeMap<String, Said> {
+    let mut out: BTreeMap<String, Said> = BTreeMap::new();
+    for e in events.iter().filter(|e| !e.session.is_empty()) {
+        match e.kind.as_str() {
+            CORRECTION if e.why != "regret" => out.entry(e.session.clone()).or_default().corrections += 1,
+            VETO => out.entry(e.session.clone()).or_default().vetoes += 1,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The local events folded into this node's buckets, keyed by bucket id (version 0).
@@ -635,6 +688,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn corrections_and_vetoes_count_per_session_merged_or_not() {
+        let ev = |kind: &str, session: &str, why: &str| Event { kind: kind.into(), session: session.into(), why: why.into(), ..Default::default() };
+        let events = [
+            ev(CORRECTION, "a", "pushback"),
+            ev(CORRECTION, "a", "rejected_tool"),
+            ev(CORRECTION, "a", "regret"),
+            ev(VETO, "a", "prompt"),
+            ev(VETO, "b", "cli"),
+            ev(CHANGED, "b", ""),
+            ev(CORRECTION, "", "pushback"),
+        ];
+        let got = per_session(&events);
+        assert_eq!(got["a"], Said { corrections: 2, vetoes: 1 });
+        assert_eq!(got["b"], Said { corrections: 0, vetoes: 1 });
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
     fn concurrent_first_calls_agree_on_one_node() {
         // The node id stamps the outcomes and stats that sync: two hooks creating it at once must
         // agree on one.
@@ -662,7 +733,8 @@ mod tests {
         Event { engineer: engineer.into(), lessons: lessons.iter().map(|s| s.to_string()).collect(), n, ..Event::new(kind, ms) }
     }
 
-    const DAY: i64 = 86_400_000;
+    /// Derived: one day (clock.rs `DAY_MS`), the tests' unit.
+    const DAY: i64 = crate::clock::DAY_MS;
 
     #[test]
     fn days_between_fills_every_day() {
@@ -819,6 +891,44 @@ mod tests {
         assert_eq!(all[5].dur_ms, 60, "time to answer");
         assert_eq!(backfill(&home), 0, "once");
         assert_eq!(events(&home).len(), all.len() + 1, "history and live events together");
+    }
+
+    /// A stop's block asked lessons that two checks routed, a live ask delivered two checks' questions,
+    /// and the judge's call wrote one verdict record per check: each is one record per check in the log
+    /// and one event live, so one event in the history too, its lessons joined. Records of separate
+    /// calls (another stamp) and results counted per record stay apart.
+    #[test]
+    fn backfill_counts_one_event_per_call_as_live_counting_does() {
+        let home = tmp("backfill-call");
+        use serde_json::json;
+        let rec = |kind: &str, lessons: &[&str], ms: i64, channel: &str, check: &str| json!({"kind": kind, "session": "s1", "lessons": lessons, "ms": ms, "repo": "app", "channel": channel, "check": check});
+        let log = [
+            rec("asked", &["L1", "L2"], 110, "stop", "c1"),
+            rec("asked", &["L3"], 110, "stop", "c2"),
+            rec("asked", &["L4"], 120, "live", "c3"),
+            rec("asked", &["L5"], 120, "live", "c4"),
+            rec("asked_then_changed", &["L1"], 130, "stop", "c1"),
+            rec("asked_then_changed", &["L3"], 130, "stop", "c2"),
+            rec("asked", &["L6"], 140, "stop", "c5"),
+            rec("asked_not_corrected", &["L2"], 150, "stop", "c1"),
+            rec("asked_not_corrected", &["L6"], 150, "stop", "c5"),
+        ];
+        std::fs::write(home.join("outcomes.jsonl"), log.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+        record(&home, &ev(TURN_END, 1000, "a@x", &[], 0));
+        backfill(&home);
+        let all: Vec<(String, i64, u64, Vec<String>)> = read_events(&backfill_path(&home)).into_iter().map(|e| (e.kind, e.ms, e.n, e.lessons)).collect();
+        let row = |kind: &str, ms: i64, n: u64, lessons: &[&str]| (kind.to_string(), ms, n, lessons.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            all,
+            [
+                row(BLOCK, 110, 3, &["L1", "L2", "L3"]),
+                row(LIVE_ASK, 120, 2, &["L4", "L5"]),
+                row(CHANGED, 130, 0, &["L1", "L3"]),
+                row(BLOCK, 140, 1, &["L6"]),
+                row(NOT_CORRECTED, 150, 0, &["L2"]),
+                row(NOT_CORRECTED, 150, 0, &["L6"]),
+            ]
+        );
     }
 
     #[test]

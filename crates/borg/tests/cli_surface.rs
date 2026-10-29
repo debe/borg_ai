@@ -101,6 +101,7 @@ const DEBUG_PROBES: &[(&str, &[&str])] = &[
     ("expert", &["missing-repo"]),
     ("vectors", &["--query", "--store", "missing.jsonl"]),
     ("ope", &["--zz-probe"]),
+    ("select", &["--zz-probe"]),
 ];
 
 #[test]

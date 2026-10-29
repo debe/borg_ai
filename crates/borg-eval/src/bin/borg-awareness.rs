@@ -9,6 +9,9 @@
 //! upper bound on clobbers. Zero tokens.
 //!
 //! usage: borg-awareness [--claude DIR] [--omp DIR]
+//!
+//! Its numbers (example counts, excerpt widths) are experiment parameters of this offline
+//! measurement, not product defaults.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

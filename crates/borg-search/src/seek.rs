@@ -11,12 +11,17 @@ use seekstorm::index::{
 use seekstorm::search::{QueryRewriting, QueryType, ResultType, Search, SearchMode};
 use seekstorm::vector::{Embedding, Inference, Quantization};
 use seekstorm::vector_similarity::AnnMode;
+// SeekStorm's segment number bits: borg vectors.rs's, so the eval measures the product's index layout.
+use borg::vectors::SEGMENT_BITS;
 use serde_json::Value;
 
 use crate::Lesson;
 
 pub const FIELDS: [&str; 4] = ["question", "situations", "consequence", "scope"];
 const IDS: &str = "borg-ids.json";
+/// Model2Vec's chunk size for embedding a field. Experiment parameter: the value of SeekStorm's README
+/// example.
+const CHUNK: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -78,11 +83,11 @@ pub async fn build(lessons: &[Lesson], dir: &Path, model: Option<&Path>) -> Resu
         query_completion: None,
         clustering: Clustering::None,
         inference: match model {
-            Some(p) => Inference::Model2VecCustom { path: p.to_string_lossy().into(), chunk_size: 1000, quantization: Quantization::None },
+            Some(p) => Inference::Model2VecCustom { path: p.to_string_lossy().into(), chunk_size: CHUNK, quantization: Quantization::None },
             None => Inference::None,
         },
     };
-    let index = create_index(dir, meta, &schema, &Vec::new(), 11, true, Some(1)).await?;
+    let index = create_index(dir, meta, &schema, &Vec::new(), SEGMENT_BITS, true, Some(1)).await?;
     let docs: Vec<Document> = lessons
         .iter()
         .map(|l| {

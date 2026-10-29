@@ -34,13 +34,25 @@ use crate::membership::{self, Membership};
 use crate::peers;
 use crate::sync::{Node, Report};
 
+/// The loop's timing. `Default` is the one place its values are written: `borg mesh serve`'s
+/// `--interval` default and the bounds of the one-shot commands (main.rs) read them from it.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
+    /// How often every peer is dialled when nothing changed locally (60 s). Guard: bounds how stale
+    /// a node can be when a peer's change never triggered a dial (a member's own round failed, a
+    /// change that arrived over a third node); a local change is carried at the next `poll` anyway.
     pub interval: Duration,
+    /// How often the local files are checked for a change to carry (2 s). Method: the polling
+    /// period of a `stat` per synced file; a change made here is dialled within this much.
     pub poll: Duration,
+    /// The longest backoff after failed dials (30 min). Guard: bounds the doubling, so a peer back
+    /// after a long outage is dialled again within this much.
     pub backoff_max: Duration,
-    /// Longest one dial may take before it counts as a failure.
+    /// Longest one dial may take before it counts as a failure (30 s). Guard: a peer that accepts
+    /// and never answers holds up only its own dial, and only this long.
     pub timeout: Duration,
+    /// How long running sessions get to finish at a stop (5 s). Guard: Ctrl-C ends the node even
+    /// when a peer's session hangs.
     pub grace: Duration,
 }
 

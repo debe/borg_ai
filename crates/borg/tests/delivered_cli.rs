@@ -60,14 +60,16 @@ fn an_early_lesson_is_asked_judged_at_the_next_stop_and_found_by_a_merged_correc
     assert!(!stop(&root, "e1", "Done: the budget place has its own consumer.", false, &[]).contains("block"));
     let p = prompts(&root);
     assert_eq!(p.len(), 1, "the judge rides on the Stop's one model call");
-    assert!(p[0].contains("## Questions asked earlier in this session") && p[0].contains("[Mdrain] question:"), "{}", p[0]);
-    assert!(p[0].contains("answer: \n"), "a free delivery asked nothing, so no answer belongs to it: {}", p[0]);
+    assert!(p[0].contains("## Lessons from earlier in this session") && p[0].contains("[Mdrain] lesson:"), "{}", p[0]);
+    // Route-blind (judge v2): a free delivery's evidence has a question's shape, and nothing says how it came.
+    assert!(p[0].contains("\nafter: work since: ") && p[0].contains("\nthis turn: ") && !p[0].contains("answer:"), "{}", p[0]);
+    assert!(!p[0].contains("(declared:"), "a free delivery declares nothing: {}", p[0]);
     assert_eq!(records(&root, "asked_then_changed", "Mdrain"), [("early".to_string(), Value::Null)]);
     assert!(state(&root, "e1", "ctx").contains("#borg-judged Mdrain=changed"));
     // Judged once: the next Stop does not send it again.
     answer(&root, &[], json!([]));
     stop(&root, "e1", "Anything else?", false, &[]);
-    assert!(!prompts(&root)[1].contains("[Mdrain] question:"));
+    assert!(!prompts(&root)[1].contains("[Mdrain] lesson:"));
 
     // `borg learn` merges a later correction of the session into Mdrain: the early delivery was asked.
     let log = borg::outcome::read(&root.join("store/collectives/corp/outcomes.jsonl"));
@@ -97,8 +99,12 @@ fn a_queued_lesson_is_asked_with_p_1_and_judged_for_its_channel() {
     answer(&root, &[], verdict("Mdrain", false));
     stop(&root, "q1", "Invoices done.", false, &off);
     assert_eq!(prompts(&root).len(), 2, "one model call per Stop");
-    assert!(prompts(&root)[1].contains("[Mdrain] question:"));
+    assert!(prompts(&root)[1].contains("[Mdrain] lesson:"));
     assert_eq!(records(&root, "asked_ignored", "Mdrain"), [("queued".to_string(), Value::Null)]);
+    // The result names the check that handed it over and the judge's version.
+    let check = outcomes(&root).into_iter().find(|o| o["kind"] == "graded").unwrap()["check"].clone();
+    let result = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_ignored").unwrap();
+    assert_eq!((result["check"].clone(), result["judge"].clone()), (check, json!(2)), "{result}");
     assert!(state(&root, "q1", "cost").contains("judge call=2 pending=1 resolved=1"), "{}", state(&root, "q1", "cost"));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -120,8 +126,14 @@ fn a_lesson_delivered_early_then_asked_at_a_stop_is_judged_for_each() {
     stop(&root, "a1", "Done: the budget place has its own consumer.", false, &[]);
     let p = prompts(&root);
     assert_eq!(p.len(), 2);
-    assert!(p[1].contains("[Mdrain] question:") && p[1].contains("(declared: applies)"), "{}", p[1]);
     assert_eq!(records(&root, "asked_then_changed", "Mdrain"), [("stop".to_string(), Value::Null)]);
+    // A random half of the questions are judged without their declaration (seeded by the check): the
+    // result says which, and the evidence agrees.
+    let result = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_then_changed" && o["channel"] == "stop").unwrap();
+    match result["stripped"].as_bool().unwrap_or(false) {
+        true => assert!(p[1].contains("[Mdrain] lesson:") && !p[1].contains("(declared:") && !p[1].to_lowercase().contains("mdrain: applies"), "{}", p[1]),
+        false => assert!(p[1].contains("[Mdrain] lesson:") && p[1].contains("(declared: applies)"), "{}", p[1]),
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -165,7 +177,7 @@ fn a_free_delivery_after_a_block_never_pushes_its_questions_out_of_the_judge() {
     let p = prompts(&root);
     let judged = p.last().unwrap();
     for q in &questions {
-        assert!(judged.contains(&format!("[{q}] question:")), "{q} left out of the judge: {judged}");
+        assert!(judged.contains(&format!("[{q}] lesson:")), "{q} left out of the judge: {judged}");
     }
     assert!(state(&root, "f1", "cost").contains("pending=10"), "{}", state(&root, "f1", "cost"));
     let _ = std::fs::remove_dir_all(root);
@@ -240,7 +252,7 @@ fn borg_learn_finds_free_deliveries_corrected_and_settles_the_rest_at_session_en
     let kinds = |lesson: &str| -> Vec<String> {
         let mut k: Vec<String> = outcomes(&root)
             .into_iter()
-            .filter(|o| o["kind"] != "asked" && o["kind"] != "graded" && o["lessons"].as_array().unwrap().iter().any(|l| l == lesson))
+            .filter(|o| !["asked", "graded", "delivery"].contains(&o["kind"].as_str().unwrap()) && o["lessons"].as_array().unwrap().iter().any(|l| l == lesson))
             .map(|o| o["kind"].as_str().unwrap().to_string())
             .collect();
         k.sort();

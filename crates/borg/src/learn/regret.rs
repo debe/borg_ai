@@ -18,8 +18,9 @@ pub const KIND: &str = "regret";
 /// builder's account, `fix_subject` the finding and `diff` its detail.
 pub const REVIEW: &str = "review";
 
-/// Each excerpt in the prompt is cut to this many characters.
-pub const CAP: usize = 1500;
+/// Each excerpt in the prompt is cut to this many characters. Derived: an episode's excerpt bound
+/// (learn.rs `EXCERPT_CHARS`), so a regret's prompt keeps as much of each part as a correction's.
+pub const CAP: usize = super::EXCERPT_CHARS;
 
 /// The decision and the fix that changed its lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

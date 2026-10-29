@@ -193,7 +193,8 @@ fn output_of(a: &SubAgent) -> Option<Value> {
     starts.rev().find_map(|i| serde_json::Deserializer::from_str(&w[i..]).into_iter::<Value>().next()?.ok().filter(listed))
 }
 
-/// A finding's detail is cut to this many characters.
+/// A finding's detail is cut to this many characters. Guard: bounds what one review finding adds to
+/// the episode and the learning prompt, whatever the reviewer wrote.
 pub const DETAIL_CHARS: usize = 800;
 
 const TEXT_KEYS: &[&str] = &["title", "claim", "problem", "description", "issue", "body"];

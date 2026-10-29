@@ -121,7 +121,12 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 &["local", "collective", "all"],
                 crate::msg::FLAGS,
             ),
-            cmd("inbox", &[("[--all] [--json]", "this session's messages; from a terminal, every recent one")], &[], crate::msg::INBOX_FLAGS),
+            cmd(
+                "inbox",
+                &[("[--all] [--json] [--show ID]", "this session's messages; from a terminal, every recent one; --show ID: one whole")],
+                &[],
+                crate::msg::INBOX_FLAGS,
+            ),
             cmd(
                 "listen",
                 &[("[--off]", "wake this session when a message arrives while it is idle"), ("--wait|--stream|--queue", "the waiter (started by borg)")],
@@ -156,6 +161,15 @@ pub const DEBUG: &[Command] = &[
     },
     cmd("vectors", &[("--query [--store LESSONS]", "the vector shortlist for a context on stdin")], &[], &["--query", "--store"]),
     cmd("ope", &[("[--dir DIR | --file FILE] [--json]", "off-policy estimates of the belief's hand-set weights")], &[], &["--dir", "--file", "--json"]),
+    cmd(
+        "select",
+        &[(
+            "[--replay] [--rebuild] [--dir DIR | --file FILE] [--json] [--eval RUNS_DIR --qrels FILE]",
+            "the lesson selection policy and its pre-registered checks",
+        )],
+        &[],
+        &["--replay", "--rebuild", "--dir", "--file", "--json", "--eval", "--qrels"],
+    ),
 ];
 
 /// What hooks and drones run, never listed: dispatched, not shown.

@@ -18,8 +18,9 @@ use crate::notes::links::{Link, Touched};
 use crate::notes::regress_diff::Hunk;
 use crate::notes::{Excerpt, redact};
 
-/// Each excerpt of an episode is cut to this many characters.
-const CAP: usize = 1500;
+// Each excerpt of an episode is cut to as many characters as the regret prompt keeps of it (derived:
+// learn/regret.rs `CAP`), so what is written is what `borg learn` asks with.
+use regret::CAP;
 
 /// What the fix's session and commit add to a link.
 #[derive(Debug, Clone, Default)]

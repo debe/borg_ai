@@ -17,11 +17,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use borg::clock::{self, DAY_MS};
 use borg::collective::Share;
 use borg::{learn, stats};
 use serde_json::{Value, json};
-
-const DAY_MS: i64 = 86_400_000;
 
 /// The Monday (UTC) of the week `ms` falls in, as a day number since 1970-01-01 (a Thursday).
 fn week(ms: i64) -> i64 {
@@ -33,13 +32,7 @@ fn week(ms: i64) -> i64 {
 fn week_of_day(day: &str) -> Option<i64> {
     let mut it = day.split('-').map(|p| p.parse::<i64>().ok());
     let (y, m, d) = (it.next()??, it.next()??, it.next()??);
-    // Howard Hinnant's days_from_civil.
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(week((era * 146_097 + doe - 719_468) * DAY_MS))
+    Some(week(clock::days_from_civil(y, m, d) * DAY_MS))
 }
 
 /// Counts per (series, week).

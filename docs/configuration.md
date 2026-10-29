@@ -117,7 +117,8 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `engineers` | Optional. Merges one person's git emails into one author for trust, `borg status` and `borg top`. Never synced |
 | `relay` | Optional, per collective. How the mesh crosses NAT; see [Relays](team-sync.md#how-peers-find-each-other) |
 | `mode` | Optional, per collective. `"live"` (default): the conscience judges the work at the turn end and also during the turn, after state-changing tool calls (Claude Code, omp ≥18.4.4, opencode 1.x and 2.x, Codex). `"hook"`: at the turn end only, about an eighth of live's own cost. `BORG_MODE` overrides it. An unknown value is live, with a warning in `borg doctor`. See [Delivery modes](delivery.md#delivery-modes) |
-| `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`) |
+| `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`). `"drone": true` also asks a read-only agent in the checkout when its index has nothing; it is bounded by time (120 s at most, and what the stop's budget leaves), and its cost is measured, never capped |
+| `budget` | Optional, per collective; none by default. The pool tokens this collective's checks may read per session, on average. Without it, lesson selection's spend is measured and shown, never priced. With it, the learned policy (`BORG_SELECT=learned`) prices a larger pool so that the replayed spend stays within the budget, from its first fit that knows the budget, its gate open or not; the fixed rule, the default, reads no budget. `borg status`, `borg top` and borg web show the budget, what was read and the price. A value that is not a positive number counts as none and never invalidates the config. See [Which lessons are asked](delivery.md#which-lessons-are-asked) |
 | `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
 
 An invalid config (bad JSON, two collectives sharing one store, an email under two engineers, `personal`
@@ -174,11 +175,12 @@ root). The mesh syncs the files marked *synced*, and only for a team collective.
 |---|---|
 | `lessons.jsonl` | The lessons. Synced |
 | `episodes.jsonl` | The corrections, vetoes and regrets `borg learn` turns into lessons |
-| `outcomes.jsonl` | What followed each lesson asked: ignored, changed, corrected, vetoed, regretted, tested |
+| `outcomes.jsonl` | What followed each lesson asked: ignored, changed, corrected, vetoed, regretted, tested. Also every graded check with its routes and propensities, what delivery did with each lesson (`delivery`), each run of a session's end hook (`ended`), and the judge's verdicts on placebos |
+| `select-summary.json` | The lesson selection summary the hooks read: the outcome log folded and the policy's fit, rebuilt from the log whenever it is missing or of another format. Local, never synced. `select-summary.json.lock` (local) lets one learned check of the store decide and record at a time; the fixed rule takes no lock. `select-reverted` (local) is the monitor's mark that put the fixed rule back: delete it to let the learned policy learn again |
 | `outcomes-team.jsonl` | The outcomes redacted for the team: lesson ids, what followed, when, the asking probability, session and repo hashed. Synced. `outcomes-team.published` (local) remembers how much was published |
 | `stats.jsonl` | One usage rollup per node, engineer and day: counts, cost, lesson ids. Synced. The raw events stay in `stats/events.jsonl` |
 | `constraints.jsonl` | Constraints ratified from a [`borg no`](commands.md#saying-no). Synced |
-| `messages.jsonl` | [Messages](commands.md#messages) between sessions, pauses, resumes and vetoes: a week at most, the newest 500. Synced. `messages/` (local) records which session saw each one, and which pauses and vetoes count here |
+| `messages.jsonl` | [Messages](commands.md#messages) between sessions, pauses, resumes and vetoes, and the `seen` lines that acknowledge them: a week at most, and of each member's lines the newest of each class within 1 MiB. Synced. `messages/` (local) records which session saw each one, which pauses and vetoes count here, and `messages/generation` the log's talk generation, which moves only when a tell, ask or steer is written, so an acknowledgement makes no hook or waiter read the log again |
 | `reasoning.jsonl` | Redacted reasoning excerpts and [decision → fix links](#decision--fix-links), replicated by the mesh |
 | `lessons.jsonl.lock` | Lets one `borg learn` run per collective at a time |
 | `queen/` | Open questions for the engineer and their answers |
@@ -451,7 +453,7 @@ All are optional.
 | `BORG_CONFIG` | `~/.config/borg/collectives.json` | The collectives config |
 | `BORG_HOME` | `~/.local/share/borg` | Root of the stores |
 | `BORG_STATE` | `/tmp/borg` | Per-session scratch state |
-| `BORG_BIN` | `borg` on `PATH` | The binary the omp and opencode adapters run, for hooks and for `borg listen` |
+| `BORG_BIN` | `borg` on `PATH` | The binary the omp and opencode adapters run, for hooks and for `borg listen` (whose `--stream` waiter also retries a wake the harness refused) |
 | `BORG_OPENCODE_LOG` | none | A file the opencode adapter logs what it did to, with every error it swallowed |
 | `BORG_RELAY` | the collective's `relay` | Mesh relay for every collective: `default` (n0), `disabled`, or URL(s) |
 
@@ -504,16 +506,17 @@ project.
 | `BORG_PREFILTER` | `8.0` | Threshold of the free gate; `off` always calls the model |
 | `BORG_STOP_GATE` | word gate | `edits`: call the model only for turns that edited files or changed state |
 | `BORG_STOP_POOL` | whole pool | `shortlist`: show the model only the word-matching shortlist |
-| `BORG_STOP_POOL_TOKENS` | `12000` | Token budget of the lesson pool |
+| `BORG_STOP_POOL_TOKENS` | `12000` (the learned policy's own choice under `BORG_SELECT=learned`) | Token budget of the lesson pool, for every check. Unset, the fixed rule keeps 12,000 and the learned policy chooses it. A pool the budget cut also shows the model up to two of the lessons it left out (the tail sample, [The pool](delivery.md#which-lessons-are-asked)) |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
-| `BORG_STOP_ATTENTION` | off | `on`: a blocking check asks the model's top `k` applying lessons and hands the rest over free. `k` is the smallest cut that, by conformal risk control over this collective's last 200 labelled checks, misses a needed lesson no more often than the fixed rule; ranks 0–10 until there are enough labels (at least ⌈1/α⌉ − 1, 999 while the fixed rule misses none). Labels come only from explored checks: every tenth blocking check asks every applying lesson, up to 20, so the cut never calibrates on what it chose not to ask. Off until its evaluation passes |
-| `BORG_STOP_ASK_CAP` | none | Evaluation only: a block asks only the first N grade-3 lessons |
-| `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; its grade-3 lessons arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A grade 3 no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
+| `BORG_SELECT` | the fixed rule | The fixed rule: with a grade 3 every 3 and 2 is asked, and the 1s up to 10 lessons; without one the 2s and 1s are handed over free, up to 10, never a lesson the session already had. `learned`: the learned policy decides, opt-in until its pre-registered checks pass ([Evidence](evidence.md#lesson-selection)). `fixed`: the fixed rule whatever else is set; it wins over `BORG_STOP_ASK_CAP` and `BORG_STOP_ATTENTION`, which win over `learned`. Any other value is the default ([Which lessons are asked](delivery.md#which-lessons-are-asked)) |
+| `BORG_STOP_ASK_CAP` | none | Evaluation only: a block asks only the first N grade-3 lessons. Wins over `BORG_STOP_ATTENTION` and `BORG_SELECT=learned`; `BORG_SELECT=fixed` wins over it |
+| `BORG_STOP_ATTENTION` | off | Evaluation only. `on`: a blocking check asks the model's top `k` applying lessons and hands the rest over free. `k` is the smallest cut that, by conformal risk control over the last 200 labelled checks of the store whose lessons it reads, misses a needed lesson no more often than the fixed rule; ranks 0–10 until there are enough labels (at least ⌈1/α⌉ − 1, 999 while the fixed rule misses none). Labels come only from explored checks: every tenth blocking check asks every applying lesson, up to 20, so the cut never calibrates on what it chose not to ask. Its evaluation missed its bar ([Evidence](evidence.md#experiments)) |
+| `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; the lessons it asks arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A question no tool call delivered blocks the stop; one from a check that finishes after the stop arrives with the next prompt. `hook`: at the turn end only. Overrides the config |
 | `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it, or a quarter of `BORG_STOP_BUDGET_MS` when that is less |
 | `BORG_PREDICT_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for the turn-end check (see *Model runner*); `off`: no model call |
 | `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (and of a live check's call; a live check's lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`) |
-| `BORG_STOP_BUDGET_MS` | 60 s | Stop-hook budget when the harness gives none (the adapters set it: omp 28 s, opencode 90 s). It bounds the expert drone and, when set, sizes the stop's wait for a live check (at most a quarter of it, never over 15 s) and its model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp 7 s and at most 18 s |
+| `BORG_STOP_BUDGET_MS` | the harness's stop budget: omp 28 s, opencode and Codex 90 s, Claude Code none ([Capabilities](harnesses.md#capabilities)) | The stop hook's budget; the omp and opencode adapters set it to the budget borg's first answer gave them. It bounds the expert drone (60 s without any budget) and, when there is one, sizes the stop's wait for a live check (at most a quarter of it, never over 15 s) and its model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp 7 s and at most 18 s |
 | `BORG_VECTORS` | on | `off`: no vector recall |
 | `BORG_VECTOR_MODEL` | `~/.local/share/borg/models/potion-multilingual-128M` | Model directory |
 | `BORG_VECTOR_K` | `10` | Vector hits added to the shortlist |

@@ -18,8 +18,14 @@ use borg::{conscience, vectors};
 use borg_search::read_queries;
 use serde_json::Value;
 
+/// Experiment parameter: BM25's share of the Stop shortlist the eval measured (the list
+/// `vectors::extend` builds on).
 const SHORT: usize = 20;
+/// Experiment parameter: the wider BM25 list it is compared with (the product's `vectors::SHORTLIST`
+/// when the eval ran).
 const WIDE: usize = 30;
+/// Experiment parameter: the depth the vector ranking is recorded to, past the shortlist's `DEFAULT_K`.
+const VECTOR_TOP: usize = 60;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -74,7 +80,7 @@ fn rank(out: &Path, root: &Path, files: &[String]) {
         let pool = conscience::load(&lessons, None);
         let bm: Vec<&conscience::Challenge> = conscience::select_scoped(&pool, &q.query, &q.query, WIDE);
         let t = std::time::Instant::now();
-        let vec = vectors::engine::query(&vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), 60).expect("query");
+        let vec = vectors::engine::query(&vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), VECTOR_TOP).expect("query");
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let short = vectors::extend(bm.iter().take(SHORT).copied().collect(), &vec, &pool, &q.query, vectors::DEFAULT_K);
         // descriptive: BM25 top 30 + the vector hits

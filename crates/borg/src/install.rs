@@ -110,17 +110,9 @@ pub fn plan(action: Action, h: &dyn Harness, t: &Targets, bin: &Path) -> Result<
 /// UTC `YYYYMMDDTHHMMSS` for an epoch-ms time (no time crate for one format).
 pub fn utc(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let day_s = crate::clock::DAY_MS / 1000;
+    let (days, rem) = (secs.div_euclid(day_s), secs.rem_euclid(day_s));
+    let (y, m, d) = crate::clock::civil_from_days(days);
     format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
@@ -245,18 +237,21 @@ fn print_status(t: &Targets) {
             "  cost         {} extra rounds (Stop blocks, {} questions, ~{} tokens); {} free deliveries ({} lessons, ~{} tokens, no extra round)",
             g.rounds,
             g.questions,
-            g.block_chars / 4,
+            g.block_chars / crate::whole::CHARS_PER_TOKEN,
             g.free,
             g.free_lessons,
-            g.free_chars / 4
+            g.free_chars / crate::whole::CHARS_PER_TOKEN
         );
         println!(
             "  judge        {} model calls also judged {} asked lessons ({} settled; ~{} prompt tokens added, no extra call)",
             g.judge_calls,
             g.judged,
             g.judge_resolved,
-            g.judge_chars / 4
+            g.judge_chars / crate::whole::CHARS_PER_TOKEN
         );
+        // The store's lesson selection (top.rs `selection`, tested there).
+        let selection = crate::top::selection(&home.join("lessons.jsonl"), crate::select::policy());
+        println!("  selection    {}", crate::top::selection_line(&selection));
         match s.last_asked {
             None => println!("  last asked   never"),
             Some((ms, ids)) => {
@@ -845,13 +840,13 @@ mod tests {
         assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/usr/local/bin/guard");
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "notify-send done", "their Stop hook stays first");
         assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], "'/opt/borg dir/borg' hook claude stop");
-        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], claude::STOP_TIMEOUT_S, "the stop hook's budget is explicit");
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["timeout"], harness::STOP_TIMEOUT_S, "the stop hook's budget is explicit");
         assert!(v["hooks"]["PostToolUse"][0]["hooks"][0].get("timeout").is_none());
         // An install from before the timeout is brought up to it.
         let old = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/b/borg hook claude stop"}]}]}}"#;
         let up: Value = serde_json::from_str(&claude_hooks().install(Some(old), Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         assert_eq!(up["hooks"]["Stop"].as_array().unwrap().len(), 1);
-        assert_eq!(up["hooks"]["Stop"][0]["hooks"][0]["timeout"], claude::STOP_TIMEOUT_S);
+        assert_eq!(up["hooks"]["Stop"][0]["hooks"][0]["timeout"], harness::STOP_TIMEOUT_S);
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "permissions", "hooks", "zz_last"], "key order kept");
         let wired = claude_hooks().wired(Some(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()));

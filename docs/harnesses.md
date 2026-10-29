@@ -70,12 +70,43 @@ effect of a refactor.
 | `session_env` | The variable the harness sets to its session's id in every command its model runs, so `borg listen`, `tell` and `inbox` know the session | `CLAUDE_CODE_SESSION_ID` | `PI_SESSION_ID` | none: the shell gets no session id, so the plugin binds the session itself | `CODEX_THREAD_ID` |
 | `pid_env` | For a harness without `session_env`: the variable that carries its pid, which its events carry too, so presence names the session | none | none | `OPENCODE_PID` | none |
 | `drone_wake` | How `borg listen` wakes an idle session ([Waking a session](commands.md#waking-a-session)) | `Model`: the model runs `borg listen --wait` in the background | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
-| `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | none (the adapter sets 28 s) | none (the adapter sets 90 s) | 90 s, the Stop hook's timeout |
+| `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | 28 s: omp's fixed 30 s handler limit less 2 s for the adapter | 90 s, borg's stop timeout (opencode sets no limit) | 90 s, the Stop hook's timeout |
+| `context_chars` | The characters of context one hook answer may inject and have arrive whole, shared by everything that event delivers (messages, lessons) | 10,000: Claude Code saves a longer `additionalContext` to a file and gives the model a preview (2.1.312) | 10,000, the guard: omp injects it whole, with no limit of its own (18.13.1) | 10,000, the guard: no limit of its own (1.19.0; 2.x not measured) | 10,000: Codex's default `additionalContextLimit`; a longer one is cut to its head and tail (0.153.2) |
 
 omp and opencode already have a channel for early delivery. It stays off until
 an evaluation shows they help. Standing lessons (ratified constraints) are exempt: they are no ranking
 guess, so they arrive early on every harness whose `prompt_context` or `tool_context` takes them
 (hook.rs `early`).
+
+Where a harness sets no context limit, the guard is the strictest limit another harness sets
+(`CONTEXT_GUARD`), so one event, a flood of messages or a long pool of lessons, cannot fill the model's
+context. A message longer than what an event has left shows its head and `borg inbox --show <id>`.
+
+**Budgets for adapters.** How long an adapter waits for borg at each event before it fails open, and
+how much of a shell call's output it sends (`tail_chars`, 4,000), are borg's: `Budgets` in
+`harness/omp.rs` and `harness/opencode.rs`. An adapter sends `"budgets": true` with its events until an
+answer carried `"budgets"` (`prompt_ms`, `pre_ms`, `post_ms`, `stop_ms`, `end_ms`, `tail_chars`); its own
+copy is only the fallback before that, and a test keeps the two equal. The adapter passes `stop_ms` on
+as `BORG_STOP_BUDGET_MS`.
+
+| Budget | omp | opencode |
+|---|---|---|
+| prompt | 5 s | 5 s |
+| before a tool call | 2 s | 2 s |
+| after a tool call | 5 s | 2 s |
+| stop | 28 s | 90 s |
+| session end | 1.5 s (omp's 2 s limit less 0.5 s) | 90 s |
+
+An answer that showed messages names them (`"shown_ids"`; it gives no count). An adapter drops a held
+wake only once its turn's hooks handed the model every message the wake names, by those ids: one event
+may show a newer message and leave the wake's. The ids add up over the turn's hooks, so a wake whose
+messages borg showed over several is dropped too, and one that arrives after they were handed over is
+dropped as it arrives. The wake goes when that context reaches the model, not when borg answers, so an
+answer kept for a later call (opencode's that came after its call's budget, omp's to a steer, kept for
+the next agent start or tool result) drops nothing until that call carries it. An answer that names none
+(an older borg's) drops nothing, and a wake that names none (an older waiter's) is never dropped. Only
+the adapters get that key: a `CommandHooks` harness (Claude Code, Codex) parses the answer itself and
+never gets it.
 
 With no budget at all, the expert drone keeps inside 60 s and the model call inside the model's own
 limit. The 60 s is Claude Code's old command-hook default, so a Stop hook installed without a `timeout`
@@ -128,7 +159,7 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
   in the background.
 - **Esc.** Codex's `Interrupt` hook (3 s) becomes `halted`: the turn of a listening session ends at
   once, so wakes go in again. Without it, a turn with no stop and a tool call that never ended would
-  hold wakes off for 10 minutes.
+  hold wakes off as long as the session's own tool calls run (10 minutes until it has some).
 - **Borg's own calls.** `--ignore-user-config` still loads `$CODEX_HOME/hooks.json`. The `codex:` runner
   passes `-c features.hooks=false`, so its call never runs borg's hooks, and never passes
   `--dangerously-bypass-hook-trust`.

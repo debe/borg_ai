@@ -20,7 +20,7 @@ fn facets_for_written(store: &std::path::Path, from: u64) {
     if ids.is_empty() || !borg::facets::enabled() {
         return;
     }
-    let r = borg::facets::fill(store, Some(&ids), true, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema), 4, learn::now_ms());
+    let r = borg::facets::fill(store, Some(&ids), true, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema), borg::runner::JOBS, learn::now_ms());
     if r.written > 0 || !r.failed.is_empty() {
         println!(
             "facets written for {} lessons (${:.4}){}",
@@ -140,6 +140,12 @@ fn learn_store(home: &std::path::Path, session: Option<&str>) -> (usize, usize, 
     // outcomes (outcome.rs `publish`) for the mesh.
     borg::stats::rollup(home);
     borg::outcome::publish(home);
+    // The selection policy's fit (select/summary.rs `refit`), after the session's lessons settled so its
+    // deliveries count; never in a hook, which reads the fit cached here. A store with no outcomes has
+    // nothing to fit.
+    if borg::outcome::path_beside(&store).exists() {
+        let _ = borg::select::summary::refit(&store);
+    }
     got
 }
 
@@ -209,6 +215,7 @@ fn debug_cmd(args: &[&str]) {
         ["expert", repo, rest @ ..] => std::process::exit(expert::main(repo, rest)),
         ["vectors", rest @ ..] if rest.contains(&"--query") => std::process::exit(borg::vectors::main(rest)),
         ["ope", rest @ ..] => std::process::exit(borg::ope::main(rest)),
+        ["select", rest @ ..] => std::process::exit(borg::select::replay::main(rest)),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), true)),
         _ => {
             eprint!("{}", help(atty(2), true));

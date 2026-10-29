@@ -32,13 +32,19 @@ pub type Ask<'a> = &'a (dyn Fn(&str, &Value) -> Option<(Value, Option<f64>)> + S
 /// The angles, in the order facets are stored.
 pub const ANGLES: [&str; 6] = ["concept", "symptom", "action", "consequence", "german", "aliases"];
 
-/// At most this many facets per lesson, each at most `FACET_CHARS` characters.
+/// At most this many facets per lesson, each at most `FACET_CHARS` characters. Guard: bounds what a
+/// model answer adds to a lesson (and to the search index) however much it writes; the prompt asks
+/// for 6 to 8, so a good answer is never cut.
 pub const MAX_FACETS: usize = 10;
+/// Guard: one facet is a phrase, not a paragraph; a longer one is cut.
 pub const FACET_CHARS: usize = 300;
-/// A model answer with fewer usable facets is no answer (retried by the next run).
+/// A model answer with fewer usable facets is no answer (retried by the next run). Guard: a refusal
+/// or a truncated answer is not stored as the lesson's facets.
 const MIN_FACETS: usize = 3;
 
-/// The cost estimate of a dry run, USD per lesson: the measured mean on the eval stores, $0.0112 (internal evaluation "facets", not published), rounded up.
+/// The cost estimate of a dry run, USD per lesson. Learned (measured once): the mean on the eval
+/// stores, $0.0112 (internal evaluation "facets", not published), rounded up. Display only: what
+/// `borg facets` without `--apply` says a run would cost; nothing is capped by it.
 pub const EST_USD_PER_LESSON: f64 = 0.012;
 
 const PROMPT: &str = "You index one lesson for keyword search (BM25). Coding agents will be matched against it with what \
@@ -169,7 +175,7 @@ pub fn fill(path: &Path, only: Option<&HashSet<String>>, apply: bool, ask: Ask, 
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(l) = todo.get(i) else { break };
-                    if failures.load(Ordering::SeqCst) >= 3 && successes.load(Ordering::SeqCst) == 0 {
+                    if failures.load(Ordering::SeqCst) >= crate::runner::MAX_FAILURES && successes.load(Ordering::SeqCst) == 0 {
                         out.lock().unwrap().failed.push(l.id.clone());
                         continue;
                     }
@@ -220,7 +226,7 @@ pub const USAGE: &str = "usage: borg facets [--apply] [--store LESSONS.jsonl] [-
 /// `borg facets [--apply] [--store PATH] [--jobs N]`: backfill facets for a store (default: this
 /// collective's, `BORG_HOME`). The exit code.
 pub fn main(args: &[&str], ask: Ask) -> i32 {
-    let (mut store, mut jobs, mut apply) = (learn::home().join("lessons.jsonl"), 4usize, false);
+    let (mut store, mut jobs, mut apply) = (learn::home().join("lessons.jsonl"), crate::runner::JOBS, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {

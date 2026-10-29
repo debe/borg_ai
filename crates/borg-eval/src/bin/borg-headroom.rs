@@ -2,6 +2,9 @@
 //! transcripts we already have. Zero tokens spent.
 //!
 //! usage: borg-headroom [--claude DIR] [--omp DIR] [--min-sessions N]
+//!
+//! Its numbers (`--min-sessions`, bucket bounds, example counts, excerpt widths) are experiment
+//! parameters of this offline measurement, not product defaults.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;

@@ -33,6 +33,8 @@ use std::sync::OnceLock;
 const ADOPT_FD: &str = "BORG_LISTEN_FD";
 
 /// How often an exec of a busy file (`ETXTBSY`) is tried, 25 ms apart, the stop signals held meanwhile.
+/// Guard: half a second for an installer still closing the new binary, then the old image keeps
+/// running rather than retrying forever with Ctrl-C held off.
 const BUSY_TRIES: u32 = 20;
 
 /// Set in the environment of a process `Image::restart` exec'd: its stops are blocked until
@@ -44,11 +46,13 @@ const RESTARTED: &str = "BORG_RESTARTED";
 const PROBE: &str = "BORG_RESTART_PROBE";
 const PROBED: &str = "takes a restart in place";
 
-/// How long `restart` waits for its probe's answer.
+/// How long `restart` waits for its probe's answer. Guard: a new file that hangs on `--help` is not
+/// exec'd, and the running image goes on.
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long `restart` waits for the process's other threads to end (Linux), so a stop can reach
-/// no thread but the one that holds it blocked.
+/// no thread but the one that holds it blocked. Guard: a thread that never ends delays the restart
+/// by this much, never blocks it.
 const ALONE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What makes one executable file this one: a rename, a copy or a rebuild changes one of them.
@@ -136,7 +140,13 @@ pub struct Image {
 }
 
 impl Image {
+    /// This process's image. In this crate's unit tests an image of no file, never stale or due: their
+    /// binary is the shared target's, which another `cargo test` may rebuild while a waiter test runs
+    /// (listen.rs `Waiter`), and a re-exec would replace the test runner with it.
     pub fn now() -> Image {
+        if cfg!(test) {
+            return Image::of(PathBuf::new(), None);
+        }
         Image::of(exe_path(), std::fs::File::open("/proc/self/exe").ok())
     }
 
@@ -458,6 +468,15 @@ mod tests {
         install(&p, "#!/bin/sh\nexec /bin/false\n");
         assert!(img.due(), "a new file is tried");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Guard: the test binary may be rebuilt under a running waiter test; an image taken in a unit test
+    /// names no file, so it is never stale or due.
+    #[test]
+    fn an_image_in_a_unit_test_never_follows_the_test_binary() {
+        let img = Image::now();
+        assert!(exec_id(&img.path).is_none() && !img.stale() && !img.due());
+        assert!(exec_id(&exe_path()).is_some(), "the test binary itself is a file: the seam, not the path, keeps it out");
     }
 
     /// A running binary deleted from under a path that stays (a symlinked install's old target) is

@@ -133,20 +133,45 @@ pub fn parse_ts(s: &str) -> i64 {
     let (y, mo, d) = (num(0..4), num(5..7), num(8..10));
     let (h, mi, sec) = (num(11..13), num(14..16), num(17..19));
     let ms = if b.get(19) == Some(&b'.') { num(20..23) } else { 0 };
-    // Days from civil (Howard Hinnant).
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    ((days * 24 + h) * 60 + mi) * 60_000 + sec * 1000 + ms
+    ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + sec * 1000 + ms
 }
 
-/// Approximate token count of a JSON tool result.
+/// Days since 1970-01-01 of the civil (proleptic Gregorian) date `y-m-d`, Howard Hinnant's
+/// `days_from_civil`. The one calendar routine of borg's crates, with `civil_from_days` (borg's
+/// clock.rs re-exports both). Its numbers are the calendar's (method): 146 097 days in a 400-year
+/// era, 719 468 days from 0000-03-01 to 1970-01-01, the year counted from March.
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The civil date `(year, month, day)` of a day number since 1970-01-01, Howard Hinnant's
+/// `civil_from_days`: the inverse of `days_from_civil`, with the same calendar numbers.
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// Characters per token wherever borg estimates a token count: a transcript's tool results here, a
+/// lesson line's cost (borg whole.rs), the cost lines of `borg status`. Method: the usual rule of
+/// thumb for English text and code under today's BPE tokenizers; an estimate, never a bound.
+pub const CHARS_PER_TOKEN: usize = 4;
+
+/// Approximate token count of a JSON tool result (`CHARS_PER_TOKEN`, counted in bytes).
 pub fn approx_tokens(v: &serde_json::Value) -> u64 {
     match v {
-        serde_json::Value::String(s) => s.len() as u64 / 4,
+        serde_json::Value::String(s) => (s.len() / CHARS_PER_TOKEN) as u64,
         serde_json::Value::Array(a) => a.iter().map(approx_tokens).sum(),
         serde_json::Value::Object(o) => o.get("text").or_else(|| o.get("content")).map(approx_tokens).unwrap_or(0),
         _ => 0,
@@ -218,6 +243,27 @@ mod tests {
         assert_eq!(parse_ts("1970-01-01T00:00:00.000Z"), 0);
         assert_eq!(parse_ts("2026-09-15T22:18:11.638Z"), 1_789_510_691_638);
         assert_eq!(parse_ts("garbage"), 0);
+    }
+
+    #[test]
+    fn the_calendar_round_trips_and_knows_its_dates() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(2026, 10, 28), 20_754);
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29), "a leap day");
+        // Every day of eight centuries, around both era boundaries (1600, 2000) and the epoch.
+        for z in days_from_civil(1600, 1, 1)..days_from_civil(2400, 1, 1) {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+            assert!((1..=12).contains(&m) && (1..=31).contains(&d), "{z}: {y}-{m}-{d}");
+        }
+    }
+
+    #[test]
+    fn a_token_is_four_bytes_of_text() {
+        assert_eq!(approx_tokens(&serde_json::json!("12345678")), 2);
+        assert_eq!(approx_tokens(&serde_json::json!([{"text": "1234567"}, "abcd"])), 2, "each part rounds down");
     }
 
     #[test]

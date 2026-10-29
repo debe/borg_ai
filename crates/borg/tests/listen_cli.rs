@@ -46,6 +46,9 @@ fn command(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Comm
     c.args(args)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
+        .env("BORG_PREDICT_MODEL", "off")
+        .env("BORG_LEARN_MODEL", "off")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_MATCH", "bm25")
@@ -115,7 +118,7 @@ fn send(root: &Path, work: &Path, cmd: &str, to: &str, text: &str) -> String {
     send_as(root, work, &[], cmd, to, text)
 }
 
-/// Sends from the session `env` names (one message per sender and recipient per msg.rs `RATE_MS`).
+/// Sends from the session `env` names (a sender's window to one recipient, msg.rs `window_for`).
 fn send_as(root: &Path, work: &Path, env: &[(&str, &str)], cmd: &str, to: &str, text: &str) -> String {
     let r = borg(root, work, &[cmd, to, text], env, "");
     assert_eq!(r.code, Some(0), "{cmd} {to}: {}", r.err);
@@ -144,19 +147,31 @@ fn signal(pid: i32, sig: i32) {
     assert_eq!(unsafe { libc::kill(pid, sig) }, 0, "kill {pid}");
 }
 
-/// A waiter this test started (`borg listen --wait|--stream`): its stdout lines as they come. Dropped
-/// while it runs (a failed assertion), it gets SIGINT, as an engineer stops it.
+/// A waiter this test started (`borg listen --wait|--stream`): its stdout lines as they come, and its
+/// stdin when the test answers its wakes as an adapter does. Dropped while it runs (a failed
+/// assertion), it gets SIGINT, as an engineer stops it.
 struct Waiter {
     child: Option<Child>,
     pid: i32,
     lines: Receiver<String>,
+    stdin: Option<std::process::ChildStdin>,
 }
 
 impl Waiter {
     fn start(root: &Path, work: &Path, flag: &str, session: &str) -> Waiter {
+        Waiter::spawn(root, work, flag, session, Stdio::null())
+    }
+
+    /// A stream whose wakes the test answers on its stdin (`answer`), as an adapter does.
+    fn answering(root: &Path, work: &Path, session: &str) -> Waiter {
+        Waiter::spawn(root, work, "--stream", session, Stdio::piped())
+    }
+
+    fn spawn(root: &Path, work: &Path, flag: &str, session: &str, stdin: Stdio) -> Waiter {
         let dir = work.display().to_string();
-        let mut child = command(root, work, &["listen", flag, "--session", session, "--dir", &dir], &[]).stdin(Stdio::null()).spawn().unwrap();
+        let mut child = command(root, work, &["listen", flag, "--session", session, "--dir", &dir], &[]).stdin(stdin).spawn().unwrap();
         let pid = i32::try_from(child.id()).unwrap();
+        let input = child.stdin.take();
         let out = child.stdout.take().unwrap();
         let (tx, lines) = channel();
         std::thread::spawn(move || {
@@ -167,11 +182,29 @@ impl Waiter {
             }
         });
         until("the waiter holds its lock", || lock_pid(root, session) == Some(pid));
-        Waiter { child: Some(child), pid, lines }
+        Waiter { child: Some(child), pid, lines, stdin: input }
     }
 
     fn line(&self) -> String {
         self.lines.recv_timeout(GUARD).unwrap_or_else(|e| panic!("no line from the waiter: {e}"))
+    }
+
+    /// Its next wake line, notes skipped (into `notes`).
+    fn wake(&self, notes: &mut Vec<String>) -> Value {
+        loop {
+            let v: Value = serde_json::from_str(&self.line()).unwrap();
+            match v.get("note").and_then(Value::as_str) {
+                Some(n) => notes.push(n.to_string()),
+                None => return v,
+            }
+        }
+    }
+
+    /// An adapter's answer to a wake, one JSON line on the waiter's stdin.
+    fn answer(&mut self, v: &Value) {
+        let stdin = self.stdin.as_mut().expect("a waiter started with `answering`");
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
     }
 
     /// Whether it still runs.
@@ -329,6 +362,60 @@ fn the_stream_says_each_message_once_on_one_json_line() {
     assert_eq!(code, Some(128 + libc::SIGINT));
     assert_eq!(rest, vec![r#"{"end":"stopped"}"#.to_string()], "no wake twice, the end last");
     assert!(wakes[0].contains("(alice@x tells)") && !wakes[1].contains("alice@x"), "each wake for its own message: {wakes:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The adapter could not send a wake in (`{"failed": ids}` on the stream's stdin): the waiter backs off,
+/// then wakes the session once more for the same message; once the adapter says it went in, never
+/// again. The second wake comes only after the backoff (10 s), awaited as a line, not slept.
+#[test]
+fn a_wake_the_adapter_could_not_send_in_wakes_once_more_after_the_backoff() {
+    let (root, work) = setup("refused");
+    let oc = |event: &str, extra: Value| hook(&root, "opencode", event, &plain("s-oc", &work, &extra), &[]);
+    oc("prompt", json!({"prompt": "carry on"}));
+    opt_in(&root, &work, "s-oc");
+    assert_eq!(oc("stop", json!({})), json!({"listen": true}));
+    let mut w = Waiter::answering(&root, &work, "s-oc");
+
+    let id = send(&root, &work, "tell", "s-oc", "the build host is back");
+    let mut notes = Vec::new();
+    let first = w.wake(&mut notes);
+    assert_eq!((&first["n"], &first["ids"]), (&json!(1), &json!([id])), "the wake names its message: {first}");
+    w.answer(&json!({"failed": [id]}));
+    let again = w.wake(&mut notes);
+    assert_eq!((&again["n"], &again["ids"], &again["wake"]), (&json!(1), &json!([id]), &first["wake"]), "the same message, once more");
+    assert!(notes.iter().any(|n| n.contains("could not send the wake in: tried again in 10 s")), "{notes:?}");
+    w.answer(&json!({"sent": [id]}));
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!(code, Some(128 + libc::SIGINT));
+    assert_eq!(rest, vec![r#"{"end":"stopped"}"#.to_string()], "it went in: no third wake");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A turn that went quiet with no stop (an Esc the adapter never reported) stops holding wakes off once
+/// it has been quiet past the floor (`TURN_IDLE_MS`), so the session is not left deaf. Its session's own
+/// pauses (a history of 50 ms gaps, injected) never shorten that hold (listen.rs's unit tests, on an
+/// injected clock); the turn's mark is injected as quiet since just past the floor.
+#[test]
+fn a_quiet_turn_releases_its_wake_once_quiet_past_the_floor() {
+    let (root, work) = setup("learned");
+    let oc = |event: &str, extra: Value| hook(&root, "opencode", event, &plain("s-oc", &work, &extra), &[]);
+    oc("prompt", json!({"prompt": "carry on"}));
+    opt_in(&root, &work, "s-oc");
+    assert_eq!(oc("stop", json!({})), json!({"listen": true}));
+    let w = Waiter::start(&root, &work, "--stream", "s-oc");
+    // A turn runs and goes quiet; the session pauses 50 ms at most.
+    oc("prompt", json!({"prompt": "and the retries"}));
+    let busy = listen_dir(&root).join("s-oc.busy");
+    assert!(busy.exists(), "the turn holds wakes off");
+    let history: String = (0..40).map(|_| "idle 50\ntool 50\n").collect();
+    std::fs::write(listen_dir(&root).join("s-oc.gaps"), history).unwrap();
+    std::fs::write(&busy, format!("0 {}", borg::learn::now_ms() - borg::listen::TURN_IDLE_MS - 1)).unwrap();
+    send(&root, &work, "tell", "s-oc", "the schema froze");
+    let mut notes = Vec::new();
+    let wake = w.wake(&mut notes);
+    assert!(wake["wake"].as_str().is_some_and(|t| t.contains("1 message")), "{wake}");
+    let _ = w.stop(libc::SIGINT);
     let _ = std::fs::remove_dir_all(&root);
 }
 

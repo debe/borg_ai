@@ -132,7 +132,7 @@ pub fn tool_output(input: &Value) -> String {
 #[must_use]
 pub fn parse_age(s: &str) -> Option<i64> {
     let s = s.trim();
-    let units = [("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)];
+    let units = [("d", crate::clock::DAY_MS / 1000), ("h", 3_600), ("m", 60), ("s", 1)];
     let (n, mult) = units.iter().find_map(|(u, m)| s.strip_suffix(u).map(|n| (n, *m))).unwrap_or((s, 1));
     n.parse::<i64>().ok().filter(|n| *n >= 0).and_then(|n| n.checked_mul(mult))
 }

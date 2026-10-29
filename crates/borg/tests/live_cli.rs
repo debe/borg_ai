@@ -26,6 +26,25 @@ fn wait_for(root: &Path, session: &str, ext: &str, done: impl Fn(&str) -> bool) 
     }
 }
 
+/// A `.queued` file's lines without the check each names (` @<check>`, hook.rs, a 12-hex check id): what
+/// is queued. Each line must name its check.
+fn queued(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let (head, check) = l.rsplit_once(" @").unwrap_or_else(|| panic!("a queued line names its check: {l:?}"));
+            assert!(check.len() == borg::select::CHECK_HEX && check.chars().all(|c| c.is_ascii_hexdigit()), "{l:?}");
+            head.to_string() + "\n"
+        })
+        .collect()
+}
+
+/// A context file's lines with the check a marker names (` @<check>`) left out: the markers as they read
+/// before checks had ids.
+fn unchecked(text: &str) -> String {
+    let is_check = |c: &str| c.len() == borg::select::CHECK_HEX && c.chars().all(|x| x.is_ascii_hexdigit());
+    text.lines().map(|l| l.rsplit_once(" @").filter(|(_, c)| is_check(c)).map_or(l, |(head, _)| head).to_string() + "\n").collect()
+}
+
 fn tool(root: &Path, session: &str, name: &str, input: Value) -> String {
     let transcript = root.join("transcript.jsonl");
     let ev = json!({"session_id": session, "cwd": root.join("harbor_orion"), "transcript_path": transcript, "tool_name": name, "tool_input": input});
@@ -53,8 +72,8 @@ fn a_change_starts_a_check_whose_asks_arrive_with_the_next_tool_call_and_cover_t
     // An edit starts one; the hook itself returns at once with nothing to say yet.
     let out = tool(&root, "l1", "Edit", json!({"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}));
     assert!(context(&out).is_empty(), "{out}");
-    let queued = wait_for(&root, "l1", "queued", |q| q.contains("live "));
-    assert_eq!(queued, "live Mdrain\n", "a 3 is asked, at the next tool call");
+    let q = wait_for(&root, "l1", "queued", |q| q.contains("live "));
+    assert_eq!(queued(&q), "live Mdrain\n", "a 3 is asked, at the next tool call");
     let mark = wait_for(&root, "l1", "live.mark", |m| !m.is_empty());
     assert!(mark.starts_with("1 "), "the check covered the one change: {mark}");
     let p = &prompts(&root)[0];
@@ -66,9 +85,9 @@ fn a_change_starts_a_check_whose_asks_arrive_with_the_next_tool_call_and_cover_t
     // The next tool call delivers it, as a question to answer; asked from then on.
     let next = context(&tool(&root, "l1", "Read", json!({"file_path": "/x/budget.rs"})));
     assert!(next.starts_with("[borg] borg check of your work so far:") && next.contains("[Mdrain]"), "{next}");
-    let ctx = state(&root, "l1", "ctx");
+    let ctx = unchecked(&state(&root, "l1", "ctx"));
     assert!(ctx.contains("#borg-asked Mdrain\n#borg-live Mdrain ms="), "{ctx}");
-    let edits = state(&root, "l1", "edits");
+    let edits = unchecked(&state(&root, "l1", "edits"));
     assert!(
         edits.contains("a reset arc. [Edit] /x/net.rs\n#borg-asked Mdrain\n#borg-live Mdrain ms="),
         "the work so far is the judge's evidence before the ask: {edits}"
@@ -95,8 +114,12 @@ fn a_change_starts_a_check_whose_asks_arrive_with_the_next_tool_call_and_cover_t
     let p = prompts(&root);
     assert_eq!(p.len(), 2);
     assert!(!p[1].contains("[Mdrain] Does the Orion"), "asked live, so done: {}", p[1]);
-    // The same call judges what the drone did with it; its answer at the covered stop is the evidence.
-    assert!(p[1].contains("[Mdrain] question: ") && p[1].contains("(declared: applies)"), "{}", p[1]);
+    // The same call judges what the drone did with it, blind to how it was delivered; its answer at the
+    // covered stop is the evidence, with the drone's declaration for the half of questions not stripped.
+    let raw = state(&root, "l1", "ctx");
+    let check = raw.lines().find_map(|l| l.strip_prefix("#borg-asked Mdrain @")).expect("the live check's ask");
+    let judged = p[1].lines().find(|l| l.starts_with("[Mdrain] lesson: ")).unwrap_or_else(|| panic!("{}", p[1]));
+    assert_eq!(judged.ends_with(" (declared: applies)"), !borg::hook::stripped(check, "Mdrain"), "{judged}");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -114,7 +137,7 @@ fn a_waiting_ask_blocks_the_stop_and_a_check_covers_its_own_turn_only() {
     answer(&root, &[("Mdrain", 3)]);
     // The last tool call of the turn is a change; its check's 3 waits, and no tool call follows.
     tool(&root, "w1", "Edit", json!({"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}));
-    assert_eq!(wait_for(&root, "w1", "queued", |q| q.contains("live ")), "live Mdrain\n");
+    assert_eq!(queued(&wait_for(&root, "w1", "queued", |q| q.contains("live "))), "live Mdrain\n");
     wait_for(&root, "w1", "live.mark", |m| !m.is_empty());
     let stop = |last: &str, active: bool| {
         borg(&root, "stop", &json!({"session_id": "w1", "cwd": cwd, "last_assistant_message": last, "stop_hook_active": active}), &ENV)
@@ -124,7 +147,7 @@ fn a_waiting_ask_blocks_the_stop_and_a_check_covers_its_own_turn_only() {
     assert!(out.contains("block") && out.contains("[Mdrain]"), "{out}");
     assert_eq!(prompts(&root).len(), 1, "no second model call");
     assert!(!root.join("store/collectives/corp/state/w1.queued").exists(), "taken by the stop");
-    assert!(state(&root, "w1", "ctx").contains("\n#borg-asked Mdrain\n"), "{}", state(&root, "w1", "ctx"));
+    assert!(unchecked(&state(&root, "w1", "ctx")).contains("\n#borg-asked Mdrain\n"), "{}", state(&root, "w1", "ctx"));
     stop("Mdrain: applies", true);
     // The next turn only talks: the earlier turn's check does not cover it, so the stop asks the model.
     borg(&root, "prompt", &json!({"session_id": "w1", "cwd": cwd, "prompt": "what about the retries?"}), &ENV);
@@ -157,7 +180,7 @@ fn a_later_check_in_the_same_turn_leaves_an_unanswered_live_ask_to_the_stop() {
     wait_for(&root, "j1", "live.mark", |m| m.starts_with("2 "));
     let p = prompts(&root);
     assert_eq!(p.len(), 2, "a second check ran");
-    assert!(!p[1].contains("[Mdrain] question: "), "not judged before the drone answered it: {}", p[1]);
+    assert!(!p[1].contains("[Mdrain] lesson: "), "not judged before the drone answered it: {}", p[1]);
     assert!(!state(&root, "j1", "ctx").contains("#borg-judged"));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -191,7 +214,8 @@ fn a_live_check_has_no_word_gate_and_a_later_tool_call_checks_a_change_the_debou
     let transcript = root.join("transcript.jsonl");
     std::fs::write(&transcript, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     answer(&root, &[("Mdrain", 3)]);
-    let env = [("BORG_MODE", "live"), ("BORG_EARLY", "off"), ("BORG_LIVE_DEBOUNCE_S", "1")];
+    // A debounce no test run outlasts: only moving the last check's start back passes it.
+    let env = [("BORG_MODE", "live"), ("BORG_EARLY", "off"), ("BORG_LIVE_DEBOUNCE_S", "3600")];
     let call = |name: &str, input: Value| {
         let ev = json!({"session_id": "g1", "cwd": cwd, "transcript_path": transcript, "tool_name": name, "tool_input": input});
         borg(&root, "post_tool", &ev, &env)
@@ -203,14 +227,18 @@ fn a_live_check_has_no_word_gate_and_a_later_tool_call_checks_a_change_the_debou
     assert!(!state(&root, "g1", "ctx").contains("#borg-live-skip"), "{}", state(&root, "g1", "ctx"));
     assert_eq!(prompts(&root).len(), 1);
 
-    // A second change inside the debounce starts nothing; a read once it has passed checks it.
+    // A second change inside the debounce starts nothing; a read once it has passed checks it. The debounce
+    // passes when the mark's start (live.rs `Mark`: covered, started ms, turn) moves back by it.
     call("Edit", json!({"file_path": "/x/a.rs", "old_string": "b", "new_string": "c"}));
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(prompts(&root).len(), 1, "debounced");
-    std::thread::sleep(Duration::from_millis(1000));
+    // The first check has let go of its lock (it writes the mark just before).
+    assert_eq!(wait_for(&root, "g1", "live.lock", str::is_empty), "");
+    let mut parts: Vec<String> = mark.split_whitespace().map(str::to_string).collect();
+    parts[1] = (parts[1].parse::<i64>().unwrap() - 3_600_000).to_string();
+    std::fs::write(root.join("store/collectives/corp/state/g1.live.mark"), parts.join(" ") + "\n").unwrap();
     call("Read", json!({"file_path": "/x/a.rs"}));
     let mark = wait_for(&root, "g1", "live.mark", |m| m.starts_with("2 "));
     assert!(mark.starts_with("2 "), "the held-back change was checked at the next tool call: {mark}");
+    assert_eq!(prompts(&root).len(), 2, "one model call per check: the change inside the debounce started none");
     assert_eq!(state(&root, "g1", "live.n").lines().count(), 2, "a read is no change");
 }
 
@@ -233,7 +261,7 @@ fn omp_and_opencode_run_live_without_a_transcript() {
         answer(&root, &[("Mdrain", 3)]);
         let out = hook("post_tool", json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}}));
         assert!(context(&out).is_empty(), "{harness}: {out}");
-        assert_eq!(wait_for(&root, "o1", "queued", |q| q.contains("live ")), "live Mdrain\n", "{harness}");
+        assert_eq!(queued(&wait_for(&root, "o1", "queued", |q| q.contains("live "))), "live Mdrain\n", "{harness}");
         wait_for(&root, "o1", "live.mark", |m| !m.is_empty());
         let p = &prompts(&root)[0];
         assert!(p.contains("[Edit] /x/net.rs") && p.contains("reset arc"), "{harness}: the turn's tool calls are the work so far: {p}");

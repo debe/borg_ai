@@ -149,7 +149,13 @@ machine is revoked:
 - **Messages between sessions** (`borg tell`, `borg ask`, and `borg pause`, `borg resume` or a
   `borg no` aimed at another machine), already redacted, checked on read, and kept for 7 days. A
   message to `local` (written `local@<node>`) is for this machine's sessions and never syncs;
-  `collective` (or `all`), `<session>@<node>` and replies do. A pause,
+  `collective` (or `all`), `<session>@<node>` and replies do. The `seen` lines a recipient writes when
+  it is shown a message travel too, under the recipient's own key: they acknowledge the message and pace
+  its sender ([Pacing](commands.md#messages)). `borg tell` paces by the sender's window; a member offers
+  and takes every tell and ask within the bound any window keeps (acknowledged, or at most 64 unread
+  from one sender to one recipient within 10 minutes), which reads no earlier line, so pruning old lines
+  never stops a message once written. It keeps the log within the same bound as `borg tell` (1 MiB per
+  member and class of line). A pause,
   resume or veto from another machine counts only when the membership gives that machine the `steer`
   or `admin` role; any other is refused and counted as `steer_dropped`.
 
@@ -157,10 +163,14 @@ Beside the logs, each session tells the other machines which sessions run where 
 kept a day at most), and reasoning excerpts go to two members chosen by hash, so the "why" survives
 its author going offline.
 
-**Versions.** This release speaks `borg/mesh/13`. It still syncs with a 0.3 peer (`borg/mesh/12`), but
-messages do not reach that peer: upgrade it. Peers on `borg/mesh/11` and earlier do not sync at all. Such a
-session ends at the handshake with a line in `borg mesh serve`'s log, and `borg doctor` warns
-("peer <key> speaks borg/mesh/5, this node borg/mesh/13: nothing syncs with it; upgrade it") until a
+**Versions.** This release speaks `borg/mesh/14`: messages keep their whole text and carry `seen`
+lines. It still syncs with a 0.4 or 0.5 peer (`borg/mesh/13`), which gets only what it can read: the
+messages of at most 1,000 characters, no `seen` line, and at most one tell or ask per sender and
+recipient every 10 minutes, as 0.5.0 paced them. Longer messages do not reach it: upgrade it. It also
+still syncs with a 0.3 peer (`borg/mesh/12`), but messages do not reach that peer. Peers on
+`borg/mesh/11` and earlier do not sync at all. Such a session ends at the handshake with a line in
+`borg mesh serve`'s log, and `borg doctor` warns
+("peer <key> speaks borg/mesh/5, this node borg/mesh/14: nothing syncs with it; upgrade it") until a
 session with it completes or it leaves the member list. The old node's log gets the same line from its
 side ("… upgrade this node").
 

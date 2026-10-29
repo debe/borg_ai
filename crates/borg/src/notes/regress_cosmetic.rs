@@ -8,9 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::notes::regress_diff::Hunk;
 
-/// Removed lines shorter than this (non-space chars) are never taken for moved: `}` recurs.
+/// Removed lines shorter than this (non-space chars) are never taken for moved: `}` recurs. Method:
+/// a heuristic of the cosmetic-change classifier, design-chosen.
 const MOVE_MIN: usize = 8;
 /// A single line re-added at most this many lines from where it was removed was reordered, not moved.
+/// Method: as `MOVE_MIN`.
 const MOVE_NEAR: u32 = 3;
 
 /// The text without whitespace, and without the trailing commas a formatter adds or drops when it

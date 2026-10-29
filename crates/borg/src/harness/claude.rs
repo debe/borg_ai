@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Probe, Run, STOP_TIMEOUT_S, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
 pub const EVENTS: [(&str, &str); 6] = [
@@ -22,11 +22,15 @@ pub const EVENTS: [(&str, &str); 6] = [
 /// Hooks an older borg installed: `SessionStart` served the hive's drones (0.3.0 and before).
 pub const RETIRED: [(&str, &str); 1] = [("SessionStart", "start")];
 
-/// Seconds Claude Code gives borg's Stop hook. Its own default for a command hook is 600 s now (its hooks
-/// docs, checked 2026-10-27; earlier versions gave 60 s): 90 s bounds how long a stuck stop can hold the
-/// engineer's turn. The expert drone keeps inside it (expert_route.rs `drone_cap`), so a slow
-/// drone never costs the conscience's answer.
-pub const STOP_TIMEOUT_S: u64 = 90;
+// The Stop hook's `timeout` install writes is `STOP_TIMEOUT_S`. Claude Code's own default for a command
+// hook is 600 s now (its hooks docs, checked 2026-10-27; earlier versions gave 60 s). The expert drone
+// keeps inside it (expert_route.rs `drone_cap`), so a slow drone never costs the conscience's answer.
+
+/// Protocol (Claude Code's): an `additionalContext` (or `systemMessage`, or plain stdout) longer than
+/// this is saved to a file, and the model gets a preview and the file's path instead of the text.
+/// Claude Code 2.1.312's bundle, read 2026-10-28: the hook-output threshold `1e4`, characters, `<=` kept
+/// whole.
+pub const CONTEXT_CHARS: usize = 10_000;
 
 pub struct Claude;
 
@@ -48,6 +52,7 @@ impl Harness for Claude {
             // so an install that predates that timeout, on a Claude Code whose default was 60 s, keeps a
             // margin too.
             stop_budget: None,
+            context_chars: CONTEXT_CHARS,
             session_env: Some("CLAUDE_CODE_SESSION_ID"),
             pid_env: None,
             drone_wake: DroneWake::Model,
@@ -255,12 +260,12 @@ fn read_block(b: &Value, call: &str, a: &mut SubAgent) {
 
 // ---------------------------------------------------------------- the transcript (JSONL)
 
-/// The drone's last visible text before now, from the transcript (its proposal), its last 2000
-/// characters.
+/// The drone's last visible text before now, from the transcript (its proposal), its last
+/// `learn::PROPOSAL_CHARS` characters (the end an episode keeps).
 pub fn last_assistant_text(transcript: &Path) -> String {
     let t = last_assistant_full(transcript);
     let chars: Vec<char> = t.chars().collect();
-    chars[chars.len().saturating_sub(2000)..].iter().collect()
+    chars[chars.len().saturating_sub(crate::learn::PROPOSAL_CHARS)..].iter().collect()
 }
 
 /// `last_assistant_text`, whole.
@@ -289,42 +294,95 @@ pub fn last_assistant_full(transcript: &Path) -> String {
 /// This turn's work so far, from a Claude transcript (live.rs): the drone's text and its tool calls (name
 /// and a short input: the path, or the command) since the engineer's last prompt, one per line, its last
 /// `cap` characters. Mid-turn the last text block may be an earlier turn's (`last_assistant_full`), so
-/// this reads the turn itself. Empty without a transcript.
+/// this reads the turn itself. Empty without a transcript. Read from the end (`TAIL_CHUNK`) until the
+/// engineer's last prompt or `cap` characters of the turn, whichever comes first: a hook delivering
+/// lessons in a long session never reads or parses the whole transcript.
 pub fn turn_so_far(transcript: &Path, cap: usize) -> String {
-    let text = std::fs::read_to_string(transcript).unwrap_or_default();
-    let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
-    // The engineer's prompt: a user entry with text of its own, not a tool result or an injected note.
-    let prompt = |v: &Value| {
-        v["type"] == "user"
-            && v["isMeta"] != true
-            && match &v["message"]["content"] {
-                Value::String(t) => !t.trim().is_empty(),
-                Value::Array(bs) => bs.iter().any(|b| b["type"] == "text") && !bs.iter().any(|b| b["type"] == "tool_result"),
-                _ => false,
+    turn_tail(transcript, cap, TAIL_CHUNK)
+}
+
+/// Method: the first read from a transcript's end (`turn_so_far`), doubled at each further one, so a
+/// turn's tail takes one small read and a long turn a few.
+const TAIL_CHUNK: u64 = 64 * 1024;
+
+/// Guard: a tool call's input keeps this many characters on its line of the turn so far (a command with
+/// a heredoc would otherwise fill it).
+const TOOL_CHARS: usize = 200;
+
+/// `turn_so_far`, its first read `chunk` bytes from the end.
+fn turn_tail(transcript: &Path, cap: usize, chunk: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(transcript) else { return String::new() };
+    let mut start = f.metadata().map_or(0, |m| m.len());
+    // The turn's lines, newest first, and how many characters they make joined.
+    let (mut newest, mut chars): (Vec<String>, usize) = (Vec::new(), 0);
+    // What was read from `start` on and not scanned yet: the end of a line that began before `start`.
+    let mut rest: Vec<u8> = Vec::new();
+    let mut step = chunk.max(1);
+    'read: while chars < cap && start > 0 {
+        let from = start.saturating_sub(step);
+        let Ok(n) = usize::try_from(start - from) else { break };
+        let mut buf = vec![0; n];
+        if f.seek(SeekFrom::Start(from)).and_then(|_| f.read_exact(&mut buf)).is_err() {
+            break;
+        }
+        buf.extend_from_slice(&rest);
+        (start, step) = (from, step.saturating_mul(2));
+        // Up to the first newline, unless the file starts there, is a line not read whole yet.
+        let whole = if start == 0 { 0 } else { buf.iter().position(|b| *b == b'\n').map_or(buf.len(), |i| i + 1) };
+        for line in buf[whole..].split(|b| *b == b'\n').rev() {
+            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+            if is_prompt(&v) {
+                break 'read;
             }
-    };
-    let start = entries.iter().rposition(prompt).map_or(0, |i| i + 1);
-    let mut out: Vec<String> = Vec::new();
-    for v in entries[start..].iter().filter(|v| v["type"] == "assistant") {
-        for b in v["message"]["content"].as_array().into_iter().flatten() {
-            match b["type"].as_str() {
-                Some("text") => out.extend(b["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string)),
-                Some("tool_use") => {
-                    let input = &b["input"];
-                    let short = ["file_path", "notebook_path", "command", "pattern", "path"]
-                        .iter()
-                        .find_map(|k| input[k].as_str())
-                        .map_or_else(|| input.to_string(), str::to_string);
-                    let short: String = short.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-                    out.push(format!("[{}] {short}", b["name"].as_str().unwrap_or("tool")));
+            if v["type"] == "assistant" {
+                for piece in pieces(&v).into_iter().rev() {
+                    chars += piece.chars().count() + usize::from(!newest.is_empty());
+                    newest.push(piece);
                 }
-                _ => {}
+                if chars >= cap {
+                    break 'read;
+                }
             }
         }
+        rest = buf[..whole].to_vec();
     }
-    let all = out.join("\n");
+    newest.reverse();
+    let all = newest.join("\n");
     let n = all.chars().count();
     all.chars().skip(n.saturating_sub(cap)).collect()
+}
+
+/// The engineer's prompt: a user entry with text of its own, not a tool result or an injected note.
+fn is_prompt(v: &Value) -> bool {
+    v["type"] == "user"
+        && v["isMeta"] != true
+        && match &v["message"]["content"] {
+            Value::String(t) => !t.trim().is_empty(),
+            Value::Array(bs) => bs.iter().any(|b| b["type"] == "text") && !bs.iter().any(|b| b["type"] == "tool_result"),
+            _ => false,
+        }
+}
+
+/// An assistant entry's lines of the turn so far: each text, and each tool call as `[name] input`.
+fn pieces(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in v["message"]["content"].as_array().into_iter().flatten() {
+        match b["type"].as_str() {
+            Some("text") => out.extend(b["text"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string)),
+            Some("tool_use") => {
+                let input = &b["input"];
+                let short = ["file_path", "notebook_path", "command", "pattern", "path"]
+                    .iter()
+                    .find_map(|k| input[k].as_str())
+                    .map_or_else(|| input.to_string(), str::to_string);
+                let short: String = short.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(TOOL_CHARS).collect();
+                out.push(format!("[{}] {short}", b["name"].as_str().unwrap_or("tool")));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 #[cfg(test)]
 mod tests {
@@ -336,6 +394,31 @@ mod tests {
         assert_eq!(turn_so_far(t, 4000), "I will replace the reset arc.\n[Read] /x/net.rs\n[Edit] /x/net.rs\n[Bash] cargo test -p net");
         assert_eq!(turn_so_far(t, 20), "[Bash] cargo test -p net".chars().skip(4).collect::<String>(), "the newest work is kept");
         assert_eq!(turn_so_far(Path::new("/nonexistent/t.jsonl"), 4000), "");
+        // Read from the end in reads of any size, a line cut by one included, the turn is the same.
+        for chunk in [1, 7, 64, 333, 1 << 20] {
+            assert_eq!(turn_tail(t, 4000, chunk), turn_so_far(t, 4000), "chunk {chunk}");
+            assert_eq!(turn_tail(t, 20, chunk), turn_so_far(t, 20), "chunk {chunk}");
+        }
+        assert_eq!(turn_so_far(t, 0), "");
+    }
+
+    /// The turn is read from the end and the scan stops at the engineer's last prompt: what came before
+    /// it is never parsed, so bytes no reader could take there leave the turn as it is (reading the whole
+    /// file as text gave nothing at all).
+    #[test]
+    fn the_turn_so_far_reads_back_only_to_the_last_prompt() {
+        let dir = std::env::temp_dir().join(format!("borg-claude-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("t.jsonl");
+        let line = |v: Value| format!("{v}\n").into_bytes();
+        let mut bytes = vec![0xff; 300_000];
+        bytes.extend(line(serde_json::json!({"type": "user", "message": {"content": "Drain the budget place"}})));
+        let text = |s: &str| serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": s}]}});
+        bytes.extend(line(text("I will replace the reset arc.")));
+        bytes.extend(line(text("Done.")));
+        std::fs::write(&t, &bytes).unwrap();
+        assert_eq!(turn_tail(&t, 4000, 64), "I will replace the reset arc.\nDone.");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

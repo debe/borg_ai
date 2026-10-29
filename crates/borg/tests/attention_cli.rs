@@ -10,13 +10,19 @@ use serde_json::json;
 const PROMPT: &str = "Tidy the budget handling of the net";
 const LAST: &str = "Retries use a fixed delay; the budget place is reset.";
 
-fn env(attention: &'static str) -> [(&'static str, &'static str); 4] {
-    [("BORG_STOP_POOL", "all"), ("BORG_PREFILTER", "off"), ("BORG_EARLY", "off"), ("BORG_STOP_ATTENTION", attention)]
+/// The attention switch. On, the selection policy is left to the switches: `BORG_SELECT=fixed` (as
+/// tests/common pins it) would win over attention, any other value is the default (select.rs
+/// `precedence`), which attention then wins over. Off, the fixed rule.
+fn env(attention: &'static str) -> [(&'static str, &'static str); 5] {
+    let select = if attention == "on" { "learned" } else { "fixed" };
+    [("BORG_STOP_POOL", "all"), ("BORG_PREFILTER", "off"), ("BORG_EARLY", "off"), ("BORG_SELECT", select), ("BORG_STOP_ATTENTION", attention)]
 }
 
 fn asked(root: &std::path::Path, session: &str) -> Vec<String> {
     let ctx = state(root, session, "ctx");
-    ctx.lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap_or_else(|| panic!("{ctx}")).split(',').map(String::from).collect()
+    let list = ctx.lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap_or_else(|| panic!("{ctx}"));
+    // The ids, without the check's ` @<id>` tag.
+    list.split(" @").next().unwrap_or_default().split(',').map(String::from).collect()
 }
 
 fn attention(root: &std::path::Path, session: &str) -> Option<String> {

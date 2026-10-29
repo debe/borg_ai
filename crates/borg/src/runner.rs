@@ -71,6 +71,17 @@ pub const FALLBACK: [Runner; 3] = [Runner::Claude, Runner::Omp, Runner::Opencode
 /// Claude's model when none is configured.
 const CLAUDE_DEFAULT: &str = "sonnet";
 
+/// A batch of model calls (`borg learn`, `borg facets`, `borg assimilate --from-dir`) stops asking
+/// after this many failed calls (learn: in a row; the parallel batches: before the first success).
+/// Guard: the model is unavailable (quota, login, network), and asking about every remaining item
+/// would burn time, and the quota once it is back, one failed call per item.
+pub const MAX_FAILURES: usize = 3;
+
+/// How many model calls a batch command runs at once unless `--jobs` (or `BORG_ASSIMILATE_JOBS`)
+/// says otherwise. Guard: one child CLI per item at once would hit the provider's rate limit and
+/// the machine's memory; the batches are bounded by this, not by their size.
+pub const JOBS: usize = 4;
+
 /// The runners to try, in order: `spec` is the configured model (`BORG_LEARN_MODEL`,
 /// `BORG_PREDICT_MODEL`), `harness` the drone's, `on_path` whether a CLI is installed. Empty: no
 /// runner is installed, or the model is `off` (tests that record episodes but must never spend).
@@ -580,7 +591,8 @@ impl Watchdog {
 }
 
 /// How long the output of a command that ended is still read: its group is gone, so the pipe closes
-/// at once, unless a process that left the group (`setsid`, a daemon) holds it open.
+/// at once, unless a process that left the group (`setsid`, a daemon) holds it open. Guard: such a
+/// process cannot hold a model call past its deadline by more than this.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The reader's chunks until the pipe closes or `DRAIN_GRACE` passes: a process that left the group

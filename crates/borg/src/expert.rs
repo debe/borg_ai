@@ -37,11 +37,14 @@ use regex::Regex;
 
 use crate::conscience::{bm25, tokens};
 
-/// At most this many claims are printed.
+/// At most this many claims are printed. Baseline: the expert section's fixed size (no eval chose
+/// it), about 200 tokens with `CLAIM_CHARS`.
 pub const MAX_CLAIMS: usize = 3;
 /// Characters of claim text per line; three lines with their citations stay near 200 tokens.
+/// Display: one line per claim.
 const CLAIM_CHARS: usize = 210;
 /// Words of a claim's body that are indexed: a long requirement would otherwise match everything.
+/// Guard: a long requirement's BM25 match is bounded like a short one's.
 const INDEX_WORDS: usize = 160;
 /// Environment variable naming the newest commit `--at` may resolve to.
 pub const CEILING_ENV: &str = "BORG_EXPERT_CEILING";
@@ -619,7 +622,8 @@ pub fn index(repo: &Path, commit: &str, pin: Option<&Pin>) -> Result<Vec<Claim>,
 }
 
 /// A newer-release change takes the reserved slot only if it scores at least this share of the best
-/// claim; a weaker one is noise, and the slot says instead that newer releases exist.
+/// claim; a weaker one is noise, and the slot says instead that newer releases exist. Baseline:
+/// design-chosen, not tuned.
 const NEWER_MIN_SHARE: f64 = 0.25;
 
 /// BM25 top claims with score > 0, at most `MAX_CLAIMS`. With a pin:

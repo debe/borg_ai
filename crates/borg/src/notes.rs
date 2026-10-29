@@ -56,7 +56,8 @@ pub use restore::{restore, wanted};
 
 pub const NOTES_REF: &str = "refs/notes/borg";
 /// At most this many commits get a note per run (a session that landed more is unusual; the
-/// newest are the ones whose reasoning is still in the session).
+/// newest are the ones whose reasoning is still in the session). Guard: a session that committed
+/// many times (a scripted series) writes at most this many notes per run.
 const MAX_COMMITS: usize = 20;
 
 const REDACTED: &str = "[REDACTED]";
@@ -213,13 +214,13 @@ pub fn windows(dir: &Path, session: &str, start: &Start) -> Vec<(i64, i64)> {
 }
 
 /// Keeps the drone's latest proposal for the excerpt (hook, at stop and end): redacted whole, then
-/// cut to its last 2000 characters, so a cut never lands inside a secret that was not redacted.
+/// cut to its last `learn::PROPOSAL_CHARS`, so a cut never lands inside a secret that was not redacted.
 pub fn remember_proposal(dir: &Path, session: &str, text: &str) {
     if text.trim().is_empty() {
         return;
     }
     let text = redact(text);
-    let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = text.chars().rev().take(crate::learn::PROPOSAL_CHARS).collect::<Vec<_>>().into_iter().rev().collect();
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(state(dir, session, "proposal"), tail);
 }
@@ -298,7 +299,7 @@ pub fn excerpt(dir: &Path, session: &str, repo: &str, commit: &str, now: i64) ->
         commit: commit.into(),
         repo: repo.into(),
         session: session.into(),
-        task: redact(&read("task").chars().take(3000).collect::<String>()),
+        task: redact(&read("task").chars().take(crate::learn::TASK_CHARS).collect::<String>()),
         proposal: redact(&read("proposal")),
         episodes,
         ms: now,

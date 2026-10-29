@@ -15,7 +15,8 @@ use serde::Deserialize;
 use tokenizers::{Normalizer, PreTokenizer};
 use tokenizers::{NormalizerWrapper, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizerWrapper};
 
-/// `tokenizers`' penalty for an unknown character (`K_UNK_PENALTY`).
+/// `tokenizers`' penalty for an unknown character (`K_UNK_PENALTY`). Protocol: must equal the
+/// library's, or this tokenizer splits text differently from the one the model was trained with.
 const UNK_PENALTY: f64 = 10.0;
 
 pub struct Unigram {
@@ -53,6 +54,7 @@ struct Model<'a> {
     byte_fallback: bool,
 }
 
+/// The FNV-1a 64-bit offset basis. Protocol: the hash's published constant.
 const FNV: u64 = 0xcbf29ce484222325;
 
 fn fnv(h: u64, bytes: &[u8]) -> u64 {

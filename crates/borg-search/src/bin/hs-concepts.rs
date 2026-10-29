@@ -18,13 +18,19 @@ use borg::concepts;
 use borg::conscience;
 use serde_json::{Value, json};
 
+/// Experiment parameter: the depth every arm's ranking is recorded to (as hs.rs `TOP`).
+const TOP: usize = 20;
+/// Experiment parameters: the boost strengths compared when none are given, around the spike's
+/// `concepts::BETA`.
+const BETAS: &str = "0.25,0.5,1";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(input), Some(out)) = (args.get(1), args.get(2)) else {
         eprintln!("usage: hs-concepts <queries.jsonl> <out.jsonl> [betas]");
         std::process::exit(2);
     };
-    let betas: Vec<f64> = args.get(3).map(String::as_str).unwrap_or("0.25,0.5,1").split(',').filter_map(|b| b.parse().ok()).collect();
+    let betas: Vec<f64> = args.get(3).map(String::as_str).unwrap_or(BETAS).split(',').filter_map(|b| b.parse().ok()).collect();
     let mut f = std::fs::File::create(out).expect("out");
     for line in std::fs::read_to_string(input).expect("queries").lines().filter(|l| !l.trim().is_empty()) {
         let q: Value = serde_json::from_str(line).expect("query json");
@@ -51,7 +57,7 @@ fn main() {
             for (c, o) in pool.iter_mut().zip(&overlaps) {
                 c.weight *= 1.0 + b * o;
             }
-            arms.insert(format!("{b}"), json!(ranked(&pool).iter().take(20).map(|(i, _)| i.clone()).collect::<Vec<_>>()));
+            arms.insert(format!("{b}"), json!(ranked(&pool).iter().take(TOP).map(|(i, _)| i.clone()).collect::<Vec<_>>()));
         }
         // Descriptive: an additive arm, which can bring back a lesson BM25 scores 0 (renamed identifiers):
         // today's score + alpha × overlap × the best score, for lessons in scope and not superseded.
@@ -67,7 +73,7 @@ fn main() {
                 .filter(|(_, s)| *s > 0.0)
                 .collect();
             scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-            arms.insert(format!("add{alpha}"), json!(scored.iter().take(20).map(|(i, _)| i.clone()).collect::<Vec<_>>()));
+            arms.insert(format!("add{alpha}"), json!(scored.iter().take(TOP).map(|(i, _)| i.clone()).collect::<Vec<_>>()));
         }
         let score = |id: &str| today.iter().find(|(i, _)| i == id).map_or(0.0, |(_, s)| *s);
         let labels = |s: &BTreeSet<usize>| s.iter().map(|&i| concepts::label(i)).collect::<Vec<_>>();
@@ -79,7 +85,7 @@ fn main() {
             .map(|(((c, s), o), g)| json!({"id": c.id, "repo": c.repo, "scope": c.scope, "concepts": labels(s), "bm25": (score(&c.id) * 1e4).round() / 1e4, "overlap": (o * 1e4).round() / 1e4, "off_system": g.off_system}))
             .collect();
         let row = json!({
-            "id": q["id"], "work": labels(&work), "today": today.iter().take(20).map(|(i, _)| i.clone()).collect::<Vec<_>>(),
+            "id": q["id"], "work": labels(&work), "today": today.iter().take(TOP).map(|(i, _)| i.clone()).collect::<Vec<_>>(),
             "boost": arms, "lessons": lessons,
         });
         writeln!(f, "{row}").expect("write");

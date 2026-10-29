@@ -85,6 +85,20 @@ pub struct Entry {
     /// in `borg doctor`. A string, not an enum: an unknown value must not invalidate the whole config.
     #[serde(default)]
     pub mode: Option<String>,
+    /// The engineer's optional budget for lesson selection (select.rs `budget_of`): the pool tokens this
+    /// collective's checks may read per session on average, by which the policy prices a larger pool.
+    /// Absent (the default): spend is measured and shown, never priced. Kept as written: a value that
+    /// is not a positive number counts as none (`budget`) and cannot invalidate the whole config.
+    #[serde(default)]
+    pub budget: Option<serde_json::Value>,
+}
+
+impl Entry {
+    /// `budget` when it is a positive number.
+    #[must_use]
+    pub fn budget(&self) -> Option<f64> {
+        self.budget.as_ref()?.as_f64().filter(|b| *b > 0.0)
+    }
 }
 
 /// An expert repo: the engineer's local checkout of a dependency, consulted when a drone's
@@ -96,7 +110,8 @@ pub struct ExpertSource {
     pub repo: String,
     #[serde(rename = "match", default)]
     pub matches: Vec<String>,
-    /// Ask a read-only expert drone (budget-capped) when the index has nothing. Off by default.
+    /// Ask a read-only expert drone (time-bounded, expert_route.rs `DRONE_TIMEOUT`) when the index has
+    /// nothing. Off by default.
     #[serde(default)]
     pub drone: bool,
 }

@@ -40,6 +40,9 @@ fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> String
     c.args(["hook", "claude", event])
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
+        .env("BORG_PREDICT_MODEL", "off")
+        .env("BORG_LEARN_MODEL", "off")
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("BORG_HOME", root.join("store"))
@@ -62,7 +65,8 @@ fn delivered(root: &Path, session: &str) -> Vec<String> {
     let mut ids: Vec<String> = st
         .lines()
         .filter_map(|l| l.strip_prefix("#borg-early ").or_else(|| l.strip_prefix("#borg-asked ")))
-        .flat_map(|ids| ids.split(','))
+        // A marker ends in the check that routed it (` @<check>`, hook.rs).
+        .flat_map(|ids| ids.split(" @").next().unwrap_or_default().split(','))
         .filter(|i| !i.is_empty())
         .map(String::from)
         .collect();

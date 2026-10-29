@@ -278,7 +278,7 @@ pub fn duration_ms(s: &str) -> Result<i64, String> {
     let (n, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, "s"), |i| s.split_at(i));
     let n: i64 = n.parse().map_err(|_| format!("duration {s:?}: expected e.g. 7d, 12h, 30m"))?;
     let unit = match unit {
-        "d" => 86_400_000,
+        "d" => borg::clock::DAY_MS,
         "h" => 3_600_000,
         "m" => 60_000,
         "s" => 1000,
@@ -375,7 +375,8 @@ mod tests {
         Identity::load_or_create(&home).unwrap().public()
     }
 
-    const DAY: i64 = 86_400_000;
+    /// Derived: one day (clock.rs `DAY_MS`), the tests' unit.
+    const DAY: i64 = borg::clock::DAY_MS;
 
     #[test]
     fn a_ticket_round_trips_and_a_tampered_one_is_refused() {

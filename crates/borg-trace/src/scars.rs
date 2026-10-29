@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::fingerprint::{command_shape, error_fingerprint, invocation, is_test_failure, is_tool_shape};
 use crate::{Kind, Session};
 
+/// The most characters of a command a scar or protocol keeps. Guard: bounds a memory's line in the
+/// store whatever a drone ran (a heredoc, a pasted script).
+const CMD_CHARS: usize = 300;
+/// The most edited files a scar names as its fix. Display: the recall line stays one line.
+const FIX_EDITS: usize = 5;
+/// The most characters of the error a recall line quotes. Display: one line in the drone's context.
+const RECALL_CHARS: usize = 160;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Memory {
@@ -84,7 +92,7 @@ pub fn learn(session: &Session, repo: &str) -> Vec<Memory> {
                 edits.push(path.clone());
             }
         }
-        let fix_cmd = (ok_cmd.trim() != cmd.trim()).then(|| clip(ok_cmd, 300));
+        let fix_cmd = (ok_cmd.trim() != cmd.trim()).then(|| clip(ok_cmd, CMD_CHARS));
         if let (Some(fp), Some(line)) = (error, error_line)
             && !is_test_failure(line)
             && (fix_cmd.is_some() || !edits.is_empty())
@@ -94,16 +102,16 @@ pub fn learn(session: &Session, repo: &str) -> Vec<Memory> {
                 fp: format!("{fp:016x}"),
                 error_line: line.clone(),
                 shape: shape.clone(),
-                failed_cmd: clip(cmd, 300),
+                failed_cmd: clip(cmd, CMD_CHARS),
                 fix_cmd: fix_cmd.clone(),
-                fix_edits: edits.into_iter().take(5).collect(),
+                fix_edits: edits.into_iter().take(FIX_EDITS).collect(),
                 ms: ev[j].ts,
                 session: session.id.clone(),
             };
             out.entry(m.key()).or_insert(m);
         }
         if let Some(fix) = fix_cmd.filter(|f| is_tool_shape(&shape) && invocation(f) != invocation(cmd)) {
-            let m = Memory::Protocol { repo: repo.into(), shape, cmd: fix, failed_cmd: clip(cmd, 300), ms: ev[j].ts, session: session.id.clone() };
+            let m = Memory::Protocol { repo: repo.into(), shape, cmd: fix, failed_cmd: clip(cmd, CMD_CHARS), ms: ev[j].ts, session: session.id.clone() };
             out.insert(m.key(), m); // the latest working command wins
         }
     }
@@ -137,7 +145,7 @@ pub fn recall(mems: &[Memory], cmd: &str, error_text: &str) -> Option<String> {
                     (Some(c), false) => format!("`{c}` passed after editing {}", fix_edits.join(", ")),
                     (None, _) => format!("it passed after editing {}", fix_edits.join(", ")),
                 };
-                return Some(format!("↳ borg scar: \"{}\" was hit before; {fix}.", clip(error_line, 160)));
+                return Some(format!("↳ borg scar: \"{}\" was hit before; {fix}.", clip(error_line, RECALL_CHARS)));
             }
         }
     }

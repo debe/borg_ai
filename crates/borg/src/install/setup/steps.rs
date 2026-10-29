@@ -140,9 +140,14 @@ pub fn wire(wiring: &[super::Wire], stamp: &str) -> i32 {
     wiring.iter().map(|(h, changes)| install::write(*h, changes, stamp)).max().unwrap_or(0)
 }
 
+/// How many past corrections setup imports. Guard: setup ends within minutes, one model call per
+/// correction; `borg assimilate --apply` imports the rest whenever the engineer runs it.
+const IMPORT_LIMIT: &str = "50";
+
 /// Offers to import corrections from past sessions (model calls, so never under `--yes`).
 pub fn import(ask: &mut Prompt) {
-    if ask.yes_no("Import corrections from your past sessions now (borg assimilate --apply --limit 50; model calls)?", false) {
-        crate::assimilate::main(&["--apply", "--limit", "50"], &learn::ask_claude);
+    let question = format!("Import corrections from your past sessions now (borg assimilate --apply --limit {IMPORT_LIMIT}; model calls)?");
+    if ask.yes_no(&question, false) {
+        crate::assimilate::main(&["--apply", "--limit", IMPORT_LIMIT], &learn::ask_claude);
     }
 }

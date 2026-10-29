@@ -26,8 +26,14 @@ pub fn normalize_error_line(line: &str) -> String {
     let s = HEX.replace_all(&s, "H");
     let s = NUM.replace_all(&s, "N");
     let s = WS.replace_all(&s, " ");
-    s.trim().to_lowercase().chars().take(160).collect()
+    s.trim().to_lowercase().chars().take(NORMAL_CHARS).collect()
 }
+
+/// The most characters of a normalized error line that enter its fingerprint. Protocol: stored
+/// scars are keyed by the fingerprint, so a change splits every one learned before.
+const NORMAL_CHARS: usize = 160;
+/// The most characters of the error line a scar keeps and shows. Display: one line.
+const LINE_CHARS: usize = 200;
 
 static FAILURE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^(Traceback \(most recent call last\)|FAILED|FAIL:|ERROR:|error(\[\w+\])?:|\w*(Error|Exception): |thread '.*' panicked|npm ERR!|fatal: )")
@@ -62,7 +68,7 @@ pub fn error_line(output: &str) -> Option<String> {
         return None;
     }
     let specific = output.lines().rev().find(|l| SPECIFIC.is_match(l) && !GENERIC.is_match(l));
-    specific.or_else(|| output.lines().find(|l| KEYWORD.is_match(l) && !GENERIC.is_match(l))).map(|l| l.trim().chars().take(200).collect())
+    specific.or_else(|| output.lines().find(|l| KEYWORD.is_match(l) && !GENERIC.is_match(l))).map(|l| l.trim().chars().take(LINE_CHARS).collect())
 }
 
 /// Fingerprint of the most specific error line (see `error_line`).

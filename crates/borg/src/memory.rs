@@ -21,11 +21,16 @@
 //! - **Usefulness belief** `Beta(1 + changed + ½·tested, 1 + ignored + 2·corrected + 3·vetoed +
 //!   regretted)` (the veto's 3 is `VETOED_W`), one result
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
-//!   learn`) without a change is ignored. A correction counts twice, as in outcome.rs; a veto (`borg no`,
+//!   learn`) is censored, no result: the judge never said whether the drone acted on the lesson. A
+//!   placebo's result and an unclear verdict are none either (outcome.rs `is_result`). A correction counts
+//!   twice (outcome.rs `CORRECTED_W`); a veto (`borg no`,
 //!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
 //!   the weighted share of later fixes of decisions the lesson was asked before (outcome.rs `regretted`),
 //!   each regret once, at most `REGRET` × 0.875: a separate, later event, added on top of the session's
-//!   result unless that result is a correction or a veto (the stronger result already counts it). A fractional β is sampled by randomised rounding (`round_seeded`).
+//!   result unless that result is a correction or a veto (the stronger result already counts it). One
+//!   deciding session's regrets give a lesson at most `regret_cap` of that session's corrections by the
+//!   engineer (`is_correction`: a miss a regret wrote is none). A fractional β is sampled by randomised
+//!   rounding (`round_seeded`).
 //!   `tested` (outcome.rs) is the session's own tests going green after the ask, one per (lesson,
 //!   session), weighed `TESTED_W`: additive to the session's result (it is about the work, a session
 //!   result about the engineer's reaction), never a use, no tick, and nothing for a session whose
@@ -68,15 +73,17 @@ use std::collections::{HashMap, HashSet};
 use crate::conscience::Challenge;
 use crate::outcome::{self, Outcome};
 
+/// Baseline: ACT-R's decay of a use's activation (`d` in the module doc), the value of the ACT-R
+/// literature; not fitted to borg's outcomes.
 pub const D: f64 = 0.5;
-/// What one regret at full strength adds to a lesson's β: half a correction (a correction is
+/// Baseline: what one regret at full strength adds to a lesson's β: half a correction (a correction is
 /// same-session, same-concern evidence; a regret is delayed and shared among the lessons asked). A veto
 /// weighs more than a correction, so regret < corrected < vetoed.
 pub const REGRET: f64 = 1.0;
-/// What one `tested` result (outcome.rs) adds to α: half a change (design-chosen, `borg debug ope`
+/// Baseline: what one `tested` result (outcome.rs) adds to α: half a change (design-chosen, `borg debug ope`
 /// estimates others): the session's own runner said the work passes.
 pub const TESTED_W: f64 = 0.5;
-/// What one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
+/// Baseline: what one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
 /// (design-chosen, no eval behind it yet).
 pub const VETOED_W: u32 = 3;
 
@@ -90,15 +97,20 @@ pub struct Weights {
 
 /// The weights in force.
 pub const WEIGHTS: Weights = Weights { vetoed: VETOED_W as f64, regret: REGRET, tested: TESTED_W };
+/// Baseline: the slower decay of a consolidated lesson (module doc), design-chosen.
 pub const D_CONSOLIDATED: f64 = 0.3;
+/// Baseline: the distinct sessions that changed their work on a lesson before it is consolidated
+/// (with two repos or two engineers), design-chosen.
 pub const CONSOLIDATE_SESSIONS: usize = 3;
+/// Baseline: the activation below which an unconsolidated lesson is dormant (about 54 sessions without
+/// a use at `D`), design-chosen; a dormant lesson is recalled only on a strong match, never deleted.
 pub const DORMANT_BELOW: f64 = -2.0;
 
 /// The collective's activity clock: its sessions in the order they first appear in the outcome log
 /// (by first ms, then id: independent of line order). Only the kinds the team shares
 /// (outcome.rs `SHARED_KINDS`) tick it, so every node counts the same sessions from the same first
 /// ms: a session that only graded never moves it, and neither does a `tested` result (about the
-/// session's work).
+/// session's work) nor a placebo's (never shared, outcome.rs `is_result`).
 #[derive(Debug, Default)]
 pub struct Clock {
     first: Vec<(i64, String)>,
@@ -111,7 +123,7 @@ impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
         let mut repos: HashMap<&str, HashSet<String>> = HashMap::new();
-        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && o.kind != outcome::TESTED) {
+        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && o.kind != outcome::TESTED && outcome::is_result(o)) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
             if !o.repo.is_empty() {
@@ -188,7 +200,7 @@ impl Memory {
 
     /// β under weights `w`.
     pub fn beta_with(&self, w: &Weights) -> f64 {
-        (1 + self.ignored + 2 * self.corrected) as f64 + w.vetoed * self.vetoed as f64 + w.regret * self.regretted
+        (1 + self.ignored + outcome::CORRECTED_W * self.corrected) as f64 + w.vetoed * self.vetoed as f64 + w.regret * self.regretted
     }
 
     pub fn alpha(&self) -> f64 {
@@ -226,7 +238,13 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
     let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
     // Per lesson: the sessions whose own tests went green after it was asked.
     let mut tested: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for o in outcomes {
+    // Per session: the engineer's corrections the log shows (`regret_cap`).
+    let mut corrections: HashMap<&str, HashSet<i64>> = HashMap::new();
+    // A placebo's result and an unclear verdict are no evidence about the lesson (outcome.rs `is_result`).
+    for o in outcomes.iter().filter(|o| outcome::is_result(o)) {
+        if is_correction(o) {
+            corrections.entry(o.session.as_str()).or_default().insert(o.ms);
+        }
         if o.kind == outcome::TESTED {
             for l in &o.lessons {
                 tested.entry(l.as_str()).or_default().insert(o.session.as_str());
@@ -244,7 +262,10 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             outcome::VETOED => 3,
             outcome::CORRECTED => 2,
             outcome::CHANGED => 1,
-            outcome::IGNORED | outcome::NOT_CORRECTED => 0,
+            outcome::IGNORED => 0,
+            // `asked_not_corrected` (settled by `borg learn`) is censored: the judge never said whether
+            // the drone acted on the lesson, so it is no ignore. A verdict for the same lesson recorded
+            // after it counts alone.
             _ => continue,
         };
         for l in &o.lessons {
@@ -258,11 +279,16 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
     }
     // A regret of a session whose result for the lesson is a correction or a veto adds nothing: the
     // stronger result already counts that session's failure, whichever was recorded first.
-    let mut regretted: HashMap<&str, f64> = HashMap::new();
+    // Per (lesson, deciding session) the regrets' credit, at most `regret_cap` of that session.
+    let mut blamed: HashMap<(&str, &str), f64> = HashMap::new();
     for ((l, _), (credit, s)) in regret {
         if result.get(l).and_then(|m| m.get(s)).is_none_or(|r| *r < 2) {
-            *regretted.entry(l).or_default() += credit;
+            *blamed.entry((l, s)).or_default() += credit;
         }
+    }
+    let mut regretted: HashMap<&str, f64> = HashMap::new();
+    for ((l, s), credit) in blamed {
+        *regretted.entry(l).or_default() += credit.min(regret_cap(corrections.get(s).map_or(0, HashSet::len)));
     }
     // Per (reach, repo): the ticks its lessons were eligible in (`Clock::eligible`).
     let mut eligible: HashMap<(&str, &str), Option<Vec<u64>>> = HashMap::new();
@@ -292,6 +318,27 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             (c.id.clone(), m)
         })
         .collect()
+}
+
+/// The most regret credit one deciding session gives a lesson: that session's corrections in the log
+/// (distinct times of its `is_correction` results), at least one, as one session counts once for a
+/// lesson's other results. Guard: one session whose work later took many fixes (a long build's review
+/// findings: 193 regrets of one session blamed every lesson it asked, 12,577 lines) would otherwise
+/// outweigh every other session of the lesson.
+pub fn regret_cap(corrections: usize) -> f64 {
+    corrections.max(1) as f64
+}
+
+/// Whether `o` is a correction the engineer made of its session's work: an `asked_then_corrected`, a
+/// `vetoed`, or an `applied_then_corrected` a correction found. The `applied_then_corrected` a regret
+/// writes (learn.rs `credit_regrets`, its `cause` the regret; a tag of it in the team view) is none: it
+/// is the regret again, and counting it would raise `regret_cap` with every regret the cap bounds.
+fn is_correction(o: &Outcome) -> bool {
+    match o.kind.as_str() {
+        outcome::CORRECTED | outcome::VETOED => true,
+        outcome::MISSED => o.cause.is_empty(),
+        _ => false,
+    }
 }
 
 /// FNV-1a over `session \0 lesson`: a stable seed (std's hasher may change between Rust versions).
@@ -377,7 +424,8 @@ fn distinctive(all: &[Challenge]) -> impl Fn(&str) -> HashSet<String> + '_ {
     move |text: &str| crate::conscience::tokens(text).into_iter().filter(|t| df.get(t).is_some_and(|d| 3 * d <= n)).collect()
 }
 
-/// Undeclared, a change needs this many of the lesson's distinctive words new in the drone's work.
+/// Baseline: undeclared, a change needs this many of the lesson's distinctive words new in the drone's
+/// work (design-chosen: one or two shared words happen by chance).
 pub const NOVEL_WORDS: usize = 3;
 
 /// The word rule: what the drone did with each asked lesson after it was delivered: (changed, ignored).
@@ -431,10 +479,55 @@ pub fn declared(lower: &str, id: &str) -> Option<bool> {
     out
 }
 
+/// `text` without the drone's declarations of lesson `id` (every `<id>: applies|skip` that `declared`
+/// reads, the id and the word both): the judge's evidence for a question whose declaration it must not
+/// see (hook.rs `stripped`). Other lessons' declarations and the rest of the text stay.
+pub fn strip_declaration(text: &str, id: &str) -> String {
+    // ASCII case folding keeps byte offsets, so a match in `lower` is the same span of `text`.
+    let (lower, id) = (text.to_ascii_lowercase(), id.to_ascii_lowercase());
+    if id.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let (mut from, mut kept) = (0, 0);
+    while let Some(i) = lower[from..].find(&id) {
+        let start = from + i;
+        let at = start + id.len();
+        let gap = lower[at..].len()
+            - lower[at..].trim_start_matches(|c: char| c == ']' || c == '`' || c == '*' || c == ':' || c == '-' || c == '–' || c.is_whitespace()).len();
+        let rest = &lower[at + gap..];
+        let word = ["applies", "apply", "skip"].iter().find(|w| rest.starts_with(**w)).map_or(0, |w| w.len());
+        // A declaration starts its line or follows a separator: the id at the start of a word.
+        let opens = start == 0 || !lower[..start].ends_with(|c: char| c.is_ascii_alphanumeric());
+        if word > 0 && opens && gap > 0 {
+            out.push_str(&text[kept..start]);
+            kept = at + gap + word;
+        }
+        from = at;
+    }
+    out.push_str(&text[kept..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::outcome::{CHANGED, CORRECTED, IGNORED, NOT_CORRECTED};
+
+    #[test]
+    fn a_stripped_declaration_is_gone_for_the_judge_and_the_rest_stays() {
+        for said in ["Mdrain: applies. Replaced the reset arc.", "- [Mdrain] - skip", "`Mdrain`: APPLY", "ok mdrain:skip then"] {
+            let s = strip_declaration(said, "Mdrain");
+            assert_eq!(declared(&s.to_lowercase(), "mdrain"), None, "{said} -> {s}");
+            assert!(declared(&said.to_lowercase(), "mdrain").is_some(), "{said}");
+        }
+        let both = "Mdrain: applies. New: skip. Mdrain is the budget lesson.";
+        let s = strip_declaration(both, "Mdrain");
+        assert_eq!(declared(&s.to_lowercase(), "new"), Some(false), "{s}");
+        assert!(s.contains("Replaced") || s.contains("Mdrain is the budget lesson"), "{s}");
+        assert_eq!(strip_declaration("no declaration here", "Mdrain"), "no declaration here");
+        assert_eq!(strip_declaration("XMdrain: applies", "Mdrain"), "XMdrain: applies", "another id ending in it");
+    }
 
     fn o(kind: &str, session: &str, lesson: &str, ms: i64, repo: &str) -> Outcome {
         Outcome { kind: kind.into(), session: session.into(), lessons: vec![lesson.into()], ms, repo: repo.into(), ..Default::default() }
@@ -530,12 +623,84 @@ mod tests {
             o(NOT_CORRECTED, "a", "L", 2, "r"), // settled later: the change stands
             o(IGNORED, "b", "L", 3, "r"),
             o(CHANGED, "c", "L", 4, "r"),
-            o(CORRECTED, "c", "L", 5, "r"), // corrected anyway: corrected wins
-            o(NOT_CORRECTED, "d", "L", 6, "r"),
+            o(CORRECTED, "c", "L", 5, "r"),     // corrected anyway: corrected wins
+            o(NOT_CORRECTED, "d", "L", 6, "r"), // never judged: censored, no result
         ];
         let m = &derive(&log, &[l], None)["L"];
-        assert_eq!((m.changed, m.ignored, m.corrected), (1, 2, 1));
-        assert_eq!((m.alpha(), m.beta()), (2.0, 5.0));
+        assert_eq!((m.changed, m.ignored, m.corrected), (1, 1, 1));
+        assert_eq!((m.alpha(), m.beta()), (2.0, 4.0));
+    }
+
+    #[test]
+    fn an_unjudged_settle_is_censored_and_a_later_verdict_counts_once() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = Outcome { check: "c1".into(), ..o(outcome::ASKED, "a", "L", 1, "r") };
+        let censored = Outcome { check: "c1".into(), reason: outcome::UNJUDGED_NO_CALL.into(), ..o(NOT_CORRECTED, "a", "L", 5, "r") };
+        let alone = mem(std::slice::from_ref(&asked));
+        assert_eq!(mem(&[asked.clone(), censored.clone()]), alone, "no belief effect: not an ignore");
+        // The session resumed and the judge spoke for the same check: its verdict alone counts.
+        for (kind, want) in [(CHANGED, (1, 0)), (IGNORED, (0, 1))] {
+            let later = Outcome { check: "c1".into(), ..o(kind, "a", "L", 9, "r") };
+            let m = mem(&[asked.clone(), censored.clone(), later]);
+            assert_eq!((m.changed, m.ignored), want, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_placebo_or_unclear_result_moves_no_belief() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = o(outcome::ASKED, "a", "L", 1, "r");
+        let alone = mem(std::slice::from_ref(&asked));
+        for kind in [CHANGED, IGNORED, CORRECTED, outcome::UNCLEAR] {
+            let placebo = Outcome { channel: outcome::PLACEBO.into(), ..o(kind, "b", "L", 5, "r") };
+            assert_eq!(mem(&[asked.clone(), placebo]), alone, "placebo {kind}");
+        }
+        assert_eq!(mem(&[asked.clone(), Outcome { channel: "stop".into(), ..o(outcome::UNCLEAR, "a", "L", 5, "r") }]), alone);
+    }
+
+    #[test]
+    fn one_sessions_regrets_blame_a_lesson_at_most_its_corrections() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = o(outcome::ASKED, "a", "L", 1, "r");
+        // Five later fixes of session a's work, half a correction each: one session counts once.
+        let mut log = vec![asked.clone()];
+        log.extend((0..5).map(|i| regret("a", "L", 10 + i, &format!("R{i}"), 0.5)));
+        assert_eq!(mem(&log).regretted, regret_cap(0));
+        assert_eq!(regret_cap(0), 1.0);
+        // The engineer corrected session a twice (other lessons): its regrets may blame up to two.
+        let mut twice = log.clone();
+        twice.extend([o(CORRECTED, "a", "X", 3, "r"), o(outcome::VETOED, "a", "Y", 4, "r"), o(CORRECTED, "a", "Z", 4, "r")]);
+        assert_eq!(mem(&twice).regretted, 2.0);
+        // Another session's regret is its own: it adds on top.
+        let mut other = log.clone();
+        other.extend([o(outcome::ASKED, "b", "L", 2, "r"), regret("b", "L", 20, "Rb", 0.5)]);
+        assert_eq!(mem(&other).regretted, 1.5);
+    }
+
+    #[test]
+    fn the_misses_a_regret_writes_leave_its_sessions_cap_unchanged() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        // Session a asked L; five later fixes of its work, each folded into a lesson Mi that a graded check
+        // of a found applying and a never asked: each regret blames L and writes a miss of Mi with itself as
+        // cause, at its decision's time (learn.rs `credit_regrets`).
+        let mut log = vec![o(outcome::ASKED, "a", "L", 1, "r")];
+        for i in 0..5 {
+            log.push(regret("a", "L", 10 + i, &format!("R{i}"), 0.5));
+            log.push(Outcome { cause: format!("R{i}"), ..o(outcome::MISSED, "a", &format!("M{i}"), 10 + i, "r") });
+        }
+        assert_eq!(mem(&log).regretted, regret_cap(0), "the regrets' own misses are no corrections");
+        // A team view carries the cause as a tag: the same.
+        let tagged: Vec<Outcome> =
+            log.iter().map(|x| Outcome { cause: if x.cause.is_empty() { String::new() } else { outcome::tag(&x.cause) }, ..x.clone() }).collect();
+        assert_eq!(mem(&tagged).regretted, regret_cap(0));
+        // The misses two corrections of the engineer's found (no cause) still count: the cap is two.
+        let mut corrected = log.clone();
+        corrected.extend([o(outcome::MISSED, "a", "X", 3, "r"), o(outcome::MISSED, "a", "Y", 4, "r")]);
+        assert_eq!(mem(&corrected).regretted, 2.0);
     }
 
     #[test]

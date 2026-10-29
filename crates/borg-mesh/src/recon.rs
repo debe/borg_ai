@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use crate::lines::Hash;
 use crate::{from_hex, to_hex};
 
-/// At or below this many hashes in a differing range, the hashes themselves are exchanged.
+/// At or below this many hashes in a differing range, the hashes themselves are exchanged. Method:
+/// trades rounds against message size (`log16(n / LEAF)` rounds, `LEAF·d` hashes per round); both
+/// sides must use the same value, so it is part of the protocol (borg/mesh/<version>).
 pub const LEAF: usize = 8;
-/// A peer that keeps claiming differences beyond this is broken or hostile.
+/// A peer that keeps claiming differences beyond this is broken or hostile. Guard: bounds the open
+/// ranges one session holds in memory (65 536, far past what two honest stores of a team differ by).
 const MAX_OPEN: usize = 1 << 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

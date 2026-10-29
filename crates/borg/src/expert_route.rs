@@ -17,7 +17,7 @@
 //! 3. at most 3 cited claims, over all experts, join the conscience's questions in the one block of
 //!    this checkpoint ("the flowlib repo says…; check whether it bears on your plan");
 //! 4. optionally (`"drone": true`, off by default) when the index has nothing, a read-only expert
-//!    drone (claude with Read/Grep/Glob only, $0.5 budget, at most 120 s and always inside the
+//!    drone (claude with Read/Grep/Glob only, at most 120 s and always inside the
 //!    harness's own cap on the stop hook, see [`drone_cap`]) answers once with citations.
 //!
 //! An expert repo is never consulted from behind the collective's boundary (under an `off` path,
@@ -41,12 +41,14 @@ use crate::collective::{self, Config, ExpertSource};
 use crate::harness::Harness;
 use crate::{expert, learn};
 
-/// The expert drone's caps: one cited answer, never resident.
-pub const DRONE_BUDGET_USD: &str = "0.5";
+/// The expert drone's caps: one cited answer, never resident, and no spend limit (its cost is measured
+/// and shown, never capped). Guard: a drone that never finishes, or loops on tool calls, is killed
+/// after this long, whatever the stop budget leaves.
 pub const DRONE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Read-only file tools only: no Bash (no git, no network), no edits.
 pub const DRONE_TOOLS: &str = "Read,Grep,Glob";
-/// Characters of the drone's answer that are injected.
+/// Characters of the drone's answer that are injected. Guard: a long answer cannot flood the
+/// drone's context; a cited answer of a few claims fits.
 const ANSWER_CHARS: usize = 1500;
 
 const DRONE_SYSTEM: &str = "You are the read-only expert on this repository. Investigate it as you need (code, specs, \
@@ -102,15 +104,18 @@ pub struct DroneRun {
 /// Runs an expert drone in `repo` with `prompt`, killed after the given time.
 pub type Drone<'a> = &'a dyn Fn(&Path, &str, Duration) -> DroneRun;
 
-/// The stop hook's time budget when the harness names none (`BORG_STOP_BUDGET_MS`, which the omp and
-/// opencode adapters set to their own timeout): 60 s, Claude Code's old default command-hook timeout
+/// The stop hook's time budget when neither the event (`BORG_STOP_BUDGET_MS`, which the omp and
+/// opencode adapters set to the harness's `Caps::stop_budget`, as borg's answer tells them) nor the
+/// harness's caps name one (`stop_budget`): 60 s, Claude Code's old default command-hook timeout
 /// (harness/mod.rs `DEFAULT_STOP_BUDGET`). `borg install claude` gives the Stop hook a longer `timeout`
-/// (install.rs), so this keeps a margin even on an install that predates it.
+/// (install.rs), so this keeps a margin even on an install that predates it. Derived: the harness's.
 pub const DEFAULT_STOP_BUDGET: Duration = crate::harness::DEFAULT_STOP_BUDGET;
 pub const STOP_BUDGET_ENV: &str = "BORG_STOP_BUDGET_MS";
-/// Time kept back from the budget for the rest of the hook (merge, log, print).
+/// Time kept back from the budget for the rest of the hook (merge, log, print). Guard: the hook ends
+/// inside the harness's timeout, so the harness never kills it mid-write.
 pub(crate) const STOP_MARGIN: Duration = Duration::from_secs(5);
-/// Less time than this left: no drone (it could not finish an answer anyway).
+/// Less time than this left: no drone (it could not finish an answer anyway). Guard: no drone is
+/// started only to be killed, paying for an answer nobody reads.
 const DRONE_MIN: Duration = Duration::from_secs(10);
 
 /// What a checkpoint consults with: the store it logs in, the scratch state that remembers what each
@@ -354,7 +359,7 @@ bear on these sentences? Cite files/IDs; say 'nothing' if none. Keep it to the f
 fn claude_drone(repo: &Path, prompt: &str, cap: Duration) -> DroneRun {
     let model = std::env::var("BORG_EXPERT_MODEL").unwrap_or_else(|_| "sonnet".into());
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", prompt, "--model", &model, "--max-budget-usd", DRONE_BUDGET_USD])
+    cmd.args(["-p", prompt, "--model", &model])
         .args(["--tools", DRONE_TOOLS, "--allowed-tools", DRONE_TOOLS, "--output-format", "json", "--no-session-persistence"])
         // No user settings (that is where borg's own hooks live) and no hooks at all: no recursion.
         .args(["--strict-mcp-config", "--setting-sources", "project", "--settings", r#"{"disableAllHooks":true}"#])

@@ -37,6 +37,7 @@ pub(crate) fn read(p: &Path) -> std::io::Result<Option<String>> {
 }
 
 /// Mode for files borg creates where none existed: settings.json often holds secrets in `env`.
+/// Protocol: owner read and write only, as for a credentials file.
 #[cfg(unix)]
 const NEW_FILE_MODE: u32 = 0o600;
 

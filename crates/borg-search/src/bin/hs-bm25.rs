@@ -9,6 +9,7 @@ use std::path::Path;
 
 use borg_search::{load, rank_a, rank_b, read_queries};
 
+/// Experiment parameter: the depth every arm's ranking is recorded to (as hs.rs `TOP`).
 const TOP: usize = 20;
 
 fn main() {

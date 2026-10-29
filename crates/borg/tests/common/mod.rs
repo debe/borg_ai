@@ -70,7 +70,13 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
         .env("BORG_QUEEN", "off")
         .env("BORG_LEARN", "off")
         .env("BORG_VECTORS", "off")
-        // These tests pin delivery; how many to ask is learned (attention.rs) and pinned in attention_cli.rs.
+        // The fake `claude` alone answers: an answer it fails would otherwise fall through to the next
+        // model CLI on PATH (runner.rs `pick`), a real call. Off Claude Code a test passes its own.
+        .env("BORG_PREDICT_MODEL", "claude:")
+        // These tests pin delivery, the fixed rule's (select.rs `Policy::Fixed`, the default), so a
+        // BORG_SELECT of the shell running them changes nothing; select_cli.rs and attention_cli.rs pass
+        // their own.
+        .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")
         // These tests pin the turn-end behaviour; the live ones pass BORG_MODE=live.
         .env("BORG_MODE", "hook")

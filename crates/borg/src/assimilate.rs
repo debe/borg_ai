@@ -34,7 +34,9 @@ use crate::harness::opencode;
 use crate::learn::{self, Episode, Lesson};
 use crate::runner;
 
-/// Two episodes of one session this close together are the same correction.
+/// Two episodes of one session this close together are the same correction. Method: a dedupe
+/// window; the live hook's capture time and the transcript's message time of one correction differ
+/// by a second or two, two corrections of a session by far more.
 const SAME_MS: i64 = 5_000;
 
 /// Its flags and `--from-dir`'s (completions.rs).
@@ -128,6 +130,10 @@ pub struct Report {
 }
 
 const NOTICE: &str = "want to proceed with this tool use";
+/// The characters of a failed tool call's first line searched for `NOTICE`. Method, not a display:
+/// the harness writes its notice at the very start of that line, so past this many characters the same
+/// words are the tool's own output (a long first line of a command's output), not a rejection.
+const NOTICE_CHARS: usize = 200;
 
 fn human(t: &str) -> bool {
     t.len() > 3 && !t.starts_with('<') && !t.contains("[Request interrupted")
@@ -200,7 +206,7 @@ impl Replay {
 
     fn assistant_text(&mut self, t: &str) {
         if !t.trim().is_empty() {
-            self.said = (tail(t.trim(), 2000), self.cwd.clone());
+            self.said = (tail(t.trim(), learn::PROPOSAL_CHARS), self.cwd.clone());
         }
     }
 
@@ -221,13 +227,13 @@ impl Replay {
             return;
         }
         if let Some(tool) = self.denied.take() {
-            self.episode(ms, Some(tool), take(t, 1500));
+            self.episode(ms, Some(tool), take(t, learn::EXCERPT_CHARS));
             return;
         }
         if learn::is_correction(t) && !self.task.0.is_empty() {
-            self.episode(ms, None, take(t, 1500));
+            self.episode(ms, None, take(t, learn::EXCERPT_CHARS));
         } else {
-            self.task = (take(t, 3000), self.cwd.clone());
+            self.task = (take(t, learn::TASK_CHARS), self.cwd.clone());
         }
     }
 
@@ -238,7 +244,7 @@ impl Replay {
         }
         // Only the harness's own notice, on the first line, is a rejection; the same words further down
         // are tool output (e.g. "Exit code 1" and then an old transcript).
-        let first: String = take(text.trim_start().lines().next().unwrap_or_default(), 200);
+        let first: String = take(text.trim_start().lines().next().unwrap_or_default(), NOTICE_CHARS);
         if let Some(said) = learn::rejection(text).filter(|_| first.contains(NOTICE)) {
             self.episode(ms, Some((tool, self.cwd.clone())), said);
         } else if learn::denied(text) {
@@ -248,7 +254,7 @@ impl Replay {
 }
 
 fn tool_text(name: &str, input: &Value) -> String {
-    format!("{name} {}", take(&input.to_string(), 1500))
+    format!("{name} {}", take(&input.to_string(), learn::EXCERPT_CHARS))
 }
 
 fn lines(path: &Path) -> impl Iterator<Item = Value> {
@@ -858,7 +864,7 @@ fn append(path: &Path, eps: &mut [Found], engineers: &mut HashMap<String, String
                     ev.engineer.clone_from(&x.episode.engineer);
                     ev.repo.clone_from(&x.episode.repo);
                     ev.why = "prompt".into();
-                    ev.text = crate::stats::excerpt(&x.episode.correction, 160);
+                    ev.text = crate::stats::excerpt(&x.episode.correction, crate::stats::FEED_CHARS);
                 });
             }
         }

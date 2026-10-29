@@ -1,7 +1,7 @@
 //! The harness abstraction's gates that need no tools (docs/harnesses.md, scripts/arch.sh prints the
 //! rest): outside `src/harness/` no code branches on a harness's name (M1; the deferred files in
 //! [`M1_DEFERRED`] aside), and `harness::ALL` is the one table of harness names (M2). Every harness module
-//! is in it.
+//! is in it, and docs/harnesses.md names every answer key only an adapter gets.
 
 use std::path::{Path, PathBuf};
 
@@ -102,4 +102,19 @@ fn every_harness_module_is_registered_in_all() {
         }
     }
     assert_eq!(modules, borg::harness::ALL.len(), "one module per harness");
+}
+
+/// The answer keys only an adapter gets (hook.rs `for_harness` takes them out for a `CommandHooks`
+/// harness, which parses the answer itself) are each named in docs/harnesses.md, so the page that says
+/// what an adapter reads from borg's answer keeps up with what borg sends.
+#[test]
+fn docs_name_every_answer_key_only_an_adapter_gets() {
+    let hook = std::fs::read_to_string(src().join("hook.rs")).unwrap();
+    let body: Vec<&str> = hook.lines().skip_while(|l| !l.starts_with("fn for_harness(")).take_while(|l| *l != "}").collect();
+    let key = Regex::new(r#"shift_remove\("(\w+)"\)"#).unwrap();
+    let keys: Vec<String> = body.iter().flat_map(|l| key.captures_iter(l).map(|c| c[1].to_string())).collect();
+    assert!(!keys.is_empty(), "hook.rs `for_harness` removes no key this test can read: follow it");
+    let doc = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/harnesses.md")).unwrap();
+    let missing: Vec<&String> = keys.iter().filter(|k| !doc.contains(&format!("`\"{k}\"`"))).collect();
+    assert!(missing.is_empty(), "docs/harnesses.md does not name {missing:?}, sent to adapters only (hook.rs `for_harness`)");
 }

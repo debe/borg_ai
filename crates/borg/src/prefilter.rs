@@ -10,11 +10,14 @@
 
 use crate::conscience::{self, Challenge};
 
-/// State-file markers that close a turn (main.rs appends one at every Stop that reaches the conscience).
+/// State-file markers that close a turn (hook.rs appends one at every Stop that reaches the conscience).
+/// Never a selection line (`#borg-select`, `#borg-pf`, `#borg-placebo`, `#borg-routed`): those come
+/// mid-turn too and close nothing. Protocol.
 pub const MARKERS: [&str; 2] = ["#borg-asked", "#borg-skip"];
 
-/// Pre-registered in the internal evaluation "stop-prefilter" (not published): 0.9 × the lowest score of any labelled checkpoint
-/// with a relevant lesson in its shortlist (9.28), rounded down.
+/// Learned (evaluation-decided): pre-registered in the internal evaluation "stop-prefilter" (not
+/// published): 0.9 × the lowest score of any labelled checkpoint with a relevant lesson in its shortlist
+/// (9.28), rounded down.
 pub const THRESHOLD: f64 = 8.0;
 
 /// What the state file gained since the last Stop: this turn's prompt and touches (plus the drone's

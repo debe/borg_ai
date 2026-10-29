@@ -18,13 +18,15 @@ use serde_json::Value;
 
 use crate::learn;
 
-/// Without a hook for this long a session shows as idle.
+/// Without a hook for this long a session shows as idle. Display: it only picks the word `borg top`
+/// and the web page show (`state`); no pacing, pruning or decision may derive from it.
 pub const IDLE_MS: i64 = 30 * 60 * 1000;
-/// Untouched for this long a record is pruned (and the mesh stops carrying it).
-pub const PRUNE_MS: i64 = 24 * 60 * 60 * 1000;
-/// At most this many recently touched files per record.
+/// Untouched for this long a record is pruned (and the mesh stops carrying it). Guard: bounds the
+/// presence files to the sessions of the last day (`clock::DAY_MS`), one record per session.
+pub const PRUNE_MS: i64 = crate::clock::DAY_MS;
+/// At most this many recently touched files per record. Display: what a drone's row names.
 pub const FILES: usize = 3;
-/// The prompt's first line, at most this many characters.
+/// The prompt's first line, at most this many characters. Display: one row of `borg top`.
 const PROMPT_CHARS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +316,7 @@ impl Mismatch {
     pub fn line(&self, key: &str) -> String {
         let n = |p: &str| p.rsplit('/').next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
         let who = if n(&self.theirs) < n(&self.ours) { "upgrade it" } else { "upgrade this node" };
-        format!("peer {} speaks {}, this node {}: nothing syncs with it; {who}", key.get(..12).unwrap_or(key), self.theirs, self.ours)
+        format!("peer {} speaks {}, this node {}: nothing syncs with it; {who}", crate::msg::short_node(key), self.theirs, self.ours)
     }
 
     /// The same, as the member on the other end reads it about this node (`me`): the close reason sent to it.
@@ -354,6 +356,44 @@ pub fn retain_mismatches(home: &Path, keep: impl Fn(&str) -> bool) -> std::io::R
         return Ok(());
     }
     write_mesh(home, &protocols_path(home), &all)
+}
+
+/// `<store>/mesh/reads.json`, `{"<member key>": v}`: the newest message line format (msg.rs
+/// `Message::v`) each member's node reads, as the protocol of its last completed session with this node
+/// says (borg-mesh sync.rs `reads`): 1 for 0.4.0 and 0.5.x, which drop a v2 line, 0 for 0.3.0, which
+/// syncs no messages. Written by the mesh daemon, dialled or served; `send` refuses what a session
+/// there could never be shown (msg.rs `SendError::Reads`). Local, never synced.
+pub fn reads_path(home: &Path) -> PathBuf {
+    home.join("mesh").join("reads.json")
+}
+
+/// What each member's node reads (`reads_path`); empty before any session completed.
+pub fn reads(home: &Path) -> std::collections::BTreeMap<String, u8> {
+    std::fs::read_to_string(reads_path(home)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Records that `key`'s node reads message lines up to format `v`; no write when that is known (a
+/// session completes every minute or so).
+pub fn note_reads(home: &Path, key: &str, v: u8) -> std::io::Result<()> {
+    let mut all = reads(home);
+    if all.get(key) == Some(&v) {
+        return Ok(());
+    }
+    all.insert(key.into(), v);
+    write_mesh(home, &reads_path(home), &all)
+}
+
+/// Keeps only the reads records of keys `keep` still allows, as `retain_mismatches` keeps theirs: a
+/// removed member's record misleads nothing (msg.rs `unread_on` counts the held members alone), but no
+/// session with it would ever replace it.
+pub fn retain_reads(home: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<()> {
+    let mut all = reads(home);
+    let before = all.len();
+    all.retain(|k, _| keep(k));
+    if all.len() == before {
+        return Ok(());
+    }
+    write_mesh(home, &reads_path(home), &all)
 }
 
 /// `borg doctor`'s line for each member the mesh cannot sync with because it speaks another session

@@ -56,11 +56,15 @@ waiter runs), the plugin keeps the session's waiter, `borg listen --stream`. The
 holds wakes off while the engineer's turn runs and prints one JSON line per wake.
 The plugin sends a wake in only while the session is idle, from its stop (or a halted turn) to its next
 prompt or tool call: opencode 1.x with `session.promptAsync`, opencode 2.x with `session.prompt` and
-`delivery: "queue"`, both marked `{ borg: true }` so the echo is not the engineer's prompt. A wake that
-fails to go in is kept and sent again 5 s later, at most 5 times in a row, then at the session's next
-stop or halt. A wake held during a turn is dropped when a hook of that turn already showed its
-messages, so no turn is spent on messages the model has read. A halted turn of a listening session (no stop) is sent to borg as `halted`, so its waiter
-holds nothing off any more. An `{"end"}` line ends the waiter until the next `"listen": true`;
+`delivery: "queue"`, both marked `{ borg: true }` so the echo is not the engineer's prompt. It answers
+each wake on the waiter's stdin: `{"sent": ids}`, or `{"failed": ids}` when opencode refused it; the
+waiter then wakes the session again for those messages 10 s later, doubling up to 5 minutes. A wake
+held during a turn is dropped once that turn's hooks handed the model every message it names (borg's
+answer names them, `"shown_ids"`), over one hook or several, and one that comes after they did is
+dropped as it comes, so no turn is spent on messages the model has read. A context that came too late
+for its call (kept for the next one, as above) drops nothing until that call carries it, and an older
+borg's answer, which names none, drops nothing: its wake goes in. A halted turn of a
+listening session (no stop) is sent to borg as `halted`, so its waiter holds nothing off any more. An `{"end"}` line ends the waiter until the next `"listen": true`;
 `--off`, the session's end and the plugin's unload stop it.
 
 The plugin ignores subagent (child) sessions, except before a tool call: a child's `pre_tool` asks
@@ -70,6 +74,12 @@ The plugin fails open. If borg is missing, slow or broken, opencode carries on a
 not there. A stop gets 90 s (opencode sets no limit of its own), which the plugin passes to borg as
 `BORG_STOP_BUDGET_MS`: room for a 15 s wait for a running live check, the 45 s model call and an
 expert drone.
+
+**Budgets.** How long the plugin waits for borg at each call, and how much of a shell call's output
+borg gets, are borg's (`BUDGETS` in `crates/borg/src/harness/opencode.rs`): the plugin asks for them
+with its calls until an answer carries them, and uses its own copy, the same values, until then. A
+prompt waits 5 s, a tool call 2 s before it runs and 2 s after, the stop and the session's end 90 s;
+borg gets the last 4,000 characters of a shell call's output.
 
 Rejections reach borg in Claude Code's wording. A rejection with feedback carries the engineer's
 words. A rejection without feedback (opencode 1: `The user rejected permission to use this specific

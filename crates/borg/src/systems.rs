@@ -112,6 +112,10 @@ fn of_alias(name: &str) -> BTreeSet<String> {
     map().systems.iter().filter(|(_, aliases)| aliases.iter().any(|a| have.contains(a))).map(|(k, _)| k.clone()).collect()
 }
 
+/// The most directories `work_repos` looks up. Guard: each is a walk up the tree (a `stat` per
+/// level), so a session that touched files all over the disk costs the hook at most this many.
+const MAX_DIRS: usize = 256;
+
 /// The repos the work is in, from the session's `.where` file: repo names on lines of their own (the
 /// hook notes the cwd's repo at each prompt), and the git repos of absolute touched paths (found on
 /// disk; a path in no git repo says nothing).
@@ -131,7 +135,7 @@ pub fn work_repos(where_text: &str) -> Vec<String> {
         for w in line.split_whitespace().filter(|w| w.starts_with('/')) {
             let dir = Path::new(w).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
             // Bounded: a long session's .where has hundreds of paths, mostly in few directories.
-            if dirs.len() >= 256 && !dirs.contains_key(&dir) {
+            if dirs.len() >= MAX_DIRS && !dirs.contains_key(&dir) {
                 continue;
             }
             let repo = dirs.entry(dir.clone()).or_insert_with(|| git_repo(&dir)).clone();

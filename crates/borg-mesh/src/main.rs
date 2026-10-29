@@ -50,8 +50,29 @@ fn show(r: &Report) -> String {
     )
 }
 
-fn short(key: &str) -> &str {
-    key.get(..12).unwrap_or(key)
+/// Where `serve` listens unless `--bind` says otherwise. Protocol: the port members and tickets use
+/// by default (docs/team-sync.md); every interface, so another machine can dial it.
+const BIND: &str = "0.0.0.0:7878";
+
+/// How long a command waits for its endpoint to reach the home relay before it goes on without one.
+/// Guard: an unreachable relay delays a command by this much, never blocks it; a member behind
+/// another NAT may then not reach this node until the relay connection comes.
+const ONLINE_WAIT: Duration = Duration::from_secs(10);
+
+/// How long `join` waits for the admin's node to answer. Guard: a ticket whose admin node is down
+/// fails with a hint instead of hanging.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often `serve` looks for Ctrl-C or SIGTERM. Method: the polling period of a flag; a stop takes
+/// effect within one tick.
+const STOP_TICK: Duration = Duration::from_millis(100);
+/// Every this many ticks (a second at `STOP_TICK`) `serve` looks for a reinstalled borg-mesh. Method:
+/// one `stat` a second; a reinstall takes over within that.
+const IMAGE_EVERY: u64 = 10;
+
+/// A member key as every label shows it (borg msg.rs `short_node`, `NODE_CHARS`).
+fn short(key: &str) -> String {
+    borg::msg::short_node(key)
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -72,13 +93,19 @@ fn positional(args: &[String]) -> Option<&str> {
     args.get(1).map(String::as_str).filter(|a| !a.starts_with("--"))
 }
 
+/// How long a ticket stays usable unless `--expires` says otherwise. Guard: a ticket that leaked (a
+/// chat log, a screenshot of its QR code) admits nobody after a week.
+const TICKET_EXPIRES: &str = "7d";
+/// How many joins a ticket admits unless `--uses` says otherwise. Guard: one ticket, one member.
+const TICKET_USES: &str = "1";
+
 /// `invite` without a key: a ticket for whoever presents it first (invite.rs).
 fn invite_ticket(place: &Place, args: &[String]) -> Result<(), String> {
     let (name, home) = place.gate()?;
     let m = Membership::load(&home)?.ok_or(format!("{name} has no membership: `borg mesh init`"))?;
     let role = flag(args, "--role").unwrap_or("member");
-    let ttl = invite::duration_ms(flag(args, "--expires").unwrap_or("7d"))?;
-    let uses = flag(args, "--uses").unwrap_or("1").parse::<u32>().map_err(|e| format!("--uses: {e}"))?;
+    let ttl = invite::duration_ms(flag(args, "--expires").unwrap_or(TICKET_EXPIRES))?;
+    let uses = flag(args, "--uses").unwrap_or(TICKET_USES).parse::<u32>().map_err(|e| format!("--uses: {e}"))?;
     let relay = place.relay()?;
     let hints = invite::load_reach(&home);
     if relay == Relay::Disabled && hints.is_empty() {
@@ -120,10 +147,11 @@ async fn join_ticket(place: &Place, text: &str, apply: bool, paths: &[String]) -
     }
     let jp = place.named(&name);
     let node = Node::joining(&jp, "0.0.0.0:0".parse().unwrap()).await?.quiet();
-    node.online(Duration::from_secs(10)).await;
-    let result = tokio::time::timeout(Duration::from_secs(60), node.join(&t)).await;
+    node.online(ONLINE_WAIT).await;
+    let result = tokio::time::timeout(JOIN_TIMEOUT, node.join(&t)).await;
     node.close().await;
-    let (m, rep) = result.map_err(|_| "the admin's node did not answer within 60 s: is `borg mesh serve` running there?".to_string())??;
+    let (m, rep) =
+        result.map_err(|_| format!("the admin's node did not answer within {} s: is `borg mesh serve` running there?", JOIN_TIMEOUT.as_secs()))??;
     let me = node.public();
     println!("joined {name} v{} as {}; first sync: {}", m.version, m.role_of(&me).unwrap_or("?"), show(&rep));
     if paths.is_empty() {
@@ -241,11 +269,13 @@ async fn run(args: &[String]) -> Result<(), String> {
         Some("serve") => {
             // What it runs, before anything: a reinstall of borg-mesh from here on replaces it.
             let image = Image::now();
-            let bind = flag(args, "--bind").unwrap_or("0.0.0.0:7878").parse().map_err(|e| format!("--bind: {e}"))?;
-            let interval = flag(args, "--interval").map(|s| s.parse::<u64>().map_err(|e| format!("--interval: {e}"))).transpose()?.unwrap_or(60);
+            let bind = flag(args, "--bind").unwrap_or(BIND).parse().map_err(|e| format!("--bind: {e}"))?;
+            let default = Options::default();
+            let interval =
+                flag(args, "--interval").map(|s| s.parse::<u64>().map_err(|e| format!("--interval: {e}"))).transpose()?.unwrap_or(default.interval.as_secs());
             let node = Arc::new(Node::bind(&place, bind).await?);
             let relay = node.relay().clone();
-            let online = node.online(Duration::from_secs(10)).await;
+            let online = node.online(ONLINE_WAIT).await;
             let hints = node.hints();
             if hints.is_empty() && relay == Relay::Disabled {
                 node.close().await;
@@ -262,7 +292,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             if !online {
                 eprintln!("borg mesh: no relay connection yet ({}): members behind another NAT may not reach this node until it has one", relay.setting());
             }
-            let opts = Options { interval: Duration::from_secs(interval.max(1)), ..Options::default() };
+            let opts = Options { interval: Duration::from_secs(interval.max(1)), ..default };
             // Its code replaced by a reinstall of borg-mesh (borg reexec.rs): the daemon stops as on
             // Ctrl-C, and `main` runs the new borg-mesh in this process.
             let reinstalled = std::sync::atomic::AtomicBool::new(false);
@@ -288,7 +318,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         Some("sync") => {
             let target = args.get(1).ok_or("sync <key>[@<ip:port>]")?;
             let node = Node::bind(&place, "0.0.0.0:0".parse().unwrap()).await?.quiet();
-            node.online(Duration::from_secs(10)).await;
+            node.online(ONLINE_WAIT).await;
             let rep = node.sync(target).await;
             node.close().await;
             let rep = rep?;
@@ -306,12 +336,14 @@ async fn run(args: &[String]) -> Result<(), String> {
             let m = Membership::load(&home)?.ok_or("no membership")?;
             let node = Node::bind(&place, "0.0.0.0:0".parse().unwrap()).await?.quiet();
             let me = node.public();
-            node.online(Duration::from_secs(10)).await;
+            node.online(ONLINE_WAIT).await;
+            // One member's dial is bounded as the daemon bounds it (`Options::timeout`).
+            let timeout = Options::default().timeout;
             for t in peers::targets(&home).into_iter().filter(|t| t.key != me && m.role_of(&t.key).is_some()) {
-                match tokio::time::timeout(Duration::from_secs(30), node.fetch(&t.to_string(), &commits)).await {
+                match tokio::time::timeout(timeout, node.fetch(&t.to_string(), &commits)).await {
                     Ok(Ok(rep)) => println!("asked {}: {} excerpt(s) received", short(&t.key), rep.received),
                     Ok(Err(e)) => eprintln!("borg mesh: {}: {e}", short(&t.key)),
-                    Err(_) => eprintln!("borg mesh: {}: no answer within 30s", short(&t.key)),
+                    Err(_) => eprintln!("borg mesh: {}: no answer within {}s", short(&t.key), timeout.as_secs()),
                 }
             }
             node.close().await;
@@ -326,13 +358,13 @@ async fn run(args: &[String]) -> Result<(), String> {
 /// Until Ctrl-C or SIGTERM (borg reexec.rs `trap_stops`, from `main`): false; or until `image`'s
 /// borg-mesh was replaced by one that can run: true.
 async fn stop(image: &Image) -> bool {
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut tick = tokio::time::interval(STOP_TICK);
     for n in 0u64.. {
         tick.tick().await;
         if reexec::stopped() {
             return false;
         }
-        if n % 10 == 0 && image.due() {
+        if n % IMAGE_EVERY == 0 && image.due() {
             return true;
         }
     }
@@ -418,7 +450,8 @@ fn main() {
     }
     let restart = RESTART.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     if let Some(mut image) = restart {
-        rt.shutdown_timeout(Duration::from_secs(5));
+        // Tasks the daemon left get its grace once more (`Options::grace`) before the new image runs.
+        rt.shutdown_timeout(Options::default().grace);
         match image.restart() {
             Ok(()) => println!("stopped"),
             Err(why) => {

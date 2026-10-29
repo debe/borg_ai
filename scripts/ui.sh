@@ -15,5 +15,6 @@ if [ "${1:-}" = "--check" ]; then
     fi
     exit 0
 fi
-trunk build --release
+# Paths in panic locations are written relative to $HOME, so the committed wasm names no home directory.
+RUSTFLAGS="--remap-path-prefix=$HOME=~ ${RUSTFLAGS:-}" trunk build --release
 hash > ../dist/.source-hash

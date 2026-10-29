@@ -47,7 +47,10 @@ behalf. `borg uninstall codex --apply` removes them again.
   running when it yields fire no PostToolUse, so borg never sees those edits during the turn.
 - Models in code mode run their tool calls inside one `exec` script: borg's context reaches the model
   only after the whole script, so a live check cannot stop a later edit of the same script.
-- Context over about 2,500 tokens is cut by codex (the rest goes to a file under `/tmp/hook_outputs`).
+- Codex cuts a hook's context past 10,000 characters (about 2,500 tokens) to its head and tail, and
+  saves the whole text under `hook_outputs`. borg sizes the messages one prompt or tool call shows to
+  fit within it, beside that event's lessons; a longer message shows its head and
+  `borg inbox --show <id>`.
 
 ## borg's own model calls
 

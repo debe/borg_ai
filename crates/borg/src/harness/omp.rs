@@ -1,14 +1,41 @@
 //! omp (oh-my-pi): the TS extension `adapters/omp/borg.ts`, compiled in and copied to
 //! `~/.omp/agent/extensions/borg.ts` (`$PI_CODING_AGENT_DIR/extensions`). The adapter translates omp's
-//! events into borg's canonical ones and back, sends omp's pid, and sets the stop's budget itself.
+//! events into borg's canonical ones and back, sends omp's pid, and gives borg the stop's budget
+//! (`BUDGETS`, which borg's first answer tells it).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Budgets, CONTEXT_GUARD, Caps, DroneWake, Harness, Probe, Run, SubAgent, Transcript, Wiring};
 
 pub const ADAPTER: &str = include_str!("../../assets/adapters/omp/borg.ts");
+
+/// Protocol (omp's): how long omp waits for an extension's handler of any event but `session_shutdown`
+/// before it gives up on it (aborting `session_stop`'s signal); no setting changes it. omp 18.13.1's
+/// extensions runner (`EXTENSION_HANDLER_TIMEOUT_MS`, 30000), read 2026-10-28.
+pub const HANDLER_LIMIT: Duration = Duration::from_secs(30);
+/// Protocol (omp's): its limit for a `session_shutdown` handler (`SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS`,
+/// 2000, the same runner).
+pub const SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
+/// Guard: what the extension keeps of omp's limit for itself (spawning borg, reading its answer,
+/// returning it to omp), so borg's answer arrives before omp gives up on the handler.
+const STOP_MARGIN: Duration = Duration::from_secs(2);
+/// Guard: the same at the session's end, where omp's limit leaves room for less.
+const END_MARGIN: Duration = Duration::from_millis(500);
+
+/// What the extension waits for each of borg's answers. Guards: the prompt's and a tool call's end are
+/// file appends, cut off at 5 s so a hung borg never holds the engineer's turn; before a tool call borg
+/// answers with a stat when nobody steers, cut off at 2 s. Derived: the stop and the end, omp's limits
+/// less the margins.
+pub const BUDGETS: Budgets = Budgets {
+    prompt: Duration::from_secs(5),
+    pre_tool: Duration::from_secs(2),
+    post_tool: Duration::from_secs(5),
+    stop: HANDLER_LIMIT.saturating_sub(STOP_MARGIN),
+    end: SHUTDOWN_LIMIT.saturating_sub(END_MARGIN),
+};
 
 pub struct Omp;
 
@@ -27,8 +54,11 @@ impl Harness for Omp {
             transcript: Transcript::None,
             deny_capture: true,
             sends_pid: true,
-            // The adapter names the stop's budget itself (`BORG_STOP_BUDGET_MS`).
-            stop_budget: None,
+            // The adapter names it too (`BORG_STOP_BUDGET_MS`), as borg's answer told it.
+            stop_budget: Some(BUDGETS.stop),
+            // omp injects a tool_result's additionalContext whole, as one developer message (18.13.1,
+            // packages/agent/src/tool-context.ts), and before_agent_start's message whole: no limit.
+            context_chars: CONTEXT_GUARD,
             session_env: Some("PI_SESSION_ID"),
             pid_env: None,
             drone_wake: DroneWake::Plugin,
@@ -37,6 +67,10 @@ impl Harness for Omp {
 
     fn wiring(&self) -> Wiring {
         Wiring::AdapterFile { source: ADAPTER }
+    }
+
+    fn budgets(&self) -> Option<Budgets> {
+        Some(BUDGETS)
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {

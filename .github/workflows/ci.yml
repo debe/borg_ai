@@ -26,6 +26,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # A CI hang guard (a test or a build that never returns), not a target: about twice the longest
+    # observed run. The longest of 56 runs each (Oct 2026) took 14 min on Linux and 30 min on macOS
+    # (a cold cache); typical runs take 7 and 10 min.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable

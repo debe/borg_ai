@@ -58,7 +58,8 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
         "msg_sent" if e.engineer.is_empty() => "A message was sent between sessions".into(),
         "msg_sent" => format!("{w} sent a message"),
         "msg_delivered" => "A session was shown a message".into(),
-        "msg_dropped" if e.why == "rate" => "A message was refused: one per sender and recipient every 10 minutes".into(),
+        "msg_dropped" if e.why == "window" => "A message was refused: its recipient had not read the ones before it".into(),
+        "msg_dropped" if e.why == "rate" => "A message was refused by 0.5's rate limit (one per sender and recipient every 10 minutes)".into(),
         "msg_dropped" => format!("{} old message{} left the bounded log", num(e.n.max(1.0)), if e.n > 1.0 { "s" } else { "" }),
         other => kind(other).0.to_string(),
     };

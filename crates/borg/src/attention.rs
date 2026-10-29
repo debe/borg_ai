@@ -25,16 +25,21 @@ use std::collections::HashMap;
 use crate::conscience::{self, Challenge};
 use crate::outcome::{self, Outcome};
 
-/// The prior cut: ranks 0 to 10. CRC by rank with α = the fixed rule's miss rate on the 169 logged
-/// checks of the review-fix runs, calibrated 2026-10-22 (eval/review-fix/crc.py, α 0.059).
+/// The prior cut: ranks 0 to 10. Learned (dated prior): CRC by rank with α = the fixed rule's miss
+/// rate on the 169 logged checks of the review-fix runs, calibrated 2026-10-22 (eval/review-fix/crc.py,
+/// α 0.059).
 pub const PRIOR_K: usize = 11;
-/// The newest labelled checks the cut is set on.
+/// The newest labelled checks the cut is set on. Method: the drift window, design-chosen; long
+/// enough for ⌈1/α⌉ − 1 labels at α ≥ 0.005.
 pub const WINDOW: usize = 200;
-/// A guard against runaway rounds, never the tuning knob: no round asks more.
+/// A guard against runaway rounds, never the tuning knob: no round asks more. Guard: a check whose
+/// model applies every lesson in a large pool cannot turn into one question per lesson.
 pub const RAIL: usize = 20;
 /// The least α (crc.py's floor): with no fixed-rule miss yet, ⌈1/α⌉ − 1 = 999 labels before the cut moves.
+/// Method: keeps the CRC bound finite when the observed miss rate is 0.
 pub const MIN_ALPHA: f64 = 1e-3;
 /// One in `EXPLORE` blocking checks under the cut asks every apply up to `RAIL`: the only labels.
+/// Method: the exploration rate of the cut, design-chosen (a tenth of checks pays for labels).
 pub const EXPLORE: usize = 10;
 
 /// One labelled check: its grades in the model's order and the ranks of the lessons it needed.
@@ -60,7 +65,8 @@ pub fn labels(outcomes: &[Outcome]) -> Vec<Labelled> {
         v.sort_by_key(|c| c.0);
     }
     let mut needed: HashMap<usize, Vec<&str>> = HashMap::new();
-    for o in outcomes.iter().filter(|o| o.kind == outcome::CHANGED || o.kind == outcome::MISSED) {
+    // A placebo's `changed` or an unclear verdict is no result (outcome.rs `is_result`): it labels nothing.
+    for o in outcomes.iter().filter(|o| outcome::is_result(o) && (o.kind == outcome::CHANGED || o.kind == outcome::MISSED)) {
         for l in &o.lessons {
             let Some(cs) = checks.get(&(o.session.as_str(), l.as_str())) else { continue };
             let before = &cs[..cs.partition_point(|c| c.0 < o.ms)];
@@ -135,10 +141,6 @@ pub fn on() -> bool {
     std::env::var("BORG_STOP_ATTENTION").as_deref() == Ok("on")
 }
 
-/// What to ask, what to hand over free, the cut (None under the fixed rule), and each apply's
-/// probability of being asked under the policy in force, aligned with the applies (`propensities`).
-pub type Split<'a> = (Vec<&'a Challenge>, Vec<&'a Challenge>, Option<Cut>, Vec<f64>);
-
 /// A graded check's split under `cut`: without a grade 3 nothing blocks, as in `conscience::graded`;
 /// with a 3, the applies ranked below `cut.k` are asked (at most `RAIL`) and the rest go free (at most
 /// `conscience::CAP`).
@@ -150,28 +152,6 @@ pub fn split<'a>(applied: &[(&'a Challenge, u8)], cut: &Cut) -> (Vec<&'a Challen
     let mut free: Vec<&Challenge> = applied[ask..].iter().map(|(c, _)| *c).collect();
     free.truncate(conscience::CAP);
     (applied[..ask].iter().map(|(c, _)| *c).collect(), free)
-}
-
-/// A graded check's split: learned (`split`, cut from the outcomes in `home`) under
-/// `BORG_STOP_ATTENTION=on`, else `conscience::graded`. `BORG_STOP_ASK_CAP` and checks without a 3 keep
-/// the fixed rule. Every `EXPLORE`th graded check in the store explores (`explores`). Also returns the
-/// cut, for the log, and the propensities: the fixed rule's choice (`fixed_p`), or the explore mixture
-/// over the cut set before the explore override (`propensities`).
-pub fn graded<'a>(applied: &[(&'a Challenge, u8)], home: &std::path::Path) -> Split<'a> {
-    if !on() || conscience::ask_cap().is_some() || !applied.iter().any(|(_, g)| *g == 3) {
-        let (ask, free) = conscience::graded(applied);
-        let p = fixed_p(applied, &ask);
-        return (ask, free, None, p);
-    }
-    let outcomes = outcome::read(&home.join("outcomes.jsonl"));
-    let base = cut(&labels(&outcomes));
-    let p = propensities(applied.len(), base.k);
-    let c = match explores(outcomes.iter().filter(|o| o.kind == outcome::GRADED).count()) {
-        true => Cut { k: RAIL, source: "explore", ..base },
-        false => base,
-    };
-    let (ask, free) = split(applied, &c);
-    (ask, free, Some(c), p)
 }
 
 /// Under a deterministic rule each apply was asked with probability 1 or 0: whether `ask` holds it.

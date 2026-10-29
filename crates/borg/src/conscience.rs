@@ -377,7 +377,9 @@ pub fn rank_scoped<'a>(challenges: &'a [Challenge], context: &str, scope_text: &
     scored
 }
 
-/// A dormant lesson needs at least this share of the best match to be recalled (`rank`).
+/// A dormant lesson needs at least this share of the best match to be recalled (`rank`). Baseline:
+/// design-chosen with dormancy (memory.rs `DORMANT_BELOW`), part of today's ranking; the same value as
+/// `BLOCK`, a different bar.
 pub const STRONG: f64 = 0.8;
 
 /// Whether a lesson applies to a context: unscoped, or one of its scope names occurs in it as a
@@ -442,10 +444,15 @@ impl Names {
     }
 }
 
-/// Okapi BM25 (k1 = 1.2, b = 0.75) of each tokenised document against the query text, in document order.
+/// Okapi BM25's term-frequency saturation and length normalisation (`bm25`, `bm25_groups`). Method:
+/// the standard parameters (Robertson and Zaragoza, "The Probabilistic Relevance Framework: BM25 and
+/// Beyond", 2009); never tuned on borg's data.
+pub const BM25_K1: f64 = 1.2;
+pub const BM25_B: f64 = 0.75;
+
+/// Okapi BM25 (`BM25_K1`, `BM25_B`) of each tokenised document against the query text, in document order.
 pub fn bm25(docs: &[Vec<String>], query: &str) -> Vec<f64> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
+    let (k1, b) = (BM25_K1, BM25_B);
     let n = docs.len().max(1) as f64;
     let avg = docs.iter().map(Vec::len).sum::<usize>() as f64 / n;
     let mut df: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
@@ -467,7 +474,7 @@ pub fn bm25(docs: &[Vec<String>], query: &str) -> Vec<f64> {
                 .map(|(t, f)| {
                     let dft = df[t.as_str()];
                     let idf = (1.0 + (n - dft + 0.5) / (dft + 0.5)).ln();
-                    idf * f * (K1 + 1.0) / (f + K1 * (1.0 - B + B * d.len() as f64 / avg))
+                    idf * f * (k1 + 1.0) / (f + k1 * (1.0 - b + b * d.len() as f64 / avg))
                 })
                 .sum()
         })
@@ -479,14 +486,13 @@ pub fn documents(c: &Challenge) -> Vec<Vec<String>> {
     std::iter::once(tokens(&c.question)).chain(c.facets.iter().map(|f| tokens(f)).filter(|d| !d.is_empty())).collect()
 }
 
-/// BM25 (k1 = 1.2, b = 0.75) of groups of documents, one group per lesson, against the query text: a
+/// BM25 (`BM25_K1`, `BM25_B`) of groups of documents, one group per lesson, against the query text: a
 /// group scores its best document plus `second` × its second best (0: the best alone). Document
 /// frequencies count groups (a word in three facets of one lesson is one lesson), so idf means what it
 /// means in `bm25`; term frequency and length are per document. Groups of one document score as `bm25`
 /// does. Only query words are counted, which keeps a 1k-lesson store with facets fast.
 pub fn bm25_groups(groups: &[Vec<Vec<String>>], query: &str, second: f64) -> Vec<f64> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
+    let (k1, b) = (BM25_K1, BM25_B);
     let n = groups.len().max(1) as f64;
     let ndocs = groups.iter().map(Vec::len).sum::<usize>().max(1) as f64;
     let avg = groups.iter().flatten().map(Vec::len).sum::<usize>() as f64 / ndocs;
@@ -532,8 +538,8 @@ pub fn bm25_groups(groups: &[Vec<Vec<String>>], query: &str, second: f64) -> Vec
         .map(|(g, docs)| {
             let (mut best, mut next) = (0.0f64, 0.0f64);
             for (tf, d) in g.iter().zip(docs) {
-                let norm = K1 * (1.0 - B + B * d.len() as f64 / avg);
-                let s: f64 = tf.iter().map(|&(q, f)| idf[q] * f * (K1 + 1.0) / (f + norm)).sum();
+                let norm = k1 * (1.0 - b + b * d.len() as f64 / avg);
+                let s: f64 = tf.iter().map(|&(q, f)| idf[q] * f * (k1 + 1.0) / (f + norm)).sum();
                 if s > best {
                     (best, next) = (s, best);
                 } else if s > next {
@@ -556,16 +562,25 @@ pub fn select_scoped<'a>(challenges: &'a [Challenge], context: &str, scope_text:
 }
 
 /// An early delivery takes lessons scoring at least this share of the best on-topic match (`early`).
+/// Baseline: today's early rule (R3b, internal evaluation "phase-r"), kept until a learned early rule
+/// is fitted on the share each early delivery's record carries per lesson (outcome.rs `rel`, hook.rs
+/// `early_rel`; empty when no plain lesson was on topic). Those records hold only delivered lessons, and
+/// every plain one scored at least this bar, so a rule fitted on them alone can learn to raise it, not
+/// what a lower bar would admit.
 pub const RELATIVE: f64 = 0.5;
 /// The Stop blocks only when a lesson not yet done scores at least this share of the best match
-/// (`budget`): a block is an extra round, the expensive part.
+/// (`budget`): a block is an extra round, the expensive part. Baseline: the R3b word-matching rule
+/// (`BORG_MATCH=bm25`), not the default path.
 pub const BLOCK: f64 = 0.8;
 /// Once the Stop blocks, every lesson not done scoring at least this share of the best match is asked
-/// (`budget`): more questions in a round that happens anyway cost little.
+/// (`budget`): more questions in a round that happens anyway cost little. Baseline: as `BLOCK`.
 pub const LOW: f64 = 0.3;
-/// At most this many lessons per Stop block.
+/// At most this many lessons per Stop block. Baseline: the fixed graded rule's block and free hand-over
+/// (`graded_capped`), the reference the learned policy is gated against (select.rs); it also bounds a
+/// block's length.
 pub const CAP: usize = 10;
 /// At most this many unscoped (generic) lessons per block: generic hygiene does not fill the block.
+/// Baseline: part of the R3b rule (`in_scope_first`).
 pub const GENERIC_CAP: usize = 3;
 
 /// The Stop's two decisions over a ranking of the whole store (best first, as `rank` returns it; the
@@ -620,7 +635,7 @@ pub fn widen_pool<'a>(ranked: &[(f64, &'a Challenge)], predicted: &[&'a Challeng
 /// - **block** (an extra round) only when at least one lesson is graded 3; then ask every 3 and 2, and
 ///   the 1s while the block has fewer than `CAP` lessons. 2s and 1s alone never block.
 /// - **without a block**, the 2s and then the 1s, at most `CAP`, go to the drone free as early context at
-///   its next prompt or touch (main.rs `queued`).
+///   its next prompt or touch (hook.rs `queued`).
 pub fn graded<'a>(applied: &[(&'a Challenge, u8)]) -> (Vec<&'a Challenge>, Vec<&'a Challenge>) {
     graded_capped(applied, ask_cap())
 }
@@ -633,9 +648,17 @@ pub fn ask_cap() -> Option<usize> {
 
 /// `graded` with an explicit cap on a block (`ask_cap`).
 pub fn graded_capped<'a>(applied: &[(&'a Challenge, u8)], cap: Option<usize>) -> (Vec<&'a Challenge>, Vec<&'a Challenge>) {
+    graded_without(applied, cap, &[])
+}
+
+/// `graded_capped` for a session that already had the lessons `had` delivered (ids in any order,
+/// select.rs `Ctx::had`): such a lesson may still be asked, but never takes a free slot, which the
+/// delivery would drop as given before (hook.rs `queued`); the next 2 or 1 takes it. With `had` empty
+/// this is `graded_capped`, the rule every record before select.rs `nofree` was decided by.
+pub fn graded_without<'a>(applied: &[(&'a Challenge, u8)], cap: Option<usize>, had: &[String]) -> (Vec<&'a Challenge>, Vec<&'a Challenge>) {
     let of = |g: u8| applied.iter().filter(move |(_, x)| *x == g).map(|(c, _)| *c);
     if of(3).next().is_none() {
-        return (Vec::new(), of(2).chain(of(1)).take(CAP).collect());
+        return (Vec::new(), of(2).chain(of(1)).filter(|c| !had.contains(&c.id)).take(CAP).collect());
     }
     if let Some(n) = cap {
         return (of(3).take(n).collect(), Vec::new());
@@ -660,8 +683,8 @@ pub fn in_scope_first<'a>(candidates: impl IntoIterator<Item = &'a Challenge>) -
     scoped.into_iter().chain(generic.into_iter().take(GENERIC_CAP)).take(CAP).collect()
 }
 
-/// Draws behind a propensity estimate (`propensity`): precision, not a tuning knob (standard error
-/// ≤ 1/(2√P_DRAWS) ≈ 0.022).
+/// Method: the draws behind a propensity estimate (`propensity`): precision, not a tuning knob
+/// (standard error ≤ 1/(2√P_DRAWS) ≈ 0.022).
 pub const P_DRAWS: usize = 512;
 
 /// Each pooled lesson's chance of a slot under the session's posterior (`budget`, `widen`): the share of
@@ -704,10 +727,22 @@ pub fn pool_base(s: f64, c: &Challenge) -> f64 {
     s / (0.5 + a / (a + b))
 }
 
-/// At most this many lessons per early delivery (`early`).
+/// At most this many lessons per early delivery (`early`). Baseline: today's early rule, as `RELATIVE`.
 pub const EARLY_CAP: usize = 5;
-/// An early delivery's text stops before this many characters (about 500 tokens).
+/// An early delivery's text stops before this many characters (about 500 tokens), a free hand-over's
+/// too (hook.rs `queued`). Guard: bounds the context one delivery adds to the drone's turn; what it
+/// cuts is logged (`dropped_chars`, outcome.rs `DELIVERY`), so its hit rate is measured.
 pub const EARLY_CHARS: usize = 2000;
+/// The characters of a lesson's question an early delivery's line shows at most, then `…`
+/// (`render_early`). Display: short enough that `EARLY_CHARS` holds several lessons, long enough for
+/// a question.
+pub const EARLY_QUESTION_CHARS: usize = 300;
+/// The characters of its consequence the line shows at most. Display: the consequence explains the
+/// question, so it gets less room.
+pub const EARLY_CONSEQUENCE_CHARS: usize = 200;
+/// The characters of the team rule it replaces the line shows at most. Display: a pointer to the old
+/// rule, not the rule itself.
+pub const EARLY_OVERRIDES_CHARS: usize = 150;
 
 /// The scope names of `challenges` that `text` names (`Names::contains`), unique, in store order.
 pub fn named_scopes(challenges: &[Challenge], text: &str) -> Vec<String> {
@@ -803,15 +838,15 @@ instructions: where one applies to this task, check it against the code and keep
     );
     let mut shown = 0;
     for c in selected {
-        let mut line = format!("\n- {}", clip(&c.question, 300));
+        let mut line = format!("\n- {}", clip(&c.question, EARLY_QUESTION_CHARS));
         if c.standing() {
             line.push_str(" (a constraint this collective ratified)");
         }
         if !c.consequence.trim().is_empty() {
-            line.push_str(&format!(" → {}", clip(&c.consequence, 200)));
+            line.push_str(&format!(" → {}", clip(&c.consequence, EARLY_CONSEQUENCE_CHARS)));
         }
         if !c.overrides.trim().is_empty() {
-            line.push_str(&format!(" (This team rule replaces: {})", clip(&c.overrides, 150)));
+            line.push_str(&format!(" (This team rule replaces: {})", clip(&c.overrides, EARLY_OVERRIDES_CHARS)));
         }
         if out.len() + line.len() > EARLY_CHARS {
             break;
@@ -1002,7 +1037,7 @@ mod tests {
 
     #[test]
     fn outcome_weight_reorders_the_shortlist() {
-        use crate::outcome::{ASKED, CORRECTED, NOT_CORRECTED, Outcome, append, path_beside};
+        use crate::outcome::{ASKED, CORRECTED, IGNORED, NOT_CORRECTED, Outcome, append, path_beside};
         let dir = std::env::temp_dir().join(format!("borg-conscience-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let lessons = dir.join("lessons.jsonl");
@@ -1014,8 +1049,9 @@ mod tests {
         let plan = "check-then-act on the shared closed flag";
         let ids = |cs: &[Challenge]| select(cs, plan, 2).iter().map(|c| c.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&load(&lessons, None)), ["generic", "specific"]);
-        // Asked twice: corrected anyway in s1, ignored (not corrected, no change) in s2: Beta(1, 4), mean
-        // 0.2. Two sessions on the clock: "specific" (born before s1) is 3 ticks old, "generic" 2.
+        // Asked twice: corrected anyway in s1, ignored (judged unchanged) in s2: Beta(1, 4), mean 0.2; s2's
+        // settle (not corrected, censored) adds nothing. Two sessions on the clock: "specific" (born
+        // before s1) is 3 ticks old, "generic" 2.
         let o = |kind: &str, s: &str, ms, l: &str| Outcome {
             kind: kind.into(),
             session: s.into(),
@@ -1024,7 +1060,13 @@ mod tests {
             repo: "r".into(),
             ..Default::default()
         };
-        for x in [o(ASKED, "s1", 1, "generic"), o(CORRECTED, "s1", 2, "generic"), o(ASKED, "s2", 3, "generic"), o(NOT_CORRECTED, "s2", 4, "generic")] {
+        for x in [
+            o(ASKED, "s1", 1, "generic"),
+            o(CORRECTED, "s1", 2, "generic"),
+            o(ASKED, "s2", 3, "generic"),
+            o(IGNORED, "s2", 4, "generic"),
+            o(NOT_CORRECTED, "s2", 4, "generic"),
+        ] {
             append(&path_beside(&lessons), &x).unwrap();
         }
         let cs = load(&lessons, None);

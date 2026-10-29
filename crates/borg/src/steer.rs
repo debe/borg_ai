@@ -31,11 +31,18 @@ use serde_json::{Value, json};
 use crate::msg::{self, Kind, Message};
 
 /// A steer older than this no longer counts: not shown, and a pause no longer holds (fail open).
-pub const TTL_MS: i64 = 24 * 60 * 60 * 1000;
-/// The most entries the admissions keep: the newest.
+/// Guard: a pause the engineer forgot, or whose resume never arrived, stops a session for a day
+/// (`clock::DAY_MS`) at most.
+pub const TTL_MS: i64 = crate::clock::DAY_MS;
+/// The most entries the admissions keep: the newest. Guard: bounds the file the hook reads at every
+/// tool call while anyone steers (a flood of admitted steers cannot grow it).
 pub const KEEP: usize = 500;
-/// How long past a TTL an entry is kept before pruning (clock skew between members).
-pub const SLACK_MS: i64 = 60 * 60 * 1000;
+/// How long past a TTL an entry is kept before pruning. Derived from msg.rs `SKEW_MS`, the one clock
+/// skew between members: an entry must outlive its TTL by at least that skew, or a member whose clock
+/// runs that far behind would still count, and offer back, a line this node already pruned. The 60
+/// skews (one hour) are margin kept from before it was derived, so pruning is unchanged; the slack
+/// only delays when dead entries leave the disk, never what counts (that checks the TTL alone).
+pub const SLACK_MS: i64 = 60 * msg::SKEW_MS;
 
 /// The role a privileged message counts under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,12 +249,10 @@ pub fn notices<'a>(mine: &'a [Message], roles: &Roles, here: &str, now: i64, sho
     (out, switches.iter().map(|m| m.id.as_str()).collect())
 }
 
-/// Who steers, as a label names them: the sender's name (its claim), the node the line was admitted
-/// for (as much of its key as msg.rs `line` shows), the role.
+/// Who steers, as a label names them: the sender as msg.rs labels it (its claim, `sender_label`), the
+/// node the line was admitted for (as much of its key as msg.rs `line` shows, `short_node`), the role.
 fn who(m: &Message, role: Role) -> String {
-    let name = if m.name.is_empty() { m.by.chars().take(8).collect() } else { m.name.clone() };
-    let node: String = m.node.chars().take(12).collect();
-    format!("{name} (node {node}, role {})", role.as_str())
+    format!("{} (node {}, role {})", msg::sender_label(m), msg::short_node(&m.node), role.as_str())
 }
 
 /// One steer as the recipient sees it, on one line (msg.rs keeps the text on one).
@@ -338,7 +343,8 @@ pub fn dropped_path(home: &Path) -> PathBuf {
     msg::dir(home).join("dropped.jsonl")
 }
 
-/// The refusal log keeps about this many bytes: past twice that, the older half goes.
+/// The refusal log keeps about this many bytes: past twice that, the older half goes. Guard: a
+/// node refusing a flood of forged or unadmitted steers cannot fill the disk.
 pub const DROPPED_BYTES: u64 = 128 * 1024;
 
 /// A privileged message refused on admission: one line of the refusal log.

@@ -24,10 +24,12 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.5.0" }
+borg-trace = { path = "../borg-trace", version = "=0.6.0" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
-serde_json = { workspace = true, features = ["preserve_order"] }
+# float_roundtrip: a float read back from the selection cache is the one written, so a hook's decision
+# replays bit for bit (select/summary.rs, `borg debug select` P1)
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
 regex.workspace = true
 # the expert drone: its own process group, killed with borg (expert_route.rs)
 libc = "0.2"

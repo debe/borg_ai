@@ -94,8 +94,11 @@ fn over_the_budget_the_shortlist_order_picks_what_fits() {
     let env = [("BORG_STOP_POOL", "all"), ("BORG_PREFILTER", "off"), ("BORG_STOP_POOL_TOKENS", "60")];
     turn(&root, "b1", "Look at the telescope and glaciers code", &[], "The telescope limits and the telescope edge case, plus glaciers.", &env);
     let ids = shown(&prompts(&root)[0]);
-    assert_eq!(ids, ["G3", "G4"], "best matches, in store order");
-    assert!(state(&root, "b1", "cost").contains("shown=2 budget=full"), "{}", state(&root, "b1", "cost"));
+    assert_eq!(ids[..2], ["G3", "G4"], "best matches, in store order");
+    // Then the tail sample (whole.rs `tail`): two of the six lessons the budget dropped.
+    let dropped = ["Mdrain", "New", "G0", "G1", "G2", "G5"];
+    assert!(ids.len() == 4 && ids[2..].iter().all(|id| dropped.contains(&id.as_str())) && ids[2] != ids[3], "{ids:?}");
+    assert!(state(&root, "b1", "cost").contains("shown=2 budget=full tail=2"), "{}", state(&root, "b1", "cost"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -163,7 +166,8 @@ fn graded_blocks_only_for_a_three_and_hands_twos_and_ones_over_free_once() {
     let out = turn(&root, "g1", "now the retries", &[], "Retries use a fixed delay, also for invoices and tomatoes.", &env);
     assert!(out.contains("block"), "{out}");
     let asked = state(&root, "g1", "ctx").lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap().to_string();
-    let mut ids: Vec<&str> = asked.split(',').collect();
+    // `<ids> @<check>`: the block's check (select.rs `check_id`).
+    let mut ids: Vec<&str> = asked.split(" @").next().unwrap().split(',').collect();
     ids.sort();
     assert_eq!(ids, ["G1", "G2", "New"]);
     assert!(!root.join("store/collectives/corp/state/g1.queued").exists(), "a blocking turn queues nothing");
@@ -195,7 +199,7 @@ fn graded_blocks_only_for_a_three_and_hands_twos_and_ones_over_free_once() {
     assert_eq!(chosen, ["G1", "G2", "New"]);
 
     // A lone 3 is asked alone: the graded block does not widen over the low bar...
-    let last = |s: &str| state(&root, s, "ctx").lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap().to_string();
+    let last = |s: &str| state(&root, s, "ctx").lines().rev().find_map(|l| l.strip_prefix("#borg-asked ")).unwrap().split(" @").next().unwrap().to_string();
     let work = "Retries use a fixed delay; the invoices handling for the invoices edge case and the invoices limits.";
     answer(&root, &[("New", 3)]);
     turn(&root, "g2", "now the retries", &[], work, &env);

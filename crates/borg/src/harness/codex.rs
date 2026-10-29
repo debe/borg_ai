@@ -15,12 +15,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::wiring::Hooks;
-use super::{Caps, DroneWake, Harness, Level, Probe, Run, SubAgent, Transcript, Wiring};
+use super::{Caps, DroneWake, Harness, Level, Probe, Run, STOP_TIMEOUT_S, SubAgent, Transcript, Wiring};
 
 /// Codex hook events and the canonical borg events they become. Codex has no failure event (a failed
 /// tool call fires no PostToolUse at all), so denials are not captured. `Interrupt` (an Esc) ends the
 /// turn of a session that listens for wakes (listen.rs), which a turn with no stop and a tool call that
-/// never ended would hold off for `listen::TOOL_MS`.
+/// never ended would hold off for at least `listen::TOOL_MS`.
 pub const EVENTS: [(&str, &str); 6] = [
     ("UserPromptSubmit", "prompt"),
     ("PreToolUse", "pre_tool"),
@@ -33,16 +33,21 @@ pub const EVENTS: [(&str, &str); 6] = [
 /// Hooks an older borg installed and this one does not.
 pub const RETIRED: [(&str, &str); 0] = [];
 
-/// Seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for SessionEnd,
-/// which it clamps to 3 s). The trust Codex keeps covers the timeout too: changing one here makes every
-/// engineer trust borg's hooks again.
+/// Guards (protocol once trusted): seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for
+/// SessionEnd, which it clamps to 3 s), so a hung borg holds Codex's turn no longer than this at each
+/// event. The stop's ([`STOP_TIMEOUT_S`]) is also its budget: the live wait, the stop's model call and
+/// the expert drone keep inside it. The trust Codex keeps covers the timeout too: changing one here
+/// makes every engineer trust borg's hooks again.
 pub const TIMEOUTS: [(&str, u64); 6] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3), ("halted", 3)];
 
-/// The stop's timeout, and so its budget: the live wait, the stop's model call and the expert drone keep
-/// inside it.
-pub const STOP_TIMEOUT_S: u64 = 90;
+/// Protocol (Codex's default `additionalContextLimit` of a hook): an `additionalContext` up to this many
+/// characters reaches the model whole as a developer message; a longer one is cut to its head and tail
+/// with a "truncated output" warning, the whole text saved under `hook_outputs`. Measured on Codex
+/// 0.153.2 against a local mock of the Responses API (2026-10-28): 10,000 characters arrived whole,
+/// 10,010 cut.
+pub const CONTEXT_CHARS: usize = 10_000;
 
-/// How long `borg doctor` waits for Codex to list its hooks.
+/// Guard: how long `borg doctor` waits for Codex to list its hooks.
 const LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct Codex;
@@ -65,6 +70,7 @@ impl Harness for Codex {
             deny_capture: false,
             sends_pid: false,
             stop_budget: Some(Duration::from_secs(STOP_TIMEOUT_S)),
+            context_chars: CONTEXT_CHARS,
             // Also inside its sandbox; equal to the hooks' `session_id` and to `codex queue --thread`'s
             // thread (0.153.2, against a local mock model).
             session_env: Some("CODEX_THREAD_ID"),

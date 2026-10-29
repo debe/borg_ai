@@ -11,6 +11,7 @@ compile_error!("borg supports Unix only (Linux, macOS): it relies on process gro
 pub mod assimilate;
 pub mod assimilate_dir;
 pub(crate) mod attention;
+pub mod clock;
 pub mod collective;
 pub mod completions;
 #[doc(hidden)]
@@ -43,6 +44,7 @@ pub mod reexec;
 pub mod review_fix;
 #[doc(hidden)]
 pub mod runner;
+pub mod select;
 pub mod stats;
 pub mod steer;
 #[doc(hidden)]

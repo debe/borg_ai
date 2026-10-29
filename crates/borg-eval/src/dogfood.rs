@@ -19,6 +19,9 @@
 //! gives a concrete atomic remedy. `--setup-only` runs install/doctor/status/uninstall without any
 //! model call. Results: `target/dogfood/<run>/results.json` (git revision, check definitions,
 //! checks, evidence, timings, cost).
+//!
+//! Its timeouts and excerpt widths are experiment parameters (main.rs): long enough for one session
+//! of the scenario, chosen for this eval, not product defaults.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -400,12 +403,13 @@ fn lesson_ids(p: &Path) -> Vec<String> {
     ids
 }
 
-/// The ids the conscience asked in a session (`#borg-asked a,b` lines of its state file).
+/// The ids the conscience asked in a session (`#borg-asked a,b @<check>` lines of its state file; the
+/// check that routed them is left out, and older lines have none).
 pub(crate) fn asked_ids(state: &str) -> Vec<String> {
     state
         .lines()
         .filter_map(|l| l.strip_prefix("#borg-asked "))
-        .flat_map(|ids| ids.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>())
+        .flat_map(|ids| ids.split(" @").next().unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>())
         .collect()
 }
 

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
-import borg, { aborted, listenCommand, runBorg, streamLine, text, toolEvent, toolInput } from "./borg.ts";
+import borg, { aborted, budgetsOf, listenCommand, runBorg, shownIds, streamLine, text, toolEvent, toolInput } from "./borg.ts";
 
 const root = resolve(import.meta.dirname, "../..");
 const BORG = process.env.BORG_BIN || join(root, "target/debug/borg");
@@ -263,8 +263,8 @@ test("session_stop: borg's questions block once, then stop_hook_active lets the 
 	assert.equal(await h.session_stop({ ...stop, stop_hook_active: true }, ctx), undefined);
 	// L2 shares no word with the work, so word matching (BORG_MATCH=bm25) does not ask it.
 	// The ask carries its propensity (#borg-p, L1) and, from this Thompson draw, the pool
-	// it was over (#borg-pool), both tagged with the check that drew it.
-	assert.match(ctxFile(), /^make the relay delivery lock-free\n#borg-p L1=1 @([0-9a-f]{12})\n#borg-pool L1=[0-9.]+ @\1\n#borg-asked L1\n$/);
+	// it was over (#borg-pool), each tagged with the check that drew it, as is the ask.
+	assert.match(ctxFile(), /^make the relay delivery lock-free\n#borg-p L1=1 @([0-9a-f]{12})\n#borg-pool L1=[0-9.]+ @\1\n#borg-asked L1 @\1\n$/);
 });
 
 test("tool_result hands borg's context (a live check's questions) to omp as additionalContext; nothing else", async () => {
@@ -361,7 +361,10 @@ test("a shell command opts its own session in or out only as `borg listen [--off
 	assert.equal(listenCommand("borg listen --session s2"), undefined, "another session's");
 	assert.equal(listenCommand("echo borg listens; ls"), undefined);
 	assert.equal(listenCommand("borg tell all hi"), undefined);
-	assert.deepEqual(streamLine('{"wake":"[borg listen] 1 message"}'), { wake: "[borg listen] 1 message" });
+	assert.deepEqual(streamLine('{"wake":"[borg listen] 1 message","n":1,"ids":["m000000000001"]}'), { wake: "[borg listen] 1 message", ids: ["m000000000001"] });
+	assert.deepEqual(streamLine('{"wake":"[borg listen] 2 messages"}'), { wake: "[borg listen] 2 messages", ids: [] }, "an older waiter's: never taken as shown");
+	assert.deepEqual([...shownIds({ shown_ids: ["m000000000001", 7, "m000000000002"] })], ["m000000000001", "m000000000002"], "only ids");
+	assert.equal(shownIds({ shown: 2, hookSpecificOutput: { additionalContext: "[borg] Message from x" } }).size, 0, "borg's ids, never a count or the prose");
 	assert.deepEqual(streamLine('{"note":"n"}'), { note: "n" });
 	assert.deepEqual(streamLine('{"end":"stopped"}'), { end: "stopped" });
 	assert.equal(streamLine('{"wake":"  "}'), undefined);
@@ -381,20 +384,26 @@ async function until(done: () => boolean | Promise<boolean>) {
 }
 
 /** A fake borg: `listen --stream` records `stream\t<args>`, prints what is written to $WAKE (each
- *  line once), ends with `{"end"}` when $WAKE holds `END`, and records `stopped` on SIGTERM; a hook
- *  records `<event>`, answers a stop with $STOP_ANSWER and a post_tool with $POST_ANSWER. Returns [binary, record file, wake file]. */
-function listenFake(): [string, string, string] {
+ *  line once), keeps the adapter's answers on its stdin in $ANSWERS, ends with `{"end"}` when $WAKE
+ *  holds `END`, and records `stopped` on SIGTERM; a hook records `<event>`, answers a stop with
+ *  $STOP_ANSWER, a post_tool with $POST_ANSWER and a prompt with $PROMPT_ANSWER. Returns [binary, record
+ *  file, wake file, answers file]. */
+function listenFake(): [string, string, string, string] {
 	const dir = mkdtempSync(join(tmpdir(), "borg-omp-listen-"));
-	const [bin, rec, wake] = [join(dir, "borg"), join(dir, "rec"), join(dir, "wake")];
+	const [bin, rec, wake, answers] = [join(dir, "borg"), join(dir, "rec"), join(dir, "wake"), join(dir, "answers")];
 	writeFileSync(
 		bin,
 		`#!/bin/sh
 if [ "$1 $2" = "listen --stream" ]; then
   printf 'stream\\t%s\\n' "$*" >> "${rec}"
-  trap 'printf "stopped\\n" >> "${rec}"; exit 143' TERM
+  # A background job of a script reads /dev/null unless given the script's own stdin explicitly.
+  exec 3<&0
+  cat <&3 >> "${answers}" &
+  reader=$!
+  trap 'kill $reader 2>/dev/null; printf "stopped\\n" >> "${rec}"; exit 143' TERM
   while :; do
     if [ -s "${wake}" ]; then
-      if grep -q '^END$' "${wake}"; then : > "${wake}"; echo '{"end":"listens no more"}'; exit 0; fi
+      if grep -q '^END$' "${wake}"; then : > "${wake}"; echo '{"end":"listens no more"}'; kill $reader 2>/dev/null; exit 0; fi
       cat "${wake}"; : > "${wake}"; printf 'printed\n' >> "${rec}"
     fi
     sleep 0.05
@@ -404,11 +413,12 @@ cat > /dev/null
 printf '%s\\n' "$3" >> "${rec}"
 [ "$3" = stop ] && [ -n "$STOP_ANSWER" ] && echo "$STOP_ANSWER"
 [ "$3" = post_tool ] && [ -n "$POST_ANSWER" ] && echo "$POST_ANSWER"
+[ "$3" = prompt ] && [ -n "$PROMPT_ANSWER" ] && echo "$PROMPT_ANSWER"
 exit 0
 `,
 	);
 	chmodSync(bin, 0o755);
-	return [bin, rec, wake];
+	return [bin, rec, wake, answers];
 }
 
 const records = (rec: string) => (existsSync(rec) ? readFileSync(rec, "utf8").trim().split("\n").filter(Boolean) : []);
@@ -429,7 +439,7 @@ test("a listening omp session: its waiter starts at its `borg listen`, wakes it 
 		await listen("borg listen", "[borg listen] This session listens: a message for it wakes it while it is idle.");
 		await until(() => streams().length === 1);
 		assert.deepEqual(streams(), ["stream\tlisten --stream --session s --dir /r"]);
-		writeFileSync(wake, '{"note":"ignored"}\n{"wake":"[borg listen] 1 message from other sessions waits for you."}\n');
+		writeFileSync(wake, '{"note":"ignored"}\n{"wake":"[borg listen] 1 message from other sessions waits for you.","n":1,"ids":["m000000000001"]}\n');
 		await until(() => sent.length === 1);
 		assert.deepEqual(sent[0], [{ customType: "borg-listen", content: "[borg listen] 1 message from other sessions waits for you.", display: true }, { deliverAs: "nextTurn", triggerTurn: true }]);
 		// A finished run is no halt; an Esc is.
@@ -456,7 +466,7 @@ test("a listening omp session: its waiter starts at its `borg listen`, wakes it 
 	}
 });
 
-test("a wake that arrives while omp runs the session's turn waits for its end, and is dropped if a hook of the turn showed its messages", { timeout: 20_000 }, async () => {
+test("a wake that arrives while omp runs the session's turn waits for its end, and is dropped only if a hook of the turn showed all its messages", { timeout: 20_000 }, async () => {
 	const [bin, rec, wake] = listenFake();
 	process.env.BORG_BIN = bin;
 	delete process.env.STOP_ANSWER;
@@ -471,7 +481,7 @@ test("a wake that arrives while omp runs the session's turn waits for its end, a
 	// by which the adapter has read it.
 	const wakeDuring = async (n: number) => {
 		await call(`c${n}`);
-		writeFileSync(wake, `{"wake":"[borg listen] 1 message from other sessions waits for you (${n})."}\n`);
+		writeFileSync(wake, `{"wake":"[borg listen] 1 message from other sessions waits for you (${n}).","n":1,"ids":["m00000000000${n}"]}\n`);
 		await until(() => records(rec).filter((r) => r === "printed").length === n);
 	};
 	try {
@@ -489,15 +499,228 @@ test("a wake that arrives while omp runs the session's turn waits for its end, a
 		// The wake's own turn ends; then a turn whose tool call shows the message drops its wake.
 		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
 		await wakeDuring(2);
-		process.env.POST_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "[borg] Message from Two of Two (tell): rebase" } });
+		const showed = (...ids: string[]) =>
+			(process.env.POST_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "[borg] Message from Two of Two (tell): rebase" }, shown_ids: ids }));
+		showed("m000000000002");
 		await result("c2");
 		delete process.env.POST_ANSWER;
 		assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), undefined);
 		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
 		assert.equal(sent.length, 1, "the turn showed its message: no wake");
+		// A hook that showed as many messages, but another one (a newer message that took the budget), or
+		// that names none (an older borg's), keeps the wake: its message waits unread, and the turn's end
+		// sends it in.
+		await wakeDuring(3);
+		showed("m000000000009");
+		await result("c3");
+		process.env.POST_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "[borg] Message from Two of Two (tell): rebase" } });
+		await result("c4");
+		delete process.env.POST_ANSWER;
+		assert.equal(sent.length, 1, "held while the turn runs");
+		assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), undefined);
+		assert.equal(sent.length, 2, "its message was not shown: the wake goes in");
+		assert.match(sent[1][0].content, /waits for you \(3\)/);
 	} finally {
 		delete process.env.POST_ANSWER;
 		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+test("a steer's context shows its messages only once handed over: its wake goes in when the turn ends first, and goes when a tool result carries it", { timeout: 20_000 }, async () => {
+	const [bin, rec, wake] = listenFake();
+	process.env.BORG_BIN = bin;
+	delete process.env.STOP_ANSWER;
+	delete process.env.POST_ANSWER;
+	const sent: [any, any][] = [];
+	const h = load((m, o) => sent.push([m, o]));
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const result = (id: string, command = "cat a", said = "x") =>
+		h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: id, input: { command }, content: [{ type: "text", text: said }], isError: false }, ctx);
+	const end = () => h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+	const MESSAGE = (n: number) => `[borg] Message from Two of Two (tell): rebase ${n}`;
+	// The engineer types into the running turn: omp emits `input` and starts no agent run.
+	const steer = async (n: number) => {
+		process.env.PROMPT_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: MESSAGE(n) }, shown_ids: [`m00000000000${n}`] });
+		await h.input({ type: "input", text: "also rebase", source: "interactive" }, ctx);
+		delete process.env.PROMPT_ANSWER;
+	};
+	const wakeDuring = async (n: number) => {
+		await h.tool_call({ type: "tool_call", toolName: "read", toolCallId: `c${n}`, input: { path: "/r/a" } }, ctx);
+		writeFileSync(wake, `{"wake":"[borg listen] 1 message from other sessions waits for you (${n}).","n":1,"ids":["m00000000000${n}"]}\n`);
+		await until(() => records(rec).filter((r) => r === "printed").length === n);
+	};
+	try {
+		await result("l1", "borg listen", "[borg listen] This session listens: a message for it wakes it while it is idle.");
+		await until(() => records(rec).some((r) => r.startsWith("stream\t")));
+		// borg answered the steer with the message, but no agent start or tool result handed it over yet.
+		await wakeDuring(1);
+		await steer(1);
+		await end();
+		assert.equal(sent.length, 1, "the model has not read it: the wake goes in");
+		// The wake's turn starts: its agent start hands the kept context over.
+		const started = await h.before_agent_start({ type: "before_agent_start", prompt: sent[0][0].content, systemPrompt: [] }, ctx);
+		assert.equal(started?.message?.content, MESSAGE(1));
+		await end();
+		// Kept from a steer and handed over by the turn's next tool result: its wake goes.
+		await wakeDuring(2);
+		await steer(2);
+		const out = await result("c2");
+		assert.equal(out?.additionalContext, MESSAGE(2));
+		await end();
+		assert.equal(sent.length, 1, "the tool result showed its message: no wake");
+	} finally {
+		delete process.env.PROMPT_ANSWER;
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+test("a held wake that names several messages is dropped once the turn's hooks together showed them all: over two tool results, a steer's kept context with the tool answer, or before it arrived; an earlier turn's hooks drop none", { timeout: 20_000 }, async () => {
+	const [bin, rec, wake] = listenFake();
+	process.env.BORG_BIN = bin;
+	delete process.env.STOP_ANSWER;
+	delete process.env.POST_ANSWER;
+	delete process.env.PROMPT_ANSWER;
+	const sent: [any, any][] = [];
+	const h = load((m, o) => sent.push([m, o]));
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const id = (n: number) => `m00000000000${n}`;
+	const MESSAGE = (n: number) => `[borg] Message from Two of Two (tell): rebase ${n}`;
+	const call = (c: string) => h.tool_call({ type: "tool_call", toolName: "read", toolCallId: c, input: { path: "/r/a" } }, ctx);
+	// A tool result whose post_tool answer shows the messages `ns` (msg.rs `capped`: the rest wait).
+	const result = async (c: string, ...ns: number[]) => {
+		if (ns.length) process.env.POST_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: ns.map(MESSAGE).join("\n\n") }, shown_ids: ns.map(id) });
+		try {
+			return await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: c, input: { command: "cat a" }, content: [{ type: "text", text: "x" }], isError: false }, ctx);
+		} finally {
+			delete process.env.POST_ANSWER;
+		}
+	};
+	// The engineer types into the running turn; borg's answer shows message `n`, kept until handed over.
+	const steer = async (n: number) => {
+		process.env.PROMPT_ANSWER = JSON.stringify({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: MESSAGE(n) }, shown_ids: [id(n)] });
+		try {
+			await h.input({ type: "input", text: "also rebase", source: "interactive" }, ctx);
+		} finally {
+			delete process.env.PROMPT_ANSWER;
+		}
+	};
+	// The waiter's wake for the messages `ns`, its `k`th line; the next hook's borg run is the sync point by
+	// which the adapter has read it.
+	const wakeFor = async (k: number, ...ns: number[]) => {
+		writeFileSync(wake, `${JSON.stringify({ wake: `[borg listen] ${ns.length} messages from other sessions wait for you (${ns.join(",")}).`, n: ns.length, ids: ns.map(id) })}\n`);
+		await until(() => records(rec).filter((r) => r === "printed").length === k);
+	};
+	const stop = async () => {
+		assert.equal(await h.session_stop({ type: "session_stop", last_assistant_message: "ok", session_id: "s" }, ctx), undefined);
+		await h.agent_end({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+	};
+	try {
+		await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "l1", input: { command: "borg listen" }, content: [{ type: "text", text: "[borg listen] This session listens: a message for it wakes it while it is idle." }], isError: false }, ctx);
+		await until(() => records(rec).some((r) => r.startsWith("stream\t")));
+		// One tool result shows the newest, the next the other.
+		await call("c1");
+		await wakeFor(1, 1, 2);
+		await result("c1", 2);
+		await call("c2");
+		await result("c2", 1);
+		await stop();
+		assert.equal(sent.length, 0, "the turn showed both: no wake");
+		// A steer's answer shows one and is kept; the next tool result hands it over with an answer that
+		// shows the other, in one message to the model.
+		await call("c3");
+		await wakeFor(2, 3, 4);
+		await steer(4);
+		assert.equal((await result("c3", 3))?.additionalContext, `${MESSAGE(4)}\n\n${MESSAGE(3)}`);
+		await stop();
+		assert.equal(sent.length, 0, "the steer and the tool answer showed both: no wake");
+		// The waiter looked before the hook that showed the message, and its wake arrives after it.
+		await call("c4");
+		await result("c4", 5);
+		await wakeFor(3, 5);
+		await call("c5");
+		await stop();
+		assert.equal(sent.length, 0, "shown before it arrived: no wake");
+		// What a turn showed is its own: a later turn's wake whose messages its own hooks did not all show
+		// goes in at its end.
+		await call("c6");
+		await result("c6", 6);
+		await stop();
+		await call("c7");
+		await wakeFor(4, 6, 7);
+		await result("c7", 7);
+		await stop();
+		assert.equal(sent.length, 1, "this turn showed only one of its messages: the wake goes in");
+		assert.match(sent[0][0].content, /wait for you \(6,7\)/);
+	} finally {
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+test("each wake answers its waiter: `sent` once omp took it, `failed` when omp refused it, so the waiter wakes the session again", { timeout: 20_000 }, async () => {
+	const [bin, rec, wake, answers] = listenFake();
+	process.env.BORG_BIN = bin;
+	delete process.env.STOP_ANSWER;
+	let refuse = true;
+	const sent: [any, any][] = [];
+	const h = load((m, o) => {
+		if (refuse) throw new Error("omp is shutting down");
+		sent.push([m, o]);
+	});
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	const answered = () => (existsSync(answers) ? readFileSync(answers, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+	try {
+		await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "l1", input: { command: "borg listen" }, content: [{ type: "text", text: "[borg listen] This session listens." }], isError: false }, ctx);
+		await until(() => records(rec).some((r) => r.startsWith("stream\t")));
+		writeFileSync(wake, '{"wake":"[borg listen] 1 message from other sessions waits for you.","n":1,"ids":["m000000000001"]}\n');
+		await until(() => answered().length === 1);
+		assert.deepEqual(answered(), [{ failed: ["m000000000001"] }], "refused: the waiter tries it again");
+		assert.equal(sent.length, 0);
+		// The waiter's next wake for it (after its backoff) goes in.
+		refuse = false;
+		writeFileSync(wake, '{"wake":"[borg listen] 1 message from other sessions waits for you.","n":1,"ids":["m000000000001"]}\n');
+		await until(() => answered().length === 2);
+		assert.deepEqual(answered()[1], { sent: ["m000000000001"] });
+		assert.equal(sent.length, 1);
+	} finally {
+		await h.session_shutdown({ type: "session_shutdown" }, ctx);
+	}
+});
+
+test("borg's answer sets the budgets: asked for until one carries them; the stop's and the output tail then follow it", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "borg-omp-budgets-"));
+	const bin = join(dir, "borg");
+	const rec = join(dir, "rec");
+	// Records each call's event, its BORG_STOP_BUDGET_MS and its input; answers an ask for budgets with $BUDGETS.
+	writeFileSync(bin, `#!/bin/sh\nin=$(cat)\nprintf '%s %s %s\\n' "$3" "$BORG_STOP_BUDGET_MS" "$in" >> "${rec}"\ncase "$in" in *'"budgets":true'*) [ -n "$BUDGETS" ] && echo "{\\"budgets\\":$BUDGETS}";; esac\nexit 0\n`);
+	chmodSync(bin, 0o755);
+	process.env.BORG_BIN = bin;
+	const calls = () => readFileSync(rec, "utf8").trim().split("\n").map((l) => {
+		const [event, budget, ...input] = l.split(" ");
+		return { event, budget: Number(budget), input: JSON.parse(input.join(" ")) };
+	});
+	const ctx = { cwd: "/r", sessionManager: { getSessionId: () => "s" } };
+	try {
+		// An older borg answers none: the fallbacks stay, and each call asks again.
+		delete process.env.BUDGETS;
+		const old = load();
+		await old.input({ type: "input", text: "hi", source: "interactive" }, ctx);
+		await old.session_stop({ type: "session_stop", last_assistant_message: "ok" }, ctx);
+		assert.deepEqual(calls().map((c) => [c.event, c.budget, c.input.budgets]), [["prompt", 5_000, true], ["stop", 28_000, true]]);
+
+		process.env.BUDGETS = JSON.stringify({ prompt_ms: 4_000, pre_ms: 1_000, post_ms: 3_000, stop_ms: 20_000, end_ms: 1_000, tail_chars: 10 });
+		const h = load();
+		await h.input({ type: "input", text: "hi", source: "interactive" }, ctx);
+		await h.tool_result({ type: "tool_result", toolName: "bash", toolCallId: "c1", input: { command: "cargo test" }, content: [{ type: "text", text: "x".repeat(50) + "test result: ok" }], isError: false }, ctx);
+		await h.session_stop({ type: "session_stop", last_assistant_message: "ok" }, ctx);
+		const [prompt, post, stop] = calls().slice(2);
+		assert.equal(prompt.input.budgets, true, "the first call asks");
+		assert.equal(post.input.budgets, undefined, "answered: asked no more");
+		assert.equal(post.input.tool_response, "result: ok", "the output's last tail_chars");
+		assert.equal(stop.budget, 20_000, "the stop's budget borg named");
+		assert.deepEqual(budgetsOf({ budgets: { stop_ms: 9, tail_chars: -1 } }), { prompt_ms: 5_000, pre_ms: 2_000, post_ms: 5_000, stop_ms: 9, end_ms: 1_500, tail_chars: 4_000 }, "each valid number taken, the rest kept");
+		assert.equal(budgetsOf({ hookSpecificOutput: {} }), undefined);
+	} finally {
+		delete process.env.BUDGETS;
 	}
 });
 

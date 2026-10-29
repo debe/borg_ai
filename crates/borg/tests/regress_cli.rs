@@ -114,6 +114,9 @@ impl Fx {
             .current_dir(&self.repo)
             .env_clear()
             .env("PATH", format!("{}:{}", self.root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
+            // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
+            // CLI on PATH (runner.rs `pick`), a real call.
+            .env("BORG_PREDICT_MODEL", "claude:")
             .env("HOME", self.root.join("home"))
             .env("BORG_HOME", self.root.join("store"))
             .env("BORG_STATE", &self.state)

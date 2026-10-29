@@ -36,6 +36,9 @@ use serde_json::{Value, json};
 
 use crate::conscience::{self, Challenge};
 use crate::outcome;
+// After `MAX_FAILURES` failed model calls in a row `borg learn` stops (runner.rs: the model is
+// unavailable, and asking about every remaining episode would only burn time and quota).
+use crate::runner::MAX_FAILURES;
 use crate::trust;
 
 pub mod regret;
@@ -50,6 +53,18 @@ static DENIAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(tool call denied by user: |tool call rejected by user \(|the user doesn'?t want to proceed with this tool use)").unwrap()
 });
 
+/// The longest excerpt an episode keeps of a correction, a rejected tool call, and the task as the
+/// learn prompt shows it. Guard: bounds what one episode adds to the store and to its prompt (a pasted
+/// log would otherwise go in whole); a regret's excerpts share it (regret.rs `CAP`).
+pub const EXCERPT_CHARS: usize = 1500;
+/// The session's task an episode keeps (hook.rs `capture_prompt`): the prompt it started from. Guard:
+/// bounds the `.task` state file and each episode's `task` (a pasted spec would otherwise go in whole);
+/// the learn prompt shows its first `EXCERPT_CHARS`.
+pub const TASK_CHARS: usize = 3000;
+/// The end of the drone's last proposal an episode keeps (hook.rs `proposal`). Guard: bounds one
+/// episode's `agent` text.
+pub const PROPOSAL_CHARS: usize = 2000;
+
 /// A prompt that pushes back on the drone's last proposal (same heuristic as the offline miner).
 pub fn is_correction(prompt: &str) -> bool {
     let t = prompt.trim();
@@ -60,7 +75,7 @@ pub fn is_correction(prompt: &str) -> bool {
 pub fn rejection(error: &str) -> Option<String> {
     let said = REJECTION.captures(error)?.get(1)?.as_str();
     let said = said.split("Note: The user").next().unwrap_or(said).trim();
-    (said.len() > 3).then(|| said.chars().take(1500).collect())
+    (said.len() > 3).then(|| said.chars().take(EXCERPT_CHARS).collect())
 }
 
 /// A refusal that carries no words (see `DENIAL`): the engineer's reason is their next prompt.
@@ -212,7 +227,7 @@ pub fn count_correction(store: &Path, e: &Episode) {
     if e.kind == crate::veto::KIND {
         return;
     }
-    let snippet = crate::stats::excerpt(&e.correction, 160);
+    let snippet = crate::stats::excerpt(&e.correction, crate::stats::FEED_CHARS);
     let (why, text) = match &e.rejected_tool {
         _ if e.kind == regret::KIND => ("regret", snippet),
         Some(tool) => ("rejected_tool", format!("{tool}: {snippet}")),
@@ -281,7 +296,7 @@ fn episode_prompt(e: &Episode, listed: &[String]) -> String {
             "{}\n\n{REACH_RULES}\n\n{FIELDS}\n{AREA}\n{}\n\n{MERGE_RULES}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{agent}\n\n## Engineer's veto\n{}\n\n## Existing lessons\n{existing}\n",
             crate::veto::OPENING,
             crate::veto::INVARIANT,
-            e.task.chars().take(1500).collect::<String>(),
+            e.task.chars().take(EXCERPT_CHARS).collect::<String>(),
             e.correction,
         );
     }
@@ -292,7 +307,7 @@ fn episode_prompt(e: &Episode, listed: &[String]) -> String {
     }
     format!(
         "{OPENING}\n\n{REACH_RULES}\n\n{FIELDS}\n{AREA}\n\n{MERGE_RULES}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{}\n{}\n\n## Engineer's correction\n{}\n\n## Existing lessons\n{existing}\n",
-        e.task.chars().take(1500).collect::<String>(),
+        e.task.chars().take(EXCERPT_CHARS).collect::<String>(),
         e.agent,
         e.rejected_tool.as_deref().unwrap_or(""),
         e.correction,
@@ -329,10 +344,6 @@ pub fn schema_for(prompt: &str) -> Value {
 /// verdict of "not a lesson", the episode stays waiting and a later `borg learn` retries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AskFailed;
-
-/// After this many failed model calls in a row `borg learn` stops: the model is unavailable, and
-/// asking about every remaining episode would only burn time (and quota once it comes back).
-const MAX_FAILURES: usize = 3;
 
 /// The model's verdict on an episode that is a lesson.
 struct Answer {
@@ -372,7 +383,12 @@ impl Answer {
     }
 }
 
-/// The library's lessons most like the episode (at most 5), offered for merging.
+/// The lessons most like an episode that the learn prompt offers for merging (`similar`). Baseline:
+/// the count since 0.1.0, never evaluated, the reference a later value is compared against. A duplicate
+/// ranked below it is not offered, so its episode can become a second lesson instead of a merge.
+const MERGE_CANDIDATES: usize = 5;
+
+/// The library's lessons most like the episode (at most `MERGE_CANDIDATES`), offered for merging.
 fn similar<'a>(e: &Episode, library: &'a [Lesson]) -> Vec<&'a Lesson> {
     let as_challenges: Vec<Challenge> = library
         .iter()
@@ -391,7 +407,7 @@ fn similar<'a>(e: &Episode, library: &'a [Lesson]) -> Vec<&'a Lesson> {
         })
         .collect();
     let query = format!("{} {} {}", e.task, e.agent, e.correction);
-    conscience::select(&as_challenges, &query, 5).iter().filter_map(|c| library.iter().find(|l| l.id == c.id)).collect()
+    conscience::select(&as_challenges, &query, MERGE_CANDIDATES).iter().filter_map(|c| library.iter().find(|l| l.id == c.id)).collect()
 }
 
 /// `old` with the episode merged in: the new wording, the old one kept in `history`.
@@ -523,8 +539,9 @@ pub fn now_ms() -> i64 {
 }
 
 /// `borg learn [--session ID]`: generalise every episode not yet folded into a lesson.
-/// `--session` is given when that session ended: its asked lessons are then settled. Any run also
-/// settles sessions idle for a day, so a missing `end` hook does not bias the outcomes.
+/// `--session` is given when that session ended: its asked lessons and the placebos the judge never
+/// reached are then settled. Any run also settles sessions idle for a day, so a missing `end` hook does
+/// not bias the outcomes.
 /// Returns (new lessons, merges, episodes still waiting because the model gave no verdict).
 pub fn learn_pending(session: Option<&str>, ask: &dyn Fn(&str) -> Option<Value>) -> (usize, usize, usize) {
     learn_in(&home(), session, ask, learning(), now_ms())
@@ -590,7 +607,14 @@ pub fn test_credit() -> bool {
 /// Indexed once per run, so a run costs one pass over the log and the library plus each deciding
 /// session's own records: `regretted` reads only the deciding session's records, and a regret's credits
 /// carry that session too.
-fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<outcome::Outcome>, path: &Path) {
+///
+/// A regret is also a correction of the deciding session's work: the lesson it was folded into, and the
+/// lessons that one supersedes, if a graded check of that session found them applying before the
+/// decision and the session never asked them, were questions needed and not asked
+/// (`applied_then_corrected`, `outcome::missed`, at the decision's time and with the regret as `cause`),
+/// as for a correction merged into a lesson. These misses are recorded with `credit` off too: they blame
+/// no lesson asked.
+fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<outcome::Outcome>, path: &Path, credit: bool) {
     let mut holder: HashMap<&str, &Lesson> = HashMap::new();
     for l in library {
         for id in &l.episodes {
@@ -607,12 +631,36 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
         let Some(holder) = holder.get(e.id.as_str()) else { continue };
         let target: Vec<String> = std::iter::once(holder.id.clone()).chain(holder.supersedes.iter().cloned()).collect();
         let records = by_session.entry(r.decision_session.clone()).or_default();
-        for o in outcome::regretted(records, &r.decision_session, r.decision_ms, &e.id, &target, regret::strength(r), e.ms, &e.repo) {
+        let blamed = match credit {
+            true => outcome::regretted(records, &r.decision_session, r.decision_ms, &e.id, &target, regret::strength(r), e.ms, &e.repo),
+            false => Vec::new(),
+        };
+        let missed = match r.decision_ms > 0 && !r.decision_session.is_empty() {
+            true => outcome::missed(records, &r.decision_session, r.decision_ms, Some(&holder.id), &holder.supersedes),
+            false => Vec::new(),
+        };
+        let missed = missed.into_iter().map(|l| outcome::Outcome {
+            kind: outcome::MISSED.into(),
+            session: r.decision_session.clone(),
+            lessons: vec![l],
+            ms: r.decision_ms,
+            repo: e.repo.clone(),
+            cause: e.id.clone(),
+            ..Default::default()
+        });
+        for o in blamed.into_iter().chain(missed.collect::<Vec<_>>()) {
             let _ = outcome::append(path, &o);
             records.push(o.clone());
             outcomes.push(o);
         }
     }
+}
+
+/// Whether the session whose state file is `ctx` is still open at `now`: the file changed within
+/// `outcome::IDLE_MS` (every prompt and touch appends to it). No file: not open.
+fn open(ctx: &Path, now: i64) -> bool {
+    let ms = std::fs::metadata(ctx).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64);
+    ms.is_some_and(|ms| ms > now - outcome::IDLE_MS)
 }
 
 /// Episode kinds the removed hive made (a group's reflection, a rework), skipped where an older store has them.
@@ -733,7 +781,7 @@ fn learn_unlocked(
                             ev.engineer = e.engineer.clone();
                             ev.repo = e.repo.clone();
                             ev.lessons = vec![l.id.clone()];
-                            ev.text = crate::stats::excerpt(&e.correction, 160);
+                            ev.text = crate::stats::excerpt(&e.correction, crate::stats::FEED_CHARS);
                         });
                     }
                     if proposes(&placed, &invariant) {
@@ -786,15 +834,19 @@ fn learn_unlocked(
         }
     }
     if track {
-        if regret_credit() {
-            credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path);
-        }
-        let mut ended: Vec<String> =
-            outcome::idle_sessions(&outcomes, &last_episode, now).into_iter().filter(|s| !pending.contains(*s)).map(str::to_string).collect();
+        credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path, regret_credit());
+        let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
+        let ctx = |s: &str| state.join(format!("{}.ctx", crate::notes::safe(s)));
+        // Settled only once ended: its `end` hook ran (`session`), or it is idle by the log and its state
+        // file is as quiet (`open`): a session working without asks or episodes for a day is still open.
+        let mut ended: Vec<String> = outcome::idle_sessions(&outcomes, &last_episode, now)
+            .into_iter()
+            .filter(|s| !pending.contains(*s) && !open(&ctx(s), now))
+            .map(str::to_string)
+            .collect();
         if let Some(s) = session.filter(|s| !ended.iter().any(|x| x == s) && !pending.contains(*s)) {
             ended.push(s.to_string());
         }
-        let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
         for s in &ended {
             // The session's own tests that went green after an ask (hook.rs `capture_test`) credit the
             // lessons asked, once each, as it settles.
@@ -805,7 +857,10 @@ fn learn_unlocked(
                     outcomes.push(o);
                 }
             }
-            for o in outcome::settle(&outcomes, s, now) {
+            // Each lesson left without a verdict says why (hook.rs `unjudged`, from the state file):
+            // censored, never an ignore (memory.rs).
+            let why = crate::hook::unjudged(&std::fs::read_to_string(ctx(s)).unwrap_or_default());
+            for o in outcome::settle_with(&outcomes, s, now, &|l| why.get(l).copied().unwrap_or(outcome::UNJUDGED_NO_CALL)) {
                 let _ = outcome::append(&outcomes_path, &o);
                 outcomes.push(o);
             }
@@ -1116,6 +1171,30 @@ mod tests {
     }
 
     #[test]
+    fn the_learn_prompt_offers_at_most_merge_candidates_lessons_for_merging() {
+        let lib: Vec<Lesson> = (0..MERGE_CANDIDATES + 2)
+            .map(|i| Lesson {
+                id: format!("L{i}"),
+                origin_ms: i as i64,
+                question: format!("Is the ReentrantLock held while delivery {i} runs?"),
+                consequence: "c".into(),
+                version: 1,
+                ..Lesson::default()
+            })
+            .collect();
+        let e = ep("e1", "no, the ReentrantLock must guard delivery");
+        let offered = similar(&e, &lib);
+        assert_eq!(offered.len(), MERGE_CANDIDATES, "every lesson matches; the prompt offers the best few");
+        let prompt = std::cell::RefCell::new(String::new());
+        let _ = generalise(&e, &lib, &|p| {
+            *prompt.borrow_mut() = p.to_string();
+            None
+        });
+        let named = lib.iter().filter(|l| prompt.borrow().contains(&format!("[{}]", l.id))).count();
+        assert_eq!(named, MERGE_CANDIDATES, "{}", prompt.borrow());
+    }
+
+    #[test]
     fn a_superseded_lesson_is_not_a_merge_target_its_successor_is_shown() {
         let lesson = |id: &str, ms: i64, q: &str, sup: &[&str]| Lesson {
             id: id.into(),
@@ -1202,6 +1281,78 @@ mod tests {
             Some(json!({"is_lesson": lesson, "question": "Before reading a shared flag, has a writer been considered?", "situations": [],
             "consequence": "a race", "same_as": "", "supersedes": []}))
         }
+    }
+
+    #[test]
+    fn a_settled_lesson_says_why_the_judge_gave_it_no_verdict() {
+        let home = temp_home("unjudged");
+        asked(&home, "s1", 10, &["A", "B", "C", "D"]);
+        let ignored =
+            outcome::Outcome { kind: outcome::IGNORED.into(), session: "s1".into(), lessons: vec!["A".into()], ms: 12, repo: "r".into(), ..Default::default() };
+        outcome::append(&home.join("outcomes.jsonl"), &ignored).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        let ctx = "#borg-asked A,B,C,D @0123456789ab\n#borg-judged B=pending\n#borg-judged B=pending\n#borg-unjudged C why=slots\n";
+        std::fs::write(home.join("state/s1.ctx"), ctx).unwrap();
+        learn_in(&home, Some("s1"), &fake_ask, true, 100);
+        let why: Vec<(String, String)> = outcome::read(&home.join("outcomes.jsonl"))
+            .into_iter()
+            .filter(|o| o.kind == outcome::NOT_CORRECTED)
+            .map(|o| (o.lessons.join(","), o.reason))
+            .collect();
+        let want = [("A", outcome::UNJUDGED_NONE), ("B", outcome::UNJUDGED_TRIES), ("C", outcome::UNJUDGED_SLOTS), ("D", outcome::UNJUDGED_NO_CALL)];
+        assert_eq!(why, want.map(|(l, r)| (l.to_string(), r.to_string())));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Settle waits for a session's end: idle by the log (no ask or episode for a day) is not enough while
+    /// its state file is still being written.
+    #[test]
+    fn an_idle_session_still_working_is_not_settled() {
+        let home = temp_home("open");
+        asked(&home, "s1", 10, &["A"]);
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::write(home.join("state/s1.ctx"), "a prompt just now\n").unwrap();
+        let now = now_ms();
+        learn_in(&home, None, &fake_ask, true, now);
+        assert!(results(&home).is_empty(), "still open: {:?}", results(&home));
+        // A day after its last line, it ended.
+        learn_in(&home, None, &fake_ask, true, now + outcome::IDLE_MS + 60_000);
+        assert_eq!(results(&home), [(outcome::NOT_CORRECTED.into(), "s1".into(), "A".into())]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A regret is a correction of the deciding session's work too: the lesson it merges into, graded
+    /// applying in that session before the decision and never asked there, was a question needed and not
+    /// asked.
+    #[test]
+    fn a_regret_merged_into_a_lesson_graded_but_not_asked_before_the_decision_is_a_miss() {
+        let home = temp_home("regret-miss");
+        append_jsonl(&home.join("episodes.jsonl"), &at("e0", "s0", 1, "ann@x", "use the lock on the flag")).unwrap();
+        learn_in(&home, Some("s0"), &fake_ask, true, 2);
+        let graded = |ms: i64| outcome::Outcome {
+            kind: outcome::GRADED.into(),
+            session: "s-dec".into(),
+            lessons: vec!["Le0".into()],
+            ms,
+            repo: "r".into(),
+            grades: vec![2],
+            ..Default::default()
+        };
+        for g in [graded(10), graded(30)] {
+            outcome::append(&home.join("outcomes.jsonl"), &g).unwrap();
+        }
+        append_jsonl(&home.join("episodes.jsonl"), &regret_at("R1", 20)).unwrap();
+        let merge = |_: &str| Some(json!({"is_lesson": true, "question": "Q", "situations": [], "consequence": "c", "same_as": "Le0", "supersedes": []}));
+        learn_in(&home, None, &merge, true, 200);
+        let missed: Vec<(String, String, i64, String)> = outcome::read(&home.join("outcomes.jsonl"))
+            .into_iter()
+            .filter(|o| o.kind == outcome::MISSED)
+            .map(|o| (o.lessons.join(","), o.session, o.ms, o.cause))
+            .collect();
+        assert_eq!(missed, [("Le0".to_string(), "s-dec".to_string(), 20, "R1".to_string())]);
+        learn_in(&home, None, &merge, true, 300);
+        assert_eq!(outcome::read(&home.join("outcomes.jsonl")).iter().filter(|o| o.kind == outcome::MISSED).count(), 1, "once");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

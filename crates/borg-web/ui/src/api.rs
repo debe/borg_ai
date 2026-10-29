@@ -18,6 +18,13 @@ pub async fn get(url: String) -> Option<Value> {
     r.json::<Value>().await.ok()
 }
 
+/// POSTs `body` as JSON (a CORS preflight from any other site's page, which borg web never answers);
+/// whether the server took it.
+pub async fn post(url: String, body: &Value) -> bool {
+    let Ok(req) = gloo_net::http::Request::post(&url).json(body) else { return false };
+    req.send().await.is_ok_and(|r| r.ok())
+}
+
 fn f(v: &Value) -> f64 {
     v.as_f64().unwrap_or(0.0)
 }
@@ -473,6 +480,206 @@ pub fn parse_messages(v: &Value) -> Vec<Message> {
         .collect()
 }
 
+/// A named share, `part` of `whole`: a deviation from the fixed rule, a label rate.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Count {
+    pub name: String,
+    pub part: f64,
+    pub whole: f64,
+}
+
+/// One cost source's spend over the sessions folded.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Spend {
+    pub source: String,
+    pub calls: f64,
+    /// Extra rounds it cost the sessions (a stop block is one).
+    pub rounds: f64,
+    pub usd: f64,
+}
+
+/// An engineer's budget for the collective: pool tokens per session, those read per session, and the
+/// price per pool token the policy weighs a larger pool against.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Budget {
+    pub tokens: f64,
+    pub spent: f64,
+    pub price: f64,
+}
+
+/// An effect and its interval, as the policy reports them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Estimate {
+    pub name: String,
+    /// `points` (percentage points of P(changed and avoids)), `coefficient` (a value-model
+    /// coefficient, logit scale) or `logit` (a spread).
+    pub unit: String,
+    pub mean: f64,
+    pub lo: f64,
+    pub hi: f64,
+    pub n: f64,
+}
+
+/// The monitor's weighted estimate (the auto-revert's evidence) and how far it can be trusted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Evaluation {
+    /// The learned policy's sessions it read.
+    pub sessions: f64,
+    /// Per apply, (policy − fixed rule) + α × the fixed rule's value, and its upper bound (None until
+    /// enough sessions): below 0 the store reverts to the fixed rule.
+    pub mean: f64,
+    pub ucb: Option<f64>,
+    /// The labelled units weighed, their effective number, the largest weight against the mean, and the
+    /// units whose weight was truncated.
+    pub units: f64,
+    pub ess: f64,
+    pub max_weight: f64,
+    pub truncated: f64,
+}
+
+/// The delivery rates the fit learned: a stop's and a live check's free lesson delivered, a live
+/// question delivered (`ask_live`), which weigh a route's value; a lesson a live check left for later
+/// delivered later and a live question still waiting at the stop (`later`, `wait`, only shown).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rates {
+    pub free_stop: f64,
+    pub free_live: f64,
+    pub ask_live: f64,
+    pub later: f64,
+    pub wait: f64,
+}
+
+/// What the checks measure for the learned policy at no cost to the fixed rule's quality: the placebos
+/// drawn (applies no route delivered, judged blindly) and those judged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Measurement {
+    pub placebos: f64,
+    pub judged: f64,
+    pub tail_shown: f64,
+    pub tail_applied: f64,
+}
+
+/// The pool's yield at fill positions `from..to` (0 first).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Yield {
+    pub from: f64,
+    pub to: f64,
+    pub shown: f64,
+    pub applied: f64,
+    pub rate: f64,
+}
+
+/// One harness's check latency against its stop budget (None: it names none).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Latency {
+    pub harness: String,
+    pub checks: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub budget_ms: Option<f64>,
+    pub over: f64,
+}
+
+/// Lesson selection as borg's monitor reads it from the store's selection summary (`/api/select`, borg
+/// top.rs `Selection`). An empty section is not measured yet, never a 0.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Selection {
+    /// The policy in force (`fixed`, `learned`, `cap`, `attention`), the one a hook runs without a switch,
+    /// and what decides (the policy, or `reverted`).
+    pub policy: String,
+    pub default: String,
+    pub source: String,
+    /// The conservative gate's budget: the quality the learned policy may still risk below the fixed rule.
+    pub gate: f64,
+    pub fit: String,
+    pub checks: f64,
+    pub sessions: f64,
+    pub deviations: Vec<Count>,
+    /// Per reason a learned decision fell back to the fixed rule (`lock_busy`, `lock_failed`,
+    /// `unrecorded`), of the graded checks folded.
+    pub fallbacks: Vec<Count>,
+    pub spend: Vec<Spend>,
+    /// Only where an engineer set one.
+    pub budget: Option<Budget>,
+    pub effects: Vec<Estimate>,
+    /// In session ticks; `Some(0)`: no forgetting.
+    pub half_life: Option<f64>,
+    pub labels: Vec<Count>,
+    pub declaration: Option<Estimate>,
+    /// None before a fit.
+    pub delivery: Option<Rates>,
+    pub evaluation: Option<Evaluation>,
+    /// None before a graded check is folded.
+    pub measurement: Option<Measurement>,
+    pub pool: Vec<Yield>,
+    pub latency: Vec<Latency>,
+}
+
+fn list<T>(v: &Value, one: impl Fn(&Value) -> T) -> Vec<T> {
+    v.as_array().into_iter().flatten().map(one).collect()
+}
+
+fn count(c: &Value) -> Count {
+    Count { name: s(&c["name"]), part: f(&c["part"]), whole: f(&c["whole"]) }
+}
+
+fn estimate(e: &Value) -> Estimate {
+    Estimate { name: s(&e["name"]), unit: s(&e["unit"]), mean: f(&e["mean"]), lo: f(&e["lo"]), hi: f(&e["hi"]), n: f(&e["n"]) }
+}
+
+pub fn parse_select(v: &Value) -> Selection {
+    let x = &v["selection"];
+    Selection {
+        policy: s(&x["policy"]),
+        default: s(&x["default"]),
+        source: s(&x["source"]),
+        gate: f(&x["gate"]),
+        fit: s(&x["fit"]),
+        checks: f(&x["checks"]),
+        sessions: f(&x["sessions"]),
+        deviations: list(&x["deviations"], count),
+        fallbacks: list(&x["fallbacks"], count),
+        spend: list(&x["spend"], |c| Spend { source: s(&c["source"]), calls: f(&c["calls"]), rounds: f(&c["rounds"]), usd: f(&c["usd"]) }),
+        budget: x["budget"].as_object().map(|_| {
+            let b = &x["budget"];
+            Budget { tokens: f(&b["tokens"]), spent: f(&b["spent"]), price: f(&b["price"]) }
+        }),
+        effects: list(&x["effects"], estimate),
+        half_life: x["half_life"].as_f64(),
+        labels: list(&x["labels"], count),
+        declaration: x["declaration"].as_object().map(|_| estimate(&x["declaration"])),
+        delivery: x["delivery"].as_object().map(|_| {
+            let r = &x["delivery"];
+            Rates { free_stop: f(&r["free_stop"]), free_live: f(&r["free_live"]), ask_live: f(&r["ask_live"]), later: f(&r["later"]), wait: f(&r["wait"]) }
+        }),
+        evaluation: x["evaluation"].as_object().map(|_| {
+            let e = &x["evaluation"];
+            Evaluation {
+                sessions: f(&e["sessions"]),
+                mean: f(&e["mean"]),
+                ucb: e["ucb"].as_f64(),
+                units: f(&e["units"]),
+                ess: f(&e["ess"]),
+                max_weight: f(&e["max_weight"]),
+                truncated: f(&e["truncated"]),
+            }
+        }),
+        measurement: x["measurement"].as_object().map(|_| {
+            let m = &x["measurement"];
+            Measurement { placebos: f(&m["placebos"]), judged: f(&m["judged"]), tail_shown: f(&m["tail_shown"]), tail_applied: f(&m["tail_applied"]) }
+        }),
+        pool: list(&x["pool"], |y| Yield { from: f(&y["from"]), to: f(&y["to"]), shown: f(&y["shown"]), applied: f(&y["applied"]), rate: f(&y["rate"]) }),
+        latency: list(&x["latency"], |l| Latency {
+            harness: s(&l["harness"]),
+            checks: f(&l["checks"]),
+            p50_ms: f(&l["p50_ms"]),
+            p95_ms: f(&l["p95_ms"]),
+            budget_ms: l["budget_ms"].as_f64(),
+            over: f(&l["over"]),
+        }),
+    }
+}
+
 /// One view's raw JSON, whether the server has it (old servers lack feed and queen), and how to load it.
 #[derive(Clone, Copy)]
 pub struct Source {
@@ -513,7 +720,7 @@ pub struct Data {
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
     /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source.
-    pub sources: [Source; 7],
+    pub sources: [Source; 8],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -524,6 +731,8 @@ pub struct Data {
     /// Messages between sessions, newest first, and how many wait unread on this node.
     pub messages: Memo<Vec<Message>>,
     pub unread: Memo<f64>,
+    /// Lesson selection (the Conscience tab).
+    pub select: Memo<Selection>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -560,8 +769,9 @@ pub fn provide() -> Data {
         Source::new("drones"),
         Source::new("learning"),
         Source::new("messages"),
+        Source::new("select"),
     ];
-    let [st, le, fe, qu, dr, _, me] = sources;
+    let [st, le, fe, qu, dr, _, me, se] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -575,6 +785,7 @@ pub fn provide() -> Data {
         drones: Memo::new(move |_| parse_drones(&dr.raw.get())),
         messages: Memo::new(move |_| parse_messages(&me.raw.get())),
         unread: Memo::new(move |_| f(&me.raw.get()["unread"])),
+        select: Memo::new(move |_| parse_select(&se.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

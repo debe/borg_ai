@@ -141,7 +141,9 @@ pub fn on() -> bool {
     std::env::var("BORG_CONCEPTS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("on"))
 }
 
-/// The boost's strength (`BORG_CONCEPTS_BETA`, default `BETA`).
+/// The boost's strength (`BORG_CONCEPTS_BETA`, default `BETA`). Baseline: the spike's untuned
+/// starting point (half a lesson's score per fully shared concept); an experiment parameter while
+/// the boost is off by default, for the eval that would decide it.
 pub const BETA: f64 = 0.5;
 
 pub fn beta() -> f64 {

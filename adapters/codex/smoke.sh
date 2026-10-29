@@ -125,6 +125,7 @@ grep -q "run /hooks to trust borg's hooks" "$W/install.out" || fail "install nam
 python3 -I - "$CODEX_HOME/hooks.json" "$BORG" <<'EOF' || fail "hooks.json: $(cat "$CODEX_HOME/hooks.json")"
 import json, sys
 h = json.load(open(sys.argv[1]))["hooks"]
+# Pinned: crates/borg/src/harness/codex.rs `TIMEOUTS` (the stop's is harness/mod.rs `STOP_TIMEOUT_S`), as install writes them.
 want = {"UserPromptSubmit": ("prompt", 30), "PreToolUse": ("pre_tool", 10), "PostToolUse": ("post_tool", 30), "Stop": ("stop", 90), "SessionEnd": ("end", 3)}
 for native, (ev, t) in want.items():
     ours = [x for g in h[native] for x in g["hooks"] if x["command"] == f"{sys.argv[2]} hook codex {ev}"]

@@ -53,9 +53,19 @@ codex's serde names, not yet checked against a real spawned rollout. See
 Each delivered lesson gets an `asked` outcome, and what follows is recorded against it: `changed` or
 `ignored` (judged by the next turn-end model call, see [Delivery](delivery.md)), `corrected` anyway,
 `vetoed`, `regretted`, `tested`. These outcomes form each lesson's usefulness belief, which ranks it
-against others and decides whether it keeps being asked. `borg debug memory <lessons.jsonl>` shows each lesson's
-belief, activation and state. `borg debug ope` replays the hand-set weights offline against the logged asks,
-with their asking probability, and reports; it never changes them.
+against others for the model's pool and lets an unused one fade. Which of the lessons the model grades
+are asked, handed over free or left for later is the selection policy's call: the fixed rule by default,
+or under `BORG_SELECT=learned` a policy that learns from the same outcomes and is refitted at the end of
+every `borg learn` ([Which lessons are asked](delivery.md#which-lessons-are-asked)).
+`borg debug memory <lessons.jsonl>` shows each lesson's belief, activation and state. `borg debug ope`
+replays the hand-set weights offline against the logged asks, with their asking probability, and
+reports; it never changes them. `borg debug select` does the same for the selection policy.
+
+At session end every delivered lesson that no correction followed settles as `asked_not_corrected`,
+with the reason when it had no verdict (no model call came after it, the judge's tries or slots ran
+out, its call failed). That mark is censored: it counts as unknown, never as ignored, and a verdict
+counts on its own. An unclear verdict and a placebo's result (a lesson judged blindly, never shown) are
+kept for measurement only: no belief, trust, statistic or team line reads them.
 
 | Outcome | Weight in the belief | Set by |
 |---|---|---|
@@ -63,13 +73,16 @@ with their asking probability, and reports; it never changes them.
 | `vetoed` | 3 | design, no eval yet |
 | `regretted` | at most half a correction | design; on while its offline check is inconclusive, see [Evidence](evidence.md#regret-credit) |
 | `tested` | 0.5 (`TESTED_W`) | design, not evaluated |
+| `asked_not_corrected`, an unclear verdict, a placebo's result | none | censored or measurement only |
 
 **Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
 against the lessons asked in the deciding session before the decision: asking them did not prevent it.
 The lesson it merged into takes the blame if it was asked; otherwise the asked lessons share it equally.
 The blame grows with the fix's evidence (one signal 0.5, two 0.75, three 0.875; a review finding 0.5,
 confirmed by a verifier 0.75). It costs 0 tokens, each regret counts once, and it weighs at most half a
-correction, so a lesson that keeps being asked before decisions that break sinks slowly. A regret judged
+correction, so a lesson that keeps being asked before decisions that break sinks slowly. One deciding
+session's regrets give a lesson at most as much blame as that session had corrections (at least one),
+so a long build whose work later took many fixes cannot outweigh every other session. A regret judged
 "not a lesson", or one whose lesson went to a private store, blames nothing. Regret credit reads only
 this machine's outcome log, so a decision made on another machine finds no asks here. `borg debug memory` and the page show it as
 `regretted`; `BORG_REGRET_CREDIT=off` turns it off. Whether the default stays on is decided by a pre-registered

@@ -34,6 +34,10 @@ jobs:
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-latest, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
+    # A release hang guard, not a target: about four times the longest observed build, since a
+    # release build often starts from a cold cache and 3 runs are few. The longest of 3 runs per
+    # target (Oct 2026) took 10 min (macOS), 6 min (Linux x86_64) and 5 min (Linux aarch64).
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -93,6 +97,9 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # Guard against a hung upload: observed under a minute (2 runs, Oct 2026), so 10 min is margin
+    # for a slow network, not a target.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

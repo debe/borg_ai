@@ -46,10 +46,16 @@ mod linked;
 
 pub use linked::LinkLine;
 
+/// Commits the compact form shows (module doc; `--full` lifts every bound here). Display: what one
+/// screen of `borg why`, or a drone reading it, takes in.
 const MAX_COMMITS: usize = 8;
+/// Lessons per commit in the compact form. Display, as `MAX_COMMITS`.
 const MAX_LESSONS: usize = 3;
+/// Characters of a task's first line, here and for a link's task (why/linked.rs). Display.
 const TASK_CAP: usize = 240;
+/// Characters kept of the end of a proposal (its conclusion). Display.
 const PROPOSAL_CAP: usize = 400;
+/// Characters of a lesson's question, and of its consequence. Display.
 const LESSON_CAP: usize = 240;
 
 const USAGE: &str = "usage: borg why <path>[:<line>[-<line>]] | <commit> [--full] [--json] [--dir DIR]";

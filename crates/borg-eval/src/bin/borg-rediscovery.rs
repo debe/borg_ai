@@ -7,6 +7,9 @@
 //! what was recalled (same command, or an overlapping edited file); otherwise it is noise.
 //!
 //! usage: borg-rediscovery [--claude DIR] [--omp DIR] [--min-sessions N]
+//!
+//! Its numbers (`--min-sessions`, bucket bounds, example counts, excerpt widths) are experiment
+//! parameters of this offline measurement, not product defaults.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -115,7 +118,7 @@ fn main() {
                 let text = error_line.clone().unwrap_or_default();
                 let Some(line) = scars::recall(&known, cmd, &text) else { continue };
                 t.recalled += 1;
-                t.injected_tokens += line.len() as u64 / 4;
+                t.injected_tokens += (line.len() / borg_trace::CHARS_PER_TOKEN) as u64;
                 // Which memory produced the line (same precedence as recall: scar first).
                 let fp = borg_trace::fingerprint::error_fingerprint(&text).map(|f| format!("{f:016x}"));
                 let used = known

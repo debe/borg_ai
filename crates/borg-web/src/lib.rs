@@ -19,7 +19,7 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use borg::collective::{self, Route, Share};
 use borg::{conscience, install, learn, memory, msg, outcome, presence, stats, top};
 use futures_util::{Stream, StreamExt};
@@ -44,6 +44,9 @@ pub struct App {
     pub minds: Vec<Mind>,
     /// The collective the page opens with: the one the start directory routes to.
     pub first: String,
+    /// The start directory: its git identity names the engineer looking at the page, whom the messages
+    /// view acknowledges what it shows (`messages_seen`, borg msg.rs `ack_engineer`).
+    pub cwd: String,
     /// Turns true on Ctrl-C. Event streams end on it, else graceful shutdown waits for every open page.
     pub stop: tokio::sync::watch::Receiver<bool>,
 }
@@ -223,6 +226,12 @@ struct FeedQuery {
     limit: Option<usize>,
 }
 
+/// Display: the rows a listing (`/api/feed`, `/api/messages`) returns when the page sets no `limit`.
+const PAGE: usize = 200;
+/// Guard: the most rows one listing returns whatever its `limit`, so one request cannot make the
+/// server serialise a whole log.
+const PAGE_MAX: usize = 2000;
+
 /// This machine's notable events, newest first (peers' activity arrives as counts only).
 async fn feed(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
@@ -230,7 +239,7 @@ async fn feed(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Respon
     let aliases = collective::aliases();
     let mut evs: Vec<stats::Event> = stats::events(&m.home).into_iter().filter(|e| NOTABLE.contains(&e.kind.as_str())).collect();
     evs.sort_by_key(|e| std::cmp::Reverse(e.ms));
-    evs.truncate(q.limit.unwrap_or(200).min(2000));
+    evs.truncate(q.limit.unwrap_or(PAGE).min(PAGE_MAX));
     let out: Vec<Value> = evs
         .into_iter()
         .map(|e| {
@@ -265,7 +274,8 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
 /// top` names them (a sender from another node with that node's short key: the one part the mesh
 /// checked), what the recipient is (`to_kind`: `all` for a broadcast, `local` or `collective`,
 /// `engineer` or `session`, from msg.rs `Address`; `to_name`, top.rs `recipient`, tells them apart),
-/// and how many sessions here it was shown to.
+/// and how many sessions here it was shown to. Listing acknowledges nothing: the page fetches every
+/// view whichever is open, so the messages view says what it showed (`messages_seen`).
 async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
     let now = learn::now_ms();
@@ -275,7 +285,7 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
     let mut all: Vec<msg::Message> = msg::read(&m.home).into_iter().filter(|x| now - x.ms <= msg::TTL_MS).collect();
     let unread: usize = top::unread_of(&m.home, &ds, &here, &all, now).values().sum();
     all.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
-    all.truncate(q.limit.unwrap_or(200).min(msg::KEEP));
+    all.truncate(q.limit.unwrap_or(PAGE).min(PAGE_MAX));
     let out: Vec<Value> = all
         .iter()
         .map(|x| {
@@ -290,6 +300,38 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
         })
         .collect();
     Json(json!({"collective": m.name, "messages": out, "unread": unread})).into_response()
+}
+
+#[derive(Deserialize)]
+struct Shown {
+    ids: Vec<String>,
+}
+
+/// The page's messages view showed the engineer the messages `ids` names: those to the engineer among
+/// them are acknowledged as the engineer of the start directory (borg msg.rs `ack_engineer`), as `borg
+/// inbox` and `borg top` acknowledge what they show; any other id is ignored. Only the page itself can
+/// call it: a JSON body needs a CORS preflight from any other site's page, which this server never
+/// answers, and the Host check (`loopback_only`) keeps a rebound name out. At most `PAGE_MAX` ids count.
+async fn messages_seen(State(app): State<Arc<App>>, Query(p): Query<Pick>, Json(shown): Json<Shown>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    let now = learn::now_ms();
+    let ids: std::collections::HashSet<&str> = shown.ids.iter().take(PAGE_MAX).map(String::as_str).collect();
+    let all: Vec<msg::Message> = msg::read(&m.home).into_iter().filter(|x| now - x.ms <= msg::TTL_MS && ids.contains(x.id.as_str())).collect();
+    let shown: Vec<&msg::Message> = all.iter().collect();
+    match msg::ack_engineer(&m.home, &app.cwd, &shown, now) {
+        Ok(()) => Json(json!({"collective": m.name})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("borg web: acknowledging: {e}")).into_response(),
+    }
+}
+
+/// Lesson selection (borg select.rs) as `borg status` and `borg top` show it, in full (top.rs
+/// `Selection`): what decides and the gate's budget, deviations from the fixed rule, spend per cost
+/// source, effects with intervals, label and evaluation health, pool yield, latency against the stop
+/// budget. Read from the store's selection summary, never recomputed here.
+async fn select_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    let s = top::selection(&m.home.join("lessons.jsonl"), borg::select::policy());
+    Json(json!({"collective": m.name, "selection": s})).into_response()
 }
 
 /// Whether learning works in the collective, week by week (learning.rs), backfilled from its logs.
@@ -330,6 +372,8 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
         // Learning health folds the lessons, the rollups and the local events.
         ("learning", vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home)]),
+        // The selection summary's cache, and the outcome log whose tail it folds on every read.
+        ("select", vec![home.join(borg::select::summary::CACHE), home.join("outcomes.jsonl")]),
     ]
 }
 
@@ -385,7 +429,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
         .route("/api/messages", get(messages))
+        .route("/api/messages/seen", post(messages_seen))
         .route("/api/learning", get(learning_of))
+        .route("/api/select", get(select_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))
         .with_state(app)
@@ -424,5 +470,27 @@ pub async fn publish(minds: Vec<Mind>) {
             outcome::publish(&m.home);
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page refetches the selection when its summary cache, or the outcome log the summary folds,
+    /// changes; the cache alone changes no other view.
+    #[test]
+    fn the_selection_view_follows_its_summary_and_the_outcomes() {
+        let home = std::env::temp_dir().join(format!("borg-web-watch-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let changed = |a: &Fingerprint, b: &Fingerprint| a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, _)| x.0).collect::<Vec<_>>();
+        let before = fingerprint(&home);
+        std::fs::write(home.join(borg::select::summary::CACHE), "{\"sv\":1,\"at\":0}").unwrap();
+        let cached = fingerprint(&home);
+        assert_eq!(changed(&before, &cached), ["select"]);
+        std::fs::write(home.join("outcomes.jsonl"), "{}\n").unwrap();
+        assert!(changed(&cached, &fingerprint(&home)).contains(&"select"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

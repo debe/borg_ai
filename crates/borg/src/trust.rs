@@ -72,7 +72,7 @@ pub const AREAS: [&str; 12] = [
 
 pub const OTHER: &str = "other";
 
-/// Trust without evidence.
+/// Baseline: trust without evidence, the middle of [0, 1].
 pub const NEUTRAL: f64 = 0.5;
 
 /// The area `raw` names (case, spaces and underscores ignored), "other" for anything else.
@@ -360,6 +360,20 @@ mod tests {
         assert_eq!(t.of("ann@x", "concurrency"), 0.75);
         assert_eq!(t.of("bob@x", "concurrency"), 0.75);
         assert_eq!(t.of("ann@x", "security"), NEUTRAL);
+    }
+
+    /// A placebo's results (outcome.rs `PLACEBO`, judged blindly, never delivered) and unclear verdicts
+    /// are no claim followed or corrected: trust is the same without them.
+    #[test]
+    fn a_placebo_or_unclear_result_moves_no_trust() {
+        let ls = [lesson("a", 1, "concurrency", &["ann@x"], &[])];
+        let outs = [o(ASKED, "s1", "a"), o(NOT_CORRECTED, "s1", "a")];
+        let base = Trust::compute(&ls, &outs);
+        let placebo = |kind: &str| Outcome { channel: crate::outcome::PLACEBO.into(), ..o(kind, "s2", "a") };
+        let mut more = outs.to_vec();
+        more.extend([placebo(CORRECTED), placebo(NOT_CORRECTED), placebo(crate::outcome::CHANGED), o(crate::outcome::UNCLEAR, "s3", "a")]);
+        assert_eq!(Trust::compute(&ls, &more).of("ann@x", "concurrency"), base.of("ann@x", "concurrency"));
+        assert_eq!(base.of("ann@x", "concurrency"), 2.0 / 3.0);
     }
 
     #[test]

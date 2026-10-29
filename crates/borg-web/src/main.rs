@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 use borg_web::{App, USAGE, minds, publish, router};
 
+/// The page's port unless `--port` says otherwise. Protocol: the address the docs and `borg web`
+/// print; one fixed port so a bookmark keeps working.
+const PORT: u16 = 7979;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,7 +22,7 @@ async fn main() {
         return;
     }
     let port: u16 = match flag("--port").map(|p| p.parse()) {
-        None => 7979,
+        None => PORT,
         Some(Ok(p)) => p,
         Some(Err(_)) => {
             eprintln!("{USAGE}");
@@ -50,7 +54,7 @@ async fn main() {
     };
     println!("borg web: http://{addr}/  ({} collectives, showing {first}; Ctrl-C stops)", minds.len());
     let (stopping, stop) = tokio::sync::watch::channel(false);
-    let app = Arc::new(App { minds, first, stop });
+    let app = Arc::new(App { minds, first, cwd: dir, stop });
     let stop = async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = stopping.send(true);

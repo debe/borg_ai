@@ -34,11 +34,23 @@ mod unigram;
 
 pub use model::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, enabled, index_dir, model_dir, model_present};
 
-/// Vector hits added to the shortlist at most (`BORG_VECTOR_K`).
+/// Vector hits added to the shortlist at most (`BORG_VECTOR_K`). Baseline: the internal evaluation
+/// "vectors" setting; with the whole-store pool (whole.rs) the shortlist only orders what fills the
+/// budget when the pool overflows.
 pub const DEFAULT_K: usize = 10;
 
-/// BM25 lessons the Stop's consequence model sees before vector additions.
+/// BM25 lessons the Stop's consequence model sees before vector additions. Baseline: top 30 found as
+/// much as top 20 plus vectors (internal evaluation "vectors"); with the whole-store pool it is the
+/// overflow order's head (whole.rs `select`).
 pub const SHORTLIST: usize = 30;
+
+/// Vector hits fetched beyond `k` + the shortlist (`shortlist`). Guard: done, out-of-scope and
+/// BM25-listed hits are dropped after the search, so a search of exactly `k` could come back short.
+const OVER_FETCH: usize = 30;
+
+/// SeekStorm's segment number bits of the index (2^11 segments). Method: SeekStorm's own default for an
+/// index of this size; borg-search's evaluation builds its indexes with the same layout.
+pub const SEGMENT_BITS: usize = 11;
 
 /// How many vector hits the Stop step adds at most (`BORG_VECTOR_K`, default `DEFAULT_K`).
 pub fn k() -> usize {
@@ -88,7 +100,7 @@ pub fn shortlist<'a>(lessons: &Path, pool: &'a [Challenge], context: &str, scope
         return (bm25, 0);
     }
     // Ask for more than `k`: done, out-of-scope and BM25-listed hits are dropped after the search.
-    let ranked = recall(lessons, &query_tail(context), k + n + 30);
+    let ranked = recall(lessons, &query_tail(context), k + n + OVER_FETCH);
     let before = bm25.len();
     let out = extend(bm25, &ranked, pool, scope_text, k);
     let added = out.len() - before;
@@ -575,7 +587,7 @@ pub mod engine {
             let idx = if fresh {
                 let _ = std::fs::remove_dir_all(&target);
                 std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-                create_index(&target, meta(manifest.dims), &schema(), &Vec::new(), 11, true, Some(1)).await?
+                create_index(&target, meta(manifest.dims), &schema(), &Vec::new(), crate::vectors::SEGMENT_BITS, true, Some(1)).await?
             } else {
                 open_index(&target).await?
             };
