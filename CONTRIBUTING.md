@@ -35,6 +35,14 @@ Every crate shares the workspace version, and the workspace's own path dependenc
 it, so the crates are released together. Each change set that ships bumps the version and opens its
 CHANGELOG section as "## X.Y.Z (unreleased)"; release notes collect there until the release.
 
+That section becomes the GitHub release notes, so keep it short and readable:
+- Open with one sentence on what the release is about.
+- Use `Added`, `Changed`, `Fixed` and `Removed`, plus `Upgrading` when users must do something.
+- Give each entry one or two lines from the user's side: what changed and what to do about it.
+- Leave out file names, internal constants and eval statistics; they belong in the docs.
+- Link docs with absolute GitHub URLs, so the links also work in the release notes.
+- Aim for 100–250 words per release.
+
 A release is made from your machine with `scripts/release.sh`, as in libpetri. Pushing a tag on its
 own publishes nothing to crates.io.
 
