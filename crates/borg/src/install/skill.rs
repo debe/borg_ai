@@ -206,8 +206,10 @@ mod tests {
         let (name, skill) = FILES[0];
         assert_eq!(name, "SKILL.md");
         let front = skill.strip_prefix("---\n").and_then(|s| s.split_once("\n---\n")).map(|(f, _)| f).expect("frontmatter first");
-        assert!(front.lines().any(|l| l == "name: borg"), "{front}");
-        let desc = front.lines().find_map(|l| l.strip_prefix("description: ")).expect("a description");
+        // Strict YAML, as Codex and opencode parse it: an unquoted `: ` in a value breaks the skill there.
+        let front: std::collections::BTreeMap<String, String> = serde_norway::from_str(front).expect("the frontmatter is YAML");
+        assert_eq!(front.get("name").map(String::as_str), Some("borg"), "{front:?}");
+        let desc = front.get("description").expect("a description");
         assert!(desc.len() <= 1024, "opencode's limit");
         for word in ["borg", "collective", "lesson", "drone", "queen", "mesh", "vectors"] {
             assert!(desc.contains(word), "the description triggers on {word}");

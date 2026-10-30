@@ -1,6 +1,6 @@
 ---
 name: borg
-description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, mesh, vectors or messages between sessions, asks why borg blocked or asked, wants to hand lessons over to a store outside borg, or wants to set up, share or fix borg.
+description: "borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, mesh, vectors or messages between sessions, asks why borg blocked or asked, wants to hand lessons over to a store outside borg, or wants to set up, share or fix borg."
 ---
 
 # borg

@@ -19,7 +19,7 @@ seekstorm = ["dep:seekstorm", "dep:tokio", "dep:model2vec-rs"]
 vectors = ["borg/vectors"]
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "=0.7.0" }
+borg = { package = "borg-ai", path = "../borg", version = "=0.7.1" }
 serde.workspace = true
 serde_json.workspace = true
 # pinned `=` with borg-ai's, which explains why (crates/borg/Cargo.toml)

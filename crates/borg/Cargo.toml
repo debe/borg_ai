@@ -24,7 +24,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.7.0" }
+borg-trace = { path = "../borg-trace", version = "=0.7.1" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 # float_roundtrip: a float read back from the selection cache is the one written, so a hook's decision
@@ -47,6 +47,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 safetensors = { version = "0.5", optional = true }
 memmap2 = { version = "0.9", optional = true }
 half = { version = "2", optional = true }
+
+[dev-dependencies]
+# The skill's frontmatter is read as YAML, the way strict harnesses read it (install/skill.rs tests).
+serde_norway = "0.9"
 
 # docs.rs builds the lean library, without the vectors stack (SeekStorm, tokenizers).
 [package.metadata.docs.rs]

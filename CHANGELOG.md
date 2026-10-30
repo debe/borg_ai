@@ -3,6 +3,16 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.1 (unreleased)
+
+Fixes the `borg` skill for harnesses that read its header strictly.
+
+### Fixed
+
+- The `borg` skill's description is valid YAML now. Its unquoted colon made strict parsers, such as
+  Codex's and opencode's, reject the skill. Run `borg update`, or `borg install <harness> --apply`, to
+  refresh the installed copies.
+
 ## 0.7.0 (2026-10-30)
 
 Hand long-term knowledge over to another store, and Borg now tells you when it or the mesh moves on.
