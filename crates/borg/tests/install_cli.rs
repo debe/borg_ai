@@ -14,7 +14,7 @@ fn tmp(name: &str) -> PathBuf {
 /// borg with a clean, fully redirected environment: nothing of the caller's borg/harness config leaks in.
 fn borg(args: &[&str], env: &[(&str, &Path)]) -> std::process::Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
-    c.args(args).env_clear().env("PATH", "");
+    c.args(args).env_clear().env("PATH", "").env("BORG_UPDATE_CHECK", "off");
     for (k, v) in env {
         c.env(k, v);
     }

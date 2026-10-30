@@ -33,6 +33,8 @@ function env() {
 	process.env.BORG_CONFIG = join(dir, "no-collectives.json");
 	process.env.BORG_MATCH = "bm25";
 	process.env.BORG_LEARN = "on";
+	// No release check from a test: it would ask GitHub (borg update.rs).
+	process.env.BORG_UPDATE_CHECK = "off";
 	delete process.env.BORG_CONSCIENCE;
 	const ctx = { cwd: join(dir, "relay"), sessionManager: { getSessionId: () => SESSION } };
 	const ctxFile = () => readFileSync(join(dir, "state", `${SESSION}.ctx`), "utf8");

@@ -17,15 +17,18 @@ each teammate makes it again.
 - **Collective:** one memory for a set of repos: shared with a team, private, or off.
 - **Queen:** the queue of decisions no lesson answers yet, asked of you one at a time.
 
-**Status:** 0.6.0. Lesson selection is measured end to end, and the learned policy is the default
-since its pre-registered checks passed (`BORG_SELECT=fixed` keeps the fixed rule). Messages between sessions are paced by
-acknowledgements instead of a fixed rate. In daily use, with lessons syncing
+**Status:** 0.7.0. A store outside Borg can take over long-term knowledge: Borg stops delivering a
+lesson held there and keeps counting the corrections that recur. Lesson selection is measured end to
+end, and the learned policy is the default since its pre-registered checks passed
+(`BORG_SELECT=fixed` keeps the fixed rule). Messages between sessions are paced by acknowledgements
+instead of a fixed rate. In daily use, with lessons syncing
 between engineers' machines over the mesh, across NATs. Tested on Linux and macOS. Read [Evidence and limits](#evidence-and-limits) before you rely on it.
 
 - [Quick start](#quick-start)
 - [How it works in one session](#how-it-works-in-one-session)
 - [The team](#the-team)
 - [Talking to other sessions](#talking-to-other-sessions)
+- [Handing knowledge to an outside store](#handing-knowledge-to-an-outside-store)
 - [Monitoring](#monitoring)
 - [Cost](#cost)
 - [Privacy](#privacy)
@@ -232,6 +235,33 @@ and the session's next prompt hook shows the messages themselves. Nothing wakes 
 engineer's own turn runs. `borg top` shows who listens in its WAKE column.
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
 
+## Handing knowledge to an outside store
+
+A team may keep its settled knowledge outside Borg, for example in a reviewed skills repo. Once a
+lesson is held there, Borg delivering it too is a second copy that can drift. Borg does not know that
+store and never names it. You ask your agent what is ready to be held elsewhere, and it runs:
+
+```sh
+borg memory export --json                                   # every lesson's evidence, 0 tokens
+borg memory absorb L42 --note "skills/review@2026-10-30"    # held elsewhere now
+borg memory release L42                                     # Borg delivers it again
+```
+
+- **The export** holds one record per lesson: the lesson as stored, its belief with a 95% credible
+  interval, how many sessions and repos it changed work in, the raw placebo and tail counts, and
+  whether it is absorbed. It is read-only. A field the logs do not hold is left out, never guessed.
+- **An absorb** stops delivery of that lesson on every harness and every path: early delivery, the
+  checks, the vector shortlist. In a team collective it syncs to the members; in a private one it
+  stays on the machine. A constraint ratified from the lesson is still delivered.
+- **The note** is an opaque label of at most 1,000 characters. Borg stores, syncs and shows it, and
+  never reads it. What Borg acts on is the absorbed state alone.
+- **Recurrence keeps measuring.** Learning still sees an absorbed lesson, so a repeated correction can
+  merge into it. Each such merge counts as a recurrence: a sign the outside copy did not hold.
+  `borg status` shows `absorbed N, recurred R` per collective, and borg web's Knowledge view marks
+  absorbed lessons with their note and recurrence.
+
+[Details](https://github.com/debe/borg_ai/blob/main/docs/learning.md#handing-a-lesson-to-an-outside-store)
+
 ## Monitoring
 
 ```sh
@@ -344,22 +374,47 @@ Full table, the regret check and every known limit: [Evidence and limits](https:
 ## Upgrade and uninstall
 
 ```sh
-cargo install borg-ai --locked --force       # or install.sh again
-cargo install borg-mesh --locked --force     # if installed
-borg install all              # dry run: shows adapter, hook and skill changes
-borg install all --apply      # only if the dry run shows a diff
-borg doctor
+borg update            # install the latest release, refresh the wiring, run borg doctor
+borg update --check    # only ask: exit 10 when a newer release exists, and who on the team runs what
 ```
+
+`borg update` installs the way borg was installed: under `~/.cargo/bin` (`$CARGO_HOME/bin`) it runs
+`cargo install --locked --force --version X` for `borg-mesh`, `borg-web` and then `borg-ai`; otherwise
+it downloads the release tarball `install.sh` uses, checks its sha256 and replaces `borg-mesh`,
+`borg-web` and then `borg` beside `borg` (a `BORG_BIN` symlink counts where it points). `borg` comes
+last, so an install that stopped part way leaves the old `borg`, and the next `borg update` starts
+again; on the current release it also reinstalls a `borg-mesh` or `borg-web` beside `borg` that
+reports another version. A build under `target/` or a platform without release binaries gets the
+commands printed instead, and nothing changes. Then the new borg refreshes every harness that is wired now
+(`borg install <h> --apply`: adapter, skill and hooks; it never wires a new one) and runs
+`borg doctor`. The mesh daemon and `borg listen` waiters restart on their own; restart a running
+`borg web`, which `borg update` names. Before 0.7 there is no `borg update`: run `install.sh` again or
+`cargo install borg-mesh borg-web borg-ai --locked --force`, then `borg install all --apply` and
+`borg doctor`.
+
+**You hear of an update without asking.** Once a day the prompt hook starts `borg update --check` in
+the background; it never waits for the network. When a newer release exists, the drone hears it once
+per session, tells you, and offers to run `borg update`, which it runs only on your yes. It also tells
+you when nothing syncs with a team member because that member speaks a newer mesh protocol, and when
+a member runs a newer released borg. `borg status` lists this borg, the latest release and the team's
+members by version; `borg doctor` warns about a newer release; `borg top` and `borg web` show one line
+or a banner while an update exists or a member's protocol differs. When a node first syncs with a member
+on an older protocol, it tells the whole collective once, as a message every borg since 0.4 shows:
+who runs which borg, what the older members miss, and the command to run
+([Versions on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#how-a-sync-works)). `BORG_UPDATE_CHECK=off` turns the release
+check off, `BORG_ANNOUNCE=off` the message ([variables](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables)).
 
 Hooks call the binary by path, so a reinstall needs no rewiring. Codex trusts each hook's command and
 timeout: after an upgrade that moves borg or changes a timeout, trust them again with `/hooks`
 (`borg doctor` says so). Stores are append-only JSONL and need no migration; the first check after an
-upgrade rebuilds the selection summary from the outcome log. The mesh protocol is now `borg/mesh/14`.
-A 0.4 or 0.5 member (`borg/mesh/13`) still syncs everything, but gets only the messages it can read
-(those of at most 1,000 characters, paced as 0.5.0 paced them): `borg tell` refuses a longer text to
-a session there and says why, and a broadcast says how many member machines will not show it. A member
-built from 0.3.0 sources (`borg/mesh/12`) syncs everything except messages; nothing syncs with an older
-one, and `borg doctor` names that member and which side has to upgrade.
+upgrade rebuilds the selection summary from the outcome log. The mesh protocol is now `borg/mesh/15`.
+A 0.6 member (`borg/mesh/14`) syncs everything except absorbs: it keeps delivering a lesson the team
+absorbed until it upgrades. A 0.4 or 0.5 member (`borg/mesh/13`) syncs the same, but gets only the
+messages it can read (those of at most 1,000 characters, paced as 0.5.0 paced them): `borg tell`
+refuses a longer text to a session there and says why, and a broadcast says how many member machines
+will not show it. A member built from 0.3.0 sources (`borg/mesh/12`) syncs everything except messages
+and absorbs; nothing syncs with an older one, and `borg doctor` names that member and which side has
+to upgrade.
 
 ```sh
 borg uninstall all --apply    # removes only what install added; keeps a backup

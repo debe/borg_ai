@@ -39,6 +39,7 @@ fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> String
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", "claude", event])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
         .env("BORG_PREDICT_MODEL", "off")

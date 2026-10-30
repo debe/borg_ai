@@ -1,7 +1,8 @@
 //! `borg top` on a terminal: one live screen, Unix top style. It redraws every second in the terminal's
 //! alternate screen, fits the window, and quits on `q`, Esc or Ctrl-C with the terminal as it was.
 //!
-//! The screen per collective: a header with the drones by state, then the drones as a table with what
+//! Under the header, a line on borg itself when it has news (top.rs `version_line`: a newer release, a
+//! member on another mesh protocol). The screen per collective: a header with the drones by state, then the drones as a table with what
 //! each is doing and its unread messages, its lesson selection line (top.rs `Selection`) when it has
 //! one, then the collective's last few messages. `frame` is pure over its inputs (`Coll`); `run` is
 //! the terminal around it, and acknowledges the messages to the engineer a frame showed when no
@@ -149,8 +150,9 @@ fn doing(prompt: &str) -> String {
 /// The screen: at most `h` lines of at most `w` columns, and per collective (its index in `cs`) the
 /// messages its lines show: those within the height whose line, cut to the width, still shows some of
 /// its text: a line cut before the text names only who wrote to whom, and `run` acknowledges what the
-/// engineer read, as msg.rs `deliver` shows a drone at least the start of a message's text.
-pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> (Vec<String>, Vec<(usize, &Message)>) {
+/// engineer read, as msg.rs `deliver` shows a drone at least the start of a message's text. `version`
+/// is the line on borg itself (top.rs `version_line`), right under the header when there is one.
+pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: usize, color: bool) -> (Vec<String>, Vec<(usize, &'a Message)>) {
     let mut lines: Vec<Ln> = Vec::new();
     // The line each message is on.
     let mut shown: Vec<(usize, usize, &Message)> = Vec::new();
@@ -166,6 +168,9 @@ pub fn frame(cs: &[Coll], now: i64, w: usize, h: usize, color: bool) -> (Vec<Str
     let hint = "q quit";
     let gap = w.saturating_sub(head.len() + hint.len());
     lines.push(if gap >= 2 { head.add(St::Plain, " ".repeat(gap)).add(St::Dim, hint) } else { head });
+    if let Some(v) = version {
+        lines.push(Ln::default().add(St::Yellow, v));
+    }
     if cs.is_empty() {
         lines.push(Ln::default());
         lines.push(Ln::default().add(St::Dim, "no drones yet: sessions show here once their hooks run (borg setup wires them)"));
@@ -330,8 +335,8 @@ pub fn run(dir: Option<&str>) -> i32 {
         let now = crate::learn::now_ms();
         let (w, h) = size();
         let lines = match crate::top::gather(dir, now) {
-            Ok(cs) => {
-                let (lines, shown) = frame(&cs, now, w, h, color);
+            Ok((cs, version)) => {
+                let (lines, shown) = frame(&cs, version.as_deref(), now, w, h, color);
                 acknowledge_shown(&cs, &shown, &cwd, crate::msg::caller, &mut acked, now);
                 lines
             }
@@ -384,20 +389,20 @@ mod tests {
             inbox: crate::top::tests_inbox(),
             select: None,
         }];
-        let f = frame(&cs, 10_000_000, 100, 6, false).0;
+        let f = frame(&cs, None, 10_000_000, 100, 6, false).0;
         assert_eq!(f.len(), 6, "{f:#?}");
         assert!(f.iter().all(|l| l.chars().count() <= 100), "{f:#?}");
-        assert!(frame(&cs, 10_000_000, 40, 6, false).0.iter().all(|l| l.chars().count() <= 40));
+        assert!(frame(&cs, None, 10_000_000, 40, 6, false).0.iter().all(|l| l.chars().count() <= 40));
         assert!(f[0].contains("3 drone(s): 0 working 1 waiting 1 idle 0 ended") && f[0].ends_with("q quit"), "{}", f[0]);
         assert!(f[2].starts_with(" corp · team · 3 drone(s)"), "{}", f[2]);
         assert!(f[4].contains("One of Three") && f[4].contains("● paused"), "{}", f[4]);
         assert!(f[5].contains("Two of Three") && !f[5].contains('@') && f[5].contains("beefca"), "{}", f[5]);
         assert!(f[4].contains(" 2    fix"), "the unread count: {}", f[4]);
-        let full = frame(&cs, 10_000_000, 100, 40, false).0;
+        let full = frame(&cs, None, 10_000_000, 100, 40, false).0;
         let at = full.iter().position(|l| l.starts_with("  MESSAGES  3 in the last day")).expect("the messages section");
         assert!(full[at + 1].contains("1m") && full[at + 1].ends_with("Three of Three asks -> One of Three: which test flakes?"), "{}", full[at + 1]);
         assert_eq!(full.len(), at + 4, "{full:#?}");
-        let empty = frame(&[], 0, 60, 10, false).0;
+        let empty = frame(&[], None, 0, 60, 10, false).0;
         assert!(empty[2].starts_with("no drones yet"), "{empty:#?}");
     }
 
@@ -414,9 +419,9 @@ mod tests {
             inbox: crate::top::tests_inbox(),
             select: None,
         }];
-        let ids = |h: usize, w: usize| frame(&cs, 10_000_000, w, h, false).1.into_iter().map(|(i, m)| (i, m.id.clone())).collect::<Vec<_>>();
+        let ids = |h: usize, w: usize| frame(&cs, None, 10_000_000, w, h, false).1.into_iter().map(|(i, m)| (i, m.id.clone())).collect::<Vec<_>>();
         let all: Vec<(usize, String)> = cs[0].inbox.recent.iter().map(|m| (0, m.id.clone())).collect();
-        let (lines, _) = frame(&cs, 10_000_000, 200, 40, false);
+        let (lines, _) = frame(&cs, None, 10_000_000, 200, 40, false);
         assert_eq!(ids(40, 200), all, "{lines:#?}");
         let at = lines.iter().position(|l| l.starts_with("  MESSAGES")).expect("the messages section");
         assert_eq!(ids(at + 2, 200), all[..1], "the first message line only");
@@ -424,7 +429,7 @@ mod tests {
         // The lines: "  1m    Three of Three asks -> One of Three: " (45 columns) then 18 of text,
         // "  2m    alice@x -> collective: " (31) then 15, "  3m    Six of Six @feedfeedfeed -> zzzz9999: "
         // (46) then 4.
-        let line = |w: usize, k: usize| frame(&cs, 10_000_000, w, 40, false).0[at + 1 + k].clone();
+        let line = |w: usize, k: usize| frame(&cs, None, 10_000_000, w, 40, false).0[at + 1 + k].clone();
         assert!(ids(40, 30).is_empty(), "each cut before its text: {:?}", line(30, 0));
         assert_eq!(ids(40, 40), all[1..2], "only the second shows any text: {:?}", line(40, 1));
         assert!(line(46, 0).ends_with("One of Three: …") && line(46, 1).ends_with("release at five"), "{:?}", line(46, 0));
@@ -449,11 +454,11 @@ mod tests {
             inbox: Inbox { recent: vec![m.clone()], ..crate::top::tests_inbox() },
             select: None,
         }];
-        let (lines, shown) = frame(&cs, 10_000_000, 30, 40, false);
+        let (lines, shown) = frame(&cs, None, 10_000_000, 30, 40, false);
         let at = lines.iter().position(|l| l.starts_with("  MESSAGES")).expect("the messages section");
         assert_eq!(lines[at + 1], "  1m    One of Three -> engin…");
         assert!(shown.is_empty(), "{shown:?}", shown = shown.iter().map(|(_, m)| &m.id).collect::<Vec<_>>());
-        let (lines, shown) = frame(&cs, 10_000_000, 36, 40, false);
+        let (lines, shown) = frame(&cs, None, 10_000_000, 36, 40, false);
         assert_eq!(lines[at + 1], "  1m    One of Three -> engineer: p…");
         assert_eq!(shown.iter().map(|(i, m)| (*i, m.id.clone())).collect::<Vec<_>>(), [(0, m.id.clone())]);
     }
@@ -497,7 +502,7 @@ mod tests {
             },
             Coll { name: "side".into(), home: base.join("side"), share: Share::Local, drones: side, inbox: Inbox::default(), select: None },
         ];
-        let (_, shown) = frame(&cs, 10_000_000, 100, 40, false);
+        let (_, shown) = frame(&cs, None, 10_000_000, 100, 40, false);
         assert_eq!(shown.iter().map(|(i, m)| (*i, m.id.as_str())).collect::<Vec<_>>(), [(0, m.id.as_str())], "the frame shows it");
         let seen = || crate::msg::lines(&home).into_iter().filter(|l| matches!(l, crate::msg::Line::Seen(_))).count();
         let cwd = work.display().to_string();
@@ -526,10 +531,31 @@ mod tests {
             inbox: crate::top::tests_inbox(),
             select: Some(line.into()),
         }];
-        let full = frame(&cs, 10_000_000, 200, 40, false).0;
+        let full = frame(&cs, None, 10_000_000, 200, 40, false).0;
         let at = full.iter().position(|l| l.starts_with("  SELECTION ")).expect("the selection line");
         assert_eq!(full[at], format!("  SELECTION {line}"));
         assert!(full[at - 1].contains("Three of Three") && full[at + 1].starts_with("  MESSAGES"), "{full:#?}");
-        assert!(frame(&cs, 10_000_000, 40, 40, false).0.iter().all(|l| l.chars().count() <= 40));
+        assert!(frame(&cs, None, 10_000_000, 40, 40, false).0.iter().all(|l| l.chars().count() <= 40));
+    }
+
+    /// The line on borg itself sits right under the header, cut to the width; without one the screen is
+    /// as before.
+    #[test]
+    fn the_line_on_borg_itself_sits_under_the_header() {
+        let cs = vec![Coll {
+            name: "corp".into(),
+            home: PathBuf::new(),
+            share: Share::Team,
+            drones: crate::top::tests_fixture(),
+            inbox: crate::top::tests_inbox(),
+            select: None,
+        }];
+        let v = "borg 9.0.0 is released, this is 0.7.0: borg update";
+        let with = frame(&cs, Some(v), 10_000_000, 200, 40, false).0;
+        let without = frame(&cs, None, 10_000_000, 200, 40, false).0;
+        assert_eq!(with[1], v);
+        assert_eq!(with[0], without[0]);
+        assert_eq!(&with[2..], &without[1..], "the rest moves down one line");
+        assert!(frame(&cs, Some(v), 10_000_000, 30, 40, false).0[1].chars().count() <= 30);
     }
 }

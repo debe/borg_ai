@@ -1,5 +1,120 @@
 # Changelog
 
+## 0.7.0 (2026-10-30)
+
+A store outside Borg can take over long-term knowledge: a team's reviewed skills repo, a handbook.
+`borg memory export` shows each lesson's evidence. `borg memory absorb` records that a lesson is now
+held elsewhere, and Borg stops delivering it. A correction that Borg later merges into an absorbed
+lesson counts as a recurrence, so Borg keeps measuring whether the outside copy holds. Borg never
+names, reads or resolves the outside store. The mesh speaks `borg/mesh/15`. Borg also says when it
+moves on: a newer release reaches the drone, which offers `borg update`, and a node on a newer mesh
+protocol tells the collective who runs what and what the older members miss. Every crate is 0.7.0 and
+pins the others `=0.7.0`.
+
+### Added
+
+- `borg memory export [--json] [--dir DIR] [--absorbed] [--since YYYY-MM-DD]`: one evidence record
+  per lesson of the collective the directory routes to. Read-only, 0 tokens; an `off` directory prints
+  nothing. `--json` prints `{"schema": 1, "collective", "lessons"}`. A record holds the lesson as stored
+  (wording, area, scope, reach, supersessions both ways, source, origin, support, engineers, old
+  versions), its memory as the conscience weighs it (the Beta belief's α, β, mean and 95% equal-tailed
+  credible interval, the result counts, activation, consolidated, dormant), its breadth (distinct
+  sessions that changed their work on it, distinct repos as a count), the raw counts of its placebo and
+  tail-sample judgements from this machine's outcome log (no estimate, no threshold), its absorb, its
+  recurrence and its last change (`last_change_ms`). Text is redacted, all but ids and reach. Personal (withdrawn) lessons are
+  left out. A field the logs do not hold is omitted, never guessed. `--absorbed` lists absorbed lessons
+  only; `--since` lessons whose last change is on or after that UTC day. Without `--json`, a compact
+  listing.
+- `borg memory absorb <id>... [--note TEXT]` and `borg memory release <id>...` (`--dir DIR`, `--json`):
+  one line per id in `<store>/absorbed.jsonl` (`id`, `kind`, `ms`, `by`, and for an absorb the note
+  and the lesson's current version). The note is an opaque label (`skills/review@2026-10-30`): Borg
+  redacts, stores, syncs and shows it, never reads or resolves it; one longer than 1,000 characters is
+  refused. A lesson's state is its record that sorts last by time, then kind (a release after an
+  absorb), then the line's text, so line order and arrival order never decide. An id the store does
+  not hold yet is accepted with a warning and applies when the lesson arrives. Any member may write it.
+  A line stamped more than a minute ahead of the reader's clock counts as no absorb, and a command is
+  stamped after the records it sees, so a release always undoes the absorb it releases.
+- Recurrence: the episodes merged into an absorbed lesson since the version that was absorbed. The
+  export shows it per lesson; it is omitted when the absorb recorded no version or the store no longer
+  holds that version.
+- `borg status` prints `absorbed N, recurred R` per collective: the absorbed lessons the store holds,
+  and how many of them had a correction merged in since their absorb.
+- borg web: `/api/memory` returns the export's JSON, and the Knowledge view marks absorbed lessons with
+  their note and recurrence.
+- The mesh syncs `absorbed.jsonl` in team collectives: signed, membership-checked and quarantined like
+  the other logs. A line from a peer must pass the check Borg reads the log with (a lesson id, kind
+  `absorb` or `release`, a note of at most 1,000 characters, no other field, a time at most a minute
+  ahead). The protocol is `borg/mesh/15`; `/14`, `/13` and `/12`
+  members keep syncing what they synced before and get no absorbs. `borg doctor` names a member on
+  another protocol, as before.
+- The `borg` skill has a section on handing long-term memory over: the agent runs the export when the
+  engineer asks what is ready to be held elsewhere, and absorb or release when the engineer says where
+  a lesson is held now.
+- Version exchange: each node's mesh hello names its borg version (an older node sends none and is
+  read as older than 0.7; a hello without it still parses). After every completed session the mesh
+  writes the peer's version, the protocol the session agreed on and the peer's engineer to
+  `<store>/mesh/versions.json`, local and never synced; a member that leaves the member list leaves the
+  file. What each protocol changed is stated once (`NOTES` in protocol.rs, `/15` down to `/12`), and a
+  test fails when the protocol is bumped without its line. `borg doctor` warns about a member on an
+  older protocol with what it misses and lists one on a newer borg. A version is kept only when it
+  reads as one (at most 64 characters of `[A-Za-z0-9.+-]`), an engineer only when it reads as an
+  address, so no member's text reaches a drone. A newer member that no longer speaks this node's
+  protocol, and so closes the session it agreed on, is recorded from its close reason: nothing syncs
+  with it, this node has to upgrade.
+- The protocol announcement: when a session agrees on an older protocol than the node's own, the newer
+  node sends its collective one tell to `all` as its engineer, starting `borg/mesh/<n> is in use:`: who
+  runs which borg, what members on the older protocols miss, and how to update (`borg update`, else
+  `install.sh` or `cargo install … --force`). It fits a message a 0.4 or 0.5 node reads, so the older
+  members' drones and engineers see it. It is sent only while the message log holds none for that
+  protocol, one session at a time; it waits while the engineer's tell to `all` from the last 10 minutes
+  holds the slot a 0.4 or 0.5 node keeps, and a send the sender's window refuses is retried at the next
+  such session.
+  `BORG_ANNOUNCE=off` in the mesh process's environment turns it off.
+- A release check: the prompt hook starts `borg update --check --quiet` detached when
+  `$BORG_HOME/update.json` is a day old or missing, at most once per 10 minutes per machine, and never
+  waits for it. It reads the latest release's `tag_name` with `curl` from GitHub (`BORG_RELEASES_URL`
+  names another feed) and records `checked_ms`, `latest` and `error`; a failed check keeps the last
+  known release. `BORG_UPDATE_CHECK=off` turns it off.
+- Notices to the drone, each said once per session (a marker per state in `BORG_STATE`): a newer
+  release, a member nothing syncs with because it speaks a newer mesh protocol (with what this node
+  misses), and a member on a newer borg once a release has it. The drone tells the engineer and offers
+  `borg update`, which it runs only on their yes; the `borg` skill says so.
+- `borg update [--check] [--quiet] [--json]`. `--check` asks the release feed and prints this borg, the
+  latest release and the team's members by version; exits 0 when current, 10 when a newer release
+  exists, 1 when the check failed. Plain `borg update` installs a newer release the way borg was
+  installed: under `$CARGO_HOME/bin` with `cargo install --locked --force --version X` for `borg-mesh`,
+  `borg-web` and then `borg-ai`; elsewhere on Linux x86_64/arm64 (glibc) or macOS on Apple silicon by
+  downloading the release tarball and its `.sha256` (`BORG_DOWNLOAD_URL` names a mirror) beside `borg`
+  (a `BORG_BIN` symlink counts where it points), checking the hash and renaming `borg-mesh`, `borg-web`
+  and then `borg` into place. `borg` last, so the next `borg update` completes an install that stopped
+  part way; on the current release it reinstalls a `borg-mesh` or `borg-web` that reports another
+  version. A `target/` build or another platform gets the commands
+  printed and nothing changed (exit 1). Then the new borg runs `borg install <h> --apply` for every
+  harness wired now and `borg doctor`, and names a running `borg web` to restart.
+- Where it shows: `borg status` has a `version` block (this borg, the latest release and when it was
+  checked, the members of each team collective by version, an older one with what it misses);
+  `borg doctor` warns when a newer release exists or the check has failed for more than 3 days;
+  `borg top` shows one line over the collectives while a newer release exists or a member's protocol
+  differs; borg web serves `/api/update` and shows a banner over the tabs in the same cases.
+
+### Changed
+
+- Delivery skips absorbed lessons on every harness and every path that hands lessons to a drone: early
+  delivery at the prompt, standing lessons, live checks and their queue, the stop's check and the
+  vector shortlist (all read the hook's one lesson list), `borg why`, and `borg debug recall`,
+  `prefilter` and `vectors --query`. A lesson the absorbed one replaced does not come back in its place;
+  an absorbed lesson a live one supersedes stays hidden behind it, so the live one ranks as before. A
+  constraint ratified from an absorbed lesson is its own standing item and is still delivered. Learning
+  still sees absorbed lessons: `borg learn` offers them for merging, so a repeated correction can merge
+  into the absorbed lesson and count as a recurrence, and a delivery made before the absorb still gets
+  the judge's verdict. A release delivers the lesson again.
+
+### Fixed
+
+- `borg <command> --help` (or `-h`), and the same under `borg debug`, prints that command's usage and
+  runs nothing. Before, `borg learn --help` ran a learn pass and `borg tell --help` took `--help` for a
+  drone. `borg mesh` and `borg web` answer `--help` in their own binaries, as before.
+
 ## 0.6.0 (2026-10-29)
 
 Messages are paced by acknowledgements instead of a fixed rate and keep their full text; the mesh

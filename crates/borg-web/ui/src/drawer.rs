@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 
 use crate::api::data;
-use crate::util::{day_of_ms, long_day, num, pct, who};
+use crate::util::{ago, day_of_ms, long_day, num, pct, who};
 
 #[component]
 pub fn Drawer() -> impl IntoView {
@@ -47,6 +47,7 @@ pub fn Drawer() -> impl IntoView {
                         <span class="chip">{l.area()}</span>
                         {l.consolidated.then(|| view! { <span class="chip g">"long-term"</span> })}
                         {l.dormant.then(|| view! { <span class="chip">"dormant"</span> })}
+                        {l.absorbed.is_some().then(|| view! { <span class="chip k">"held elsewhere"</span> })}
                     </div>
                     <button class="x" on:click=move |_| d.open.set(None) aria-label="Close">"×"</button>
                 </div>
@@ -61,6 +62,20 @@ pub fn Drawer() -> impl IntoView {
                     <div class="drawer-sec">
                         <div class="k">"What it prevents"</div>
                         <p class="conseq">{l.consequence.clone()}</p>
+                    </div>
+                })}
+                {l.absorbed.clone().map(|a| view! {
+                    <div class="drawer-sec">
+                        <div class="k">"Held elsewhere"</div>
+                        <dl class="facts-dl">
+                            <dt>"Note"</dt><dd>{if a.note.is_empty() { "—".to_string() } else { a.note.clone() }}</dd>
+                            <dt>"Since"</dt><dd>{format!("{} ({}) by {}", long_day(day_of_ms(a.ms)), ago(a.ms), who(&a.by))}</dd>
+                            <dt>"Recurred"</dt><dd>{match a.recurrence {
+                                Some(n) => format!("{} correction{} merged since", num(n), if n == 1.0 { "" } else { "s" }),
+                                None => "unknown: the absorbed version is not in the store".to_string(),
+                            }}</dd>
+                        </dl>
+                        <p class="meta">"No drone is asked it any more; corrections still merge into it."</p>
                     </div>
                 })}
                 <div class="drawer-sec">

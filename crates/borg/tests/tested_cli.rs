@@ -86,6 +86,7 @@ fn learn_again(root: &Path, s: &str) {
     let status = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["learn", "--session", s])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         .env("HOME", root.join("home"))
         .env("BORG_HOME", &store)

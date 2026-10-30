@@ -132,6 +132,73 @@ included; a repo convention ages only with sessions started in its repo
 
 <p align="center"><img src="img/memory.svg" width="480" alt="Activation of a lesson rises at each use and decays between uses; spaced uses keep it above the dormancy line"></p>
 
+### Handing a lesson to an outside store
+
+A team may keep its settled knowledge somewhere else, for example a reviewed skills repo or a
+handbook. Once a lesson is held there, Borg delivering it too is a second copy that can drift. Borg
+does not know that store and never names it. Three commands hand a lesson over; the agent runs them
+for the engineer ([commands](commands.md#learning)):
+
+```sh
+borg memory export --json                                   # every lesson's evidence
+borg memory absorb L42 --note "skills/review@2026-10-30"    # held elsewhere now
+borg memory release L42                                     # Borg delivers it again
+```
+
+**The export** is read-only and costs 0 tokens. It holds one record per lesson of the collective the
+directory routes to; an `off` directory prints nothing. `--json` prints `{"schema": 1, "collective",
+"lessons": [...]}`. A personal lesson (withdrawn to a private collective) is left out. Every text field
+but the ids (`id`, `supersedes`, `superseded_by`) and `reach` is redacted, the engineers and an absorb's
+`by` too. A field the logs do not hold is omitted, never guessed.
+
+| Field | What it holds |
+|---|---|
+| `id`, `version`, `repo`, `question`, `situations`, `consequence`, `area`, `scope` | The lesson as stored |
+| `reach` | `team` or `repo` |
+| `overrides`, `supersedes`, `superseded_by` | What it overrides, the lessons it supersedes, and those that supersede it |
+| `source`, `origin`, `support`, `engineers`, `history` | Where it came from, how many episodes back it, who corrected it, and its old versions' wording |
+| `memory` | The belief the conscience weighs it by: `alpha`, `beta`, `mean`, `ci95` (the Beta belief's 95% equal-tailed credible interval), the counts `changed`, `ignored`, `corrected`, `vetoed`, `regretted` and `tested`, and `activation`, `consolidated`, `dormant` |
+| `breadth` | The distinct sessions that changed their work on it, and the number of distinct repos of those changes, as memory.rs counts them to consolidate it (a change without a repo counts as one more). Team lines carry hashed repos, so this is a count, never names |
+| `placebo`, `tail` | Raw counts from this machine's outcome log: how often it was judged as a placebo or shown in the tail sample (`count`), and how often it applied (`applied`). No estimate and no threshold. Omitted when the log holds none |
+| `absorbed` | `{note, ms, by, version}`, or `null` |
+| `recurrence` | Absorbed lessons only: the episodes merged into it since the absorbed version |
+| `last_change_ms` | The latest of its first correction, an engineer joining it, its episodes held here, an outcome naming it, and its last absorb or release |
+
+`--absorbed` lists only absorbed lessons. `--since YYYY-MM-DD` lists lessons whose last change is on
+or after that UTC day.
+
+**Absorb and release** append one line per id to `<store>/absorbed.jsonl`: the id, `absorb` or
+`release`, the time, the engineer's git email, and for an absorb the note and the lesson's current
+version. Any member may write it. A lesson's state is its record that sorts last by time, then kind (a
+release after an absorb), then the line's text, so neither line order nor arrival order decides. An id
+the store does not hold yet is accepted with a warning and applies when the lesson arrives. A missing
+file or a malformed line counts as no absorb, and so does a line stamped more than a minute (the
+members' clock skew) ahead of this machine's clock. A command is stamped after the records of its ids
+that it sees, so a release always takes effect over the absorb it releases.
+
+**What an absorb does.** Borg stops delivering the lesson on every harness and every path that hands
+lessons to a drone: early delivery, standing lessons, live checks and their queue, the stop's check,
+the vector shortlist, `borg why`, and `borg debug recall`, `prefilter` and `vectors --query`. A lesson
+the absorbed one replaced does not come back in its place. An absorbed lesson that a live lesson
+supersedes stays hidden behind it, so the live lesson ranks as it did before. In a team collective the line syncs to the members
+(`borg/mesh/15`); in a private one it stays on the machine.
+
+**What it does not do.** The note is an opaque label: Borg redacts, stores, syncs and shows it, and
+never reads, resolves or matches it. A note longer than 1,000 characters is refused: name where the
+lesson is held, do not copy it. The state is what Borg acts on, not the note. An absorb never widens a
+lesson's reach and applies only in the store it was written to. A constraint ratified from the lesson
+is its own standing item and is still delivered. A lesson delivered before its absorb still gets the
+judge's verdict on that delivery: that is evidence about the lesson, not a delivery.
+
+**Recurrence keeps measuring.** Learning still sees an absorbed lesson. `borg learn` offers it for
+merging, so a correction of the same concern can merge into it. Each episode merged after the absorb
+counts as a recurrence: a sign the outside copy did not hold. The lesson stays absorbed. `recurrence`
+is the latest version's episodes beyond those of the version absorbed. It is omitted when the absorb
+recorded no version (the lesson was not in the store yet, or its line has no version) or the store no
+longer holds that version's line. `borg status` prints `absorbed N, recurred R` per collective: R is
+the number of absorbed lessons with at least one recurrence. borg web's Knowledge view marks absorbed
+lessons with their note and recurrence, and `/api/memory` serves the export.
+
 ## Reach and collectives
 
 A correction about the code becomes a team lesson. One about how *you* like the agent to work (commit

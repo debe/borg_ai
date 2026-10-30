@@ -24,7 +24,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.6.0" }
+borg-trace = { path = "../borg-trace", version = "=0.7.0" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 # float_roundtrip: a float read back from the selection cache is the one written, so a hook's decision
@@ -35,6 +35,9 @@ regex.workspace = true
 libc = "0.2"
 # hashed session and repo ids in the outcomes the team sees (outcome.rs `tag`); the mesh uses it already
 blake3 = "1.8"
+# sha256 of downloads checked against their published sums: the vector model (vectors.rs `fetch`) and a
+# release tarball (update.rs `tarball`)
+sha2 = "0.11"
 # Vector recall at the Stop step (vectors.rs, internal evaluation "vectors", not published): embedded SeekStorm, and a Model2Vec
 # embedder that maps the model file instead of reading it. SeekStorm is pinned `=`: each store keeps its index on
 # disk (`<store>/vectors/`) in SeekStorm's own format, so an upgrade is a deliberate step, checked with `borg vectors --rebuild`.
@@ -44,7 +47,6 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 safetensors = { version = "0.5", optional = true }
 memmap2 = { version = "0.9", optional = true }
 half = { version = "2", optional = true }
-sha2 = { version = "0.11", optional = true }
 
 # docs.rs builds the lean library, without the vectors stack (SeekStorm, tokenizers).
 [package.metadata.docs.rs]
@@ -53,4 +55,4 @@ no-default-features = true
 [features]
 # Vectors are on by default; `--no-default-features` builds a lean binary (BM25 only).
 default = ["vectors"]
-vectors = ["dep:seekstorm", "dep:tokio", "dep:tokenizers", "dep:safetensors", "dep:memmap2", "dep:half", "dep:sha2"]
+vectors = ["dep:seekstorm", "dep:tokio", "dep:tokenizers", "dep:safetensors", "dep:memmap2", "dep:half"]

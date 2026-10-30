@@ -23,6 +23,7 @@ fn borg_in(args: &[&str], root: &Path, cwd: &Path) -> Output {
         .args(args)
         .current_dir(cwd)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("BORG_MATCH", "bm25") // word matching only: no model call from a test

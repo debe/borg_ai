@@ -531,6 +531,15 @@ project.
 | `BORG_QUEEN_ASK` | on | `off`: the drone asks no queued question at a session's first prompt (also off with `BORG_LEARN=off`) |
 | `BORG_NOTIFY` | on | `off`: no desktop notification (`notify-send`) for new questions |
 
+**Updates and versions** ([Upgrade](../README.md#upgrade-and-uninstall), [Versions on the mesh](team-sync.md#how-a-sync-works))
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BORG_UPDATE_CHECK` | on | `off`: no release check. The prompt hook starts no background `borg update --check`, the drone hears of no newer release, `borg update` refuses (exit 1), and `borg doctor`, `borg status`, `borg top` and `borg web` say nothing about the release. The notice about a member on a newer mesh protocol stays |
+| `BORG_RELEASES_URL` | `https://api.github.com/repos/debe/borg_ai/releases/latest` | The release feed the check reads (`tag_name`); any URL `curl` reads, `file://` included |
+| `BORG_DOWNLOAD_URL` | `https://github.com/debe/borg_ai/releases/download` | Where `borg update` (as `install.sh`) downloads `v<X>/borg-v<X>-<target>.tar.gz` and its `.sha256` |
+| `BORG_ANNOUNCE` | on | Read by `borg mesh serve` and `borg mesh sync` when they start. `off`: this node never sends the announcement of a newer mesh protocol to its collective |
+
 **Experimental**, off by default. Most failed a pre-registered test and stay for further experiments.
 
 | Variable | Effect when `on` |

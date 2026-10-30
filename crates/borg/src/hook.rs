@@ -230,8 +230,22 @@ fn record(session: &str, input: &Value, task: String, agent: String, rejected_to
 }
 
 /// The lessons the conscience reads (BORG_CONSCIENCE, the BORG_BEFORE cut-off) as `session` sees them:
-/// weighted by their memory with this session's usefulness sample (memory.rs).
+/// weighted by their memory with this session's usefulness sample (memory.rs), without the ones it may
+/// not deliver here (systems, reach, absorbed). Every hook path that hands lessons to a drone reads them
+/// here.
 fn lessons(session: &str) -> Vec<conscience::Challenge> {
+    loaded(session).0
+}
+
+/// Every lesson the judge gives a verdict on: `all` and the absorbed ones withheld from it (`loaded`).
+/// A delivery made before its lesson was absorbed is evidence about the lesson, not a delivery, so the
+/// judge still sees it (`Work::judged`).
+fn judged(all: &[conscience::Challenge], withheld: Vec<conscience::Challenge>) -> std::borrow::Cow<'_, [conscience::Challenge]> {
+    if withheld.is_empty() { all.into() } else { all.iter().cloned().chain(withheld).collect::<Vec<_>>().into() }
+}
+
+/// `lessons`, and the lessons the absorbed filter withheld from it (absorb.rs `withhold`).
+fn loaded(session: &str) -> (Vec<conscience::Challenge>, Vec<conscience::Challenge>) {
     let before = std::env::var("BORG_BEFORE").ok().and_then(|v| v.parse().ok());
     let mut all = conscience::load_for(&lessons_path(), before, Some(session));
     // The system gate (systems.rs): where the repo says which system this is, lessons scoped to other
@@ -243,6 +257,8 @@ fn lessons(session: &str) -> Vec<conscience::Challenge> {
     }
     // Reach (reach.rs): a withdrawn personal lesson is never delivered, a repo convention only in its repo.
     all.retain(|c| crate::reach::deliverable(c, &repos));
+    // Absorbed (absorb.rs): held outside Borg now, so delivered on no path; every path reads this list.
+    let withheld = crate::absorb::withhold_beside(&lessons_path(), &mut all, before);
     // Spike (concepts.rs): lessons sharing engineering concepts with the code written, the touched paths
     // and the latest prompt rank higher; never a filter.
     if crate::concepts::on() {
@@ -251,7 +267,7 @@ fn lessons(session: &str) -> Vec<conscience::Challenge> {
         let latest = std::fs::read_to_string(state_file(session).with_extension("lastprompt")).unwrap_or_default();
         crate::concepts::apply(&mut all, &crate::concepts::of_work(&edits, &where_text, &latest), crate::concepts::beta());
     }
-    all
+    (all, withheld)
 }
 
 /// The lessons file the conscience reads: BORG_CONSCIENCE, default $BORG_HOME/lessons.jsonl.
@@ -1335,8 +1351,11 @@ enum Verdict {
 
 /// The work a check judges, as the stop or a live check read it.
 struct Work<'a> {
-    /// Every lesson of the session (the judge's pending lessons and the ungraded widening look here).
+    /// Every lesson of the session it may deliver (the ungraded widening looks here).
     all: &'a [conscience::Challenge],
+    /// `all` and the absorbed lessons withheld from it (`judged`): the judge's pending lessons look here,
+    /// so a delivery made before an absorb still gets its verdict.
+    judged: &'a [conscience::Challenge],
     /// The lessons that may be asked: not done (`done_in`), not decided already (waiting in the queue to
     /// be asked or handed over, `waiting_in`), not of another system.
     challenges: &'a [conscience::Challenge],
@@ -1460,7 +1479,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
     // R1: the same call judges what the drone did with lessons delivered earlier this session.
     let judging = if w.judge {
-        pending(session, w.state, w.all, w.message, live, w.check)
+        pending(session, w.state, w.judged, w.message, live, w.check)
     } else {
         Judging { pending: Vec::new(), question: false, crowded: Vec::new() }
     };
@@ -1864,12 +1883,13 @@ pub fn live_check(h: &dyn Harness, session: &str, input: &Value) {
         return;
     }
     let turn = turn_id(session);
-    let all = lessons(session);
+    let (all, withheld) = loaded(session);
+    let judged = judged(&all, withheld);
     let state = std::fs::read_to_string(&ctx).unwrap_or_default();
     let message = work_so_far(h, input);
     // Done as at the stop (`done_in`), and also what still waits to be asked or handed over: it is
     // decided already. A placebo waiting stays eligible: it was routed nowhere.
-    let acted = early_acted(session, &all, &message);
+    let acted = early_acted(session, &judged, &message);
     let mut done = done_in(&state, &acted);
     let waiting = std::fs::read_to_string(queued_file(session)).unwrap_or_default();
     done.extend(waiting_in(&waiting));
@@ -1881,6 +1901,7 @@ pub fn live_check(h: &dyn Harness, session: &str, input: &Value) {
     let summary = crate::select::summary::refresh(&lessons_path());
     let work = Work {
         all: &all,
+        judged: &judged,
         challenges: &challenges,
         done: &done,
         state: &state,
@@ -1959,12 +1980,18 @@ fn on_prompt(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     }
     note_where(session, &repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()));
     let _ = std::fs::write(state_file(session).with_extension("lastprompt"), prompt);
+    // A newer borg (update.rs): the daily release check, started detached when `update.json` is stale
+    // (one read of it when fresh), and what the drone hears of it below.
+    let checked = crate::update::maybe_check(learn::now_ms());
     // An adapter that will not wait for the answer (`"context": false`), or a harness whose model never
     // sees a prompt's context, gets none: what is handed over here is marked delivered and would be lost.
     let out = (h.caps().prompt_context && input.get("context") != Some(&Value::Bool(false))).then(|| {
         let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
         let ask = queen_ask(h, session, cwd);
-        let extra: Vec<String> = [ask, vetoed.as_deref().map(crate::veto::render)].into_iter().flatten().collect();
+        // Once per session per state (`<session>.update`): a newer release, a member nothing syncs with,
+        // a member on a newer borg; the routed store's mesh/ is read only when it exists.
+        let update = crate::update::notice(checked.as_ref(), &learn::home(), &state_file(session).with_extension("update"));
+        let extra: Vec<String> = [ask, vetoed.as_deref().map(crate::veto::render), update].into_iter().flatten().collect();
         free_context_with(h, "UserPromptSubmit", session, input, prompt, (!extra.is_empty()).then(|| extra.join("\n\n")))
     });
     // A new turn's work starts, after a live ask handed over here took the last turn's as its evidence.
@@ -2122,7 +2149,8 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     if std::env::var("BORG_CRITIC").as_deref() == Ok("generic") {
         return (!second_round).then(|| json!({"decision": "block", "reason": conscience::GENERIC}));
     }
-    let all = lessons(session);
+    let (all, withheld) = loaded(session);
+    let judged = judged(&all, withheld);
     // R1: the drone's answer to the last block's questions, at the first turn end after it: evidence
     // for the judge at the next model call (`pending`), not a label.
     note_answer(h, session, input);
@@ -2141,7 +2169,7 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     // handed over free (`#borg-early`, `#borg-queued`) is done once the drone acted on it; one it did
     // not act on may still be asked (`done_in`).
     let proposal = full_proposal(h, input);
-    let acted = early_acted(session, &all, &proposal);
+    let acted = early_acted(session, &judged, &proposal);
     let only = std::env::var_os("BORG_ONLY").is_some();
     let done = if only { std::collections::HashSet::new() } else { done_in(&state, &acted) };
     // What still waits is decided already: a live check's asks and its test's hand-overs in place of
@@ -2164,6 +2192,7 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     let summary = crate::select::summary::refresh(&lessons_path());
     let work = Work {
         all: &all,
+        judged: &judged,
         challenges: &challenges,
         done: &done,
         state: &state,

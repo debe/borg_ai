@@ -57,6 +57,7 @@ fn borg(root: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> String
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         // The fixed rule's delivery (select.rs `Policy::Fixed`), as tests/common pins it.
         .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")

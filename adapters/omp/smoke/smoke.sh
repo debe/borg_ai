@@ -52,7 +52,7 @@ sleep 1
 (cd "$run/repo" && env -i PATH=/usr/bin:/bin HOME="$run/home" TERM=dumb \
   XDG_CONFIG_HOME="$run/home/.config" XDG_DATA_HOME="$run/home/.local/share" XDG_CACHE_HOME="$run/home/.cache" \
   PI_CODING_AGENT_DIR="$run/agent" \
-  BORG_BIN="$run/borg-live" BORG_STATE="$run/state" BORG_HOME="$run/borg" BORG_LEARN=off BORG_MATCH=bm25 \
+  BORG_BIN="$run/borg-live" BORG_STATE="$run/state" BORG_HOME="$run/borg" BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_MATCH=bm25 \
   timeout 120 "$omp" -p --no-session --auto-approve --model mock/mock-1 --no-extensions \
   -e "$root/adapters/omp/borg.ts" "make the relay delivery lock-free" > "$run/omp.out" 2> "$run/omp.err")
 

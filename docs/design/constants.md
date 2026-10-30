@@ -1,7 +1,7 @@
 # Numeric constants by kind
 
 Every numeric constant's doc comment says its kind and why it has its value. This file lists them by
-kind, as the code labels them in 0.6.0. Paths are relative to `crates/`; the adapters are under
+kind, as the code labels them in 0.7.0. Paths are relative to `crates/`; the adapters are under
 `crates/borg/assets/adapters/`. Rows name a constant or a function, never a line, because lines move.
 When a doc comment and this file disagree, the doc comment is right and this file is stale.
 
@@ -37,14 +37,27 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/msg.rs` | `window_for` | 1 at first, doubled per acknowledgement up to `WINDOW_CAP`, halved per expiry, at least 1 | The unacknowledged tells and asks one sender may have to one recipient; `send` decides by it, under the log's lock. Where no acknowledgement may come (`Pace`) `V1_RATE_MS` also admits (a broadcast, the engineer) or alone admits (a session of a node that acknowledged none of the pair's messages) |
 | `borg/src/msg.rs` | `within_windows` | acknowledged, or at most `WINDOW_CAP` unread of a pair within `V1_RATE_MS` | What the mesh carries (borg-mesh sync.rs `window`, on offer and on receipt): the bound every window keeps, reading no earlier line, so the TTL and the bound never take a held line out of it |
 | `borg/src/msg.rs` | `V1_RATE_MS` | 10 min | 0.5.0's pacing, one tell or ask per sender and recipient: all a `/13` node takes (borg-mesh `v1_window`, which imports it), the pace of a node that acknowledges nothing (`Pace::Rate`), the floor where no acknowledgement may come (`Pace::Floor`), and the span `within_windows` bounds |
-| `borg-mesh/src/sync.rs` | `ALPN` | `borg/mesh/14` | The session protocol: messages v2, `seen` lines, the acknowledgement window |
+| `borg-mesh/src/sync.rs` | `ALPN` | `borg/mesh/15` | The session protocol: `borg/mesh/14`'s session with `absorbed.jsonl` as its last log |
+| `borg-mesh/src/sync.rs` | `V14_ALPN` | `borg/mesh/14` | 0.6.x's protocol, still spoken whole except for the absorbs: messages v2, `seen` lines, the acknowledgement window |
 | `borg-mesh/src/sync.rs` | `V13_ALPN` | `borg/mesh/13` | 0.4.0's and 0.5.x's protocol, still spoken; such a peer is offered only what 0.5.0 takes (`v1_window`) |
 | `borg-mesh/src/sync.rs` | `V1_KEEP` | 500 lines | 0.5.0's line bound, applied with msg.rs `V1_RATE_MS` to what a `/13` peer is offered |
 | `borg-mesh/src/sync.rs` | `LEGACY_ALPN` | `borg/mesh/12` | 0.3.0's protocol, still spoken whole except for the messages |
 | `borg-mesh/src/sync.rs` | `LEGACY_GOAL_LOGS` | 7 | Logs per goal a 0.3.0 peer reconciles |
 | `borg-mesh/src/sync.rs` | `JOIN_ALPN` | `borg/join/1` | The join handshake |
 | `borg-mesh/src/sync.rs` | `older` | `/11` down to `/1` | Offered only so a mismatch is named, not silent |
-| `borg-mesh/src/sync.rs` | `STEPS` | 6 logs | The order a session steps through the logs |
+| `borg-mesh/src/sync.rs` | `STEPS` | 7 logs | The order a session steps through the logs |
+| `borg/src/absorb.rs` | `NOTE_CHARS` | 1,000 chars | The longest note an absorb carries: `borg memory absorb` refuses a longer one, and borg-mesh lines.rs `travels` refuses a longer line from a peer (absorb.rs `written`) |
+| `borg/src/memory_export.rs` | `SCHEMA` | 1 | The export's schema version: a changed meaning or a removed field raises it, an added field does not |
+| `borg/src/protocol.rs` | `NOTES` | one line per spoken protocol, `/15` down to `/12` | What a member on an older protocol misses, the one statement doctor, status, top, web, the drone notice and the announcement quote; each protocol bump adds its line (borg-mesh sync.rs test `every_spoken_protocol_has_a_note`) |
+| `borg/src/protocol.rs` | `ANNOUNCE_PREFIX`, `announcement_head` | `borg/mesh/`, `borg/mesh/<n> is in use:` | The protocols' common prefix, and the announcement's first words, by which every node tells that it was sent (`announced`) |
+
+### Releases
+
+| File | Name | Value | Meaning |
+|---|---|---|---|
+| `borg/src/update.rs` | `RELEASES_URL` | `https://api.github.com/repos/debe/borg_ai/releases/latest` | The release feed whose `tag_name` the check reads, as scripts/install.sh does; `BORG_RELEASES_URL` names another |
+| `borg/src/update.rs` | `DOWNLOAD_URL` | `https://github.com/debe/borg_ai/releases/download` | Where release tarballs are, in install.sh's layout (`<base>/v<X>/borg-v<X>-<target>.tar.gz` and `.sha256`); `BORG_DOWNLOAD_URL`, install.sh's mirror variable, names another |
+| `borg/src/update.rs` | `EXIT_NEWER` | 10 | `borg update --check`'s exit code when a newer release exists (0: current, 1: the check failed) |
 
 ### Formats and caches
 
@@ -180,6 +193,14 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-mesh/src/daemon.rs` | `Options` | interval 60 s, backoff_max 30 min, timeout 30 s, grace 5 s | Staleness when no change triggered a dial, an unbounded backoff, a peer that never answers, a hung session at Ctrl-C. The CLI's defaults read them from `Options::default` |
 | `borg-mesh/src/main.rs` | `JOIN_TIMEOUT`, `ONLINE_WAIT` | 60 s, 10 s | A join whose admin node is down hanging; an unreachable relay blocking a command |
 
+### Release check
+
+| File | Name | Value | Runaway it stops |
+|---|---|---|---|
+| `borg/src/update.rs` | `CHECK_SECS` | 10 s | A hung connection keeping the background release check alive (curl `--max-time`) |
+| `borg/src/update.rs` | `DOWNLOAD_SECS` | 600 s | A release download that never ends: a tarball of three binaries on a slow link still fits |
+| `borg/src/update.rs` | `CHECKING_MS` | 10 min | Every prompt starting a check: a started check (`update.checking`) holds the others off, so at most one curl per machine per 10 minutes, even when every check fails |
+
 ### Learning, notes and the queen
 
 | File | Name | Value | Runaway it stops |
@@ -277,6 +298,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/conscience.rs` | `BM25_K1`, `BM25_B` | 1.2, 0.75 | BM25's standard parameters (Robertson and Zaragoza 2009), never tuned on borg's data |
 | `borg/src/ope.rs` | `AGREE` | 0.01 | A replayed p this close to the logged one is the same draw: the logged p is rounded, the estimate Monte Carlo |
 | `borg/src/ope.rs` | `SEED` | `0x006f_7065` | The bootstrap's seed, fixed so a run is deterministic (select/replay.rs's too) |
+| `borg/src/memory_export.rs` | `beta_cf`'s `TINY`, `EPS`, `MAX_TERMS` | 10⁻³⁰⁰, 10⁻¹⁵, 10,000 terms | The incomplete Beta's continued fraction (Lentz's method): `TINY` keeps a denominator off zero, `EPS` is double precision, and the fraction needs about √max(a, b) terms, so `MAX_TERMS` covers beliefs of millions of outcomes and is never the stop |
+| `borg/src/memory_export.rs` | `beta_quantile`'s halvings | 60 | Bisection on the monotone Beta CDF over [0, 1]: 60 halvings place the quantile within 2⁻⁶⁰ of the root, finer than the 4 decimals the export shows |
 | `borg/src/top.rs` | `Z95` | 1.96 | The normal quantile of a 95% interval, for the estimates the monitoring shows |
 | `borg-trace/src/lib.rs` | `CHARS_PER_TOKEN` | 4 | The usual rule of thumb for English text and code; an estimate, never a bound (borg-trace, whole.rs, `borg status`) |
 | `borg/src/vectors.rs` | `SEGMENT_BITS` | 11 | SeekStorm's own default for an index of this size; borg-search's seek.rs uses it |
@@ -327,6 +350,8 @@ later value would be compared against.
 | `borg/src/learn.rs` | `MERGE_CANDIDATES` | 5 | The most similar lessons offered to the learn model for a merge (`similar`), the count since 0.1.0 |
 | `borg-mesh/src/sync.rs` | `REPLICAS` | 2 | Members besides the author holding each reasoning excerpt, so it outlives one member going away |
 | `borg/src/concepts.rs` | `BETA` | 0.5 (`BORG_CONCEPTS_BETA`) | The concept boost's untuned start; an experiment parameter while `BORG_CONCEPTS` is off |
+| `borg/src/update.rs` | `STALE_MS` | 24 h (`clock::DAY_MS`) | How old `update.json` may be before a prompt starts another release check: a release a day late is news enough, and an idle prompt reads one small file |
+| `borg/src/update.rs` | `FAILING_WARN_MS` | 3 days (`3 × clock::DAY_MS`) | How long the release check may keep failing before `borg doctor` warns: an offline day is no news, a check that never works is |
 
 ## Display
 
@@ -341,6 +366,8 @@ later value would be compared against.
 | `borg/src/msg.rs` | `NODE_CHARS`, `SESSION_CHARS` | 12, 8 chars | A node key in every label of a node (`short_node`: a delivered line, steer.rs, presence.rs, top.rs, borg-mesh main.rs), and the session id of a sender that gave no name (`sender_label`) |
 | `borg/src/clock.rs` | `ago` | `45s`, `12m`, `3h05m`, `2d` | A relative time in at most 6 characters (msg.rs, top.rs, top_live.rs); borg-web's ui has its own copy |
 | `borg/src/stats.rs` | `FEED_CHARS` | 160 chars | An event's text in the feed and borg web |
+| `borg/src/update.rs` | `INSTALL_SH` | install.sh's one-line `curl … \| sh` | The install for a machine without `borg update`, in the commands `borg update` prints when it cannot install |
+| `borg/src/protocol.rs` | `UPDATE_COMMANDS` | `borg update`, else install.sh or `cargo install … --force` | The update commands the announcement offers, for an install of 0.7 or newer and for an older one |
 | `borg-web/src/lib.rs` | `PAGE` | 200 rows | A listing without `limit` (`/api/feed`, `/api/messages`) |
 | `borg/src/listen.rs` | `NAMES` | 3 | Senders a wake names |
 | `borg/src/notify.rs` | `BODY_CHARS` | 120 chars | A notification's question |
@@ -382,14 +409,14 @@ labelled.
 | 10 | conscience.rs `CAP`; hook.rs `MAX_PENDING` (derived from it) | One block; one judge call's lessons, so a block's lessons share their evidence |
 | 4,000 chars | hook.rs `EVIDENCE_CHARS` (and `LIVE_WORK_CHARS` from it); harness/mod.rs `OUTPUT_TAIL` | Judge evidence; a shell call's output tail |
 | 500 | steer.rs `KEEP`; borg-mesh `V1_KEEP` | Steering admissions; 0.5.0's message bound for `/13` peers |
-| 24 h | clock.rs `DAY_MS`, and from it presence.rs `PRUNE_MS`, steer.rs `TTL_MS`, outcome.rs `IDLE_MS` | One unit, three guards |
+| 24 h | clock.rs `DAY_MS`, and from it presence.rs `PRUNE_MS`, steer.rs `TTL_MS`, outcome.rs `IDLE_MS` (guards), update.rs `STALE_MS` (baseline) | One unit, three guards and a release check's age |
 | "Idle" | presence.rs `IDLE_MS` 30 min (display), listen.rs `TURN_IDLE_MS` 5 min (a learned hold's prior), outcome.rs `IDLE_MS` 24 h (a session's end) | Three meanings, three names |
 | 2,000 | conscience.rs `EARLY_CHARS`, learn.rs `PROPOSAL_CHARS`, borg-trace `REFUSAL_CHARS` (chars); notes/regress.rs `Cfg::default` `max_lines` (lines); borg-web `PAGE_MAX` (rows) | Different bounds, each labelled |
 | 160 / 240 / 300 chars | stats.rs `FEED_CHARS`, whole.rs's line, why.rs caps, facets, queen.rs `QUOTE_CHARS`, conscience.rs `EARLY_QUESTION_CHARS` | Each labelled |
 | 120 / 200 chars | top.rs `MESSAGE_CHARS`, escalation.rs `ANSWER_CHARS`, notify.rs `BODY_CHARS`; veto.rs `EVIDENCE_CHARS`, conscience.rs `EARLY_CONSEQUENCE_CHARS`, the opencode adapter's `LOG_CHARS` (display), assimilate.rs `NOTICE_CHARS` (method) | Each labelled |
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
 | 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method) | A window's ceiling; the gaps a hold reads |
-| 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor) | 0.5.0's message rate; a tool call's hold |
+| 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor), update.rs `CHECKING_MS` (guard) | 0.5.0's message rate; a tool call's hold; one release check at a time |
 | 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` and `SAME` (method) | A probability kept off 0 and 1; a prediction that is 1/2; two recalls that are equal |
 | 300 and 30 | select/replay.rs `READOUT_UNITS`, `READOUT_SESSIONS`; `TEST_CHECKS`, `TEST_SESSIONS` (method) | The online readout's labelled units and sessions; the question-count test's checks and sessions |
 | 0.6 and 0.8 | queen.rs `STATED` and `DUPLICATE`; conscience.rs `STRONG` and `BLOCK` | Same value, different bars |

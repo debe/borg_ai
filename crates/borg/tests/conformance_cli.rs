@@ -73,6 +73,7 @@ fn borg_cli(root: &Path, args: &[&str], env: &[(String, String)]) -> (String, i3
     let out = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -171,6 +172,7 @@ impl<'a> Drone<'a> {
         let mut c = Command::new("sh");
         c.args(["-c", &self.command(event)])
             .env_clear()
+            .env("BORG_UPDATE_CHECK", "off")
             .env("PATH", path)
             .env("HOME", self.home())
             .env("GIT_CONFIG_NOSYSTEM", "1")

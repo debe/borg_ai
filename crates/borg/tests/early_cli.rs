@@ -45,6 +45,7 @@ fn borg(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&str, &s
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", harness, event])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
         // CLI on PATH (runner.rs `pick`), a real call.
@@ -236,6 +237,7 @@ fn the_consequence_model_path_asks_every_predicted_lesson_in_scope_first() {
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", "claude", "stop"])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
         // CLI on PATH (runner.rs `pick`), a real call.

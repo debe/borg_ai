@@ -50,6 +50,7 @@ fn hook(root: &Path, input: &Value, env: &[(&str, &str)]) -> String {
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", "claude", "prompt"])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

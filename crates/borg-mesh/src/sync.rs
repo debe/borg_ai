@@ -13,14 +13,16 @@
 //!    same way everywhere). The peer must still be a member under the result, and revocations are
 //!    applied (quarantine) before any data moves, also when the held version did not change but
 //!    the logs were never checked against it (`origin::apply_if_new`).
-//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl`, `messages.jsonl`
-//!    (lines.rs `SYNCED` and the removed playbooks' step, `PLAYBOOKS`; a 0.3.0 peer's `borg/mesh/12`
-//!    session stops before the messages), each in turn:
+//! 3. `lessons.jsonl`, `stats.jsonl`, `outcomes-team.jsonl`, `playbooks.jsonl`, `constraints.jsonl`, `messages.jsonl`,
+//!    `absorbed.jsonl` (lines.rs `SYNCED` and the removed playbooks' step, `PLAYBOOKS`; a 0.4.0 to 0.6.x
+//!    peer's `borg/mesh/13` or `/14` session stops before the absorbs, a 0.3.0 peer's `borg/mesh/12`
+//!    session before the messages), each in turn:
 //!    range-based set reconciliation (recon.rs), cost ∝ difference: one fingerprint when nothing
 //!    changed. Then `Lines`: what the other side lacks, each line with its
 //!    signed origin (origin.rs). A line is stored only if the peer announced it, its origin verifies,
 //!    the membership admits its origin key at its stamp time, and it may travel under that key
-//!    (lines.rs `travels`: a message or seen line names its origin key as its node, and is fresh).
+//!    (lines.rs `travels`: a message or seen line names its origin key as its node, and is fresh; an
+//!    absorb or release has the shape borg's write path gives it).
 //!    Messages also travel only within their `window` (borg msg.rs `within_windows`: what any sender's
 //!    window, msg.rs `window_for`, can have let through to one recipient, decided by no earlier line, so
 //!    pruning never takes a held line out of it), on offer and on receipt, and the log stays bounded as
@@ -73,7 +75,7 @@ use std::time::Duration;
 use borg::collective::{self, Config, Route};
 use borg::msg::{Line, V1_RATE_MS};
 use iroh::Endpoint;
-use iroh::endpoint::{Builder, ConnectOptions, Connection, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::endpoint::{Builder, ConnectOptions, Connection, ConnectionError, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
 use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
@@ -86,21 +88,25 @@ use crate::origin::{self, Origin};
 use crate::recon::{self, Recon};
 use crate::{from_hex, peers, to_hex};
 use crate::{live, steer};
+use borg::protocol::PeerVersion;
 
 mod vectors;
 
-/// The session protocol. 14: messages v2 (borg msg.rs: texts kept whole up to `WIRE_TEXT`, `seen`
-/// lines, the acknowledgement window instead of 0.5.0's rate). 13: `messages.jsonl` joined the synced
-/// logs (lines.rs `SYNCED`). The logs reconcile in a fixed list, so a peer on another list would
-/// reconcile another file at the same step; 11 added `constraints.jsonl` and refused 10 at the
-/// handshake for that reason.
-pub const ALPN: &[u8] = b"borg/mesh/14";
-/// 0.4.0 and 0.5.x's protocol, still spoken whole: `ALPN`'s steps, but such a peer reads only v1
+/// The session protocol. 15: `absorbed.jsonl` joined the synced logs, last (lines.rs `ABSORBED`). 14:
+/// messages v2 (borg msg.rs: texts kept whole up to `WIRE_TEXT`, `seen` lines, the acknowledgement
+/// window instead of 0.5.0's rate). 13: `messages.jsonl` joined the synced logs (lines.rs `SYNCED`).
+/// The logs reconcile in a fixed list, so a peer on another list would reconcile another file at the
+/// same step; 11 added `constraints.jsonl` and refused 10 at the handshake for that reason.
+pub const ALPN: &[u8] = b"borg/mesh/15";
+/// 0.6.x's protocol, still spoken whole: the session of `ALPN` without the absorbs (`synced`). Such a
+/// peer reads every message line this node writes.
+pub const V14_ALPN: &[u8] = b"borg/mesh/14";
+/// 0.4.0 and 0.5.x's protocol, still spoken whole: `V14_ALPN`'s steps, but such a peer reads only v1
 /// message lines and keeps only what 0.5.0's window takes (`V1_RATE_MS`, `V1_KEEP`), so it is offered
 /// only that (`v1_window`): no v2 text, no seen line, one tell or ask per sender and recipient per
 /// rate slot.
 pub const V13_ALPN: &[u8] = b"borg/mesh/13";
-/// 0.3.0's protocol, still spoken whole: the session of `ALPN` without the messages (`synced`). 12
+/// 0.3.0's protocol, still spoken whole: the session of `V13_ALPN` without the messages (`synced`). 12
 /// already outlived the hive: its steps (`Goals`, the beats of `Live`) are spoken empty.
 pub const LEGACY_ALPN: &[u8] = b"borg/mesh/12";
 /// The protocols of older nodes (`borg/mesh/11` down to `/1`), offered and accepted beside `ALPN` only to
@@ -111,6 +117,11 @@ fn older() -> Vec<Vec<u8>> {
     (1..below).rev().map(|v| format!("borg/mesh/{v}").into_bytes()).collect()
 }
 
+/// Protocol: the close code of a session on a protocol this node does not speak (`mismatch`), with the
+/// reason borg protocol.rs `Mismatch::told`. The node on the other end reads both (`refused`): a newer
+/// member that no longer speaks this node's protocol agrees on it at the handshake and then refuses it.
+const MISMATCH_CLOSE: u32 = 2;
+
 /// The other side of a session, as the handshake left it: its member key and the protocol it speaks.
 #[derive(Clone, Copy)]
 struct Peer<'a> {
@@ -118,10 +129,10 @@ struct Peer<'a> {
     alpn: &'a [u8],
 }
 
-/// Whether a session on `alpn` syncs with this node: `ALPN`, a 0.4.0 or 0.5.x peer's `V13_ALPN`, or a
-/// 0.3.0 peer's `LEGACY_ALPN`.
+/// Whether a session on `alpn` syncs with this node: `ALPN`, a 0.6.x peer's `V14_ALPN`, a 0.4.0 or 0.5.x
+/// peer's `V13_ALPN`, or a 0.3.0 peer's `LEGACY_ALPN`.
 fn spoken(alpn: &[u8]) -> bool {
-    alpn == ALPN || alpn == V13_ALPN || alpn == LEGACY_ALPN
+    alpn == ALPN || alpn == V14_ALPN || alpn == V13_ALPN || alpn == LEGACY_ALPN
 }
 
 /// The removed playbooks' log. Its step (after the outcomes) stays in the session, so `ALPN` and
@@ -130,13 +141,14 @@ fn spoken(alpn: &[u8]) -> bool {
 const PLAYBOOKS: &str = "playbooks.jsonl";
 
 /// The logs a session on `ALPN` steps through, in order: `SYNCED` with the `PLAYBOOKS` step.
-const STEPS: [&str; 6] = [SYNCED[0], SYNCED[1], SYNCED[2], PLAYBOOKS, SYNCED[3], SYNCED[4]];
+const STEPS: [&str; 7] = [SYNCED[0], SYNCED[1], SYNCED[2], PLAYBOOKS, SYNCED[3], SYNCED[4], SYNCED[5]];
 
-/// The logs a session on `alpn` steps through, in order: all of `STEPS`, or on `LEGACY_ALPN` the five a
-/// 0.3.0 peer knows.
+/// The logs a session on `alpn` steps through, in order: all of `STEPS` on `ALPN`; without the absorbs
+/// the six a 0.4.0 to 0.6.x peer knows (`V13_ALPN`, `V14_ALPN`); without the messages too on
+/// `LEGACY_ALPN` the five a 0.3.0 peer knows.
 fn synced(alpn: &[u8]) -> impl Iterator<Item = &'static str> {
-    let legacy = alpn == LEGACY_ALPN;
-    STEPS.into_iter().filter(move |f| !legacy || *f != borg::msg::FILE)
+    let (absorbs, messages) = (alpn == ALPN, alpn != LEGACY_ALPN);
+    STEPS.into_iter().filter(move |f| (absorbs || *f != lines::ABSORBED) && (messages || *f != borg::msg::FILE))
 }
 
 /// The number of a session protocol (`borg/mesh/<n>`).
@@ -144,10 +156,10 @@ fn version(alpn: &[u8]) -> Option<u32> {
     std::str::from_utf8(alpn).ok()?.strip_prefix("borg/mesh/")?.parse().ok()
 }
 /// Protocol: the newest message line format (borg msg.rs `Message::v`) a peer whose session ran on
-/// `alpn` reads: 2 on `ALPN`; 1 on `V13_ALPN`, whose 0.5.0 drops a v2 line; 0 on `LEGACY_ALPN`, which
-/// syncs no messages (`synced`).
+/// `alpn` reads: 2 on `ALPN` and `V14_ALPN`; 1 on `V13_ALPN`, whose 0.5.0 drops a v2 line; 0 on
+/// `LEGACY_ALPN`, which syncs no messages (`synced`).
 fn reads(alpn: &[u8]) -> u8 {
-    if alpn == ALPN {
+    if alpn == ALPN || alpn == V14_ALPN {
         2
     } else if alpn == V13_ALPN {
         1
@@ -303,12 +315,15 @@ pub struct Signed {
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Msg {
     /// `relay`: the dialler's home relay, so the listener can dial it back across NAT (absent from
-    /// older nodes).
+    /// older nodes). `borg`: the sender's borg version (borg protocol.rs `PeerVersion`), absent from a
+    /// node older than 0.7, which ignores it in a hello it reads.
     Hello {
         collective: String,
         listen: Option<String>,
         #[serde(default)]
         relay: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        borg: Option<String>,
     },
     Refused {
         reason: String,
@@ -396,6 +411,33 @@ pub struct Node {
     /// a 0.3.0 peer's hive goal log, 3b), by (peer, goal or file, log): never stored, so the next dial
     /// reconciles against them and the peer gives only what is new.
     legacy: Mutex<HashMap<(String, String, usize), BTreeSet<Hash>>>,
+    /// What this node says it is and announces against (`Speaks`).
+    speaks: Speaks,
+    /// Held from `announce`'s check for a held announcement to its send: sessions end concurrently
+    /// under `serve`, and each would otherwise find none and send its own.
+    announcing: Mutex<()>,
+}
+
+/// What a node tells its peers it is: the newest protocol it speaks and its borg version, and whether it
+/// announces a session on an older protocol (`Node::announce`). This build's: `ALPN`, its
+/// `CARGO_PKG_VERSION`, and `BORG_ANNOUNCE` not `off`. A test poses as an older node by changing it.
+#[derive(Debug, Clone, Copy)]
+struct Speaks {
+    alpn: &'static [u8],
+    /// Sent in the hello; `None` as a node older than 0.7 sends none.
+    borg: Option<&'static str>,
+    tell: bool,
+}
+
+impl Speaks {
+    fn this() -> Speaks {
+        Speaks { alpn: ALPN, borg: Some(env!("CARGO_PKG_VERSION")), tell: tells(std::env::var("BORG_ANNOUNCE").ok().as_deref()) }
+    }
+}
+
+/// Whether a node announces, given `BORG_ANNOUNCE`: unless it is `off`.
+fn tells(var: Option<&str>) -> bool {
+    var != Some("off")
 }
 
 impl Node {
@@ -430,14 +472,25 @@ impl Node {
         };
         let mut builder = builder
             .secret_key(me.iroh_secret())
-            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat())
+            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), V14_ALPN.to_vec(), V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat())
             .clear_ip_transports()
             .ca_tls_config(ca_trust());
         if let Some(a) = addr {
             builder = builder.bind_addr(a).map_err(|e| e.to_string())?;
         }
         let endpoint = tweak(builder).bind().await.map_err(|e| format!("bind {}: {e}", addr.map(|a| a.to_string()).unwrap_or("relay".into())))?;
-        Ok(Node { place: place.clone(), home, me, endpoint, store: Mutex::new(()), announce: true, relay, legacy: Mutex::default() })
+        Ok(Node {
+            place: place.clone(),
+            home,
+            me,
+            endpoint,
+            store: Mutex::new(()),
+            announce: true,
+            relay,
+            legacy: Mutex::default(),
+            speaks: Speaks::this(),
+            announcing: Mutex::new(()),
+        })
     }
 
     /// Waits until the endpoint holds a connection to its home relay (at most `within`); true if
@@ -545,16 +598,60 @@ impl Node {
     /// Records a completed session with `remote` on `alpn` that started at `started` (borg presence.rs
     /// `synced_path`): a claim written before it reached the peer, and the peer's earlier claims came
     /// back. And what that node reads (`reads`, presence.rs `reads_path`), so `send` refuses a message
-    /// its sessions could never be shown.
-    fn synced(&self, remote: &str, alpn: &[u8], started: i64) {
-        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = borg::presence::note_synced(&self.home, remote, started);
-        let _ = borg::presence::forget_mismatch(&self.home, remote);
-        let _ = borg::presence::note_reads(&self.home, remote, reads(alpn));
+    /// its sessions could never be shown, and the version its hello gave (`borg`, borg protocol.rs
+    /// `versions_path`) with its engineer as its drones name them. Then, with the store's lock released,
+    /// the announcement of this node's protocol, if the session agreed on an older one (`announce`).
+    fn synced(&self, remote: &str, alpn: &[u8], started: i64, borg: Option<String>) {
+        {
+            let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = borg::presence::note_synced(&self.home, remote, started);
+            let _ = borg::presence::forget_mismatch(&self.home, remote);
+            let _ = borg::presence::note_reads(&self.home, remote, reads(alpn));
+            if let Some(protocol) = version(alpn) {
+                let now = borg::learn::now_ms();
+                let engineer = engineer_of(&self.home, remote, now);
+                let v = PeerVersion { borg, protocol, ms: now, engineer };
+                let _ = borg::protocol::note_version(&self.home, remote, &v);
+            }
+        }
+        self.announce(alpn);
+    }
+
+    /// Tells the collective that this node's protocol is in use (borg protocol.rs `announcement`) after
+    /// a session agreed on the older `alpn`, as a tell to all from this node's engineer: the peer still
+    /// syncs messages, as does every node since 0.4. Once: not while the message log holds one
+    /// (`announced`; one session at a time checks and sends, `announcing`). Not while the engineer's
+    /// slot to all on a 0.4 or 0.5 member holds another tell (`v1_slot_held`): that member is offered
+    /// the earlier one alone. A send refused either way, or by the window, is dropped, and the next such
+    /// session tries again. `None` when nothing was sent.
+    fn announce(&self, alpn: &[u8]) -> Option<borg::msg::Message> {
+        let (ours, theirs) = (version(self.speaks.alpn)?, version(alpn)?);
+        if !self.speaks.tell || theirs >= ours {
+            return None;
+        }
+        let _one = self.announcing.lock().unwrap_or_else(|e| e.into_inner());
+        if borg::protocol::announced(&self.home, ours) {
+            return None;
+        }
+        // As msg.rs `sender` names the engineer of a repo; never a session the mesh process's
+        // environment may name.
+        let email: String = borg::learn::engineer(&self.place.dir).chars().filter(|c| c.is_ascii_alphanumeric() || "-_.@+".contains(*c)).collect();
+        let (by, who) = match email.as_str() {
+            "" => (borg::msg::ENGINEER.to_string(), format!("the engineer of node {}", borg::msg::short_node(&self.me.public()))),
+            e => (format!("{}:{e}", borg::msg::ENGINEER), e.to_string()),
+        };
+        let name = if email.is_empty() { borg::msg::ENGINEER.to_string() } else { email };
+        let from = borg::msg::Sender { by, name, harness: "terminal".into(), node: self.me.public() };
+        let now = borg::learn::now_ms();
+        if v1_slot_held(&borg::msg::read(&self.home), &from, now) {
+            return None;
+        }
+        let text = borg::protocol::announcement(ours, theirs, &who, self.speaks.borg.unwrap_or("older than 0.7"));
+        borg::msg::send(&self.home, borg::msg::Message::new(borg::msg::TELL, &from, borg::msg::ALL, None, now, &text), now).ok()
     }
 
     /// A session with member `remote` that came up on another protocol (`older`): recorded for `borg
-    /// doctor` (borg presence.rs `protocols_path`), closed, and the error says who has to upgrade; the
+    /// doctor` (borg protocol.rs `protocols_path`), closed, and the error says who has to upgrade; the
     /// close reason says the same from the peer's side.
     fn mismatch(&self, conn: &Connection, remote: &str) -> String {
         let m = borg::presence::Mismatch {
@@ -567,14 +664,40 @@ impl Node {
             let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let _ = borg::presence::note_mismatch(&self.home, remote, m);
         }
-        conn.close(2u32.into(), told.as_bytes());
+        conn.close(MISMATCH_CLOSE.into(), told.as_bytes());
         line
+    }
+
+    /// Whether member `remote` closed this session because it does not speak the protocol agreed on
+    /// (`MISMATCH_CLOSE`, as its `mismatch` does): a newer node that dropped this node's protocol. Then
+    /// it is recorded as `mismatch` records an older one, from the close reason, so `borg doctor`, the
+    /// views and the drone notice say that this node has to upgrade; the line says so too.
+    fn refused(&self, conn: &Connection, remote: &str) -> Option<String> {
+        let Some(ConnectionError::ApplicationClosed(c)) = conn.close_reason() else { return None };
+        if u64::from(c.error_code) != u64::from(MISMATCH_CLOSE) {
+            return None;
+        }
+        let said = borg::presence::Mismatch::from_told(&String::from_utf8_lossy(&c.reason), borg::learn::now_ms())?;
+        let ours = version(ALPN)?;
+        if borg::protocol::number(&said.theirs)? <= ours {
+            return None;
+        }
+        let m = borg::presence::Mismatch { ours: String::from_utf8_lossy(ALPN).into_owned(), ..said };
+        let line = m.line(remote);
+        let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = borg::presence::note_mismatch(&self.home, remote, m);
+        Some(line)
     }
 
     /// Forgets `remote`'s last completed session (presence.rs `forget_synced`): a dial to it failed.
     pub(crate) fn unreachable(&self, remote: &str) {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let _ = borg::presence::forget_synced(&self.home, remote);
+    }
+
+    /// The borg version this node's hello gives (`Speaks`).
+    fn borg(&self) -> Option<String> {
+        self.speaks.borg.map(str::to_string)
     }
 
     /// The home relay this node tells peers about (not for a one-shot dial, nor with relays off).
@@ -590,7 +713,7 @@ impl Node {
     /// `sync`, also asking the peer for the reasoning excerpts of `commits` (step 5): what it
     /// holds lands in this node's reasoning.jsonl.
     pub async fn fetch(&self, target: &str, commits: &[String]) -> Result<Report, String> {
-        self.dial(target, commits, ALPN, [vec![V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat()).await
+        self.dial(target, commits, ALPN, [vec![V14_ALPN.to_vec(), V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat()).await
     }
 
     /// `fetch` on the protocol `alpn`, with `also` offered beside it (a test speaks an older one alone).
@@ -611,8 +734,8 @@ impl Node {
         let result = async {
             let remote = authorise(&conn, &membership, name)?;
             let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
-            let hello = Msg::Hello { collective: name.into(), listen: self.listen(), relay: self.announced() };
-            let Msg::Hello { collective, .. } = swap(true, &mut tx, &mut rx, hello).await? else {
+            let hello = Msg::Hello { collective: name.into(), listen: self.listen(), relay: self.announced(), borg: self.borg() };
+            let Msg::Hello { collective, borg, .. } = swap(true, &mut tx, &mut rx, hello).await? else {
                 return Err("protocol: expected hello".into());
             };
             if collective != name {
@@ -620,10 +743,11 @@ impl Node {
             }
             let report = self.exchange(Peer { key: &remote, alpn: conn.alpn() }, true, &mut tx, &mut rx, membership, commits).await?;
             let _ = tx.finish();
-            self.synced(&remote, conn.alpn(), started);
+            self.synced(&remote, conn.alpn(), started, borg);
             Ok(report)
         }
         .await;
+        let result = result.map_err(|e| self.refused(&conn, &t.key).unwrap_or(e));
         conn.close(0u32.into(), if result.is_ok() { b"done" } else { b"error" });
         vectors::reindexed(&self.home, result).await
     }
@@ -726,21 +850,28 @@ impl Node {
             let membership = members(home)?;
             let remote = authorise(&conn, &membership, name)?;
             let (mut tx, mut rx) = conn.accept_bi().await.map_err(|e| e.to_string())?;
-            let Msg::Hello { collective, listen, relay } = recv(&mut rx).await? else { return Err("protocol: expected hello".into()) };
+            let Msg::Hello { collective, listen, relay, borg } = recv(&mut rx).await? else { return Err("protocol: expected hello".into()) };
             if collective != name {
                 let reason = format!("this node serves collective {name:?}, not {collective:?}");
                 send(&mut tx, &Msg::Refused { reason: reason.clone() }).await?;
                 return Err(reason);
             }
             heard(home, &remote, listen, relay, observed);
-            send(&mut tx, &Msg::Hello { collective: name.into(), listen: self.listen(), relay: self.announced() }).await?;
+            send(&mut tx, &Msg::Hello { collective: name.into(), listen: self.listen(), relay: self.announced(), borg: self.borg() }).await?;
             let report = self.exchange(Peer { key: &remote, alpn: conn.alpn() }, false, &mut tx, &mut rx, membership, &[]).await?;
             let _ = tx.finish();
             conn.closed().await; // the dialler closes once it has read everything
-            self.synced(&remote, conn.alpn(), started);
+            self.synced(&remote, conn.alpn(), started, borg);
             Ok(report)
         };
-        let result = if conn.alpn() == JOIN_ALPN { self.admit(&conn, observed).await } else { session.await };
+        let result = if conn.alpn() == JOIN_ALPN {
+            self.admit(&conn, observed).await
+        } else {
+            session.await.map_err(|e| {
+                let member = self.gate().ok().and_then(|(name, home)| authorise(&conn, &members(&home).ok()?, &name).ok());
+                member.and_then(|remote| self.refused(&conn, &remote)).unwrap_or(e)
+            })
+        };
         if let Err(e) = &result {
             conn.close(1u32.into(), e.as_bytes());
         }
@@ -1171,6 +1302,15 @@ fn v1_share(m: &Membership) -> usize {
     (V1_KEEP / m.members.len().max(1)).max(1)
 }
 
+/// Whether `from`'s rate slot to all on a `V13_ALPN` peer (`v1_window`: per node, sender and recipient,
+/// the earliest within `V1_RATE_MS` wins) holds a tell or ask of `messages` from the last `V1_RATE_MS`
+/// at `now`: a message written now would not be offered to that peer.
+fn v1_slot_held(messages: &[borg::msg::Message], from: &borg::msg::Sender, now: i64) -> bool {
+    messages
+        .iter()
+        .any(|m| m.v == 1 && !m.kind.privileged() && m.node == from.node && m.by == from.by && m.to == borg::msg::ALL && now.saturating_sub(m.ms) < V1_RATE_MS)
+}
+
 /// What a `V13_ALPN` peer's window (0.5.0's `window`) takes of `set`: only v1 messages (no v2 text, no
 /// seen line), per node, sender and recipient one tell or ask per `V1_RATE_MS` (the earliest wins; a
 /// steer is not paced), then for conversation and for steers apart the `per_node` newest per node and
@@ -1235,6 +1375,13 @@ fn reachable(listen: &str, observed: Option<SocketAddr>) -> Option<SocketAddr> {
     };
     let at = SocketAddr::new(ip, listen.port());
     (!at.ip().is_unspecified() && at.port() != 0).then_some(at)
+}
+
+/// The engineer of member `key`'s node at `now`: the newest of its drones' presence records that names
+/// one (borg presence.rs `remote`), else the one its last version record kept.
+fn engineer_of(home: &Path, key: &str, now: i64) -> Option<String> {
+    let seen = borg::presence::remote(home, now).into_iter().filter(|r| r.key == key && !r.p.engineer.is_empty()).max_by_key(|r| r.p.ms);
+    seen.map(|r| r.p.engineer).or_else(|| borg::protocol::versions(home).remove(key).and_then(|v| v.engineer))
 }
 
 /// Remembers a member that dialled in where it can be dialled back: the IP its packets came from
@@ -1494,6 +1641,126 @@ mod tests {
         assert_eq!(standing, ["locks are taken in id order"], "bob's sessions get it as a standing lesson");
         alice.close().await;
         bob.close().await;
+    }
+
+    /// An absorb or release of lesson `id`, as borg `memory absorb` and `release` write it.
+    fn absorb(id: &str, kind: &str, ms: i64, note: Option<&str>) -> String {
+        let mut v = json!({"id": id, "kind": kind, "ms": ms, "by": "lead@x"});
+        if let Some(n) = note {
+            (v["note"], v["version"]) = (json!(n), json!(1));
+        }
+        v.to_string()
+    }
+
+    /// Absorbs and releases reach the other member signed, both ways; a line the write path would have
+    /// refused (an oversize note) is never offered, and a resync is quiet over every synced log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absorbs_reach_the_team_signed_and_a_malformed_one_stays_home() {
+        let (pa, pb) = team("absorbs");
+        let (a, b) = (home(&pa), home(&pb));
+        let (held, released) = (absorb("L1", "absorb", 5, Some("skills/review@2026-10-30")), absorb("L2", "release", 6, None));
+        let oversize = absorb("L3", "absorb", 7, Some(&"n".repeat(borg::absorb::NOTE_CHARS + 1)));
+        write(&a, lines::ABSORBED, &[held.clone(), released.clone(), oversize.clone()]);
+        let bobs = absorb("L4", "absorb", 8, Some("a team's skills repo"));
+        write(&b, lines::ABSORBED, std::slice::from_ref(&bobs));
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        let (served, synced) = (served.unwrap(), synced.unwrap());
+        assert_eq!((synced.received, synced.rejected, served.received), (2, 0, 1), "the two well-formed lines, the oversize one never offered");
+        assert!(holds(&b, lines::ABSORBED, &held) && holds(&b, lines::ABSORBED, &released) && !holds(&b, lines::ABSORBED, &oversize));
+        assert!(holds(&a, lines::ABSORBED, &bobs), "bob's absorb reaches alice");
+        assert!(origin::load(&b).contains_key(&lines::hash(&held)), "it arrived with its signed origin");
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        let quiet = Report { rounds: SYNCED.len(), fps: SYNCED.len(), ..Report::default() };
+        assert_eq!((synced.unwrap(), served.unwrap()), (quiet, quiet), "resync is quiet");
+        alice.close().await;
+        bob.close().await;
+    }
+
+    /// Lines a peer gives bypass the write path's checks, so they are checked on receipt: an oversize
+    /// note, an unknown kind or a line without a field the write path sets is refused, signed or not.
+    #[test]
+    fn a_malformed_or_oversize_absorb_from_a_peer_is_refused() {
+        let (pa, pb) = team("absorb-refused");
+        let (a, b) = (home(&pa), home(&pb));
+        let (alice, bob) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&b).unwrap());
+        let ok = absorb("L1", "absorb", 5, Some("skills/review@2026-10-30"));
+        let bad = [
+            absorb("L1", "absorb", 5, Some(&"n".repeat(borg::absorb::NOTE_CHARS + 1))),
+            absorb("L1", "forget", 5, None),
+            json!({"id": "L1", "kind": "release", "ms": 5}).to_string(),
+        ];
+        let now = borg::learn::now_ms();
+        let got: Vec<Signed> =
+            std::iter::once(&ok).chain(&bad).map(|l| Signed { origin: Origin::new(&alice, &lines::hash(l), now), line: l.clone() }).collect();
+        let want: BTreeSet<Hash> = got.iter().map(|s| lines::hash(&s.line)).collect();
+        let lock = Mutex::new(());
+        let store = Store { home: &b, lock: &lock, me: &bob };
+        let mut report = Report::default();
+        store.store_lines(&b.join(lines::ABSORBED), got, &want, &members(&b).unwrap(), None, &mut report).unwrap();
+        assert_eq!((report.received, report.rejected), (1, bad.len()));
+        assert_eq!(lines::read(&b.join(lines::ABSORBED)).into_values().collect::<Vec<_>>(), [ok]);
+    }
+
+    /// A 0.6 member (`borg/mesh/14`) keeps syncing everything it syncs today, whichever side dials, and
+    /// no absorb moves either way: its session has no absorbs step.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mesh_14_peer_syncs_everything_but_the_absorbs_both_ways() {
+        let p = crew("v14", &["alice", "old1", "old2"]);
+        let (a, o1, o2) = (home(&p[0]), home(&p[1]), home(&p[2]));
+        let keys: Vec<String> = [&a, &o1, &o2].iter().map(|h| Identity::load_or_create(h).unwrap().public()).collect();
+        let now = borg::learn::now_ms();
+        write(&a, "lessons.jsonl", &[lesson("L1", 1, "lock order?")]);
+        let o = json!({"kind": "asked_then_changed", "session": "s1", "lessons": ["L1"], "ms": 1, "repo": "app"}).to_string();
+        write(&a, "outcomes.jsonl", &[o]);
+        assert_eq!(borg::outcome::publish(&a), 1);
+        let tell = message(&a, &keys[0], ALL_TO, now - 100, "migrations are mine today");
+        let ours = absorb("L1", "absorb", 5, Some("skills/review@2026-10-30"));
+        write(&a, lines::ABSORBED, std::slice::from_ref(&ours));
+        let mut theirs = Vec::new();
+        for (i, h) in [(1, &o1), (2, &o2)] {
+            write(h, "lessons.jsonl", &[lesson(&format!("L{}", i + 1), 1, "retry budget?")]);
+            write(h, lines::ABSORBED, &[absorb(&format!("L{}", i + 1), "absorb", 6, Some("a team's skills repo"))]);
+            theirs.push(message(h, &keys[i], ALL_TO, now - 50, "from a 0.6 node"));
+        }
+        let mut alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
+        alice.speaks.tell = false; // the counts below are the logs' alone; the announcement has its own tests
+        let old = |i: usize| Node::open(&p[i], Some(LOCAL.parse().unwrap()), true, |x| x.alpns(vec![V14_ALPN.to_vec()]));
+        let (old1, old2) = (old(1).await.unwrap(), old(2).await.unwrap());
+        // The older node dials.
+        let ticket = alice.ticket();
+        let (served, dialled) = tokio::join!(alice.accept(), old1.dial(&ticket, &[], V14_ALPN, Vec::new()));
+        served.unwrap();
+        dialled.unwrap();
+        // This node dials the older one, offering its own protocol first.
+        let old_ticket = old2.ticket();
+        let (served, dialled) = tokio::join!(old2.accept(), alice.sync(&old_ticket));
+        served.unwrap();
+        dialled.unwrap();
+        let team = borg::outcome::TEAM_FILE;
+        for o in [&o1, &o2] {
+            assert!(holds(o, "lessons.jsonl", &lesson("L1", 1, "lock order?")), "lessons travel");
+            assert_eq!(lines::read(&o.join(team)), lines::read(&a.join(team)), "outcomes travel");
+            assert!(holds(o, borg::msg::FILE, &tell), "messages travel");
+            assert!(!holds(o, lines::ABSORBED, &ours), "no absorb reaches a 0.6 node");
+        }
+        assert!(theirs.iter().all(|l| holds(&a, borg::msg::FILE, l)), "their messages reach this node");
+        assert!(holds(&a, "lessons.jsonl", &lesson("L2", 1, "retry budget?")) && holds(&a, "lessons.jsonl", &lesson("L3", 1, "retry budget?")));
+        assert_eq!(lines::read(&a.join(lines::ABSORBED)).into_values().collect::<Vec<_>>(), [ours], "and none of theirs reaches it");
+        assert_eq!(borg::presence::reads(&a).get(&keys[1]).copied(), Some(2), "a 0.6 node reads every message line");
+        // In step: old1 takes what old2 gave alice since (its lesson and message), and then a resync
+        // reconciles the five logs a 0.6 node keeps, once each, and moves nothing.
+        let (served, dialled) = tokio::join!(alice.accept(), old1.dial(&ticket, &[], V14_ALPN, Vec::new()));
+        assert_eq!((dialled.unwrap().received, served.unwrap().sent), (2, 2));
+        assert!(!holds(&o1, lines::ABSORBED, &absorb("L3", "absorb", 6, Some("a team's skills repo"))));
+        let (served, dialled) = tokio::join!(alice.accept(), old1.dial(&ticket, &[], V14_ALPN, Vec::new()));
+        let quiet = Report { rounds: SYNCED.len() - 1, fps: SYNCED.len() - 1, ..Report::default() };
+        assert_eq!((dialled.unwrap(), served.unwrap()), (quiet, quiet));
+        for n in [alice, old1, old2] {
+            n.close().await;
+        }
     }
 
     const ALL_TO: &str = borg::msg::ALL;
@@ -2107,16 +2374,228 @@ mod tests {
     #[test]
     fn older_protocols_are_every_version_below_the_spoken_ones() {
         let n = version(LEGACY_ALPN).expect("borg/mesh/<n>");
-        assert_eq!((version(V13_ALPN), version(ALPN)), (Some(n + 1), Some(n + 2)), "this protocol, 0.4.0's and 0.3.0's are the three spoken");
-        assert!(spoken(ALPN) && spoken(V13_ALPN) && spoken(LEGACY_ALPN));
+        assert_eq!(
+            (version(V13_ALPN), version(V14_ALPN), version(ALPN)),
+            (Some(n + 1), Some(n + 2), Some(n + 3)),
+            "this protocol, 0.6's, 0.4.0's and 0.3.0's are the four spoken"
+        );
+        assert!(spoken(ALPN) && spoken(V14_ALPN) && spoken(V13_ALPN) && spoken(LEGACY_ALPN));
+        assert_eq!((reads(ALPN), reads(V14_ALPN), reads(V13_ALPN), reads(LEGACY_ALPN)), (2, 2, 1, 0));
         let o = older();
         let below = format!("borg/mesh/{}", n - 1);
         assert_eq!((o.len(), o[0].as_slice(), o[o.len() - 1].as_slice()), (n as usize - 1, below.as_bytes(), b"borg/mesh/1".as_slice()));
         assert!(o.iter().all(|a| !spoken(a)));
         assert_eq!(synced(ALPN).filter(|f| *f != PLAYBOOKS).collect::<Vec<_>>(), SYNCED, "every synced log, in order");
-        assert_eq!(synced(ALPN).collect::<Vec<_>>(), [&OLD_SYNCED[..], &[borg::msg::FILE]].concat(), "0.4.0's list, in its order");
-        assert_eq!(synced(V13_ALPN).collect::<Vec<_>>(), synced(ALPN).collect::<Vec<_>>(), "0.4.0's list is this one");
+        assert_eq!(synced(ALPN).collect::<Vec<_>>(), [&OLD_SYNCED[..], &[borg::msg::FILE, lines::ABSORBED]].concat(), "0.6's list, then the absorbs");
+        assert_eq!(synced(V14_ALPN).collect::<Vec<_>>(), [&OLD_SYNCED[..], &[borg::msg::FILE]].concat(), "0.6's list, in its order");
+        assert_eq!(synced(V13_ALPN).collect::<Vec<_>>(), synced(V14_ALPN).collect::<Vec<_>>(), "0.4.0's list is 0.6's");
         assert_eq!(synced(LEGACY_ALPN).collect::<Vec<_>>(), OLD_SYNCED, "0.3.0's list, in its order");
+    }
+
+    /// Bump rule (borg protocol.rs `NOTES`): this protocol says what an older member misses, and so does
+    /// every spoken one above the oldest, so the announcement and `borg doctor` can name it.
+    #[test]
+    fn every_spoken_protocol_has_a_note() {
+        let ours = version(ALPN).unwrap();
+        assert_eq!(borg::protocol::current(), ours, "add borg/mesh/{ours} to borg protocol.rs NOTES, first");
+        let oldest = version(LEGACY_ALPN).unwrap();
+        for n in oldest + 1..=ours {
+            let alpn = format!("borg/mesh/{n}");
+            assert!(spoken(alpn.as_bytes()), "{alpn} is spoken");
+            assert!(borg::protocol::note(n).is_some(), "{alpn} has a NOTES line");
+        }
+        assert_eq!(borg::protocol::announcement_head(ours), format!("{} is in use:", String::from_utf8_lossy(ALPN)));
+    }
+
+    /// A node older than 0.7 sends a hello without its version: it still parses, as `None`; a hello
+    /// from this node names its version, and a node posing as an older one sends the old shape.
+    #[test]
+    fn a_hello_without_a_version_is_an_older_node() {
+        let old: Msg = serde_json::from_str(r#"{"t":"hello","collective":"work","listen":null,"relay":null}"#).unwrap();
+        assert!(matches!(old, Msg::Hello { borg: None, .. }));
+        let older: Msg = serde_json::from_str(r#"{"t":"hello","collective":"work","listen":"127.0.0.1:1"}"#).unwrap();
+        assert!(matches!(older, Msg::Hello { borg: None, relay: None, .. }), "before the relay too");
+        let ours = Msg::Hello { collective: "work".into(), listen: None, relay: None, borg: Speaks::this().borg.map(str::to_string) };
+        let text = serde_json::to_string(&ours).unwrap();
+        assert!(text.contains(&format!(r#""borg":"{}""#, env!("CARGO_PKG_VERSION"))), "{text}");
+        let posing = serde_json::to_string(&Msg::Hello { collective: "work".into(), listen: None, relay: None, borg: None }).unwrap();
+        assert!(!posing.contains("borg"), "the old shape: {posing}");
+        assert!(tells(None) && tells(Some("on")) && !tells(Some("off")), "BORG_ANNOUNCE=off turns it off");
+    }
+
+    /// The announcements in `home`'s message log of protocol `n`.
+    fn announcements(home: &Path, n: u32) -> Vec<borg::msg::Message> {
+        let head = borg::protocol::announcement_head(n);
+        borg::msg::read(home).into_iter().filter(|m| m.text.starts_with(&head)).collect()
+    }
+
+    /// A session on an older protocol is announced once, as a tell to all from this node's engineer:
+    /// not for a peer on this node's protocol, not while one is held, not when turned off, and again
+    /// after a send the window refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_protocol_is_announced_once_and_retried_after_a_refusal() {
+        let (pa, _) = team("announce");
+        let a = home(&pa);
+        let mut alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let ours = version(ALPN).unwrap();
+        assert!(alice.announce(ALPN).is_none(), "a peer on this protocol");
+        assert!(alice.announce(JOIN_ALPN).is_none(), "no session protocol");
+        alice.speaks.tell = false;
+        assert!(alice.announce(V14_ALPN).is_none(), "BORG_ANNOUNCE=off");
+        alice.speaks.tell = true;
+
+        // The window is full: refused, nothing written, and the next session tries again.
+        let from = borg::msg::Sender { by: borg::msg::ENGINEER.into(), name: borg::msg::ENGINEER.into(), harness: "terminal".into(), node: alice.public() };
+        let now = borg::learn::now_ms();
+        let mut filled = 0;
+        while borg::msg::send(&a, borg::msg::Message::new(borg::msg::TELL, &from, ALL_TO, None, now + filled, &format!("note {filled}")), now + filled).is_ok()
+        {
+            filled += 1;
+            assert!(filled < 1000, "the window bounds a sender");
+        }
+        assert!(alice.announce(V14_ALPN).is_none(), "refused by the window");
+        assert!(announcements(&a, ours).is_empty());
+        std::fs::remove_file(borg::msg::path(&a)).unwrap(); // read, expired: the window is open again
+
+        // The engineer told all a minute ago and a drone saw it: the window takes another, but a 0.4 or
+        // 0.5 member would be offered that tell alone (`v1_window`), so the announcement waits.
+        let freeze = borg::msg::send(&a, borg::msg::Message::new(borg::msg::TELL, &from, ALL_TO, None, now - 60_000, "freeze"), now - 60_000).unwrap();
+        borg::msg::ack(&a, "s1", &[&freeze.id], now - 30_000).unwrap();
+        assert!(alice.announce(V13_ALPN).is_none(), "the engineer's v1 slot to all is held");
+        assert!(announcements(&a, ours).is_empty());
+        std::fs::remove_file(borg::msg::path(&a)).unwrap();
+
+        let sent = alice.announce(V13_ALPN).expect("announced");
+        assert_eq!(
+            (sent.kind, sent.to.as_str(), sent.by.as_str(), sent.node.as_str()),
+            (borg::msg::TELL, ALL_TO, borg::msg::ENGINEER, alice.public().as_str())
+        );
+        assert_eq!(sent.v, 1, "a 0.4 or 0.5 node reads it: {}", sent.text);
+        for missed in [14, 15] {
+            assert!(sent.text.contains(borg::protocol::note(missed).unwrap()), "{}", sent.text);
+        }
+        assert!(sent.text.contains(env!("CARGO_PKG_VERSION")) && sent.text.contains("borg update"), "{}", sent.text);
+        assert!(alice.announce(V14_ALPN).is_none() && alice.announce(V13_ALPN).is_none(), "held: once");
+        assert_eq!(announcements(&a, ours).len(), 1);
+        alice.close().await;
+    }
+
+    /// Sessions with older members that end together under `serve` announce once between them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_that_end_together_announce_once() {
+        let (pa, _) = team("announce-race");
+        let a = home(&pa);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let ours = version(ALPN).unwrap();
+        // A tell a drone saw, from before the v1 slot: the window would take two announcements.
+        let from = borg::msg::Sender { by: borg::msg::ENGINEER.into(), name: borg::msg::ENGINEER.into(), harness: "terminal".into(), node: alice.public() };
+        let then = borg::learn::now_ms() - V1_RATE_MS - 60_000;
+        let early = borg::msg::send(&a, borg::msg::Message::new(borg::msg::TELL, &from, ALL_TO, None, then, "early"), then).unwrap();
+        borg::msg::ack(&a, "s1", &[&early.id], then + 1).unwrap();
+        let go = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    go.wait();
+                    alice.announce(V14_ALPN)
+                });
+            }
+        });
+        assert_eq!(announcements(&a, ours).len(), 1);
+        alice.close().await;
+    }
+
+    /// A newer member that no longer speaks this node's protocol agrees on it at the handshake and closes
+    /// the session (its `mismatch`): this node records it from the close reason, both ways, so `borg
+    /// doctor`, the views and the drone notice say that this node has to upgrade.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_on_a_newer_protocol_is_recorded_from_its_refusal() {
+        let (pa, pb) = team("newer");
+        let (a, b) = (home(&pa), home(&pb));
+        let bob_key = Identity::load_or_create(&b).unwrap().public();
+        let ours = String::from_utf8_lossy(ALPN).into_owned();
+        let newer = format!("borg/mesh/{}", version(ALPN).unwrap() + 1);
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        // Bob speaks only the newer protocol and accepts this one only to tell the mismatch.
+        let new_bob = Node::open(&pb, Some(LOCAL.parse().unwrap()), true, |x| x.alpns(vec![newer.clone().into_bytes(), ALPN.to_vec()])).await.unwrap();
+        let told = borg::presence::Mismatch { theirs: ours.clone(), ours: newer.clone(), ms: 1 }.told(&bob_key);
+        let line = format!("peer {} speaks {newer}, this node {ours}: nothing syncs with it; upgrade this node", &bob_key[..12]);
+
+        // Alice dials the newer node.
+        let refuse = async {
+            let conn = new_bob.incoming().await?.await.ok()?;
+            let agreed = conn.alpn().to_vec();
+            conn.close(MISMATCH_CLOSE.into(), told.as_bytes());
+            Some(agreed)
+        };
+        let ticket = new_bob.ticket();
+        let (agreed, synced) = tokio::join!(refuse, alice.sync(&ticket));
+        assert_eq!(agreed.as_deref(), Some(ALPN), "the handshake agreed on this node's protocol");
+        assert_eq!(synced.unwrap_err(), line);
+        let m = &borg::presence::mismatches(&a)[&bob_key];
+        assert_eq!((m.theirs.as_str(), m.ours.as_str()), (newer.as_str(), ours.as_str()));
+        let shown = a.join("shown");
+        let n = borg::update::notice(None, &a, &shown).expect("the drone hears it");
+        assert!(n.contains(&format!("Nothing syncs with peer {} ({newer}", &bob_key[..12])), "{n}");
+
+        // The newer node dials alice.
+        let _ = std::fs::remove_file(borg::presence::protocols_path(&a));
+        let addr = Target::parse(&alice.ticket()).unwrap().endpoint_addr(&new_bob.relay).unwrap();
+        let dial_new = async {
+            let opts = ConnectOptions::new().with_additional_alpns(vec![ALPN.to_vec()]);
+            let conn = new_bob.endpoint.connect_with_opts(addr, newer.as_bytes(), opts).await.map_err(|e| e.to_string())?.await.map_err(|e| e.to_string())?;
+            let agreed = conn.alpn().to_vec();
+            conn.close(MISMATCH_CLOSE.into(), told.as_bytes());
+            Ok::<Vec<u8>, String>(agreed)
+        };
+        let (served, dialled) = tokio::join!(alice.accept(), dial_new);
+        assert_eq!(dialled.unwrap(), ALPN);
+        assert_eq!(served.unwrap_err(), line);
+        assert_eq!(borg::presence::mismatches(&a)[&bob_key].theirs, newer);
+        // A close for any other reason records nothing.
+        assert!(borg::presence::Mismatch::from_told("error", 1).is_none());
+        alice.close().await;
+        new_bob.close().await;
+    }
+
+    /// A 0.6 node (`borg/mesh/14`, no version in its hello) and this one sync: each records the other's
+    /// version and protocol, this node announces its protocol once, the announcement reaches the older
+    /// node at the next session, and no session announces again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_on_an_older_protocol_hears_the_announcement_once() {
+        let (pa, pb) = team("announce-sim");
+        let (a, b) = (home(&pa), home(&pb));
+        let (alice_key, bob_key) = (Identity::load_or_create(&a).unwrap().public(), Identity::load_or_create(&b).unwrap().public());
+        let (ours, theirs) = (version(ALPN).unwrap(), version(V14_ALPN).unwrap());
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let mut old_bob = Node::open(&pb, Some(LOCAL.parse().unwrap()), true, |x| x.alpns(vec![V14_ALPN.to_vec()])).await.unwrap();
+        old_bob.speaks = Speaks { alpn: V14_ALPN, borg: None, tell: true };
+
+        // The old node dials: this node announces once its session completed.
+        let ticket = alice.ticket();
+        let (served, dialled) = tokio::join!(alice.accept(), old_bob.dial(&ticket, &[], V14_ALPN, Vec::new()));
+        served.unwrap();
+        dialled.unwrap();
+        let held = announcements(&a, ours);
+        assert_eq!(held.len(), 1, "one announcement");
+        assert!(held[0].text.contains(borg::protocol::note(ours).unwrap()), "{}", held[0].text);
+        assert!(announcements(&b, ours).is_empty() && announcements(&b, theirs).is_empty(), "the old node announces nothing");
+        let v = &borg::protocol::versions(&a)[&bob_key];
+        assert_eq!((v.borg.as_deref(), v.protocol), (None, theirs), "no version: older than 0.7");
+        let v = &borg::protocol::versions(&b)[&alice_key];
+        assert_eq!((v.borg.as_deref(), v.protocol), (Some(env!("CARGO_PKG_VERSION")), theirs));
+
+        // This node dials: the announcement reaches the old node, and nothing is announced again.
+        let old_ticket = old_bob.ticket();
+        for _ in 0..2 {
+            let (served, dialled) = tokio::join!(old_bob.accept(), alice.sync(&old_ticket));
+            served.unwrap();
+            dialled.unwrap();
+        }
+        assert_eq!(announcements(&a, ours), held, "still the one");
+        assert_eq!(announcements(&b, ours), held, "the old node holds it, signed by this node");
+        alice.close().await;
+        old_bob.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2534,7 +3013,7 @@ mod tests {
         let t = Target::parse(target)?;
         let conn = n.endpoint.connect(t.endpoint_addr(&n.relay)?, LEGACY_ALPN).await.map_err(|e| e.to_string())?;
         let (mut tx, mut rx) = conn.open_bi().await.map_err(|e| e.to_string())?;
-        swap(true, &mut tx, &mut rx, Msg::Hello { collective: "work".into(), listen: None, relay: None }).await?;
+        swap(true, &mut tx, &mut rx, Msg::Hello { collective: "work".into(), listen: None, relay: None, borg: None }).await?;
         let got = old_exchange(n, true, &mut tx, &mut rx, goal).await;
         let _ = tx.finish();
         conn.close(0u32.into(), b"done");
@@ -2545,7 +3024,7 @@ mod tests {
         let conn = n.incoming().await.ok_or("closed")?.await.map_err(|e| e.to_string())?;
         let (mut tx, mut rx) = conn.accept_bi().await.map_err(|e| e.to_string())?;
         let Msg::Hello { .. } = recv(&mut rx).await? else { return Err("hello".into()) };
-        send(&mut tx, &Msg::Hello { collective: "work".into(), listen: None, relay: None }).await?;
+        send(&mut tx, &Msg::Hello { collective: "work".into(), listen: None, relay: None, borg: None }).await?;
         let got = old_exchange(n, false, &mut tx, &mut rx, goal).await;
         let _ = tx.finish();
         conn.closed().await;

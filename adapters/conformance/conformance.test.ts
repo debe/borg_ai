@@ -72,6 +72,8 @@ function world(tag: string) {
     BORG_CONFIG: join(root, "collectives.json"),
     BORG_QUEEN: "off",
     BORG_LEARN: "off",
+    // No release check from a test: it would ask GitHub (update.rs).
+    BORG_UPDATE_CHECK: "off",
     BORG_VECTORS: "off",
     BORG_PREFILTER: "off",
     BORG_EARLY: "off",

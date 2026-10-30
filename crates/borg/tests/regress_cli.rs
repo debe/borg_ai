@@ -113,6 +113,7 @@ impl Fx {
         c.args(args)
             .current_dir(&self.repo)
             .env_clear()
+            .env("BORG_UPDATE_CHECK", "off")
             .env("PATH", format!("{}:{}", self.root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
             // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
             // CLI on PATH (runner.rs `pick`), a real call.

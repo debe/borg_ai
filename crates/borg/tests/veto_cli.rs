@@ -20,6 +20,7 @@ fn borg(root: &Path, dir: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

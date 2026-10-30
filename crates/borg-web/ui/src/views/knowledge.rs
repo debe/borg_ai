@@ -1,5 +1,7 @@
 //! Knowledge: a map of the lessons by system and concern area (drill in by clicking), the lessons of
-//! the current selection grouped under headings, and how the knowledge grew.
+//! the current selection grouped under headings, and how the knowledge grew. Lessons an outside store
+//! holds now (`borg memory absorb`) are marked with its note, when, and how often they recurred since;
+//! the view can show those alone.
 
 use std::collections::BTreeMap;
 
@@ -7,7 +9,7 @@ use leptos::prelude::*;
 
 use crate::api::{Lesson, data};
 use crate::charts::{HBars, Row, Series, StackedChart};
-use crate::util::{day_of_ms, num, palette, pct, short_day, trunc};
+use crate::util::{ago, day_of_ms, num, palette, pct, short_day, trunc, who};
 
 /// Squarified treemap (Bruls et al.): rectangles for `areas` (largest first) filling `w`×`h`.
 pub fn squarify(areas: &[f64], w: f64, h: f64) -> Vec<(f64, f64, f64, f64)> {
@@ -122,10 +124,18 @@ pub fn Knowledge() -> impl IntoView {
     let area = RwSignal::new(None::<String>);
     let query = RwSignal::new(String::new());
     let color_by = RwSignal::new(ColorBy::Activation);
+    let only_absorbed = RwSignal::new(false);
+    let absorbed = Memo::new(move |_| d.lessons.with(|ls| ls.iter().filter(|l| l.absorbed.is_some()).count()));
 
     let matching = Memo::new(move |_| {
         let q = query.get().to_lowercase();
-        d.lessons.with(|ls| ls.iter().filter(|l| q.is_empty() || q.split_whitespace().all(|w| l.haystack().contains(w))).cloned().collect::<Vec<_>>())
+        let only = only_absorbed.get();
+        d.lessons.with(|ls| {
+            ls.iter()
+                .filter(|l| (!only || l.absorbed.is_some()) && (q.is_empty() || q.split_whitespace().all(|w| l.haystack().contains(w))))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     });
     // The lessons of the current selection.
     let selected = Memo::new(move |_| {
@@ -274,8 +284,14 @@ pub fn Knowledge() -> impl IntoView {
     let list = move || {
         let ls = selected.get();
         if ls.is_empty() {
-            return view! { <p class="empty">{if d.lessons.with(Vec::is_empty) { "No lessons in this collective yet." } else { "No lesson matches." }}</p> }
-                .into_any();
+            let empty = if d.lessons.with(Vec::is_empty) {
+                "No lessons in this collective yet."
+            } else if only_absorbed.get() && absorbed.get() == 0 {
+                "No lesson is held elsewhere."
+            } else {
+                "No lesson matches."
+            };
+            return view! { <p class="empty">{empty}</p> }.into_any();
         }
         let by_area = system.get().is_some();
         let mut m: BTreeMap<String, Vec<Lesson>> = BTreeMap::new();
@@ -360,6 +376,11 @@ pub fn Knowledge() -> impl IntoView {
             </div>
             <div class="kn-bar">
                 {crumbs}
+                <div class="seg" title="lessons an outside store holds now: no longer delivered to drones">
+                    <span class="seg-l">"show"</span>
+                    <button class:on=move || !only_absorbed.get() on:click=move |_| only_absorbed.set(false)>"all"</button>
+                    <button class:on=move || only_absorbed.get() on:click=move |_| only_absorbed.set(true)>{move || format!("held elsewhere {}", absorbed.get())}</button>
+                </div>
                 <div class="seg">
                     <span class="seg-l">"shade by"</span>
                     {[ColorBy::Activation, ColorBy::Usefulness, ColorBy::Asked].into_iter().map(|c| view! {
@@ -391,10 +412,27 @@ pub fn Knowledge() -> impl IntoView {
 pub fn lesson_card(l: Lesson, open: RwSignal<Option<String>>) -> impl IntoView {
     let id = l.id.clone();
     let use_pct = pct(l.usefulness(), 1.0);
+    let held = l.absorbed.clone().map(|a| {
+        let note = if a.note.is_empty() { "no note".to_string() } else { trunc(&a.note, 80) };
+        let since = format!("since {} by {}", ago(a.ms), who(&a.by));
+        let recurred = a.recurrence.map(|n| {
+            let title = "corrections merged into it since it was absorbed: the knowledge held elsewhere did not prevent them";
+            view! { <span class="chip" class:h={n > 0.0} title=title>{format!("recurred {}×", num(n))}</span> }
+        });
+        view! {
+            <span class="held">
+                <span class="chip k" title="held by an outside store: no longer delivered to drones">"held elsewhere"</span>
+                <span class="held-note" title=a.note.clone()>{note}</span>
+                <span>{since}</span>
+                {recurred}
+            </span>
+        }
+    });
     view! {
-        <button class="lesson" class:dormant=l.dormant on:click=move |_| open.set(Some(id.clone()))>
+        <button class="lesson" class:dormant=l.dormant class:absorbed=l.absorbed.is_some() on:click=move |_| open.set(Some(id.clone()))>
             <span class="q">{l.question.clone()}</span>
             {(!l.consequence.is_empty()).then(|| view! { <span class="c">{trunc(&l.consequence, 180)}</span> })}
+            {held}
             <span class="meta">
                 {l.scope.iter().take(2).map(|s| view! { <span class="chip a">{s.clone()}</span> }).collect_view()}
                 <span class="chip">{l.area()}</span>

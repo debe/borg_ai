@@ -31,6 +31,7 @@ fn borg(root: &Path, args: &[&str]) -> (String, String, Option<i32>) {
         .args(args)
         .current_dir(root)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store"))
@@ -71,11 +72,14 @@ const PROBES: &[(&str, &[&str])] = &[
     ("vectors", &[]),
     ("completions", &[]),
     ("version", &[]),
+    // A probe that never asks the release feed: an unknown flag is a usage error.
+    ("update", &["--zz-probe"]),
     ("learn", &[]),
     ("no", &[]),
     ("assimilate", &["--zz-probe"]),
     ("reach", &["--zz-probe"]),
     ("facets", &["--zz-probe"]),
+    ("memory", &["--zz-probe"]),
     ("queen", &[]),
     ("why", &[]),
     ("notes", &["--zz-probe"]),
@@ -150,6 +154,26 @@ fn help_completions_and_dispatch_name_the_same_commands() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Asking how a command works never runs it: `borg learn --help` once ran a learn pass, and
+/// `borg tell --help` took `--help` for a drone. `mesh` and `web` are their own binaries' to answer.
+#[test]
+fn every_command_answers_help_with_its_usage_and_runs_nothing() {
+    let root = tmp("command-help");
+    let (help, _, _) = borg(&root, &["help"]);
+    let (debug, _, _) = borg(&root, &["debug", "help"]);
+    let commands = listed(&help).into_iter().filter(|c| !matches!(c.as_str(), "mesh" | "web")).map(|c| vec![c]);
+    for args in commands.chain(listed(&debug).into_iter().map(|c| vec!["debug".to_string(), c])) {
+        for flag in ["--help", "-h"] {
+            let mut call: Vec<&str> = args.iter().map(String::as_str).collect();
+            call.push(flag);
+            let (out, err, code) = borg(&root, &call);
+            assert_eq!(code, Some(0), "borg {call:?}: {err}");
+            assert!(out.starts_with(&format!("usage: borg {}", args.join(" "))), "borg {call:?} prints its usage:\n{out}{err}");
+        }
+    }
+    assert!(!root.join("store").exists(), "no command wrote a store");
+}
+
 #[test]
 fn version_prints_one_line_at_each_spelling() {
     let root = tmp("version");
@@ -175,7 +199,8 @@ fn removed_and_moved_commands_exit_non_zero_at_their_old_names() {
         (&["recall", "missing.jsonl"], "borg: unknown command recall"),
         (&["resolve", "missing.jsonl"], "borg: unknown command resolve"),
         (&["prefilter", "missing.jsonl"], "borg: unknown command prefilter"),
-        (&["memory", "missing.jsonl"], "borg: unknown command memory"),
+        // 0.7.0 gave the name to `borg memory export|absorb|release`: the old form gets its usage.
+        (&["memory", "missing.jsonl"], "usage: borg memory"),
         (&["expert", "missing-repo", "--at", "HEAD", "--q", "x"], "borg: unknown command expert"),
         (&["ope"], "borg: unknown command ope"),
         (&["vectors", "--query"], "borg vectors: unknown flag --query"),

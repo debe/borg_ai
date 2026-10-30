@@ -135,7 +135,7 @@ append-only files, so nothing is overwritten; when two machines improved the sam
 version wins everywhere. Cost grows with what changed: a laptop back from three weeks' vacation
 downloads three weeks of lessons.
 
-**What travels.** Five logs, each line signed by the machine that wrote it and quarantined when that
+**What travels.** Six logs, each line signed by the machine that wrote it and quarantined when that
 machine is revoked:
 
 - **Lessons.** Raw episodes stay where they were captured, so each is learned exactly once.
@@ -158,21 +158,65 @@ machine is revoked:
   member and class of line). A pause,
   resume or veto from another machine counts only when the membership gives that machine the `steer`
   or `admin` role; any other is refused and counted as `steer_dropped`.
+- **Absorbs and releases** (`borg memory absorb`, `borg memory release`, `absorbed.jsonl`): which
+  lesson is now held outside Borg, by whom, when, at which lesson version, and the note the absorb
+  carries (redacted, at most 1,000 characters). Borg never reads the note. A line received from a peer
+  passes the check Borg reads the log with: a JSON record with a lesson id, a kind `absorb` or
+  `release`, a time, an author, optionally the note and the version, and no other field; a longer note,
+  another kind, a duplicate field, or a time more than a minute ahead of the receiver's clock is
+  refused. A private collective (`share: local`) never syncs, so its absorbs stay
+  on the machine.
 
 Beside the logs, each session tells the other machines which sessions run where (shown by `borg top`,
 kept a day at most), and reasoning excerpts go to two members chosen by hash, so the "why" survives
 its author going offline.
 
-**Versions.** This release speaks `borg/mesh/14`: messages keep their whole text and carry `seen`
-lines. It still syncs with a 0.4 or 0.5 peer (`borg/mesh/13`), which gets only what it can read: the
-messages of at most 1,000 characters, no `seen` line, and at most one tell or ask per sender and
-recipient every 10 minutes, as 0.5.0 paced them. Longer messages do not reach it: upgrade it. It also
-still syncs with a 0.3 peer (`borg/mesh/12`), but messages do not reach that peer. Peers on
-`borg/mesh/11` and earlier do not sync at all. Such a session ends at the handshake with a line in
+**Versions.** This release speaks `borg/mesh/15`: `borg/mesh/14`'s session with the absorbs as its
+last log. It still syncs with a 0.6 peer (`borg/mesh/14`), which syncs everything it synced before;
+absorbs do not reach it, and its machines deliver an absorbed lesson until they upgrade. Since
+`borg/mesh/14`, messages keep their whole text and carry `seen` lines. It still syncs with a 0.4 or
+0.5 peer (`borg/mesh/13`), which gets only what it can read: the messages of at most 1,000
+characters, no `seen` line, and at most one tell or ask per sender and recipient every 10 minutes, as
+0.5.0 paced them. Longer messages do not reach it: upgrade it. It also still syncs with a 0.3 peer
+(`borg/mesh/12`), but messages and absorbs do not reach that peer. Peers on `borg/mesh/11` and
+earlier do not sync at all. Such a session ends at the handshake with a line in
 `borg mesh serve`'s log, and `borg doctor` warns
-("peer <key> speaks borg/mesh/5, this node borg/mesh/14: nothing syncs with it; upgrade it") until a
+("peer <key> speaks borg/mesh/5, this node borg/mesh/15: nothing syncs with it; upgrade it") until a
 session with it completes or it leaves the member list. The old node's log gets the same line from its
-side ("… upgrade this node").
+side ("… upgrade this node"). The other way round, a newer member that no longer speaks this node's
+protocol agrees on it at the handshake and closes the session with that line; this node reads the line
+back and records the member the same way, so `borg doctor`, `borg status`, `borg top`, `borg web` and
+the drone's next prompt say that this node has to upgrade.
+
+**Who runs what.** Each node's hello names its borg version (0.7 and later; an older node sends none,
+and a node reading a hello ignores fields it does not know). After every completed session the mesh
+writes the peer's version, the protocol the session agreed on and the peer's engineer (as its drones'
+presence names them) to `<store>/mesh/versions.json`, local and never synced. A version is kept only
+when it reads as one (at most 64 characters of `[A-Za-z0-9.+-]`) and an engineer only when it reads as
+an address; anything else is read as unknown, so no member's text reaches a drone as borg's notice. A
+member that leaves the member list leaves the file too. `borg doctor` reads it: a member on an older
+protocol is a warning with what it misses ("mesh team: bob@x runs older than 0.7 on borg/mesh/14:
+/15: absorbs (absorbed.jsonl) don't sync with members on /14 or older; …"), and a member on a newer
+borg is listed ("… runs borg 0.8.0 (borg/mesh/15), this node 0.7.0": the protocol is the one the
+session agreed on).
+
+**The announcement.** When a session agrees on an older protocol than the node's own, the newer node
+tells the collective once: a tell to `all` from its engineer, starting with
+`borg/mesh/<n> is in use:`. It names who runs which borg, what members on the older protocols miss,
+and how to update: `borg update` from 0.7 on, otherwise `install.sh` again
+(`curl -fsSL https://raw.githubusercontent.com/debe/borg_ai/main/scripts/install.sh | sh`) or
+`cargo install borg-mesh borg-web borg-ai --locked --force`. Messages are the one log every node since
+0.4 syncs, and the text fits a message a 0.4 or 0.5 node reads, so the older members' drones and
+engineers see it (`borg inbox`, `borg top`, `borg web`, the next prompt). A node sends it only while
+the message log holds none starting with those words, one session at a time. It waits while the
+engineer's tell or ask to `all` from the last 10 minutes holds the slot a 0.4 or 0.5 node keeps per
+sender (that node would keep only the earlier one), and when the sender's message window refuses it;
+the next such session tries again. Two nodes that upgrade within the same minute may both announce.
+`BORG_ANNOUNCE=off` in the mesh process's environment turns it off.
+
+What each protocol changed is stated once, in `NOTES` (`crates/borg/src/protocol.rs`): the
+announcement, `borg doctor` and `borg status` quote it. Every protocol bump adds its line; a test
+fails without it.
 
 **Revocation.** `borg mesh revoke <key>` re-signs the member list. Every peer that has it refuses the key
 and drops lines it stamped after the revocation; earlier contributions stay. A revoked machine's

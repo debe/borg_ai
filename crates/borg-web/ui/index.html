@@ -54,6 +54,12 @@ input.search { width: min(420px, 100%); }
 .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--c-slate); display: inline-block; }
 .live.on i { background: var(--c-good); box-shadow: 0 0 0 0 var(--c-good); animation: pulse 2.4s ease-out infinite; }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-good) 60%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+/* borg itself: a newer release, a member on another protocol (banner.rs) */
+.update-banner { max-width: 1180px; margin: 0 auto 10px; padding: 0 16px; font-size: .88rem; }
+.update-banner > * { margin: 0; padding: 10px 14px; background: var(--heat-soft); border: 1px solid color-mix(in srgb, var(--heat) 40%, transparent); border-radius: 8px; }
+.update-banner > * + * { margin-top: 6px; }
+.update-banner ul { list-style: none; display: grid; gap: 4px; }
+.update-banner code { font: 600 .82rem var(--mono); }
 nav.tabs { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--paper) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--rule); display: flex; gap: 2px; overflow-x: auto; padding: 0 max(16px, calc((100% - 1180px) / 2 + 16px)); scrollbar-width: none; }
 nav.tabs a { color: var(--muted); padding: 10px 12px; font-weight: 500; font-size: .92rem; white-space: nowrap; border-bottom: 2px solid transparent; }
 nav.tabs a:hover { color: var(--ink); }
@@ -213,7 +219,10 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
 .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: .72rem var(--mono); color: var(--muted); }
 .stat { margin-left: 2px; }
 .chip { border: 1px solid currentColor; border-radius: 3px; padding: 0 6px; font: .68rem var(--mono); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
-.chip.a { color: var(--accent); } .chip.g { color: var(--good); } .chip.v { color: var(--c-violet); } .chip.h { color: var(--heat); }
+.chip.a { color: var(--accent); } .chip.g { color: var(--good); } .chip.v { color: var(--c-violet); } .chip.h { color: var(--heat); } .chip.k { color: var(--c-sky); }
+.lesson.absorbed { border-left: 3px solid var(--c-sky); }
+.held { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: .72rem var(--mono); color: var(--muted); }
+.held-note { color: var(--ink); overflow-wrap: anywhere; }
 
 /* drawer */
 .scrim { position: fixed; inset: 0; background: rgba(10, 14, 20, .38); z-index: 20; animation: fade .15s; }

@@ -15,6 +15,8 @@ import plugin from "./borg.ts"
 import { fakeClient, fakeCtx } from "./fakes.ts"
 
 const BORG = process.env.BORG_TEST_BIN ?? resolve(import.meta.dirname, "../../target/debug/borg")
+// No release check from a test: it would ask GitHub (borg update.rs).
+process.env.BORG_UPDATE_CHECK = "off"
 
 const SESSION = "ses_contract1"
 const PLAN = "I check closed.get() on the AtomicBoolean before deliver(); reader and drainer threads race."

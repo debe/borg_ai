@@ -14,7 +14,7 @@ fn root() -> PathBuf {
 }
 
 fn borg(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_borg")).args(args).env_clear().stdin(Stdio::null()).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_borg")).args(args).env_clear().env("BORG_UPDATE_CHECK", "off").stdin(Stdio::null()).output().unwrap()
 }
 
 /// The command-like text of a Markdown file: its inline code spans and its fenced code lines, without

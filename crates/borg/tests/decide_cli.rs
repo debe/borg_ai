@@ -58,6 +58,7 @@ fn learned_live_check(root: &Path, session: &str, env: &[(&str, &str)]) {
     let out = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["check", "--session", session, "--cwd", cwd.to_str().unwrap()])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

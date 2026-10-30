@@ -6,6 +6,10 @@
 //! tells the page which views changed, and the page refetches only those. Once a minute it publishes
 //! this node's daily rollups (borg stats.rs) so the mesh can spread them.
 //!
+//! `/api/update` is borg itself: this borg's version, the last release check (borg update.rs), and the
+//! members by version with what an older protocol misses (borg protocol.rs). The page shows a banner
+//! from it when a newer release exists or a member's protocol differs from this node's.
+//!
 //! The binary (main.rs) parses the command line and serves [`router`]; tests drive it in process.
 
 use std::collections::BTreeMap;
@@ -21,7 +25,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use borg::collective::{self, Route, Share};
-use borg::{conscience, install, learn, memory, msg, outcome, presence, stats, top};
+use borg::{absorb, conscience, install, learn, memory, memory_export, msg, outcome, presence, protocol, stats, top, update};
 use futures_util::{Stream, StreamExt};
 
 pub mod learning;
@@ -186,6 +190,23 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
     Json(json!({"collective": m.name, "lessons": out})).into_response()
 }
 
+#[derive(Deserialize)]
+struct MemoryQuery {
+    c: Option<String>,
+    /// Only the absorbed lessons (`borg memory export --absorbed`).
+    #[serde(default)]
+    absorbed: bool,
+}
+
+/// The collective's evidence records, exactly what `borg memory export --json` prints (borg
+/// memory_export.rs `document`): each lesson's memory, breadth and, when an outside store holds it, its
+/// absorb and recurrence. The Knowledge view marks absorbed lessons from it.
+async fn memory_of(State(app): State<Arc<App>>, Query(q): Query<MemoryQuery>) -> Response {
+    let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
+    let filter = memory_export::Filter { absorbed: q.absorbed, ..Default::default() };
+    Json(memory_export::document(&m.name, &m.home, &filter)).into_response()
+}
+
 /// What the feed shows: what people and drones did, not the routine of every turn end.
 const NOTABLE: [&str; 28] = [
     stats::CORRECTION,
@@ -340,6 +361,55 @@ async fn learning_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Resp
     Json(learning::view(&m.name, &m.home, m.share)).into_response()
 }
 
+/// What `/api/update` serves for the collective `name` at `home`: this borg (`borg`, its mesh protocol
+/// `protocol`), the last release check (`latest`, `checked_ms`, `error`; all null before the first) and
+/// whether its release is newer (`update`, false while `check` is off: `BORG_UPDATE_CHECK=off`), then
+/// the members this node knows of. Each member has its `key`, its `engineer` when known and `name` (the
+/// engineer, else its short key), `borg` (null: older than 0.7, it sent none), the `protocol` its last
+/// session agreed on, `syncs` (false: nothing syncs with it, it speaks a protocol this node does not)
+/// and `note`: what it misses on an older protocol (protocol.rs `NOTES`), or why nothing syncs; null
+/// on this node's footing. Without `mesh/` there are no members.
+pub fn update_view(name: &str, home: &Path) -> Value {
+    let checked = update::checked_at(home);
+    let latest = checked.as_ref().and_then(|c| c.latest.clone());
+    let on = update::on();
+    let newer = on && latest.as_deref().is_some_and(|l| update::newer(l, update::VERSION));
+    let ours = protocol::current();
+    let aliases = collective::aliases();
+    let versions = protocol::versions(home);
+    let mismatches = protocol::mismatches(home);
+    let engineer = |v: Option<&protocol::PeerVersion>| v.and_then(|v| v.engineer.as_deref()).filter(|e| !e.is_empty()).map(|e| aliases.display(e));
+    let named = |key: &str, e: &Option<String>| e.clone().unwrap_or_else(|| protocol::member(key, None));
+    // A member nothing syncs with is told by its mismatch, the newer state: its version record is from
+    // the last session that completed.
+    let mut members: Vec<Value> = versions
+        .iter()
+        .filter(|(key, _)| !mismatches.contains_key(*key))
+        .map(|(key, v)| {
+            let missed = protocol::misses(v.protocol, ours);
+            let e = engineer(Some(v));
+            json!({"key": key, "engineer": e, "name": named(key, &e), "borg": v.borg, "protocol": v.protocol, "ms": v.ms, "syncs": true,
+                "note": (!missed.is_empty()).then_some(missed)})
+        })
+        .collect();
+    members.extend(mismatches.iter().map(|(key, m)| {
+        let v = versions.get(key);
+        let e = engineer(v);
+        json!({"key": key, "engineer": e, "name": named(key, &e), "borg": v.and_then(|v| v.borg.clone()), "protocol": protocol::number(&m.theirs),
+            "ms": m.ms, "syncs": false, "note": m.line(key)})
+    }));
+    json!({
+        "collective": name, "borg": update::VERSION, "protocol": ours, "check": on,
+        "latest": latest, "checked_ms": checked.as_ref().map(|c| c.checked_ms), "error": checked.and_then(|c| c.error),
+        "update": newer, "members": members,
+    })
+}
+
+async fn update_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    Json(update_view(&m.name, &m.home)).into_response()
+}
+
 /// Size and modification time of `path`, or of every file directly in it.
 fn stamp(path: &Path) -> Vec<(u64, u128)> {
     let one = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), mtime(&m)));
@@ -364,6 +434,11 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
             "lessons",
             vec![home.join("lessons.jsonl"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE), home.join("stats.jsonl"), stats::events_path(home)],
         ),
+        // The evidence records fold the lessons, the outcomes, this machine's episodes and the absorb log.
+        (
+            "memory",
+            vec![home.join("lessons.jsonl"), home.join("outcomes.jsonl"), home.join(outcome::TEAM_FILE), home.join("episodes.jsonl"), absorb::path(home)],
+        ),
         ("stats", vec![home.join("stats.jsonl"), stats::events_path(home)]),
         // A drone's unread count moves with the log and the shown-once claims.
         ("drones", vec![home.join("presence"), presence::remote_path(home), msg::path(home), msg::seen_path(home)]),
@@ -374,6 +449,8 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("learning", vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home)]),
         // The selection summary's cache, and the outcome log whose tail it folds on every read.
         ("select", vec![home.join(borg::select::summary::CACHE), home.join("outcomes.jsonl")]),
+        // The release check and what the mesh last heard of the members' versions.
+        ("update", vec![update::path_for(home), protocol::versions_path(home), protocol::protocols_path(home)]),
     ]
 }
 
@@ -425,6 +502,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/collectives", get(collectives))
         .route("/api/stats", get(stats_of))
         .route("/api/lessons", get(lessons))
+        .route("/api/memory", get(memory_of))
         .route("/api/drones", get(drones))
         .route("/api/feed", get(feed))
         .route("/api/queen", get(queen))
@@ -432,6 +510,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/messages/seen", post(messages_seen))
         .route("/api/learning", get(learning_of))
         .route("/api/select", get(select_of))
+        .route("/api/update", get(update_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))
         .with_state(app)
@@ -491,6 +570,36 @@ mod tests {
         assert_eq!(changed(&before, &cached), ["select"]);
         std::fs::write(home.join("outcomes.jsonl"), "{}\n").unwrap();
         assert!(changed(&cached, &fingerprint(&home)).contains(&"select"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A release check or a member's version changes the update view only.
+    #[test]
+    fn the_update_view_follows_the_release_check_and_the_members_versions() {
+        let home = std::env::temp_dir().join(format!("borg-web-watch-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let changed = |a: &Fingerprint, b: &Fingerprint| a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, _)| x.0).collect::<Vec<_>>();
+        let before = fingerprint(&home);
+        std::fs::write(update::path_for(&home), "{\"checked_ms\":1,\"latest\":\"0.7.0\",\"error\":null}").unwrap();
+        let checked = fingerprint(&home);
+        assert_eq!(changed(&before, &checked), ["update"]);
+        let v = protocol::PeerVersion { borg: Some("0.7.0".into()), protocol: protocol::current(), ms: 1, engineer: None };
+        protocol::note_version(&home, "k", &v).unwrap();
+        assert_eq!(changed(&checked, &fingerprint(&home)), ["update"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An absorb or release changes the memory view only: the lessons themselves did not change.
+    #[test]
+    fn the_memory_view_follows_the_absorb_log() {
+        let home = std::env::temp_dir().join(format!("borg-web-watch-memory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let changed = |a: &Fingerprint, b: &Fingerprint| a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, _)| x.0).collect::<Vec<_>>();
+        let before = fingerprint(&home);
+        std::fs::write(absorb::path(&home), "{\"id\":\"L1\",\"kind\":\"absorb\",\"ms\":1,\"by\":\"a@x\"}\n").unwrap();
+        assert_eq!(changed(&before, &fingerprint(&home)), ["memory"]);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

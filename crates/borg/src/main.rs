@@ -67,6 +67,24 @@ fn help(color: bool, debug: bool) -> String {
     out
 }
 
+/// `borg [debug] <command> … --help` (or `-h`): that command's rows of the help, so asking how a
+/// command works never runs it. None when no argument asks, for a command not in `cmds`, and for `mesh`
+/// and `web`, whose own binaries answer `--help`.
+fn command_help<'a>(mut cmds: impl Iterator<Item = &'a borg::completions::Command>, args: &[&str], prefix: &str) -> Option<String> {
+    let [name, rest @ ..] = args else { return None };
+    if !rest.iter().any(|a| matches!(*a, "--help" | "-h")) || matches!(*name, "mesh" | "web") {
+        return None;
+    }
+    let c = cmds.find(|c| c.name == *name)?;
+    let names = harness::names("|");
+    Some(
+        c.help
+            .iter()
+            .map(|(args, what)| format!("usage: {prefix}{}\n  {what}\n", format!("{} {args}", c.name).trim_end().replace("HARNESS", &names)))
+            .collect(),
+    )
+}
+
 /// Runs `borg-<part>` (beside this borg, else on PATH) in place of this process.
 fn exec(part: &str, args: &[&str]) -> ! {
     use std::os::unix::process::CommandExt;
@@ -93,10 +111,12 @@ fn collective_cmd(rest: &[&str]) {
     }
 }
 
-/// The challenges of the state file `path` (before the time `rest` may name), and stdin.
+/// The challenges of the state file `path` (before the time `rest` may name) as a drone gets them, the
+/// absorbed ones withheld (absorb.rs), and stdin.
 fn challenges_and_stdin(path: &str, rest: &[&str]) -> (Vec<conscience::Challenge>, String) {
     let before = rest.first().and_then(|v| v.parse().ok());
-    let challenges = conscience::load(path.as_ref(), before);
+    let mut challenges = conscience::load(path.as_ref(), before);
+    borg::absorb::withhold_beside(path.as_ref(), &mut challenges, before);
     let mut context = String::new();
     let _ = std::io::stdin().read_to_string(&mut context);
     (challenges, context)
@@ -198,6 +218,10 @@ fn resolve_cmd(path: &str) {
 
 /// `borg debug <command>`: the evaluation and debugging tools (completions.rs `DEBUG`).
 fn debug_cmd(args: &[&str]) {
+    if let Some(h) = command_help(borg::completions::DEBUG.iter(), args, "borg debug ") {
+        print!("{h}");
+        return;
+    }
     match args {
         // The Stop gate's score for a state file + final message on stdin.
         ["prefilter", path, rest @ ..] => {
@@ -232,6 +256,10 @@ fn main() {
         eprintln!("borg: unknown command {cmd} (borg help lists them)");
         std::process::exit(2);
     }
+    if let Some(h) = command_help(borg::completions::commands(), &args, "borg ") {
+        print!("{h}");
+        return;
+    }
     match args.as_slice() {
         // The harness's event on stdin (hook.rs); an unknown harness fails open, like any hook error.
         ["hook", name, event] => borg::hook::main(name, event),
@@ -248,6 +276,8 @@ fn main() {
         }
         ["vectors", rest @ ..] => std::process::exit(borg::vectors::main(rest)),
         ["debug", rest @ ..] => debug_cmd(rest),
+        // `borg memory export|absorb|release` (memory_export.rs); `borg debug memory` is the memory view.
+        ["memory", rest @ ..] => std::process::exit(borg::memory_export::main(rest)),
         ["setup", rest @ ..] => std::process::exit(borg::install::setup::main(rest)),
         ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),
         ["reach", rest @ ..] => {
@@ -280,6 +310,8 @@ fn main() {
         ["listen", rest @ ..] => std::process::exit(borg::listen::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
+        // A newer release, and installing it (update.rs); the prompt hook runs `--check --quiet` daily.
+        ["update", rest @ ..] => std::process::exit(borg::update::main(rest)),
         ["version" | "--version" | "-V"] => println!("borg {}", env!("CARGO_PKG_VERSION")),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),
         _ => {

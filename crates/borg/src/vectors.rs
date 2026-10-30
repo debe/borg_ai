@@ -207,7 +207,8 @@ pub fn main(args: &[&str]) -> i32 {
             use std::io::Read;
             let mut context = String::new();
             let _ = std::io::stdin().read_to_string(&mut context);
-            let pool = conscience::load(&store, None);
+            let mut pool = conscience::load(&store, None);
+            crate::absorb::withhold_beside(&store, &mut pool, None);
             let scope_text = flag("--scope").map(str::to_string).unwrap_or_else(|| context.clone());
             let t = std::time::Instant::now();
             let (list, added) = shortlist(&store, &pool, &context, &scope_text, SHORTLIST);
@@ -666,14 +667,12 @@ pub mod engine {
     /// Download the model's files at the pinned revision into `dir`, each checked against its sha256
     /// before it replaces anything (curl; never called by a hook).
     pub fn fetch(dir: &Path) -> Result<(), String> {
-        use sha2::Digest;
-        use std::io::Read;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let base = std::env::var("BORG_VECTOR_URL").unwrap_or_else(|_| format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}"));
         for (name, sha) in MODEL_FILES {
             let path = dir.join(name);
             let part = dir.join(format!("{name}.part"));
-            if sum(&path, &mut Default::default()).as_deref() == Some(sha) {
+            if crate::update::sha256_file(&path).as_deref() == Some(sha) {
                 continue;
             }
             eprintln!("fetching {name}");
@@ -684,7 +683,7 @@ pub mod engine {
                 .status()
                 .map_err(|e| format!("curl: {e}"))?
                 .success();
-            let got = sum(&part, &mut Default::default());
+            let got = crate::update::sha256_file(&part);
             if !ok || got.as_deref() != Some(sha) {
                 let _ = std::fs::remove_file(&part);
                 return Err(format!("{name}: download failed or sha256 mismatch (got {}, want {sha})", got.unwrap_or_default()));
@@ -692,20 +691,7 @@ pub mod engine {
             std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
         }
         std::fs::write(dir.join("REVISION"), MODEL_REVISION).map_err(|e| e.to_string())?;
-        return Ok(());
-
-        fn sum(path: &Path, h: &mut sha2::Sha256) -> Option<String> {
-            let mut f = File::open(path).ok()?;
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = f.read(&mut buf).ok()?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-            Some(h.clone().finalize().iter().map(|b| format!("{b:02x}")).collect())
-        }
+        Ok(())
     }
 }
 

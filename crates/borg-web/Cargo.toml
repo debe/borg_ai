@@ -21,7 +21,7 @@ name = "borg-web"
 path = "src/main.rs"
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "=0.6.0", default-features = false }
+borg = { package = "borg-ai", path = "../borg", version = "=0.7.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }

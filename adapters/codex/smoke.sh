@@ -116,7 +116,7 @@ EOF
 # Everything borg's hooks inherit through codex: the store, the fake model, live mode at once.
 export PATH=$W/bin:$PATH HOME=$W/home GIT_CONFIG_NOSYSTEM=1 OPENAI_API_KEY=sk-dummy-not-real
 export BORG_BIN=$BORG BORG_HOME=$W/store BORG_CONFIG=$W/collectives.json BORG_PREDICT_MODEL=claude:sonnet
-export BORG_MODE=live BORG_LIVE_DEBOUNCE_S=0 BORG_QUEEN=off BORG_LEARN=off BORG_VECTORS=off BORG_EARLY=off BORG_NOTIFY=off
+export BORG_MODE=live BORG_LIVE_DEBOUNCE_S=0 BORG_QUEEN=off BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_VECTORS=off BORG_EARLY=off BORG_NOTIFY=off
 unset OPENAI_BASE_URL BORG_STATE BORG_HARNESS BORG_STOP_BUDGET_MS
 
 # ---------------------------------------------------------------- 1. install

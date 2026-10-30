@@ -62,6 +62,7 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", harness, event])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_NOSYSTEM", "1")

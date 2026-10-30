@@ -40,12 +40,22 @@ use serde_json::Value;
 /// And the messages between sessions (borg msg.rs): plain lines, each naming its author's node, and the
 /// `seen` lines their recipients write (msg.rs `Seen`, which pace the senders). That name is a claim,
 /// so a line travels only under an origin of the key it names (`travels`), and only while it is fresh:
-/// a line one node pruned would otherwise come back from every peer. Last in the list: a 0.3.0 peer
-/// (`borg/mesh/12`) never reconciles this one.
+/// a line one node pruned would otherwise come back from every peer. A 0.3.0 peer (`borg/mesh/12`)
+/// never reconciles this one.
+///
+/// And the absorbs and releases (`ABSORBED`, borg `memory absorb` and `release`): plain lines saying a
+/// lesson is now held outside Borg, or is no longer. Each must be one borg could have written and
+/// folds (`travels`), because a line a peer gives never passes the write path. Last in the list: a
+/// 0.4.0 to 0.6.x peer (`borg/mesh/13`, `/14`) never reconciles this one.
 ///
 /// The removed playbooks' log is not listed: a session still steps through it after the outcomes
 /// and keeps nothing (sync.rs `PLAYBOOKS`).
-pub const SYNCED: [&str; 5] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::veto::FILE, borg::msg::FILE];
+pub const SYNCED: [&str; 6] = ["lessons.jsonl", "stats.jsonl", borg::outcome::TEAM_FILE, borg::veto::FILE, borg::msg::FILE, ABSORBED];
+
+/// The absorbs and releases of the collective's lessons (`SYNCED`, borg absorb.rs `FILE`): one line per
+/// id and command, `{"id", "kind": "absorb" | "release", "ms", "by", "note"?, "version"?}`. The mesh
+/// checks a line as borg reads it (`travels`), never what the note says.
+pub const ABSORBED: &str = borg::absorb::FILE;
 
 /// Redacted reasoning excerpts behind git notes (`borg notes`): replicated by their author to
 /// `sync::REPLICAS` members, not reconciled with everyone (sync.rs, step 4).
@@ -62,14 +72,21 @@ pub fn logs(home: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Whether `line` of the log `file` may be offered or stored under an origin of `key`, at `now`. Any
-/// line but a message's. A message or a seen line must be one borg msg.rs could have written
-/// (`Line::parse`), name `key` as its node (the member key its sender or reader wrote, as `borg top`
-/// names a remote node), and be fresh (msg.rs `fresh_at`: neither past `TTL_MS` nor stamped further
-/// ahead of this clock than `SKEW_MS`): a member's forged node, or a far-future line that would outlive
-/// every prune, never reaches another member, and no node acknowledges for another's sessions. A
+/// line but an absorb's or a message's. An absorb or a release must be a line borg `memory absorb` and
+/// `release` could have written at `now` (borg absorb.rs `written`: the record borg folds, its note at
+/// most `NOTE_CHARS`, no other field, stamped no further ahead than `SKEW_MS`), whoever stamped it. A
+/// message or a seen line must be one
+/// borg msg.rs could have written (`Line::parse`), name `key` as its node (the member key its sender or
+/// reader wrote, as `borg top` names a remote node), and be fresh (msg.rs `fresh_at`: neither past
+/// `TTL_MS` nor stamped further ahead of this clock than `SKEW_MS`): a member's forged node, or a
+/// far-future line that would outlive every prune, never reaches another member, and no node
+/// acknowledges for another's sessions. A
 /// message to the sessions of its own node (`local`, msg.rs `stays_here`) never travels: it is for
 /// that machine alone.
 pub fn travels(file: &str, line: &str, key: &str, now: i64) -> bool {
+    if file == ABSORBED {
+        return borg::absorb::written(line, now).is_some();
+    }
     if file != borg::msg::FILE {
         return true;
     }
@@ -129,7 +146,12 @@ fn append(path: &Path, lines: &[&String]) -> Result<(), String> {
 
 /// Makes the winning version of every versioned record the last line for its id (module doc).
 /// Also after lines were removed (quarantine): the line that is now last may be an older version.
+/// Not the absorbs (`ABSORBED`): an absorb names its lesson's `id` and `version`, but it is no version
+/// of a record, and borg folds every line of that log whatever their order.
 pub fn settle(path: &Path) -> Result<(), String> {
+    if path.file_name().is_some_and(|f| f == ABSORBED) {
+        return Ok(());
+    }
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut winner: HashMap<String, ((u64, Hash), &str)> = HashMap::new();
     let mut last: HashMap<String, Hash> = HashMap::new();
@@ -183,6 +205,60 @@ mod tests {
         assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["m0123456789ab"]), &other, 1_000), "signed by another node");
         assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["m0123456789ab"]), &key, 1_000 + borg::msg::TTL_MS + 1), "expired");
         assert!(!travels(borg::msg::FILE, &seen(&key, 1_000, &["not an id"]), &key, 1_000), "malformed");
+    }
+
+    /// An absorb or release travels only as a line borg could have written and folds, whoever signed
+    /// it: a peer's line never passes the write path.
+    #[test]
+    fn an_absorb_travels_only_well_formed() {
+        let key = "ab".repeat(32);
+        let ok = |v: Value| travels(ABSORBED, &v.to_string(), &key, 10);
+        const ABSORB_NOTE: usize = borg::absorb::NOTE_CHARS;
+        let absorb = serde_json::json!({"id": "L1", "kind": "absorb", "ms": 5, "by": "lead@x", "note": "skills/review@2026-10-30", "version": 2});
+        assert!(ok(absorb.clone()));
+        assert!(ok(serde_json::json!({"id": "L1", "kind": "release", "ms": 6, "by": "lead@x"})));
+        assert!(ok(serde_json::json!({"id": "L1", "kind": "release", "ms": 6, "by": "lead@x", "note": null, "version": null})), "null is absent");
+        assert!(ok(serde_json::json!({"id": "L1", "kind": "absorb", "ms": 5, "by": "lead@x", "note": "é".repeat(ABSORB_NOTE)})), "characters, not bytes");
+        let with = |k: &str, v: Value| {
+            let mut a = absorb.clone();
+            a[k] = v;
+            a
+        };
+        for (what, bad) in [
+            ("an oversize note", with("note", Value::from("n".repeat(ABSORB_NOTE + 1)))),
+            ("another kind", with("kind", Value::from("delete"))),
+            ("no kind", serde_json::json!({"id": "L1", "ms": 5, "by": "lead@x"})),
+            ("a numeric id", with("id", Value::from(1))),
+            ("an empty id", with("id", Value::from(""))),
+            ("a blank id", with("id", Value::from(" "))),
+            ("a version borg cannot read", with("version", Value::from(5_000_000_000_u64))),
+            ("stamped past the clock skew", with("ms", Value::from(10 + borg::msg::SKEW_MS + 1))),
+            ("a text ms", with("ms", Value::from("5"))),
+            ("a fractional ms", with("ms", Value::from(5.5))),
+            ("no by", serde_json::json!({"id": "L1", "kind": "absorb", "ms": 5})),
+            ("a note that is no text", with("note", serde_json::json!({"x": 1}))),
+            ("a negative version", with("version", Value::from(-1))),
+            ("an unknown field", with("reach", Value::from("team"))),
+            ("no object", serde_json::json!(["L1", "absorb"])),
+        ] {
+            assert!(!ok(bad), "{what} is refused");
+        }
+        assert!(!travels(ABSORBED, "not json", &key, 1));
+        assert!(!travels(ABSORBED, r#"{"id":"A","id":"B","kind":"absorb","ms":1,"by":"a@x"}"#, &key, 10), "a duplicate key");
+        assert!(logs(Path::new("s")).contains(&Path::new("s").join(ABSORBED)), "stamped, signed and quarantined like every synced log");
+    }
+
+    /// Absorbs name a lesson's `id` and `version` but are no versions of a record: a merge appends what
+    /// is new and never re-appends an earlier line to settle them.
+    #[test]
+    fn absorbs_are_not_settled_as_versions() {
+        let d = tmp("absorbed");
+        let p = d.join(ABSORBED);
+        let a = |version: u32, ms: i64| serde_json::json!({"id": "L1", "kind": "absorb", "ms": ms, "by": "lead@x", "version": version}).to_string();
+        merge(&p, &[a(3, 1)]).unwrap();
+        merge(&p, &[a(2, 2)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("{}\n{}\n", a(3, 1), a(2, 2)));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

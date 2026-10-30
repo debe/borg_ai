@@ -78,6 +78,7 @@ fn borg(root: &Path, args: &[&str], stdin: &str, model: bool, env: &[(&str, &str
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model
         // CLI on PATH (runner.rs `pick`), a real call.

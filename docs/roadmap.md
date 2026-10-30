@@ -4,6 +4,9 @@ What 0.6.0 left open, each with what would show it done. Selection changes follo
 0.6.0: checks written and dated before the change is built ([Evidence](evidence.md#lesson-selection)),
 quality the objective, no cost cap.
 
+**Done in 0.7.0:** an outside store can take over long-term knowledge (`borg memory export`,
+`absorb`, `release`; [Handing a lesson to an outside store](learning.md#handing-a-lesson-to-an-outside-store)).
+
 ## Lesson selection
 
 - **Early delivery learns its bar.** It keeps today's rule (at most 5 lessons, at least half the best

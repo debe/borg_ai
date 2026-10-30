@@ -15,6 +15,7 @@ fn borg(args: &[&str], root: &Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", "")
         .env("HOME", root.join("home"))
         .env("BORG_MATCH", "bm25") // word matching only: no model call from a test
@@ -101,6 +102,7 @@ fn an_engineers_emails_count_once_and_a_bad_section_routes_off() {
     let out = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["trust", "--dir", corp.to_str().unwrap()])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", "")
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store"))

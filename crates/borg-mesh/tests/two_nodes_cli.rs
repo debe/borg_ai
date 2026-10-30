@@ -106,6 +106,8 @@ impl Machine {
             .env("BORG_HOME", self.root.join("base"))
             .env("BORG_CONFIG", self.root.join("collectives.json"))
             .env("BORG_LEARN", "off")
+            // No release check from a test: it would ask GitHub (borg update.rs).
+            .env("BORG_UPDATE_CHECK", "off")
             .env("BORG_QUEEN", "off")
             .env("BORG_VECTORS", "off")
             .env("BORG_MODE", "hook")

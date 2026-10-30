@@ -25,7 +25,7 @@ trap 'kill $mock ${server:-} 2>/dev/null || true' EXIT
 export HOME=$tmp/home XDG_CONFIG_HOME=$tmp/config XDG_DATA_HOME=$tmp/data XDG_CACHE_HOME=$tmp/cache XDG_STATE_HOME=$tmp/state TMPDIR=$tmp/tmp
 borg=${BORG_BIN:-$repo/target/debug/borg}
 # BORG_CONFIG names no file: no collectives, no model call, nothing of the engineer's config.
-export BORG_BIN=$tmp/borg-logged BORG_HOME=$tmp/borg BORG_STATE=$tmp/borg/state BORG_LEARN=off BORG_MATCH=bm25 \
+export BORG_BIN=$tmp/borg-logged BORG_HOME=$tmp/borg BORG_STATE=$tmp/borg/state BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_MATCH=bm25 \
   BORG_CONFIG=$tmp/no-collectives.json BORG_OPENCODE_LOG=$tmp/adapter.log SPY_LOG=$tmp/events-v2.log
 unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT OPENCODE_SERVER_PASSWORD
 # The private server's password, sent by every client that names it with --server.

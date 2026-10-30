@@ -142,6 +142,7 @@ fn learn(root: &Path, session: &str, env: &[(&str, &str)]) {
     let ok = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["learn", "--session", session])
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store/collectives/corp"))

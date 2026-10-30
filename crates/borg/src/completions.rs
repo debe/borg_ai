@@ -36,6 +36,12 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             cmd("vectors", &[("[--fetch|--rebuild] [--store LESSONS]", "the vector model and index")], &[], &["--fetch", "--rebuild", "--store"]),
             cmd("completions", &[("<bash|zsh|fish>", "a shell completion script")], &["bash", "zsh", "fish"], &[]),
             cmd("version", &[("", "borg's version (also --version, -V)")], &[], &[]),
+            cmd(
+                "update",
+                &[("[--check] [--quiet] [--json]", "install the latest release and refresh the wiring; --check: is there one (exit 10), who runs what")],
+                &[],
+                &["--check", "--quiet", "--json"],
+            ),
         ],
     ),
     (
@@ -59,6 +65,16 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             ),
             cmd("reach", &[("[--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal")], &[], &["--plan", "--apply", "--jobs"]),
             cmd("facets", &[("[--apply] [--store FILE] [--jobs N]", "search facets for lessons")], &[], &["--apply", "--store", "--jobs"]),
+            cmd(
+                "memory",
+                &[
+                    ("export [--json] [--absorbed] [--since DATE] [--dir DIR]", "each lesson's evidence, for a store outside borg to take over"),
+                    ("absorb <id>... [--note TEXT]", "a lesson is held outside borg now: borg stops delivering it"),
+                    ("release <id>...", "an absorbed lesson: borg delivers it again"),
+                ],
+                crate::memory_export::SUBS,
+                crate::memory_export::FLAGS,
+            ),
         ],
     ),
     (

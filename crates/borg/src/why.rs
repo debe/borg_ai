@@ -311,7 +311,10 @@ fn describe(p: &Place, shas: &[String]) -> Result<Vec<Why>, String> {
     let mut from_notes = notes_of(&p.repo, &p.name, shas);
     let missing: HashSet<&str> = shas.iter().map(String::as_str).filter(|s| !from_notes.contains_key(*s)).collect();
     let mut from_store = stored_of(&p.home, &p.name, &missing);
-    let lessons = learn::lessons(&p.home.join("lessons.jsonl"));
+    // An absorbed lesson (absorb.rs) is held outside Borg now: `borg why` hands it to no drone either.
+    let absorbed = crate::absorb::state(&crate::absorb::path(&p.home), None);
+    let mut lessons = learn::lessons(&p.home.join("lessons.jsonl"));
+    lessons.retain(|l| !absorbed.contains_key(&l.id));
     let stored_links = regress::links_of(&p.home, &p.name, &shas.iter().map(String::as_str).collect::<HashSet<_>>());
     let mut commits = Vec::new();
     for sha in shas {
@@ -637,6 +640,10 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["commits"][0]["lessons"][0]["id"], "L1");
         assert!(json["commits"][0].get("ts").is_none());
+        // Absorbed: held outside Borg, so `borg why` no longer prints it.
+        crate::absorb::write(&fx.store, &["L1"], crate::absorb::ABSORB, None, "lead@x", 5, &|_| Some(1)).unwrap();
+        let r = fx.why(&fx.repo, &fx.two, false).unwrap().unwrap();
+        assert!(r.commits[0].lessons.is_empty(), "{:?}", r.commits[0].lessons.iter().map(|l| &l.id).collect::<Vec<_>>());
     }
 
     #[test]

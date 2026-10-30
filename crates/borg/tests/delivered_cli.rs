@@ -78,6 +78,25 @@ fn an_early_lesson_is_asked_judged_at_the_next_stop_and_found_by_a_merged_correc
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A lesson absorbed after its delivery is still judged: the verdict is evidence about the lesson
+/// (absorb.rs), not a delivery, and the drone gets the lesson on no path after the absorb.
+#[test]
+fn a_lesson_absorbed_after_its_delivery_still_gets_its_verdict() {
+    let root = setup("absorbed-judged");
+    let out = hook(&root, "e1", "prompt", json!({"prompt": "Fix the Orion net: the budget place and its reset arc"}), &[]);
+    assert!(out.contains("explicit consumer"), "delivered early: {out}");
+    let store = root.join("store/collectives/corp");
+    borg::absorb::write(&store, &["Mdrain"], borg::absorb::ABSORB, Some("skills/review@1"), "lead@x", borg::learn::now_ms() - 1, &|_| Some(1)).unwrap();
+    hook(&root, "e1", "post_tool", json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "old_string": "a", "new_string": "b"}}), &[]);
+    answer(&root, &[], verdict("Mdrain", true));
+    let out = stop(&root, "e1", "Done: the budget place has its own consumer.", false, &[]);
+    assert!(!out.contains("explicit consumer"), "absorbed: not delivered again: {out}");
+    let p = prompts(&root);
+    assert!(p[0].contains("[Mdrain] lesson:"), "the judge still sees it: {}", p[0]);
+    assert_eq!(records(&root, "asked_then_changed", "Mdrain"), [("early".to_string(), Value::Null)]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn a_queued_lesson_is_asked_with_p_1_and_judged_for_its_channel() {
     let root = setup("queued-judged");
@@ -191,6 +210,7 @@ fn learn(root: &Path, session: Option<&str>) {
     std::process::Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store/collectives/corp"))

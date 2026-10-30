@@ -324,6 +324,7 @@ impl Membership {
         // A key this version no longer lists never completes another session to clear its records.
         let _ = borg::presence::retain_mismatches(home, |k| self.role_of(k).is_some());
         let _ = borg::presence::retain_reads(home, |k| self.role_of(k).is_some());
+        let _ = borg::protocol::retain_versions(home, |k| self.role_of(k).is_some());
         self.record(home)
     }
 
@@ -385,12 +386,18 @@ mod tests {
         borg::presence::note_mismatch(&ha, &eve.public(), old(2)).unwrap();
         borg::presence::note_reads(&ha, &bob.public(), 1).unwrap();
         borg::presence::note_reads(&ha, &eve.public(), 2).unwrap();
+        for (k, ms) in [(bob.public(), 1), (eve.public(), 2)] {
+            let v = borg::protocol::PeerVersion { borg: Some("0.7.0".into()), protocol: 15, ms, engineer: None };
+            borg::protocol::note_version(&ha, &k, &v).unwrap();
+        }
         m.revoke(&admin, &bob.public(), 3).unwrap();
         m.save(&ha).unwrap();
         let left: Vec<String> = borg::presence::mismatches(&ha).into_keys().collect();
         assert_eq!(left, vec![eve.public()], "only the member still listed keeps its warning");
         let reads: Vec<String> = borg::presence::reads(&ha).into_keys().collect();
         assert_eq!(reads, vec![eve.public()], "and the line format its node reads");
+        let versions: Vec<String> = borg::protocol::versions(&ha).into_keys().collect();
+        assert_eq!(versions, vec![eve.public()], "and the version it last told");
         for h in [ha, hb, hc] {
             let _ = std::fs::remove_dir_all(h);
         }

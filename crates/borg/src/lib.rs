@@ -8,6 +8,7 @@
 #[cfg(not(unix))]
 compile_error!("borg supports Unix only (Linux, macOS): it relies on process groups, signals and Unix file modes");
 
+pub mod absorb;
 pub mod assimilate;
 pub mod assimilate_dir;
 pub(crate) mod attention;
@@ -29,6 +30,7 @@ pub mod learn;
 pub mod listen;
 pub mod live;
 pub mod memory;
+pub mod memory_export;
 pub mod msg;
 pub mod notes;
 pub(crate) mod notify;
@@ -38,6 +40,7 @@ pub mod outcome;
 pub mod predict;
 pub mod prefilter;
 pub mod presence;
+pub mod protocol;
 pub mod queen;
 pub mod reach;
 pub mod reexec;
@@ -52,6 +55,7 @@ pub mod systems;
 pub mod top;
 pub(crate) mod top_live;
 pub mod trust;
+pub mod update;
 pub mod vectors;
 pub mod veto;
 #[doc(hidden)]

@@ -45,6 +45,7 @@ fn command(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Comm
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
         .env("BORG_PREDICT_MODEL", "off")

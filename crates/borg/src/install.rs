@@ -209,10 +209,10 @@ fn print_status(t: &Targets) {
         Ok(c) => collectives(c.as_ref(), &base),
         Err(_) => Vec::new(), // nothing is routed anywhere; listing stores would suggest otherwise
     };
-    for r in routes {
-        let Route::Collective { name, home, share } = &r else { continue };
+    for r in &routes {
+        let Route::Collective { name, home, share } = r else { continue };
         let s = stats(home);
-        println!("\ncollective {name} ({share:?}, may sync: {})", collective::may_sync(&r));
+        println!("\ncollective {name} ({share:?}, may sync: {})", collective::may_sync(r));
         println!("  store        {}", home.display());
         let m = crate::live::of(cfg.as_ref().ok().and_then(Option::as_ref), name);
         let off = (m.mode == crate::live::Mode::Live).then(crate::live::unsupported).flatten();
@@ -223,6 +223,9 @@ fn print_status(t: &Targets) {
         };
         println!("  mode         {} ({}){note}", m.mode.name(), m.source);
         println!("  lessons      {}", s.lessons);
+        // Held outside borg (absorb.rs), and of them the ones a correction merged into since.
+        let (absorbed, recurred) = crate::memory_export::summary(home);
+        println!("  absorbed     {absorbed}, recurred {recurred}");
         println!("  episodes     {}", s.episodes);
         println!("  outcomes     {}", s.outcomes);
         println!("  queen open   {}", crate::queen::open(home).len());
@@ -262,6 +265,16 @@ fn print_status(t: &Targets) {
             }
         }
     }
+    // This borg, the latest release, and the members of each synced collective by version (update.rs).
+    println!("\nversion");
+    println!("  this borg    {}", crate::update::VERSION);
+    println!("  latest       {}", crate::update::release_line(crate::update::checked().as_ref(), learn::now_ms()));
+    for r in routes.iter().filter(|r| collective::may_sync(r)) {
+        let Route::Collective { name, home, .. } = r else { continue };
+        for l in crate::update::member_lines(home) {
+            println!("  {name:<12} {l}");
+        }
+    }
     println!("\nharnesses");
     for &h in harness::ALL {
         let line = wiring(h, t);
@@ -298,7 +311,7 @@ pub fn sibling(part: &str) -> Option<PathBuf> {
 }
 
 /// First line of `<cli> --version`, if it answers within 5 s.
-fn version(cli: &Path) -> Option<String> {
+pub(crate) fn version(cli: &Path) -> Option<String> {
     let mut child = std::process::Command::new(cli)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -552,6 +565,8 @@ fn doctor(t: &Targets) -> i32 {
         }
     }
     let borg_found = env_bin.as_deref().is_some_and(executable) || on_path.is_some();
+    // A newer release, or a release check that keeps failing (update.rs).
+    checks.push(crate::update::doctor_check(learn::now_ms()));
     checks.extend(harness_checks(harness::visible(), t));
     checks.extend(wiring_checks(t, borg_found));
     let cfg = collective::load();

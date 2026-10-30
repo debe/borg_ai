@@ -19,7 +19,7 @@ trap 'kill $mock ${server:-} 2>/dev/null || true' EXIT
 
 export HOME=$tmp/home XDG_CONFIG_HOME=$tmp/config XDG_DATA_HOME=$tmp/data XDG_CACHE_HOME=$tmp/cache XDG_STATE_HOME=$tmp/state
 borg=${BORG_BIN:-$repo/target/debug/borg}
-export BORG_BIN=$tmp/borg-logged BORG_HOME=$tmp/borg BORG_STATE=$tmp/borg/state BORG_LEARN=off BORG_OPENCODE_LOG=$tmp/adapter.log
+export BORG_BIN=$tmp/borg-logged BORG_HOME=$tmp/borg BORG_STATE=$tmp/borg/state BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_OPENCODE_LOG=$tmp/adapter.log
 # Never the engineer's collectives config, and word matching at Stop (no consequence-model call).
 export BORG_CONFIG=$tmp/no-collectives.json BORG_MATCH=bm25
 unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT

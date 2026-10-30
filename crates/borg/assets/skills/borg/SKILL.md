@@ -1,6 +1,6 @@
 ---
 name: borg
-description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, mesh, vectors or messages between sessions, asks why borg blocked or asked, or wants to set up, share or fix borg.
+description: borg is a shared memory for coding agents: lessons from corrections, checked against the work, shared with a team. Use when the engineer mentions borg, a lesson, collective, drone, queen, mesh, vectors or messages between sessions, asks why borg blocked or asked, wants to hand lessons over to a store outside borg, or wants to set up, share or fix borg.
 ---
 
 # borg
@@ -37,6 +37,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | Everything set up in one guided pass | `borg setup` (interactive; run it in the engineer's own terminal) |
 | To know what is wired and how big each collective is | `borg status` |
 | To know what is broken | `borg doctor`, then [troubleshooting](references/troubleshooting.md) |
+| borg says an update exists (a newer release, or a member nothing syncs with) | Tell the engineer; on their yes run `borg update` (it installs the release, refreshes the wired harnesses and runs `borg doctor`); `borg update --check` shows who runs what |
 | To know which collective a repo belongs to | `borg collective <dir>` |
 | To wire or unwire a harness | `borg install <harness\|all>`, `borg uninstall <harness\|all>` |
 | To answer borg's open questions | `borg queen`, `borg queen show <n>`, `borg queen answer <n> <text>` |
@@ -58,6 +59,27 @@ on this machine unless the collective they belong to is synced with a team over 
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
 | Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` |
 | Every command | `borg help`, `borg mesh --help` |
+
+## Hand over long-term memory
+
+A team may keep settled knowledge in a store outside borg (a reviewed skills repo, a handbook). The
+engineer never runs these commands; you do.
+
+- **The engineer asks what in borg is ready to be held elsewhere:** run `borg memory export --json`
+  (read-only, 0 tokens) and read each record's evidence: `memory` (the belief, its `ci95`, the result
+  counts, `consolidated`), `breadth` (sessions and repos it changed work in), `support`, `history`, and
+  `placebo` and `tail` when present. Summarise what the evidence shows. Do not invent a threshold: the
+  engineer decides.
+- **The engineer says a lesson is now held elsewhere:** run `borg memory absorb <id> --note "<where>"`,
+  with a short label such as `skills/review@2026-10-30`. borg stops delivering the lesson on every
+  path. The note is a label borg never reads, at most 1,000 characters: name where it is held, never
+  copy the lesson into it.
+- **The engineer says borg should deliver it again:** run `borg memory release <id>`.
+- **Absorbed lessons that recur:** `borg memory export --absorbed` lists them with `recurrence`: how
+  many episodes merged into the lesson since the absorb. Show the engineer a recurring one: the outside
+  copy may not hold. A constraint ratified from an absorbed lesson is still delivered.
+
+All three act on the collective of the current directory; `--dir <repo>` names another.
 
 ## Safety rules
 

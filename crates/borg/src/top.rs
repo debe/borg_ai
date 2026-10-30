@@ -18,6 +18,10 @@
 //! Lesson selection (select.rs): one line per collective once its summary has folded a graded check,
 //! or while a policy other than the default (a switch) or the monitor's revert decides (`Selection`);
 //! `--json` carries it in full as `select`. `borg status` prints the same line, borg web the rest.
+//!
+//! borg itself (`version_line`): one line over the collectives when a newer release exists (update.rs)
+//! or a member's mesh protocol differs from this node's (protocol.rs), none otherwise. `borg status`
+//! and `borg doctor` say the rest; `--json` leaves it out.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -29,7 +33,7 @@ use crate::clock::{DAY_MS, ago};
 use crate::collective::{self, Route, Share};
 use crate::msg::{self, Address, Message};
 use crate::presence::{self, Presence, State};
-use crate::{install, learn, select, steer};
+use crate::{install, learn, protocol, select, steer, update};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Drone {
@@ -964,6 +968,33 @@ pub fn render_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, se
     s
 }
 
+/// The line over the collectives when borg itself needs the engineer, none otherwise: a newer release
+/// than this borg (`checked`, the last release check; ignored while `check` is off,
+/// `BORG_UPDATE_CHECK=off`), then per store in `stores` (only one with `mesh/`) each member nothing
+/// syncs with, and each member on an older protocol with what it misses (protocol.rs `NOTES`). A
+/// member on this node's protocol, even on a newer borg, is no news here (`borg status` lists it).
+pub fn version_line<'a>(stores: impl IntoIterator<Item = &'a Path>, checked: Option<&update::Checked>, check: bool) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(l) = checked.and_then(|c| c.latest.as_deref()).filter(|l| check && update::newer(l, update::VERSION)) {
+        parts.push(format!("borg {l} is released, this is {}: borg update", update::VERSION));
+    }
+    let aliases = collective::aliases();
+    let ours = protocol::current();
+    for home in stores.into_iter().filter(|h| h.join("mesh").is_dir()) {
+        let versions = protocol::versions(home);
+        let mismatches = protocol::mismatches(home);
+        let name = |key: &str| aliases.display(&protocol::member(key, versions.get(key)));
+        for (key, m) in &mismatches {
+            parts.push(format!("nothing syncs with {} ({}, this node {})", name(key), m.theirs, m.ours));
+        }
+        for (key, v) in versions.iter().filter(|(k, v)| v.protocol < ours && !mismatches.contains_key(*k)) {
+            parts.push(format!("{} on /{} misses {}", name(key), v.protocol, protocol::misses(v.protocol, ours)));
+        }
+    }
+    parts.dedup();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The collectives to show: the one `dir` routes to, or every one on this machine.
 fn routes(dir: Option<&str>) -> Result<Vec<Route>, String> {
     let cfg = collective::load()?;
@@ -974,13 +1005,23 @@ fn routes(dir: Option<&str>) -> Result<Vec<Route>, String> {
     })
 }
 
-/// Every collective to show with its drones (top_live.rs).
-pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>, String> {
+/// Every collective to show with its drones, and the line on borg itself over them (`version_line`,
+/// over every collective `dir` routes to, shown or not) (top_live.rs).
+pub fn gather(dir: Option<&str>, now: i64) -> Result<(Vec<crate::top_live::Coll>, Option<String>), String> {
     let mut out = Vec::new();
-    for r in routes(dir)? {
-        let Route::Collective { name, home, share } = &r else { continue };
+    let routes = routes(dir)?;
+    let stores: Vec<&Path> = routes
+        .iter()
+        .filter_map(|r| match r {
+            Route::Collective { home, .. } => Some(home.as_path()),
+            Route::Off => None,
+        })
+        .collect();
+    let version = version_line(stores, update::checked().as_ref(), update::on());
+    for r in &routes {
+        let Route::Collective { name, home, share } = r else { continue };
         presence::prune(home, now);
-        let mut ds = drones(home, collective::may_sync(&r), now);
+        let mut ds = drones(home, collective::may_sync(r), now);
         for d in &mut ds {
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
@@ -995,11 +1036,21 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<Vec<crate::top_live::Coll>,
         let select = Some(Selection::of(&summary, select::policy(), select::risk_of(&lessons))).filter(Selection::shown).map(|s| selection_line(&s));
         out.push(crate::top_live::Coll { name: name.clone(), home: home.clone(), share: *share, drones: ds, inbox, select });
     }
-    Ok(out)
+    Ok((out, version))
 }
 
+/// The printed screen, with the line on borg itself first (`version_line`; not in `--json`).
 fn screen(dir: Option<&str>, json_out: bool, now: i64) -> Result<String, String> {
-    Ok(screen_of(&routes(dir)?, dir.is_some(), &engineer_dir(dir), msg::caller, json_out, now))
+    let routes = routes(dir)?;
+    let text = screen_of(&routes, dir.is_some(), &engineer_dir(dir), msg::caller, json_out, now);
+    let stores = routes.iter().filter_map(|r| match r {
+        Route::Collective { home, .. } => Some(home.as_path()),
+        Route::Off => None,
+    });
+    Ok(match version_line(stores, update::checked().as_ref(), update::on()).filter(|_| !json_out) {
+        Some(v) => format!("{v}\n\n{text}"),
+        None => text,
+    })
 }
 
 /// The printed screen (or `--json`) of the collectives `routes`, `one` when `--dir` named the one to
@@ -1831,6 +1882,36 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!((recipient(&ds, "n1", "engineer"), recipient(&ds, "n1", msg::ALL)), ("engineer".into(), "collective".into()), "an `all` line");
         assert_eq!(recipient(&ds, "n1", "local@n1"), "local");
         assert_eq!(recipient(&ds, "n1", "local@beefcafebeefcafe00"), "local @beefcafebeef");
+    }
+
+    /// The line on borg itself: a newer release (while the check is on), a member nothing syncs with and
+    /// one on an older protocol with what it misses; nothing for a store without `mesh/` or members on
+    /// this node's protocol.
+    #[test]
+    fn the_line_on_borg_itself_names_a_release_and_the_protocols_that_differ() {
+        let home = std::env::temp_dir().join(format!("borg-top-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let newer = update::Checked { checked_ms: 1, latest: Some("99.0.0".into()), error: None };
+        let current = update::Checked { latest: Some(update::VERSION.into()), ..newer.clone() };
+        assert_eq!(version_line([home.as_path()], None, true), None);
+        assert_eq!(version_line([home.as_path()], Some(&current), true), None);
+        let release = format!("borg 99.0.0 is released, this is {}: borg update", update::VERSION);
+        assert_eq!(version_line([home.as_path()], Some(&newer), true), Some(release.clone()));
+        assert_eq!(version_line([home.as_path()], Some(&newer), false), None, "BORG_UPDATE_CHECK=off");
+
+        let ours = protocol::current();
+        let v = |protocol, engineer: Option<&str>| protocol::PeerVersion { borg: None, protocol, ms: 1, engineer: engineer.map(str::to_string) };
+        protocol::note_version(&home, "k-same", &v(ours, Some("ann@x"))).unwrap();
+        assert_eq!(version_line([home.as_path()], None, true), None, "a member on this node's protocol is no news");
+        protocol::note_version(&home, "k-old", &v(ours - 1, Some("bob@x"))).unwrap();
+        let mismatch = protocol::Mismatch { theirs: format!("borg/mesh/{}", ours + 1), ours: format!("borg/mesh/{ours}"), ms: 2 };
+        protocol::note_mismatch(&home, "k-new", mismatch).unwrap();
+        let line = version_line([home.as_path()], Some(&newer), true).unwrap();
+        let old = format!("bob@x on /{} misses /{ours}: {}", ours - 1, protocol::note(ours).unwrap());
+        let none = format!("nothing syncs with peer k-new (borg/mesh/{}, this node borg/mesh/{ours})", ours + 1);
+        assert_eq!(line, format!("{release} · {none} · {old}"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

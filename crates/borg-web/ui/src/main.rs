@@ -1,8 +1,10 @@
 //! The borg web page: the collective's knowledge and what it did, live. Data comes from borg-web's
 //! JSON API; a server-sent event stream names the views whose files changed, and only those are
-//! fetched again. Tabs follow the URL hash, so a view can be linked.
+//! fetched again. Tabs follow the URL hash, so a view can be linked. A banner over the tabs says when
+//! borg itself has news: a newer release, or a member on another mesh protocol (banner.rs).
 
 mod api;
+mod banner;
 mod charts;
 mod drawer;
 mod feed;
@@ -11,6 +13,7 @@ mod views;
 
 use leptos::prelude::*;
 
+use crate::banner::Banner;
 use crate::drawer::Drawer;
 use crate::views::{
     conscience::Conscience, cost::Cost, drones::Drones, knowledge::Knowledge, learning::Learning, messages::Messages, overview::Overview, queen::Queen,
@@ -67,6 +70,7 @@ fn App() -> impl IntoView {
                 <i></i>{move || if d.live.get() { "live" } else { "offline" }}
             </span>
         </header>
+        <Banner />
         <nav class="tabs">
             {TABS.iter().map(|(k, label)| {
                 let k = *k;

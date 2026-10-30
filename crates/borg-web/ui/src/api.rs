@@ -200,6 +200,33 @@ pub struct Lesson {
     pub usage: BTreeMap<String, f64>,
     /// Who hears it: empty for the team, `repo` for its repo only (reach.rs in borg).
     pub reach: String,
+    /// Held by an outside store and no longer delivered to drones (`borg memory absorb`), from `/api/memory`.
+    pub absorbed: Option<Absorbed>,
+}
+
+/// A lesson's absorb (borg memory_export.rs `Absorbed`) and its recurrence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Absorbed {
+    /// The engineer's label of where it is held now: shown as given, never read.
+    pub note: String,
+    pub ms: f64,
+    pub by: String,
+    /// Corrections merged into the lesson since its absorb; None when the export cannot tell.
+    pub recurrence: Option<f64>,
+}
+
+/// The absorbed lessons of an `/api/memory` document, by id.
+pub fn parse_absorbed(v: &Value) -> BTreeMap<String, Absorbed> {
+    v["lessons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["absorbed"].is_object())
+        .map(|l| {
+            let a = &l["absorbed"];
+            (s(&l["id"]), Absorbed { note: s(&a["note"]), ms: f(&a["ms"]), by: s(&a["by"]), recurrence: l["recurrence"].as_f64() })
+        })
+        .collect()
 }
 
 impl Lesson {
@@ -233,14 +260,19 @@ impl Lesson {
         }
     }
 
-    /// Words the search box matches against.
+    /// Words the search box matches against (an absorbed lesson's note too).
     pub fn haystack(&self) -> String {
-        format!("{} {} {} {} {} {}", self.question, self.consequence, self.situations.join(" "), self.scope.join(" "), self.area, self.engineers.join(" "))
-            .to_lowercase()
+        let mut h =
+            format!("{} {} {} {} {} {}", self.question, self.consequence, self.situations.join(" "), self.scope.join(" "), self.area, self.engineers.join(" "));
+        if let Some(a) = &self.absorbed {
+            h = format!("{h} {}", a.note);
+        }
+        h.to_lowercase()
     }
 }
 
-pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
+/// The lessons of `/api/lessons`, each marked with its absorb from `memory` (`parse_absorbed`).
+pub fn parse_lessons(v: &Value, memory: &BTreeMap<String, Absorbed>) -> Vec<Lesson> {
     v["lessons"]
         .as_array()
         .into_iter()
@@ -268,6 +300,7 @@ pub fn parse_lessons(v: &Value) -> Vec<Lesson> {
             consolidated: l["consolidated"].as_bool().unwrap_or(false),
             usage: map(&l["usage"]),
             reach: s(&l["reach"]),
+            absorbed: memory.get(&s(&l["id"])).cloned(),
         })
         // A personal lesson withdrawn to a private collective is a tombstone here: nothing to show.
         .filter(|l| l.reach != "personal")
@@ -478,6 +511,71 @@ pub fn parse_messages(v: &Value) -> Vec<Message> {
             shown_to: f(&m["shown_to"]),
         })
         .collect()
+}
+
+/// A member of the collective by version, as `/api/update` lists it (borg protocol.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Member {
+    /// Its engineer when known, else its short node key.
+    pub name: String,
+    /// Its borg version; empty when it sent none (older than 0.7).
+    pub borg: String,
+    /// The protocol its last session agreed on, or the one it speaks when nothing syncs with it.
+    pub protocol: f64,
+    /// False when nothing syncs with it: it speaks a protocol this node does not.
+    pub syncs: bool,
+    /// What it misses on an older protocol, or why nothing syncs; empty on this node's footing.
+    pub note: String,
+}
+
+/// borg itself (`/api/update`): this borg, the last release check and the members by version.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Update {
+    pub borg: String,
+    /// This node's mesh protocol (`borg/mesh/<n>`).
+    pub protocol: f64,
+    /// The latest release; empty before the first check.
+    pub latest: String,
+    pub checked_ms: f64,
+    pub error: String,
+    /// A newer release exists (and the check is on).
+    pub update: bool,
+    pub members: Vec<Member>,
+}
+
+impl Update {
+    /// The members whose protocol differs from this node's: on an older one, or one nothing syncs with.
+    pub fn differ(&self) -> Vec<&Member> {
+        self.members.iter().filter(|m| !m.syncs || m.protocol != self.protocol).collect()
+    }
+
+    /// Whether the page shows its banner: a newer release, or a member on another protocol.
+    pub fn shown(&self) -> bool {
+        self.update || !self.differ().is_empty()
+    }
+}
+
+pub fn parse_update(v: &Value) -> Update {
+    Update {
+        borg: s(&v["borg"]),
+        protocol: f(&v["protocol"]),
+        latest: s(&v["latest"]),
+        checked_ms: f(&v["checked_ms"]),
+        error: s(&v["error"]),
+        update: v["update"].as_bool().unwrap_or(false),
+        members: v["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| Member {
+                name: s(&m["name"]),
+                borg: s(&m["borg"]),
+                protocol: f(&m["protocol"]),
+                syncs: m["syncs"].as_bool().unwrap_or(true),
+                note: s(&m["note"]),
+            })
+            .collect(),
+    }
 }
 
 /// A named share, `part` of `whole`: a deviation from the fixed rule, a label rate.
@@ -749,7 +847,12 @@ impl Source {
 
     fn load(self, collective: String, newest: RwSignal<f64>) {
         spawn_local(async move {
-            let extra = if self.path == "feed" { "&limit=300" } else { "" };
+            // The Knowledge view marks only the absorbed lessons: their evidence records are all it reads.
+            let extra = match self.path {
+                "feed" => "&limit=300",
+                "memory" => "&absorbed=true",
+                _ => "",
+            };
             match get(format!("/api/{}?c={collective}{extra}", self.path)).await {
                 Some(v) => {
                     if self.path == "feed" {
@@ -773,8 +876,9 @@ pub struct Data {
     /// Name, share and delivery mode (`hook` or `live`) of each collective.
     pub collectives: RwSignal<Vec<(String, String, String)>>,
     pub live: RwSignal<bool>,
-    /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source.
-    pub sources: [Source; 8],
+    /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source,
+    /// `memory` (the absorbed lessons' evidence) is joined into `lessons`.
+    pub sources: [Source; 10],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -787,6 +891,8 @@ pub struct Data {
     pub unread: Memo<f64>,
     /// Lesson selection (the Conscience tab).
     pub select: Memo<Selection>,
+    /// borg itself: the release check and the members by version (the banner).
+    pub update: Memo<Update>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -824,15 +930,17 @@ pub fn provide() -> Data {
         Source::new("learning"),
         Source::new("messages"),
         Source::new("select"),
+        Source::new("memory"),
+        Source::new("update"),
     ];
-    let [st, le, fe, qu, dr, _, me, se] = sources;
+    let [st, le, fe, qu, dr, _, me, se, mo, up] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
         live: RwSignal::new(false),
         sources,
         stats: Memo::new(move |_| parse_stats(&st.raw.get())),
-        lessons: Memo::new(move |_| parse_lessons(&le.raw.get())),
+        lessons: Memo::new(move |_| parse_lessons(&le.raw.get(), &parse_absorbed(&mo.raw.get()))),
         feed: Memo::new(move |_| parse_feed(&fe.raw.get())),
         queen: Memo::new(move |_| parse_queen(&qu.raw.get())),
         attention: Memo::new(move |_| parse_attention(&qu.raw.get())),
@@ -840,6 +948,7 @@ pub fn provide() -> Data {
         messages: Memo::new(move |_| parse_messages(&me.raw.get())),
         unread: Memo::new(move |_| f(&me.raw.get()["unread"])),
         select: Memo::new(move |_| parse_select(&se.raw.get())),
+        update: Memo::new(move |_| parse_update(&up.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

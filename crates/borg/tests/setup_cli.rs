@@ -16,7 +16,8 @@ fn tmp(name: &str) -> PathBuf {
 /// borg with a clean environment and no stdin: nothing of the caller's config leaks in. PATH holds
 /// only `bin` (borg itself, which the adapters need to find).
 fn borg(args: &[&str], bin: &Path) -> std::process::Output {
-    let out = Command::new(env!("CARGO_BIN_EXE_borg")).args(args).env_clear().env("PATH", bin).stdin(Stdio::null()).output().unwrap();
+    let out =
+        Command::new(env!("CARGO_BIN_EXE_borg")).args(args).env_clear().env("BORG_UPDATE_CHECK", "off").env("PATH", bin).stdin(Stdio::null()).output().unwrap();
     eprintln!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     out
 }
