@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.7.1 (unreleased)
+## 0.7.1 (2026-10-30)
 
 Fixes the `borg` skill for harnesses that read its header strictly.
 
