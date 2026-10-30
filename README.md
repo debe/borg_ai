@@ -2,6 +2,13 @@
 
 # Borg
 
+[![CI](https://github.com/debe/borg_ai/actions/workflows/ci.yml/badge.svg)](https://github.com/debe/borg_ai/actions/workflows/ci.yml)
+[![Release](https://github.com/debe/borg_ai/actions/workflows/release.yml/badge.svg)](https://github.com/debe/borg_ai/actions/workflows/release.yml)
+[![crates.io](https://img.shields.io/crates/v/borg-ai)](https://crates.io/crates/borg-ai)
+[![GitHub release](https://img.shields.io/github/v/release/debe/borg_ai)](https://github.com/debe/borg_ai/releases/latest)
+[![MSRV](https://img.shields.io/badge/rust-1.91%2B-orange)](https://github.com/debe/borg_ai/blob/main/Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](https://github.com/debe/borg_ai/blob/main/LICENSE-MIT)
+
 Borg is a shared memory for coding agents. It turns the corrections you give your agent, and your team's
 written knowledge, into short lessons, and brings each lesson back when a later session, yours or a
 teammate's, meets the same decision. It runs as hooks in Claude Code and Codex and as extensions in omp
