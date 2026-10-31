@@ -223,8 +223,13 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     let cost = store_file(&root, "state/s1.cost");
     let line = cost.lines().find(|l| l.starts_with("judge ")).unwrap_or_else(|| panic!("{cost}"));
     assert!(line.starts_with(&format!("judge call=2 pending={} resolved=2 chars=", ids.len())), "{line}");
-    let chars: usize = line.rsplit("chars=").next().unwrap().parse().unwrap();
+    let field = |k: &str| line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap_or_else(|| panic!("{line}"));
+    let chars: usize = field("chars=").parse().unwrap();
     assert!(chars > 300 && prompt.len() > chars, "{chars}");
+    // What the answer named, each id once, and the one no pending lesson has: zero tokens, no prompt text.
+    let mut want = vec!["Llock", "Ldrain", "Lnope"];
+    want.extend(ids.iter().filter(|i| !["Llock", "Ldrain"].contains(&i.as_str())).map(String::as_str));
+    assert_eq!((field("returned="), field("unmatched=")), (want.join(",").as_str(), "Lnope"), "{line}");
 
     // Judged once: later calls do not send them again (an unclear one may come back once more).
     answer(&root, &[], json!([{"id": "Llock", "verdict": "unchanged", "avoids_consequence": false}]));

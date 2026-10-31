@@ -982,6 +982,7 @@ mod tests {
             per_lesson: 300.0,
             latency: (1000.0, 0.1, 500.0),
             latency_n: policy::LATENCY_MIN as u32,
+            latency_reach: 24_000,
             not: (-1.0, 0.1),
             ..policy::PoolFit::default()
         };

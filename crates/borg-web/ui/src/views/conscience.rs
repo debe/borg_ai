@@ -142,6 +142,10 @@ fn decides(s: &Selection) -> (String, String) {
     let (v, note) = match s.source.as_str() {
         "reverted" => ("reverted", "the monitor saw harm beyond the gate's share: the fixed rule decides (sticky)".to_string()),
         "learned" if s.gate > 0.0 => ("learned", format!("{opt}deviates on evidence, and tests the question count, where the gate admits it · fit {}", if s.fit.is_empty() { "prior" } else { &s.fit })),
+        "learned" if !s.fit.is_empty() && s.allowance > 0.0 => (
+            "learned",
+            format!("{opt}gate spent (ledger q05 {:+.3} against allowance {:.3}): deviations need positive evidence", s.ledger, s.allowance),
+        ),
         "learned" => ("learned", format!("{opt}cold start: every decision the fixed rule's until the gate has budget")),
         "fixed" if default => ("fixed rule", "the default · the learned policy is opt-in: BORG_SELECT=learned".into()),
         "fixed" => ("fixed rule", "BORG_SELECT=fixed".into()),
@@ -530,8 +534,8 @@ fn LessonSelection() -> impl IntoView {
         if !t.due {
             return view! {
                 <p class="empty">{format!(
-                    "Due after {} checks drawn or {} sessions with one: {} and {} so far.",
-                    num(t.due_checks), num(t.due_sessions), num(t.ran), num(t.sessions)
+                    "Due after {} checks drawn in {} sessions with one, or {} sessions: {} and {} so far.",
+                    num(t.due_checks), num(t.due_min_sessions), num(t.due_sessions), num(t.ran), num(t.sessions)
                 )}</p>
             }
             .into_any();

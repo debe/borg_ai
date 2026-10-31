@@ -416,6 +416,12 @@ pub struct Selection {
     /// select/policy.rs `remaining_at`). Not money. 0 at cold start, where every decision is the fixed
     /// rule's.
     pub gate: f64,
+    /// The two parts the gate adds (select/policy.rs `gate_parts`), at the same risk share: the
+    /// allowance the fixed rule's value accrued, and the ledger's `DELTA` quantile (≤ 0 once the
+    /// deviations cost). A gate of 0 with a positive allowance is spent, not a cold start. Both 0
+    /// where `gate` is (another policy, a revert).
+    pub allowance: f64,
+    pub ledger: f64,
     /// The fit decisions draw from (select/policy.rs `Fit::key`); empty: the prior.
     pub fit: String,
     /// The bytes of `outcomes.jsonl` the summary has folded.
@@ -491,13 +497,15 @@ pub struct Test {
     /// Per k, how often each s was drawn (`draws[s]`, s from 0 to k) and the checks refused at that k.
     pub by_k: Vec<Draws>,
     /// The pre-registered readout (select/replay.rs `test_readout`): due after `TEST_CHECKS` checks drawn
-    /// or `TEST_SESSIONS` sessions with one, and only then estimated, each with its session-bootstrap
+    /// in `TEST_MIN_SESSIONS` sessions with one (`due_min_sessions`), or `TEST_SESSIONS` sessions alone,
+    /// and only then estimated, each with its session-bootstrap
     /// 95% interval: per number m ≥ 2 of the test's questions asked, the test's top lesson's change rate
     /// against asked alone (`dilution`, unit `points changed`), and asking a grade 2 against handing it
     /// over (`ask_free`, unit `points changed`). Empty and None until due, or with no drawn check.
     pub due: bool,
     pub due_checks: u64,
     pub due_sessions: u64,
+    pub due_min_sessions: u64,
     pub dilution: Vec<Estimate>,
     pub ask_free: Option<Estimate>,
 }
@@ -515,7 +523,7 @@ impl Test {
     /// `test_readout`), under the risk share `risk` the collective sets (None: `ALPHA`).
     #[must_use]
     pub fn of(summary: &select::summary::Summary, risk: Option<f64>) -> Test {
-        use select::replay::{TEST_CHECKS, TEST_SESSIONS, test_readout};
+        use select::replay::{TEST_CHECKS, TEST_MIN_SESSIONS, TEST_SESSIONS, test_readout};
         let e = &summary.experiment;
         let (ran, refused) = e.totals();
         let r = test_readout(summary);
@@ -554,6 +562,7 @@ impl Test {
             due: r.due,
             due_checks: TEST_CHECKS,
             due_sessions: u64::from(TEST_SESSIONS),
+            due_min_sessions: u64::from(TEST_MIN_SESSIONS),
             dilution: r.by_asked.iter().filter_map(|(m, x)| estimate(format!("{m} asked − 1 asked"), "points changed", x)).collect(),
             ask_free: r.ask_free.as_ref().and_then(|x| estimate("grade 2 asked − handed over".into(), "points changed", x)),
         }
@@ -761,8 +770,9 @@ impl Selection {
                 rate: s.fit.pool.yields.get(b).map_or(applied as f64 / shown as f64, |(a, b)| a / (a + b)),
             })
             .collect();
+        let (allowance, ledger) = if learned && !reverted { select::policy::gate_parts(&s.gate, risk.unwrap_or(select::policy::ALPHA)) } else { (0.0, 0.0) };
         let mon = &s.monitor;
-        let evaluation = (mon.labelled > 0).then(|| Evaluation {
+        let evaluation = (mon.sessions > 0).then(|| Evaluation {
             sessions: u64::from(mon.sessions),
             mean: mon.mean,
             ucb: mon.ucb,
@@ -795,6 +805,8 @@ impl Selection {
             default,
             source: if reverted { select::REVERTED_SOURCE } else { policy.name() },
             gate: if learned && !reverted { select::policy::remaining_at(&s.gate, risk.unwrap_or(select::policy::ALPHA)) } else { 0.0 },
+            allowance,
+            ledger,
             fit: s.fit.key.clone(),
             at: s.at,
             checks,
@@ -876,8 +888,12 @@ pub fn selection_line(s: &Selection) -> String {
             let opt = if default { "" } else { " (opt-in, BORG_SELECT=learned)" };
             if s.gate > 0.0 {
                 format!("learned{opt}, gate {:.3} (quality it may still risk below the fixed rule)", s.gate)
-            } else {
+            } else if s.fit.is_empty() || s.allowance <= 0.0 {
                 format!("learned{opt}, cold start: gate 0, every decision the fixed rule's")
+            } else {
+                // The ledger's quantile used the allowance up: a deviation passes only on its own
+                // positive evidence (select/policy.rs `choose`: risk ≤ 0).
+                format!("learned{opt}, gate spent (ledger q05 {:+.3} against allowance {:.3}), deviations need positive evidence", s.ledger, s.allowance)
             }
         }
         "fixed" if default => "the fixed rule (the default; BORG_SELECT=learned opts in to the learned policy)".into(),
@@ -954,7 +970,7 @@ fn test_line(t: &Test) -> String {
     match (&t.ask_free, t.due) {
         (Some(e), true) => format!("{head}; readout: grade 2 asked − handed over {:+.1} [{:+.1}, {:+.1}] points changed", e.mean, e.lo, e.hi),
         (None, true) => format!("{head}; readout due, no judged grade 2 on both routes yet"),
-        (_, false) => format!("{head}; readout after {} checks or {} sessions", t.due_checks, t.due_sessions),
+        (_, false) => format!("{head}; readout after {} checks in {} sessions, or {} sessions", t.due_checks, t.due_min_sessions, t.due_sessions),
     }
 }
 
@@ -1247,7 +1263,18 @@ corp (team): 3 drone(s), 2 active, 1 remote
             spend: vec![spend("stop", 4, 3.0), spend("live", 0, 2.04)],
             evaluation: Some(evaluation),
             measurement: Some(Measurement { placebos: 40, judged: 31, tail_shown: 12, tail_applied: 3 }),
-            test: Some(Test { risk: 0.1, ran: 30, control: 9, refused: 4, sessions: 6, kept: 30, due_checks: 300, due_sessions: 30, ..Test::default() }),
+            test: Some(Test {
+                risk: 0.1,
+                ran: 30,
+                control: 9,
+                refused: 4,
+                sessions: 6,
+                kept: 30,
+                due_checks: 300,
+                due_sessions: 30,
+                due_min_sessions: 15,
+                ..Test::default()
+            }),
             ..Selection::default()
         }
     }
@@ -1277,7 +1304,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let line = selection_line(&s);
         assert_eq!(
             line,
-            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · question-count test 30 drawn (9 control, 4 refused by the gate) in 6 sessions, risk 0.10; readout after 300 checks or 30 sessions · placebos 40 drawn, 31 judged · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
+            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · question-count test 30 drawn (9 control, 4 refused by the gate) in 6 sessions, risk 0.10; readout after 300 checks in 15 sessions, or 30 sessions · placebos 40 drawn, 31 judged · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
         );
         assert!(!line.contains("budget") && !line.contains("price"), "no budget set: spend measured, never priced: {line}");
         let mut early = learned();
@@ -1294,6 +1321,34 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert!(selection_line(&s).ends_with(" · budget 30000 pool tokens per session: 24000 read, price 2.00e-4 per token"), "{}", selection_line(&s));
         s.source = select::REVERTED_SOURCE;
         assert!(selection_line(&s).starts_with("REVERTED to the fixed rule"), "{}", selection_line(&s));
+    }
+
+    /// A gate of 0 is a cold start only without a fit or an allowance; a positive allowance the ledger's
+    /// quantile used up is a spent gate, where a deviation needs positive evidence (a team store on
+    /// 2026-10-31: allowance 0.076, ledger q05 −0.102, 74 evidence and test decisions that day).
+    #[test]
+    fn a_spent_gate_is_not_a_cold_start() {
+        use select::Policy;
+        use select::summary::{Gate, Summary};
+        let line = |s: &Summary| selection_line(&Selection { default: "learned", ..Selection::of(s, Policy::Learned, None) });
+        let mut s = Summary::default();
+        s.fit.key = "3556601-bc6d6191".into();
+        // A fit whose ledger accrued nothing yet: cold start.
+        assert!(line(&s).starts_with("learned, cold start: gate 0, every decision the fixed rule's"), "{}", line(&s));
+        s.gate = Gate { gain: vec![-0.1018; select::policy::DRAWS], allowance: 0.0760, ..Gate::default() };
+        let spent = Selection::of(&s, Policy::Learned, None);
+        assert_eq!((spent.gate, spent.allowance, spent.ledger), (0.0, 0.0760, -0.1018));
+        assert!(line(&s).starts_with("learned, gate spent (ledger q05 -0.102 against allowance 0.076), deviations need positive evidence · "), "{}", line(&s));
+        // No fit: whatever the ledger says, the prior decides as the fixed rule.
+        s.fit.key.clear();
+        assert!(line(&s).starts_with("learned, cold start: gate 0"), "{}", line(&s));
+        // An allowance the ledger leaves room in: the gate as before.
+        s.fit.key = "3556601-bc6d6191".into();
+        s.gate.gain = vec![-0.05; select::policy::DRAWS];
+        assert!(line(&s).starts_with("learned, gate 0.026 (quality it may still risk below the fixed rule)"), "{}", line(&s));
+        // Another policy shows neither part.
+        let fixed = Selection::of(&s, Policy::Fixed, None);
+        assert_eq!((fixed.allowance, fixed.ledger), (0.0, 0.0));
     }
 
     /// `borg status`'s line, read from a store: one with nothing folded decides by the fixed rule under
@@ -1333,7 +1388,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let v = serde_json::to_value(learned()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let want = "at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life labels latency measurement policy pool sessions source spend test";
+        let want = "allowance at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life labels latency ledger measurement policy pool sessions source spend test";
         assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
         assert_eq!((&v["budget"], &v["spend"][0]["source"], &v["deviations"][0]["whole"]), (&Value::Null, &json!("stop"), &json!(400)));
         let mut keys: Vec<&str> = v["evaluation"].as_object().unwrap().keys().map(String::as_str).collect();
@@ -1342,7 +1397,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!((&v["default"], &v["measurement"]), (&json!("fixed"), &json!({"placebos": 40, "judged": 31, "tail_shown": 12, "tail_applied": 3})));
         let mut keys: Vec<&str> = v["test"].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let want = "ask_free by_k control dilution due due_checks due_sessions kept ran refused risk sessions set";
+        let want = "ask_free by_k control dilution due due_checks due_min_sessions due_sessions kept ran refused risk sessions set";
         assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
     }
 
@@ -1603,7 +1658,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!((t.due_checks, t.due_sessions), (select::replay::TEST_CHECKS, u64::from(select::replay::TEST_SESSIONS)));
         let line = selection_line(&Selection::of(&s, select::Policy::Learned, Some(0.2)));
         assert!(
-            line.contains(" · question-count test 5 drawn (1 control, 2 refused by the gate) in 2 sessions, risk 0.20 (the collective's); readout after 300 checks or 30 sessions · "),
+            line.contains(" · question-count test 5 drawn (1 control, 2 refused by the gate) in 2 sessions, risk 0.20 (the collective's); readout after 300 checks in 15 sessions, or 30 sessions · "),
             "{line}"
         );
         assert_eq!(t.kept, t.ran, "every drawn check still held: {t:?}");

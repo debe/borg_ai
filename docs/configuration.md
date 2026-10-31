@@ -497,9 +497,15 @@ All are optional.
 
 Borg's own model calls run headless through a CLI: the harness the drone runs in first (the hook
 passes it on as `BORG_HARNESS`), then every other installed one of `claude`, `omp`, `opencode`, until
-one answers. A model name with a runner prefix pins the runner: `claude:opus`, `omp:` (omp's default),
-`omp:<model>`, `opencode:github-copilot/gpt-6.1-sol`, `codex:gpt-5`. A name without a prefix is a
-Claude model (default `sonnet`); omp and opencode then use their own configured default model. codex
+one answers. A model name with a runner prefix pins the runner: `claude:opus`, `omp:` (omp, with the
+model below), `omp:<model>`, `opencode:github-copilot/gpt-6.1-sol`, `codex:gpt-5`. A name without a
+prefix is a Claude model (default `sonnet`). omp asks a Sonnet-class model unless one is pinned
+(`claude-sonnet-5`, which omp finds among the providers you are logged in to): its own default role
+can be an Opus-class model, too slow for omp's 28 s stop. `BORG_OMP_MODEL` names another for omp alone
+(any value `omp --model` takes), and `BORG_OMP_MODEL=default` keeps omp's own default. Where none of
+your omp providers offers `claude-sonnet-5`, omp refuses it at once and borg asks omp's own default
+instead. opencode uses its
+own configured default model. codex
 answers only when pinned with `codex:`, even for a Codex drone; its call ignores your codex config and
 runs with hooks off (`-c features.hooks=false`). A Codex drone on a machine with no `claude`, `omp` or
 `opencode` therefore needs `BORG_PREDICT_MODEL=codex:<model>` and `BORG_LEARN_MODEL=codex:<model>`:
@@ -529,6 +535,7 @@ project.
 | `BORG_MODE` | the collective's `mode`, else `live` | `live`: also check the work during the turn, in a background `borg check` after state-changing tool calls; the lessons it asks arrive with the next tool call (every harness; needs the model, so not with `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC`, which `borg doctor` warns about). A question no tool call delivered blocks the stop only when its check graded a 3; else it arrives with the next prompt, as one from a check that finishes after the stop does. `hook`: at the turn end only. Overrides the config |
 | `BORG_LIVE_DEBOUNCE_S` | `45` | Live mode: the least time between the starts of two checks of a session. One check runs at a time; a stop waits at most 15 s for it, or a quarter of `BORG_STOP_BUDGET_MS` when that is less |
 | `BORG_PREDICT_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for the turn-end check (see *Model runner*); `off`: no model call |
+| `BORG_OMP_MODEL` | `claude-sonnet-5` | The model of borg's calls through omp when `BORG_PREDICT_MODEL` and `BORG_LEARN_MODEL` pin none (see *Model runner*); `default`: omp's own default role. Unlike `omp:<model>`, it leaves Claude and opencode drones' calls alone |
 | `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (and of a live check's call; a live check's lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`) |
 | `BORG_STOP_BUDGET_MS` | the harness's stop budget: omp 28 s, opencode and Codex 90 s, Claude Code none ([Capabilities](harnesses.md#capabilities)) | The stop hook's budget; the omp and opencode adapters set it to the budget borg's first answer gave them. It bounds the expert drone (60 s without any budget) and, when there is one, sizes the stop's wait for a live check (at most a quarter of it, never over 15 s) and its model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp 7 s and at most 18 s |
 | `BORG_VECTORS` | on | `off`: no vector recall |

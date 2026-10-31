@@ -223,23 +223,74 @@ tree gives the same verdict for every check; only counts moved: P3 118 deviation
 test), 0 over the gate's budget, 598 questions and 3,446 free against the fixed rule's 540 and 3,504;
 P5 doubly robust +0.010 [−0.012, +0.028], coverage 87.0%. P4a, P4b and P4c are unchanged.
 
+**Amendment 2026-10-31** (to Rules v2, after a 0-token diagnosis on copies of the author's stores,
+before any pooled readout was read):
+
+- The question-count test's readout is due at 300 checks that drew a count in at least 15 sessions
+  with one, or at 30 sessions alone. Its bootstrap resamples sessions, and an open-source store held 167
+  draws, 164 of them in one session: 300 checks alone would have been due with about 3 sessions.
+- It is read pooled over a team store and an open-source store, stratified by collective: each
+  collective's sessions are resampled within it. A store that holds history copied from another stays
+  out. A session that drew a count in two collectives counts once toward the 15 and the 30. If two
+  collectives' estimates differ beyond their joint 95% interval, it is read per collective only.
+- It is intent-to-treat: a draw the gate refused counts at its drawn number, and the share played per
+  drawn number is reported beside it (the team store's gate refused 38% of its draws).
+- An approximate interim was seen while measuring progress, before this amendment: asking 2 against 1
+  changed the top lesson's rate by −0.10 [−0.43, 0.00], diluted by the refused draws. It decides nothing.
+- On 2026-10-31 the pooled readout was not due: 250 checks with a draw in 8 sessions.
+
+**Decisions dated 2026-10-31**, from the same diagnosis. Each value stays until its evidence changes;
+[Numeric constants](design/constants.md) carries the same dates.
+
+| Decision | Evidence |
+|---|---|
+| The pool budget stays 12,000 tokens | A smaller pool loses 0.89 [0.79, 1.00] applies per check (team store). Past the budget lessons apply at 2.05% [1.00, 4.18] against 2.35% just inside it, from 7 judged applies, and no call has read more than 12,000 tokens. Revisit at 30 judged applies past the budget |
+| Withholding is not learned; `NOT_PRIOR` stays N(−0.3, 0.25²) | 8 placebos drawn, 1 judged; the fitted not-now effect is its prior (−0.280, sd 0.249). Reopen at 100 judged placebos or a placebo unclear rate under 50%; drop the placebo arm if the next 60 give fewer than 15 labels |
+| The stop's prefilter stays at 8.0 | 9 corrections followed a turn it skipped (team store); none was about an existing lesson |
+| `VETOED_W` 3 and `CORRECTED_W` 2 stay fixed | 0 vetoes and 1–2 corrections after an ask per store; `borg debug ope` finds 0 usable decisions |
+| The gate's allowance keeps scaling with the fixed rule's modelled value; `risk` stays 0.1 | The allowance grows about 0.0004 per check in the team store, about one deviation in 9 to 10 checks. The team store deviated on 15% and spent its gate (allowance 0.076, ledger 5% quantile −0.102) |
+
+**Measurement fixed in 0.7.3**, each on its own argument; no bar or prior changed:
+
+- A verdict goes to the delivery that earned it. A lesson handed over free, then asked live, was judged
+  on the hand-over while the question waited for its answer: 12 of the team store's 36 "changed"
+  verdicts on free hand-overs, and its 15 questions left open in ended sessions. A settle written by
+  0.7.3 on also censors every delivered apply of its lesson left without a verdict (the team store's
+  copy had 307 open in ended sessions, the open-source store's 291). Settles from before 0.7.3 fold as
+  they did, so the replay (P1) still reproduces the decisions made on them.
+- A live check judges a free hand-over or a placebo only once work follows it: 54% of free verdicts
+  came within 2 minutes of delivery, 74% of those unclear. Kill: revert unless, over the next 150 free
+  deliveries, the labelled share rises from 38% to at least 50% or the unclear share falls by 15 points.
+- The monitor's health counts the labels that can move its estimate, and a route's weighted residual
+  enters from 5 labels that can move it (`ROUTE_LABELS_MIN`). On the team and open-source copies the
+  mean is unchanged to 12 digits; the third store's moved from +0.012 to +0.002, a route there having
+  had 1 such label among its 5. The team store's ESS went from 9 of 127, largest weight 42.3×,
+  to 24 of 29 at 2.4×.
+- A larger pool needs a gain above 0 at the 5% quantile and 20 calls that read at least 90% of its
+  budget (`LATENCY_NEAR`); before, a tie at 0 and a flat latency fit could admit 16,971 tokens.
+- The replay counts a record whose summary or fit points into another store's log as imported. The
+  open-source store's P1 went from FAIL (1,791 of 1,841) to PASS (1,791 of 1,791, 50 imported); every
+  other check's verdict on the three copies is unchanged.
+
 **In use**, under the learned policy, a monitor estimates the policy's value against the fixed rule
 per session and reverts the store to the fixed rule for good if its bound shows harm beyond 10% of the
 fixed rule's value. After 300 judged lessons whose route was randomised, or 30 sessions under the
 learned policy, a readout compares asking against handing over, and handing over against not
 delivering, per grade, with session-bootstrap intervals. The question-count test's own readout (Rules
-v2) is due after 300 checks that drew a count (played or refused by the gate) or 30 sessions with one.
-It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
+v2, amended 2026-10-31) is due after 300 checks that drew a count (played or refused by the gate) in
+at least 15 sessions with one, or 30 sessions alone. It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
 rate asked with m against it asked alone, and asking against handing over a grade 2 as a
 Horvitz–Thompson mean, each with session-bootstrap 95% intervals. `borg debug select`, `borg status`, `borg top` and
-the Conscience page of `borg web` show both from the selection summary. The policy stays on unless the
-monitor fired.
+the Conscience page of `borg web` show both from the selection summary; `borg debug select --replay
+--file A --file B` reads the test pooled over stores, as the amendment of 2026-10-31 says, leaving
+out each store's graded records imported from another store's log. The policy
+stays on unless the monitor fired.
 
 Not built yet: a learned rule for early delivery (it keeps today's; the early records now carry `rel`
 for one, though only of delivered lessons, every plain one at or above today's bar, so they can show
 whether to raise it, not what a lower bar would admit), and counting deviations of the pool's size and
-of early delivery from the fixed rule (the graded record does not log the pool budget a check chose,
-so `deviations` counts routes only).
+of early delivery from the fixed rule (since 0.7.3 the graded record logs the pool budget a check chose,
+`budget`, but `deviations` counts routes only).
 
 ## Regret credit
 

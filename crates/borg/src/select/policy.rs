@@ -85,7 +85,9 @@ use crate::memory::Rng;
 /// The share of the fixed rule's replayed quality (mistakes avoided) the learned policy may risk below
 /// it while it learns, at the gate (`choose`, unless the collective sets `risk`, select.rs `risk_of`)
 /// and in the monitor (`monitor`), and the share the gate's ledger accrues (`ledger_add_without`).
-/// Method: a bound on quality, not on cost; the engineer's tolerance for learning, stated once.
+/// Method: a bound on quality, not on cost; the engineer's tolerance for learning, stated once. Kept by
+/// dated decision (2026-10-31), with the allowance scaling with the fixed rule's modelled value: about one
+/// deviation in 9 to 10 checks in both main stores.
 pub const ALPHA: f64 = 0.10;
 /// The gate's and the evidence rule's quantile, and the monitor's error probability. Method: the
 /// conventional 95% confidence.
@@ -107,7 +109,9 @@ pub const PRIOR_SD: f64 = 2.5;
 /// +6.3, handed over +7.3 points against the plain agent) puts them within a few points; wide.
 pub const ASK_PRIOR: (f64, f64) = (0.0, 0.35);
 /// Not now against free, N(−0.3, 0.25²). Learned, dated prior: the same evaluation, a lesson not
-/// delivered changes less than one handed over.
+/// delivered changes less than one handed over. Fixed by dated decision (2026-10-31, docs/evidence.md):
+/// 8 placebos drawn, 1 judged, the fitted effect is this prior; withholding is not learned until 100
+/// judged placebos exist.
 pub const NOT_PRIOR: (f64, f64) = (-0.3, 0.25);
 /// Dilution slope per ln(m) of asks or free lessons, N(0, 0.1²) truncated ≤ 0 (half-normal, its mode
 /// at 0). Learned, dated prior: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question on the
@@ -140,6 +144,23 @@ pub const POOL_STEPS: [i32; 5] = [-2, -1, 0, 1, 2];
 /// Latency observations needed before the pool may grow past the baseline. Method: with 20, the
 /// empirical 95% quantile has an observation above it.
 pub const LATENCY_MIN: usize = 20;
+/// The share of a budget a call must have read to count as latency observed at that budget
+/// (`PoolFit::latency_reach`, `pool_feasible`). Guard, dated 2026-10-31: a pool grows only to a budget
+/// its latency was measured at, never on a slope extrapolated past the calls (a team store's fit was
+/// flat, b = 0, and would have let a 16,971-token pool in on 12,000-token calls alone). At 0.9 a pool
+/// filled to its budget counts: it stops within a lesson of it (about 90 tokens there), and 193 of
+/// that store's 203 calls at the 12,000 baseline read 10,800 or more.
+pub const LATENCY_NEAR: f64 = 0.9;
+
+/// The labelled applies with leverage (the taken route's difference between the policy and the fixed
+/// rule is not 0) a route needs before the monitor uses its weighted residual (`monitor`); below it the
+/// direct-method term (the cross-fitted outcome model) carries the route alone. Guard, dated
+/// 2026-10-31: weights are normalised per route, so a route's only label carries the whole route (a
+/// team store's not-now route: 1 judged placebo at 42× the mean weight, ESS 9 of 127); at 5 one label
+/// is at most about a fifth of its route's residual. Labels without leverage do not count: they move
+/// no residual, so 5 of them would leave the next label with leverage carrying the route alone. Below it a route's residual is noise one verdict
+/// decides, so dropping it loses no evidence a confidence sequence could use.
+pub const ROUTE_LABELS_MIN: usize = 5;
 
 /// Newton's convergence: the largest step below this. Method.
 const TOL: f64 = 1e-8;
@@ -735,6 +756,11 @@ pub struct PoolFit {
     pub latency: (f64, f64, f64),
     #[serde(default, skip_serializing_if = "is_default")]
     pub latency_n: u32,
+    /// The largest pool tokens `LATENCY_MIN` of those calls read at least (the `LATENCY_MIN`-th
+    /// largest; 0 with fewer calls): a budget above the baseline is feasible only up to this over
+    /// `LATENCY_NEAR`, where the latency fit is read among calls, not extrapolated.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub latency_reach: u32,
     /// The model's mean η of a labelled apply, its pool slope and its "not now" effect (mean, sd):
     /// what a lesson more in the pool is worth.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1210,6 +1236,9 @@ fn pool_state(s: &Summary, pool: &mut PoolFit) {
     pool.per_lesson = if s.pool.shown > 0 { s.pool.tokens as f64 / s.pool.shown as f64 } else { 0.0 };
     let obs = &s.pool.latency;
     pool.latency_n = obs.len() as u32;
+    let mut read: Vec<u32> = obs.iter().map(|o| o.0).collect();
+    read.sort_unstable_by(|a, b| b.cmp(a));
+    pool.latency_reach = read.get(LATENCY_MIN - 1).copied().unwrap_or(0);
     if obs.len() >= 2 {
         let n = obs.len() as f64;
         let mx = obs.iter().map(|o| f64::from(o.0)).sum::<f64>() / n;
@@ -1744,7 +1773,17 @@ fn allowance_at(gate: &Gate, alpha: f64) -> f64 {
 /// in force (`Decision::gate`), which the monitoring shows.
 #[must_use]
 pub fn remaining_at(gate: &Gate, alpha: f64) -> f64 {
-    (allowance_at(gate, alpha) + lower_quantile(&mut gate.gain.clone())).max(0.0)
+    let (allowance, ledger) = gate_parts(gate, alpha);
+    (allowance + ledger).max(0.0)
+}
+
+/// The two parts `remaining_at` adds: `gate`'s allowance at the risk share `alpha`, and its ledger's
+/// `DELTA` quantile (what the policy's deviations did against the fixed rule, ≤ 0 once they cost).
+/// The monitoring tells a cold start (no allowance yet) from a spent gate (an allowance the ledger's
+/// quantile used up) by them.
+#[must_use]
+pub fn gate_parts(gate: &Gate, alpha: f64) -> (f64, f64) {
+    (allowance_at(gate, alpha), lower_quantile(&mut gate.gain.clone()))
 }
 
 /// The seed of the gate's draw `k` under `fit`: shared by every check, so the ledger and a decision
@@ -2023,7 +2062,10 @@ pub struct Monitor {
     pub ucb: Option<f64>,
     /// How far its weights can be trusted (borg top `Evaluation`): the labelled applies weighed, the
     /// effective number of the weights the estimate used (truncated, normalised per route: (Σw)² /
-    /// Σw²), the largest of them against their mean, and the applies whose weight the √N cap cut.
+    /// Σw²), the largest of them against their mean, and the applies whose weight the √N cap cut; each
+    /// over the applies whose weight can move the estimate: a residual in use (`ROUTE_LABELS_MIN`) on a
+    /// taken route where the policy and the fixed rule differ (a placebo both rules leave undelivered
+    /// has none, however large its weight).
     #[serde(default, skip_serializing_if = "is_default")]
     pub labelled: u32,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -2037,7 +2079,9 @@ pub struct Monitor {
 /// The monitor of `s` (module doc): per session, the doubly robust difference between the policy
 /// that ran (its logged propensities) and the fixed rule, each apply's outcome model fitted without
 /// its session's half (cross-fitting by the parity of the session's tick), the inverse-probability
-/// weights truncated at √N × their mean and normalised per route; plus α × the fixed rule's value;
+/// weights truncated at √N × their mean and normalised per route, a route's weighted residual in use
+/// from `ROUTE_LABELS_MIN` labelled applies on (the direct-method term alone before); plus α × the
+/// fixed rule's value;
 /// per apply, a session's mean an increment, in session order, under a one-sided time-uniform
 /// confidence sequence at `DELTA` (`upper_bound`). Trips when its upper bound falls below 0.
 #[must_use]
@@ -2110,10 +2154,19 @@ pub fn monitor(s: &Summary) -> Monitor {
     }
     let count = terms.len() as f64;
     let norm = norm.map(|x| if x > 0.0 { x / count } else { 1.0 });
+    // A route's residual only from `ROUTE_LABELS_MIN` labels with leverage on: below, its direct-method
+    // term alone. A label whose difference is 0 adds nothing to the residual, only weight to the
+    // route's normaliser, so it opens no route.
+    let mut routed = [0usize; ARMS];
+    for t in terms.iter().filter(|t| t.y.is_some() && t.diff[t.taken] != 0.0) {
+        routed[t.taken] += 1;
+    }
+    let residual = routed.map(|n| n >= ROUTE_LABELS_MIN);
     let mut per: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
     for t in &terms {
         let w = t.w.min(cap) / norm[t.taken];
-        let dr: f64 = (0..ARMS).map(|a| t.diff[a] * (t.p_hat[a] + if a == t.taken { t.y.map_or(0.0, |y| w * (y - t.p_hat[a])) } else { 0.0 })).sum();
+        let r = |a: usize| if a == t.taken && residual[a] { t.y.map_or(0.0, |y| w * (y - t.p_hat[a])) } else { 0.0 };
+        let dr: f64 = (0..ARMS).map(|a| t.diff[a] * (t.p_hat[a] + r(a))).sum();
         let e = per.entry(t.tick).or_insert((0.0, 0));
         e.0 += dr + ALPHA * t.vb;
         e.1 += 1;
@@ -2121,8 +2174,11 @@ pub fn monitor(s: &Summary) -> Monitor {
     let z: Vec<f64> = per.values().map(|(x, n)| x / *n as f64).collect();
     let mean = z.iter().sum::<f64>() / z.len() as f64;
     let ucb = Some(upper_bound(&z)).filter(|u| u.is_finite());
-    // The weights' health, over the labelled applies' weights as the estimate used them (each > 0).
-    let used: Vec<f64> = terms.iter().filter(|t| t.y.is_some()).map(|t| t.w.min(cap) / norm[t.taken]).collect();
+    // The weights' health, over the labelled applies' weights as the estimate used them (each > 0), of
+    // the applies whose weighted residual enters it: a residual in use, times a difference that is not
+    // 0 (a placebo neither rule delivers moves nothing, its weight however large).
+    let moves = |t: &&Term| t.y.is_some() && residual[t.taken] && t.diff[t.taken] != 0.0;
+    let used: Vec<f64> = terms.iter().filter(moves).map(|t| t.w.min(cap) / norm[t.taken]).collect();
     let (sum, sq) = used.iter().fold((0.0, 0.0), |(s, q), w| (s + w, q + w * w));
     let ess = if sq > 0.0 { sum * sum / sq } else { 0.0 };
     let max_weight = if sum > 0.0 { used.iter().copied().fold(0.0, f64::max) * used.len() as f64 / sum } else { 0.0 };
@@ -2135,7 +2191,7 @@ pub fn monitor(s: &Summary) -> Monitor {
         labelled: used.len() as u32,
         ess,
         max_weight,
-        truncated: labelled.iter().filter(|w| **w > cap).count() as u32,
+        truncated: terms.iter().filter(moves).filter(|t| t.w > cap).count() as u32,
     }
 }
 
@@ -2198,8 +2254,9 @@ fn pool_value(pool: &PoolFit, tokens: usize, seed: u64) -> f64 {
 }
 
 /// Whether a pool of `tokens` may be chosen at all: never above the baseline without a known latency
-/// limit (`limit_ms`) its 95% latency fits in and a yield for every position it adds; below it, a
-/// yield for every position it drops, or a price to pay.
+/// limit (`limit_ms`) its 95% latency fits in, latency observed at that budget (`LATENCY_NEAR` of it,
+/// `PoolFit::latency_reach`: the fit read among its calls, never extrapolated) and a yield for every
+/// position it adds; below it, a yield for every position it drops, or a price to pay.
 fn pool_feasible(pool: &PoolFit, tokens: usize, limit_ms: Option<u64>, lambda: f64) -> bool {
     let baseline = crate::whole::TOKENS;
     let bins_to = |t: usize| -> usize {
@@ -2210,7 +2267,8 @@ fn pool_feasible(pool: &PoolFit, tokens: usize, limit_ms: Option<u64>, lambda: f
     if tokens > baseline {
         let (a, b, q) = pool.latency;
         let fits = limit_ms.is_some_and(|l| a + b * tokens as f64 + q <= l as f64);
-        return known && fits && pool.latency_n as usize >= LATENCY_MIN;
+        let observed = f64::from(pool.latency_reach) >= LATENCY_NEAR * tokens as f64;
+        return known && fits && observed && pool.latency_n as usize >= LATENCY_MIN;
     }
     tokens == baseline || known || lambda > 0.0
 }
@@ -2231,14 +2289,16 @@ impl PoolDraws {
 
     /// The budget a session plays (`play`: its own draw's value per budget) at price `lambda`: of the
     /// feasible budgets, those whose gain over the baseline, price included, is ≥ 0 at the `DELTA`
-    /// quantile of the shared draws (the baseline always), the one its draw values most.
+    /// quantile of the shared draws (the baseline always; a larger budget only on a gain > 0 there,
+    /// never on draws that tie with the baseline), the one its draw values most.
     fn choose(&self, play: &[f64], feasible: &[bool], lambda: f64) -> usize {
         let baseline = crate::whole::TOKENS;
         let Some(b) = self.grid.iter().position(|&t| t == baseline) else { return baseline };
         let admits = |i: usize| -> bool {
             let cost = lambda * (self.grid[i] as f64 - baseline as f64);
             let mut gain: Vec<f64> = self.shared[i].iter().zip(&self.shared[b]).map(|(x, y)| x - y - cost).collect();
-            i == b || lower_quantile(&mut gain) >= 0.0
+            let q = lower_quantile(&mut gain);
+            i == b || if self.grid[i] > baseline { q > 0.0 } else { q >= 0.0 }
         };
         (0..self.grid.len())
             .filter(|&i| feasible[i] && admits(i))
@@ -2255,7 +2315,8 @@ impl PoolDraws {
 
 /// The pool budget for a session (`seed`) under `fit`: the baseline (whole.rs `TOKENS`) unless the
 /// learned policy is in force (`active`); else, of the feasible budgets of `pool_grid` whose gain over
-/// the baseline, the budget's price included, is ≥ 0 at the `DELTA` quantile (the gate's caution: an
+/// the baseline, the budget's price included, is ≥ 0 at the `DELTA` quantile (> 0 for a larger one,
+/// `PoolDraws::choose`; the gate's caution: an
 /// unidentified dilution never moves the pool), the one the session's Thompson draw values most. One
 /// draw per session keeps a session's pool, and its prompt prefix, stable.
 #[must_use]
@@ -3104,6 +3165,7 @@ mod tests {
             per_lesson: 300.0,
             latency: (1000.0, 0.1, 500.0),
             latency_n: LATENCY_MIN as u32,
+            latency_reach: 24_000,
             not: (-1.0, 0.1),
             ..PoolFit::default()
         };
@@ -3136,6 +3198,58 @@ mod tests {
         // High yields everywhere, but no latency evidence: never past the baseline.
         assert!(pool_tokens(&f, true, Some(60_000), 1) <= crate::whole::TOKENS);
         assert_eq!(pool_grid(), [6000, 8485, 12000, 16971, 24000]);
+    }
+
+    /// A larger pool needs a gain > 0 at the `DELTA` quantile: draws that tie with the baseline (no
+    /// yield past it to tell them apart) never move it, whatever a session's own draw prefers. A
+    /// smaller one still may on a tie (it costs nothing it was not already pricing).
+    #[test]
+    fn a_larger_pool_is_admitted_only_on_a_positive_gain() {
+        let grid = pool_grid();
+        let b = grid.iter().position(|&t| t == crate::whole::TOKENS).unwrap();
+        let tied = PoolDraws { grid: grid.clone(), shared: vec![vec![1.0; DRAWS]; grid.len()] };
+        let mut play = vec![0.0; grid.len()];
+        play[grid.len() - 1] = 5.0;
+        // The baseline and the larger budgets (a smaller one would win the tie of plays at 0).
+        let feasible: Vec<bool> = (0..grid.len()).map(|i| i >= b).collect();
+        assert_eq!(tied.choose(&play, &feasible, 0.0), crate::whole::TOKENS, "a tie at 0 keeps the baseline");
+        let mut ahead = tied.shared.clone();
+        ahead[grid.len() - 1] = vec![1.5; DRAWS];
+        let ahead = PoolDraws { grid: grid.clone(), shared: ahead };
+        assert_eq!(ahead.choose(&play, &feasible, 0.0), grid[grid.len() - 1], "a gain > 0 at every draw admits it");
+        let mut smaller = vec![0.0; grid.len()];
+        smaller[0] = 5.0;
+        assert_eq!(tied.choose(&smaller, &[true; 5], 0.0), grid[0], "a smaller pool on a tie, as before");
+    }
+
+    /// A pool grows only to a budget its latency was measured at: a flat fit over calls at the
+    /// baseline (a team store on 2026-10-31: b = 0, 203 calls, none above 12,000 tokens) admits no
+    /// larger budget however roomy the limit, and calls that read `LATENCY_NEAR` of a budget admit it.
+    #[test]
+    fn a_pool_grows_only_where_its_latency_was_observed() {
+        let mut s = Summary::default();
+        // Pairs of calls at the same size, one 16 s and one 19 s: no slope at all.
+        s.pool.latency = (0..204u32).map(|i| (if i / 2 < 5 { 9_500 } else { 11_000 + i / 2 }, 16_000 + 3_000 * (i % 2))).collect();
+        // Yields known past the largest budget, as the bins would give them (`pool_state` reads them).
+        s.pool.bins = vec![(400, 300); 9];
+        (s.pool.shown, s.pool.tokens) = (100, 9_100);
+        let mut pool = PoolFit::default();
+        pool_state(&s, &mut pool);
+        assert!(pool.yields.len() == 9 && pool.per_lesson == 91.0, "{pool:?}");
+        assert_eq!((pool.latency.1, pool.latency_n), (0.0, 204), "the scenario: a flat fit, enough calls");
+        assert!(pool.latency_reach >= 11_000 && pool.latency_reach < 12_000, "{}", pool.latency_reach);
+        let roomy = Some(u64::MAX);
+        assert!(pool_feasible(&pool, crate::whole::TOKENS, roomy, 0.0));
+        for t in pool_grid().into_iter().filter(|&t| t > crate::whole::TOKENS) {
+            assert!(!pool_feasible(&pool, t, roomy, 0.0), "{t}: no call read near it");
+        }
+        // Twenty calls that read 15,300 tokens or more: 16,971 is within reach, 24,000 is not.
+        s.pool.latency.extend((0..LATENCY_MIN as u32).map(|i| (15_300 + i, 20_000)));
+        pool_state(&s, &mut pool);
+        assert_eq!(pool.latency_reach, 15_300);
+        assert!(pool_feasible(&pool, 16_971, roomy, 0.0) && !pool_feasible(&pool, 24_000, roomy, 0.0));
+        // The same evidence without the reach (a fit from before it): no growth.
+        assert!(!pool_feasible(&PoolFit { latency_reach: 0, ..pool }, 16_971, roomy, 0.0));
     }
 
     /// A tail sample's sparse places can leave a bin no lesson was shown in before bins that have some:
@@ -3196,6 +3310,11 @@ mod tests {
     /// truth where asking changes far more than handing over (`free_helps` false) the monitor trips;
     /// where both routes are as good it does not.
     fn monitored(free_helps: bool) -> Summary {
+        summary::with_fit(monitored_sim(free_helps).0.summary(), None)
+    }
+
+    /// `monitored`'s log before the fit, and its truth.
+    fn monitored_sim(free_helps: bool) -> (Sim, Truth) {
         let mut t = truth();
         t.b[ASK] = 1.5;
         if free_helps {
@@ -3217,7 +3336,109 @@ mod tests {
         for i in 0..60 {
             sim_session(&mut sim, &format!("s{i}"));
         }
-        summary::with_fit(sim.summary(), None)
+        (sim, t)
+    }
+
+    /// A placebo neither rule delivers (both leave it not now) has no leverage: its weight, however
+    /// large, multiplies a difference of 0. Nor has a free lesson the policy hands over surely, as the
+    /// fixed rule does. The monitor's estimate is the 0.7.2 one (pinned within 1e-9), and its weights'
+    /// health leaves those applies out: before, the placebo, its route's only label, counted at the
+    /// whole route's weight (a team store's ESS 9 of 127, largest weight 42×).
+    #[test]
+    fn a_placebo_neither_rule_delivers_moves_neither_the_estimate_nor_its_health() {
+        // The monitor of this log under 0.7.2, before its health left zero-leverage applies out.
+        const MEAN: f64 = -0.155_976_075_091_821;
+        const UCB: f64 = -0.117_250_989_323_595;
+        let (mut sim, t) = monitored_sim(false);
+        let without = summary::with_fit(sim.summary(), None).monitor;
+        // One check of 12 grade-1 lessons routed as the fixed rule routes them (`CAP` handed over
+        // surely, the rest not now), the last of the rest drawn as a placebo and judged.
+        let n = 12;
+        let mut as_fixed = |grades: &[u8], _: bool, _: &mut Rng| -> (Vec<Route>, Vec<f64>, Vec<f64>, &'static str) {
+            let routes: Vec<Route> = (0..grades.len())
+                .map(|j| match j {
+                    j if j < conscience::CAP => Route::Free,
+                    j if j + 1 == grades.len() => Route::Placebo,
+                    _ => Route::Not,
+                })
+                .collect();
+            let pf = routes.iter().map(|r| f64::from(u8::from(*r == Route::Free))).collect();
+            (routes, vec![0.0; grades.len()], pf, "learned")
+        };
+        let ids: Vec<String> = (0..n).map(|i| format!("P{i}")).collect();
+        sim.check("s59", false, &vec![1; n], &ids, &t, &mut as_fixed);
+        let s = summary::with_fit(sim.summary(), None);
+        let judged = |r: Route| s.applies.iter().filter(|a| a.route == r && matches!(a.label, summary::Label::Changed | summary::Label::Ignored)).count();
+        assert_eq!(judged(Route::Placebo), 1, "the scenario: the placebo is judged");
+        assert_eq!(fixed_routes(&ids.iter().map(|l| unit(l, 1, 0)).collect::<Vec<_>>(), &[]).iter().filter(|r| **r == Route::Free).count(), conscience::CAP);
+        let m = &s.monitor;
+        assert!((m.mean - MEAN).abs() < 1e-9, "mean {} vs 0.7.2's {MEAN}", m.mean);
+        assert!(m.ucb.is_some_and(|u| (u - UCB).abs() < 1e-9), "ucb {:?} vs 0.7.2's {UCB}", m.ucb);
+        // The health of the applies that move it: the check added none.
+        assert_eq!((m.labelled, m.truncated), (without.labelled, without.truncated), "{m:?} vs {without:?}");
+        assert!(m.max_weight < 10.0 && m.ess > 0.5 * f64::from(m.labelled), "{m:?}");
+    }
+
+    /// A placebo on a check where the policy deviated (the fixed rule asks it, the policy left it not
+    /// now with chance 1/2) has leverage, and as its route's only label its normalised weight is the
+    /// whole route's: under `ROUTE_LABELS_MIN` its residual stays out, so one verdict moves the
+    /// estimate only as far as it moves the fit (0.7.2: by 0.37 of a unit).
+    #[test]
+    fn one_label_does_not_carry_its_route() {
+        for changed in [true, false] {
+            let (mut sim, t) = monitored_sim(true);
+            let without = summary::with_fit(sim.summary(), None).monitor;
+            let mut deviated = |grades: &[u8], _: bool, _: &mut Rng| -> (Vec<Route>, Vec<f64>, Vec<f64>, &'static str) {
+                (vec![Route::Ask, Route::Placebo], vec![1.0, 0.5], vec![0.0; grades.len()], "learned")
+            };
+            let truth = Truth { b: if changed { [9.0; P] } else { [-9.0; P] }, ..t };
+            sim.check("s59", false, &[3, 2], &["Q0".to_string(), "Q1".to_string()], &truth, &mut deviated);
+            let s = summary::with_fit(sim.summary(), None);
+            let want = if changed { summary::Label::Changed } else { summary::Label::Ignored };
+            assert_eq!(s.applies.iter().filter(|a| a.route == Route::Placebo).map(|a| a.label).collect::<Vec<_>>(), [want], "the scenario");
+            let shift = (s.monitor.mean - without.mean).abs();
+            assert!(shift < 0.05, "changed {changed}: one placebo moved the mean by {shift} ({} vs {})", s.monitor.mean, without.mean);
+        }
+    }
+
+    /// `ROUTE_LABELS_MIN` counts labels with leverage: judged placebos neither rule delivers (the
+    /// expected kind) do not open the not-now route, so the first placebo on a deviated check after
+    /// them still moves the estimate only as far as it moves the fit.
+    #[test]
+    fn labels_without_leverage_do_not_open_a_route() {
+        let n = 12;
+        let mut as_fixed = |grades: &[u8], _: bool, _: &mut Rng| -> (Vec<Route>, Vec<f64>, Vec<f64>, &'static str) {
+            let routes: Vec<Route> = (0..grades.len())
+                .map(|j| match j {
+                    j if j < conscience::CAP => Route::Free,
+                    j if j + 1 == grades.len() => Route::Placebo,
+                    _ => Route::Not,
+                })
+                .collect();
+            let pf = routes.iter().map(|r| f64::from(u8::from(*r == Route::Free))).collect();
+            (routes, vec![0.0; grades.len()], pf, "learned")
+        };
+        let mut deviated = |grades: &[u8], _: bool, _: &mut Rng| -> (Vec<Route>, Vec<f64>, Vec<f64>, &'static str) {
+            (vec![Route::Ask, Route::Placebo], vec![1.0, 0.5], vec![0.0; grades.len()], "learned")
+        };
+        for changed in [true, false] {
+            let (mut sim, t) = monitored_sim(true);
+            for k in 0..ROUTE_LABELS_MIN {
+                let ids: Vec<String> = (0..n).map(|i| format!("Z{k}-{i}")).collect();
+                sim.check(&format!("z{k}"), false, &vec![1; n], &ids, &t, &mut as_fixed);
+            }
+            let before = summary::with_fit(sim.summary(), None);
+            let placebos = |s: &Summary| {
+                s.applies.iter().filter(|a| a.route == Route::Placebo && matches!(a.label, summary::Label::Changed | summary::Label::Ignored)).count()
+            };
+            assert_eq!(placebos(&before), ROUTE_LABELS_MIN, "the scenario: every zero-leverage placebo judged");
+            let truth = Truth { b: if changed { [9.0; P] } else { [-9.0; P] }, ..t };
+            sim.check("s59", false, &[3, 2], &["Q0".to_string(), "Q1".to_string()], &truth, &mut deviated);
+            let s = summary::with_fit(sim.summary(), None);
+            assert_eq!(placebos(&s), ROUTE_LABELS_MIN + 1);
+            let shift = (s.monitor.mean - before.monitor.mean).abs();
+            assert!(shift < 0.05, "changed {changed}: one placebo moved the mean by {shift} ({} vs {})", s.monitor.mean, before.monitor.mean);
+        }
     }
 
     #[test]

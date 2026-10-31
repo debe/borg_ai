@@ -996,15 +996,36 @@ impl Summary {
     }
 
     /// A settle record: the session ended (`end`); a lesson it settles without a verdict (an unjudged
-    /// reason) is censored.
+    /// reason) is censored. A settle that names the binary that wrote it (0.7.3 on, outcome.rs
+    /// `settle_with`) also censors every delivered apply of the lesson in the session still without a
+    /// verdict, whatever the reason: a later delivery took its place in the judge's list (hook.rs
+    /// `pending`, the latest delivery wins), so none of them is judged now, and a lesson handed over
+    /// free and then asked, or asked and then handed over, leaves no delivered apply open in an ended
+    /// session, which the fit (policy.rs `judged`) and the readout (replay.rs `unit_outcome`) would
+    /// skip. An older settle folds as it did when its hooks decided on it, so the replay (P1) still
+    /// reproduces their decisions. One never delivered (`Delivered::Unknown`) stays as it was.
     fn settled(&mut self, o: &Outcome, ix: &mut Index) {
         let tick = self.tick(&o.session, ix);
         self.end(tick, ix);
-        if o.reason == outcome::UNJUDGED_NONE {
-            return;
-        }
         for l in &o.lessons {
-            if let Some(i) = self.apply_of(o, l, &[Route::Ask, Route::Free, Route::Placebo], ix) {
+            if o.reason != outcome::UNJUDGED_NONE
+                && let Some(i) = self.apply_of(o, l, &[Route::Ask, Route::Free, Route::Placebo], ix)
+            {
+                self.label(i, Label::Censored, ix);
+            }
+            if o.version.is_empty() {
+                continue;
+            }
+            let Some(&lesson) = ix.lessons.get(l) else { continue };
+            let open: Vec<usize> = ix
+                .by_lesson
+                .get(&(tick, lesson))
+                .into_iter()
+                .flatten()
+                .map(|&i| i as usize)
+                .filter(|&i| self.applies[i].delivered == Delivered::Yes && waiting(&self.applies[i]))
+                .collect();
+            for i in open {
                 self.label(i, Label::Censored, ix);
             }
         }

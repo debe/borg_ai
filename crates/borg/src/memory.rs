@@ -84,7 +84,8 @@ pub const REGRET: f64 = 1.0;
 /// estimates others): the session's own runner said the work passes.
 pub const TESTED_W: f64 = 0.5;
 /// Baseline: what one veto (`borg no`, veto.rs) adds to a lesson's β: above a correction's 2, as the design asks
-/// (design-chosen, no eval behind it yet).
+/// (design-chosen, no eval behind it yet). Fixed by dated decision (2026-10-31): 0 vetoes in every store,
+/// nothing to estimate another from.
 pub const VETOED_W: u32 = 3;
 
 /// The belief's hand-set weights (design-chosen; `borg debug ope` estimates others offline, never applies them).

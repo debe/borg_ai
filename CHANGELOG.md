@@ -3,6 +3,34 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.3 (unreleased)
+
+Lesson selection's labels and status lines now mean what they say, so the learned policy learns from
+the right verdicts.
+
+### Fixed
+
+- A lesson handed over free and then asked is judged on the question once it is answered, and a
+  session's settle leaves no delivered lesson open.
+  [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+- `borg status` and borg web say "gate spent" instead of "cold start" when the allowance is used up.
+- The monitor's ESS and largest weight count only labels that can move its estimate.
+- The learned pool grows past 12,000 tokens only on a positive gain and latency measured near that size.
+- `borg debug select --replay` counts records copied from another store's log instead of failing P1.
+- `borg assimilate --apply` no longer appends an episode a turn end captured while it ran.
+
+### Changed
+
+- omp's model calls ask `claude-sonnet-5` unless a model is pinned, falling back to omp's default
+  where no provider offers it. `BORG_OMP_MODEL` names another; `default` keeps omp's own.
+  [Model runner](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#environment-variables)
+- A live check judges a free hand-over or placebo only once work follows it.
+- The question-count test's readout is due at 300 checks in 15 sessions, or 30 sessions;
+  `--replay --file A --file B` pools stores.
+  [Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)
+- The judge's `.cost` line names the ids the model returned and those matching no pending lesson; the
+  graded record logs its pool `budget`.
+
 ## 0.7.2 (2026-10-31)
 
 Corrections and answers reach Borg from every harness's own transcript, so a harness update can no

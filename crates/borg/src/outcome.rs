@@ -165,7 +165,8 @@ pub const DECIDED_NO_RECORD: &str = "unrecorded";
 /// right after asking is strong evidence the question did not help, a session without one weak evidence
 /// (the engineer may not have looked). Baseline: design-chosen (no evaluation behind the 2), used by
 /// `weight` and memory.rs `Memory::beta_with` alike; `borg debug ope` (ope.rs) estimates other belief
-/// weights offline, never applies them.
+/// weights offline, never applies them. Fixed by dated decision (2026-10-31): 1–2 corrections after an
+/// ask per store, and `borg debug ope` finds 0 usable decisions.
 pub const CORRECTED_W: u32 = 2;
 
 /// A session without asks or episodes for this long is treated as ended (24h). Guard: a session whose
@@ -332,6 +333,11 @@ pub struct Outcome {
     pub shown: u32,
     #[serde(default, skip_serializing_if = "is_default")]
     pub tokens: u32,
+    /// `graded`, the pool's token budget its check filled to (hook.rs `check`: `BORG_STOP_POOL_TOKENS`,
+    /// else select.rs `pool_tokens`), so a check at a budget other than the baseline shows. 0: not
+    /// logged (a record from before 0.7.3, or a check without the whole pool).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub budget: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fill: Vec<u16>,
     /// `graded`, the model call: the model (empty: the CLI's default), a hash of the prompt template,
@@ -840,7 +846,11 @@ pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
 /// `UNJUDGED_*`, from the session's state file, hook.rs `unjudged`); and its `check`, the check behind
 /// that latest `asked` record. A verdict on an earlier delivery says nothing of a later question: a
 /// stop that judges a lesson handed over free and then asks it writes the verdict first, and no judge
-/// call need follow the answer.
+/// call need follow the answer. Nor does a verdict on a free delivery (`free`) say anything of a
+/// question (or one on a question of a free delivery), whenever it came: an older binary's live check
+/// judged the earlier free delivery of a lesson asked since and not yet answered (hook.rs `pending`),
+/// and its question, never judged, then settles censored instead of staying open in the selection
+/// summary (select/summary.rs `settled`).
 /// Then every placebo of the session (a `delivery` routed `placebo`, which writes no `asked`) that no
 /// verdict and no earlier settle closed (`open_placebos`): `asked_not_corrected` on channel `placebo`
 /// (no result, `is_result`; it ends no ask's wait, `resolves`) with the placebo's check and repo, and
@@ -854,16 +864,16 @@ pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
 pub fn settle_with(outcomes: &[Outcome], session: &str, ms: i64, unjudged: &dyn Fn(&str) -> &'static str) -> Vec<Outcome> {
     let mine: Vec<&Outcome> = outcomes.iter().filter(|o| o.session == session).collect();
     let resolved: std::collections::HashSet<&str> = mine.iter().filter(|o| resolves(o)).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
-    // Per lesson: its verdicts' (ms, check).
-    let mut verdicts: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
+    // Per lesson: its verdicts' (ms, check, on a free delivery).
+    let mut verdicts: HashMap<&str, Vec<(i64, &str, bool)>> = HashMap::new();
     for o in mine.iter().filter(|o| (o.kind == CHANGED || o.kind == IGNORED) && is_result(o)) {
         for l in &o.lessons {
-            verdicts.entry(l.as_str()).or_default().push((o.ms, o.check.as_str()));
+            verdicts.entry(l.as_str()).or_default().push((o.ms, o.check.as_str(), free(o)));
         }
     }
     // Per lesson: the first of its asks' repos in sort order (as before checks were kept), and the
-    // ms and check of its latest ask.
-    let mut asked: std::collections::BTreeMap<&str, (&str, i64, &str)> = std::collections::BTreeMap::new();
+    // ms, check and whether free of its latest ask.
+    let mut asked: std::collections::BTreeMap<&str, (&str, i64, &str, bool)> = std::collections::BTreeMap::new();
     // Per lesson: the ms of its latest delivery, an `asked` for every one the drone sees and a
     // placebo's `delivery`.
     let mut latest: HashMap<&str, i64> = HashMap::new();
@@ -874,28 +884,34 @@ pub fn settle_with(outcomes: &[Outcome], session: &str, ms: i64, unjudged: &dyn 
             if o.kind != ASKED || resolved.contains(l) {
                 continue;
             }
-            let e = asked.entry(l).or_insert((o.repo.as_str(), o.ms, o.check.as_str()));
+            let e = asked.entry(l).or_insert((o.repo.as_str(), o.ms, o.check.as_str(), free(o)));
             e.0 = e.0.min(o.repo.as_str());
             if o.ms >= e.1 {
-                (e.1, e.2) = (o.ms, o.check.as_str());
+                (e.1, e.2, e.3) = (o.ms, o.check.as_str(), free(o));
             }
         }
     }
-    // A verdict on the latest ask came after it (the judge sees a delivery in a later call), or names
-    // its check. Time first: an older binary's stop wrote one `asked` naming the stop's check also for a
-    // lesson another check routed (hook.rs `#borg-routed`), whose verdict names that check; a stop now
-    // writes one `asked` per routing check (hook.rs `stop_ask`).
-    let judged = |l: &str, at: i64, check: &str| verdicts.get(l).is_some_and(|v| v.iter().any(|&(t, c)| t > at || (!check.is_empty() && c == check)));
+    // A verdict on the latest ask is on the same kind of delivery (a question, or free) and came after it
+    // (the judge sees a delivery in a later call), or names its check. Time first: an older binary's stop
+    // wrote one `asked` naming the stop's check also for a lesson another check routed (hook.rs
+    // `#borg-routed`), whose verdict names that check; a stop now writes one `asked` per routing check
+    // (hook.rs `stop_ask`).
+    let judged = |l: &str, at: i64, check: &str, as_free: bool| {
+        verdicts.get(l).is_some_and(|v| v.iter().any(|&(t, c, f)| f == as_free && (t > at || (!check.is_empty() && c == check))))
+    };
     let mut out: Vec<Outcome> = asked
         .into_iter()
-        .map(|(l, (repo, at, check))| Outcome {
+        .map(|(l, (repo, at, check, as_free))| Outcome {
             kind: NOT_CORRECTED.into(),
             session: session.into(),
             lessons: vec![l.into()],
             ms,
             repo: repo.into(),
             check: check.into(),
-            reason: if judged(l, at, check) { UNJUDGED_NONE } else { unjudged(l) }.into(),
+            reason: if judged(l, at, check, as_free) { UNJUDGED_NONE } else { unjudged(l) }.into(),
+            // The binary that settled: from 0.7.3 on, the selection summary closes every delivery of the
+            // lesson the session left without a verdict (select/summary.rs `settled`).
+            version: env!("CARGO_PKG_VERSION").into(),
             ..Default::default()
         })
         .collect();
@@ -1169,8 +1185,9 @@ mod tests {
         assert!(asked_before(&all, "s1", "A", 11) && !asked_before(&all, "s1", "C", 15) && !asked_before(&all, "s2", "A", 99));
     }
 
+    /// An ask's settle record, as this binary writes it (`settle_with`: with its version).
     fn unjudged(session: &str, lesson: &str, reason: &str) -> Outcome {
-        Outcome { reason: reason.into(), ..o(NOT_CORRECTED, session, &[lesson], 99) }
+        Outcome { reason: reason.into(), version: env!("CARGO_PKG_VERSION").into(), ..o(NOT_CORRECTED, session, &[lesson], 99) }
     }
 
     #[test]
@@ -1204,6 +1221,91 @@ mod tests {
         assert_eq!(why(&[ask("stop", 20, "cS"), verdict("stop", 15, "cS")]), said(UNJUDGED_NONE, "cS"));
     }
 
+    /// An older binary's live check judged a lesson's earlier free delivery after the lesson was asked
+    /// live and before the answer (hook.rs `pending`); no judge saw the question. The session ends: the
+    /// free verdict is not the question's, so the question settles censored (an unjudged reason), which
+    /// the selection summary reads as its label, instead of staying open for good. A free delivery's own
+    /// verdict still settles it as judged.
+    #[test]
+    fn a_free_deliverys_verdict_after_a_later_question_leaves_the_question_unjudged() {
+        let ask = |channel: &str, ms: i64, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(ASKED, "s", &["L"], ms) };
+        let verdict = |channel: &str, ms: i64, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(CHANGED, "s", &["L"], ms) };
+        let why = |log: &[Outcome]| settle_with(log, "s", 99, &|_| UNJUDGED_TRIES).into_iter().map(|x| (x.reason, x.check)).collect::<Vec<_>>();
+        let said = |reason: &str, check: &str| vec![(reason.to_string(), check.to_string())];
+        let stuck = vec![ask("queued", 10, "cA"), ask("live", 20, "cB"), verdict("queued", 30, "cA")];
+        assert_eq!(why(&stuck), said(UNJUDGED_TRIES, "cB"));
+        let early = vec![ask("early", 10, "cA"), ask("stop", 20, "cB"), verdict("early", 30, "cA")];
+        assert_eq!(why(&early), said(UNJUDGED_TRIES, "cB"));
+        assert_eq!(why(&[stuck.clone(), vec![verdict("live", 40, "cB")]].concat()), said(UNJUDGED_NONE, "cB"), "the question's own verdict");
+        assert_eq!(why(&[ask("queued", 10, "cA"), verdict("queued", 30, "cA")]), said(UNJUDGED_NONE, "cA"), "a free delivery's own");
+
+        // The selection summary labels the stuck question censored once the session settles.
+        use crate::select::{
+            Route,
+            summary::{Label, Summary, fold},
+        };
+        let graded = |check: &str, ms: i64, channel: &str| Outcome {
+            grades: vec![3],
+            ranks: vec![0],
+            applied: 1,
+            channel: channel.into(),
+            check: check.into(),
+            ..o(GRADED, "s", &["L"], ms)
+        };
+        let mut log = vec![Outcome { free: vec!["L".into()], ..graded("cA", 5, "live") }, Outcome { chosen: vec!["L".into()], ..graded("cB", 15, "live") }];
+        log.extend(stuck);
+        log.extend(settle_with(&log, "s", 99, &|_| UNJUDGED_TRIES));
+        let text: String = log.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        let label = |route: Route| s.applies.iter().find(|a| a.route == route).map(|a| a.label);
+        assert_eq!(label(Route::Ask), Some(Label::Censored), "{:?}", s.applies);
+    }
+
+    /// The later delivery wins the judge (hook.rs `pending`): handed over free at cA then asked at cB, or
+    /// asked at cA then handed over free at cB, the lesson is judged on cB alone. Once the session settles
+    /// (a settle naming its binary), the delivery the judge never got to is censored, never left open,
+    /// whose reason says "judged".
+    #[test]
+    fn a_settle_leaves_no_delivery_of_its_lesson_open() {
+        use crate::select::{
+            Route,
+            summary::{Label, Summary, fold},
+        };
+        let graded = |check: &str, ms: i64, ask: bool| Outcome {
+            grades: vec![2],
+            ranks: vec![0],
+            applied: 1,
+            channel: "live".into(),
+            check: check.into(),
+            chosen: if ask { vec!["L".into()] } else { Vec::new() },
+            free: if ask { Vec::new() } else { vec!["L".into()] },
+            ..o(GRADED, "s", &["L"], ms)
+        };
+        let asked = |channel: &str, ms: i64, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(ASKED, "s", &["L"], ms) };
+        let verdict = |channel: &str, check: &str| Outcome { channel: channel.into(), check: check.into(), ..o(CHANGED, "s", &["L"], 40) };
+        for (first_ask, channels) in [(false, ["queued", "live"]), (true, ["live", "queued"])] {
+            let mut log = vec![graded("cA", 5, first_ask), asked(channels[0], 10, "cA"), graded("cB", 15, !first_ask), asked(channels[1], 20, "cB")];
+            log.push(verdict(channels[1], "cB"));
+            let settled = settle_with(&log, "s", 99, &|_| UNJUDGED_TRIES);
+            assert_eq!(settled.iter().map(|x| (x.reason.as_str(), x.check.as_str())).collect::<Vec<_>>(), [(UNJUDGED_NONE, "cB")]);
+            log.extend(settled);
+            let text: String = log.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+            let s = fold(&text, Summary::default());
+            let label = |route: Route| s.applies.iter().find(|a| a.route == route).map(|a| a.label);
+            let (a, b) = if first_ask { (Route::Ask, Route::Free) } else { (Route::Free, Route::Ask) };
+            assert_eq!((label(a), label(b)), (Some(Label::Censored), Some(Label::Changed)), "first asked {first_ask}: {:?}", s.applies);
+        }
+        // An older binary judged the free delivery while the question waited, and its settle (no
+        // version) said "judged" for the question: it folds as when its hooks decided on it, the
+        // question open, so the replay still reproduces those decisions.
+        let mut log = vec![graded("cA", 5, false), asked("queued", 10, "cA"), graded("cB", 15, true), asked("live", 20, "cB"), verdict("queued", "cA")];
+        log.push(Outcome { reason: UNJUDGED_NONE.into(), check: "cB".into(), ..o(NOT_CORRECTED, "s", &["L"], 99) });
+        let text: String = log.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        let labels: Vec<(Route, Label)> = s.applies.iter().map(|a| (a.route, a.label)).collect();
+        assert_eq!(labels, [(Route::Free, Label::Changed), (Route::Ask, Label::Open)]);
+    }
+
     fn placebo(lessons: &[&str], check: &str, ms: i64) -> Outcome {
         Outcome { channel: PLACEBO.into(), check: check.into(), route: ROUTE_PLACEBO.into(), ..o(DELIVERY, "s", lessons, ms) }
     }
@@ -1224,7 +1326,8 @@ mod tests {
         ];
         let why = |l: &str| if l == "B" { UNJUDGED_TRIES } else { UNJUDGED_NO_CALL };
         let got = settle_with(&log, "s", 99, &why);
-        let closed = |l: &str, check: &str, reason: &str| Outcome { channel: PLACEBO.into(), check: check.into(), ..unjudged("s", l, reason) };
+        let closed =
+            |l: &str, check: &str, reason: &str| Outcome { channel: PLACEBO.into(), check: check.into(), version: String::new(), ..unjudged("s", l, reason) };
         let asked = Outcome { check: "c3".into(), ..unjudged("s", "C", UNJUDGED_NO_CALL) };
         let want = vec![asked, closed("B", "p1", UNJUDGED_TRIES), closed("C", "p2", UNJUDGED_LATER)];
         assert_eq!(got, want, "A has its verdict; D never reached the judge's queue");

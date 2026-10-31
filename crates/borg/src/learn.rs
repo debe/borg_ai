@@ -205,18 +205,43 @@ fn prompt_episode(e: &Episode) -> bool {
     e.rejected_tool.is_none() && e.via.is_empty() && e.kind != regret::KIND
 }
 
-/// Append `e` to `store` (counted as `record_episode_in` counts it) unless `known` holds it; `known`
-/// then holds it too. True when appended. The one entry for transcript capture.
+impl AsMut<Episode> for Episode {
+    fn as_mut(&mut self) -> &mut Episode {
+        self
+    }
+}
+
+/// Appends to `store` each of `eps` it does not hold yet ([`Known`]), each counted as
+/// `record_episode_in` counts it, and returns those appended, in order. `ready` completes an episode
+/// (its repo, its engineer) just before it is appended, so one already held costs nothing. The one
+/// entry for transcript capture (the transcript sweep, `borg assimilate --apply`).
+///
+/// What the store holds is read under the lock of its `episodes.jsonl`, which every caller of this
+/// takes: a writer that read the store earlier (an assimilate that learned another collective
+/// meanwhile, a turn-end sweep of the same session) never appends an episode another one appended
+/// since.
 ///
 /// # Errors
-/// When the episode cannot be appended.
-pub fn record_new_in(store: &Path, known: &mut Known, e: &Episode) -> std::io::Result<bool> {
-    if known.holds(e) {
-        return Ok(false);
+/// When an episode cannot be appended; none after it is.
+pub fn record_new_in<T: AsMut<Episode>>(store: &Path, eps: Vec<T>, mut ready: impl FnMut(&mut T)) -> std::io::Result<Vec<T>> {
+    if eps.is_empty() {
+        return Ok(Vec::new());
     }
-    record_episode_in(store, e)?;
-    known.add(e);
-    Ok(true)
+    std::fs::create_dir_all(store)?;
+    crate::live::locked(&store.join("episodes.jsonl"), || {
+        let mut known = Known::read(store);
+        let mut appended = Vec::new();
+        for mut x in eps {
+            if known.holds(x.as_mut()) {
+                continue;
+            }
+            ready(&mut x);
+            record_episode_in(store, x.as_mut())?;
+            known.add(x.as_mut());
+            appended.push(x);
+        }
+        Ok(appended)
+    })
 }
 
 /// A lesson as stored: the conscience's `Challenge` plus provenance and consolidation state.
@@ -1233,15 +1258,33 @@ mod tests {
         assert_eq!(transcript_id("abcdefghij", "toolu_9", 5), "abcdefgh-Ttoolu_9");
         assert_eq!(transcript_id("abcdefghij", "", 5), "abcdefgh-5");
 
-        // record_new_in appends once and remembers.
+        // record_new_in appends once, and once within one batch.
         let store = std::env::temp_dir().join(format!("borg-known-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        std::fs::create_dir_all(&store).unwrap();
-        let mut known = Known::read(&store);
         let e = at("s1-Tq", 5, None, "Exponential");
-        assert!(record_new_in(&store, &mut known, &e).unwrap());
-        assert!(!record_new_in(&store, &mut known, &e).unwrap());
+        let mut readied = 0;
+        assert_eq!(record_new_in(&store, vec![e.clone(), e.clone()], |_| readied += 1).unwrap().len(), 1);
+        assert!(record_new_in(&store, vec![e.clone()], |_| panic!("a held episode is not readied")).unwrap().is_empty());
+        assert_eq!(readied, 1);
         assert!(Known::read(&store).holds(&e));
+        assert_eq!(read_jsonl::<Episode>(&store.join("episodes.jsonl")).len(), 1);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn writers_at_once_append_an_episode_once() {
+        let store = std::env::temp_dir().join(format!("borg-known-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let e = Episode { id: "s1-Tx".into(), session: "s1".into(), correction: "keep the cache dir".into(), ..Episode::default() };
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    start.wait();
+                    record_new_in(&store, vec![e.clone()], |_| std::thread::yield_now()).unwrap();
+                });
+            }
+        });
         assert_eq!(read_jsonl::<Episode>(&store.join("episodes.jsonl")).len(), 1);
         let _ = std::fs::remove_dir_all(&store);
     }

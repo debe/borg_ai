@@ -17,8 +17,9 @@
 //!   a session never ended no longer keeps them waiting. Only sessions swept once have the `.swept` it
 //!   looks for; one never swept is read at its end or by `borg assimilate`.
 //!
-//! Episodes are only appended, through learn.rs's one dedupe ([`Known`]: the same id, the same words in
-//! the same session, a prompt moments apart), so the hook's capture and this one never double; nothing
+//! Episodes are only appended, through learn.rs's one dedupe (`record_new_in`, under the store's lock: the
+//! same id, the same words in the same session, a prompt moments apart is held already), so the hook's
+//! capture, this one and `borg assimilate` never double; nothing
 //! here settles an outcome (a session may still be open). `BORG_TRANSCRIPT_CAPTURE=off` turns all of it
 //! off. [`doctor`] compares what the transcripts say happened with what Borg holds.
 
@@ -32,7 +33,7 @@ use serde_json::Value;
 use crate::assimilate::{self, Carry, Found};
 use crate::collective::{self, Config, Route};
 use crate::harness::{self, Harness, Level};
-use crate::learn::{self, Episode, Known};
+use crate::learn::{self, Episode};
 
 /// Whether transcript capture runs: learning is on and `BORG_TRANSCRIPT_CAPTURE` is not `off`.
 pub fn on() -> bool {
@@ -217,8 +218,8 @@ fn sweep(h: &dyn Harness, state: &Path, session: &str, locate: &dyn Fn() -> Opti
 type Place<'a> = &'a dyn Fn(Vec<Found>) -> BTreeSet<PathBuf>;
 
 /// Appends each episode to the store its cwd routes to (assimilate.rs `place`), unless that store holds
-/// it already ([`Known`]), and counts it as the hook would; the stores that got one. The collectives
-/// config is read only here, once there is something to route.
+/// it already (learn.rs `record_new_in`), and counts it as the hook would; the stores that got one. The
+/// collectives config is read only here, once there is something to route.
 fn record(found: Vec<Found>) -> BTreeSet<PathBuf> {
     let Ok(cfg) = collective::load() else { return BTreeSet::new() };
     let base = collective::root_of(&learn::home());
@@ -226,19 +227,20 @@ fn record(found: Vec<Found>) -> BTreeSet<PathBuf> {
 }
 
 fn record_in(found: Vec<Found>, cfg: Option<&Config>, base: &Path) -> BTreeSet<PathBuf> {
-    let mut known: HashMap<PathBuf, Known> = HashMap::new();
+    let mut by: BTreeMap<PathBuf, Vec<Found>> = BTreeMap::new();
+    for f in found {
+        let Some(p) = assimilate::place(cfg, base, f) else { continue };
+        by.entry(p.home).or_default().push(p.found);
+    }
     let mut engineers = HashMap::new();
     let mut got = BTreeSet::new();
-    for f in found {
-        let Some(mut p) = assimilate::place(cfg, base, f) else { continue };
-        let k = known.entry(p.home.clone()).or_insert_with(|| Known::read(&p.home));
-        if k.holds(&p.found.episode) {
-            continue;
+    for (home, eps) in by {
+        let appended = learn::record_new_in(&home, eps, |f| assimilate::complete(f, &mut engineers)).unwrap_or_default();
+        for f in &appended {
+            assimilate::count_veto(&home, &f.episode);
         }
-        assimilate::complete(&mut p.found, &mut engineers);
-        if learn::record_new_in(&p.home, k, &p.found.episode).unwrap_or(false) {
-            assimilate::count_veto(&p.home, &p.found.episode);
-            got.insert(p.home);
+        if !appended.is_empty() {
+            got.insert(home);
         }
     }
     got
@@ -926,6 +928,60 @@ mod tests {
         end_of(&[&Claude], CLAUDE_SESSION, &state, &ends);
         let off = warns(&doctor_with(Some(&cfg), &base, now, false, &list));
         assert!(off.iter().any(|m| m.starts_with("claude 2.1.312: its hook captured no rejected tool call since 2026-10-28, its transcript 1")), "{off:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_turn_end_sweep_while_assimilate_learns_leaves_it_nothing_to_append() {
+        let root = temp("assimilate-race");
+        let (base, state, claude) = (root.join("home"), root.join("state"), root.join("claude"));
+        // The session the turn end sweeps (collective dev), and another collective's that assimilate
+        // learns first (app), after it read what dev holds.
+        let t = claude.join(format!("-home-dev-work-relay/{CLAUDE_SESSION}.jsonl"));
+        std::fs::create_dir_all(t.parent().unwrap()).unwrap();
+        std::fs::copy(claude_fixture(), &t).unwrap();
+        let line = |kind: &str, at: &str, content: Value| {
+            serde_json::json!({"type": kind, "cwd": "/home/dev/app", "timestamp": at, "message": {"role": kind, "content": content}}).to_string() + "\n"
+        };
+        let app = [
+            line("user", "2026-10-27T09:00:00.000Z", "add a cache to the lookup".into()),
+            line("assistant", "2026-10-27T09:00:05.000Z", serde_json::json!([{"type": "text", "text": "I'll keep it in memory."}])),
+            line("user", "2026-10-27T09:01:00.000Z", "no, keep the cache on disk".into()),
+        ];
+        let app_t = claude.join("-home-dev-app/a1b2c3d4-0000-4000-8000-000000000001.jsonl");
+        std::fs::create_dir_all(app_t.parent().unwrap()).unwrap();
+        grow(&app_t, app.concat().as_bytes());
+        let cfg: Config = serde_json::from_str(
+            r#"{ "default": "off", "collectives": [ { "name": "app", "paths": ["/home/dev/app"] }, { "name": "dev", "paths": ["/home/dev/work"] } ] }"#,
+        )
+        .unwrap();
+        let place = |f: Vec<Found>| record_in(f, Some(&cfg), &base);
+        let swept = std::cell::Cell::new(false);
+        let ask = |_: &str| {
+            if !swept.replace(true) {
+                let got = sweep(&Claude, &state, CLAUDE_SESSION, &|| Some(t.clone()), (Restart::Tail, false), &place);
+                assert_eq!(got, BTreeSet::from([base.join("collectives/dev")]), "the turn end appends dev's episodes");
+            }
+            Some(serde_json::json!({"is_lesson": true, "question": "Q?", "situations": [], "consequence": "c", "same_as": "", "supersedes": []}))
+        };
+        let opts = assimilate::Options {
+            claude: Some(claude.clone()),
+            omp: None,
+            opencode: None,
+            codex: None,
+            session: None,
+            since: Some(borg_trace::parse_ts("2026-10-01T00:00:00Z")),
+            limit: None,
+            apply: true,
+            skip: Vec::new(),
+        };
+        let r = assimilate::run(&opts, Some(&cfg), &base, &ask);
+        assert!(swept.get(), "learning app called the model");
+        let whole: Vec<Episode> = assimilate::claude_session(&claude_fixture()).into_iter().map(|f| f.episode).collect();
+        assert_eq!(ids(&stored(&base)), ids(&whole), "each once");
+        assert_eq!((r.collectives["dev"].episodes, r.collectives["dev"].known), (0, whole.len()), "assimilate appended none");
+        assert_eq!(r.collectives["dev"].calls, whole.len(), "each episode the turn end appended is one call to learn, not two");
+        assert_eq!(r.collectives["app"].episodes, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

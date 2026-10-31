@@ -71,6 +71,21 @@ pub const FALLBACK: [Runner; 3] = [Runner::Claude, Runner::Omp, Runner::Opencode
 /// Claude's model when none is configured.
 const CLAUDE_DEFAULT: &str = "sonnet";
 
+/// omp's model when none is pinned (`BORG_PREDICT_MODEL`, `BORG_LEARN_MODEL`), unless `BORG_OMP_MODEL`
+/// names another; `BORG_OMP_MODEL=default` leaves the choice to omp's own default role, as before 0.7.3.
+/// Baseline, dated 2026-10-31: a Sonnet-class model, as the claude runner's [`CLAUDE_DEFAULT`]. Without
+/// `--model` omp answered with its default role (on the measured machine an Opus-class model at automatic
+/// thinking): live checks took p50 19.6 s and p95 34.9 s against 10.3 s and 19.2 s on claude, and 8 of 13
+/// omp stop checks failed at their 28 s deadline. That this model is faster there is the expectation, not
+/// yet a measurement; the stop's failure rate under omp decides. A bare id: omp picks it among the
+/// providers the engineer is logged in to (the exact id first, else the ids containing it), the provider
+/// they used last first, so no provider is named here.
+pub const OMP_DEFAULT: &str = "claude-sonnet-5";
+
+/// [`OMP_DEFAULT`]'s override, and the value of it that keeps omp's own default.
+const OMP_MODEL_ENV: &str = "BORG_OMP_MODEL";
+const OMP_OWN: &str = "default";
+
 /// A batch of model calls (`borg learn`, `borg facets`, `borg assimilate --from-dir`) stops asking
 /// after this many failed calls (learn: in a row; the parallel batches: before the first success).
 /// Guard: the model is unavailable (quota, login, network), and asking about every remaining item
@@ -151,7 +166,13 @@ fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(V
         Runner::Claude => claude(prompt, c.model.as_deref().unwrap_or(CLAUDE_DEFAULT), schema, timeout),
         Runner::Codex => codex(prompt, c.model.as_deref().unwrap_or("gpt-5"), schema, timeout),
         Runner::Omp => {
-            let (text, cost) = omp_answer(&run_capped(omp_command(c.model.as_deref(), &with_schema(prompt, schema)), None, timeout)?)?;
+            let env = std::env::var(OMP_MODEL_ENV).ok();
+            let model = omp_model(c.model.as_deref(), env.as_deref());
+            let p = with_schema(prompt, schema);
+            // Only borg's own default falls back: a model the engineer named fails as named.
+            let defaulted = c.model.is_none() && env.as_deref().map(str::trim).is_none_or(str::is_empty);
+            let fallback = defaulted.then(|| omp_command(None, &p));
+            let (text, cost) = omp_run(omp_command(model, &p), fallback, timeout)?;
             Some((last_json(&text)?, cost))
         }
         Runner::Opencode => {
@@ -174,6 +195,32 @@ fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(V
 pub const OPENCODE_TITLE: &str = "borg (model call)";
 
 const SYSTEM: &str = "You are a careful analyst. You never use tools. You answer with exactly one JSON object and nothing else.";
+
+/// The model an omp call asks for: the pinned one, else `env` (`BORG_OMP_MODEL`), else
+/// [`OMP_DEFAULT`]. None (`BORG_OMP_MODEL=default`): omp's own default role.
+fn omp_model<'a>(pinned: Option<&'a str>, env: Option<&'a str>) -> Option<&'a str> {
+    match pinned.or(env.map(str::trim).filter(|m| !m.is_empty())) {
+        Some(OMP_OWN) => None,
+        Some(m) => Some(m),
+        None => Some(OMP_DEFAULT),
+    }
+}
+
+/// An omp call's answer (`omp_answer`): `cmd`, and when it exits failed before omp printed a single
+/// event (omp resolves the model before it starts: an id none of the engineer's providers offers exits 1
+/// at once, `Model "…" not found` on stderr), `fallback` in the time left, which then asks omp's own
+/// default role. So [`OMP_DEFAULT`] never makes omp unusable where it is unknown. A run cut off at the
+/// timeout, or one that reached the model, falls back to nothing: it answered, or spent its time.
+fn omp_run(cmd: Command, fallback: Option<Command>, timeout: Duration) -> Option<(String, Option<f64>)> {
+    let start = Instant::now();
+    let b = run_bounded(cmd, None, timeout)?;
+    let unresolved = b.status.is_some_and(|s| !s.success()) && events(&b.out).next().is_none();
+    match fallback {
+        Some(f) if unresolved => omp_answer(&run_capped(f, None, timeout.saturating_sub(start.elapsed()))?),
+        // As `run_capped`: nothing from a run cut off at the cap.
+        _ => omp_answer(&b.status.map(|_| b.out)?),
+    }
+}
 
 /// The headless omp command.
 fn omp_command(model: Option<&str>, prompt: &str) -> Command {
@@ -806,7 +853,6 @@ mod tests {
         for f in ["-p", "--no-extensions", "--no-tools", "--no-session"] {
             assert!(omp.contains(&f.to_string()), "{f}");
         }
-        assert!(!omp.contains(&"--model".to_string()));
         let tmp = std::env::temp_dir();
         let cmd = opencode_command(Some("p/m"), "p", Opencode::V1, None, None);
         let oc = args(&cmd);
@@ -816,6 +862,46 @@ mod tests {
         assert!(set(&cmd, "OPENCODE_PERMISSION", r#"{"*":"deny"}"#) && set(&cmd, "OPENCODE_DISABLE_PROJECT_CONFIG", "1"));
         // The session opencode stores lands in the temp dir, not in the engineer's project (PWD wins).
         assert!(set(&cmd, "PWD", &tmp.to_string_lossy()) && cmd.get_current_dir() == Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn an_omp_call_asks_a_fast_model_unless_one_is_pinned() {
+        let model = |spec: Option<&str>, env: Option<&str>| {
+            let c = pick(spec, Some("omp"), &only(&["omp"]));
+            let cmd = omp_command(omp_model(c[0].model.as_deref(), env), "p");
+            args(&cmd).windows(2).find(|w| w[0] == "--model").map(|w| w[1].clone())
+        };
+        assert_eq!(model(None, None).as_deref(), Some(OMP_DEFAULT), "unpinned: the fast default, not omp's own");
+        assert_eq!(model(Some("omp:"), None).as_deref(), Some(OMP_DEFAULT), "the runner pinned, not the model");
+        assert_eq!(model(Some("sonnet"), None).as_deref(), Some(OMP_DEFAULT), "a bare name is a Claude model");
+        assert_eq!(model(Some("omp:github-copilot/gpt-5-mini"), Some("haiku")).as_deref(), Some("github-copilot/gpt-5-mini"), "pinned wins");
+        assert_eq!(model(None, Some(" haiku ")).as_deref(), Some("haiku"), "BORG_OMP_MODEL");
+        assert_eq!(model(None, Some("")).as_deref(), Some(OMP_DEFAULT), "set but empty");
+        assert_eq!(model(None, Some("default")), None, "omp's own default: no --model");
+        let p = args(&omp_command(Some("m"), "the prompt"));
+        assert_eq!(p.last().map(String::as_str), Some("the prompt"), "the prompt stays last");
+    }
+
+    /// omp exits 1 before any event when no provider of the engineer's offers the model: borg's default
+    /// then falls back to omp's own default role; a run that printed events, or has no fallback, does not.
+    #[test]
+    fn an_unknown_default_omp_model_falls_back_to_omps_own() {
+        let answer =
+            json!({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "{\"ok\": true}"}], "stopReason": "stop"}});
+        let sh = |script: String| {
+            let mut c = Command::new("sh");
+            c.args(["-c", &script]);
+            c
+        };
+        let unknown = || sh("echo 'Model \"x\" not found' >&2; exit 1".into());
+        let answers = || sh(format!("printf '%s\\n' '{answer}'"));
+        let t = Duration::from_secs(20);
+        let got = omp_run(unknown(), Some(answers()), t).map(|(text, _)| last_json(&text));
+        assert_eq!(got, Some(Some(json!({"ok": true}))), "the default unknown: omp's own answers");
+        assert_eq!(omp_run(unknown(), None, t), None, "a model the engineer named fails as named");
+        assert!(omp_run(answers(), Some(unknown()), t).is_some(), "an answer needs no fallback");
+        let errored = json!({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error"}});
+        assert_eq!(omp_run(sh(format!("printf '%s\\n' '{errored}'; exit 1")), Some(answers()), t), None, "it reached the model: no second call");
     }
 
     #[test]

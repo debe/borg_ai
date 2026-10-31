@@ -119,7 +119,7 @@ fn a_fixed_rule_log_is_reproduced_with_its_propensities() {
     assert!(text.contains("spend, policy: 3 checks, 2 questions, 1 blocks at the stop, 4 free, pool tokens not logged"), "{text}");
     assert!(text.contains("no check has judged units of one grade on two routes yet"), "{text}");
     assert!(
-        text.contains("question-count test readout (rules v2): not due (0 of 300 checks that drew a count, 0 of 30 sessions with one; 0 of them the control arm, 0 refused by the gate)\n"),
+        text.contains("question-count test readout (rules v2, amendment 2026-10-31): not due (0 checks that drew a count in 0 sessions with one, due at 300 checks in 15 sessions or 30 sessions; 0 of them the control arm, 0 refused by the gate)\n"),
         "{text}"
     );
     assert!(text.contains("P4 full-information recall: NOT RUN: pass --eval RUNS_DIR --qrels FILE"), "{text}");
@@ -485,6 +485,11 @@ fn select_reads_the_routed_store_and_refuses_bad_usage() {
         &["debug", "select", "--zz-probe"][..],
         &["debug", "select", "--dir"],
         &["debug", "select", "--dir", "a", "--file", "b"],
+        &["debug", "select", "--file", "a", "--dir", "b"],
+        // Several stores: only the pooled readout, under --replay.
+        &["debug", "select", "--file", "a/outcomes.jsonl", "--file", "b/outcomes.jsonl"],
+        &["debug", "select", "--replay", "--bench", "--file", "a/outcomes.jsonl", "--file", "b/outcomes.jsonl"],
+        &["debug", "select", "--file"],
         &["debug", "select", "--eval", "runs"],
         &["debug", "select", "--qrels", "q.jsonl"],
     ] {
@@ -510,5 +515,39 @@ fn the_bench_times_each_check_that_applies_a_lesson_and_writes_nothing_beside_th
     assert!(["load", "decide", "total"].iter().all(|k| b[k]["p95"].as_f64().is_some_and(|x| x >= 0.0)), "{v}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), fixed_log(), "the log is untouched");
     assert!(!root.join("select-summary.json").exists(), "no cache beside the log");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Several stores' logs, each a collective named by its directory: the question-count test's readout
+/// pooled over them, stratified by collective (amendment 2026-10-31), never their checks; a collective
+/// with no drawn count still counts as one, and each file's imported records are counted.
+#[test]
+fn several_files_read_the_question_count_test_pooled_by_collective() {
+    let root = tmp("pooled");
+    let mut files = Vec::new();
+    for name in ["team", "open"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        let file = root.join(name).join("outcomes.jsonl");
+        std::fs::write(&file, fixed_log()).unwrap();
+        files.push(file.to_str().unwrap().to_string());
+    }
+    let args = ["debug", "select", "--replay", "--file", &files[0], "--file", &files[1]];
+    let out = borg(&args, &root);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "non-decisive: {text}");
+    assert!(
+        text.contains("question-count test readout (rules v2, amendment 2026-10-31), pooled over 2 collectives, stratified by collective: not due (0 checks that drew a count in 0 sessions with one, due at 300 checks in 15 sessions or 30 sessions)\n")
+            && text.contains("\n  team: 0 drawn in 0 sessions (0 of them the control arm, 0 refused by the gate); no count drawn\n")
+            && text.contains("\n  open: 0 drawn in 0 sessions")
+            && text.contains("\n  pooled: no count drawn\n")
+            && !text.contains("P0 baseline identity"),
+        "{text}"
+    );
+    let json_args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
+    let v: Value = serde_json::from_slice(&borg(&json_args, &root).stdout).unwrap();
+    assert_eq!((v["pooled"]["due"].as_bool(), v["pooled"]["strata"][1]["collective"].as_str()), (Some(false), Some("open")), "{v}");
+    let missing = root.join("absent").join("outcomes.jsonl");
+    let out = borg(&["debug", "select", "--replay", "--file", &files[0], "--file", missing.to_str().unwrap()], &root);
+    assert_eq!(out.status.code(), Some(1), "an unreadable file: {out:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

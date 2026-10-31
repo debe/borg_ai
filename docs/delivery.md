@@ -31,8 +31,12 @@ Borg spends tokens only where a lesson is likely to matter.
    check that routed it and its probability of that route. Every route gets the same evidence (the work
    before the delivery and after it); a random half of the questions are judged without the agent's own
    `applies`/`skip` line, so its effect on the judge is measured. Questions keep their judge slots first
-   (at most 10 wait); free deliveries alone never pay for a call. A live check judges free deliveries at
-   once and leaves a question the agent has not answered yet to the stop, which sees the answer. A correction merged into a
+   (at most 10 wait); free deliveries alone never pay for a call. A live check judges a free delivery
+   or a placebo only once work follows it, and leaves a question the agent has not answered yet to the
+   stop, which sees the answer; a lesson asked after it was handed over is judged on the question, not
+   on the hand-over. A stop's judge call judges every delivery; a stop that makes none (the last live
+   check covered the turn, or only free deliveries wait) leaves them to the next turn's live check, or
+   to `borg learn`. A correction merged into a
    lesson delivered free counts against it. At session end `borg learn` settles the rest: a lesson with
    no verdict is `asked_not_corrected`, with the reason it had none, and counts as unknown, never as
    ignored. See [Mode and channel](statistics.md#what-is-counted).
@@ -176,8 +180,9 @@ every check). When that budget leaves lessons out, the tail sample adds up to tw
 pool, whatever the policy; the session's `.cost` file then reads `tail=<n>` on the pool line. Under
 the fixed rule the budget stays 12,000 tokens. Under the learned policy, once its gate is open or an
 engineer set a budget, the pool may shrink where the yield of its last fill positions buys nothing,
-and it grows past 12,000 only with the tail sample's yield of the positions it would add and a latency
-that fits the harness's stop budget (at least 20 calls measured).
+and it grows past 12,000 only on a gain above 0, with the tail sample's yield of the positions it
+would add, and with a latency that fits the harness's stop budget measured at that size (20 calls that
+read at least 90% of it).
 
 **Cost.** Spend is measured and shown, never capped: calls, extra rounds and dollars per session for
 the stop and live checks, in `borg status`, `borg top`, `borg debug select` and the Conscience page of
@@ -212,7 +217,7 @@ withholds no lesson and which the gate rations by `risk`; it leaves the fixed ru
 once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
 
 **Readout.** Under the learned policy the monitor guards the policy, and after 300 randomised
-checks or 30 sessions a readout reports dilution (for each number m ≥ 2 of the test's questions
+checks in 15 sessions, or 30 sessions, a readout reports dilution (for each number m ≥ 2 of the test's questions
 asked, how often the top tested lesson changed the work against it asked alone) and asking against
 handing over a grade 2, with session-bootstrap 95% intervals ([Evidence](evidence.md#lesson-selection)).
 

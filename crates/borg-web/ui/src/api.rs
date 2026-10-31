@@ -698,12 +698,14 @@ pub struct Test {
     /// compaction drops the oldest checks, never the counts.
     pub kept: f64,
     pub by_k: Vec<Draws>,
-    /// The readout: due after `due_checks` checks drawn or `due_sessions` sessions with one, and only then
+    /// The readout: due after `due_checks` checks drawn in `due_min_sessions` sessions with one, or
+    /// `due_sessions` sessions alone (amendment 2026-10-31), and only then
     /// estimated: per number asked, the share of judged questions that changed the work (`percent
     /// changed`), and a grade 2 asked against handed over (`points changed`).
     pub due: bool,
     pub due_checks: f64,
     pub due_sessions: f64,
+    pub due_min_sessions: f64,
     pub dilution: Vec<Estimate>,
     pub ask_free: Option<Estimate>,
 }
@@ -727,6 +729,10 @@ pub struct Selection {
     pub source: String,
     /// The conservative gate's budget: the quality the learned policy may still risk below the fixed rule.
     pub gate: f64,
+    /// The gate's two parts: the allowance the fixed rule's value accrued and the ledger's 5% quantile.
+    /// A gate of 0 with an allowance is spent, not a cold start.
+    pub allowance: f64,
+    pub ledger: f64,
     pub fit: String,
     pub checks: f64,
     pub sessions: f64,
@@ -772,6 +778,8 @@ pub fn parse_select(v: &Value) -> Selection {
         default: s(&x["default"]),
         source: s(&x["source"]),
         gate: f(&x["gate"]),
+        allowance: f(&x["allowance"]),
+        ledger: f(&x["ledger"]),
         fit: s(&x["fit"]),
         checks: f(&x["checks"]),
         sessions: f(&x["sessions"]),
@@ -829,6 +837,7 @@ pub fn parse_select(v: &Value) -> Selection {
                 due: t["due"].as_bool().unwrap_or(false),
                 due_checks: f(&t["due_checks"]),
                 due_sessions: f(&t["due_sessions"]),
+                due_min_sessions: f(&t["due_min_sessions"]),
                 dilution: list(&t["dilution"], estimate),
                 ask_free: t["ask_free"].as_object().map(|_| estimate(&t["ask_free"])),
             }

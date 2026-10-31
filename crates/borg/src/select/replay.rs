@@ -70,7 +70,8 @@
 //!
 //! **The question-count test's readout** (`test_readout`, rules v2), from the summary's fold of the
 //! log (select/summary.rs `Experiment`, `Check::xk`; never a recount): due after `TEST_CHECKS` checks
-//! that drew a count (played or refused by the gate) or `TEST_SESSIONS` sessions with one, and only
+//! that drew a count (played or refused by the gate) in `TEST_MIN_SESSIONS` sessions with one, or
+//! `TEST_SESSIONS` sessions alone (`test_due`, amendment 2026-10-31; pooled over stores, `pooled`), and only
 //! then estimated over the drawn checks the summary still holds (compaction drops the oldest, never
 //! the counts): dilution, the test's top lesson's change rate with m of its questions asked against
 //! asked alone (the same lesson across the uniform draws), and asking a 2 against handing it over (a
@@ -155,9 +156,23 @@ pub const READOUT_UNITS: usize = 300;
 pub const READOUT_SESSIONS: usize = 30;
 
 /// The question-count test's readout (`test_readout`) is due after this many checks that drew a count
-/// (randomised: played or refused) or this many sessions with one. Method: pre-registered (rules v2, 2026-10-29).
+/// (randomised: played or refused) in at least `TEST_MIN_SESSIONS` sessions, or this many sessions with
+/// one. Method: pre-registered (rules v2, 2026-10-29; `TEST_AMENDMENT`).
 pub const TEST_CHECKS: u64 = 300;
 pub const TEST_SESSIONS: u32 = 30;
+/// The sessions with a drawn count `TEST_CHECKS` checks need beside them for the readout to be due.
+/// Method: pre-registered by the amendment of 2026-10-31 (`TEST_AMENDMENT`), written before a pooled
+/// readout was read: sessions are the bootstrap's unit, so 300 checks from a session or two (an
+/// open-source store's: 164 of its 167 in one) would be due with an interval that says nothing.
+pub const TEST_MIN_SESSIONS: u32 = 15;
+/// The dated amendment of rules v2 this file implements (2026-10-31): the readout's sessions
+/// (`TEST_MIN_SESSIONS`), and its pooled reading over several stores, stratified by collective,
+/// intention to treat with the share played per arm (`pooled`). Protocol: printed with the readout.
+pub const TEST_AMENDMENT: &str = "2026-10-31";
+
+/// The normal quantile of a 95% interval: a bootstrap interval read as ±`Z95` standard errors, to
+/// join two collectives' intervals (`pooled`). Method.
+const Z95: f64 = 1.96;
 
 /// How far an arm's recall of a run may lie from the fixed rule's and still be equal (P4c). Method:
 /// float slack of summing `conscience::P_DRAWS` draw shares of 1/`P_DRAWS`, far below any one draw's
@@ -491,6 +506,10 @@ pub struct P1 {
     pub tests: usize,
     /// Checks under an evaluation switch (cap, learned cut): counted, not replayed.
     pub switches: usize,
+    /// Checks imported from another store's log (`imported`): the summary or fit their record names
+    /// lies at a byte that is no line boundary of this log, so no summary of it is the one their hook
+    /// read. Counted, not replayed.
+    pub imported: usize,
     /// The largest |Δ| between a replayed and a logged propensity (p or pf).
     pub max_delta: f64,
     /// Folding the log check by check gives the summary that folding it whole gives.
@@ -560,6 +579,19 @@ fn seen_at(o: &Outcome, text: &str, here: usize) -> Result<usize, String> {
         .ok_or_else(|| format!("its summary {:?} is no line boundary before it", o.seen))
 }
 
+/// Whether the graded record `o` came with history copied from another store's log: the summary or the
+/// fit it names (`Outcome::seen`, `Outcome::fit`, each keyed by the byte of the log it was folded to)
+/// lies at a byte that is no line boundary of `text` (past its end included). A hook of this store only
+/// ever folds whole lines, so such a key is another log's. A key at a boundary is this log's, whatever
+/// else is wrong with it (P1 then fails it), and one whose byte does not parse is no import either.
+fn imported(o: &Outcome, text: &str) -> bool {
+    let off = |key: &str| -> bool {
+        let Some(at) = key.split('-').next().and_then(|a| a.parse::<usize>().ok()) else { return false };
+        !(at <= text.len() && text.is_char_boundary(at) && (at == 0 || text[..at].ends_with('\n')))
+    };
+    off(&o.seen) || off(&o.fit)
+}
+
 fn as_logged(text: &str, lessons: &Path) -> AsLogged {
     let mut s = Summary::default();
     // Per fit key the hook logged, the summary it decided with (`fitted`).
@@ -569,8 +601,19 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
     let mut checks = Vec::new();
     let mut malformed = 0;
     let mut p0 = P0 { verdict: Verdict::Pass, checks: 0, empty: 0, differ: 0, first: Vec::new() };
-    let mut p1 =
-        P1 { verdict: Verdict::Pass, replayed: 0, reproduced: 0, empty: 0, seen: 0, tests: 0, switches: 0, max_delta: 0.0, fold: true, first: Vec::new() };
+    let mut p1 = P1 {
+        verdict: Verdict::Pass,
+        replayed: 0,
+        reproduced: 0,
+        empty: 0,
+        seen: 0,
+        tests: 0,
+        switches: 0,
+        imported: 0,
+        max_delta: 0.0,
+        fold: true,
+        first: Vec::new(),
+    };
     let mut start = 0;
     for line in lines(text) {
         let here = start;
@@ -611,6 +654,7 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
         // P1: the logged policy from its logged fit, summary and seed.
         match replayable(&check.o) {
             None => p1.switches += 1,
+            Some(_) if imported(&check.o, text) => p1.imported += 1,
             Some(policy) => {
                 p1.replayed += 1;
                 p1.empty += usize::from(applied.is_empty());
@@ -1327,7 +1371,7 @@ pub struct Readout {
 /// The question-count test's readout (module doc), from the summary's fold (select/summary.rs
 /// `Experiment`, `Check::xk`): its checks that drew a count (randomised), of them the control arm's,
 /// those the gate refused (the fixed rule played) and the sessions with a drawn one, all-time; once
-/// due (`TEST_CHECKS`, `TEST_SESSIONS`), and only then, its estimates over the drawn checks the summary
+/// due (`test_due`: `TEST_CHECKS` in `TEST_MIN_SESSIONS` sessions, or `TEST_SESSIONS`), and only then, its estimates over the drawn checks the summary
 /// still holds (`kept`: compaction drops the oldest checks, select/summary.rs `compact`, never the
 /// counts), refused ones included, each with its session's bootstrap 95% interval (`ope::snips`).
 /// Each a Horvitz–Thompson mean over every unit that could go either way, so a unit's outcome y·ω
@@ -1381,13 +1425,34 @@ fn unit_outcome(s: &Summary, judged: &HashMap<usize, f64>, i: usize) -> Option<f
 pub fn test_readout(s: &Summary) -> TestReadout {
     let e = &s.experiment;
     let (checks, refused) = e.totals();
-    let due = checks >= TEST_CHECKS || e.sessions >= TEST_SESSIONS;
-    let drawn: Vec<&summary::Check> = s.checks.iter().filter(|c| c.xs.is_some()).collect();
-    let kept = drawn.len() as u64;
+    let due = test_due(checks, e.sessions);
+    let kept = s.checks.iter().filter(|c| c.xs.is_some()).count() as u64;
     let mut out = TestReadout { due, checks, control: e.control, refused, sessions: e.sessions, kept, by_asked: Vec::new(), ask_free: None };
     if !due {
         return out;
     }
+    let units = test_units(s);
+    out.by_asked = units.by.into_iter().map(|(m, units)| (m, ope::snips(&units, ope::SEED))).collect();
+    out.ask_free = Some(ope::snips(&units.both, ope::SEED));
+    out
+}
+
+/// Whether the question-count test's readout is due after `checks` drawn checks in `sessions`
+/// sessions with one: `TEST_CHECKS` in `TEST_MIN_SESSIONS`, or `TEST_SESSIONS` alone.
+#[must_use]
+pub fn test_due(checks: u64, sessions: u32) -> bool {
+    checks >= TEST_CHECKS && sessions >= TEST_MIN_SESSIONS || sessions >= TEST_SESSIONS
+}
+
+/// The question-count test's Horvitz–Thompson units (`TestReadout`), as (1, term, session tick): per
+/// m ≥ 2 the dilution's (`by`), and asking a 2 against handing it over (`both`).
+struct TestUnits {
+    by: BTreeMap<u16, Vec<(f64, f64, usize)>>,
+    both: Vec<(f64, f64, usize)>,
+}
+
+fn test_units(s: &Summary) -> TestUnits {
+    let drawn: Vec<&summary::Check> = s.checks.iter().filter(|c| c.xs.is_some()).collect();
     let judged = policy::judged(s);
     let mut by: BTreeMap<u16, Vec<(f64, f64, usize)>> = BTreeMap::new();
     let mut both: Vec<(f64, f64, usize)> = Vec::new();
@@ -1427,8 +1492,250 @@ pub fn test_readout(s: &Summary) -> TestReadout {
             by.entry(key).or_default().push((1.0, r, session));
         }
     }
-    out.by_asked = by.into_iter().map(|(m, units)| (m, ope::snips(&units, ope::SEED))).collect();
-    out.ask_free = Some(ope::snips(&both, ope::SEED));
+    TestUnits { by, both }
+}
+
+// --- The question-count test pooled over stores (amendment 2026-10-31) ----------------------------
+
+/// The checks that drew one count s of the question-count test (`drawn`), and of them those that
+/// played it; the gate refused the rest (source `GATE`: the fixed rule played). The readout is by the
+/// drawn count (intention to treat), so this says how far each arm was the treatment it names.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Played {
+    pub drawn: u32,
+    pub checks: u64,
+    pub played: u64,
+}
+
+/// One store of a pooled readout: its collective, its graded records imported from another log
+/// (`imported`, as P1 counts them), left out of everything else here (the amendment reads no copied
+/// history), its own readout (its counts and its own due; its estimates whenever the pool is due, so the
+/// collectives can be compared), and the share played per drawn count.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Stratum {
+    pub collective: String,
+    pub imported: usize,
+    pub readout: TestReadout,
+    pub played: Vec<Played>,
+}
+
+/// The question-count test's readout over several stores (amendment 2026-10-31, `TEST_AMENDMENT`),
+/// stratified by collective: the checks summed and the sessions counted once each however many
+/// collectives drew in them (`pooled`), due by `test_due` over them; once due, each estimate
+/// of `TestReadout` pooled over every collective's units, its interval a session bootstrap that
+/// resamples each collective's sessions within it (`stratified`); the share played per drawn count;
+/// and, per estimate, each pair of collectives whose estimates differ beyond their joint 95% interval
+/// (`differ`), where the pooled one is not to be read: per collective only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Pooled {
+    pub due: bool,
+    pub checks: u64,
+    pub sessions: u32,
+    pub strata: Vec<Stratum>,
+    pub by_asked: Vec<(u16, Estimate)>,
+    pub ask_free: Option<Estimate>,
+    pub played: Vec<Played>,
+    pub differ: Vec<String>,
+}
+
+/// The share played per drawn count of the graded records of `text`.
+fn played_of(text: &str) -> Vec<Played> {
+    let mut by: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for o in lines(text).into_iter().filter_map(|l| l.o).filter(|o| o.kind == outcome::GRADED) {
+        let Some(s) = o.xs else { continue };
+        let e = by.entry(s).or_default();
+        e.0 += 1;
+        e.1 += u64::from(o.source != policy::GATE);
+    }
+    by.into_iter().map(|(drawn, (checks, played))| Played { drawn, checks, played }).collect()
+}
+
+/// The ratio Σwr/Σw over every stratum's units (w, r, session), its 95% interval the 2.5th and 97.5th
+/// percentiles of `ope::RESAMPLES` resamples that draw each stratum's sessions within it (a stratified
+/// session bootstrap, deterministic from `seed`), as `ope::snips` resamples one stratum's.
+fn stratified(strata: &[&[(f64, f64, usize)]], seed: u64) -> Estimate {
+    let all: Vec<(f64, f64, usize)> = strata.iter().flat_map(|s| s.iter().copied()).collect();
+    let one = ope::snips(&all, seed);
+    let groups: Vec<Vec<(f64, f64)>> = strata
+        .iter()
+        .map(|s| {
+            let mut by: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+            for (w, r, x) in *s {
+                let e = by.entry(*x).or_default();
+                e.0 += w;
+                e.1 += w * r;
+            }
+            by.into_values().collect()
+        })
+        .collect();
+    let mut rng = memory::Rng::new(seed);
+    let mut values: Vec<f64> = Vec::new();
+    if one.value.is_some() {
+        for _ in 0..ope::RESAMPLES {
+            let (mut sw, mut swr) = (0.0, 0.0);
+            for g in groups.iter().filter(|g| !g.is_empty()) {
+                for _ in 0..g.len() {
+                    let x = g[(rng.next_u64() % g.len() as u64) as usize];
+                    sw += x.0;
+                    swr += x.1;
+                }
+            }
+            if sw > 0.0 {
+                values.push(swr / sw);
+            }
+        }
+    }
+    values.sort_by(f64::total_cmp);
+    let pct = |q: f64| values.get((q * (values.len().max(1) - 1) as f64).round() as usize).copied().unwrap_or(0.0);
+    Estimate { lo: pct(0.025), hi: pct(0.975), ..one }
+}
+
+/// Where two collectives' estimates of `what` differ beyond their joint 95% interval: each interval
+/// read as ±`Z95` standard errors, the difference's as √(se₁² + se₂²); one line per such pair.
+fn differences(what: &str, each: &[(&str, &Estimate)]) -> Vec<String> {
+    let se = |e: &Estimate| (e.hi - e.lo) / (2.0 * Z95);
+    let mut out = Vec::new();
+    for (i, (a, x)) in each.iter().enumerate() {
+        for (b, y) in &each[i + 1..] {
+            let (Some(u), Some(v)) = (x.value, y.value) else { continue };
+            let joint = Z95 * (se(x).powi(2) + se(y).powi(2)).sqrt();
+            if (u - v).abs() > joint {
+                out.push(format!("{what}: {a} {u:+.3} and {b} {v:+.3} differ beyond their joint interval (±{joint:.3}): read per collective only"));
+            }
+        }
+    }
+    out
+}
+
+/// The question-count test's readout over `stores` (collective, outcome log text), stratified by
+/// collective (`Pooled`). Each store's summary is its log folded, as `borg debug select --file` folds it,
+/// without the graded records imported from another log (`imported`): their checks, and a session only
+/// they hold, count toward nothing, neither the due rule nor an estimate. The pooled sessions are
+/// distinct sessions: one drone session that drew a count in two collectives (it worked in both
+/// stores' repos) is one session toward `TEST_MIN_SESSIONS` and `TEST_SESSIONS`, read off the session
+/// tables (`Session::tested`); a session a store's compaction took off its table counts as that store
+/// counted it.
+#[must_use]
+pub fn pooled(stores: &[(String, String)]) -> Pooled {
+    let parts: Vec<(Stratum, TestUnits, Vec<String>)> = stores
+        .iter()
+        .map(|(collective, text)| {
+            let all = lines(text);
+            let copied = |l: &Line| l.o.as_ref().is_some_and(|o| o.kind == outcome::GRADED && imported(o, text));
+            let imported = all.iter().filter(|l| copied(l)).count();
+            let own: String = all.iter().filter(|l| !copied(l)).map(|l| l.text).collect();
+            let s = summary::fold(&own, Summary::default());
+            let stratum = Stratum { collective: collective.clone(), imported, readout: test_readout(&s), played: played_of(&own) };
+            let tested = s.sessions.iter().filter(|x| x.tested).map(|x| x.id.clone()).collect();
+            (stratum, test_units(&s), tested)
+        })
+        .collect();
+    let checks = parts.iter().map(|(s, _, _)| s.readout.checks).sum();
+    let mut distinct: BTreeSet<&str> = BTreeSet::new();
+    let mut compacted = 0u32;
+    for (s, _, tested) in &parts {
+        distinct.extend(tested.iter().map(String::as_str));
+        compacted += s.readout.sessions.saturating_sub(u32::try_from(tested.len()).unwrap_or(u32::MAX));
+    }
+    let sessions = u32::try_from(distinct.len()).unwrap_or(u32::MAX).saturating_add(compacted);
+    let mut played: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for p in parts.iter().flat_map(|(s, _, _)| &s.played) {
+        let e = played.entry(p.drawn).or_default();
+        e.0 += p.checks;
+        e.1 += p.played;
+    }
+    let mut out = Pooled {
+        due: test_due(checks, sessions),
+        checks,
+        sessions,
+        strata: Vec::new(),
+        by_asked: Vec::new(),
+        ask_free: None,
+        played: played.into_iter().map(|(drawn, (checks, played))| Played { drawn, checks, played }).collect(),
+        differ: Vec::new(),
+    };
+    if out.due {
+        let both: Vec<&[(f64, f64, usize)]> = parts.iter().map(|(_, u, _)| u.both.as_slice()).collect();
+        out.ask_free = Some(stratified(&both, ope::SEED));
+        let ms: BTreeSet<u16> = parts.iter().flat_map(|(_, u, _)| u.by.keys().copied()).collect();
+        for m in ms {
+            let each: Vec<&[(f64, f64, usize)]> = parts.iter().map(|(_, u, _)| u.by.get(&m).map_or(&[][..], Vec::as_slice)).collect();
+            out.by_asked.push((m, stratified(&each, ope::SEED)));
+        }
+    }
+    for (mut stratum, units, _) in parts {
+        if out.due {
+            stratum.readout.by_asked = units.by.into_iter().map(|(m, u)| (m, ope::snips(&u, ope::SEED))).collect();
+            stratum.readout.ask_free = Some(ope::snips(&units.both, ope::SEED));
+        }
+        out.strata.push(stratum);
+    }
+    if out.due {
+        let each: Vec<(&str, &Estimate)> = out.strata.iter().filter_map(|s| Some((s.collective.as_str(), s.readout.ask_free.as_ref()?))).collect();
+        out.differ.extend(differences("grade 2 asked − handed over", &each));
+        for (m, _) in &out.by_asked {
+            let each: Vec<(&str, &Estimate)> =
+                out.strata.iter().filter_map(|s| Some((s.collective.as_str(), s.readout.by_asked.iter().find(|(k, _)| k == m).map(|(_, e)| e)?))).collect();
+            out.differ.extend(differences(&format!("dilution, {m} asked − 1 asked"), &each));
+        }
+    }
+    out
+}
+
+/// The share played per drawn count as text: "s asked played/drawn".
+fn played_line(played: &[Played]) -> String {
+    if played.is_empty() {
+        return "no count drawn".into();
+    }
+    let each: Vec<String> = played.iter().map(|p| format!("{} asked {}/{}", p.drawn, p.played, p.checks)).collect();
+    format!("played per drawn count: {}", each.join(", "))
+}
+
+/// The pooled readout as text (`borg debug select --replay --file A --file B …`).
+#[must_use]
+pub fn render_pooled(p: &Pooled) -> String {
+    let mut out = format!(
+        "question-count test readout (rules v2, amendment {TEST_AMENDMENT}), pooled over {} collectives, stratified by collective: {} ({} checks that drew a count in {} sessions with one, due at {TEST_CHECKS} checks in {TEST_MIN_SESSIONS} sessions or {TEST_SESSIONS} sessions)\n",
+        p.strata.len(),
+        if p.due { "due" } else { "not due" },
+        p.checks,
+        p.sessions
+    );
+    for s in &p.strata {
+        let r = &s.readout;
+        let imported = if s.imported > 0 { format!("; {} graded records imported from another store's log, left out", s.imported) } else { String::new() };
+        out.push_str(&format!(
+            "  {}: {} drawn in {} sessions ({} of them the control arm, {} refused by the gate){imported}; {}\n",
+            s.collective,
+            r.checks,
+            r.sessions,
+            r.control,
+            r.refused,
+            played_line(&s.played)
+        ));
+    }
+    out.push_str(&format!("  pooled: {}\n", played_line(&p.played)));
+    if !p.due {
+        return out;
+    }
+    out.push_str(
+        "  intention to treat: by the drawn count, a count the gate refused read as drawn (session 95% CI; pooled: resampled within each collective)\n",
+    );
+    let row = |out: &mut String, what: &str, unit: &str, each: Vec<(&str, Option<&Estimate>)>, pooled: Option<&Estimate>| {
+        let shown = |e: Option<&Estimate>| e.map_or_else(|| "-".to_string(), |e| format!("{} over {} {unit}", ci(e, 1.0), e.n));
+        let mut parts: Vec<String> = each.into_iter().map(|(c, e)| format!("{c} {}", shown(e))).collect();
+        parts.push(format!("pooled {}", shown(pooled)));
+        out.push_str(&format!("  {what}: {}\n", parts.join("; ")));
+    };
+    let each = p.strata.iter().map(|s| (s.collective.as_str(), s.readout.ask_free.as_ref())).collect();
+    row(&mut out, "grade 2 asked − handed over", "2s", each, p.ask_free.as_ref());
+    for (m, e) in &p.by_asked {
+        let each = p.strata.iter().map(|s| (s.collective.as_str(), s.readout.by_asked.iter().find(|(k, _)| k == m).map(|(_, e)| e))).collect();
+        row(&mut out, &format!("dilution, {m} asked − 1 asked"), "checks", each, Some(e));
+    }
+    for d in &p.differ {
+        out.push_str(&format!("  {d}\n"));
+    }
     out
 }
 
@@ -2014,7 +2321,7 @@ pub fn render(r: &Report) -> String {
     ));
     list(&mut out, &c.p0.first);
     out.push_str(&format!(
-        "P1 determinism: {}: {} of {} replayed checks reproduce their decision and propensities within {} (max |Δ| {:.4}), {} from the summary their record names{}{}; {} under an evaluation switch not replayed; incremental fold {} the whole fold\n",
+        "P1 determinism: {}: {} of {} replayed checks reproduce their decision and propensities within {} (max |Δ| {:.4}), {} from the summary their record names{}{}{}; {} under an evaluation switch not replayed; incremental fold {} the whole fold\n",
         c.p1.verdict.label(),
         c.p1.reproduced,
         c.p1.replayed,
@@ -2023,6 +2330,11 @@ pub fn render(r: &Report) -> String {
         c.p1.seen,
         empty(c.p1.empty, "only the summary and source they name"),
         if c.p1.tests > 0 { format!("; {} of them the question-count test's, its draw replayed", c.p1.tests) } else { String::new() },
+        if c.p1.imported > 0 {
+            format!("; {} imported from another store's log (the summary or fit they name is no line boundary of this one), skipped", c.p1.imported)
+        } else {
+            String::new()
+        },
         c.p1.switches,
         if c.p1.fold { "=" } else { "≠" }
     ));
@@ -2165,7 +2477,7 @@ pub fn render(r: &Report) -> String {
     }
     let t = &ro.test;
     out.push_str(&format!(
-        "question-count test readout (rules v2): {} ({} of {TEST_CHECKS} checks that drew a count, {} of {TEST_SESSIONS} sessions with one; {} of them the control arm, {} refused by the gate)\n",
+        "question-count test readout (rules v2, amendment {TEST_AMENDMENT}): {} ({} checks that drew a count in {} sessions with one, due at {TEST_CHECKS} checks in {TEST_MIN_SESSIONS} sessions or {TEST_SESSIONS} sessions; {} of them the control arm, {} refused by the gate)\n",
         if t.due { "due" } else { "not due" },
         t.checks,
         t.sessions,
@@ -2286,15 +2598,23 @@ fn bench(text: &str, lessons: &Path) -> Bench {
 pub fn main(args: &[&str]) -> i32 {
     let usage = || {
         eprintln!(
-            "usage: borg debug select [--replay | --bench] [--rebuild] [--dir DIR | --file OUTCOMES.jsonl] [--json] [--eval RUNS_DIR --qrels QRELS.jsonl]"
+            "usage: borg debug select [--replay | --bench] [--rebuild] [--dir DIR | --file OUTCOMES.jsonl] [--json] [--eval RUNS_DIR --qrels QRELS.jsonl]\n       borg debug select --replay --file OUTCOMES.jsonl --file OUTCOMES.jsonl ... [--json]  (the question-count test's readout pooled over the stores, stratified by collective: each file's directory names its collective)"
         );
         2
     };
     let (mut replay, mut rebuild, mut json, mut timed) = (false, false, false, false);
-    let (mut dir, mut file, mut eval, mut qrels_path): (Option<&str>, Option<&str>, Option<&str>, Option<&str>) = (None, None, None, None);
+    let (mut dir, mut eval, mut qrels_path): (Option<&str>, Option<&str>, Option<&str>) = (None, None, None);
+    let mut files: Vec<&str> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let slot = match *a {
+            "--file" if dir.is_none() => {
+                match it.next() {
+                    Some(v) => files.push(v),
+                    None => return usage(),
+                }
+                continue;
+            }
             "--replay" => {
                 replay = true;
                 continue;
@@ -2311,8 +2631,7 @@ pub fn main(args: &[&str]) -> i32 {
                 timed = true;
                 continue;
             }
-            "--dir" if file.is_none() => &mut dir,
-            "--file" if dir.is_none() => &mut file,
+            "--dir" if files.is_empty() => &mut dir,
             "--eval" => &mut eval,
             "--qrels" => &mut qrels_path,
             _ => return usage(),
@@ -2325,6 +2644,14 @@ pub fn main(args: &[&str]) -> i32 {
     if eval.is_some() != qrels_path.is_some() {
         return usage();
     }
+    if files.len() > 1 {
+        // Several stores: only the pooled readout (amendment 2026-10-31), never their checks at once.
+        if !replay || timed || rebuild || eval.is_some() {
+            return usage();
+        }
+        return pooled_main(&files, json);
+    }
+    let file = files.first().copied();
     let (source, lessons): (String, PathBuf) = match file {
         Some(f) => (format!("file {f}"), Path::new(f).with_file_name("lessons.jsonl")),
         None => {
@@ -2370,6 +2697,33 @@ pub fn main(args: &[&str]) -> i32 {
         false => print!("{source}\n{}", render(&report)),
     }
     i32::from(unmet(&report))
+}
+
+/// `borg debug select --replay --file A --file B …`: the question-count test's readout pooled over the
+/// stores (`pooled`), each named after its file's directory (the store's, so its collective's), or
+/// after the file where two directories share a name. Non-decisive: exits 0, 1 when a file is unreadable.
+fn pooled_main(files: &[&str], json: bool) -> i32 {
+    let name = |f: &str| Path::new(f).parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.to_string());
+    let mut stores: Vec<(String, String)> = Vec::new();
+    for f in files {
+        match std::fs::read_to_string(f) {
+            Ok(text) => {
+                let shared = files.iter().filter(|g| name(g) == name(f)).count() > 1;
+                stores.push((if shared { (*f).to_string() } else { name(f) }, text));
+            }
+            Err(e) => {
+                eprintln!("borg debug select: cannot read {f}: {e}");
+                return 1;
+            }
+        }
+    }
+    let p = pooled(&stores);
+    let source = format!("files {}", files.join(", "));
+    match json {
+        true => println!("{}", serde_json::json!({ "source": source, "pooled": p })),
+        false => print!("{source}\n{}", render_pooled(&p)),
+    }
+    0
 }
 
 #[cfg(test)]
@@ -2486,6 +2840,30 @@ mod tests {
         let pass = as_logged(&text(&cut), none);
         assert_eq!((pass.p0.verdict, pass.p0.checks), (Verdict::Pass, 1), "{:?}", pass.p0);
         assert_eq!((pass.p1.verdict, pass.p1.replayed, pass.p1.switches), (Verdict::NotTested, 0, 1), "{:?}", pass.p1);
+    }
+
+    /// Records copied in from another store's log name summaries and fits at its bytes: where such a
+    /// byte is no line boundary of this log, P1 counts the record as imported and skips it, instead of
+    /// failing on a summary this log never had (an open-source store on 2026-10-31: 50 such checks).
+    /// A byte at a boundary is this log's, so a wrong key there still fails.
+    #[test]
+    fn p1_skips_records_imported_from_another_log() {
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        let log = labelled(3, 6, 5);
+        let graded_at: Vec<usize> = log.iter().enumerate().filter(|(_, o)| o.kind == outcome::GRADED).map(|(i, _)| i).collect();
+        let clean = as_logged(&text(&log), none).p1;
+        assert_eq!((clean.verdict, clean.imported), (Verdict::Pass, 0), "{clean:?}");
+        let mut copied = log.clone();
+        // Byte 5 lies inside the first line; a fit at a byte past this log's end.
+        copied[graded_at[1]].seen = "5-abcdef01".into();
+        copied[graded_at[2]].fit = format!("{}-abcdef02", 1u64 << 40);
+        let p1 = as_logged(&text(&copied), none).p1;
+        assert_eq!((p1.verdict, p1.imported, p1.replayed + 2), (Verdict::Pass, 2, clean.replayed), "{p1:?}");
+        // At a boundary of this log (its start), a fit no refit gave there is a failure, not an import.
+        copied[graded_at[1]].seen.clear();
+        copied[graded_at[1]].fit = "0-abcdef01".into();
+        let p1 = as_logged(&text(&copied), none).p1;
+        assert_eq!((p1.verdict, p1.imported), (Verdict::Fail, 1), "{p1:?}");
     }
 
     /// P1 replays a learned decision from the summary its record names (`seen`): the hook read it
@@ -2765,6 +3143,7 @@ mod tests {
                     seen: 0,
                     tests: 0,
                     switches: 0,
+                    imported: 0,
                     max_delta: 0.0,
                     fold: true,
                     first: Vec::new(),
@@ -2960,6 +3339,7 @@ mod tests {
             per_lesson: 400.0,
             latency: (1000.0, 0.1, 500.0),
             latency_n: 30,
+            latency_reach: 24_000,
             eta: 0.0,
             slope: (0.0, 0.0),
             not: (-3.0, 0.0),
@@ -3393,12 +3773,99 @@ mod tests {
             eval: None,
         }));
         assert!(
-            shown.contains("question-count test readout (rules v2): due (60 of 300 checks that drew a count, 30 of 30 sessions with one; 15 of them the control arm, 0 refused by the gate)\n")
+            shown.contains("question-count test readout (rules v2, amendment 2026-10-31): due (60 checks that drew a count in 30 sessions with one, due at 300 checks in 15 sessions or 30 sessions; 15 of them the control arm, 0 refused by the gate)\n")
                 && shown.contains("  estimated over the 60 drawn checks the summary still holds ")
                 && shown.contains("  dilution, 2 asked − 1 asked: the test's top lesson's change rate ")
                 && shown.contains("  grade 2 asked − handed over: "),
             "{shown}"
         );
+    }
+
+    /// The readout's due rule amended 2026-10-31: `TEST_CHECKS` drawn checks need `TEST_MIN_SESSIONS`
+    /// sessions with one beside them (an open-source store's 167 checks came 164 from one session);
+    /// `TEST_SESSIONS` sessions alone still suffice.
+    #[test]
+    fn the_question_count_readout_needs_sessions_beside_its_checks() {
+        let at = |checks: u64, sessions: u32| {
+            let mut s = Summary::default();
+            s.experiment.ran = vec![(3, 1, checks)];
+            s.experiment.sessions = sessions;
+            test_readout(&s).due
+        };
+        assert!(!at(300, TEST_MIN_SESSIONS - 1), "300 checks in 14 sessions: not due");
+        assert!(at(300, TEST_MIN_SESSIONS) && at(1_000, 20), "300 checks in 15 sessions");
+        assert!(!at(299, TEST_SESSIONS - 1), "neither");
+        assert!(at(0, TEST_SESSIONS), "30 sessions alone");
+    }
+
+    /// Two collectives' tests pooled (amendment 2026-10-31): neither due alone (16 sessions each), due
+    /// pooled; intention to treat over every collective's units, a refused draw counted at its drawn
+    /// number and shown in the share played; equal effects pool, opposite ones are flagged.
+    #[test]
+    fn the_pooled_readout_is_stratified_by_collective_and_flags_collectives_that_differ() {
+        const REVERSED: Plant = Plant {
+            change: |j, _, ask| {
+                if j == 2 {
+                    0.0
+                } else if ask {
+                    0.2
+                } else {
+                    0.8
+                }
+            },
+            delivered: 1.0,
+            seen: |_| 1.0,
+        };
+        let mut team = tested_log(16, &UNDILUTED, 7);
+        let g = team.iter_mut().find(|o| o.kind == outcome::GRADED && o.xs == Some(3)).unwrap();
+        g.source = policy::GATE.into();
+        // The other collective's sessions are other sessions (`tested_log` names them t0, t1, … in both).
+        let elsewhere = |log: Vec<Outcome>| log.into_iter().map(|o| Outcome { session: format!("o{}", o.session), ..o }).collect::<Vec<_>>();
+        let open = elsewhere(tested_log(16, &UNDILUTED, 8));
+        let p = pooled(&[("team".into(), text(&team)), ("open".into(), text(&open))]);
+        assert_eq!((p.due, p.checks, p.sessions), (true, 64, 32), "{p:?}");
+        // The same 16 drone sessions drawing in both collectives are 16 sessions: 64 checks in them are
+        // not due, as they would be counted per collective (32).
+        let same = pooled(&[("team".into(), text(&team)), ("open".into(), text(&tested_log(16, &UNDILUTED, 8)))]);
+        assert_eq!((same.due, same.checks, same.sessions), (false, 64, 16), "{same:?}");
+        assert!(same.strata.iter().all(|s| s.readout.sessions == 16), "each collective still counts its own: {same:?}");
+        assert!(p.strata.iter().all(|s| !s.readout.due && s.readout.ask_free.is_some()), "each estimated once the pool is due: {p:?}");
+        assert_eq!(p.strata[0].played.iter().map(|x| (x.drawn, x.checks, x.played)).collect::<Vec<_>>(), [(0, 8, 8), (1, 8, 8), (2, 8, 8), (3, 8, 7)]);
+        assert_eq!(p.played.iter().map(|x| (x.drawn, x.checks, x.played)).collect::<Vec<_>>(), [(0, 16, 16), (1, 16, 16), (2, 16, 16), (3, 16, 15)]);
+        let gain = p.ask_free.as_ref().unwrap();
+        let each: usize = p.strata.iter().map(|s| s.readout.ask_free.as_ref().unwrap().n).sum();
+        assert_eq!(gain.n, each, "every collective's 2s: {gain:?}");
+        assert!(gain.value.is_some_and(|v| (v - 0.6).abs() < 0.15) && gain.lo > 0.0 && gain.lo < gain.hi, "{gain:?}");
+        assert_eq!(p.by_asked.iter().map(|(m, e)| (*m, e.n)).collect::<Vec<_>>(), [(2, 64), (3, 64)]);
+        assert!(p.differ.is_empty(), "{:?}", p.differ);
+        let shown = render_pooled(&p);
+        assert!(
+            shown.starts_with("question-count test readout (rules v2, amendment 2026-10-31), pooled over 2 collectives, stratified by collective: due (64 checks that drew a count in 32 sessions with one, ")
+                && shown.contains("\n  team: 32 drawn in 16 sessions (8 of them the control arm, 1 refused by the gate); played per drawn count: 0 asked 8/8, 1 asked 8/8, 2 asked 8/8, 3 asked 7/8\n")
+                && shown.contains("\n  pooled: played per drawn count: 0 asked 16/16, 1 asked 16/16, 2 asked 16/16, 3 asked 15/16\n")
+                && shown.contains("\n  intention to treat: ")
+                && shown.contains("\n  grade 2 asked − handed over: team ")
+                && shown.contains("; pooled "),
+            "{shown}"
+        );
+        // Asking helps in one collective and hurts in the other: the pool is no reading, per collective only.
+        let reversed = elsewhere(tested_log(16, &REVERSED, 8));
+        let p = pooled(&[("team".into(), text(&team)), ("open".into(), text(&reversed))]);
+        assert!(p.differ.iter().any(|d| d.starts_with("grade 2 asked − handed over: team +") && d.ends_with("read per collective only")), "{:?}", p.differ);
+        // A drawn check copied from another store's log (its summary key no line boundary here), in a
+        // session of its own: left out of the counts, the due rule and the share played.
+        let mut copied = open.clone();
+        let mut g = open.iter().find(|o| o.kind == outcome::GRADED && o.xs.is_some()).unwrap().clone();
+        (g.session, g.check, g.seen) = ("copied".into(), "c0000000copy".into(), format!("{}-0badc0de", text(&open).len() + 7));
+        copied.push(g);
+        let (with, without) = (pooled(&[("open".into(), text(&copied))]), pooled(&[("open".into(), text(&open))]));
+        assert_eq!((with.checks, with.sessions, with.strata[0].imported), (without.checks, without.sessions, 1), "{with:?}");
+        assert_eq!(with.played, without.played);
+        assert!(render_pooled(&with).contains("; 1 graded records imported from another store's log, left out; "), "{}", render_pooled(&with));
+        // Not due: counts only.
+        let p = pooled(&[("team".into(), text(&tested_log(5, &UNDILUTED, 7)))]);
+        assert!(!p.due && p.ask_free.is_none() && p.by_asked.is_empty() && p.strata[0].readout.ask_free.is_none(), "{p:?}");
+        assert!(!render_pooled(&p).contains("intention to treat"));
     }
 
     /// Asking a 2 against handing it over is a Horvitz–Thompson difference over every 2 that could go

@@ -30,11 +30,13 @@
 //! (comma-separated, case-insensitive, default none; for knowledge the team abandoned) is dropped. The default is a dry run that writes nothing; `--apply` appends the new episodes and runs
 //! `borg learn` on each collective. Re-running adds nothing: an episode the store already holds (learn.rs
 //! `Known`: the same id, the same words in the same session, or a prompt within `learn::SAME_MS`, since
-//! the live hook stamps capture time and the transcript message time) is a duplicate.
+//! the live hook stamps capture time and the transcript message time) is a duplicate. What a store holds
+//! is read again under its lock when appending (learn.rs `record_new_in`), so a turn-end sweep that
+//! appended an episode while another collective was learning leaves nothing to append twice.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -90,6 +92,12 @@ pub struct Found {
     pub agent_cwd: String,
     pub tool_cwd: String,
     pub episode: Episode,
+}
+
+impl AsMut<Episode> for Found {
+    fn as_mut(&mut self) -> &mut Episode {
+        &mut self.episode
+    }
 }
 
 pub struct Options {
@@ -1469,14 +1477,23 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
     report.usd_per_call = learn_cost(base);
 
     let mut engineers: HashMap<String, String> = HashMap::new();
-    for (name, (mut t, mut fresh)) in tallies {
-        let ep_path = t.home.join("episodes.jsonl");
+    for (name, (mut t, fresh)) in tallies {
         t.sessions = fresh.iter().map(|f| &f.episode.session).collect::<HashSet<_>>().len();
         t.episodes = fresh.len();
         t.calls = fresh.len() + waiting(&t.home);
         if opts.apply {
-            if !fresh.is_empty() && append(&ep_path, &mut fresh, &mut engineers).is_err() {
-                eprintln!("borg assimilate: cannot write {}", ep_path.display());
+            // Appended under the store's lock, against what it holds now: a turn-end sweep may have
+            // appended some of these while an earlier collective was learning.
+            match learn::record_new_in(&t.home, fresh, |f| complete(f, &mut engineers)) {
+                Ok(appended) => {
+                    appended.iter().for_each(|f| count_veto(&t.home, &f.episode));
+                    t.known += t.episodes - appended.len();
+                    t.episodes = appended.len();
+                    // What the learning ahead calls the model for: the store's unlearned episodes now,
+                    // each once, whoever appended it.
+                    t.calls = waiting(&t.home);
+                }
+                Err(_) => eprintln!("borg assimilate: cannot write {}", t.home.join("episodes.jsonl").display()),
             }
             eprintln!("learning {name}: one model call per episode, in order (each sees the lessons before it)");
             (t.new_lessons, t.merged, t.pending) = learn::learn_in_reporting(&t.home, None, ask, learn::learning(), learn::now_ms(), &mut learn::print_step);
@@ -1548,24 +1565,6 @@ pub fn count_veto(store: &Path, e: &Episode) {
             ev.text = crate::stats::excerpt(&e.correction, crate::stats::FEED_CHARS);
         });
     }
-}
-
-/// Complete the episodes (repo, engineer) and append them to the store.
-fn append(path: &Path, eps: &mut [Found], engineers: &mut HashMap<String, String>) -> std::io::Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    for x in eps {
-        complete(x, engineers);
-        writeln!(f, "{}", serde_json::to_string(&x.episode)?)?;
-        // An imported correction counts at the time it was made.
-        if let Some(store) = path.parent() {
-            learn::count_correction(store, &x.episode);
-            count_veto(store, &x.episode);
-        }
-    }
-    Ok(())
 }
 
 pub fn render(r: &Report, apply: bool) -> String {

@@ -142,6 +142,10 @@ pub struct Prediction {
     /// answer that leaves a grade out, counts as 2.
     pub grades: Vec<u8>,
     pub resolved: Vec<Judged>,
+    /// Every id the answer's `resolved` names, in its order, each once, whatever its verdict and whether
+    /// it was pending (`returned`): what the judge gave back, for the cost line (hook.rs
+    /// `record_verdicts`), which tells a lesson the model left out from one it judged unclear.
+    pub returned: Vec<String>,
     pub cost: f64,
 }
 
@@ -242,7 +246,23 @@ fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, grad
     let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout)?;
     let cost = cost.unwrap_or(0.0);
     let (applies, grades) = applies(&v, shortlist)?.into_iter().unzip();
-    Some(Prediction { applies, grades, resolved: resolved(&v, pending), cost })
+    Some(Prediction { applies, grades, resolved: resolved(&v, pending), returned: returned(&v), cost })
+}
+
+/// The ids the answer's `resolved` entries name (`Prediction::returned`), first seen first, each on one
+/// line without commas (the cost line lists them comma-separated): every whitespace or comma in one
+/// becomes `_`, so an id `resolved` would not match as it was given (" a" for pending "a") never reads as
+/// a pending id on the cost line either. Entries without a string id, or an empty one, and a missing or
+/// malformed `resolved`, name none.
+fn returned(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in v["resolved"].as_array().into_iter().flatten().filter_map(|r| r["id"].as_str()) {
+        let id: String = id.chars().map(|c| if c.is_whitespace() || c == ',' { '_' } else { c }).collect();
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// The model's verdicts, kept only for pending ids with a valid verdict, the first per id. A missing
@@ -353,6 +373,14 @@ mod tests {
         );
         assert_eq!((r[0].label(), r[1].label()), (Some(crate::outcome::CHANGED), None));
         assert!(resolved(&json!({"applies": []}), &p).is_empty(), "missing: all stay pending");
+        assert_eq!(returned(&v), ["a", "zz", "b", "c"], "every id named, once, whatever its verdict");
+        let odd = json!({"resolved": [{"id": "x y,z"}, {"id": 7}, {"id": ""}, {"verdict": "changed"}, {"id": "x\n"}]});
+        assert_eq!(returned(&odd), ["x_y_z", "x_"], "one word per id, so the cost line stays parseable");
+        // A padded id is no pending one: not resolved, and not returned as one either.
+        let padded = json!({"resolved": [{"id": " a", "verdict": "changed", "avoids_consequence": true}]});
+        assert!(resolved(&padded, &p).is_empty());
+        assert_eq!(returned(&padded), ["_a"]);
+        assert!(returned(&json!({"applies": []})).is_empty() && returned(&json!({"resolved": "a"})).is_empty());
         let j = |verdict, avoids| Judged { id: "x".into(), verdict, avoids_consequence: avoids }.label();
         assert_eq!((j(Verdict::Unchanged, false), j(Verdict::Unclear, true)), (Some(crate::outcome::IGNORED), None));
     }

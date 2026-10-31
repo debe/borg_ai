@@ -16,7 +16,9 @@ use crate::conscience::{self, Challenge, Names};
 
 /// The default budget of the lesson block, in tokens (`BORG_STOP_POOL_TOKENS`). Baseline: the size
 /// the internal evaluation "whole-store" passed with; it defines today's pool, which the learned pool
-/// size (select.rs) starts from and keeps until the yield by fill position has data.
+/// size (select.rs) starts from and keeps until the yield by fill position has data. Kept by dated
+/// decision (2026-10-31): a smaller pool loses 0.89 [0.79, 1.00] applies per check (a team store); a
+/// larger one has 7 judged applies past the budget and no latency measured above it.
 pub const TOKENS: usize = 12_000;
 /// Guard: a compact line keeps this many characters of the question...
 pub const QUESTION_CHARS: usize = 240;

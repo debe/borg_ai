@@ -41,7 +41,8 @@ an invalid config or a missing binary explains most of what follows it.
 borg's own model calls (learning, the turn-end and live checks) run headless through a harness CLI:
 the drone's own first, then `claude`, `omp`, `opencode`. Pin one with a prefix:
 `BORG_PREDICT_MODEL=claude:sonnet`, `omp:<model>`, `opencode:<provider/model>`, `codex:<model>`;
-`BORG_LEARN_MODEL` likewise for `borg learn`, `assimilate` and `reach`. `off` disables the call. Set
+`BORG_LEARN_MODEL` likewise for `borg learn`, `assimilate` and `reach`. `off` disables the call. Unpinned,
+omp's calls ask `claude-sonnet-5`; `BORG_OMP_MODEL` names another for omp alone (`default`: omp's own). Set
 these in the harness's environment (for example the `env` block of `~/.claude/settings.json`) or the
 shell profile, after showing the engineer the change.
 
