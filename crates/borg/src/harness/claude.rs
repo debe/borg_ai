@@ -75,9 +75,27 @@ impl Harness for Claude {
     /// sub-agents (the Agent tool, [`agent_runs`]), under `$CLAUDE_CONFIG_DIR/projects`, else
     /// `home/.claude/projects`.
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
-        let config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".claude"), PathBuf::from);
-        project_runs(&config.join("projects"), session, since)
+        project_runs(&projects(home), session, since)
     }
+
+    /// The hook's `transcript_path`, else `<projects>/<slug>/<session>.jsonl`.
+    fn session_log(&self, home: &Path, session: &str, input: &Value) -> Option<PathBuf> {
+        super::transcript(self.caps(), input).map(PathBuf::from).or_else(|| session_file(&projects(home), session))
+    }
+}
+
+// ---------------------------------------------------------------- transcripts
+
+/// Where Claude Code keeps its session transcripts, `<projects>/<slug>/<session>.jsonl`:
+/// `$CLAUDE_CONFIG_DIR/projects`, else `home/.claude/projects`.
+pub fn projects(home: &Path) -> PathBuf {
+    super::env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")).join("projects")
+}
+
+/// Session `id`'s transcript under `projects`, in whichever project directory it is.
+pub fn session_file(projects: &Path, id: &str) -> Option<PathBuf> {
+    let name = format!("{id}.jsonl");
+    std::fs::read_dir(projects).ok()?.flatten().map(|slug| slug.path().join(&name)).find(|f| f.is_file())
 }
 
 // ---------------------------------------------------------------- workflow runs

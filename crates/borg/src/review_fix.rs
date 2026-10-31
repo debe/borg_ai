@@ -133,6 +133,7 @@ impl Finding {
             engineer: engineer.to_string(),
             kind: regret::KIND.into(),
             regret: Some(r),
+            ..Episode::default()
         }
     }
 }

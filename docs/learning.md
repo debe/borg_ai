@@ -23,9 +23,25 @@ shared memory for a set of repos and engineers.
 ## Sources of lessons
 
 **Corrections.** Borg records an *episode* when you push back on the agent ("no, use a channel") or
-reject a tool call with a reason (Codex reports no rejected calls). At session end, `borg learn` makes one
+reject a tool call with a reason (Codex records no rejected calls). At session end, `borg learn` makes one
 model call per episode and writes a lesson. A new correction on the same point updates the existing
 lesson.
+
+**Answers to the agent's questions.** When the agent asks you (Claude Code `AskUserQuestion`, omp `ask`,
+opencode `question`, Codex `request_user_input`), your answer is an episode too, marked `via: answer`:
+the questions and their options are what the agent proposed, your picks, typed words and notes the
+correction. The learn call decides whether the answer holds a rule beyond its task; a pick that only
+fits the task is no lesson. Answers are counted apart from corrections.
+
+**Where they come from.** The hooks capture corrections live. Each harness's own transcript is read too:
+at every turn end (Claude Code, omp, Codex: only what the turn added), at session end (all four, opencode
+through its CLI export), and by every `borg learn` for a session left open and idle for a day. One
+dedupe keeps the hook's episode and the transcript's as one. So a correction still arrives when a
+harness stops telling a hook (Claude Code 2.1.312 sends no `PostToolUseFailure` for a rejected tool
+call), and `borg doctor` warns when the transcripts name more than Borg holds
+([The harness's own transcript](harnesses.md#the-harnesss-own-transcript)). `borg assimilate` reads the
+same transcripts for the past ([Import](configuration.md#import-what-you-already-have)).
+`BORG_TRANSCRIPT_CAPTURE=off` leaves the hooks alone.
 
 **Team documents.** `borg assimilate --from-dir` condenses a checkout of written team knowledge into
 scoped lessons, and its open decisions into queen questions ([Import](configuration.md#import-what-you-already-have)).

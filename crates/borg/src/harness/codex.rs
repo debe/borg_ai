@@ -113,8 +113,12 @@ impl Harness for Codex {
     /// Each session's spawned agents ([`spawn_runs`]) under `$CODEX_HOME/sessions`, else
     /// `home/.codex/sessions`.
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
-        let codex = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()).map_or_else(|| home.join(".codex"), PathBuf::from);
-        spawn_runs(&codex.join("sessions"), session, since)
+        spawn_runs(&sessions(home), session, since)
+    }
+
+    /// The thread's rollout ([`rollout_of`]; the session id is the thread id).
+    fn session_log(&self, home: &Path, session: &str, _input: &Value) -> Option<PathBuf> {
+        rollout_of(&sessions(home), session)
     }
 
     fn install_notes(&self) -> Vec<String> {
@@ -235,8 +239,29 @@ fn spawned(m: &Value, root: &str, from: &str) -> SubAgent {
     }
 }
 
+// ---------------------------------------------------------------- rollouts
+
+/// Where Codex keeps every thread's rollout, `<sessions>/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`:
+/// `$CODEX_HOME/sessions`, else `home/.codex/sessions`.
+pub fn sessions(home: &Path) -> PathBuf {
+    super::env_dir("CODEX_HOME").unwrap_or_else(|| home.join(".codex")).join("sessions")
+}
+
+/// Thread `id`'s rollout under `sessions`: a file named after it whose `session_meta` names it.
+pub fn rollout_of(sessions: &Path, id: &str) -> Option<PathBuf> {
+    let suffix = format!("-{id}.jsonl");
+    let named = |f: &PathBuf| f.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&suffix));
+    rollouts(sessions).into_iter().filter(named).find(|f| first_meta(f).is_some_and(|m| m["id"] == id))
+}
+
+/// A main session's rollout: one the engineer talked in, not a spawned agent's thread
+/// (`source.subagent`) nor a non-interactive `codex exec` run (borg's own model calls among them).
+pub(crate) fn main_session(meta: &Value) -> bool {
+    meta["source"].get("subagent").is_none() && meta["source"] != "exec"
+}
+
 /// The `rollout-*.jsonl` files under `dir`, at any depth.
-fn rollouts(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn rollouts(dir: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort();
     let mut out = Vec::new();
@@ -251,7 +276,7 @@ fn rollouts(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// A rollout's `session_meta` payload, from its first line only.
-fn first_meta(f: &Path) -> Option<Value> {
+pub(crate) fn first_meta(f: &Path) -> Option<Value> {
     let line = std::io::BufReader::new(std::fs::File::open(f).ok()?).lines().next()?.ok()?;
     let v: Value = serde_json::from_str(&line).ok()?;
     (v["type"] == "session_meta").then(|| v["payload"].clone())
@@ -261,10 +286,15 @@ fn ts(v: &Value) -> i64 {
     v.as_str().map_or(0, borg_trace::parse_ts)
 }
 
-/// A rollout's response items, in order.
-fn items(f: &Path) -> Vec<Value> {
+/// A rollout's lines (`{timestamp, type, payload}`), in order.
+pub(crate) fn records(f: &Path) -> Vec<Value> {
     let text = std::fs::read_to_string(f).unwrap_or_default();
-    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["type"] == "response_item").map(|v| v["payload"].clone()).collect()
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
+}
+
+/// A rollout's response items, in order.
+pub(crate) fn items(f: &Path) -> Vec<Value> {
+    records(f).into_iter().filter(|v| v["type"] == "response_item").map(|v| v["payload"].clone()).collect()
 }
 
 /// Read one spawned agent's rollout into `a`: its task (its first user message that Codex did not

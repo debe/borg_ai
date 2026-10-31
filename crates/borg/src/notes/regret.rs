@@ -105,6 +105,7 @@ pub fn episode(l: &Link, decision: Option<&Excerpt>, fix: &FixContext) -> Episod
         engineer: fix.email.trim().to_string(),
         kind: regret::KIND.into(),
         regret: Some(r),
+        ..Episode::default()
     }
 }
 

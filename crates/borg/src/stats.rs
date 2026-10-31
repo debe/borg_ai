@@ -45,8 +45,14 @@ pub const REGRETTED: &str = "regretted";
 /// `borg learn` credited a lesson asked before the session's own tests went green (outcome.rs `tested`;
 /// `lessons`: that lesson).
 pub const TESTED: &str = "tested";
-/// The engineer corrected the drone (an episode): `why` is `rejected_tool` or `pushback`, `text` a snippet.
+/// The engineer corrected the drone (an episode): `why` is `rejected_tool`, `pushback`, `regret` or
+/// `answer` (learn.rs `ANSWER`: an answer to the drone's own question), `text` a snippet. An answer is
+/// rolled up under [`ANSWERED`], never as a correction: the corrections tiles keep counting rejected
+/// tool calls and pushback.
 pub const CORRECTION: &str = "correction";
+/// The rollup count of the answers to a drone's own questions (a `CORRECTION` event whose `why` is
+/// learn.rs `ANSWER`; `fold`).
+pub const ANSWERED: &str = "answer";
 /// The engineer said no (`borg no`, veto.rs): `lessons` the lessons shown so far (credited `vetoed`),
 /// `n` their number, `why` `cli`, `prompt` or `mesh`, `text` the reason.
 pub const VETO: &str = "veto";
@@ -121,6 +127,17 @@ pub struct Event {
     /// On asks and on their results (`changed`, `ignored`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
+    /// On a correction: the harness, and its version where known, whose own transcript it was read from
+    /// (learn.rs `Episode::harness`; sweep.rs, `borg assimilate`), e.g. `claude 2.1.312`; empty when a
+    /// hook captured it, or `borg assimilate` before 0.7.2 imported it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
+/// An episode's [`Event::source`]: its `harness` and `harness_version`, joined; empty for the hooks' (and
+/// imports from before 0.7.2).
+pub fn source(harness: &str, version: &str) -> String {
+    format!("{harness} {version}").trim().to_string()
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -331,14 +348,22 @@ fn derive_history(home: &Path) -> Vec<Event> {
             });
             continue;
         }
+        let answer = s(&e, "via") == crate::learn::ANSWER;
         out.push(Event {
             ms: ms(&e, "ms"),
             kind: CORRECTION.into(),
             session: s(&e, "session"),
             engineer: s(&e, "engineer"),
             repo: s(&e, "repo"),
-            why: if tool.is_empty() { "pushback".into() } else { "rejected_tool".into() },
-            text: if tool.is_empty() { snippet } else { format!("{tool}: {snippet}") },
+            why: if answer {
+                ANSWERED.into()
+            } else if tool.is_empty() {
+                "pushback".into()
+            } else {
+                "rejected_tool".into()
+            },
+            text: if tool.is_empty() || answer { snippet } else { format!("{tool}: {snippet}") },
+            source: source(&s(&e, "harness"), &s(&e, "harness_version")),
             ..Default::default()
         });
     }
@@ -575,7 +600,8 @@ fn day_number(date: &str) -> Option<i64> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Said {
     /// The engineer's corrections: a rejected tool call or a pushback (`CORRECTION`, a regret aside:
-    /// a regret is a later fix, counted in the session that fixed, not by the engineer in this one).
+    /// a regret is a later fix, counted in the session that fixed, not by the engineer in this one; an
+    /// answer to the drone's own question aside too: the drone asked for it).
     pub corrections: u64,
     /// `borg no` vetoes (`VETO`).
     pub vetoes: u64,
@@ -588,7 +614,7 @@ pub fn per_session(events: &[Event]) -> BTreeMap<String, Said> {
     let mut out: BTreeMap<String, Said> = BTreeMap::new();
     for e in events.iter().filter(|e| !e.session.is_empty()) {
         match e.kind.as_str() {
-            CORRECTION if e.why != "regret" => out.entry(e.session.clone()).or_default().corrections += 1,
+            CORRECTION if e.why != "regret" && e.why != crate::learn::ANSWER => out.entry(e.session.clone()).or_default().corrections += 1,
             VETO => out.entry(e.session.clone()).or_default().vetoes += 1,
             _ => {}
         }
@@ -603,7 +629,9 @@ pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
         let day = day(e.ms);
         let id = format!("stat:{node}:{}:{day}", e.engineer);
         let b = out.entry(id.clone()).or_insert_with(|| Bucket { id, day, node: node.into(), engineer: e.engineer.clone(), ..Default::default() });
-        *b.counts.entry(e.kind.clone()).or_default() += 1;
+        // An answer to the drone's question is counted apart, so "correction" keeps its meaning.
+        let kind = if e.kind == CORRECTION && e.why == crate::learn::ANSWER { ANSWERED } else { e.kind.as_str() };
+        *b.counts.entry(kind.to_string()).or_default() += 1;
         if e.n > 0 {
             *b.counts.entry(format!("{}_n", e.kind)).or_default() += e.n;
         }
@@ -694,15 +722,35 @@ mod tests {
             ev(CORRECTION, "a", "pushback"),
             ev(CORRECTION, "a", "rejected_tool"),
             ev(CORRECTION, "a", "regret"),
+            ev(CORRECTION, "a", crate::learn::ANSWER),
             ev(VETO, "a", "prompt"),
             ev(VETO, "b", "cli"),
             ev(CHANGED, "b", ""),
             ev(CORRECTION, "", "pushback"),
         ];
         let got = per_session(&events);
-        assert_eq!(got["a"], Said { corrections: 2, vetoes: 1 });
+        assert_eq!(got["a"], Said { corrections: 2, vetoes: 1 }, "an answer to the drone's own question is no correction");
         assert_eq!(got["b"], Said { corrections: 0, vetoes: 1 });
         assert_eq!(got.len(), 2);
+        // Rolled up, an answer has a count of its own: the corrections tiles keep their meaning.
+        let buckets = fold("n", &events);
+        let b = buckets.values().next().unwrap();
+        assert_eq!((b.counts[CORRECTION], b.counts[ANSWERED]), (4, 1));
+    }
+
+    #[test]
+    fn the_history_derived_from_episodes_tells_answers_apart() {
+        let home = std::env::temp_dir().join(format!("borg-stats-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let eps = [
+            serde_json::json!({"id":"e1","ms":1,"repo":"r","session":"s","task":"t","agent":"Which backoff?","rejected_tool":null,"correction":"Exponential","via":"answer"}),
+            serde_json::json!({"id":"e2","ms":2,"repo":"r","session":"s","task":"t","agent":"a","rejected_tool":null,"correction":"no, not like that"}),
+        ];
+        std::fs::write(home.join("episodes.jsonl"), eps.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
+        let whys: Vec<String> = derive_history(&home).into_iter().filter(|e| e.kind == CORRECTION).map(|e| e.why).collect();
+        assert_eq!(whys, [ANSWERED, "pushback"]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

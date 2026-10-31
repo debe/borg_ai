@@ -42,7 +42,7 @@ pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Openc
 |---|---|
 | `harness/mod.rs` | The trait, `Caps`, `DroneWake`, `Transcript`, `Wiring`, `Probe`, `Run`, `SubAgent`, `ALL`, `by_name`, and the transcript-or-event readers keyed on `Caps::transcript`: `work_so_far` (live mode's evidence), `last_message` (the drone's last message, whole) and `plan` (what the queen and the experts read) |
 | `harness/wiring.rs` | The generic command-hook merge: install, uninstall and status for any `CommandHooks` harness. Each hook runs `<borg> hook <harness> <event>` |
-| `harness/claude.rs`, `omp.rs`, `opencode.rs`, `codex.rs` | One harness each: event table or compiled-in adapter, config path, capabilities, doctor probe, and the reader of its sub-agent runs ([Review → fix findings](configuration.md#review--fix-findings)). Claude's transcript readers are in `claude.rs`; Codex's patch-to-edit `normalise` and its hook-trust check for `borg doctor` are in `codex.rs` |
+| `harness/claude.rs`, `omp.rs`, `opencode.rs`, `codex.rs` | One harness each: event table or compiled-in adapter, config path, capabilities, doctor probe, the reader of its sub-agent runs ([Review → fix findings](configuration.md#review--fix-findings)), and where its own transcripts are (`session_log`, [The harness's own transcript](#the-harnesss-own-transcript)). Claude's transcript readers are in `claude.rs`; Codex's patch-to-edit `normalise` and its hook-trust check for `borg doctor` are in `codex.rs` |
 | `harness/sim.rs` | The simulated harness, used by the conformance suite. It is hidden from help, completions, `all`, status and doctor, and `borg install sim` and `borg hook sim …` know it only with `BORG_TEST_HARNESS` set, as the suites run them |
 | `hook.rs` | The shared hook handler, `hook::dispatch(h, event, input)`, with one function per event |
 | `install.rs` | Plan, apply, diff, backup, status and doctor, generic over `&dyn Harness` |
@@ -65,7 +65,7 @@ effect of a refactor.
 | `early_delivery` | A prompt or touch naming a lesson's scope gets that scope's lessons at once | yes | no | no | no |
 | `question_dialog` | A queen question uses the AskUserQuestion dialog (otherwise it is asked inline) | yes | no | no | no |
 | `transcript` | Where the turn's work and the last message come from | Claude JSONL | none: the tool calls the hook logs (`.turn`) | none | none: `transcript_path` is a Codex rollout and is dropped |
-| `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored) | yes | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event |
+| `deny_capture` | `post_tool_failure` carries the engineer's denials, which become episodes (otherwise the event is ignored); the transcript sweep catches what it misses (below) | yes, though since 2.1.312 Claude Code sends no `PostToolUseFailure` for a rejection | yes (synthesised) | yes (canonicalised) | no: Codex has no failure event and records no rejection |
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
 | `session_env` | The variable the harness sets to its session's id in every command its model runs, so `borg listen`, `tell` and `inbox` know the session | `CLAUDE_CODE_SESSION_ID` | `PI_SESSION_ID` | none: the shell gets no session id, so the plugin binds the session itself | `CODEX_THREAD_ID` |
 | `pid_env` | For a harness without `session_env`: the variable that carries its pid, which its events carry too, so presence names the session | none | none | `OPENCODE_PID` | none |
@@ -123,6 +123,50 @@ install and uninstall alike.
 | `AdapterFile` | opencode | `~/.config/opencode/plugins/borg.ts` (`$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`) |
 | `CommandHooks` | Codex CLI | Hook groups appended to `~/.codex/hooks.json` (`$CODEX_HOME`), written through a symlink, each with its own timeout |
 | `CommandHooks` | sim (hidden) | `~/.sim/hooks.json`; capabilities from `BORG_SIM_CAPS` |
+
+## The harness's own transcript
+
+A hook can go quiet when a harness changes: since Claude Code 2.1.312 a rejected tool call no longer
+reaches `PostToolUseFailure`, while the transcript still names the engineer's words. The transcript is
+the durable record, and it also holds the engineer's answers to the agent's own questions, which no hook
+sees. Borg reads it at three moments (sweep.rs; `BORG_TRANSCRIPT_CAPTURE=off` turns them off):
+
+- **Turn end** (`stop`), Claude Code, omp and Codex: only what the turn added, from the offset kept in
+  `<state>/<session>.swept` (with a hash of the 64 bytes before it, and where the reader stood, so a
+  tool call and its result read in different turns still pair). A transcript that did not grow costs
+  one stat. A file that shrank or changed is read again; the dedupe keeps that safe.
+- **Session end** (`borg learn --session`, before it learns): the whole transcript, on all four
+  harnesses; opencode's through its CLI export, which is too slow for a hook.
+- **Every `borg learn`**: a session whose transcript grew since its last sweep and has been quiet for a
+  day (`outcome::IDLE_MS`) is swept, and its episodes are learned; a session never ended no longer
+  keeps them waiting. It looks in every collective's state, but only for sessions swept once: a
+  session never swept (open since before 0.7.2) is read at its end or by `borg assimilate`.
+
+Episodes are only appended, through one dedupe (learn.rs `Known`): the same id, the same words in the
+same session as an episode no transcript named by its call (so the hook's capture and the
+transcript's are one episode, while two tool calls with the same words stay two; an answer matches by
+its id alone), or a prompt of the same session within 5 seconds. The sweep never settles an outcome. `borg assimilate` reads the same
+transcripts for the past. Each module knows where its harness keeps them (`session_log`, `projects`,
+`sessions`, `data_dir`, honouring `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `CODEX_HOME` and
+`XDG_DATA_HOME`); assimilate.rs knows how to read them:
+
+| | Claude Code | omp | opencode | Codex |
+|---|---|---|---|---|
+| Read at | turn end (`transcript_path`), session end | turn end (the session file by id), session end | session end (CLI export) | turn end (the rollout by thread id), session end |
+| Rejection with words | `tool_result` "…the user said:\n<words>" | none: denials are wordless, the next prompt is the reason | 1.x feedback error, 2.x `permission.rejected` message | none: no rejection is recorded at all |
+| Answer to the agent's question | `AskUserQuestion` result, `toolUseResult.answers` and notes | `ask` result `details` (`selectedOptions`, `customInput`, `results`) | `question` result `metadata.answers` (a dismissed question is none) | `request_user_input` output `answers` |
+| Episode id (`<session8>-T<id>`) | `tool_use_id` | `toolCallId` | part id (1.x), item id (2.x) | `call_id` |
+| Version on the episode | each line's `version` | `runtime.version` | 1.x session `version`; 2.x none | `session_meta.cli_version` |
+
+`borg doctor` notices when capture breaks again: per harness and harness version, it counts the
+rejections with words and the answers in the transcripts of the last 14 days (raw lines, not the
+replay, with the replay's first-line rule for a rejection) and compares them with the episodes Borg
+holds of those sessions. A session counts under the version of its newest mark, so a break at an
+update is not hidden by the captures before it. It warns when Borg holds none or under half, naming
+the harness version and the first day. When the hook captured no rejection under a version while
+the transcript did, it says so: as ok while transcript capture covers it, as a warning when
+`BORG_TRANSCRIPT_CAPTURE=off`.
+opencode is not counted there: its sessions are read through its CLI only.
 
 ## Codex notes
 

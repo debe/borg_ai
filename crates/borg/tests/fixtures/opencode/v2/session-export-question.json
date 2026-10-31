@@ -1,0 +1,148 @@
+{
+ "info": {
+  "id": "ses_0c1a2b3c4d5eRelayAnswers01",
+  "projectID": "1111111111111111111111111111111111111111",
+  "time": {
+   "created": 1793185200000,
+   "updated": 1793185500000
+  },
+  "title": "relay retries",
+  "location": {
+   "directory": "/home/dev/work/relay"
+  }
+ },
+ "messages": [
+  {
+   "id": "msg_01",
+   "time": {
+    "created": 1793185200100
+   },
+   "text": "add retries to the relay",
+   "files": [],
+   "type": "user"
+  },
+  {
+   "id": "msg_02",
+   "time": {
+    "created": 1793185201000,
+    "completed": 1793185230000
+   },
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "m",
+    "providerID": "p"
+   },
+   "content": [
+    {
+     "type": "text",
+     "text": "I will add a retry wrapper in the deploy shell script."
+    },
+    {
+     "type": "tool",
+     "id": "call_oc_shell",
+     "name": "shell",
+     "executed": false,
+     "state": {
+      "status": "error",
+      "input": {
+       "command": "sed -i 's/deliver/retry deliver/' deploy.sh"
+      },
+      "error": {
+       "type": "permission.rejected",
+       "message": "no, keep the retries in the client, not in the shell script"
+      }
+     },
+     "time": {
+      "created": 1793185201100,
+      "completed": 1793185229000
+     }
+    }
+   ]
+  },
+  {
+   "id": "msg_03",
+   "time": {
+    "created": 1793185240000,
+    "completed": 1793185300000
+   },
+   "type": "assistant",
+   "agent": "build",
+   "model": {
+    "id": "m",
+    "providerID": "p"
+   },
+   "content": [
+    {
+     "type": "tool",
+     "id": "call_oc_question",
+     "name": "question",
+     "executed": true,
+     "state": {
+      "status": "completed",
+      "input": {
+       "questions": [
+        {
+         "question": "Which backoff should the client use?",
+         "header": "Backoff",
+         "options": [
+          {
+           "label": "Exponential",
+           "description": "Doubles each time."
+          },
+          {
+           "label": "Linear",
+           "description": "Adds a fixed step."
+          }
+         ]
+        },
+        {
+         "question": "What is the longest wait?",
+         "header": "Cap",
+         "options": [
+          {
+           "label": "10 s",
+           "description": ""
+          },
+          {
+           "label": "60 s",
+           "description": ""
+          }
+         ]
+        }
+       ]
+      },
+      "content": [
+       {
+        "type": "text",
+        "text": "User has answered your questions: \"Which backoff should the client use?\"=\"Exponential\", \"What is the longest wait?\"=\"cap at 30 s, the health check gives up at 45\". You can now continue with the user's answers in mind."
+       }
+      ],
+      "metadata": {
+       "answers": [
+        [
+         "Exponential"
+        ],
+        [
+         "cap at 30 s, the health check gives up at 45"
+        ]
+       ]
+      }
+     },
+     "time": {
+      "created": 1793185240100,
+      "completed": 1793185290000
+     }
+    }
+   ]
+  },
+  {
+   "id": "msg_04",
+   "time": {
+    "created": 1793185300100
+   },
+   "type": "idle",
+   "outcome": "succeeded"
+  }
+ ]
+}

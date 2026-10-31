@@ -11,6 +11,7 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
     let detail = e.text.clone();
     let head = match e.kind.as_str() {
         "correction" if e.why == "rejected_tool" => format!("{w} rejected a tool call"),
+        "correction" if e.why == "answer" => format!("{w} answered the drone's question"),
         "correction" => format!("{w} corrected the drone"),
         "veto" => format!("{w} said no to a drone's work"),
         "veto_repeat" => "A veto repeated an earlier one: the lesson did not hold".into(),
@@ -67,6 +68,12 @@ pub fn describe(e: &FeedEvent) -> (String, String) {
     (head, detail)
 }
 
+/// Where a correction was read from: the harness's own transcript (with its version). Nothing when the
+/// event names no source: a hook's capture, or an import made before transcripts were named.
+fn captured(e: &FeedEvent) -> Option<String> {
+    (e.kind == "correction" && e.why != "regret" && !e.source.is_empty()).then(|| format!("from the {} transcript", e.source))
+}
+
 /// Feed rows; items newer than the last refresh glow briefly.
 #[component]
 pub fn FeedList(
@@ -91,6 +98,7 @@ pub fn FeedList(
                 let fresh = seen > 0.0 && e.ms > seen;
                 let meta = [
                     (!e.repo.is_empty()).then(|| e.repo.clone()),
+                    captured(&e),
                     Some(ago(e.ms)),
                     (e.usd > 0.0).then(|| usd(e.usd)),
                     (e.lessons.len() > 1).then(|| format!("{} lessons", e.lessons.len())),

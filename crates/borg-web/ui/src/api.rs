@@ -319,6 +319,9 @@ pub struct FeedEvent {
     pub dur_ms: f64,
     pub why: String,
     pub text: String,
+    /// On a correction: the harness (and version) whose transcript it was read from; empty when a hook
+    /// captured it, or an import from before 0.7.2.
+    pub source: String,
 }
 
 pub fn parse_feed(v: &Value) -> Vec<FeedEvent> {
@@ -337,6 +340,7 @@ pub fn parse_feed(v: &Value) -> Vec<FeedEvent> {
             dur_ms: f(&e["dur_ms"]),
             why: s(&e["why"]),
             text: s(&e["text"]),
+            source: s(&e["source"]),
         })
         .collect()
 }

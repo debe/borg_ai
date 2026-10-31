@@ -265,7 +265,7 @@ async fn feed(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Respon
         .into_iter()
         .map(|e| {
             json!({"ms": e.ms, "kind": e.kind, "engineer": aliases.display(&e.engineer), "repo": e.repo, "lessons": e.lessons,
-                "n": e.n, "usd": e.usd, "dur_ms": e.dur_ms, "why": e.why, "text": e.text})
+                "n": e.n, "usd": e.usd, "dur_ms": e.dur_ms, "why": e.why, "text": e.text, "source": e.source})
         })
         .collect();
     Json(json!({"collective": m.name, "events": out})).into_response()

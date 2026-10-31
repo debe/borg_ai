@@ -50,6 +50,7 @@ pub mod runner;
 pub mod select;
 pub mod stats;
 pub mod steer;
+pub mod sweep;
 #[doc(hidden)]
 pub mod systems;
 pub mod top;

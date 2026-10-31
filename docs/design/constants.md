@@ -222,6 +222,9 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-trace/src/dialogue.rs` | `REFUSAL_CHARS` | 2,000 chars | A refused call's error text, whatever the harness printed |
 | `borg-trace/src/scars.rs` | `CMD_CHARS` | 300 chars | A memory's line holding a heredoc or a pasted script |
 | `borg-web/src/lib.rs` | `PAGE_MAX` | 2,000 rows | One request making the server serialise a whole log (`/api/feed`, `/api/messages`) |
+| `borg/src/sweep.rs` | `FIRST_READ` | 4 MiB | A turn-end sweep without a valid offset (the first turn after an upgrade, a rewritten file) reading a long session's whole transcript in the hook; the session's end and the idle sweep read the rest |
+| `borg/src/sweep.rs` | `DOCTOR_FILES` | 200 transcripts per harness, the newest | `borg doctor` reading every transcript of a busy fortnight; a note says when there were more |
+| `borg/src/assimilate.rs` | `OPEN_CALLS` | 64 calls | Tool calls left without a result by interrupted turns growing the `.swept` state written at every turn end; a result whose call fell out keeps its id |
 
 ## Derived
 
@@ -309,7 +312,10 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/assimilate.rs` | `NOTICE_CHARS` | 200 chars | How far into a failed tool call's first line the harness's rejection notice is looked for: past it the same words are the tool's own output. Not a display length: it decides what counts as a rejection |
 | `borg/src/listen.rs` | `TICK`, `LOOK` | 250 ms, 2 s | The waiter's poll: one `stat` per tick, a look at the session when the log is unchanged |
 | `borg/src/live.rs` | `WAIT_POLL` | 200 ms | How often a stop waiting for a live check looks at its lock |
-| `borg/src/assimilate.rs` | `SAME_MS` | 5 s | Two episodes this close are one correction (a dedupe window) |
+| `borg/src/sweep.rs` | `HASHED` | 64 bytes | The bytes before the swept offset whose hash says a transcript is still the file swept (rewritten in place, or another file at its path, differs there) |
+| `borg/src/sweep.rs` | `DOCTOR_DAYS` | 14 days | How far back `borg doctor` compares transcripts with what Borg holds: a harness update a few days old and the sessions on either side of it |
+| `borg/src/sweep.rs` | `CAPTURED_SHARE` | 0.5 | `borg doctor`'s "far fewer": a working capture holds about every rejection and answer a transcript names, a broken one few or none |
+| `borg/src/learn.rs` | `SAME_MS` | 5 s | Two prompt episodes of one session this close are one correction (a dedupe window: the hook's capture time and the transcript's message time); a tool call's episode is matched by its id or words instead (`Known`) |
 | `borg/src/queen.rs` | `DUPLICATE` | 0.6 | The Jaccard overlap that makes two questions one (a dedupe threshold) |
 | `borg/src/notes/regress_cosmetic.rs` | `MOVE_MIN`, `MOVE_NEAR` | 8 chars, 3 lines | The cosmetic-change classifier's heuristics |
 | `borg-mesh/src/recon.rs` | `LEAF` | 8 hashes | Trades rounds against message size; both sides must use the same value, so it is part of the protocol |
@@ -415,7 +421,7 @@ labelled.
 | 160 / 240 / 300 chars | stats.rs `FEED_CHARS`, whole.rs's line, why.rs caps, facets, queen.rs `QUOTE_CHARS`, conscience.rs `EARLY_QUESTION_CHARS` | Each labelled |
 | 120 / 200 chars | top.rs `MESSAGE_CHARS`, escalation.rs `ANSWER_CHARS`, notify.rs `BODY_CHARS`; veto.rs `EVIDENCE_CHARS`, conscience.rs `EARLY_CONSEQUENCE_CHARS`, the opencode adapter's `LOG_CHARS` (display), assimilate.rs `NOTICE_CHARS` (method) | Each labelled |
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
-| 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method) | A window's ceiling; the gaps a hold reads |
+| 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method), sweep.rs `HASHED` (method, bytes), assimilate.rs `OPEN_CALLS` (guard, calls) | A window's ceiling; the gaps a hold reads; the bytes whose hash says a transcript is unchanged; the open tool calls kept between sweeps |
 | 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor), update.rs `CHECKING_MS` (guard) | 0.5.0's message rate; a tool call's hold; one release check at a time |
 | 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` and `SAME` (method) | A probability kept off 0 and 1; a prediction that is 1/2; two recalls that are equal |
 | 300 and 30 | select/replay.rs `READOUT_UNITS`, `READOUT_SESSIONS`; `TEST_CHECKS`, `TEST_SESSIONS` (method) | The online readout's labelled units and sessions; the question-count test's checks and sessions |

@@ -58,6 +58,12 @@ pub trait Harness: Sync {
     fn sub_runs(&self, _home: &Path, _session: Option<&str>, _since: Option<i64>) -> Vec<Run> {
         Vec::new()
     }
+    /// The file its own transcript of main session `session` is in, which the turn-end sweep reads
+    /// (sweep.rs): under `home` (`$HOME`, its config-dir variable honoured), or as the hook's `input`
+    /// names it. Default: none (opencode keeps no file borg reads; its CLI exports a session at its end).
+    fn session_log(&self, _home: &Path, _session: &str, _input: &Value) -> Option<PathBuf> {
+        None
+    }
     /// What its adapter waits for each answer ([`Budgets`]); None where the harness runs borg's hooks
     /// itself, under the `timeout` borg installs or its own default (Claude Code, Codex). Default: None.
     fn budgets(&self) -> Option<Budgets> {
@@ -376,6 +382,12 @@ pub fn env_sessions() -> Vec<(String, &'static str)> {
 pub fn env_pids() -> Vec<(u32, &'static str)> {
     let pid = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u32>().ok());
     ALL.iter().filter_map(|h| h.caps().pid_env.and_then(pid).map(|p| (p, h.name()))).collect()
+}
+
+/// A directory a harness's own variable names (`CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `CODEX_HOME`,
+/// `XDG_DATA_HOME`); None when it is unset or empty. Each harness module's transcript locations start here.
+pub(crate) fn env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// The event's transcript, when the harness writes one and the event names it.

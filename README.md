@@ -95,7 +95,7 @@ Everything in this section works in one plain interactive session, with no team.
 
 ```mermaid
 flowchart LR
-  S["corrections, borg no,<br/>review → fix findings,<br/>team documents"] -->|"borg learn at session end"| L[("lessons")]
+  S["corrections, answers, borg no,<br/>review → fix findings,<br/>team documents"] -->|"borg learn at session end"| L[("lessons")]
   L -->|"at the prompt: free"| D["drone"]
   L -->|"during the turn: live check"| D
   L -->|"at the stop: graded call"| D
@@ -105,8 +105,10 @@ flowchart LR
 ```
 
 **Learning.** Borg records an *episode* when you push back ("no, use a channel") or reject a tool call
-with a reason. At session end `borg learn` makes one model call per episode and writes or updates a
-lesson. Team documents become lessons through `borg assimilate --from-dir`.
+with a reason. Your answers to the agent's own questions (Claude Code `AskUserQuestion`, omp `ask`,
+opencode `question`, Codex `request_user_input`) are episodes too. Borg reads each harness's own
+transcript beside its hooks, so a harness update cannot silence them. At session end `borg learn`
+makes one model call per episode and writes or updates a lesson. Team documents become lessons through `borg assimilate --from-dir`.
 [Sources of lessons](https://github.com/debe/borg_ai/blob/main/docs/learning.md#sources-of-lessons)
 
 **Delivery.** Lessons arrive at three moments. *At the prompt or a touched file*, free, by word matching

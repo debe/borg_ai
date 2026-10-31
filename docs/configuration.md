@@ -236,15 +236,19 @@ After an upgrade, `borg install all --apply` brings both up to date.
 
 ## Import what you already have
 
-**Past sessions.** Mine your Claude Code, omp and opencode sessions for corrections:
+**Past sessions.** Mine your Claude Code, omp, opencode and Codex sessions for corrections and for your
+answers to the agent's own questions:
 
 ```sh
-borg assimilate                         # dry run: what it found, per collective; no model calls
+borg assimilate                         # dry run: what it found, per collective and harness; no model calls
 borg assimilate --apply --limit 50      # learn the newest 50 new episodes (model calls)
 borg assimilate --apply --since 2026-09-01
+borg assimilate --session <id>          # one session only, to check what it gives
 ```
 
-It reads `~/.claude/projects` and `~/.omp/agent/sessions` (`--claude DIR`, `--omp DIR`), and opencode
+It reads `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`), `$PI_CODING_AGENT_DIR/sessions`
+(default `~/.omp/agent/sessions`) and `$CODEX_HOME/sessions` (default `~/.codex/sessions`), or
+`--claude DIR`, `--omp DIR`, `--codex DIR`, and opencode
 1.x and 2.x sessions through the `opencode` CLI when it is installed (read-only exports; `--opencode DIR`
 reads a directory of `opencode export` / `opencode session export` files instead). opencode 1.x lists
 every session with one query. opencode 2.x lists sessions per project only, so Borg asks it for the
@@ -252,8 +256,16 @@ projects it knows: the directories of your Claude Code and omp sessions, the col
 the git repos up to two levels inside them. opencode 2.x does not list the sessions it migrated from
 1.x, under any project; export those with an opencode 1.x (2.x keeps the 1.x tables) into a directory
 and pass `--opencode DIR`. Sub-agent sessions and Borg's own model calls are skipped. The first output lines count the sessions
-per source. Each episode routes by the directory it happened in, so off repos contribute nothing. A
-second run adds nothing twice. `BORG_ASSIMILATE_SKIP=word1,word2` drops every episode that mentions one of those words, such as
+per source, then per harness (with the version the newest episode was written by) the new rejected
+tool calls, answers and prompts and the episodes already present. A dry run ends with the learn cost:
+one model call per episode, at the mean cost of this machine's recorded learn calls (unknown until
+one reported a cost). Answers (Claude Code `AskUserQuestion`, omp `ask`, opencode `question`, Codex
+`request_user_input`) become episodes marked `via: answer`; the learn call decides whether an answer
+holds a lesson beyond its task. Codex rollouts give answers only: Codex records no rejected tool call.
+Each episode routes by the directory it happened in, so off repos contribute nothing. A second run
+adds nothing twice: an episode is the same when it has the same id (the harness's id for the tool
+call), the same words in the same session as one the live hook recorded, or is a prompt of the
+same session within 5 seconds. Two tool calls or answers with the same words are two episodes. `BORG_ASSIMILATE_SKIP=word1,word2` drops every episode that mentions one of those words, such as
 an abandoned project's name.
 
 **Team documents.** Turn a git checkout of written team knowledge into scoped lessons:
@@ -468,6 +480,7 @@ All are optional.
 | `BORG_REGRESS` | `links` | [Decision → fix links](#decision--fix-links): `learn` also makes fix links regret episodes (team or private); `off`: no links |
 | `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
 | `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
+| `BORG_TRANSCRIPT_CAPTURE` | on | `off`: Borg no longer reads the harnesses' own transcripts for corrections and answers (at a turn end, at session end, for idle sessions); the hooks alone capture ([The harness's own transcript](harnesses.md#the-harnesss-own-transcript)). `borg assimilate` still reads them |
 | `BORG_REVIEW_FIX` | on | [Review → fix findings](#review--fix-findings): `off`: the ended session's sub-agent review findings are not learned from |
 | `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
 | `BORG_TEST_CREDIT` | on | `off`: a session's own tests going green after a lesson was asked no longer credit it (`tested` outcomes; [Green tests credit the question](learning.md#outcomes-and-the-usefulness-belief)). For an eval's frozen arm. Also off with `BORG_LEARN=off` |

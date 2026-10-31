@@ -3,6 +3,35 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.2 (unreleased)
+
+Corrections and answers reach Borg from every harness's own transcript, so a harness update can no
+longer silence them unnoticed.
+
+### Fixed
+
+- Rejected tool calls are captured again on Claude Code 2.1.312 and later, which stopped telling the
+  hook about them. Borg now reads them from the transcript at each turn end.
+  [The harness's own transcript](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md#the-harnesss-own-transcript)
+- A session left open no longer keeps its corrections waiting: `borg learn` picks them up once it has
+  been idle for a day.
+
+### Added
+
+- Your answers to the agent's own questions (Claude Code, omp, opencode, Codex) become episodes, and
+  lessons where they state a rule. [Sources of lessons](https://github.com/debe/borg_ai/blob/main/docs/learning.md#sources-of-lessons)
+- `borg doctor` warns, per harness version, when a harness's transcripts name more rejections or
+  answers than Borg holds, and says when a harness stopped telling the hook. `borg status` and borg
+  web show which harness's transcript a correction came from.
+- `borg assimilate` reads Codex sessions and answers, and gains `--session` and `--codex`.
+
+### Upgrading
+
+- Run `borg doctor`: it names the day capture broke and the `borg assimilate --since <day>` that
+  recovers it. The dry run states the cost (one model call per episode); add `--apply` to learn it. A
+  longer `--since` also recovers older answers, which no earlier release captured.
+  `BORG_TRANSCRIPT_CAPTURE=off` turns transcript reading off.
+
 ## 0.7.1 (2026-10-30)
 
 Fixes the `borg` skill for harnesses that read its header strictly.

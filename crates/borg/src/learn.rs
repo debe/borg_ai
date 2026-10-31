@@ -101,6 +101,122 @@ pub struct Episode {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regret: Option<regret::Regret>,
+    /// How the engineer said it, where that is not a prompt or a rejected tool call: [`ANSWER`] for an
+    /// answer to the agent's own question (the questions and their options are the `agent` text).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
+    /// The harness whose transcript the episode was read from (`Harness::name`); empty for one the hook
+    /// captured live.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub harness: String,
+    /// That harness's version as its transcript names it (Claude Code's `version`, omp's
+    /// `runtime.version`, opencode 1.x's session `version`, Codex's `cli_version`); empty where it names none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub harness_version: String,
+}
+
+/// `Episode::via` of an answer to the agent's own question, and its `why` in the usage statistics.
+pub const ANSWER: &str = "answer";
+
+/// Two prompt episodes of one session this close together are the same correction. Method: a dedupe
+/// window; the live hook's capture time and the transcript's message time of one prompt differ by a
+/// second or two, two corrections of a session by far more. Episodes of a tool call are matched by
+/// their id and words instead ([`Known::holds`]).
+pub const SAME_MS: i64 = 5_000;
+
+/// The id of an episode read from a transcript: `<session8>-T<call>` for one about a tool call (the
+/// harness's own id for it: Claude's `tool_use_id`, omp's `toolCallId`, opencode's part id, Codex's
+/// `call_id`), else `<session8>-<ms>` as the hook names a prompt's. Content, never a position: a
+/// transcript still being written cannot shift it.
+pub fn transcript_id(session: &str, call: &str, ms: i64) -> String {
+    let s8: String = session.chars().take(8).collect();
+    if call.is_empty() { format!("{s8}-{ms}") } else { format!("{s8}-T{call}") }
+}
+
+/// A correction's words with its whitespace collapsed: the hook and a transcript may wrap or pad the
+/// same words differently.
+fn words(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a store already holds, so an episode read again (the transcript sweep, session end,
+/// `borg assimilate`) is never appended twice. Read once, then grown with what is appended.
+#[derive(Debug, Default)]
+pub struct Known {
+    ids: HashSet<String>,
+    /// Per session: each episode's time, whether it was a prompt's, whether a transcript named it by its
+    /// tool call ([`from_call`]), and its words ([`words`]).
+    sessions: HashMap<String, Vec<Held>>,
+}
+
+impl Known {
+    /// The episodes of `store`'s `episodes.jsonl`.
+    pub fn read(store: &Path) -> Self {
+        let mut k = Known::default();
+        for e in read_jsonl::<Episode>(&store.join("episodes.jsonl")) {
+            k.add(&e);
+        }
+        k
+    }
+
+    /// Whether `e` is already held: an episode with its id; one of its session with the same words that no
+    /// transcript named by its call (the hook stamps capture time, a transcript message time, so their ids
+    /// differ; two calls the transcript named are two events, whatever their words); or, for a prompt's
+    /// episode, a prompt's of its session within [`SAME_MS`] (the hook and the transcript cut a prompt
+    /// alike, but an older store's wording may differ). An answer is matched by its id alone: only a
+    /// transcript records answers, and the same pick to two questions is two answers.
+    pub fn holds(&self, e: &Episode) -> bool {
+        if self.ids.contains(&e.id) {
+            return true;
+        }
+        let said = words(&e.correction);
+        let (prompt, answer) = (prompt_episode(e), e.via == ANSWER);
+        self.sessions
+            .get(&e.session)
+            .is_some_and(|seen| seen.iter().any(|h| (!answer && !h.from_call && h.words == said) || (prompt && h.prompt && (h.ms - e.ms).abs() < SAME_MS)))
+    }
+
+    /// Remember `e` as held.
+    pub fn add(&mut self, e: &Episode) {
+        self.ids.insert(e.id.clone());
+        let held = Held { ms: e.ms, prompt: prompt_episode(e), from_call: from_call(e), words: words(&e.correction) };
+        self.sessions.entry(e.session.clone()).or_default().push(held);
+    }
+}
+
+/// One held episode, as [`Known::holds`] compares it.
+#[derive(Debug)]
+struct Held {
+    ms: i64,
+    prompt: bool,
+    from_call: bool,
+    words: String,
+}
+
+/// Whether a transcript named `e` by its tool call ([`transcript_id`]'s `<session8>-T<call>`); the hook
+/// names its episodes `<session8>-<ms>`.
+fn from_call(e: &Episode) -> bool {
+    let s8: String = e.session.chars().take(8).collect();
+    e.id.strip_prefix(&s8).is_some_and(|rest| rest.starts_with("-T"))
+}
+
+/// An episode said in a prompt: a pushback or a veto, not a rejected tool call or an answer.
+fn prompt_episode(e: &Episode) -> bool {
+    e.rejected_tool.is_none() && e.via.is_empty() && e.kind != regret::KIND
+}
+
+/// Append `e` to `store` (counted as `record_episode_in` counts it) unless `known` holds it; `known`
+/// then holds it too. True when appended. The one entry for transcript capture.
+///
+/// # Errors
+/// When the episode cannot be appended.
+pub fn record_new_in(store: &Path, known: &mut Known, e: &Episode) -> std::io::Result<bool> {
+    if known.holds(e) {
+        return Ok(false);
+    }
+    record_episode_in(store, e)?;
+    known.add(e);
+    Ok(true)
 }
 
 /// A lesson as stored: the conscience's `Challenge` plus provenance and consolidation state.
@@ -221,7 +337,8 @@ pub fn record_episode_in(store: &Path, e: &Episode) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A correction in the usage statistics: a rejected tool call, a pushback or a regret, with a short excerpt.
+/// A correction in the usage statistics: a rejected tool call, a pushback, an answer to the agent's question
+/// (`why` [`ANSWER`], rolled up apart from the corrections, stats.rs `fold`) or a regret, with a short excerpt.
 pub fn count_correction(store: &Path, e: &Episode) {
     // A veto counts itself (`stats::VETO`, veto.rs).
     if e.kind == crate::veto::KIND {
@@ -230,6 +347,7 @@ pub fn count_correction(store: &Path, e: &Episode) {
     let snippet = crate::stats::excerpt(&e.correction, crate::stats::FEED_CHARS);
     let (why, text) = match &e.rejected_tool {
         _ if e.kind == regret::KIND => ("regret", snippet),
+        _ if e.via == ANSWER => (ANSWER, snippet),
         Some(tool) => ("rejected_tool", format!("{tool}: {snippet}")),
         None => ("pushback", snippet),
     };
@@ -239,6 +357,7 @@ pub fn count_correction(store: &Path, e: &Episode) {
         ev.repo.clone_from(&e.repo);
         ev.why = why.into();
         ev.text = text;
+        ev.source = crate::stats::source(&e.harness, &e.harness_version);
     });
 }
 
@@ -309,10 +428,14 @@ fn episode_prompt(e: &Episode, listed: &[String]) -> String {
         "{OPENING}\n\n{REACH_RULES}\n\n{FIELDS}\n{AREA}\n\n{MERGE_RULES}\n\n## Task the agent had\n{}\n\n## What the agent proposed (excerpt)\n{}\n{}\n\n## Engineer's correction\n{}\n\n## Existing lessons\n{existing}\n",
         e.task.chars().take(EXCERPT_CHARS).collect::<String>(),
         e.agent,
-        e.rejected_tool.as_deref().unwrap_or(""),
+        if e.via == ANSWER { ANSWERED } else { e.rejected_tool.as_deref().unwrap_or("") },
         e.correction,
     )
 }
+
+/// Under an answer's proposal (the agent's own questions): what makes an answer a lesson.
+const ANSWERED: &str = "(The agent asked these questions; the correction below is the engineer's answer. An answer that only picks \
+what fits this one task is NOT a lesson; one that states a rule, a preference or a reason that holds beyond it is.)";
 
 fn schema() -> Value {
     json!({"type": "object", "additionalProperties": false, "properties": {
@@ -663,6 +786,30 @@ fn open(ctx: &Path, now: i64) -> bool {
     ms.is_some_and(|ms| ms > now - outcome::IDLE_MS)
 }
 
+/// The sessions besides `session` whose waiting episodes (not in `done` nor `skipped`) a run with
+/// `session` learns too: quiet ones, whose newest episode is `outcome::IDLE_MS` old at `now` and which
+/// `is_open` (its state file, `open`) says are not open. A session left open never sends its end, and
+/// the transcript sweep (sweep.rs `idle`) adds its last corrections after it went quiet. Each such
+/// session costs one stat.
+fn quiet(
+    episodes: &[Episode],
+    session: Option<&str>,
+    done: &HashSet<String>,
+    skipped: &HashSet<String>,
+    now: i64,
+    is_open: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let Some(session) = session else { return HashSet::new() };
+    let mut newest: HashMap<&str, i64> = HashMap::new();
+    for e in episodes {
+        let n = newest.entry(e.session.as_str()).or_insert(e.ms);
+        *n = (*n).max(e.ms);
+    }
+    let waiting: HashSet<&str> =
+        episodes.iter().filter(|e| e.session != session && !done.contains(&e.id) && !skipped.contains(&e.id)).map(|e| e.session.as_str()).collect();
+    waiting.into_iter().filter(|s| newest[s] <= now - outcome::IDLE_MS && !is_open(s)).map(str::to_string).collect()
+}
+
 /// Episode kinds the removed hive made (a group's reflection, a rework), skipped where an older store has them.
 const RETIRED: [&str; 2] = ["group", "rework"];
 
@@ -705,8 +852,12 @@ fn learn_unlocked(
     // `RETIRED` kinds an older store holds are never learned.
     let episodes: Vec<Episode> = read_jsonl::<Episode>(&ep_path).into_iter().filter(|e| !RETIRED.contains(&e.kind.as_str())).collect();
     let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
+    let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
+    let ctx = |s: &str| state.join(format!("{}.ctx", crate::notes::safe(s)));
     // A veto is learned at the end of any session (veto.rs): a terminal veto may name one already ended.
-    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND;
+    // So is a quiet session's episode (`quiet`): one that never sends its end would keep it waiting.
+    let quiet = quiet(&episodes, session, &done, &skipped, now, |s| open(&ctx(s), now));
+    let mine = |e: &Episode| session.is_none_or(|s| s == e.session) || e.kind == crate::veto::KIND || quiet.contains(&e.session);
     let vetoes: HashSet<String> = episodes.iter().filter(|e| e.kind == crate::veto::KIND).map(|e| e.id.clone()).collect();
     let total = episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && mine(e)).count();
     let mut asked = 0;
@@ -835,8 +986,6 @@ fn learn_unlocked(
     }
     if track {
         credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path, regret_credit());
-        let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
-        let ctx = |s: &str| state.join(format!("{}.ctx", crate::notes::safe(s)));
         // Settled only once ended: its `end` hook ran (`session`), or it is idle by the log and its state
         // file is as quiet (`open`): a session working without asks or episodes for a day is still open.
         let mut ended: Vec<String> = outcome::idle_sessions(&outcomes, &last_episode, now)
@@ -1050,6 +1199,65 @@ mod tests {
         ));
         assert!(!denied(err), "a rejection with words is captured directly");
         assert!(!denied("Exit code 1\nTool call denied by user: bash"), "only the harness's own message, not tool output");
+    }
+
+    #[test]
+    fn known_holds_an_id_the_same_words_or_a_prompt_moments_apart() {
+        let at = |id: &str, ms: i64, tool: Option<&str>, said: &str| Episode {
+            id: id.into(),
+            ms,
+            session: "s1".into(),
+            rejected_tool: tool.map(String::from),
+            correction: said.into(),
+            ..Episode::default()
+        };
+        let mut k = Known::default();
+        // What the hook recorded: a rejection at capture time, a prompt.
+        k.add(&at("s1-100000", 100_000, Some("Edit {}"), "use backoff,\n  not a fixed sleep"));
+        k.add(&at("s1-200000", 200_000, None, "no, the other crate"));
+        assert!(k.holds(&at("s1-Ttoolu_1", 70_000, Some("Edit {}"), "use backoff, not a fixed sleep")), "same words, whitespace aside");
+        assert!(k.holds(&at("s1-100000", 1, None, "anything")), "same id");
+        assert!(k.holds(&at("s1-201500", 201_500, None, "no, the other crate!")), "a prompt within SAME_MS");
+        assert!(!k.holds(&at("s1-Ttoolu_2", 201_000, Some("Bash {}"), "keep the cache")), "a tool call's episode needs its id or its words");
+        assert!(!k.holds(&Episode { via: ANSWER.into(), ..at("s1-Ttoolu_3", 200_500, None, "Exponential") }), "nor does an answer");
+        assert!(!k.holds(&Episode { session: "s2".into(), ..at("s2-Tx", 100_000, Some("Edit {}"), "use backoff, not a fixed sleep") }));
+        // Two calls the transcript named are two events, though their words match: a second rejection
+        // with the same words, the same pick to another question.
+        let mut t = Known::default();
+        t.add(&at("s1-Ttoolu_4", 300_000, Some("Edit {}"), "keep it in the relay crate"));
+        t.add(&Episode { via: ANSWER.into(), ..at("s1-Ttoolu_5", 400_000, None, "Create, no parent") });
+        assert!(!t.holds(&at("s1-Ttoolu_6", 900_000, Some("Edit {}"), "keep it in the relay crate")), "another rejected call");
+        assert!(!t.holds(&Episode { via: ANSWER.into(), ..at("s1-Ttoolu_7", 900_000, None, "Create, no parent") }), "another question");
+        // An answer is never matched to a hook's episode by words.
+        assert!(!k.holds(&Episode { via: ANSWER.into(), ..at("s1-Ttoolu_8", 900_000, None, "no, the other crate") }));
+        assert_eq!(transcript_id("abcdefghij", "toolu_9", 5), "abcdefgh-Ttoolu_9");
+        assert_eq!(transcript_id("abcdefghij", "", 5), "abcdefgh-5");
+
+        // record_new_in appends once and remembers.
+        let store = std::env::temp_dir().join(format!("borg-known-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        let mut known = Known::read(&store);
+        let e = at("s1-Tq", 5, None, "Exponential");
+        assert!(record_new_in(&store, &mut known, &e).unwrap());
+        assert!(!record_new_in(&store, &mut known, &e).unwrap());
+        assert!(Known::read(&store).holds(&e));
+        assert_eq!(read_jsonl::<Episode>(&store.join("episodes.jsonl")).len(), 1);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn an_answer_is_asked_as_an_answer_and_counted_as_one() {
+        let answer = Episode { via: ANSWER.into(), agent: "Which backoff?\n  options: Exponential | Linear".into(), ..ep("a1", "Exponential") };
+        let p = episode_prompt(&answer, &[]);
+        assert!(p.contains(ANSWERED) && p.contains("## Engineer's correction\nExponential"), "{p}");
+        assert!(!episode_prompt(&ep("e1", "no"), &[]).contains(ANSWERED));
+        let store = std::env::temp_dir().join(format!("borg-answer-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        count_correction(&store, &answer);
+        let ev = crate::stats::live(&store);
+        assert_eq!((ev.len(), ev[0].why.as_str()), (1, ANSWER));
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     fn ep(id: &str, correction: &str) -> Episode {
@@ -1451,11 +1659,16 @@ mod tests {
                 .collect()
         };
         let not = |s: &str, l: &str| (outcome::NOT_CORRECTED.to_string(), s.to_string(), l.to_string());
-        // s2 ends a day later: its own ask settles, and idle s3; s1 not, its episode is still pending.
+        // s2 ends a day later: its own ask settles, and idle s3; s1 not: it is still open (its state file
+        // is fresh), so its episode is still pending.
+        let ctx = home.join("state/s1.ctx");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+        std::fs::write(&ctx, "").unwrap();
         asked(&home, "s2", idle - 1, &["Le1"]);
         learn_in(&home, Some("s2"), &fake_ask, true, idle);
         assert_eq!(results(), [not("s3", "Le0"), not("s2", "Le1")]);
-        // A plain `borg learn` folds e2 in and settles s1 too, so s1 gives both kinds of outcome.
+        // s1 goes quiet; a plain `borg learn` folds e2 in and settles s1 too, so s1 gives both kinds of outcome.
+        std::fs::remove_file(&ctx).unwrap();
         assert_eq!(learn_in(&home, None, &fake_ask, true, idle), (0, 1, 0));
         let corrected = (outcome::CORRECTED.to_string(), "s1".to_string(), "Le0".to_string());
         assert_eq!(results(), [not("s3", "Le0"), not("s2", "Le1"), corrected.clone(), not("s1", "Le1")]);
@@ -1463,6 +1676,29 @@ mod tests {
         asked(&home, "s4", idle, &["Le1"]);
         learn_in(&home, None, &fake_ask, true, idle + 1);
         assert_eq!(results().len(), 4);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_quiet_sessions_episodes_are_learned_by_another_sessions_end() {
+        let home = temp_home("quiet");
+        // s1 never ends; the transcript sweep added its last correction after it went quiet (sweep.rs `idle`).
+        append_jsonl(&home.join("episodes.jsonl"), &at("e0", "s1", 10, "", "check TOCTOU on the flag")).unwrap();
+        // s9 is busy (an episode an hour ago) and open; s2 ends now.
+        append_jsonl(&home.join("episodes.jsonl"), &at("e1", "s9", 10 + outcome::IDLE_MS, "", "check against the spec")).unwrap();
+        append_jsonl(&home.join("episodes.jsonl"), &at("e2", "s2", 20 + outcome::IDLE_MS, "", "no, keep the cache")).unwrap();
+        let now = 30 + outcome::IDLE_MS;
+        // While s1's state file is fresh it is open, and waits for its own end.
+        let ctx = home.join("state/s1.ctx");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+        std::fs::write(&ctx, "").unwrap();
+        assert_eq!(learn_in(&home, Some("s2"), &fake_ask, true, now), (1, 0, 0), "s2's own episode only");
+        // Quiet: s2's end learns it too; busy s9 still waits.
+        std::fs::remove_file(&ctx).unwrap();
+        append_jsonl(&home.join("episodes.jsonl"), &at("e3", "s3", 25 + outcome::IDLE_MS, "", "no, the other crate")).unwrap();
+        assert_eq!(learn_in(&home, Some("s3"), &fake_ask, true, now), (2, 0, 0), "s3's own and quiet s1's");
+        let learned: HashSet<String> = lessons(&home.join("lessons.jsonl")).into_iter().flat_map(|l| l.episodes).collect();
+        assert!(learned.contains("e0") && !learned.contains("e1"), "{learned:?}");
         let _ = std::fs::remove_dir_all(home);
     }
 

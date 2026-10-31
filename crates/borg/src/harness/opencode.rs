@@ -79,13 +79,18 @@ impl Harness for Opencode {
     /// only where opencode keeps data under `home` (`$XDG_DATA_HOME/opencode`, else
     /// `home/.local/share/opencode`). Every session: 1.x only (2.x has no query that lists them).
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
-        let data = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()).map_or_else(|| home.join(".local/share"), PathBuf::from);
-        if !data.join("opencode").is_dir() {
+        if !data_dir(home).is_dir() {
             return Vec::new();
         }
         let here = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         session_runs(session, since, &|id, dir| export(id, dir.unwrap_or(&here)), &db)
     }
+}
+
+/// Where opencode keeps its data (its sessions are read through its CLI, never from here):
+/// `$XDG_DATA_HOME/opencode`, else `home/.local/share/opencode`.
+pub fn data_dir(home: &Path) -> PathBuf {
+    super::env_dir("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")).join("opencode")
 }
 
 // ---------------------------------------------------------------- the CLI

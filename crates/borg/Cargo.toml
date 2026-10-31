@@ -24,7 +24,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.7.1" }
+borg-trace = { path = "../borg-trace", version = "=0.7.2" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 # float_roundtrip: a float read back from the selection cache is the one written, so a hook's decision

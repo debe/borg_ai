@@ -231,6 +231,9 @@ fn print_status(t: &Targets) {
         println!("  queen open   {}", crate::queen::open(home).len());
         println!("  trust        {}", crate::trust::summary(home));
         println!("  last capture {}", s.last_capture_ms.map(human).unwrap_or_else(|| "never".into()));
+        // Corrections and answers per source: the hooks' live capture and each harness's transcript (sweep.rs).
+        let sources: Vec<String> = crate::sweep::sources(home).into_iter().map(|(k, (n, ms))| format!("{k} {n} (last {})", human(ms))).collect();
+        println!("  captures     {}", if sources.is_empty() { "none yet".to_string() } else { sources.join("; ") });
         let g = crate::prefilter::tally(&home.join("state"));
         println!("  stop gate    {} turn ends skipped at 0 tokens, {} asked the model (${:.2} so far)", g.skipped, g.asked, g.cost);
         if g.live_checks > 0 {
@@ -577,6 +580,8 @@ fn doctor(t: &Targets) -> i32 {
     if let Ok(c) = &cfg {
         let routes = collectives(c.as_ref(), &learn::home());
         checks.extend(crate::vectors::doctor::checks(&routes));
+        // What the harnesses' transcripts name against what Borg captured (sweep.rs).
+        checks.extend(crate::sweep::doctor(c.as_ref(), &learn::home(), &t.home, learn::now_ms()));
         checks.extend(crate::presence::mesh_checks(&routes));
         let emails: BTreeSet<String> = routes
             .iter()

@@ -83,9 +83,30 @@ impl Harness for Omp {
 
     /// Each session's task agents (`$PI_CODING_AGENT_DIR/sessions`, else `home/.omp/agent/sessions`).
     fn sub_runs(&self, home: &Path, session: Option<&str>, since: Option<i64>) -> Vec<Run> {
-        let agent = std::env::var_os("PI_CODING_AGENT_DIR").filter(|v| !v.is_empty()).map_or_else(|| home.join(".omp/agent"), PathBuf::from);
-        session_runs(&agent.join("sessions"), session, since)
+        session_runs(&sessions(home), session, since)
     }
+
+    /// `<sessions>/<slug>/<ts>_<session>.jsonl` ([`session_file`]).
+    fn session_log(&self, home: &Path, session: &str, _input: &Value) -> Option<PathBuf> {
+        session_file(&sessions(home), session)
+    }
+}
+
+// ---------------------------------------------------------------- transcripts
+
+/// Where omp keeps its sessions, `<sessions>/<slug>/<ts>_<id>.jsonl`: `$PI_CODING_AGENT_DIR/sessions`,
+/// else `home/.omp/agent/sessions`.
+pub fn sessions(home: &Path) -> PathBuf {
+    super::env_dir("PI_CODING_AGENT_DIR").unwrap_or_else(|| home.join(".omp/agent")).join("sessions")
+}
+
+/// Main session `id`'s file under `sessions`: a `<slug>/<ts>_<id>.jsonl` whose session record names `id`.
+pub fn session_file(sessions: &Path, id: &str) -> Option<PathBuf> {
+    let suffix = format!("_{id}.jsonl");
+    let named = |f: &PathBuf| f.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&suffix));
+    // The session record is the file's first line: one line read per candidate.
+    let records = |f: &PathBuf| first_line(f).is_some_and(|v| v["type"] == "session" && v["id"] == id);
+    read_dir(sessions).into_iter().filter(|p| p.is_dir()).flat_map(|slug| read_dir(&slug)).filter(|f| f.is_file() && named(f)).find(records)
 }
 
 // ---------------------------------------------------------------- sub-agent sessions
@@ -130,6 +151,13 @@ fn read_dir(p: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(p).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).collect();
     v.sort();
     v
+}
+
+/// The first line of `p`, parsed: an omp session file's session record.
+pub fn first_line(p: &Path) -> Option<Value> {
+    use std::io::BufRead;
+    let line = std::io::BufReader::new(std::fs::File::open(p).ok()?).lines().next()?.ok()?;
+    serde_json::from_str(&line).ok()
 }
 
 fn read_lines(p: &Path) -> Vec<Value> {

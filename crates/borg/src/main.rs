@@ -129,14 +129,25 @@ fn learn_cmd(rest: &[&str]) {
     // Unless BORG_REVIEW_FIX=off: the ended session's review → fix findings (its harness's sub-agent
     // runs) become episodes first, each in the store its repo routes to; a store other than this one
     // is learned here too, for this session.
+    // Unless BORG_TRANSCRIPT_CAPTURE=off (sweep.rs): the ended session's whole transcript, and every
+    // session's left idle since its last sweep, add the corrections and answers no hook captured.
     let mut others = Vec::new();
-    if let Some(s) = session
-        && learn::learning()
-        && borg::review_fix::on()
+    if learn::learning()
         && let Ok(cfg) = borg::collective::load()
     {
         let root = borg::collective::root_of(&learn::home());
-        let (_, homes) = borg::review_fix::record_session(&borg::review_fix::home_dir(), s, cfg.as_ref(), &root);
+        let mut homes = std::collections::BTreeSet::new();
+        if let Some(s) = session
+            && borg::review_fix::on()
+        {
+            homes.extend(borg::review_fix::record_session(&borg::review_fix::home_dir(), s, cfg.as_ref(), &root).1);
+        }
+        if borg::sweep::on() {
+            if let Some(s) = session {
+                homes.extend(borg::sweep::session_end(s, cfg.as_ref(), &root));
+            }
+            homes.extend(borg::sweep::idle(cfg.as_ref(), &root, learn::now_ms()));
+        }
         others = homes.into_iter().filter(|h| *h != learn::home()).collect();
     }
     for home in &others {

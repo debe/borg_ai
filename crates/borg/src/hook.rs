@@ -2144,6 +2144,8 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
         // The drone's latest proposal, for the reasoning note of what it commits (notes.rs).
         crate::notes::remember_proposal(&crate::notes::state_dir(), session, &full_proposal(h, input));
         crate::notes::mark(&crate::notes::state_dir(), session, "stop");
+        // What this turn added to the harness's own transcript: its corrections and answers (sweep.rs).
+        crate::sweep::turn_end(h, session, input);
     }
     let second_round = input.get("stop_hook_active").and_then(Value::as_bool) == Some(true);
     if std::env::var("BORG_CRITIC").as_deref() == Ok("generic") {
