@@ -247,6 +247,13 @@ use the same setting; `join` copies the admin's.
 
 ## Privacy on the mesh
 
+**What never syncs.** A collective's `personal.jsonl`, your personal lessons (commit style, tone) kept in
+the collective they were learned in, is local: the mesh never offers, signs or accepts it, so a
+teammate's machine never holds it. Only a tombstone in `lessons.jsonl` syncs, when one of your own team
+lessons became personal: it hides the text and carries none. Nothing moves between collectives over the
+mesh either; `borg move` crosses on your word, on this machine
+([Who hears a lesson](configuration.md#who-hears-a-lesson)).
+
 Traffic is end-to-end encrypted (QUIC with TLS). Each end authenticates the other by key, and Borg checks
 that key against the signed membership. A relay forwards packets it cannot read, and without a member key
 it can neither join nor inject data.

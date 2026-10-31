@@ -31,6 +31,7 @@ pub mod listen;
 pub mod live;
 pub mod memory;
 pub mod memory_export;
+pub mod moves;
 pub mod msg;
 pub mod notes;
 pub(crate) mod notify;

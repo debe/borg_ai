@@ -583,6 +583,10 @@ fn doctor(t: &Targets) -> i32 {
         // What the harnesses' transcripts name against what Borg captured (sweep.rs).
         checks.extend(crate::sweep::doctor(c.as_ref(), &learn::home(), &t.home, learn::now_ms()));
         checks.extend(crate::presence::mesh_checks(&routes));
+        // Lessons and evidence outside the collective their repo routes to, with the `borg move` that
+        // fixes each (moves.rs): shown, never acted on.
+        let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        checks.extend(crate::moves::doctor(c.as_ref(), &collective::root_of(&learn::home()), &learn::engineer(&cwd)));
         let emails: BTreeSet<String> = routes
             .iter()
             .filter_map(|r| match r {

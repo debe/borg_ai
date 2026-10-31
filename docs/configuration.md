@@ -120,7 +120,7 @@ Paths match whole components: `~/work` does not match `~/work-old`.
 | `experts` | Optional, per collective. Local checkouts of dependencies to cite at the turn end (`crates/borg/src/expert_route.rs`). `"drone": true` also asks a read-only agent in the checkout when its index has nothing; it is bounded by time (120 s at most, and what the stop's budget leaves), and its cost is measured, never capped |
 | `budget` | Optional, per collective; none by default. The pool tokens this collective's checks may read per session, on average. Without it, lesson selection's spend is measured and shown, never priced. With it, the learned policy (the default) prices a larger pool so that the replayed spend stays within the budget, from its first fit that knows the budget, its gate open or not; the fixed rule (`BORG_SELECT=fixed`) reads no budget. `borg status`, `borg top` and borg web show the budget, what was read and the price. A value that is not a positive number counts as none and never invalidates the config. See [Which lessons are asked](delivery.md#which-lessons-are-asked) |
 | `risk` | Optional, per collective; 0.1 by default. The engineer's tolerance for learning: the share of the fixed rule's replayed quality (mistakes avoided) the learned policy's gate (the default) lets it risk below the fixed rule while it learns, for its deviations on evidence and its randomised question-count test on live checks alike. The test never withholds a lesson; this share rations how often it may move one between asked and handed over. `0` turns the test off, and a deviation on evidence then plays only where what the gate's earlier deviations gained covers its risk; `1` lets the gate risk the whole value. The monitor's revert keeps its own 10%. The fixed rule (`BORG_SELECT=fixed`) reads no `risk`. Each graded check logs the share it was decided under (`alpha` on its record, under every policy; absent at 0.1), and `borg debug select --replay` decides each check under its logged value, not whatever the config says then. `borg status`, `borg top` and borg web show the share in force. A value that is not a number from 0 to 1 counts as none and never invalidates the config. See [The question-count test](delivery.md#which-lessons-are-asked) |
-| `personal` | Optional, top level. The `local` collective that receives personal lessons; needed only when you have several |
+| `personal` | Unused since 0.7.4, still accepted: a personal lesson stays in the collective it was learned in ([Who hears a lesson](#who-hears-a-lesson)) |
 
 An invalid config (bad JSON, two collectives sharing one store, an email under two engineers, `personal`
 naming a collective that is not `local`) routes
@@ -139,7 +139,7 @@ borg collective ~/personal/notes   # -> private (Local, may sync: false) ...
 |---|---|---|
 | team | An engineering concern about the code, design or verification | The collective it was learned in, delivered to everyone |
 | repo | A convention of one repo, such as its branch or deploy workflow | The same collective, delivered only in that repo |
-| personal | How you like the agent to work: commit style, AI attribution, when to branch or push, tone | Your private collective, which never syncs; without one it is dropped |
+| personal | How you like the agent to work: commit style, AI attribution, when to branch or push, tone | The collective it was learned in, in that store's `personal.jsonl`: delivered only to you, never synced |
 
 The model decides by asking: would a teammate working on the same code get this correction too?
 Imported team documents are always team; their repo conventions are scoped by system already.
@@ -152,9 +152,46 @@ session's repo is the one it started in: a session that edits another repo does 
 conventions (a use there still counts). The system gate is not applied to aging, and in the team view a
 repo is a case-sensitive name, so a clone whose directory differs in case does not age its lessons.
 
-Personal lessons go to the `local` collective named by `personal`, or to your only `local` collective.
-A personal lesson already shared with the team is withdrawn there: a newer version replaces its text
-with a tombstone that is never delivered, and peers receive that version too.
+**Collectives never mix on their own.** A personal lesson learned in a team collective stays in that
+collective, in its local `personal.jsonl`: your sessions there hear it, your teammates never do, and
+your other collectives never do either. The private collective is an ordinary collective for its own
+repos, not a place personal lessons are sent. When one of your own team lessons turns out personal, a
+newer version in `lessons.jsonl` replaces its text with a tombstone that is never delivered, and peers
+receive that version too. A lesson another engineer is on, one no engineer is recorded on, and an
+imported one are never withdrawn: they stay for the team.
+
+**Crossing is explicit.** When a lesson sits in the wrong collective, or a session corrects something
+that belongs to another one, you say so and the agent runs one of two commands
+([Commands](commands.md#learning)):
+
+```sh
+borg move L42 --to oss                       # dry run: what the move would write
+borg move L42 --to oss --apply               # the target gets it as its next version, the source a tombstone
+borg move ~/src/lib --to oss --apply         # a repo that changed collectives: its waiting corrections follow
+borg correct --collective oss "Keep the public API free of the platform's types"
+```
+
+- **`borg move <id>`** appends the lesson to the target as its next version and leaves a tombstone with
+  the same id and episodes in the source, so the source never learns it again. The target notes the
+  move in its local `placed.jsonl` (never synced), so doctor never calls the lesson misplaced. A lesson
+  another engineer is on is copied instead, never hidden from their team. Moving it again changes
+  nothing. `--personal` puts it in the target's
+  `personal.jsonl`; `--from` names the source when the current directory routes elsewhere.
+- **`borg move <repo-path>`** moves the episodes of a repo that no lesson was learned from yet to the
+  store the repo routes to now (any other target is refused), from the stores that hold them for that
+  reason or from `--from`'s. Until then `borg learn` holds them, unlearned: it never learns an episode
+  in a store its repo no longer routes to. A repo name it cannot place for sure (none in the config's
+  paths up to one folder deep, or two of that name in different collectives) is learned where it was
+  captured.
+- **`borg correct --collective <name>`** records a correction of the current session in that
+  collective, learned there when the session ends. Into another collective goes only what you said: no
+  task, proposal or email of the session's collective. One command per collective the correction
+  concerns, the session's own included: the words the hooks captured in the session's collective are
+  set aside once `borg correct` runs. Without it, a correction stays in the session's collective.
+
+`borg doctor` lists what may be misplaced (held evidence, a lesson naming a repo that routes elsewhere,
+lessons an earlier Borg moved to a private collective) with the `borg move` for each. It never moves
+anything.
 
 **Clean up lessons learned before reach existed:**
 
@@ -163,9 +200,10 @@ borg reach                              # dry run: one model call per lesson lea
 borg reach --apply --plan <store>/reach-plan.json
 ```
 
-The plan lists what moves to your private collective, what becomes repo-only, and what the model was
-unsure about. `--apply` makes the sure moves and turns the unsure ones into queen questions, which you
-answer with `borg queen`. Answering one moves the lesson; it writes no new lesson.
+The plan lists what becomes personal, what becomes repo-only, and what the model was unsure about.
+`--apply` makes the sure changes and turns the unsure ones into queen questions, which you answer with
+`borg queen`. Answering one changes the lesson's reach; it writes no new lesson. `borg reach` never
+touches a lesson another engineer is on, and a personal lesson stays in its collective.
 
 ## Storage
 
@@ -175,6 +213,7 @@ root). The mesh syncs the files marked *synced*, and only for a team collective.
 | File | Holds |
 |---|---|
 | `lessons.jsonl` | The lessons. Synced |
+| `personal.jsonl` | Your personal lessons of this collective, delivered only to you. Local, never synced |
 | `episodes.jsonl` | The corrections, vetoes and regrets `borg learn` turns into lessons |
 | `outcomes.jsonl` | What followed each lesson asked: ignored, changed, corrected, vetoed, regretted, tested. Also every graded check with its routes and propensities, what delivery did with each lesson (`delivery`), each run of a session's end hook (`ended`), and the judge's verdicts on placebos |
 | `select-summary.json` | The lesson selection summary the hooks read: the outcome log folded and the policy's fit, rebuilt from the log whenever it is missing or of another format. Local, never synced. `select-summary.json.lock` (local) lets one learned check of the store decide and record at a time; the fixed rule takes no lock. `select-reverted` (local) is the monitor's mark that put the fixed rule back: delete it to let the learned policy learn again |

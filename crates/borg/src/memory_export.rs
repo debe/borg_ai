@@ -20,8 +20,8 @@
 //! absorbed, its recurrence: the episodes merged into it since the absorbed version.
 //!
 //! Every text field but the ids (`id`, `supersedes`, `superseded_by`) and `reach` goes through notes.rs
-//! `redact`, the engineers and an absorb's `by` too. A lesson withdrawn to a private collective (reach
-//! `personal`, a tombstone) is left out. A field the logs do not hold is omitted, never guessed:
+//! `redact`, the engineers and an absorb's `by` too. A personal lesson's tombstone (reach
+//! `personal`) is left out, and the store's `personal.jsonl` is never read. A field the logs do not hold is omitted, never guessed:
 //! `version`, `support` and `history` for a lesson line without them (an older or hand-written line),
 //! `placebo` and `tail` when the log holds no such judgement of the lesson, `recurrence` when the
 //! absorb named no version (the lesson was not in the store yet) or the store no longer holds that

@@ -247,7 +247,8 @@ fn judged(all: &[conscience::Challenge], withheld: Vec<conscience::Challenge>) -
 /// `lessons`, and the lessons the absorbed filter withheld from it (absorb.rs `withhold`).
 fn loaded(session: &str) -> (Vec<conscience::Challenge>, Vec<conscience::Challenge>) {
     let before = std::env::var("BORG_BEFORE").ok().and_then(|v| v.parse().ok());
-    let mut all = conscience::load_for(&lessons_path(), before, Some(session));
+    // The routed collective's lessons and this engineer's personal ones of it (reach.rs), nothing else.
+    let mut all = conscience::load_store_for(&lessons_path(), before, Some(session));
     // The system gate (systems.rs): where the repo says which system this is, lessons scoped to other
     // systems score 0, however much the conversation names them.
     let where_text = std::fs::read_to_string(where_file(session)).unwrap_or_default();
@@ -255,7 +256,7 @@ fn loaded(session: &str) -> (Vec<conscience::Challenge>, Vec<conscience::Challen
     if crate::systems::on() {
         crate::systems::gate(&mut all, &repos);
     }
-    // Reach (reach.rs): a withdrawn personal lesson is never delivered, a repo convention only in its repo.
+    // Reach (reach.rs): a tombstone is never delivered, a repo convention only in its repo.
     all.retain(|c| crate::reach::deliverable(c, &repos));
     // Absorbed (absorb.rs): held outside Borg now, so delivered on no path; every path reads this list.
     let withheld = crate::absorb::withhold_beside(&lessons_path(), &mut all, before);

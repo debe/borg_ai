@@ -117,6 +117,10 @@ pub struct Episode {
 
 /// `Episode::via` of an answer to the agent's own question, and its `why` in the usage statistics.
 pub const ANSWER: &str = "answer";
+/// `Episode::via` of a correction the engineer recorded in a collective by name (`borg correct
+/// --collective`): placed there explicitly, so `borg learn` never holds it for its repo's route
+/// ([`held`]).
+pub const CORRECT: &str = "correct";
 
 /// Two prompt episodes of one session this close together are the same correction. Method: a dedupe
 /// window; the live hook's capture time and the transcript's message time of one prompt differ by a
@@ -295,7 +299,8 @@ pub struct Lesson {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<String>,
     /// Who should hear the lesson (reach.rs): empty for the team, `repo` for its repo only, `personal`
-    /// for a tombstone withdrawn to an engineer's private collective.
+    /// for a lesson in the store's local-only `personal.jsonl`, and for the tombstone that withdrew it
+    /// from `lessons.jsonl`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reach: String,
 }
@@ -348,8 +353,24 @@ pub fn engineer(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Records the hook's episode `e` in this session's store (`record_episode_locked`).
+///
+/// # Errors
+/// When the episode cannot be appended.
 pub fn record_episode(e: &Episode) -> std::io::Result<()> {
-    record_episode_in(&home(), e)
+    record_episode_locked(&home(), e)
+}
+
+/// `record_episode_in` under the store's `episodes.jsonl` lock (live.rs `locked`): a `borg move` of a
+/// repo's evidence rewrites that file under the lock, and an append landing between its read and its
+/// rename would be lost. Contended only by those moves and the captures that also lock it; uncontended,
+/// one lock taken on a path that writes anyway.
+///
+/// # Errors
+/// When the episode cannot be appended.
+pub fn record_episode_locked(store: &Path, e: &Episode) -> std::io::Result<()> {
+    std::fs::create_dir_all(store)?;
+    crate::live::locked(&store.join("episodes.jsonl"), || record_episode_in(store, e))
 }
 
 /// `record_episode` into `store` (the end-of-session job writes to the route's store).
@@ -384,6 +405,24 @@ pub fn count_correction(store: &Path, e: &Episode) {
         ev.text = text;
         ev.source = crate::stats::source(&e.harness, &e.harness_version);
     });
+}
+
+/// The lessons of the store `home` as this engineer has them: `lessons.jsonl` with the store's personal
+/// lessons (reach.rs `PERSONAL_FILE`) over it, a personal version winning over the team one of its id
+/// (the tombstone that withdrew it). For counts and "learned" (`learned_episodes`); `borg status`.
+pub fn store_lessons(home: &Path) -> Vec<Lesson> {
+    let mine = crate::reach::personal_lessons(home);
+    let mut all: Vec<Lesson> = lessons(&home.join("lessons.jsonl")).into_iter().filter(|l| !mine.iter().any(|m| m.id == l.id)).collect();
+    all.extend(mine);
+    all.sort_by_key(|l| l.origin_ms);
+    all
+}
+
+/// The episodes the store `home` has folded into a lesson, team or personal (tombstones included: they
+/// keep their episodes).
+pub fn learned_episodes(home: &Path) -> HashSet<String> {
+    let mine = crate::reach::personal_all(home);
+    lessons(&home.join("lessons.jsonl")).into_iter().chain(mine).flat_map(|l| l.episodes).collect()
 }
 
 /// The latest version of every lesson.
@@ -591,7 +630,7 @@ fn merged(old: &Lesson, e: &Episode, a: Answer, mut supersedes: Vec<String>) -> 
         supersedes,
         // New wording: the old facets describe the old wording; `borg learn` generates new ones.
         facets: Vec::new(),
-        reach: crate::reach::narrower(&old.reach, &a.reach).to_string(),
+        reach: scoped(&old.repo, crate::reach::narrower(&old.reach, &a.reach)),
         ..old.clone()
     }
 }
@@ -611,13 +650,21 @@ fn fresh(e: &Episode, a: Answer, supersedes: Vec<String>) -> Lesson {
         engineers: Some(e.engineer.clone()).filter(|x| !x.is_empty()).into_iter().collect(),
         area: a.area,
         supersedes,
-        reach: a.reach,
+        reach: scoped(&e.repo, &a.reach),
         ..Lesson::default()
     }
 }
 
-/// Generalise one episode against the existing library: `Ok(Some)` a new lesson or a merged version
-/// of an existing one, `Ok(None)` not a lesson, `Err` no verdict. `ask` performs the model call
+/// `reach` for a lesson of `repo`: one repo's reach needs a repo to be delivered in (reach.rs
+/// `deliverable`), so a lesson of none (a `borg correct` without `--repo`) is the team's instead of
+/// heard nowhere.
+fn scoped(repo: &str, reach: &str) -> String {
+    if reach == crate::reach::REPO && repo.trim().is_empty() { String::new() } else { reach.to_string() }
+}
+
+/// Generalise one episode against the existing library (the merge targets: team and personal lessons, no
+/// tombstone): `Ok(Some)` a new lesson or a merged version of an existing one, `Ok(None)` not a lesson,
+/// `Err` no verdict. `ask` performs the model call
 /// (injectable for tests). A regret (regret.rs) gets its own prompt, the same verdict.
 ///
 /// # Errors
@@ -631,9 +678,7 @@ pub fn generalise(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<
 /// # Errors
 /// `AskFailed` when the model gave no usable verdict.
 pub fn generalise_with(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Option<Value>) -> Result<Option<(Lesson, String)>, AskFailed> {
-    // A withdrawn personal lesson (reach.rs) is no merge target: it lives in a private collective now.
-    let library: Vec<Lesson> = library.iter().filter(|l| l.reach != crate::reach::PERSONAL).cloned().collect();
-    let similar = similar(e, &library);
+    let similar = similar(e, library);
     let listed: Vec<String> = similar.iter().map(|l| format!("[{}] {} -> {}", l.id, l.question, l.consequence)).collect();
     let Some(a) = Answer::parse(&ask(&episode_prompt(e, &listed)).ok_or(AskFailed)?)? else { return Ok(None) };
     let same_as = similar.iter().find(|l| a.same_as == l.id);
@@ -726,8 +771,8 @@ pub struct Step<'a> {
     pub secs: f64,
 }
 
-/// Whether a veto's lesson, placed as `placed`, proposes its `invariant` as a constraint: only a lesson
-/// placed in this store; a personal or dropped one never does, a preference being no invariant.
+/// Whether a veto's lesson, placed as `placed`, proposes its `invariant` as a constraint: only a team
+/// lesson; a personal one never does, a preference being no invariant.
 fn proposes(placed: &crate::reach::Placed, invariant: &str) -> bool {
     matches!(placed, crate::reach::Placed::Here(_)) && !invariant.trim().is_empty()
 }
@@ -838,6 +883,76 @@ fn quiet(
 /// Episode kinds the removed hive made (a group's reflection, a rework), skipped where an older store has them.
 const RETIRED: [&str; 2] = ["group", "rework"];
 
+/// Where the episodes of a store route now, one lookup per repo (collective.rs `route_repo`).
+struct Routes<'a> {
+    cfg: Option<&'a crate::collective::Config>,
+    home: PathBuf,
+    base: PathBuf,
+    by_repo: HashMap<String, Option<crate::collective::Route>>,
+}
+
+impl<'a> Routes<'a> {
+    /// For the store `home` under `cfg`. Holds nothing without a config, nor in a store that is no
+    /// collective's (the root store, a test's or an eval's directory).
+    fn new(cfg: Option<&'a crate::collective::Config>, home: &Path) -> Self {
+        let cfg = cfg.filter(|c| crate::collective::is_store(c, home));
+        Routes { cfg, home: home.to_path_buf(), base: crate::collective::root_of(home), by_repo: HashMap::new() }
+    }
+
+    /// Where `e` belongs when that is not this store: its repo routes to another collective's store, or
+    /// off, under the current config. `None`: it belongs here, or its route is unknown (never guessed),
+    /// or the engineer placed it here by name ([`CORRECT`]).
+    fn elsewhere(&mut self, e: &Episode) -> Option<crate::collective::Route> {
+        let cfg = self.cfg?;
+        if e.via == CORRECT {
+            return None;
+        }
+        let (base, home) = (&self.base, &self.home);
+        let r = self.by_repo.entry(e.repo.clone()).or_insert_with(|| crate::collective::route_repo(cfg, &e.repo, base)).clone()?;
+        match &r {
+            crate::collective::Route::Collective { home: h, .. } if h == home => None,
+            _ => Some(r),
+        }
+    }
+}
+
+/// The waiting episodes of one repo that `borg learn` holds in a store because the repo routes elsewhere
+/// now (`held`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldRepo {
+    pub repo: String,
+    /// Where the repo routes now: another collective (its name and store) or `Off`.
+    pub route: crate::collective::Route,
+    /// The held episodes' ids, in log order.
+    pub episodes: Vec<String>,
+}
+
+/// The episodes of the store `home` that `borg learn` holds under `cfg`, per repo: not learned, not
+/// skipped, not recorded here by name ([`CORRECT`]), of a repo that routes to another store (or off)
+/// now. They wait, never learned here, until they are moved where they belong (`borg move <repo>`).
+/// Reads this store and the config only.
+pub fn held(home: &Path, cfg: Option<&crate::collective::Config>) -> Vec<HeldRepo> {
+    let mut routes = Routes::new(cfg, home);
+    if routes.cfg.is_none() {
+        return Vec::new();
+    }
+    let done = learned_episodes(home);
+    let skipped: HashSet<String> = std::fs::read_to_string(home.join("episodes-not-lessons.txt")).unwrap_or_default().lines().map(str::to_string).collect();
+    let mut out: Vec<HeldRepo> = Vec::new();
+    for e in read_jsonl::<Episode>(&home.join("episodes.jsonl")) {
+        if done.contains(&e.id) || skipped.contains(&e.id) || RETIRED.contains(&e.kind.as_str()) {
+            continue;
+        }
+        let Some(route) = routes.elsewhere(&e) else { continue };
+        match out.iter_mut().find(|h| h.repo == e.repo) {
+            Some(h) if !h.episodes.contains(&e.id) => h.episodes.push(e.id),
+            Some(_) => {}
+            None => out.push(HeldRepo { repo: e.repo, route, episodes: vec![e.id] }),
+        }
+    }
+    out
+}
+
 /// `learn_in`, calling `report` after every model call (the CLI prints it; the hooks pass a no-op).
 ///
 /// One run per store at a time (an exclusive lock on `lessons.jsonl.lock`): session-end runs of several
@@ -852,11 +967,27 @@ pub fn learn_in_reporting(
     now: i64,
     report: &mut dyn FnMut(Step),
 ) -> (usize, usize, usize) {
-    crate::live::locked(&home.join("lessons.jsonl"), || learn_unlocked(home, session, ask, track, now, report))
+    let cfg = crate::collective::load().ok().flatten();
+    learn_in_config(home, cfg.as_ref(), session, ask, track, now, report)
+}
+
+/// `learn_in_reporting` under an explicit collectives config: an episode whose repo routes to another
+/// store under `cfg` is held, never learned here ([`held`]).
+pub fn learn_in_config(
+    home: &Path,
+    cfg: Option<&crate::collective::Config>,
+    session: Option<&str>,
+    ask: &dyn Fn(&str) -> Option<Value>,
+    track: bool,
+    now: i64,
+    report: &mut dyn FnMut(Step),
+) -> (usize, usize, usize) {
+    crate::live::locked(&home.join("lessons.jsonl"), || learn_unlocked(home, cfg, session, ask, track, now, report))
 }
 
 fn learn_unlocked(
     home: &Path,
+    cfg: Option<&crate::collective::Config>,
     session: Option<&str>,
     ask: &dyn Fn(&str) -> Option<Value>,
     track: bool,
@@ -866,16 +997,29 @@ fn learn_unlocked(
     let (ep_path, lessons_path) = (home.join("episodes.jsonl"), home.join("lessons.jsonl"));
     let outcomes_path = outcome::path_beside(&lessons_path);
     let mut outcomes = if track { outcome::read(&outcomes_path) } else { Vec::new() };
-    let mut library = lessons(&lessons_path);
-    let done: std::collections::HashSet<String> = library.iter().flat_map(|l| l.episodes.clone()).collect();
+    // The merge targets: this engineer's personal lessons (reach.rs) and the team's, no tombstone. Done:
+    // every episode either file holds, tombstones included.
+    let team = lessons(&lessons_path);
+    let personal_lines = crate::reach::personal_all(home);
+    let done: HashSet<String> = team.iter().chain(&personal_lines).flat_map(|l| l.episodes.clone()).collect();
+    // A lesson `borg move` took elsewhere is no merge target here (reach.rs `MOVED`).
+    let personal: Vec<Lesson> = personal_lines.into_iter().filter(|l| l.question != crate::reach::MOVED).collect();
+    let mut personal_ids: HashSet<String> = personal.iter().map(|l| l.id.clone()).collect();
+    let mut library: Vec<Lesson> = team.into_iter().filter(|l| l.reach != crate::reach::PERSONAL && !personal_ids.contains(&l.id)).chain(personal).collect();
     let skipped_path = home.join("episodes-not-lessons.txt");
-    let skipped: std::collections::HashSet<String> = std::fs::read_to_string(&skipped_path).unwrap_or_default().lines().map(str::to_string).collect();
+    let mut skipped: HashSet<String> = std::fs::read_to_string(&skipped_path).unwrap_or_default().lines().map(str::to_string).collect();
     let (mut new, mut merged, mut failed, mut failures_in_row) = (0, 0, 0, 0);
     // Newest episode per session, and sessions with episodes this run left pending (--session).
     let mut last_episode: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
     // `RETIRED` kinds an older store holds are never learned.
     let episodes: Vec<Episode> = read_jsonl::<Episode>(&ep_path).into_iter().filter(|e| !RETIRED.contains(&e.kind.as_str())).collect();
+    // Held (`held`): an episode of a repo that routes elsewhere now waits, unlearned and unmarked, and
+    // keeps no session pending. Treated as settled for this run only, never written as skipped.
+    let mut routes = Routes::new(cfg, home);
+    let held_here: HashSet<String> =
+        episodes.iter().filter(|e| !done.contains(&e.id) && !skipped.contains(&e.id) && routes.elsewhere(e).is_some()).map(|e| e.id.clone()).collect();
+    skipped.extend(held_here);
     let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
     let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
     let ctx = |s: &str| state.join(format!("{}.ctx", crate::notes::safe(s)));
@@ -918,13 +1062,14 @@ fn learn_unlocked(
                 pending.insert(e.session.clone());
             }
             Ok(Some((l, invariant))) => {
-                if l.version > 1 {
+                // A personal lesson stays in this store, for this engineer only (reach.rs `place`).
+                let team = library.iter().find(|x| x.id == l.id && !personal_ids.contains(&x.id));
+                let placed = crate::reach::place(&l, &e, personal_ids.contains(&l.id), team);
+                if placed.lesson().version > 1 {
                     merged += 1
                 } else {
                     new += 1
                 }
-                // A personal lesson goes to the engineer's private collective, never into a team store (reach.rs).
-                let placed = crate::reach::place(home, &l);
                 // Where it came from, for the feed: a review finding, a later fix, or a correction.
                 let source = match &e.regret {
                     Some(r) if regret::is_review(r) => "review",
@@ -932,18 +1077,14 @@ fn learn_unlocked(
                     None if e.kind == crate::veto::KIND => "veto",
                     None => "session",
                 };
-                let (kind, why, counted_in) = match &placed {
-                    crate::reach::Placed::Here(l) => {
-                        let _ = append_jsonl(&lessons_path, &**l);
-                        (if l.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW }, source, home.to_path_buf())
-                    }
-                    crate::reach::Placed::Private(store) => (crate::stats::LESSON_NEW, "personal", store.clone()),
-                    crate::reach::Placed::Dropped => (crate::stats::NOT_A_LESSON, "personal", home.to_path_buf()),
-                };
-                crate::stats::count(&counted_in, kind, &e.session, |ev| {
+                let _ = crate::reach::write(home, &placed);
+                let written = placed.lesson();
+                let kind = if written.version > 1 { crate::stats::LESSON_MERGED } else { crate::stats::LESSON_NEW };
+                let why = if matches!(placed, crate::reach::Placed::Personal { .. }) { "personal" } else { source };
+                crate::stats::count(home, kind, &e.session, |ev| {
                     ev.engineer = e.engineer.clone();
                     ev.repo = e.repo.clone();
-                    ev.lessons = vec![l.id.clone()];
+                    ev.lessons = vec![written.id.clone()];
                     ev.why = why.into();
                 });
                 if e.kind == crate::veto::KIND {
@@ -952,7 +1093,7 @@ fn learn_unlocked(
                     if l.version > 1 && earlier.is_some_and(|o| o.episodes.iter().any(|id| id != &e.id && vetoes.contains(id))) {
                         // Dated when the engineer said it, the week of its own `veto`, not when it was
                         // learned: a weekly share of repeated vetoes pairs counts of the same no's.
-                        crate::stats::count(&counted_in, crate::stats::VETO_REPEAT, &e.session, |ev| {
+                        crate::stats::count(home, crate::stats::VETO_REPEAT, &e.session, |ev| {
                             ev.ms = if e.ms > 0 { e.ms } else { ev.ms };
                             ev.engineer = e.engineer.clone();
                             ev.repo = e.repo.clone();
@@ -1000,8 +1141,12 @@ fn learn_unlocked(
                     let _ = outcome::append(&outcomes_path, &o);
                     outcomes.push(o);
                 }
-                library.retain(|x| x.id != l.id);
-                library.push(l);
+                let written = placed.lesson().clone();
+                if matches!(placed, crate::reach::Placed::Personal { .. }) {
+                    personal_ids.insert(written.id.clone());
+                }
+                library.retain(|x| x.id != written.id);
+                library.push(written);
             }
             Ok(None) => {
                 let _ = append_line(&skipped_path, &e.id);
@@ -1010,7 +1155,7 @@ fn learn_unlocked(
         }
     }
     if track {
-        credit_regrets(&regrets, &lessons(&lessons_path), &mut outcomes, &outcomes_path, regret_credit());
+        credit_regrets(&regrets, &store_lessons(home), &mut outcomes, &outcomes_path, regret_credit());
         // Settled only once ended: its `end` hook ran (`session`), or it is idle by the log and its state
         // file is as quiet (`open`): a session working without asks or episodes for a day is still open.
         let mut ended: Vec<String> = outcome::idle_sessions(&outcomes, &last_episode, now)
@@ -1201,10 +1346,11 @@ mod tests {
                 && queue[0].evidence.contains(&"lesson Lno-s1-1".to_string())
         );
         assert!(!crate::veto::constraints_path(&home).exists());
-        // A personal or dropped lesson never proposes; nor does one without an invariant.
+        // A personal lesson never proposes; nor does one without an invariant.
         let l = Lesson { id: "L".into(), ..Lesson::default() };
-        assert!(proposes(&crate::reach::Placed::Here(Box::new(l)), "x") && !proposes(&crate::reach::Placed::Dropped, "x"));
-        assert!(!proposes(&crate::reach::Placed::Private(home.clone()), "x") && !proposes(&crate::reach::Placed::Here(Box::default()), " "));
+        let personal = crate::reach::Placed::Personal { lesson: Box::new(l.clone()), withdraw: None };
+        assert!(proposes(&crate::reach::Placed::Here(Box::new(l)), "x") && !proposes(&personal, "x"));
+        assert!(!proposes(&crate::reach::Placed::Here(Box::default()), " "));
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -1496,6 +1642,196 @@ mod tests {
             })
             .collect();
         assert_eq!(trust::successors(&all).get("L0").map(String::as_str), Some(back.id.as_str()));
+    }
+
+    /// `fake_ask`, judging a correction that says "mine only" personal.
+    fn fake_personal(p: &str) -> Option<Value> {
+        let mut v = fake_ask(p)?;
+        if p.split("## Engineer's correction\n").nth(1)?.lines().next()?.contains("mine only") {
+            v["reach"] = json!(crate::reach::PERSONAL);
+        }
+        Some(v)
+    }
+
+    #[test]
+    fn a_personal_lesson_stays_in_its_collective_is_learned_once_and_delivered_only_there() {
+        let base = temp_home("personal");
+        let (work, oss) = (crate::collective::store(&base, "work"), crate::collective::store(&base, "oss"));
+        std::fs::create_dir_all(&oss).unwrap();
+        append_jsonl(&work.join("episodes.jsonl"), &at("e0", "s0", 1, "ann@x", "no co-author trailer, mine only")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let ask = |p: &str| {
+            calls.set(calls.get() + 1);
+            fake_personal(p)
+        };
+        assert_eq!(learn_in(&work, None, &ask, false, 3), (1, 0, 0));
+        let personal = crate::reach::personal_lessons(&work);
+        assert_eq!(personal.iter().map(|l| (l.id.as_str(), l.reach.as_str())).collect::<Vec<_>>(), [("Le0", crate::reach::PERSONAL)]);
+        assert!(lessons(&work.join("lessons.jsonl")).is_empty(), "nothing in the team's lessons");
+        assert_eq!(std::fs::read_dir(base.join("collectives")).unwrap().count(), 2, "no other store written");
+        assert!(!oss.join("lessons.jsonl").exists() && !crate::reach::personal_path(&oss).exists());
+        // Learned once: the second run finds its episode done and asks nothing.
+        assert_eq!(learn_in(&work, None, &ask, false, 4), (0, 0, 0));
+        assert_eq!(calls.get(), 1);
+        // A later correction merging into it stays personal, whatever its own verdict: a merge never widens.
+        append_jsonl(&work.join("episodes.jsonl"), &at("e1", "s1", 5, "ann@x", "the trailer again merge:Le0")).unwrap();
+        assert_eq!(learn_in(&work, None, &ask, false, 6), (0, 1, 0));
+        assert_eq!(crate::reach::personal_lessons(&work)[0].version, 2);
+        assert!(lessons(&work.join("lessons.jsonl")).is_empty());
+        assert_eq!(learned_episodes(&work), ["e0".to_string(), "e1".to_string()].into_iter().collect());
+        // Delivered in this collective's sessions, as a team lesson for this engineer; in another
+        // collective's never, nor in the team's own view of the store.
+        let aliases = crate::collective::Aliases::default();
+        let here = crate::conscience::load_store_with(&work.join("lessons.jsonl"), None, &aliases);
+        assert!(here.iter().any(|c| c.id == "Le0" && crate::reach::deliverable(c, &["r".into()])), "{here:?}");
+        assert!(crate::conscience::load_store_with(&oss.join("lessons.jsonl"), None, &aliases).is_empty());
+        assert!(crate::conscience::load_with(&work.join("lessons.jsonl"), None, &aliases).is_empty());
+        // Asked beside a team lesson: the team's synced logs name the team lesson only, never the
+        // personal one (its id, when, which repo).
+        for id in ["Le0", "Lteam"] {
+            let o =
+                outcome::Outcome { kind: outcome::ASKED.into(), session: "s9".into(), lessons: vec![id.into()], ms: 9, repo: "r".into(), ..Default::default() };
+            outcome::append(&work.join("outcomes.jsonl"), &o).unwrap();
+        }
+        crate::stats::count(&work, crate::stats::LESSON_NEW, "s9", |ev| ev.lessons = vec!["Lteam".into()]);
+        assert!(outcome::publish(&work) > 0 && crate::stats::rollup(&work) > 0);
+        for f in [outcome::TEAM_FILE, "stats.jsonl"] {
+            let text = std::fs::read_to_string(work.join(f)).unwrap();
+            assert!(text.contains("Lteam") && !text.contains("Le0"), "{f}: {text}");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_personal_lesson_replaces_its_tombstone_where_it_is_delivered() {
+        let base = temp_home("tombstone");
+        let work = crate::collective::store(&base, "work");
+        let l = Lesson { id: "L1".into(), question: "short commit subjects?".into(), version: 2, engineers: vec!["ann@x".into()], ..Lesson::default() };
+        append_jsonl(&work.join("lessons.jsonl"), &crate::reach::tombstone(&l)).unwrap();
+        append_jsonl(&crate::reach::personal_path(&work), &Lesson { reach: crate::reach::PERSONAL.into(), ..l }).unwrap();
+        let cs = crate::conscience::load_store_with(&work.join("lessons.jsonl"), None, &crate::collective::Aliases::default());
+        assert_eq!(cs.len(), 1);
+        assert!(cs[0].question == "short commit subjects?" && crate::reach::deliverable(&cs[0], &[]));
+        assert_eq!(store_lessons(&work).len(), 1);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_personal_lesson_moved_elsewhere_is_neither_delivered_nor_merged_into_here() {
+        let base = temp_home("moved-personal");
+        let work = crate::collective::store(&base, "work");
+        let l = Lesson {
+            id: "Le0".into(),
+            question: "short commit subjects?".into(),
+            version: 1,
+            episodes: vec!["e0".into()],
+            reach: crate::reach::PERSONAL.into(),
+            engineers: vec!["ann@x".into()],
+            ..Lesson::default()
+        };
+        append_jsonl(&crate::reach::personal_path(&work), &l).unwrap();
+        // What `borg move` leaves behind (moves.rs): the tombstone keeps the episodes.
+        let t = Lesson { version: 2, question: crate::reach::MOVED.into(), consequence: String::new(), ..l.clone() };
+        append_jsonl(&crate::reach::personal_path(&work), &t).unwrap();
+        append_jsonl(&work.join("episodes.jsonl"), &at("e0", "s0", 1, "ann@x", "short subjects, mine only")).unwrap();
+        let cs = crate::conscience::load_store_with(&work.join("lessons.jsonl"), None, &crate::collective::Aliases::default());
+        assert!(cs.is_empty(), "the tombstone is never delivered: {cs:?}");
+        assert!(store_lessons(&work).is_empty() && crate::reach::personal_lessons(&work).is_empty());
+        assert!(learned_episodes(&work).contains("e0"), "its episodes stay learned");
+        // A later correction that would merge into it makes a lesson of its own: the moved one stays gone.
+        append_jsonl(&work.join("episodes.jsonl"), &at("e1", "s1", 2, "ann@x", "subjects moved to another collective again merge:Le0 mine only")).unwrap();
+        assert_eq!(learn_in(&work, None, &fake_personal, false, 3), (1, 0, 0), "e0 is done; e1 cannot merge into Le0");
+        let latest = crate::learn::lessons(&crate::reach::personal_path(&work));
+        assert_eq!(latest.iter().find(|l| l.id == "Le0").map(|l| l.question.as_str()), Some(crate::reach::MOVED));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn the_hooks_episode_waits_for_a_move_rewriting_the_log() {
+        let home = temp_home("record-locked");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let log = home.join("episodes.jsonl");
+        let mover = {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                crate::live::locked(&log, || {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    // A move's rewrite: the log taken whole while the lock is held.
+                    std::fs::write(&log, "").unwrap();
+                })
+            })
+        };
+        held_rx.recv().unwrap();
+        let writer = {
+            let home = home.clone();
+            std::thread::spawn(move || record_episode_locked(&home, &at("e1", "s1", 1, "ann@x", "no, use the lock")).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty(), "the append waits for the lock");
+        go_tx.send(()).unwrap();
+        mover.join().unwrap();
+        writer.join().unwrap();
+        assert!(std::fs::read_to_string(&log).unwrap().contains("\"e1\""), "and lands after the rewrite, not in it");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_repo_reach_without_a_repo_is_the_teams() {
+        let reach = |repo: &str, same_as: &str, lib: &[Lesson]| {
+            let e = Episode { repo: repo.into(), ..ep("e1", "in the library keep the upstream grammar") };
+            let answer = json!({"is_lesson": true, "question": "Q", "situations": [], "consequence": "c", "same_as": same_as, "area": "", "supersedes": [], "reach": "repo"});
+            generalise(&e, lib, &|_| Some(answer.clone())).unwrap().unwrap().reach
+        };
+        assert_eq!(reach("", "", &[]), "", "a borg correct without --repo: heard by the team, not nowhere");
+        assert_eq!(reach("lib", "", &[]), crate::reach::REPO);
+        let old = Lesson { id: "L0".into(), question: "Does the library keep the upstream grammar?".into(), version: 1, ..Lesson::default() };
+        assert_eq!(reach("lib", "L0", std::slice::from_ref(&old)), "", "merged into a lesson of no repo");
+    }
+
+    #[test]
+    fn an_episode_of_a_repo_that_routes_elsewhere_now_is_held_and_listed() {
+        let base = temp_home("held");
+        let repos = base.join("repos");
+        for d in ["work/app", "oss/lib"] {
+            std::fs::create_dir_all(repos.join(d)).unwrap();
+        }
+        let config = |oss: &str| -> crate::collective::Config {
+            serde_json::from_value(json!({"collectives": [
+                {"name": "work", "paths": [repos.join("work")]},
+                {"name": "oss", "paths": [repos.join(oss)]}]}))
+            .unwrap()
+        };
+        let cfg = config("oss/lib");
+        let (work, oss) = (crate::collective::store(&base, "work"), crate::collective::store(&base, "oss"));
+        let on = |id: &str, repo: &str, via: &str| Episode { repo: repo.into(), via: via.into(), ..at(id, "s0", 1, "ann@x", &format!("check {id}")) };
+        for e in [on("e0", "app", ""), on("e1", "lib", ""), on("e2", "lib", CORRECT), on("e3", "elsewhere", ""), on("e4", "lib", "")] {
+            append_jsonl(&work.join("episodes.jsonl"), &e).unwrap();
+        }
+        let calls = std::cell::Cell::new(0);
+        let ask = |p: &str| {
+            calls.set(calls.get() + 1);
+            fake_ask(p)
+        };
+        // Learned here: its repo routes here, it was recorded here by name, or its route is unknown.
+        assert_eq!(learn_in_config(&work, Some(&cfg), None, &ask, false, 3, &mut |_| {}), (3, 0, 0));
+        let mut learned: Vec<String> = lessons(&work.join("lessons.jsonl")).into_iter().map(|l| l.id).collect();
+        learned.sort();
+        assert_eq!(learned, ["Le0", "Le2", "Le3"]);
+        let route = crate::collective::Route::Collective { name: "oss".into(), home: oss.clone(), share: crate::collective::Share::Team };
+        assert_eq!(held(&work, Some(&cfg)), [HeldRepo { repo: "lib".into(), route, episodes: vec!["e1".into(), "e4".into()] }]);
+        // Held, not skipped: nothing marks them, and a second run asks nothing.
+        assert!(!work.join("episodes-not-lessons.txt").exists());
+        assert_eq!(learn_in_config(&work, Some(&cfg), None, &ask, false, 4, &mut |_| {}), (0, 0, 0));
+        assert_eq!(calls.get(), 3);
+        // No config, or a store that is no collective's: nothing is held.
+        assert!(held(&work, None).is_empty() && held(&base, Some(&cfg)).is_empty());
+        // Routed here again: learned here.
+        let back = config("oss/none");
+        assert!(held(&work, Some(&back)).is_empty());
+        assert_eq!(learn_in_config(&work, Some(&back), None, &ask, false, 5, &mut |_| {}), (2, 0, 0));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn temp_home(name: &str) -> PathBuf {

@@ -163,14 +163,16 @@ The drone asks you one at a session's first prompt; `borg queen` lists them.
 
 Each repo belongs to one collective: **team** (synced to its members), **private** (`"share": "local"`,
 never leaves the machine) or **off** (Borg reads and writes nothing). A correction about the code becomes
-a team lesson; one about how *you* like the agent to work goes to your private collective; a repo
-convention is delivered only in its repo. [Who hears a lesson](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#who-hears-a-lesson)
+a team lesson; one about how *you* like the agent to work stays personal, delivered only to you in the
+collective it was learned in and never synced; a repo convention is delivered only in its repo. Nothing
+crosses between collectives on its own: `borg move` and `borg correct --collective` cross on your word.
+[Who hears a lesson](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#who-hears-a-lesson)
 
 ```mermaid
 flowchart LR
   subgraph A["your machine"]
-    SA["session"] --> TA[("team collective")]
-    SA --> PA[("private collective")]
+    SA["session in a work repo"] --> TA[("team collective")]
+    SP["session in a private repo"] --> PA[("private collective")]
   end
   subgraph B["teammate's machine"]
     TB[("team collective")] --> SB["session"]
@@ -312,9 +314,9 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 
 ## Privacy
 
-**Stays on your machine:** everything from off repos and private collectives; raw episodes (your exact
-corrections), transcripts, the shell output adapters hand to borg, source code, `collectives.json`,
-per-session state.
+**Stays on your machine:** everything from off repos and private collectives; your personal lessons,
+in every collective; raw episodes (your exact corrections), transcripts, the shell output adapters hand
+to borg, source code, `collectives.json`, per-session state.
 
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
 lessons (with author emails and repo names); redacted reasoning excerpts of landed commits, each held by

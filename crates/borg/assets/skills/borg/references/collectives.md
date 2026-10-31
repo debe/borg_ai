@@ -2,7 +2,8 @@
 
 A collective is one separate memory. Every repo path routes to exactly one collective or to none
 (`off`). A drone reads and writes only its own collective's store, so nothing crosses between
-collectives. The mapping lives only on this machine and is never synced.
+collectives on its own: `borg move` and `borg correct --collective` cross on the engineer's word
+([below](#crossing-a-boundary)). The mapping lives only on this machine and is never synced.
 
 ## The file
 
@@ -18,7 +19,6 @@ wiring borg if some repos must stay private.
     { "name": "platform-team", "paths": ["~/work"], "share": "team", "mode": "live" },
     { "name": "private", "paths": ["~/personal"], "share": "local" }
   ],
-  "personal": "private",
   "engineers": [
     { "name": "alex", "emails": ["alex.doe@example.com", "alex@home.example"] }
   ]
@@ -30,7 +30,7 @@ wiring borg if some repos must stay private.
 | `default` | top | `"off"` (the default when the file exists) or a collective's name: where repos no rule matches go |
 | `off` | top | Paths no collective may ever see: the hooks do nothing there and leave no trace |
 | `collectives` | top | The list of collectives |
-| `personal` | top | The `local` collective that receives personal lessons; needed only with several `local` ones |
+| `personal` | top | Unused since 0.7.4 and still accepted: a personal lesson stays in the collective it was learned in. Leave it or drop it |
 | `engineers` | top | One person's several git emails counted as one engineer (trust, status, top). Never synced |
 | `name` | entry | The collective's name; its store is `$BORG_HOME/collectives/<name>/` |
 | `paths` | entry | Directories whose repos belong to it; `~/` is expanded |
@@ -69,7 +69,24 @@ repos then route off.
 4. Run `borg doctor` (the collectives lines) and `borg collective <dir>` for each repo you moved.
 
 Renaming a collective starts an empty store under the new name; the old store stays where it was.
-Moving a repo from a `team` to a `local` collective does not withdraw lessons already synced.
+Moving a repo from a `team` to a `local` collective does not withdraw lessons already synced. Its
+waiting corrections stay in the old store, unlearned, until `borg move <repo-path> --to <collective>`
+moves them; `borg doctor` names the command.
+
+## Crossing a boundary
+
+Nothing crosses between collectives on its own. Two commands cross on the engineer's word:
+
+- **A misplaced lesson:** `borg move <id> --to <collective>` (a dry run; `--apply` writes). The target
+  gets the lesson as its next version; the source keeps a tombstone, unless another engineer is on the
+  lesson, which is then only copied. `--from <collective>` names the source when this directory routes
+  elsewhere; `--personal` keeps it for the engineer alone in the target.
+- **A correction about another collective's work:** `borg correct --collective <name> "<words>"`
+  records it there, for this session. One command per collective, each in that collective's terms.
+
+A personal lesson (commit style, tone) stays in the collective it was learned in, in that store's
+`personal.jsonl`: delivered only to this engineer, never synced. `borg doctor` lists lessons and
+evidence that sit outside the collective their repo routes to, with the `borg move` for each.
 
 ## Worked examples
 
@@ -85,8 +102,9 @@ are off.
 
 Use `"default": "private"` instead to cover repos outside `~/src` as well.
 
-**A team plus a private collective.** Work repos share lessons with the team; personal projects and
-personal lessons (commit style, tone) stay local.
+**A team plus a private collective.** Work repos share lessons with the team; personal projects stay
+local. Personal lessons (commit style, tone) stay in the collective they were learned in, for the
+engineer alone.
 
 ```json
 {
@@ -95,8 +113,7 @@ personal lessons (commit style, tone) stay local.
   "collectives": [
     { "name": "platform-team", "paths": ["~/work"], "share": "team" },
     { "name": "private", "paths": ["~/personal"], "share": "local" }
-  ],
-  "personal": "private"
+  ]
 }
 ```
 
@@ -120,8 +137,7 @@ let the turn-end check cite an internal library's checkout.
       ]
     },
     { "name": "private", "paths": ["~/personal"], "share": "local" }
-  ],
-  "personal": "private"
+  ]
 }
 ```
 

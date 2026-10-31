@@ -147,6 +147,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/outcome.rs` | `IDLE_MS` | 24 h (`clock::DAY_MS`) | A session whose `end` hook never ran never settling |
 | `borg/src/veto.rs` | `REASON_CHARS` | learn.rs `EXCERPT_CHARS` (1,500) | A veto's episode, as a correction's is bounded |
 | `borg/src/veto.rs` | `REASON_MIN` | 4 chars | A stray "borg no" becoming a veto |
+| `borg/src/moves.rs` | `CORRECTION_CHARS` | learn.rs `EXCERPT_CHARS` (1,500) | A `borg correct` episode, as a correction's is bounded |
 | `borg/src/memory.rs` | `regret_cap` | the deciding session's corrections, at least 1 | One session whose work later took many fixes outweighing every other session of a lesson |
 
 ### Hooks, harnesses and adapters
@@ -226,6 +227,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-web/src/lib.rs` | `PAGE_MAX` | 2,000 rows | One request making the server serialise a whole log (`/api/feed`, `/api/messages`) |
 | `borg/src/sweep.rs` | `FIRST_READ` | 4 MiB | A turn-end sweep without a valid offset (the first turn after an upgrade, a rewritten file) reading a long session's whole transcript in the hook; the session's end and the idle sweep read the rest |
 | `borg/src/sweep.rs` | `DOCTOR_FILES` | 200 transcripts per harness, the newest | `borg doctor` reading every transcript of a busy fortnight; a note says when there were more |
+| `borg/src/collective.rs` | `REPO_DEPTH` | 2 levels (a config path's repo, or one group deeper) | Finding a repo known only by its name (an episode's) costing a walk of a whole source tree: one listing per config path and one stat per entry in it, per repo name; a repo deeper is unknown and learned where it was captured |
+| `borg/src/moves.rs` | `REWRITE_TRIES` | 3 | A `borg move <repo>` whose source store is appended to without pause rewriting its episodes forever; it stops with an error, and a second run moves what is left |
 | `borg/src/assimilate.rs` | `OPEN_CALLS` | 64 calls | Tool calls left without a result by interrupted turns growing the `.swept` state written at every turn end; a result whose call fell out keeps its id |
 
 ## Derived

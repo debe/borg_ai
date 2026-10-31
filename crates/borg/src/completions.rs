@@ -64,6 +64,24 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 crate::assimilate::FLAGS,
             ),
             cmd("reach", &[("[--plan FILE] [--apply] [--jobs N]", "sort lessons into team, repo-only and personal")], &[], &["--plan", "--apply", "--jobs"]),
+            Command {
+                path: true,
+                ..cmd(
+                    "move",
+                    &[(
+                        "<lesson-id|repo-path> --to <collective> [--from <collective>] [--personal] [--apply]",
+                        "move a misplaced lesson, or a repo's waiting evidence, to another collective (a dry run without --apply)",
+                    )],
+                    &[],
+                    crate::moves::MOVE_FLAGS,
+                )
+            },
+            cmd(
+                "correct",
+                &[("--collective <name> [--session ID] [--repo NAME] <words>", "record this session's correction in another collective, learned there")],
+                &[],
+                crate::moves::CORRECT_FLAGS,
+            ),
             cmd("facets", &[("[--apply] [--store FILE] [--jobs N]", "search facets for lessons")], &[], &["--apply", "--store", "--jobs"]),
             cmd(
                 "memory",

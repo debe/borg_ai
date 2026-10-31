@@ -177,7 +177,9 @@ pub struct Config {
     /// Engineers known under several git emails (see the module doc).
     #[serde(default, deserialize_with = "engineers")]
     pub engineers: Vec<Engineer>,
-    /// The local collective that receives personal lessons (reach.rs); optional when there is exactly one.
+    /// Named a local collective that received personal lessons until 0.7.3. Unused since: a personal
+    /// lesson stays in the collective it was learned in (reach.rs `PERSONAL_FILE`). Still read and
+    /// checked, so a config that names it stays valid.
     #[serde(default)]
     pub personal: Option<String>,
 }
@@ -379,19 +381,59 @@ pub fn root_of(home: &Path) -> PathBuf {
     }
 }
 
-/// The store of the local collective that receives an engineer's personal lessons (reach.rs): the one
-/// `personal` names, else the only `share: local` collective; none when there is none or several. `home`
-/// is any collective's store (or the root store), the root is derived from it.
-pub fn personal_store(cfg: Option<&Config>, home: &Path) -> Option<PathBuf> {
-    let cfg = cfg?;
+/// Guard: how many directory levels below a config path [`places_of`] looks for a repo known only by
+/// its name: a repo directly in a config path (`~/work/app`) or one group deeper (`~/work/group/app`).
+/// Deeper ones stay unknown, never guessed. Bounds the cost: one directory listing per config path and
+/// one stat per entry in it, per repo name.
+pub const REPO_DEPTH: usize = 2;
+
+/// The directories of the repo `repo` (a name, as episodes carry it) among `cfg`'s paths (collective or
+/// `off`): a path named like it, or a directory of that name up to [`REPO_DEPTH`] levels inside one
+/// (hidden directories skipped).
+pub fn places_of(cfg: &Config, repo: &str) -> Vec<PathBuf> {
+    if repo.is_empty() || repo == "." || repo == ".." || repo.contains('/') {
+        return Vec::new();
+    }
+    fn inside(p: &Path, repo: &str, depth: usize, out: &mut Vec<PathBuf>) {
+        let here = p.join(repo);
+        if here.is_dir() {
+            out.push(here);
+        }
+        if depth <= 1 {
+            return;
+        }
+        for d in std::fs::read_dir(p).into_iter().flatten().flatten() {
+            let name = d.file_name();
+            if name.to_string_lossy().starts_with('.') || name == repo || !d.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            inside(&d.path(), repo, depth - 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    for p in cfg.collectives.iter().flat_map(|c| c.paths.iter()).chain(cfg.off.iter()).map(|p| expand(p)) {
+        if p.file_name().is_some_and(|n| n == repo) {
+            out.push(p.clone());
+        }
+        inside(&p, repo, REPO_DEPTH, &mut out);
+    }
+    out
+}
+
+/// Where a repo known only by its name (an episode's `repo`, hook.rs `repo_of`) routes under `cfg`: the
+/// route of every place of it ([`places_of`]). `None` when there is none or they route to different
+/// places (a team repo and an open-source one of one name): unknown, never guessed. Reads the config's
+/// own directories only, never another store.
+pub fn route_repo(cfg: &Config, repo: &str, base: &Path) -> Option<Route> {
+    let mut routes = places_of(cfg, repo).into_iter().map(|p| route(Some(cfg), &p.to_string_lossy(), base));
+    let first = routes.next()?;
+    routes.all(|r| r == first).then_some(first)
+}
+
+/// Whether `home` is the store of one of `cfg`'s collectives (under the root store it lies in).
+pub fn is_store(cfg: &Config, home: &Path) -> bool {
     let base = root_of(home);
-    let local: Vec<&Entry> = cfg.collectives.iter().filter(|c| c.share == Share::Local).collect();
-    let pick = match &cfg.personal {
-        Some(name) => local.iter().find(|c| &c.name == name).copied(),
-        None if local.len() == 1 => local.first().copied(),
-        None => None,
-    }?;
-    Some(store(&base, &pick.name))
+    cfg.collectives.iter().any(|c| store(&base, &c.name) == home)
 }
 
 /// A `share: local` collective of `cfg` whose store is `home`, if any. Second guard for a sync: even
@@ -615,6 +657,27 @@ mod tests {
             assert!(e.contains(why) && e.contains(&p.display().to_string()), "{json}: {e}");
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    #[test]
+    fn a_repo_name_routes_only_where_no_other_place_of_it_could_be() {
+        let root = std::env::temp_dir().join(format!("borg-collective-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["work/group/api", "work/app", "oss/api", "oss/lib", "work/a/b/deep"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let cfg: Config = serde_json::from_value(serde_json::json!({"collectives": [
+            {"name": "work", "paths": [root.join("work")]}, {"name": "oss", "paths": [root.join("oss")]}]}))
+        .unwrap();
+        let base = root.join("base");
+        let to = |name: &str| Some(Route::Collective { name: name.into(), home: store(&base, name), share: Share::Team });
+        assert_eq!(route_repo(&cfg, "lib", &base), to("oss"));
+        assert_eq!(route_repo(&cfg, "app", &base), to("work"));
+        // A team repo one group deeper and an open-source one of the same name: unknown, never the other's.
+        assert_eq!(route_repo(&cfg, "api", &base), None);
+        assert_eq!(places_of(&cfg, "api").len(), 2);
+        assert_eq!(route_repo(&cfg, "deep", &base), None, "deeper than REPO_DEPTH: unknown");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

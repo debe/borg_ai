@@ -18,7 +18,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | drone | One running agent session wired to borg (this one, if the hooks are installed) |
 | collective | A separate memory: one store of lessons, episodes and outcomes. Every repo path routes to one collective, or to none (`off`) |
 | lesson | A learned rule: a question to ask, the situations it applies in, and the consequence of ignoring it |
-| reach | Who hears a lesson: `team` (everyone in the collective), `repo` (only that repo) or `personal` (only the engineer, in their private collective) |
+| reach | Who hears a lesson: `team` (everyone in the collective), `repo` (only that repo) or `personal` (only the engineer: it stays in the collective it was learned in, on this machine only, never synced) |
 | queen | The queue of open decisions waiting for the engineer (`borg queen`) |
 | mesh | Peer-to-peer sync of a `share: "team"` collective between members' machines (`borg mesh`, a separate `borg-mesh` binary) |
 | link | A decision → fix pair: an earlier commit with borg reasoning whose lines a later session's commit changed. A *fix* link (revert, fix-shaped subject, test failed then passed, the engineer named a bug) can become a `regret` lesson; a *revisited* link never does |
@@ -39,6 +39,8 @@ on this machine unless the collective they belong to is synced with a team over 
 | To know what is broken | `borg doctor`, then [troubleshooting](references/troubleshooting.md) |
 | borg says an update exists (a newer release, or a member nothing syncs with) | Tell the engineer; on their yes run `borg update` (it installs the release, refreshes the wired harnesses and runs `borg doctor`); `borg update --check` shows who runs what |
 | To know which collective a repo belongs to | `borg collective <dir>` |
+| Misplaced: the engineer says a lesson belongs in another collective | `borg move <id> --to <collective>` prints a dry run: show it, and on their yes run it again with `--apply`. The source keeps a tombstone unless another engineer is on the lesson (then it is only copied); `--personal` keeps it for the engineer alone there. For a repo that changed collectives, `borg move <repo-path> --to <collective>` moves its waiting corrections. `borg doctor` lists suggested moves; nothing moves on its own |
+| Correction for another collective: the engineer corrects something about another collective's repo or project (an open-source library during team work) | `borg correct --collective <name> [--repo <repo>] "<the correction>"`, learned in that collective when this session ends. One command per collective the correction concerns, this session's own included: once `borg correct` runs, the words the hooks captured in this session's collective are set aside, so a part that belongs here needs its own `borg correct --collective <this one>`. State each in that collective's own terms, never the other's; `--repo` names the repo it is about. Into another collective goes only what you write: no task, proposal or work email of this session. Without the command a correction stays in this session's collective. `borg collective <dir>` and `borg status` show the names |
 | To wire or unwire a harness | `borg install <harness\|all>`, `borg uninstall <harness\|all>` |
 | To answer borg's open questions | `borg queen`, `borg queen show <n>`, `borg queen answer <n> <text>` |
 | The reasoning behind a line or commit | `borg why <path>[:<line>]` or `borg why <commit>` |
@@ -83,7 +85,7 @@ All three act on the collective of the current directory; `--dir <repo>` names a
 
 ## Safety rules
 
-1. **Dry run first.** `install`, `uninstall`, `assimilate`, `reach`, `mesh join` and `queen dedupe` print
+1. **Dry run first.** `install`, `uninstall`, `assimilate`, `reach`, `move`, `mesh join` and `queen dedupe` print
    what they would change without `--apply`. Run the dry run, show the engineer the diff or plan, and
    add `--apply` only after they agree. `--apply` backs up every file it changes. `borg setup` asks
    before it writes, but `borg setup --yes` does not: from a drone, tell the engineer what the flags
@@ -94,11 +96,15 @@ All three act on the collective of the current directory; `--dir <repo>` names a
 3. **`share: "local"` never syncs.** Put private and client work in a `local` collective or under
    `off`. Never move a repo into a `team` collective without the engineer saying so: its lessons then
    reach everyone in that team.
-4. **Learning from fixes is the engineer's call.** `BORG_REGRESS` defaults to `links`: nothing is
+4. **Collectives never mix on their own.** Cross a boundary only on the engineer's word: `borg move`
+   for a lesson or a repo's evidence, `borg correct --collective` for a correction. Name the collective
+   from `borg collective` or `borg status`, and ask the engineer when unsure. Write each correction in
+   its collective's terms: no team details in an open-source or personal collective's, nor the reverse.
+5. **Learning from fixes is the engineer's call.** `BORG_REGRESS` defaults to `links`: nothing is
    learned. Before suggesting `BORG_REGRESS=learn`, run `borg regress --replay <A..B> --explain` on
    their history and `borg regress --session ID --explain` on a few real sessions, and let them check
    the fix links: their precision on real repos is not measured yet.
-5. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg assimilate --from-dir` and
+6. **Ask before calling a model in bulk.** `borg assimilate --apply`, `borg assimilate --from-dir` and
    `borg reach` spend a model call per item; say roughly how many before running them.
 
 ## Setting up

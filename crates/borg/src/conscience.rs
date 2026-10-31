@@ -135,18 +135,40 @@ pub fn load(path: &Path, before_ms: Option<i64>) -> Vec<Challenge> {
 
 /// `load` under explicit aliases.
 pub fn load_with(path: &Path, before_ms: Option<i64>, aliases: &Aliases) -> Vec<Challenge> {
-    load_as(path, before_ms, aliases, None)
+    load_as(path, before_ms, aliases, None, false)
 }
 
 /// `load` as seen from `session`: each weight takes that session's Thompson sample of the lesson's
 /// usefulness (memory.rs), stable within the session. Without a session, the belief's mean.
 pub fn load_for(path: &Path, before_ms: Option<i64>, session: Option<&str>) -> Vec<Challenge> {
-    load_as(path, before_ms, collective::aliases(), session)
+    load_as(path, before_ms, collective::aliases(), session, false)
 }
 
-fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Option<&str>) -> Vec<Challenge> {
+/// `load_for` with this engineer's personal lessons of the same store (reach.rs `PERSONAL_FILE`, beside
+/// `path`) over the team's: what a session of this collective is delivered. A personal lesson replaces
+/// its tombstone and is delivered like a team lesson, for this file is this machine's alone and this
+/// store this collective's alone. Costs one open more, a read only when the file exists.
+pub fn load_store_for(path: &Path, before_ms: Option<i64>, session: Option<&str>) -> Vec<Challenge> {
+    load_as(path, before_ms, collective::aliases(), session, true)
+}
+
+/// `load_store_for` under explicit aliases, without a session.
+pub fn load_store_with(path: &Path, before_ms: Option<i64>, aliases: &Aliases) -> Vec<Challenge> {
+    load_as(path, before_ms, aliases, None, true)
+}
+
+fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Option<&str>, personal: bool) -> Vec<Challenge> {
     let outcomes = crate::outcome::read_team(path);
     let mut out = load_unweighted_with(path, before_ms, aliases);
+    if personal {
+        let mut mine = load_unweighted_with(&path.with_file_name(crate::reach::PERSONAL_FILE), before_ms, aliases);
+        // A lesson `borg move` took elsewhere leaves its tombstone here: nothing to deliver.
+        mine.retain(|c| c.question != crate::reach::MOVED);
+        if !mine.is_empty() {
+            out.retain(|c| !mine.iter().any(|m| m.id == c.id));
+            out.extend(mine.into_iter().map(|c| Challenge { reach: String::new(), ..c }));
+        }
+    }
     let memory = crate::memory::derive(&outcomes, &out, session);
     let trust = trust::Trust::compute(&out, &outcomes);
     for c in &mut out {

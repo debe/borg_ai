@@ -142,6 +142,10 @@ fn learn_cmd(rest: &[&str]) {
         {
             homes.extend(borg::review_fix::record_session(&borg::review_fix::home_dir(), s, cfg.as_ref(), &root).1);
         }
+        // The stores `borg correct` recorded this session's corrections into (moves.rs).
+        if let Some(s) = session {
+            homes.extend(borg::moves::corrected_homes(s));
+        }
         if borg::sweep::on() {
             if let Some(s) = session {
                 homes.extend(borg::sweep::session_end(s, cfg.as_ref(), &root));
@@ -291,6 +295,9 @@ fn main() {
         ["memory", rest @ ..] => std::process::exit(borg::memory_export::main(rest)),
         ["setup", rest @ ..] => std::process::exit(borg::install::setup::main(rest)),
         ["completions", rest @ ..] => std::process::exit(borg::completions::main(rest)),
+        // Crossing a collective boundary, on the engineer's word only (moves.rs).
+        ["move", rest @ ..] => std::process::exit(borg::moves::main_move(rest)),
+        ["correct", rest @ ..] => std::process::exit(borg::moves::main_correct(rest)),
         ["reach", rest @ ..] => {
             borg::stats::set_purpose("reach");
             std::process::exit(borg::reach::main(rest))

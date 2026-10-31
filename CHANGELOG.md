@@ -3,6 +3,38 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.4 (unreleased)
+
+Collectives stay separate: nothing crosses between them on its own, and crossing on your word is one
+command.
+
+### Fixed
+
+- A personal lesson stays in the collective it was learned in, delivered only to you and never synced.
+  It no longer moves to your private collective, and `borg reach` never hides a teammate's lesson, one
+  no engineer is recorded on, or an imported one.
+  [Who hears a lesson](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#who-hears-a-lesson)
+- A personal lesson is learned once, not again on every `borg learn`.
+- Corrections of a repo that now routes to another collective are held, not learned in the old one.
+
+### Added
+
+- `borg move <lesson-id|repo-path> --to <collective>` moves a misplaced lesson, or a repo's waiting
+  corrections; a dry run until `--apply`. A teammate's lesson is copied, never hidden.
+  [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#learning)
+- `borg correct --collective <name> "<words>"` records a correction in another collective, one command
+  per collective, learned there when the session ends. Only your words cross. The `borg` skill runs
+  one for each collective a correction concerns.
+  [Correcting another collective](https://github.com/debe/borg_ai/blob/main/docs/learning.md#reach-and-collectives)
+- `borg doctor` lists held corrections, possibly misplaced lessons and the repair below, each with its
+  `borg move`. It never moves anything.
+
+### Upgrading
+
+- Run `borg doctor`. It lists anything to move, including lessons an earlier borg moved to your
+  private collective; run each `borg move` it names, dry run first, then `--apply`. The `personal` key
+  in `collectives.json` is no longer used and stays valid.
+
 ## 0.7.3 (2026-10-31)
 
 Lesson selection's labels and status lines now mean what they say, so the learned policy learns from

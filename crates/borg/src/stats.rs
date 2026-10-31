@@ -681,9 +681,12 @@ pub fn rollup(home: &Path) -> usize {
     }
     let me = node(home);
     let published = rollups(home);
+    // This engineer's personal lessons (reach.rs) are no team's business, not even by id.
+    let personal = crate::reach::personal_ids(home);
     let fresh: Vec<Bucket> = fold(&me, &evs)
         .into_values()
         .filter_map(|mut b| {
+            b.lessons.retain(|id, _| !personal.contains(id));
             let old = published.get(&b.id);
             if old.is_some_and(|o| o.same(&b)) {
                 return None;

@@ -78,6 +78,8 @@ const PROBES: &[(&str, &[&str])] = &[
     ("no", &[]),
     ("assimilate", &["--zz-probe"]),
     ("reach", &["--zz-probe"]),
+    ("move", &["--zz-probe"]),
+    ("correct", &["--zz-probe"]),
     ("facets", &["--zz-probe"]),
     ("memory", &["--zz-probe"]),
     ("queen", &[]),

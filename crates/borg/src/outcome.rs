@@ -551,7 +551,13 @@ pub fn publish(home: &Path) -> usize {
     let text = std::fs::read_to_string(&team).unwrap_or_default();
     let mut have: std::collections::HashSet<String> = text.lines().map(str::to_string).collect();
     let mut out = String::new();
-    let records = mine.lines().filter_map(|l| serde_json::from_str::<Outcome>(l).ok());
+    // This engineer's personal lessons (reach.rs) are no team's business, not even by id.
+    let personal = crate::reach::personal_ids(home);
+    let records = mine.lines().filter_map(|l| serde_json::from_str::<Outcome>(l).ok()).filter_map(|mut o| {
+        let named = !o.lessons.is_empty();
+        o.lessons.retain(|id| !personal.contains(id));
+        (!named || !o.lessons.is_empty()).then_some(o)
+    });
     for line in records.filter_map(|o| share(&o, &node)).filter_map(|x| serde_json::to_string(&x).ok()) {
         if have.insert(line.clone()) {
             out.push_str(&line);

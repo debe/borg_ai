@@ -161,3 +161,23 @@ fn every_install_flag_the_skill_names_is_accepted() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `move` and `correct` refuse a flag they do not know with "unknown flag" before reading any store: a
+/// trailing unknown flag makes every probe stop there.
+#[test]
+fn every_move_and_correct_flag_the_skill_names_is_accepted() {
+    let used: BTreeSet<(String, String)> = all_mentions()
+        .into_iter()
+        .filter(|(c, _)| matches!(c.as_str(), "move" | "correct"))
+        .flat_map(|(c, rest)| flags(&rest).into_iter().map(move |f| (c.clone(), f)))
+        .collect();
+    for want in [("move", "--to"), ("move", "--from"), ("correct", "--collective")] {
+        assert!(used.contains(&(want.0.into(), want.1.into())), "the skill teaches {want:?}: {used:?}");
+    }
+    for (cmd, f) in used {
+        let out = borg(&[cmd.as_str(), &f, "x", "--zz-probe"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains(&format!("unknown flag {f}")), "borg {cmd} {f}: {err}");
+        assert!(err.contains("unknown flag --zz-probe"), "borg {cmd} {f}: the probe stopped at the parse: {err}");
+    }
+}

@@ -263,6 +263,12 @@ pub fn locked<T>(file: &Path, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// The lock of `file` (`<file>.lock`), held until the returned file is dropped; None when it cannot be
+/// taken (`locked` runs unlocked then too). For holding several at once (moves.rs `with_locks`).
+pub fn hold(file: &Path) -> Option<std::fs::File> {
+    lock_of(file).ok()
+}
+
 /// `<file>.lock`, opened and locked exclusively.
 fn lock_of(file: &Path) -> std::io::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()

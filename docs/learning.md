@@ -163,9 +163,9 @@ borg memory release L42                                     # Borg delivers it a
 
 **The export** is read-only and costs 0 tokens. It holds one record per lesson of the collective the
 directory routes to; an `off` directory prints nothing. `--json` prints `{"schema": 1, "collective",
-"lessons": [...]}`. A personal lesson (withdrawn to a private collective) is left out. Every text field
-but the ids (`id`, `supersedes`, `superseded_by`) and `reach` is redacted, the engineers and an absorb's
-`by` too. A field the logs do not hold is omitted, never guessed.
+"lessons": [...]}`. Personal lessons (`personal.jsonl`) and their tombstones are left out. Every
+text field but the ids (`id`, `supersedes`, `superseded_by`) and `reach` is redacted, the engineers and
+an absorb's `by` too. A field the logs do not hold is omitted, never guessed.
 
 | Field | What it holds |
 |---|---|
@@ -218,9 +218,9 @@ lessons with their note and recurrence, and `/api/memory` serves the export.
 ## Reach and collectives
 
 A correction about the code becomes a team lesson. One about how *you* like the agent to work (commit
-style, AI attribution, branching) is personal: it goes to your private collective and never reaches the
-team. A convention of one repo is delivered only there. See
-[Who hears a lesson](configuration.md#who-hears-a-lesson).
+style, AI attribution, branching) is personal: it stays in the collective it was learned in, in that
+store's `personal.jsonl`, delivered only to you and never synced. A convention of one repo is delivered
+only there. See [Who hears a lesson](configuration.md#who-hears-a-lesson).
 
 Each repo path belongs to one collective, or to none:
 
@@ -229,6 +229,33 @@ Each repo path belongs to one collective, or to none:
 - **off** repos are invisible: Borg returns before it reads or writes anything.
 
 A session reads only its own collective's lessons.
+
+**Isolation.** Collectives never mix on their own: a personal lesson never reaches your teammates or
+another collective, nothing of the team reaches your private collective, and `borg reach` never
+withdraws or re-sorts a lesson another engineer is on. A personal lesson is learned once, in its own collective, since its episodes and the
+lesson share a store. When a repo moves to another collective, its corrections not yet learned stay
+where they were captured and wait: `borg learn` never learns them in a store the repo no longer routes
+to, and `borg doctor` names the `borg move <repo-path> --to <collective>` that sends them on.
+
+**Crossing on your word.** A misplaced lesson moves with `borg move <id> --to <collective>`: a dry run,
+then `--apply`. The target gets it as its next version and the source a tombstone that keeps its
+episodes; a lesson another engineer is on is copied, never hidden from their team.
+
+**Correcting another collective.** One session can touch two collectives' work, such as an open-source
+library during team work. The agent records a correction about the library in its collective:
+
+```sh
+borg correct --collective oss "Validate the input length before parsing"
+```
+
+Into another collective goes only what the command says, with the session's id and the email that
+collective's repo (`--repo`) knows you by: never the session's task, the agent's proposal or the email
+of the session's repo. In the session's own collective it carries the task and the agent's last
+proposal (Claude Code transcripts). Either is learned when the session ends. Run one command per
+collective the correction concerns, the session's own included: once `borg correct` runs, the words
+the hooks captured in the session's collective are set aside, so each collective learns only what was
+said for it. Without the command, a correction stays in the session's collective; Borg never guesses
+across a boundary. The `borg` skill teaches the agent both commands.
 
 ## The queen
 

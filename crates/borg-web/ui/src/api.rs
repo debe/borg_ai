@@ -302,7 +302,8 @@ pub fn parse_lessons(v: &Value, memory: &BTreeMap<String, Absorbed>) -> Vec<Less
             reach: s(&l["reach"]),
             absorbed: memory.get(&s(&l["id"])).cloned(),
         })
-        // A personal lesson withdrawn to a private collective is a tombstone here: nothing to show.
+        // In lessons.jsonl a personal lesson is a tombstone (the lesson itself stays in the store's
+        // local personal.jsonl, never served here): nothing to show.
         .filter(|l| l.reach != "personal")
         .collect()
 }

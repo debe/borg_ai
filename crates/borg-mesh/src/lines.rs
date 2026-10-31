@@ -248,6 +248,23 @@ mod tests {
         assert!(logs(Path::new("s")).contains(&Path::new("s").join(ABSORBED)), "stamped, signed and quarantined like every synced log");
     }
 
+    /// An engineer's personal lessons (borg reach.rs `PERSONAL_FILE`) stay on their machine: not a synced
+    /// log, not stamped or fingerprinted, and none of their lines is in what a store offers its peers.
+    #[test]
+    fn personal_lessons_are_never_synced_nor_offered() {
+        let d = tmp("personal");
+        let personal = borg::reach::PERSONAL_FILE;
+        assert!(!SYNCED.contains(&personal), "personal.jsonl is no synced log");
+        assert!(!logs(&d).contains(&d.join(personal)), "nor stamped, signed or fingerprinted");
+        std::fs::write(d.join("lessons.jsonl"), lesson("L1", 1, "team lesson") + "\n").unwrap();
+        std::fs::write(d.join(personal), lesson("L2", 1, "my commit style") + "\n").unwrap();
+        let offered: Vec<String> = logs(&d).iter().flat_map(|p| read(p).into_values()).collect();
+        assert_eq!(offered, [lesson("L1", 1, "team lesson")], "only the team's line is offered");
+        // Nor where a `borg move` placed a lesson from (it names the source collective).
+        assert!(!SYNCED.contains(&borg::moves::PLACED_FILE) && !logs(&d).contains(&d.join(borg::moves::PLACED_FILE)));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     /// Absorbs name a lesson's `id` and `version` but are no versions of a record: a merge appends what
     /// is new and never re-appends an earlier line to settle them.
     #[test]
