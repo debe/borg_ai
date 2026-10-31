@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.7.4 (unreleased)
+## 0.7.4 (2026-10-31)
 
 Collectives stay separate: nothing crosses between them on its own, and crossing on your word is one
 command.
