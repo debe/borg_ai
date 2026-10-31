@@ -17,6 +17,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # check.sh builds every test twice (default features and --no-default-features) in one target dir.
+  # With full debug info that outgrew the Linux runner's ~14 GB free disk (0.7.3, Oct 2026); line
+  # tables keep file:line in panics and backtraces at a fraction of the size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -31,6 +35,12 @@ jobs:
     # (a cold cache); typical runs take 7 and 10 min.
     timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 30 }}
     steps:
+      # The Linux image ships toolchains borg never uses; removing them frees about 20 GB for the build.
+      - name: free disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
