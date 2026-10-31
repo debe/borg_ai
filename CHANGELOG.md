@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.7.2 (unreleased)
+## 0.7.2 (2026-10-31)
 
 Corrections and answers reach Borg from every harness's own transcript, so a harness update can no
 longer silence them unnoticed.
