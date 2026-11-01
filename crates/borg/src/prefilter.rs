@@ -22,8 +22,9 @@ pub const MARKERS: [&str; 2] = ["#borg-asked", "#borg-skip"];
 pub const THRESHOLD: f64 = 8.0;
 
 /// What the state file gained since the last Stop: this turn's prompt and touches (plus the drone's
-/// final message, appended by the caller). A live check's ask (`#borg-asked` followed by `#borg-live`,
-/// main.rs `ask_live`) comes during the turn and does not end it.
+/// final message, appended by the caller). A live check's ask (`#borg-asked` followed by `#borg-live`:
+/// before 0.7.6, or one such ask handed over after the upgrade, hook.rs `LEGACY_ASK`) came during the
+/// turn and does not end it.
 pub fn turn(context: &str) -> &str {
     let mut start = 0;
     let mut at = 0;
@@ -147,7 +148,7 @@ pub struct Tally {
     pub judged: usize,
     pub judge_resolved: usize,
     pub judge_chars: usize,
-    /// Live mode (main.rs `live_check`): model calls during the turn, their cost and lessons shown.
+    /// Live mode's model calls during the turn (before 0.7.6, history only), their cost and lessons shown.
     pub live_checks: usize,
     pub live_cost: f64,
     pub live_lessons: usize,

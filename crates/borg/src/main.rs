@@ -189,18 +189,6 @@ fn learn_store(home: &std::path::Path, session: Option<&str>) -> (usize, usize, 
     got
 }
 
-/// Live mode's check (live.rs), spawned by the `PostToolUse` hook with the hook's environment.
-fn check_cmd(rest: &[&str]) {
-    let flag = |f: &str| rest.iter().position(|a| *a == f).and_then(|i| rest.get(i + 1)).copied().unwrap_or_default();
-    let session = flag("--session");
-    if session.is_empty() {
-        eprintln!("borg check: --session ID is required (internal: the PostToolUse hook runs it in live mode)");
-        std::process::exit(2);
-    }
-    let input = json!({"session_id": session, "cwd": flag("--cwd"), "transcript_path": flag("--transcript")});
-    borg::hook::live_check(harness::current(), session, &input);
-}
-
 /// Each lesson's memory (memory.rs) from the outcomes beside it, as JSON lines; with --session,
 /// that session's view (its clock tick and usefulness sample).
 fn memory_cmd(path: &str, rest: &[&str]) {
@@ -289,7 +277,6 @@ fn main() {
         // The live page (crates/borg-web): its web stack stays out of the hook binary too.
         ["web", rest @ ..] => exec("web", rest),
         ["learn", rest @ ..] => learn_cmd(rest),
-        ["check", rest @ ..] => check_cmd(rest),
         ["vectors", rest @ ..] if rest.contains(&"--query") => {
             eprintln!("borg vectors: unknown flag --query (borg debug vectors --query)");
             std::process::exit(2);

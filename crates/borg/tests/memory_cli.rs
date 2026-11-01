@@ -423,7 +423,14 @@ fn the_session_end_judges_every_open_delivery_once_with_the_whole_session() {
     assert!(state.contains("#borg-judged Llock=changed\n#borg-end-judged Llock\n"), "{state}");
     let cost = store_file(&root, "state/s1.cost");
     let line = cost.lines().last().unwrap_or_default();
-    assert!(line.starts_with("judge call=4 pending=1 resolved=1 ") && line.ends_with(" at=end"), "{cost}");
+    // No evidence of the judge's effective length yet: the start budget, or on a drawn share of passes
+    // the step above it (judge_length.rs), the chance logged.
+    let start = line.contains(" model=claude:sonnet at=end batch=1/1 budget=72000 psi=0.2000 explore=0 cut=none");
+    let explored = line.contains(" model=claude:sonnet at=end batch=1/1 budget=108000 psi=0.2000 explore=1 cut=none");
+    assert!(line.starts_with("judge call=4 pending=1 resolved=1 ") && (start || explored), "{cost}");
+    let check = cost.lines().find(|l| l.starts_with("judge ")).unwrap_or_default();
+    let prompt = check.split_once(" model=claude:sonnet prompt=").map(|(_, n)| n.parse::<usize>());
+    assert!(matches!(prompt, Some(Ok(n)) if n > 0), "a check's judge line names its model and its prompt's size too: {check}");
     let judge: Vec<Value> = store_file(&root, "stats/events.jsonl")
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())

@@ -60,7 +60,7 @@ async fn the_learning_view_shows_per_week_whether_learning_works() {
     let _ = std::fs::remove_dir_all(&home);
     seed(&home);
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team, mode: "hook" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
     let res = router(app).oneshot(Request::get("/api/learning?c=corp").header("host", "127.0.0.1:7979").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);

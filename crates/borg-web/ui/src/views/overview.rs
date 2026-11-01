@@ -176,10 +176,11 @@ pub fn Overview() -> impl IntoView {
     });
 
     // Questions at a stop block (each block an extra round) plus questions a live check asked during the
-    // turn (no extra round): both count as asked, as their verdicts count as used or ignored.
+    // turn (no extra round; live mode ran until 0.7.6): both count as asked, as their verdicts count as
+    // used or ignored.
     let questions = |t: &crate::api::Totals| {
         let live = t.n("live_ask_n");
-        if live > 0.0 { format!("{} questions, {} more live", num(t.n("block_n")), num(live)) } else { format!("{} questions", num(t.n("block_n"))) }
+        if live > 0.0 { format!("{} questions, {} more live before 0.7.6", num(t.n("block_n")), num(live)) } else { format!("{} questions", num(t.n("block_n"))) }
     };
     let funnel = Signal::derive(move || {
         let t = t();
@@ -200,7 +201,7 @@ pub fn Overview() -> impl IntoView {
                 sub=Signal::derive(move || {
                     let live = t().n("live_ask_n");
                     if live > 0.0 {
-                        format!("in {} extra rounds; {} live, without one", num(t().n("block")), num(live))
+                        format!("in {} extra rounds; {} live before 0.7.6, without one", num(t().n("block")), num(live))
                     } else {
                         format!("in {} extra rounds", num(t().n("block")))
                     }

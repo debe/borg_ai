@@ -471,6 +471,10 @@ pub struct Selection {
     /// The learned policy's randomised question-count test; None under another policy while the
     /// summary counts none of its checks.
     pub test: Option<Test>,
+    /// Label health: the judge's effective length per model (judge_length.rs), the session-end judge's
+    /// prompt budget: the answered share per prompt-size step and what is explored. Read from the
+    /// store's judge cost lines by `selection`; empty from `Selection::of`.
+    pub judge: Vec<crate::judge_length::Length>,
 }
 
 /// The randomised question-count test of the learned policy (select/policy.rs `choose`; docs/delivery.md
@@ -841,6 +845,7 @@ impl Selection {
             pool,
             latency,
             test: (learned || s.experiment.totals() != (0, 0)).then(|| Test::of(s, risk)),
+            judge: Vec::new(),
         }
     }
 
@@ -884,7 +889,71 @@ fn effects(m: &select::policy::Model, n: u32) -> Vec<Estimate> {
 /// The selection of the store whose lessons file is `lessons`, under `policy` (select.rs `policy`).
 #[must_use]
 pub fn selection(lessons: &Path, policy: select::Policy) -> Selection {
-    Selection::of(&select::summary::load(lessons), policy, select::risk_of(lessons))
+    let mut s = Selection::of(&select::summary::load(lessons), policy, select::risk_of(lessons));
+    // The store's judge cost lines are in its `state/`, beside its lessons; the judge this environment runs.
+    let current = crate::hook::judge_model(&std::env::var("BORG_PREDICT_MODEL").unwrap_or_default());
+    s.judge = crate::judge_length::lengths(&lessons.with_file_name("state"), &current);
+    s
+}
+
+/// `n` with its thousands grouped (`72,000`).
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One judge's effective length as one line (`borg status`): the budget and whether evidence moved it,
+/// the answered share per prompt-size step with what it decided, and the step explored with its chance.
+#[must_use]
+pub fn judge_length_line(l: &crate::judge_length::Length) -> String {
+    use crate::judge_length::Decision;
+    let start = crate::hook::END_START_BUDGET;
+    let how = if l.start {
+        "the start: no decided step moved it".to_string()
+    } else if l.chars > start {
+        format!("measured, up from the start {}", grouped(start))
+    } else {
+        format!("measured, down from the start {}", grouped(start))
+    };
+    let mut parts = vec![format!("{}: session-end budget {} chars ({how})", l.model, grouped(l.chars))];
+    let measured: Vec<String> = l
+        .steps
+        .iter()
+        .filter(|s| s.sent > 0)
+        .map(|s| {
+            let what = match s.decision {
+                Decision::Reference => format!("reference, line {:.0}%", 100.0 * l.line.unwrap_or(0.0)),
+                Decision::Below => "below the reference".into(),
+                Decision::Holds => "holds".into(),
+                Decision::Fails => "fails".into(),
+                Decision::Open => "open".into(),
+            };
+            format!("≤{} {:.0}% of {} [{:.0}–{:.0}%] {what}", grouped(s.upto), 100.0 * s.answered as f64 / s.sent as f64, s.sent, 100.0 * s.lo, 100.0 * s.hi)
+        })
+        .collect();
+    parts.push(if measured.is_empty() { "no judge call measured yet".into() } else { format!("answered by prompt size: {}", measured.join(", ")) });
+    if l.line.is_none() && !measured.is_empty() {
+        parts.push(format!(
+            "no reference yet (the smallest steps with {} lessons in {} calls)",
+            crate::judge_length::REFERENCE_LESSONS,
+            crate::judge_length::MIN_CALLS
+        ));
+    }
+    parts.push(match l.explore {
+        Some(up) if l.steps.iter().any(|s| s.upto == up && s.decision == Decision::Fails) => {
+            format!("exploring the failed ≤{} on {:.0}% of session-end passes", grouped(up), 100.0 * l.psi)
+        }
+        Some(up) => format!("exploring ≤{} on {:.0}% of session-end passes", grouped(up), 100.0 * l.psi),
+        None => "nothing explored".into(),
+    });
+    parts.join(" · ")
 }
 
 /// `s` as one line (`borg status`, `borg top`): what decides (the default named as such, a policy
@@ -1295,6 +1364,40 @@ corp (team): 3 drone(s), 2 active, 1 remote
         }
     }
 
+    /// The judge's effective length in a store's selection (`borg status`, borg web, `borg top --json`):
+    /// read from the store's judge cost lines per model, the current judge listed even without any; its
+    /// line names the budget, each measured step's share with its decision, and what is explored.
+    #[test]
+    fn the_judges_effective_length_is_read_from_the_stores_cost_lines_and_shown() {
+        let home = std::env::temp_dir().join(format!("borg-top-judge-length-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        let line = |chars: usize, n: u64, a: u64| {
+            format!(
+                "judge call=1 pending={n} resolved={a} chars={chars} returned= unmatched= verdicts=changed:{a},ignored:0,not_arisen:0,consequence_remains:0,unclear:{} reason_chars=1 model=x:big at=end\n",
+                n - a
+            )
+            .repeat(10)
+        };
+        std::fs::write(home.join("state/s.cost"), line(30_000, 40, 20) + &line(70_000, 30, 15) + &line(100_000, 30, 15)).unwrap();
+        let sel = selection(&home.join("lessons.jsonl"), select::policy());
+        let big = sel.judge.iter().find(|l| l.model == "x:big").expect("the store's judge");
+        assert_eq!((big.chars, big.start, big.explore), (108_000, false, Some(162_000)));
+        assert_eq!(
+            judge_length_line(big),
+            "x:big: session-end budget 108,000 chars (measured, up from the start 72,000) · answered by prompt size: ≤32,000 50% of 400 [45–55%] reference, line 42%, ≤72,000 50% of 300 [44–56%] holds, ≤108,000 50% of 300 [44–56%] holds · exploring ≤162,000 on 20% of session-end passes"
+        );
+        let v = serde_json::to_value(&sel).unwrap();
+        assert_eq!(v["judge"].as_array().map(|a| a.iter().any(|j| j["model"] == "x:big" && j["chars"] == 108_000)), Some(true), "{v}");
+        let none = crate::judge_length::Length::of("y:new", &crate::judge_length::Steps::new());
+        assert_eq!(
+            judge_length_line(&none),
+            "y:new: session-end budget 72,000 chars (the start: no decided step moved it) · no judge call measured yet · exploring ≤108,000 on 20% of session-end passes"
+        );
+        assert_eq!((grouped(0), grouped(999), grouped(1_000), grouped(1_234_567)), ("0".into(), "999".into(), "1,000".into(), "1,234,567".into()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn the_selection_line_says_what_decides_and_prices_spend_only_under_a_budget() {
         use select::Policy;
@@ -1404,7 +1507,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let v = serde_json::to_value(learned()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let want = "allowance at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life labels latency ledger measurement policy pool sessions source spend test";
+        let want = "allowance at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life judge labels latency ledger measurement policy pool sessions source spend test";
         assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
         assert_eq!((&v["budget"], &v["spend"][0]["source"], &v["deviations"][0]["whole"]), (&Value::Null, &json!("stop"), &json!(400)));
         let mut keys: Vec<&str> = v["evaluation"].as_object().unwrap().keys().map(String::as_str).collect();

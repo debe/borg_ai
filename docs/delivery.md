@@ -1,4 +1,4 @@
-# Delivery and modes
+# Delivery
 
 [← README](../README.md)
 
@@ -6,8 +6,8 @@ Borg spends tokens only where a lesson is likely to matter.
 
 - [When a lesson arrives](#when-a-lesson-arrives)
 - [Which lessons are asked](#which-lessons-are-asked)
-- [Delivery modes](#delivery-modes)
-- [Why live is the default](#why-live-is-the-default)
+- [Context and time limits](#context-and-time-limits)
+- [Live mode (removed in 0.7.6)](#live-mode-removed-in-076)
 
 ## When a lesson arrives
 
@@ -24,8 +24,8 @@ Borg spends tokens only where a lesson is likely to matter.
    gives each graded lesson a route: asked, handed over free with the next prompt or touch, or left for
    later. A stop that asks anything blocks, and the agent works one more round. The default, the fixed
    rule, decides as 0.5.0 did: a grade 3 blocks, and grades 2 and 1 alone arrive free ([Which lessons
-   are asked](#which-lessons-are-asked)). In live mode, the default, the same call also runs during the
-   turn, after the agent changes something.
+   are asked](#which-lessons-are-asked)). Nothing checks the work during the turn: live mode, which
+   did, was removed in 0.7.6 ([why](#live-mode-removed-in-076)).
 3. **Judged by meaning.** The same call checks whether what was handed over earlier changed the agent's
    work: questions it asked, and free deliveries (early and queued), each recorded with its channel, the
    check that routed it and its probability of that route. The verdict is one of `changed`, `ignored`,
@@ -37,29 +37,64 @@ Borg spends tokens only where a lesson is likely to matter.
    questions are judged without the agent's own `applies`/`skip` line, so its effect on the judge is
    measured. Questions keep their judge slots first (at most 10 wait).
 
-   **When.** A question is judged as before: a live check judges it once the agent has answered it,
-   and leaves an unanswered one to the stop, which sees the answer. A lesson asked after it was handed
-   over is judged on the question, not on the hand-over. A free delivery (early or queued) and a
-   placebo are judged only at the turn end, never by a live check mid-turn: a live check's next call
-   came a median 0.5-0.8 minutes after the delivery, before the agent had done the work, and
-   most such verdicts were unclear. A stop's judge call judges every open delivery; a stop that makes
-   none (the last live check covered the turn, the gate skipped it, or only free deliveries wait) leaves
-   them to a later stop, and free deliveries alone never pay for a check's call.
+   **When.** Every delivery is judged at a turn end, after the agent did the work: a question at the
+   next stop's call, which sees the answer, a free delivery (early or queued) and a placebo likewise
+   (0.7.5 moved them there: a live check's call came a median 0.5-0.8 minutes after the delivery, and
+   most of its verdicts on them were unclear). A lesson asked after it was handed over is judged on the
+   question, not on the hand-over. A stop's judge call judges every open delivery; a stop that makes
+   none (the gate skipped it, or only free deliveries wait) leaves them to a later stop, and free
+   deliveries alone never pay for a check's call.
 
-   **Session end.** `borg learn --session` makes one more judge call before it learns: every delivery of
-   the session, on any channel, that no verdict settled yet (none came, or only `unclear`,
-   `consequence_remains` or missing ones, whatever its tries) is judged once more with the whole
-   session's work in view: the prompts and touches, the edits and answers, and the agent's messages
-   where its transcript has them (Claude Code's), the newest kept within 24,000 characters. In live
-   mode a stop the last live check covered makes no call, so free deliveries and placebos left open
-   there are judged here. Its verdicts are recorded as a check's are, marked `at: end`, and a lesson it
-   judged is not judged again unless it is delivered again. A session whose end hook never ran gets
-   the same call when a later `borg learn` settles it as idle. Cost: one
-   call per session with something open, on the checks' model (`BORG_PREDICT_MODEL`), seeing at most 40
-   lessons, counted as a `model_call` with why `judge` and its dollars in the statistics. A session with
-   nothing open makes no call; `BORG_LEARN=off` or `BORG_PREDICT_MODEL=off` turns it off.
+   **Session end.** `borg learn --session` judges once more before it learns: every delivery of the
+   session, on any channel, that no verdict settled yet (none came, or only `unclear`,
+   `consequence_remains` or missing ones, whatever its tries), with the session's work in view: the
+   prompts and touches, the edits and answers, and the agent's messages where its transcript has them
+   (Claude Code's). Every open delivery is judged (0.7.6; 0.7.5 saw at most 40): the lessons go in
+   batches by delivery order, each batch one call whose whole prompt stays within the judge's budget,
+   the lessons taking at most half of it and the work the rest. The budget is the judge's measured
+   effective length (below), 72,000 characters until evidence moves it. A session whose work fits is
+   read whole in every batch; a longer one is cut per batch by `BORG_END_WORK`: `ends` (the default,
+   picked by the 0.7.6 backtest) reads half right after the batch's earliest delivery and half the
+   session's end, `after` from that delivery on, `newest` the session's end (0.7.5's); the agent's messages always keep
+   their newest part. The batches' calls run four at a
+   time under the session's lock, which a stop also holds while it checks. Free deliveries and
+   placebos that no stop's call judged are judged here. Its verdicts are recorded as a
+   check's are, marked `at: end`, and a lesson it judged is not judged again unless it is delivered
+   again; each batch records as soon as its call returns; a failed batch leaves its own lessons open
+   (`why=failed`). A second pass of the same session (a resumed session that ends again) waits while
+   the first holds the lock, and `borg learn` settles no session whose lock another pass holds. A stop
+   that finds the pass holding the lock does not wait: it checks and asks, but judges nothing and asks
+   no lesson whose delivery is still open, which the pass is judging. A
+   session whose end hook never ran
+   gets the same pass when a later `borg learn` settles it as idle. Cost: one call per batch, on the
+   checks' model (`BORG_PREDICT_MODEL`), each counted as a `model_call` with why `judge` and its
+   dollars in the statistics. A session with nothing open makes no call; `BORG_LEARN=off` or
+   `BORG_PREDICT_MODEL=off` turns it off.
 
-   A correction merged into a lesson delivered free counts against it. After the session-end call
+   **The judge's effective length.** How much a model reads well falls with the prompt's length, by
+   how much depends on the model and the task ([NoLiMa](https://huggingface.co/papers/2502.05167),
+   ICML 2025: a model's effective length is the longest context at which it keeps 85% of its
+   short-context score). Borg measures it per judge model on the session-end judge's own task, from
+   its cost lines in the store: the answered share, the lessons sent that came back with a verdict
+   other than `unclear` (a failed call's lessons count as sent and not answered), per prompt size in
+   steps of ×1.5 (…, 48,000, 72,000, 108,000, … characters). A check's judge lines are left out: a
+   check judges an unfinished session beside its grading, another task. The reference is the smallest
+   steps pooled until they hold 30 lessons sent in 5 calls. A step above it, once it has 5 calls,
+   holds when the lower bound of its answered share's 95% Wilson interval is at least 85% of the
+   reference's share, fails when the upper bound is below that line, and stays open until its
+   evidence decides it. The interval counts the lessons a step's calls are worth, not the lessons
+   sent: one call's lessons share one prompt and one answer, so calls that disagree widely count for
+   fewer (a design effect). The budget starts at 72,000 characters, moves up while the step above
+   holds and down while its own step fails. While the step above is open, one session-end pass in
+   five, drawn per pass, uses it; once it failed, one in twenty, so it can still hold again later. Its
+   cost lines log the chance (`psi=`) and the draw (`explore=`). Lines from before 0.7.6 count where
+   they can: a session end's line gives its prompt's size; one without verdict counts (before 0.7.5)
+   counts `resolved` as answered; one without `model=` counts for the default judge. The counts are cached in the store's `state/judge-length.json`,
+   rebuilt when a cost file changes. `borg status`, `borg top --json` and borg web's label health show
+   the budget per model, the answered share per step with its decision, and what is explored.
+   `BORG_END_BUDGET=<chars>` pins the budget for an evaluation.
+
+   A correction merged into a lesson delivered free counts against it. After the session-end judge
    `borg learn` settles the rest: a lesson with no verdict is `asked_not_corrected`, with the reason it
    had none, and counts as unknown, never as ignored. See [Mode and
    channel](statistics.md#what-is-counted).
@@ -111,8 +146,8 @@ logged outcomes: the chance that a lesson changes the work and avoids its conseq
 channel, a 3 in the check, route and how many lessons share the route (more questions, or more free
 context, may make each one less likely to land), with an effect per session, per lesson and per judge
 version. A free lesson's value is weighed by its learned chance of
-arriving, and so is a live question's (a stop's question blocks, so it always arrives); a lesson left
-for later earns its value at the check that delivers it, not here.
+arriving (a stop's question blocks, so it always arrives); a lesson left for later earns its value at
+the check that delivers it, not here.
 
 **It deviates only on evidence.** Each check finds the routes that avoid the most mistakes under the
 model's posterior mean, and plays them only when they beat the fixed rule's routes at the 5% quantile
@@ -135,7 +170,10 @@ applies it leaves for later.
 **The question-count test.** The fixed rule never varies how many lessons a check asks: with a grade
 3 it asks every lesson it delivers, without one it asks none and hands the 2s and 1s over. Whether
 asking a 2 beats handing it over is therefore the decision its history cannot inform. The learned
-policy learns it by a randomised test on the live checks where the evidence keeps the fixed rule:
+policy learned it by a randomised test on the live checks where the evidence kept the fixed rule.
+**Since live mode was removed (0.7.6) no check runs the test**: it never ran at the stop (below). Its
+draws before 0.7.6 stay in the log and still count toward its readout, which therefore waits until
+the test runs again (it would need a stop design of its own, pre-registered first). As it ran:
 
 1. Of the lessons the fixed rule delivers, asked or handed over, take the k that are not grade 3 and
    may go free (not one the session already had). With k = 0 there is nothing to test.
@@ -208,7 +246,7 @@ would add, and with a latency that fits the harness's stop budget measured at th
 read at least 90% of it).
 
 **Cost.** Spend is measured and shown, never capped: calls, extra rounds and dollars per session for
-the stop and live checks, in `borg status`, `borg top`, `borg debug select` and the Conscience page of
+the stop checks (and live checks, before 0.7.6), in `borg status`, `borg top`, `borg debug select` and the Conscience page of
 `borg web`. Only an engineer who sets a `budget` for a collective
 ([Collectives](configuration.md#collectives)) puts a price on it: the pool tokens its checks may read
 per session on average. The learned policy then weighs a larger pool against the smallest price that
@@ -235,9 +273,9 @@ deviates nowhere and is the fixed rule (P4b), and the test's recall must equal t
 (P4c). Their one run (2026-10-29, the P4 cases seen a third time) passed P0–P3, P4a and P4c, and
 P4b was NOT TESTED: under the store's posterior the decision rule deviated on none of the
 evaluation's checks, so there it is the fixed rule. That made the learned policy the default, as the
-rules say. Today it differs from the fixed rule by the question-count test on live checks, which
-withholds no lesson and which the gate rations by `risk`; it leaves the fixed rule on evidence only
-once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
+rules say. Until 0.7.6 it differed from the fixed rule by the question-count test on live checks,
+which withheld no lesson and which the gate rationed by `risk`; with live mode gone it leaves the fixed
+rule on evidence only, once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
 
 **Readout.** Under the learned policy the monitor guards the policy, and after 300 randomised
 checks in 15 sessions, or 30 sessions, a readout reports dilution (for each number m ≥ 2 of the test's questions
@@ -249,63 +287,32 @@ handing over a grade 2, with session-bootstrap 95% intervals ([Evidence](evidenc
 `BORG_SELECT=fixed` wins over the cap, the cap over attention, and both over `BORG_SELECT=learned`
 ([Environment variables](configuration.md#environment-variables)).
 
-## Delivery modes
+## Context and time limits
 
-Each collective delivers in one of two modes. Both use the same lessons, the same graded model call and
-the same questions. They differ in *when* the call runs.
-
-- **live** (the default): the call also runs *during* the turn, so a lesson can land before a mistake
-  spreads across ten edits. It reuses the hook machinery: no daemon, no extra process between turns.
-- **hook**: the call runs at the turn end only. A lesson that applies mostly arrives after the work is
-  done, and a grade 3 costs the agent a redo round. Borg's own side costs about an eighth of live.
-
-| | hook | live |
-|---|---|---|
-| Prompt | Early delivery and waiting free lessons (grades 2 and 1 under the fixed rule) | The same, plus questions from a live check that finished since |
-| Tool call | Early delivery, free | The same. After a state-changing call (an edit, or a shell command that is not read-only), a check of the turn so far starts in the background; a later tool call starts one while changes wait unchecked. A live check has no word gate: a turn half done has too few words for it. The lessons it asks (under the fixed rule: with a grade 3, every 3 and 2 and the 1s up to 10) arrive with the next tool call as "borg check of your work so far"; the agent answers them as it works. Its free lessons arrive as at the turn end |
-| Turn end | The free gate, then one graded call; a stop that asks blocks for one more round | The same backstop. When a live check that started this turn covered every change and nothing changed since, the stop skips its model call. A live check's question that no tool call delivered yet blocks the stop only when its check graded a 3, as the stop's own grade 3 does; else it arrives with the next prompt. Lessons asked live are not asked again |
-| Model calls | At most one per turn end; the gate skips most | One per burst of changes (at most one running at a time, at most one start per 45 s), plus the turn end when changes came after the last check |
-| Added latency | None mid-turn; ~10 s at a checked turn end | None: the hook starts the check and returns at once. A stop waits at most 15 s (omp: 7 s) for a check still running |
-| Harnesses | Claude Code, omp, opencode 1.x/2.x, Codex | Claude Code, omp (≥18.4.4), opencode 1.x/2.x, Codex |
-
-**Switch back to hook** per collective with `"mode": "hook"` in its entry of `collectives.json`, or for
-one shell with `BORG_MODE=hook` (or `live`), which overrides the config. `BORG_LIVE_DEBOUNCE_S` sets the
-least time between two checks (default 45). An unknown value means the default, live, and `borg doctor`
-warns. Switching back is the same edit; nothing is migrated.
-
-**See what it does:** `borg status` and `borg doctor` print each collective's mode and where it came
-from, and `borg status` counts live checks apart from turn-end checks. In `borg web`, the header and the
-drone cards show the mode, the Conscience page splits live checks from turn-end checks and what the
-questions led to by channel, and the Cost page shows check cost by mode per day.
-
-A live check still running when the stop gives up waiting (15 s; on omp 7 s, a quarter of its stop
-budget) can finish after the turn ended; its questions then arrive with the next prompt, or never if
-the session ends there.
-
-**On omp, opencode and Codex** a tool call's context reaches the model before its next step, as on
-Claude Code: omp takes it as the `tool_result` handler's `additionalContext` (a hidden message; the tool
-output stays as it is), opencode 1.x appends it to the tool output, opencode 2.x steers it into the
-session as a hidden input, and Codex adds it as a developer message to the next request (in code mode
-only after the whole `exec` script). None of them gives borg a Claude transcript, so a live check there
-reads the turn's tool calls and edits, not the agent's prose. The stop still reads the agent's last
-message. Details per harness: [Capabilities](harnesses.md#capabilities).
-
-Live mode needs the consequence model. Under `BORG_MATCH=bm25`, `BORG_ONLY` or `BORG_CRITIC` it does
-nothing: the drones run in hook mode. `borg doctor` warns and `borg status` notes it on the mode line
-(the hook's own stderr note is not shown by the agent).
+**On omp, opencode and Codex** a tool call's context (waiting hand-overs, messages) reaches the model
+before its next step, as on Claude Code: omp takes it as the `tool_result` handler's
+`additionalContext` (a hidden message; the tool output stays as it is), opencode 1.x appends it to the
+tool output, opencode 2.x steers it into the session as a hidden input, and Codex adds it as a
+developer message to the next request (in code mode only after the whole `exec` script). None of them
+gives borg a Claude transcript, so the work so far that a hand-over records as its evidence is the
+turn's tool calls and edits, not the agent's prose. The stop reads the agent's last message. Details
+per harness: [Capabilities](harnesses.md#capabilities).
 
 **Time limits.** The turn-end call stops after `BORG_PREDICT_TIMEOUT_S` (45 s). Claude Code's and Codex's
 Stop hooks get a 90 s timeout from `borg install`, and opencode's adapter gives a stop the same 90 s.
 omp gives a stop 30 s, which no setting changes; borg's stop budget for omp is 28 s, which the adapter
-passes on as `BORG_STOP_BUDGET_MS`, so the call there stops after at most 18 s. A call that fails or
+passes on as `BORG_STOP_BUDGET_MS`, so the call there stops after at most 25 s. A call that fails or
 runs out ends the turn without questions.
 
-## Why live is the default
+## Live mode (removed in 0.7.6)
 
-The rule was fixed before the run: live becomes the default if, on an internal benchmark of real
-engineering tasks with graded outcomes, it passes more criteria than hook (mean difference > 0, 95% CI
-lower bound ≥ −0.5) and causes no more redo rounds per run. 3 tasks × 3 seeds per mode, the same
-lessons, solver (Claude Opus 5) and check model (Sonnet 5.5):
+Live mode ran the same graded call during the turn as well: after a state-changing tool call the hook
+started a detached `borg check` of the turn so far, its questions arrived with the next tool call, and a
+stop whose changes a check had covered skipped its own call. From 0.5.0 it was the default, by this
+rule fixed before the run: live becomes the default if, on an internal benchmark of real engineering
+tasks with graded outcomes, it passes more criteria than hook (mean difference > 0, 95% CI lower bound
+≥ −0.5) and causes no more redo rounds per run. 3 tasks × 3 seeds per mode, the same lessons, solver
+(Claude Opus 5) and check model (Sonnet 5.5), October 2026:
 
 | Per run | hook | live |
 |---|---|---|
@@ -316,8 +323,22 @@ lessons, solver (Claude Opus 5) and check model (Sonnet 5.5):
 | Whole run cost (agent, borg) | $4.97 | $5.05 |
 | Wall time | 464 s | 467 s |
 
-The rule fired. Live never passed fewer criteria than hook on the same task and seed; it passed more in
-2 of 8 pairs. The gain is small and the sample is small (p = 0.50), so treat it as "not worse, sometimes
-better, never blocked" rather than a proven win. Borg's side costs about 8× more ($0.49 more per task),
-yet whole runs cost about the same ($5.05 vs $4.97). Switch back with `"mode": "hook"` when borg's own
-spend matters more.
+The rule fired, but the gain was small and the sample small (p = 0.50): live passed more criteria in 2
+of 8 pairs, and fewer in none.
+
+**Why it was removed (2026-11-01).** It added nothing measurable and cost the most. The criteria that
+say whether lessons land, the knowledge criteria, tied in all 8 pairs; the +0.38 came from 2 pairs on
+other criteria. Live checks had cost about $690 by then (5,862 calls), 8× hook's Borg-side cost. And
+judging no longer needs them: since 0.7.5 every delivery is judged at the stop, and at the session's
+end. Accepted with the removal: about 10× fewer graded checks to learn from, so the selection
+readouts come later ([Roadmap](roadmap.md)); the stop blocks again when it asks (about 0.5 redo rounds
+per run in that benchmark); and the question-count test, which ran on live checks only, runs no more.
+
+**Upgrading.** Nothing to do. `"mode"` in `collectives.json` and `BORG_MODE` are accepted and ignored,
+and `borg doctor` notes once that one is still set; `BORG_LIVE_DEBOUNCE_S` does nothing. History stays
+readable: outcome records with channel `live`, the statistics `live_check` and `live_ask`, and live
+checks' lines in a session's files still parse and count, and the selection replay of records written
+before 0.7.6 is unchanged. A live check's queued question still waiting at the upgrade is handed over
+at the next prompt or tool call, as context, never a block; it is recorded as the question its check
+decided (channel `live`), so the selection fold and the judge join it as before. `borg web` and `borg status` show live checks before 0.7.6 apart,
+labelled so.

@@ -717,15 +717,15 @@ const after1 = (hooks: any, callID: string) => {
   return hooks["tool.execute.after"]!({ tool: "edit", sessionID: SESSION, callID, args: { filePath: "/work/repo/relay.rs" } }, output).then(() => output.output)
 }
 
-test("opencode 1: borg's tool context (a live check's questions) is appended to the tool output the model reads next", async () => {
+test("opencode 1: borg's tool context (waiting graded lessons, messages) is appended to the tool output the model reads next", async () => {
   process.env.BORG_BIN = contextBorg()
   const { client } = fakeClient(() => PLAN)
   const hooks = await load(client, "/work/repo")
   await hooks["chat.message"]!({ sessionID: SESSION }, userMessage("Fix the relay race"))
   assert.equal(await after1(hooks, "c1"), "fn deliver() {}", "no context: the output as it was")
-  process.env.CTX = "[borg] borg check of your work so far: Q?"
+  process.env.CTX = "[borg] Peer lessons: Q?"
   try {
-    assert.equal(await after1(hooks, "c2"), "fn deliver() {}\n\n[borg] borg check of your work so far: Q?")
+    assert.equal(await after1(hooks, "c2"), "fn deliver() {}\n\n[borg] Peer lessons: Q?")
   } finally {
     delete process.env.CTX
   }
@@ -740,13 +740,13 @@ test("opencode 2: borg's tool context is steered into the session; the tool resu
     hooks["tool.execute.after"]({ tool: "edit", sessionID: SESSION, agent: "build", messageID: "msg_2", id, input: { path: "/work/repo/relay.rs" }, status: "completed", result })
   assert.equal(await after("c1"), undefined)
   assert.equal(synthetics.length, 0, "no context: nothing sent")
-  process.env.CTX = "[borg] borg check of your work so far: Q?"
+  process.env.CTX = "[borg] Peer lessons: Q?"
   try {
     const e = { tool: "edit", sessionID: SESSION, agent: "build", messageID: "msg_2", id: "c2", input: { path: "/work/repo/relay.rs" }, status: "completed", result }
     assert.equal(await hooks["tool.execute.after"](e), undefined, "the hook returns nothing")
     assert.equal(e.result, result)
     assert.deepEqual(result.content, [{ type: "text", text: "fn deliver() {}" }])
-    assert.deepEqual(synthetics, [{ sessionID: SESSION, text: "[borg] borg check of your work so far: Q?", delivery: "steer", resume: false, metadata: { borg: true } }])
+    assert.deepEqual(synthetics, [{ sessionID: SESSION, text: "[borg] Peer lessons: Q?", delivery: "steer", resume: false, metadata: { borg: true } }])
   } finally {
     delete process.env.CTX
   }
@@ -1394,7 +1394,7 @@ test("real borg, opencode 1: the plugin binds the session that ran `borg listen`
   for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID", "STOP_ANSWER"]) delete process.env[k]
   Object.assign(process.env, {
     BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"),
-    BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MODE: "hook", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+    BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
   })
   const S = "ses_listen_real1"
   const { client, prompts } = fakeClient(() => "Listening.")

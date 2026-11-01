@@ -134,7 +134,7 @@ pub struct Run {
 pub struct Caps {
     /// Context returned at a prompt reaches the model.
     pub prompt_context: bool,
-    /// Context returned after a tool call reaches the model before its next step (live mode's asks).
+    /// Context returned after a tool call reaches the model before its next step (waiting hand-overs, messages).
     pub tool_context: bool,
     /// Early delivery: a prompt or touch naming a lesson's scope gets that scope's lessons at once (hook.rs `early`).
     pub early_delivery: bool,
@@ -148,7 +148,7 @@ pub struct Caps {
     /// it an event's `pid` is dropped (hook.rs `main`).
     pub sends_pid: bool,
     /// The stop's budget when the event names none (`BORG_STOP_BUDGET_MS`, which an adapter sets to its
-    /// [`Budgets::stop`]): the live wait, the stop's model call and the expert drone keep inside it
+    /// [`Budgets::stop`]): the stop's model call and the expert drone keep inside it
     /// (expert_route.rs `stop_budget`). None: the expert drone keeps inside [`DEFAULT_STOP_BUDGET`], the
     /// model call inside the model's own limit.
     pub stop_budget: Option<Duration>,
@@ -183,7 +183,7 @@ pub const CONTEXT_GUARD: usize = if claude::CONTEXT_CHARS < codex::CONTEXT_CHARS
 
 /// Guard: the seconds borg gives a stop where it sets the limit itself (Claude Code's and Codex's Stop
 /// hook `timeout`, opencode's adapter budget, which opencode does not limit): it bounds how long a stuck
-/// stop can hold the engineer's turn, and leaves room for the live wait (live.rs `stop_wait`), the
+/// stop can hold the engineer's turn, and leaves room for the
 /// model call (`BORG_PREDICT_TIMEOUT_S`, 45 s) and an expert drone. Changing it makes every Codex
 /// engineer trust borg's hooks again (codex.rs `TIMEOUTS`).
 pub const STOP_TIMEOUT_S: u64 = 90;
@@ -348,7 +348,7 @@ pub fn names(sep: &str) -> String {
     visible().map(|h| h.name()).collect::<Vec<_>>().join(sep)
 }
 
-/// The drone's harness in a process its hook started (`BORG_HARNESS`, `borg check`), else the first.
+/// The drone's harness in a process its hook started (`BORG_HARNESS`, `borg learn`), else the first.
 pub fn current() -> &'static dyn Harness {
     named_current().unwrap_or(ALL[0])
 }
@@ -398,7 +398,7 @@ pub fn transcript(caps: Caps, ev: &Value) -> Option<&str> {
     }
 }
 
-/// Live mode: this turn's work so far, its last `cap` characters: from the transcript where the harness
+/// This turn's work so far, its last `cap` characters (a free delivery's evidence, hook.rs `note_work`): from the transcript where the harness
 /// writes one ([`Transcript`]), else the turn's tool calls the hook logged in `turn_log`.
 pub fn work_so_far(caps: Caps, ev: &Value, turn_log: &Path, cap: usize) -> String {
     if let Some(t) = transcript(caps, ev).filter(|t| std::fs::metadata(t).is_ok()) {

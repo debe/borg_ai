@@ -1,8 +1,8 @@
 //! The harness conformance suite for command-hook harnesses (docs/harnesses.md): every harness in
 //! `harness::ALL` wired by command hooks (Claude Code, the simulated one, any added later) is installed
 //! into a temp HOME, and the *installed* command string runs its recorded native payloads
-//! (tests/fixtures/<harness>/). One scenario, the same for every harness: install, the hooks, live mode,
-//! and what `borg top --json` (the web page's drones) shows. An assertion that does not apply is skipped
+//! (tests/fixtures/<harness>/). One scenario, the same for every harness: install, the hooks, the turn-end
+//! check and its hand-over, and what `borg top --json` (the web page's drones) shows. An assertion that does not apply is skipped
 //! by a capability flag (`Caps`), never by the harness's name, and a flag that is off has its other side
 //! asserted where a profile has it off. The model is the fake `claude` of
 //! tests/common: 0 tokens. The adapter harnesses (omp, opencode) run the same scenario in
@@ -88,7 +88,7 @@ fn borg_cli(root: &Path, args: &[&str], env: &[(String, String)]) -> (String, i3
 }
 
 impl<'a> Drone<'a> {
-    fn new(p: &'a Profile, tag: &str, mode: &str) -> Drone<'a> {
+    fn new(p: &'a Profile, tag: &str) -> Drone<'a> {
         let root = setup(&format!("conf-{tag}-{}", p.tag()));
         std::fs::write(root.join("transcript.jsonl"), std::fs::read(fixture_dir("claude").join("live-turn.jsonl")).unwrap()).unwrap();
         let mut env: Vec<(String, String)> = [
@@ -100,10 +100,8 @@ impl<'a> Drone<'a> {
             ("BORG_PREFILTER", "off"),
             ("BORG_EARLY", "off"),
             ("BORG_NOTIFY", "off"),
-            ("BORG_LIVE_DEBOUNCE_S", "0"),
             // Pinned to the fake `claude`: a harness's own CLI would otherwise answer.
             ("BORG_PREDICT_MODEL", "claude:sonnet"),
-            ("BORG_MODE", mode),
             // The simulated harness is known by name only here.
             (harness::TEST_ENV, "1"),
         ]
@@ -206,17 +204,6 @@ impl<'a> Drone<'a> {
         let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         let drones = v.as_array().into_iter().flatten().flat_map(|c| c["drones"].as_array().cloned().unwrap_or_default());
         drones.into_iter().find(|d| d["session"] == self.session.as_str()).unwrap_or(Value::Null)
-    }
-
-    fn wait_for(&self, ext: &str, done: impl Fn(&str) -> bool) -> String {
-        let until = Instant::now() + Duration::from_secs(20);
-        loop {
-            let text = self.state(ext);
-            if done(&text) || Instant::now() > until {
-                return text;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -348,7 +335,7 @@ fn install_is_a_dry_run_first_then_idempotent_kept_apart_and_reversible() {
 fn hooks_record_the_turn_block_once_and_end_the_drone() {
     for p in profiles() {
         let caps = p.caps();
-        let d = Drone::new(&p, "hooks", "hook");
+        let d = Drone::new(&p, "hooks");
         let tag = p.tag();
 
         // Off-repo: no state, no presence.
@@ -404,7 +391,7 @@ fn hooks_record_the_turn_block_once_and_end_the_drone() {
 #[test]
 fn a_paused_drone_has_its_tools_refused() {
     for p in profiles() {
-        let d = Drone::new(&p, "pause", "hook");
+        let d = Drone::new(&p, "pause");
         let caps = p.caps();
         let tag = p.tag();
         d.step("prompt", "prompt");
@@ -428,60 +415,51 @@ fn a_paused_drone_has_its_tools_refused() {
     }
 }
 
+/// No check runs during the turn (live mode is gone, 0.7.6): the stop makes the one model call, and a 2
+/// it hands over free arrives with the next call the harness reads.
 #[test]
-fn a_change_is_checked_live_and_its_ask_arrives_on_the_next_call_the_harness_reads() {
+fn a_change_is_checked_at_the_turn_end_and_its_hand_over_arrives_on_the_next_call_the_harness_reads() {
     for p in profiles() {
         let caps = p.caps();
         let tag = p.tag();
-        let d = Drone::new(&p, "live", "live");
+        let d = Drone::new(&p, "turn-end");
         d.step("prompt", "prompt");
-        answer(&d.root, &[("Mdrain", 3)]);
+        answer(&d.root, &[("Mdrain", 2)]);
         d.step("post_tool", "read");
-        assert_eq!(d.state("live.n"), "", "{tag}: a read changes nothing");
-        // An edit starts a detached check; the hook returns at once with nothing to say yet.
-        let started = Instant::now();
         let out = d.step("post_tool", "edit");
-        assert!(started.elapsed() < Duration::from_secs(5) && context(&out).is_empty(), "{tag}: {out}");
-        assert_eq!(queued(&d.wait_for("queued", |q| q.contains("live "))), "live Mdrain\n", "{tag}: the ask is queued");
-        d.wait_for("live.mark", |m| !m.is_empty());
-        // The check read the turn so far: the transcript's prose, or the logged tool calls.
-        let checked = &prompts(&d.root)[0];
-        match caps.transcript {
-            Transcript::Claude => assert!(checked.contains("I will replace the reset arc."), "{tag}: {checked}"),
-            Transcript::None => assert!(checked.contains("[Edit] ") && checked.contains("reset arc on the budget place"), "{tag}: {checked}"),
+        assert!(context(&out).is_empty(), "{tag}: {out}");
+        for ext in ["live.n", "live.mark", "queued"] {
+            assert_eq!(d.state(ext), "", "{tag}: no check during the turn ({ext})");
         }
+        assert!(prompts(&d.root).is_empty(), "{tag}: no model call during the turn");
+        let stop = d.step("stop", "stop");
+        assert_ne!(stop["decision"], "block", "{tag}: a 2 does not block: {stop}");
+        assert_eq!(prompts(&d.root).len(), 1, "{tag}: the stop's one model call");
+        assert_eq!(queued(&d.state("queued")), "Mdrain\n", "{tag}: handed over at the next call");
         // Delivered with the next tool call where the harness reads tool context.
         let next = context(&d.step("post_tool", "read_again"));
         if caps.tool_context {
-            assert!(next.contains("borg check of your work so far") && next.contains("[Mdrain]"), "{tag}: {next}");
-            // The stop: the check covered the turn, so no model call, and no block: delivered already.
-            let stop = d.step("stop", "stop");
-            assert_eq!(prompts(&d.root).len(), 1, "{tag}: a covered stop costs no model call");
-            assert_eq!(stop, Value::Null, "{tag}: delivered already: {stop}");
-            assert!(d.state("ctx").contains("#borg-skip live_covered"), "{tag}: {}", d.state("ctx"));
+            assert!(next.contains("drain the budget place"), "{tag}: {next}");
+            assert_eq!(d.state("queued"), "", "{tag}: handed over");
             continue;
         }
         assert_eq!(next, "", "{tag}: no tool context");
         // Else with the next prompt, where the harness reads a prompt's context.
         let at_prompt = context(&d.step("prompt", "correction"));
         if caps.prompt_context {
-            assert!(at_prompt.contains("[Mdrain]"), "{tag}: delivered with the next prompt: {at_prompt}");
+            assert!(at_prompt.contains("drain the budget place"), "{tag}: delivered with the next prompt: {at_prompt}");
             assert_eq!(d.state("queued"), "", "{tag}: handed over");
             continue;
         }
         assert_eq!(at_prompt, "", "{tag}: no prompt context");
-        assert_eq!(queued(&d.state("queued")), "live Mdrain\n", "{tag}: still waiting");
-        // Read nowhere before: the stop asks it, never lost.
-        let stop = d.step("stop", "stop");
-        assert!(stop["reason"].as_str().unwrap_or_default().contains("[Mdrain]"), "{tag}: late context is not lost: {stop}");
-        assert_eq!(d.state("queued"), "", "{tag}: asked at the stop");
+        assert_eq!(queued(&d.state("queued")), "Mdrain\n", "{tag}: still waiting");
     }
 }
 
 #[test]
 fn early_delivery_only_where_the_harness_takes_it() {
     for p in profiles() {
-        let mut d = Drone::new(&p, "early", "hook");
+        let mut d = Drone::new(&p, "early");
         d.with("BORG_EARLY", "on");
         let out = context(&d.step("prompt", "prompt"));
         if p.caps().early_delivery {
@@ -495,7 +473,7 @@ fn early_delivery_only_where_the_harness_takes_it() {
 #[test]
 fn a_wordless_denial_and_the_next_prompt_become_an_episode() {
     for p in profiles() {
-        let mut d = Drone::new(&p, "deny", "hook");
+        let mut d = Drone::new(&p, "deny");
         d.with("BORG_LEARN", "on");
         d.with("BORG_PREDICT_MODEL", "off");
         d.step("prompt", "prompt");
@@ -519,7 +497,7 @@ fn a_wordless_denial_and_the_next_prompt_become_an_episode() {
 #[test]
 fn a_gone_harness_process_reads_as_ended() {
     for p in profiles() {
-        let d = Drone::new(&p, "pid", "hook");
+        let d = Drone::new(&p, "pid");
         let mut v: Value = serde_json::from_str(&d.payload("prompt", &d.cwd())).unwrap();
         v["pid"] = json!(4_194_303); // above Linux's default pid_max: never running
         d.run("prompt", &v.to_string());
@@ -532,7 +510,7 @@ fn a_gone_harness_process_reads_as_ended() {
 #[test]
 fn a_slow_model_never_holds_the_stop_past_its_budget() {
     for p in profiles().into_iter().filter(|p| p.sim_caps.is_none_or(|c| c == "prompt,tool,deny")) {
-        let mut d = Drone::new(&p, "slow", "hook");
+        let mut d = Drone::new(&p, "slow");
         // A model that would take 30 s, inside a 6 s stop.
         let called = d.root.join("called");
         std::fs::write(d.root.join("bin/claude"), format!("#!/bin/sh\ntouch {}\nsleep 30\n", called.display())).unwrap();

@@ -1,172 +1,37 @@
-//! Delivery modes: when the conscience judges the work (docs/delivery.md).
+//! The session lock, and the file locks every store append takes (`locked`).
 //!
-//! - **hook**: early delivery and queued lessons are free word matching; one graded model
-//!   call runs at the turn end (main.rs `stop`), and only a grade 3 blocks the stop.
-//! - **live** (the default, chosen by the live-vs-hook eval): the same graded call also runs *during* the turn. After a state-changing tool call
-//!   (prefilter.rs `changes`), the PostToolUse hook spawns a detached `borg check` and returns at once;
-//!   the check judges the work so far and leaves its verdict in the `.queued` file, which the next
-//!   prompt or tool call delivers (main.rs `queued`). The stop still runs as the backstop, and skips its
-//!   own model call when a live check this turn already covered every change (`covered`).
+//! Live mode, which checked the work during the turn from here, was removed in 0.7.6
+//! (docs/delivery.md, "Live mode (removed in 0.7.6)"); the module kept its name and its lock file's.
 //!
-//! The mode is chosen per collective (`"mode"` in collectives.json, collective.rs) and `BORG_MODE`
-//! overrides it; unset or anything else is `DEFAULT`. Every harness runs it: Claude Code and omp take the
-//! next tool call's context as PostToolUse `additionalContext`, the opencode adapter adds it to the tool
-//! output (1.x) or steers it into the session (2.x). Without a Claude transcript the work so far is the
-//! turn's tool calls (main.rs `turn_file`).
-//!
-//! Three small files per session beside its state file, no daemon:
-//! - `<S>.live.n`: one line per state-changing tool call (the change counter);
-//! - `<S>.live.mark`: `<covered> <started_ms> <turn>`, the counter value the last completed check covered,
-//!   when the last check started (the debounce runs from there) and the turn it started in (main.rs
-//!   `turn_id`: a check of an earlier turn never covers this one);
-//! - `<S>.live.lock`: `<pid> <started_ms>` while a check (or a live stop) runs, linked into place whole
-//!   so two quick tool calls never run two checks; stale when its process is gone or it is older than
-//!   `stale_ms`.
+//! The session lock: `<S>.live.lock` beside the session's state file, `<pid> <started_ms>`, held by a
+//! stop for its whole check and by the session-end judge (hook.rs `judge_session`), so two judge calls
+//! never judge the same deliveries at once. Linked into place whole; stale when its process is gone or
+//! it is older than `stale_ms`.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Hook,
-    Live,
-}
-
-impl Mode {
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Hook => "hook",
-            Mode::Live => "live",
-        }
-    }
-}
-
-/// The mode in force and where it came from (`BORG_MODE`, `config` or `default`), with a warning
-/// when a value was not a mode (`borg doctor` shows it; the mode is then `DEFAULT`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resolved {
-    pub mode: Mode,
-    pub source: &'static str,
-    pub warning: Option<String>,
-}
-
-/// The mode when neither BORG_MODE nor the collective sets one: live, which passed the eval's fixed
-/// rule against hook (docs/delivery.md, "Why live is the default"). `"mode": "hook"` or `BORG_MODE=hook` switches back.
-pub const DEFAULT: Mode = Mode::Live;
-
-/// `env` (BORG_MODE) wins over `configured` (the collective's `mode`), else `DEFAULT`. An unknown value
-/// is `DEFAULT` plus a warning: a typo must never break the hooks.
-pub fn resolve(env: Option<&str>, configured: Option<&str>) -> Resolved {
-    let pick = |v: &str, source: &'static str| match v.trim().to_ascii_lowercase().as_str() {
-        "hook" => Resolved { mode: Mode::Hook, source, warning: None },
-        "live" => Resolved { mode: Mode::Live, source, warning: None },
-        _ => Resolved { mode: DEFAULT, source, warning: Some(format!("{source}: mode {v:?} is neither \"hook\" nor \"live\"; using {}", DEFAULT.name())) },
-    };
-    match (env.filter(|v| !v.trim().is_empty()), configured.filter(|v| !v.trim().is_empty())) {
-        (Some(v), _) => pick(v, "BORG_MODE"),
-        (None, Some(v)) => pick(v, "config"),
-        (None, None) => Resolved { mode: DEFAULT, source: "default", warning: None },
-    }
-}
-
-/// The mode of collective `name` in `cfg` for this process (BORG_MODE first).
-pub fn of(cfg: Option<&crate::collective::Config>, name: &str) -> Resolved {
-    let configured = cfg.and_then(|c| c.collectives.iter().find(|e| e.name == name)).and_then(|e| e.mode.as_deref());
-    resolve(std::env::var("BORG_MODE").ok().as_deref(), configured)
-}
-
-/// The mode of this hook process: the hook exports the resolved mode as `BORG_MODE` (main.rs), so the
-/// stop and the spawned check read the same one.
-pub fn current() -> Mode {
-    resolve(std::env::var("BORG_MODE").ok().as_deref(), None).mode
-}
-
-/// Why live mode cannot run here, if it cannot: it needs the consequence model, which word matching
-/// alone (`BORG_MATCH=bm25`) and the eval modes `BORG_ONLY` and `BORG_CRITIC` replace.
-pub fn unsupported() -> Option<&'static str> {
-    if std::env::var("BORG_MATCH").as_deref() == Ok("bm25") {
-        Some("BORG_MATCH=bm25")
-    } else if std::env::var_os("BORG_ONLY").is_some() {
-        Some("BORG_ONLY")
-    } else if std::env::var_os("BORG_CRITIC").is_some() {
-        Some("BORG_CRITIC")
-    } else {
-        None
-    }
-}
-
-/// Baseline: the least time between the starts of two checks of a session when `BORG_LIVE_DEBOUNCE_S`
-/// is unset, the value live mode passed the live-vs-hook eval with (docs/delivery.md, "Why live is the
-/// default"). It also guards against a check per tool call.
-pub const DEBOUNCE_S: i64 = 45;
-
-/// The least time between the starts of two checks of a session: `BORG_LIVE_DEBOUNCE_S`, else
-/// [`DEBOUNCE_S`].
-pub fn debounce_ms() -> i64 {
-    std::env::var("BORG_LIVE_DEBOUNCE_S").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(DEBOUNCE_S).max(0) * 1000
-}
-
-/// Guard: what a lock may outlive its check's longest model call by (the check's own reading and
-/// writing), before it is taken for a crashed check's.
+/// Guard: what a lock may outlive its holder's longest model call by (its own reading and writing),
+/// before it is taken for a crashed holder's.
 const STALE_SLACK_MS: i64 = 30_000;
 
-/// A lock older than this belongs to a check that cannot still be waiting for its model (or to a pid
+/// A lock older than this belongs to a holder that cannot still be waiting for its model (or to a pid
 /// that was reused): derived, twice the predict timeout plus [`STALE_SLACK_MS`].
 pub fn stale_ms() -> i64 {
     i64::try_from(crate::predict::timeout().as_millis()).unwrap_or(i64::MAX).saturating_mul(2).saturating_add(STALE_SLACK_MS)
 }
 
-fn beside(ctx: &Path, ext: &str) -> PathBuf {
-    ctx.with_extension(ext)
-}
-
-pub fn counter_file(ctx: &Path) -> PathBuf {
-    beside(ctx, "live.n")
-}
-
-pub fn mark_file(ctx: &Path) -> PathBuf {
-    beside(ctx, "live.mark")
-}
-
+/// The session lock's file beside the state file `ctx`. Its name is live mode's: a lock an older
+/// binary holds across an upgrade still counts.
 pub fn lock_file(ctx: &Path) -> PathBuf {
-    beside(ctx, "live.lock")
-}
-
-/// State-changing tool calls of the session so far.
-pub fn count(ctx: &Path) -> u64 {
-    std::fs::read_to_string(counter_file(ctx)).map_or(0, |t| t.lines().count() as u64)
-}
-
-/// Counts one state-changing tool call.
-pub fn bump(ctx: &Path, tool: &str) {
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open(counter_file(ctx)).and_then(|mut f| writeln!(f, "{tool}"));
-}
-
-/// What the last check covered, when it started and in which turn (None: a mark without one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Mark {
-    pub covered: u64,
-    pub started_ms: i64,
-    pub turn: Option<u64>,
-}
-
-pub fn read_mark(ctx: &Path) -> Option<Mark> {
-    let t = std::fs::read_to_string(mark_file(ctx)).ok()?;
-    let mut it = t.split_whitespace();
-    Some(Mark { covered: it.next()?.parse().ok()?, started_ms: it.next()?.parse().ok()?, turn: it.next().and_then(|v| v.parse().ok()) })
-}
-
-pub fn write_mark(ctx: &Path, m: Mark) {
-    let turn = m.turn.map_or(String::new(), |t| format!(" {t}"));
-    let _ = std::fs::write(mark_file(ctx), format!("{} {}{turn}\n", m.covered, m.started_ms));
+    ctx.with_extension("live.lock")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lock {
     Free,
     Held,
-    /// The file is there, but its check is gone (or far too old): it may be taken over.
+    /// The file is there, but its holder is gone (or far too old): it may be taken over.
     Stale,
 }
 
@@ -206,6 +71,42 @@ pub struct Guard {
     text: String,
 }
 
+impl Guard {
+    /// Writes the lock anew at `now`, if it is still this one's: a holder whose work outlasts one model
+    /// call (the session-end judge's batches, hook.rs `judge_session`) renews it before each call, so it
+    /// never reads stale while its holder still works. Whole, by a rename: no one reads it half-written.
+    /// `Lost` when another holds it now (or it is gone), and nothing is written; `Unwritten` when it is
+    /// still this one's but could not be written (it stays as it was, and may read stale later).
+    pub fn renew(&mut self, now: i64) -> Renewal {
+        match std::fs::read_to_string(&self.path) {
+            Ok(t) if t == self.text => {}
+            Ok(_) => return Renewal::Lost,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Renewal::Lost,
+            Err(_) => return Renewal::Unwritten,
+        }
+        let pid = std::process::id();
+        let text = format!("{pid} {now}\n");
+        let tmp = self.path.with_extension(format!("lock.{pid}.renew"));
+        if std::fs::write(&tmp, &text).is_err() || std::fs::rename(&tmp, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Renewal::Unwritten;
+        }
+        self.text = text;
+        Renewal::Renewed
+    }
+}
+
+/// What renewing a held lock did (`Guard::renew`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewal {
+    /// Written anew: held for another `stale_ms`.
+    Renewed,
+    /// Another process holds it now (it read stale and was taken over), or it is gone.
+    Lost,
+    /// Still this one's, but not written (an I/O failure): held as before.
+    Unwritten,
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         if std::fs::read_to_string(&self.path).is_ok_and(|t| t == self.text) {
@@ -214,7 +115,7 @@ impl Drop for Guard {
     }
 }
 
-/// Takes the session's lock for this process, or None when another check holds it. The lock is written
+/// Takes the session's lock for this process, or None when another holds it. The lock is written
 /// to a file of its own first and hard-linked into place, which fails when a lock is there: no one ever
 /// reads a half-written lock. A stale lock is moved aside (a rename: only one process gets it) and taken
 /// once more; when what was moved aside is no longer the stale lock seen, someone took it over first,
@@ -280,35 +181,10 @@ fn lock_of(file: &Path) -> std::io::Result<std::fs::File> {
     Ok(lock)
 }
 
-/// Whether a check should start now (Ok) or why not: not live mode, a check still running, no change
-/// since the last completed check, or the last check started less than `debounce` ago.
-pub fn decide(mode: Mode, lock: Lock, count: u64, mark: Option<Mark>, now: i64, debounce: i64) -> Result<(), &'static str> {
-    if mode != Mode::Live {
-        return Err("hook mode");
-    }
-    if lock == Lock::Held {
-        return Err("running");
-    }
-    if count <= mark.map_or(0, |m| m.covered) {
-        return Err("nothing new");
-    }
-    if mark.is_some_and(|m| now - m.started_ms < debounce) {
-        return Err("debounce");
-    }
-    Ok(())
-}
-
-/// The stop's skip in live mode: no check runs, a check that started in this turn (`turn`, main.rs
-/// `turn_id`) covered every change, and none came since. A check of an earlier turn, or one that
-/// finished after its turn's stop, never covers this turn's message.
-pub fn covered(lock: Lock, count: u64, mark: Option<Mark>, turn: u64) -> bool {
-    lock != Lock::Held && count > 0 && mark.is_some_and(|m| m.covered == count && m.turn == Some(turn))
-}
-
-/// Method: how often a stop waiting for a running check looks at its lock.
+/// Method: how often a holder waiting for the lock (hook.rs `judge_session`) looks at it.
 const WAIT_POLL: Duration = Duration::from_millis(200);
 
-/// Waits up to `max_ms` for a running check to finish; the lock's state after.
+/// Waits up to `max_ms` for the lock's holder to finish; the lock's state after.
 pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
     let until = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
     loop {
@@ -320,28 +196,13 @@ pub fn wait_free(ctx: &Path, max_ms: u64) -> Lock {
     }
 }
 
-/// Guard: the most of the stop's budget its wait for a running check may take (a quarter), so a slow
-/// check never starves the stop's own model call, which gets the rest ([`call_limit`]).
-pub const WAIT_SHARE: u32 = 4;
-
-/// How long a stop in live mode waits for a running check at most. Derived: the share [`WAIT_SHARE`] of
-/// the budget a stop gets where the harness names none (`harness::DEFAULT_STOP_BUDGET`, 60 s: 15 s), so
-/// a harness with a longer budget does not keep the engineer waiting longer for a check.
-pub const STOP_WAIT: Duration = Duration::from_millis(crate::harness::DEFAULT_STOP_BUDGET.as_millis() as u64 / WAIT_SHARE as u64);
-
 /// Guard: what the stop's model call leaves of the budget for the rest of the hook (its records and its
 /// answer), so the answer is out before the harness kills the hook.
 pub const AFTER_CALL: Duration = Duration::from_secs(3);
 
-/// The stop's wait for a running check, inside the harness's budget (expert_route.rs `stop_budget`; none:
-/// Claude Code's): at most [`STOP_WAIT`], and at most its [`WAIT_SHARE`]. omp's 28 s gives 7 s.
-pub fn stop_wait(budget: Option<Duration>) -> Duration {
-    budget.map_or(STOP_WAIT, |b| STOP_WAIT.min(b / WAIT_SHARE))
-}
-
 /// The stop's model call's limit, `spent` into the hook: what the harness's budget leaves but
 /// [`AFTER_CALL`] for the rest of the hook, never over the model's own limit. omp's 28 s gives at most
-/// 18 s, after a 7 s wait.
+/// 25 s.
 pub fn call_limit(budget: Option<Duration>, spent: Duration) -> Duration {
     let Some(b) = budget else { return crate::predict::timeout() };
     crate::predict::timeout().min(b.saturating_sub(spent).saturating_sub(AFTER_CALL))
@@ -350,6 +211,7 @@ pub fn call_limit(budget: Option<Duration>, spent: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-live-{tag}-{}", std::process::id()));
@@ -359,36 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn env_beats_config_and_unknown_values_fall_back_to_the_default() {
-        assert_eq!(resolve(None, None), Resolved { mode: Mode::Live, source: "default", warning: None });
-        assert_eq!(resolve(None, Some("live")).mode, Mode::Live);
-        assert_eq!(resolve(Some("hook"), Some("live")), Resolved { mode: Mode::Hook, source: "BORG_MODE", warning: None });
-        assert_eq!(resolve(Some(" LIVE "), None).mode, Mode::Live);
-        assert_eq!(resolve(Some(""), Some("live")).source, "config", "an empty BORG_MODE is unset");
-        let r = resolve(None, Some("eager"));
-        assert_eq!(r.mode, Mode::Live);
-        assert!(r.warning.unwrap().contains("\"eager\""));
-    }
-
-    #[test]
-    fn a_check_starts_only_in_live_mode_with_new_changes_no_running_check_and_after_the_debounce() {
-        let m = |covered, started_ms| Some(Mark { covered, started_ms, turn: None });
-        assert_eq!(decide(Mode::Live, Lock::Free, 1, None, 0, 45_000), Ok(()), "the first change checks at once");
-        assert_eq!(decide(Mode::Hook, Lock::Free, 1, None, 0, 45_000), Err("hook mode"));
-        assert_eq!(decide(Mode::Live, Lock::Held, 3, m(1, 0), 100_000, 45_000), Err("running"));
-        assert_eq!(decide(Mode::Live, Lock::Stale, 3, m(1, 0), 100_000, 45_000), Ok(()), "a stale lock does not block");
-        assert_eq!(decide(Mode::Live, Lock::Free, 2, m(2, 0), 100_000, 45_000), Err("nothing new"));
-        assert_eq!(decide(Mode::Live, Lock::Free, 0, None, 0, 45_000), Err("nothing new"));
-        assert_eq!(decide(Mode::Live, Lock::Free, 3, m(2, 60_000), 100_000, 45_000), Err("debounce"));
-        assert_eq!(decide(Mode::Live, Lock::Free, 3, m(2, 55_000), 100_000, 45_000), Ok(()));
-    }
-
-    #[test]
     fn the_lock_is_held_while_its_process_lives_and_stale_when_gone_or_too_old() {
         let ctx = tmp("lock");
         assert_eq!(lock_state(&ctx, 1000, 120_000, |_| true), Lock::Free);
         let g = acquire(&ctx, 1000).expect("free lock taken");
-        assert!(acquire(&ctx, 1001).is_none(), "a second check does not run");
+        assert!(acquire(&ctx, 1001).is_none(), "a second holder does not get it");
         assert_eq!(lock_state(&ctx, 2000, 120_000, |_| true), Lock::Held);
         assert_eq!(lock_state(&ctx, 2000, 120_000, |_| false), Lock::Stale, "its process is gone");
         assert_eq!(lock_state(&ctx, 200_000, 120_000, |_| true), Lock::Stale, "older than twice the timeout");
@@ -400,6 +237,29 @@ mod tests {
         let g = acquire(&ctx, 2000).expect("stale lock taken over");
         // A guard whose lock was taken over leaves the new holder's file alone.
         std::fs::write(lock_file(&ctx), "1 2000\n").unwrap();
+        drop(g);
+        assert!(lock_file(&ctx).exists(), "not this guard's lock any more");
+    }
+
+    /// A holder that works past one call renews its lock, so it stays held; a guard whose lock was taken
+    /// over renews nothing and leaves the new holder's file alone.
+    #[test]
+    fn a_renewed_lock_stays_held_and_a_lost_one_is_left_alone() {
+        let ctx = tmp("renew");
+        let mut g = acquire(&ctx, 1000).expect("free lock taken");
+        assert_eq!(lock_state(&ctx, 200_000, 120_000, |_| true), Lock::Stale, "unrenewed: stale after the limit");
+        assert_eq!(g.renew(150_000), Renewal::Renewed);
+        assert_eq!(lock_state(&ctx, 200_000, 120_000, |_| true), Lock::Held, "renewed: held");
+        assert!(acquire(&ctx, 200_000).is_none());
+        // Not written (here: its temp file's place is taken), but still this guard's: not lost.
+        let tmp = lock_file(&ctx).with_extension(format!("lock.{}.renew", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(g.renew(160_000), Renewal::Unwritten, "an I/O failure is no takeover");
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(g.renew(170_000), Renewal::Renewed, "still this guard's");
+        std::fs::write(lock_file(&ctx), "1 2000\n").unwrap();
+        assert_eq!(g.renew(210_000), Renewal::Lost, "taken over: not renewed");
+        assert_eq!(std::fs::read_to_string(lock_file(&ctx)).unwrap(), "1 2000\n");
         drop(g);
         assert!(lock_file(&ctx).exists(), "not this guard's lock any more");
     }
@@ -416,39 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn counter_and_mark_round_trip() {
-        let ctx = tmp("mark");
-        assert_eq!((count(&ctx), read_mark(&ctx)), (0, None));
-        bump(&ctx, "Edit");
-        bump(&ctx, "Bash");
-        assert_eq!(count(&ctx), 2);
-        write_mark(&ctx, Mark { covered: 2, started_ms: 77, turn: Some(9) });
-        assert_eq!(read_mark(&ctx), Some(Mark { covered: 2, started_ms: 77, turn: Some(9) }));
-        std::fs::write(mark_file(&ctx), "2 77\n").unwrap();
-        assert_eq!(read_mark(&ctx), Some(Mark { covered: 2, started_ms: 77, turn: None }), "a mark of before turns");
-    }
-
-    #[test]
-    fn the_stop_skips_only_when_a_check_of_this_turn_covered_every_change() {
-        let m = Some(Mark { covered: 3, started_ms: 0, turn: Some(40) });
-        assert!(covered(Lock::Free, 3, m, 40));
-        assert!(!covered(Lock::Held, 3, m, 40), "a running check");
-        assert!(!covered(Lock::Free, 4, m, 40), "a change after the check");
-        assert!(!covered(Lock::Free, 3, m, 41), "the check was an earlier turn's");
-        assert!(!covered(Lock::Free, 3, Some(Mark { covered: 3, started_ms: 0, turn: None }), 40), "a mark without its turn");
-        assert!(!covered(Lock::Free, 0, None, 40));
-    }
-
-    #[test]
-    fn the_stop_fits_its_wait_and_model_call_into_the_harness_budget() {
+    fn the_stop_fits_its_model_call_into_the_harness_budget() {
         let s = Duration::from_secs;
-        assert_eq!(STOP_WAIT, s(15), "a quarter of the 60 s a stop gets where the harness names none");
-        assert_eq!((stop_wait(None), call_limit(None, s(30))), (s(15), s(45)), "Claude Code: unchanged");
-        assert_eq!((stop_wait(Some(s(90))), call_limit(Some(s(90)), s(15))), (s(15), s(45)), "opencode: room for both");
-        assert_eq!((stop_wait(Some(s(28))), call_limit(Some(s(28)), s(7))), (s(7), s(18)), "omp");
-        assert_eq!(call_limit(Some(s(28)), s(11)), s(14), "time spent before the call comes off it");
+        assert_eq!(call_limit(None, s(30)), crate::predict::timeout(), "Claude Code: the model's own limit");
+        assert_eq!(call_limit(Some(s(90)), s(15)), crate::predict::timeout().min(s(72)), "opencode");
+        assert_eq!(call_limit(Some(s(28)), s(0)), crate::predict::timeout().min(s(25)), "omp");
+        assert_eq!(call_limit(Some(s(28)), s(11)), crate::predict::timeout().min(s(14)), "time spent before the call comes off it");
         assert_eq!(call_limit(Some(s(28)), s(27)), Duration::ZERO);
-        assert_eq!(stop_wait(Some(s(8))), s(2));
     }
 
     #[test]

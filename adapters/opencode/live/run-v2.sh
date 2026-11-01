@@ -8,8 +8,8 @@
 #   cargo build -p borg-ai && adapters/opencode/live/run-v2.sh
 #
 # Passes when the plugin loaded, the prompt, a successful and a failed tool call reached borg, a lesson
-# waiting in the session's queue reached the LLM right after the tool results (a steer, live mode's
-# mid-turn channel), the conscience's question went back into the session (the mock LLM saw it) exactly once and its echo
+# waiting in the session's queue reached the LLM right after the tool results (a steer, the tool call's
+# context channel), the conscience's question went back into the session (the mock LLM saw it) exactly once and its echo
 # carried the borg marker, a queen question reached the LLM through a hidden synthetic input, and
 # deleting the session ended it. Then it reports, without failing,
 # whether a second session gets `end` when the server shuts down normally (setup's cleanup).
@@ -40,15 +40,15 @@ echo '{"disabled": true}' > "$cfg/service.json"
 # learning on, which queen delivery needs (no model call at prompt); everything else keeps it off,
 # so no background `borg learn` starts.
 # At the first successful tool call the wrapper also leaves the lesson `drain` in the session's queue,
-# as a live check would (a real check needs the consequence model; crates/borg/tests/live_cli.rs runs
-# one on a fake): borg hands it over with that call, and the next LLM request must carry it.
+# as a stop's hand-over would (a real check needs the consequence model; crates/borg/tests/select_cli.rs
+# runs one on a fake): borg hands it over with that call, and the next LLM request must carry it.
 cat > "$BORG_BIN" <<EOF
 #!/bin/sh
 in=\$(cat)
 printf "%s %s\n" "\$3" "\$in" >> "$tmp/events.log"
 if [ "\$3" = post_tool ] && [ ! -e "$tmp/seeded" ]; then
   sid=\$(printf '%s' "\$in" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9-')
-  mkdir -p "$BORG_STATE" && echo "live drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
+  mkdir -p "$BORG_STATE" && echo "drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
 fi
 [ "\$3" = prompt ] && unset BORG_LEARN
 printf '%s' "\$in" | exec "$borg" "\$@"

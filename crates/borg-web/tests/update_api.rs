@@ -29,7 +29,7 @@ async fn the_update_view_names_the_release_and_the_members_by_version() {
     let home = root.join("collectives").join("corp");
     std::fs::create_dir_all(&home).unwrap();
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team, mode: "hook" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
 
     // Nothing checked, no mesh: this borg alone.

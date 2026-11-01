@@ -6,8 +6,8 @@
 //                                                      joins the turn as a hidden custom message)
 //   tool_call                   -> pre_tool          (a paused drone's call is blocked with borg's reason)
 //   tool_result                 -> post_tool | post_tool_failure (error = the result text; borg's
-//                                                      context for a successful call, e.g. a live check's
-//                                                      questions, is returned as additionalContext: omp
+//                                                      context for a successful call, e.g. waiting graded
+//                                                      lessons, is returned as additionalContext: omp
 //                                                      >= 18.4.4 shows it to the model as a hidden message
 //                                                      before its next step and leaves the tool output as is)
 //   tool_approval_resolved deny -> post_tool_failure  (error = omp's "Tool call denied by user: <tool>")
@@ -212,8 +212,8 @@ export function runBorg(event: string, payload: Canonical, timeoutMs: number, si
 		if (signal?.aborted) return resolve(null);
 		let child: ReturnType<typeof spawn>;
 		try {
-			// BORG_STOP_BUDGET_MS: at a stop borg keeps its wait for a live check, its model call and its
-			// expert drone inside this timeout, so its answer arrives.
+			// BORG_STOP_BUDGET_MS: at a stop borg keeps its model call and its expert drone inside this
+			// timeout, so its answer arrives.
 			const env = { ...process.env, BORG_STOP_BUDGET_MS: String(timeoutMs) };
 			child = spawn(process.env.BORG_BIN || "borg", ["hook", "omp", event], { stdio: ["pipe", "pipe", "ignore"], env });
 		} catch {
@@ -345,7 +345,7 @@ export function aborted(messages: unknown): boolean {
 
 export default function borg(pi: any): void {
 	// borg's budgets: FALLBACK until an answer carried them, asked for until then. At a stop borg sizes
-	// its wait for a live check and its model call from BORG_STOP_BUDGET_MS = stop_ms.
+	// its model call from BORG_STOP_BUDGET_MS = stop_ms.
 	let budgets: Budgets = { ...FALLBACK };
 	let learned = false;
 	/** `borg hook omp <event>`, waiting `budgets[within]`; an answer's budgets are taken. */
@@ -526,7 +526,7 @@ export default function borg(pi: any): void {
 		safe(async (ev, ctx) => {
 			calls.delete(String(ev.toolCallId));
 			const [event, payload] = toolEvent(ctx, ev, budgets.tail_chars);
-			// A live check's questions (or graded lessons) waiting since an earlier call reach the model
+			// Graded lessons (or messages) waiting since an earlier call reach the model
 			// before its next step, as a hidden message; the tool output stays as it is.
 			// Context kept from a mid-turn steer goes first; both reach the model in one message, so the
 			// messages of both count as shown together.

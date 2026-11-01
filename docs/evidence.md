@@ -28,7 +28,7 @@ Intervals are 95% paired-bootstrap confidence intervals unless the row names ano
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms | internal |
 | Public data, 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one | [swe-chat](../reports/swe-chat.md) |
 | End-to-end run in a sandboxed home | all 18 plumbing checks pass; no measurable gain on that task | [dogfood](../reports/dogfood-e2e.md) |
-| Live vs hook mode, internal task benchmark, 3 tasks × 3 seeds per mode (8 pairs) | live +0.38 criteria per task [0, +0.88], p = 0.50, 0 redo rounds vs 0.5; directional only (2 pairs differ, both in live's favour); live is the default ([details](delivery.md#why-live-is-the-default)) | internal |
+| Live vs hook mode, internal task benchmark, 3 tasks × 3 seeds per mode (8 pairs) | live +0.38 criteria per task [0, +0.88], p = 0.50, 0 redo rounds vs 0.5; directional only (2 pairs differ, both in live's favour); the knowledge criteria tied in 8 of 8. Live was the default until 0.7.6, which removed it ([details](delivery.md#live-mode-removed-in-076)) | internal |
 | Decision → fix links, replay of a scripted repo with known answers | fix links 4 of 5 right, 4 of 5 reachable fixes found (subject and revert signals only; tests and prompts are not measured); no real-repo precision yet | [regress](../reports/regress.md) |
 | Review → fix findings as lessons, 14 sealed cases × 6 seeds from recurring real findings | later bugs avoided 42% → 48%, +6.3 [−5.1, +17.9] (9 cases won, 1 tied, 4 lost); a lesson handed over directly +7.3 [−4.0, +19.3]; 89% of lessons faithful to their finding, 9% add a claim it does not make. The pre-registered rule (borg beats a plain agent, interval excluding 0) was **not met**; the engineer turned it on anyway, since a user who never configures would otherwise never get it | internal |
 | How many lessons a check asks, learned from outcomes by an earlier policy, since retired (cold start: no outcomes yet), same 14 cases × 6 seeds | questions per run 19 → 5, but later bugs avoided −3 points [−9, +2] against the fixed rule and the right lesson asked in 18% of runs instead of 67%: missed its bar. `BORG_STOP_ATTENTION=on` now runs a conformal cut on the model's rank instead | internal |
@@ -41,6 +41,17 @@ Also in reports/: a test set of engineering corrections drawn from SWE-chat
 ([swe-chat-engineering](../reports/swe-chat-engineering.md)), the pre-registration of a cross-repo transfer test on it
 ([swe-chat-engineering-transfer](../reports/swe-chat-engineering-transfer.md)), and the baseline of a plain Sonnet agent
 ([b0-vanilla-sonnet](../reports/b0-vanilla-sonnet.md)).
+
+**Live mode removed, decided 2026-11-01.** The engineer removed live mode in 0.7.6: expensive, and no
+measured value. The only causal test of it, the live-vs-hook benchmark above, tied on the knowledge
+criteria (whether lessons land) in all 8 pairs; its +0.38 came from 2 pairs on other criteria (p =
+0.50). Live checks had cost about $690 (5,862 calls), 8× hook's Borg-side cost. Accepted with it: about
+10× fewer graded checks for learning, so readouts come later ([Roadmap](roadmap.md)); the stop blocks
+again when it asks (0.5 redo rounds per run in that benchmark); and the question-count test, which ran
+on live checks only, draws no more. Judging no longer needed live checks: since 0.7.5 every delivery is
+judged at the stop and at the session's end. No run measured the removal itself; the decision rests on
+the benchmark and the cost. Records written before 0.7.6 replay as before
+([Live mode](delivery.md#live-mode-removed-in-076)).
 
 ## Lesson selection
 
@@ -205,9 +216,10 @@ was NOT TESTED, so **the learned policy is the default** (`BORG_SELECT=fixed` ke
 | P5 | the learned policy, doubly robust: +0.007 [−0.016, +0.023], coverage 87.1%, ESS 376; non-decisive |
 
 What the default changes today: on the P4 checks the evidence rule found no deviation worth playing,
-so the learned default differs from the fixed rule by the question-count test on live checks, rationed
-by the gate (`risk`, 10% unless the collective sets it), which withholds no lesson. Its readout is
-due after 300 checks that drew a count or 30 sessions with one.
+so the learned default differed from the fixed rule by the question-count test on live checks, rationed
+by the gate (`risk`, 10% unless the collective sets it), which withholds no lesson. Its readout was
+due after 300 checks that drew a count or 30 sessions with one; since live mode was removed (0.7.6) no
+check draws a count, and the readout waits ([Roadmap](roadmap.md)).
 
 **Amendment 2026-10-29** (to Rules v2, written after Run v2): the evidence rule's candidate, the
 routes best "under the posterior mean" in the first rule (W1, *It deviates only on evidence*), is
@@ -290,13 +302,48 @@ against a replay that reads no `not_arisen`, the verdicts are reviewed. Cost: on
 session with something open, reported in dollars per week. Replayed on the three copies, the records
 written before 0.7.5 give the same decisions and the same P0 and P1 as under 0.7.4.
 
+**The session-end judge judges everything in 0.7.6**, pre-registered 2026-11-01 before any code.
+0.7.5's one session-end call saw at most 40 open deliveries and the newest 24,000 characters of the
+work, two guards nobody measured (the 24,000 was a check's `TAIL`). On copies of the stores, 31% of
+sessions had more than 24,000 work characters (90th percentile 167,000), and one session ended with
+150 deliveries open, about 110 of which would have stayed unjudged. 0.7.6 judges every open delivery
+in batches, each prompt within the judge's effective length (NoLiMa's definition: the largest ×1.5
+prompt-size step whose answered share's lower 95% bound is at least 85% of the smallest step's;
+72,000 characters at the start, one step up explored on a logged share of passes) ([Session
+end](delivery.md)). Changed in the build, before any session-end line was logged: the smallest steps
+are pooled until they hold 30 lessons sent in 5 calls (`REFERENCE_LESSONS`, `MIN_CALLS`), so one
+call's few lessons do not set the line; a step is decided only from 5 calls on, its interval over the
+lessons its calls are worth (one call's lessons share one answer: a design effect); only the
+session-end judge's own lines count (a check's is another task); a failed call's lessons count as sent
+and not answered; and a failed step above the budget is still explored on one pass in twenty. Target: at least 95% of the deliveries open at a session's end get a verdict;
+pure unclear below 10% overall; each batch's answered share at least 85% of a single batch's. A
+session too long for the budget is cut by one of three arms: (a) its newest work, (b) from the
+batch's earliest delivery on, (c) half after that delivery and half the end. The default is the arm
+with the highest answered share on lessons delivered more than 24,000 characters before the session's
+end, in a paid backtest on 13 sessions of the copies (about $5-8); a tie goes to (b), the default
+until then. Kill: back to one call per pass, keeping the size budget, if pure unclear on batched
+passes is above 10% or more than 5% of batch calls fail. The 618 judge calls logged before 0.7.6 are
+all checks whose cost line gave only the judge section's size, not the prompt's, so none of them
+counts toward the effective length; the earlier reading of a flat 36-42% answered share from 5,000 to
+50,000 characters was of the judge section.
+
+**Readout 2026-11-01** (11 sessions on copies, 9 with open deliveries; 344 open, 196 of them delivered
+more than 24,000 characters before the end; $8.42 in all). 0.7.5's one call: 9 calls, $1.31, a verdict
+for 218 of 344 (63%), 125 left for lack of slots; of the far lessons only 85 of 196 were sent. 0.7.6 at
+72,000 characters: 24 calls per arm, $2.18-2.73, no call failed; a verdict for 343-344 of 344 (99.7-100%,
+target met), pure unclear 0.3-1.7% of sent (target met), answered 98.0-99.7% of sent (0.7.5: 99.1%).
+Far lessons answered: `ends` 196 of 196, `newest` 195, `after` 192, so `ends` is the default; the
+arms differ by 1-4 lessons, within noise. Most far lessons were judged "never came up" (80-83%; 0.7.5:
+82% of those it sent). Cost: about 1.7-2.1× 0.7.5's per pass for 1.6× the verdicts.
+
 **In use**, under the learned policy, a monitor estimates the policy's value against the fixed rule
 per session and reverts the store to the fixed rule for good if its bound shows harm beyond 10% of the
 fixed rule's value. After 300 judged lessons whose route was randomised, or 30 sessions under the
 learned policy, a readout compares asking against handing over, and handing over against not
 delivering, per grade, with session-bootstrap intervals. The question-count test's own readout (Rules
 v2, amended 2026-10-31) is due after 300 checks that drew a count (played or refused by the gate) in
-at least 15 sessions with one, or 30 sessions alone. It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
+at least 15 sessions with one, or 30 sessions alone; the test ran on live checks only, so since 0.7.6
+no check adds to it. It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
 rate asked with m against it asked alone, and asking against handing over a grade 2 as a
 Horvitz–Thompson mean, each with session-bootstrap 95% intervals. `borg debug select`, `borg status`, `borg top` and
 the Conscience page of `borg web` show both from the selection summary; `borg debug select --replay
@@ -337,16 +384,17 @@ wrong fix links; that replay has not run, so `BORG_REGRESS` stays `links`.
 - omp, opencode and Codex get no early delivery of ordinary lessons yet; standing lessons (ratified
   constraints) do arrive early there.
 - omp gives a stop 30 s, which no setting changes. borg's stop budget there is 28 s, so the turn-end call stops
-  after at most 18 s (less what the stop spent before it); about one in eight measured turn-end calls
-  took longer, and such a turn ends without questions. A stop that a live check covered makes no call.
-- On omp, opencode and Codex a live check sees the turn's tool calls and edits, not the agent's prose.
+  after at most 25 s (less what the stop spent before it; 18 s while live mode's wait took 7 s); about
+  one in eight measured turn-end calls took longer than 18 s, and such a turn ends without questions.
+- On omp, opencode and Codex a free hand-over's evidence is the turn's tool calls and edits, not the
+  agent's prose.
 - Codex skips an untrusted hook without a word, and fires no PostToolUse for a failed `apply_patch`, a
   patch run through a shell heredoc or a command still running when it yields: borg never sees those
   edits. In code mode borg's context reaches the model only after the whole `exec` script, and codex cuts
   a hook's context past 10,000 characters, the budget borg sizes messages by
   ([codex](../adapters/codex/README.md#what-borg-misses)).
-- opencode 1.x runs no hook after a failed tool call, so a live check's questions wait for the next
-  successful call, the next prompt or the stop. Its tool-call context is stored in the tool output: the
+- opencode 1.x runs no hook after a failed tool call, so a waiting hand-over waits for the next
+  successful call or the next prompt. Its tool-call context is stored in the tool output: the
   TUI hides it for built-in tools, but session exports show it.
 - Review → fix findings come from Claude Code workflows and omp; opencode, Codex and Claude Code's Agent
   tool yield them only when their reviewers answer in JSON, as they have no structured output. The Codex

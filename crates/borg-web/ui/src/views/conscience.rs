@@ -46,7 +46,7 @@ pub fn Conscience() -> impl IntoView {
             s.days
                 .iter()
                 .map(|day| {
-                    // `check` counts turn-end checks only; live mode's checks during the turn are `live_check`.
+                    // `check` counts turn-end checks only; live mode's checks during the turn (before 0.7.6) are `live_check`.
                     let (skip, check, block) = (day.t.n("gate_skip"), day.t.n("check"), day.t.n("block"));
                     Row { label: short_day(day.day), vals: vec![skip, (check - block).max(0.0), block, day.t.n("live_check")] }
                 })
@@ -57,7 +57,7 @@ pub fn Conscience() -> impl IntoView {
         Series::new("skip", "skipped free (0 tokens)", "var(--c-slate)"),
         Series::new("quiet", "checked, nothing to ask", "var(--c-accent)"),
         Series::new("block", "extra round with questions", "var(--c-violet)"),
-        Series::new("live", "live check during the turn (no extra round)", "var(--c-teal)"),
+        Series::new("live", "live check during the turn (before 0.7.6)", "var(--c-teal)"),
     ];
     // Only verdicts that say whether a question helped: used, ignored or corrected anyway. "No
     // correction followed" says nothing either way, so it is neither a ring segment nor in the
@@ -98,7 +98,7 @@ pub fn Conscience() -> impl IntoView {
     view! {
         <section class="tiles">
             <Tile label="Turn ends" value=Signal::derive(move || num(t().n("turn_end"))) sub=Signal::derive(move || format!("{} skipped free", pct(t().n("gate_skip"), t().n("turn_end")))) color="var(--c-muted)" />
-            <Tile label="Model checks" value=Signal::derive(move || num(t().n("check"))) sub=Signal::derive(move || format!("{} per check · {} live during the turn", usd(check_cost()), num(t().n("live_check")))) />
+            <Tile label="Model checks" value=Signal::derive(move || num(t().n("check"))) sub=Signal::derive(move || format!("{} per check · {} live before 0.7.6", usd(check_cost()), num(t().n("live_check")))) />
             <Tile label="Lessons per check" value=Signal::derive(move || num(t().n("check_n") / t().n("check").max(1.0))) sub=Signal::derive(|| "read by the model, one line each".to_string()) />
             <Tile label="Questions per round" value=Signal::derive(move || num(t().n("block_n") / t().n("block").max(1.0))) sub=Signal::derive(move || format!("{} rounds in total", num(t().n("block")))) color="var(--c-violet)" />
             <Tile label="Early, free" value=Signal::derive(move || num(t().n("early"))) sub=Signal::derive(move || format!("{} free hand-overs of grade 2/1", num(t().n("queued_free")))) color="var(--c-teal)" />
@@ -374,6 +374,35 @@ fn LessonSelection() -> impl IntoView {
             unit_label(&e.unit)
         ),
     };
+    // The judge's effective length per model: the session-end budget, then the answered share per
+    // prompt-size step as bars, each named by its edge and what it decided.
+    let judge = move || {
+        let js = sel.with(|s| s.judge.clone());
+        if js.is_empty() {
+            return view! { <p class="empty">"Judge's effective length: no judge runs here."</p> }.into_any();
+        }
+        js.into_iter()
+            .map(|j| {
+                let how = if j.start { "the start, no decided step moved it".to_string() } else { "measured".to_string() };
+                let line = j.line.map_or("no reference step yet".to_string(), |l| format!("a step holds at ≥ {} answered (85% of the reference's)", pct(l, 1.0)));
+                let explore = match j.explore {
+                    Some(up) => format!("exploring ≤ {} chars on {} of session-end passes", num(up), pct(j.psi, 1.0)),
+                    None => "the step above is decided: nothing explored".to_string(),
+                };
+                let rows: Vec<Count> = j
+                    .steps
+                    .iter()
+                    .filter(|t| t.sent > 0.0)
+                    .map(|t| Count { name: format!("≤ {} chars · {}", num(t.upto), t.decision.replace('_', " ")), part: t.answered, whole: t.sent })
+                    .collect();
+                view! {
+                    <p class="empty">{format!("Judge {}: session-end budget {} chars ({how}); {line}; {explore}.", j.model, num(j.chars))}</p>
+                    <Shares rows=Signal::derive(move || rows.clone()) color="var(--c-violet)" />
+                }
+            })
+            .collect_view()
+            .into_any()
+    };
     let evaluation = move || match sel.with(|s| s.evaluation.clone()) {
         None => view! { <p class="empty">"Not measured yet: the monitor reads the learned policy's sessions only."</p> }.into_any(),
         Some(e) => view! {
@@ -607,6 +636,8 @@ fn LessonSelection() -> impl IntoView {
                         <h2>"Label health"<small>"judged share per route; unclear (judge 3 on, per route), not arisen and consequence remains shares; placebo rate"</small></h2>
                         <Shares rows=Signal::derive(move || sel.with(|s| s.labels.clone())) color="var(--c-good)" />
                         <p class="empty">{declaration}</p>
+                        <h2>"Judge's effective length"<small>"answered share (a verdict, not unclear) per prompt size, ×1.5 steps; the session-end budget is the largest step still at 85% of the reference's"</small></h2>
+                        {judge}
                     </div>
                 </section>
                 <section class="two">

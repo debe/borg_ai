@@ -1167,6 +1167,12 @@ fn learn_unlocked(
             ended.push(s.to_string());
         }
         for s in &ended {
+            // A session whose lock another process holds is still being judged (a session-end pass of a
+            // resumed session, hook.rs `judge_session`, or a stop): settled once it lets go,
+            // never under it, where a verdict would come after its settle.
+            if crate::live::lock_state(&ctx(s), now_ms(), crate::live::stale_ms(), crate::live::alive) == crate::live::Lock::Held {
+                continue;
+            }
             // Its settle's time: after a verdict the session-end judge gives here.
             let mut at = now;
             // An idle session's end hook never ran: the session-end judge (hook.rs `judge_session`) gives
@@ -2066,6 +2072,24 @@ mod tests {
         asked(&home, "s4", idle, &["Le1"]);
         learn_in(&home, None, &fake_ask, true, idle + 1);
         assert_eq!(results().len(), 4);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A session whose live lock another process holds (a session-end pass still judging it) is not
+    /// settled under it; once the lock is gone, it is.
+    #[test]
+    fn a_session_another_pass_still_judges_is_not_settled_under_it() {
+        let home = temp_home("held");
+        asked(&home, "s2", 10, &["Le1"]);
+        let ctx = home.join("state/s2.ctx");
+        std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();
+        std::fs::write(crate::live::lock_file(&ctx), format!("{} {}\n", std::process::id(), now_ms())).unwrap();
+        let settled = || outcome::read(&home.join("outcomes.jsonl")).into_iter().filter(|o| o.kind == outcome::NOT_CORRECTED).count();
+        learn_in(&home, Some("s2"), &fake_ask, true, 20);
+        assert_eq!(settled(), 0, "held: not settled");
+        std::fs::remove_file(crate::live::lock_file(&ctx)).unwrap();
+        learn_in(&home, Some("s2"), &fake_ask, true, 30);
+        assert_eq!(settled(), 1, "let go: settled");
         let _ = std::fs::remove_dir_all(home);
     }
 

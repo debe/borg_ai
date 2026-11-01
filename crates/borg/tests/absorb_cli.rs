@@ -2,7 +2,7 @@
 //! absorbs and releases through the binary. Every harness of `harness::ALL` (the simulated one with early
 //! delivery on) runs the same scenario through `borg hook <harness> <event>`: a control session before
 //! the absorb shows each path delivering the lesson (early at the prompt where the harness takes it, the
-//! stop's block, a live check's queued ask), then the same paths after `borg memory absorb` deliver it
+//! stop's block), then the same paths after `borg memory absorb` deliver it
 //! nowhere, though the fake model still grades it as applying, while the constraint ratified from it
 //! stays standing. `borg debug recall` and `borg debug prefilter` read the lessons as a drone gets them.
 //! The model is the fake `claude` of tests/common: 0 tokens.
@@ -11,10 +11,9 @@ mod common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use borg::harness::{self, sim};
-use common::{borg_as, context, prompts, setup, state};
+use common::{borg_as, context, prompts, setup};
 use serde_json::{Value, json};
 
 /// Words of the absorbed lesson's question (tests/common `Mdrain`), and of the constraint ratified from it.
@@ -84,27 +83,12 @@ impl Drone<'_> {
     fn stop(&self) -> String {
         self.hook("stop", json!({"session_id": self.session, "cwd": repo(self.root), "last_assistant_message": "Done: the budget place uses a reset arc.", "stop_hook_active": false}))
     }
-
-    /// The live check's queue once the check the edit started finished (its mark is written last).
-    fn live_queue(&self) -> String {
-        let until = Instant::now() + Duration::from_secs(20);
-        while state(self.root, &self.session, "live.mark").is_empty() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        state(self.root, &self.session, "queued")
-    }
 }
 
 /// The env of a drone of `h`: early delivery where asked, the model pinned to the fake `claude`.
-fn env(h: &str, early: bool, mode: &'static str) -> Vec<(&'static str, &'static str)> {
-    let mut env = vec![
-        (harness::TEST_ENV, "1"),
-        ("BORG_PREFILTER", "off"),
-        ("BORG_PREDICT_MODEL", "claude:sonnet"),
-        ("BORG_EARLY", if early { "on" } else { "off" }),
-        ("BORG_MODE", mode),
-        ("BORG_LIVE_DEBOUNCE_S", "0"),
-    ];
+fn env(h: &str, early: bool) -> Vec<(&'static str, &'static str)> {
+    let mut env =
+        vec![(harness::TEST_ENV, "1"), ("BORG_PREFILTER", "off"), ("BORG_PREDICT_MODEL", "claude:sonnet"), ("BORG_EARLY", if early { "on" } else { "off" })];
     if h == "sim" {
         env.push((sim::CAPS_ENV, "prompt,tool,early,deny"));
     }
@@ -118,39 +102,31 @@ fn an_absorbed_lesson_is_delivered_on_no_harness_path() {
         let root = setup(&format!("absorb-{name}"));
         ratify(&root);
         let caps = if name == "sim" { sim::caps_of("prompt,tool,early,deny") } else { h.caps() };
-        let drone = |session: &str, early: bool, mode: &'static str| Drone { root: &root, harness: name, session: session.into(), env: env(name, early, mode) };
+        let drone = |session: &str, early: bool| Drone { root: &root, harness: name, session: session.into(), env: env(name, early) };
 
         // Before: each path delivers it.
-        let early = drone("c-early", true, "hook").prompt();
+        let early = drone("c-early", true).prompt();
         assert_eq!(early.contains(DRAIN), caps.early_delivery, "{name}: early where the harness takes it: {early}");
-        let d = drone("c-stop", false, "hook");
+        let d = drone("c-stop", false);
         d.prompt();
         d.edit();
         assert!(d.stop().contains("[Mdrain]"), "{name}: the stop asks it");
-        let d = drone("c-live", false, "live");
-        d.prompt();
-        d.edit();
-        assert!(d.live_queue().contains("Mdrain"), "{name}: a live check queues it");
 
         let (out, err, code) = cli(&root, &["memory", "absorb", "Mdrain", "--note", "skills/review@2026-10-30", "--dir", &repo(&root)], "");
         assert_eq!(code, 0, "{name}: {out} {err}");
         let asked = prompts(&root).len();
 
         // After: no path delivers it, though the fake model still grades it as applying.
-        let early = drone("a-early", true, "hook").prompt();
+        let early = drone("a-early", true).prompt();
         assert!(!early.contains(DRAIN), "{name}: not early: {early}");
         if caps.prompt_context {
             assert!(early.contains(STANDING), "{name}: the constraint ratified from it stays standing: {early}");
         }
-        let d = drone("a-stop", false, "hook");
+        let d = drone("a-stop", false);
         d.prompt();
         assert!(!d.edit().contains(DRAIN), "{name}");
         let stop = d.stop();
         assert!(!stop.contains("[Mdrain]") && !stop.contains(DRAIN), "{name}: the stop never asks it: {stop}");
-        let d = drone("a-live", false, "live");
-        d.prompt();
-        d.edit();
-        assert!(!d.live_queue().contains("Mdrain"), "{name}: no live check queues it");
         assert!(!d.prompt().contains(DRAIN) && !d.edit().contains(DRAIN), "{name}: nor hands it over");
         let after = prompts(&root);
         assert!(after.len() > asked, "{name}: the model was still asked about the rest");

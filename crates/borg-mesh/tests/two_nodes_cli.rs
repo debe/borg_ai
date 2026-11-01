@@ -110,7 +110,6 @@ impl Machine {
             .env("BORG_UPDATE_CHECK", "off")
             .env("BORG_QUEEN", "off")
             .env("BORG_VECTORS", "off")
-            .env("BORG_MODE", "hook")
             .envs(env.iter().copied())
             .current_dir(self.work())
             .stdin(Stdio::piped())

@@ -25,7 +25,7 @@
 // engineer's TUI: opencode 1 adds it to the message as a synthetic text part, opencode 2 as a
 // synthetic session input without a description, just before the prompt.
 //
-// After a tool call, borg's additionalContext (live mode: a check's questions, graded lessons) reaches
+// After a tool call, borg's additionalContext (waiting graded lessons, messages) reaches
 // the model before its next step; both after-hooks are awaited. opencode 1 appends it to the tool's
 // output (stored with the call: the TUI hides it for built-in tools, exports show it); opencode 2 sends
 // it as a steer synthetic input and leaves the tool result alone (the TUI shows that). opencode 1 runs
@@ -80,7 +80,7 @@ type Budgets = { prompt_ms: number; pre_ms: number; post_ms: number; stop_ms: nu
 // result 2 s for borg's context (file appends; a later answer is kept for the next call or prompt), a
 // tool call 2 s before it runs (a stat when nobody steers). The stop, the one call with a model call,
 // and every call queued behind it get borg's stop timeout, which is also its BORG_STOP_BUDGET_MS: room
-// for a live check's wait, the model call and an expert drone; the session's end, queued too, the same
+// for the model call and an expert drone; the session's end, queued too, the same
 // as its own end_ms. The output's end holds a test run's summary.
 const FALLBACK: Budgets = { prompt_ms: 5_000, pre_ms: 2_000, post_ms: 2_000, stop_ms: 90_000, end_ms: 90_000, tail_chars: 4_000 }
 
@@ -302,8 +302,8 @@ function borg(event: string, payload: Record<string, unknown>, timeoutMs: number
     }
     let child: ReturnType<typeof spawn>
     try {
-      // BORG_STOP_BUDGET_MS: at a stop borg keeps its wait for a live check, its model call and its expert
-      // drone inside this timeout, so its answer arrives.
+      // BORG_STOP_BUDGET_MS: at a stop borg keeps its model call and its expert drone inside this timeout,
+      // so its answer arrives.
       const env = { ...process.env, BORG_STOP_BUDGET_MS: String(stopMs) }
       child = spawn(process.env.BORG_BIN || "borg", ["hook", "opencode", event], { stdio: ["pipe", "pipe", "ignore"], env })
     } catch (e) {

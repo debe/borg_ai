@@ -29,7 +29,7 @@ fn app(name: &str, home: PathBuf) -> Arc<App> {
 /// `app` started in `cwd`, whose git identity is the engineer's.
 fn app_in(name: &str, home: PathBuf, cwd: String) -> Arc<App> {
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    Arc::new(App { first: name.into(), minds: vec![Mind { name: name.into(), home, share: Share::Local, mode: "hook" }], cwd, stop })
+    Arc::new(App { first: name.into(), minds: vec![Mind { name: name.into(), home, share: Share::Local }], cwd, stop })
 }
 
 /// A POST of `body` with `content_type`, as the page sends it.

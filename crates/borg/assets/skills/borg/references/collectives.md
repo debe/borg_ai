@@ -16,7 +16,7 @@ wiring borg if some repos must stay private.
   "default": "off",
   "off": ["~/work/payroll-secrets", "~/personal/journal"],
   "collectives": [
-    { "name": "platform-team", "paths": ["~/work"], "share": "team", "mode": "live" },
+    { "name": "platform-team", "paths": ["~/work"], "share": "team" },
     { "name": "private", "paths": ["~/personal"], "share": "local" }
   ],
   "engineers": [
@@ -35,7 +35,7 @@ wiring borg if some repos must stay private.
 | `name` | entry | The collective's name; its store is `$BORG_HOME/collectives/<name>/` |
 | `paths` | entry | Directories whose repos belong to it; `~/` is expanded |
 | `share` | entry | `"team"` (default): may sync over the mesh. `"local"`: never leaves this machine |
-| `mode` | entry | `"live"` (default): checks during the turn and at its end. `"hook"`: at the turn end only, about an eighth of live's cost. `BORG_MODE` overrides it |
+| `mode` | entry | Ignored since 0.7.6 (live mode is gone: every check runs at the turn end); still accepted, and `borg doctor` notes it once. Drop it |
 | `relay` | entry | Mesh only: absent or `"default"` (n0's public relays), `"disabled"` (LAN/VPN only) or a self-hosted `iroh-relay` URL. `BORG_RELAY` overrides it. See [team](team.md) |
 | `experts` | entry | Local checkouts of dependencies the turn-end check may cite: `{"name", "repo", "match": [...], "drone": false}`. `"drone": true` also asks a read-only, time-bounded agent in that checkout when its index has nothing |
 | `budget` | entry | Optional, absent by default: the pool tokens this collective's checks may read per session, on average. Without it lesson selection's spend is measured and shown, never priced; with it the learned policy (the default) prices a larger pool to stay within it, and the fixed rule (`BORG_SELECT=fixed`) reads none. A value that is not a positive number counts as none. Set it only when the engineer asks for a spend limit: quality, not spend, is what selection optimises |
@@ -131,7 +131,6 @@ let the turn-end check cite an internal library's checkout.
       "paths": ["~/work/acme"],
       "share": "team",
       "relay": "https://relay.acme.example",
-      "mode": "live",
       "experts": [
         { "name": "acme-core", "repo": "~/work/acme/core", "match": ["acme-core", "com.acme.core"] }
       ]

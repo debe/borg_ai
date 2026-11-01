@@ -40,7 +40,7 @@ async fn the_memory_view_is_the_export_with_absorbs_and_recurrence() {
     std::fs::write(borg::absorb::path(&home), format!("{absorb}\n")).unwrap();
 
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team, mode: "hook" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Team };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
 
     let (status, v) = get(app.clone(), "/api/memory?c=corp").await;

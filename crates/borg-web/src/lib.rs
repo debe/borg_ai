@@ -40,8 +40,6 @@ pub struct Mind {
     pub name: String,
     pub home: PathBuf,
     pub share: Share,
-    /// The delivery mode its drones run in (borg live.rs: `hook` or `live`).
-    pub mode: &'static str,
 }
 
 pub struct App {
@@ -74,10 +72,7 @@ pub fn minds(dir: &str) -> Result<(Vec<Mind>, String), String> {
     let minds: Vec<Mind> = install::collectives(cfg.as_ref(), &base)
         .into_iter()
         .filter_map(|r| match r {
-            Route::Collective { name, home, share } => {
-                let mode = borg::live::of(cfg.as_ref(), &name).mode.name();
-                Some(Mind { name, home, share, mode })
-            }
+            Route::Collective { name, home, share } => Some(Mind { name, home, share }),
             Route::Off => None,
         })
         .collect();
@@ -93,8 +88,7 @@ fn not_found(what: &str) -> Response {
 }
 
 async fn collectives(State(app): State<Arc<App>>) -> Json<Value> {
-    let list: Vec<Value> =
-        app.minds.iter().map(|m| json!({"name": m.name, "share": if m.share == Share::Team { "team" } else { "local" }, "mode": m.mode})).collect();
+    let list: Vec<Value> = app.minds.iter().map(|m| json!({"name": m.name, "share": if m.share == Share::Team { "team" } else { "local" }})).collect();
     Json(json!({"first": app.first, "collectives": list}))
 }
 

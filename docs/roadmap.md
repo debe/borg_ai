@@ -17,8 +17,13 @@ outcome logs).
   harm bound.
 
 **Today:** the learned policy is the default. Its gate reads 0.023 in the open-source store and is
-spent in the team store. No learnable number has a readout yet; the question-count test's is due
-first.
+spent in the team store. No learnable number has a readout yet.
+
+**Since live mode was removed (0.7.6, [why](delivery.md#live-mode-removed-in-076)) every readout comes
+later.** Live checks were most of the graded checks: about 10× as many as the stops' in the live-mode
+months (5,862 live calls). A session now makes only its stops' checks, so each target below that
+counts checks or labels takes about that much longer to reach; the sessions targets are unchanged. The
+question-count test ran on live checks only, so it draws no more (step 2).
 
 The steps are ordered by what unblocks the rest.
 
@@ -46,7 +51,7 @@ Every later readout reads these labels, this monitor and this status line.
 **Still open:**
 
 - **Fresh copies confirm the verdict fix.** Done when copies taken after new sessions show no free
-  verdict after a live ask and no delivered lesson left open in an ended session. The 15 stuck questions
+  verdict after a later question and no delivered lesson left open in an ended session. The 15 stuck questions
   settled before 0.7.3 stay open in the team store's summary, so the replay still reproduces the
   decisions made on it; closing them needs a dated re-settle.
 - **Missing verdicts are explained.** The judge returns no verdict for 29–44% of the lessons it is sent
@@ -70,7 +75,12 @@ Every later readout reads these labels, this monitor and this status line.
 - **Amended 2026-10-31:** due at 300 checks in at least 15 sessions with a draw, or 30 sessions; pooled
   over the two main stores, stratified by collective; intent-to-treat, with the share played per drawn
   count (`borg debug select --replay --file A --file B`, records copied from another store's log left
-  out). Today: 243 checks in 7 sessions, due about 2026-11-05.
+  out). Today: 243 checks in 7 sessions.
+- **Stalled 2026-11-01:** the test ran on live checks only, and live mode was removed in 0.7.6, so no
+  check draws a count now and the readout is no longer due on a date. Its draws so far stay in the log
+  and count toward it. Done needs either a readout on what exists (243 checks, under the bar) labelled
+  as such, or a stop design of the test (a stop's question blocks, so it is not the live test moved),
+  pre-registered before it is built.
 - **Done** when the readout is in [Evidence](evidence.md#lesson-selection) and the evidence rule deviates
   on it, or it shows no effect. The readout reads only the top tested lesson; pooling lower positions
   would add power.
@@ -116,7 +126,7 @@ ask).
 - **Verdicts the judge can give, judged after the work** (0.7.5, replacing 0.7.3's wait for work after
   the delivery). The judge gives one of five verdicts with a logged reason: changed, ignored, not
   arisen (the point never came up; censored for the belief, no change for selection), consequence
-  remains, or unclear. A live check never judges a free hand-over or a placebo; a stop's judge call
+  remains, or unclear. A live check never judged a free hand-over or a placebo; a stop's judge call
   does, and `borg learn --session` judges what is still open once more, in one call with the whole
   session's work (its prompts and touches, edits and answers, and the agent's messages). Before:
   unclear (`asked_unclear`, which then also held a remaining consequence) 77-79% of free and 86-100% of placebo verdicts, 58-62% live, 29-51% at the stop; a
@@ -126,6 +136,21 @@ ask).
   below 40% by then; review the verdicts if lessons' belief means move by more than 0.05 on average
   against a replay without `not_arisen`. Cost: one extra model call per session with something open
   ([Evidence](evidence.md#lesson-selection)).
+- **The session-end judge judges everything, sized by what it reads well** (0.7.6). 0.7.5's one call
+  saw at most 40 open deliveries and the newest 24,000 work characters, both unmeasured. 0.7.6 judges
+  every open delivery in batches, one call each, each prompt within the judge's effective length per
+  model, measured from its own cost lines (72,000 characters until they decide; one step up explored
+  on a logged share of passes). A session too long for the budget is cut from each batch's earliest
+  delivery on until a paid backtest of the three cuts (newest, after, ends) picks the default. Target:
+  at least 95% of open deliveries judged, pure unclear below 10%. Kill: one call per pass again if
+  batched passes are more than 10% unclear or more than 5% of batch calls fail
+  ([Evidence](evidence.md#lesson-selection)).
+- **A check's work and lessons, measured the same way.** A check still reads the newest 24,000
+  characters of the turn's work (`TAIL`) and judges at most 10 lessons (`MAX_PENDING`), two unmeasured
+  guards kept for the stop's latency. Since 0.7.6 a check's cost line logs its prompt's size, so its
+  answered share per size step can be read as the session end's is. Done when `TAIL` and
+  `MAX_PENDING` are each either derived from the judge's effective length within the stop's latency
+  budget or fixed by a dated decision with that evidence.
 - **Placebos from the lessons the budget cuts.** A placebo is never a lesson the session already had,
   and 414 of 419 not-now applies in the team store (1,219 of 1,224 in the open-source store) are such
   lessons. Meanwhile the character budget cut 469 free hand-overs in the open-source store (29 in the
@@ -155,10 +180,6 @@ ask).
 
 ### Smaller items
 
-- A live ask queued during the stop's model call can be asked twice and then dropped as done, which
-  counts as a miss.
-- The evidence rule's hand-overs on a live check with a 3 are never asked by a stop that comes first
-  (the test's are).
 - The replay's cold start grows about quadratically with sessions.
 
 ## Messages and the mesh

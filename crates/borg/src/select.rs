@@ -17,8 +17,9 @@
 //! learned policy cannot get from the fixed rule's history, which asks and hands over by grade alone.
 //!
 //! **The learned policy** (select/policy.rs `choose`, policy v2) leaves the fixed rule only on evidence
-//! from a fitted value model, and on live checks runs a randomised test of how many of the fixed
-//! rule's delivered lessons to ask rather than hand over (nothing withheld), both under a
+//! from a fitted value model, and on live checks (live mode, removed in 0.7.6: the test runs no more)
+//! ran a randomised test of how many of the fixed rule's delivered lessons to ask rather than hand
+//! over (nothing withheld), both under a
 //! conservative gate rationed by the collective's tolerance (`alpha`); cold start (no fit, or a gate
 //! that may risk nothing yet) is exactly the fixed rule, and so is a store the monitor reverted
 //! (select/summary.rs `REVERTED`). It draws its placebos

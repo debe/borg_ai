@@ -25,10 +25,11 @@ pub const GATE_SKIP: &str = "gate_skip";
 pub const CHECK: &str = "check";
 /// A block: one extra round of agent work (`n`: questions, `lessons`: the asked ids).
 pub const BLOCK: &str = "block";
-/// Live mode (live.rs): one model call during the turn (`n`, `usd`, `dur_ms`, `why: "failed"`, as `check`).
+/// Live mode, before 0.7.6 (removed; history only): one model call during the turn (`n`, `usd`,
+/// `dur_ms`, `why: "failed"`, as `check`).
 pub const LIVE_CHECK: &str = "live_check";
-/// Live mode: grade-3 lessons a live check asked, delivered with the next prompt or tool call (`n`,
-/// `lessons`). Never an extra round: the drone answers as it works.
+/// Live mode, before 0.7.6 (removed; history only): grade-3 lessons a live check asked, delivered with
+/// the next prompt or tool call (`n`, `lessons`). Never an extra round: the drone answered as it worked.
 pub const LIVE_ASK: &str = "live_ask";
 /// Lessons handed over free at a prompt or touch (`n`, `lessons`).
 pub const EARLY: &str = "early";
@@ -121,10 +122,12 @@ pub struct Event {
     /// A short excerpt for this machine's own feed (a correction's words). Never folded into a rollup.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    /// The delivery mode the hook ran in (live.rs: `hook` or `live`); empty outside a hook.
+    /// The delivery mode the hook ran in before 0.7.6 (`hook` or `live`); empty since live mode was
+    /// removed, and outside a hook. Kept so older events still fold into `Bucket::usd_mode`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
-    /// How an asked lesson reached the drone: `stop` (a block), `live` (a live check), `early`, `queued`.
+    /// How an asked lesson reached the drone: `stop` (a block), `early`, `queued`, or `live` (a live
+    /// check, before 0.7.6).
     /// On asks and on their results (`changed`, `ignored`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub channel: String,
@@ -150,10 +153,9 @@ fn is_zero_f(v: &f64) -> bool {
 }
 
 impl Event {
-    /// An event now, in the delivery mode of this process (the hook exports `BORG_MODE`, main.rs).
+    /// An event now.
     pub fn new(kind: &str, ms: i64) -> Self {
-        let mode = std::env::var("BORG_MODE").map(|_| crate::live::current().name().to_string()).unwrap_or_default();
-        Event { kind: kind.into(), ms, mode, ..Default::default() }
+        Event { kind: kind.into(), ms, ..Default::default() }
     }
 }
 
@@ -175,8 +177,9 @@ pub struct Bucket {
     /// Events per kind for each lesson they named.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lessons: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The conscience's model cost (`check` and `live_check`) per delivery mode (`hook`, `live`). A
-    /// split of part of `usd`, so never stacked with `usd_by`.
+    /// The conscience's model cost (`check` and `live_check`) per delivery mode: `live` for live mode's
+    /// events before 0.7.6, `hook` for every other (an event without a mode). A split of part of `usd`,
+    /// so never stacked with `usd_by`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usd_mode: BTreeMap<String, f64>,
     /// Events per `<kind>@<channel>` for events that name a channel (`block@stop`, `changed@live`).

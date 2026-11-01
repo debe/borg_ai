@@ -79,8 +79,6 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
         // their own.
         .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")
-        // These tests pin the turn-end behaviour; the live ones pass BORG_MODE=live.
-        .env("BORG_MODE", "hook")
         .envs(env.iter().copied())
         .current_dir(root)
         .stdin(Stdio::piped())

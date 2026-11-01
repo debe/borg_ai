@@ -23,7 +23,7 @@ async fn stats_show_the_off_policy_support() {
     ];
     std::fs::write(home.join("outcomes.jsonl"), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "hook" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
     let res = router(app).oneshot(Request::get("/api/stats?c=corp").header("host", "127.0.0.1:7979").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);

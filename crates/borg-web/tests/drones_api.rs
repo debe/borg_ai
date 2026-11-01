@@ -42,12 +42,12 @@ async fn every_harness_drone_shows_with_its_harness_and_state() {
     presence::touch(&home, "corp", last, "end", &json!({"session_id": format!("s-{last}"), "cwd": "/work/harbor_orion"}), now).unwrap();
 
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
 
     let (status, v) = get(app.clone(), "/api/collectives").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["collectives"], json!([{"name": "corp", "share": "local", "mode": "live"}]), "{v}");
+    assert_eq!(v["collectives"], json!([{"name": "corp", "share": "local"}]), "{v}");
     assert_eq!(v["first"], "corp");
 
     let (status, v) = get(app.clone(), "/api/drones?c=corp").await;
@@ -81,7 +81,7 @@ async fn a_veto_shows_in_the_feed_and_on_the_lessons_it_credited() {
     borg::veto::record(&home, &said).unwrap();
 
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local, mode: "live" };
+    let mind = Mind { name: "corp".into(), home: home.clone(), share: Share::Local };
     let app = Arc::new(App { minds: vec![mind], first: "corp".into(), cwd: String::new(), stop });
     let (status, v) = get(app.clone(), "/api/feed?c=corp").await;
     assert_eq!(status, StatusCode::OK);

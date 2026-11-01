@@ -58,7 +58,6 @@ fn command(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Comm
         .env("BORG_LEARN", "off")
         .env("BORG_QUEEN", "off")
         .env("BORG_VECTORS", "off")
-        .env("BORG_MODE", "hook")
         .env("BORG_TEST_HARNESS", "1")
         .envs(env.iter().copied())
         .current_dir(cwd)

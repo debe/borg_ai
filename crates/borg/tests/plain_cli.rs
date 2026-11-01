@@ -1,36 +1,24 @@
-//! A plain interactive session, end to end through the binary and every harness's hooks, in both
-//! delivery modes: its prompt gets its lessons where the harness delivers them early, its stop a
-//! verdict, and it leaves outcomes. The model is the fake
+//! A plain interactive session, end to end through the binary and every harness's hooks: its prompt
+//! gets its lessons where the harness delivers them early, its stop a verdict, and it leaves outcomes. The model is the fake
 //! `claude` of `common`: no test makes a real model call.
 
 mod common;
 
 use std::path::Path;
 
-use common::{borg_as, context, setup, state};
+use common::{borg_as, context, setup};
 use serde_json::{Value, json};
 
 /// Learning stays on, as for an engineer, and the stop always asks the model (no free gate), so it has
 /// a verdict to compare.
 const ASKED: [(&str, &str); 2] = [("BORG_LEARN", "on"), ("BORG_PREFILTER", "off")];
 
-/// The harnesses whose hooks run a plain session, and the delivery modes: `hook` judges at the turn's
-/// end, `live` (the default, live.rs) also checks during the turn, through `borg check`.
+/// The harnesses whose hooks run a plain session.
 const HARNESSES: [&str; 4] = ["claude", "omp", "opencode", "codex"];
-const MODES: [&str; 2] = ["hook", "live"];
 
-/// Waits (at most 20 s) until the session's live check has covered its edit.
-fn checked(root: &Path, session: &str) {
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while state(root, session, "live.mark").is_empty() && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(!state(root, session, "live.mark").is_empty(), "the live check ran");
-}
-
-/// Each event's hook output through `harness` in `mode` (the root path written as `<root>`) and the
-/// outcome kinds the session left.
-fn session(root: &Path, harness: &str, mode: &str) -> (Vec<(String, String)>, Vec<String>) {
+/// Each event's hook output through `harness` (the root path written as `<root>`) and the outcome kinds
+/// the session left.
+fn session(root: &Path, harness: &str) -> (Vec<(String, String)>, Vec<String>) {
     let cwd = root.join("harbor_orion");
     let s = "plain1";
     let events = [
@@ -46,7 +34,7 @@ fn session(root: &Path, harness: &str, mode: &str) -> (Vec<(String, String)>, Ve
         ("end", json!({"session_id": s, "cwd": cwd})),
     ];
     // Off Claude Code the model call is pinned to the fake `claude` (common.rs `borg_as`).
-    let mut env: Vec<_> = ASKED.into_iter().chain([("BORG_MODE", mode)]).collect();
+    let mut env: Vec<_> = ASKED.into_iter().collect();
     if harness != "claude" {
         env.push(("BORG_PREDICT_MODEL", "claude:sonnet"));
     }
@@ -55,9 +43,6 @@ fn session(root: &Path, harness: &str, mode: &str) -> (Vec<(String, String)>, Ve
     let mut outs = Vec::new();
     for (e, input) in &events {
         outs.push((e.to_string(), borg_as(root, harness, e, input, &env).replace(&shown, "<root>")));
-        if mode == "live" && *e == "post_tool" {
-            checked(root, s);
-        }
     }
     let outcomes = std::fs::read_to_string(root.join("store/collectives/corp/outcomes.jsonl")).unwrap_or_default();
     let mut kinds: Vec<String> = outcomes.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()?["kind"].as_str().map(String::from)).collect();
@@ -68,15 +53,13 @@ fn session(root: &Path, harness: &str, mode: &str) -> (Vec<(String, String)>, Ve
 #[test]
 fn a_plain_session_gets_its_lessons_and_a_verdict_in_every_harness() {
     for harness in HARNESSES {
-        for mode in MODES {
-            let root = setup(&format!("plain-{harness}-{mode}"));
-            let (a, kinds) = session(&root, harness, mode);
-            // Only Claude Code delivers a scope's lessons at the prompt (harness caps `early_delivery`).
-            let early = harness == "claude";
-            assert_eq!(!context(&a[0].1).is_empty(), early, "{harness} {mode}: the plain session's prompt got its lessons: {a:?}");
-            assert!(a.iter().any(|(_, out)| out.contains("[G0]")), "{harness} {mode}: and a verdict: {a:?}");
-            assert!(!kinds.is_empty(), "{harness} {mode}: the session left outcomes");
-            let _ = std::fs::remove_dir_all(root);
-        }
+        let root = setup(&format!("plain-{harness}"));
+        let (a, kinds) = session(&root, harness);
+        // Only Claude Code delivers a scope's lessons at the prompt (harness caps `early_delivery`).
+        let early = harness == "claude";
+        assert_eq!(!context(&a[0].1).is_empty(), early, "{harness}: the plain session's prompt got its lessons: {a:?}");
+        assert!(a.iter().any(|(_, out)| out.contains("[G0]")), "{harness}: and a verdict: {a:?}");
+        assert!(!kinds.is_empty(), "{harness}: the session left outcomes");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

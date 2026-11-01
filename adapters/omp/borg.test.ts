@@ -269,10 +269,10 @@ test("session_stop: borg's questions block once, then stop_hook_active lets the 
 	assert.match(ctxFile(), /^make the relay delivery lock-free\n#borg-p L1=1 @([0-9a-f]{12})\n#borg-pool L1=[0-9.]+ @\1\n#borg-asked L1 @\1\n$/);
 });
 
-test("tool_result hands borg's context (a live check's questions) to omp as additionalContext; nothing else", async () => {
+test("tool_result hands borg's context (waiting graded lessons, messages) to omp as additionalContext; nothing else", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "borg-omp-live-"));
 	const bin = join(dir, "borg-live");
-	writeFileSync(bin, `#!/bin/sh\ncat >/dev/null\n[ "$3" = post_tool ] && [ -n "$ASK" ] && echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[borg] borg check of your work so far: Q?"}}'\nexit 0\n`);
+	writeFileSync(bin, `#!/bin/sh\ncat >/dev/null\n[ "$3" = post_tool ] && [ -n "$ASK" ] && echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[borg] Peer lessons: Q?"}}'\nexit 0\n`);
 	chmodSync(bin, 0o755);
 	process.env.BORG_BIN = bin;
 	const h = load();
@@ -281,7 +281,7 @@ test("tool_result hands borg's context (a live check's questions) to omp as addi
 		h.tool_result({ type: "tool_result", toolName: "edit", toolCallId: "c1", input: { path: "a.rs" }, content: [{ type: "text", text: "ok" }], isError }, ctx);
 	assert.equal(await result(), undefined, "no answer: nothing");
 	process.env.ASK = "1";
-	assert.deepEqual(await result(), { additionalContext: "[borg] borg check of your work so far: Q?" });
+	assert.deepEqual(await result(), { additionalContext: "[borg] Peer lessons: Q?" });
 	assert.equal(await result(true), undefined, "a failure is post_tool_failure: borg answers nothing");
 	delete process.env.ASK;
 });
@@ -748,7 +748,7 @@ test(
 		for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID", "STOP_ANSWER"]) delete process.env[k];
 		Object.assign(process.env, {
 			BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"),
-			BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MODE: "hook", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+			BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
 		});
 		const S = "omp-listen-1";
 		const sent: [any, any][] = [];

@@ -78,7 +78,7 @@ impl Harness for Omp {
     }
 
     fn probe(&self) -> Probe {
-        Probe { cli: "omp", tested: " (adapter tested with 18.8.5 and 18.10.4; live mode needs 18.4.4 or newer)" }
+        Probe { cli: "omp", tested: " (adapter tested with 18.8.5 and 18.10.4; a tool call's context needs 18.4.4 or newer)" }
     }
 
     /// Each session's task agents (`$PI_CODING_AGENT_DIR/sessions`, else `home/.omp/agent/sessions`).

@@ -228,6 +228,9 @@ pub struct Prediction {
     /// `record_verdicts`), which tells a lesson the model left out from one it judged unclear.
     pub returned: Vec<String>,
     pub cost: f64,
+    /// The characters of the prompt the call sent: a judge's prompt size, the effective length's
+    /// measure (judge_length.rs; hook.rs logs it on a check's cost line, `prompt=`).
+    pub prompt: usize,
 }
 
 /// The first `n` characters of `s`, marked when cut.
@@ -263,8 +266,10 @@ pub fn judge_section(pending: &[Pending]) -> String {
     out
 }
 
-/// The model reads the last this many characters of the work. Guard: bounds the work part of a call's
-/// prompt in a long session.
+/// A check's model call reads the last this many characters of the work. Guard: bounds the work part of
+/// a check's prompt in a long session. Unmeasured: a check's latency, which the stop's budget bounds, is
+/// its reason, not a measured loss past it. The session-end judge reads by its own budget instead
+/// (hook.rs `end_budget`).
 pub const TAIL: usize = 24_000;
 
 /// The instructions, with the grading sentence appended when graded.
@@ -303,7 +308,8 @@ then lessons delivered during the session, each with the work before and after i
 later work will come, so read the whole session's work for each lesson.";
 
 /// The session-end judge's prompt (hook.rs `judge_session`): `END`, the session's work (already within
-/// its budget, hook.rs `END_WORK_CHARS`), then the judge section of `pending` (`judge_section`).
+/// what its batch's budget leaves, hook.rs `within`), then the judge section of `pending`
+/// (`judge_section`). Its characters are the work's plus `judge_prompt("", pending)`'s.
 #[must_use]
 pub fn judge_prompt(work: &str, pending: &[Pending]) -> String {
     format!("{END}\n\n## The session's work\n{work}\n{}", judge_section(pending))
@@ -313,9 +319,11 @@ pub fn judge_prompt(work: &str, pending: &[Pending]) -> String {
 /// list alone as its schema, parsed as a check's verdicts are (`resolved`, `returned`); no applies.
 /// None on any failure or after `timeout`: the deliveries stay as they were.
 pub fn judge(work: &str, pending: &[Pending], model: &str, timeout: Duration) -> Option<Prediction> {
-    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), &judge_prompt(work, pending), &judge_schema(), timeout)?;
+    let p = judge_prompt(work, pending);
+    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), &p, &judge_schema(), timeout)?;
     v["resolved"].as_array()?;
-    Some(Prediction { applies: Vec::new(), grades: Vec::new(), resolved: resolved(&v, pending), returned: returned(&v), cost: cost.unwrap_or(0.0) })
+    let prompt = p.chars().count();
+    Some(Prediction { applies: Vec::new(), grades: Vec::new(), resolved: resolved(&v, pending), returned: returned(&v), cost: cost.unwrap_or(0.0), prompt })
 }
 
 /// Ids the model predicts apply, in its order, restricted to the shortlist, with their grades; its
@@ -350,7 +358,7 @@ fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, grad
     let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout)?;
     let cost = cost.unwrap_or(0.0);
     let (applies, grades) = applies(&v, shortlist)?.into_iter().unzip();
-    Some(Prediction { applies, grades, resolved: resolved(&v, pending), returned: returned(&v), cost })
+    Some(Prediction { applies, grades, resolved: resolved(&v, pending), returned: returned(&v), cost, prompt: p.chars().count() })
 }
 
 /// The ids the answer's `resolved` entries name (`Prediction::returned`), first seen first, each on one
@@ -412,7 +420,7 @@ fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
 
 /// How long the Stop step waits for the model before failing open (the drone just finishes):
 /// `BORG_PREDICT_TIMEOUT_S`, default 45 s, under Claude Code's 60 s hook limit. At the stop it is capped
-/// by the harness's budget (live.rs `call_limit`). Live mode's lock goes stale after twice this (live.rs).
+/// by the harness's budget (live.rs `call_limit`). The session lock goes stale after twice this (live.rs).
 pub fn timeout() -> Duration {
     let secs = std::env::var("BORG_PREDICT_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(45u64);
     Duration::from_secs(secs)

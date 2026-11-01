@@ -39,7 +39,7 @@ Reuse: `why::blamed` (why.rs), `reasoning::reasoning_for` and `notes_of` (notes/
 - Codex and omp: parse the `@@` hunks from the patch text.
 - opencode: the adapter needs to map `oldString` too (assets/adapters/opencode/borg.ts).
 
-**Budget:** opencode allows about 2 s for post_tool and omp about 5 s, and the hook is synchronous. Match against the cached index only. If the index is cold, queue the lookup in the background and deliver through `.queued` on the next call, the way live mode does. The hook fails open.
+**Budget:** opencode allows about 2 s for post_tool and omp about 5 s, and the hook is synchronous. Match against the cached index only. If the index is cold, queue the lookup in the background and deliver through `.queued` on the next call, as a stop's hand-over is. The hook fails open.
 
 **Matching:** an edited range or identifier counts when it falls inside the same function or hunk as a decision, not only on overlapping lines.
 

@@ -222,7 +222,7 @@ pub struct Outcome {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
     /// How the lessons were asked (`asked` and the judge's results): `stop` (a turn-end block), `live`
-    /// (a live check during the turn, live.rs), `early` (early delivery, conscience.rs `early`),
+    /// (a live check during the turn, before 0.7.6), `early` (early delivery, conscience.rs `early`),
     /// `queued` (a graded check's 2s and 1s, handed over free) or `placebo` (`PLACEBO`: never shown,
     /// judged blindly where a free delivery would be). Empty in records from before delivery modes.
     #[serde(default, skip_serializing_if = "String::is_empty")]

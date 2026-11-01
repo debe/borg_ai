@@ -4,11 +4,14 @@
 #
 #  1. `borg install codex --apply --home`, beside a hook of the engineer's own (a marker).
 #  2. `codex exec` through a scripted turn: the prompt, an apply_patch edit, a slow read, the final
-#     message. The edit starts borg's live check (a fake `claude` answers it: Mdrain at grade 3), and the
-#     read after it delivers the ask. Asserted: the ask reached the model (the mock's request log), the
-#     edit's path and text are in borg's state, the file changed, the engineer's hook ran.
-# 2b. A second turn in hook mode: borg blocks the first stop with its question (Mdrain), codex runs one
-#     more round, and the second stop (stop_hook_active) passes: exactly 2 model requests, one hook_prompt.
+#     message. No check runs during the turn (live mode is gone, 0.7.6). borg runs behind a wrapper
+#     that, at the first tool call, leaves Lflag in the session's queue as a stop's hand-over would; that
+#     tool call hands it over (PostToolUse additionalContext). The stop checks the work (a fake `claude`
+#     answers it: Mdrain at grade 3) and blocks. Asserted: the hand-over reached the model's next request
+#     as a developer message, the stop's question reached the model (the mock's request log), the edit's
+#     path and text are in borg's state, the file changed, the engineer's hook ran.
+# 2b. A second turn: borg blocks the first stop with its question (Mdrain), codex runs one more round,
+#     and the second stop (stop_hook_active) passes: exactly 2 model requests, one hook_prompt.
 #  3. borg's own model call through codex (`BORG_PREDICT_MODEL=codex:…`) runs no hook, although
 #     hooks.json holds borg's and the marker, and a shim forces the trust bypass on top: only
 #     `-c features.hooks=false` keeps them out.
@@ -47,8 +50,23 @@ REPOD=$W/harbor_orion
 mkdir -p "$W/home" "$W/bin" "$W/shim" "$W/prompts" "$W/store/collectives/corp" "$REPOD/src"
 git -C "$REPOD" init -q
 printf 'fn net() {\n    drain the budget\n}\n' > "$REPOD/src/net.rs"
-echo '{"id":"Mdrain","origin_ms":1,"scope":["Orion"],"question":"Does the Orion net drain the budget place with an explicit consumer instead of a reset arc?","consequence":"a reset arc drops the budget token"}' \
+printf '%s\n' '{"id":"Mdrain","origin_ms":1,"scope":["Orion"],"question":"Does the Orion net drain the budget place with an explicit consumer instead of a reset arc?","consequence":"a reset arc drops the budget token"}' \
+    '{"id":"Lflag","origin_ms":2,"question":"Does the changelog mention the new CLI flag?","consequence":"users miss the flag"}' \
     > "$W/store/collectives/corp/lessons.jsonl"
+STATE=$W/store/collectives/corp/state
+# borg behind a wrapper that, at the first tool call, leaves Lflag in the session's queue as a stop's
+# hand-over would (a real check needs the consequence model; crates/borg/tests/select_cli.rs runs one on
+# a fake). install writes it into hooks.json ($BORG_BIN).
+cat > "$W/borg-seed" <<EOF
+#!/bin/sh
+in=\$(cat)
+if [ "\$3" = post_tool ] && [ ! -e "$W/seeded" ]; then
+  sid=\$(printf '%s' "\$in" | sed -n 's/.*"session_id": *"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9-')
+  mkdir -p "$STATE" && echo "Lflag" > "$STATE/\$sid.queued" && touch "$W/seeded"
+fi
+printf '%s' "\$in" | exec "$BORG" "\$@"
+EOF
+chmod +x "$W/borg-seed"
 printf '{"default":"off","collectives":[{"name":"corp","paths":["%s"],"share":"local"}]}' "$REPOD" > "$W/collectives.json"
 # The fake consequence model (crates/borg/tests/common): Mdrain at grade 3.
 cat > "$W/bin/claude" <<EOF
@@ -75,7 +93,7 @@ mock turn "[
  [{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"sleep 3; cat src/net.rs\\\"}\"}],
  [{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I replaced the drain of the Orion budget place with a reset arc.\"}]}]
 ]"
-# Step 2b, in hook mode: the final message, the drone's answer to borg's block, then nothing more is due.
+# Step 2b: the final message, the drone's answer to borg's block, then nothing more is due.
 SAY() { printf '[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"%s"}]}]' "$1"; }
 mock stopturn "[$(SAY "I replaced the drain of the Orion budget place with a reset arc."), $(SAY "Mdrain: applies, I keep an explicit consumer."), $(SAY "extra"), $(SAY "extra")]"
 mock judge '[[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"moves\":[],\"applies\":[{\"id\":\"Mdrain\",\"why\":\"w\",\"grade\":3}]}"}]}]]'
@@ -114,16 +132,16 @@ cat > "$CODEX_HOME/hooks.json" <<EOF
 }}
 EOF
 
-# Everything borg's hooks inherit through codex: the store, the fake model, live mode at once.
+# Everything borg's hooks inherit through codex: the store, the fake model, a stop that always asks it.
 export PATH=$W/bin:$PATH HOME=$W/home GIT_CONFIG_NOSYSTEM=1 OPENAI_API_KEY=sk-dummy-not-real
-export BORG_BIN=$BORG BORG_HOME=$W/store BORG_CONFIG=$W/collectives.json BORG_PREDICT_MODEL=claude:sonnet
-export BORG_MODE=live BORG_LIVE_DEBOUNCE_S=0 BORG_QUEEN=off BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_VECTORS=off BORG_EARLY=off BORG_NOTIFY=off
+export BORG_BIN=$W/borg-seed BORG_HOME=$W/store BORG_CONFIG=$W/collectives.json BORG_PREDICT_MODEL=claude:sonnet
+export BORG_PREFILTER=off BORG_QUEEN=off BORG_LEARN=off BORG_UPDATE_CHECK=off BORG_VECTORS=off BORG_EARLY=off BORG_NOTIFY=off
 unset OPENAI_BASE_URL BORG_STATE BORG_HARNESS BORG_STOP_BUDGET_MS
 
 # ---------------------------------------------------------------- 1. install
 "$BORG" install codex --apply --home "$W/home" > "$W/install.out"
 grep -q "run /hooks to trust borg's hooks" "$W/install.out" || fail "install names the trust step: $(cat "$W/install.out")"
-python3 -I - "$CODEX_HOME/hooks.json" "$BORG" <<'EOF' || fail "hooks.json: $(cat "$CODEX_HOME/hooks.json")"
+python3 -I - "$CODEX_HOME/hooks.json" "$BORG_BIN" <<'EOF' || fail "hooks.json: $(cat "$CODEX_HOME/hooks.json")"
 import json, sys
 h = json.load(open(sys.argv[1]))["hooks"]
 # Pinned: crates/borg/src/harness/codex.rs `TIMEOUTS` (the stop's is harness/mod.rs `STOP_TIMEOUT_S`), as install writes them.
@@ -138,32 +156,43 @@ ok "install: borg's 5 hooks appended with their timeouts, the engineer's kept fi
 # ---------------------------------------------------------------- 2. a turn through codex
 (cd "$REPOD" && timeout 120 codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -s workspace-write --json \
     "Tidy the budget handling of the Orion net" < /dev/null > "$W/turn.jsonl" 2> "$W/turn.err") || fail "codex exec: $(tail -5 "$W/turn.err")"
-STATE=$W/store/collectives/corp/state
 EDITS=$(cat "$STATE"/*.edits 2>/dev/null || true)
 CTX=$(cat "$STATE"/*.ctx 2>/dev/null || true)
 grep -q "reset arc" "$REPOD/src/net.rs" || fail "the patch was applied: $(cat "$REPOD/src/net.rs")"
 [[ $EDITS == *"$REPOD/src/net.rs"* && $EDITS == *"use a reset arc on the budget place"* ]] || fail ".edits has the edit's path and text: $EDITS"
 ok "apply_patch: the edit's path and text are in borg's .edits"
-[[ $CTX == *"#borg-asked Mdrain"* && $CTX == *"#borg-live Mdrain"* ]] || fail "the live check asked Mdrain: $CTX"
-ok "live check: Mdrain asked during the turn ($(ls "$W/prompts" | wc -l) fake model call(s))"
-python3 -I - "$W/turn.requests" <<'EOF' || fail "borg's ask did not reach the model"
+! ls "$STATE"/*.live.n > /dev/null 2>&1 && [[ $CTX != *"#borg-live"* ]] || fail "no check during the turn: $CTX"
+[[ $CTX == *"#borg-asked Mdrain"* && $(ls "$W/prompts" | wc -l) -eq 1 ]] || fail "the stop asked Mdrain in its one model call: $CTX"
+ok "stop check: Mdrain asked at the turn end, 1 fake model call, none during the turn"
+[ -e "$W/seeded" ] && [[ $CTX == *"#borg-queued Lflag"* ]] || fail "the first tool call handed Lflag over: $CTX"
+python3 -I - "$W/turn.requests" <<'EOF' || fail "borg's hand-over did not reach the model"
 import json, os, sys
 d = sys.argv[1]
 reqs = [json.load(open(os.path.join(d, f)))["body"] for f in sorted(os.listdir(d))]
 dev = [c["text"] for r in reqs for it in r.get("input", []) if it.get("role") == "developer" for c in it.get("content", []) if "text" in c]
-hit = [t for t in dev if "borg check of your work so far" in t and "[Mdrain]" in t]
+hit = [t for t in dev if "[borg] Peer lessons" in t and "changelog mention the new CLI flag" in t]
 assert hit, dev
-print(f"     request log: {len(reqs)} model requests, borg's ask in a developer message ({len(hit[0])} chars)")
+print(f"     request log: borg's hand-over in a developer message ({len(hit[0])} chars)")
 EOF
-ok "delivery: borg's ask reached the model's next request"
+ok "tool context: the hand-over after the first tool call reached the model's next request"
+python3 -I - "$W/turn.requests" <<'EOF' || fail "borg's question did not reach the model"
+import json, os, sys
+d = sys.argv[1]
+reqs = [json.load(open(os.path.join(d, f)))["body"] for f in sorted(os.listdir(d))]
+texts = [c.get("text", "") for r in reqs for it in r.get("input", []) for c in (it.get("content") or []) if isinstance(c, dict)]
+hit = [t for t in texts if "hook_prompt" in t and "[Mdrain]" in t]
+assert hit, texts[-3:]
+print(f"     request log: {len(reqs)} model requests, borg's question in the stop's hook_prompt ({len(hit[0])} chars)")
+EOF
+ok "delivery: borg's question reached the model's next request"
 grep -q '^prompt$' "$W/markers" && grep -q '^stop$' "$W/markers" || fail "the engineer's hooks ran: $(cat "$W/markers" 2>/dev/null)"
 ok "the engineer's own hooks ran beside borg's"
 
 # ---------------------------------------------------------------- 2b. a blocking stop through codex
-# Hook mode: borg blocks the first stop with its question, codex starts one more round, and borg
-# answers nothing to the second stop (stop_hook_active), which codex itself never caps.
+# borg blocks the first stop with its question, codex starts one more round, and borg answers nothing to
+# the second stop (stop_hook_active), which codex itself never caps.
 : > "$W/markers"
-(cd "$REPOD" && BORG_MODE=hook BORG_PREFILTER=off timeout 120 codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -s workspace-write --json \
+(cd "$REPOD" && timeout 120 codex exec --dangerously-bypass-hook-trust --skip-git-repo-check -s workspace-write --json \
     -c "model_providers.mock={name=\"mock\",base_url=\"http://127.0.0.1:$STOPTURN/v1\",wire_api=\"responses\",request_max_retries=0,stream_max_retries=0}" \
     "Tidy the Orion budget place" < /dev/null > "$W/stopturn.jsonl" 2> "$W/stopturn.err") || fail "codex exec (stop): $(tail -5 "$W/stopturn.err")"
 python3 -I - "$W/stopturn.requests" <<'EOF' || fail "the stop's block did not round-trip through codex"
@@ -191,7 +220,7 @@ exec "$REAL_CODEX" exec -c model_provider=mock -c 'model_providers.mock={name="m
 EOF
 chmod +x "$W/shim/codex"
 before=$(ls "$STATE"/*.ctx | wc -l)
-hook() { printf '%s' "$2" | PATH=$W/shim:$PATH BORG_MODE=hook BORG_PREFILTER=off BORG_PREDICT_MODEL=codex:mock-plain "$BORG" hook codex "$1"; }
+hook() { printf '%s' "$2" | PATH=$W/shim:$PATH BORG_PREDICT_MODEL=codex:mock-plain "$BORG" hook codex "$1"; }
 S='"session_id":"smoke-runner","cwd":"'$REPOD'"'
 hook prompt "{$S,\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"Tidy the Orion net\"}" > /dev/null
 hook post_tool "{$S,\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Update File: src/net.rs\\n@@\\n+reset arc\\n*** End Patch\\n\"},\"tool_response\":\"ok\"}" > /dev/null

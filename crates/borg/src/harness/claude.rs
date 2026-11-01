@@ -328,8 +328,9 @@ pub fn last_assistant_full(transcript: &Path) -> String {
     String::new()
 }
 
-/// This turn's work so far, from a Claude transcript (live.rs): the drone's text and its tool calls (name
-/// and a short input: the path, or the command) since the engineer's last prompt, one per line, its last
+/// This turn's work so far, from a Claude transcript (harness `work_so_far`: a free delivery's
+/// evidence): the drone's text and its tool calls (name and a short input: the path, or the command)
+/// since the engineer's last prompt, one per line, its last
 /// `cap` characters. Mid-turn the last text block may be an earlier turn's (`last_assistant_full`), so
 /// this reads the turn itself. Empty without a transcript. Read from the end (`TAIL_CHUNK`) until the
 /// engineer's last prompt or `cap` characters of the turn, whichever comes first: a hook delivering

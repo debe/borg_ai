@@ -247,7 +247,7 @@ impl Lesson {
         a / (a + b)
     }
 
-    /// Times asked: in a turn-end block or by a live check (live mode).
+    /// Times asked: in a turn-end block, or by a live check (live mode, before 0.7.6).
     pub fn asked(&self) -> f64 {
         self.usage.get("block").copied().unwrap_or(0.0) + self.usage.get("live_ask").copied().unwrap_or(0.0)
     }
@@ -758,6 +758,36 @@ pub struct Selection {
     pub latency: Vec<Latency>,
     /// None under another policy while the summary counts none of the test's checks.
     pub test: Option<Test>,
+    /// Label health: the judge's effective length per model, the session-end judge's budget (borg
+    /// judge_length.rs).
+    pub judge: Vec<JudgeLength>,
+}
+
+/// One judge's effective length (borg judge_length.rs `Length`): the session-end budget, whether it is
+/// still the start, the line a step must hold, the answered share per prompt-size step, and the step a
+/// share of passes explores with that share.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct JudgeLength {
+    pub model: String,
+    pub chars: f64,
+    pub start: bool,
+    pub line: Option<f64>,
+    pub steps: Vec<JudgeStep>,
+    pub explore: Option<f64>,
+    pub psi: f64,
+}
+
+/// One prompt-size step: prompts up to `upto` characters, the lessons sent and answered (a verdict
+/// other than unclear), the share's 95% interval, and what it decided (`reference`, `below`, `holds`,
+/// `fails`, `open`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct JudgeStep {
+    pub upto: f64,
+    pub sent: f64,
+    pub answered: f64,
+    pub lo: f64,
+    pub hi: f64,
+    pub decision: String,
 }
 
 fn list<T>(v: &Value, one: impl Fn(&Value) -> T) -> Vec<T> {
@@ -824,6 +854,22 @@ pub fn parse_select(v: &Value) -> Selection {
             budget_ms: l["budget_ms"].as_f64(),
             over: f(&l["over"]),
         }),
+        judge: list(&x["judge"], |j| JudgeLength {
+            model: s(&j["model"]),
+            chars: f(&j["chars"]),
+            start: j["start"].as_bool().unwrap_or(false),
+            line: j["line"].as_f64(),
+            steps: list(&j["steps"], |t| JudgeStep {
+                upto: f(&t["upto"]),
+                sent: f(&t["sent"]),
+                answered: f(&t["answered"]),
+                lo: f(&t["lo"]),
+                hi: f(&t["hi"]),
+                decision: s(&t["decision"]),
+            }),
+            explore: j["explore"].as_f64(),
+            psi: f(&j["psi"]),
+        }),
         test: x["test"].as_object().map(|_| {
             let t = &x["test"];
             Test {
@@ -888,7 +934,7 @@ impl Source {
 pub struct Data {
     pub collective: RwSignal<String>,
     /// Name, share and delivery mode (`hook` or `live`) of each collective.
-    pub collectives: RwSignal<Vec<(String, String, String)>>,
+    pub collectives: RwSignal<Vec<(String, String)>>,
     pub live: RwSignal<bool>,
     /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source,
     /// `memory` (the absorbed lessons' evidence) is joined into `lessons`.
@@ -916,12 +962,6 @@ pub struct Data {
 impl Data {
     pub fn source(&self, path: &str) -> Source {
         *self.sources.iter().find(|s| s.path == path).expect("known view")
-    }
-
-    /// The delivery mode of the shown collective (`hook` when the server does not say).
-    pub fn mode(&self) -> String {
-        let c = self.collective.get();
-        self.collectives.with(|cs| cs.iter().find(|x| x.0 == c).map(|x| x.2.clone())).filter(|m| !m.is_empty()).unwrap_or_else(|| "hook".into())
     }
 
     pub fn lesson(&self, id: &str) -> Option<Lesson> {
@@ -975,7 +1015,7 @@ pub fn provide() -> Data {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .map(|c| (s(&c["name"]), s(&c["share"]), s(&c["mode"])))
+                    .map(|c| (s(&c["name"]), s(&c["share"])))
                     .filter(|(n, ..)| !n.is_empty())
                     .collect(),
             );

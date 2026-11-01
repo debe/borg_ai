@@ -35,7 +35,7 @@ pub const RETIRED: [(&str, &str); 0] = [];
 
 /// Guards (protocol once trusted): seconds Codex gives each hook, written explicitly (its own default is 600 s, and 1 s for
 /// SessionEnd, which it clamps to 3 s), so a hung borg holds Codex's turn no longer than this at each
-/// event. The stop's ([`STOP_TIMEOUT_S`]) is also its budget: the live wait, the stop's model call and
+/// event. The stop's ([`STOP_TIMEOUT_S`]) is also its budget: the stop's model call and
 /// the expert drone keep inside it. The trust Codex keeps covers the timeout too: changing one here
 /// makes every engineer trust borg's hooks again.
 pub const TIMEOUTS: [(&str, u64); 6] = [("prompt", 30), ("pre_tool", 10), ("post_tool", 30), ("stop", STOP_TIMEOUT_S), ("end", 3), ("halted", 3)];

@@ -3,6 +3,41 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.6 (unreleased)
+
+The session-end judge judges every open delivery, sized by how much its model reads well, not by
+two unmeasured limits. Live mode is gone.
+
+### Changed
+
+- At the session's end, `borg learn` judges every open delivery, not at most 40, and reads the
+  session's work by a budget instead of its newest 24,000 characters. The lessons go in batches by
+  delivery order, one model call per batch, four at a time; a session whose work fits is read whole.
+  [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+- A session too long for the budget is read per batch from both ends: right after the batch's
+  earliest delivery and the session's end (`BORG_END_WORK=ends`, picked by a backtest); `after` and
+  `newest` (0.7.5's) stay switchable. [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md)
+- A failed batch leaves only its own lessons unjudged.
+
+### Added
+
+- The budget is the judge's measured effective length per model, 72,000 characters until its cost
+  lines show more or less is read well; a logged share of passes tries the size above.
+  `borg status`, `borg top --json` and borg web's label health show it.
+  [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+- Every judge cost line names its model; a check's line also gives its prompt's size.
+  [Statistics](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
+
+### Removed
+
+- Live mode, the check during the turn (`borg check`): 8× the cost, and no measured gain. Every check
+  runs at the turn end. [Live mode](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#live-mode-removed-in-076)
+
+### Upgrading
+
+- Nothing to do: `"mode"` and `BORG_MODE` are ignored, and `borg doctor` notes one still set. History
+  from live mode stays readable.
+
 ## 0.7.5 (2026-11-01)
 
 The judge says what happened to a lesson instead of "unclear", and judges a hand-over after the work,

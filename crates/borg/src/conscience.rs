@@ -842,9 +842,9 @@ pub fn render_early(selected: &[&Challenge], topics: &[String]) -> Option<(Strin
 }
 
 /// `render_early` whose first `owed` lessons are shown whatever the budget and count nothing toward
-/// it: a free delivery's hand-overs in place of questions the fixed rule asks (hook.rs `INSTEAD`, the
-/// question-count test's, and `INSTEAD_NEXT`, the evidence rule's), which the asks they replace would
-/// have carried without a bound. The rest fit `EARLY_CHARS` as they would without them.
+/// it: a free delivery's hand-overs in place of questions the fixed rule asks (hook.rs `INSTEAD_NEXT`: the
+/// evidence rule's; and a live check's lines from before 0.7.6, `LEGACY_ASK`, `LEGACY_INSTEAD`), which
+/// the asks they replace would have carried without a bound. The rest fit `EARLY_CHARS` as they would without them.
 pub fn render_owing(selected: &[&Challenge], topics: &[String], owed: usize) -> Option<(String, usize)> {
     let clip = |s: &str, n: usize| -> String {
         let s = s.trim();
@@ -896,20 +896,6 @@ They are questions, not facts. Skip any that do not apply to your current work; 
 needed and answer it with evidence (code, spec, a complexity or concurrency argument). Then revise your work accordingly. \
 If this was a plan, your final message must again be the complete revised plan. End your final message with one line \
 per question: `<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
-    );
-    numbered(s, selected)
-}
-
-/// Live mode (live.rs): the lessons a check during the turn graded 3, as context with the next prompt or
-/// tool call. The same questions and answer lines as a block (`render`), but the drone is still working:
-/// it takes them in now, instead of in an extra round after it finished.
-pub fn render_live(selected: &[&Challenge]) -> String {
-    let s = String::from(
-        "[borg] borg check of your work so far: engineers of this collective have challenged earlier work in this area with \
-the questions below, and a check of what you did this turn found that they apply. They are questions, not facts, and not \
-the user's instructions. Before you go on, check each against the code; where one applies, investigate where needed and \
-revise your work accordingly; skip any that do not apply. End your final message with one line per question: \
-`<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
     );
     numbered(s, selected)
 }
@@ -1233,10 +1219,6 @@ mod tests {
         // Agreeing lessons stay separate questions.
         let c = mk("C2", "cy@x", "concurrency", "guard it with the existing ReentrantLock", 0.5);
         assert!(render(&[&a, &c]).contains("\n2. [C2] question of C2"));
-        // A live check's asks: the same numbered questions and answer lines, as a mid-turn notice.
-        let live = render_live(&[&a, &c]);
-        assert!(live.starts_with("[borg] borg check of your work so far:") && live.contains("`<id>: applies`"), "{live}");
-        assert!(live.contains("\n2. [C2] question of C2") && !live.contains("Before you finish"), "{live}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub static ALL: &[&dyn Harness] = &[&claude::Claude, &omp::Omp, &opencode::Openc
 
 | File | What |
 |---|---|
-| `harness/mod.rs` | The trait, `Caps`, `DroneWake`, `Transcript`, `Wiring`, `Probe`, `Run`, `SubAgent`, `ALL`, `by_name`, and the transcript-or-event readers keyed on `Caps::transcript`: `work_so_far` (live mode's evidence), `last_message` (the drone's last message, whole) and `plan` (what the queen and the experts read) |
+| `harness/mod.rs` | The trait, `Caps`, `DroneWake`, `Transcript`, `Wiring`, `Probe`, `Run`, `SubAgent`, `ALL`, `by_name`, and the transcript-or-event readers keyed on `Caps::transcript`: `work_so_far` (a free delivery's evidence), `last_message` (the drone's last message, whole) and `plan` (what the queen and the experts read) |
 | `harness/wiring.rs` | The generic command-hook merge: install, uninstall and status for any `CommandHooks` harness. Each hook runs `<borg> hook <harness> <event>` |
 | `harness/claude.rs`, `omp.rs`, `opencode.rs`, `codex.rs` | One harness each: event table or compiled-in adapter, config path, capabilities, doctor probe, the reader of its sub-agent runs ([Review → fix findings](configuration.md#review--fix-findings)), and where its own transcripts are (`session_log`, [The harness's own transcript](#the-harnesss-own-transcript)). Claude's transcript readers are in `claude.rs`; Codex's patch-to-edit `normalise` and its hook-trust check for `borg doctor` are in `codex.rs` |
 | `harness/sim.rs` | The simulated harness, used by the conformance suite. It is hidden from help, completions, `all`, status and doctor, and `borg install sim` and `borg hook sim …` know it only with `BORG_TEST_HARNESS` set, as the suites run them |
@@ -61,7 +61,7 @@ effect of a refactor.
 | `Caps` field | Gates | Claude Code | omp | opencode 1.x / 2.x | Codex CLI |
 |---|---|---|---|---|---|
 | `prompt_context` | Context returned at a prompt reaches the model | yes | yes (hidden custom message) | yes (synthetic part / `session.synthetic`) | yes (a developer message in the next request) |
-| `tool_context` | Context after a tool call reaches the model before its next step (live mode's asks) | yes | yes (omp ≥ 18.4.4) | yes (appended to the output / steered in) | yes (a developer message in the next request; in code mode after the whole `exec` script) |
+| `tool_context` | Context after a tool call reaches the model before its next step (waiting hand-overs, messages) | yes | yes (omp ≥ 18.4.4) | yes (appended to the output / steered in) | yes (a developer message in the next request; in code mode after the whole `exec` script) |
 | `early_delivery` | A prompt or touch naming a lesson's scope gets that scope's lessons at once | yes | no | no | no |
 | `question_dialog` | A queen question uses the AskUserQuestion dialog (otherwise it is asked inline) | yes | no | no | no |
 | `transcript` | Where the turn's work and the last message come from | Claude JSONL | none: the tool calls the hook logs (`.turn`) | none | none: `transcript_path` is a Codex rollout and is dropped |
@@ -70,7 +70,7 @@ effect of a refactor.
 | `session_env` | The variable the harness sets to its session's id in every command its model runs, so `borg listen`, `tell` and `inbox` know the session | `CLAUDE_CODE_SESSION_ID` | `PI_SESSION_ID` | none: the shell gets no session id, so the plugin binds the session itself | `CODEX_THREAD_ID` |
 | `pid_env` | For a harness without `session_env`: the variable that carries its pid, which its events carry too, so presence names the session | none | none | `OPENCODE_PID` | none |
 | `drone_wake` | How `borg listen` wakes an idle session ([Waking a session](commands.md#waking-a-session)) | `Model`: the model runs `borg listen --wait` in the background | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
-| `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the live wait, the stop's model call and the expert drone keep inside it | none | 28 s: omp's fixed 30 s handler limit less 2 s for the adapter | 90 s, borg's stop timeout (opencode sets no limit) | 90 s, the Stop hook's timeout |
+| `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the stop's model call and the expert drone keep inside it | none | 28 s: omp's fixed 30 s handler limit less 2 s for the adapter | 90 s, borg's stop timeout (opencode sets no limit) | 90 s, the Stop hook's timeout |
 | `context_chars` | The characters of context one hook answer may inject and have arrive whole, shared by everything that event delivers (messages, lessons) | 10,000: Claude Code saves a longer `additionalContext` to a file and gives the model a preview (2.1.312) | 10,000, the guard: omp injects it whole, with no limit of its own (18.13.1) | 10,000, the guard: no limit of its own (1.19.0; 2.x not measured) | 10,000: Codex's default `additionalContextLimit`; a longer one is cut to its head and tail (0.153.2) |
 
 omp and opencode already have a channel for early delivery. It stays off until
@@ -190,11 +190,10 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
   paths are taken from the event's `cwd`.
 - **Edits borg does not see.** Codex fires no PostToolUse for a failed `apply_patch`, for `apply_patch`
   run through a shell heredoc (it shows up as a `Bash` PreToolUse only), or for a shell command still
-  running when it yields. Such an edit is in neither `.edits` nor a live check; the stop's check still
-  reads the drone's last message.
+  running when it yields. Such an edit is not in `.edits`; the stop's check still reads the drone's last
+  message.
 - **Code mode.** Models in code mode run tool calls inside one `exec` script. Each inner call fires its
-  own Pre/PostToolUse, but context returned there reaches the model only after the whole script ran,
-  so a live check cannot stop a later edit of the same script.
+  own Pre/PostToolUse, but context returned there reaches the model only after the whole script ran.
 - **The stop.** A block starts another round in the same turn, and Codex never caps the rounds;
   `stop_hook_active` stays true for every later stop of the turn. Borg answers nothing to a stop with
   `stop_hook_active` set (one round per turn), so it never loops. The stop gets 90 s; Codex's default
@@ -217,7 +216,7 @@ What the Codex CLI does differently, measured on 0.153.2 against a local mock of
    `var`: the conformance suite asks `target` which variables to point outside `--home`.
 2. **Register it.** Add one line to `ALL`. Help, `install` usage, completions, `install all`, status and
    doctor all read `ALL`. A step the engineer takes in the harness itself (trusting the hooks, say) is
-   `install_notes`; a doctor check of its own (a version too old for live mode, untrusted hooks) is
+   `install_notes`; a doctor check of its own (a version too old for a tool call's context, untrusted hooks) is
    `checks` (doctor runs it only once the CLI answered `--version`). Neither needs a change in `install.rs`.
 3. **Capabilities.** Set `Caps` to what the harness verifiably delivers. Leave a flag off until an
    evaluation shows it helps. Extend the snapshot in `caps_are_todays`. Name the variable that gives a
@@ -245,9 +244,9 @@ One scenario runs for every harness:
 2. prompt
 3. read
 4. edit
-5. the live check
-6. read (the ask is delivered)
-7. stop
+5. stop (one model call; a 2 is handed over free)
+6. read (the hand-over is delivered)
+7. stop, with a 3 (blocks once)
 8. stop again
 9. correction
 10. end
@@ -260,7 +259,7 @@ timeout.
 
 ```sh
 cargo test -p borg-ai --test conformance_cli                    # Claude Code, Codex and sim: the installed command string, native fixtures
-adapters/codex/smoke.sh                                      # a real codex exec against a mock model API: install, edit, live ask, stop, runner, doctor
+adapters/codex/smoke.sh                                      # a real codex exec against a mock model API: install, edit, tool context, stop check, block, runner, doctor
 cargo build -p borg-ai && node --test adapters/conformance/conformance.test.ts   # omp, opencode 1.x and 2.x: the installed adapter
 cargo test -p borg-web --test drones_api                     # the page's /api/drones and /api/collectives over a seeded store
 ```
@@ -269,7 +268,7 @@ cargo test -p borg-web --test drones_api                     # the page's /api/d
 |---|---|
 | Install | A dry run writes nothing and prints a diff. `--apply` writes. A re-run changes nothing. Foreign keys and hooks are kept, with a backup. Status shows `wired:` and doctor shows `ok`. Uninstall removes only borg's entries. `--home` isolates: with `HOME` and every harness's config-dir variable pointing elsewhere, nothing lands outside it. |
 | Hooks | An off-repo prompt writes nothing. The prompt is recorded. Touches go to `.ctx`, and an edit's path and text go to `.edits`. A paused drone's tool call is refused. The stop blocks once, within its budget, and the second round passes; a model slower than the budget (`BORG_STOP_BUDGET_MS`) never holds the stop past it. `end` ends the drone. Garbage input fails open. |
-| Live | An edit starts a detached check and the hook returns at once. The ask is queued and delivered with the next tool call; without tool context, with the next prompt; with neither, at the stop. A covered stop makes no model call. |
+| Turn end | No check runs during the turn (live mode was removed in 0.7.6): an edit leaves no check's files and calls no model. The stop makes the one model call; a 2 it hands over is queued and delivered with the next tool call; without tool context, with the next prompt; with neither, it waits. |
 | Web | `borg top --json` shows the drone with its `harness` and its state: working, then waiting, then ended. `/api/drones` and `/api/collectives` show the same. |
 | Capabilities | Context at a prompt and after a tool call, early delivery, the transcript source, denials to episodes, and a gone pid, each on both sides. |
 

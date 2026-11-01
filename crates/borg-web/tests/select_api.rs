@@ -43,7 +43,7 @@ async fn the_selection_is_the_monitors_own_reading_of_the_summary() {
     ];
     std::fs::write(corp.join("outcomes.jsonl"), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     let (_tx, stop) = tokio::sync::watch::channel(false);
-    let mind = |name: &str, home: &std::path::Path| Mind { name: name.into(), home: home.to_path_buf(), share: Share::Local, mode: "hook" };
+    let mind = |name: &str, home: &std::path::Path| Mind { name: name.into(), home: home.to_path_buf(), share: Share::Local };
     let app = Arc::new(App { minds: vec![mind("corp", &corp), mind("mine", &mine)], first: "mine".into(), cwd: String::new(), stop });
 
     let (status, v) = get(app.clone(), "/api/select?c=corp").await;

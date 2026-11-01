@@ -59,7 +59,7 @@ usual:
 | Harness | After setup | Notes |
 |---|---|---|
 | Claude Code | `claude` | Every feature. Hooks in `~/.claude/settings.json` |
-| omp 18.8.5, 18.10.4 | `omp` | Live mode needs omp 18.4.4 or newer. [adapters/omp](https://github.com/debe/borg_ai/blob/main/adapters/omp/README.md) |
+| omp 18.8.5, 18.10.4 | `omp` | A tool call's context needs omp 18.4.4 or newer. [adapters/omp](https://github.com/debe/borg_ai/blob/main/adapters/omp/README.md) |
 | opencode 1.18.32, 1.19.0, 2.0.23, 2.0.29 | `opencode` | [adapters/opencode](https://github.com/debe/borg_ai/blob/main/adapters/opencode/README.md) |
 | Codex CLI 0.153.2 | `codex`, then `/hooks` once to trust borg's hooks | Hooks in `~/.codex/hooks.json`; `borg doctor` says when codex skips them. Borg's own model calls need `claude`, `omp` or `opencode` on `PATH`, or `BORG_PREDICT_MODEL=codex:<model>` and `BORG_LEARN_MODEL=codex:<model>`. [adapters/codex](https://github.com/debe/borg_ai/blob/main/adapters/codex/README.md) |
 
@@ -84,7 +84,7 @@ one every repo joins a team collective named `default`), then `borg install all`
 `borg install all --apply`, `borg vectors --fetch`, and optionally `borg assimilate --apply --limit 50`.
 Intel Macs, the macOS C++ header workaround and source builds: [Install](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#install).
 
-Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/docs/learning.md) · [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md) ·
+Reference: [How one session learns](https://github.com/debe/borg_ai/blob/main/docs/learning.md) · [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md) ·
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md) · [Configuration](https://github.com/debe/borg_ai/blob/main/docs/configuration.md) · [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md) ·
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md) · [Harnesses](https://github.com/debe/borg_ai/blob/main/docs/harnesses.md) · [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md) ·
 [Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md) · [Roadmap](https://github.com/debe/borg_ai/blob/main/docs/roadmap.md) · [Reports](https://github.com/debe/borg_ai/tree/main/reports)
@@ -97,7 +97,6 @@ Everything in this section works in one plain interactive session, with no team.
 flowchart LR
   S["corrections, answers, borg no,<br/>review → fix findings,<br/>team documents"] -->|"borg learn at session end"| L[("lessons")]
   L -->|"at the prompt: free"| D["drone"]
-  L -->|"during the turn: live check"| D
   L -->|"at the stop: graded call"| D
   D --> O["outcomes: changed, ignored,<br/>corrected, vetoed, tested, regretted"]
   O --> B["usefulness belief"]
@@ -111,13 +110,14 @@ transcript beside its hooks, so a harness update cannot silence them. At session
 makes one model call per episode and writes or updates a lesson. Team documents become lessons through `borg assimilate --from-dir`.
 [Sources of lessons](https://github.com/debe/borg_ai/blob/main/docs/learning.md#sources-of-lessons)
 
-**Delivery.** Lessons arrive at three moments. *At the prompt or a touched file*, free, by word matching
-(Claude Code; ratified constraints on every harness). *During the turn*, in live mode (the default): after
-an edit a background check grades the work so far and its questions arrive with the next tool call. *At
-the stop*, a free word gate skips most turns; otherwise one model call grades the eligible lessons, and a
+**Delivery.** Lessons arrive at two moments. *At the prompt or a touched file*, free, by word matching
+(Claude Code; ratified constraints on every harness), and graded lessons a stop handed over arrive the
+same way. *At the stop*, a free word gate skips most turns; otherwise one model call grades the eligible lessons, and a
 grade 3 blocks the stop for one more round. The same call judges whether what was handed over earlier
 changed the work; free hand-overs are judged at the turn end, and what is still open once more at the
-session's end, in one call that sees the whole session. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+session's end: every open delivery, in batches, each call reading as much of the session as the judge
+reads well. Live mode, which also checked during the turn, was removed in 0.7.6: it cost 8× more and
+added nothing measurable. [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
 
 **Which lessons are asked.** Per check, a selection policy decides for each graded lesson whether to
 ask it, hand it over free or leave it for later. The reference is 0.5.0's fixed rule, by grade (it no
@@ -126,9 +126,9 @@ measures what a learned policy needs and the fixed rule's history cannot show: a
 blindly up to two lessons the check does not deliver, a tail sample grades up to two lessons past the
 pool's budget, and the records say which lessons the session already had. The learned policy, the
 default, routes by the mistakes it expects each route to avoid, learned from the logged outcomes, and
-deviates from the fixed rule only where the outcomes show it gains. On live checks it learns how many
-lessons to ask by a randomised test that moves lessons between asked and handed over, never withholding
-one. A conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
+deviates from the fixed rule only where the outcomes show it gains. Until 0.7.6 it also learned how
+many lessons to ask by a randomised test on live checks, which moved lessons between asked and handed
+over, never withholding one. A conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
 by default), keeps it on the fixed rule until the outcomes support a deviation, and a monitor puts the
 fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
 
@@ -292,24 +292,25 @@ effects with their intervals, label health, the fitted delivery rates, pool yiel
 harness against its stop budget, and the learned decisions a guard gave the fixed rule; under the
 learned policy also its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test (checks drawn,
 refused by the gate, the draws, the risk share in force, the readout once due) and the monitor's reading
-with the health of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (modes, stores, lesson selection, what is wired,
+with the health of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (stores, lesson selection, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
 ## Cost
 
-- **Most turn ends cost 0 tokens** in hook mode: the free gate skipped 78% of 1,117 real turn ends. Early delivery
+- **Most turn ends cost 0 tokens**: the free gate skipped 78% of 1,117 real turn ends. Early delivery
   and grade-2 and grade-1 lessons never call a model during the session; they are judged inside a call a
   question pays for, or in one judge call at the session's end, made only when something is still open.
 - **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s. An extra round
   happens only for a grade-3 lesson.
-- **Live mode** adds one call per burst of changes: about 8× borg's own spend in hook mode, while whole
-  runs cost about the same ([Why live is the default](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#why-live-is-the-default)).
+- **No call during the turn.** Live mode, which added one per burst of changes (8× borg's own spend,
+  about $690 over 5,862 calls), was removed in 0.7.6
+  ([why](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#live-mode-removed-in-076)).
 - **Learning** costs about $0.02 per correction (21 lessons from 10 sessions: $0.66). `assimilate --from-dir` makes one call per chunk and
   prints its cost. Messages, `borg no`, review → fix, regrets and green tests are found at 0 tokens; a
   veto's reason or a fixed finding is then learned like any correction.
 - There is no cost cap. Quality is what selection optimises; `borg status`, `borg top` and the Cost and
-  Conscience tabs show what each mode and each check spent. An engineer who wants spend priced sets an
+  Conscience tabs show what each check spent. An engineer who wants spend priced sets an
   optional `budget` for a collective, which prices the learned policy's pools ([Collectives](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#collectives)); none is set by default.
 - **The tail sample** adds at most two lessons to a turn-end call whose pool (12,000 tokens) left
   lessons out, so the yield past the budget is measured.
@@ -337,9 +338,8 @@ excerpts and presence. Lessons skip it: the model writes them as general questio
 `lessons.jsonl` before you share a collective that handled secrets.
 
 **Hooks fail open.** A missing binary, a crash, an invalid config, an unreachable model or a locked index
-lets the agent continue untouched. A turn-end call that fails ends the turn without questions, a live
-check that fails asks nothing (the turn end then checks as in hook mode), and unlearned episodes wait for
-the next run. [Time limits](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#delivery-modes)
+lets the agent continue untouched. A turn-end call that fails ends the turn without questions, and
+unlearned episodes wait for the next run. [Time limits](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#context-and-time-limits)
 
 ## Evidence and limits
 
@@ -353,7 +353,8 @@ sessions, so the data is not here):
   memory model;
 - the system gate cut wrong-system deliveries from 83 to 0;
 - live mode: not worse than hook (+0.38 criteria per task [0, +0.88], 8 pairs, p = 0.50, directional
-  only: 2 pairs differ; 0 redo rounds).
+  only: 2 pairs differ; 0 redo rounds), but the knowledge criteria tied in all 8 pairs, at 8× borg's
+  own cost: removed in 0.7.6.
 
 **On although its rule was not met:** review → fix lessons, +6.3 points of later bugs avoided
 [−5.1, +17.9]; the pre-registered rule (an interval excluding 0) failed, and the engineer turned it on so
@@ -374,14 +375,15 @@ question count by a randomised test, under checks written before the rebuild (Ru
 passed P0–P3 (P2 by the pruned model), P4a (with no outcomes it is the fixed rule on every evaluation
 check) and P4c (the test keeps the fixed rule's recall, 76.2%); P4b was NOT TESTED, since under the
 store's posterior it deviated on none of the evaluation's checks, and the P4 cases had been seen a third
-time. So the learned policy is the default; today it differs from the fixed rule by the question-count
-test on live checks, and `BORG_SELECT=fixed` keeps the fixed rule ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
+time. So the learned policy is the default; until 0.7.6 it differed from the fixed rule by the
+question-count test on live checks, which runs no more without them, and `BORG_SELECT=fixed` keeps the
+fixed rule ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
 
 **Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit
 improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests. omp,
-opencode and Codex get no early delivery of ordinary lessons, and there a live check sees tool calls,
-not prose.
+opencode and Codex get no early delivery of ordinary lessons, and there a hand-over's evidence is the
+tool calls, not prose.
 Full table, the regret check and every known limit: [Evidence and limits](https://github.com/debe/borg_ai/blob/main/docs/evidence.md).
 
 ## Upgrade and uninstall

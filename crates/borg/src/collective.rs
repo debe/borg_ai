@@ -22,8 +22,8 @@
 //! between collectives in either direction. `share: "local"` means the collective must never be
 //! synced to any peer: `may_sync` is the one gate a mesh has to ask.
 //!
-//! A collective may also set `"mode": "live"` (live.rs): its conscience then also judges the work during
-//! the turn, not only at its end. `BORG_MODE` overrides it; absent or unknown is `"hook"`.
+//! A `"mode"` key (live mode, removed in 0.7.6) is still read and ignored: the conscience judges the work
+//! at the turn end only, and `borg doctor` says so once.
 //!
 //! A collective may also list `experts` (expert repos its drones consult at the Stop checkpoint,
 //! see expert_route.rs); only the routed collective's experts are ever read, and never one whose
@@ -80,9 +80,8 @@ pub struct Entry {
     /// only (LAN or VPN), or the URL of a self-hosted `iroh-relay`. `BORG_RELAY` overrides it.
     #[serde(default)]
     pub relay: Option<String>,
-    /// When the conscience judges the work (live.rs): `"hook"` at the turn end, or `"live"` (the
-    /// default) also during the turn. `BORG_MODE` overrides it; any other value is the default, with a warning
-    /// in `borg doctor`. A string, not an enum: an unknown value must not invalidate the whole config.
+    /// Live mode's switch, removed in 0.7.6: read and ignored (an older config keeps loading), so `borg
+    /// doctor` can say once that live mode is gone (`mode_gone`).
     #[serde(default)]
     pub mode: Option<String>,
     /// The engineer's optional budget for lesson selection (select.rs `budget_of`): the pool tokens this
@@ -481,9 +480,36 @@ pub fn may_sync(r: &Route) -> bool {
     matches!(r, Route::Collective { share: Share::Team, .. })
 }
 
+/// What still sets live mode's switch, removed in 0.7.6 (docs/delivery.md): `BORG_MODE` (`env`) and the
+/// collectives whose config has a `"mode"`, for `borg doctor`'s one note; None when nothing does. Both
+/// are ignored: every check runs at the turn end.
+pub fn mode_gone(cfg: Option<&Config>, env: Option<&str>) -> Option<String> {
+    let mut set: Vec<String> = env.filter(|v| !v.trim().is_empty()).map(|_| "BORG_MODE".to_string()).into_iter().collect();
+    let named: Vec<&str> = cfg.into_iter().flat_map(|c| &c.collectives).filter(|e| e.mode.is_some()).map(|e| e.name.as_str()).collect();
+    if !named.is_empty() {
+        set.push(format!("\"mode\" in collectives.json ({})", named.join(", ")));
+    }
+    (!set.is_empty()).then(|| set.join(" and "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live mode is gone (0.7.6): its switch still parses, and doctor names what still sets it, once.
+    #[test]
+    fn a_mode_left_set_is_named_once_and_ignored() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "default": "a",
+            "collectives": [{"name": "a", "paths": ["/w/a"], "mode": "live"}, {"name": "b", "paths": ["/w/b"]}, {"name": "c", "paths": ["/w/c"], "mode": "hook"}]
+        }))
+        .expect("an old config with mode still loads");
+        assert_eq!(mode_gone(Some(&cfg), None).as_deref(), Some("\"mode\" in collectives.json (a, c)"));
+        assert_eq!(mode_gone(Some(&cfg), Some("live")).as_deref(), Some("BORG_MODE and \"mode\" in collectives.json (a, c)"));
+        assert_eq!(mode_gone(None, Some("hook")).as_deref(), Some("BORG_MODE"));
+        assert_eq!(mode_gone(None, Some(" ")), None, "an empty BORG_MODE is unset");
+        assert_eq!(mode_gone(None, None), None);
+    }
 
     fn cfg(json: &str) -> Config {
         serde_json::from_str(json).unwrap()

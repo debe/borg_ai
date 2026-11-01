@@ -127,7 +127,6 @@ impl Fx {
             .env("BORG_LEARN_MODEL", "claude:fake")
             .env("BORG_QUEEN", "off")
             .env("BORG_VECTORS", "off")
-            .env("BORG_MODE", "hook")
             .envs(env.iter().copied());
         c
     }

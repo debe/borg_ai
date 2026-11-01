@@ -3,8 +3,8 @@
 [← README](../README.md)
 
 Everything on this page works in one plain interactive session, with no team. A team adds other
-people's lessons ([Team sync](team-sync.md)) and changes nothing else a session does, on every harness and
-in both [delivery modes](delivery.md) (`crates/borg/tests/plain_cli.rs`).
+people's lessons ([Team sync](team-sync.md)) and changes nothing else a session does, on every harness
+([Delivery](delivery.md), `crates/borg/tests/plain_cli.rs`).
 
 A **drone** is one agent session. A **lesson** is what a correction becomes: a question the agent should
 ask itself, the situations where it applies, and the consequence it prevents. A **collective** is one
@@ -94,12 +94,13 @@ still followed; those records keep that meaning. A placebo's verdict (a lesson j
 shown) is measurement only, whatever it says. No belief, trust, statistic or team line reads an
 unclear verdict, a remaining consequence, a point that never came up or a placebo's result.
 
-At session end `borg learn --session` first judges, in one model call with the whole session's work,
-every delivery no verdict settled yet ([Delivery](delivery.md)); a session whose end hook never ran
-gets the same call when a later `borg learn` settles it as idle. Then every delivered lesson that no
-correction followed settles as `asked_not_corrected`, with the reason when it had no verdict (no model
-call came after it, the judge's tries or slots ran out, the session-end judge's included, its call
-failed). That mark is censored: it counts as unknown, never as ignored, and a verdict counts on its own.
+At session end `borg learn --session` first judges every delivery no verdict settled yet, in batches
+of one model call each with the session's work in view (read whole when it fits the judge's budget)
+([Delivery](delivery.md)); a session whose end hook never ran gets the same pass when a later `borg
+learn` settles it as idle. Then every delivered lesson that no correction followed settles as
+`asked_not_corrected`, with the reason when it had no verdict (no model call came after it, the
+judge's tries ran out, the session-end judge's included, a check's slots ran out, or the session-end
+judge's call failed). A session whose lock another pass still holds is not settled until it lets go. That mark is censored: it counts as unknown, never as ignored, and a verdict counts on its own.
 
 | Outcome | Weight in the belief | Set by |
 |---|---|---|
@@ -212,7 +213,7 @@ members' clock skew) ahead of this machine's clock. A command is stamped after t
 that it sees, so a release always takes effect over the absorb it releases.
 
 **What an absorb does.** Borg stops delivering the lesson on every harness and every path that hands
-lessons to a drone: early delivery, standing lessons, live checks and their queue, the stop's check,
+lessons to a drone: early delivery, standing lessons, the queue of hand-overs, the stop's check,
 the vector shortlist, `borg why`, and `borg debug recall`, `prefilter` and `vectors --query`. A lesson
 the absorbed one replaced does not come back in its place. An absorbed lesson that a live lesson
 supersedes stays hidden behind it, so the live lesson ranks as it did before. In a team collective the line syncs to the members

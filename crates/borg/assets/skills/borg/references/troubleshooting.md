@@ -26,8 +26,7 @@ an invalid config or a missing binary explains most of what follows it.
 | `WARN collectives: a name appears twice` | Two entries share one store | Rename one |
 | `WARN store x: ... is a removed feature's data (the hive), unused now` / `WARN worktree ... was made by a removed feature (the hive)` | Left over from borg 0.3 or earlier; nothing reads it | The `rm -r` or `git worktree remove` command the line names, once the engineer agrees |
 | `WARN mesh x: peer ... speaks ..., this node ...: nothing syncs with it` | That member runs a borg whose mesh protocol differs | Upgrade the side the line names |
-| `WARN collective x: ... mode "..." is neither "hook" nor "live"` | A typo in `mode` or `BORG_MODE` | Use `"live"` or `"hook"` |
-| `WARN collective x: live mode is off while BORG_MATCH=bm25 is set` (or `BORG_ONLY`, `BORG_CRITIC`) | Live checks need the model | Unset that variable, or accept turn-end checks only |
+| `ok   delivery mode: live mode is gone since 0.7.6; ... is ignored` | `"mode"` in collectives.json or `BORG_MODE` is still set | Nothing breaks; drop the key or the variable |
 | `WARN evidence: N waiting episode(s) of <repo> are in x, but <repo> routes to y now: ...` | The repo changed collectives; `borg learn` holds its corrections in x, unlearned | Show the engineer; on their yes run the `borg move <repo-path> --from x --to y` the line names, dry run first, then `--apply` |
 | `WARN evidence: ... routes off now; they wait unlearned ...` | The repo routes to no collective now | Nothing to run: they wait until the engineer routes the repo to a collective, then doctor names the move |
 | `WARN misplaced? lesson <id> in x names <repo>, which routes to y: ...` | A lesson may belong to another collective. Only a suggestion | Ask the engineer; move it only on their yes, with the `borg move` the line names (dry run, then `--apply`) |
@@ -44,7 +43,7 @@ an invalid config or a missing binary explains most of what follows it.
 
 ## Model runner
 
-borg's own model calls (learning, the turn-end and live checks) run headless through a harness CLI:
+borg's own model calls (learning, the turn-end checks) run headless through a harness CLI:
 the drone's own first, then `claude`, `omp`, `opencode`. Pin one with a prefix:
 `BORG_PREDICT_MODEL=claude:sonnet`, `omp:<model>`, `opencode:<provider/model>`, `codex:<model>`;
 `BORG_LEARN_MODEL` likewise for `borg learn`, `assimilate` and `reach`. `off` disables the call. Unpinned,
@@ -66,7 +65,7 @@ shell profile, after showing the engineer the change.
 | `borg tell` says the recipient's node "has acknowledged no message yet" | | A session on another machine gets one message per 10 minutes from each sender until that machine acknowledges one (a machine on borg 0.5 never does): send again when it says, put everything into one message, or upgrade that machine |
 | An idle session is not woken by a message | Run `borg listen` inside that session | Claude Code starts a background waiter at its next stop; omp and opencode need the current adapter (`borg install <harness> --apply`, then restart); Codex is woken through `codex queue` |
 | A pause or veto from another member does nothing | That member's role: `borg mesh members` | Only an `admin` or `steer` role steers other members' sessions; the admin re-invites with `borg mesh invite <key> --role steer` |
-| Too many questions or blocks | `borg status` (cost, stop gate and selection lines) | `"mode": "hook"` for that collective (about an eighth of live's cost). The selection line says whether the learned policy (the default) or the fixed rule decides; `BORG_SELECT=fixed` keeps the fixed rule whatever else is set |
+| Too many questions or blocks | `borg status` (cost, stop gate and selection lines) | A stop blocks only when it asks: for a grade 3 under the fixed rule, or for what the learned policy asks. The selection line says which of the two decides (the learned policy by default); `BORG_SELECT=fixed` keeps the fixed rule whatever else is set |
 | The selection line says `REVERTED to the fixed rule` | `borg status` | The monitor saw the learned policy do worse than the fixed rule and put the fixed rule back for good. Tell the engineer; only they decide to delete `<store>/select-reverted` to let it learn again |
 | After upgrading borg | `borg doctor` | `borg install all` (dry run), then `borg install all --apply`; for Codex, `/hooks` again |
 

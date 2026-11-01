@@ -7,7 +7,7 @@
 #   cargo build -p borg-ai && adapters/opencode/live/run.sh
 #
 # Passes when the prompt, a successful and a failed tool call reached borg, a lesson waiting in the
-# session's queue reached the LLM with the tool output (live mode's mid-turn channel), the
+# session's queue reached the LLM with the tool output (the tool call's context channel), the
 # conscience's question went back into the session (the mock LLM saw it) once, and deleting the
 # session ended it.
 set -euo pipefail
@@ -28,15 +28,15 @@ export OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DI
 mkdir -p "$HOME" "$XDG_CONFIG_HOME/opencode/plugins" "$BORG_HOME" "$tmp/work"
 # borg behind a wrapper that logs each hook event and its canonical JSON.
 # At the first successful tool call the wrapper also leaves the lesson `drain` in the session's queue,
-# as a live check would (a real check needs the consequence model; crates/borg/tests/live_cli.rs runs
-# one on a fake): borg hands it over with that call, and the next LLM request must carry it.
+# as a stop's hand-over would (a real check needs the consequence model; crates/borg/tests/select_cli.rs
+# runs one on a fake): borg hands it over with that call, and the next LLM request must carry it.
 cat > "$BORG_BIN" <<EOF
 #!/bin/sh
 in=\$(cat)
 printf "%s %s\n" "\$3" "\$in" >> "$tmp/events.log"
 if [ "\$3" = post_tool ] && [ ! -e "$tmp/seeded" ]; then
   sid=\$(printf '%s' "\$in" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9-')
-  mkdir -p "$BORG_STATE" && echo "live drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
+  mkdir -p "$BORG_STATE" && echo "drain" > "$BORG_STATE/\$sid.queued" && touch "$tmp/seeded"
 fi
 printf '%s' "\$in" | exec "$borg" "\$@"
 EOF

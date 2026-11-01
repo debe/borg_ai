@@ -148,11 +148,15 @@ fn help_completions_and_dispatch_name_the_same_commands() {
     assert!(err.contains("Usage: borg debug <command>"), "{err}");
 
     // The internal commands dispatch, and are never listed.
-    for internal in ["hook", "check"] {
+    for &internal in borg::completions::INTERNAL {
         assert!(!main.contains(internal) && !top.contains(internal), "{internal} is internal");
         let (_, err, _) = borg(&root, &[internal]);
         assert!(!err.contains("borg: unknown command"), "{internal}: {err}");
     }
+    // Live mode's `borg check` is gone (0.7.6).
+    let (_, err, code) = borg(&root, &["check", "--session", "s1"]);
+    assert_eq!(code, Some(2));
+    assert!(err.contains("borg: unknown command"), "{err}");
     let _ = std::fs::remove_dir_all(root);
 }
 

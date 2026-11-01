@@ -26,6 +26,7 @@ pub mod harness;
 pub mod hook;
 pub mod install;
 pub(crate) mod jsonl;
+pub mod judge_length;
 pub mod learn;
 pub mod listen;
 pub mod live;

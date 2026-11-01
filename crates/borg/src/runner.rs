@@ -65,6 +65,30 @@ pub struct Choice {
     pub model: Option<String>,
 }
 
+impl Choice {
+    /// The runner and the model it asks, as cost lines name it (hook.rs `judge_model`, `claude:sonnet`):
+    /// where none is pinned, the model borg asks for by default (claude [`CLAUDE_DEFAULT`], omp
+    /// [`OMP_DEFAULT`] or `BORG_OMP_MODEL`, codex [`CODEX_DEFAULT`]), else `default` (the runner's own).
+    /// One word: no whitespace.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let model = match self.runner {
+            Runner::Claude => Some(self.model.as_deref().unwrap_or(CLAUDE_DEFAULT).to_string()),
+            Runner::Codex => Some(self.model.as_deref().unwrap_or(CODEX_DEFAULT).to_string()),
+            Runner::Omp => {
+                let env = std::env::var(OMP_MODEL_ENV).ok();
+                omp_model(self.model.as_deref(), env.as_deref()).map(str::to_string)
+            }
+            Runner::Opencode => self.model.clone(),
+        };
+        let label = format!("{}:{}", self.runner.name(), model.as_deref().unwrap_or(OMP_OWN));
+        label.split_whitespace().collect::<Vec<_>>().join("_")
+    }
+}
+
+/// Codex's model when none is configured.
+const CODEX_DEFAULT: &str = "gpt-5";
+
 /// The order borg tries runners in after the drone's own harness.
 pub const FALLBACK: [Runner; 3] = [Runner::Claude, Runner::Omp, Runner::Opencode];
 
@@ -86,14 +110,15 @@ pub const OMP_DEFAULT: &str = "claude-sonnet-5";
 const OMP_MODEL_ENV: &str = "BORG_OMP_MODEL";
 const OMP_OWN: &str = "default";
 
-/// A batch of model calls (`borg learn`, `borg facets`, `borg assimilate --from-dir`) stops asking
-/// after this many failed calls (learn: in a row; the parallel batches: before the first success).
+/// A batch of model calls (`borg learn`, `borg facets`, `borg assimilate --from-dir`, `borg reach`, the
+/// session-end judge's batches, hook.rs `judge_session`) stops asking after this many failed calls
+/// (learn: in a row; the parallel batches: before the first success).
 /// Guard: the model is unavailable (quota, login, network), and asking about every remaining item
 /// would burn time, and the quota once it is back, one failed call per item.
 pub const MAX_FAILURES: usize = 3;
 
 /// How many model calls a batch command runs at once unless `--jobs` (or `BORG_ASSIMILATE_JOBS`)
-/// says otherwise. Guard: one child CLI per item at once would hit the provider's rate limit and
+/// says otherwise; the session-end judge's batches (hook.rs `judge_session`) always this many. Guard: one child CLI per item at once would hit the provider's rate limit and
 /// the machine's memory; the batches are bounded by this, not by their size.
 pub const JOBS: usize = 4;
 
@@ -164,7 +189,7 @@ pub fn structured(candidates: &[Choice], prompt: &str, schema: &Value, timeout: 
 fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(Value, Option<f64>)> {
     match c.runner {
         Runner::Claude => claude(prompt, c.model.as_deref().unwrap_or(CLAUDE_DEFAULT), schema, timeout),
-        Runner::Codex => codex(prompt, c.model.as_deref().unwrap_or("gpt-5"), schema, timeout),
+        Runner::Codex => codex(prompt, c.model.as_deref().unwrap_or(CODEX_DEFAULT), schema, timeout),
         Runner::Omp => {
             let env = std::env::var(OMP_MODEL_ENV).ok();
             let model = omp_model(c.model.as_deref(), env.as_deref());
@@ -665,6 +690,17 @@ fn drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A choice's label names the model it asks: the default where none is pinned, one word.
+    #[test]
+    fn a_choice_is_labelled_by_runner_and_the_model_it_asks() {
+        let c = |runner, model: Option<&str>| Choice { runner, model: model.map(str::to_string) };
+        assert_eq!(c(Runner::Claude, None).label(), "claude:sonnet");
+        assert_eq!(c(Runner::Claude, Some("opus")).label(), "claude:opus");
+        assert_eq!(c(Runner::Codex, None).label(), "codex:gpt-5");
+        assert_eq!(c(Runner::Opencode, None).label(), "opencode:default");
+        assert_eq!(c(Runner::Omp, Some("a b")).label(), "omp:a_b");
+    }
 
     /// `sleep` in a process group of its own, and whether it is still running after `wait`.
     fn group_alive_after(stop_first: bool) -> bool {

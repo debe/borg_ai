@@ -2,7 +2,8 @@
 // opencode 2.x. `borg install <harness> --apply` writes the adapter into a temp HOME, and the *installed*
 // file is loaded into a fake host (the omp `pi.on` stand-in, opencode's fakes.ts), which finds borg on
 // PATH as a real host would. One scenario, the same for every host and the same as the command-hook
-// harnesses' (crates/borg/tests/conformance_cli.rs): install, the hooks, live mode, and what
+// harnesses' (crates/borg/tests/conformance_cli.rs): install, the hooks, the turn-end check and its
+// hand-over, and what
 // `borg top --json` (the web page's drones) shows. The model is a fake `claude` on PATH: 0 tokens.
 //
 //   cargo build -p borg-ai && node --test adapters/conformance/conformance.test.ts
@@ -47,8 +48,9 @@ function adapterBudget(harness: string, name: string): number {
 }
 
 /** A Orion repo routed to the collective `corp`, its Orion-scoped lesson, and a fake `claude` that saves
- *  each prompt and grades `Mdrain` 3 (as crates/borg/tests/common). `borg` is on PATH as itself. */
-function world(tag: string) {
+ *  each prompt and grades `Mdrain` `grade` (3 unless named, as crates/borg/tests/common). `borg` is on
+ *  PATH as itself. */
+function world(tag: string, grade = 3) {
   assert.ok(existsSync(BORG), `no borg binary at ${BORG} (cargo build -p borg-ai)`)
   const root = mkdtempSync(join(tmpdir(), `borg-conf-${tag}-`))
   for (const d of ["harbor_orion/src", "home", "bin", "prompts", "store/collectives/corp"]) mkdirSync(join(root, d), { recursive: true })
@@ -58,7 +60,7 @@ function world(tag: string) {
   const prompts = join(root, "prompts")
   writeFileSync(
     join(root, "bin/claude"),
-    `#!/bin/sh\np=$(cat)\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$p" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'\n`,
+    `#!/bin/sh\np=$(cat)\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$p" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":${grade}}]},"total_cost_usd":0.05}'\n`,
   )
   chmodSync(join(root, "bin/claude"), 0o755)
   symlinkSync(BORG, join(root, "bin/borg"))
@@ -78,10 +80,8 @@ function world(tag: string) {
     BORG_PREFILTER: "off",
     BORG_EARLY: "off",
     BORG_NOTIFY: "off",
-    BORG_LIVE_DEBOUNCE_S: "0",
     // Pinned to the fake `claude`: the harness's own CLI would otherwise answer.
     BORG_PREDICT_MODEL: "claude:sonnet",
-    BORG_MODE: "hook",
   })
   const cli = (...args: string[]) => execFileSync("borg", args, { encoding: "utf8", env: process.env })
   const state = (session: string, ext: string) => {
@@ -559,29 +559,24 @@ for (const p of PROFILES) {
     rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
-  test(`${p.name}: a change is checked live and its ask arrives with the next tool call`, async () => {
-    const w = world("live")
-    process.env.BORG_MODE = "live"
-    const s = `conf-live-${p.harness}`
+  // No check runs during the turn (live mode is gone, 0.7.6): the stop makes the one model call, and a 2
+  // it hands over free arrives with the next tool call.
+  test(`${p.name}: a change is checked at the turn end and its hand-over arrives with the next tool call`, async () => {
+    const w = world("turn-end", 2)
+    const s = `conf-turn-end-${p.harness}`
     const net = join(w.cwd, "src/net.rs")
     const h = await drone(w, p, s)
     await h.prompt(PROMPT)
     await h.tool({ kind: "read", path: net }, "c1")
-    assert.equal(w.state(s, "live.n"), "", "a read changes nothing")
-    // The edit starts a detached check; the call returns at once, nothing to say yet.
-    const started = Date.now()
     assert.equal(await h.tool({ kind: "edit", path: net }, "c2"), "")
-    assert.ok(Date.now() - started < 5_000)
-    await until(() => w.state(s, "queued").includes("live ") && w.state(s, "live.mark") !== "")
-    assert.match(w.state(s, "queued"), /^live Mdrain @[0-9a-f]{12}\n$/, "the ask is queued, with the check that asked it")
-    const checked = readFileSync(join(w.root, "prompts/0.txt"), "utf8")
-    assert.ok(checked.includes("[Edit] ") && checked.includes(NEW_TEXT), `the check read the turn's tool calls: ${checked}`)
+    for (const ext of ["live.n", "live.mark", "queued"]) assert.equal(w.state(s, ext), "", `no check during the turn (${ext})`)
+    assert.equal(w.asked(), 0, "no model call during the turn")
+    assert.equal(await h.stop(PLAN), "", "a 2 does not block")
+    assert.equal(w.asked(), 1, "the stop's one model call")
+    assert.match(w.state(s, "queued"), /^Mdrain @[0-9a-f]{12}\n$/, "handed over at the next call, with the check that routed it")
     const next = await h.tool({ kind: "read", path: join(w.cwd, "src/budget.rs") }, "c3")
-    assert.ok(next.includes("borg check of your work so far") && next.includes("[Mdrain]"), next)
-    // The check covered the turn: no model call, no block (the ask was delivered).
-    assert.equal(await h.stop(PLAN), "")
-    assert.equal(w.asked(), 1, "a covered stop costs no model call")
-    assert.match(w.state(s, "ctx"), /#borg-skip live_covered/)
+    assert.ok(next.includes("explicit consumer") && !next.includes("borg check of your work so far"), next)
+    assert.equal(w.state(s, "queued"), "", "handed over once")
     await h.end()
     await h.close()
     rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })

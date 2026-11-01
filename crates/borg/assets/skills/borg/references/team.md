@@ -51,7 +51,7 @@ borg mesh serve                     # keep it running: syncs every 60 s and on l
 ```
 
 `borg setup --team NAME --paths DIR... [--relay URL|disabled]` does this in one pass: it writes the
-team entry (asking for off paths and the mode), runs `borg mesh init` and offers a first invite (with
+team entry (asking for off paths), runs `borg mesh init` and offers a first invite (with
 `--relay disabled`, an invite needs `borg mesh serve` running first, so it says that instead).
 
 Keep `serve` running as a service. A systemd user unit, for example

@@ -207,7 +207,7 @@ pub const DEBUG: &[Command] = &[
 ];
 
 /// What hooks and drones run, never listed: dispatched, not shown.
-pub const INTERNAL: &[&str] = &["hook", "check"];
+pub const INTERNAL: &[&str] = &["hook"];
 
 /// Every command of the main help, in its order.
 pub fn commands() -> impl Iterator<Item = &'static Command> {

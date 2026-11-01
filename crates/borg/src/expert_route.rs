@@ -146,9 +146,8 @@ pub fn checkpoint(h: &dyn Harness, event: &str, input: &Value, conscience: impl 
 }
 
 /// The stop hook's time budget: the one the event's harness named (`BORG_STOP_BUDGET_MS`), else its
-/// caps' `stop_budget`; None when neither names one. The live wait, the stop's model call and the expert
-/// drone all keep inside it. Read at the stop only: the omp adapter sets the variable for every event,
-/// and a `borg check` spawned by a tool call inherits it.
+/// caps' `stop_budget`; None when neither names one. The stop's model call and the expert drone both
+/// keep inside it. Read at the stop only: the omp adapter sets the variable for every event.
 pub fn stop_budget(h: &dyn Harness) -> Option<Duration> {
     std::env::var(STOP_BUDGET_ENV).ok().and_then(|v| v.trim().parse().ok()).map(Duration::from_millis).or(h.caps().stop_budget)
 }
