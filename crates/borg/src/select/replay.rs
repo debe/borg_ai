@@ -37,7 +37,8 @@
 //!   engineer's budget for the collective the policy's pools stay within it; spend and the decisions'
 //!   sources are reported.
 //!
-//! **Labels** (P2, P5, the readout): a judge's verdict (`asked_then_changed`, `asked_ignored`) joined to
+//! **Labels** (P2, P5, the readout): a judge's verdict that settles its delivery (`asked_then_changed`,
+//! `asked_ignored`, `asked_not_arisen`, a 0 as the selection model's fit reads it) joined to
 //! the graded check that routed its delivery: by check id, or for older records the session's last
 //! graded check before it that routed the lesson that way (asked for a stop or live verdict, free for a
 //! queued one, placebo for a placebo one). A verdict on an early delivery has no check. A unit is 1 when
@@ -993,7 +994,9 @@ fn labels(checks: &[Check], log: &[Outcome]) -> (Vec<Label>, usize) {
     }
     let mut joined: BTreeMap<(usize, usize), Joined> = BTreeMap::new();
     let mut unjoined = 0;
-    for r in log.iter().filter(|r| r.kind == outcome::CHANGED || r.kind == outcome::IGNORED) {
+    // A verdict that settles its delivery (`outcome::settles`): a point that never came up
+    // (`asked_not_arisen`, no rank) is a 0 as an ignore is, as the selection model's fit reads it.
+    for r in log.iter().filter(|r| outcome::settles(&r.kind)) {
         let route = match r.channel.as_str() {
             "early" => continue,
             "queued" => FREE,
@@ -1409,10 +1412,11 @@ fn unit_outcome(s: &Summary, judged: &HashMap<usize, f64>, i: usize) -> Option<f
     let never = a.delivered == Delivered::Dropped;
     let y = match a.label {
         Label::Changed => 1.0,
-        Label::Ignored => 0.0,
+        // Nothing in the work: no change on the lesson's point.
+        Label::Ignored | Label::NotArisen => 0.0,
         _ if never => return Some(0.0),
         Label::Open => return None,
-        Label::Unclear | Label::Censored => return Some(0.0),
+        Label::Unclear | Label::Remains | Label::Censored => return Some(0.0),
     };
     // A lesson never delivered is known to be so: its verdict, if any, stands for itself.
     let p = if never { 1.0 } else { judged.get(&i).copied().unwrap_or(1.0).max(1.0 / policy::MAX_IPW) };
@@ -2730,6 +2734,28 @@ fn pooled_main(files: &[&str], json: bool) -> i32 {
 mod tests {
     use super::*;
 
+    /// Judge v3 (0.7.5): a point that never came up is a verdict of no change (the readout's 0 over its
+    /// chance of a verdict, and a verdict for the judge-missingness fit), a remaining consequence an
+    /// unclear one (0, no verdict); the older labels read as before.
+    #[test]
+    fn not_arisen_reads_as_no_change_and_a_remaining_consequence_as_unclear() {
+        use summary::{Apply, Check, Delivered, Label, Summary};
+        let labels = [Label::Changed, Label::Ignored, Label::NotArisen, Label::Remains, Label::Unclear, Label::Censored, Label::Open];
+        let summary = |of: &[Label]| Summary {
+            applies: of.iter().map(|&label| Apply { label, route: Route::Free, delivered: Delivered::Yes, grade: 2, ..Default::default() }).collect(),
+            checks: vec![Check { stop: true, first: 0, n: of.len() as u16, ..Default::default() }],
+            ..Default::default()
+        };
+        let s = summary(&labels);
+        let got: Vec<Option<f64>> = (0..labels.len()).map(|i| unit_outcome(&s, &HashMap::new(), i)).collect();
+        assert_eq!(got, [Some(1.0), Some(0.0), Some(0.0), Some(0.0), Some(0.0), Some(0.0), None]);
+        // The judge-missingness fit: not arisen is judged, a remaining consequence is not.
+        let p = |label: Label| policy::judged(&summary(&[label; 40])).get(&0).copied().unwrap();
+        assert!(p(Label::NotArisen) > 0.9 && p(Label::Remains) < 0.1, "{} {}", p(Label::NotArisen), p(Label::Remains));
+        assert_eq!(p(Label::NotArisen), p(Label::Changed));
+        assert_eq!(p(Label::Remains), p(Label::Unclear));
+    }
+
     fn graded(session: &str, ms: i64, lessons: &[&str], grades: &[u8]) -> Outcome {
         let cs: Vec<Challenge> = lessons.iter().map(|id| Challenge { id: id.to_string(), ..Default::default() }).collect();
         let applied: Vec<(&Challenge, u8)> = cs.iter().zip(grades.iter().copied()).collect();
@@ -2998,6 +3024,38 @@ mod tests {
         assert_eq!((ls.len(), unjoined), (1, 1));
         // Its chance of a label is the draw's: routed nowhere (1) and drawn as a placebo (ψ).
         assert_eq!((ls[0].j, ls[0].route, ls[0].mu, ls[0].y), (10, NOT, [0.0, 0.0, 0.5], 1.0));
+    }
+
+    /// A point that never came up is a verdict of no change (0) for the replay's labels, as for the
+    /// selection model's fit (policy.rs `Data::of`): asked, handed over free or drawn as a placebo; a
+    /// later change in the session still outranks it.
+    #[test]
+    fn a_not_arisen_verdict_labels_its_unit_no_change_on_every_route() {
+        let mut log = vec![
+            graded("s", 10, &["A", "B"], &[3, 3]), // asks A and B
+            graded("s", 20, &["C"], &[2]),         // hands C over free
+            result(outcome::NOT_ARISEN, "s", "A", 25, "stop"),
+            result(outcome::NOT_ARISEN, "s", "C", 26, "queued"),
+            result(outcome::NOT_ARISEN, "s", "B", 27, "live"),
+            result(outcome::CHANGED, "s", "B", 40, "stop"),
+            result(outcome::REMAINS, "s", "A", 41, "stop"),
+            result(outcome::UNCLEAR, "s", "C", 42, "queued"),
+        ];
+        let (ls, unjoined) = labels(&checks_of(&log), &log);
+        let got: Vec<(usize, usize, usize, f64)> = ls.iter().map(|l| (l.check, l.j, l.route, l.y)).collect();
+        assert_eq!(got, [(0, 0, ASK, 0.0), (0, 1, ASK, 1.0), (1, 0, FREE, 0.0)], "unclear and remaining label nothing");
+        assert_eq!(unjoined, 0);
+        assert_eq!(ls[1].known, [(27, 0.0), (40, 1.0)]);
+        // A placebo's not arisen labels its not-delivered unit 0.
+        let lessons: Vec<String> = (0..11).map(|i| format!("L{i}")).collect();
+        let mut f = graded("s", 200, &lessons.iter().map(String::as_str).collect::<Vec<_>>(), &[1; 11]);
+        (f.check, f.policy, f.placebo, f.psi) = ("0123456789ab".into(), "fixed".into(), vec!["L10".into()], 0.5);
+        f.free = lessons[..10].to_vec();
+        f.pf = holds(&f.lessons, &f.free);
+        let blind = Outcome { check: "0123456789ab".into(), ..result(outcome::NOT_ARISEN, "s", "L10", 210, outcome::PLACEBO) };
+        log = vec![f, blind];
+        let (ls, _) = labels(&checks_of(&log), &log);
+        assert_eq!(ls.iter().map(|l| (l.route, l.y)).collect::<Vec<_>>(), [(NOT, 0.0)]);
     }
 
     /// Each unit is predicted from the results before its check: a result arriving later moves no

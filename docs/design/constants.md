@@ -64,7 +64,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | File | Name | Value | Meaning |
 |---|---|---|---|
 | `borg/src/select.rs` | `CHECK_HEX` | 12 hex digits (48 bits) | A graded check's id, the ` @<check>` tag on its record and on every delivery marker |
-| `borg/src/select/summary.rs` | `SV` | 8 | The selection summary cache's format; a summary of another version is rebuilt, never read (2: `spend`; 3: the stops' latency per harness, the monitor's weights; 4: `Past`, "left for later" counted at live checks, tallies at a session's end; 5: the live question's tally, what a session had, tail yields and counts; 6: the learned decisions that fell back to the fixed rule, per reason; 7: the question-count test's checks by k and s; 8: a live check's hand-over a stop asked is its free apply's delivery and verdict, and the live question's tally counts only checks with a 3) |
+| `borg/src/select/summary.rs` | `SV` | 9 | The selection summary cache's format; a summary of another version is rebuilt, never read (2: `spend`; 3: the stops' latency per harness, the monitor's weights; 4: `Past`, "left for later" counted at live checks, tallies at a session's end; 5: the live question's tally, what a session had, tail yields and counts; 6: the learned decisions that fell back to the fixed rule, per reason; 7: the question-count test's checks by k and s; 8: a live check's hand-over a stop asked is its free apply's delivery and verdict, and the live question's tally counts only checks with a 3; 9: the judge's `not_arisen` and `consequence_remains` verdicts as labels of their own, every answer's judge version on its apply (`jv`), the session-end judge a judge level of its own) |
 | `borg/src/select/summary.rs` | `STOP`, `LIVE`; `FREE_STOP`, `FREE_LIVE`, `LATER`, `WAIT`, `ASK_LIVE`; `TALLIES` | 0, 1; 0 to 4; 5 | Indices of `Summary::spend` and of a session's delivery tallies, and the tallies' width (checked at compile time): part of the cache's layout |
 | `borg/src/select/summary.rs` | `FELL_BACK` | `lock_busy` 0, `lock_failed` 1, `unrecorded` 2 | Indices of `Summary::fell_back`, by the graded record's `reason` (outcome.rs `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD`): part of the cache's layout |
 | `borg/src/select.rs` | `ARMS`, `Route::arm` | 3: ask 0, free 1, not now and placebo 2 | The length and order of every per-arm array (select/policy.rs `monitor`, select/replay.rs) |
@@ -76,7 +76,11 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/outcome.rs` | `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD` | `lock_busy`, `lock_failed`, `unrecorded` | A graded record's `reason` when its learned check fell back to the fixed rule: another check held the store's decision lock past hook.rs `DECIDE_WAIT`, the lock could not be taken, or the learned decision's record cannot land in the log its gate is folded from |
 | `borg/src/msg.rs` | `STAMP` | `v3` | The format of a session's `.scanned` stamp, this node's alone: a stamp of another format (0.5.0's, an earlier 0.6.0 build's) makes the session read the log once |
 | `borg/src/listen.rs` | `WAKE` | `w` | The first word of a wake's turn mark, `w <ms> [<tool start>]`, this node's alone: every reader takes it as a running turn, and a waiter undoes the mark of a refused wake |
-| `borg/src/predict.rs` | `JUDGE_VERSION` | 2 | The judge template's version, logged on every verdict (0: before versions were logged) |
+| `borg/src/predict.rs` | `JUDGE_VERSION` | 3 | The judge template's version, logged on every verdict (0: before versions were logged; 2: changed / unchanged / unclear with `avoids_consequence`; 3: changed / ignored / not_arisen / consequence_remains / unclear, each with a reason) |
+| `borg/src/predict.rs` | `Verdict::WORDS` | 5 words | The judge's verdicts in its answer and in the hook's `#borg-judged` lines: `changed`, `ignored`, `not_arisen`, `consequence_remains`, `unclear` |
+| `borg/src/predict.rs` | `PURE_UNCLEAR_FROM` | 3 | The first judge version whose `unclear` is pure (before it, `asked_unclear` also held a remaining consequence); the label health's verdict shares (top.rs) count answers from it on |
+| `borg/src/outcome.rs` | `AT_END` | `end` | A judge result's `at` when the session-end judge gave it (hook.rs `judge_session`); empty for a check's verdict, so older records and a check's stay as they were. Local, never shared |
+| `borg/src/hook.rs` | `END_JUDGED` | `#borg-end-judged <ids>` | The state line after a session-end judge call: the lessons it was shown are settled for every later call and a second pass, whatever it said, until a lesson is delivered again; one it left pending settles at `borg learn` as having used its tries |
 | `borg-trace/src/dialogue.rs` | `TOUCH_CHARS` | 200 chars | A command's head a touch keeps; the live hook records the same head (hook.rs `COMMAND_CHARS`), and a replay must see what it saw |
 | `borg-trace/src/fingerprint.rs` | `NORMAL_CHARS` | 160 chars | The normalised error line a scar's fingerprint is made of: a change splits every stored scar |
 | `borg/src/vectors/unigram.rs` | `UNK_PENALTY` | 10.0 | `tokenizers`' `K_UNK_PENALTY`: must equal the library's, or text splits differently from the model's training |
@@ -103,7 +107,9 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/conscience.rs` | `EARLY_CHARS` | 2,000 chars (about 500 tokens) | The context one early or free delivery adds, less the lines handed over in place of questions (the question-count test's `instead` and the evidence rule's `instead-next` hand-overs of lessons the fixed rule asks, `render_owing`), which it never cuts; a free lesson it cuts is logged `dropped_chars`, so its hit rate is measured |
 | `borg/src/hook.rs` | `MAX_EARLY_DELIVERIES` | 3 per session | A long session naming many systems getting a delivery at every touch (standing lessons are exempt) |
 | `borg/src/hook.rs` | `MAX_PENDING` | conscience.rs `CAP` (10) | Pending lessons one judge call sees: an unbounded judge section. What it leaves out is logged (`#borg-unjudged … why=slots`) |
-| `borg/src/hook.rs` | `MAX_JUDGE_TRIES` | 2 | A lesson the judge never settles riding on every later call; what stays unjudged is censored with its reason |
+| `borg/src/hook.rs` | `MAX_JUDGE_TRIES` | 2 | A lesson the judge never settles riding on every later check's call; the session-end judge takes it once more, then what stays unjudged is censored with its reason |
+| `borg/src/hook.rs` | `END_MAX_PENDING` | 4 × `MAX_PENDING` (40) | Pending lessons the session-end judge's one call sees: an unbounded judge section. On copies of three stores a session ended with a median of 4-14 open lessons, 32-78 at the 90th percentile. What it leaves out is logged (`#borg-unjudged … why=slots`) |
+| `borg/src/hook.rs` | `END_WORK_CHARS` | predict.rs `TAIL` (24,000 chars) | The session's whole work the session-end judge reads (prompts and touches, edits and answers, the agent's messages), the newest of each, a short part leaving its share to the others |
 | `borg/src/hook.rs` | `EVIDENCE_CHARS` | 4,000 chars | One evidence line of the `.edits` file every judge call reads (at least three times `predict::JUDGE_PART`) |
 | `borg/src/hook.rs` | `EDIT_CHARS` | 600 chars | One edit's line in the `.edits` and turn files: a whole written file |
 | `borg/src/hook.rs` | `COMMAND_CHARS` | borg-trace `TOUCH_CHARS` (200) | A shell command kept as a touch: a heredoc going in whole |
@@ -126,6 +132,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/predict.rs` | `timeout` | 45 s (`BORG_PREDICT_TIMEOUT_S`) | One consequence-model call, under Claude Code's former 60 s hook limit |
 | `borg/src/predict.rs` | `TAIL` | 24,000 chars | A huge transcript filling the call: the model reads the end of the work |
 | `borg/src/predict.rs` | `JUDGE_PART` | 1,200 chars | Judge evidence per delivery: `before` this, `after` three times as much, the same for every route |
+| `borg/src/predict.rs` | `JUDGE_REASON_CHARS` | 240 chars | One verdict's reason in the outcome log, whatever the model writes: redacted, on one line, about twice the 25 words the prompt asks for |
 | `borg/src/live.rs` | `WAIT_SHARE` | 4 | A slow live check starving the stop's own model call: the stop waits at most a quarter of its budget |
 | `borg/src/live.rs` | `AFTER_CALL` | 3 s | The stop's model call leaving no time for the hook's records and answer |
 | `borg/src/live.rs` | `STALE_SLACK_MS` | 30 s | A crashed check's lock held forever (`stale_ms`) |
@@ -248,8 +255,10 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/live.rs` | `STOP_WAIT`, `stop_wait` | 15 s; min(15 s, budget / 4) | `DEFAULT_STOP_BUDGET / WAIT_SHARE`; omp's 28 s gives 7 s |
 | `borg/src/live.rs` | `call_limit` | budget − time spent − `AFTER_CALL`, at most predict.rs `timeout` | omp gives at most 18 s after a 7 s wait |
 | `borg/src/live.rs` | `stale_ms` | 2 × predict.rs `timeout` + 30 s | A check's longest model call and `STALE_SLACK_MS` |
+| `borg/src/hook.rs` | `end_timeout` | min(learn.rs `learn_timeout`, 2 × predict.rs `timeout`): 90 s | The session-end judge's call holds the session's live lock: it ends before the lock reads stale (`stale_ms`) |
 | `borg/src/listen.rs` | `stop_ms` | `longest_stop` + 30 s | A stop's mark outlives the longest stop by `STOP_SLACK_MS` |
 | `borg/src/hook.rs` | `LIVE_WORK_CHARS` | 4,000 chars | `EVIDENCE_CHARS`: as much of the turn as the judge's evidence keeps |
+| `borg/src/hook.rs` | `END_MAX_PENDING`, `END_WORK_CHARS` | 40 lessons, 24,000 chars | 4 × `MAX_PENDING`; predict.rs `TAIL`: guards listed under [Lesson delivery and selection](#lesson-delivery-and-selection), derived from these |
 | `borg/src/learn/regret.rs` | `CAP` | 1,500 chars | learn.rs `EXCERPT_CHARS` |
 | `borg/src/escalation.rs` | `MISSED_W` | 3 | memory.rs `VETOED_W` |
 | `borg/src/memory.rs`, `borg/src/ope.rs` | `WEIGHTS`, `CURRENT` | veto 3, regret 1, tested 0.5 | `VETOED_W`, `REGRET`, `TESTED_W`: the weights in force |
@@ -419,12 +428,13 @@ labelled.
 | Value | Where | Meaning |
 |---|---|---|
 | 10 | conscience.rs `CAP`; hook.rs `MAX_PENDING` (derived from it) | One block; one judge call's lessons, so a block's lessons share their evidence |
+| 24,000 chars | predict.rs `TAIL`; hook.rs `END_WORK_CHARS` (derived from it) | The work a check's call reads; the whole session's work the session-end judge reads |
 | 4,000 chars | hook.rs `EVIDENCE_CHARS` (and `LIVE_WORK_CHARS` from it); harness/mod.rs `OUTPUT_TAIL` | Judge evidence; a shell call's output tail |
 | 500 | steer.rs `KEEP`; borg-mesh `V1_KEEP` | Steering admissions; 0.5.0's message bound for `/13` peers |
 | 24 h | clock.rs `DAY_MS`, and from it presence.rs `PRUNE_MS`, steer.rs `TTL_MS`, outcome.rs `IDLE_MS` (guards), update.rs `STALE_MS` (baseline) | One unit, three guards and a release check's age |
 | "Idle" | presence.rs `IDLE_MS` 30 min (display), listen.rs `TURN_IDLE_MS` 5 min (a learned hold's prior), outcome.rs `IDLE_MS` 24 h (a session's end) | Three meanings, three names |
 | 2,000 | conscience.rs `EARLY_CHARS`, learn.rs `PROPOSAL_CHARS`, borg-trace `REFUSAL_CHARS` (chars); notes/regress.rs `Cfg::default` `max_lines` (lines); borg-web `PAGE_MAX` (rows) | Different bounds, each labelled |
-| 160 / 240 / 300 chars | stats.rs `FEED_CHARS`, whole.rs's line, why.rs caps, facets, queen.rs `QUOTE_CHARS`, conscience.rs `EARLY_QUESTION_CHARS` | Each labelled |
+| 160 / 240 / 300 chars | stats.rs `FEED_CHARS`, whole.rs's line, why.rs caps, facets, queen.rs `QUOTE_CHARS`, conscience.rs `EARLY_QUESTION_CHARS`, predict.rs `JUDGE_REASON_CHARS` (240, a verdict's reason) | Each labelled |
 | 120 / 200 chars | top.rs `MESSAGE_CHARS`, escalation.rs `ANSWER_CHARS`, notify.rs `BODY_CHARS`; veto.rs `EVIDENCE_CHARS`, conscience.rs `EARLY_CONSEQUENCE_CHARS`, the opencode adapter's `LOG_CHARS` (display), assimilate.rs `NOTICE_CHARS` (method) | Each labelled |
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
 | 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method), sweep.rs `HASHED` (method, bytes), assimilate.rs `OPEN_CALLS` (guard, calls) | A window's ceiling; the gaps a hold reads; the bytes whose hash says a transcript is unchanged; the open tool calls kept between sweeps |

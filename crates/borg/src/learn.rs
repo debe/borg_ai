@@ -723,7 +723,7 @@ fn call_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
 
 /// How long one learn-side model call may take (`BORG_LEARN_TIMEOUT_S`, default 300 s): it runs in
 /// the background, but a hung runner must not keep `borg learn` alive forever.
-fn learn_timeout() -> std::time::Duration {
+pub(crate) fn learn_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(std::env::var("BORG_LEARN_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300))
 }
 
@@ -1167,6 +1167,17 @@ fn learn_unlocked(
             ended.push(s.to_string());
         }
         for s in &ended {
+            // Its settle's time: after a verdict the session-end judge gives here.
+            let mut at = now;
+            // An idle session's end hook never ran: the session-end judge (hook.rs `judge_session`) gives
+            // its open deliveries their last verdict here, before its tests are credited and the rest is
+            // settled, as `borg learn --session` does for the session that ended (main.rs `learn_cmd`).
+            // It writes to the hooks' store and reads their state file, so only for those; what it
+            // judged it marks (`END_JUDGED`), so never twice.
+            if Some(s.as_str()) != session && home == self::home().as_path() && ctx(s) == crate::hook::state_file(s) && crate::hook::judge_session(s) > 0 {
+                outcomes = outcome::read(&outcomes_path);
+                at = at.max(now_ms());
+            }
             // The session's own tests that went green after an ask (hook.rs `capture_test`) credit the
             // lessons asked, once each, as it settles.
             if test_credit() {
@@ -1179,7 +1190,7 @@ fn learn_unlocked(
             // Each lesson left without a verdict says why (hook.rs `unjudged`, from the state file):
             // censored, never an ignore (memory.rs).
             let why = crate::hook::unjudged(&std::fs::read_to_string(ctx(s)).unwrap_or_default());
-            for o in outcome::settle_with(&outcomes, s, now, &|l| why.get(l).copied().unwrap_or(outcome::UNJUDGED_NO_CALL)) {
+            for o in outcome::settle_with(&outcomes, s, at, &|l| why.get(l).copied().unwrap_or(outcome::UNJUDGED_NO_CALL)) {
                 let _ = outcome::append(&outcomes_path, &o);
                 outcomes.push(o);
             }

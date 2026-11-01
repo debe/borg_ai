@@ -119,8 +119,8 @@ pub struct Breadth {
     pub repos: usize,
 }
 
-/// Raw judgement counts. Placebo: the judge's verdicts on the lesson where it was routed nowhere
-/// (outcome.rs `PLACEBO`), and of them the ones that found the drone changed its work on its point
+/// Raw judgement counts. Placebo: the judge's verdicts (changed, ignored, and from 0.7.5 not arisen) on
+/// the lesson where it was routed nowhere (outcome.rs `PLACEBO`), and of them the ones that found the drone changed its work on its point
 /// anyway. Tail: the graded checks whose tail sample showed the lesson past the pool budget (outcome.rs
 /// `Outcome::tail`), and of them the ones whose model graded it as applying.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
@@ -188,7 +188,9 @@ fn redact_value(v: &Value) -> Value {
 fn judgements(local: &[Outcome]) -> (HashMap<&str, Judged>, HashMap<&str, Judged>) {
     let (mut placebo, mut tail): (HashMap<&str, Judged>, HashMap<&str, Judged>) = Default::default();
     for o in local {
-        if o.channel == outcome::PLACEBO && (o.kind == outcome::CHANGED || o.kind == outcome::IGNORED) {
+        // A placebo's verdicts: changed, ignored, or its point never came up (`asked_not_arisen`, 0.7.5 on:
+        // nothing in the work, no change). Unclear and a remaining consequence are no judgement.
+        if o.channel == outcome::PLACEBO && matches!(o.kind.as_str(), outcome::CHANGED | outcome::IGNORED | outcome::NOT_ARISEN) {
             for l in &o.lessons {
                 let j = placebo.entry(l.as_str()).or_default();
                 j.count += 1;

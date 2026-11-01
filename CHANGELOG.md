@@ -3,6 +3,38 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.5 (unreleased)
+
+The judge says what happened to a lesson instead of "unclear", and judges a hand-over after the work,
+not while it is still being done.
+
+### Changed
+
+- The judge gives one of five verdicts, each with a short reason in the outcome log: changed, ignored,
+  not arisen (the lesson's point never came up), consequence remains (changed, but the consequence still
+  follows) or unclear. A point that never came up moves no lesson's belief. Older outcome records read
+  as before.
+  [Outcomes and the usefulness belief](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
+- Lessons handed over free and placebos are judged at the turn end, never by a live check mid-turn.
+  Questions are judged as before.
+  [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+- borg web's Conscience page (Label health) and `borg top --json` show the shares of unclear, not
+  arisen and consequence remains verdicts.
+
+### Added
+
+- At the session's end, `borg learn` judges every delivery still without a settling verdict once more,
+  in one model call that sees the whole session's work; a session whose end hook never ran gets it
+  when it is settled as idle. It costs one call per session with something open, and none with
+  `BORG_LEARN=off`.
+  [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+
+### Fixed
+
+- Every model call (claude, omp, opencode, the expert drone) hands its prompt over on stdin, never as
+  a command-line argument. A long prompt failed on all of them (the kernel caps one argument at
+  128 KiB), and an argument is visible to every process on the machine.
+
 ## 0.7.4 (2026-10-31)
 
 Collectives stay separate: nothing crosses between them on its own, and crossing on your word is one

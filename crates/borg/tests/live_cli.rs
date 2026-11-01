@@ -185,6 +185,45 @@ fn a_later_check_in_the_same_turn_leaves_an_unanswered_live_ask_to_the_stop() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Judge timing (0.7.5): a free delivery is never judged by a live check, even with work after it; the
+/// turn's stop judges it.
+#[test]
+fn a_free_delivery_waits_for_the_stops_judge_never_a_live_checks() {
+    let root = setup("live-free-judge");
+    let cwd = root.join("harbor_orion");
+    std::fs::write(root.join("transcript.jsonl"), format!("{}\n", json!({"type": "user", "message": {"role": "user", "content": "Tidy it"}}))).unwrap();
+    borg(&root, "prompt", &json!({"session_id": "f1", "cwd": cwd, "prompt": "Tidy it"}), &ENV);
+    let tool = |name: &str, input: Value, debounce: &str| {
+        let ev = json!({"session_id": "f1", "cwd": cwd, "transcript_path": root.join("transcript.jsonl"), "tool_name": name, "tool_input": input});
+        borg(&root, "post_tool", &ev, &[ENV[0], ENV[1], ENV[2], ("BORG_LIVE_DEBOUNCE_S", debounce)])
+    };
+    // A 2 goes free: handed over at the next tool call.
+    answer(&root, &[("Mdrain", 2)]);
+    tool("Edit", json!({"file_path": "/x/net.rs", "old_string": "a", "new_string": "reset arc"}), "0");
+    wait_for(&root, "f1", "queued", |q| q.contains("Mdrain"));
+    wait_for(&root, "f1", "live.mark", |m| !m.is_empty());
+    assert!(context(&tool("Read", json!({"file_path": "/x/a.rs"}), "0")).contains("drain the budget place"));
+    assert!(state(&root, "f1", "ctx").contains("#borg-queued Mdrain"), "{}", state(&root, "f1", "ctx"));
+    // Work follows the delivery, and a live check runs: it does not judge the free delivery.
+    answer(&root, &[]);
+    tool("Edit", json!({"file_path": "/x/net.rs", "old_string": "reset arc", "new_string": "explicit consumer drains the budget place"}), "0");
+    wait_for(&root, "f1", "live.mark", |m| m.starts_with("2 "));
+    let p = prompts(&root);
+    assert_eq!(p.len(), 2, "a second check ran");
+    assert!(!p[1].contains("[Mdrain] lesson: "), "not judged mid-turn: {}", p[1]);
+    assert!(!state(&root, "f1", "ctx").contains("#borg-judged"));
+    // A change no check covered (the debounce holds it back): the stop calls the model, and judges it.
+    tool("Edit", json!({"file_path": "/x/b.rs", "old_string": "a", "new_string": "b"}), "3600");
+    let stop =
+        json!({"session_id": "f1", "cwd": cwd, "transcript_path": root.join("transcript.jsonl"), "last_assistant_message": "Done.", "stop_hook_active": false});
+    borg(&root, "stop", &stop, &ENV);
+    let p = prompts(&root);
+    assert_eq!(p.len(), 3, "the stop's call");
+    assert!(p[2].contains("[Mdrain] lesson: "), "judged at the stop: {}", p[2]);
+    assert!(state(&root, "f1", "ctx").contains("#borg-judged Mdrain="), "{}", state(&root, "f1", "ctx"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn hook_mode_and_word_matching_start_no_check() {
     let root = setup("live-off");

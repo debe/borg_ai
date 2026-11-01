@@ -286,6 +286,25 @@ pub fn last_assistant_text(transcript: &Path) -> String {
     chars[chars.len().saturating_sub(crate::learn::PROPOSAL_CHARS)..].iter().collect()
 }
 
+/// Every text the drone wrote in a whole transcript, one per line in order, its last `cap` characters
+/// (marked when cut): the session-end judge's view of its messages (mod.rs `session_texts`). Tool calls
+/// are left out; the hook's own logs hold them. Empty without a transcript.
+pub fn session_texts(transcript: &Path, cap: usize) -> String {
+    let text = std::fs::read_to_string(transcript).unwrap_or_default();
+    let mut said: Vec<&str> = Vec::new();
+    let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["type"] == "assistant").collect();
+    for v in &entries {
+        let blocks = v["message"]["content"].as_array().into_iter().flatten();
+        said.extend(blocks.filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).filter(|t| !t.trim().is_empty()));
+    }
+    let all = said.join("\n");
+    let n = all.chars().count();
+    if n <= cap {
+        return all;
+    }
+    format!("…{}", all.chars().skip(n - cap).collect::<String>())
+}
+
 /// `last_assistant_text`, whole.
 pub fn last_assistant_full(transcript: &Path) -> String {
     let text = std::fs::read_to_string(transcript).unwrap_or_default();
@@ -405,6 +424,16 @@ fn pieces(v: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session-end judge's view of the agent's messages: every text of every turn, no tool call,
+    /// the newest kept when cut.
+    #[test]
+    fn the_session_texts_are_every_turns_texts_newest_kept() {
+        let t = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude/live-turn.jsonl"));
+        assert_eq!(session_texts(t, 4000), "Earlier turn: retries now use backoff.\nI will replace the reset arc.");
+        assert_eq!(session_texts(t, 12), "…e reset arc.");
+        assert_eq!(session_texts(Path::new("/nonexistent/t.jsonl"), 4000), "");
+    }
 
     #[test]
     fn the_turn_so_far_is_this_turns_text_and_tool_calls_since_the_last_prompt() {

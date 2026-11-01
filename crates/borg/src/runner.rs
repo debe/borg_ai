@@ -171,8 +171,8 @@ fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(V
             let p = with_schema(prompt, schema);
             // Only borg's own default falls back: a model the engineer named fails as named.
             let defaulted = c.model.is_none() && env.as_deref().map(str::trim).is_none_or(str::is_empty);
-            let fallback = defaulted.then(|| omp_command(None, &p));
-            let (text, cost) = omp_run(omp_command(model, &p), fallback, timeout)?;
+            let fallback = defaulted.then(|| omp_command(None));
+            let (text, cost) = omp_run(omp_command(model), fallback, &p, timeout)?;
             Some((last_json(&text)?, cost))
         }
         Runner::Opencode => {
@@ -183,8 +183,8 @@ fn ask(c: &Choice, prompt: &str, schema: &Value, timeout: Duration) -> Option<(V
                 Opencode::V1 => None,
             };
             let empty = scratch.as_ref().map(|s| s.0.as_path());
-            let cmd = opencode_command(c.model.as_deref(), &with_schema(prompt, schema), cli, empty, engineers_config());
-            let (text, cost) = opencode_answer(&run_capped(cmd, None, timeout)?)?;
+            let cmd = opencode_command(c.model.as_deref(), cli, empty, engineers_config());
+            let (text, cost) = opencode_answer(&run_capped(cmd, Some(with_schema(prompt, schema).as_bytes()), timeout)?)?;
             Some((last_json(&text)?, cost))
         }
     }
@@ -211,19 +211,20 @@ fn omp_model<'a>(pinned: Option<&'a str>, env: Option<&'a str>) -> Option<&'a st
 /// at once, `Model "…" not found` on stderr), `fallback` in the time left, which then asks omp's own
 /// default role. So [`OMP_DEFAULT`] never makes omp unusable where it is unknown. A run cut off at the
 /// timeout, or one that reached the model, falls back to nothing: it answered, or spent its time.
-fn omp_run(cmd: Command, fallback: Option<Command>, timeout: Duration) -> Option<(String, Option<f64>)> {
+fn omp_run(cmd: Command, fallback: Option<Command>, prompt: &str, timeout: Duration) -> Option<(String, Option<f64>)> {
     let start = Instant::now();
-    let b = run_bounded(cmd, None, timeout)?;
+    let b = run_bounded(cmd, Some(prompt.as_bytes()), timeout)?;
     let unresolved = b.status.is_some_and(|s| !s.success()) && events(&b.out).next().is_none();
     match fallback {
-        Some(f) if unresolved => omp_answer(&run_capped(f, None, timeout.saturating_sub(start.elapsed()))?),
+        Some(f) if unresolved => omp_answer(&run_capped(f, Some(prompt.as_bytes()), timeout.saturating_sub(start.elapsed()))?),
         // As `run_capped`: nothing from a run cut off at the cap.
         _ => omp_answer(&b.status.map(|_| b.out)?),
     }
 }
 
-/// The headless omp command.
-fn omp_command(model: Option<&str>, prompt: &str) -> Command {
+/// The headless omp command. The prompt goes in on stdin ([`run_bounded`]'s input), never as an
+/// argument: an argument is capped by the kernel (128 KiB, `E2BIG`) and visible in `ps`.
+fn omp_command(model: Option<&str>) -> Command {
     let mut cmd = Command::new("omp");
     cmd.args(["-p", "--mode", "json", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules"]).args([
         "--no-title",
@@ -234,7 +235,7 @@ fn omp_command(model: Option<&str>, prompt: &str) -> Command {
     if let Some(m) = model {
         cmd.args(["--model", m]);
     }
-    cmd.arg(prompt).current_dir(std::env::temp_dir());
+    cmd.current_dir(std::env::temp_dir());
     cmd
 }
 
@@ -315,8 +316,9 @@ pub(crate) fn standalone_env(cmd: &mut Command, empty: Option<&Path>, config: Op
 }
 
 /// The headless opencode command. `empty` is the call's own empty config dir (2.x), `config` the
-/// file with the engineer's providers (`provider_config`).
-fn opencode_command(model: Option<&str>, prompt: &str, cli: Opencode, empty: Option<&Path>, config: Option<PathBuf>) -> Command {
+/// file with the engineer's providers (`provider_config`). The prompt goes in on stdin, never as an
+/// argument (see [`omp_command`]).
+fn opencode_command(model: Option<&str>, cli: Opencode, empty: Option<&Path>, config: Option<PathBuf>) -> Command {
     let mut cmd = Command::new("opencode");
     match cli {
         Opencode::V1 => {
@@ -340,7 +342,7 @@ fn opencode_command(model: Option<&str>, prompt: &str, cli: Opencode, empty: Opt
     }
     // opencode files the session under PWD, which current_dir does not change.
     let tmp = std::env::temp_dir();
-    cmd.arg(prompt).env("PWD", &tmp).current_dir(&tmp);
+    cmd.env("PWD", &tmp).current_dir(&tmp);
     cmd
 }
 
@@ -420,12 +422,18 @@ fn last_json(text: &str) -> Option<Value> {
     last
 }
 
-fn claude(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Option<(Value, Option<f64>)> {
+/// The headless claude command. The prompt goes in on stdin (`claude -p` reads it there), never as an
+/// argument (see [`omp_command`]).
+fn claude_command(model: &str, schema: &Value) -> Command {
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", prompt, "--model", model, "--tools", "", "--output-format", "json"])
+    cmd.args(["-p", "--model", model, "--tools", "", "--output-format", "json"])
         .args(["--json-schema", &schema.to_string(), "--setting-sources", "project", "--strict-mcp-config", "--no-session-persistence"])
         .current_dir(std::env::temp_dir());
-    let res: Value = serde_json::from_slice(&run_capped(cmd, None, timeout)?).ok()?;
+    cmd
+}
+
+fn claude(prompt: &str, model: &str, schema: &Value, timeout: Duration) -> Option<(Value, Option<f64>)> {
+    let res: Value = serde_json::from_slice(&run_capped(claude_command(model, schema), Some(prompt.as_bytes()), timeout)?).ok()?;
     let v = res.get("structured_output").cloned().or_else(|| serde_json::from_str(res["result"].as_str()?).ok())?;
     Some((v, res["total_cost_usd"].as_f64()))
 }
@@ -773,7 +781,7 @@ mod tests {
         let c = [Choice { runner: Runner::Omp, model: Some("x".into()) }, Choice { runner: Runner::Opencode, model: None }];
         let fake = std::env::temp_dir().join(format!("borg-runner-nopath-{}", std::process::id()));
         std::fs::create_dir_all(&fake).unwrap();
-        let mut cmd = omp_command(Some("x"), "p");
+        let mut cmd = omp_command(Some("x"));
         cmd.env("PATH", &fake);
         assert!(run_capped(cmd, None, Duration::from_secs(2)).is_none());
         assert!(structured(&[], "p", &json!({}), Duration::from_secs(5)).is_none());
@@ -847,18 +855,42 @@ mod tests {
         env(cmd).contains(&(k.to_string(), Some(v.to_string())))
     }
 
+    /// A prompt is never an argument of a model CLI: an argument is capped by the kernel (128 KiB,
+    /// `E2BIG`, which failed a long session's end judge on every runner) and visible in `ps`.
+    #[test]
+    fn no_runner_passes_the_prompt_as_an_argument_and_stdin_carries_more_than_the_argument_cap() {
+        let prompt = "the whole prompt";
+        let schema = json!({"type": "object"});
+        for cmd in [
+            claude_command("sonnet", &schema),
+            omp_command(Some("m")),
+            omp_command(None),
+            opencode_command(Some("p/m"), Opencode::V1, None, None),
+            opencode_command(None, Opencode::V2, None, None),
+        ] {
+            let a = args(&cmd);
+            assert!(!a.iter().any(|x| x.contains(prompt)), "{a:?}");
+        }
+        // What stdin carries has no such cap: 200 KiB arrive whole (a single argument stops at 128 KiB).
+        let big = "x".repeat(200 * 1024);
+        let mut wc = Command::new("sh");
+        wc.args(["-c", "wc -c"]);
+        let out = run_capped(wc, Some(big.as_bytes()), Duration::from_secs(10)).expect("wc runs");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), (200 * 1024).to_string());
+    }
+
     #[test]
     fn omp_and_opencode_run_headless_without_borgs_adapter_or_tools() {
-        let omp = args(&omp_command(None, "p"));
+        let omp = args(&omp_command(None));
         for f in ["-p", "--no-extensions", "--no-tools", "--no-session"] {
             assert!(omp.contains(&f.to_string()), "{f}");
         }
         let tmp = std::env::temp_dir();
-        let cmd = opencode_command(Some("p/m"), "p", Opencode::V1, None, None);
+        let cmd = opencode_command(Some("p/m"), Opencode::V1, None, None);
         let oc = args(&cmd);
         assert!(oc.contains(&"--pure".to_string()) && oc.windows(2).any(|w| w == ["-m", "p/m"]));
         assert!(oc.windows(2).any(|w| w == ["--title", OPENCODE_TITLE]));
-        assert_eq!(oc.last().unwrap(), "p");
+        assert!(!oc.iter().any(|a| a == "p"), "the prompt is never an argument");
         assert!(set(&cmd, "OPENCODE_PERMISSION", r#"{"*":"deny"}"#) && set(&cmd, "OPENCODE_DISABLE_PROJECT_CONFIG", "1"));
         // The session opencode stores lands in the temp dir, not in the engineer's project (PWD wins).
         assert!(set(&cmd, "PWD", &tmp.to_string_lossy()) && cmd.get_current_dir() == Some(tmp.as_path()));
@@ -868,7 +900,7 @@ mod tests {
     fn an_omp_call_asks_a_fast_model_unless_one_is_pinned() {
         let model = |spec: Option<&str>, env: Option<&str>| {
             let c = pick(spec, Some("omp"), &only(&["omp"]));
-            let cmd = omp_command(omp_model(c[0].model.as_deref(), env), "p");
+            let cmd = omp_command(omp_model(c[0].model.as_deref(), env));
             args(&cmd).windows(2).find(|w| w[0] == "--model").map(|w| w[1].clone())
         };
         assert_eq!(model(None, None).as_deref(), Some(OMP_DEFAULT), "unpinned: the fast default, not omp's own");
@@ -878,8 +910,8 @@ mod tests {
         assert_eq!(model(None, Some(" haiku ")).as_deref(), Some("haiku"), "BORG_OMP_MODEL");
         assert_eq!(model(None, Some("")).as_deref(), Some(OMP_DEFAULT), "set but empty");
         assert_eq!(model(None, Some("default")), None, "omp's own default: no --model");
-        let p = args(&omp_command(Some("m"), "the prompt"));
-        assert_eq!(p.last().map(String::as_str), Some("the prompt"), "the prompt stays last");
+        let p = args(&omp_command(Some("m")));
+        assert_eq!(p.last().map(String::as_str), Some("m"), "the prompt is never an argument: it goes in on stdin");
     }
 
     /// omp exits 1 before any event when no provider of the engineer's offers the model: borg's default
@@ -896,23 +928,23 @@ mod tests {
         let unknown = || sh("echo 'Model \"x\" not found' >&2; exit 1".into());
         let answers = || sh(format!("printf '%s\\n' '{answer}'"));
         let t = Duration::from_secs(20);
-        let got = omp_run(unknown(), Some(answers()), t).map(|(text, _)| last_json(&text));
+        let got = omp_run(unknown(), Some(answers()), "p", t).map(|(text, _)| last_json(&text));
         assert_eq!(got, Some(Some(json!({"ok": true}))), "the default unknown: omp's own answers");
-        assert_eq!(omp_run(unknown(), None, t), None, "a model the engineer named fails as named");
-        assert!(omp_run(answers(), Some(unknown()), t).is_some(), "an answer needs no fallback");
+        assert_eq!(omp_run(unknown(), None, "p", t), None, "a model the engineer named fails as named");
+        assert!(omp_run(answers(), Some(unknown()), "p", t).is_some(), "an answer needs no fallback");
         let errored = json!({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error"}});
-        assert_eq!(omp_run(sh(format!("printf '%s\\n' '{errored}'; exit 1")), Some(answers()), t), None, "it reached the model: no second call");
+        assert_eq!(omp_run(sh(format!("printf '%s\\n' '{errored}'; exit 1")), Some(answers()), "p", t), None, "it reached the model: no second call");
     }
 
     #[test]
     fn opencode_2_runs_standalone_with_an_empty_config_dir_and_the_engineers_providers() {
         let tmp = std::env::temp_dir();
         let (empty, global) = (tmp.join("borg-empty"), tmp.join("cfg/opencode/opencode.json"));
-        let cmd = opencode_command(Some("p/m"), "p", Opencode::V2, Some(&empty), Some(global.clone()));
+        let cmd = opencode_command(Some("p/m"), Opencode::V2, Some(&empty), Some(global.clone()));
         let oc = args(&cmd);
         assert_eq!(&oc[..6], ["run", "--standalone", "--format", "json", "--title", OPENCODE_TITLE]);
         assert!(!oc.contains(&"--pure".to_string()), "2.x rejects --pure");
-        assert!(oc.windows(2).any(|w| w == ["-m", "p/m"]) && oc.last().unwrap() == "p");
+        assert!(oc.windows(2).any(|w| w == ["-m", "p/m"]) && oc.last().unwrap() == "p/m", "the prompt goes in on stdin, never as an argument");
         assert!(set(&cmd, "OPENCODE_CONFIG_DIR", &empty.to_string_lossy()));
         assert!(set(&cmd, "OPENCODE_CONFIG", &global.to_string_lossy()));
         assert!(set(&cmd, "OPENCODE_CONFIG_CONTENT", r#"{"permission":{"*":"deny"}}"#));
@@ -920,7 +952,7 @@ mod tests {
         assert!(set(&cmd, "PWD", &tmp.to_string_lossy()) && cmd.get_current_dir() == Some(tmp.as_path()));
         // 2.x does not read OPENCODE_PERMISSION; without a global config file none is passed on.
         assert!(!env(&cmd).iter().any(|(k, _)| k == "OPENCODE_PERMISSION"));
-        let bare = opencode_command(None, "p", Opencode::V2, Some(&empty), None);
+        let bare = opencode_command(None, Opencode::V2, Some(&empty), None);
         assert!(env(&bare).contains(&("OPENCODE_CONFIG".into(), None)), "unset, not inherited");
         assert!(!args(&bare).contains(&"-m".to_string()));
     }
@@ -958,7 +990,7 @@ mod tests {
         assert_eq!(provider_config(Some(custom.clone()), &home), Some(custom.clone()));
         assert_eq!(provider_config(Some(home.join("gone.json")), &home), Some(global.clone()), "a missing file is no config");
         assert_eq!(provider_config(None, &home), Some(global));
-        let cmd = opencode_command(None, "p", Opencode::V2, Some(&home), provider_config(Some(custom.clone()), &home));
+        let cmd = opencode_command(None, Opencode::V2, Some(&home), provider_config(Some(custom.clone()), &home));
         assert!(set(&cmd, "OPENCODE_CONFIG", &custom.to_string_lossy()));
         let _ = std::fs::remove_dir_all(&home);
     }

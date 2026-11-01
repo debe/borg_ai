@@ -43,7 +43,7 @@ fn setup(name: &str) -> PathBuf {
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\nn=$(( $(ls {c} | wc -l) / 2 ))\nprintf '%s' \"$2\" > {c}/$n.prompt\nprintf '%s' \"${{10}}\" > {c}/$n.schema\ncat {a}\n",
+            "#!/bin/sh\np=$(cat)\nn=$(( $(ls {c} | wc -l) / 2 ))\nprintf '%s' \"$p\" > {c}/$n.prompt\nprintf '%s' \"$9\" > {c}/$n.schema\ncat {a}\n",
             c = calls.display(),
             a = root.join("answer.json").display()
         ),
@@ -284,7 +284,7 @@ fn unclear_or_missing_verdicts_stay_pending_and_are_sent_twice_at_most() {
     // No `resolved` at all: everything stays pending.
     std::fs::write(root.join("answer.json"), json!({"structured_output": {"moves": [], "applies": []}, "total_cost_usd": 0.01}).to_string()).unwrap();
     stop(&root, "s1", false, "Next step done.", true, &[]);
-    // Unclear, and a change that still leads to the consequence: pending too.
+    // Unclear, and a change that still leads to the consequence (judge v2's answer shape): pending too.
     answer(
         &root,
         &[],
@@ -292,8 +292,9 @@ fn unclear_or_missing_verdicts_stay_pending_and_are_sent_twice_at_most() {
     );
     stop(&root, "s1", false, "Another step done.", true, &[]);
     assert!(kind(&root, "asked_then_changed").is_empty() && kind(&root, "asked_ignored").is_empty(), "{:?}", outcomes(&root));
-    // Measured, not a result: the unclear verdicts are `asked_unclear` (a missing one writes nothing).
-    assert_eq!(kind(&root, "asked_unclear"), ["Ldrain", "Llock"], "{:?}", outcomes(&root));
+    // Measured, not a result, each under its own kind (a missing verdict writes nothing).
+    assert_eq!(kind(&root, "asked_unclear"), ["Ldrain"], "{:?}", outcomes(&root));
+    assert_eq!(kind(&root, "asked_consequence_remains"), ["Llock"], "{:?}", outcomes(&root));
     let state = store_file(&root, "state/s1.ctx");
     assert_eq!(state.matches("#borg-judged Llock=pending").count(), 2, "{state}");
     // Twice sent without a verdict: not sent again (borg learn settles it as asked_not_corrected).
@@ -303,6 +304,203 @@ fn unclear_or_missing_verdicts_stay_pending_and_are_sent_twice_at_most() {
     assert_eq!(c.len(), 4);
     assert!(c[1].0.contains("[Llock] lesson") && c[2].0.contains("[Llock] lesson") && !c[3].0.contains("from earlier in this session"), "{}", c[3].0);
     assert!(kind(&root, "asked_then_changed").is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Judge v3 (0.7.5): the schema asks for five verdicts with a reason; a point that never came up
+/// (`not_arisen`) is recorded under its own kind with the judge's reason (redacted, on one line), a
+/// remaining consequence (`consequence_remains`) too; at a check both stay open (the point may still
+/// come up later in the session) and are sent again, and only the session-end judge's `not_arisen`
+/// settles; the cost line counts the verdicts by word and the reasons' characters; and the belief does
+/// not move for the point that never came up.
+#[test]
+fn the_judge_gives_five_verdicts_each_with_its_reason() {
+    let root = setup("verdicts");
+    blocked_and_answered(&root, "s1", "Llock: applies");
+    let lessons = root.join("store/collectives/corp/lessons.jsonl");
+    let memory = || -> Vec<Value> {
+        borg(&root, &["debug", "memory", lessons.to_str().unwrap()], "", false, &[]).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    };
+    let before = memory();
+    answer(
+        &root,
+        &[],
+        json!([
+            {"id": "Llock", "verdict": "not_arisen", "reason": "the turn only touched\nthe changelog; token AKIAIOSFODNN7EXAMPLE"},
+            {"id": "Ldrain", "verdict": "consequence_remains", "reason": "one writer now, but frames still interleave on reconnect"}
+        ]),
+    );
+    stop(&root, "s1", false, "Updated the changelog.", true, &[]);
+    let (_, schema) = &calls(&root)[1];
+    let schema: Value = serde_json::from_str(schema).unwrap();
+    let item = &schema["properties"]["resolved"]["items"];
+    assert_eq!(item["properties"]["verdict"]["enum"], json!(["changed", "ignored", "not_arisen", "consequence_remains", "unclear"]), "{schema}");
+    assert_eq!(item["required"], json!(["id", "verdict", "reason"]));
+    let rec = |k: &str| outcomes(&root).into_iter().find(|o| o["kind"] == k).unwrap_or_else(|| panic!("no {k}: {:?}", outcomes(&root)));
+    let na = rec("asked_not_arisen");
+    assert_eq!((na["lessons"].clone(), na["channel"].clone(), na["judge"].clone()), (json!(["Llock"]), json!("stop"), json!(3)), "{na}");
+    let reason = na["reasons"][0].as_str().unwrap();
+    assert!(reason.starts_with("the turn only touched the changelog; token ") && !reason.contains("AKIA"), "redacted, one line: {reason}");
+    let remains = rec("asked_consequence_remains");
+    assert_eq!(remains["reasons"], json!(["one writer now, but frames still interleave on reconnect"]), "{remains}");
+    assert!(kind(&root, "asked_unclear").is_empty(), "{:?}", outcomes(&root));
+    let state = store_file(&root, "state/s1.ctx");
+    assert!(state.contains("#borg-judged Llock=pending") && state.contains("#borg-judged Ldrain=pending"), "a check's not arisen stays open: {state}");
+    let cost = store_file(&root, "state/s1.cost");
+    let line = cost.lines().find(|l| l.starts_with("judge ")).unwrap_or_else(|| panic!("{cost}"));
+    assert!(line.contains(" resolved=1 ") && line.contains(" verdicts=changed:0,ignored:0,not_arisen:1,consequence_remains:1,unclear:"), "{line}");
+    let chars: usize = line.split_whitespace().find_map(|w| w.strip_prefix("reason_chars=")).unwrap().parse().unwrap();
+    assert_eq!(chars, reason.chars().count() + "one writer now, but frames still interleave on reconnect".len(), "{line}");
+    // Both open: sent again.
+    answer(&root, &[], json!([{"id": "Ldrain", "verdict": "changed", "reason": "the reconnect path is serialised too"}]));
+    stop(&root, "s1", false, "Serialised the reconnect.", true, &[]);
+    let (third, _) = &calls(&root)[2];
+    assert!(third.contains("[Llock] lesson") && third.contains("[Ldrain] lesson"), "{third}");
+    assert_eq!(kind(&root, "asked_then_changed"), ["Ldrain"]);
+    // The session-end judge sees Llock once more, with the whole session; its not arisen settles.
+    let end = json!({"structured_output": {"resolved": [{"id": "Llock", "verdict": "not_arisen", "reason": "no lock in the session's work"}]}, "total_cost_usd": 0.01});
+    std::fs::write(root.join("answer.json"), end.to_string()).unwrap();
+    learn_end(&root, "s1", &[]);
+    let c = calls(&root);
+    assert_eq!(c.len(), 4, "one call at the session's end");
+    assert!(c[3].0.contains("[Llock] lesson") && !c[3].0.contains("[Ldrain] lesson"), "{}", c[3].0);
+    let state = store_file(&root, "state/s1.ctx");
+    assert!(state.contains("#borg-judged Llock=not_arisen\n#borg-end-judged Llock\n"), "{state}");
+    assert!(outcomes(&root).iter().any(|o| o["kind"] == "asked_not_arisen" && o["at"] == "end"), "{:?}", outcomes(&root));
+    // Censored for the belief: Llock's memory is as before its verdict.
+    let m = |mem: &[Value], id: &str| mem.iter().find(|m| m["id"] == id).unwrap().clone();
+    assert_eq!(m(&memory(), "Llock"), m(&before, "Llock"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `borg learn --session` as the end hook starts it: in the session's collective, with its state.
+fn learn_end(root: &Path, session: &str, env: &[(&str, &str)]) {
+    let corp = root.join("store/collectives/corp");
+    let (home, state) = (corp.display().to_string(), corp.join("state").display().to_string());
+    let mut all = vec![
+        ("BORG_HOME", home.as_str()),
+        ("BORG_STATE", state.as_str()),
+        ("BORG_HARNESS", "claude"),
+        ("BORG_TRANSCRIPT_CAPTURE", "off"),
+        ("BORG_REVIEW_FIX", "off"),
+    ];
+    all.extend_from_slice(env);
+    borg(root, &["learn", "--session", session], "", true, &all);
+}
+
+/// The session-end judge (0.7.5): `borg learn --session` judges once, in one call with the whole
+/// session's work, every delivery no verdict settled (a question whose check tries were spent on unclear
+/// verdicts included), never one a check settled; records the verdict as a check's judge does, marked
+/// `at` end, with its cost line and a `model_call` with why `judge`; and never judges again. A session
+/// with nothing open, `BORG_LEARN=off` and a consequence model turned off make no call.
+#[test]
+fn the_session_end_judges_every_open_delivery_once_with_the_whole_session() {
+    let root = setup("end");
+    blocked_and_answered(&root, "s1", "Llock: applies");
+    // The checks settle Ldrain and spend Llock's tries on unclear verdicts.
+    answer(&root, &[], json!([{"id": "Llock", "verdict": "unclear", "reason": "r"}, {"id": "Ldrain", "verdict": "changed", "reason": "one writer"}]));
+    stop(&root, "s1", false, "Next step done.", true, &[]);
+    answer(&root, &[], json!([{"id": "Llock", "verdict": "unclear", "reason": "r"}]));
+    stop(&root, "s1", false, "Another step done.", true, &[]);
+    assert_eq!(calls(&root).len(), 3);
+    let end = json!({"structured_output": {"resolved": [{"id": "Llock", "verdict": "changed", "reason": "no lock is held across the await any more"}]}, "total_cost_usd": 0.02});
+    std::fs::write(root.join("answer.json"), end.to_string()).unwrap();
+    learn_end(&root, "s1", &[]);
+    let c = calls(&root);
+    assert_eq!(c.len(), 4, "one call at the session's end");
+    let (prompt, schema) = &c[3];
+    assert!(prompt.starts_with("You are the consequence model of an engineering team. A coding agent's session has ended."), "{prompt}");
+    assert!(prompt.contains("## The session's work") && prompt.contains("one writer thread drains the delivery queue"), "the whole session: {prompt}");
+    assert!(prompt.contains("[Llock] lesson") && !prompt.contains("[Ldrain] lesson"), "only what stays open: {prompt}");
+    let schema: Value = serde_json::from_str(schema).unwrap();
+    assert_eq!(schema["required"], json!(["resolved"]), "{schema}");
+    let rec = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_then_changed" && o["lessons"] == json!(["Llock"])).expect("Llock judged");
+    assert_eq!((rec["at"].clone(), rec["channel"].clone(), rec["judge"].clone()), (json!("end"), json!("stop"), json!(3)), "{rec}");
+    assert_eq!(rec["reasons"], json!(["no lock is held across the await any more"]));
+    let checked = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_then_changed" && o["lessons"] == json!(["Ldrain"])).unwrap();
+    assert!(checked.get("at").is_none(), "a check's verdict has no `at`: {checked}");
+    let state = store_file(&root, "state/s1.ctx");
+    assert!(state.contains("#borg-judged Llock=changed\n#borg-end-judged Llock\n"), "{state}");
+    let cost = store_file(&root, "state/s1.cost");
+    let line = cost.lines().last().unwrap_or_default();
+    assert!(line.starts_with("judge call=4 pending=1 resolved=1 ") && line.ends_with(" at=end"), "{cost}");
+    let judge: Vec<Value> = store_file(&root, "stats/events.jsonl")
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["kind"] == "model_call" && e["why"] == "judge")
+        .collect();
+    assert_eq!(judge.len(), 1, "{judge:?}");
+    assert_eq!((judge[0]["session"].clone(), judge[0]["usd"].clone()), (json!("s1"), json!(0.02)));
+    // Settled at the end: a second run judges nothing again.
+    learn_end(&root, "s1", &[]);
+    assert_eq!(calls(&root).len(), 4, "never judged twice");
+    assert_eq!(kind(&root, "asked_then_changed"), ["Ldrain", "Llock"]);
+    // Nothing open: no call.
+    learn_end(&root, "s2", &[]);
+    assert_eq!(calls(&root).len(), 4);
+    // Open, but learning or the consequence model is off: no call; on again, the call comes.
+    blocked_and_answered(&root, "s3", "Llock: applies");
+    let n = calls(&root).len();
+    learn_end(&root, "s3", &[("BORG_LEARN", "off")]);
+    learn_end(&root, "s3", &[("BORG_PREDICT_MODEL", "off")]);
+    assert_eq!(calls(&root).len(), n, "off: nothing runs");
+    assert!(!store_file(&root, "state/s3.ctx").contains("#borg-end-judged"));
+    std::fs::write(root.join("answer.json"), json!({"structured_output": {"resolved": []}}).to_string()).unwrap();
+    learn_end(&root, "s3", &[]);
+    assert_eq!(calls(&root).len(), n + 1);
+    assert!(store_file(&root, "state/s3.ctx").contains("#borg-end-judged "), "judged without a verdict: settled there as well");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A session whose end hook never ran settles once idle (outcome.rs `idle_sessions`) in any later
+/// `borg learn`: the session-end judge gives its open deliveries their last verdict there too, in one
+/// call, before the settle, which then leaves the judged lesson alone; once.
+#[test]
+fn an_idle_session_gets_the_session_end_judge_before_it_settles() {
+    let root = setup("idle");
+    blocked_and_answered(&root, "s1", "Llock: applies");
+    answer(&root, &[], json!([{"id": "Llock", "verdict": "unclear", "reason": "r"}, {"id": "Ldrain", "verdict": "changed", "reason": "one writer"}]));
+    stop(&root, "s1", false, "Next step done.", true, &[]);
+    let n = calls(&root).len();
+    // Two days quiet: its records and its state file.
+    let corp = root.join("store/collectives/corp");
+    let old = |v: &mut Value| {
+        if let Some(ms) = v["ms"].as_i64() {
+            v["ms"] = json!(ms - 2 * 86_400_000);
+        }
+    };
+    for f in ["outcomes.jsonl", "episodes.jsonl"] {
+        let Ok(text) = std::fs::read_to_string(corp.join(f)) else { continue };
+        let aged: String = text
+            .lines()
+            .map(|l| {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                old(&mut v);
+                format!("{v}\n")
+            })
+            .collect();
+        std::fs::write(corp.join(f), aged).unwrap();
+    }
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+    std::fs::File::options().append(true).open(corp.join("state/s1.ctx")).unwrap().set_modified(then).unwrap();
+    std::fs::write(
+        root.join("answer.json"),
+        json!({"structured_output": {"resolved": [{"id": "Llock", "verdict": "ignored", "reason": "the lock still spans the await"}]}}).to_string(),
+    )
+    .unwrap();
+    // Another session's end runs `borg learn`: s1 is idle.
+    learn_end(&root, "s2", &[]);
+    let c = calls(&root);
+    assert_eq!(c.len(), n + 1, "one session-end call for the idle session");
+    assert!(c[n].0.contains("## The session's work") && c[n].0.contains("[Llock] lesson"), "{}", c[n].0);
+    let rec = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_ignored" && o["lessons"] == json!(["Llock"])).expect("Llock judged");
+    assert_eq!(rec["at"], json!("end"), "{rec}");
+    let settled: Vec<Value> = outcomes(&root).into_iter().filter(|o| o["kind"] == "asked_not_corrected" && o["lessons"] == json!(["Llock"])).collect();
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0]["reason"], json!("judged"), "settled as judged: {settled:?}");
+    assert!(settled[0]["ms"].as_i64() >= rec["ms"].as_i64(), "after the verdict: {settled:?} {rec}");
+    learn_end(&root, "s2", &[]);
+    assert_eq!(calls(&root).len(), n + 1, "once");
     let _ = std::fs::remove_dir_all(root);
 }
 

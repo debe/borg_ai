@@ -104,6 +104,8 @@ pub(crate) fn rank(kind: &str) -> Option<u8> {
         outcome::CORRECTED => Some(2),
         outcome::CHANGED => Some(1),
         outcome::IGNORED => Some(0),
+        // Censored, as memory.rs reads them: no verdict on the lesson's use.
+        outcome::NOT_CORRECTED | outcome::NOT_ARISEN | outcome::UNCLEAR | outcome::REMAINS => None,
         _ => None,
     }
 }
@@ -112,7 +114,8 @@ pub(crate) fn rank(kind: &str) -> Option<u8> {
 /// 1 when the strongest result of its session at or after the ask is a change, else 0: a correction or
 /// a veto after the ask means asking did not help. A placebo's result (outcome.rs `PLACEBO`: judged
 /// where a free delivery would be, never shown) is no result about the lesson, and an unclear verdict
-/// (`UNCLEAR`) has no rank: neither rewards anything.
+/// (`UNCLEAR`), a remaining consequence (`REMAINS`) and a point that never came up (`NOT_ARISEN`) have no
+/// rank: none rewards anything.
 pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
     let mut results: HashMap<(&str, &str), Vec<(i64, u8)>> = HashMap::new();
     for o in outcomes.iter().filter(|o| o.channel != outcome::PLACEBO) {

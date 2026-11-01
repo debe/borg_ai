@@ -113,11 +113,19 @@ ask).
 
 ### 5. Learning quality: judging with the session's own evidence
 
-- **Free hand-overs and placebos are judged after the work** (0.7.3): a live check waits until work
-  follows the delivery; a stop's judge call judges the rest. Before, 54% of free verdicts came within 2
-  minutes of delivery, 74% of those unclear. Kill: revert if, over the next 150 free deliveries, the
-  labelled share (over every free delivery, those settled `no_call` included) does not rise from 38% to at least 50%, or the unclear share does not fall by at least 15
-  points.
+- **Verdicts the judge can give, judged after the work** (0.7.5, replacing 0.7.3's wait for work after
+  the delivery). The judge gives one of five verdicts with a logged reason: changed, ignored, not
+  arisen (the point never came up; censored for the belief, no change for selection), consequence
+  remains, or unclear. A live check never judges a free hand-over or a placebo; a stop's judge call
+  does, and `borg learn --session` judges what is still open once more, in one call with the whole
+  session's work (its prompts and touches, edits and answers, and the agent's messages). Before:
+  unclear (`asked_unclear`, which then also held a remaining consequence) 77-79% of free and 86-100% of placebo verdicts, 58-62% live, 29-51% at the stop; a
+  delivery's next judging check came after a median 0.5-0.8 minutes. Target: pure unclear below 10% of
+  all verdicts and below 20% on the free and placebo channels over the first 150 free and placebo
+  deliveries after release. Kill: revert the session-end judge if that free and placebo share is not
+  below 40% by then; review the verdicts if lessons' belief means move by more than 0.05 on average
+  against a replay without `not_arisen`. Cost: one extra model call per session with something open
+  ([Evidence](evidence.md#lesson-selection)).
 - **Placebos from the lessons the budget cuts.** A placebo is never a lesson the session already had,
   and 414 of 419 not-now applies in the team store (1,219 of 1,224 in the open-source store) are such
   lessons. Meanwhile the character budget cut 469 free hand-overs in the open-source store (29 in the

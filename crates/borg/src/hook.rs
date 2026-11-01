@@ -411,11 +411,48 @@ fn note_answer(h: &dyn Harness, session: &str, input: &Value) {
 /// `CAP`), whose lessons share their evidence in the prompt. A lesson it leaves out is logged
 /// (`#borg-unjudged <ids> why=slots`), so its hit rate is measured.
 const MAX_PENDING: usize = conscience::CAP;
-/// A lesson whose verdicts stay pending (unclear, missing) is sent to the judge this often at most;
-/// after that it waits for `borg learn` to settle it as `asked_not_corrected` (censored, reason
+/// A lesson whose verdicts stay pending (unclear, missing) is sent to a check's judge this often at
+/// most; after that it waits for the session-end judge (`judge_session`), which judges it once more
+/// whatever its tries, then for `borg learn` to settle it as `asked_not_corrected` (censored, reason
 /// `tries`). Guard: a lesson the judge never settles would otherwise ride on every later call. A failed
 /// call is no try: its lessons stay pending as they were (`#borg-unjudged … why=failed`).
 const MAX_JUDGE_TRIES: usize = 2;
+
+/// Pending lessons the session-end judge (`judge_session`) sees in its one call at most (the most
+/// recently delivered; questions first, as at a check). Guard: bounds that call's judge section. Derived:
+/// four checks' worth (`MAX_PENDING`); on copies of three stores (2026-10-31) a session ended with a
+/// median of 4-14 delivered lessons that no verdict settled, 32-78 at the 90th percentile. What it
+/// leaves out is logged (`#borg-unjudged … why=slots`).
+const END_MAX_PENDING: usize = 4 * MAX_PENDING;
+
+/// The characters of the session's whole work the session-end judge reads (`session_work`): its
+/// prompts and touches, its edits and answers, and its messages where the harness's transcript gives
+/// them, each the newest part of it, sharing what one leaves unused. Guard: bounds that part of the
+/// call's prompt in a long session. Derived: what a check's call reads of the work (predict.rs `TAIL`).
+const END_WORK_CHARS: usize = predict::TAIL;
+
+/// How long the session-end judge's one call (`judge_session`) may take: a learn-side call's limit
+/// (`BORG_LEARN_TIMEOUT_S`), at most twice the check's (`BORG_PREDICT_TIMEOUT_S`). Derived: the session's
+/// live lock it holds reads stale after twice the check's limit plus a slack (live.rs `stale_ms`), so a
+/// stop of a session resumed meanwhile never takes the lock over and judges the same deliveries again.
+fn end_timeout() -> std::time::Duration {
+    learn::learn_timeout().min(predict::timeout().saturating_mul(2))
+}
+
+/// After a session-end judge call, in the state file: `#borg-end-judged <ids>`, the lessons it was
+/// shown. Their latest deliveries are settled by it whatever it said (`pending`), so neither a later
+/// check nor a second session-end pass judges them again; one it left pending settles at `borg learn`
+/// as having used its tries (`unjudged`). A later delivery of the lesson opens it again.
+const END_JUDGED: &str = "#borg-end-judged ";
+
+/// When a judge call runs (`pending`), which decides what it judges: a live check mid-turn, a turn end
+/// (a stop's check), or the session's end (`judge_session`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum When {
+    Live,
+    Stop,
+    End,
+}
 
 /// The markers of a delivery of lessons to the drone, in the state and .edits files: asked at a Stop or
 /// live (`#borg-asked`), delivered early, handed over free (`#borg-queued`); and a placebo
@@ -464,16 +501,19 @@ struct Judging<'a> {
 /// which may be the answer itself (a live question answered at this stop; `check` takes it out of the
 /// work the call shows too). `#borg-judged <id>=<label>` lines in the state file record verdicts, each for
 /// the lesson's latest delivery before it: a lesson delivered early, judged, then asked at a Stop is
-/// judged again on the question. `mid_turn` (a live check) holds two kinds of delivery back for a later
-/// judge, without a try: a question the drone has not answered yet (no `#borg-answer` after it, written
+/// judged again on the question. A live check (`When::Live`) holds deliveries back for a later judge,
+/// without a try (`held`): a question the drone has not answered yet (no `#borg-answer` after it, written
 /// at the stop) waits for the stop's judge, which sees the answer, as in hook mode; a free delivery or a
-/// placebo with no work after it yet (no line but `#borg-` ones) waits for a later judge call: a live
-/// check after more work, or a stop that calls the judge (`deferred`). A delivery held back still is its lessons' latest: no earlier delivery of
-/// them is judged in its place, so a lesson handed over free, then asked live, never earns the free
-/// route what the question did. Of the `MAX_PENDING` slots, questions take theirs first (the newest),
-/// free deliveries what is left: a free hand-over never pushes a question out of its judge. `judging`:
-/// this call's check, the coin's seed for a delivery from before checks had ids.
-fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str, mid_turn: bool, judging: &str) -> Judging<'a> {
+/// placebo always waits for the turn's end: a stop that calls the judge, or else the session-end judge
+/// (`judge_session`). A delivery held back still is its lessons' latest: no earlier delivery of them is
+/// judged in its place, so a lesson handed over free, then asked live, never earns the free route what
+/// the question did. Of the `MAX_PENDING` slots, questions take theirs first (the newest), free
+/// deliveries what is left: a free hand-over never pushes a question out of its judge. At the session's
+/// end (`When::End`) nothing is held, a lesson's tries do not bar it (`MAX_JUDGE_TRIES`) and the call
+/// has `END_MAX_PENDING` slots. A lesson a session-end judge was shown (`END_JUDGED`) is settled for
+/// every later call. `judging`: this call's check, the coin's seed for a delivery from before checks
+/// had ids.
+fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], final_msg: &str, when: When, judging: &str) -> Judging<'a> {
     let mut tries: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut settled = std::collections::HashSet::new();
     for l in state.lines() {
@@ -483,6 +523,8 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
             if label.trim() != "pending" {
                 settled.insert(id);
             }
+        } else if let Some(list) = l.strip_prefix(END_JUDGED) {
+            settled.extend(ids_in(list));
         } else if let Some(list) = DELIVERED.iter().find_map(|m| l.strip_prefix(m)) {
             for id in ids_in(list) {
                 tries.remove(id);
@@ -520,7 +562,7 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
         let answers: Vec<&str> = if question { later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect() } else { Vec::new() };
         let work: Vec<&str> = later.iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
         let (list, tag) = tagged(list);
-        if mid_turn && deferred(question, &answers, &work) {
+        if held(when, question, &answers) {
             let held = list.split(',').map(str::trim).filter(|i| !i.is_empty()).collect();
             deliveries.push(Delivery { channel, question, before: "", answers, work, fresh: Vec::new(), held });
             continue;
@@ -537,7 +579,7 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
         let fresh: Vec<&str> = list
             .split(',')
             .map(str::trim)
-            .filter(|i| !i.is_empty() && !settled.contains(i) && tries.get(i).copied().unwrap_or(0) < MAX_JUDGE_TRIES)
+            .filter(|i| !i.is_empty() && !settled.contains(i) && (when == When::End || tries.get(i).copied().unwrap_or(0) < MAX_JUDGE_TRIES))
             .filter(|i| all.iter().any(|c| c.id == *i))
             .collect();
         let check_of = |id: &str| routed.get(id).copied().or(tag).unwrap_or_default();
@@ -571,8 +613,9 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
             out.push((pending, d.question));
         }
     }
-    let questions = out.iter().filter(|x| x.1).count().min(MAX_PENDING);
-    let mut room = [MAX_PENDING - questions, questions];
+    let slots = if when == When::End { END_MAX_PENDING } else { MAX_PENDING };
+    let questions = out.iter().filter(|x| x.1).count().min(slots);
+    let mut room = [slots - questions, questions];
     let (mut kept, mut crowded): (Vec<(predict::Pending, bool)>, Vec<String>) = (Vec::new(), Vec::new());
     for x in out.into_iter().rev() {
         let r = &mut room[usize::from(x.1)];
@@ -588,20 +631,20 @@ fn pending<'a>(session: &str, state: &str, all: &'a [conscience::Challenge], fin
     Judging { pending: kept.into_iter().map(|x| x.0).collect(), question: questions > 0, crowded }
 }
 
-/// Whether a live check (mid-turn) holds a delivery back for a later judge (`pending`): a question with no
-/// answer yet (`answers`), whose answer comes at the stop; a free delivery or a placebo with no work after
-/// it yet (`work`, its lines that are no `#borg-` bookkeeping), whose verdict would read only the work
-/// before it. Method (judge timing, 2026-10-31): 54% of free verdicts came within 2 minutes of the
-/// delivery and 74% of those were unclear, using up the lesson's tries (`MAX_JUDGE_TRIES`) before the
-/// drone had done anything. A stop's judge call holds nothing back, but not every stop makes one: a live
-/// stop the last live check covered skips (`stop_check`), a stop without the live guard judges nothing
-/// (`Work::judge`), and free deliveries alone pay for no call (`check`); a delivery still held then waits
-/// for the next turn's live check, or `borg learn` settles it `no_call`. Kill: revert if, over the next
-/// 150 free deliveries, the labelled share (changed or ignored over every free delivery, those settled
-/// `no_call` included) does not rise from 38% to at least 50%, or the unclear share does not fall by at
-/// least 15 points.
-fn deferred(question: bool, answers: &[&str], work: &[&str]) -> bool {
-    if question { answers.is_empty() } else { work.is_empty() }
+/// Whether a judge call `when` holds a delivery back for a later one (`pending`): only a live check
+/// (mid-turn) does, a question with no answer yet (`answers`), whose answer comes at the stop, and every
+/// free delivery (early or queued) and placebo, whose verdict waits for the turn's end. Method (0.7.5
+/// pre-registration, 2026-10-31): 0.7.3 held a free delivery until work followed it, yet 77-79% of free
+/// and 86-100% of placebo verdicts stayed unclear, against 29-51% at the stop; the median gap from a
+/// delivery to the next judging check was 0.5-0.8 minutes. A stop's judge call holds nothing back, but
+/// not every stop makes one: a live stop the last live check covered skips (`stop_check`), a stop without
+/// the live guard judges nothing (`Work::judge`), and free deliveries alone pay for no call (`check`); a
+/// delivery still open then waits for a later stop, and at the latest for the session-end judge
+/// (`judge_session`). Target: pure unclear below 10% of all verdicts and below 20% on the free and
+/// placebo channels over the first 150 free and placebo deliveries after release; kill: revert the
+/// session-end judge if the free and placebo share is not below 40% by then.
+fn held(when: When, question: bool, answers: &[&str]) -> bool {
+    when == When::Live && (!question || answers.is_empty())
 }
 
 /// `text` without the declarations of the stripped questions among `pending` (`stripped`): the work a
@@ -621,8 +664,8 @@ fn note_unjudged(session: &str, ids: &[String], why: &str) {
 
 /// Why each lesson delivered in a session's state file `state` has no verdict, as `borg learn` settles
 /// it (outcome.rs `settle_with`): its tries ran out on unclear or missing verdicts since its latest
-/// delivery (`tries`), else the last judge call that left it out (`slots`, `failed`), else no call came
-/// after its delivery (`no_call`).
+/// delivery, the session-end judge's included (`END_JUDGED`; `tries`), else the last judge call that
+/// left it out (`slots`, `failed`), else no call came after its delivery (`no_call`).
 pub(crate) fn unjudged(state: &str) -> std::collections::HashMap<String, &'static str> {
     let mut why: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
     let mut tries: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -641,6 +684,12 @@ pub(crate) fn unjudged(state: &str) -> std::collections::HashMap<String, &'stati
                     why.insert(id.to_string(), outcome::UNJUDGED_TRIES);
                 }
             }
+        } else if let Some(list) = l.strip_prefix(END_JUDGED) {
+            // The session-end judge was its last try, whatever its count.
+            for id in ids_in(list) {
+                tries.insert(id, MAX_JUDGE_TRIES);
+                why.insert(id.to_string(), outcome::UNJUDGED_TRIES);
+            }
         } else if let Some(rest) = l.strip_prefix("#borg-unjudged ") {
             let (list, reason) = rest.rsplit_once(" why=").unwrap_or((rest, ""));
             let reason = match reason.trim() {
@@ -658,56 +707,59 @@ pub(crate) fn unjudged(state: &str) -> std::collections::HashMap<String, &'stati
     why
 }
 
-/// R1: the consequence model's verdicts on the pending lessons it was shown (predict.rs `Judged`).
-/// `asked_then_changed` only for a change that avoids the consequence, `asked_ignored` for no change;
-/// an unclear verdict, or a change that still leads to the consequence, is `asked_unclear` (outcome.rs
-/// `UNCLEAR`, a measurement only) and stays pending, as a missing verdict does. Each result names its
-/// delivery's channel (outcome.rs `PLACEBO` for a placebo, never a result about the lesson), the check
-/// that routed it, the judge's version (predict.rs `JUDGE_VERSION`) and whether the declaration was
-/// stripped. Logs the call's judging cost in the .cost file: `judge call=<nth model call of the
-/// session> pending=N resolved=K chars=<prompt chars added> returned=<ids the answer named>
-/// unmatched=<those of them not pending>` (`judge_line`).
-fn record_verdicts(session: &str, input: &Value, pending: &[predict::Pending], pred: &predict::Prediction, chars: usize, call: usize) {
-    let resolved = &pred.resolved;
+/// R1: the consequence model's verdicts on the pending lessons it was shown (predict.rs `Judged`), each
+/// recorded under its own kind (predict.rs `Verdict::kind`): `asked_then_changed` for a change that
+/// avoids the consequence, `asked_ignored` for no change on a point that came up, `asked_not_arisen`
+/// for a point that never came up (censored for beliefs); these three settle the delivery
+/// (`#borg-judged <id>=<verdict>`), a `not_arisen` only at the session's end (`at` outcome.rs
+/// `AT_END`): at a check the point may still come up later, so it stays pending for later stops and
+/// the session-end judge (`judge_session`), a try as an unclear one is. An unclear verdict (`asked_unclear`) and a change that still leads
+/// to the consequence (`asked_consequence_remains`) are measurements only and stay pending
+/// (`#borg-judged <id>=pending`), as a missing verdict does. Each result names its delivery's channel
+/// (outcome.rs `PLACEBO` for a placebo, never a result about the lesson), the check that routed it, the
+/// judge's version (predict.rs `JUDGE_VERSION`), whether the declaration was stripped, per lesson the
+/// judge's redacted reason (`reasons`), the session's `repo`, and where it was judged (`at`: empty at a
+/// check, outcome.rs `AT_END` at the session's end). Logs the call's judging cost in the .cost file
+/// (`judge_line`, then ` at=<at>` when not at a check).
+fn record_verdicts(session: &str, repo: &str, at: &str, pending: &[predict::Pending], pred: &predict::Prediction, chars: usize, call: usize) {
     // One record per (kind, channel, check, stripped): the statistics split what the deliveries led to by
-    // how they were made.
-    let mut records: std::collections::BTreeMap<(&str, &str, &str, bool), Vec<String>> = std::collections::BTreeMap::new();
-    let mut settled = 0;
+    // how they were made. Each lesson with its reason.
+    type Key<'k> = (&'k str, &'k str, &'k str, bool);
+    let mut records: std::collections::BTreeMap<Key, Vec<(String, String)>> = std::collections::BTreeMap::new();
     for p in pending {
-        let judged = resolved.iter().find(|j| j.id == p.lesson.id);
-        let label = judged.and_then(predict::Judged::label);
-        let word = match label {
-            Some(outcome::CHANGED) => "changed",
-            Some(_) => "ignored",
-            None => "pending",
+        let judged = pred.resolved.iter().find(|j| j.id == p.lesson.id);
+        // A point that has not come up by a check may still come up later in the session: only the
+        // session-end judge's `not_arisen`, with the whole session in view, settles the delivery.
+        let word = match judged {
+            Some(j) if j.label().is_some() && (j.verdict != predict::Verdict::NotArisen || at == outcome::AT_END) => j.verdict.word(),
+            _ => "pending",
         };
         append(session, &format!("#borg-judged {}={word}", p.lesson.id));
-        let kind = match (label, judged) {
-            (Some(kind), _) => kind,
-            (None, Some(_)) => outcome::UNCLEAR,
-            (None, None) => continue,
-        };
-        settled += usize::from(label.is_some());
-        records.entry((kind, p.channel, p.check.as_str(), p.stripped)).or_default().push(p.lesson.id.clone());
+        let Some(j) = judged else { continue };
+        records.entry((j.verdict.kind(), p.channel, p.check.as_str(), p.stripped)).or_default().push((p.lesson.id.clone(), j.reason.clone()));
     }
-    log_cost(session, &judge_line(call, pending, settled, chars, &pred.returned));
+    let at_field = if at.is_empty() { String::new() } else { format!(" at={at}") };
+    log_cost(session, &format!("{}{at_field}", judge_line(call, pending, &pred.resolved, chars, &pred.returned)));
     if learning() {
-        let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
         let (home, ms) = (learn::home(), learn::now_ms());
         // The statistics count one event per kind and channel, whatever checks routed its lessons.
         let mut counted: std::collections::BTreeMap<(&str, &str), Vec<String>> = std::collections::BTreeMap::new();
-        for ((kind, channel, check, stripped), lessons) in records {
+        for ((kind, channel, check, stripped), judged) in records {
+            let (lessons, reasons): (Vec<String>, Vec<String>) = judged.into_iter().unzip();
             counted.entry((kind, channel)).or_default().extend(lessons.iter().cloned());
             let o = outcome::Outcome {
                 kind: kind.into(),
                 session: session.into(),
                 lessons,
                 ms,
-                repo: repo_of(cwd),
+                repo: repo.into(),
                 channel: channel.into(),
                 check: check.into(),
                 judge: predict::JUDGE_VERSION,
                 stripped,
+                at: at.into(),
+                // None at all: left out, as an older record.
+                reasons: if reasons.iter().all(String::is_empty) { Vec::new() } else { reasons },
                 ..Default::default()
             };
             let _ = learn::append_jsonl(&home.join("outcomes.jsonl"), &o);
@@ -715,27 +767,153 @@ fn record_verdicts(session: &str, input: &Value, pending: &[predict::Pending], p
         for ((kind, channel), lessons) in counted {
             outcome::count_result(
                 &home,
-                &outcome::Outcome {
-                    kind: kind.into(),
-                    session: session.into(),
-                    lessons,
-                    ms,
-                    repo: repo_of(cwd),
-                    channel: channel.into(),
-                    ..Default::default()
-                },
+                &outcome::Outcome { kind: kind.into(), session: session.into(), lessons, ms, repo: repo.into(), channel: channel.into(), ..Default::default() },
             );
         }
     }
 }
 
-/// A judge call's cost line (`record_verdicts`): `judge call=… pending=N resolved=K chars=M`, then the ids
-/// the answer named (`returned=a,b`, predict.rs `Prediction::returned`) and those of them no pending
-/// lesson has (`unmatched=`), each empty for none. A pending lesson in neither list was left out by the
-/// model; one returned but not resolved got an unclear or malformed verdict. Zero tokens, no prompt text.
-fn judge_line(call: usize, pending: &[predict::Pending], resolved: usize, chars: usize, returned: &[String]) -> String {
+/// A judge call's cost line (`record_verdicts`): `judge call=<nth model call of the session> pending=N
+/// resolved=K chars=<prompt chars added>`, K the verdicts that settle (changed, ignored, not_arisen);
+/// then the ids the answer named (`returned=a,b`, predict.rs `Prediction::returned`) and those of them
+/// no pending lesson has (`unmatched=`), each empty for none; then the verdicts on pending lessons by
+/// word, every word in `Verdict::WORDS` order (`verdicts=changed:1,ignored:0,…`), and the characters
+/// of their reasons (`reason_chars=`, what the answer added). A pending lesson in neither list was left
+/// out by the model; one returned but not resolved got a malformed verdict. Zero tokens, no prompt text.
+fn judge_line(call: usize, pending: &[predict::Pending], resolved: &[predict::Judged], chars: usize, returned: &[String]) -> String {
     let unmatched: Vec<&str> = returned.iter().map(String::as_str).filter(|id| !pending.iter().any(|p| p.lesson.id == *id)).collect();
-    format!("judge call={call} pending={} resolved={resolved} chars={chars} returned={} unmatched={}", pending.len(), returned.join(","), unmatched.join(","))
+    let mine: Vec<&predict::Judged> = resolved.iter().filter(|j| pending.iter().any(|p| p.lesson.id == j.id)).collect();
+    let settled = mine.iter().filter(|j| j.label().is_some()).count();
+    let verdicts: Vec<String> = predict::Verdict::ALL.iter().map(|v| format!("{}:{}", v.word(), mine.iter().filter(|j| j.verdict == *v).count())).collect();
+    let reason_chars: usize = mine.iter().map(|j| j.reason.chars().count()).sum();
+    format!(
+        "judge call={call} pending={} resolved={settled} chars={chars} returned={} unmatched={} verdicts={} reason_chars={reason_chars}",
+        pending.len(),
+        returned.join(","),
+        unmatched.join(","),
+        verdicts.join(",")
+    )
+}
+
+/// The session-end judge (0.7.5), run by `borg learn --session` before it learns (main.rs `learn_cmd`):
+/// one model call over every delivery of `session` (any channel) whose latest delivery no verdict settled
+/// yet (none came, or only unclear, consequence_remains or missing ones, its tries spent or not), with
+/// the whole session's work in view (`session_work`), through the same records as a check's judge
+/// (`record_verdicts`, `at` outcome.rs `AT_END`) and the state lines `#borg-judged`, then `END_JUDGED`:
+/// what it judged settles there, and `borg learn` then settles the rest as `asked_not_corrected` with
+/// its reason (`unjudged`). Its call is counted as a `model_call` with why `judge`. Nothing runs, and
+/// nothing is written, without learning (`BORG_LEARN=off`), without a runner for the consequence model
+/// (`BORG_PREDICT_MODEL=off`, none installed), with nothing open, or while a live check holds the
+/// session's lock past its staleness (it judges them itself). A failed call is no try (`#borg-unjudged
+/// … why=failed`). Returns how many lessons it judged.
+pub fn judge_session(session: &str) -> usize {
+    if !learning() {
+        return 0;
+    }
+    let ctx = state_file(session);
+    let opened = |state: &str| state.lines().any(|l| DELIVERED.iter().any(|m| l.starts_with(m)));
+    if !opened(&std::fs::read_to_string(&ctx).unwrap_or_default()) {
+        return 0;
+    }
+    let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
+    if crate::runner::choose(Some(&model)).is_empty() {
+        return 0;
+    }
+    // A live check of the session still running judges the same lessons: wait for it, at most until its
+    // lock goes stale.
+    let wait = u64::try_from(live::stale_ms()).unwrap_or(u64::MAX);
+    if live::wait_free(&ctx, wait) == live::Lock::Held {
+        return 0;
+    }
+    let Some(_guard) = live::acquire(&ctx, learn::now_ms()) else { return 0 };
+    let state = std::fs::read_to_string(&ctx).unwrap_or_default();
+    let (all, withheld) = loaded(session);
+    let judged = judged(&all, withheld);
+    let last = crate::notes::proposal(&crate::notes::state_dir(), session);
+    let check = crate::select::check_id(session, "end", learn::now_ms(), std::process::id());
+    let judging = pending(session, &state, &judged, &last, When::End, &check);
+    note_unjudged(session, &judging.crowded, "slots");
+    let pend = &judging.pending;
+    if pend.is_empty() {
+        return 0;
+    }
+    let work = session_work(session, &state, pend);
+    let repo = where_repo(session);
+    let started = std::time::Instant::now();
+    let pred = predict::judge(&work, pend, &model, end_timeout());
+    crate::stats::count(&learn::home(), crate::stats::MODEL_CALL, session, |ev| {
+        ev.why = "judge".into();
+        ev.repo = repo.clone();
+        ev.n = pend.len() as u64;
+        ev.usd = pred.as_ref().map_or(0.0, |p| p.cost);
+        ev.dur_ms = started.elapsed().as_millis() as u64;
+        if pred.is_none() {
+            ev.text = "no answer".into();
+        }
+    });
+    let ids: Vec<String> = pend.iter().map(|p| p.lesson.id.clone()).collect();
+    let Some(pred) = pred else {
+        note_unjudged(session, &ids, "failed");
+        return 0;
+    };
+    // The judge's call numbering counts every model call of the session: the checks', then this one.
+    let call = state.lines().filter(|l| l.starts_with("#borg-predict-cost")).count() + 1;
+    record_verdicts(session, &repo, outcome::AT_END, pend, &pred, predict::judge_prompt(&work, pend).len(), call);
+    append(session, &format!("{END_JUDGED}{}", ids.join(",")));
+    ids.len()
+}
+
+/// The whole session's work as the session-end judge reads it (`judge_session`), within
+/// `END_WORK_CHARS` (`within`), labelled by source: the engineer's prompts and the agent's touches (the
+/// state file without its bookkeeping), the agent's edits and its answers to questions (the .edits
+/// file), and its messages (its harness's transcript, harness.rs `session_texts`, where it writes one).
+/// Without the declarations of the stripped questions among `pending` (`without_declarations`).
+fn session_work(session: &str, state: &str, pending: &[predict::Pending]) -> String {
+    let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
+    let done: Vec<&str> = edits
+        .lines()
+        .filter_map(|l| match l.strip_prefix("#borg-answer ") {
+            Some(a) => Some(a),
+            None => (!l.starts_with("#borg-")).then_some(l),
+        })
+        .collect();
+    let said = harness::session_texts(harness::current(), session, END_WORK_CHARS);
+    let parts = [
+        ("The engineer's prompts and the agent's touches", conscience::work_text(state).trim().to_string()),
+        ("The agent's edits and answers", done.join("\n")),
+        ("The agent's messages", said),
+    ];
+    without_declarations(&within(&parts, END_WORK_CHARS), pending).into_owned()
+}
+
+/// `parts` (label, text) in `budget` characters in all, each as `### <label>` and its newest characters
+/// (marked when cut): an equal share of what is left each, the shortest first, so a part shorter than
+/// its share leaves the rest to the others. An empty part is left out.
+fn within(parts: &[(&str, String)], budget: usize) -> String {
+    let len: Vec<usize> = parts.iter().map(|(_, t)| t.chars().count()).collect();
+    let mut order: Vec<usize> = (0..parts.len()).filter(|i| len[*i] > 0).collect();
+    order.sort_by_key(|i| len[*i]);
+    let (mut keep, mut left) = (vec![0; parts.len()], budget);
+    for (k, &i) in order.iter().enumerate() {
+        keep[i] = len[i].min(left / (order.len() - k));
+        left -= keep[i];
+    }
+    let mut out = String::new();
+    for (((label, text), n), all) in parts.iter().zip(keep).zip(len) {
+        if n == 0 {
+            continue;
+        }
+        let cut = if n < all { "…" } else { "" };
+        out.push_str(&format!("### {label}\n{cut}{}\n", text.chars().skip(all - n).collect::<String>()));
+    }
+    out
+}
+
+/// The repo the session works in: the latest repo the hook noted at a prompt (`.where`, a repo name on
+/// a line of its own, systems.rs `work_repos`); empty when none.
+fn where_repo(session: &str) -> String {
+    let text = std::fs::read_to_string(where_file(session)).unwrap_or_default();
+    text.lines().map(str::trim).rfind(|l| !l.is_empty() && !l.contains(['/', ' '])).unwrap_or_default().to_string()
 }
 
 /// Ids listed on the state file's `marker` lines (`#borg-asked a,b @<check>`).
@@ -1518,7 +1696,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
     // R1: the same call judges what the drone did with lessons delivered earlier this session.
     let judging = if w.judge {
-        pending(session, w.state, w.judged, w.message, live, w.check)
+        pending(session, w.state, w.judged, w.message, if live { When::Live } else { When::Stop }, w.check)
     } else {
         Judging { pending: Vec::new(), question: false, crowded: Vec::new() }
     };
@@ -1569,7 +1747,7 @@ fn check(session: &str, input: &Value, w: &Work, live: bool) -> Verdict {
     }
     if !pend.is_empty() {
         let call = w.state.lines().filter(|l| l.starts_with("#borg-predict-cost")).count() + 1;
-        record_verdicts(session, input, pend, &pred, extra, call);
+        record_verdicts(session, &repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()), "", pend, &pred, extra, call);
     }
     let applied: Vec<(&conscience::Challenge, u8)> =
         pred.applies.iter().zip(&pred.grades).filter_map(|(i, g)| shortlist.iter().find(|c| &c.id == i).map(|c| (*c, *g))).collect();
@@ -2730,7 +2908,7 @@ mod tests {
                      #borg-work later work\n#borg-asked E @0000000000c5\n";
         let _ = std::fs::write(edits_file(&session), edits);
         let state: String = edits.lines().filter(|l| DELIVERED.iter().any(|m| l.starts_with(m))).map(|l| format!("{l}\n")).collect();
-        let j = pending(&session, &state, &all, "the final message", false, "00000000cafe");
+        let j = pending(&session, &state, &all, "the final message", When::Stop, "00000000cafe");
         let got: Vec<(&str, &str, &str)> = j.pending.iter().map(|p| (p.lesson.id.as_str(), p.channel, p.check.as_str())).collect();
         assert_eq!(
             got,
@@ -2760,17 +2938,17 @@ mod tests {
             }
         }
         assert!(!p("C").stripped && !p("D").stripped, "only questions are stripped");
-        // A live check judges free deliveries and placebos now, questions once answered.
-        let live = pending(&session, &state, &all, "", true, "00000000cafe");
+        // A live check judges questions once answered, never a free delivery or a placebo.
+        let live = pending(&session, &state, &all, "", When::Live, "00000000cafe");
         let ids: Vec<&str> = live.pending.iter().map(|p| p.lesson.id.as_str()).collect();
-        assert_eq!(ids, ["A", "B", "C", "D"], "E is not answered yet");
+        assert_eq!(ids, ["A", "B"], "C and D wait for the turn's end, E for its answer");
         assert!(j.question && j.crowded.is_empty());
         let _ = std::fs::remove_file(edits_file(&session));
     }
 
     /// A lesson handed over free at check A, then asked live at check B: until the drone answers, a live
     /// check judges neither delivery (the free one would earn what the question did), and once it has,
-    /// the lesson is judged once, on the question.
+    /// the lesson is judged once, on the question. A free delivery waits for the turn's end.
     #[test]
     fn a_later_question_not_yet_answered_keeps_the_earlier_free_delivery_from_its_judge() {
         let session = format!("pending-later-{}", std::process::id());
@@ -2780,44 +2958,94 @@ mod tests {
         let asked = format!("#borg-work so far\n#borg-queued L,M @{a}\nedit one\n#borg-work more\n#borg-asked L @{b}\n#borg-live L ms=1\nedit two\n");
         let state_of = |edits: &str| edits.lines().filter(|l| DELIVERED.iter().any(|m| l.starts_with(m))).map(|l| format!("{l}\n")).collect::<String>();
         let _ = std::fs::write(edits_file(&session), &asked);
-        let live = pending(&session, &state_of(&asked), &all, "", true, "00000000cafe");
-        let got: Vec<(&str, &str)> = live.pending.iter().map(|p| (p.lesson.id.as_str(), p.channel)).collect();
-        assert_eq!(got, [("M", "queued")], "L waits for its answer; M, handed over alone, is judged");
+        let live = pending(&session, &state_of(&asked), &all, "", When::Live, "00000000cafe");
+        assert!(live.pending.is_empty(), "L waits for its answer, M for the turn's end");
         assert!(!live.question && live.crowded.is_empty(), "nothing held back takes a slot or a try");
         let answered = format!("{asked}#borg-answer L: applies\n");
         let _ = std::fs::write(edits_file(&session), &answered);
-        for mid_turn in [true, false] {
-            let j = pending(&session, &state_of(&answered), &all, "", mid_turn, "00000000cafe");
-            let got: Vec<(&str, &str, &str)> = j.pending.iter().map(|p| (p.lesson.id.as_str(), p.channel, p.check.as_str())).collect();
-            assert_eq!(got, [("M", "queued", a), ("L", "live", b)], "mid-turn {mid_turn}");
+        let got = |when: When| -> Vec<(String, &str, String)> {
+            let j = pending(&session, &state_of(&answered), &all, "", when, "00000000cafe");
+            j.pending.iter().map(|p| (p.lesson.id.clone(), p.channel, p.check.clone())).collect()
+        };
+        assert_eq!(got(When::Live), [("L".to_string(), "live", b.to_string())], "answered: judged mid-turn; M still waits");
+        for when in [When::Stop, When::End] {
+            assert_eq!(got(when), [("M".to_string(), "queued", a.to_string()), ("L".to_string(), "live", b.to_string())], "{when:?}");
         }
         let _ = std::fs::remove_file(edits_file(&session));
     }
 
-    /// Judge timing: a live check judges a free delivery or a placebo only once the drone worked after
-    /// it; a stop's judge call judges it whatever (a stop that makes none leaves it waiting, `deferred`).
-    /// A question is judged once answered, work or not.
+    /// Judge timing (0.7.5): a live check never judges a free delivery, an early one or a placebo, work
+    /// after it or not; a stop's judge call judges them, and so does the session-end judge. A question is
+    /// judged once answered, work or not.
     #[test]
-    fn a_free_delivery_or_placebo_waits_for_work_after_it_or_a_stops_judge() {
+    fn a_free_delivery_or_placebo_is_judged_at_the_turn_end_never_mid_turn() {
         let session = format!("pending-work-{}", std::process::id());
         let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
-        let all = [c("A"), c("C"), c("D")];
+        let all = [c("A"), c("C"), c("D"), c("E")];
         let state_of = |edits: &str| edits.lines().filter(|l| DELIVERED.iter().any(|m| l.starts_with(m))).map(|l| format!("{l}\n")).collect::<String>();
         let ids = |j: &Judging| j.pending.iter().map(|p| p.lesson.id.clone()).collect::<Vec<_>>();
         let fresh = "Plan: blocked\n#borg-asked A @0000000000c1\n#borg-answer A: applies\n#borg-work so far\n#borg-queued C @0000000000c3\n#borg-placebo D @0000000000c4\n";
-        let _ = std::fs::write(edits_file(&session), fresh);
-        let live = pending(&session, &state_of(fresh), &all, "", true, "00000000cafe");
-        assert_eq!(ids(&live), ["A"], "nothing done since C and D were delivered");
-        assert!(live.crowded.is_empty());
-        assert_eq!(ids(&pending(&session, &state_of(fresh), &all, "", false, "00000000cafe")), ["A", "C", "D"], "the stop judges them");
-        let worked = format!("{fresh}edit one\n");
-        let _ = std::fs::write(edits_file(&session), &worked);
-        assert_eq!(ids(&pending(&session, &state_of(&worked), &all, "", true, "00000000cafe")), ["A", "C", "D"]);
-        // Its own work line and a later delivery's markers are no work after it.
-        let marked = format!("{fresh}#borg-work later\n#borg-early A @0000000000c5\n");
-        let _ = std::fs::write(edits_file(&session), &marked);
-        assert!(ids(&pending(&session, &state_of(&marked), &all, "", true, "00000000cafe")).is_empty(), "C, D and A's early delivery wait");
+        for edits in [fresh.to_string(), format!("{fresh}edit one\n"), format!("{fresh}edit one\n#borg-work later\n#borg-early E @0000000000c5\nedit two\n")] {
+            let _ = std::fs::write(edits_file(&session), &edits);
+            let state = state_of(&edits);
+            let live = pending(&session, &state, &all, "", When::Live, "00000000cafe");
+            assert_eq!(ids(&live), ["A"], "mid-turn, only the answered question: {edits}");
+            assert!(live.crowded.is_empty() && live.question);
+            let early = edits.contains("#borg-early ");
+            for when in [When::Stop, When::End] {
+                let want: &[&str] = if early { &["A", "C", "D", "E"] } else { &["A", "C", "D"] };
+                assert_eq!(ids(&pending(&session, &state, &all, "", when, "00000000cafe")), want, "{when:?}: {edits}");
+            }
+        }
         let _ = std::fs::remove_file(edits_file(&session));
+    }
+
+    /// The session-end judge (`When::End`): every delivery no verdict settled, a question not answered
+    /// and a lesson whose check tries ran out included, never one a verdict settled; what it was shown
+    /// (`END_JUDGED`) is settled for every later call, until the lesson is delivered again, and settles
+    /// at `borg learn` as having used its tries.
+    #[test]
+    fn the_session_end_judge_never_outlives_its_lock() {
+        let (end, stale) = (end_timeout(), live::stale_ms());
+        assert!(i64::try_from(end.as_millis()).unwrap() < stale, "{end:?} against a lock stale after {stale} ms");
+        assert!(end <= learn::learn_timeout());
+    }
+
+    #[test]
+    fn the_session_end_judge_takes_every_open_delivery_once() {
+        let session = format!("pending-end-{}", std::process::id());
+        let c = |id: &str| conscience::Challenge { id: id.into(), ..Default::default() };
+        let all = [c("A"), c("B"), c("C"), c("D"), c("Q")];
+        let ids = |j: &Judging| j.pending.iter().map(|p| p.lesson.id.clone()).collect::<Vec<_>>();
+        let edits = "Plan\n#borg-asked A,B @0000000000c1\n#borg-answer A: applies\nedit\n#borg-work w\n#borg-queued C,D @0000000000c3\nedit two\nPlan two\n#borg-asked Q @0000000000c4\n";
+        let _ = std::fs::write(edits_file(&session), edits);
+        let delivered: String = edits.lines().filter(|l| DELIVERED.iter().any(|m| l.starts_with(m))).map(|l| format!("{l}\n")).collect();
+        // A changed, B unclear twice (tries spent), C unclear once, D not judged, Q never answered.
+        let state = format!("{delivered}#borg-judged A=changed\n#borg-judged B=pending\n#borg-judged C=pending\n#borg-judged B=pending\n");
+        assert_eq!(ids(&pending(&session, &state, &all, "", When::Stop, "00000000cafe")), ["C", "D", "Q"], "a check: B's tries are spent");
+        assert_eq!(ids(&pending(&session, &state, &all, "", When::End, "00000000cafe")), ["B", "C", "D", "Q"], "the end: every open one");
+        let ended = format!("{state}#borg-judged B=pending\n#borg-judged C=changed\n{END_JUDGED}B,C,D,Q\n");
+        for when in [When::Live, When::Stop, When::End] {
+            assert!(pending(&session, &ended, &all, "", when, "00000000cafe").pending.is_empty(), "{when:?}: judged at the end once");
+        }
+        let why = unjudged(&ended);
+        assert_eq!((why["B"], why["D"], why["Q"]), (outcome::UNJUDGED_TRIES, outcome::UNJUDGED_TRIES, outcome::UNJUDGED_TRIES));
+        // Delivered again after the end (a resumed session): open again.
+        let again = format!("{ended}#borg-queued D @0000000000c5\n");
+        let _ = std::fs::write(edits_file(&session), format!("{edits}#borg-queued D @0000000000c5\n"));
+        assert_eq!(ids(&pending(&session, &again, &all, "", When::End, "00000000cafe")), ["D"]);
+        assert_eq!(unjudged(&again)["D"], outcome::UNJUDGED_NO_CALL);
+        let _ = std::fs::remove_file(edits_file(&session));
+    }
+
+    /// The session's work for the session-end judge: each source labelled, its newest characters, the
+    /// budget shared so a short source leaves the rest to the longer ones.
+    #[test]
+    fn the_session_work_shares_its_budget_newest_first() {
+        let parts = [("short", "abc".to_string()), ("long", "0123456789".to_string()), ("none", String::new())];
+        assert_eq!(within(&parts, 100), "### short\nabc\n### long\n0123456789\n");
+        assert_eq!(within(&parts, 9), "### short\nabc\n### long\n…456789\n", "short keeps its 3, long the other 6");
+        assert_eq!(within(&parts, 4), "### short\n…bc\n### long\n…89\n", "two each when neither fits its share");
     }
 
     /// The judge's cost line names the ids the answer returned and those that matched no pending lesson,
@@ -2831,8 +3059,19 @@ mod tests {
         let (a, b) = (c("La"), c("Lb"));
         let pend = [p(&a), p(&b)];
         let returned = ["La".to_string(), "Lz".to_string()];
-        assert_eq!(judge_line(3, &pend, 1, 900, &returned), "judge call=3 pending=2 resolved=1 chars=900 returned=La,Lz unmatched=Lz");
-        assert_eq!(judge_line(4, &pend, 0, 10, &[]), "judge call=4 pending=2 resolved=0 chars=10 returned= unmatched=");
+        let j = |id: &str, verdict, reason: &str| predict::Judged { id: id.into(), verdict, reason: reason.into() };
+        let one = [j("La", predict::Verdict::NotArisen, "only docs"), j("Lz", predict::Verdict::Changed, "not pending")];
+        assert_eq!(
+            judge_line(3, &pend, &one, 900, &returned),
+            "judge call=3 pending=2 resolved=1 chars=900 returned=La,Lz unmatched=Lz \
+             verdicts=changed:0,ignored:0,not_arisen:1,consequence_remains:0,unclear:0 reason_chars=9"
+        );
+        let pair = [j("La", predict::Verdict::Unclear, ""), j("Lb", predict::Verdict::ConsequenceRemains, "still awaits")];
+        assert_eq!(
+            judge_line(4, &pend, &pair, 10, &[]),
+            "judge call=4 pending=2 resolved=0 chars=10 returned= unmatched= \
+             verdicts=changed:0,ignored:0,not_arisen:0,consequence_remains:1,unclear:1 reason_chars=12"
+        );
     }
 
     /// A live question answered at the stop: the stop's own message is the answer, so a stripped
@@ -2853,7 +3092,7 @@ mod tests {
         );
         let _ = std::fs::write(edits_file(&session), &edits);
         let state: String = edits.lines().filter(|l| DELIVERED.iter().any(|m| l.starts_with(m))).map(|l| format!("{l}\n")).collect();
-        let j = pending(&session, &state, &all, answer, false, "00000000cafe");
+        let j = pending(&session, &state, &all, answer, When::Stop, "00000000cafe");
         let p = |id: &str| j.pending.iter().find(|p| p.lesson.id == id).unwrap();
         assert!(p("F").stripped && p("F").declared.is_none(), "{:?}", p("F"));
         for x in &j.pending {

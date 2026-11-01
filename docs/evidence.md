@@ -261,6 +261,7 @@ before any pooled readout was read):
 - A live check judges a free hand-over or a placebo only once work follows it: 54% of free verdicts
   came within 2 minutes of delivery, 74% of those unclear. Kill: revert unless, over the next 150 free
   deliveries, the labelled share rises from 38% to at least 50% or the unclear share falls by 15 points.
+  Replaced in 0.7.5, below.
 - The monitor's health counts the labels that can move its estimate, and a route's weighted residual
   enters from 5 labels that can move it (`ROUTE_LABELS_MIN`). On the team and open-source copies the
   mean is unchanged to 12 digits; the third store's moved from +0.012 to +0.002, a route there having
@@ -271,6 +272,23 @@ before any pooled readout was read):
 - The replay counts a record whose summary or fit points into another store's log as imported. The
   open-source store's P1 went from FAIL (1,791 of 1,841) to PASS (1,791 of 1,791, 50 imported); every
   other check's verdict on the three copies is unchanged.
+
+**Judging changed in 0.7.5**, pre-registered 2026-10-31 before any code. On copies of three stores,
+the judge called 77-79% of its verdicts on free hand-overs unclear, 86-100% on placebos, 58-62% at
+live checks and 29-51% at stops; a delivery's next judging check came a median 0.5-0.8 minutes after
+it, before the agent had done the work, and `asked_unclear` mixed "cannot tell" with "changed, but
+the consequence still follows". 0.7.5 gives the judge five verdicts with a logged reason
+([The judge's verdicts](learning.md#outcomes-and-the-usefulness-belief)), judges free hand-overs and
+placebos only at the turn end, and judges what is still open once more at the session's end with the
+whole session's work ([Delivery](delivery.md)). Target: pure unclear below 10% of all verdicts and
+below 20% on the free and placebo channels, per channel on the team store, over the first 150 free
+and placebo deliveries after release (only records with judge version 3 or later count; each
+delivery's latest answer, as `borg top --json` and borg web's label health show them per route). Kill: if
+the pure unclear share on free and placebo deliveries is not below 40% by then, the session-end judge
+is reverted and the five verdicts kept; if lessons' belief means move by more than 0.05 on average
+against a replay that reads no `not_arisen`, the verdicts are reviewed. Cost: one extra model call per
+session with something open, reported in dollars per week. Replayed on the three copies, the records
+written before 0.7.5 give the same decisions and the same P0 and P1 as under 0.7.4.
 
 **In use**, under the learned policy, a monitor estimates the policy's value against the fixed rule
 per session and reverts the store to the fixed rule for good if its bound shows harm beyond 10% of the

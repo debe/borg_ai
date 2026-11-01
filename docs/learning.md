@@ -67,7 +67,7 @@ codex's serde names, not yet checked against a real spawned rollout. See
 ## Outcomes and the usefulness belief
 
 Each delivered lesson gets an `asked` outcome, and what follows is recorded against it: `changed` or
-`ignored` (judged by the next turn-end model call, see [Delivery](delivery.md)), `corrected` anyway,
+`ignored` (the judge's verdicts, below), `corrected` anyway,
 `vetoed`, `regretted`, `tested`. These outcomes form each lesson's usefulness belief, which ranks it
 against others for the model's pool and lets an unused one fade. Which of the lessons the model grades
 are asked, handed over free or left for later is the selection policy's call: the fixed rule by default,
@@ -77,11 +77,29 @@ every `borg learn` ([Which lessons are asked](delivery.md#which-lessons-are-aske
 replays the hand-set weights offline against the logged asks, with their asking probability, and
 reports; it never changes them. `borg debug select` does the same for the selection policy.
 
-At session end every delivered lesson that no correction followed settles as `asked_not_corrected`,
-with the reason when it had no verdict (no model call came after it, the judge's tries or slots ran
-out, its call failed). That mark is censored: it counts as unknown, never as ignored, and a verdict
-counts on its own. An unclear verdict and a placebo's result (a lesson judged blindly, never shown) are
-kept for measurement only: no belief, trust, statistic or team line reads them.
+**The judge's verdicts.** A model call judges each delivery against the work around it, at a check
+or at the session's end ([when](delivery.md)), and gives one of five verdicts with a short reason
+(at most 240 characters, redacted, kept in the local outcome log only):
+
+| Verdict | Recorded as | Means | For the lesson |
+|---|---|---|---|
+| `changed` | `asked_then_changed` | The work changed on the lesson's point and avoids its consequence | Counts for it; the delivery is settled |
+| `ignored` | `asked_ignored` | The point came up and the work did not change | Counts against it; settled |
+| `not_arisen` | `asked_not_arisen` | The point never came up in this work | Censored: says nothing of the lesson's use and moves no belief. The selection model and its replay read it as no change, what delivering it there was worth. At a check the delivery stays open (the point may come up later); the session-end judge's settles it |
+| `consequence_remains` | `asked_consequence_remains` | The work changed on the point, but the consequence still follows | Measurement only; the delivery stays open for another try |
+| `unclear` | `asked_unclear` | The judge cannot tell | Measurement only; stays open |
+
+Before 0.7.5 the judge had three verdicts, and `asked_unclear` also held a change whose consequence
+still followed; those records keep that meaning. A placebo's verdict (a lesson judged blindly, never
+shown) is measurement only, whatever it says. No belief, trust, statistic or team line reads an
+unclear verdict, a remaining consequence, a point that never came up or a placebo's result.
+
+At session end `borg learn --session` first judges, in one model call with the whole session's work,
+every delivery no verdict settled yet ([Delivery](delivery.md)); a session whose end hook never ran
+gets the same call when a later `borg learn` settles it as idle. Then every delivered lesson that no
+correction followed settles as `asked_not_corrected`, with the reason when it had no verdict (no model
+call came after it, the judge's tries or slots ran out, the session-end judge's included, its call
+failed). That mark is censored: it counts as unknown, never as ignored, and a verdict counts on its own.
 
 | Outcome | Weight in the belief | Set by |
 |---|---|---|
@@ -89,7 +107,7 @@ kept for measurement only: no belief, trust, statistic or team line reads them.
 | `vetoed` | 3 | design, no eval yet |
 | `regretted` | at most half a correction | design; on while its offline check is inconclusive, see [Evidence](evidence.md#regret-credit) |
 | `tested` | 0.5 (`TESTED_W`) | design, not evaluated |
-| `asked_not_corrected`, an unclear verdict, a placebo's result | none | censored or measurement only |
+| `asked_not_corrected`, `asked_not_arisen`, an unclear verdict, a remaining consequence, a placebo's result | none | censored or measurement only |
 
 **Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
 against the lessons asked in the deciding session before the decision: asking them did not prevent it.
@@ -107,7 +125,8 @@ offline check: the belief with the regret term must predict later outcomes at le
 **Green tests credit the question.** A session's own test runs count too. When a lesson was asked and the session's tests then failed and passed again, or passed after the
 drone changed its work on the lesson's point, `borg learn` gives that lesson a `tested` result at session
 end, once per session and lesson, at 0 tokens. The last run must pass; a pass before the question, a
-question the drone ignored, or a lesson only handed over as context earns nothing, and a correction or a
+question the drone ignored, a question whose point the judge found never came up (a verdict on that
+question, not a placebo's or a hand-over's; unless the drone also changed on it), or a lesson only handed over as context earns nothing, and a correction or a
 veto of the lesson in the session outranks it. Borg tells a pass from a failure by the shell call's
 output: Claude Code and Codex send it, and the omp and opencode adapters send the last 4,000 characters
 of a shell call's output (opencode with an `Exit code: N` line when it failed). A run whose result the

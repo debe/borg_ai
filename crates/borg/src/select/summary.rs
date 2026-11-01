@@ -86,8 +86,10 @@ use crate::outcome::{self, Outcome};
 /// 5: `ASK_LIVE`, what a session had (`Session::had`, `Apply::had`, `Apply::nofree`, `Summary::fresh`),
 /// tail yields and counts; 6: `Summary::fell_back`; 7: the question-count test, `Summary::experiment`,
 /// `Check::xk`, `xs`, `Session::tested`; 8: a stop's results on a live check's hand-overs it asked
-/// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`).
-pub const SV: u32 = 8;
+/// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`;
+/// 9: the judge's `not_arisen` and `consequence_remains` verdicts, `Label::NotArisen`, `Label::Remains`,
+/// `Apply::jv`, the session-end judge's own judge level).
+pub const SV: u32 = 9;
 /// The cache beside the lessons file. Protocol.
 pub const CACHE: &str = "select-summary.json";
 /// The monitor's auto-revert mark beside the lessons file: while it exists the store keeps the fixed
@@ -136,22 +138,44 @@ pub enum Label {
     Changed,
     /// Changed nothing on its point (`asked_ignored`).
     Ignored,
-    /// The judge could not tell (`asked_unclear`).
+    /// The judge could not tell (`asked_unclear`; before 0.7.5 also a change that left the consequence).
     Unclear,
     /// Its session settled without a verdict (`asked_not_corrected` with an unjudged reason).
     Censored,
+    /// Its point never came up in the work (`asked_not_arisen`, 0.7.5 on): a verdict, read as "nothing in
+    /// the work", no change on the lesson's point (select/policy.rs `Data::of`, `judged`; replay.rs
+    /// `unit_outcome`). Appended, so older caches keep their labels' places.
+    #[serde(rename = "not_arisen")]
+    NotArisen,
+    /// Changed on its point but the consequence remains (`asked_consequence_remains`, 0.7.5 on): read as
+    /// an unclear verdict everywhere but the label health (top.rs), which counts it apart.
+    Remains,
 }
 
 impl Label {
-    /// Does a verdict of kind `next` replace this one? A verdict replaces anything, an unclear only an
-    /// open or censored mark, a censored mark only an open one.
+    /// Does a verdict of kind `next` replace this one? A verdict (changed, ignored, not arisen) replaces
+    /// anything; a pending one (unclear, remains) an open or censored mark or another pending one, so
+    /// the latest pending verdict shows; a censored mark only an open one.
     fn yields_to(self, next: Label) -> bool {
         match next {
-            Label::Changed | Label::Ignored => true,
-            Label::Unclear => matches!(self, Label::Open | Label::Censored),
+            Label::Changed | Label::Ignored | Label::NotArisen => true,
+            Label::Unclear | Label::Remains => matches!(self, Label::Open | Label::Censored | Label::Unclear | Label::Remains),
             Label::Censored => self == Label::Open,
             Label::Open => false,
         }
+    }
+
+    /// Whether the judge left it pending (`Unclear`, `Remains`): no verdict for the fit, the readout or
+    /// the judge-missingness model, as an unclear one has always been.
+    #[must_use]
+    pub fn pending(self) -> bool {
+        matches!(self, Label::Unclear | Label::Remains)
+    }
+
+    /// Whether it is a verdict that settles its apply (`Changed`, `Ignored`, `NotArisen`).
+    #[must_use]
+    pub fn verdict(self) -> bool {
+        matches!(self, Label::Changed | Label::Ignored | Label::NotArisen)
     }
 }
 
@@ -183,6 +207,11 @@ pub struct Apply {
     /// The judge of its verdict (`Summary::judges`: template version, model and prompt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<u32>,
+    /// The judge template version (outcome.rs `judge`) of the answer its label shows, a pending one
+    /// (`Label::pending`) too; 0 none. Read by the label health only (top.rs: the verdict shares from
+    /// `predict::PURE_UNCLEAR_FROM` on), never by the fit, whose judge levels are `judge`'s.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub jv: u8,
     /// The judge saw it without the drone's declaration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stripped: bool,
@@ -653,7 +682,7 @@ fn intern(table: &mut Vec<String>, ix: &mut HashMap<String, u32>, name: &str) ->
 }
 
 /// The kinds the fold reads with serde; any other is skipped (module doc).
-const USED: [&str; 11] = [
+const USED: [&str; 13] = [
     outcome::GRADED,
     outcome::ASKED,
     outcome::DELIVERY,
@@ -661,6 +690,8 @@ const USED: [&str; 11] = [
     outcome::CHANGED,
     outcome::IGNORED,
     outcome::UNCLEAR,
+    outcome::NOT_ARISEN,
+    outcome::REMAINS,
     outcome::NOT_CORRECTED,
     outcome::CORRECTED,
     outcome::MISSED,
@@ -716,6 +747,8 @@ impl Summary {
             outcome::CHANGED => self.verdict(&o, Label::Changed, ix),
             outcome::IGNORED => self.verdict(&o, Label::Ignored, ix),
             outcome::UNCLEAR => self.verdict(&o, Label::Unclear, ix),
+            outcome::NOT_ARISEN => self.verdict(&o, Label::NotArisen, ix),
+            outcome::REMAINS => self.verdict(&o, Label::Remains, ix),
             outcome::NOT_CORRECTED => self.settled(&o, ix),
             outcome::ASKED | outcome::DELIVERY => self.delivered(&o, ix),
             // A session without a graded check or settle has nothing to tally: no entry for it.
@@ -970,7 +1003,7 @@ impl Summary {
 
     fn verdict(&mut self, o: &Outcome, label: Label, ix: &mut Index) {
         if o.channel == "early" {
-            if label != Label::Unclear {
+            if !label.pending() {
                 self.early.judged += 1;
                 self.early.changed += u32::from(label == Label::Changed);
             }
@@ -986,9 +1019,16 @@ impl Summary {
         for l in &o.lessons {
             let Some(i) = self.apply_of(o, l, routes, ix) else { continue };
             self.label(i, label, ix);
-            if label != Label::Unclear {
+            if self.applies[i].label == label {
+                self.applies[i].jv = o.judge;
+            }
+            if !label.pending() {
                 let model = self.models.get(self.checks[self.applies[i].check as usize].model as usize).cloned().unwrap_or_default();
-                let key = format!("v{}|{model}", o.judge);
+                // The session-end judge (outcome.rs `AT_END`) is its own instrument: another prompt, the
+                // whole session's work in view, after every check. A check's verdict and an older record
+                // have no `at`: their level is as before.
+                let at = if o.at.is_empty() { String::new() } else { format!("@{}", o.at) };
+                let key = format!("v{}{at}|{model}", o.judge);
                 self.applies[i].judge = Some(intern(&mut self.judges, &mut ix.judges, &key));
                 self.applies[i].stripped = o.stripped;
             }

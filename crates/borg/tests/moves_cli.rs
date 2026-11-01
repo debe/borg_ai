@@ -54,7 +54,7 @@ fn fake_model(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let answer = json!({"structured_output": {"is_lesson": true, "question": "Q", "situations": [], "consequence": "c", "same_as": "",
         "area": "", "supersedes": [], "reach": "team"}, "total_cost_usd": 0});
-    let script = format!("#!/bin/sh\nprintf '%s\\n---\\n' \"$2\" >> '{}'\necho '{answer}'\n", root.join("prompts.txt").display());
+    let script = format!("#!/bin/sh\np=$(cat)\nprintf '%s\\n---\\n' \"$p\" >> '{}'\necho '{answer}'\n", root.join("prompts.txt").display());
     std::fs::write(root.join("bin/claude"), script).unwrap();
     std::fs::set_permissions(root.join("bin/claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }

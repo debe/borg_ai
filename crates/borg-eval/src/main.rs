@@ -257,30 +257,44 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
 
 /// Run `claude -p` in the eval sandbox. Streams JSON to `stream`; returns the final
 /// `result` message and wall time.
-pub(crate) fn bwrap_claude(cwd: &Path, writable: &[&Path], readonly: &[&Path], claude_args: &[String], stream: &Path, timeout_s: u32) -> (Option<Value>, f64) {
-    bwrap_claude_with(cwd, writable, readonly, &Extra::default(), claude_args, stream, timeout_s)
+pub(crate) fn bwrap_claude(
+    cwd: &Path,
+    writable: &[&Path],
+    readonly: &[&Path],
+    claude_args: &[String],
+    prompt: &str,
+    stream: &Path,
+    timeout_s: u32,
+) -> (Option<Value>, f64) {
+    bwrap_claude_with(cwd, writable, readonly, &Extra::default(), claude_args, prompt, stream, timeout_s)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bwrap_claude_with(
     cwd: &Path,
     writable: &[&Path],
     readonly: &[&Path],
     extra: &Extra,
     claude_args: &[String],
+    prompt: &str,
     stream: &Path,
     timeout_s: u32,
 ) -> (Option<Value>, f64) {
-    let (result, secs, _) = bwrap_claude_run(cwd, writable, readonly, extra, claude_args, stream, timeout_s);
+    let (result, secs, _) = bwrap_claude_run(cwd, writable, readonly, extra, claude_args, prompt, stream, timeout_s);
     (result, secs)
 }
 
-/// `bwrap_claude_with`, also returning the exit code (`timeout`'s 124 when the wall cap fired).
+/// `bwrap_claude_with`, also returning the exit code (`timeout`'s 124 when the wall cap fired). The
+/// prompt goes in on stdin (`claude -p` reads it there), never as an argument: an argument is capped by
+/// the kernel (128 KiB) and visible in `ps`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bwrap_claude_run(
     cwd: &Path,
     writable: &[&Path],
     readonly: &[&Path],
     extra: &Extra,
     claude_args: &[String],
+    prompt: &str,
     stream: &Path,
     timeout_s: u32,
 ) -> (Option<Value>, f64, Option<i32>) {
@@ -290,7 +304,12 @@ pub(crate) fn bwrap_claude_run(
     cmd.args(["--setting-sources", extra.setting_sources.as_deref().unwrap_or("project"), "--strict-mcp-config", "--no-session-persistence"]);
     let started = Instant::now();
     let out = fs::File::create(stream).unwrap();
-    let status = cmd.stdout(out).stderr(Stdio::null()).status().expect("spawn bwrap/claude");
+    let mut child = cmd.stdin(Stdio::piped()).stdout(out).stderr(Stdio::null()).spawn().expect("spawn bwrap/claude");
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    let status = child.wait().expect("wait bwrap/claude");
     let secs = started.elapsed().as_secs_f64();
     if !status.success() {
         eprintln!("    claude exited with {status}");
@@ -305,12 +324,12 @@ pub(crate) fn bwrap_claude_run(
 }
 
 fn run_drone(a: &Args, work: &Path, prompt: &str, stream: &Path) -> (Option<Value>, f64) {
-    let mut args: Vec<String> = ["-p", prompt, "--model", &a.model, "--max-budget-usd", &a.budget_usd].map(String::from).to_vec();
+    let mut args: Vec<String> = ["-p", "--model", &a.model, "--max-budget-usd", &a.budget_usd].map(String::from).to_vec();
     args.extend(["--permission-mode", "bypassPermissions", "--append-system-prompt", SYSTEM].map(String::from));
     if let Some(s) = &a.settings {
         args.extend(["--settings".to_string(), s.display().to_string()]);
     }
-    bwrap_claude(work, &[work], &[], &args, stream, a.timeout_s)
+    bwrap_claude(work, &[work], &[], &args, prompt, stream, a.timeout_s)
 }
 
 /// `borg-eval report <results.jsonl>...`: per-arm, per-task table.
@@ -372,9 +391,8 @@ git log --all --oneline | wc -l; git branch -a; git remote -v; git stash list; g
 ls ~/.ssh ~/.config 2>&1"
     );
     let stream = std::env::temp_dir().join("borg-sandbox-probe.jsonl");
-    let args: Vec<String> =
-        ["-p", probe.as_str(), "--model", "haiku", "--permission-mode", "bypassPermissions", "--max-budget-usd", "0.3"].map(String::from).to_vec();
-    let (result, _) = bwrap_claude(&cwd, &[], &[], &args, &stream, 300);
+    let args: Vec<String> = ["-p", "--model", "haiku", "--permission-mode", "bypassPermissions", "--max-budget-usd", "0.3"].map(String::from).to_vec();
+    let (result, _) = bwrap_claude(&cwd, &[], &[], &args, &probe, &stream, 300);
     println!("{}", result.and_then(|r| r["result"].as_str().map(str::to_string)).unwrap_or_else(|| "no result (see stream)".into()));
 }
 

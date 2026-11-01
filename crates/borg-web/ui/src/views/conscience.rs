@@ -441,7 +441,7 @@ fn LessonSelection() -> impl IntoView {
             return view! { <p class="empty">"Not measured yet."</p> }.into_any();
         };
         let share = if m.placebos > 0.0 { m.judged / m.placebos } else { 0.0 };
-        let title = format!("{} placebos drawn, {} judged changed or ignored", num(m.placebos), num(m.judged));
+        let title = format!("{} placebos drawn, {} judged changed, ignored or not arisen", num(m.placebos), num(m.judged));
         let judged = bar("placebos judged".into(), share, format!("{} of {}", num(m.judged), num(m.placebos)), title, "var(--c-good)");
         // The tail sample: lessons the pool budget dropped, shown past it so the yield there is learned.
         let tail = (m.tail_shown > 0.0).then(|| {
@@ -604,7 +604,7 @@ fn LessonSelection() -> impl IntoView {
                         {fallbacks}
                     </div>
                     <div class="panel">
-                        <h2>"Label health"<small>"judged share per route, unclear share, placebo rate"</small></h2>
+                        <h2>"Label health"<small>"judged share per route; unclear (judge 3 on, per route), not arisen and consequence remains shares; placebo rate"</small></h2>
                         <Shares rows=Signal::derive(move || sel.with(|s| s.labels.clone())) color="var(--c-good)" />
                         <p class="empty">{declaration}</p>
                     </div>

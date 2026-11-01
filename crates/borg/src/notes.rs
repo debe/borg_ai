@@ -225,6 +225,13 @@ pub fn remember_proposal(dir: &Path, session: &str, text: &str) {
     let _ = std::fs::write(state(dir, session, "proposal"), tail);
 }
 
+/// The drone's latest proposal `remember_proposal` kept for `session` in `dir` (redacted, its last
+/// `learn::PROPOSAL_CHARS` characters); empty when none was kept.
+#[must_use]
+pub fn proposal(dir: &Path, session: &str) -> String {
+    std::fs::read_to_string(state(dir, session, "proposal")).unwrap_or_default()
+}
+
 /// The redacted reasoning of one landed commit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Excerpt {

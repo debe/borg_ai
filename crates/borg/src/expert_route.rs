@@ -359,13 +359,14 @@ bear on these sentences? Cite files/IDs; say 'nothing' if none. Keep it to the f
 fn claude_drone(repo: &Path, prompt: &str, cap: Duration) -> DroneRun {
     let model = std::env::var("BORG_EXPERT_MODEL").unwrap_or_else(|_| "sonnet".into());
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", prompt, "--model", &model])
+    // The prompt goes in on stdin, never as an argument (runner.rs `omp_command`).
+    cmd.args(["-p", "--model", &model])
         .args(["--tools", DRONE_TOOLS, "--allowed-tools", DRONE_TOOLS, "--output-format", "json", "--no-session-persistence"])
         // No user settings (that is where borg's own hooks live) and no hooks at all: no recursion.
         .args(["--strict-mcp-config", "--setting-sources", "project", "--settings", r#"{"disableAllHooks":true}"#])
         .args(["--append-system-prompt", DRONE_SYSTEM])
         .current_dir(repo);
-    match crate::runner::run_capped(cmd, None, cap) {
+    match crate::runner::run_capped(cmd, Some(prompt.as_bytes()), cap) {
         None => DroneRun { status: "timeout".into(), ..Default::default() },
         Some(out) => drone_result(&out),
     }

@@ -116,7 +116,8 @@ makes one model call per episode and writes or updates a lesson. Team documents 
 an edit a background check grades the work so far and its questions arrive with the next tool call. *At
 the stop*, a free word gate skips most turns; otherwise one model call grades the eligible lessons, and a
 grade 3 blocks the stop for one more round. The same call judges whether what was handed over earlier
-changed the work. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
+changed the work; free hand-overs are judged at the turn end, and what is still open once more at the
+session's end, in one call that sees the whole session. `"mode": "hook"` checks only at the stop. [Delivery and modes](https://github.com/debe/borg_ai/blob/main/docs/delivery.md)
 
 **Which lessons are asked.** Per check, a selection policy decides for each graded lesson whether to
 ask it, hand it over free or leave it for later. The reference is 0.5.0's fixed rule, by grade (it no
@@ -133,7 +134,8 @@ fixed rule back for good if it sees harm. [Which lessons are asked](https://gith
 
 **Outcomes and belief.** Every delivery is logged with the check that routed it and its probability,
 and what followed (changed, ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's
-usefulness belief; a lesson nobody judged counts as unknown, not as ignored. The
+usefulness belief; a lesson nobody judged, or whose point never came up, counts as unknown, not as
+ignored. The
 Knowledge tab of `borg web` shows it. [Outcomes](https://github.com/debe/borg_ai/blob/main/docs/learning.md#outcomes-and-the-usefulness-belief)
 
 **Review → fix.** A reviewer sub-agent finds a bug and a fix step fixes it before any commit. `borg
@@ -297,8 +299,8 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 ## Cost
 
 - **Most turn ends cost 0 tokens** in hook mode: the free gate skipped 78% of 1,117 real turn ends. Early delivery
-  and grade-2 and grade-1 lessons never call a model; they are judged only inside a call a question pays
-  for.
+  and grade-2 and grade-1 lessons never call a model during the session; they are judged inside a call a
+  question pays for, or in one judge call at the session's end, made only when something is still open.
 - **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s. An extra round
   happens only for a grade-3 lesson.
 - **Live mode** adds one call per burst of changes: about 8× borg's own spend in hook mode, while whole

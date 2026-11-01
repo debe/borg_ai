@@ -35,7 +35,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `/api/drones?c=` | The sessions, as in `borg top`, each with its unread messages |
 | `/api/messages?c=&limit=` | Messages between sessions from the last 7 days, newest first: sender, recipient (`to_kind`: `all`, `engineer` or `session`), text, how many sessions here were shown it, and the unread total |
 | `POST /api/messages/seen?c=` | The Messages view showed the engineer these messages (a JSON body, `{"ids": [...]}`, at most 2000): those to the engineer are acknowledged as the engineer of the directory `borg web` started in, as `borg inbox` does; any other id is ignored. 415 without a JSON body, so another site's page cannot call it (a JSON body needs a CORS preflight, which the server never answers) |
-| `/api/select?c=` | Lesson selection ([Which lessons are asked](delivery.md#which-lessons-are-asked)), from the store's selection summary: the `policy` of this process, the `default` (`learned`) and the `source` (`reverted` once the monitor put the fixed rule back), the `gate` (the quality the learned policy may still risk below the fixed rule, not money; 0 under the fixed rule) and its two parts, the `allowance` the fixed rule's value accrued and the `ledger`'s 5% quantile (a gate of 0 with a positive allowance is spent, not a cold start), the `fit`, `checks` and `sessions` folded, `deviations` from the fixed rule (routes only), `fallbacks` (per `reason` a learned decision took the fixed rule instead, `lock_busy`, `lock_failed` and `unrecorded`, the graded checks it did of those folded), `spend` per source (`stop`, `live`: calls, extra rounds, dollars), the engineer's `budget` (`{tokens, spent, price}`, `null` unless one is set), `effects` with 95% intervals, the forgetting `half_life`, label health (`labels`: the judged share per route, the unclear share, the placebo rate; the free row leaves out applies of a lesson the session already had or had waiting in its queue, which delivery drops as given before or queued twice, while a question of one is delivered and judged as any other), the `declaration`'s effect on the judge, the fitted `delivery` rates (`free_stop`, `free_live` and `ask_live` weigh a route's value: `ask_live` a live question's of a check with a 3, `free_live` a hand-over's and a live question's of a check without one; `later` and `wait` are only shown), the monitor's `evaluation` (its `mean` and upper bound `ucb` over its `sessions`, and the weights' health over the labelled applies that can move the estimate, on a route with at least 5 labels: labelled `units`, `ess`, `max_weight` against the mean, `truncated`), the `measurement` for the learned policy (`placebos` drawn and `judged`, `tail_shown` and `tail_applied`), `pool` yield by fill position, and `latency` per harness (the stop calls' `p50_ms` and `p95_ms` against the harness's `budget_ms`, `over`: failed calls). A section not measured yet is empty or `null` |
+| `/api/select?c=` | Lesson selection ([Which lessons are asked](delivery.md#which-lessons-are-asked)), from the store's selection summary: the `policy` of this process, the `default` (`learned`) and the `source` (`reverted` once the monitor put the fixed rule back), the `gate` (the quality the learned policy may still risk below the fixed rule, not money; 0 under the fixed rule) and its two parts, the `allowance` the fixed rule's value accrued and the `ledger`'s 5% quantile (a gate of 0 with a positive allowance is spent, not a cold start), the `fit`, `checks` and `sessions` folded, `deviations` from the fixed rule (routes only), `fallbacks` (per `reason` a learned decision took the fixed rule instead, `lock_busy`, `lock_failed` and `unrecorded`, the graded checks it did of those folded), `spend` per source (`stop`, `live`: calls, extra rounds, dollars), the engineer's `budget` (`{tokens, spent, price}`, `null` unless one is set), `effects` with 95% intervals, the forgetting `half_life`, label health (`labels`: the judged share per route (a verdict: changed, ignored or not arisen), the shares of the judge's answers from judge version 3 (0.7.5) on, each apply's latest, that were `unclear` (also per route: `unclear, asked`, `unclear, free`, `unclear, placebo`), `not arisen` and `consequence remains`; an older `unclear` also held a remaining consequence and is in none of them, and an apply the judge never answered is in the judged share, not here; the placebo rate; the free row leaves out applies of a lesson the session already had or had waiting in its queue, which delivery drops as given before or queued twice, while a question of one is delivered and judged as any other), the `declaration`'s effect on the judge, the fitted `delivery` rates (`free_stop`, `free_live` and `ask_live` weigh a route's value: `ask_live` a live question's of a check with a 3, `free_live` a hand-over's and a live question's of a check without one; `later` and `wait` are only shown), the monitor's `evaluation` (its `mean` and upper bound `ucb` over its `sessions`, and the weights' health over the labelled applies that can move the estimate, on a route with at least 5 labels: labelled `units`, `ess`, `max_weight` against the mean, `truncated`), the `measurement` for the learned policy (`placebos` drawn and `judged`, `tail_shown` and `tail_applied`), `pool` yield by fill position, and `latency` per harness (the stop calls' `p50_ms` and `p95_ms` against the harness's `budget_ms`, `over`: failed calls). A section not measured yet is empty or `null` |
 | `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/memory?c=&absorbed=` | The `borg memory export --json` document (`{"schema": 1, "collective", "lessons"}`, [Memory](learning.md)); `absorbed=true` keeps only absorbed lessons |
 | `/api/update?c=` | borg itself: this borg (`borg`), its mesh `protocol`, whether the release check is on (`check`), the last check's `latest`, `checked_ms` and `error` (`null` before the first), `update` (a newer release exists and the check is on), and `members`: each member the mesh last heard from with its `key`, `engineer` (when known), `name` (the engineer, else `peer <short key>`), `borg` (`null`: older than 0.7, it sent no version), the `protocol` its last session agreed on (or the one it speaks when nothing syncs with it), `ms`, `syncs` (`false`: nothing syncs with it) and `note` (what it misses on an older protocol, or why nothing syncs; `null` on this node's footing). No members without the store's `mesh/` ([Versions on the mesh](team-sync.md#how-a-sync-works)) |
@@ -104,7 +104,7 @@ reads `/api/update` and follows the release check and the mesh's version records
 | `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned and dated when the veto was said, so the latest days can still grow |
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
-| `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone |
+| `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone, the session-end judge (`why: judge`, `n` lessons sent to the judge, its `usd` and `dur_ms`; `text: no answer` when the call failed) |
 | `steer_issued`, `steer_delivered`, `steer_dropped` | A pause, resume or veto message (`borg pause`, `borg resume`, or `borg no` naming a session on another machine) sent, shown to a session, or refused because the sending machine may not steer here (`why`: its role, or that it is revoked or unknown). On the first two, `why` is the kind (`pause`, `resume`, `veto`). A store from before 0.4 adds its old directives to the history |
 | `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: window` when the sender's window to that recipient was full, its 10-minute rate not yet due, or its unread messages there filled its machine's share of the log ([Pacing](commands.md#messages)), `why: bounds` when the log's bound of 1 MiB per member and class cut lines (`n` lines). `why: rate` is 0.5's rate limit, in older events. Lines that expire after 7 days are not counted |
 | `pause_refused` | A tool call refused because its drone was paused |
@@ -117,12 +117,20 @@ reads `/api/update` and follows the release check and the mesh's version records
 **Mode and channel.** Events from a hook carry `mode`: the delivery mode it ran in (`hook` or `live`,
 [Delivery modes](delivery.md#delivery-modes)), on every harness. Asks and their results carry `channel`: how the lesson
 reached the drone, `stop` (a turn-end block), `live` (a live check), `early` or `queued` (free). The
-`asked` outcome records and the judge's `asked_then_changed` and `asked_ignored` records in
-`outcomes.jsonl` carry the same `channel`. A placebo's verdicts carry `placebo`: the lesson was never
-shown, so they measure the judge and are left out of every count, belief and team line, as is an
-unclear verdict (`asked_unclear`). A free delivery's `asked` record counts as its `early` or
-`queued_free` event, never as a `block`, and the next turn end's model call judges it as it judges a
-question (questions keep their judge slots first; free deliveries alone pay for no model call). A
+`asked` outcome records and the judge's records in `outcomes.jsonl` carry the same `channel`. The judge
+gives one of five verdicts, each with a short reason (`reasons`, redacted, local only):
+`asked_then_changed` (changed, the consequence avoided), `asked_ignored` (the point came up, nothing
+changed), `asked_not_arisen` (the point never came up in the work), `asked_consequence_remains` (changed,
+but the consequence still follows) and `asked_unclear`; before 0.7.5 a remaining consequence was written
+as `asked_unclear`. The first three settle the delivery; the last two leave it pending for another try. A
+placebo's verdicts carry `placebo`: the lesson was never shown, so they measure the judge and are left out
+of every count, belief and team line, as are an unclear verdict, a remaining consequence and a point that
+never came up (censored: it says nothing of the lesson's use; the selection model reads it as no
+change). A verdict the session-end judge gave carries `at: "end"` (local, empty at a check); its records
+keep the delivery's channel. Records before 0.7.5 have neither `reasons` nor `at`. A free delivery's
+`asked` record counts as its `early` or `queued_free` event, never as a `block`, and a turn end's model
+call judges it as it judges a question (questions keep their judge slots first; free deliveries alone
+pay for no check's call, only for the session-end judge's). A
 correction `borg learn` merges into a lesson delivered free is `asked_then_corrected`; one a graded check
 left unchosen stays `applied_then_corrected` too, since a free delivery asks nothing, and `borg debug ope`
 leaves free deliveries out: they draw from no pool. A veto adds a `vetoed` record per lesson shown in the session
@@ -178,10 +186,14 @@ when it had no lesson to ask and none to judge (a check with nothing in its pool
 end, makes no model call; the turn end logs `#borg-skip empty`). A live check's model call is
 logged as `#borg-predict-cost`, like a turn end's, and as `live usd=… lessons=…` in the `.cost` file,
 so `borg status` counts it apart. Each judge call adds
-`judge call=<n> pending=<n> resolved=<n> chars=<n> returned=<ids> unmatched=<ids>`: the ids the model's
-answer named, and those of them no pending lesson has, each empty for none. A pending lesson in neither
-list was left out by the model; one returned but not counted in `resolved` got an unclear or unreadable
-verdict. An id is logged as the model wrote it, a space or comma in it as `_`, so a padded id is
+`judge call=<n> pending=<n> resolved=<n> chars=<n> returned=<ids> unmatched=<ids> verdicts=<word>:<n>,…
+reason_chars=<n>`: `resolved` counts the verdicts that settle (changed, ignored, not_arisen); then the ids
+the model's answer named, and those of them no pending lesson has, each empty for none; then the verdicts
+on pending lessons by word (`changed`, `ignored`, `not_arisen`, `consequence_remains`, `unclear`, always all
+five) and the characters of their reasons. A pending lesson in neither id list was left out by the model;
+one returned but not counted in `resolved` got a pending (unclear, consequence_remains) or unreadable
+verdict. The session-end judge's line ends in ` at=end`; it numbers its call after the session's
+checks. An id is logged as the model wrote it, a space or comma in it as `_`, so a padded id is
 returned and unmatched. The whole pool's
 line there reads
 `pool mode=all eligible=<n> shown=<n> budget=fits|full`, with ` tail=<n>` when a tail sample was
@@ -189,7 +201,9 @@ shown. A graded check writes `#borg-graded n=<applies> <id>:<grade>:<rank>,…`,
 `#borg-select policy=… source=… fit=… gate=… applied=… @<check>`, `#borg-p` and `#borg-pf` before it
 delivers anything; every delivery marker (`#borg-asked`, `#borg-early`, `#borg-queued`, `#borg-placebo`)
 ends in ` @<check>`, the check that routed it, and `#borg-unjudged <ids> why=<reason>` names what a judge
-call left out.
+call left out. Each judged lesson gets `#borg-judged <id>=<verdict>`, `pending` for a verdict that does
+not settle (`unclear`, `consequence_remains`) or none; after the session-end judge, `#borg-end-judged
+<ids>` names the lessons it was shown, settled for every later call until one is delivered again.
 
 ## Privacy
 

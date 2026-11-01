@@ -65,7 +65,8 @@ pub fn labels(outcomes: &[Outcome]) -> Vec<Labelled> {
         v.sort_by_key(|c| c.0);
     }
     let mut needed: HashMap<usize, Vec<&str>> = HashMap::new();
-    // A placebo's `changed` or an unclear verdict is no result (outcome.rs `is_result`): it labels nothing.
+    // A placebo's `changed`, an unclear verdict, a remaining consequence or a point that never came up
+    // (`asked_not_arisen`) is no result (outcome.rs `is_result`): it labels nothing.
     for o in outcomes.iter().filter(|o| outcome::is_result(o) && (o.kind == outcome::CHANGED || o.kind == outcome::MISSED)) {
         for l in &o.lessons {
             let Some(cs) = checks.get(&(o.session.as_str(), l.as_str())) else { continue };

@@ -67,7 +67,8 @@ pub const LESSON_MERGED: &str = "lesson_merged";
 pub const REVIEW_FINDING: &str = "review_finding";
 /// `borg learn` judged an episode not to be a lesson.
 pub const NOT_A_LESSON: &str = "not_a_lesson";
-/// A model call outside the turn end (`why`: learn, assimilate, facets, expert; `usd`, `dur_ms`).
+/// A model call outside the turn end (`why`: learn, assimilate, facets, expert, judge: the session-end
+/// judge, hook.rs `judge_session`, with `n` the lessons sent to the judge; `usd`, `dur_ms`).
 pub const MODEL_CALL: &str = "model_call";
 /// Steering: a directive issued, shown to a drone (`why`: say/pause/resume), refused on receipt
 /// (`why`: the reason), and a tool call refused because the drone was paused (`why`: the tool).
@@ -389,6 +390,8 @@ fn derive_history(home: &Path) -> Vec<Event> {
             crate::outcome::NOT_CORRECTED => NOT_CORRECTED,
             crate::outcome::REGRETTED => REGRETTED,
             crate::outcome::TESTED => TESTED,
+            // Measurements, never results (outcome.rs `is_result`): no event, as live counting skips them.
+            crate::outcome::UNCLEAR | crate::outcome::REMAINS | crate::outcome::NOT_ARISEN => continue,
             _ => continue,
         };
         let lessons = ids(&o, "lessons");

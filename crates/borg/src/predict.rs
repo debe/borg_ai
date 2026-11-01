@@ -47,19 +47,36 @@ that apply, most consequential first; return none if none apply.";
 const GRADE: &str = "Grade each lesson you return: 3 = this work clearly runs into the consequence unless the lesson \
 is followed; 2 = probably relevant; 1 = loosely related, worth a thought.";
 
-/// The judge's instructions (judge v2, `JUDGE_VERSION`): route-blind, one template for a lesson asked
+/// The judge's instructions (judge v3, `JUDGE_VERSION`): route-blind, one template for a lesson asked
 /// at a stop or live, handed over free, or never shown (a placebo, hook.rs `#borg-placebo`): the judge
-/// sees the same evidence for each and is never told how, or whether, the agent was given it.
+/// sees the same evidence for each and is never told how, or whether, the agent was given it. Five
+/// distinct verdicts (`Verdict`), so "the point never came up" and "changed, but the consequence still
+/// follows" are no longer folded into unclear, and a short reason per verdict.
 const JUDGE: &str = "## Lessons from earlier in this session\n\
 Each group below shows the agent's work at one point in this session (before) and its work since (after), then lessons \
-that may bear on it. Judge by meaning, not by shared words, comparing the two: did the agent change its work on the \
-lesson's point (changed), keep it as it was (unchanged), or does the evidence not tell (unclear)? Set avoids_consequence \
-true only if the work after no longer leads to the consequence. A declaration (applies / skip) is the agent's claim, not \
-proof: judge the work. Put one verdict per id in `resolved`.";
+that may bear on it. Judge by meaning, not by shared words, comparing the two, and give each lesson exactly one verdict: \
+changed (the work changed on the lesson's point and no longer leads to the consequence); consequence_remains (the work \
+changed on that point but still leads to the consequence); ignored (the point came up in the work and was kept as it \
+was); not_arisen (nothing in the work since touches the lesson's point, so there was nothing to change); unclear (only \
+when the evidence shown cannot tell these apart). A declaration (applies / skip) is the agent's claim, not proof: judge \
+the work. Put one verdict per id in `resolved`, each with a reason: one short sentence (at most 25 words) naming what in \
+the work decided it.";
 
 /// The judge template's version, logged on every judge result (outcome.rs `judge`). Protocol: 0 is the
-/// template before versions were logged (it told questions from free deliveries); 2 is `JUDGE`.
-pub const JUDGE_VERSION: u8 = 2;
+/// template before versions were logged (it told questions from free deliveries); 2 the route-blind
+/// template with changed / unchanged / unclear and `avoids_consequence` (0.7.4 and before); 3 is
+/// `JUDGE`, five verdicts with a reason (0.7.5 on).
+pub const JUDGE_VERSION: u8 = 3;
+
+/// Protocol: the first judge template version (`JUDGE_VERSION` 3, 0.7.5) whose `unclear` is pure: before
+/// it, `asked_unclear` also held a change that left the consequence. The label health's verdict shares
+/// (top.rs) count answers from it on, the 0.7.5 target's measure (docs/evidence.md, Lesson selection).
+pub const PURE_UNCLEAR_FROM: u8 = 3;
+
+/// The characters of a judge's reason kept per verdict (`reason_of`), after redaction, on one line.
+/// Guard: bounds what one verdict adds to the outcome log and the judge's answer, whatever the model
+/// writes; about twice the 25 words the prompt asks for.
+pub const JUDGE_REASON_CHARS: usize = 240;
 
 fn schema(judging: bool, graded: bool) -> Value {
     let mut s = json!({"type": "object", "additionalProperties": false, "properties": {
@@ -72,13 +89,23 @@ fn schema(judging: bool, graded: bool) -> Value {
         s["properties"]["applies"]["items"]["required"] = json!(["id", "why", "grade"]);
     }
     if judging {
-        s["properties"]["resolved"] = json!({"type": "array", "items": {"type": "object", "additionalProperties": false,
-            "properties": {"id": {"type": "string"}, "verdict": {"type": "string", "enum": ["changed", "unchanged", "unclear"]},
-                "avoids_consequence": {"type": "boolean"}},
-            "required": ["id", "verdict", "avoids_consequence"]}});
+        s["properties"]["resolved"] = resolved_schema();
         s["required"] = json!(["moves", "applies", "resolved"]);
     }
     s
+}
+
+/// The judge's `resolved` list (judge v3): one verdict per id, each with its reason.
+fn resolved_schema() -> Value {
+    json!({"type": "array", "items": {"type": "object", "additionalProperties": false,
+        "properties": {"id": {"type": "string"}, "verdict": {"type": "string", "enum": Verdict::WORDS},
+            "reason": {"type": "string"}},
+        "required": ["id", "verdict", "reason"]}})
+}
+
+/// The session-end judge's schema (`judge`): its `resolved` list alone, nothing to grade.
+fn judge_schema() -> Value {
+    json!({"type": "object", "additionalProperties": false, "properties": {"resolved": resolved_schema()}, "required": ["resolved"]})
 }
 
 /// A lesson delivered earlier in this session (asked, handed over free, or a placebo never shown) whose
@@ -106,31 +133,85 @@ pub struct Pending<'a> {
 /// judge section of a call, whatever the drone wrote.
 pub const JUDGE_PART: usize = 1200;
 
+/// The judge's verdict on one pending lesson (judge v3, `JUDGE`). Protocol: its word in the answer
+/// (`word`, the schema's enum) and the outcome kind it records (`kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
+    /// The work changed on the lesson's point and no longer leads to the consequence: a use.
     Changed,
-    Unchanged,
+    /// The point came up and the work kept it as it was (v2's `unchanged`).
+    Ignored,
+    /// Nothing in the work since touches the lesson's point: censored for beliefs, "nothing in the
+    /// work" for selection.
+    NotArisen,
+    /// The work changed on the point but still leads to the consequence (v2: `changed` with
+    /// `avoids_consequence` false): as unclear, pending.
+    ConsequenceRemains,
+    /// The evidence cannot tell: pending.
     Unclear,
 }
 
-/// The model's verdict on one pending lesson.
+impl Verdict {
+    /// The words the schema allows, in `Verdict` order. Protocol: the judge's answer and the hook's
+    /// `#borg-judged` state lines for a verdict that settles.
+    pub const WORDS: [&'static str; 5] = ["changed", "ignored", "not_arisen", "consequence_remains", "unclear"];
+    /// Every verdict, in `WORDS` order.
+    pub const ALL: [Verdict; 5] = [Verdict::Changed, Verdict::Ignored, Verdict::NotArisen, Verdict::ConsequenceRemains, Verdict::Unclear];
+
+    /// Its word in the answer (`WORDS`).
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        Self::WORDS[self as usize]
+    }
+
+    /// The verdict a word of the answer names: one of `WORDS`, or judge v2's `unchanged` (an ignore).
+    /// None for any other word.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Verdict> {
+        match word {
+            "unchanged" => Some(Verdict::Ignored),
+            w => Self::WORDS.iter().position(|x| *x == w).map(|i| Self::ALL[i]),
+        }
+    }
+
+    /// The outcome kind it records (outcome.rs): `asked_then_changed`, `asked_ignored`,
+    /// `asked_not_arisen`, `asked_consequence_remains`, `asked_unclear`.
+    #[must_use]
+    pub fn kind(self) -> &'static str {
+        match self {
+            Verdict::Changed => crate::outcome::CHANGED,
+            Verdict::Ignored => crate::outcome::IGNORED,
+            Verdict::NotArisen => crate::outcome::NOT_ARISEN,
+            Verdict::ConsequenceRemains => crate::outcome::REMAINS,
+            Verdict::Unclear => crate::outcome::UNCLEAR,
+        }
+    }
+}
+
+/// The model's verdict on one pending lesson, with its reason (`reason_of`; empty when it gave none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judged {
     pub id: String,
     pub verdict: Verdict,
-    pub avoids_consequence: bool,
+    pub reason: String,
 }
 
 impl Judged {
-    /// The outcome it settles (outcome.rs): a change that avoids the consequence is a use, no change is
-    /// an ignore; anything else (unclear, a change that still leads to the consequence) stays pending.
+    /// The outcome it settles (outcome.rs `settles`): a change that avoids the consequence is a use, no
+    /// change an ignore, a point that never came up `asked_not_arisen`; an unclear verdict or a change
+    /// that still leads to the consequence stays pending (None).
     pub fn label(&self) -> Option<&'static str> {
-        match (self.verdict, self.avoids_consequence) {
-            (Verdict::Changed, true) => Some(crate::outcome::CHANGED),
-            (Verdict::Unchanged, _) => Some(crate::outcome::IGNORED),
-            _ => None,
-        }
+        let kind = self.verdict.kind();
+        crate::outcome::settles(kind).then_some(kind)
     }
+}
+
+/// The judge's reason as logged: redacted (notes.rs `redact`) before it is cut, on one line, at most
+/// `JUDGE_REASON_CHARS` characters, marked when cut (`clip`).
+#[must_use]
+pub fn reason_of(text: &str) -> String {
+    let one: String = crate::notes::redact(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    clip(&one, JUDGE_REASON_CHARS)
 }
 
 /// One checkpoint's answer: the lessons predicted to apply with their grades, the verdicts on pending
@@ -214,6 +295,29 @@ pub fn prompt(context: &str, shortlist: &[&Challenge], pending: &[Pending], grad
     format!("{}\n\n## Current work\n{tail}\n\n## Lessons\n{}\n{}", instructions(PROMPT, graded), lessons.join("\n"), judge_section(pending))
 }
 
+/// The session-end judge's opening (`judge_prompt`): the session is over, its whole work comes first,
+/// then the judge's own section (`JUDGE`) with each delivery's evidence, as at a check.
+const END: &str = "You are the consequence model of an engineering team. A coding agent's session has ended. First \
+comes the whole session's work (the engineer's prompts and the agent's touches, its edits and answers, its messages), \
+then lessons delivered during the session, each with the work before and after its delivery. The session is over: no \
+later work will come, so read the whole session's work for each lesson.";
+
+/// The session-end judge's prompt (hook.rs `judge_session`): `END`, the session's work (already within
+/// its budget, hook.rs `END_WORK_CHARS`), then the judge section of `pending` (`judge_section`).
+#[must_use]
+pub fn judge_prompt(work: &str, pending: &[Pending]) -> String {
+    format!("{END}\n\n## The session's work\n{work}\n{}", judge_section(pending))
+}
+
+/// One judge-only call at a session's end (hook.rs `judge_session`): `judge_prompt` with the resolved
+/// list alone as its schema, parsed as a check's verdicts are (`resolved`, `returned`); no applies.
+/// None on any failure or after `timeout`: the deliveries stay as they were.
+pub fn judge(work: &str, pending: &[Pending], model: &str, timeout: Duration) -> Option<Prediction> {
+    let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), &judge_prompt(work, pending), &judge_schema(), timeout)?;
+    v["resolved"].as_array()?;
+    Some(Prediction { applies: Vec::new(), grades: Vec::new(), resolved: resolved(&v, pending), returned: returned(&v), cost: cost.unwrap_or(0.0) })
+}
+
 /// Ids the model predicts apply, in its order, restricted to the shortlist, with their grades; its
 /// verdicts on the pending lessons; and the call's cost (USD for Claude; total tokens for
 /// `codex:<model>`). None on any failure or after `timeout`: the caller fails open, and pending lessons
@@ -265,8 +369,10 @@ fn returned(v: &Value) -> Vec<String> {
     out
 }
 
-/// The model's verdicts, kept only for pending ids with a valid verdict, the first per id. A missing
-/// or malformed `resolved` yields none: every lesson stays pending.
+/// The model's verdicts, kept only for pending ids with a valid verdict (`Verdict::of`), the first per
+/// id, each with its reason (`reason_of`). A missing or malformed `resolved` yields none: every lesson
+/// stays pending. Tolerant of judge v2's answer shape: `unchanged` is an ignore, and `changed` with
+/// `avoids_consequence` false a remaining consequence (as v2 read it).
 fn resolved(v: &Value, pending: &[Pending]) -> Vec<Judged> {
     let mut out: Vec<Judged> = Vec::new();
     for r in v["resolved"].as_array().into_iter().flatten() {
@@ -274,13 +380,11 @@ fn resolved(v: &Value, pending: &[Pending]) -> Vec<Judged> {
         if !pending.iter().any(|p| p.lesson.id == id) || out.iter().any(|j| j.id == id) {
             continue;
         }
-        let verdict = match r["verdict"].as_str() {
-            Some("changed") => Verdict::Changed,
-            Some("unchanged") => Verdict::Unchanged,
-            Some("unclear") => Verdict::Unclear,
-            _ => continue,
-        };
-        out.push(Judged { id: id.to_string(), verdict, avoids_consequence: r["avoids_consequence"].as_bool().unwrap_or(false) });
+        let Some(mut verdict) = r["verdict"].as_str().and_then(Verdict::of) else { continue };
+        if verdict == Verdict::Changed && r["avoids_consequence"].as_bool() == Some(false) {
+            verdict = Verdict::ConsequenceRemains;
+        }
+        out.push(Judged { id: id.to_string(), verdict, reason: reason_of(r["reason"].as_str().unwrap_or_default()) });
     }
     out
 }
@@ -347,6 +451,25 @@ mod tests {
         assert!(prompt("w", &[&x], &[], true).starts_with(&format!("{PROMPT} {GRADE}\n\n## Current work")));
     }
 
+    /// The session-end judge's call (hook.rs `judge_session`): its opening, the session's work, then the
+    /// same judge section a check shows, route-blind; a schema of the verdicts alone, each with a reason.
+    #[test]
+    fn the_session_end_judge_reads_the_whole_work_then_the_judge_section() {
+        let a = Challenge { id: "La".into(), question: "Q?".into(), consequence: "C".into(), ..Default::default() };
+        let pend = [pending(&a)];
+        let p = judge_prompt("### The agent's edits and answers\nedit one\n", &pend);
+        assert!(p.starts_with(END), "{p}");
+        let (work, judged) = (p.find("edit one").unwrap(), p.find(&judge_section(&pend)).unwrap());
+        assert!(p.contains("## The session's work\n### The agent's edits") && work < judged, "{p}");
+        for word in ["asked", "question", "free", "placebo", "context", "declared"] {
+            assert!(!END.to_lowercase().contains(word), "{word}: {END}");
+        }
+        let s = judge_schema();
+        assert_eq!(s["required"], json!(["resolved"]));
+        assert_eq!(s["properties"]["resolved"], schema(true, true)["properties"]["resolved"], "the verdicts a check's judge gives");
+        assert!(s["properties"].get("applies").is_none());
+    }
+
     fn pending(c: &Challenge) -> Pending<'_> {
         Pending { lesson: c, before: "b".into(), after: "a".into(), declared: None, check: String::new(), channel: "stop", stripped: false }
     }
@@ -364,14 +487,10 @@ mod tests {
             {"id": "b", "verdict": "maybe", "avoids_consequence": true},
             {"id": "c", "verdict": "changed"}]});
         let r = resolved(&v, &p);
-        assert_eq!(
-            r,
-            vec![
-                Judged { id: "a".into(), verdict: Verdict::Changed, avoids_consequence: true },
-                Judged { id: "c".into(), verdict: Verdict::Changed, avoids_consequence: false },
-            ]
-        );
-        assert_eq!((r[0].label(), r[1].label()), (Some(crate::outcome::CHANGED), None));
+        let judged = |id: &str, verdict| Judged { id: id.into(), verdict, reason: String::new() };
+        // v2's answer shape still reads: `changed` without `avoids_consequence` is a change.
+        assert_eq!(r, vec![judged("a", Verdict::Changed), judged("c", Verdict::Changed)]);
+        assert_eq!((r[0].label(), r[1].label()), (Some(crate::outcome::CHANGED), Some(crate::outcome::CHANGED)));
         assert!(resolved(&json!({"applies": []}), &p).is_empty(), "missing: all stay pending");
         assert_eq!(returned(&v), ["a", "zz", "b", "c"], "every id named, once, whatever its verdict");
         let odd = json!({"resolved": [{"id": "x y,z"}, {"id": 7}, {"id": ""}, {"verdict": "changed"}, {"id": "x\n"}]});
@@ -381,8 +500,54 @@ mod tests {
         assert!(resolved(&padded, &p).is_empty());
         assert_eq!(returned(&padded), ["_a"]);
         assert!(returned(&json!({"applies": []})).is_empty() && returned(&json!({"resolved": "a"})).is_empty());
-        let j = |verdict, avoids| Judged { id: "x".into(), verdict, avoids_consequence: avoids }.label();
-        assert_eq!((j(Verdict::Unchanged, false), j(Verdict::Unclear, true)), (Some(crate::outcome::IGNORED), None));
+        let j = |verdict| Judged { id: "x".into(), verdict, reason: String::new() }.label();
+        assert_eq!((j(Verdict::Ignored), j(Verdict::Unclear)), (Some(crate::outcome::IGNORED), None));
+    }
+
+    /// Judge v3: five distinct verdicts, each with its reason; the three that settle are labels, the
+    /// other two stay pending under their own kinds; v2's shape reads as v2 meant it.
+    #[test]
+    fn the_five_verdicts_parse_with_their_reason_and_only_three_settle() {
+        use crate::outcome;
+        let l: Vec<Challenge> = ["a", "b", "c", "d", "e", "f", "g"].iter().map(|i| Challenge { id: (*i).into(), ..Default::default() }).collect();
+        let p: Vec<Pending> = l.iter().map(pending).collect();
+        let v = json!({"resolved": [
+            {"id": "a", "verdict": "changed", "reason": "moved the send off the lock"},
+            {"id": "b", "verdict": "ignored", "reason": "still holds the lock across the await"},
+            {"id": "c", "verdict": "not_arisen", "reason": "only CSS was touched"},
+            {"id": "d", "verdict": "consequence_remains", "reason": "split the lock, still awaits under it"},
+            {"id": "e", "verdict": "unclear"},
+            {"id": "f", "verdict": "unchanged", "avoids_consequence": false},
+            {"id": "g", "verdict": "changed", "avoids_consequence": false, "reason": "x"}]});
+        let r = resolved(&v, &p);
+        let got: Vec<(&str, Verdict, Option<&str>, &str)> = r.iter().map(|j| (j.id.as_str(), j.verdict, j.label(), j.reason.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("a", Verdict::Changed, Some(outcome::CHANGED), "moved the send off the lock"),
+                ("b", Verdict::Ignored, Some(outcome::IGNORED), "still holds the lock across the await"),
+                ("c", Verdict::NotArisen, Some(outcome::NOT_ARISEN), "only CSS was touched"),
+                ("d", Verdict::ConsequenceRemains, None, "split the lock, still awaits under it"),
+                ("e", Verdict::Unclear, None, ""),
+                ("f", Verdict::Ignored, Some(outcome::IGNORED), ""),
+                ("g", Verdict::ConsequenceRemains, None, "x"),
+            ]
+        );
+        let kinds: Vec<&str> = Verdict::ALL.iter().map(|v| v.kind()).collect();
+        assert_eq!(kinds, [outcome::CHANGED, outcome::IGNORED, outcome::NOT_ARISEN, outcome::REMAINS, outcome::UNCLEAR]);
+        for v in Verdict::ALL {
+            assert_eq!(Verdict::of(v.word()), Some(v), "{v:?}");
+        }
+        assert_eq!(Verdict::of("maybe"), None);
+        // The schema asks for exactly these words, and a reason with each.
+        let s = schema(true, false);
+        assert_eq!(s["properties"]["resolved"]["items"]["properties"]["verdict"]["enum"], json!(Verdict::WORDS));
+        assert_eq!(s["properties"]["resolved"]["items"]["required"], json!(["id", "verdict", "reason"]));
+        // A reason is redacted before it is cut, on one line, bounded.
+        let secret = format!("kept  the\nkey AKIAIOSFODNN7EXAMPLE in {}", "y".repeat(2 * JUDGE_REASON_CHARS));
+        let r = reason_of(&secret);
+        assert!(!r.contains("AKIAIOSFODNN7EXAMPLE") && !r.contains('\n') && r.starts_with("kept the key "), "{r}");
+        assert_eq!(r.chars().count(), JUDGE_REASON_CHARS + 1, "cut and marked");
     }
 
     #[test]
@@ -430,7 +595,10 @@ mod tests {
         for word in ["asked", "question", "free", "placebo", "context", "declared"] {
             assert!(!question.to_lowercase().contains(word), "{word}: {question}");
         }
-        assert_eq!(JUDGE_VERSION, 2);
+        assert_eq!(JUDGE_VERSION, 3);
+        for word in Verdict::WORDS {
+            assert!(question.contains(word), "{word}: {question}");
+        }
         let hashes = [template_hash(true, true), template_hash(true, false), template_hash(false, true), template_hash(false, false)];
         assert!(hashes.iter().all(|h| h.len() == 12) && hashes.iter().collect::<std::collections::HashSet<_>>().len() == 4, "{hashes:?}");
         assert_eq!(template_hash(true, true), hashes[0], "stable");

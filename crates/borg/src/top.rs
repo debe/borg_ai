@@ -450,7 +450,9 @@ pub struct Selection {
     pub effects: Vec<Estimate>,
     /// The forgetting half-life chosen, in session ticks; `Some(0)`: no forgetting.
     pub half_life: Option<u32>,
-    /// Label health: the judged share per route, the unclear share, the placebo rate.
+    /// Label health: the judged share per route (a verdict: changed, ignored or not arisen), the shares
+    /// of the judge's answers from `predict::PURE_UNCLEAR_FROM` on that were unclear (overall and per
+    /// route), not arisen and a remaining consequence, the placebo rate.
     pub labels: Vec<Count>,
     /// Label health: how the apply/skip declaration moves the judge (a random half is judged without it).
     pub declaration: Option<Estimate>,
@@ -717,7 +719,8 @@ impl Selection {
             .map(|(source, i)| Spend { source: source.into(), calls: s.spend[i].calls, rounds: s.spend[i].rounds, usd: s.spend[i].usd })
             .collect();
         let budget = s.fit.budget.map(|tokens| Budget { tokens, spent: s.pool.tokens as f64 / sessions.max(1) as f64, price: s.fit.lambda });
-        let judged = |l: Label| matches!(l, Label::Changed | Label::Ignored);
+        // A verdict (select/summary.rs `Label::verdict`): changed, ignored or not arisen.
+        let judged = |l: Label| l.verdict();
         // Per route, its applies and those judged: the label health's rows, and the placebo's the
         // measurement's. A free apply of a lesson its session had is dropped at delivery as given before,
         // so no verdict can come of it: out of its row, as it is out of the summary's delivery tallies
@@ -732,8 +735,21 @@ impl Selection {
             let (part, whole) = of(route);
             labels.push(count(name, part, whole));
         }
-        let verdicts = s.applies.iter().filter(|a| judged(a.label) || a.label == Label::Unclear).count();
-        labels.push(count("unclear", s.applies.iter().filter(|a| a.label == Label::Unclear).count(), verdicts));
+        // Every answer of the judge from `predict::PURE_UNCLEAR_FROM` on, the pending ones too, each
+        // apply's latest (`Apply::jv`): the pure unclear share is the 0.7.5 target (docs/evidence.md),
+        // overall and per route, not arisen and a remaining consequence apart from it. An older
+        // `asked_unclear` also held a remaining consequence: in none of them.
+        let answers: Vec<_> = s.applies.iter().filter(|a| a.jv >= crate::predict::PURE_UNCLEAR_FROM && (judged(a.label) || a.label.pending())).collect();
+        let share = |name: &str, label: Label, route: Option<select::Route>| {
+            let of: Vec<_> = answers.iter().filter(|a| route.is_none_or(|r| a.route == r)).collect();
+            count(name, of.iter().filter(|a| a.label == label).count(), of.len())
+        };
+        for (name, label) in [("unclear", Label::Unclear), ("not arisen", Label::NotArisen), ("consequence remains", Label::Remains)] {
+            labels.push(share(name, label, None));
+        }
+        for (name, route) in [("unclear, asked", select::Route::Ask), ("unclear, free", select::Route::Free), ("unclear, placebo", select::Route::Placebo)] {
+            labels.push(share(name, Label::Unclear, Some(route)));
+        }
         let later = s.applies.iter().filter(|a| matches!(a.route, select::Route::Not | select::Route::Placebo)).count();
         let (placebos_judged, placebos) = of(select::Route::Placebo);
         labels.push(count("placebo", placebos, later));
@@ -1448,6 +1464,73 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let row = |name: &str| sel.labels.iter().find(|c| c.name == name).map(|c| (c.part, c.whole));
         assert_eq!(row("judged, free"), Some((1, 1)), "c1's delivered and judged; c2's had, out: {:?}", sel.labels);
         assert_eq!(row("judged, asked"), Some((1, 1)), "c3's question of what B's session had, judged: {:?}", sel.labels);
+    }
+
+    /// The verdict shares count the judge's answers from `predict::PURE_UNCLEAR_FROM` on, the pending ones
+    /// too, overall and per route: an older `asked_unclear` (which also held a remaining consequence) is
+    /// in none of them; an apply's latest answer is its own.
+    #[test]
+    fn the_verdict_shares_read_judge_three_answers_per_route() {
+        use crate::outcome::{self, Outcome};
+        use select::summary::{Summary, fold};
+        let rec = |kind: &str, l: &str, check: &str, channel: &str, ms: i64, judge: u8| Outcome {
+            kind: kind.into(),
+            session: "s".into(),
+            lessons: vec![l.into()],
+            check: check.into(),
+            channel: channel.into(),
+            ms,
+            judge,
+            ..Default::default()
+        };
+        let graded = |check: &str, ms: i64, chosen: &[&str], free: &[&str], placebo: &[&str]| {
+            let lessons: Vec<String> = chosen.iter().chain(free).chain(placebo).map(|l| l.to_string()).collect();
+            let n = lessons.len();
+            Outcome {
+                grades: vec![2; n],
+                ranks: (0..n as u16).collect(),
+                applied: n as u16,
+                chosen: chosen.iter().map(|l| l.to_string()).collect(),
+                free: free.iter().map(|l| l.to_string()).collect(),
+                placebo: placebo.iter().map(|l| l.to_string()).collect(),
+                p: lessons.iter().map(|l| f64::from(u8::from(chosen.contains(&l.as_str())))).collect(),
+                pf: lessons.iter().map(|l| f64::from(u8::from(free.contains(&l.as_str())))).collect(),
+                psi: if placebo.is_empty() { 0.0 } else { 0.5 },
+                policy: "fixed".into(),
+                lessons,
+                ..rec(outcome::GRADED, "", check, "stop", ms, 0)
+            }
+        };
+        let deliver = |l: &str, check: &str, route: &str, ms: i64| Outcome { route: route.into(), ..rec(outcome::DELIVERY, l, check, "", ms, 0) };
+        let log = [
+            // Before 0.7.5: an unclear free delivery, in no share.
+            graded("c0", 5, &[], &["O"], &[]),
+            deliver("O", "c0", outcome::ROUTE_FREE, 6),
+            rec(outcome::UNCLEAR, "O", "c0", "queued", 7, 2),
+            graded("c1", 10, &["A", "B"], &["F", "G", "H"], &["P", "Q"]),
+            deliver("A", "c1", outcome::ROUTE_ASKED, 11),
+            deliver("B", "c1", outcome::ROUTE_ASKED, 11),
+            deliver("F", "c1", outcome::ROUTE_FREE, 11),
+            deliver("G", "c1", outcome::ROUTE_FREE, 11),
+            deliver("H", "c1", outcome::ROUTE_FREE, 11),
+            rec(outcome::CHANGED, "A", "c1", "stop", 20, 3),
+            rec(outcome::UNCLEAR, "B", "c1", "stop", 20, 3),
+            rec(outcome::UNCLEAR, "F", "c1", "queued", 20, 3),
+            Outcome { at: outcome::AT_END.into(), ..rec(outcome::NOT_ARISEN, "F", "c1", "queued", 30, 3) },
+            rec(outcome::REMAINS, "G", "c1", "queued", 20, 3),
+            rec(outcome::UNCLEAR, "H", "c1", "queued", 20, 3),
+            rec(outcome::UNCLEAR, "P", "c1", outcome::PLACEBO, 20, 3),
+            rec(outcome::IGNORED, "Q", "c1", outcome::PLACEBO, 20, 3),
+        ];
+        let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
+        let sel = Selection::of(&fold(&text, Summary::default()), select::Policy::Fixed, None);
+        let row = |name: &str| sel.labels.iter().find(|c| c.name == name).map(|c| (c.part, c.whole));
+        assert_eq!(row("unclear"), Some((3, 7)), "B, H and P of seven judge-3 answers, O's older one out: {:?}", sel.labels);
+        assert_eq!(row("not arisen"), Some((1, 7)));
+        assert_eq!(row("consequence remains"), Some((1, 7)));
+        assert_eq!(row("unclear, asked"), Some((1, 2)));
+        assert_eq!(row("unclear, free"), Some((1, 3)), "F's end verdict replaced its unclear: {:?}", sel.labels);
+        assert_eq!(row("unclear, placebo"), Some((1, 2)));
     }
 
     /// The placebos a fixed-rule store's checks drew, and those judged, as the summary folds them:

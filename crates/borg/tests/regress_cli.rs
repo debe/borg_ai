@@ -97,7 +97,7 @@ fn fake_model(root: &Path) {
         .to_string()
     };
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n---\\n' \"$2\" >> '{log}'\ncase \"$2\" in\n  'A coding agent made a decision'*) echo '{regret}' ;;\n  *) echo '{other}' ;;\nesac\n",
+        "#!/bin/sh\np=$(cat)\nprintf '%s\\n---\\n' \"$p\" >> '{log}'\ncase \"$p\" in\n  'A coding agent made a decision'*) echo '{regret}' ;;\n  *) echo '{other}' ;;\nesac\n",
         log = root.join("prompts.txt").display(),
         regret = answer(BEFORE),
         other = answer("Q other"),

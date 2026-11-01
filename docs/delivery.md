@@ -28,18 +28,41 @@ Borg spends tokens only where a lesson is likely to matter.
    turn, after the agent changes something.
 3. **Judged by meaning.** The same call checks whether what was handed over earlier changed the agent's
    work: questions it asked, and free deliveries (early and queued), each recorded with its channel, the
-   check that routed it and its probability of that route. Every route gets the same evidence (the work
-   before the delivery and after it); a random half of the questions are judged without the agent's own
-   `applies`/`skip` line, so its effect on the judge is measured. Questions keep their judge slots first
-   (at most 10 wait); free deliveries alone never pay for a call. A live check judges a free delivery
-   or a placebo only once work follows it, and leaves a question the agent has not answered yet to the
-   stop, which sees the answer; a lesson asked after it was handed over is judged on the question, not
-   on the hand-over. A stop's judge call judges every delivery; a stop that makes none (the last live
-   check covered the turn, or only free deliveries wait) leaves them to the next turn's live check, or
-   to `borg learn`. A correction merged into a
-   lesson delivered free counts against it. At session end `borg learn` settles the rest: a lesson with
-   no verdict is `asked_not_corrected`, with the reason it had none, and counts as unknown, never as
-   ignored. See [Mode and channel](statistics.md#what-is-counted).
+   check that routed it and its probability of that route. The verdict is one of `changed`, `ignored`,
+   `not_arisen` (the point never came up), `consequence_remains` (changed, but the consequence still
+   follows) or `unclear`, with a short reason; `changed` and `ignored` settle the delivery, the others
+   leave it for another try: a point that has not come up by a check may still come up later, so only
+   the session-end judge's `not_arisen` settles ([what each means for a lesson](learning.md#outcomes-and-the-usefulness-belief)).
+   Every route gets the same evidence (the work before the delivery and after it); a random half of the
+   questions are judged without the agent's own `applies`/`skip` line, so its effect on the judge is
+   measured. Questions keep their judge slots first (at most 10 wait).
+
+   **When.** A question is judged as before: a live check judges it once the agent has answered it,
+   and leaves an unanswered one to the stop, which sees the answer. A lesson asked after it was handed
+   over is judged on the question, not on the hand-over. A free delivery (early or queued) and a
+   placebo are judged only at the turn end, never by a live check mid-turn: a live check's next call
+   came a median 0.5-0.8 minutes after the delivery, before the agent had done the work, and
+   most such verdicts were unclear. A stop's judge call judges every open delivery; a stop that makes
+   none (the last live check covered the turn, the gate skipped it, or only free deliveries wait) leaves
+   them to a later stop, and free deliveries alone never pay for a check's call.
+
+   **Session end.** `borg learn --session` makes one more judge call before it learns: every delivery of
+   the session, on any channel, that no verdict settled yet (none came, or only `unclear`,
+   `consequence_remains` or missing ones, whatever its tries) is judged once more with the whole
+   session's work in view: the prompts and touches, the edits and answers, and the agent's messages
+   where its transcript has them (Claude Code's), the newest kept within 24,000 characters. In live
+   mode a stop the last live check covered makes no call, so free deliveries and placebos left open
+   there are judged here. Its verdicts are recorded as a check's are, marked `at: end`, and a lesson it
+   judged is not judged again unless it is delivered again. A session whose end hook never ran gets
+   the same call when a later `borg learn` settles it as idle. Cost: one
+   call per session with something open, on the checks' model (`BORG_PREDICT_MODEL`), seeing at most 40
+   lessons, counted as a `model_call` with why `judge` and its dollars in the statistics. A session with
+   nothing open makes no call; `BORG_LEARN=off` or `BORG_PREDICT_MODEL=off` turns it off.
+
+   A correction merged into a lesson delivered free counts against it. After the session-end call
+   `borg learn` settles the rest: a lesson with no verdict is `asked_not_corrected`, with the reason it
+   had none, and counts as unknown, never as ignored. See [Mode and
+   channel](statistics.md#what-is-counted).
 4. **System gate.** When the repo maps to a known system, lessons scoped to other systems stay out, even
    if the conversation names them ([System map](configuration.md#system-map)).
 

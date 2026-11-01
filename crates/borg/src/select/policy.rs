@@ -940,9 +940,11 @@ impl Data {
                 let Some(route) = model_route(a) else { continue };
                 let y = match a.label {
                     Label::Changed => 1.0,
-                    Label::Ignored => 0.0,
-                    Label::Unclear if zero => 0.0,
-                    _ => continue,
+                    // The point never came up: nothing in the work changed on it, whatever the route.
+                    Label::Ignored | Label::NotArisen => 0.0,
+                    // A change that left the consequence is read as an unclear verdict.
+                    Label::Unclear | Label::Remains if zero => 0.0,
+                    Label::Unclear | Label::Remains | Label::Open | Label::Censored => continue,
                 };
                 if c.tick < from {
                     d.dropped += 1;
@@ -959,7 +961,7 @@ impl Data {
                 d.obs.push(Obs { x: design(f, route, m), y, w, lv });
                 d.tick.push(c.tick);
                 d.base_w.push(w);
-                d.unclear.push(a.label == Label::Unclear);
+                d.unclear.push(a.label.pending());
             }
         }
         // Every apply's levels among the labelled ones (the monitor's predictions): an unseen one has none.
@@ -996,8 +998,8 @@ impl Data {
 
 /// Per delivered apply of `s` with a closed fate (judged, unclear or censored), the probability that
 /// the judge gave it a verdict: a logistic fit on its route, channel, the session's applies waiting
-/// for a verdict at its check, and whether its check was the session's last. Unclear counts as not
-/// judged.
+/// for a verdict at its check, and whether its check was the session's last. Unclear (and a remaining
+/// consequence, `Label::pending`) counts as not judged; not arisen as judged (`Label::verdict`).
 pub(crate) fn judged(s: &Summary) -> HashMap<usize, f64> {
     // Derived: the fit's features (intercept, asked, free, stop, log pending, last check).
     const K: usize = 6;
@@ -1012,7 +1014,7 @@ pub(crate) fn judged(s: &Summary) -> HashMap<usize, f64> {
             if model_route(a).is_none() || a.label == Label::Open {
                 continue;
             }
-            let y = f64::from(u8::from(matches!(a.label, Label::Changed | Label::Ignored)));
+            let y = f64::from(u8::from(a.label.verdict()));
             let x = [
                 1.0,
                 f64::from(u8::from(a.route == Route::Ask)),
@@ -2131,8 +2133,8 @@ pub fn monitor(s: &Summary) -> Monitor {
             let diff: [f64; ARMS] = std::array::from_fn(|x| mu[x] - f64::from(u8::from(x == fixed)));
             let y = match a.label {
                 Label::Changed => Some(1.0),
-                Label::Ignored => Some(0.0),
-                _ => None,
+                Label::Ignored | Label::NotArisen => Some(0.0),
+                Label::Unclear | Label::Remains | Label::Open | Label::Censored => None,
             };
             // Floors: a logged ψ or μ of 0 for a route that happened is rounding (outcome.rs `round_p`),
             // so the least the log can say (ψ at 1/1000, μ at one draw of `DRAWS`).

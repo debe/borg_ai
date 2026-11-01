@@ -58,7 +58,7 @@ function world(tag: string) {
   const prompts = join(root, "prompts")
   writeFileSync(
     join(root, "bin/claude"),
-    `#!/bin/sh\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$2" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'\n`,
+    `#!/bin/sh\np=$(cat)\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$p" > ${prompts}/$n.txt\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'\n`,
   )
   chmodSync(join(root, "bin/claude"), 0o755)
   symlinkSync(BORG, join(root, "bin/borg"))

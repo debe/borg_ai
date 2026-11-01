@@ -154,6 +154,11 @@ fn learn_cmd(rest: &[&str]) {
         }
         others = homes.into_iter().filter(|h| *h != learn::home()).collect();
     }
+    // The ended session's deliveries no verdict settled: one judge call with the whole session in view
+    // (hook.rs `judge_session`), before learning settles the rest and credits its tests.
+    if let Some(s) = session {
+        borg::hook::judge_session(s);
+    }
     for home in &others {
         learn_store(home, session);
     }

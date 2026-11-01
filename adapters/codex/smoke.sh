@@ -53,8 +53,9 @@ printf '{"default":"off","collectives":[{"name":"corp","paths":["%s"],"share":"l
 # The fake consequence model (crates/borg/tests/common): Mdrain at grade 3.
 cat > "$W/bin/claude" <<EOF
 #!/bin/sh
+p=\$(cat)
 n=\$(( \$(ls $W/prompts | wc -l) ))
-printf '%s' "\$2" > $W/prompts/\$n.txt
+printf '%s' "\$p" > $W/prompts/\$n.txt
 echo '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":3}]},"total_cost_usd":0.05}'
 EOF
 chmod +x "$W/bin/claude"

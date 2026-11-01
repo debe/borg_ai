@@ -19,7 +19,18 @@
 //!   call (predict.rs) also judged, by meaning, that the drone changed its work on the lesson's point
 //!   and that the change avoids the consequence: a use, the deposit that keeps a lesson active
 //!   (memory.rs). The drone's `<id>: applies|skip` is evidence in that prompt, never a label alone;
-//! - `asked_ignored` (hook): the same judge found the drone changed nothing on that point.
+//! - `asked_ignored` (hook): the same judge found the lesson's point came up and the drone changed
+//!   nothing on it.
+//! - `asked_not_arisen` (hook, 0.7.5 on): the same judge found the lesson's point never came up in the
+//!   work: nothing to change, so nothing about the lesson. It settles the delivery (no further try),
+//!   is censored for beliefs, trust, the statistics and the team (`is_result`), and the selection model
+//!   reads it as "nothing in the work" (select/summary.rs `Label::NotArisen`).
+//! - `asked_consequence_remains` (hook, 0.7.5 on): the drone changed its work on the point, but the work
+//!   still leads to the consequence. As an unclear verdict: measured, never a result, pending for another
+//!   try. Before 0.7.5 such a verdict was written as `asked_unclear`, which therefore mixes both there.
+//!
+//! Every judge result (0.7.5 on) carries the judge's short reason per lesson (`reasons`, redacted,
+//! predict.rs `JUDGE_REASON_CHARS`). Local: never shared.
 //! - `vetoed` (`borg no`, veto.rs, 0 tokens): the engineer said no to the session's work; every lesson
 //!   shown in the session before it is credited, the strongest negative result.
 //!
@@ -38,7 +49,8 @@
 //!   not about an engineer following a lesson: never a use, and not read by trust.rs, `weight` or
 //!   attention.rs.
 //!
-//! An unclear verdict (`asked_unclear`, measured, never a result), or a session whose later turn ends
+//! An unclear verdict (`asked_unclear`, measured, never a result), a remaining consequence
+//! (`asked_consequence_remains`, the same), or a session whose later turn ends
 //! never reach the model (the prefilter skipped them, or BORG_MATCH=bm25), leaves the lesson pending:
 //! `settle` turns it into `asked_not_corrected` with the reason it had no verdict (`reason`). That is
 //! censored for beliefs (memory.rs): no correction followed, but whether the drone acted on the lesson
@@ -104,11 +116,35 @@ pub const REGRETTED: &str = "regretted";
 /// after a change on the lesson's point. Once per (session, lesson), dated at that pass.
 pub const TESTED: &str = "tested";
 
-/// The judge saw the lesson's delivery but could not tell (an `unclear` verdict), or found a change that
-/// still leads to the consequence (predict.rs `Judged::label` gives neither a use nor an ignore): the
-/// lesson stays pending for another try. A label-health measurement only: no belief, trust, statistic,
-/// team line or off-policy decision reads it (`counts`).
+/// The judge saw the lesson's delivery but could not tell (an `unclear` verdict): the lesson stays
+/// pending for another try. A label-health measurement only: no belief, trust, statistic, team line or
+/// off-policy decision reads it (`counts`). Before 0.7.5 a change that still leads to the consequence
+/// was written as this kind too (now `REMAINS`), so an older record means either.
 pub const UNCLEAR: &str = "asked_unclear";
+
+/// The judge found the lesson's point never came up in the work since its delivery (`not_arisen`,
+/// predict.rs `Verdict::NotArisen`): a verdict that settles the delivery (`settles`), but no evidence
+/// about the lesson's usefulness, so no result (`is_result`) for beliefs, trust, the statistics, the
+/// team file or the off-policy log. The selection summary reads it as "nothing in the work": no change
+/// on the lesson's point (select/summary.rs `Label::NotArisen`).
+pub const NOT_ARISEN: &str = "asked_not_arisen";
+
+/// The judge found the drone changed its work on the lesson's point but the work still leads to the
+/// consequence (`consequence_remains`): `UNCLEAR`'s semantics (pending for another try, a measurement
+/// only, no result), kept apart so the pure unclear share is measured.
+pub const REMAINS: &str = "asked_consequence_remains";
+
+/// A judge result's `at` when the session-end judge gave it (hook.rs `judge_session`, at `borg learn
+/// --session`): with the whole session's work in view, after every check of the session. Protocol: empty
+/// for a check's verdict (a stop or a live check), so its records stay as before.
+pub const AT_END: &str = "end";
+
+/// Whether a judge result of `kind` settles its delivery: a use (`CHANGED`), an ignore (`IGNORED`) or
+/// nothing to judge (`NOT_ARISEN`). An unclear verdict and a remaining consequence leave it pending.
+#[must_use]
+pub fn settles(kind: &str) -> bool {
+    matches!(kind, CHANGED | IGNORED | NOT_ARISEN)
+}
 
 /// What delivery did with a graded check's decision, per check and lesson (hook.rs): `route` (one of
 /// `ROUTES`), `reason`, `check` the check that decided it. The latest record per (check, lesson) is
@@ -123,18 +159,20 @@ pub const DELIVERY: &str = "delivery";
 /// nothing queued and no ask left open counts too.
 pub const ENDED: &str = "ended";
 
-/// The channel of a placebo's judge results (`asked_then_changed`, `asked_ignored`, `asked_unclear`): a
+/// The channel of a placebo's judge results (`asked_then_changed`, `asked_ignored`, `asked_unclear`, and
+/// from 0.7.5 `asked_not_arisen`, `asked_consequence_remains`): a
 /// graded apply never delivered, judged blindly where a free delivery would be (hook.rs `#borg-placebo`).
 /// Its "changed" rate is the judge's own false positives plus what the drone would have done anyway, so
 /// it is never a result about the lesson (`is_result`).
 pub const PLACEBO: &str = "placebo";
 
 /// Whether `o` is evidence about its lessons for the readers that learn from results (memory.rs, trust.rs,
-/// the statistics, the team file): not a placebo's result (`PLACEBO`) and not an unclear verdict
-/// (`UNCLEAR`).
+/// the statistics, the team file): not a placebo's result (`PLACEBO`), not an unclear verdict
+/// (`UNCLEAR`), not a change that leaves the consequence (`REMAINS`) and not a point that never came up
+/// (`NOT_ARISEN`, censored).
 #[must_use]
 pub fn is_result(o: &Outcome) -> bool {
-    o.channel != PLACEBO && o.kind != UNCLEAR
+    o.channel != PLACEBO && !matches!(o.kind.as_str(), UNCLEAR | REMAINS | NOT_ARISEN)
 }
 
 /// Why a lesson settled as `asked_not_corrected` had no verdict (`reason`, `settle_why`). Protocol: the
@@ -366,6 +404,15 @@ pub struct Outcome {
     pub judge: u8,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stripped: bool,
+    /// The judge's results (0.7.5 on): per lesson (aligned with `lessons`), the judge's short reason for
+    /// its verdict, redacted and at most predict.rs `JUDGE_REASON_CHARS`; empty where it gave none.
+    /// Empty in older records. Local: never shared (`share`), never read as a result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    /// The judge's results (0.7.5 on): where the verdict was given, `AT_END` at the session-end judge
+    /// (hook.rs `judge_session`); empty at a check (a stop or a live check) and in older records. Local.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
 }
 
 /// `route` values. Protocol: what a check decided for a lesson, then what delivery did with it.
@@ -680,6 +727,8 @@ pub fn count_result(home: &Path, o: &Outcome) {
         NOT_CORRECTED => crate::stats::NOT_CORRECTED,
         REGRETTED => crate::stats::REGRETTED,
         TESTED => crate::stats::TESTED,
+        // Measurements, never results (`is_result` already turned them away).
+        UNCLEAR | REMAINS | NOT_ARISEN => return,
         _ => return,
     };
     crate::stats::count(home, kind, &o.session, |e| {
@@ -800,7 +849,9 @@ pub fn regretted(outcomes: &[Outcome], session: &str, before_ms: i64, cause: &st
 /// test-first session) whose last test result after its first ask passed, after a failed run since that ask (red, then green) or a change the drone
 /// made on the lesson's point (`asked_then_changed`), and that has no `tested` record there yet, nor a
 /// correction or a veto (the engineer's word outranks a green run), nor `asked_then_ignored` (red, then
-/// green is also how a feature is built: it does not make an ignored question useful). A pass before the ask says nothing
+/// green is also how a feature is built: it does not make an ignored question useful), nor
+/// `asked_not_arisen` on a question of it since its first ask without a change (the lesson's point never came up: a green run says nothing of
+/// it, and `tested` would move a belief `asked_not_arisen` is censored for). A pass before the ask says nothing
 /// of the lesson. One record per lesson, sorted, at that last pass. Every record's session has an
 /// earlier `asked` record, so it never moves memory.rs's `Clock`.
 pub fn tested(outcomes: &[Outcome], session: &str, tests: &str) -> Vec<Outcome> {
@@ -820,9 +871,17 @@ pub fn tested(outcomes: &[Outcome], session: &str, tests: &str) -> Vec<Outcome> 
             }
         }
     }
+    // A verdict that the question's point never came up, on a question of the lesson (not a placebo's
+    // or a free delivery's, none before its first ask): only that says the green run is not about it.
+    let not_arisen_on_ask = |l: &str, at: i64| {
+        outcomes
+            .iter()
+            .any(|o| o.kind == NOT_ARISEN && o.session == session && o.channel != PLACEBO && !free(o) && o.ms >= at && o.lessons.iter().any(|x| x == l))
+    };
     let mut out: Vec<Outcome> = first
         .into_iter()
         .filter(|(l, _)| ![TESTED, CORRECTED, VETOED, IGNORED].iter().any(|k| has(outcomes, k, session, l)))
+        .filter(|&(l, (at, _))| !not_arisen_on_ask(l, at) || has(outcomes, CHANGED, session, l))
         .filter_map(|(l, (at, repo))| {
             let after = &runs[runs.partition_point(|r| r.0 <= at)..];
             let &(ms, pass) = after.last()?;
@@ -848,7 +907,8 @@ pub fn settle(outcomes: &[Outcome], session: &str, ms: i64) -> Vec<Outcome> {
 }
 
 /// `settle`, each record with its `reason`: `judged` when the judge gave the lesson's latest ask in the
-/// session a verdict (`asked_then_changed`, `asked_ignored`), else `unjudged(lesson)` (one of the
+/// session a verdict that settles it (`settles`: `asked_then_changed`, `asked_ignored`,
+/// `asked_not_arisen`), else `unjudged(lesson)` (one of the
 /// `UNJUDGED_*`, from the session's state file, hook.rs `unjudged`); and its `check`, the check behind
 /// that latest `asked` record. A verdict on an earlier delivery says nothing of a later question: a
 /// stop that judges a lesson handed over free and then asks it writes the verdict first, and no judge
@@ -872,7 +932,7 @@ pub fn settle_with(outcomes: &[Outcome], session: &str, ms: i64, unjudged: &dyn 
     let resolved: std::collections::HashSet<&str> = mine.iter().filter(|o| resolves(o)).flat_map(|o| o.lessons.iter().map(String::as_str)).collect();
     // Per lesson: its verdicts' (ms, check, on a free delivery).
     let mut verdicts: HashMap<&str, Vec<(i64, &str, bool)>> = HashMap::new();
-    for o in mine.iter().filter(|o| (o.kind == CHANGED || o.kind == IGNORED) && is_result(o)) {
+    for o in mine.iter().filter(|o| settles(&o.kind) && o.channel != PLACEBO) {
         for l in &o.lessons {
             verdicts.entry(l.as_str()).or_default().push((o.ms, o.check.as_str(), free(o)));
         }
@@ -953,16 +1013,17 @@ fn is_placebo(o: &Outcome) -> bool {
     o.kind == DELIVERY && o.route == ROUTE_PLACEBO
 }
 
-/// Does `r`, a placebo channel's verdict (`asked_then_changed`, `asked_ignored`) or settle record
-/// (`asked_not_corrected`), close placebo delivery `d` of its lesson? A settle record names the
-/// placebo's own check, so it closes exactly that one, and settling again writes nothing. A verdict
-/// names the check it judged (a check routes a lesson once), or, a record from before check ids, came
-/// after the placebo. An unclear verdict closes nothing, as it leaves an ask pending.
+/// Does `r`, a placebo channel's verdict that settles (`settles`: `asked_then_changed`, `asked_ignored`,
+/// `asked_not_arisen`) or settle record (`asked_not_corrected`), close placebo delivery `d` of its
+/// lesson? A settle record names the placebo's own check, so it closes exactly that one, and settling
+/// again writes nothing. A verdict names the check it judged (a check routes a lesson once), or, a
+/// record from before check ids, came after the placebo. An unclear verdict or a remaining consequence
+/// closes nothing, as it leaves an ask pending.
 fn closes(r: &Outcome, d: &Outcome) -> bool {
     match r.kind.as_str() {
         NOT_CORRECTED => r.check == d.check,
-        CHANGED | IGNORED if r.check.is_empty() || d.check.is_empty() => r.ms > d.ms,
-        CHANGED | IGNORED => r.check == d.check,
+        k if settles(k) && (r.check.is_empty() || d.check.is_empty()) => r.ms > d.ms,
+        k if settles(k) => r.check == d.check,
         _ => false,
     }
 }
@@ -1346,6 +1407,89 @@ mod tests {
         let again: Vec<(String, String, String)> =
             settle_with(&resumed, "s", 120, &why).into_iter().map(|x| (x.lessons.join(","), x.channel, x.check)).collect();
         assert_eq!(again, [("B".to_string(), String::new(), "c5".to_string()), ("E".to_string(), PLACEBO.to_string(), "p6".to_string())]);
+    }
+
+    /// Judge v3 (0.7.5): `asked_not_arisen` settles its delivery (a question's settle says "judged", a
+    /// placebo is closed) while staying no result and never shared; `asked_consequence_remains` leaves
+    /// it pending as `asked_unclear` does. The selection summary labels each apart, an older
+    /// `asked_unclear` still `Unclear`, and a pending verdict never overwrites a settling one.
+    #[test]
+    fn not_arisen_settles_its_delivery_and_a_remaining_consequence_leaves_it_pending() {
+        use crate::select::{
+            Route,
+            summary::{Label, Summary, fold},
+        };
+        let ask = |l: &str, check: &str| Outcome { channel: "stop".into(), check: check.into(), ..o(ASKED, "s", &[l], 10) };
+        let on = |kind: &str, l: &str, check: &str, channel: &str| Outcome {
+            channel: channel.into(),
+            check: check.into(),
+            judge: 3,
+            reasons: vec!["only the docs changed".into()],
+            ..o(kind, "s", &[l], 20)
+        };
+        let log = vec![
+            ask("A", "cA"),
+            on(NOT_ARISEN, "A", "cA", "stop"),
+            ask("B", "cB"),
+            on(REMAINS, "B", "cB", "stop"),
+            placebo(&["P"], "pP", 10),
+            on(NOT_ARISEN, "P", "pP", PLACEBO),
+            placebo(&["Q"], "pQ", 10),
+            on(REMAINS, "Q", "pQ", PLACEBO),
+        ];
+        assert!(log.iter().filter(|x| x.kind == NOT_ARISEN || x.kind == REMAINS).all(|x| !is_result(x) && share(x, "n1").is_none()));
+        assert!(settles(NOT_ARISEN) && settles(CHANGED) && settles(IGNORED) && !settles(REMAINS) && !settles(UNCLEAR));
+        let got: Vec<(String, String, String)> =
+            settle_with(&log, "s", 99, &|_| UNJUDGED_TRIES).into_iter().map(|x| (x.lessons.join(","), x.channel, x.reason)).collect();
+        let row = |l: &str, channel: &str, reason: &str| (l.to_string(), channel.to_string(), reason.to_string());
+        assert_eq!(got, [row("A", "", UNJUDGED_NONE), row("B", "", UNJUDGED_TRIES), row("Q", PLACEBO, UNJUDGED_TRIES)], "P closed by its verdict");
+        // The reason travels on the record and reads back; an older line without it reads empty.
+        let line = serde_json::to_string(&log[1]).unwrap();
+        assert!(line.contains(r#""reasons":["only the docs changed"]"#), "{line}");
+        assert_eq!(serde_json::from_str::<Outcome>(&line).unwrap(), log[1]);
+        let old: Outcome = serde_json::from_str(r#"{"kind":"asked_unclear","session":"s","lessons":["A"],"ms":1,"repo":"r","channel":"stop"}"#).unwrap();
+        assert!(old.reasons.is_empty() && !is_result(&old) && !settles(&old.kind));
+
+        // The summary: each graded apply its own label.
+        let graded = |l: &str, check: &str, ask: bool, placebo: bool| Outcome {
+            grades: vec![3],
+            ranks: vec![0],
+            applied: 1,
+            channel: "stop".into(),
+            check: check.into(),
+            chosen: if ask { vec![l.into()] } else { Vec::new() },
+            placebo: if placebo { vec![l.into()] } else { Vec::new() },
+            psi: if placebo { 0.5 } else { 0.0 },
+            ..o(GRADED, "s", &[l], 5)
+        };
+        let mut all = vec![graded("A", "cA", true, false), graded("B", "cB", true, false), graded("C", "cC", true, false)];
+        all.push(graded("P", "pP", false, true));
+        all.extend(log);
+        all.extend([ask("C", "cC"), on(UNCLEAR, "C", "cC", "stop")]);
+        // A later pending verdict does not undo a settling one; a later settling one replaces a pending one.
+        all.extend([on(UNCLEAR, "A", "cA", "stop"), on(CHANGED, "B", "cB", "stop")]);
+        let text: String = all.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        let label = |l: &str| {
+            let i = s.lessons.iter().position(|x| x == l).unwrap() as u32;
+            s.applies.iter().find(|a| a.lesson == i).map(|a| (a.route, a.label, a.judge.is_some()))
+        };
+        assert_eq!(label("A"), Some((Route::Ask, Label::NotArisen, true)), "{:?}", s.applies);
+        assert_eq!(label("B"), Some((Route::Ask, Label::Changed, true)));
+        assert_eq!(label("C"), Some((Route::Ask, Label::Unclear, false)), "an older kind keeps its label");
+        assert_eq!(label("P"), Some((Route::Placebo, Label::NotArisen, true)));
+        // Before the later change, B's remaining consequence is its own pending label.
+        let first: String = all[..all.len() - 1].iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&first, Summary::default());
+        let b = s.lessons.iter().position(|x| x == "B").unwrap() as u32;
+        let a = s.applies.iter().find(|a| a.lesson == b).unwrap();
+        assert_eq!((a.label, a.judge, a.jv), (Label::Remains, None, 3), "a pending label keeps its judge's version");
+        assert!(a.label.pending() && !a.label.verdict() && Label::NotArisen.verdict() && !Label::NotArisen.pending());
+        // The session-end judge is a judge level of its own; a check's verdict keeps the level it had.
+        let end = [&all[..], &[graded("E", "cE", true, false), ask("E", "cE"), Outcome { at: AT_END.into(), ..on(CHANGED, "E", "cE", "stop") }]].concat();
+        let text: String = end.iter().map(|x| format!("{}\n", serde_json::to_string(x).unwrap())).collect();
+        let s = fold(&text, Summary::default());
+        assert!(s.judges.iter().any(|j| j.starts_with("v3|")) && s.judges.iter().any(|j| j.starts_with("v3@end|")), "{:?}", s.judges);
     }
 
     /// An open placebo keeps its session waiting to settle when its `end` hook never ran, as an open ask

@@ -398,7 +398,7 @@ fn a_placebo_is_judged_blind_and_counts_for_nothing() {
     for kind in ["asked_then_changed", "asked_ignored"] {
         let r = of(&root, kind);
         assert_eq!(r.len(), 1, "{kind}: {:?}", outcomes(&root));
-        assert_eq!((r[0]["channel"].as_str(), r[0]["check"].as_str(), r[0]["judge"].clone()), (Some("placebo"), Some(check), json!(2)), "{kind}");
+        assert_eq!((r[0]["channel"].as_str(), r[0]["check"].as_str(), r[0]["judge"].clone()), (Some("placebo"), Some(check), json!(3)), "{kind}");
     }
     // Excluded from beliefs (memory.rs), from the statistics' results, and from the team file.
     let mem = memory(&root);

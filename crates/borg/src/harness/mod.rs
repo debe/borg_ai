@@ -409,6 +409,17 @@ pub fn work_so_far(caps: Caps, ev: &Value, turn_log: &Path, cap: usize) -> Strin
     text.chars().skip(n.saturating_sub(cap)).collect()
 }
 
+/// Every text the drone wrote in `session` (hook.rs `judge_session`), its last `cap` characters: from
+/// its transcript where the harness writes one borg reads ([`Transcript`], found by
+/// [`Harness::session_log`] under `$HOME`); empty otherwise.
+pub fn session_texts(h: &dyn Harness, session: &str, cap: usize) -> String {
+    if h.caps().transcript != Transcript::Claude {
+        return String::new();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    h.session_log(&home, session, &Value::Null).map(|t| claude::session_texts(&t, cap)).unwrap_or_default()
+}
+
 /// The drone's last message, whole: the event's `last_assistant_message`, else the transcript's last
 /// assistant text.
 pub fn last_message(caps: Caps, ev: &Value) -> String {

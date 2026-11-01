@@ -500,6 +500,19 @@ impl Ctx {
         (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
+    /// `exec` with `input` on stdin: how a prompt reaches `claude -p`, never as an argument.
+    fn exec_input(&self, cwd: &Path, argv: &[&str], input: &str, timeout_s: u32) -> (i32, String, String) {
+        let (mut cmd, private) = sandbox_with(cwd, &[&self.home], &[&self.borg], &self.extra(), timeout_s);
+        let mut child = cmd.args(argv).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn sandbox");
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let out = child.wait_with_output().expect("wait sandbox");
+        let _ = fs::remove_dir_all(private);
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
     fn check(&mut self, name: &str, ok: bool, evidence: Value) {
         eprintln!("  [{}] {name}", if ok { "PASS" } else { "FAIL" });
         self.checks.push(json!({"check": name, "pass": ok, "evidence": evidence}));
@@ -509,7 +522,7 @@ impl Ctx {
     /// `--setting-sources`), so the installed hooks fire; read-only tools; hook events in the stream.
     fn claude(&mut self, label: &str, cwd: &Path, prompt: &str, id: &str, resume: bool, budget: &str) -> Turn {
         let stream_path = self.dir.join(format!("{label}.stream.jsonl"));
-        let mut args: Vec<String> = ["-p", prompt, "--model", &self.model, "--max-budget-usd", budget, "--tools", "Read,Grep,Glob"].map(String::from).to_vec();
+        let mut args: Vec<String> = ["-p", "--model", &self.model, "--max-budget-usd", budget, "--tools", "Read,Grep,Glob"].map(String::from).to_vec();
         args.extend(
             ["--append-system-prompt", SYSTEM, "--output-format", "stream-json", "--verbose", "--include-hook-events", "--strict-mcp-config"].map(String::from),
         );
@@ -517,7 +530,12 @@ impl Ctx {
         let (mut cmd, private) = sandbox_with(cwd, &[&self.home], &[&self.borg], &self.extra(), 900);
         eprintln!("  {label}: claude -p in {} …", cwd.display());
         let started = Instant::now();
-        let mut child = cmd.arg("claude").args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn claude");
+        let mut child = cmd.arg("claude").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn claude");
+        // The prompt on stdin, never as an argument; closing stdin lets `claude -p` start.
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = stdin.write_all(prompt.as_bytes());
+        }
         // Each line's arrival time: a hook's latency is hook_response minus hook_started.
         let mut timed: Vec<(f64, String)> = Vec::new();
         for line in std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap())).map_while(Result::ok) {
@@ -578,7 +596,6 @@ impl Ctx {
         let argv = [
             "claude",
             "-p",
-            &prompt,
             "--model",
             "sonnet",
             "--tools",
@@ -594,7 +611,7 @@ impl Ctx {
             "--max-budget-usd",
             "0.3",
         ];
-        let (_, out, err) = self.exec(&self.dir.clone(), &argv, 300);
+        let (_, out, err) = self.exec_input(&self.dir.clone(), &argv, &prompt, 300);
         let v: Value = serde_json::from_str(out.trim()).unwrap_or(Value::Null);
         let cost = v["total_cost_usd"].as_f64().unwrap_or(0.0);
         self.judge_cost += cost;

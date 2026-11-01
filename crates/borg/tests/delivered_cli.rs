@@ -123,7 +123,7 @@ fn a_queued_lesson_is_asked_with_p_1_and_judged_for_its_channel() {
     // The result names the check that handed it over and the judge's version.
     let check = outcomes(&root).into_iter().find(|o| o["kind"] == "graded").unwrap()["check"].clone();
     let result = outcomes(&root).into_iter().find(|o| o["kind"] == "asked_ignored").unwrap();
-    assert_eq!((result["check"].clone(), result["judge"].clone()), (check, json!(2)), "{result}");
+    assert_eq!((result["check"].clone(), result["judge"].clone()), (check, json!(3)), "{result}");
     assert!(state(&root, "q1", "cost").contains("judge call=2 pending=1 resolved=1"), "{}", state(&root, "q1", "cost"));
     let _ = std::fs::remove_dir_all(root);
 }

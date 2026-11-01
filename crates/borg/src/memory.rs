@@ -22,7 +22,8 @@
 //!   regretted)` (the veto's 3 is `VETOED_W`), one result
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
 //!   learn`) is censored, no result: the judge never said whether the drone acted on the lesson. A
-//!   placebo's result and an unclear verdict are none either (outcome.rs `is_result`). A correction counts
+//!   placebo's result, an unclear verdict, a remaining consequence (`asked_consequence_remains`) and a
+//!   point that never came up (`asked_not_arisen`) are none either (outcome.rs `is_result`). A correction counts
 //!   twice (outcome.rs `CORRECTED_W`); a veto (`borg no`,
 //!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
 //!   the weighted share of later fixes of decisions the lesson was asked before (outcome.rs `regretted`),
@@ -267,6 +268,10 @@ pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>
             // `asked_not_corrected` (settled by `borg learn`) is censored: the judge never said whether
             // the drone acted on the lesson, so it is no ignore. A verdict for the same lesson recorded
             // after it counts alone.
+            outcome::NOT_CORRECTED => continue,
+            // Censored too, and already turned away by `is_result`: a point that never came up says
+            // nothing of the lesson's use; an unclear verdict and a remaining consequence are measured only.
+            outcome::NOT_ARISEN | outcome::UNCLEAR | outcome::REMAINS => continue,
             _ => continue,
         };
         for l in &o.lessons {
@@ -659,6 +664,44 @@ mod tests {
             assert_eq!(mem(&[asked.clone(), placebo]), alone, "placebo {kind}");
         }
         assert_eq!(mem(&[asked.clone(), Outcome { channel: "stop".into(), ..o(outcome::UNCLEAR, "a", "L", 5, "r") }]), alone);
+    }
+
+    /// Judge v3 (0.7.5): a point that never came up is censored, as a settle without a verdict is, and a
+    /// change that left the consequence keeps an unclear verdict's meaning; neither moves the belief, the
+    /// uses or the clock's results, on any channel, and a green test run after a not-arisen ask adds no
+    /// `tested` credit either.
+    #[test]
+    fn a_not_arisen_or_remaining_verdict_moves_no_belief() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = Outcome { channel: "stop".into(), ..o(outcome::ASKED, "a", "L", 1, "r") };
+        let alone = mem(std::slice::from_ref(&asked));
+        for kind in [outcome::NOT_ARISEN, outcome::REMAINS] {
+            for channel in ["stop", "live", "queued", outcome::PLACEBO] {
+                let v = Outcome { channel: channel.into(), reasons: vec!["only docs changed".into()], ..o(kind, "a", "L", 5, "r") };
+                assert!(!outcome::is_result(&v), "{kind} {channel}");
+                assert_eq!(mem(&[asked.clone(), v]), alone, "{kind} {channel}");
+            }
+        }
+        // A not-arisen verdict blocks the session's `tested` credit, unless the drone changed on the point.
+        let tests = "fail 2\npass 3\n";
+        let na = Outcome { channel: "stop".into(), ..o(outcome::NOT_ARISEN, "a", "L", 5, "r") };
+        assert_eq!(outcome::tested(std::slice::from_ref(&asked), "a", tests).len(), 1, "red then green: credited");
+        assert!(outcome::tested(&[asked.clone(), na.clone()], "a", tests).is_empty());
+        let changed = Outcome { channel: "stop".into(), ..o(CHANGED, "a", "L", 6, "r") };
+        assert_eq!(outcome::tested(&[asked.clone(), na, changed], "a", tests).len(), 1);
+        // Only a verdict on the asked delivery blocks it: a placebo's, a free delivery's or one from
+        // before the ask is no verdict on the question.
+        let late = Outcome { channel: "stop".into(), ..o(outcome::ASKED, "a", "L", 10, "r") };
+        let tests = "fail 11\npass 12\n";
+        for (channel, ms) in [(outcome::PLACEBO, 5), ("queued", 5), ("early", 5), ("stop", 5)] {
+            let before = Outcome { channel: channel.into(), ..o(outcome::NOT_ARISEN, "a", "L", ms, "r") };
+            assert_eq!(outcome::tested(&[before, late.clone()], "a", tests).len(), 1, "{channel} not arisen before the ask");
+        }
+        let after = Outcome { channel: outcome::PLACEBO.into(), ..o(outcome::NOT_ARISEN, "a", "L", 11, "r") };
+        assert_eq!(outcome::tested(&[late.clone(), after], "a", tests).len(), 1, "a placebo's verdict after the ask");
+        let on_it = Outcome { channel: "stop".into(), ..o(outcome::NOT_ARISEN, "a", "L", 11, "r") };
+        assert!(outcome::tested(&[asked, late, on_it], "a", tests).is_empty(), "the question's own verdict");
     }
 
     #[test]
