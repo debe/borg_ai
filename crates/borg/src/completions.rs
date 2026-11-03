@@ -82,6 +82,7 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 &[],
                 crate::moves::CORRECT_FLAGS,
             ),
+            cmd("cues", &[("[--apply] [--store FILE] [--jobs N]", "retrieval cues for lessons (logged, not ranked)")], &[], &["--apply", "--store", "--jobs"]),
             cmd("facets", &[("[--apply] [--store FILE] [--jobs N]", "search facets for lessons")], &[], &["--apply", "--store", "--jobs"]),
             cmd(
                 "memory",

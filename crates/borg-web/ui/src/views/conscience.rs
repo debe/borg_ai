@@ -198,6 +198,18 @@ fn unit_label(unit: &str) -> String {
 }
 
 /// One bar row in `HBars`' style, in the given order: a label, a fill share (0 to 1), its value, a hover title.
+/// What a miss cause (borg pools.rs `CAUSES`) means.
+fn miss_why(cause: &str) -> &'static str {
+    match cause {
+        "scope" => "out of scope for where the session works",
+        "vector_only" => "no word of the work matched it; the vectors found it",
+        "no_word_match" => "no word of the work matched it",
+        "demoted" => "its words matched well; weight and trust put it low",
+        "weak_words" => "its words matched less than half the pool's",
+        _ => "words and score high; the shortlist, ties or newest first put it low",
+    }
+}
+
 fn bar(label: String, share: f64, value: String, title: String, color: &'static str) -> impl IntoView {
     view! {
         <div class="hbar" title=title>
@@ -484,6 +496,34 @@ fn LessonSelection() -> impl IntoView {
         }
         .into_any()
     };
+    // The pool log's miss causes (borg pools.rs): of the first applies at grade ≥ 2, those the fill order
+    // ranked low (past half the pool, or shown only by a draw), per mechanical cause.
+    let misses = move || {
+        let (Some(m), share) = sel.with(|s| (s.misses.clone(), s.boundary)) else {
+            return view! { <p class="empty">"No pool logged yet: a detached check logs its pool."</p> }.into_any();
+        };
+        let explore = if share > 0.0 { format!("exploration {:.0}% of the budget and of the dropped lessons", 100.0 * share) } else { "exploration off".into() };
+        let low = bar(
+            "ranked low".into(),
+            if m.positives > 0.0 { m.low / m.positives } else { 0.0 },
+            format!("{} of {}", num(m.low), num(m.positives)),
+            format!("{} of {} first applies at grade ≥ 2 sat past half the pool or were shown only by a draw ({} of them)", num(m.low), num(m.positives), num(m.drawn)),
+            "var(--c-amber)",
+        );
+        let causes = m
+            .causes
+            .iter()
+            .filter(|(_, n)| *n > 0.0)
+            .map(|(c, n)| bar(c.clone(), if m.low > 0.0 { n / m.low } else { 0.0 }, num(*n), format!("{}: {} of the {} ranked low", miss_why(c), num(*n), num(m.low)), "var(--c-sky)"))
+            .collect_view();
+        let facts = format!("{} checks logged ({:.1} MB), {explore}", num(m.checks), m.bytes / 1_048_576.0);
+        view! {
+            {low}
+            {causes}
+            <p class="empty">{facts}</p>
+        }
+        .into_any()
+    };
     // The learned decisions the fixed rule took over, per reason, of the graded checks folded: a guard
     // that binds often shows here.
     let fallbacks = move || {
@@ -666,6 +706,8 @@ fn LessonSelection() -> impl IntoView {
                     <div class="panel">
                         <h2>"Pool yield by position"<small>"applied of shown at each fill position, fitted to fall with position"</small></h2>
                         {pool}
+                        <h2>"Miss causes"<small>"why first applies at grade ≥ 2 sat low in the fill order, from the logged scores"</small></h2>
+                        {misses}
                     </div>
                     <div class="panel">
                         <h2>"Latency"<small>"95th percentile of a check against the harness's stop budget"</small></h2>

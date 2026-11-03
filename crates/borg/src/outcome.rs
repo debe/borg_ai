@@ -413,19 +413,42 @@ pub struct Outcome {
     /// (hook.rs `judge_session`); empty at a check (a stop or a live check) and in older records. Local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub at: String,
+    /// `graded` (0.7.7 on): the model's design moves of the work it checked (predict.rs
+    /// `Prediction::moves`), and per apply (aligned with `lessons`) its one-line why; empty in older
+    /// records and on a failed call. Local, as the whole record is (`share`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whys: Vec<String>,
+    /// `graded` (0.7.7 on): the tokens the call showed past `tokens`, the boundary draw's and the tail
+    /// sample's (`tail`), so a prompt's whole lesson size is `tokens` + `xtokens`; 0 without any, and in
+    /// older records. Logged only: the latency fit reads `tokens`, the size a budget is predicted at.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub xtokens: u32,
+    /// `graded` (0.7.7 on): the lesson line format of the compact prompt (whole.rs `Line`, `a1` or
+    /// `a2`); empty without it (`BORG_STOP_FORMAT=classic`, the shortlist) and in older records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub line: String,
+    /// `graded` (0.7.7 on): how its check ran, `async` for a detached check (check_async.rs); empty for
+    /// a stop's own check and in older records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run: String,
 }
 
 /// `route` values. Protocol: what a check decided for a lesson, then what delivery did with it.
 /// Asked, handed over free, or judged as a placebo, as decided; or dropped at delivery because the
 /// session had the lesson already (`ROUTE_DROPPED_DONE`) or the delivery budget was spent
-/// (`ROUTE_DROPPED_CHARS`); or never delivered because the session ended first (`ROUTE_NEVER`).
+/// (`ROUTE_DROPPED_CHARS`); or never delivered because the session ended first (`ROUTE_NEVER`); or (0.7.7
+/// on) a detached check's waiting ask taken off the queue because a newer check asks the same lesson
+/// (`ROUTE_SUPERSEDED`): the newer ask carries its delivery.
 pub const ROUTE_ASKED: &str = "asked";
 pub const ROUTE_FREE: &str = "free";
 pub const ROUTE_PLACEBO: &str = "placebo";
 pub const ROUTE_DROPPED_DONE: &str = "dropped_done";
 pub const ROUTE_DROPPED_CHARS: &str = "dropped_chars";
 pub const ROUTE_NEVER: &str = "never_delivered";
-pub const ROUTES: [&str; 6] = [ROUTE_ASKED, ROUTE_FREE, ROUTE_PLACEBO, ROUTE_DROPPED_DONE, ROUTE_DROPPED_CHARS, ROUTE_NEVER];
+pub const ROUTE_SUPERSEDED: &str = "superseded";
+pub const ROUTES: [&str; 7] = [ROUTE_ASKED, ROUTE_FREE, ROUTE_PLACEBO, ROUTE_DROPPED_DONE, ROUTE_DROPPED_CHARS, ROUTE_NEVER, ROUTE_SUPERSEDED];
 
 /// The policy a `graded` record was decided under: its `policy`; for a record from before select.rs,
 /// the fixed rule (`fixed`), unless it shows the one other policy an older binary logged,
@@ -1805,6 +1828,28 @@ mod tests {
             assert!(line.contains(field) && !shared.contains(field), "{field}: {shared}");
         }
         assert!(!serde_json::to_string(&o(ASKED, "s", &["A"], 5)).unwrap().contains("pool"), "empty: not written");
+    }
+
+    #[test]
+    fn new_graded_fields_stay_local() {
+        let g = Outcome {
+            moves: vec!["hold a lock across an await".into()],
+            whys: vec!["the send awaits under the lock".into()],
+            xtokens: 120,
+            line: "a2".into(),
+            run: "async".into(),
+            ..o(GRADED, "s", &["A"], 5)
+        };
+        let line = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<Outcome>(&line).unwrap(), g, "round trip");
+        for field in ["moves", "whys", "xtokens", "\"line\"", "\"run\""] {
+            assert!(line.contains(field), "{field}: {line}");
+        }
+        assert!(share(&g, "n1").is_none(), "graded stays local");
+        let plain = serde_json::to_string(&o(GRADED, "s", &["A"], 5)).unwrap();
+        for field in ["moves", "whys", "xtokens", "\"line\"", "\"run\""] {
+            assert!(!plain.contains(field), "empty: not written, older lines write back unchanged: {plain}");
+        }
     }
 
     #[test]

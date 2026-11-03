@@ -332,6 +332,17 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
+/// The episodes of the `episodes.jsonl` at `path` by id, the first line of each; read line by line.
+pub fn episodes_of(path: &Path) -> HashMap<String, Episode> {
+    use std::io::BufRead;
+    let mut out = HashMap::new();
+    let Ok(f) = std::fs::File::open(path) else { return out };
+    for e in std::io::BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str::<Episode>(&l).ok()) {
+        out.entry(e.id.clone()).or_insert(e);
+    }
+    out
+}
+
 /// False when BORG_LEARN=off (eval drones): nothing is captured or recorded.
 pub fn learning() -> bool {
     std::env::var("BORG_LEARN").as_deref() != Ok("off")
@@ -703,10 +714,16 @@ pub fn ask_claude(prompt: &str) -> Option<Value> {
 /// The model call behind `ask_claude`, for any JSON schema: the structured answer and its cost in USD
 /// (None when the CLI reported none). `BORG_LEARN_MODEL` picks the model, `runner::choose` the CLI.
 pub fn ask_model(prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
+    ask_model_for(crate::stats::purpose(), prompt, schema)
+}
+
+/// `ask_model`, its `MODEL_CALL` event counted under `purpose` instead of the process's (a learn run's
+/// cues, cues.rs, are `cues`).
+pub fn ask_model_for(purpose: &str, prompt: &str, schema: &Value) -> Option<(Value, Option<f64>)> {
     let started = std::time::Instant::now();
     let answer = call_model(prompt, schema);
     crate::stats::count(&home(), crate::stats::MODEL_CALL, "", |ev| {
-        ev.why = crate::stats::purpose().into();
+        ev.why = purpose.into();
         ev.usd = answer.as_ref().and_then(|(_, c)| *c).unwrap_or(0.0);
         ev.dur_ms = started.elapsed().as_millis() as u64;
         if answer.is_none() {
@@ -1167,6 +1184,11 @@ fn learn_unlocked(
             ended.push(s.to_string());
         }
         for s in &ended {
+            // The job files a detached check of the hooks' session left (its process gone, or older than
+            // a check may take): no later stop comes to remove them (check_async.rs `sweep`).
+            if home == self::home().as_path() && ctx(s) == crate::hook::state_file(s) {
+                crate::check_async::sweep(s);
+            }
             // A session whose lock another process holds is still being judged (a session-end pass of a
             // resumed session, hook.rs `judge_session`, or a stop): settled once it lets go,
             // never under it, where a verdict would come after its settle.

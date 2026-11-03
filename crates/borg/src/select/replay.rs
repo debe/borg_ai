@@ -1407,9 +1407,9 @@ pub struct TestReadout {
 /// delivered (dropped: outside `judged`'s fit, as policy.rs `model_route` leaves it) or closed without
 /// a verdict, None while open.
 fn unit_outcome(s: &Summary, judged: &HashMap<usize, f64>, i: usize) -> Option<f64> {
-    use summary::{Delivered, Label};
+    use summary::Label;
     let a = s.applies.get(i)?;
-    let never = a.delivered == Delivered::Dropped;
+    let never = a.delivered.never();
     let y = match a.label {
         Label::Changed => 1.0,
         // Nothing in the work: no change on the lesson's point.

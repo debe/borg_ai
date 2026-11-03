@@ -80,6 +80,9 @@ function world(tag: string, grade = 3) {
     BORG_PREFILTER: "off",
     BORG_EARLY: "off",
     BORG_NOTIFY: "off",
+    // The stop's own check and its block (check_async.rs `on`), as these scenarios pin; the detached
+    // check's scenario turns it on.
+    BORG_ASYNC: "off",
     // Pinned to the fake `claude`: the harness's own CLI would otherwise answer.
     BORG_PREDICT_MODEL: "claude:sonnet",
   })
@@ -92,7 +95,25 @@ function world(tag: string, grade = 3) {
     }
   }
   const asked = () => readdirSync(prompts).length
-  return { root, home: join(root, "home"), cwd: join(root, "harbor_orion"), cli, state, asked }
+  /** The fake `claude` answers only once `release()` was called (or the world is gone): a model call
+   *  that stays open while the test looks. */
+  const blocking = () => {
+    const [gate, dir] = [join(root, "release"), root]
+    writeFileSync(
+      join(root, "bin/claude"),
+      `#!/bin/sh\np=$(cat)\nn=$(( $(ls ${prompts} | wc -l) ))\nprintf '%s' "$p" > ${prompts}/$n.txt\nwhile [ ! -f ${gate} ] && [ -d ${dir} ]; do sleep 0.05; done\necho '{"structured_output":{"moves":[],"applies":[{"id":"Mdrain","why":"w","grade":${grade}}]},"total_cost_usd":0.05}'\n`,
+    )
+    return () => writeFileSync(gate, "")
+  }
+  /** The session's job files (a detached check's, check_async.rs): none once its checks ended. */
+  const jobs = (session: string) => {
+    try {
+      return readdirSync(join(root, "store/collectives/corp/state")).filter((n) => n.startsWith(`${session}.job.`))
+    } catch {
+      return []
+    }
+  }
+  return { root, home: join(root, "home"), cwd: join(root, "harbor_orion"), cli, state, asked, blocking, jobs }
 }
 
 /** A tool call, in borg's terms; each host spells it natively. */
@@ -579,6 +600,43 @@ for (const p of PROFILES) {
     assert.equal(w.state(s, "queued"), "", "handed over once")
     await h.end()
     await h.close()
+    rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+  })
+
+  // The check detached (BORG_ASYNC on, the default since 0.7.7): the stop returns with no block while the
+  // model call is still open; once the model answered, the ask arrives with the next tool call, once.
+  test(`${p.name}: a detached check's stop returns with no block, and its ask arrives once with the next tool call`, async () => {
+    const w = world("async")
+    process.env.BORG_ASYNC = "on"
+    const release = w.blocking()
+    const s = `conf-async-${p.harness}`
+    const net = join(w.cwd, "src/net.rs")
+    const h = await drone(w, p, s)
+    try {
+      await h.prompt(PROMPT)
+      await h.tool({ kind: "read", path: net }, "c1")
+      await h.tool({ kind: "edit", path: net }, "c2")
+      assert.equal(await h.stop(PLAN), "", "no block")
+      assert.match(w.state(s, "ctx"), /#borg-checking @[0-9a-f]{12}\n/, "the turn ends at the stop")
+      assert.equal(w.state(s, "checked"), "", "the stop did not wait for the model")
+      await until(() => w.asked() === 1)
+      assert.equal(w.asked(), 1, "the detached check's one model call")
+      assert.equal(w.state(s, "queued"), "", "nothing queued while the model runs")
+      release()
+      await until(() => w.state(s, "queued") !== "")
+      assert.match(w.state(s, "queued"), /^live Mdrain @[0-9a-f]{12}\n$/, "the ask waits for the next call")
+      const next = await h.tool({ kind: "read", path: join(w.cwd, "src/budget.rs") }, "c3")
+      assert.ok(next.includes("[Mdrain]") && next.includes(PLAN.slice(0, 40)), `a question about the turn it judged: ${next}`)
+      assert.equal(w.state(s, "queued"), "", "taken off the queue")
+      assert.match(w.state(s, "ctx"), /#borg-asked Mdrain @[0-9a-f]{12}\n#borg-live Mdrain ms=/)
+      assert.doesNotMatch(await h.tool({ kind: "read", path: net }, "c4"), /\[Mdrain\]/, "once: not with the next call")
+      assert.doesNotMatch(await h.prompt("now the retries"), /\[Mdrain\]/, "once: not with the next prompt")
+    } finally {
+      release()
+      await until(() => w.jobs(s).length === 0)
+      await h.end()
+      await h.close()
+    }
     rmSync(w.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 }

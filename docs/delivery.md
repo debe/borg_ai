@@ -22,10 +22,40 @@ Borg spends tokens only where a lesson is likely to matter.
 2. **Turn end, graded.** A free word gate (`BORG_PREFILTER`) skips most turns. Otherwise one model call
    grades every eligible lesson: 3 = certain, 2 = likely, 1 = worth a thought. The selection policy then
    gives each graded lesson a route: asked, handed over free with the next prompt or touch, or left for
-   later. A stop that asks anything blocks, and the agent works one more round. The default, the fixed
-   rule, decides as 0.5.0 did: a grade 3 blocks, and grades 2 and 1 alone arrive free ([Which lessons
-   are asked](#which-lessons-are-asked)). Nothing checks the work during the turn: live mode, which
-   did, was removed in 0.7.6 ([why](#live-mode-removed-in-076)).
+   later. The fixed rule decides as 0.5.0 did: a grade 3 is asked, and grades 2 and 1 alone arrive free
+   ([Which lessons are asked](#which-lessons-are-asked)). Nothing checks the work during the turn: live
+   mode, which did, was removed in 0.7.6 ([why](#live-mode-removed-in-076)).
+
+   **Detached (0.7.7, the default).** The stop never waits for the model. It runs the free gate, writes
+   the turn to a job file in the session's state (the state file's length at the stop, the agent's
+   message, where it worked: a file, never arguments), starts `borg check --job <file>` in its own
+   session with no input or output, and returns without a block. The check reads the turn up to the
+   stop, so the next prompt's lines never reach what it judges. It calls the model holding no lock and
+   takes the session lock only to write its answer. Its questions wait for the next prompt or tool call,
+   which shows them as questions about the turn they judged (its message's first 160 characters), and
+   the agent may skip one the work since then already settled; a session that listens (`borg listen`)
+   is woken with them while idle ([Talking to other sessions](../README.md#talking-to-other-sessions)).
+   Their channel is `live`: asked, delivered later, no extra round.
+   - **One check per session.** A stop while a check runs leaves its job waiting, replacing an older
+     waiting one, which never runs (`check_dropped`, why `superseded`); the running check takes the
+     newest when it is done. A waiting job it cannot read (another borg's format) is removed and
+     counted (`check_dropped`, why `unplaced`).
+   - **A newer check settles an older question.** A check grades the questions still waiting again:
+     one it asks again replaces the waiting one (route `superseded`: the newer ask's delivery counts),
+     one it grades lower or no longer applies is dropped as settled by later work (`dropped_done`). Each
+     is a `delivery` record with its reason. While a check runs, no wake carries a waiting question.
+   - **The session ended.** A check whose session ended during its call queues nothing; its record
+     and each route's `delivery` record say so. A check that never ran logs `check_dropped`, why `gone`.
+   - **Leftovers.** A check removes its job file when it exits; a later stop, and `borg learn` for an
+     idle session, removes those of a check that died. Nothing else is left: no log, no lock.
+   - **Time limit.** The call may take the larger of `BORG_PREDICT_TIMEOUT_S` (45 s) and twice the
+     95th percentile of the same model's last 64 answered checks (set, `BORG_PREDICT_TIMEOUT_S` is the
+     limit as given). No hook waits for it: it bounds a hung call, never a slow answer. `borg status`
+     shows the limit now, the checks that reached it, those superseded or too late, and the largest
+     peak memory (`turn check`).
+
+   `BORG_ASYNC=off` keeps the stop's own check: it takes the session lock, calls the model within the
+   harness's stop budget, and a grade 3 blocks the stop for one more round.
 3. **Judged by meaning.** The same call checks whether what was handed over earlier changed the agent's
    work: questions it asked, and free deliveries (early and queued), each recorded with its channel, the
    check that routed it and its probability of that route. The verdict is one of `changed`, `ignored`,
@@ -237,8 +267,24 @@ fixed rule for good: `borg status`, `borg top` and borg web say `REVERTED`, and 
 again, until the monitor trips again.
 
 **The pool.** The model call reads up to 12,000 tokens of lessons (`BORG_STOP_POOL_TOKENS` sets it for
-every check). When that budget leaves lessons out, the tail sample adds up to two of them after the
-pool, whatever the policy; the session's `.cost` file then reads `tail=<n>` on the pool line. Under
+every check), one line each: the question, the consequence and, by default, the engineer's correction
+it was learned from (`BORG_LESSON_LINE=a2`; `a1` without it). When the eligible lessons do not all fit,
+the check explores, whatever the policy (0.7.7; `BORG_BOUNDARY=off` turns it off):
+- the fill order (the shortlist, then word match × weight × trust, then newest first) fills the first
+  85% of the budget;
+- the **tail sample** then draws as many of the lessons that left out as fit in 15% of the budget at
+  their mean size, at least two, uniformly, each at the exact chance k / n;
+- the **boundary draw** fills the rest of the budget from the remaining ones, favouring those the fill
+  order met first: each draw weighs a lesson by e^(−i/τ) at its place i past the prefix, τ the lessons a
+  plain fill of that rest would place, skipping one that no longer fits.
+
+The model sees the prefix in store order, then the boundary's lessons, then the tail's. The check's
+record keeps `shown` and `tokens` for the prefix, so the pool's yield by position means what it did;
+the draws' tokens are its `xtokens`, logged beside them. The latency fit reads `tokens` alone, the size
+a budget is predicted at: the draws grow with the store, not the budget. Each lesson's chance to be
+shown is logged with the pool (the chance of the boundary draw estimated from 512 seeded replays of both
+draws), so the yield past the budget is measured without bias ([The pool log](learning.md#the-pool-log)).
+The session's `.cost` file reads `tail=<n> boundary=<n>` on the pool line. Under
 the fixed rule the budget stays 12,000 tokens. Under the learned policy, once its gate is open or an
 engineer set a budget, the pool may shrink where the yield of its last fill positions buys nothing,
 and it grows past 12,000 only on a gain above 0, with the tail sample's yield of the positions it
@@ -298,7 +344,9 @@ gives borg a Claude transcript, so the work so far that a hand-over records as i
 turn's tool calls and edits, not the agent's prose. The stop reads the agent's last message. Details
 per harness: [Capabilities](harnesses.md#capabilities).
 
-**Time limits.** The turn-end call stops after `BORG_PREDICT_TIMEOUT_S` (45 s). Claude Code's and Codex's
+**Time limits.** A detached check's call (the default) has its own limit, at least 45 s and measured
+from the model's own checks ([Detached](#when-a-lesson-arrives)); no hook waits for it. With
+`BORG_ASYNC=off`, the turn-end call stops after `BORG_PREDICT_TIMEOUT_S` (45 s). Claude Code's and Codex's
 Stop hooks get a 90 s timeout from `borg install`, and opencode's adapter gives a stop the same 90 s.
 omp gives a stop 30 s, which no setting changes; borg's stop budget for omp is 28 s, which the adapter
 passes on as `BORG_STOP_BUDGET_MS`, so the call there stops after at most 25 s. A call that fails or

@@ -12,12 +12,14 @@ pub mod absorb;
 pub mod assimilate;
 pub mod assimilate_dir;
 pub(crate) mod attention;
+pub mod check_async;
 pub mod clock;
 pub mod collective;
 pub mod completions;
 #[doc(hidden)]
 pub mod concepts;
 pub mod conscience;
+pub mod cues;
 pub mod escalation;
 pub mod expert;
 pub(crate) mod expert_route;
@@ -38,6 +40,7 @@ pub mod notes;
 pub(crate) mod notify;
 pub mod ope;
 pub mod outcome;
+pub mod pools;
 #[doc(hidden)]
 pub mod predict;
 pub mod prefilter;

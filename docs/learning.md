@@ -14,6 +14,7 @@ shared memory for a set of repos and engineers.
 
 - [Sources of lessons](#sources-of-lessons)
 - [Outcomes and the usefulness belief](#outcomes-and-the-usefulness-belief)
+- [The pool log](#the-pool-log)
 - [Saying no](#saying-no)
 - [Memory](#memory)
 - [Reach and collectives](#reach-and-collectives)
@@ -70,9 +71,10 @@ Each delivered lesson gets an `asked` outcome, and what follows is recorded agai
 `ignored` (the judge's verdicts, below), `corrected` anyway,
 `vetoed`, `regretted`, `tested`. These outcomes form each lesson's usefulness belief, which ranks it
 against others for the model's pool and lets an unused one fade. Which of the lessons the model grades
-are asked, handed over free or left for later is the selection policy's call: the fixed rule by default,
-or under `BORG_SELECT=learned` a policy that learns from the same outcomes and is refitted at the end of
-every `borg learn` ([Which lessons are asked](delivery.md#which-lessons-are-asked)).
+are asked, handed over free or left for later is the selection policy's call: by default a policy that
+learns from the same outcomes, refitted at the end of every `borg learn`, and deviates from the fixed
+rule only where they show a gain; `BORG_SELECT=fixed` keeps the fixed rule ([Which lessons are
+asked](delivery.md#which-lessons-are-asked)).
 `borg debug memory <lessons.jsonl>` shows each lesson's belief, activation and state. `borg debug ope`
 replays the hand-set weights offline against the logged asks, with their asking probability, and
 reports; it never changes them. `borg debug select` does the same for the selection policy.
@@ -133,6 +135,46 @@ output: Claude Code and Codex send it, and the omp and opencode adapters send th
 of a shell call's output (opencode with an `Exit code: N` line when it failed). A run whose result the
 harness does not show counts as no run. That output stays on the machine; the `tested` outcome syncs to
 the team like the others. `BORG_TEST_CREDIT=off` turns it off.
+
+## The pool log
+
+Which lessons the model is shown at a check is decided by one fixed order: the shortlist, then word
+match × weight × trust, then newest first. Whether another order would find more of what the judge
+applies can only be measured on what the model was shown. So every detached check (0.7.7) logs its pool
+to `pools.jsonl` beside the store's outcomes, one line per check, failed calls included: every eligible
+lesson in fill order with its role (in the prefix, drawn at the boundary, in the tail sample, not
+shown), its exact chance to be shown ([The pool](delivery.md#which-lessons-are-asked)), the grade it
+got, and the scores of the candidate orders a pre-registered switch test compares:
+
+| Column | What it scores |
+|---|---|
+| `bm25q` | Today's word match of the work, before weight and trust; `w`, `trust`, `act`: the memory weight, the authors' trust, the activation behind the weight |
+| `bm25f` | Word match of question, situations and consequence against the whole work, word weights from the store's lessons at the stop |
+| `cue` | The lesson's best retrieval cue against the work's newest part; empty without cues |
+| `mv` | Situations and cues against the design moves the model named at the session's latest earlier check; empty without them |
+| `q` | The lesson's value from its earlier verdicts: each changed moves it a fifth of the way to +1, each ignored to −0.5, from 0; placebos count for nothing |
+| `cos` | The cosine of the lesson's vector to the work's newest part; empty without vectors |
+| `rrf` | Reciprocal rank fusion of `bm25f`, `cue`, `mv` (`bm25f` without moves) and `q` over the lessons the model was shown |
+
+None of these reaches the pool, its order or the prompt; a test pins that the prompt is byte for byte
+the same with and without cues and earlier moves. The order changes only once the switch test, fixed before any of this
+data was read, passes. The log is local (never synced or shared), kept whole until that test reads it,
+and its size is in `borg status`. Nothing is logged with `BORG_LEARN=off`, nor by a stop's own check
+(`BORG_ASYNC=off`).
+
+**Cues.** At the end of `borg learn`, one model call per new or reworded lesson writes ten short cues
+in the words of the work where it matters again (prompts, paths and commands, proposals,
+identifiers, design moves), with the correction it was learned from. They go to the store's local
+`cues.jsonl`, never into the lesson: as facets they would change the word match now and travel over the
+mesh. `borg cues` backfills a store learned before 0.7.7 (a dry run with its cost by default);
+`BORG_CUES=off` stops `borg learn` from writing them.
+
+**Miss causes.** For each first apply at grade ≥ 2 the fill order ranked low (past half the prefix, or
+shown only by a draw), the logged scores name a mechanical cause: `no_word_match` (no word of the work
+matched), `vector_only` (no word matched, the vectors found it), `demoted` (its words matched in the
+pool's top half, weight and trust put it in the bottom half), `weak_words` (its words matched less than
+half the pool's), `scope`, or `other` (the shortlist, ties, newest first). `borg status` and the
+Conscience tab of `borg web` count them, folded from the log at 0 tokens.
 
 ## Saying no
 

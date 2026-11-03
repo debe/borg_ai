@@ -13,7 +13,7 @@ use std::time::Duration;
 
 /// Guard: what a lock may outlive its holder's longest model call by (its own reading and writing),
 /// before it is taken for a crashed holder's.
-const STALE_SLACK_MS: i64 = 30_000;
+pub const STALE_SLACK_MS: i64 = 30_000;
 
 /// A lock older than this belongs to a holder that cannot still be waiting for its model (or to a pid
 /// that was reused): derived, twice the predict timeout plus [`STALE_SLACK_MS`].

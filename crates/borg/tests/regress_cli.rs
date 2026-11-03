@@ -113,6 +113,8 @@ impl Fx {
         c.args(args)
             .current_dir(&self.repo)
             .env_clear()
+            // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+            .env("BORG_ASYNC", "off")
             .env("BORG_UPDATE_CHECK", "off")
             .env("PATH", format!("{}:{}", self.root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
             // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model

@@ -231,6 +231,11 @@ pub struct Prediction {
     /// The characters of the prompt the call sent: a judge's prompt size, the effective length's
     /// measure (judge_length.rs; hook.rs logs it on a check's cost line, `prompt=`).
     pub prompt: usize,
+    /// The design moves the model read the work as (the answer's `moves`, strings only, in its order),
+    /// and per `applies` entry its `why` (empty where it gave none): logged on the check's `graded`
+    /// record (outcome.rs `moves`, `whys`), never read back into a decision.
+    pub moves: Vec<String>,
+    pub whys: Vec<String>,
 }
 
 /// The first `n` characters of `s`, marked when cut.
@@ -278,14 +283,24 @@ fn instructions(base: &str, graded: bool) -> String {
 }
 
 /// The prompt template a check's call used (`prompt_whole` when `compact`, else `prompt`), as 12 hex
-/// digits of blake3 over its instructions and the judge's: logged with every graded check (outcome.rs
-/// `prompt_hash`), so a change of wording resets what was learned of the grader and the judge.
+/// digits of blake3 over its instructions and the judge's, and for a compact prompt whose lesson lines
+/// are not `A1` their format (whole.rs `line_format`; `A1` hashes as before 0.7.7): logged with every
+/// graded check (outcome.rs `prompt_hash`), so a change of wording or of the lesson line resets what was
+/// learned of the grader and the judge (select/summary.rs `models` never mixes them).
 pub fn template_hash(compact: bool, graded: bool) -> String {
+    template_hash_with(compact, graded, crate::whole::line_format())
+}
+
+fn template_hash_with(compact: bool, graded: bool, line: crate::whole::Line) -> String {
     let mut h = blake3::Hasher::new();
     h.update(b"borg-prompt-v1\0");
     h.update(instructions(if compact { WHOLE } else { PROMPT }, graded).as_bytes());
     h.update(b"\0");
     h.update(JUDGE.as_bytes());
+    if compact && line != crate::whole::Line::A1 {
+        h.update(b"\0line=");
+        h.update(line.name().as_bytes());
+    }
     h.finalize().to_hex()[..crate::select::CHECK_HEX].to_string()
 }
 
@@ -323,7 +338,16 @@ pub fn judge(work: &str, pending: &[Pending], model: &str, timeout: Duration) ->
     let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), &p, &judge_schema(), timeout)?;
     v["resolved"].as_array()?;
     let prompt = p.chars().count();
-    Some(Prediction { applies: Vec::new(), grades: Vec::new(), resolved: resolved(&v, pending), returned: returned(&v), cost: cost.unwrap_or(0.0), prompt })
+    Some(Prediction {
+        applies: Vec::new(),
+        grades: Vec::new(),
+        resolved: resolved(&v, pending),
+        returned: returned(&v),
+        cost: cost.unwrap_or(0.0),
+        prompt,
+        moves: Vec::new(),
+        whys: Vec::new(),
+    })
 }
 
 /// Ids the model predicts apply, in its order, restricted to the shortlist, with their grades; its
@@ -357,8 +381,15 @@ fn ask(p: &str, shortlist: &[&Challenge], pending: &[Pending], model: &str, grad
     let s = schema(judging, graded);
     let (v, cost) = crate::runner::structured(&crate::runner::choose(Some(model)), p, &s, timeout)?;
     let cost = cost.unwrap_or(0.0);
-    let (applies, grades) = applies(&v, shortlist)?.into_iter().unzip();
-    Some(Prediction { applies, grades, resolved: resolved(&v, pending), returned: returned(&v), cost, prompt: p.chars().count() })
+    let (applies, rest): (Vec<String>, Vec<(u8, String)>) = applies(&v, shortlist)?.into_iter().map(|(id, grade, why)| (id, (grade, why))).unzip();
+    let (grades, whys) = rest.into_iter().unzip();
+    Some(Prediction { applies, grades, resolved: resolved(&v, pending), returned: returned(&v), cost, prompt: p.chars().count(), moves: moves(&v), whys })
+}
+
+/// The answer's `moves`, its strings in order, each kept as a judge's reason is (`reason_of`: redacted,
+/// on one line, bounded); none when missing.
+fn moves(v: &Value) -> Vec<String> {
+    v["moves"].as_array().into_iter().flatten().filter_map(Value::as_str).map(reason_of).filter(|m| !m.is_empty()).collect()
 }
 
 /// The ids the answer's `resolved` entries name (`Prediction::returned`), first seen first, each on one
@@ -397,11 +428,12 @@ fn resolved(v: &Value, pending: &[Pending]) -> Vec<Judged> {
     out
 }
 
-/// The model's `applies` ids in its order with their grades, kept only when on the shortlist and first
-/// seen: a partial or repeating answer still yields its valid part. A missing grade counts as 2; an
-/// entry whose grade is not 1, 2 or 3 is dropped.
-fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
-    let mut out: Vec<(String, u8)> = Vec::new();
+/// The model's `applies` ids in its order with their grades and whys (`reason_of`; empty where it gave
+/// none), kept only when on the shortlist and first seen: a partial or repeating answer still yields its
+/// valid part, each why with its own entry. A missing grade counts as 2; an entry whose grade is not 1, 2
+/// or 3 is dropped.
+fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8, String)>> {
+    let mut out: Vec<(String, u8, String)> = Vec::new();
     for a in v["applies"].as_array()? {
         let Some(id) = a["id"].as_str() else { continue };
         let grade = match &a["grade"] {
@@ -411,8 +443,8 @@ fn applies(v: &Value, shortlist: &[&Challenge]) -> Option<Vec<(String, u8)>> {
                 _ => continue,
             },
         };
-        if shortlist.iter().any(|c| c.id == id) && !out.iter().any(|(i, _)| i == id) {
-            out.push((id.to_string(), grade));
+        if shortlist.iter().any(|c| c.id == id) && !out.iter().any(|(i, _, _)| i == id) {
+            out.push((id.to_string(), grade, reason_of(a["why"].as_str().unwrap_or_default())));
         }
     }
     Some(out)
@@ -435,7 +467,7 @@ mod tests {
         let a = Challenge { id: "a".into(), ..Default::default() };
         let b = Challenge { id: "b".into(), ..Default::default() };
         let v = json!({"applies": [{"id": "b"}, {"id": "zz"}, {"id": "b"}, {"nope": 1}, {"id": "a"}]});
-        assert_eq!(applies(&v, &[&a, &b]), Some(vec![("b".to_string(), 2), ("a".to_string(), 2)]));
+        assert_eq!(applies(&v, &[&a, &b]), Some(vec![("b".to_string(), 2, String::new()), ("a".to_string(), 2, String::new())]));
         assert_eq!(applies(&json!({}), &[&a]), None);
     }
 
@@ -446,7 +478,7 @@ mod tests {
         let v = json!({"applies": [
             {"id": "a", "grade": 3}, {"id": "b"}, {"id": "c", "grade": "1"},
             {"id": "d", "grade": 0}, {"id": "e", "grade": "high"}, {"id": "f", "grade": 4}, {"id": "a", "grade": 1}]});
-        let got = applies(&v, &refs).unwrap();
+        let got: Vec<(String, u8)> = applies(&v, &refs).unwrap().into_iter().map(|(id, g, _)| (id, g)).collect();
         assert_eq!(got, vec![("a".to_string(), 3), ("b".to_string(), 2), ("c".to_string(), 1)]);
         let s = schema(false, true);
         assert_eq!(s["properties"]["applies"]["items"]["required"], json!(["id", "why", "grade"]));
@@ -457,6 +489,26 @@ mod tests {
         assert!(g.starts_with(&format!("{WHOLE} {GRADE}\n\n## Lessons\n")) && u.starts_with(&format!("{WHOLE}\n\n## Lessons\n")), "{g}");
         assert_eq!(g.replacen(&format!(" {GRADE}"), "", 1), u);
         assert!(prompt("w", &[&x], &[], true).starts_with(&format!("{PROMPT} {GRADE}\n\n## Current work")));
+    }
+
+    /// Each kept apply keeps its own why, whatever the shortlist, repeat and grade filters dropped
+    /// around it; the moves are kept in order, one line each.
+    #[test]
+    fn whys_stay_aligned_after_filters() {
+        let l: Vec<Challenge> = ["a", "b", "c"].iter().map(|i| Challenge { id: (*i).into(), ..Default::default() }).collect();
+        let refs: Vec<&Challenge> = l.iter().collect();
+        let v = json!({"moves": ["hold a lock\n across an await", 7, "", "retry without a bound"], "applies": [
+            {"id": "zz", "why": "not on the shortlist", "grade": 3},
+            {"id": "b", "why": "b's why", "grade": 9},
+            {"id": "c", "why": "c's why", "grade": 3},
+            {"id": "c", "why": "a repeat", "grade": 1},
+            {"id": "a", "grade": 2},
+            {"id": "b", "why": "b, valid now", "grade": 1}]});
+        let got = applies(&v, &refs).unwrap();
+        let want = [("c", 3, "c's why"), ("a", 2, ""), ("b", 1, "b, valid now")].map(|(i, g, w)| (i.to_string(), g, w.to_string()));
+        assert_eq!(got, want);
+        assert_eq!(moves(&v), ["hold a lock across an await", "retry without a bound"]);
+        assert!(moves(&json!({"applies": []})).is_empty());
     }
 
     /// The session-end judge's call (hook.rs `judge_session`): its opening, the session's work, then the
@@ -610,5 +662,9 @@ mod tests {
         let hashes = [template_hash(true, true), template_hash(true, false), template_hash(false, true), template_hash(false, false)];
         assert!(hashes.iter().all(|h| h.len() == 12) && hashes.iter().collect::<std::collections::HashSet<_>>().len() == 4, "{hashes:?}");
         assert_eq!(template_hash(true, true), hashes[0], "stable");
+        use crate::whole::Line;
+        let (a1, a2) = (template_hash_with(true, true, Line::A1), template_hash_with(true, true, Line::A2));
+        assert_ne!(a1, a2, "the lesson line format is part of the compact template");
+        assert_eq!(template_hash_with(false, true, Line::A1), template_hash_with(false, true, Line::A2), "the shortlist's layout shows no line");
     }
 }

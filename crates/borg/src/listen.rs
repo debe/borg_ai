@@ -7,6 +7,15 @@
 //! message is not exclusive, so a wake the session never took leaves it unread, and the next message
 //! wakes it again. Each message wakes a session once (`<session>.woke`).
 //!
+//! A detached check's asks (check_async.rs, hook.rs `ASK_NEXT`) wake an idle session too, and the wake
+//! carries their questions itself: a wake's turn may fire no prompt hook to show them. The waiter
+//! watches the session's `.queued` and `.checked` files beside its state file. Before the wake it
+//! reserves the asks (hook.rs `reserve_asks`: off the queue, so no prompt shows them meanwhile), and
+//! once the wake went in (said, or an adapter's `{"sent": ids}`) it marks them delivered (`commit_asks`);
+//! a wake that did not go in puts them back (`release_asks`), and so does a waiter's start, for one that
+//! died with asks reserved. Their wake ids are `L@<check>:<lesson>` (hook.rs `lesson_wake_id`), which an
+//! adapter treats as it treats message ids; a prompt that shows them names them in `shown_ids`.
+//!
 //! How an idle session is woken follows its harness (`Caps::drone_wake`, `after_stop`):
 //! - Claude Code (`Model`): a stop with no waiter asks the model once to start `borg listen --wait` in
 //!   the background. It exits printing a summary once a message waits and the engineer's turn is not
@@ -71,7 +80,7 @@ pub const TOOL_MS: i64 = 10 * 60_000;
 const HOLD_PCT: usize = 95;
 /// Method: how many of a session's latest gaps of each kind a hold is read from: it follows the
 /// session's recent pace, and `<session>.gaps` stays a few kB.
-const GAPS_KEPT: usize = 64;
+pub(crate) const GAPS_KEPT: usize = 64;
 /// Guard: how long a stop's mark outlives the longest stop of any harness (`stop_ms`), should its hook
 /// be killed before it removed the mark: the hook's own work past its budget (its records, its answer)
 /// runs inside it, and a killed hook's mark still expires.
@@ -750,6 +759,51 @@ fn look(home: &Path, session: &str) -> Look {
     Look::Listens { started: p.map_or(i64::MAX, |p| p.started) }
 }
 
+/// Whether `id` names what a wake is for: a message (msg.rs `is_id`) or a detached check's ask (hook.rs
+/// `lesson_wake_id`).
+fn wake_id(id: &str) -> bool {
+    msg::is_id(id) || crate::hook::lesson_of_wake_id(id).is_some()
+}
+
+/// The lesson ids among a wake's `ids` (hook.rs `lesson_wake_id`).
+fn lesson_ids(ids: &[String]) -> Vec<String> {
+    ids.iter().filter(|id| crate::hook::lesson_of_wake_id(id).is_some()).cloned().collect()
+}
+
+/// `f` with the session's store and state routed as its hooks route them (hook.rs `main`): `BORG_HOME` the
+/// collective's store `home`, `BORG_STATE` its `state` unless set; restored after, so a re-exec routes
+/// from the root store again. The waiter's other thread reads only stdin (`answers`).
+fn routed<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let (was_home, was_state) = (std::env::var_os("BORG_HOME"), std::env::var_os("BORG_STATE"));
+    // SAFETY: no other thread of the waiter reads the environment (`answers` reads stdin alone).
+    unsafe {
+        std::env::set_var("BORG_HOME", home);
+        if was_state.is_none() {
+            std::env::set_var("BORG_STATE", home.join("state"));
+        }
+    }
+    let out = f();
+    // SAFETY: as above.
+    unsafe {
+        match was_home {
+            Some(h) => std::env::set_var("BORG_HOME", h),
+            None => std::env::remove_var("BORG_HOME"),
+        }
+        if was_state.is_none() {
+            std::env::remove_var("BORG_STATE");
+        }
+    }
+    out
+}
+
+/// The files a detached check's asks move (hook.rs `queued_file`, check_async.rs `Checked`), beside the
+/// session's state file: the waiter looks again when either changes.
+fn ask_files(home: &Path, session: &str) -> [PathBuf; 2] {
+    let dir = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), PathBuf::from);
+    let ctx = crate::hook::state_file_in(&dir, session);
+    [ctx.with_extension("queued"), ctx.with_extension("checked")]
+}
+
 /// The ids `session` was woken for (`<session>.woke`).
 fn woken(home: &Path, session: &str) -> HashSet<String> {
     std::fs::read_to_string(file(home, session, "woke")).map(|t| t.lines().filter(|l| msg::is_id(l)).map(String::from).collect()).unwrap_or_default()
@@ -888,8 +942,8 @@ fn queue(session: &str, text: &str) -> Result<(), WakeError> {
 /// An adapter's answer to a wake of its stream, one JSON line on the waiter's stdin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
-    /// `{"sent": ids}`: the wake went in.
-    Sent,
+    /// `{"sent": ids}`: the wake went in (the ids it names, for its lessons, `commit_asks`).
+    Sent(Vec<String>),
     /// `{"failed": ids}`: the harness refused it; these messages wake the session again.
     Failed(Vec<String>),
 }
@@ -898,11 +952,11 @@ impl Answer {
     fn parse(line: &str) -> Option<Answer> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ids = |k: &str| {
-            v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|id| msg::is_id(id)).map(String::from).collect::<Vec<_>>())
+            v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|id| wake_id(id)).map(String::from).collect::<Vec<_>>())
         };
         match (ids("sent"), ids("failed")) {
             (_, Some(ids)) => Some(Answer::Failed(ids)),
-            (Some(_), None) => Some(Answer::Sent),
+            (Some(ids), None) => Some(Answer::Sent(ids)),
             (None, None) => None,
         }
     }
@@ -948,6 +1002,17 @@ struct Waiter<'a> {
     woke: HashSet<String>,
     /// The adapter's answers to its wakes (`--stream` only).
     answers: Option<std::sync::mpsc::Receiver<Answer>>,
+    /// The session's directory (`--dir`): the repo of its asks' records (hook.rs `commit_asks`).
+    cwd: String,
+    /// The files a detached check's asks move (`ask_files`), and how they were at the last pass.
+    asks: [PathBuf; 2],
+    asks_seen: [Option<(u64, SystemTime)>; 2],
+    /// The asks' files as they were when the queue's waiting asks gave nothing to reserve (done, their
+    /// lesson no longer delivered, or a check of the session running: hook.rs `reserve_asks`): not read
+    /// again until one changes (that check's `<s>.checked` among them).
+    unreservable: Option<[Option<(u64, SystemTime)>; 2]>,
+    /// Answers `idle` took off the stream while it waited, for the next pass (`take_answers`).
+    early: Vec<Answer>,
 }
 
 /// What a pass of the waiter's loop ends in.
@@ -962,8 +1027,9 @@ enum Pass {
 }
 
 impl<'a> Waiter<'a> {
-    fn new(home: &'a Path, session: &'a str, mode: Mode, lock: std::fs::File) -> Waiter<'a> {
+    fn new(home: &'a Path, session: &'a str, mode: Mode, lock: std::fs::File, cwd: &str) -> Waiter<'a> {
         let (here, image) = (msg::node(home), reexec::Image::now());
+        let asks = ask_files(home, session);
         Waiter {
             home,
             session,
@@ -978,6 +1044,36 @@ impl<'a> Waiter<'a> {
             told: false,
             woke: HashSet::new(),
             answers: None,
+            cwd: cwd.to_string(),
+            asks,
+            asks_seen: [None, None],
+            unreservable: None,
+            early: Vec::new(),
+        }
+    }
+
+    /// Asks a wake reserved wait for the adapter's answer (hook.rs `reserved_file`).
+    fn reserved(&self) -> bool {
+        std::fs::metadata(self.asks[0].with_extension("queued.wake")).is_ok_and(|m| m.len() > 0)
+    }
+
+    fn asks_mark(&self) -> [Option<(u64, SystemTime)>; 2] {
+        [mark(&self.asks[0]), mark(&self.asks[1])]
+    }
+
+    /// The reserved asks `ids` names delivered (hook.rs `commit_asks`): their wake went in.
+    fn commit(&self, ids: &[String]) {
+        let lessons = lesson_ids(ids);
+        if !lessons.is_empty() {
+            routed(self.home, || crate::hook::commit_asks(self.session, &self.cwd, &lessons));
+        }
+    }
+
+    /// The reserved asks `ids` names back on the queue (hook.rs `release_asks`): their wake did not go in.
+    fn release(&self, ids: &[String]) {
+        let lessons = lesson_ids(ids);
+        if !lessons.is_empty() {
+            routed(self.home, || crate::hook::release_asks(self.session, Some(&lessons)));
         }
     }
 
@@ -986,11 +1082,17 @@ impl<'a> Waiter<'a> {
     /// `unset_wake`: also when an earlier image of this waiter sent it) and backs off before its messages
     /// wake the session again.
     fn take_answers(&mut self) {
-        let got: Vec<Answer> = self.answers.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        let mut got = std::mem::take(&mut self.early);
+        got.extend(self.answers.as_ref().map(|rx| rx.try_iter().collect::<Vec<_>>()).unwrap_or_default());
         for a in got {
             match a {
-                Answer::Sent => self.retry = None,
+                Answer::Sent(ids) => {
+                    self.retry = None;
+                    self.commit(&ids);
+                }
                 Answer::Failed(ids) => {
+                    // Its asks back on the queue (the busy mark is undone below only while it is the wake's).
+                    self.release(&ids);
                     self.woke.retain(|id| !ids.contains(id));
                     unnote_woken(self.home, self.session, &ids);
                     unset_wake(self.home, self.session);
@@ -1004,6 +1106,13 @@ impl<'a> Waiter<'a> {
 
     fn path(&self) -> PathBuf {
         msg::path(self.home)
+    }
+
+    /// The waiter ends (a stop, the session listens no more or is gone): the asks it reserved for a wake
+    /// the adapter has not said went in go back on the queue (hook.rs `release_asks`), so the next prompt
+    /// or tool call delivers them (and its `shown_ids` drops an adapter's held copy) rather than no one.
+    fn release_all(&self) {
+        routed(self.home, || crate::hook::release_asks(self.session, None));
     }
 
     /// The session listens no more: its log and lock go, the lock while this still holds it (`forget`
@@ -1027,6 +1136,7 @@ impl<'a> Waiter<'a> {
         // there would leave its ids in `<session>.woke`, never to wake the session again.
         self.take_answers();
         if let Some(sig) = signal() {
+            self.release_all();
             end(self.mode, "stopped");
             // `--off` forgets the session before it signals its waiter.
             if !listening(self.home, self.session) {
@@ -1034,7 +1144,9 @@ impl<'a> Waiter<'a> {
             }
             return Pass::Exit(128 + sig);
         }
-        if self.image.due() {
+        // Not while a wake's asks are reserved (`<s>.queued.wake`): the adapter's answer to that wake may
+        // sit unread in this image's stdin buffer, lost by the exec, and nothing then delivers them.
+        if self.image.due() && !self.reserved() {
             match self.image.reexec(&self.lock, || signal().is_some()) {
                 Ok(()) => return Pass::Again,
                 Err(why) if !self.told => {
@@ -1046,11 +1158,13 @@ impl<'a> Waiter<'a> {
         }
         let started = match look(self.home, self.session) {
             Look::Off => {
+                self.release_all();
                 end(self.mode, "this session listens no more");
                 self.leave();
                 return Pass::Exit(0);
             }
             Look::Gone => {
+                self.release_all();
                 forget(self.home, self.session);
                 end(self.mode, "the session is gone");
                 self.leave();
@@ -1068,34 +1182,59 @@ impl<'a> Waiter<'a> {
             }
             (self.seen, self.talk) = (mark, talk);
         }
+        // As the log's: `idle` waits for the asks' next change, not this one.
+        self.asks_seen = self.asks_mark();
         let now = learn::now_ms();
         if self.retry.is_some_and(|(at, _)| Instant::now() < at) || held_off(self.home, self.session, now, self.mode) {
             return Pass::Wait;
         }
         let (new, mine) = news(self.home, &self.msgs, &self.here, self.session, started, now, &self.woke);
+        // A detached check's asks waiting (hook.rs `asks_waiting`), read only once the queue holds any, and
+        // not again while it holds only asks none could be reserved of.
+        let looked = self.asks_seen[0].is_some() && self.unreservable != Some(self.asks_seen);
+        let waiting = if looked { routed(self.home, || crate::hook::asks_waiting(self.session)) } else { Vec::new() };
         // Paused: a wake's turn could only have its tool calls refused; the resume moves the log.
-        if new.is_empty() || paused(self.home, self.session, || Some(started), now) {
+        if (new.is_empty() && waiting.is_empty()) || paused(self.home, self.session, || Some(started), now) {
             return Pass::Wait;
         }
-        let ids: Vec<&str> = new.iter().map(|m| m.id.as_str()).collect();
+        // The asks taken off the queue for this wake, with their questions (hook.rs `reserve_asks`).
+        let lessons = if waiting.is_empty() { None } else { routed(self.home, || crate::hook::reserve_asks(self.session, &waiting)) };
+        self.unreservable = (!waiting.is_empty() && lessons.is_none()).then_some(self.asks_seen);
+        if new.is_empty() && lessons.is_none() {
+            return Pass::Wait;
+        }
+        let msg_ids: Vec<&str> = new.iter().map(|m| m.id.as_str()).collect();
+        let (lesson_text, lesson_ids) = lessons.unwrap_or_default();
+        let ids: Vec<&str> = msg_ids.iter().copied().chain(lesson_ids.iter().map(String::as_str)).collect();
+        let text = match (new.is_empty(), lesson_text.is_empty()) {
+            (false, false) => format!("{}\n\n{lesson_text}", summary(&new)),
+            (false, true) => summary(&new),
+            (true, _) => lesson_text,
+        };
         self.cut_log();
-        match say(self.mode, self.session, &summary(&new), &ids) {
+        match say(self.mode, self.session, &text, &ids) {
             Ok(()) => {
-                self.woke.extend(ids.iter().map(|id| (*id).to_string()));
-                note_woken(self.home, self.session, &ids, &mine);
+                self.woke.extend(msg_ids.iter().map(|id| (*id).to_string()));
+                note_woken(self.home, self.session, &msg_ids, &mine);
                 // The wake's turn may fire no prompt hook (an adapter's own message): held off as a turn
                 // until its stop, so the next message does not wake it again for what it shows.
                 if listening(self.home, self.session) {
                     set_wake(self.home, self.session, now);
                 }
-                // A stream's wake went in only once its adapter says so (`take_answers`).
+                // A stream's wake went in only once its adapter says so (`take_answers`): its asks are
+                // delivered then.
                 if self.mode != Mode::Stream {
                     self.retry = None;
+                    self.commit(&lesson_ids);
                 }
                 if self.mode.lives() { Pass::Again } else { Pass::Exit(0) }
             }
-            Err(WakeError::Closed) => Pass::Exit(0),
+            Err(WakeError::Closed) => {
+                self.release(&lesson_ids);
+                Pass::Exit(0)
+            }
             Err(why) => {
+                self.release(&lesson_ids);
                 let d = backoff(self.retry.map(|(_, d)| d));
                 note(self.mode, &format!("[borg listen] the wake did not reach the session ({why}): tried again in {} s", d.as_secs()));
                 self.retry = Some((Instant::now() + d, d));
@@ -1104,12 +1243,22 @@ impl<'a> Waiter<'a> {
         }
     }
 
-    /// At least one `TICK`, then until the log moves, `LOOK` passes, or a signal comes.
-    fn idle(&self) {
+    /// At least one `TICK`, then until the log moves, `LOOK` passes, a signal comes, or (a stream) the
+    /// adapter answers: a wake it says went in is marked delivered at once (`take_answers`), before the
+    /// woken turn's stop reads whether it was asked.
+    fn idle(&mut self) {
         let t0 = Instant::now();
         loop {
-            std::thread::sleep(TICK);
-            if t0.elapsed() >= LOOK || signal().is_some() || mark(&self.path()) != self.seen {
+            match self.answers.as_ref().map(|rx| rx.recv_timeout(TICK)) {
+                Some(Ok(a)) => {
+                    self.early.push(a);
+                    return;
+                }
+                // An adapter that closed its end answers nothing more: a plain tick.
+                None | Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => std::thread::sleep(TICK),
+                Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
+            }
+            if t0.elapsed() >= LOOK || signal().is_some() || mark(&self.path()) != self.seen || self.asks_mark() != self.asks_seen {
                 return;
             }
         }
@@ -1166,7 +1315,7 @@ fn take_lock(home: &Path, session: &str, mode: Mode, inherited: Option<std::os::
 /// `borg listen --wait|--stream|--queue`: waits for messages of `session` (module doc). 0 once it woke
 /// the session (`--wait`), it listens no more, or the session is gone; 1 when it does not listen; 128 +
 /// the signal that stopped it.
-fn wait(home: &Path, session: &str, mode: Mode) -> i32 {
+fn wait(home: &Path, session: &str, mode: Mode, cwd: &str) -> i32 {
     // Its stops trapped first; re-exec'd by its previous image (reexec.rs), they are unblocked only then.
     trap();
     let inherited = reexec::inherited();
@@ -1180,7 +1329,11 @@ fn wait(home: &Path, session: &str, mode: Mode) -> i32 {
     };
     // The stop's ask is answered: once this waiter ends, a stop may ask again.
     amend(home, session, |r| std::mem::take(&mut r.asked));
-    let mut w = Waiter::new(home, session, mode, lock);
+    // Asks a waiter that died had reserved go back on the queue; one re-executed keeps its own.
+    if inherited.is_none() {
+        routed(home, || crate::hook::release_asks(session, None));
+    }
+    let mut w = Waiter::new(home, session, mode, lock, cwd);
     if mode == Mode::Stream {
         w.answers = Some(answers());
     }
@@ -1361,7 +1514,7 @@ pub fn main(args: &[&str]) -> i32 {
     match a.action {
         Action::On => on(home, &session, h, &cwd, now),
         Action::Off => off(home, &session),
-        Action::Wait(mode) => wait(home, &session, mode),
+        Action::Wait(mode) => wait(home, &session, mode, &cwd),
     }
 }
 
@@ -1382,7 +1535,7 @@ mod tests {
     }
 
     fn waiter<'a>(home: &'a Path, mode: Mode) -> Waiter<'a> {
-        Waiter::new(home, "s1", mode, take_lock(home, "s1", mode, None).unwrap())
+        Waiter::new(home, "s1", mode, take_lock(home, "s1", mode, None).unwrap(), "")
     }
 
     fn message(home: &Path, to: &str, ms: i64, text: &str) -> Message {
@@ -1736,7 +1889,15 @@ mod tests {
 
     #[test]
     fn an_adapters_answer_is_one_json_line_of_message_ids() {
-        assert_eq!(Answer::parse(r#"{"sent":["m000000000001"]}"#), Some(Answer::Sent));
+        assert_eq!(Answer::parse(r#"{"sent":["m000000000001"]}"#), Some(Answer::Sent(vec!["m000000000001".into()])));
+        // A detached check's ask (hook.rs `lesson_wake_id`) is a wake's id too; anything else is not.
+        let lesson = crate::hook::lesson_wake_id("0123456789ab", "Mdrain");
+        assert_eq!(lesson, "L@0123456789ab:Mdrain");
+        assert_eq!(crate::hook::lesson_of_wake_id(&lesson), Some(("0123456789ab", "Mdrain")));
+        assert_eq!(crate::hook::lesson_of_wake_id("L@:x"), None);
+        let both = format!(r#"{{"sent":["m000000000001","{lesson}","L@nothing"]}}"#);
+        assert_eq!(Answer::parse(&both), Some(Answer::Sent(vec!["m000000000001".into(), lesson.clone()])));
+        assert_eq!(lesson_ids(&["m000000000001".into(), lesson.clone()]), [lesson]);
         assert_eq!(Answer::parse(r#"{"failed":["m000000000001","junk"]}"#), Some(Answer::Failed(vec!["m000000000001".into()])), "only ids");
         assert_eq!(Answer::parse(r#"{"other":1}"#), None);
         assert_eq!(Answer::parse("not json"), None);
@@ -1771,7 +1932,7 @@ mod tests {
         assert_eq!(w.retry.map(|(_, d)| d), Some(RETRY_MIN * 2), "refused again: doubled");
         w.retry = w.retry.map(|(_, d)| (Instant::now(), d));
         assert_eq!(w.pass(), Pass::Again);
-        tx.send(Answer::Sent).unwrap();
+        tx.send(Answer::Sent(vec![m.id.clone()])).unwrap();
         assert_eq!(w.pass(), Pass::Wait, "its turn holds the next wake off");
         assert_eq!(w.retry, None, "it went in: the backoff ends");
         let _ = std::fs::remove_dir_all(home);

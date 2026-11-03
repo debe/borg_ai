@@ -475,6 +475,12 @@ pub struct Selection {
     /// prompt budget: the answered share per prompt-size step and what is explored. Read from the
     /// store's judge cost lines by `selection`; empty from `Selection::of`.
     pub judge: Vec<crate::judge_length::Length>,
+    /// The pool's exploration share in force (whole.rs `boundary_share`: the boundary draw's share of the
+    /// budget and the tail's of the dropped lessons; 0 with `BORG_BOUNDARY=off`), and the miss causes of
+    /// the detached checks' pool log (pools.rs `misses`, with its size). Read by `selection`; 0 and None
+    /// from `Selection::of`, and None before a check logged its pool.
+    pub boundary: f64,
+    pub misses: Option<crate::pools::Misses>,
 }
 
 /// The randomised question-count test of the learned policy (select/policy.rs `choose`; docs/delivery.md
@@ -846,6 +852,8 @@ impl Selection {
             latency,
             test: (learned || s.experiment.totals() != (0, 0)).then(|| Test::of(s, risk)),
             judge: Vec::new(),
+            boundary: 0.0,
+            misses: None,
         }
     }
 
@@ -893,6 +901,9 @@ pub fn selection(lessons: &Path, policy: select::Policy) -> Selection {
     // The store's judge cost lines are in its `state/`, beside its lessons; the judge this environment runs.
     let current = crate::hook::judge_model(&std::env::var("BORG_PREDICT_MODEL").unwrap_or_default());
     s.judge = crate::judge_length::lengths(&lessons.with_file_name("state"), &current);
+    s.boundary = crate::whole::boundary_share();
+    // The pool log beside the store's outcomes (pools.rs `path`).
+    s.misses = lessons.parent().map(crate::pools::misses).filter(|m| m.checks > 0);
     s
 }
 
@@ -1007,6 +1018,9 @@ pub fn selection_line(s: &Selection) -> String {
             parts.push(format!("tail {} shown past the pool, {} applied", m.tail_shown, m.tail_applied));
         }
     }
+    if let Some(m) = &s.misses {
+        parts.push(misses_line(m, s.boundary));
+    }
     if let Some(e) = &s.evaluation {
         let reading = match e.ucb {
             Some(u) => format!("monitor {:+.3}, bound {u:+.3} over {} sessions (below 0 reverts)", e.mean, e.sessions),
@@ -1034,6 +1048,52 @@ pub fn selection_line(s: &Selection) -> String {
     }
     if let Some(b) = &s.budget {
         parts.push(format!("budget {:.0} pool tokens per session: {:.0} read, price {:.2e} per token", b.tokens, b.spent, b.price));
+    }
+    parts.join(" · ")
+}
+
+/// The pool log as one part of the selection line (pools.rs `Misses`): the checks it holds and its size,
+/// the exploration share, and of the first applies at grade ≥ 2 those the fill order ranked low (past
+/// half the pool, or shown only by a draw past it) with their causes, the most frequent first.
+#[must_use]
+pub fn misses_line(m: &crate::pools::Misses, share: f64) -> String {
+    let size = format!("{:.1} MB", m.at as f64 / 1_048_576.0);
+    let explore = if share > 0.0 {
+        format!("exploration {:.0}% of the budget and of the dropped lessons", 100.0 * share)
+    } else {
+        "exploration off (BORG_BOUNDARY=off)".into()
+    };
+    let head = format!("pool log {} checks ({size}), {explore}", m.checks);
+    if m.positives == 0 {
+        return format!("{head}, no first apply at grade ≥ 2 yet");
+    }
+    let mut causes: Vec<&(String, u64)> = m.causes.iter().filter(|(_, n)| *n > 0).collect();
+    causes.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let why = if causes.is_empty() { String::new() } else { format!(": {}", causes.iter().map(|(c, n)| format!("{c} {n}")).collect::<Vec<_>>().join(", ")) };
+    format!("{head}, {} of {} first applies at grade ≥ 2 ranked low ({} shown by a draw){why}", m.low, m.positives, m.drawn)
+}
+
+/// `borg status`'s line of the turn-end check: where it runs (detached, check_async.rs, or at the stop
+/// with `BORG_ASYNC=off`), and what the detached checks did (`t`, stats.rs `async_tally`): model calls,
+/// failed ones and those that took their whole limit, jobs a newer stop superseded or that found the
+/// session ended, the call limit a check gets now (`limit`, check_async.rs `call_limit`), the largest
+/// peak memory, and the lessons a check showed its model (an `a2` line costs more, so fewer fit).
+#[must_use]
+pub fn async_line(t: &crate::stats::AsyncTally, on: bool, limit: std::time::Duration, line: &str) -> String {
+    let head = if on { "detached, the stop never waits (BORG_ASYNC=off checks at the stop)" } else { "at the stop, which waits for it (BORG_ASYNC=off)" };
+    let mut parts = vec![head.to_string()];
+    if on {
+        parts.push(format!("call limit now {} s", limit.as_secs()));
+    }
+    if t.checks + t.superseded + t.gone + t.unstarted > 0 {
+        let at_limit = format!("{} at the limit, {} s last", t.timed_out, t.limit_ms / 1000);
+        parts.push(format!("{} detached checks (${:.2}), {} failed ({at_limit})", t.checks, t.usd, t.failed));
+        parts.push(format!("{} superseded by a newer stop, {} after the session ended", t.superseded, t.gone));
+        if t.unstarted > 0 {
+            parts.push(format!("{} never started (their job could not be written or run)", t.unstarted));
+        }
+        parts.push(format!("peak memory {} MB", t.rss_kb.div_ceil(1024)));
+        parts.push(format!("{:.1} lessons shown per check (line {line})", t.lessons));
     }
     parts.join(" · ")
 }
@@ -1254,6 +1314,29 @@ pub(crate) fn tests_inbox() -> Inbox {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_async_line_says_where_the_check_runs_and_what_it_did() {
+        use crate::stats::AsyncTally;
+        let secs = std::time::Duration::from_secs(45);
+        assert_eq!(super::async_line(&AsyncTally::default(), false, secs, "a2"), "at the stop, which waits for it (BORG_ASYNC=off)");
+        let fresh = super::async_line(&AsyncTally::default(), true, secs, "a2");
+        assert_eq!(fresh, "detached, the stop never waits (BORG_ASYNC=off checks at the stop) · call limit now 45 s");
+        let t =
+            AsyncTally { checks: 12, failed: 2, timed_out: 1, superseded: 3, gone: 1, unstarted: 0, limit_ms: 45_000, rss_kb: 38_000, lessons: 41.3, usd: 0.5 };
+        let l = super::async_line(&t, true, secs, "a2");
+        for part in [
+            "12 detached checks ($0.50), 2 failed (1 at the limit, 45 s last)",
+            "3 superseded by a newer stop, 1 after the session ended",
+            "peak memory 38 MB",
+            "41.3 lessons shown per check (line a2)",
+        ] {
+            assert!(l.contains(part), "{part}: {l}");
+        }
+        assert!(!l.contains("never started"), "{l}");
+        let lost = super::async_line(&AsyncTally { unstarted: 2, ..t }, true, secs, "a2");
+        assert!(lost.contains("2 never started (their job could not be written or run)"), "{lost}");
+    }
+
     use super::*;
 
     fn p(session: &str, engineer: &str, started: i64, ms: i64, event: &str, prompt: &str, files: &[&str]) -> Presence {
@@ -1398,6 +1481,27 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The pool log's part of the selection line: its checks, size and share, then the low first applies
+    /// by cause, the most frequent first, causes that never happened left out.
+    #[test]
+    fn the_misses_line_names_the_causes_of_low_first_applies() {
+        let causes = |v: &[(&str, u64)]| v.iter().map(|(c, n)| (c.to_string(), *n)).collect();
+        let m = crate::pools::Misses {
+            at: 3 * 1_048_576 / 2,
+            checks: 40,
+            positives: 12,
+            low: 5,
+            drawn: 2,
+            causes: causes(&[("scope", 0), ("no_word_match", 1), ("demoted", 3), ("other", 1)]),
+        };
+        assert_eq!(
+            misses_line(&m, 0.15),
+            "pool log 40 checks (1.5 MB), exploration 15% of the budget and of the dropped lessons, 5 of 12 first applies at grade ≥ 2 ranked low (2 shown by a draw): demoted 3, no_word_match 1, other 1"
+        );
+        let none = crate::pools::Misses { positives: 0, ..m };
+        assert!(misses_line(&none, 0.0).ends_with("exploration off (BORG_BOUNDARY=off), no first apply at grade ≥ 2 yet"), "{}", misses_line(&none, 0.0));
+    }
+
     #[test]
     fn the_selection_line_says_what_decides_and_prices_spend_only_under_a_budget() {
         use select::Policy;
@@ -1507,7 +1611,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let v = serde_json::to_value(learned()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        let want = "allowance at budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life judge labels latency ledger measurement policy pool sessions source spend test";
+        let want = "allowance at boundary budget checks declaration default delivery deviations effects evaluation fallbacks fit gate half_life judge labels latency ledger measurement misses policy pool sessions source spend test";
         assert_eq!(keys, want.split(' ').collect::<Vec<_>>());
         assert_eq!((&v["budget"], &v["spend"][0]["source"], &v["deviations"][0]["whole"]), (&Value::Null, &json!("stop"), &json!(400)));
         let mut keys: Vec<&str> = v["evaluation"].as_object().unwrap().keys().map(String::as_str).collect();

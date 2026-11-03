@@ -78,6 +78,8 @@ fn borg(root: &Path, args: &[&str], stdin: &str, model: bool, env: &[(&str, &str
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(args)
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         // The fake `claude` alone answers: a failed answer would otherwise fall through to the next model

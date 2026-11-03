@@ -441,8 +441,9 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
         // Learning health folds the lessons, the rollups and the local events.
         ("learning", vec![home.join("lessons.jsonl"), home.join("stats.jsonl"), stats::events_path(home)]),
-        // The selection summary's cache, and the outcome log whose tail it folds on every read.
-        ("select", vec![home.join(borg::select::summary::CACHE), home.join("outcomes.jsonl")]),
+        // The selection summary's cache, and the outcome log whose tail it folds on every read; the pool
+        // log its miss causes fold (borg pools.rs).
+        ("select", vec![home.join(borg::select::summary::CACHE), home.join("outcomes.jsonl"), borg::pools::path(home)]),
         // The release check and what the mesh last heard of the members' versions.
         ("update", vec![update::path_for(home), protocol::versions_path(home), protocol::protocols_path(home)]),
     ]
@@ -550,8 +551,22 @@ pub async fn publish(minds: Vec<Mind>) {
 mod tests {
     use super::*;
 
-    /// The page refetches the selection when its summary cache, or the outcome log the summary folds,
-    /// changes; the cache alone changes no other view.
+    /// The UI (a WASM crate of its own, borg-web/ui) matches the detached check's protocol words by
+    /// their text: its feed every `why` of a check not run, its cost view the stats mode.
+    #[test]
+    fn the_ui_matches_the_detached_checks_words() {
+        let feed = include_str!("../ui/src/feed.rs");
+        assert!(feed.contains(&format!("\"{}\" if e.why", borg::stats::CHECK_DROPPED)), "the feed's event kind");
+        // `superseded` is the feed's last arm for the kind, matched by no word.
+        for why in borg::check_async::WHYS.iter().filter(|w| **w != borg::check_async::WHY_SUPERSEDED) {
+            assert!(feed.contains(&format!("e.why == \"{why}\"")), "the feed matches {why}");
+        }
+        let cost = include_str!("../ui/src/views/cost.rs");
+        assert!(cost.contains(&format!("\"{}\"", borg::check_async::MODE)), "the cost view's mode");
+    }
+
+    /// The page refetches the selection when its summary cache, the outcome log the summary folds, or
+    /// the pool log changes; the cache and the pool log alone change no other view.
     #[test]
     fn the_selection_view_follows_its_summary_and_the_outcomes() {
         let home = std::env::temp_dir().join(format!("borg-web-watch-select-{}", std::process::id()));
@@ -563,7 +578,11 @@ mod tests {
         let cached = fingerprint(&home);
         assert_eq!(changed(&before, &cached), ["select"]);
         std::fs::write(home.join("outcomes.jsonl"), "{}\n").unwrap();
-        assert!(changed(&cached, &fingerprint(&home)).contains(&"select"));
+        let logged = fingerprint(&home);
+        assert!(changed(&cached, &logged).contains(&"select"));
+        // The pool log its miss causes fold.
+        std::fs::write(borg::pools::path(&home), "{}\n").unwrap();
+        assert_eq!(changed(&logged, &fingerprint(&home)), ["select"]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

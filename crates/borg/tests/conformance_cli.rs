@@ -73,6 +73,8 @@ fn borg_cli(root: &Path, args: &[&str], env: &[(String, String)]) -> (String, i3
     let out = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(args)
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
@@ -170,6 +172,8 @@ impl<'a> Drone<'a> {
         let mut c = Command::new("sh");
         c.args(["-c", &self.command(event)])
             .env_clear()
+            // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+            .env("BORG_ASYNC", "off")
             .env("BORG_UPDATE_CHECK", "off")
             .env("PATH", path)
             .env("HOME", self.home())
@@ -453,6 +457,57 @@ fn a_change_is_checked_at_the_turn_end_and_its_hand_over_arrives_on_the_next_cal
         }
         assert_eq!(at_prompt, "", "{tag}: no prompt context");
         assert_eq!(queued(&d.state("queued")), "Mdrain\n", "{tag}: still waiting");
+    }
+}
+
+/// Waits up to 20 s for `cond`; fails the test past it.
+fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The check detached (`BORG_ASYNC` on, the default since 0.7.7): the stop returns with no block while
+/// the model call is still open; once the model answered, its ask arrives once with the next call the
+/// harness reads (a tool call's context, else a prompt's), and waits where it reads neither.
+#[test]
+fn a_detached_checks_stop_returns_with_no_block_and_its_ask_arrives_once() {
+    for p in profiles() {
+        let caps = p.caps();
+        let tag = p.tag();
+        let mut d = Drone::new(&p, "async");
+        d.with("BORG_ASYNC", "on");
+        common::blocking_fake(&d.root);
+        d.step("prompt", "prompt");
+        d.step("post_tool", "read");
+        d.step("post_tool", "edit");
+        let stop = d.step("stop", "stop");
+        assert_ne!(stop["decision"], "block", "{tag}: no block: {stop}");
+        assert!(d.state("ctx").contains("#borg-checking @"), "{tag}: the turn ends at the stop");
+        assert_eq!(d.state("checked"), "", "{tag}: the stop did not wait for the model");
+        until(&format!("{tag}: the model call"), || d.root.join("started").exists());
+        assert_eq!(d.state("queued"), "", "{tag}: nothing queued while the model runs");
+        common::release(&d.root);
+        until(&format!("{tag}: the ask"), || !d.state("queued").is_empty());
+        assert_eq!(queued(&d.state("queued")), "live Mdrain\n", "{tag}");
+        let next = context(&d.step("post_tool", "read_again"));
+        let got = if caps.tool_context {
+            next
+        } else {
+            assert_eq!(next, "", "{tag}: no tool context");
+            context(&d.step("prompt", "correction"))
+        };
+        if !caps.tool_context && !caps.prompt_context {
+            assert_eq!(got, "", "{tag}: no prompt context");
+            assert_eq!(queued(&d.state("queued")), "live Mdrain\n", "{tag}: still waiting");
+            continue;
+        }
+        assert!(got.contains("[Mdrain]") && got.contains("After your turn"), "{tag}: a question about the turn it judged: {got}");
+        assert_eq!(d.state("queued"), "", "{tag}: taken off the queue");
+        let again = context(&d.step("post_tool", "read_again")) + &context(&d.step("prompt", "correction"));
+        assert!(!again.contains("[Mdrain]"), "{tag}: once: {again}");
     }
 }
 

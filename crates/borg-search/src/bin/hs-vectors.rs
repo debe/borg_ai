@@ -80,7 +80,13 @@ fn rank(out: &Path, root: &Path, files: &[String]) {
         let pool = conscience::load(&lessons, None);
         let bm: Vec<&conscience::Challenge> = conscience::select_scoped(&pool, &q.query, &q.query, WIDE);
         let t = std::time::Instant::now();
-        let vec = vectors::engine::query(&vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), VECTOR_TOP).expect("query");
+        // One embedder for the whole run (`query` loads and leaks one per call).
+        let embedder = vectors::engine::Embedder::shared(&model).expect("embedder");
+        let vec: Vec<String> = vectors::engine::query_scored(embedder, &vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), VECTOR_TOP)
+            .expect("query")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let short = vectors::extend(bm.iter().take(SHORT).copied().collect(), &vec, &pool, &q.query, vectors::DEFAULT_K);
         // descriptive: BM25 top 30 + the vector hits

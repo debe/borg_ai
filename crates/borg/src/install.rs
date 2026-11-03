@@ -228,6 +228,15 @@ fn print_status(t: &Targets) {
         println!("  captures     {}", if sources.is_empty() { "none yet".to_string() } else { sources.join("; ") });
         let g = crate::prefilter::tally(&home.join("state"));
         println!("  stop gate    {} turn ends skipped at 0 tokens, {} asked the model (${:.2} so far)", g.skipped, g.asked, g.cost);
+        // The turn-end check: detached or at the stop, and what the detached ones did (check_async.rs).
+        let model = std::env::var("BORG_PREDICT_MODEL").unwrap_or_default();
+        let line = crate::top::async_line(
+            &crate::stats::async_tally(&crate::stats::live(home)),
+            crate::check_async::on(),
+            crate::check_async::call_limit_in(home, &model),
+            crate::whole::line_format().name(),
+        );
+        println!("  turn check   {line}");
         // Live mode's checks during the turn, before it was removed in 0.7.6: history only.
         if g.live_checks > 0 {
             println!("  live checks  {} during the turn before 0.7.6, {} lessons read (${:.2})", g.live_checks, g.live_lessons, g.live_cost);
@@ -241,6 +250,15 @@ fn print_status(t: &Targets) {
             g.free_lessons,
             g.free_chars / crate::whole::CHARS_PER_TOKEN
         );
+        // A detached check's questions, delivered after the turn they judged (no extra round).
+        if g.late > 0 {
+            println!(
+                "  questions    {} asked after their turn ({} in a wake, ~{} tokens, no extra round)",
+                g.late_questions,
+                g.late_woken,
+                g.late_chars / crate::whole::CHARS_PER_TOKEN
+            );
+        }
         println!(
             "  judge        {} model calls also judged {} asked lessons ({} settled; ~{} prompt tokens added, no extra call)",
             g.judge_calls,

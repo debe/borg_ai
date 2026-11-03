@@ -877,7 +877,7 @@ fn level_of(names: &mut [Vec<String>; FAMILIES], index: &mut [HashMap<String, us
 /// apply never delivered or never judged.
 fn model_route(a: &Apply) -> Option<Route> {
     match a.route {
-        Route::Ask | Route::Free if a.delivered != super::summary::Delivered::Dropped => Some(a.route),
+        Route::Ask | Route::Free if !a.delivered.never() => Some(a.route),
         Route::Placebo => Some(Route::Not),
         _ => None,
     }

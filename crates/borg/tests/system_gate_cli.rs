@@ -39,6 +39,8 @@ fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> String
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", "claude", event])
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         // No fake model here: a model call fails open instead of reaching a real CLI on PATH.

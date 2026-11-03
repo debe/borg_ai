@@ -342,6 +342,10 @@ index. `--rebuild` is needed only for a store that already had lessons when the 
 index another model built. `borg doctor` warns while the model or an index is missing and names the
 command. No hook downloads the model; without model or index, Borg matches words only.
 
+A detached check also logs each eligible lesson's cosine to the work, and whether the shortlist would
+hold it, in its pool log ([The pool log](learning.md#the-pool-log)). Logged only: it never changes what
+the model is shown. A process loads the model once, however many queries it makes.
+
 **Behind a proxy or offline.** `--fetch` downloads with `curl`, which honours `HTTPS_PROXY` and
 `CURL_CA_BUNDLE`. `BORG_VECTOR_URL` points it at a mirror that serves the same three files
 (`config.json`, `tokenizer.json`, `model.safetensors`), `file://` included; each must match its pinned
@@ -514,7 +518,8 @@ All are optional.
 | Variable | Default | Effect |
 |---|---|---|
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
-| `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach` and `facets` (see *Model runner*); `off`: no model call, episodes wait |
+| `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach`, `facets` and `cues` (see *Model runner*); `off`: no model call, episodes wait |
+| `BORG_CUES` | on | `off`: `borg learn` writes no retrieval cues for the lessons it learned (`borg cues --apply` still does). Cues are logged as a score only and change nothing a drone sees ([The pool log](learning.md#the-pool-log)) |
 | `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call; the session-end judge's call also stays within twice `BORG_PREDICT_TIMEOUT_S`, so the session lock it holds never reads stale |
 | `BORG_REGRESS` | `links` | [Decision → fix links](#decision--fix-links): `learn` also makes fix links regret episodes (team or private); `off`: no links |
 | `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
@@ -567,7 +572,10 @@ project.
 | `BORG_PREFILTER` | `8.0` | Threshold of the free gate; `off` always calls the model |
 | `BORG_STOP_GATE` | word gate | `edits`: call the model only for turns that edited files or changed state |
 | `BORG_STOP_POOL` | whole pool | `shortlist`: show the model only the word-matching shortlist |
-| `BORG_STOP_POOL_TOKENS` | the learned policy's own choice (`12000` under the fixed rule) | Token budget of the lesson pool, for every check. Unset, the fixed rule keeps 12,000 and the learned policy chooses it. A pool the budget cut also shows the model up to two of the lessons it left out (the tail sample, [The pool](delivery.md#which-lessons-are-asked)) |
+| `BORG_STOP_POOL_TOKENS` | the learned policy's own choice (`12000` under the fixed rule) | Token budget of the lesson pool, for every check. Unset, the fixed rule keeps 12,000 and the learned policy chooses it. A pool the budget cut fills its last 15% by a draw and also shows the model as many of the lessons it left out as fit in 15% of the budget, at least two (the boundary draw and the tail sample, [The pool](delivery.md#which-lessons-are-asked)) |
+| `BORG_BOUNDARY` | on | `off`: no boundary draw, and a tail sample of two lessons: the pool fills its whole budget in its fixed order, as before 0.7.7 ([The pool](delivery.md#which-lessons-are-asked)) |
+| `BORG_LESSON_LINE` | `a2` | How the compact prompt shows a lesson: `a2`, `[id] question -> consequence` and the engineer's correction it was learned from, where this machine holds it (a synced peer's lesson shows as `a1`); `a1`, without the correction, as before 0.7.7. The pre-registered replay of logged checks picked `a2`. An `a2` line costs more tokens, so fewer lessons fit the same budget; `borg status` shows the lessons shown per check |
+| `BORG_ASYNC` | on | The turn-end check runs detached: the stop starts it and returns at once, and its questions reach the agent with the next prompt or tool call, or wake a listening idle session ([When a lesson arrives](delivery.md#when-a-lesson-arrives)). `off`: the stop makes the call itself and blocks for a grade 3, as before 0.7.7 |
 | `BORG_STOP_FORMAT` | compact | `classic`: the older prompt layout |
 | `BORG_STOP_GRADED` | on | `off`: no grades; any applying lesson blocks |
 | `BORG_SELECT` | the learned policy | The learned policy decides, the default since its pre-registered checks passed ([Evidence](evidence.md#lesson-selection)): it deviates from the fixed rule only where the outcomes show the deviation avoids more mistakes, rationed by the collective's `risk` ([Collectives](#collectives)). Until 0.7.6 it also ran the randomised question-count test on live checks; no check runs it now. `learned` names it. `fixed`: the fixed rule whatever else is set, the way back: with a grade 3 every 3 and 2 is asked, and the 1s up to 10 lessons; without one the 2s and 1s are handed over free, up to 10, never a lesson the session already had. `fixed` wins over `BORG_STOP_ASK_CAP` and `BORG_STOP_ATTENTION`, which win over the learned policy. Any other value is the default ([Which lessons are asked](delivery.md#which-lessons-are-asked)) |
@@ -576,7 +584,7 @@ project.
 | `BORG_MODE` | ignored | Ignored since 0.7.6 (live mode was removed; every check runs at the turn end). `borg doctor` notes once that it is set. `BORG_LIVE_DEBOUNCE_S` is gone too |
 | `BORG_PREDICT_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for the turn-end check and the session-end judge (see *Model runner*); `off`: no model call |
 | `BORG_OMP_MODEL` | `claude-sonnet-5` | The model of borg's calls through omp when `BORG_PREDICT_MODEL` and `BORG_LEARN_MODEL` pin none (see *Model runner*); `default`: omp's own default role. Unlike `omp:<model>`, it leaves Claude and opencode drones' calls alone |
-| `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (the session lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`) |
+| `BORG_PREDICT_TIMEOUT_S` | `45` | Time limit of the turn-end call (the session lock goes stale after twice this plus 30 s). At the stop it is capped by the harness's budget (`BORG_STOP_BUDGET_MS`). Unset, a detached check's call may take the larger of 45 s and twice the 95th percentile of the same model's last 64 answered checks; set, it is the limit as given |
 | `BORG_STOP_BUDGET_MS` | the harness's stop budget: omp 28 s, opencode and Codex 90 s, Claude Code none ([Capabilities](harnesses.md#capabilities)) | The stop hook's budget; the omp and opencode adapters set it to the budget borg's first answer gave them. It bounds the expert drone (60 s without any budget) and, when there is one, sizes the stop's model call (what the budget leaves when the call starts, less 3 s, never over `BORG_PREDICT_TIMEOUT_S`): on omp at most 25 s |
 | `BORG_VECTORS` | on | `off`: no vector recall |
 | `BORG_VECTOR_MODEL` | `~/.local/share/borg/models/potion-multilingual-128M` | Model directory |

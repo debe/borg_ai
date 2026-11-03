@@ -3,6 +3,36 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.7 (unreleased)
+
+The stop never waits for the model, and every check logs the pool it showed, so a better order can be
+measured before it is switched on.
+
+### Changed
+
+- The turn-end check runs detached: the stop returns at once, and its questions arrive with the next
+  prompt or tool call; `BORG_ASYNC=off` blocks at the stop as before. [Delivery](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#when-a-lesson-arrives)
+- A newer check settles a question still waiting from an older one; one check runs per session.
+- A question a newer check asks again is recorded `superseded`, not as an undelivered question.
+- A lesson line shows the engineer's correction it was learned from (`BORG_LESSON_LINE=a1`: without).
+- A pool its budget cuts fills its last 15% by a draw, and its tail sample adds as many of the lessons
+  left out as fit in 15% of the budget, at least two (`BORG_BOUNDARY=off`: as before). [The pool](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+
+### Added
+
+- Waiting questions wake a listening idle session, with their text in the wake.
+- `pools.jsonl`: each detached check's eligible lessons, their exact chance to be shown and the
+  candidate orders' scores, logged only. [The pool log](https://github.com/debe/borg_ai/blob/main/docs/learning.md#the-pool-log)
+- Retrieval cues per lesson at `borg learn` (`BORG_CUES=off`), and `borg cues` to backfill.
+- Miss causes in `borg status` and borg web's Conscience tab.
+- `borg status` shows the turn-end check: call limit, failures, superseded jobs, peak memory.
+- A graded record keeps the model's design moves and each apply's why; stats count `check_dropped`.
+
+### Upgrading
+
+- Nothing to do. To keep the stop's own check and its block, set `BORG_ASYNC=off`.
+- Lessons learned before 0.7.7 have no retrieval cues: `borg cues` estimates the cost, `borg cues --apply` adds them.
+
 ## 0.7.6 (2026-11-01)
 
 The session-end judge judges every open delivery, sized by how much its model reads well, not by

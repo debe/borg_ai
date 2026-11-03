@@ -40,13 +40,19 @@ pub fn Cost() -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     });
-    // The conscience's checks: at the turn end, and live mode's during the turn (removed in 0.7.6, history).
-    let mode_series = vec![Series::new("hook", "turn-end checks", "var(--c-accent)"), Series::new("live", "live checks (before 0.7.6)", "var(--c-teal)")];
+    // The conscience's checks: at the stop, detached after it (0.7.7 on, check_async.rs), and live mode's
+    // during the turn (removed in 0.7.6, history).
+    let modes = ["hook", "async", "live"];
+    let mode_series = vec![
+        Series::new("hook", "checks at the stop", "var(--c-accent)"),
+        Series::new("async", "detached checks", "var(--c-violet)"),
+        Series::new("live", "live checks (before 0.7.6)", "var(--c-teal)"),
+    ];
     let mode_rows = Signal::derive(move || {
         st.with(|s| {
             s.days
                 .iter()
-                .map(|day| Row { label: short_day(day.day), vals: ["hook", "live"].iter().map(|m| day.t.usd_mode.get(*m).copied().unwrap_or(0.0)).collect() })
+                .map(|day| Row { label: short_day(day.day), vals: modes.iter().map(|m| day.t.usd_mode.get(*m).copied().unwrap_or(0.0)).collect() })
                 .collect::<Vec<_>>()
         })
     });
@@ -65,14 +71,14 @@ pub fn Cost() -> impl IntoView {
                 if c > 0.0 { usd(t.usd_by.get("check").copied().unwrap_or(t.usd) / c) } else { "–".into() }
             }) />
             <Tile label="Per used lesson" value=Signal::derive(move || per(t().n("changed"))) sub=Signal::derive(|| "all cost over lessons that changed the work".to_string()) color="var(--c-good)" />
-            <Tile label="Per question" value=Signal::derive(move || per(t().n("block_n") + t().n("live_ask_n"))) sub=Signal::derive(|| "asked at a stop (or live, before 0.7.6)".to_string()) color="var(--c-violet)" />
+            <Tile label="Per question" value=Signal::derive(move || per(t().n("block_n") + t().n("live_ask_n"))) sub=Signal::derive(|| "asked at a stop, or with the next prompt".to_string()) color="var(--c-violet)" />
         </section>
         <section class="panel">
             <h2>"Cost per day"<small>"by purpose, with the running total"</small></h2>
             <StackedChart rows=rows series=series money=true cumulative=true ranges=true />
         </section>
         <section class="panel">
-            <h2>"Checks"<small>"the conscience's model calls per day: at the turn end, and live mode's during the turn until 0.7.6"</small></h2>
+            <h2>"Checks"<small>"the conscience's model calls per day: at the stop, detached after it, and live mode's during the turn until 0.7.6"</small></h2>
             <StackedChart rows=mode_rows series=mode_series money=true ranges=true />
         </section>
         <section class="two">

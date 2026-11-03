@@ -31,6 +31,23 @@ fn facets_for_written(store: &std::path::Path, from: u64) {
     }
 }
 
+/// The retrieval cues (cues.rs) of the lessons a learn run appended to `store` after byte `from`: one
+/// model call each, a merge's new wording included; logged as a shadow score only (pools.rs).
+fn cues_for_written(store: &std::path::Path, from: u64) {
+    let ids = borg::facets::appended_ids(store, from);
+    if ids.is_empty() || !borg::cues::enabled() || !learn::learning() {
+        return;
+    }
+    let ask = |prompt: &str, schema: &Value| learn::ask_model_for("cues", prompt, schema);
+    let r = borg::cues::fill(store, Some(&ids), true, &ask, borg::runner::JOBS, learn::now_ms());
+    if r.written > 0 {
+        println!("cues written for {} lessons (${:.4})", r.written, r.cost_usd);
+    }
+    if !r.failed.is_empty() {
+        eprintln!("borg learn: no cues for {} lessons, `borg cues --apply` retries", r.failed.len());
+    }
+}
+
 /// Whether file descriptor `fd` is a terminal (bold headings only there, and never with NO_COLOR).
 fn atty(fd: i32) -> bool {
     // SAFETY: isatty only inspects the descriptor.
@@ -175,6 +192,7 @@ fn learn_store(home: &std::path::Path, session: Option<&str>) -> (usize, usize, 
     let from = borg::facets::len_of(&store);
     let got = learn::learn_in_reporting(home, session, &learn::ask_claude, learn::learning(), learn::now_ms(), &mut learn::print_step);
     facets_for_written(&store, from);
+    cues_for_written(&store, from);
     borg::vectors::refresh(&store);
     // Session end runs this in the background: publish today's counts (stats.rs) and the redacted
     // outcomes (outcome.rs `publish`) for the mesh.
@@ -259,6 +277,11 @@ fn debug_cmd(args: &[&str]) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // A stop's check, detached (check_async.rs): started by the stop hook with its job file, never a
+    // command of the table (`borg check` alone stays unknown).
+    if let ["check", "--job", job] = args.as_slice() {
+        std::process::exit(borg::check_async::main(job));
+    }
     // The table is the CLI: a word it does not name is no command, whatever an arm below would take.
     if let Some(cmd) = args.first().filter(|c| !borg::completions::known(c)) {
         eprintln!("borg: unknown command {cmd} (borg help lists them)");
@@ -297,6 +320,10 @@ fn main() {
         ["assimilate", rest @ ..] if rest.contains(&"--from-dir") => {
             borg::stats::set_purpose("assimilate");
             std::process::exit(borg::assimilate_dir::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema)))
+        }
+        ["cues", rest @ ..] => {
+            borg::stats::set_purpose("cues");
+            std::process::exit(borg::cues::main(rest, &|prompt: &str, schema: &Value| learn::ask_model(prompt, schema)))
         }
         ["facets", rest @ ..] => {
             borg::stats::set_purpose("facets");

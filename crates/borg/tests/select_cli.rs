@@ -474,8 +474,10 @@ fn a_pool_the_budget_cut_shows_a_tail_sample_and_logs_it() {
     let root = setup("select-tail");
     let eligible = ["Mdrain", "New", "G0", "G1", "G2", "G3", "G4", "G5"];
     for (session, policy) in [("t1", "fixed"), ("t2", "learned")] {
-        // Room for about two lines of the eight eligible: six dropped, two of them sampled.
-        let env = [("BORG_STOP_POOL_TOKENS", "60"), ("BORG_SELECT", policy)];
+        // Room for about two lines of the eight eligible: six dropped, two of them sampled. Without the
+        // boundary draw (`BORG_BOUNDARY=off`): the budget's pool and the tail alone, as before 0.7.7
+        // (whole.rs `explore` has the boundary's tests).
+        let env = [("BORG_STOP_POOL_TOKENS", "60"), ("BORG_SELECT", policy), ("BORG_BOUNDARY", "off")];
         prompt(&root, session, "Look at the telescope and glaciers code", &env);
         answer(&root, &eligible.map(|id| (id, 1)));
         stop(&root, session, "The telescope limits and the telescope edge case, plus glaciers.", &env);
@@ -506,7 +508,7 @@ fn a_pool_the_budget_cut_shows_a_tail_sample_and_logs_it() {
     // too; the next prompt delivers them tagged with their check, the next call judges one, and its
     // verdict lands on the queued channel with that check. The summary keeps each tail apply on its
     // route, delivered and labelled: the yield's `fill < shown` skips them in the pool's bins alone.
-    let env = [("BORG_STOP_POOL_TOKENS", "60"), ("BORG_SELECT", "fixed")];
+    let env = [("BORG_STOP_POOL_TOKENS", "60"), ("BORG_SELECT", "fixed"), ("BORG_BOUNDARY", "off")];
     let g = of(&root, "graded").into_iter().find(|g| g["session"] == "t1").unwrap();
     let (check, tail) = (g["check"].as_str().unwrap().to_string(), strings(&g["tail"]));
     assert!(tail.iter().all(|t| strings(&g["free"]).contains(t)), "{g}");

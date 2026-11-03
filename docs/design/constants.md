@@ -66,6 +66,9 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/select.rs` | `CHECK_HEX` | 12 hex digits (48 bits) | A graded check's id, the ` @<check>` tag on its record and on every delivery marker |
 | `borg/src/select/summary.rs` | `SV` | 9 | The selection summary cache's format; a summary of another version is rebuilt, never read (2: `spend`; 3: the stops' latency per harness, the monitor's weights; 4: `Past`, "left for later" counted at live checks, tallies at a session's end; 5: the live question's tally, what a session had, tail yields and counts; 6: the learned decisions that fell back to the fixed rule, per reason; 7: the question-count test's checks by k and s; 8: a live check's hand-over a stop asked is its free apply's delivery and verdict, and the live question's tally counts only checks with a 3; 9: the judge's `not_arisen` and `consequence_remains` verdicts as labels of their own, every answer's judge version on its apply (`jv`), the session-end judge a judge level of its own) |
 | `borg/src/judge_length.rs` | `VERSION`, `CACHE` | 2; `state/judge-length.json` | The judge's effective-length cache: its counts per model and prompt-size step (`[[step, tally], …]`: lessons sent and answered, calls, and the sums of squares their spread is computed from; the label `""` for lines naming no model) and the stamp of the `.cost` files they were read from; another version is rebuilt, never read (1: sent and answered only, check lines included) |
+| `borg/src/check_async.rs` | `JOB_VERSION` | 1 | A detached check's job file (`<state>/<s>.job.<check>`): the turn as its stop saw it |
+| `borg/src/pools.rs` | `VERSION`; `misses.json` | 1 | A line of the pool log (`pools.jsonl`); the miss causes' cache beside it, folded from its offset and rebuilt when the log is shorter |
+| `borg/src/cues.rs` | `key` | 16 hex digits (8 bytes of BLAKE3) | A lesson text's key: `cues.jsonl` and the pool log's `ver` name a wording by it |
 | `borg/src/select/summary.rs` | `STOP`, `LIVE`; `FREE_STOP`, `FREE_LIVE`, `LATER`, `WAIT`, `ASK_LIVE`; `TALLIES` | 0, 1; 0 to 4; 5 | Indices of `Summary::spend` and of a session's delivery tallies, and the tallies' width (checked at compile time): part of the cache's layout |
 | `borg/src/select/summary.rs` | `FELL_BACK` | `lock_busy` 0, `lock_failed` 1, `unrecorded` 2 | Indices of `Summary::fell_back`, by the graded record's `reason` (outcome.rs `DECIDED_BUSY`, `DECIDED_NO_LOCK`, `DECIDED_NO_RECORD`): part of the cache's layout |
 | `borg/src/select.rs` | `ARMS`, `Route::arm` | 3: ask 0, free 1, not now and placebo 2 | The length and order of every per-arm array (select/policy.rs `monitor`, select/replay.rs) |
@@ -116,7 +119,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/hook.rs` | `EDIT_CHARS` | 600 chars | One edit's line in the `.edits` and turn files: a whole written file |
 | `borg/src/hook.rs` | `COMMAND_CHARS` | borg-trace `TOUCH_CHARS` (200) | A shell command kept as a touch: a heredoc going in whole |
 | `borg/src/select.rs` | `PLACEBO_SLOTS` | 2 per check | The judge's extra work for the placebo arm (the fixed rule and the learned policy): of the applies a check delivers neither way, never one its session had, each lesson once; the chance ψ = min(1, 2 / candidates) is logged |
-| `borg/src/whole.rs` | `TAIL_SAMPLE` | 2 per check | The grader's extra lessons past the pool's budget, under every policy, and so what the sample adds to the prompt past the stable lesson block; their chance k / n is logged (`pt`) |
+| `borg/src/whole.rs` | `TAIL_SAMPLE` | at least 2 per check | The tail sample's floor where `BOUNDARY_SHARE` of a short remainder rounds to fewer; its chance k / n is logged (`pt`) |
+| `borg/src/hook.rs` | `LOCK_TRIES` | 3 | A detached check whose session lock cannot be written retrying forever: past it, it writes its answer without the lock |
 | `borg/src/hook.rs` | `DECIDE_WAIT` | 1 s (live.rs `AFTER_CALL` / 3) | A learned check holding the store's decision lock long (a summary rebuilt from a long log, a stopped process) holding up every other learned check's answer; past it the check takes the fixed rule (`reason`). Also derived: a third of what the stop's call leaves for the hook's records |
 | `borg/src/select/policy.rs` | `SOLVE_MAX` | 16 applies | The exact route solver's time per check (O(n³ log n) per draw); a larger check takes the fixed rule (source `size`), so its hit rate shows |
 | `borg/src/select/policy.rs` | `FIT_SESSIONS` | 256 sessions | The fit's dense block and its time; the labels it leaves out are counted |
@@ -223,6 +227,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/learn.rs` | `PROPOSAL_CHARS` | 2,000 chars | One episode's `agent` text: the end of the drone's last proposal (hook.rs, harness/claude.rs, assimilate.rs, notes.rs) |
 | `borg/src/learn.rs` | `TASK_CHARS` | 3,000 chars | A pasted spec going into the `.task` file and every episode |
 | `borg/src/facets.rs` | `MAX_FACETS`, `FACET_CHARS`, `MIN_FACETS` | 10, 300 chars, 3 | What a model answer adds to a lesson; a refusal or truncated answer stored as facets |
+| `borg/src/cues.rs` | `MAX_CUES`, `CUE_CHARS`, `MIN_CUES` | 10, 300 chars, 3 | What a model answer adds to `cues.jsonl`; a refusal or truncated answer stored as cues |
 | `borg/src/assimilate_dir.rs` | `CHUNK_LINES` | 150 lines | A long knowledge file overflowing, or diluting, one prompt |
 | `borg/src/review_fix.rs` | `DETAIL_CHARS` | 800 chars | What one review finding adds to the episode and the prompt |
 | `borg/src/notes.rs` | `MAX_COMMITS` | 20 | A scripted series of commits writing a note each |
@@ -256,6 +261,9 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/live.rs` | `call_limit` | budget − time spent − `AFTER_CALL`, at most predict.rs `timeout` | omp gives at most 25 s |
 | `borg/src/live.rs` | `stale_ms` | 2 × predict.rs `timeout` + 30 s | A holder's longest model call and `STALE_SLACK_MS` |
 | `borg/src/hook.rs` | `end_timeout` | min(learn.rs `learn_timeout`, 2 × predict.rs `timeout`): 90 s | Each session-end batch's call holds the session lock, renewed before each call (live.rs `Guard::renew`): it ends before the lock reads stale (`stale_ms`) |
+| `borg/src/check_async.rs` | `call_limit` | max(predict.rs `timeout`, 2 × p95 of the model's last `listen::GAPS_KEPT` answered checks) | A detached check's call: as `stale_ms`, twice what the model takes; `BORG_PREDICT_TIMEOUT_S` set is the limit as given |
+| `borg/src/whole.rs` | `explore`'s τ and replays | τ = the lessons a greedy fill of the window places; 512 replays | The boundary draw's scale, from measured per-lesson cost; conscience.rs `P_DRAWS` replays estimate π_b |
+| `borg/src/cues.rs` | `INCIDENT_CHARS` | 1,500 chars | learn.rs `EXCERPT_CHARS`: what an episode keeps of a correction |
 | `borg/src/listen.rs` | `stop_ms` | `longest_stop` + 30 s | A stop's mark outlives the longest stop by `STOP_SLACK_MS` |
 | `borg/src/learn/regret.rs` | `CAP` | 1,500 chars | learn.rs `EXCERPT_CHARS` |
 | `borg/src/escalation.rs` | `MISSED_W` | 3 | memory.rs `VETOED_W` |
@@ -283,6 +291,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/listen.rs` | `QUEUE_IDLE_MS` | 60 s | The same floor for codex's waiter, whose wake waits in codex's queue behind a running turn |
 | `borg/src/listen.rs` | `TOOL_MS` | 10 min | Floor, dated 2026-10-28: the least time a tool call that never ended holds a wake off; longer for a session whose tool calls run longer |
 | `borg/src/facets.rs` | `EST_USD_PER_LESSON` | $0.012 | Measured once (internal evaluation "facets"): the mean on the eval stores, $0.0112, rounded up. Display only: a dry run's estimate; nothing is capped by it |
+| `borg/src/cues.rs` | `EST_TOKENS_PER_LESSON` | 2,100 tokens | Measured once offline (internal evaluation "learn-retrieval", 2026-11-02): 1,415,298 tokens for 678 lessons. Display only, a dry run's estimate before `cues.jsonl` holds a measured cost |
 
 ## Method
 
@@ -292,6 +301,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/judge_length.rs` | `HOLD` | 0.85 | A prompt-size step is within the judge's effective length while its answered share's lower bound is at least this share of the reference's: NoLiMa's effective-length threshold (Modarressi et al., ICML 2025, arXiv 2502.05167) |
 | `borg/src/judge_length.rs` | `STEP` | ×1.5 | The prompt-size steps the judge's answered share is measured in, edges `END_START_BUDGET` × 1.5^j: finer than NoLiMa's ×2, so the budget moves by at most half again per decision (0.7.6 pre-registration, 2026-11-01) |
 | `borg/src/select/policy.rs` | `DELTA` | 0.05 | The gate's quantile, the evidence rule's (a deviation must beat the fixed rule at it) and the monitor's error probability: the conventional 95% |
+| `borg/src/pools.rs` | `RRF_K` | 60 | Reciprocal rank fusion's offset (Cormack, Clarke and Büttcher, SIGIR 2009), as the offline scorer |
+| `borg/src/pools.rs` | `Q_STEP`, `Q_CHANGED`, `Q_IGNORED` | 0.2, +1, −0.5 | The online value logged per lesson (`q`): the offline scorer's E2, fixed before the switch test was registered |
 | `borg/src/select/policy.rs` | `PRIOR_SD` | 2.5 | The weakly informative default for logistic coefficients (Gelman et al. 2008); also the ceiling of every learned spread |
 | `borg/src/select/policy.rs` | `ARD_START`, `LEVEL_START`, `SD_FLOOR` | 1.0, 0.5, 0.01 | Starting sd of a term without a dated prior (rank, pool, the interactions), starting spread of the session, lesson and judge effects (EM moves both), and the floor of every spread (0.01 on the log-odds scale is no effect) |
 | `borg/src/select/policy.rs` | `PSI_FLOOR` | 10⁻³ | The least chance a drawn placebo is weighed at (the monitor, the replay's P5): a logged ψ of 0 is rounding, so such a label weighs at most a thousand sure ones |
@@ -419,6 +430,7 @@ later value would be compared against.
 | `borg-search/src/bin/hs-vectors.rs` | `SHORT`, `WIDE`, `VECTOR_TOP` | 20, 30, 60 | Vector shortlist arms |
 | `borg-search/src/bin/hs-whole.rs` | `BM25_N` | 30 | Whole-pool arms |
 | `borg-search/src/seek.rs` | `CHUNK` | 1,000 | Model2Vec's chunk size, SeekStorm's README example |
+| `borg/src/whole.rs` | `BOUNDARY_SHARE` | 0.15 (`BORG_BOUNDARY=off`: 0) | Dated decision, 2026-11-03: the boundary draw's share of the pool budget and the tail sample's of the dropped lessons, sized for the pre-registered switch test of the pool's order (about 100 tail applies at grade ≥ 2 per evaluation window) |
 | eval switches | `BORG_STOP_ASK_CAP`, `BORG_STOP_ATTENTION=on` | | Eval arms; `BORG_SELECT=fixed` wins over the cap, which wins over attention, and both over the learned policy |
 | `eval/` | each script | | Each evaluation's parameters stay with its scripts and README |
 

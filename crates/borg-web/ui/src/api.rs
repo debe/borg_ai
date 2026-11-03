@@ -47,7 +47,8 @@ pub struct Totals {
     pub counts: BTreeMap<String, f64>,
     pub usd: f64,
     pub usd_by: BTreeMap<String, f64>,
-    /// The conscience's check cost per delivery mode (`hook`, `live`): part of `usd`, never stacked with `usd_by`.
+    /// The conscience's check cost per mode (`hook` at the stop, `async` detached, `live` before 0.7.6):
+    /// part of `usd`, never stacked with `usd_by`.
     pub usd_mode: BTreeMap<String, f64>,
     /// Events per `<kind>@<channel>` (`changed@live`, `block@stop`).
     pub channels: BTreeMap<String, f64>,
@@ -247,7 +248,8 @@ impl Lesson {
         a / (a + b)
     }
 
-    /// Times asked: in a turn-end block, or by a live check (live mode, before 0.7.6).
+    /// Times asked: in a turn-end block, or with the next prompt (a detached check's, or a live check's
+    /// before 0.7.6).
     pub fn asked(&self) -> f64 {
         self.usage.get("block").copied().unwrap_or(0.0) + self.usage.get("live_ask").copied().unwrap_or(0.0)
     }
@@ -761,6 +763,22 @@ pub struct Selection {
     /// Label health: the judge's effective length per model, the session-end judge's budget (borg
     /// judge_length.rs).
     pub judge: Vec<JudgeLength>,
+    /// The pool's exploration share (0: off), and the miss causes of the pool log (borg pools.rs
+    /// `Misses`); None before a detached check logged its pool.
+    pub boundary: f64,
+    pub misses: Option<Misses>,
+}
+
+/// The pool log's miss causes (borg pools.rs `Misses`): of the first applies at grade ≥ 2, those the fill
+/// order ranked low, per cause; the log's size.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Misses {
+    pub bytes: f64,
+    pub checks: f64,
+    pub positives: f64,
+    pub low: f64,
+    pub drawn: f64,
+    pub causes: Vec<(String, f64)>,
 }
 
 /// One judge's effective length (borg judge_length.rs `Length`): the session-end budget, whether it is
@@ -887,6 +905,18 @@ pub fn parse_select(v: &Value) -> Selection {
                 due_min_sessions: f(&t["due_min_sessions"]),
                 dilution: list(&t["dilution"], estimate),
                 ask_free: t["ask_free"].as_object().map(|_| estimate(&t["ask_free"])),
+            }
+        }),
+        boundary: f(&x["boundary"]),
+        misses: x["misses"].as_object().map(|_| {
+            let m = &x["misses"];
+            Misses {
+                bytes: f(&m["at"]),
+                checks: f(&m["checks"]),
+                positives: f(&m["positives"]),
+                low: f(&m["low"]),
+                drawn: f(&m["drawn"]),
+                causes: list(&m["causes"], |c| (s(&c[0]), f(&c[1]))),
             }
         }),
     }

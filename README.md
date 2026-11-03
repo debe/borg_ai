@@ -112,8 +112,11 @@ makes one model call per episode and writes or updates a lesson. Team documents 
 
 **Delivery.** Lessons arrive at two moments. *At the prompt or a touched file*, free, by word matching
 (Claude Code; ratified constraints on every harness), and graded lessons a stop handed over arrive the
-same way. *At the stop*, a free word gate skips most turns; otherwise one model call grades the eligible lessons, and a
-grade 3 blocks the stop for one more round. The same call judges whether what was handed over earlier
+same way. *At the stop*, a free word gate skips most turns; otherwise one model call grades the eligible
+lessons. Since 0.7.7 the stop never waits for it: the call runs detached, and its questions reach the
+agent with the next prompt or tool call, as questions about the turn they judged, or wake a listening
+idle session. A newer check settles an older waiting question; one check runs per session
+(`BORG_ASYNC=off`: the stop calls the model itself and a grade 3 blocks it for one more round). The same call judges whether what was handed over earlier
 changed the work; free hand-overs are judged at the turn end, and what is still open once more at the
 session's end: every open delivery, in batches, each call reading as much of the session as the judge
 reads well. Live mode, which also checked during the turn, was removed in 0.7.6: it cost 8× more and
@@ -123,14 +126,21 @@ added nothing measurable. [Delivery](https://github.com/debe/borg_ai/blob/main/d
 ask it, hand it over free or leave it for later. The reference is 0.5.0's fixed rule, by grade (it no
 longer hands over free a lesson the session already had; `BORG_SELECT=fixed`). Every check also
 measures what a learned policy needs and the fixed rule's history cannot show: a placebo arm judges
-blindly up to two lessons the check does not deliver, a tail sample grades up to two lessons past the
-pool's budget, and the records say which lessons the session already had. The learned policy, the
+blindly up to two lessons the check does not deliver, a pool its budget cuts fills its last 15% by a
+draw and grades a tail sample of the lessons past it that fit in 15% of the budget (at least two), each at a logged chance,
+and the records say which lessons the session already had. The learned policy, the
 default, routes by the mistakes it expects each route to avoid, learned from the logged outcomes, and
 deviates from the fixed rule only where the outcomes show it gains. Until 0.7.6 it also learned how
 many lessons to ask by a randomised test on live checks, which moved lessons between asked and handed
 over, never withholding one. A conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
 by default), keeps it on the fixed rule until the outcomes support a deviation, and a monitor puts the
 fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+
+**The pool log.** Each detached check logs every eligible lesson it could have shown, with its chance to
+be shown and the scores of the candidate orders a pre-registered test will compare: word matches,
+retrieval cues `borg learn` writes per lesson, the design moves of the previous check, the lesson's
+value from its verdicts, vectors. Logged only, never in the prompt; `borg status` and `borg web` show
+why first applies sat low in the order. [The pool log](https://github.com/debe/borg_ai/blob/main/docs/learning.md#the-pool-log)
 
 **Outcomes and belief.** Every delivery is logged with the check that routed it and its probability,
 and what followed (changed, ignored, corrected anyway, vetoed, regretted, tested) moves the lesson's
@@ -244,7 +254,9 @@ The opt-in lasts until `--off` or the session's end.
 When its turn ends, borg wakes it in the way its harness allows. On Claude Code the model starts
 `borg listen --wait` in the background. The omp and opencode adapters keep a stream running. On codex a
 detached waiter queues a turn with `codex queue`. The wake names who wrote and how many messages wait,
-and the session's next prompt hook shows the messages themselves. Nothing wakes a session while the
+and the session's next prompt hook shows the messages themselves. Questions a turn-end check left
+waiting wake a listening session too, and the wake carries them itself; a wake that fails puts them
+back, so the next prompt still asks them. Nothing wakes a session while the
 engineer's own turn runs. `borg top` shows who listens in its WAKE column.
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
 
@@ -292,7 +304,8 @@ effects with their intervals, label health, the fitted delivery rates, pool yiel
 harness against its stop budget, and the learned decisions a guard gave the fixed rule; under the
 learned policy also its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test (checks drawn,
 refused by the gate, the draws, the risk share in force, the readout once due) and the monitor's reading
-with the health of its weights. It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (stores, lesson selection, what is wired,
+with the health of its weights, and why first applies sat low in the pool's order (miss causes, from
+the pool log). It reads the same files as `borg top` and needs no mesh. In the terminal: `borg status` (stores, the turn-end check, lesson selection, what is wired,
 spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 [Statistics and the page](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
 
@@ -301,8 +314,9 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 - **Most turn ends cost 0 tokens**: the free gate skipped 78% of 1,117 real turn ends. Early delivery
   and grade-2 and grade-1 lessons never call a model during the session; they are judged inside a call a
   question pays for, or in one judge call at the session's end, made only when something is still open.
-- **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s. An extra round
-  happens only for a grade-3 lesson.
+- **A turn-end call** costs about $0.07 (Sonnet, mean over 67 calls) and takes about 10 s, which no
+  hook waits for since 0.7.7: it runs detached. An extra round happens only with `BORG_ASYNC=off`, for
+  a grade-3 lesson.
 - **No call during the turn.** Live mode, which added one per burst of changes (8× borg's own spend,
   about $690 over 5,862 calls), was removed in 0.7.6
   ([why](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#live-mode-removed-in-076)).
@@ -312,14 +326,18 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 - There is no cost cap. Quality is what selection optimises; `borg status`, `borg top` and the Cost and
   Conscience tabs show what each check spent. An engineer who wants spend priced sets an
   optional `budget` for a collective, which prices the learned policy's pools ([Collectives](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#collectives)); none is set by default.
-- **The tail sample** adds at most two lessons to a turn-end call whose pool (12,000 tokens) left
-  lessons out, so the yield past the budget is measured.
+- **Exploration.** A turn-end call whose pool (12,000 tokens) left lessons out fills its last 15% by a
+  draw and adds a tail sample of the lessons left out that fit in 15% of the budget, at least two,
+  so the yield past the budget is measured (`BORG_BOUNDARY=off`: two). The default lesson line also
+  carries the engineer's correction, so fewer lessons fit the same budget.
+- **Retrieval cues** cost one learn call per new lesson (about 2,100 tokens); `BORG_CUES=off` stops them.
 
 ## Privacy
 
 **Stays on your machine:** everything from off repos and private collectives; your personal lessons,
-in every collective; raw episodes (your exact corrections), transcripts, the shell output adapters hand
-to borg, source code, `collectives.json`, per-session state.
+in every collective; raw episodes (your exact corrections, except what the model provider receives,
+below), transcripts, the shell output adapters hand to borg, source code, `collectives.json`,
+per-session state.
 
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
 lessons (with author emails and repo names); redacted reasoning excerpts of landed commits, each held by
@@ -331,7 +349,9 @@ and ratified constraints (the invariant, its lesson and who ratified it, never t
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content; run your own to keep even
 that in-house ([Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh), [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md)).
 **The model provider** receives what each model step needs: the turn and the eligible lessons, or the
-episode being learned.
+episode being learned. Since 0.7.7 a lesson's line in the turn-end check carries your correction behind
+it (`BORG_LESSON_LINE=a1` leaves it out), and a lesson's retrieval cues are asked with the agent's
+proposal and your correction (`BORG_CUES=off` asks none).
 
 Redaction (`redact` in `crates/borg/src/notes.rs`) strips tokens, keys, passwords and `.env` values from
 excerpts and presence. Lessons skip it: the model writes them as general questions, but read

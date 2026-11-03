@@ -1584,7 +1584,10 @@ pub fn deliver(home: &Path, caps: Caps, event: &str, input: &Value, started: Opt
         return out;
     }
     let mut answer = with_context(out, name, &render(&won, &view));
-    answer["shown_ids"] = json!(talk[..shown_now]);
+    // After the ids the hook's own answer named (hook.rs `free_context_with`: a detached check's asks).
+    let mut ids: Vec<Value> = answer.get("shown_ids").and_then(Value::as_array).cloned().unwrap_or_default();
+    ids.extend(talk[..shown_now].iter().map(|id| json!(id)));
+    answer["shown_ids"] = Value::Array(ids);
     Some(answer)
 }
 

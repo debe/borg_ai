@@ -78,6 +78,8 @@ fn borg(root: &Path, args: &[&str], bin: &Path, extra: &[(&str, &str)]) -> Outpu
     Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(args)
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store"))
@@ -272,6 +274,8 @@ fn prompt(root: &Path, session: &str) -> String {
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
     c.args(["hook", "claude", "prompt"])
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("BORG_HOME", root.join("store"))

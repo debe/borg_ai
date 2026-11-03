@@ -7,9 +7,15 @@
 //! - **Where:** only on the Stop path, after the free gate passed and right before the consequence model
 //!   call (seconds), where loading the embedder is small next to it. Prompt, early delivery and the free
 //!   gate stay BM25 only.
-//! - **How:** no rank fusion. The shortlist is BM25's top 20 as before, plus up to `k` vector hits not
-//!   already in it, under the same scope rule and done set (`extend`). The model decides relevance;
-//!   vectors only add recall. R3b's widening stays BM25-based.
+//! - **How:** no rank fusion. The shortlist is BM25's top `SHORTLIST` (30), plus up to `k` vector hits
+//!   not already in it, under the same scope rule and done set (`extend`). The model decides relevance;
+//!   vectors only add recall. R3b's widening stays BM25-based. With the whole-store pool (whole.rs) the
+//!   shortlist only orders the fill when the pool overflows its budget.
+//! - **Shadow:** a detached check also logs every eligible lesson's cosine to the work (`scored`,
+//!   pools.rs `cos`), and whether the shortlist would hold it, even when the pool fits. Logged only:
+//!   it never changes what the model is shown.
+//! - **One embedder per process:** `engine::Embedder::shared` loads the model once and keeps it for
+//!   the process's life; `engine::query_scored` searches with it and keeps each hit's score.
 //! - **Index:** an embedded SeekStorm vector index per store (`<store>/vectors/`), one vector per lesson
 //!   (question + situations + consequence), updated after `borg learn` / `borg assimilate --apply`, after a
 //!   mesh sync brings new lessons, and by `borg vectors --rebuild`; a missing index is built by the first
@@ -40,13 +46,13 @@ pub use model::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, enabled, index_dir, mod
 pub const DEFAULT_K: usize = 10;
 
 /// BM25 lessons the Stop's consequence model sees before vector additions. Baseline: top 30 found as
-/// much as top 20 plus vectors (internal evaluation "vectors"); with the whole-store pool it is the
+/// much as a top 20 plus vectors (internal evaluation "vectors"); with the whole-store pool it is the
 /// overflow order's head (whole.rs `select`).
 pub const SHORTLIST: usize = 30;
 
 /// Vector hits fetched beyond `k` + the shortlist (`shortlist`). Guard: done, out-of-scope and
 /// BM25-listed hits are dropped after the search, so a search of exactly `k` could come back short.
-const OVER_FETCH: usize = 30;
+pub const OVER_FETCH: usize = 30;
 
 /// SeekStorm's segment number bits of the index (2^11 segments). Method: SeekStorm's own default for an
 /// index of this size; borg-search's evaluation builds its indexes with the same layout.
@@ -62,7 +68,7 @@ pub fn lesson_text(c: &Challenge) -> String {
     format!("{}\n{}\n{}", c.question, c.situations.join("\n"), c.consequence)
 }
 
-/// The Stop shortlist: `bm25` (BM25's top 20, as `select_scoped` returns it) and then, in vector order,
+/// The Stop shortlist: `bm25` (BM25's top `SHORTLIST`, as `select_scoped` returns it) and then, in vector order,
 /// up to `k` lessons of `ranked` (lesson ids, best first) that `bm25` lacks. Each added lesson must be in
 /// `pool` (the lessons not done this session), in scope for `scope_text` (`rank_scoped`'s rule), not
 /// superseded and not dormant (a dormant lesson needs a strong word match, which a vector hit is not).
@@ -94,15 +100,20 @@ pub fn extend<'a>(bm25: Vec<&'a Challenge>, ranked: &[String], pool: &'a [Challe
 /// `scope_text`) extended by the vector index's hits (`extend`). Without vectors (off, no model, no index,
 /// any error) it is exactly BM25's top `n`. Also returns how many lessons the vectors added.
 pub fn shortlist<'a>(lessons: &Path, pool: &'a [Challenge], context: &str, scope_text: &str, n: usize) -> (Vec<&'a Challenge>, usize) {
-    let bm25 = conscience::select_scoped(pool, context, scope_text, n);
     let k = k();
     if !enabled() || k == 0 {
-        return (bm25, 0);
+        return (conscience::select_scoped(pool, context, scope_text, n), 0);
     }
     // Ask for more than `k`: done, out-of-scope and BM25-listed hits are dropped after the search.
     let ranked = recall(lessons, &query_tail(context), k + n + OVER_FETCH);
+    shortlist_from(pool, context, scope_text, n, &ranked)
+}
+
+/// `shortlist` with the vector index's hits given (`ranked`, lesson ids best first; empty: BM25 alone).
+pub fn shortlist_from<'a>(pool: &'a [Challenge], context: &str, scope_text: &str, n: usize, ranked: &[String]) -> (Vec<&'a Challenge>, usize) {
+    let bm25 = conscience::select_scoped(pool, context, scope_text, n);
     let before = bm25.len();
-    let out = extend(bm25, &ranked, pool, scope_text, k);
+    let out = extend(bm25, ranked, pool, scope_text, if enabled() { k() } else { 0 });
     let added = out.len() - before;
     (out, added)
 }
@@ -116,22 +127,29 @@ pub fn query_tail(context: &str) -> String {
 /// The ids of the lessons nearest to `text`, best first, at most `n`; empty whenever vectors are not
 /// available (fail open: no model, no index, the index being written, any error or panic).
 pub fn recall(lessons: &Path, text: &str, n: usize) -> Vec<String> {
+    scored(lessons, text, n).unwrap_or_default().into_iter().map(|(id, _)| id).collect()
+}
+
+/// The lessons nearest to `text` with their cosine to it, best first, at most `n`; None whenever
+/// vectors are not available (fail open, as `recall`). The embedder is the process's one
+/// (`engine::Embedder::shared`): a check that calls this twice loads it once.
+pub fn scored(lessons: &Path, text: &str, n: usize) -> Option<Vec<(String, f32)>> {
     #[cfg(feature = "vectors")]
     {
         if !enabled() {
-            return Vec::new();
+            return None;
         }
         let (index, model) = (index_dir(lessons), model_dir());
         if !index.join(engine::MANIFEST).is_file() || !model_present(&model) {
-            return Vec::new();
+            return None;
         }
         let text = text.to_string();
-        std::panic::catch_unwind(move || engine::query(&index, &model, &text, n).unwrap_or_default()).unwrap_or_default()
+        std::panic::catch_unwind(move || engine::Embedder::shared(&model).and_then(|e| engine::query_scored(e, &index, &model, &text, n)).ok()).ok().flatten()
     }
     #[cfg(not(feature = "vectors"))]
     {
         let _ = (lessons, text, n);
-        Vec::new()
+        None
     }
 }
 
@@ -495,8 +513,43 @@ pub mod engine {
         serde_json::from_str(&std::fs::read_to_string(index.join(MANIFEST)).ok()?).ok()
     }
 
-    /// The query: embed `text`, search the index, map hits to lesson ids (stored with each vector).
+    /// The query: embed `text`, search the index, map hits to lesson ids (stored with each vector),
+    /// best first. It loads the embedder for this one call and leaks it (`mem::forget`: a hook process
+    /// ends right after, and freeing the vocabulary would only cost time): never call it in a loop, or
+    /// twice in a process; `query_scored` with `Embedder::shared` loads it once.
     pub fn query(index: &Path, model: &Path, text: &str, n: usize) -> Result<Vec<String>, String> {
+        let t = std::time::Instant::now();
+        let embedder = Embedder::load(model)?;
+        let loaded = t.elapsed();
+        let hits = query_scored(&embedder, index, model, text, n);
+        std::mem::forget(embedder);
+        if std::env::var_os("BORG_VECTORS_TRACE").is_some() {
+            eprintln!("vectors: load {:.1} ms", ms(loaded));
+        }
+        Ok(hits?.into_iter().map(|(id, _)| id).collect())
+    }
+
+    impl Embedder {
+        /// The process's embedder for the model in `dir`, loaded on first use and kept for the
+        /// process's life, one per model directory and identity (`identity`: a fetched revision is a
+        /// new one): a detached check's shortlist and its logged cosines share one load.
+        pub fn shared(dir: &Path) -> Result<&'static Embedder, String> {
+            type Loaded = Vec<(std::path::PathBuf, String, &'static Embedder)>;
+            static LOADED: std::sync::Mutex<Loaded> = std::sync::Mutex::new(Vec::new());
+            let id = identity(dir);
+            let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, _, e)) = loaded.iter().find(|(d, i, _)| d == dir && *i == id) {
+                return Ok(e);
+            }
+            let e: &'static Embedder = Box::leak(Box::new(Embedder::load(dir)?));
+            loaded.push((dir.to_path_buf(), id, e));
+            Ok(e)
+        }
+    }
+
+    /// `query` with a loaded `embedder` (`Embedder::shared`): the hits with their scores, the dot
+    /// product of normalised vectors (the cosine), best first, at most `n`; ids once each.
+    pub fn query_scored(embedder: &Embedder, index: &Path, model: &Path, text: &str, n: usize) -> Result<Vec<(String, f32)>, String> {
         // A write (after `borg learn`) takes well under a second: wait briefly rather than give up.
         let _lock = (0..15)
             .find_map(|i| {
@@ -511,12 +564,8 @@ pub mod engine {
             return Err("index was built with another model".into());
         }
         let t = std::time::Instant::now();
-        let embedder = Embedder::load(model)?;
-        let loaded = t.elapsed();
         let v = embedder.embed(text);
-        let embedded = t.elapsed() - loaded;
-        // A hook process ends right after: freeing the vocabulary would only cost time.
-        std::mem::forget(embedder);
+        let embedded = t.elapsed();
         let _quiet = Quiet::new();
         runtime()?.block_on(async {
             let idx = open_index(index).await?;
@@ -539,20 +588,20 @@ pub mod engine {
                 )
                 .await;
             let fields = std::collections::HashSet::from(["id".to_string()]);
-            let mut ids = Vec::new();
+            let mut hits: Vec<(String, f32)> = Vec::new();
             for hit in &r.results {
                 let doc = idx.read().await.get_document(hit.doc_id, false, &None, &fields, &[]).await;
                 if let Some(id) = doc.ok().and_then(|d| d.get("id").and_then(Value::as_str).map(str::to_string))
-                    && !ids.contains(&id)
+                    && !hits.iter().any(|(x, _)| *x == id)
                 {
-                    ids.push(id);
+                    hits.push((id, hit.score));
                 }
             }
             idx.close().await;
             if std::env::var_os("BORG_VECTORS_TRACE").is_some() {
-                eprintln!("vectors: load {:.1} ms, embed {:.1} ms, index {:.1} ms", ms(loaded), ms(embedded), ms(t.elapsed() - loaded - embedded));
+                eprintln!("vectors: embed {:.1} ms, index {:.1} ms", ms(embedded), ms(t.elapsed() - embedded));
             }
-            Ok(ids)
+            Ok(hits)
         })
     }
 

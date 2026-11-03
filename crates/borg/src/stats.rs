@@ -21,15 +21,21 @@ use serde::{Deserialize, Serialize};
 pub const TURN_END: &str = "turn_end";
 /// The free gate skipped the model call (`why`: the score, or `noedit`).
 pub const GATE_SKIP: &str = "gate_skip";
-/// One turn-end model call (`n`: lessons shown, `usd`, `dur_ms`; `why: "failed"` when it gave no answer).
+/// One turn-end model call (`n`: lessons shown, `usd`, `dur_ms`; `why: "failed"` when it gave no answer):
+/// a stop's own, or a detached check's (`mode` `async`, with `rss_kb` and `limit_ms`, check_async.rs).
 pub const CHECK: &str = "check";
+/// A detached check that never called the model (check_async.rs `not_run`; `why`: `superseded`, a newer
+/// stop's job replaced it while another check ran; `gone`, the session ended before it ran). Counted
+/// apart from `check`, which counts model calls.
+pub const CHECK_DROPPED: &str = "check_dropped";
 /// A block: one extra round of agent work (`n`: questions, `lessons`: the asked ids).
 pub const BLOCK: &str = "block";
 /// Live mode, before 0.7.6 (removed; history only): one model call during the turn (`n`, `usd`,
 /// `dur_ms`, `why: "failed"`, as `check`).
 pub const LIVE_CHECK: &str = "live_check";
-/// Live mode, before 0.7.6 (removed; history only): grade-3 lessons a live check asked, delivered with
-/// the next prompt or tool call (`n`, `lessons`). Never an extra round: the drone answered as it worked.
+/// Grade-3 lessons a check asked, delivered with the next prompt or tool call (`n`, `lessons`): a
+/// detached check's (check_async.rs, since 0.7.7), or a live check's before 0.7.6. Never an extra round:
+/// the drone answers as it works.
 pub const LIVE_ASK: &str = "live_ask";
 /// Lessons handed over free at a prompt or touch (`n`, `lessons`).
 pub const EARLY: &str = "early";
@@ -122,8 +128,9 @@ pub struct Event {
     /// A short excerpt for this machine's own feed (a correction's words). Never folded into a rollup.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    /// The delivery mode the hook ran in before 0.7.6 (`hook` or `live`); empty since live mode was
-    /// removed, and outside a hook. Kept so older events still fold into `Bucket::usd_mode`.
+    /// How a check ran: `async` for a detached check (check_async.rs, 0.7.7 on); before 0.7.6 the
+    /// delivery mode the hook ran in (`hook` or `live`). Empty for a stop's own check and outside a
+    /// check; folded into `Bucket::usd_mode`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
     /// How an asked lesson reached the drone: `stop` (a block), `early`, `queued`, or `live` (a live
@@ -136,6 +143,13 @@ pub struct Event {
     /// hook captured it, or `borg assimilate` before 0.7.2 imported it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
+    /// On a detached check's `check` (check_async.rs): its process's peak resident memory, KiB.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rss_kb: u64,
+    /// On a detached check's `check`: the limit its model call had (check_async.rs `call_limit`), ms; a
+    /// failed call that took it all timed out (`async_tally`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub limit_ms: u64,
 }
 
 /// An episode's [`Event::source`]: its `harness` and `harness_version`, joined; empty for the hooks' (and
@@ -177,9 +191,9 @@ pub struct Bucket {
     /// Events per kind for each lesson they named.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lessons: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The conscience's model cost (`check` and `live_check`) per delivery mode: `live` for live mode's
-    /// events before 0.7.6, `hook` for every other (an event without a mode). A split of part of `usd`,
-    /// so never stacked with `usd_by`.
+    /// The conscience's model cost (`check` and `live_check`) per mode: `async` for detached checks
+    /// (0.7.7 on), `live` for live mode's events before 0.7.6, `hook` for every other (an event without a
+    /// mode: a stop's own check). A split of part of `usd`, so never stacked with `usd_by`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usd_mode: BTreeMap<String, f64>,
     /// Events per `<kind>@<channel>` for events that name a channel (`block@stop`, `changed@live`).
@@ -595,6 +609,63 @@ pub fn days_between(first: &str, last: &str) -> Vec<String> {
     (a..=b).map(|d| day(d * crate::clock::DAY_MS)).collect()
 }
 
+/// What the detached checks (check_async.rs) did, from the local events (`async_tally`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AsyncTally {
+    /// Model calls, and of them those that gave no answer, and those that took their whole limit.
+    pub checks: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+    /// Jobs that never called the model: a newer stop's replaced them, the session had ended, or their
+    /// job could not be written, started or placed (check_async.rs `not_run`).
+    pub superseded: u64,
+    pub gone: u64,
+    pub unstarted: u64,
+    /// The latest call's limit (ms), the largest peak memory of a check (KiB), and the lessons a check
+    /// showed its model, on average.
+    pub limit_ms: u64,
+    pub rss_kb: u64,
+    pub lessons: f64,
+    pub usd: f64,
+}
+
+/// Grace: a failed call this close to its limit (ms) took it all. The runner kills it at the limit; its
+/// own start and teardown are within this.
+const LIMIT_GRACE_MS: u64 = 1_000;
+
+/// The detached checks among `events` (`mode` `async`), and their checks that never ran.
+#[must_use]
+pub fn async_tally(events: &[Event]) -> AsyncTally {
+    let mut t = AsyncTally::default();
+    let mut shown = 0u64;
+    let mut latest = i64::MIN;
+    for e in events {
+        match e.kind.as_str() {
+            CHECK if e.mode == crate::check_async::MODE => {
+                t.checks += 1;
+                shown += e.n;
+                t.usd += e.usd;
+                t.rss_kb = t.rss_kb.max(e.rss_kb);
+                if e.why == "failed" {
+                    t.failed += 1;
+                    t.timed_out += u64::from(e.limit_ms > 0 && e.dur_ms + LIMIT_GRACE_MS >= e.limit_ms);
+                }
+                if e.limit_ms > 0 && e.ms >= latest {
+                    (latest, t.limit_ms) = (e.ms, e.limit_ms);
+                }
+            }
+            CHECK_DROPPED if e.why == crate::check_async::WHY_SUPERSEDED => t.superseded += 1,
+            CHECK_DROPPED if e.why == crate::check_async::WHY_GONE => t.gone += 1,
+            CHECK_DROPPED if e.why == crate::check_async::WHY_UNSTARTED || e.why == crate::check_async::WHY_UNPLACED => t.unstarted += 1,
+            _ => {}
+        }
+    }
+    if t.checks > 0 {
+        t.lessons = shown as f64 / t.checks as f64;
+    }
+    t
+}
+
 /// Days since 1970-01-01 of a `YYYY-MM-DD` date (clock.rs `days_from_civil`).
 fn day_number(date: &str) -> Option<i64> {
     let mut it = date.split('-').map(|p| p.parse::<i64>().ok());
@@ -840,6 +911,38 @@ mod tests {
         assert_eq!(b.usd_mode.len(), 2, "only the conscience's checks: {:?}", b.usd_mode);
         assert_eq!((b.channels["block@stop"], b.channels["live_ask@live"], b.channels["changed@live"]), (1, 1, 1));
         assert_eq!((b.counts[CHECK], b.counts[LIVE_CHECK]), (2, 1), "live checks are counted apart from turn-end checks");
+    }
+
+    #[test]
+    fn the_async_tally_counts_detached_checks_and_the_jobs_that_never_ran() {
+        let check = |ms: i64, n: u64, why: &str, dur_ms: u64, limit_ms: u64, rss_kb: u64| Event {
+            mode: crate::check_async::MODE.into(),
+            why: why.into(),
+            dur_ms,
+            limit_ms,
+            rss_kb,
+            usd: 0.01,
+            ..ev(CHECK, ms, "a@x", &[], n)
+        };
+        let dropped = |why: &str| Event { why: why.into(), mode: crate::check_async::MODE.into(), ..ev(CHECK_DROPPED, 5, "a@x", &[], 0) };
+        let evs = [
+            check(10, 40, "", 9_000, 45_000, 30_000),
+            check(30, 20, "failed", 44_500, 45_000, 52_000),
+            check(20, 30, "failed", 2_000, 60_000, 31_000),
+            ev(CHECK, 40, "a@x", &[], 99),
+            dropped("superseded"),
+            dropped("superseded"),
+            dropped("gone"),
+        ];
+        let t = async_tally(&evs);
+        assert_eq!((t.checks, t.failed, t.timed_out, t.superseded, t.gone), (3, 2, 1, 2, 1), "{t:?}");
+        assert_eq!((t.limit_ms, t.rss_kb), (45_000, 52_000), "the latest limit, the largest peak");
+        assert!((t.lessons - 30.0).abs() < 1e-9 && (t.usd - 0.03).abs() < 1e-9, "a stop's own check is not counted: {t:?}");
+        assert_eq!(async_tally(&[]), AsyncTally::default());
+        // A job that never ran is no model check in the rollup either.
+        let b = &fold("n1", &evs)["stat:n1:a@x:1970-01-01"];
+        assert_eq!((b.counts[CHECK], b.counts[CHECK_DROPPED]), (4, 3));
+        assert!((b.usd_mode["async"] - 0.03).abs() < 1e-9, "{:?}", b.usd_mode);
     }
 
     #[test]

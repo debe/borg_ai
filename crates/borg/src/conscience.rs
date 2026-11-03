@@ -55,6 +55,18 @@ pub struct Challenge {
     /// Who should hear it (reach.rs): empty for the team, `repo`, or `personal` (a withdrawn tombstone).
     #[serde(default)]
     pub reach: String,
+    /// The episodes the lesson was learned from (learn.rs `Lesson::episodes`), first first.
+    #[serde(default)]
+    pub episodes: Vec<String>,
+    /// The stored line's version (learn.rs `Lesson::version`; a merge writes the next): which wording a
+    /// check showed (pools.rs `ver`). 0 for a line without one (a ratified constraint).
+    #[serde(default)]
+    pub version: u32,
+    /// The engineer's correction of the first of `episodes` this machine holds (`with_corrections`):
+    /// shown with an `A2` line (whole.rs `line`). Empty when none resolves (a synced peer's lesson: its
+    /// episodes stay on the peer) or none was read.
+    #[serde(skip)]
+    pub correction: String,
     /// Scoped to systems none of which is the work's known system (systems.rs `gate`): scores 0.
     #[serde(skip)]
     pub off_system: bool,
@@ -80,6 +92,10 @@ pub struct Challenge {
     /// Mean trust of the lesson's authors in its area (trust.rs), 0.5 without evidence.
     #[serde(skip, default = "neutral")]
     pub trust: f64,
+    /// Its activation (memory.rs `Memory::activation`, the A behind `weight`), 0 for a new lesson:
+    /// logged beside the pool's scores (pools.rs `act`), never ranked by alone.
+    #[serde(skip)]
+    pub activation: f64,
 }
 
 fn one() -> f64 {
@@ -112,6 +128,9 @@ impl Default for Challenge {
             facets: Vec::new(),
             repo: String::new(),
             reach: String::new(),
+            episodes: Vec::new(),
+            version: 0,
+            correction: String::new(),
             off_system: false,
             weight: 1.0,
             dormant: false,
@@ -119,6 +138,7 @@ impl Default for Challenge {
             explore: 1.0,
             belief: uniform(),
             trust: trust::NEUTRAL,
+            activation: 0.0,
         }
     }
 }
@@ -161,13 +181,7 @@ fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Opti
     let outcomes = crate::outcome::read_team(path);
     let mut out = load_unweighted_with(path, before_ms, aliases);
     if personal {
-        let mut mine = load_unweighted_with(&path.with_file_name(crate::reach::PERSONAL_FILE), before_ms, aliases);
-        // A lesson `borg move` took elsewhere leaves its tombstone here: nothing to deliver.
-        mine.retain(|c| c.question != crate::reach::MOVED);
-        if !mine.is_empty() {
-            out.retain(|c| !mine.iter().any(|m| m.id == c.id));
-            out.extend(mine.into_iter().map(|c| Challenge { reach: String::new(), ..c }));
-        }
+        with_personal(&mut out, path, before_ms, aliases);
     }
     let memory = crate::memory::derive(&outcomes, &out, session);
     let trust = trust::Trust::compute(&out, &outcomes);
@@ -181,11 +195,45 @@ fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Opti
             c.belief = (m.alpha(), m.beta());
             c.dormant = m.dormant;
             c.consolidated = m.consolidated;
+            c.activation = m.activation;
         }
         c.trust = trust.lesson(c);
     }
     out.extend(constraints(path, before_ms, aliases, &out));
     out
+}
+
+/// Sets each lesson's `correction` from the `episodes.jsonl` beside `lessons` (a store's lessons file):
+/// the correction of the first of its `episodes` found there, not empty. Read only when the compact
+/// prompt shows corrections (whole.rs `line_format` `A2`), line by line. Local: episodes are never
+/// synced, so a peer's lesson keeps none.
+pub fn with_corrections(lessons: &Path, cs: &mut [Challenge]) {
+    use std::io::BufRead;
+    if crate::whole::line_format() != crate::whole::Line::A2 || cs.iter().all(|c| c.episodes.is_empty()) {
+        return;
+    }
+    let Ok(f) = std::fs::File::open(lessons.with_file_name("episodes.jsonl")) else { return };
+    let wanted: HashSet<&str> = cs.iter().flat_map(|c| c.episodes.iter().map(String::as_str)).collect();
+    #[derive(Deserialize)]
+    struct Said {
+        id: String,
+        #[serde(default)]
+        correction: String,
+    }
+    let mut said: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if let Ok(e) = serde_json::from_str::<Said>(&line)
+            && wanted.contains(e.id.as_str())
+            && !e.correction.trim().is_empty()
+        {
+            said.entry(e.id).or_insert(e.correction);
+        }
+    }
+    for c in cs {
+        if let Some(text) = c.episodes.iter().find_map(|e| said.get(e)) {
+            c.correction.clone_from(text);
+        }
+    }
 }
 
 /// `source` of a ratified constraint loaded as a lesson (`constraints`).
@@ -248,6 +296,27 @@ fn constraints(path: &Path, before_ms: Option<i64>, aliases: &Aliases, lessons: 
         by.insert(id, (ms, author, c));
     }
     by.into_values().map(|(_, _, c)| c).collect()
+}
+
+/// This engineer's personal lessons of the store at `path` (reach.rs `PERSONAL_FILE`) over the team's in
+/// `out`, as `load_store_for` delivers them: each replaces the team's line of its id (a tombstone too).
+fn with_personal(out: &mut Vec<Challenge>, path: &Path, before_ms: Option<i64>, aliases: &Aliases) {
+    let mut mine = load_unweighted_with(&path.with_file_name(crate::reach::PERSONAL_FILE), before_ms, aliases);
+    // A lesson `borg move` took elsewhere leaves its tombstone here: nothing to deliver.
+    mine.retain(|c| c.question != crate::reach::MOVED);
+    if !mine.is_empty() {
+        out.retain(|c| !mine.iter().any(|m| m.id == c.id));
+        out.extend(mine.into_iter().map(|c| Challenge { reach: String::new(), ..c }));
+    }
+}
+
+/// `load_unweighted` with this engineer's personal lessons over the team's (`load_store_for`'s texts,
+/// without weight or trust): the corpus the pool log scores a session's lessons in (pools.rs).
+pub fn load_store_unweighted(path: &Path, before_ms: Option<i64>) -> Vec<Challenge> {
+    let aliases = collective::aliases();
+    let mut out = load_unweighted_with(path, before_ms, aliases);
+    with_personal(&mut out, path, before_ms, aliases);
+    out
 }
 
 /// The lessons as stored (latest version per id, area normalised, engineers canonical), without
@@ -361,8 +430,19 @@ pub fn work_text(context: &str) -> std::borrow::Cow<'_, str> {
 /// `rank`, with scopes judged against `scope_text` (where the session works) instead of the whole
 /// context: a system the conversation only talks about is not one the drone works on.
 pub fn rank_scoped<'a>(challenges: &'a [Challenge], context: &str, scope_text: &str) -> Vec<(f64, &'a Challenge)> {
+    rank_raw(challenges, raw(challenges, context), scope_text)
+}
+
+/// Each challenge's word match against `context`, before scope, dormancy, successors, weight and trust
+/// (`rank_scoped`): BM25 of its documents (`documents`, `bm25_groups`), in challenge order. A check
+/// logs it (pools.rs `bm25q`).
+pub fn raw(challenges: &[Challenge], context: &str) -> Vec<f64> {
     let groups: Vec<Vec<Vec<String>>> = challenges.iter().map(documents).collect();
-    let mut raw = bm25_groups(&groups, context, 0.0);
+    bm25_groups(&groups, context, 0.0)
+}
+
+/// `rank_scoped` from the word matches `raw` computed (aligned with `challenges`).
+pub fn rank_raw<'a>(challenges: &'a [Challenge], mut raw: Vec<f64>, scope_text: &str) -> Vec<(f64, &'a Challenge)> {
     if challenges.iter().any(|c| !c.scope.is_empty()) {
         let have = Names::of(scope_text);
         for (r, c) in raw.iter_mut().zip(challenges) {
@@ -843,7 +923,7 @@ pub fn render_early(selected: &[&Challenge], topics: &[String]) -> Option<(Strin
 
 /// `render_early` whose first `owed` lessons are shown whatever the budget and count nothing toward
 /// it: a free delivery's hand-overs in place of questions the fixed rule asks (hook.rs `INSTEAD_NEXT`: the
-/// evidence rule's; and a live check's lines from before 0.7.6, `LEGACY_ASK`, `LEGACY_INSTEAD`), which
+/// evidence rule's; and a live check's lines from before 0.7.6, `ASK_NEXT`, `LEGACY_INSTEAD`), which
 /// the asks they replace would have carried without a bound. The rest fit `EARLY_CHARS` as they would without them.
 pub fn render_owing(selected: &[&Challenge], topics: &[String], owed: usize) -> Option<(String, usize)> {
     let clip = |s: &str, n: usize| -> String {
@@ -896,6 +976,22 @@ They are questions, not facts. Skip any that do not apply to your current work; 
 needed and answer it with evidence (code, spec, a complexity or concurrency argument). Then revise your work accordingly. \
 If this was a plan, your final message must again be the complete revised plan. End your final message with one line \
 per question: `<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
+    );
+    numbered(s, selected)
+}
+
+/// A detached check's questions (hook.rs `queued`, check_async.rs), delivered with the next prompt or
+/// tool call after the turn they are about: `render`'s questions, naming that turn by `excerpt` (the
+/// start of the message it ended with; empty: "your last turn"), each answered with `<id>: applies|skip`
+/// as `render` asks. The work may have moved on since, so one it already settled is skipped too.
+pub fn render_late(selected: &[&Challenge], excerpt: &str) -> String {
+    let turn = if excerpt.trim().is_empty() { "your last turn".to_string() } else { format!("your turn that ended with \"{}…\"", excerpt.trim()) };
+    let s = format!(
+        "[borg] After {turn}, engineers of this collective challenged that work with the questions below. They are \
+questions, not facts. Skip any that do not apply, and skip one the work since then already settled; for each that \
+does apply, investigate where needed and answer it with evidence (code, spec, a complexity or concurrency argument), \
+then revise your work accordingly. End your next final message with one line per question: `<id>: applies` if you \
+changed your work for it, `<id>: skip` if it does not apply.\n"
     );
     numbered(s, selected)
 }
@@ -1125,6 +1221,22 @@ mod tests {
             crate::outcome::append(&dir.join("outcomes.jsonl"), &o).unwrap();
         }
         dir
+    }
+
+    /// The pool log's corpus (pools.rs) holds the lessons a session is delivered: this engineer's own
+    /// beside the team's, and one that replaces its team tombstone by its own text.
+    #[test]
+    fn the_unweighted_store_has_the_personal_lessons_over_the_teams() {
+        use serde_json::json;
+        let l = |id: &str, q: &str| json!({"id": id, "origin_ms": 1, "question": q});
+        let dir = store("unweighted-personal", &[l("T", "team words"), l("P", "tombstone")], &[]);
+        let lessons = dir.join("lessons.jsonl");
+        std::fs::write(dir.join(crate::reach::PERSONAL_FILE), format!("{}\n{}\n", l("P", "my own words"), l("M", "mine alone"))).unwrap();
+        let mut got: Vec<(String, String)> = load_store_unweighted(&lessons, None).into_iter().map(|c| (c.id, c.question)).collect();
+        got.sort();
+        assert_eq!(got, [("M".into(), "mine alone".into()), ("P".into(), "my own words".into()), ("T".into(), "team words".into())]);
+        assert_eq!(load_unweighted(&lessons, None).len(), 2, "the team file alone");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1478,6 +1590,28 @@ output arc puts the job back into Queued, and the shift-start reset arc is remov
         let pool: Vec<(f64, &Challenge)> = ls.iter().map(|c| (5.0, c)).collect();
         let p = propensity(&pool, "s");
         assert!(p["proven"] > p["harmful"], "{p:?}");
+    }
+
+    /// `raw` then `rank_raw` is `rank_scoped`: the split that lets a check log its word matches changes
+    /// no ranking (scope, dormancy, successors, weight and trust all apply after it).
+    #[test]
+    fn the_raw_word_match_then_rank_raw_is_rank_scoped() {
+        let mut cs = vec![
+            ch("a", "websocket deadlock on reconnect"),
+            ch("b", "cache invalidation after deploy"),
+            Challenge { scope: vec!["Orion".into()], ..ch("c", "orion websocket buffer") },
+            Challenge { dormant: true, ..ch("d", "deadlock in the websocket pool") },
+            Challenge { supersedes: vec!["b".into()], source: "queen".into(), ..ch("e", "cache invalidation on deploy") },
+        ];
+        cs[0].weight = 0.4;
+        cs[4].trust = 0.9;
+        let (context, scope) = ("websocket deadlock cache deploy", "repo beacon");
+        let raw = raw(&cs, context);
+        assert_eq!(raw.len(), cs.len());
+        let split: Vec<(f64, String)> = rank_raw(&cs, raw, scope).into_iter().map(|(s, c)| (s, c.id.clone())).collect();
+        let whole: Vec<(f64, String)> = rank_scoped(&cs, context, scope).into_iter().map(|(s, c)| (s, c.id.clone())).collect();
+        assert!(!whole.is_empty());
+        assert_eq!(split, whole);
     }
 
     #[test]

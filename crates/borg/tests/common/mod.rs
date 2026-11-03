@@ -51,6 +51,31 @@ pub fn setup(name: &str) -> PathBuf {
     root
 }
 
+/// Replaces `setup`'s fake `claude` with one that blocks: it reads and saves its prompt as the plain
+/// fake does (from stdin), writes `started`, and answers only once `release` exists in `root` (or `root`
+/// is gone), with `answer.json` when there is one. A detached check's model call stays open until the
+/// test lets it go (`release`).
+pub fn blocking_fake(root: &Path) {
+    let fake = root.join("bin/claude");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\np=$(cat)\nn=$(( $(ls {d} | wc -l) ))\nprintf '%s' \"$p\" > {d}/$n.txt\ntouch {r}/started\nwhile [ ! -f {r}/release ] && [ -d {r} ]; do sleep 0.05; done\nif [ -f {a} ]; then cat {a}; else echo '{{\"structured_output\":{{\"moves\":[],\"applies\":[{{\"id\":\"Mdrain\",\"why\":\"w\",\"grade\":3}}]}},\"total_cost_usd\":0.05}}'; fi\n",
+            d = root.join("prompts").display(),
+            r = root.display(),
+            a = root.join("answer.json").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Lets a `blocking_fake` answer.
+pub fn release(root: &Path) {
+    std::fs::write(root.join("release"), "").unwrap();
+}
+
 pub fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> String {
     borg_as(root, "claude", event, input, env)
 }
@@ -58,9 +83,18 @@ pub fn borg(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> St
 /// `borg` as the hook of `harness` (claude, omp, opencode). Off Claude Code, pass
 /// `BORG_PREDICT_MODEL=claude:…`: the model call would otherwise go through that harness's real CLI.
 pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&str, &str)]) -> String {
+    let mut c = command(root, &["hook", harness, event], env);
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
+    String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into()
+}
+
+/// `borg args…` in the test environment the hooks run in (`borg_as`), with `env` on top: stdin and
+/// stdout piped, stderr null.
+pub fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
     let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
     let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
-    c.args(["hook", harness, event])
+    c.args(args)
         .env_clear()
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", path)
@@ -79,14 +113,15 @@ pub fn borg_as(root: &Path, harness: &str, event: &str, input: &Value, env: &[(&
         // their own.
         .env("BORG_SELECT", "fixed")
         .env("BORG_STOP_ATTENTION", "off")
+        // The stop's own check and its block (check_async.rs `on`): these tests pin what a stop asks;
+        // async_cli.rs passes `BORG_ASYNC=on` for the detached check.
+        .env("BORG_ASYNC", "off")
         .envs(env.iter().copied())
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = c.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
-    String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into()
+    c
 }
 
 /// One turn: a prompt, the given tool calls, then the Stop with `last`. Returns the Stop's output.

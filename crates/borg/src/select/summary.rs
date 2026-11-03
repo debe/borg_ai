@@ -88,8 +88,8 @@ use crate::outcome::{self, Outcome};
 /// `Check::xk`, `xs`, `Session::tested`; 8: a stop's results on a live check's hand-overs it asked
 /// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`;
 /// 9: the judge's `not_arisen` and `consequence_remains` verdicts, `Label::NotArisen`, `Label::Remains`,
-/// `Apply::jv`, the session-end judge's own judge level).
-pub const SV: u32 = 9;
+/// `Apply::jv`, the session-end judge's own judge level; 10: `Delivered::Superseded`, out of `counted`).
+pub const SV: u32 = 10;
 /// The cache beside the lessons file. Protocol.
 pub const CACHE: &str = "select-summary.json";
 /// The monitor's auto-revert mark beside the lessons file: while it exists the store keeps the fixed
@@ -125,6 +125,17 @@ pub enum Delivered {
     Yes,
     /// Dropped at delivery (the session had it, the budget was spent) or never delivered.
     Dropped,
+    /// A detached check's waiting ask a newer check asked again (outcome.rs `ROUTE_SUPERSEDED`): not
+    /// delivered, and no undelivered question either (`counted`); the newer ask's delivery counts.
+    Superseded,
+}
+
+impl Delivered {
+    /// Never reached the drone: dropped, or superseded by a newer ask.
+    #[must_use]
+    pub fn never(self) -> bool {
+        matches!(self, Delivered::Dropped | Delivered::Superseded)
+    }
 }
 
 /// What the judge made of an apply.
@@ -321,7 +332,9 @@ pub struct Fresh {
 }
 
 /// The pool's evidence: per log2 bin of fill position (positions 2^b − 1 to 2^(b+1) − 2), lessons
-/// shown and applied; tokens and lessons shown in all; the model calls' (tokens, ms); and per
+/// shown and applied; tokens and lessons shown in all; the model calls' (tokens, ms), the pool's tokens
+/// (`tokens`, what select/policy.rs `pool_feasible` predicts a budget at; the draws past it, outcome.rs
+/// `xtokens`, stay out, so the fit and its prediction read one size); and per
 /// harness, its stops' model calls (ms, failed), what borg top shows against the harness's stop
 /// budget (top.rs `Latency`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -668,7 +681,7 @@ impl Index {
 
 /// Is `a` delivered (or drawn as a placebo) and still without a verdict?
 fn waiting(a: &Apply) -> bool {
-    a.label == Label::Open && a.route != Route::Not && a.delivered != Delivered::Dropped
+    a.label == Label::Open && a.route != Route::Not && !a.delivered.never()
 }
 
 /// The index of `name` in `table`, added when new.
@@ -834,6 +847,8 @@ impl Summary {
             if self.pool.latency.len() >= LATENCY_KEEP {
                 self.pool.latency.remove(0);
             }
+            // At the pool's tokens, as a budget is predicted (`pool_feasible`): the boundary's and the
+            // tail's (`xtokens`) grow with the store, not the budget, and are in the fit's intercept.
             self.pool.latency.push((o.tokens, u32::try_from(o.dur_ms).unwrap_or(u32::MAX)));
         }
         // A stop's call against its harness's stop budget; a name borg does not know has no budget, and
@@ -1106,11 +1121,18 @@ impl Summary {
         let after = counted(&self.applies[i], stop, three);
         let Some(x) = self.sessions.get_mut(tick).filter(|_| tallied) else { return };
         for (b, a) in before.into_iter().zip(after) {
-            if let (Some((which, was)), Some((_, is))) = (b, a)
-                && was != is
-            {
-                let hits = &mut x.tally[which].1;
-                *hits = if is { *hits + 1 } else { hits.saturating_sub(1) };
+            match (b, a) {
+                (Some((which, was)), Some((_, is))) if was != is => {
+                    let hits = &mut x.tally[which].1;
+                    *hits = if is { *hits + 1 } else { hits.saturating_sub(1) };
+                }
+                // Out of the tally (a superseded ask, `counted`): its count goes with it.
+                (Some((which, was)), None) => {
+                    let t = &mut x.tally[which];
+                    t.0 = t.0.saturating_sub(1);
+                    t.1 = t.1.saturating_sub(u32::from(was));
+                }
+                _ => {}
             }
         }
     }
@@ -1148,6 +1170,7 @@ impl Summary {
             (outcome::DELIVERY, outcome::ROUTE_ASKED) => (Delivered::Yes, &[Route::Ask]),
             (outcome::DELIVERY, outcome::ROUTE_FREE) => (Delivered::Yes, &[Route::Free]),
             (outcome::DELIVERY, outcome::ROUTE_PLACEBO) => (Delivered::Yes, &[Route::Placebo]),
+            (outcome::DELIVERY, outcome::ROUTE_SUPERSEDED) => (Delivered::Superseded, &[Route::Ask]),
             (outcome::DELIVERY, _) => (Delivered::Dropped, &[Route::Ask, Route::Free, Route::Placebo]),
             (_, _) if o.channel == "queued" => (Delivered::Yes, &[Route::Free]),
             (_, _) if o.channel == "stop" => (Delivered::Yes, self.stop_routes(o, ix)),
@@ -1254,9 +1277,10 @@ impl Summary {
 /// (`Apply::had`; module doc: the rates are those of a lesson the session lacks, and a question of it
 /// may still be delivered and judged), an ask at the stop (it blocks: certain), a live question of a
 /// check without a 3 (no stop asks it: it arrives at a tool call or the next prompt, as a hand-over
-/// does, and is valued at the free rate, select/policy.rs `Valuer::ask`) and a placebo.
+/// does, and is valued at the free rate, select/policy.rs `Valuer::ask`), a placebo, and a superseded
+/// ask (`Delivered::Superseded`: the newer check's ask of the lesson counts, once).
 fn counted(a: &Apply, stop: bool, three: bool) -> [Option<(usize, bool)>; 2] {
-    if a.had {
+    if a.had || a.delivered == Delivered::Superseded {
         return [None; 2];
     }
     match a.route {
@@ -1847,6 +1871,35 @@ mod tests {
         // Resumed, the session asks Q3 after all: both its counts move.
         let s = fold(&lines(&[at_stop(delivery("q", "Q3", "q1", outcome::ROUTE_ASKED, 9))]), s);
         assert_eq!((s.sessions[0].tally[ASK_LIVE], s.sessions[0].tally[WAIT]), ((3, 3), (3, 2)));
+    }
+
+    #[test]
+    fn a_superseded_ask_counts_nowhere_in_the_live_question_tally() {
+        // A detached check's ask waits; a newer check asks the same lesson and takes the older line off
+        // the queue (hook.rs `supersede`); the newer ask reaches the drone. One question, delivered.
+        let log = [
+            graded("a", "a1", &["A"], &[3], &["A"], &[], 1),
+            graded("a", "a2", &["A"], &[3], &["A"], &[], 2),
+            Outcome { channel: "live".into(), reason: "superseded".into(), ..delivery("a", "A", "a1", outcome::ROUTE_SUPERSEDED, 3) },
+            Outcome { channel: "live".into(), ..delivery("a", "A", "a2", outcome::ROUTE_ASKED, 4) },
+            rec(outcome::ENDED, "a", &[], 5),
+        ];
+        let s = fold(&lines(&log), Summary::default());
+        assert_eq!(s.sessions[0].tally[ASK_LIVE], (1, 1), "the superseded ask is not an undelivered question");
+        assert_eq!(label_of(&s, "a1", "A"), (Route::Ask, Label::Open, Delivered::Superseded));
+        assert!(!waiting(&s.applies[s.checks[0].first as usize]), "no verdict waits on it");
+        // Superseded after the session's tallies were taken (it ended, then resumed): its count goes.
+        let ended = fold(&lines(&[graded("r", "r1", &["A"], &[3], &["A"], &[], 1), rec(outcome::ENDED, "r", &[], 2)]), Summary::default());
+        assert_eq!(ended.sessions[0].tally[ASK_LIVE], (1, 0));
+        let resumed = fold(&lines(&[Outcome { channel: "live".into(), ..delivery("r", "A", "r1", outcome::ROUTE_SUPERSEDED, 3) }]), ended);
+        assert_eq!(resumed.sessions[0].tally[ASK_LIVE], (0, 0));
+        // A withdrawn ask (settled by later work) stays a dropped one, as before.
+        let log = [
+            graded("b", "b1", &["A"], &[3], &["A"], &[], 1),
+            Outcome { channel: "live".into(), reason: "settled by later work".into(), ..delivery("b", "A", "b1", outcome::ROUTE_DROPPED_DONE, 3) },
+            rec(outcome::ENDED, "b", &[], 5),
+        ];
+        assert_eq!(fold(&lines(&log), Summary::default()).sessions[0].tally[ASK_LIVE], (1, 0));
     }
 
     #[test]

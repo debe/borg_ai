@@ -90,8 +90,10 @@ fn the_classic_format_asks_about_the_whole_pool_in_the_shortlist_layout() {
 #[test]
 fn over_the_budget_the_shortlist_order_picks_what_fits() {
     let root = setup("budget");
-    // Room for about two lines: the BM25 best matches of this turn win (telescope, then glaciers).
-    let env = [("BORG_STOP_POOL", "all"), ("BORG_PREFILTER", "off"), ("BORG_STOP_POOL_TOKENS", "60")];
+    // Room for about two lines: the BM25 best matches of this turn win (telescope, then glaciers). The
+    // fill order alone, without the boundary draw (`BORG_BOUNDARY=off`, as before 0.7.7; pools_cli.rs
+    // has the draw's).
+    let env = [("BORG_STOP_POOL", "all"), ("BORG_PREFILTER", "off"), ("BORG_STOP_POOL_TOKENS", "60"), ("BORG_BOUNDARY", "off")];
     turn(&root, "b1", "Look at the telescope and glaciers code", &[], "The telescope limits and the telescope edge case, plus glaciers.", &env);
     let ids = shown(&prompts(&root)[0]);
     assert_eq!(ids[..2], ["G3", "G4"], "best matches, in store order");

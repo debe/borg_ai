@@ -353,7 +353,11 @@ type Session = {
   owner: number // bumped by each mark of busy: a failed send frees only the mark it made (`occupy`)
   wakes: { text: string; ids: string[] }[] // the waiter's wakes not sent yet, with their messages' ids: sent once idle
   handed: Set<string> // ids of the messages the turn's contexts handed the model (`shown`), the newest HANDED: emptied once idle
+  waking?: Waking // the wake sent in and not yet answered to its waiter (`flush`)
 }
+
+/** A wake sent into the session: its ids, and whether its waiter was answered (once, `answered`). */
+type Waking = { ids: string[]; answered: boolean }
 
 /** What the session state machine needs from one opencode version. */
 type Io = {
@@ -407,6 +411,16 @@ function drones(io: Io) {
     }
   }
   const lastText = async (id: string) => (await history(id)).text
+
+  /** Answers the waiter of `s` for the wake `w`, once: `sent` at its echo or its send, whichever is
+   *  first; `failed` only when its send failed before any echo. */
+  const answerWaking = (s: Session, w: Waking, how: "sent" | "failed") => {
+    if (w.answered) return false
+    w.answered = true
+    if (s.waking === w) s.waking = undefined
+    answerWake(s.stream, how, w.ids)
+    return true
+  }
 
   /** Marks the session busy; the mark's number, for `release`. */
   const occupy = (s: Session) => {
@@ -476,6 +490,10 @@ function drones(io: Io) {
     occupy(s)
     if (marked) {
       s.echoes = Math.max(0, s.echoes - 1)
+      // A wake's echo: it went in, its turn starts. Answered now, not when its send resolves (opencode 1's
+      // `session.prompt`, opencode 2's queued prompt may resolve only once the turn ends), so the waiter
+      // marks its asks before this turn's stop reads whether they were answered.
+      if (s.waking) answerWaking(s, s.waking, "sent")
       return
     }
     if (!text.trim()) return
@@ -648,15 +666,18 @@ function drones(io: Io) {
     const sent = s.wakes.splice(0)
     const ids = sent.flatMap((w) => w.ids)
     const mark = occupy(s)
+    const waking: Waking = { ids, answered: false }
+    s.waking = waking
     io.ask(id, sent.map((w) => w.text).join("\n\n")).then(
       () => {
-        answerWake(s.stream, "sent", ids)
+        answerWaking(s, waking, "sent")
         note(`woke ${id}: messages wait`)
       },
       (e) => {
+        // Its echo came first: it went in after all.
+        if (!answerWaking(s, waking, "failed")) return note(`waking ${id} reported ${e} after its echo: it went in`)
         note(`waking ${id} failed: ${e}; its waiter wakes it again`)
         release(s, mark)
-        answerWake(s.stream, "failed", ids)
       },
     )
   }

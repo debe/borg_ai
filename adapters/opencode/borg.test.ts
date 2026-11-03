@@ -1039,6 +1039,82 @@ test("opencode 2: a wake that fails to go in is answered `failed`, so its waiter
   }
 })
 
+// opencode 2's queued prompt (and opencode 1's `session.prompt`) may resolve only once the woken turn
+// ends: the wake is answered at its echo, the turn's start, so the waiter marks its asks before that
+// turn's stop. Answered once.
+test("opencode 2: a wake is answered `sent` at its echo, before its prompt call resolves, and once", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log, answers] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const v2 = await setupV2()
+  const send = v2.ctx.session.prompt
+  let endTurn = () => {}
+  const turnEnds = new Promise<void>((r) => (endTurn = r))
+  v2.ctx.session.prompt = async (input: any) => {
+    await send(input)
+    await turnEnds
+  }
+  try {
+    await v2.emit("session.execution.succeeded", { sessionID: SESSION })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => v2.prompts.length === 1)
+    await settle()
+    assert.deepEqual(answered(answers), [], "not before it went in")
+    // The wake's echo: its turn starts.
+    await v2.say(WAKE, { borg: true })
+    await until(() => answered(answers).length === 1)
+    assert.deepEqual(answered(answers), [{ sent: ["m000000000001"] }])
+    endTurn()
+    await settle()
+    assert.equal(answered(answers).length, 1, "answered once")
+  } finally {
+    endTurn()
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_OPENCODE_LOG
+    await v2.cleanup()
+  }
+})
+
+test("opencode 1: without promptAsync a wake is answered `sent` at its echo, before session.prompt resolves", { timeout: 20_000 }, async () => {
+  const [bin, rec, wake, log, answers] = listenFake()
+  process.env.BORG_BIN = bin
+  process.env.BORG_OPENCODE_LOG = log
+  process.env.STOP_ANSWER = '{"listen":true}'
+  const { client, prompts } = fakeClient(() => PLAN)
+  let endTurn = () => {}
+  const turnEnds = new Promise<void>((r) => (endTurn = r))
+  const session: any = client.session
+  delete session.promptAsync
+  session.prompt = async (opts: any) => {
+    prompts.push(opts)
+    await turnEnds
+    return { data: undefined }
+  }
+  const hooks: any = await plugin.server({ client, directory: "/work/repo" } as any)
+  try {
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: SESSION } } })
+    await until(() => lines(rec).some((l) => l[0] === "stream"))
+    writeFileSync(wake, wakeLine(WAKE))
+    await until(() => prompts.length === 1)
+    await settle()
+    assert.deepEqual(answered(answers), [], "not before it went in")
+    await hooks["chat.message"]({ sessionID: SESSION }, { message: {}, parts: [{ type: "text", text: WAKE, metadata: { borg: true } }] })
+    await until(() => answered(answers).length === 1)
+    assert.deepEqual(answered(answers), [{ sent: ["m000000000001"] }])
+    endTurn()
+    await settle()
+    assert.equal(answered(answers).length, 1, "answered once")
+  } finally {
+    endTurn()
+    delete process.env.STOP_ANSWER
+    delete process.env.BORG_OPENCODE_LOG
+    await hooks.event({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } })
+    await hooks.dispose?.()
+  }
+})
+
 // A post_tool answer that shows the messages `ids`, as msg.rs `render` words one and `deliver` names
 // them; an `older` borg's names none.
 const showing = (ids: string[], older = false) =>

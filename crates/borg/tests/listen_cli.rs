@@ -42,9 +42,16 @@ fn listen_dir(root: &Path) -> PathBuf {
 
 /// `borg args…` in `cwd`, with only `env` on top of a bare test environment (no outer session id).
 fn command(root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_borg"));
+    command_of(Path::new(env!("CARGO_BIN_EXE_borg")), root, cwd, args, env)
+}
+
+/// `command`, run from the binary at `exe`.
+fn command_of(exe: &Path, root: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
+    let mut c = Command::new(exe);
     c.args(args)
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         // No fake model here: a model call fails open instead of reaching a real CLI on PATH.
@@ -188,8 +195,12 @@ impl Waiter {
     }
 
     fn spawn(root: &Path, work: &Path, flag: &str, session: &str, stdin: Stdio) -> Waiter {
+        Waiter::spawn_from(Path::new(env!("CARGO_BIN_EXE_borg")), root, work, flag, session, stdin)
+    }
+
+    fn spawn_from(exe: &Path, root: &Path, work: &Path, flag: &str, session: &str, stdin: Stdio) -> Waiter {
         let dir = work.display().to_string();
-        let mut child = command(root, work, &["listen", flag, "--session", session, "--dir", &dir], &[]).stdin(stdin).spawn().unwrap();
+        let mut child = command_of(exe, root, work, &["listen", flag, "--session", session, "--dir", &dir], &[]).stdin(stdin).spawn().unwrap();
         let pid = i32::try_from(child.id()).unwrap();
         let input = child.stdin.take();
         let out = child.stdout.take().unwrap();
@@ -570,5 +581,244 @@ fn under_a_binding_plugin_the_shells_listen_binds_no_session_by_pid() {
     let r = borg(&root, &work, &["listen"], &shell[..1], "");
     assert_eq!(r.code, Some(0), "{}", r.err);
     assert!(listens("s-b"), "the case the binder prevents: {}", r.out);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------- a detached check's asks
+
+/// A store lesson about the work, and a fake `claude` on PATH (`root/bin`) that reads its prompt from
+/// stdin and answers it applies at grade 3: a detached check (check_async.rs) of the stop asks it. The
+/// hooks' environment for it: the check detached, nothing between the stop and the model.
+fn async_store(root: &Path) -> Vec<(&'static str, String)> {
+    let store = root.join("base/collectives/corp");
+    std::fs::create_dir_all(&store).unwrap();
+    let lesson = json!({"id": "Mdrain", "origin_ms": 1, "question": "Does the net drain the budget place with an explicit consumer instead of a reset arc?", "consequence": "a reset arc drops the budget token"});
+    std::fs::write(store.join("lessons.jsonl"), format!("{lesson}\n")).unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("claude");
+    std::fs::write(&fake, "#!/bin/sh\ncat > /dev/null\necho '{\"structured_output\":{\"moves\":[],\"applies\":[{\"id\":\"Mdrain\",\"why\":\"w\",\"grade\":3}]},\"total_cost_usd\":0.01}'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vec![
+        ("BORG_ASYNC", "on".into()),
+        ("BORG_MATCH", String::new()),
+        ("BORG_PREFILTER", "off".into()),
+        ("BORG_EARLY", "off".into()),
+        ("BORG_SELECT", "fixed".into()),
+        ("BORG_PREDICT_MODEL", "claude:".into()),
+        ("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())),
+    ]
+}
+
+fn state_of(root: &Path, session: &str, ext: &str) -> String {
+    std::fs::read_to_string(root.join("base/collectives/corp/state").join(format!("{session}.{ext}"))).unwrap_or_default()
+}
+
+/// An opencode turn on the lesson's point, opted in, and its stop: the detached check's ask waits in
+/// the queue (the check ended by itself). Its check's id.
+fn asked_at_stop(root: &Path, work: &Path, env: &[(&str, &str)], session: &str) -> String {
+    let oc = |event: &str, extra: Value| hook(root, "opencode", event, &plain(session, work, &extra), env);
+    oc("prompt", json!({"prompt": "drain the budget place of the net"}));
+    opt_in(root, work, session);
+    let out = oc("stop", json!({"last_assistant_message": "I drop the budget token with a reset arc."}));
+    assert_eq!(out, json!({"listen": true}), "no block, the adapter starts its stream");
+    let check = state_of(root, session, "ctx").lines().find_map(|l| l.strip_prefix("#borg-checking @").map(String::from)).expect("a detached check");
+    until("the check's result", || state_of(root, session, "checked").contains(&check));
+    assert_eq!(state_of(root, session, "queued"), format!("live Mdrain @{check}\n"));
+    check
+}
+
+/// A detached check's ask wakes an idle listening session, and the wake carries its question about the
+/// turn it judged (a wake's turn may fire no prompt hook). Reserved while the wake is out; once the
+/// adapter says it went in, it is marked asked (via the wake) and never shown or woken for again.
+#[test]
+fn an_async_ask_wakes_an_idle_stream_session_with_its_text() {
+    let (root, work) = setup("async-ask");
+    let env = async_store(&root);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let check = asked_at_stop(&root, &work, &env, "s-oc");
+    let mut w = Waiter::answering(&root, &work, "s-oc");
+    let mut notes = Vec::new();
+    let wake = w.wake(&mut notes);
+    let id = format!("L@{check}:Mdrain");
+    assert_eq!((&wake["n"], &wake["ids"]), (&json!(1), &json!([id])), "{wake}");
+    let text = wake["wake"].as_str().unwrap_or_default();
+    assert!(text.contains("[Mdrain]") && text.contains("I drop the budget token with a reset arc."), "the question and its turn: {text}");
+    assert!(state_of(&root, "s-oc", "queued").is_empty(), "reserved: off the queue");
+    assert_eq!(state_of(&root, "s-oc", "queued.wake"), format!("live Mdrain @{check}\n"));
+    w.answer(&json!({"sent": [id]}));
+    until("the wake's ask marked", || state_of(&root, "s-oc", "ctx").contains("via=wake"));
+    let ctx = state_of(&root, "s-oc", "ctx");
+    assert!(ctx.contains(&format!("#borg-asked Mdrain @{check}\n#borg-live Mdrain ms=")), "{ctx}");
+    assert!(state_of(&root, "s-oc", "queued.wake").is_empty(), "committed");
+    let edits = state_of(&root, "s-oc", "edits");
+    assert!(edits.contains("I drop the budget token with a reset arc.\n#borg-asked Mdrain"), "the judged turn before the question: {edits}");
+    // Its turn: the prompt shows it no more.
+    let next = hook(&root, "opencode", "prompt", &plain("s-oc", &work, &json!({"prompt": "and the retries"})), &env);
+    assert!(!context(&next).contains("[Mdrain]"), "{next}");
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!(code, Some(128 + libc::SIGINT));
+    assert_eq!(rest, vec![r#"{"end":"stopped"}"#.to_string()], "woken once");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An ask a wake reserved is not the prompt's to show; a wake the adapter could not send in puts it back
+/// on the queue and leaves the engineer's turn mark (set meanwhile) as it is; the next prompt shows it
+/// and names it in `shown_ids`, so an adapter drops any wake it holds for it.
+#[test]
+fn a_failed_lesson_wake_returns_its_asks_to_the_queue_and_keeps_busy() {
+    let (root, work) = setup("async-failed");
+    let env = async_store(&root);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let check = asked_at_stop(&root, &work, &env, "s-oc");
+    let mut w = Waiter::answering(&root, &work, "s-oc");
+    let mut notes = Vec::new();
+    let wake = w.wake(&mut notes);
+    let id = format!("L@{check}:Mdrain");
+    assert_eq!(wake["ids"], json!([id]), "{wake}");
+    // The engineer types before the adapter answers: the reserved ask is not this prompt's.
+    let typed = hook(&root, "opencode", "prompt", &plain("s-oc", &work, &json!({"prompt": "now the retries"})), &env);
+    assert!(!context(&typed).contains("[Mdrain]") && typed.get("shown_ids").is_none(), "a_reserved_ask_is_not_delivered_by_the_prompt: {typed}");
+    let busy = std::fs::read_to_string(listen_dir(&root).join("s-oc.busy")).unwrap();
+    assert!(busy.starts_with("0 "), "the engineer's turn: {busy}");
+    w.answer(&json!({"failed": [id]}));
+    until("the ask back on the queue", || state_of(&root, "s-oc", "queued") == format!("live Mdrain @{check}\n"));
+    assert!(state_of(&root, "s-oc", "queued.wake").is_empty());
+    assert_eq!(std::fs::read_to_string(listen_dir(&root).join("s-oc.busy")).unwrap(), busy, "a failed wake never clears the engineer's mark");
+    assert!(!state_of(&root, "s-oc", "ctx").contains("#borg-asked"), "nothing marked asked");
+    let shown = hook(&root, "opencode", "post_tool", &plain("s-oc", &work, &json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}})), &env);
+    assert!(context(&shown).contains("[Mdrain]"), "{shown}");
+    assert_eq!(shown["shown_ids"], json!([id]), "{shown}");
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!(code, Some(128 + libc::SIGINT));
+    assert!(rest.iter().all(|l| !l.contains("wake\"")), "the shown ask wakes nothing: {rest:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A waiter that ends with an ask reserved (its adapter never said the wake went in) gives it back to
+/// the queue as it ends, so the next prompt, or the next waiter, delivers it: a waiting ask wakes once
+/// per waiter, and one the session was shown never.
+#[test]
+fn a_waiting_ask_wakes_once_and_a_delivered_one_never() {
+    let (root, work) = setup("async-once");
+    let env = async_store(&root);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let check = asked_at_stop(&root, &work, &env, "s-oc");
+    let id = format!("L@{check}:Mdrain");
+    let w = Waiter::answering(&root, &work, "s-oc");
+    let mut notes = Vec::new();
+    assert_eq!(w.wake(&mut notes)["ids"], json!([id]));
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!((code, rest), (Some(128 + libc::SIGINT), vec![r#"{"end":"stopped"}"#.to_string()]), "one wake for it");
+    assert!(state_of(&root, "s-oc", "queued.wake").is_empty(), "no answer came: given back as the waiter ended");
+    assert_eq!(state_of(&root, "s-oc", "queued"), format!("live Mdrain @{check}\n"));
+    // The wake's turn ends: its stop's check grades the waiting ask again and asks it in its place.
+    let out = hook(&root, "opencode", "stop", &plain("s-oc", &work, &json!({"last_assistant_message": "Looked at it."})), &env);
+    assert_eq!(out, json!({"listen": true}));
+    let newer = state_of(&root, "s-oc", "ctx").lines().rev().find_map(|l| l.strip_prefix("#borg-checking @")).unwrap_or_default().to_string();
+    assert_ne!(newer, check);
+    until("the stop's own check", || state_of(&root, "s-oc", "checked").contains(&newer));
+    assert_eq!(state_of(&root, "s-oc", "queued"), format!("live Mdrain @{newer}\n"), "superseded: one ask waits");
+    // The next waiter wakes for it once; this time it goes in.
+    let id = format!("L@{newer}:Mdrain");
+    let mut w = Waiter::answering(&root, &work, "s-oc");
+    let again = w.wake(&mut notes);
+    assert_eq!(again["ids"], json!([id]), "{again}");
+    w.answer(&json!({"sent": [id]}));
+    until("marked asked", || state_of(&root, "s-oc", "ctx").contains("via=wake"));
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!((code, rest), (Some(128 + libc::SIGINT), vec![r#"{"end":"stopped"}"#.to_string()]), "delivered: never again");
+    assert!(state_of(&root, "s-oc", "queued").is_empty() && state_of(&root, "s-oc", "queued.wake").is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The waiter's lines within `window`, none of them a wake: notes only (none of its passes woke).
+fn no_wake(w: &Waiter, window: Duration) -> Vec<String> {
+    let end = Instant::now() + window;
+    let mut seen = Vec::new();
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        match w.lines.recv_timeout(left) {
+            Ok(l) => {
+                assert!(!l.contains("\"wake\""), "no wake: {l}");
+                seen.push(l);
+            }
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
+/// While a detached check of the session runs (a job claimed by a live process), a waiting ask wakes
+/// nothing: that check may grade it again against newer work. Once it writes its result the waiter looks
+/// again and the ask wakes the session.
+#[test]
+fn a_waiting_ask_wakes_nothing_while_a_check_of_the_session_runs() {
+    let (root, work) = setup("async-running");
+    let env = async_store(&root);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let check = asked_at_stop(&root, &work, &env, "s-oc");
+    let state = root.join("base/collectives/corp/state");
+    let claimed = state.join(format!("s-oc.job.0000000000ff.{}", std::process::id()));
+    std::fs::write(&claimed, "{}").unwrap();
+    let mut w = Waiter::answering(&root, &work, "s-oc");
+    // Its first pass looks at once; the window spans more than one look (listen.rs `LOOK`).
+    no_wake(&w, Duration::from_secs(3));
+    assert_eq!(state_of(&root, "s-oc", "queued"), format!("live Mdrain @{check}\n"), "not reserved");
+    // The check ends: its job file goes, its result is written.
+    std::fs::remove_file(&claimed).unwrap();
+    let done = state_of(&root, "s-oc", "checked");
+    std::fs::write(state.join("s-oc.checked"), done).unwrap();
+    let mut notes = Vec::new();
+    let id = format!("L@{check}:Mdrain");
+    assert_eq!(w.wake(&mut notes)["ids"], json!([id]));
+    w.answer(&json!({"sent": [id]}));
+    until("marked asked", || state_of(&root, "s-oc", "ctx").contains("via=wake"));
+    let (code, _) = w.stop(libc::SIGINT);
+    assert_eq!(code, Some(128 + libc::SIGINT));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The running binary of `pid` was replaced on disk and this process still runs it.
+fn runs_deleted(pid: i32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p.to_string_lossy().ends_with(" (deleted)"))
+}
+
+/// A reinstalled borg restarts a waiter (reexec.rs) only once no wake's asks wait reserved for the
+/// adapter's answer: an answer the old image read into its buffer would be lost by the exec, and
+/// nothing would deliver those asks. Once the answer came, the waiter restarts on the new binary.
+#[test]
+fn a_waiter_restarts_on_a_reinstalled_borg_only_once_its_wake_is_answered() {
+    let (root, work) = setup("async-reexec");
+    let env = async_store(&root);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let check = asked_at_stop(&root, &work, &env, "s-oc");
+    let exe = root.join("exe/borg");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_borg"), &exe).unwrap();
+    let mut w = Waiter::spawn_from(&exe, &root, &work, "--stream", "s-oc", Stdio::piped());
+    let mut notes = Vec::new();
+    let id = format!("L@{check}:Mdrain");
+    assert_eq!(w.wake(&mut notes)["ids"], json!([id]));
+    assert!(!state_of(&root, "s-oc", "queued.wake").is_empty(), "reserved");
+    // The reinstall: another file at the path the waiter was started by.
+    let new = root.join("exe/borg.new");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_borg"), &new).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_borg"), &new).unwrap();
+    }
+    std::fs::rename(&new, &exe).unwrap();
+    assert!(runs_deleted(w.pid));
+    // More than two looks (listen.rs `LOOK`): each would restart it, were it not for the reserved ask.
+    let end = Instant::now() + Duration::from_millis(4_500);
+    while Instant::now() < end {
+        assert!(runs_deleted(w.pid), "no restart while the wake's ask waits for its answer");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    w.answer(&json!({"sent": [id]}));
+    until("marked asked", || state_of(&root, "s-oc", "ctx").contains("via=wake"));
+    until("restarted on the new binary", || !runs_deleted(w.pid));
+    assert!(state_of(&root, "s-oc", "queued.wake").is_empty());
+    let (code, rest) = w.stop(libc::SIGINT);
+    assert_eq!(code, Some(128 + libc::SIGINT), "{rest:?}");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -31,6 +31,8 @@ fn hook(root: &Path, event: &str, input: &Value, env: &[(&str, &str)]) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["hook", "claude", event])
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         .env("HOME", root.join("home"))
@@ -116,6 +118,8 @@ fn learn(root: &Path, env: &[(&str, &str)]) {
     let ok = Command::new(env!("CARGO_BIN_EXE_borg"))
         .args(["learn", "--session", SESSION])
         .env_clear()
+        // The stop's own check and its block (check_async.rs `on`), as these tests pin.
+        .env("BORG_ASYNC", "off")
         .env("BORG_UPDATE_CHECK", "off")
         .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
         .env("HOME", root.join("home"))

@@ -10,10 +10,11 @@
 
 use crate::conscience::{self, Challenge};
 
-/// State-file markers that close a turn (hook.rs appends one at every Stop that reaches the conscience).
-/// Never a selection line (`#borg-select`, `#borg-pf`, `#borg-placebo`, `#borg-routed`): those come
-/// mid-turn too and close nothing. Protocol.
-pub const MARKERS: [&str; 2] = ["#borg-asked", "#borg-skip"];
+/// State-file markers that close a turn (hook.rs appends one at every Stop that reaches the conscience;
+/// a detached check's stop `#borg-checking`, hook.rs `CHECKING`). Never a selection line (`#borg-select`,
+/// `#borg-pf`, `#borg-placebo`, `#borg-routed`) nor a detached check's later lines (`#borg-graded`,
+/// `#borg-predict-cost`): those come mid-turn too and close nothing. Protocol.
+pub const MARKERS: [&str; 3] = ["#borg-asked", "#borg-skip", "#borg-checking"];
 
 /// Learned (evaluation-decided): pre-registered in the internal evaluation "stop-prefilter" (not
 /// published): 0.9 × the lowest score of any labelled checkpoint with a relevant lesson in its shortlist
@@ -23,7 +24,7 @@ pub const THRESHOLD: f64 = 8.0;
 
 /// What the state file gained since the last Stop: this turn's prompt and touches (plus the drone's
 /// final message, appended by the caller). A live check's ask (`#borg-asked` followed by `#borg-live`:
-/// before 0.7.6, or one such ask handed over after the upgrade, hook.rs `LEGACY_ASK`) came during the
+/// before 0.7.6, or a queued ask handed over at a prompt or tool call, hook.rs `ASK_NEXT`) came during the
 /// turn and does not end it.
 pub fn turn(context: &str) -> &str {
     let mut start = 0;
@@ -148,6 +149,12 @@ pub struct Tally {
     pub judged: usize,
     pub judge_resolved: usize,
     pub judge_chars: usize,
+    /// A detached check's questions delivered after its turn (hook.rs `mark_late`, `late` lines): the
+    /// deliveries, their questions and size, and the questions a wake carried (`event=wake`).
+    pub late: usize,
+    pub late_questions: usize,
+    pub late_chars: usize,
+    pub late_woken: usize,
     /// Live mode's model calls during the turn (before 0.7.6, history only), their cost and lessons shown.
     pub live_checks: usize,
     pub live_cost: f64,
@@ -168,6 +175,13 @@ pub fn tally(state: &std::path::Path) -> Tally {
                     t.free += 1;
                     t.free_lessons += field("lessons=");
                     t.free_chars += field("chars=");
+                } else if line.starts_with("late ") {
+                    t.late += 1;
+                    t.late_questions += field("questions=");
+                    t.late_chars += field("chars=");
+                    if line.split_whitespace().any(|w| w == "event=wake") {
+                        t.late_woken += field("questions=");
+                    }
                 } else if line.starts_with("live ") {
                     t.live_checks += 1;
                     t.live_lessons += field("lessons=");
@@ -232,6 +246,29 @@ mod tests {
         assert_eq!(turn("x\n#borg-asked \n"), "");
         // A live check's ask is part of the turn, not its end.
         assert_eq!(turn("a\n#borg-asked L1\nb\n#borg-asked L2\n#borg-live L2 ms=5\nc\n"), "b\n#borg-asked L2\n#borg-live L2 ms=5\nc\n");
+    }
+
+    /// `borg status` counts a detached check's questions (hook.rs `mark_late`'s `late` cost lines), a
+    /// wake's apart.
+    #[test]
+    fn the_tally_counts_questions_asked_after_their_turn() {
+        let d = std::env::temp_dir().join(format!("borg-prefilter-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("s.cost"), "late event=prompt questions=2 chars=400\nlate event=wake questions=1 chars=100\nblock questions=1 chars=50\n")
+            .unwrap();
+        let t = tally(&d);
+        assert_eq!((t.late, t.late_questions, t.late_chars, t.late_woken, t.rounds), (2, 3, 500, 1, 1));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_detached_checks_stop_ends_the_turn_and_its_late_lines_do_not() {
+        let ctx = "first prompt\nsrc/a.rs\n#borg-checking @0123456789ab\nsecond prompt\n";
+        assert_eq!(turn(ctx), "second prompt\n", "the stop's marker ends the turn");
+        // The check writes its lines once the model answers, during the next turn: they end nothing.
+        let late = format!("{ctx}#borg-predict-cost 0.0500\n#borg-graded n=1 L1:3:0\n#borg-select policy=fixed @0123456789ab\nsrc/b.rs\n");
+        assert_eq!(turn(&late), "second prompt\n#borg-predict-cost 0.0500\n#borg-graded n=1 L1:3:0\n#borg-select policy=fixed @0123456789ab\nsrc/b.rs\n");
     }
 
     #[test]

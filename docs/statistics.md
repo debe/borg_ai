@@ -58,13 +58,20 @@ one lesson can get on top of either, as on the Conscience tab.
 **The tabs.** Overview (the day's activity and a live feed), Knowledge (the lessons), Conscience
 (checks, what their questions led to, and lesson selection: its policy and the default, spend per
 session, effects, label health, what is measured for the learned policy, the delivery rates, pool
-yield and stop latency per harness, the learned decisions a guard gave the fixed rule, per reason,
+yield and stop latency per harness, the miss causes of the pool log (the first applies at grade ≥ 2
+the fill order ranked low, per cause, [The pool log](learning.md#the-pool-log)), the learned decisions a guard gave the fixed rule, per reason,
 and under the learned policy its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test
 (checks drawn, controls, refused by the gate, the draws of s, the risk share in force, the readout once
 due) and the monitor's reading, each "not measured yet"
 until it is), Learning (above), Steering (corrections, pauses, resumes, vetoes and refused steers),
 Messages (the conversation between sessions, sends and refusals; the messages to the engineer it lists
 are acknowledged), Queen, Cost and Drones (which sessions run where, and their unread messages).
+
+**In the terminal.** `borg status` shows, per store, the turn-end check (`turn check`: detached or at
+the stop, the call limit now, the detached checks with their cost, failed ones and those at the limit,
+the jobs a newer stop superseded or that came after the session ended, the largest peak memory, the
+lessons shown per check and the lesson line format) and, in its selection line, the pool log: checks
+logged, its size, the exploration share and the miss causes.
 
 **The banner.** Over the tabs, the page says when borg itself has news, and only then: a newer
 release than this borg, with `borg update` to install it, and each member whose mesh protocol differs
@@ -91,10 +98,11 @@ reads `/api/update` and follows the release check and the mesh's version records
 |---|---|
 | `turn_end` | A drone finished a turn |
 | `gate_skip` | The free gate decided no lesson applies: no model call, 0 tokens |
-| `check` | The turn-end model call; `n` lessons shown, its cost and duration. `why: failed` when it gave no answer |
+| `check` | The turn-end model call; `n` lessons shown, its cost and duration. `why: failed` when it gave no answer. A detached check's (0.7.7, [Delivery](delivery.md#when-a-lesson-arrives)) has `mode: async`, its call's limit (`limit_ms`) and the process's peak memory (`rss_kb`) |
+| `check_dropped` | A detached check that never called the model: `why: superseded` (a newer stop's job replaced it), `gone` (the session ended first), `unstarted` or `unplaced` (its check could not start, or its job not be placed or read) |
 | `block` | An extra round: the drone was stopped and asked `n` questions |
 | `live_check` | History only (live mode, removed in 0.7.6): a model call during the turn (`borg check`); as `check`, but never a turn end |
-| `live_ask` | History only (live mode, removed in 0.7.6): the `n` lessons a live check asked (under the fixed rule, a check with a grade 3), delivered with the next prompt or tool call. No extra round |
+| `live_ask` | The `n` questions a detached check asked (0.7.7), delivered with the next prompt or tool call or in a wake; before 0.7.6 a live check's. No extra round |
 | `early`, `queued_free` | Lessons handed over free at a prompt or touch |
 | `changed`, `ignored`, `corrected`, `not_corrected` | What happened after a lesson was asked: used, ignored, corrected anyway, or no correction followed |
 | `regretted` | `borg learn` counted a later fix, or a review finding, against a lesson asked before the decision (`lessons`: that lesson). Its share of the blame is the `credit` of the `regretted` record in `outcomes.jsonl`, keyed by the regret episode (`cause`) |
@@ -104,7 +112,7 @@ reads `/api/update` and follows the release check and the mesh's version records
 | `veto_repeat` | `borg learn` merged a veto into a lesson an earlier veto made: the same reason said twice. Repeated vetoes per veto is the rate the collective should bring to zero. It is counted when the veto is learned and dated when the veto was said, so the latest days can still grow |
 | `review_finding` | A workflow review step found a bug and its fix step fixed it before any commit (recorded as an episode; `why`: severity) |
 | `lesson_new`, `lesson_merged`, `not_a_lesson` | What `borg learn`, an import or a queen answer made of it |
-| `model_call` | A model call outside the turn end: learn, assimilate, facets, the expert drone, the session-end judge (`why: judge`, one per batch, `n` lessons sent to the judge, its `usd` and `dur_ms`; `text: no answer` when the call failed) |
+| `model_call` | A model call outside the turn end: learn, assimilate, facets, retrieval cues (`why: cues`), the expert drone, the session-end judge (`why: judge`, one per batch, `n` lessons sent to the judge, its `usd` and `dur_ms`; `text: no answer` when the call failed) |
 | `steer_issued`, `steer_delivered`, `steer_dropped` | A pause, resume or veto message (`borg pause`, `borg resume`, or `borg no` naming a session on another machine) sent, shown to a session, or refused because the sending machine may not steer here (`why`: its role, or that it is revoked or unknown). On the first two, `why` is the kind (`pause`, `resume`, `veto`). A store from before 0.4 adds its old directives to the history |
 | `msg_sent`, `msg_delivered`, `msg_dropped` | A message (`borg tell`, `borg ask`) sent, shown to a session, or dropped: `why: window` when the sender's window to that recipient was full, its 10-minute rate not yet due, or its unread messages there filled its machine's share of the log ([Pacing](commands.md#messages)), `why: bounds` when the log's bound of 1 MiB per member and class cut lines (`n` lines). `why: rate` is 0.5's rate limit, in older events. Lines that expire after 7 days are not counted |
 | `pause_refused` | A tool call refused because its drone was paused |
@@ -163,7 +171,8 @@ decision read (`seen`), why a learned check fell back to the fixed rule (`reason
 the call (`model`, `prompt_hash`, `harness`, `version`, `dur_ms`, `failed`, `usd` as the CLI reported
 it). A `delivery` record says what delivery did with each lesson of a check: `route` `asked`, `free`,
 `placebo`, `dropped_done` (the session had it already, or it was queued twice), `dropped_chars` (past
-the delivery's character bound) or `never_delivered` (the session ended first), with its `reason`. An
+the delivery's character bound), `never_delivered` (the session ended first) or `superseded` (a newer
+detached check asked it again; out of the live-question rate), with its `reason`. An
 `ended` record marks each run of a session's end hook; the selection summary counts the session's
 delivery rates there. Every result of a routed lesson carries the `check` too, and the judge's carry
 its template version (`judge`) and whether the agent's declaration was left out (`stripped`). Records
@@ -173,7 +182,8 @@ from before 0.6.0 lack these fields and read as the fixed rule.
 statistics never read it, since the rollups already sync their counts. Rollups keep two splits beside the counts:
 
 - `usd_mode`: the cost of `check` and `live_check` per mode. Checks without a mode (from before modes
-  existed, and since 0.7.6) count as `hook`; `live` holds live mode's checks before 0.7.6. It is part of `usd`, never added to `usd_by`.
+  existed, a stop's own check since 0.7.6) count as `hook`; `async` holds detached checks (0.7.7), `live`
+  live mode's checks before 0.7.6. It is part of `usd`, never added to `usd_by`.
 - `channels`: events per `<kind>@<channel>`, for example `changed@live` (a question a live check asked
   that changed the work) or `block@stop`.
 
@@ -207,7 +217,8 @@ is logged as the model wrote it, a space or comma in it as `_`, so a padded id i
 unmatched. The whole pool's
 line there reads
 `pool mode=all eligible=<n> shown=<n> budget=fits|full`, with ` tail=<n>` when a tail sample was
-shown. A graded check writes `#borg-graded n=<applies> <id>:<grade>:<rank>,…`,
+shown, then ` boundary=<n>`, the lessons the boundary draw showed (0.7.7). A detached check's turn
+starts with `#borg-checking @<check>` at its stop; the turn ends there, never at its later lines. A graded check writes `#borg-graded n=<applies> <id>:<grade>:<rank>,…`,
 `#borg-select policy=… source=… fit=… gate=… applied=… @<check>`, `#borg-p` and `#borg-pf` before it
 delivers anything; every delivery marker (`#borg-asked`, `#borg-early`, `#borg-queued`, `#borg-placebo`)
 ends in ` @<check>`, the check that routed it, and `#borg-unjudged <ids> why=<reason>` names what a judge
