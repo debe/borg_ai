@@ -779,7 +779,8 @@ fn a_waiting_ask_wakes_nothing_while_a_check_of_the_session_runs() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The running binary of `pid` was replaced on disk and this process still runs it.
+/// The running binary of `pid` was replaced on disk and this process still runs it (Linux: `/proc`).
+#[cfg(target_os = "linux")]
 fn runs_deleted(pid: i32) -> bool {
     std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p.to_string_lossy().ends_with(" (deleted)"))
 }
@@ -787,6 +788,7 @@ fn runs_deleted(pid: i32) -> bool {
 /// A reinstalled borg restarts a waiter (reexec.rs) only once no wake's asks wait reserved for the
 /// adapter's answer: an answer the old image read into its buffer would be lost by the exec, and
 /// nothing would deliver those asks. Once the answer came, the waiter restarts on the new binary.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_waiter_restarts_on_a_reinstalled_borg_only_once_its_wake_is_answered() {
     let (root, work) = setup("async-reexec");
