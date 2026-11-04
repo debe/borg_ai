@@ -78,7 +78,7 @@ impl Harness for Omp {
     }
 
     fn probe(&self) -> Probe {
-        Probe { cli: "omp", tested: " (adapter tested with 18.8.5 and 18.10.4; a tool call's context needs 18.4.4 or newer)" }
+        Probe { cli: "omp", tested: " (adapter tested with 18.8.5, 18.10.4 and 18.15.0; a tool call's context needs 18.4.4 or newer)" }
     }
 
     /// Each session's task agents (`$PI_CODING_AGENT_DIR/sessions`, else `home/.omp/agent/sessions`).
@@ -104,8 +104,8 @@ pub fn sessions(home: &Path) -> PathBuf {
 pub fn session_file(sessions: &Path, id: &str) -> Option<PathBuf> {
     let suffix = format!("_{id}.jsonl");
     let named = |f: &PathBuf| f.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&suffix));
-    // The session record is the file's first line: one line read per candidate.
-    let records = |f: &PathBuf| first_line(f).is_some_and(|v| v["type"] == "session" && v["id"] == id);
+    // The session record is among the header lines: a few lines read per candidate.
+    let records = |f: &PathBuf| session_record(f).is_some_and(|v| v["id"] == id);
     read_dir(sessions).into_iter().filter(|p| p.is_dir()).flat_map(|slug| read_dir(&slug)).filter(|f| f.is_file() && named(f)).find(records)
 }
 
@@ -153,11 +153,14 @@ fn read_dir(p: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// The first line of `p`, parsed: an omp session file's session record.
-pub fn first_line(p: &Path) -> Option<Value> {
+/// An omp session file's session record: among its header records, before the first entry of the
+/// session's tree (an entry names its `parentId`). omp writes a `title` record before it once a
+/// session has a title, so it need not be the first line.
+pub fn session_record(p: &Path) -> Option<Value> {
     use std::io::BufRead;
-    let line = std::io::BufReader::new(std::fs::File::open(p).ok()?).lines().next()?.ok()?;
-    serde_json::from_str(&line).ok()
+    let lines = std::io::BufReader::new(std::fs::File::open(p).ok()?).lines().map_while(Result::ok);
+    let records = lines.filter_map(|l| serde_json::from_str::<Value>(&l).ok());
+    records.take_while(|v| v.get("parentId").is_none()).find(|v| v["type"] == "session")
 }
 
 fn read_lines(p: &Path) -> Vec<Value> {
@@ -307,6 +310,32 @@ mod tests {
         assert_eq!(ids("bbb"), ["T2_bbb"]);
         assert!(ids("aaa").is_empty(), "the main file confirms the id");
         assert_eq!(session_runs(&root, None, None).len(), 2, "a full scan reads every one");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// omp (18.14+) writes a `title` record before the session record once a session has a title:
+    /// the session's transcript is still found, so the turn-end, session-end and idle sweeps read it.
+    #[test]
+    fn a_titled_session_file_is_found_by_its_session_record() {
+        let root = std::env::temp_dir().join(format!("borg-omp-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let slug = root.join("-w-app");
+        std::fs::create_dir_all(&slug).unwrap();
+        let id = "01a1a0b8-4278-7400-b3df-ccfbc05cfc17";
+        let file = slug.join(format!("2026-11-03T09-23-12-632Z_{id}.jsonl"));
+        let lines = [
+            serde_json::json!({"type": "title", "v": 1, "title": "Port it", "source": "auto", "pad": "    "}),
+            serde_json::json!({"type": "session", "version": 3, "id": id, "timestamp": "2026-11-03T09:23:12.632Z", "cwd": "/w/app"}),
+            serde_json::json!({"type": "model_change", "id": "bf8d7273", "parentId": null}),
+        ];
+        std::fs::write(&file, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        assert_eq!(session_file(&root, id), Some(file.clone()));
+        assert_eq!(session_record(&file).unwrap()["cwd"], "/w/app");
+        // A session record past the first tree entry is no header: not this file's record.
+        let late = slug.join("2026-11-03T10-00-00-000Z_late.jsonl");
+        let rec = serde_json::json!({"type": "session", "id": "late"});
+        std::fs::write(&late, format!("{}\n{rec}\n", lines[2])).unwrap();
+        assert_eq!(session_file(&root, "late"), None);
         let _ = std::fs::remove_dir_all(root);
     }
 }

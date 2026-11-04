@@ -3,6 +3,13 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.8 (unreleased)
+
+### Fixed
+
+- omp transcripts are swept again: since omp writes a `title` line first, borg found no omp session's
+  transcript, so its corrections and answers waited for `borg assimilate`. Tested with omp 18.15.0.
+
 ## 0.7.7 (2026-11-03)
 
 The stop never waits for the model, and every check logs the pool it showed, so a better order can be

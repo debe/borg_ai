@@ -862,10 +862,10 @@ pub fn log_lines(h: &dyn harness::Harness, path: &Path, session: &str, carry: Ca
         Source::Claude => claude_from(session, carry, lines),
         Source::Omp => {
             // A read past the session record (a tail, the first turn after an upgrade) knows no cwd yet:
-            // the record, the file's first line, names it and says whether this is a sub-agent's session
+            // the record, among the file's first lines, names it and says whether this is a sub-agent's session
             // (as Codex reseeds from its `session_meta`).
-            let unseated = carry.cwd.is_empty() && lines.first().is_none_or(|v| v["type"] != "session");
-            let record = unseated.then(|| harness::omp::first_line(path)).flatten();
+            let unseated = carry.cwd.is_empty() && !lines.iter().take_while(|v| v.get("parentId").is_none()).any(|v| v["type"] == "session");
+            let record = unseated.then(|| harness::omp::session_record(path)).flatten();
             omp_from(session, carry, record.into_iter().chain(lines))
         }
         Source::Codex => codex_from(&codex::first_meta(path)?, carry, lines),

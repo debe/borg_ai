@@ -1,6 +1,6 @@
 # borg for omp (oh-my-pi)
 
-`borg.ts` is an omp extension. It turns omp's events into `borg hook omp <event>` calls and hands borg's answer back to omp. Tested against omp 18.8.5 and 18.10.4; a tool call's context needs 18.4.4 or newer.
+`borg.ts` is an omp extension. It turns omp's events into `borg hook omp <event>` calls and hands borg's answer back to omp. Tested against omp 18.8.5, 18.10.4 and 18.15.0; a tool call's context needs 18.4.4 or newer.
 
 | omp event | borg event | Notes |
 |---|---|---|
