@@ -125,17 +125,22 @@ impl Clock {
     pub fn of(outcomes: &[Outcome]) -> Self {
         let mut first: HashMap<&str, i64> = HashMap::new();
         let mut repos: HashMap<&str, HashSet<String>> = HashMap::new();
-        for o in outcomes.iter().filter(|o| outcome::SHARED_KINDS.contains(&o.kind.as_str()) && o.kind != outcome::TESTED && outcome::is_result(o)) {
+        for o in outcomes.iter().filter(|o| ticks(&o.kind) && outcome::is_result(o)) {
             let m = first.entry(o.session.as_str()).or_insert(o.ms);
             *m = (*m).min(o.ms);
             if !o.repo.is_empty() {
                 repos.entry(o.session.as_str()).or_default().insert(o.repo.clone());
             }
         }
-        let mut first: Vec<(i64, String)> = first.into_iter().map(|(s, ms)| (ms, s.to_string())).collect();
-        first.sort();
-        let at = first.iter().enumerate().map(|(i, (_, s))| (s.clone(), i as u64)).collect();
-        let repos = first.iter().map(|(_, s)| repos.remove(s.as_str()).unwrap_or_default()).collect();
+        Self::from_sessions(first.into_iter().map(|(s, ms)| (s.to_string(), ms, repos.remove(s).unwrap_or_default())))
+    }
+
+    /// From each ticking session's (id, first ms, repos), one row per session (facts.rs folds them).
+    pub fn from_sessions(sessions: impl IntoIterator<Item = (String, i64, HashSet<String>)>) -> Self {
+        let mut rows: Vec<((i64, String), HashSet<String>)> = sessions.into_iter().map(|(s, ms, r)| ((ms, s), r)).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let at = rows.iter().enumerate().map(|(i, ((_, s), _))| (s.clone(), i as u64)).collect();
+        let (first, repos) = rows.into_iter().unzip();
         Clock { first, at, repos }
     }
 
@@ -227,74 +232,122 @@ impl Memory {
     }
 }
 
+/// Whether a record of `kind` ticks the activity clock (`Clock`): a kind the team shares, not `tested`.
+pub fn ticks(kind: &str) -> bool {
+    outcome::SHARED_KINDS.contains(&kind) && kind != outcome::TESTED
+}
+
+/// A result kind's rank for a (lesson, session): 3 vetoed > 2 corrected > 1 changed > 0 ignored; None for
+/// every other kind. `asked_not_corrected` (settled by `borg learn`) is censored: the judge never said
+/// whether the drone acted on the lesson, so it is no ignore, and a verdict for the same lesson recorded
+/// after it counts alone. A point that never came up, an unclear verdict and a remaining consequence are
+/// censored too (and already turned away by outcome.rs `is_result`): they are measured only.
+pub fn result_of(kind: &str) -> Option<u8> {
+    match kind {
+        outcome::VETOED => Some(3),
+        outcome::CORRECTED => Some(2),
+        outcome::CHANGED => Some(1),
+        outcome::IGNORED => Some(0),
+        _ => None,
+    }
+}
+
+/// What `derive` reads from the outcomes, before any lesson or session is applied. Every part is a max, a
+/// min or a union per key, so it is the same whatever the order of the lines and however often one
+/// repeats: facts.rs folds it incrementally and hands it over in this form.
+#[derive(Debug, Default)]
+pub struct Folded<'a> {
+    pub clock: Clock,
+    /// Per (lesson, session): its `result_of`, the largest.
+    pub result: HashMap<&'a str, HashMap<&'a str, u8>>,
+    /// Per lesson: the sessions whose result was a change (a later correction in that session still
+    /// deposited the change), and the repos of those changes.
+    pub uses: HashMap<&'a str, HashSet<&'a str>>,
+    pub repos: HashMap<&'a str, HashSet<&'a str>>,
+    /// Per (lesson, deciding session): (lesson, session, the credit of the regrets that blame it, each
+    /// regret once: `blame`). A regret's credit is the largest of its duplicate lines (merging two logs
+    /// merges memory), the session it blames the first line's.
+    pub regret: Vec<(&'a str, &'a str, f64)>,
+    /// Per lesson: the sessions whose own tests went green after it was asked.
+    pub tested: HashMap<&'a str, HashSet<&'a str>>,
+    /// Per session: the engineer's corrections the log shows (`regret_cap`).
+    pub corrections: HashMap<&'a str, HashSet<i64>>,
+}
+
+impl<'a> Folded<'a> {
+    pub fn of(outcomes: &'a [Outcome]) -> Self {
+        let mut f = Folded { clock: Clock::of(outcomes), ..Folded::default() };
+        let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
+        // A placebo's result and an unclear verdict are no evidence about the lesson (outcome.rs `is_result`).
+        for o in outcomes.iter().filter(|o| outcome::is_result(o)) {
+            if is_correction(o) {
+                f.corrections.entry(o.session.as_str()).or_default().insert(o.ms);
+            }
+            if o.kind == outcome::TESTED {
+                for l in &o.lessons {
+                    f.tested.entry(l.as_str()).or_default().insert(o.session.as_str());
+                }
+                continue;
+            }
+            if o.kind == outcome::REGRETTED {
+                for l in &o.lessons {
+                    let e = regret.entry((l.as_str(), o.cause.as_str())).or_insert((0.0, o.session.as_str()));
+                    e.0 = e.0.max(o.credit.clamp(0.0, 1.0));
+                }
+                continue;
+            }
+            let Some(r) = result_of(&o.kind) else { continue };
+            for l in &o.lessons {
+                let e = f.result.entry(l.as_str()).or_default().entry(o.session.as_str()).or_insert(r);
+                *e = (*e).max(r);
+                if r == 1 {
+                    f.uses.entry(l.as_str()).or_default().insert(o.session.as_str());
+                    f.repos.entry(l.as_str()).or_default().insert(o.repo.as_str());
+                }
+            }
+        }
+        f.regret = blame(regret.into_iter().map(|((l, _), (credit, s))| (l, s, credit)));
+        f
+    }
+}
+
+/// Per (lesson, deciding session) the sum of its regrets' credits (lesson, session, credit), taken in
+/// ascending order so the float result does not depend on the order the regrets were folded in.
+pub fn blame<L: Copy + Ord, S: Copy + Ord>(regrets: impl IntoIterator<Item = (L, S, f64)>) -> Vec<(L, S, f64)> {
+    let mut v: Vec<(L, S, f64)> = regrets.into_iter().collect();
+    v.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(a.2.total_cmp(&b.2)));
+    let mut out: Vec<(L, S, f64)> = Vec::new();
+    for (l, s, credit) in v {
+        match out.last_mut() {
+            Some(last) if (last.0, last.1) == (l, s) => last.2 += credit,
+            _ => out.push((l, s, credit)),
+        }
+    }
+    out
+}
+
 /// Each lesson's memory as of `session` (its tick; the next tick when absent or None).
 pub fn derive(outcomes: &[Outcome], lessons: &[Challenge], session: Option<&str>) -> HashMap<String, Memory> {
-    let clock = Clock::of(outcomes);
+    derive_folded(Folded::of(outcomes), lessons, session)
+}
+
+/// `derive` from the outcomes as folded.
+pub fn derive_folded(f: Folded<'_>, lessons: &[Challenge], session: Option<&str>) -> HashMap<String, Memory> {
+    let Folded { clock, result, uses, repos, regret, tested, corrections } = f;
     let now = clock.now(session);
-    // Per (lesson, session): 3 vetoed > 2 corrected > 1 changed > 0 ignored; and the repos of the changes.
-    let mut result: HashMap<&str, HashMap<&str, u8>> = HashMap::new();
-    let mut uses: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let mut repos: HashMap<&str, HashSet<&str>> = HashMap::new();
-    // Per (lesson, regret): its credit, the largest of duplicate lines (merging two logs merges memory),
-    // and the deciding session it blames.
-    let mut regret: HashMap<(&str, &str), (f64, &str)> = HashMap::new();
-    // Per lesson: the sessions whose own tests went green after it was asked.
-    let mut tested: HashMap<&str, HashSet<&str>> = HashMap::new();
-    // Per session: the engineer's corrections the log shows (`regret_cap`).
-    let mut corrections: HashMap<&str, HashSet<i64>> = HashMap::new();
-    // A placebo's result and an unclear verdict are no evidence about the lesson (outcome.rs `is_result`).
-    for o in outcomes.iter().filter(|o| outcome::is_result(o)) {
-        if is_correction(o) {
-            corrections.entry(o.session.as_str()).or_default().insert(o.ms);
-        }
-        if o.kind == outcome::TESTED {
-            for l in &o.lessons {
-                tested.entry(l.as_str()).or_default().insert(o.session.as_str());
-            }
-            continue;
-        }
-        if o.kind == outcome::REGRETTED {
-            for l in &o.lessons {
-                let e = regret.entry((l.as_str(), o.cause.as_str())).or_insert((0.0, o.session.as_str()));
-                e.0 = e.0.max(o.credit.clamp(0.0, 1.0));
-            }
-            continue;
-        }
-        let r = match o.kind.as_str() {
-            outcome::VETOED => 3,
-            outcome::CORRECTED => 2,
-            outcome::CHANGED => 1,
-            outcome::IGNORED => 0,
-            // `asked_not_corrected` (settled by `borg learn`) is censored: the judge never said whether
-            // the drone acted on the lesson, so it is no ignore. A verdict for the same lesson recorded
-            // after it counts alone.
-            outcome::NOT_CORRECTED => continue,
-            // Censored too, and already turned away by `is_result`: a point that never came up says
-            // nothing of the lesson's use; an unclear verdict and a remaining consequence are measured only.
-            outcome::NOT_ARISEN | outcome::UNCLEAR | outcome::REMAINS => continue,
-            _ => continue,
-        };
-        for l in &o.lessons {
-            let e = result.entry(l.as_str()).or_default().entry(o.session.as_str()).or_insert(r);
-            *e = (*e).max(r);
-            if r == 1 {
-                uses.entry(l.as_str()).or_default().insert(o.session.as_str());
-                repos.entry(l.as_str()).or_default().insert(o.repo.as_str());
-            }
-        }
-    }
     // A regret of a session whose result for the lesson is a correction or a veto adds nothing: the
     // stronger result already counts that session's failure, whichever was recorded first.
-    // Per (lesson, deciding session) the regrets' credit, at most `regret_cap` of that session.
-    let mut blamed: HashMap<(&str, &str), f64> = HashMap::new();
-    for ((l, _), (credit, s)) in regret {
-        if result.get(l).and_then(|m| m.get(s)).is_none_or(|r| *r < 2) {
-            *blamed.entry((l, s)).or_default() += credit;
-        }
-    }
+    // Per (lesson, deciding session) the regrets' credit (`blame`), at most `regret_cap` of that session;
+    // per lesson their sum, in ascending order (the float result does not depend on the fold's order).
+    let mut capped: Vec<(&str, f64)> = regret
+        .into_iter()
+        .filter(|(l, s, _)| result.get(l).and_then(|m| m.get(s)).is_none_or(|r| *r < 2))
+        .map(|(l, s, credit)| (l, credit.min(regret_cap(corrections.get(s).map_or(0, HashSet::len)))))
+        .collect();
+    capped.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.total_cmp(&b.1)));
     let mut regretted: HashMap<&str, f64> = HashMap::new();
-    for ((l, s), credit) in blamed {
-        *regretted.entry(l).or_default() += credit.min(regret_cap(corrections.get(s).map_or(0, HashSet::len)));
+    for (l, credit) in capped {
+        *regretted.entry(l).or_default() += credit;
     }
     // Per (reach, repo): the ticks its lessons were eligible in (`Clock::eligible`).
     let mut eligible: HashMap<(&str, &str), Option<Vec<u64>>> = HashMap::new();
@@ -340,9 +393,14 @@ pub fn regret_cap(corrections: usize) -> f64 {
 /// writes (learn.rs `credit_regrets`, its `cause` the regret; a tag of it in the team view) is none: it
 /// is the regret again, and counting it would raise `regret_cap` with every regret the cap bounds.
 fn is_correction(o: &Outcome) -> bool {
-    match o.kind.as_str() {
+    is_correction_of(&o.kind, &o.cause)
+}
+
+/// `is_correction` of a record's kind and cause.
+pub fn is_correction_of(kind: &str, cause: &str) -> bool {
+    match kind {
         outcome::CORRECTED | outcome::VETOED => true,
-        outcome::MISSED => o.cause.is_empty(),
+        outcome::MISSED => cause.is_empty(),
         _ => false,
     }
 }
@@ -417,17 +475,33 @@ pub fn shuffle<T>(items: &mut [T], session: &str) {
     }
 }
 
-/// Words of `text` that discriminate in this store: tokens (conscience.rs `tokens`) that occur in at
-/// most a third of the lessons' questions.
-fn distinctive(all: &[Challenge]) -> impl Fn(&str) -> HashSet<String> + '_ {
-    let mut df: HashMap<String, usize> = HashMap::new();
-    for c in all {
-        for t in crate::conscience::tokens(&c.question).into_iter().collect::<HashSet<_>>() {
-            *df.entry(t).or_default() += 1;
+/// The words that discriminate in a store: tokens (conscience.rs `tokens`) that occur in at most a third
+/// of the lessons' questions. Built once per store, asked per text.
+pub struct Distinctive {
+    df: HashMap<String, usize>,
+    n: usize,
+}
+
+impl Distinctive {
+    pub fn new(all: &[Challenge]) -> Self {
+        let mut df: HashMap<String, usize> = HashMap::new();
+        for c in all {
+            for t in crate::conscience::tokens(&c.question).into_iter().collect::<HashSet<_>>() {
+                *df.entry(t).or_default() += 1;
+            }
         }
+        Distinctive { df, n: all.len().max(1) }
     }
-    let n = all.len().max(1);
-    move |text: &str| crate::conscience::tokens(text).into_iter().filter(|t| df.get(t).is_some_and(|d| 3 * d <= n)).collect()
+
+    /// Whether the token `t` discriminates.
+    pub fn is(&self, t: &str) -> bool {
+        self.df.get(t).is_some_and(|d| 3 * d <= self.n)
+    }
+
+    /// The distinctive words of `text`.
+    pub fn words(&self, text: &str) -> HashSet<String> {
+        crate::conscience::tokens(text).into_iter().filter(|t| self.is(t)).collect()
+    }
 }
 
 /// Baseline: undeclared, a change needs this many of the lesson's distinctive words new in the drone's
@@ -442,21 +516,21 @@ pub const NOVEL_WORDS: usize = 3;
 /// - Declared, in its final message: `<id>: applies` is a change, `<id>: skip` an ignore (the block
 ///   asks for one such line per question).
 /// - Undeclared: a change when its work after the block (`after`: the edits since, and the final
-///   message) brings in at least `min_new` of the lesson's distinctive words (`distinctive`, over `all`)
+///   message) brings in at least `min_new` of the lesson's distinctive words (`Distinctive`, over `all`)
 ///   that its work before the block (`before`: prompt, touches, earlier edits, the blocked message) did
 ///   not contain. Shared words alone are not enough: a drone working on the lesson's topic already used
 ///   them (the R1 replay's control matched other cases' edits as often as a run's own).
 pub fn resolve(asked: &[&Challenge], all: &[Challenge], before: &str, after: &str, final_msg: &str, min_new: usize) -> (Vec<String>, Vec<String>) {
-    let words = distinctive(all);
+    let words = Distinctive::new(all);
     let had: HashSet<String> = crate::conscience::tokens(before).into_iter().collect();
-    let new: HashSet<String> = words(&format!("{after}\n{final_msg}")).into_iter().filter(|w| !had.contains(w)).collect();
+    let new: HashSet<String> = words.words(&format!("{after}\n{final_msg}")).into_iter().filter(|w| !had.contains(w)).collect();
     let lower = final_msg.to_lowercase();
     let (mut changed, mut ignored) = (Vec::new(), Vec::new());
     for c in asked {
         let verdict = declared(&lower, &c.id.to_lowercase());
         let applies = match verdict {
             Some(v) => v,
-            None => words(&c.question).intersection(&new).count() >= min_new,
+            None => words.words(&c.question).intersection(&new).count() >= min_new,
         };
         match applies {
             true => changed.push(c.id.clone()),

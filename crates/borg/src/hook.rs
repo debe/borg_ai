@@ -311,16 +311,105 @@ fn log_cost(session: &str, line: &str) {
 fn early_acted(session: &str, all: &[conscience::Challenge], final_msg: &str, upto: Option<usize>) -> std::collections::HashSet<String> {
     let edits = edits_upto(session, upto);
     let state = std::fs::read_to_string(state_file(session)).unwrap_or_default();
+    acted_since(&state, &edits, all, final_msg)
+}
+
+/// `early_acted` of a session's state file and .edits lines, in one pass over each: O(session + deliveries
+/// × their lessons' question words), where reading each delivery's before and after whole is O(deliveries ×
+/// session), seconds in a long session.
+///
+/// Per delivery `resolve` reads the text before it (the state file up to the delivery's line, at `cut`,
+/// where `{line}\n` first appears, and every .edits line before it) and the work after it (the later
+/// .edits lines that are no `#borg-` bookkeeping, and the final message). Tokens never span a line break,
+/// so for the delivery at .edits line `p` a lesson's distinctive question word is new exactly when it
+/// occurs in a later work line or the final message, its first word in the state file starts at or after
+/// `cut`, and its first .edits line is not before `p`. The index keeps those four facts per question word
+/// of the lessons delivered, nothing per other word.
+fn acted_since(state: &str, edits: &str, all: &[conscience::Challenge], final_msg: &str) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
     let lines: Vec<&str> = edits.lines().filter(|l| !l.starts_with(WORK)).collect();
-    let mut out = std::collections::HashSet::new();
-    for (p, l) in lines.iter().enumerate() {
-        let Some(list) = l.strip_prefix("#borg-early ").or_else(|| l.strip_prefix("#borg-queued ")) else { continue };
-        let ids: std::collections::HashSet<&str> = ids_in(list).collect();
-        let asked: Vec<&conscience::Challenge> = all.iter().filter(|c| ids.contains(c.id.as_str())).collect();
-        let after: Vec<&str> = lines[p + 1..].iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
-        let upto = state.find(&format!("{l}\n")).map_or(state.as_str(), |i| &state[..i]);
-        let before = format!("{upto}\n{}", lines[..p].join("\n"));
-        out.extend(crate::memory::resolve(&asked, all, &before, &after.join("\n"), final_msg, crate::memory::NOVEL_WORDS).0);
+    let deliveries: Vec<(usize, &str, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(p, l)| l.strip_prefix("#borg-early ").or_else(|| l.strip_prefix("#borg-queued ")).map(|list| (p, *l, list)))
+        .collect();
+    let mut out = HashSet::new();
+    if deliveries.is_empty() {
+        return out;
+    }
+    let words = crate::memory::Distinctive::new(all);
+    // Each delivery's lessons (indices into `all`), each lesson's question words as slots of the index.
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    let mut asked_words: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut asked: Vec<Vec<usize>> = Vec::with_capacity(deliveries.len());
+    for (_, _, list) in &deliveries {
+        let ids: HashSet<&str> = ids_in(list).collect();
+        let these: Vec<usize> = all.iter().enumerate().filter(|(_, c)| ids.contains(c.id.as_str())).map(|(k, _)| k).collect();
+        for k in &these {
+            asked_words.entry(*k).or_insert_with(|| {
+                words
+                    .words(&all[*k].question)
+                    .into_iter()
+                    .map(|w| {
+                        let n = slot.len();
+                        *slot.entry(w).or_insert(n)
+                    })
+                    .collect()
+            });
+        }
+        asked.push(these);
+    }
+    let n = slot.len();
+    // Per slot: its first word's byte in the state file, its first .edits line, its last work line, and
+    // whether the final message has it.
+    let (mut first_byte, mut first_line, mut last_work, mut in_final) = (vec![usize::MAX; n], vec![usize::MAX; n], vec![None; n], vec![false; n]);
+    conscience::tokens_at(state, |at, t| {
+        if let Some(s) = slot.get(t) {
+            first_byte[*s] = first_byte[*s].min(at);
+        }
+    });
+    for (q, l) in lines.iter().enumerate() {
+        let work = !l.starts_with("#borg-");
+        conscience::tokens_at(l, |_, t| {
+            if let Some(s) = slot.get(t) {
+                first_line[*s] = first_line[*s].min(q);
+                if work {
+                    last_work[*s] = Some(q);
+                }
+            }
+        });
+    }
+    conscience::tokens_at(final_msg, |_, t| {
+        if let Some(s) = slot.get(t) {
+            in_final[*s] = true;
+        }
+    });
+    // Where each delivery line first appears in the state file followed by a line end (`str::find` of
+    // `{line}\n`). Every such place starts with a marker, which cannot overlap itself, so one pass over
+    // the markers' places finds them all.
+    let mut cut: HashMap<&str, usize> = HashMap::new();
+    for marker in ["#borg-early ", "#borg-queued "] {
+        for (at, _) in state.match_indices(marker) {
+            if let Some(end) = state[at..].find('\n') {
+                cut.entry(&state[at..at + end]).or_insert(at);
+            }
+        }
+    }
+    let lower = final_msg.to_lowercase();
+    let mut declared: HashMap<usize, Option<bool>> = HashMap::new();
+    for ((p, l, _), these) in deliveries.iter().zip(&asked) {
+        let i = cut.get(l).copied().unwrap_or(state.len());
+        let new = |s: &&usize| (last_work[**s].is_some_and(|q| q > *p) || in_final[**s]) && first_byte[**s] >= i && first_line[**s] >= *p;
+        for k in these {
+            let c = &all[*k];
+            let applies = match *declared.entry(*k).or_insert_with(|| crate::memory::declared(&lower, &c.id.to_lowercase())) {
+                Some(v) => v,
+                None => asked_words[k].iter().filter(new).count() >= crate::memory::NOVEL_WORDS,
+            };
+            if applies {
+                out.insert(c.id.clone());
+            }
+        }
     }
     out
 }
@@ -694,8 +783,6 @@ fn pending_upto<'a>(
             "#borg-queued " => "queued",
             _ => outcome::PLACEBO,
         };
-        let answers: Vec<&str> = if question { later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect() } else { Vec::new() };
-        let work: Vec<&str> = later.iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
         let (list, tag) = tagged(list);
         // The work before: the line before this delivery's markers, a delivery's own work line (`WORK`)
         // read as its text; nothing when that is another bookkeeping line.
@@ -712,9 +799,16 @@ fn pending_upto<'a>(
             .filter(|i| !i.is_empty() && !settled.contains(i) && (when == When::End || tries.get(i).copied().unwrap_or(0) < MAX_JUDGE_TRIES))
             .filter(|i| all.iter().any(|c| c.id == *i))
             .collect();
+        // A delivery without a fresh lesson adds nothing: skipped before its evidence is gathered, the call
+        // is O(open deliveries × session), not O(every delivery × session).
+        if fresh.is_empty() {
+            continue;
+        }
         let check_of = |id: &str| routed.get(id).copied().or(tag).unwrap_or_default();
         let fresh =
             fresh.into_iter().map(|id| (id, check_of(id), question && stripped(if check_of(id).is_empty() { judging } else { check_of(id) }, id))).collect();
+        let answers: Vec<&str> = if question { later.iter().filter_map(|l| l.strip_prefix("#borg-answer ")).collect() } else { Vec::new() };
+        let work: Vec<&str> = later.iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
         deliveries.push(Delivery { channel, question, before, answers, work, fresh });
     }
     // Every stripped question's declaration leaves all of this call's evidence before any cut could halve
@@ -4526,6 +4620,149 @@ mod tests {
         }
         for name in ["omp", "opencode"] {
             assert_eq!(for_harness(harness::by_name(name).unwrap(), out.clone()), out, "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod acted_since_tests {
+    use super::*;
+
+    /// `early_acted` as 0.7.7 computed it, the oracle: every delivery reads the session before and after
+    /// it whole.
+    fn acted_scan(state: &str, edits: &str, all: &[conscience::Challenge], final_msg: &str) -> std::collections::HashSet<String> {
+        let lines: Vec<&str> = edits.lines().filter(|l| !l.starts_with(WORK)).collect();
+        let mut out = std::collections::HashSet::new();
+        for (p, l) in lines.iter().enumerate() {
+            let Some(list) = l.strip_prefix("#borg-early ").or_else(|| l.strip_prefix("#borg-queued ")) else { continue };
+            let ids: std::collections::HashSet<&str> = ids_in(list).collect();
+            let asked: Vec<&conscience::Challenge> = all.iter().filter(|c| ids.contains(c.id.as_str())).collect();
+            let after: Vec<&str> = lines[p + 1..].iter().copied().filter(|l| !l.starts_with("#borg-")).collect();
+            let upto = state.find(&format!("{l}\n")).map_or(state, |i| &state[..i]);
+            let before = format!("{upto}\n{}", lines[..p].join("\n"));
+            out.extend(crate::memory::resolve(&asked, all, &before, &after.join("\n"), final_msg, crate::memory::NOVEL_WORDS).0);
+        }
+        out
+    }
+
+    fn pick<'a>(r: &mut crate::memory::Rng, xs: &[&'a str]) -> &'a str {
+        xs[(r.next_u64() % xs.len() as u64) as usize]
+    }
+
+    /// The index equals the scan on random sessions: camelCase and non-ASCII words, delivery lines found
+    /// in the state file, missing, repeated and mid-line, `#borg-work` and other bookkeeping lines, ids
+    /// unknown to the store, declarations in the final message, and every cut of the .edits file a
+    /// detached check reads (`edits_upto`).
+    #[test]
+    fn the_index_equals_the_scan_on_random_sessions() {
+        let vocab = [
+            "budget",
+            "place",
+            "drain",
+            "resetArc",
+            "token",
+            "transition",
+            "inhibitor",
+            "arc",
+            "netBudget",
+            "ÜberPlace",
+            "straße",
+            "ΣIGMA",
+            "fork_join",
+            "subnet",
+            "deadlock",
+            "x",
+            "go",
+            "HTTPServer",
+            "parseJSONLine",
+            "retry",
+            "bound",
+            "guard",
+            "Place",
+            "PLACE",
+            "café",
+            "L1",
+            "early",
+        ];
+        let mut acted = 0;
+        for seed in 0..3000u64 {
+            let mut r = crate::memory::Rng::new(seed);
+            let nl = 3 + (r.next_u64() % 8) as usize;
+            let all: Vec<conscience::Challenge> = (0..nl)
+                .map(|k| conscience::Challenge {
+                    id: format!("L{k}"),
+                    question: (0..(4 + r.next_u64() % 10)).map(|_| pick(&mut r, &vocab)).collect::<Vec<_>>().join(" "),
+                    ..Default::default()
+                })
+                .collect();
+            let text = |r: &mut crate::memory::Rng| {
+                let sep = if r.next_u64().is_multiple_of(2) { " " } else { "-" };
+                (0..(r.next_u64() % 9)).map(|_| pick(r, &vocab)).collect::<Vec<_>>().join(sep)
+            };
+            let (mut edits, mut state) = (String::new(), String::new());
+            for _ in 0..(r.next_u64() % 30) {
+                let line = match r.next_u64() % 9 {
+                    0 | 1 => {
+                        let ids: Vec<String> = (0..1 + r.next_u64() % 3).map(|_| format!("L{}", r.next_u64() % (nl as u64 + 1))).collect();
+                        let marker = if r.next_u64().is_multiple_of(2) { "#borg-early " } else { "#borg-queued " };
+                        let check = if r.next_u64().is_multiple_of(2) { format!(" @c{}", r.next_u64() % 3) } else { String::new() };
+                        format!("{marker}{}{check}", ids.join(","))
+                    }
+                    2 => format!("{WORK}{}", text(&mut r)),
+                    3 => format!("#borg-answer {}", text(&mut r)),
+                    _ => text(&mut r),
+                };
+                match r.next_u64() % 6 {
+                    0 => {}
+                    1 => state.push_str(&format!("{} {line}\n", text(&mut r))),
+                    2 => state.push_str(&format!("{line}\n{}\n{line}\n", text(&mut r))),
+                    _ => state.push_str(&format!("{line}\n")),
+                }
+                state.push_str(&text(&mut r));
+                state.push('\n');
+                edits.push_str(&line);
+                edits.push('\n');
+            }
+            let mut fin = text(&mut r);
+            if r.next_u64().is_multiple_of(3) {
+                let verdict = if r.next_u64().is_multiple_of(2) { "applies" } else { "skip" };
+                fin.push_str(&format!("\nL{}: {verdict}", r.next_u64() % nl as u64));
+            }
+            let want = acted_scan(&state, &edits, &all, &fin);
+            assert_eq!(acted_since(&state, &edits, &all, &fin), want, "seed {seed}\nstate:\n{state}\nedits:\n{edits}\nfinal: {fin}");
+            let cut = (r.next_u64() as usize) % (edits.len() + 1);
+            if edits.is_char_boundary(cut) {
+                assert_eq!(acted_since(&state, &edits[..cut], &all, ""), acted_scan(&state, &edits[..cut], &all, ""), "seed {seed} cut {cut}");
+            }
+            acted += usize::from(!want.is_empty());
+        }
+        assert!(acted > 300, "only {acted} sessions with a lesson acted on");
+    }
+
+    /// On a real session (an ignored test, it reads files outside the repo): BORG_ACTED_STATE, a state
+    /// dir; BORG_ACTED_SESSION, a session id in it; BORG_ACTED_LESSONS, its store's lessons file. Equal for
+    /// several final messages and at 40 cuts of the .edits file.
+    #[test]
+    #[ignore]
+    fn the_index_equals_the_scan_on_a_real_session() {
+        let (Some(dir), Some(s), Some(lessons)) =
+            (std::env::var_os("BORG_ACTED_STATE"), std::env::var("BORG_ACTED_SESSION").ok(), std::env::var_os("BORG_ACTED_LESSONS"))
+        else {
+            panic!("set BORG_ACTED_STATE, BORG_ACTED_SESSION and BORG_ACTED_LESSONS");
+        };
+        let state = std::fs::read_to_string(state_file_in(Path::new(&dir), &s)).unwrap();
+        let edits = std::fs::read_to_string(state_file_in(Path::new(&dir), &s).with_extension("edits")).unwrap();
+        let all = conscience::load_store_for(Path::new(&lessons), None, None);
+        for fin in ["", "I replaced the drain of the budget place with a reset arc.", "Done: the hook folds the outcome history incrementally."] {
+            let t = std::time::Instant::now();
+            let want = acted_scan(&state, &edits, &all, fin);
+            let scan = t.elapsed();
+            let t = std::time::Instant::now();
+            assert_eq!(acted_since(&state, &edits, &all, fin), want);
+            eprintln!("scan {scan:?}, index {:?}: {} acted", t.elapsed(), want.len());
+        }
+        for cut in (0..edits.len()).step_by(edits.len() / 40 + 1).filter(|c| edits.is_char_boundary(*c)) {
+            assert_eq!(acted_since(&state, &edits[..cut], &all, ""), acted_scan(&state, &edits[..cut], &all, ""), "cut {cut}");
         }
     }
 }

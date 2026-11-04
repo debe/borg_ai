@@ -7,6 +7,9 @@ What changed in each release and what you need to do about it. The details live 
 
 ### Fixed
 
+- Hooks no longer re-read the whole outcome history: a prompt or tool-call hook took 55-60 ms of CPU on a
+  7.8 MB history and grew with it; it now folds only new lines into `beliefs.bin` (8-9 ms). A long
+  session's turn end took about 2 s of CPU and grew with the square of the session; it now takes about 70 ms.
 - omp transcripts are swept again: since omp writes a `title` line first, borg found no omp session's
   transcript, so its corrections and answers waited for `borg assimilate`. Tested with omp 18.15.0.
 

@@ -248,6 +248,16 @@ mod tests {
         assert!(logs(Path::new("s")).contains(&Path::new("s").join(ABSORBED)), "stamped, signed and quarantined like every synced log");
     }
 
+    /// The belief snapshot (borg facts.rs) is this node's cache of its own fold: never synced.
+    #[test]
+    fn the_belief_snapshot_is_never_synced() {
+        let d = tmp("facts");
+        for f in [borg::facts::FILE, borg::facts::REGRETS_FILE] {
+            assert!(!SYNCED.contains(&f) && !logs(&d).contains(&d.join(f)), "{f}");
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     /// An engineer's personal lessons (borg reach.rs `PERSONAL_FILE`) stay on their machine: not a synced
     /// log, not stamped or fingerprinted, and none of their lines is in what a store offers its peers.
     #[test]

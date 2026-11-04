@@ -77,8 +77,9 @@
 //! `outcomes-team.jsonl` (`TEAM_FILE`), which the mesh syncs (borg-mesh lines.rs `SYNCED`): kind,
 //! lesson ids, time, propensity, channel, the hashed session and repo (`tag`), a regret's hashed cause
 //! and credit, and the node, never raw sessions, repos, causes, groups, grades or text. Only the belief readers opt in to the team view
-//! (`read_team`): memory and trust in the conscience (conscience.rs `load_as`), `borg trust`, `borg
-//! memory` and borg-web's lessons. learn.rs (it would settle remote sessions), attention.rs (labels and
+//! (`read_team`): memory and trust in the conscience (conscience.rs `load_as`, folded incrementally by
+//! facts.rs into the same view), `borg trust`, `borg memory` and borg-web's lessons. learn.rs (it would
+//! settle remote sessions), attention.rs (labels and
 //! the explore counter are this node's policy), stats.rs (rollups sync their own counts), install.rs and
 //! the hook's pending/judge read this machine's log only. BORG_SHARE_OUTCOMES=off publishes and reads
 //! nothing of the team's.
