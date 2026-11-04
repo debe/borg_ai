@@ -1223,6 +1223,9 @@ fn learn_unlocked(
                 outcomes.push(o);
             }
         }
+        // The hooks' belief snapshot folded afresh, once per learn: it read the log whole anyway, and
+        // this catches an edit inside a log that no checkpoint sees (facts.rs).
+        crate::facts::rebuild(&lessons_path);
     }
     (new, merged, failed)
 }

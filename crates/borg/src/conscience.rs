@@ -145,8 +145,8 @@ impl Default for Challenge {
 
 /// Lessons known before `before_ms`. The store is append-only: when a lesson was consolidated,
 /// a later line carries the same id, and the latest version wins. Each carries its weight from
-/// `outcomes.jsonl` beside the lessons file and the team's synced outcomes (outcome.rs `read_team`;
-/// absent, e.g. for eval challenge files: all 1) and its authors' trust in its area, computed from
+/// `outcomes.jsonl` beside the lessons file and the team's synced outcomes (outcome.rs `read_team`, as
+/// facts.rs folds and keeps them beside the store; absent, e.g. for eval challenge files: all 1) and its authors' trust in its area, computed from
 /// this store alone (trust.rs). Engineers are
 /// canonical under this machine's aliases (collective.rs "Engineers").
 pub fn load(path: &Path, before_ms: Option<i64>) -> Vec<Challenge> {
@@ -178,13 +178,16 @@ pub fn load_store_with(path: &Path, before_ms: Option<i64>, aliases: &Aliases) -
 }
 
 fn load_as(path: &Path, before_ms: Option<i64>, aliases: &Aliases, session: Option<&str>, personal: bool) -> Vec<Challenge> {
-    let outcomes = crate::outcome::read_team(path);
     let mut out = load_unweighted_with(path, before_ms, aliases);
     if personal {
         with_personal(&mut out, path, before_ms, aliases);
     }
-    let memory = crate::memory::derive(&outcomes, &out, session);
-    let trust = trust::Trust::compute(&out, &outcomes);
+    // The outcomes as folded beside the store (facts.rs): what `read_team` would read, at the cost of
+    // what was appended since the last load instead of the whole history.
+    let facts = crate::facts::load(path);
+    let view = facts.view(crate::outcome::on());
+    let trust = trust::Trust::compute_with(&out, &view.trust);
+    let memory = crate::memory::derive_folded(view.folded, &out, session);
     for c in &mut out {
         if let Some(m) = memory.get(&c.id) {
             // The bar (`RELATIVE`) is set on the expected weight; the session's draw only decides which
@@ -372,6 +375,51 @@ fn canonical(c: &mut Challenge, aliases: &Aliases) {
 
 /// Lowercased words of 3+ characters, plus the parts of camelCase words.
 pub fn tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    tokens_at(text, |_, t| out.push(t.to_string()));
+    out
+}
+
+/// `tokens`, each handed to `f` with the byte offset in `text` of the word it comes from (a camelCase
+/// part has its word's): the same tokens in the same order, lowercased into one reused buffer, so an
+/// ASCII word costs no allocation (hook.rs `early_acted` indexes a whole session this way).
+pub fn tokens_at(text: &str, mut f: impl FnMut(usize, &str)) {
+    let mut low = String::new();
+    let mut emit = |at: usize, s: &str| {
+        low.clear();
+        if s.is_ascii() {
+            low.push_str(s);
+            low.make_ascii_lowercase();
+        } else {
+            low.push_str(&s.to_lowercase());
+        }
+        f(at, &low);
+    };
+    for raw in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if raw.len() < 3 {
+            continue;
+        }
+        let at = raw.as_ptr() as usize - text.as_ptr() as usize;
+        emit(at, raw);
+        let mut start = 0;
+        for (i, ch) in raw.char_indices() {
+            if ch.is_uppercase() && i > start {
+                let word = &raw[start..i];
+                if word.len() >= 3 && word.len() < raw.len() {
+                    emit(at, word);
+                }
+                start = i;
+            }
+        }
+        let word = &raw[start..];
+        if word.len() >= 3 && word.len() < raw.len() {
+            emit(at, word);
+        }
+    }
+}
+
+#[cfg(test)]
+fn tokens_0_7_7(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         if raw.len() < 3 {
@@ -1107,6 +1155,39 @@ mod tests {
 
     fn ch(id: &str, q: &str) -> Challenge {
         Challenge { id: id.into(), origin_ms: 1, question: q.into(), ..Default::default() }
+    }
+
+    /// `tokens` (by way of `tokens_at`) yields 0.7.7's tokens, and each offset is its word's.
+    #[test]
+    fn tokens_are_0_7_7_tokens_with_their_offsets() {
+        let parts = [
+            "parseJSONLine",
+            "HTTPServer",
+            "ÜberPlace",
+            "straße",
+            "ΣIGMA",
+            "ΑΣ",
+            "café",
+            "fork_join",
+            "x",
+            "go",
+            "aBcDeF",
+            "ABCdefGHI_jk",
+            "12abcDEF",
+            "İstanbul",
+        ];
+        let seps = [" ", "-", "\n", ".", "", "::"];
+        let mut r = crate::memory::Rng::new(7);
+        for _ in 0..2000 {
+            let text: String =
+                (0..r.next_u64() % 12).map(|_| format!("{}{}", parts[(r.next_u64() % 14) as usize], seps[(r.next_u64() % 6) as usize])).collect();
+            assert_eq!(tokens(&text), tokens_0_7_7(&text), "{text}");
+            tokens_at(&text, |at, t| {
+                let word = &text[at..];
+                let word = &word[..word.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(word.len())];
+                assert!(tokens_0_7_7(word).iter().any(|w| w == t), "{t} at {at} of {text}");
+            });
+        }
     }
 
     #[test]

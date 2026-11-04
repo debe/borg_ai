@@ -48,6 +48,7 @@
 //! conscience renders them as one disagreement with each side's trust.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasher;
 use std::path::Path;
 
 use crate::conscience::{self, Challenge};
@@ -112,7 +113,11 @@ pub struct Trust {
 impl Trust {
     /// From a store's lessons (latest versions) and its outcomes.
     pub fn compute(lessons: &[Challenge], outcomes: &[Outcome]) -> Trust {
-        let sessions = outcome::sessions(outcomes);
+        Self::compute_with(lessons, &outcome::sessions(outcomes))
+    }
+
+    /// `compute` from the outcomes' per-lesson sessions (outcome.rs `sessions`; facts.rs `View::trust`).
+    pub fn compute_with<A: BuildHasher, B: BuildHasher>(lessons: &[Challenge], sessions: &HashMap<&str, HashMap<&str, (bool, i64), B>, A>) -> Trust {
         let followed = |id: &str| sessions.get(id).is_some_and(|ss| outcome::tally(ss.values(), i64::MIN).0 > 0);
         let replaced: std::collections::HashSet<&str> =
             edges(lessons).into_iter().filter(|(x, y)| decisive(x, y) || followed(&x.id)).map(|(_, y)| y.id.as_str()).collect();
