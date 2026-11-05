@@ -659,6 +659,8 @@ pub struct Measurement {
     /// select/summary.rs `Pool::tail`): the yield past the budget, learned under every policy.
     pub tail_shown: u64,
     pub tail_applied: u64,
+    /// The judged placebos needed before not now is learned (policy.rs `NOT_LEARNED_UNTIL`).
+    pub placebos_needed: u64,
 }
 
 /// The pool's yield at fill positions `from..to` (0 first): of the lessons shown there, those applied,
@@ -769,6 +771,7 @@ impl Selection {
             judged: placebos_judged as u64,
             tail_shown: s.pool.tail.0,
             tail_applied: s.pool.tail.1,
+            placebos_needed: select::policy::NOT_LEARNED_UNTIL,
         });
         // The declaration's effect on the judge: the changed share of judged questions with it minus without.
         let share = |stripped: bool| {
@@ -1430,7 +1433,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
             deviations: vec![Count { name: "route".into(), part: 5, whole: 400 }],
             spend: vec![spend("stop", 4, 3.0), spend("live", 0, 2.04)],
             evaluation: Some(evaluation),
-            measurement: Some(Measurement { placebos: 40, judged: 31, tail_shown: 12, tail_applied: 3 }),
+            measurement: Some(Measurement { placebos: 40, judged: 31, tail_shown: 12, tail_applied: 3, placebos_needed: 100 }),
             test: Some(Test {
                 risk: 0.1,
                 ran: 30,
@@ -1617,7 +1620,10 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let mut keys: Vec<&str> = v["evaluation"].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["ess", "max_weight", "mean", "sessions", "truncated", "ucb", "units"]);
-        assert_eq!((&v["default"], &v["measurement"]), (&json!("fixed"), &json!({"placebos": 40, "judged": 31, "tail_shown": 12, "tail_applied": 3})));
+        assert_eq!(
+            (&v["default"], &v["measurement"]),
+            (&json!("fixed"), &json!({"placebos": 40, "judged": 31, "tail_shown": 12, "tail_applied": 3, "placebos_needed": 100}))
+        );
         let mut keys: Vec<&str> = v["test"].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         let want = "ask_free by_k control dilution due due_checks due_min_sessions due_sessions kept ran refused risk sessions set";
@@ -1792,7 +1798,11 @@ corp (team): 3 drone(s), 2 active, 1 remote
         ];
         let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
         let sel = Selection::of(&fold(&text, Summary::default()), select::Policy::Fixed, None);
-        assert_eq!(sel.measurement, Some(Measurement { placebos: 2, judged: 1, tail_shown: 2, tail_applied: 1 }), "{sel:?}");
+        assert_eq!(
+            sel.measurement,
+            Some(Measurement { placebos: 2, judged: 1, tail_shown: 2, tail_applied: 1, placebos_needed: select::policy::NOT_LEARNED_UNTIL }),
+            "{sel:?}"
+        );
         assert!(selection_line(&sel).contains(" · 2 checks · placebos 2 drawn, 1 judged · tail 2 shown past the pool, 1 applied"), "{}", selection_line(&sel));
         assert_eq!(Selection::of(&Summary::default(), select::Policy::Fixed, None).measurement, None, "nothing folded: not measured");
     }

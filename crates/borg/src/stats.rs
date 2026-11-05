@@ -199,6 +199,12 @@ pub struct Bucket {
     /// Events per `<kind>@<channel>` for events that name a channel (`block@stop`, `changed@live`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub channels: BTreeMap<String, u64>,
+    /// Events per `<kind>:<why>` (why a turn end passed free, why a check was dropped, failed checks,
+    /// a detached check's asks) and the turn-end checks' time (`check_ms`, `check_timed`), from 0.7.9.
+    /// Apart from `counts`, so a bucket an older borg published compares equal on its side (its `same`
+    /// ignores this field) and two versions on one store do not republish every day by turns.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub why: BTreeMap<String, u64>,
 }
 
 impl Bucket {
@@ -207,6 +213,7 @@ impl Bucket {
         self.counts == other.counts
             && self.lessons == other.lessons
             && self.channels == other.channels
+            && self.why == other.why
             && self.dur_ms == other.dur_ms
             && (self.usd - other.usd).abs() < 1e-9
     }
@@ -230,6 +237,9 @@ impl Bucket {
         }
         for (k, v) in &other.channels {
             *self.channels.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &other.why {
+            *self.why.entry(k.clone()).or_default() += v;
         }
         self.usd += other.usd;
         self.dur_ms += other.dur_ms;
@@ -712,6 +722,27 @@ pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
         if e.n > 0 {
             *b.counts.entry(format!("{}_n", e.kind)).or_default() += e.n;
         }
+        // Reasons folded as `<kind>:<why>` into `why`, so the page can say why a turn end passed free,
+        // why a check was dropped, how many failed and which asks a detached check made (the raw `why`
+        // stays on the event; a score folds to `score`, `live_covered` is live mode's skip before 0.7.6,
+        // a skip without a reason folds to none).
+        let why = match (e.kind.as_str(), e.why.as_str()) {
+            (GATE_SKIP, w @ ("noedit" | "empty" | "live_covered")) => w,
+            (GATE_SKIP, w) if w.parse::<f64>().is_ok() => "score",
+            (GATE_SKIP, w) if !w.is_empty() => "other",
+            (CHECK | LIVE_CHECK, "failed") => "failed",
+            (CHECK_DROPPED, w) if !w.is_empty() => w,
+            (LIVE_ASK, _) if e.mode == crate::check_async::MODE => crate::check_async::MODE,
+            _ => "",
+        };
+        if !why.is_empty() {
+            *b.why.entry(format!("{}:{why}", e.kind)).or_default() += 1;
+        }
+        // A turn-end check's time, summed with the checks that report one: the page's average.
+        if e.kind == CHECK && e.dur_ms > 0 {
+            *b.why.entry("check_ms".into()).or_default() += e.dur_ms;
+            *b.why.entry("check_timed".into()).or_default() += 1;
+        }
         b.usd += e.usd;
         if e.usd > 0.0 {
             *b.usd_by.entry(e.kind.clone()).or_default() += e.usd;
@@ -914,6 +945,35 @@ mod tests {
     }
 
     #[test]
+    fn fold_counts_skip_and_drop_reasons_failed_checks_and_check_time() {
+        let why = |kind: &str, why: &str, dur_ms: u64| Event { why: why.into(), dur_ms, ..ev(kind, 10, "a@x", &[], 0) };
+        let evs = [
+            why(GATE_SKIP, "noedit", 0),
+            why(GATE_SKIP, "0.12", 0),
+            why(GATE_SKIP, "0.30", 0),
+            why(GATE_SKIP, "empty", 0),
+            why(GATE_SKIP, "live_covered", 0),
+            why(GATE_SKIP, "", 0),
+            why(CHECK, "failed", 4_000),
+            why(CHECK, "", 6_000),
+            why(CHECK, "", 0),
+            why(CHECK_DROPPED, "superseded", 0),
+            why(CHECK_DROPPED, "", 0),
+            Event { mode: crate::check_async::MODE.into(), ..why(LIVE_ASK, "wake", 0) },
+            why(LIVE_ASK, "", 0),
+        ];
+        let b = &fold("n1", &evs)["stat:n1:a@x:1970-01-01"];
+        let n = |k: &str| b.counts.get(k).or(b.why.get(k)).copied().unwrap_or(0);
+        assert!(b.counts.keys().all(|k| !k.contains(':') && !k.starts_with("check_ms") && k != "check_timed"), "counts stay as 0.7.8 folds them: {:?}", b.counts);
+        assert_eq!((n("gate_skip:noedit"), n("gate_skip:score"), n("gate_skip:empty"), n("gate_skip:live_covered")), (1, 2, 1, 1), "{:?}", b.counts);
+        assert_eq!(n(GATE_SKIP), 6, "a skip without a reason is counted, with no reason");
+        assert_eq!((n("check:failed"), n("check_dropped:superseded")), (1, 1));
+        assert_eq!((n("check_ms"), n("check_timed")), (10_000, 2), "an untimed check is not averaged");
+        assert_eq!((n(LIVE_ASK), n("live_ask:async")), (2, 1), "a detached check's asks apart from live mode's");
+        assert!(!b.why.keys().any(|k| k.ends_with(':') || k == "gate_skip:other"), "no empty reason: {:?}", b.why);
+    }
+
+    #[test]
     fn the_async_tally_counts_detached_checks_and_the_jobs_that_never_ran() {
         let check = |ms: i64, n: u64, why: &str, dur_ms: u64, limit_ms: u64, rss_kb: u64| Event {
             mode: crate::check_async::MODE.into(),
@@ -958,6 +1018,26 @@ mod tests {
         assert_eq!((b.version, b.counts[TURN_END], b.counts[GATE_SKIP]), (2, 1, 1));
         let text = std::fs::read_to_string(rollups_path(&home)).unwrap();
         assert!(!text.contains("session"), "no session ids leave the machine");
+    }
+
+    /// A store shared with an older borg (0.7.8, no `why`): the older one published this node's day
+    /// without reasons; this one publishes it once with them and then settles, and its line's `counts`
+    /// equal the older fold's, so the older borg's `same` (counts, lessons, channels, time, cost) sees
+    /// no change either: neither republishes the day by turns.
+    #[test]
+    fn reasons_publish_once_beside_an_older_borgs_buckets() {
+        let home = tmp("rollup-why");
+        record(&home, &Event { why: "noedit".into(), ..ev(GATE_SKIP, 10, "a@x", &[], 0) });
+        record(&home, &Event { why: "failed".into(), dur_ms: 900, ..ev(CHECK, 11, "a@x", &[], 0) });
+        let mut older = fold(&node(&home), &events(&home)).into_values().next().unwrap();
+        older.why.clear();
+        older.version = 1;
+        std::fs::write(rollups_path(&home), serde_json::to_string(&older).unwrap() + "\n").unwrap();
+        assert_eq!(rollup(&home), 1, "the reasons are published once");
+        assert_eq!(rollup(&home), 0, "then nothing changes");
+        let mine = rollups(&home).into_values().next().unwrap();
+        assert_eq!((mine.version, &mine.counts), (2, &older.counts), "counts stay as the older borg folds them");
+        assert_eq!((mine.why["gate_skip:noedit"], mine.why["check:failed"]), (1, 1));
     }
 
     #[test]

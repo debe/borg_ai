@@ -101,8 +101,11 @@ fn sum_by(buckets: &[stats::Bucket], key: impl Fn(&stats::Bucket) -> String) -> 
     out.into_iter().collect()
 }
 
+/// A bucket's totals for the page; the reasons (stats.rs `Bucket::why`) read as counts there.
 fn totals(b: &stats::Bucket) -> Value {
-    json!({"counts": b.counts, "usd": b.usd, "usd_by": b.usd_by, "usd_mode": b.usd_mode, "channels": b.channels, "dur_ms": b.dur_ms})
+    let mut counts = b.counts.clone();
+    counts.extend(b.why.iter().map(|(k, v)| (k.clone(), *v)));
+    json!({"counts": counts, "usd": b.usd, "usd_by": b.usd_by, "usd_mode": b.usd_mode, "channels": b.channels, "dur_ms": b.dur_ms})
 }
 
 /// One entry per day from `first` to `last`, zero where nothing was counted.

@@ -50,9 +50,9 @@ fn attention(d: crate::api::Data) -> impl IntoView {
     let parts = Signal::derive(move || {
         let a = a();
         vec![
-            ("ended in no".to_string(), a.no, "var(--c-good)".to_string()),
-            ("yes, fine".into(), a.stamps, "var(--c-amber)".into()),
-            ("missed".into(), a.missed, "var(--c-heat)".into()),
+            ("ended in no".to_string(), a.no, "var(--c-good)".to_string(), String::new()),
+            ("yes, fine".into(), a.stamps, "var(--c-amber)".into(), String::new()),
+            ("missed".into(), a.missed, "var(--c-heat)".into(), String::new()),
         ]
     });
     let share = Signal::derive(move || a().share.map_or_else(|| "–".to_string(), |s| format!("{:.0}%", s * 100.0)));
@@ -81,9 +81,9 @@ pub fn Queen() -> impl IntoView {
     let by = move |s: &'static str| d.queen.with(|q| q.iter().filter(|e| e.state() == s).count() as f64);
     let parts = Signal::derive(move || {
         vec![
-            ("open".to_string(), by("open"), "var(--c-violet)".to_string()),
-            ("answered".into(), by("answered"), "var(--c-good)".into()),
-            ("dismissed".into(), by("dismissed"), "var(--c-slate)".into()),
+            ("open".to_string(), by("open"), "var(--c-violet)".to_string(), String::new()),
+            ("answered".into(), by("answered"), "var(--c-good)".into(), String::new()),
+            ("dismissed".into(), by("dismissed"), "var(--c-slate)".into(), String::new()),
         ]
     });
     let latency = Signal::derive(move || {

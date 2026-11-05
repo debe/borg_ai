@@ -1,6 +1,8 @@
 //! Charts drawn as SVG by Rust: stacked bars over time with hover and legend toggles, sparklines,
 //! a funnel, a donut and horizontal bars. No JavaScript chart library.
 
+use std::collections::BTreeMap;
+
 use leptos::prelude::*;
 
 use crate::util::{nice_max, num, pct, usd};
@@ -265,10 +267,29 @@ pub fn Sparkline(values: Vec<f64>, #[prop(default = "var(--c-accent)")] color: &
     }
 }
 
-/// A headline number with its trend and the change against the week before.
+/// A small ⓘ that carries hover help; focusable, so keyboard users get it too. Screen readers name it
+/// "help" and read the text as its description, not as part of the heading it sits in. `quiet`: no
+/// hover title of its own, for a container that already carries it (a tile).
+#[component]
+pub fn Help(#[prop(into)] text: Signal<String>, #[prop(optional)] quiet: bool) -> impl IntoView {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = format!("help-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    view! {
+        <span class="help" tabindex="0" role="note" aria-label="help" aria-describedby=id.clone() title=move || (!quiet).then(|| text.get())>"ⓘ"</span>
+        <span id=id hidden>{move || text.get()}</span>
+    }
+}
+
+/// A headline number with its trend and the change against the week before. `help` (or `help_dyn`, when
+/// the help names live numbers) is the hover text: what the number means, how to read it, its raw name.
 #[component]
 pub fn Tile(
     label: &'static str,
+    #[prop(optional)] help: Option<&'static str>,
+    #[prop(into, optional)] help_dyn: Option<Signal<String>>,
+    /// The note reads as a warning (heat).
+    #[prop(into, optional)]
+    warn: Option<Signal<bool>>,
     #[prop(into)] value: Signal<String>,
     #[prop(into, optional)] sub: Option<Signal<String>>,
     #[prop(into, optional)] spark: Option<Signal<Vec<f64>>>,
@@ -280,10 +301,12 @@ pub fn Tile(
     #[prop(default = true)]
     up_is_good: bool,
 ) -> impl IntoView {
+    let tip = Signal::derive(move || help_dyn.map(|h| h.get()).or(help.map(String::from)).unwrap_or_default());
+    let has = help.is_some() || help_dyn.is_some();
     view! {
-        <div class="tile">
+        <div class="tile" title=move || has.then(|| tip.get())>
             <div class="tile-top">
-                <span class="l">{label}</span>
+                <span class="l">{label}{has.then(|| view! { <Help text=tip quiet=true /> })}</span>
                 {move || delta.and_then(|d| d.get()).map(|d| {
                     let good = (d >= 0.0) == up_is_good;
                     let cls = if d.abs() < 0.005 { "delta" } else if good { "delta good" } else { "delta bad" };
@@ -291,7 +314,7 @@ pub fn Tile(
                 })}
             </div>
             <span class="v">{move || value.get()}</span>
-            {sub.map(|s| view! { <span class="s">{move || s.get()}</span> })}
+            {sub.map(|s| view! { <span class="s" class:warn=move || warn.is_some_and(|w| w.get())>{move || s.get()}</span> })}
             {spark.map(|sp| view! { <div class="tile-spark">{move || view! { <Sparkline values=sp.get() color=color /> }}</div> })}
         </div>
     }
@@ -321,9 +344,9 @@ pub fn Funnel(#[prop(into)] steps: Signal<Vec<(String, f64, String, String)>>) -
     }
 }
 
-/// A donut of parts, with its legend.
+/// A donut of parts (label, value, colour, hover help; empty help: none), with its legend.
 #[component]
-pub fn Donut(#[prop(into)] parts: Signal<Vec<(String, f64, String)>>, #[prop(into)] center: Signal<String>, caption: &'static str) -> impl IntoView {
+pub fn Donut(#[prop(into)] parts: Signal<Vec<(String, f64, String, String)>>, #[prop(into)] center: Signal<String>, caption: &'static str) -> impl IntoView {
     let hover = RwSignal::new(None::<usize>);
     let r = 40.0;
     let c = 2.0 * std::f64::consts::PI * r;
@@ -337,7 +360,7 @@ pub fn Donut(#[prop(into)] parts: Signal<Vec<(String, f64, String)>>, #[prop(int
         ps.into_iter()
             .enumerate()
             .filter(|(_, p)| p.1 > 0.0)
-            .map(|(i, (_, v, color))| {
+            .map(|(i, (_, v, color, _))| {
                 let len = v / total * c;
                 let off = -at;
                 at += len;
@@ -355,9 +378,9 @@ pub fn Donut(#[prop(into)] parts: Signal<Vec<(String, f64, String)>>, #[prop(int
         let total: f64 = ps.iter().map(|p| p.1).sum();
         ps.into_iter()
             .enumerate()
-            .map(|(i, (label, v, color))| {
+            .map(|(i, (label, v, color, help))| {
                 view! {
-                    <div class="dl-row" class:hl=move || hover.get() == Some(i)
+                    <div class="dl-row" class:hl=move || hover.get() == Some(i) title=(!help.is_empty()).then_some(help)
                         on:mouseenter=move |_| hover.set(Some(i)) on:mouseleave=move |_| hover.set(None)>
                         <i style=format!("background:{color}")></i><span>{label}</span><b>{num(v)}</b><em>{pct(v, total)}</em>
                     </div>
@@ -389,6 +412,9 @@ pub fn HBars(
     #[prop(optional)] money: bool,
     #[prop(optional)] on_pick: Option<Callback<String>>,
     #[prop(default = 10)] limit: usize,
+    /// Hover text per label; a label without one shows itself.
+    #[prop(into, optional)]
+    titles: Option<Signal<BTreeMap<String, String>>>,
 ) -> impl IntoView {
     move || {
         let mut it = items.get();
@@ -401,9 +427,10 @@ pub fn HBars(
             .take(limit)
             .map(|(label, v)| {
                 let l2 = label.clone();
+                let title = titles.and_then(|t| t.with(|t| t.get(&label).cloned())).unwrap_or_else(|| label.clone());
                 view! {
-                    <div class="hbar" class:pick=on_pick.is_some() on:click=move |_| if let Some(cb) = on_pick { cb.run(l2.clone()) }>
-                        <span class="hbar-l" title=label.clone()>{label.clone()}</span>
+                    <div class="hbar" class:pick=on_pick.is_some() title=title on:click=move |_| if let Some(cb) = on_pick { cb.run(l2.clone()) }>
+                        <span class="hbar-l">{label.clone()}</span>
                         <span class="hbar-t"><span class="hbar-f" style=format!("width:{:.1}%;background:{color}", v / mx * 100.0)></span></span>
                         <span class="hbar-v">{if money { usd(v) } else { num(v) }}</span>
                     </div>
@@ -411,5 +438,45 @@ pub fn HBars(
             })
             .collect_view()
             .into_any()
+    }
+}
+
+/// One horizontal 100% bar of parts (label, value, colour, hover help) with its legend. A part of 0 is
+/// left out of the bar but kept in the legend, so "corrected anyway: 0" stays visible. `compact`: no
+/// legend, a thin bar for a table cell.
+#[component]
+pub fn StackBar(#[prop(into)] parts: Signal<Vec<(String, f64, String, String)>>, #[prop(optional)] compact: bool) -> impl IntoView {
+    move || {
+        let ps = parts.get();
+        let total: f64 = ps.iter().map(|p| p.1).sum();
+        let tip = |label: &str, v: f64, help: &str| {
+            let head = format!("{label}: {} ({})", num(v), pct(v, total));
+            if help.is_empty() { head } else { format!("{head}\n{help}") }
+        };
+        let segs = ps
+            .iter()
+            .filter(|p| p.1 > 0.0)
+            .map(|(label, v, color, help)| {
+                view! { <span style=format!("width:{:.2}%;background:{color}", v / total.max(1e-9) * 100.0) title=tip(label, *v, help)></span> }
+            })
+            .collect_view();
+        let title = compact.then(|| ps.iter().map(|(l, v, _, _)| format!("{l}: {}", num(*v))).collect::<Vec<_>>().join(" · "));
+        let legend = (!compact).then(|| {
+            ps.iter()
+                .map(|(label, v, color, help)| {
+                    view! {
+                        <div class="dl-row" title=tip(label, *v, help)>
+                            <i style=format!("background:{color}")></i><span>{label.clone()}</span><b>{num(*v)}</b><em>{pct(*v, total)}</em>
+                        </div>
+                    }
+                })
+                .collect_view()
+        });
+        view! {
+            <div class="stackbar-wrap">
+                <div class="stackbar" class:compact=compact title=title>{segs}</div>
+                {legend.map(|l| view! { <div class="stackbar-legend">{l}</div> })}
+            </div>
+        }
     }
 }

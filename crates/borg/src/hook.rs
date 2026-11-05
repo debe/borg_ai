@@ -1697,6 +1697,8 @@ fn mark_late(session: &str, input: &Value, check: &str, members: &[&conscience::
         e.lessons = members.iter().map(|c| c.id.clone()).collect();
         e.channel = "live".into();
         e.why = if event == WAKE_EVENT { WAKE_EVENT.into() } else { String::new() };
+        // A detached check's asks (live mode's, before 0.7.6, had no mode): stats.rs folds them apart.
+        e.mode = crate::check_async::MODE.into();
     });
 }
 

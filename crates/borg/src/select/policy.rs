@@ -113,6 +113,9 @@ pub const ASK_PRIOR: (f64, f64) = (0.0, 0.35);
 /// 8 placebos drawn, 1 judged, the fitted effect is this prior; withholding is not learned until 100
 /// judged placebos exist.
 pub const NOT_PRIOR: (f64, f64) = (-0.3, 0.25);
+/// The judged placebos needed before not now is learned rather than fixed at [`NOT_PRIOR`] (the same
+/// dated decision, 2026-10-31): shown as progress on the Conscience tab.
+pub const NOT_LEARNED_UNTIL: u64 = 100;
 /// Dilution slope per ln(m) of asks or free lessons, N(0, 0.1²) truncated ≤ 0 (half-normal, its mode
 /// at 0). Learned, dated prior: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question on the
 /// log-odds scale) has an interval that includes 0, so no dilution is assumed; its width sets the scale.

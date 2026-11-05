@@ -200,10 +200,9 @@ applies it leaves for later.
 **The question-count test.** The fixed rule never varies how many lessons a check asks: with a grade
 3 it asks every lesson it delivers, without one it asks none and hands the 2s and 1s over. Whether
 asking a 2 beats handing it over is therefore the decision its history cannot inform. The learned
-policy learned it by a randomised test on the live checks where the evidence kept the fixed rule.
-**Since live mode was removed (0.7.6) no check runs the test**: it never ran at the stop (below). Its
-draws before 0.7.6 stay in the log and still count toward its readout, which therefore waits until
-the test runs again (it would need a stop design of its own, pre-registered first). As it ran:
+policy learns it by a randomised test on the checks that do not block the stop, where the evidence keeps
+the fixed rule: live checks before 0.7.6, detached checks (channel `live`) since 0.7.7. It never runs at
+a blocking stop (below). Draws from both count toward its readout. It runs as follows:
 
 1. Of the lessons the fixed rule delivers, asked or handed over, take the k that are not grade 3 and
    may go free (not one the session already had). With k = 0 there is nothing to test.
@@ -319,9 +318,9 @@ deviates nowhere and is the fixed rule (P4b), and the test's recall must equal t
 (P4c). Their one run (2026-10-29, the P4 cases seen a third time) passed P0–P3, P4a and P4c, and
 P4b was NOT TESTED: under the store's posterior the decision rule deviated on none of the
 evaluation's checks, so there it is the fixed rule. That made the learned policy the default, as the
-rules say. Until 0.7.6 it differed from the fixed rule by the question-count test on live checks,
-which withheld no lesson and which the gate rationed by `risk`; with live mode gone it leaves the fixed
-rule on evidence only, once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
+rules say. It differs from the fixed rule by the question-count test on checks that do not block the
+stop (live checks before 0.7.6, detached checks since 0.7.7), which withholds no lesson and which the
+gate rations by `risk`, and on evidence once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
 
 **Readout.** Under the learned policy the monitor guards the policy, and after 300 randomised
 checks in 15 sessions, or 30 sessions, a readout reports dilution (for each number m ≥ 2 of the test's questions
@@ -380,7 +379,7 @@ other criteria. Live checks had cost about $690 by then (5,862 calls), 8× hook'
 judging no longer needs them: since 0.7.5 every delivery is judged at the stop, and at the session's
 end. Accepted with the removal: about 10× fewer graded checks to learn from, so the selection
 readouts come later ([Roadmap](roadmap.md)); the stop blocks again when it asks (about 0.5 redo rounds
-per run in that benchmark); and the question-count test, which ran on live checks only, runs no more.
+per run in that benchmark); and the question-count test paused until detached checks (0.7.7) ran it again.
 
 **Upgrading.** Nothing to do. `"mode"` in `collectives.json` and `BORG_MODE` are accepted and ignored,
 and `borg doctor` notes once that one is still set; `BORG_LIVE_DEBOUNCE_S` does nothing. History stays

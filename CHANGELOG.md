@@ -3,6 +3,13 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.9 (unreleased)
+
+### Changed
+
+- Conscience tab reorganised around the developer's questions, with hover help on every card; skip and
+  drop reasons are counted (upgrade borg and borg-web together; older nodes' days show "reason not recorded").
+
 ## 0.7.8 (2026-11-04)
 
 ### Fixed

@@ -662,6 +662,8 @@ pub struct Measurement {
     pub judged: f64,
     pub tail_shown: f64,
     pub tail_applied: f64,
+    /// The judged placebos needed before not now is learned (0: an older server, which names none).
+    pub placebos_needed: f64,
 }
 
 /// The pool's yield at fill positions `from..to` (0 first).
@@ -803,6 +805,8 @@ pub struct JudgeStep {
     pub upto: f64,
     pub sent: f64,
     pub answered: f64,
+    /// The judge calls that sent them.
+    pub calls: f64,
     pub lo: f64,
     pub hi: f64,
     pub decision: String,
@@ -861,7 +865,13 @@ pub fn parse_select(v: &Value) -> Selection {
         }),
         measurement: x["measurement"].as_object().map(|_| {
             let m = &x["measurement"];
-            Measurement { placebos: f(&m["placebos"]), judged: f(&m["judged"]), tail_shown: f(&m["tail_shown"]), tail_applied: f(&m["tail_applied"]) }
+            Measurement {
+                placebos: f(&m["placebos"]),
+                judged: f(&m["judged"]),
+                tail_shown: f(&m["tail_shown"]),
+                tail_applied: f(&m["tail_applied"]),
+                placebos_needed: f(&m["placebos_needed"]),
+            }
         }),
         pool: list(&x["pool"], |y| Yield { from: f(&y["from"]), to: f(&y["to"]), shown: f(&y["shown"]), applied: f(&y["applied"]), rate: f(&y["rate"]) }),
         latency: list(&x["latency"], |l| Latency {
@@ -881,6 +891,7 @@ pub fn parse_select(v: &Value) -> Selection {
                 upto: f(&t["upto"]),
                 sent: f(&t["sent"]),
                 answered: f(&t["answered"]),
+                calls: f(&t["calls"]),
                 lo: f(&t["lo"]),
                 hi: f(&t["hi"]),
                 decision: s(&t["decision"]),
@@ -1040,15 +1051,8 @@ pub fn provide() -> Data {
 
     spawn_local(async move {
         if let Some(v) = get("/api/collectives".into()).await {
-            d.collectives.set(
-                v["collectives"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|c| (s(&c["name"]), s(&c["share"])))
-                    .filter(|(n, ..)| !n.is_empty())
-                    .collect(),
-            );
+            d.collectives
+                .set(v["collectives"].as_array().into_iter().flatten().map(|c| (s(&c["name"]), s(&c["share"]))).filter(|(n, ..)| !n.is_empty()).collect());
             d.collective.set(s(&v["first"]));
         }
     });

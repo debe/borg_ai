@@ -76,6 +76,7 @@ nav.tabs a.on { color: var(--ink); border-bottom-color: var(--accent); }
 .tile .l { font: 500 .68rem var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
 .tile .v { font: 700 1.7rem/1.15 var(--sans); font-variant-numeric: tabular-nums; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .s { font-size: .78rem; color: var(--muted); }
+.tile .s.warn { color: var(--c-heat); }
 .delta { font: 600 .7rem var(--mono); padding: 1px 6px; border-radius: 10px; background: var(--panel-2); color: var(--muted); }
 .delta.good { color: var(--good); background: var(--good-soft); }
 .delta.bad { color: var(--heat); background: var(--heat-soft); }
@@ -132,12 +133,44 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
 .dl-row em { font: .75rem var(--mono); color: var(--muted); font-style: normal; text-align: right; }
 
 /* horizontal bars and ranks */
-.hbar { display: grid; grid-template-columns: minmax(80px, 38%) 1fr 64px; gap: 8px; align-items: center; font-size: .84rem; padding: 3px 0; }
+.hbar { display: grid; grid-template-columns: minmax(80px, 38%) 1fr minmax(64px, max-content); gap: 8px; align-items: center; font-size: .84rem; padding: 3px 0; }
 .hbar.pick { cursor: pointer; } .hbar.pick:hover .hbar-l { color: var(--accent); }
 .hbar-l { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hbar-t { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
 .hbar-f { display: block; height: 100%; border-radius: 5px; }
-.hbar-v { font: .78rem var(--mono); text-align: right; }
+.hbar-v { font: .78rem var(--mono); text-align: right; white-space: nowrap; }
+.hbar.wrap { grid-template-columns: minmax(140px, 50%) 1fr minmax(64px, max-content); }
+.hbar.wrap .hbar-l { white-space: normal; line-height: 1.25; }
+.hbar.few .hbar-l, .few { color: var(--muted); font-style: italic; }
+
+/* hover help, section heads, 100% bars, lesson table (Conscience) */
+.help { display: inline-block; margin-left: 6px; font: 400 .72rem var(--sans); color: var(--muted); cursor: help; vertical-align: super; text-transform: none; letter-spacing: 0; }
+.help:hover, .help:focus { color: var(--accent); outline: none; }
+.tile[title] { cursor: help; }
+.section-head { margin: 28px 0 0; display: grid; gap: 4px; }
+.section-head h1 { font: 600 1.15rem var(--sans); margin: 0; }
+.verdict { font-size: .92rem; margin: 0; }
+.verdict b { font-variant-numeric: tabular-nums; }
+.verdict .warn { color: var(--c-heat); } .verdict .ok { color: var(--c-good); }
+.how { font-size: .8rem; color: var(--muted); margin: 8px 0 0; max-width: 90ch; }
+.how b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.panel h3 { font-size: .92rem; margin: 18px 0 8px; }
+.stackbar-wrap { display: grid; gap: 8px; }
+.stackbar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--panel-2); }
+.stackbar > span { height: 100%; }
+.stackbar.compact { height: 8px; min-width: 80px; border-radius: 4px; }
+.stackbar-legend { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.ltable { width: 100%; border-collapse: collapse; font-size: .84rem; }
+.ltable th { font: 500 .68rem var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); text-align: right; padding: 4px 6px; cursor: help; }
+.ltable th:first-child, .ltable td:first-child { text-align: left; }
+.ltable td { padding: 5px 6px; border-top: 1px solid var(--rule); text-align: right; font-variant-numeric: tabular-nums; }
+.ltable td.outcome { width: 120px; }
+.ltable tr.pick { cursor: pointer; } .ltable tr.pick:hover td:first-child { color: var(--accent); }
+.sorts { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.sorts button { font-size: .78rem; padding: 2px 8px; border: 1px solid var(--rule); border-radius: 12px; background: none; color: var(--muted); cursor: pointer; }
+.sorts button.on { color: var(--accent); border-color: var(--accent); }
+.group.diag > summary { font-weight: 600; }
+.group.diag > .stack { padding: 0 16px 16px; }
 .rank { display: grid; grid-template-columns: 1fr 90px 80px; gap: 10px; align-items: center; width: 100%; padding: 7px 4px; border-bottom: 1px solid var(--rule); font-size: .86rem; }
 .rank:hover .rank-q { color: var(--accent); }
 .rank-bar { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }

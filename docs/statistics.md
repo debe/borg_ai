@@ -35,7 +35,7 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `/api/drones?c=` | The sessions, as in `borg top`, each with its unread messages |
 | `/api/messages?c=&limit=` | Messages between sessions from the last 7 days, newest first: sender, recipient (`to_kind`: `all`, `engineer` or `session`), text, how many sessions here were shown it, and the unread total |
 | `POST /api/messages/seen?c=` | The Messages view showed the engineer these messages (a JSON body, `{"ids": [...]}`, at most 2000): those to the engineer are acknowledged as the engineer of the directory `borg web` started in, as `borg inbox` does; any other id is ignored. 415 without a JSON body, so another site's page cannot call it (a JSON body needs a CORS preflight, which the server never answers) |
-| `/api/select?c=` | Lesson selection ([Which lessons are asked](delivery.md#which-lessons-are-asked)), from the store's selection summary: the `policy` of this process, the `default` (`learned`) and the `source` (`reverted` once the monitor put the fixed rule back), the `gate` (the quality the learned policy may still risk below the fixed rule, not money; 0 under the fixed rule) and its two parts, the `allowance` the fixed rule's value accrued and the `ledger`'s 5% quantile (a gate of 0 with a positive allowance is spent, not a cold start), the `fit`, `checks` and `sessions` folded, `deviations` from the fixed rule (routes only), `fallbacks` (per `reason` a learned decision took the fixed rule instead, `lock_busy`, `lock_failed` and `unrecorded`, the graded checks it did of those folded), `spend` per source (`stop`, `live`: calls, extra rounds, dollars), the engineer's `budget` (`{tokens, spent, price}`, `null` unless one is set), `effects` with 95% intervals, the forgetting `half_life`, label health (`labels`: the judged share per route (a verdict: changed, ignored or not arisen), the shares of the judge's answers from judge version 3 (0.7.5) on, each apply's latest, that were `unclear` (also per route: `unclear, asked`, `unclear, free`, `unclear, placebo`), `not arisen` and `consequence remains`; an older `unclear` also held a remaining consequence and is in none of them, and an apply the judge never answered is in the judged share, not here; the placebo rate; the free row leaves out applies of a lesson the session already had or had waiting in its queue, which delivery drops as given before or queued twice, while a question of one is delivered and judged as any other), the `declaration`'s effect on the judge, the fitted `delivery` rates (`free_stop`, `free_live` and `ask_live` weigh a route's value: `ask_live` a live question's of a check with a 3, `free_live` a hand-over's and a live question's of a check without one; `later` and `wait` are only shown), the monitor's `evaluation` (its `mean` and upper bound `ucb` over its `sessions`, and the weights' health over the labelled applies that can move the estimate, on a route with at least 5 labels: labelled `units`, `ess`, `max_weight` against the mean, `truncated`), the `measurement` for the learned policy (`placebos` drawn and `judged`, `tail_shown` and `tail_applied`), `pool` yield by fill position, `latency` per harness (the stop calls' `p50_ms` and `p95_ms` against the harness's `budget_ms`, `over`: failed calls), and `judge`, the judge's effective length per model ([Session end](delivery.md)): the session-end budget `chars`, whether it is still the `start`, the `line` a step must reach, per prompt-size `steps` (`upto` characters) the lessons `sent` and `answered` with their 95% Wilson interval `lo`–`hi` and `decision` (`reference`, `below`, `holds`, `fails`, `open`), the step it `explore`s and the chance `psi`. A section not measured yet is empty or `null` |
+| `/api/select?c=` | Lesson selection ([Which lessons are asked](delivery.md#which-lessons-are-asked)), from the store's selection summary: the `policy` of this process, the `default` (`learned`) and the `source` (`reverted` once the monitor put the fixed rule back), the `gate` (the quality the learned policy may still risk below the fixed rule, not money; 0 under the fixed rule) and its two parts, the `allowance` the fixed rule's value accrued and the `ledger`'s 5% quantile (a gate of 0 with a positive allowance is spent, not a cold start), the `fit`, `checks` and `sessions` folded, `deviations` from the fixed rule (routes only), `fallbacks` (per `reason` a learned decision took the fixed rule instead, `lock_busy`, `lock_failed` and `unrecorded`, the graded checks it did of those folded), `spend` per source (`stop`, `live`: calls, extra rounds, dollars), the engineer's `budget` (`{tokens, spent, price}`, `null` unless one is set), `effects` with 95% intervals, the forgetting `half_life`, label health (`labels`: the judged share per route (a verdict: changed, ignored or not arisen), the shares of the judge's answers from judge version 3 (0.7.5) on, each apply's latest, that were `unclear` (also per route: `unclear, asked`, `unclear, free`, `unclear, placebo`), `not arisen` and `consequence remains`; an older `unclear` also held a remaining consequence and is in none of them, and an apply the judge never answered is in the judged share, not here; the placebo rate; the free row leaves out applies of a lesson the session already had or had waiting in its queue, which delivery drops as given before or queued twice, while a question of one is delivered and judged as any other), the `declaration`'s effect on the judge, the fitted `delivery` rates (`free_stop`, `free_live` and `ask_live` weigh a route's value: `ask_live` a live question's of a check with a 3, `free_live` a hand-over's and a live question's of a check without one; `later` and `wait` are only shown), the monitor's `evaluation` (its `mean` and upper bound `ucb` over its `sessions`, and the weights' health over the labelled applies that can move the estimate, on a route with at least 5 labels: labelled `units`, `ess`, `max_weight` against the mean, `truncated`), the `measurement` for the learned policy (`placebos` drawn and `judged`, `placebos_needed` before leaving a lesson for later is learned, `tail_shown` and `tail_applied`), `pool` yield by fill position, `latency` per harness (the stop calls' `p50_ms` and `p95_ms` against the harness's `budget_ms`, `over`: failed calls), and `judge`, the judge's effective length per model ([Session end](delivery.md)): the session-end budget `chars`, whether it is still the `start`, the `line` a step must reach, per prompt-size `steps` (`upto` characters) the lessons `sent` and `answered` with their 95% Wilson interval `lo`–`hi` and `decision` (`reference`, `below`, `holds`, `fails`, `open`), the step it `explore`s and the chance `psi`. A section not measured yet is empty or `null` |
 | `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/memory?c=&absorbed=` | The `borg memory export --json` document (`{"schema": 1, "collective", "lessons"}`, [Memory](learning.md)); `absorbed=true` keeps only absorbed lessons |
 | `/api/update?c=` | borg itself: this borg (`borg`), its mesh `protocol`, whether the release check is on (`check`), the last check's `latest`, `checked_ms` and `error` (`null` before the first), `update` (a newer release exists and the check is on), and `members`: each member the mesh last heard from with its `key`, `engineer` (when known), `name` (the engineer, else `peer <short key>`), `borg` (`null`: older than 0.7, it sent no version), the `protocol` its last session agreed on (or the one it speaks when nothing syncs with it), `ms`, `syncs` (`false`: nothing syncs with it) and `note` (what it misses on an older protocol, or why nothing syncs; `null` on this node's footing). No members without the store's `mesh/` ([Versions on the mesh](team-sync.md#how-a-sync-works)) |
@@ -56,16 +56,43 @@ week. A "verdict on an asked lesson" is a Stop's changed or ignored, or a later 
 one lesson can get on top of either, as on the Conscience tab.
 
 **The tabs.** Overview (the day's activity and a live feed), Knowledge (the lessons), Conscience
-(checks, what their questions led to, and lesson selection: its policy and the default, spend per
-session, effects, label health, what is measured for the learned policy, the delivery rates, pool
-yield and stop latency per harness, the miss causes of the pool log (the first applies at grade ≥ 2
-the fill order ranked low, per cause, [The pool log](learning.md#the-pool-log)), the learned decisions a guard gave the fixed rule, per reason,
-and under the learned policy its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test
-(checks drawn, controls, refused by the gate, the draws of s, the risk share in force, the readout once
-due) and the monitor's reading, each "not measured yet"
-until it is), Learning (above), Steering (corrections, pauses, resumes, vetoes and refused steers),
+(below), Learning (above), Steering (corrections, pauses, resumes, vetoes and refused steers),
 Messages (the conversation between sessions, sends and refusals; the messages to the engineer it lists
 are acknowledged), Queen, Cost and Drones (which sessions run where, and their unread messages).
+
+**The Conscience tab** answers a developer's questions top-down. Every card names its question, its
+unit and how to read it; hover a tile, a heading's ⓘ, a bar or a legend row for what the number means
+and its raw names. Headline tiles show the last 7 days, with the change against the 7 before;
+lifetime values are in the hover text.
+
+1. *Is the conscience working?* Turn ends seen, the share that passed free and why (no edits, nothing
+   matched well enough, no lessons), paid checks with their cost, failures and average time, and the
+   lessons read per check. Per day, what happened at each turn end (passed free, checked with nothing
+   to ask, asked with the next prompt, asked in an extra round, check dropped), and the checks that did
+   not finish, by reason.
+2. *Did the agent act on what borg said?* Of judged lesson deliveries (per lesson, from `/api/lessons`
+   usage), the share acted on, not acted on and corrected anyway, with the verdict coverage and the
+   share about a situation that never came up; the acted-on rate per delivery path (verdict events,
+   which can cover several lessons each); how lessons reached agents (asked in an extra round, asked with
+   the next prompt, side note, up front); the lessons said and still corrected.
+3. *What does it cost?* Checking spend and cost per lesson that landed (7 days), spend per session and
+   where it goes (blocking or detached), and live mode's history (removed in 0.7.6) in one line.
+4. *Which lessons matter?* One table per lesson: asked, passed along, outcome per session (acted on, not
+   acted on, corrected anyway) and the rate from 5 judged sessions on; sorted by asked, acted on, rarely
+   acted on (candidates to reword or retire) or best rate. Click a lesson to open it.
+5. *How lessons are picked, and is the learned policy safe?* Who picks the questions (fixed rule or
+   learned policy), the safety brake (the monitor: no harm while its upper bound stays above 0), the
+   safety budget left (the gate: allowance plus the ledger's 5% quantile), how often the learned policy
+   differed from the fixed rule; what makes a lesson land (the model's effects in percentage points for a
+   grade-2 lesson); the question-count experiment (draws, vetoes, progress to its pre-registered readout,
+   the placebo controls); whether deliveries arrived per path; where useful lessons sit in the ranked
+   list, past the budget, and why relevant lessons ranked low.
+6. *Diagnostics for the author* (folded): raw coefficients, spreads and fit facts, verdict coverage per
+   route, the judge's answers, the self-report effect, the session-end judge's length, the randomisation
+   check, the safety brake's reliability and fallbacks, blocking check speed, the data for testing other
+   selection rules (`borg debug ope`) and the pool log.
+
+Each section is "not measured yet", with what fills it, until it is.
 
 **In the terminal.** `borg status` shows, per store, the turn-end check (`turn check`: detached or at
 the stop, the call limit now, the detached checks with their cost, failed ones and those at the limit,
@@ -121,6 +148,13 @@ reads `/api/update` and follows the release check and the mesh's version records
 | `assimilated` | One imported chunk of team documents and the lessons it gave |
 
 `<kind>_n` in the counts sums the events' `n`, for example `block_n` is the number of questions asked.
+
+Reasons are counted too, as `<kind>:<why>` (0.7.9): `gate_skip:noedit`, `gate_skip:score` (the word
+match scored below the bar), `gate_skip:empty` (no candidate lessons), `gate_skip:live_covered` (live
+mode, before 0.7.6) and `gate_skip:other`; `check:failed` and `live_check:failed`; `check_dropped:superseded`,
+`gone`, `unstarted` and `unplaced`. `check_ms` and `check_timed` sum the time of the checks that report
+one, for the average. A node counts them for its own history at its next rollup; a node on an older
+borg counts none, so the page states how many reasons it knows.
 
 **Mode and channel.** Events from a hook before 0.7.6 carry `mode`: the delivery mode it ran in
 (`hook` or `live`); since live mode was removed ([Live mode](delivery.md#live-mode-removed-in-076))
