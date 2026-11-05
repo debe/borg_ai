@@ -964,7 +964,11 @@ mod tests {
         ];
         let b = &fold("n1", &evs)["stat:n1:a@x:1970-01-01"];
         let n = |k: &str| b.counts.get(k).or(b.why.get(k)).copied().unwrap_or(0);
-        assert!(b.counts.keys().all(|k| !k.contains(':') && !k.starts_with("check_ms") && k != "check_timed"), "counts stay as 0.7.8 folds them: {:?}", b.counts);
+        assert!(
+            b.counts.keys().all(|k| !k.contains(':') && !k.starts_with("check_ms") && k != "check_timed"),
+            "counts stay as 0.7.8 folds them: {:?}",
+            b.counts
+        );
         assert_eq!((n("gate_skip:noedit"), n("gate_skip:score"), n("gate_skip:empty"), n("gate_skip:live_covered")), (1, 2, 1, 1), "{:?}", b.counts);
         assert_eq!(n(GATE_SKIP), 6, "a skip without a reason is counted, with no reason");
         assert_eq!((n("check:failed"), n("check_dropped:superseded")), (1, 1));
