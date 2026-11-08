@@ -23,7 +23,9 @@
 //!   per (session, lesson), vetoed > corrected > changed > ignored. `asked_not_corrected` (settled by `borg
 //!   learn`) is censored, no result: the judge never said whether the drone acted on the lesson. A
 //!   placebo's result, an unclear verdict, a remaining consequence (`asked_consequence_remains`) and a
-//!   point that never came up (`asked_not_arisen`) are none either (outcome.rs `is_result`). A correction counts
+//!   point that never came up (`asked_not_arisen`) are none either (outcome.rs `is_result`), nor is an ignore
+//!   written before 0.7.5, whose judge filed a point that never came up as an ignore (outcome.rs
+//!   `ambiguous`: about nine in ten were, by the later judge's split). A correction counts
 //!   twice (outcome.rs `CORRECTED_W`); a veto (`borg no`,
 //!   veto.rs) three times, above a correction as the design asks (no eval behind the 3 yet). Regretted is
 //!   the weighted share of later fixes of decisions the lesson was asked before (outcome.rs `regretted`),
@@ -241,7 +243,9 @@ pub fn ticks(kind: &str) -> bool {
 /// every other kind. `asked_not_corrected` (settled by `borg learn`) is censored: the judge never said
 /// whether the drone acted on the lesson, so it is no ignore, and a verdict for the same lesson recorded
 /// after it counts alone. A point that never came up, an unclear verdict and a remaining consequence are
-/// censored too (and already turned away by outcome.rs `is_result`): they are measured only.
+/// censored too (and already turned away by outcome.rs `is_result`): they are measured only. So is an
+/// ignore from before 0.7.5 (outcome.rs `ambiguous`), which only `is_result` turns away: the kind alone
+/// does not tell it, so every caller filters by `is_result` first.
 pub fn result_of(kind: &str) -> Option<u8> {
     match kind {
         outcome::VETOED => Some(3),
@@ -609,8 +613,10 @@ mod tests {
         assert_eq!(strip_declaration("XMdrain: applies", "Mdrain"), "XMdrain: applies", "another id ending in it");
     }
 
+    /// A record by today's judge: its ignore is a result (outcome.rs `ambiguous`).
     fn o(kind: &str, session: &str, lesson: &str, ms: i64, repo: &str) -> Outcome {
-        Outcome { kind: kind.into(), session: session.into(), lessons: vec![lesson.into()], ms, repo: repo.into(), ..Default::default() }
+        let judge = if kind == IGNORED { outcome::NEVER_SPLIT } else { 0 };
+        Outcome { kind: kind.into(), session: session.into(), lessons: vec![lesson.into()], ms, repo: repo.into(), judge, ..Default::default() }
     }
 
     fn lesson(id: &str, ms: i64) -> Challenge {
@@ -738,6 +744,31 @@ mod tests {
             assert_eq!(mem(&[asked.clone(), placebo]), alone, "placebo {kind}");
         }
         assert_eq!(mem(&[asked.clone(), Outcome { channel: "stop".into(), ..o(outcome::UNCLEAR, "a", "L", 5, "r") }]), alone);
+    }
+
+    /// Before 0.7.5 the judge filed a point that never came up as an ignore: such an ignore (judge < 3,
+    /// a peer's line without a version too) moves no belief, today's ignore does, and an old judge's
+    /// change still counts.
+    #[test]
+    fn an_ignore_from_before_the_never_came_up_verdict_moves_no_belief() {
+        let l = lesson("L", 0);
+        let mem = |log: &[Outcome]| derive(log, std::slice::from_ref(&l), None)["L"].clone();
+        let asked = Outcome { channel: "stop".into(), ..o(outcome::ASKED, "a", "L", 1, "r") };
+        let alone = mem(std::slice::from_ref(&asked));
+        for judge in [0, 2] {
+            let old = Outcome { channel: "stop".into(), judge, ..o(IGNORED, "a", "L", 5, "r") };
+            assert!(!outcome::is_result(&old) && outcome::share(&old, "n1").is_none(), "judge {judge}");
+            assert_eq!(mem(&[asked.clone(), old]), alone, "judge {judge}");
+            let changed = Outcome { channel: "stop".into(), judge, ..o(CHANGED, "a", "L", 5, "r") };
+            assert!(mem(&[asked.clone(), changed]).alpha() > alone.alpha(), "judge {judge}: a change counts");
+        }
+        let today = Outcome { channel: "stop".into(), ..o(IGNORED, "a", "L", 5, "r") };
+        assert!(mem(&[asked.clone(), today.clone()]).beta() > alone.beta());
+        // A peer reads today's ignore with its version, and an older one's not at all.
+        let shared = outcome::share(&today, "n1").unwrap();
+        assert_eq!(shared.judge, outcome::NEVER_SPLIT);
+        let unversioned: outcome::Shared = serde_json::from_str(&serde_json::to_string(&outcome::Shared { judge: 0, ..shared }).unwrap()).unwrap();
+        assert!(outcome::ambiguous(&unversioned.kind, unversioned.judge));
     }
 
     /// Judge v3 (0.7.5): a point that never came up is censored, as a settle without a verdict is, and a

@@ -114,11 +114,12 @@ pub(crate) fn rank(kind: &str) -> Option<u8> {
 /// 1 when the strongest result of its session at or after the ask is a change, else 0: a correction or
 /// a veto after the ask means asking did not help. A placebo's result (outcome.rs `PLACEBO`: judged
 /// where a free delivery would be, never shown) is no result about the lesson, and an unclear verdict
-/// (`UNCLEAR`), a remaining consequence (`REMAINS`) and a point that never came up (`NOT_ARISEN`) have no
-/// rank: none rewards anything.
+/// (`UNCLEAR`), a remaining consequence (`REMAINS`), a point that never came up (`NOT_ARISEN`) and an
+/// ignore by a judge that could not tell it from one (outcome.rs `ambiguous`) have no rank: none
+/// rewards anything.
 pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
     let mut results: HashMap<(&str, &str), Vec<(i64, u8)>> = HashMap::new();
-    for o in outcomes.iter().filter(|o| o.channel != outcome::PLACEBO) {
+    for o in outcomes.iter().filter(|o| o.channel != outcome::PLACEBO && !outcome::ambiguous(&o.kind, o.judge)) {
         if let Some(r) = rank(&o.kind) {
             for l in &o.lessons {
                 results.entry((o.session.as_str(), l.as_str())).or_default().push((o.ms, r));
@@ -516,6 +517,7 @@ mod tests {
     use crate::outcome::{ASKED, CHANGED, GRADED, IGNORED, VETOED};
     use std::collections::HashSet;
 
+    /// A record by today's judge: its ignore is a result (outcome.rs `ambiguous`).
     fn o(kind: &str, session: &str, lessons: &[&str], ms: i64) -> Outcome {
         Outcome {
             kind: kind.into(),
@@ -523,6 +525,7 @@ mod tests {
             lessons: lessons.iter().map(|l| l.to_string()).collect(),
             ms,
             repo: "r".into(),
+            judge: if kind == IGNORED { crate::outcome::NEVER_SPLIT } else { 0 },
             ..Default::default()
         }
     }
@@ -715,7 +718,11 @@ mod tests {
         let (ds, skipped) = decisions(&log(changed.clone()));
         assert_eq!((ds.len(), skipped.pending), (1, 0), "a plain change rewards the ask");
         let censored = Outcome { kind: outcome::NOT_CORRECTED.into(), ..changed.clone() };
-        for x in [Outcome { channel: outcome::PLACEBO.into(), ..changed.clone() }, Outcome { kind: outcome::UNCLEAR.into(), ..changed }, censored] {
+        let ignored = o(IGNORED, "d", &["A"], 2);
+        assert_eq!(decisions(&log(ignored.clone())).0.len(), 1, "today's ignore is a result");
+        // An ignore by a judge before the never-came-up verdict (outcome.rs `ambiguous`).
+        let old = Outcome { judge: 2, ..ignored };
+        for x in [Outcome { channel: outcome::PLACEBO.into(), ..changed.clone() }, Outcome { kind: outcome::UNCLEAR.into(), ..changed }, censored, old] {
             let (ds, skipped) = decisions(&log(x.clone()));
             assert_eq!((ds.len(), skipped.pending), (0, 1), "{x:?} leaves the ask without a result");
         }

@@ -12,7 +12,9 @@
 //! session was given, a regret's session the first line's (this machine's log first, then by offset).
 //! Lines parse exactly as outcome.rs `read` and `team_parts` parse them. `team_parts` keeps the first of
 //! duplicate team lines; the fold keeps their union, which is the same for the lines `publish` writes
-//! (deterministic per record) and needs no dedup set.
+//! (deterministic per record) and needs no dedup set. The one record with two lines, an ignore by judge 3
+//! published before and after 0.7.10 (outcome.rs `Shared::judge`), `team_parts` keeps both of, as the
+//! fold does.
 //!
 //! **Regrets.** Most lines of a long history are regrets (12,577 of 17,293 on one store), each its own
 //! (lesson, cause) key, while `derive` needs only their sum per (lesson, deciding session) (memory.rs
@@ -66,7 +68,7 @@ use crate::outcome::{self, Outcome, Shared};
 pub const FILE: &str = "beliefs.bin";
 /// The regrets behind the snapshot's sums (module doc).
 pub const REGRETS_FILE: &str = "beliefs-regrets.bin";
-const MAGIC: &[u8; 8] = b"BORGFCT2";
+const MAGIC: &[u8; 8] = b"BORGFCT3";
 const REGRETS_MAGIC: &[u8; 8] = b"BORGRGT2";
 /// The bytes hashed at the start of a log and before its checkpoint.
 const WINDOW: u64 = 4096;
@@ -272,6 +274,7 @@ struct Rec<'a> {
     channel: &'a str,
     cause: &'a str,
     credit: f64,
+    judge: u8,
 }
 
 #[cfg(test)]
@@ -359,8 +362,17 @@ impl Facts {
             if team {
                 let Ok(x) = serde_json::from_str::<Shared>(text) else { continue };
                 if outcome::SHARED_KINDS.contains(&x.kind.as_str()) {
-                    let rec =
-                        Rec { kind: &x.kind, session: &x.s, lessons: &x.lessons, ms: x.ms, repo: &x.r, channel: &x.channel, cause: &x.c, credit: x.credit };
+                    let rec = Rec {
+                        kind: &x.kind,
+                        session: &x.s,
+                        lessons: &x.lessons,
+                        ms: x.ms,
+                        repo: &x.r,
+                        channel: &x.channel,
+                        cause: &x.c,
+                        credit: x.credit,
+                        judge: x.judge,
+                    };
                     self.add(true, &rec, off);
                 }
             } else if let Ok(o) = serde_json::from_str::<Outcome>(text) {
@@ -373,6 +385,7 @@ impl Facts {
                     channel: &o.channel,
                     cause: &o.cause,
                     credit: o.credit,
+                    judge: o.judge,
                 };
                 self.add(false, &rec, off);
             }
@@ -404,7 +417,7 @@ impl Facts {
             self.team.given.extend(lessons.iter().map(|l| (s, *l)));
         }
         // outcome.rs `is_result`: no evidence for any reader of the fold.
-        if o.channel == outcome::PLACEBO || matches!(o.kind, outcome::UNCLEAR | outcome::REMAINS | outcome::NOT_ARISEN) {
+        if o.channel == outcome::PLACEBO || matches!(o.kind, outcome::UNCLEAR | outcome::REMAINS | outcome::NOT_ARISEN) || outcome::ambiguous(o.kind, o.judge) {
             return;
         }
         let part = if team { &mut self.team } else { &mut self.local };
@@ -1064,6 +1077,8 @@ mod tests {
                 channel: if r.next_u64().is_multiple_of(6) { outcome::PLACEBO.into() } else { pick(r, &["", "early", "stop"]).into() },
                 cause: if kind == outcome::REGRETTED || kind == outcome::MISSED { pick(r, &causes).into() } else { String::new() },
                 credit: if kind == outcome::REGRETTED { (r.next_u64() % 16) as f64 / 10.0 - 0.2 } else { 0.0 },
+                // Judges before and since the never-came-up verdict (outcome.rs `ambiguous`).
+                judge: [0, 2, outcome::NEVER_SPLIT][(r.next_u64() % 3) as usize],
                 ..Default::default()
             }
         };
@@ -1093,6 +1108,10 @@ mod tests {
                     let peer = format!("{:032x}", r.next_u64() % 4);
                     let mut x = outcome::share(&o, "peer").unwrap_or_else(|| outcome::Shared { kind: o.kind.clone(), ms: o.ms, ..Default::default() });
                     (x.s, x.lessons) = (peer, o.lessons.clone());
+                    // The same ignore as the peer published it before 0.7.10, without the judge's version.
+                    if x.judge > 0 && r.next_u64().is_multiple_of(2) {
+                        team.push(serde_json::to_string(&outcome::Shared { judge: 0, ..x.clone() }).unwrap());
+                    }
                     serde_json::to_string(&x).unwrap()
                 }
             };
@@ -1373,7 +1392,9 @@ mod tests {
         let d = dir("version");
         let lessons = d.join("lessons.jsonl");
         let (pl, pt) = (outcome::path_beside(&lessons), d.join(outcome::TEAM_FILE));
-        let (local, team, cs) = (0..20).map(logs).find(|(l, _, _)| l.contains("\"regretted\"")).expect("a store with regrets");
+        // A regret a fold reads the regrets for: not a placebo's (no result).
+        let read = |l: &str| l.contains("\"regretted\"") && !l.contains(outcome::PLACEBO);
+        let (local, team, cs) = (0..20).map(logs).find(|(l, _, _)| l.lines().any(read)).expect("a store with regrets");
         std::fs::write(&pl, &local).unwrap();
         std::fs::write(&pt, &team).unwrap();
         let cold = load(&lessons);
@@ -1398,7 +1419,7 @@ mod tests {
         theirs.regrets_file = Some(regrets_beside(&lessons));
         let r = theirs.regrets().cloned().unwrap();
         std::fs::write(regrets_beside(&lessons), encode_regrets(&r, saved.generation ^ 1)).unwrap();
-        let regret = local.lines().find(|l| l.contains("\"regretted\"")).unwrap();
+        let regret = local.lines().find(|l| read(l)).unwrap();
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(&pl).unwrap().write_all(format!("{regret}\n").as_bytes()).unwrap();
         same(&lessons, &cs, &load(&lessons), "other generation");

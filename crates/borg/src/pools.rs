@@ -357,7 +357,8 @@ pub fn ranks(v: &[Option<f64>]) -> Vec<f64> {
 type Moves = (String, Vec<String>);
 
 /// From the outcomes at `log`, read line by line: each of `rows`' Q before `stop_ms` (strictly, in time
-/// order: changed +1, ignored −0.5, placebos skipped), and the moves of `session`'s latest `graded`
+/// order: changed +1, ignored −0.5, placebos and ignores by a judge before the never-came-up verdict
+/// skipped, outcome.rs `ambiguous`), and the moves of `session`'s latest `graded`
 /// record with moves that finished before `stop_ms`, with its check.
 fn read_outcomes(log: &Path, session: &str, stop_ms: i64, rows: &HashSet<&str>) -> (HashMap<String, f64>, Option<Moves>) {
     #[derive(Deserialize)]
@@ -375,6 +376,8 @@ fn read_outcomes(log: &Path, session: &str, stop_ms: i64, rows: &HashSet<&str>) 
         check: String,
         #[serde(default)]
         moves: Vec<String>,
+        #[serde(default)]
+        judge: u8,
     }
     let mut verdicts: Vec<(i64, f64, Vec<String>)> = Vec::new();
     let mut moves: Option<(i64, String, Vec<String>)> = None;
@@ -399,7 +402,7 @@ fn read_outcomes(log: &Path, session: &str, stop_ms: i64, rows: &HashSet<&str>) 
                 }
                 _ => continue,
             };
-            if o.channel == crate::outcome::PLACEBO {
+            if o.channel == crate::outcome::PLACEBO || crate::outcome::ambiguous(&o.kind, o.judge) {
                 continue;
             }
             let mine: Vec<String> = o.lessons.into_iter().filter(|l| rows.contains(l.as_str())).collect();
@@ -564,7 +567,8 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let log = d.join("outcomes.jsonl");
         let lines = [
-            r#"{"kind":"asked_ignored","session":"x","ms":30,"lessons":["A"]}"#,
+            r#"{"kind":"asked_ignored","session":"x","ms":20,"lessons":["A"]}"#,
+            r#"{"kind":"asked_ignored","session":"x","ms":30,"lessons":["A"],"judge":3}"#,
             r#"{"kind":"asked_then_changed","session":"x","ms":10,"lessons":["A","Z"]}"#,
             r#"{"kind":"asked_then_changed","session":"x","ms":20,"lessons":["A"],"channel":"placebo"}"#,
             r#"{"kind":"asked_then_changed","session":"x","ms":99,"lessons":["A"]}"#,
@@ -579,7 +583,7 @@ mod tests {
         let rows: HashSet<&str> = ["A", "B"].into();
         let (q, moves) = read_outcomes(&log, "s", 50, &rows);
         // A: changed at 10 (0 → 0.2), ignored at 30 (0.2 + 0.2·(−0.5 − 0.2) = 0.06); the placebo and the
-        // verdict after the stop count for nothing.
+        // verdict after the stop count for nothing, nor does the ignore at 20 by a judge before 0.7.5.
         assert!((q["A"] - 0.06).abs() < 1e-12, "{q:?}");
         assert!(!q.contains_key("B") && !q.contains_key("Z"));
         assert_eq!(moves, Some(("c2".to_string(), vec!["later".to_string()])));
