@@ -412,6 +412,8 @@ fn derive_history(home: &Path) -> Vec<Event> {
             crate::outcome::ASKED if live => LIVE_ASK,
             crate::outcome::ASKED => BLOCK,
             crate::outcome::CHANGED => CHANGED,
+            // An ignore by a judge before the never-came-up verdict is none (outcome.rs `ambiguous`).
+            crate::outcome::IGNORED if crate::outcome::ambiguous(crate::outcome::IGNORED, o["judge"].as_u64().map_or(0, |j| j.min(255) as u8)) => continue,
             crate::outcome::IGNORED => IGNORED,
             crate::outcome::CORRECTED => CORRECTED,
             crate::outcome::NOT_CORRECTED => NOT_CORRECTED,
@@ -861,6 +863,21 @@ mod tests {
         std::fs::write(home.join("episodes.jsonl"), eps.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
         let whys: Vec<String> = derive_history(&home).into_iter().filter(|e| e.kind == CORRECTION).map(|e| e.why).collect();
         assert_eq!(whys, [ANSWERED, "pushback"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An ignore by a judge before the never-came-up verdict is no event (outcome.rs `ambiguous`), as
+    /// live counting leaves it out; today's judge's ignore is one.
+    #[test]
+    fn the_history_counts_no_ignore_from_before_the_never_came_up_verdict() {
+        let home = std::env::temp_dir().join(format!("borg-stats-old-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let rec = |s: &str, judge: u8| serde_json::json!({"kind":"asked_ignored","session":s,"lessons":["L"],"ms":5,"channel":"stop","judge":judge});
+        let log = [rec("old", 0), rec("v2", 2), rec("today", 3)];
+        std::fs::write(home.join("outcomes.jsonl"), log.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
+        let got: Vec<String> = derive_history(&home).into_iter().filter(|e| e.kind == IGNORED).map(|e| e.session).collect();
+        assert_eq!(got, ["today"]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

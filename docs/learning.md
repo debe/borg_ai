@@ -92,7 +92,11 @@ or at the session's end ([when](delivery.md)), and gives one of five verdicts wi
 | `unclear` | `asked_unclear` | The judge cannot tell | Measurement only; stays open |
 
 Before 0.7.5 the judge had three verdicts, and `asked_unclear` also held a change whose consequence
-still followed; those records keep that meaning. A placebo's verdict (a lesson judged blindly, never
+still followed; those records keep that meaning. That judge also wrote a point that never came up as
+`asked_ignored`: of the questions judged since, about nine in ten that were not acted on never came up.
+From 0.7.10 an `asked_ignored` by a judge before version 3 (the record's `judge`) is censored like
+`asked_not_arisen`, so old lessons no longer carry those ignores against them. Team lines carry the
+judge's version from 0.7.10; an older line's ignore is read as one from before 0.7.5. A placebo's verdict (a lesson judged blindly, never
 shown) is measurement only, whatever it says. No belief, trust, statistic or team line reads an
 unclear verdict, a remaining consequence, a point that never came up or a placebo's result.
 
@@ -110,7 +114,7 @@ judge's call failed). A session whose lock another pass still holds is not settl
 | `vetoed` | 3 | design, no eval yet |
 | `regretted` | at most half a correction | design; on while its offline check is inconclusive, see [Evidence](evidence.md#regret-credit) |
 | `tested` | 0.5 (`TESTED_W`) | design, not evaluated |
-| `asked_not_corrected`, `asked_not_arisen`, an unclear verdict, a remaining consequence, a placebo's result | none | censored or measurement only |
+| `asked_not_corrected`, `asked_not_arisen`, an `asked_ignored` from before 0.7.5, an unclear verdict, a remaining consequence, a placebo's result | none | censored or measurement only |
 
 **Regret reaches back.** A regret learned as a lesson, from a later fix or a review finding, also counts
 against the lessons asked in the deciding session before the decision: asking them did not prevent it.

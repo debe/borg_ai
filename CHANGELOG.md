@@ -3,6 +3,16 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.10 (unreleased)
+
+### Fixed
+
+- Ignores recorded before 0.7.5 no longer count against a lesson: that judge could not say a point never
+  came up and filed most such questions as ignored. On the author's stores, 210 of 448 lessons sat below
+  0.34 usefulness, 14 after ([Learning](docs/learning.md)). Upgrade every machine of a team: a peer
+  before 0.7.10 publishes its ignores without the judge's version, and other machines then do not count
+  them. After the upgrade, each machine publishes its ignores since 0.7.5 once more, with the version.
+
 ## 0.7.9 (2026-11-05)
 
 ### Changed

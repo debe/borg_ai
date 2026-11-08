@@ -20,7 +20,9 @@
 //!   and that the change avoids the consequence: a use, the deposit that keeps a lesson active
 //!   (memory.rs). The drone's `<id>: applies|skip` is evidence in that prompt, never a label alone;
 //! - `asked_ignored` (hook): the same judge found the lesson's point came up and the drone changed
-//!   nothing on it.
+//!   nothing on it. Before 0.7.5 (`judge` < `NEVER_SPLIT`) the judge had no verdict for a point that
+//!   never came up and wrote those as `asked_ignored` too, about nine in ten of them by the later
+//!   judge's split: such a record is censored as `asked_not_arisen` is (`ambiguous`, `is_result`).
 //! - `asked_not_arisen` (hook, 0.7.5 on): the same judge found the lesson's point never came up in the
 //!   work: nothing to change, so nothing about the lesson. It settles the delivery (no further try),
 //!   is censored for beliefs, trust, the statistics and the team (`is_result`), and the selection model
@@ -98,6 +100,9 @@ pub const CORRECTED: &str = "asked_then_corrected";
 pub const NOT_CORRECTED: &str = "asked_not_corrected";
 pub const CHANGED: &str = "asked_then_changed";
 pub const IGNORED: &str = "asked_ignored";
+/// The judge template version (predict.rs `JUDGE_VERSION`) from which a point that never came up has
+/// its own verdict (`NOT_ARISEN`, 0.7.5); an older judge wrote it as `IGNORED`.
+pub const NEVER_SPLIT: u8 = 3;
 /// One graded check: every lesson the model graded as applying (`lessons`, in its order, with
 /// `grades` and `ranks`), and which of them the check chose to ask (`chosen`). The denominator for
 /// learning how many to ask: a lesson that applied but was not chosen can still turn out needed.
@@ -170,10 +175,18 @@ pub const PLACEBO: &str = "placebo";
 /// Whether `o` is evidence about its lessons for the readers that learn from results (memory.rs, trust.rs,
 /// the statistics, the team file): not a placebo's result (`PLACEBO`), not an unclear verdict
 /// (`UNCLEAR`), not a change that leaves the consequence (`REMAINS`) and not a point that never came up
-/// (`NOT_ARISEN`, censored).
+/// (`NOT_ARISEN`, censored), and not an ignore by a judge that could not tell it from one (`ambiguous`).
 #[must_use]
 pub fn is_result(o: &Outcome) -> bool {
-    o.channel != PLACEBO && !matches!(o.kind.as_str(), UNCLEAR | REMAINS | NOT_ARISEN)
+    o.channel != PLACEBO && !matches!(o.kind.as_str(), UNCLEAR | REMAINS | NOT_ARISEN) && !ambiguous(&o.kind, o.judge)
+}
+
+/// Whether a record of `kind` by judge version `judge` is an ignore written before the judge could say
+/// the point never came up (`NEVER_SPLIT`): no evidence about the lesson, censored as `NOT_ARISEN` is.
+/// A team record without a version (a peer before 0.7.10) counts as such an ignore.
+#[must_use]
+pub fn ambiguous(kind: &str, judge: u8) -> bool {
+    kind == IGNORED && judge < NEVER_SPLIT
 }
 
 /// Why a lesson settled as `asked_not_corrected` had no verdict (`reason`, `settle_why`). Protocol: the
@@ -576,6 +589,12 @@ pub struct Shared {
     /// A `regretted` record's share of the blame.
     #[serde(default, skip_serializing_if = "is_zero_f")]
     pub credit: f64,
+    /// An ignore's judge version (`Outcome::judge`), 0 on every other line: a peer reads an ignore without
+    /// one as `ambiguous`. A node before 0.7.10 wrote no version, so after an upgrade `publish` appends a
+    /// versioned copy of each of its ignores from judge 3; `team_parts` keeps both, and the result per
+    /// (lesson, session) is a max, so the copy counts once.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub judge: u8,
 }
 
 /// `o` as the team sees it, or None for a kind not in `SHARED_KINDS` and for a placebo's result
@@ -592,6 +611,9 @@ pub fn share(o: &Outcome, node: &str) -> Option<Shared> {
         r: tag_repo(&o.repo),
         c: tag_repo(&o.cause),
         credit: o.credit,
+        // Only an ignore's: what `ambiguous` reads. Every other line stays as an older node writes it, so
+        // `publish` (text dedup) appends no copy of it after an upgrade.
+        judge: if o.kind == IGNORED { o.judge } else { 0 },
     })
 }
 
@@ -601,7 +623,8 @@ pub fn on() -> bool {
 }
 
 /// Appends to `TEAM_FILE` in `home` the shared lines of `home`'s `outcomes.jsonl` it lacks; returns
-/// how many. The lines are deterministic, so a re-run appends nothing; two runs at once may append the
+/// how many. The lines are deterministic, so a re-run appends nothing (but once after an upgrade to
+/// 0.7.10, a versioned copy of each judge-3 ignore, `Shared::judge`); two runs at once may append the
 /// same line twice, which the mesh's union and the per-session count make harmless. Nothing when off.
 /// A local log no longer than at the last publish (`PUBLISHED`, its length then) is not read again: the
 /// log only grows, so nothing new can be in it.
@@ -695,10 +718,13 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
     for x in lines.iter().filter(|x| SHARED_KINDS.contains(&x.kind.as_str()) && x.kind != TESTED) {
         given.entry(x.s.as_str()).or_default().extend(x.lessons.iter().map(String::as_str));
     }
-    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String, u8)> = std::collections::HashSet::new();
     let mut team = Vec::new();
     for x in lines.iter() {
-        if !SHARED_KINDS.contains(&x.kind.as_str()) || mine.contains(&x.s) || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone()))
+        // The judge in the key: an ignore's versioned copy is kept beside an older node's line (`Shared::judge`).
+        if !SHARED_KINDS.contains(&x.kind.as_str())
+            || mine.contains(&x.s)
+            || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone(), x.judge))
         {
             continue;
         }
@@ -715,6 +741,7 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
             channel: x.channel.clone(),
             cause: x.c.clone(),
             credit: x.credit,
+            judge: x.judge,
             ..Default::default()
         });
     }
@@ -1166,6 +1193,7 @@ pub fn tally<'a>(sessions: impl IntoIterator<Item = &'a (bool, i64)>, since: i64
 mod tests {
     use super::*;
 
+    /// A record by today's judge: its ignore is a result (outcome.rs `ambiguous`).
     fn o(kind: &str, session: &str, lessons: &[&str], ms: i64) -> Outcome {
         Outcome {
             kind: kind.into(),
@@ -1173,6 +1201,7 @@ mod tests {
             lessons: lessons.iter().map(|l| l.to_string()).collect(),
             ms,
             repo: "r".into(),
+            judge: if kind == IGNORED { crate::outcome::NEVER_SPLIT } else { 0 },
             ..Default::default()
         }
     }
@@ -1878,6 +1907,36 @@ mod tests {
         std::fs::remove_file(home.join(TEAM_FILE)).unwrap();
         assert_eq!(publish(&home), 3);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// 0.7.10: an ignore's line carries its judge. A node upgraded from before appends a versioned copy
+    /// of its judge-3 ignores and nothing else (an older judge's ignore is no longer shared), and a peer
+    /// keeps both copies of the ignore and counts it once.
+    #[test]
+    fn an_upgrade_republishes_only_versioned_ignores_and_a_peer_counts_them_once() {
+        let home = tmp("upgrade");
+        let log = [Outcome { judge: 2, ..o(CHANGED, "s1", &["A"], 1) }, o(IGNORED, "s1", &["B"], 2), Outcome { judge: 2, ..o(IGNORED, "s1", &["C"], 3) }];
+        lines(&home.join("outcomes.jsonl"), &log.clone().map(|x| serde_json::to_string(&x).unwrap()));
+        // As a node before 0.7.10 published them: every result, no judge.
+        let node = crate::stats::node(&home);
+        let before = log.clone().map(|x| serde_json::to_string(&Shared { judge: 0, ..share(&Outcome { judge: 3, ..x }, &node).unwrap() }).unwrap());
+        lines(&home.join(TEAM_FILE), &before);
+        assert_eq!(publish(&home), 1, "only the judge-3 ignore again");
+        let team = std::fs::read_to_string(home.join(TEAM_FILE)).unwrap();
+        assert!(team.lines().last().unwrap().contains(r#""lessons":["B"]"#) && team.contains(r#""judge":3"#), "{team}");
+        // A peer: both copies of B's ignore kept, C's unversioned one censored, B counted once.
+        let peer = tmp("upgrade-peer");
+        std::fs::write(peer.join("lessons.jsonl"), "").unwrap();
+        std::fs::write(peer.join(TEAM_FILE), &team).unwrap();
+        let seen = team_view(&peer.join("lessons.jsonl"), true);
+        assert_eq!(seen.iter().filter(|x| x.kind == IGNORED && x.lessons == ["B"]).count(), 2);
+        let counted: Vec<&Outcome> = seen.iter().filter(|x| x.kind == IGNORED && is_result(x)).collect();
+        assert_eq!(counted.iter().map(|x| x.lessons.clone()).collect::<Vec<_>>(), [vec!["B".to_string()]]);
+        let lessons = ["A", "B", "C"].map(|id| crate::conscience::Challenge { id: id.into(), ..Default::default() });
+        let m = crate::memory::derive(&seen, &lessons, None);
+        assert_eq!((m["B"].ignored, m["C"].ignored), (1, 0));
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(peer);
     }
 
     /// A store whose local log has s1 changed L1, and whose team file holds that result as published

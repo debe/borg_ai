@@ -1253,6 +1253,8 @@ mod tests {
             lessons: vec![l.into()],
             ms,
             repo: "r".into(),
+            // Today's judge: an ignore from it is a result (outcome.rs `ambiguous`).
+            judge: if kind == IGNORED { crate::outcome::NEVER_SPLIT } else { 0 },
             ..Default::default()
         };
         for x in [
