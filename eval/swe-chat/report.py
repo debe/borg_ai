@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Score the judged cases (pre-registered metrics, reports/swe-chat.md) -> run/summary.json and stdout.
+"""Score the judged cases (pre-registered metrics) -> run/summary.json and stdout.
 
-Catch (strict) = some item of the arm judged yes; lenient = yes or partial. Arms: N, L, H, B-block (asked lessons),
+Catch (strict) = some item of the arm judged yes; lenient = yes or partial. Arms: N, L, B-block (asked lessons),
 B-all (asked + free). Paired differences by cluster bootstrap over repos (10,000 resamples, seed 20261012).
 """
 import collections, json, math, random, sys
 
 from common import OUT, SEED, jl
 
-H5 = {"entireio/cli", "JanDeDobbeleer/oh-my-posh", "ebridges/wakil", "yash-learner/care_fe", "hxrshx/ehl-bayern-codewerk"}
-ARMS = ["N", "L", "H5", "H", "B-block", "B-all"]
-PAIRS = [("B-all", "L"), ("B-all", "N"), ("H5", "L"), ("B-all", "H5"), ("H5", "N"), ("H", "L"), ("B-all", "H"), ("L", "N"), ("B-block", "L"), ("B-block", "N"),
-         ("B-block", "H")]
+ARMS = ["N", "L", "B-block", "B-all"]
+PAIRS = [("B-all", "L"), ("B-all", "N"), ("L", "N"), ("B-block", "L"), ("B-block", "N")]
 
 
 def wilson(k, n, z=1.96):
@@ -28,12 +26,10 @@ def srcs(item, arm):
     s = set(item["arms"])
     if arm == "B-all":
         return bool(s & {"B-block", "B-free"})
-    return ("H" if arm == "H5" else arm) in s
+    return arm in s
 
 
 def arm_present(r, arm):
-    if arm == "H5":
-        return r["repo"] in H5 and "H" in r["arms_present"]
     return (arm.split("-")[0] if arm.startswith("B") else arm) in r["arms_present"]
 
 

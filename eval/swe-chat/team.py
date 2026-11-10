@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SWE-chat one-team test (reports/swe-chat.md, "One-team test"): one team's long history as one collective.
+"""SWE-chat one-team test (one-team test): one team's long history as one collective.
 
   python3 eval/swe-chat/team.py select     # team choice + the 200 newest sessions -> run/team/sample.csv (+ download)
   python3 eval/swe-chat/team.py prep       # cases, episodes, recurrence inputs (no model calls)

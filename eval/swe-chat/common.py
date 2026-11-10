@@ -1,4 +1,4 @@
-"""Shared helpers for the SWE-chat anticipation eval (reports/swe-chat.md).
+"""Shared helpers for the SWE-chat anticipation eval.
 
 Data: ~/.local/share/borg/eval/swe-chat/ (sample.csv, prompt_labels.parquet, transcripts_compact/).
 Outputs go to DATA / "run". Nothing here touches ~/.config/borg or ~/.local/share/borg/collectives.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Sonnet anticipation arms N (no memory), L (plain log), H (Hindsight recall) -> run/arm_<X>.jsonl
+"""Sonnet anticipation arms N (no memory), L (plain log) -> run/arm_<X>.jsonl
 
-  python3 eval/swe-chat/arms.py N|L|H [--workers 6] [--kind pos|neg]
+  python3 eval/swe-chat/arms.py N|L [--workers 6] [--kind pos|neg]
 """
 import argparse, concurrent.futures as cf, datetime, json, re
 
@@ -26,35 +26,31 @@ def plain_log(repo, T):
     return "\n".join(keep)
 
 
-def prompt(arm, c, hs):
+def prompt(arm, c):
     turn = f"## The agent's turn (transcript since the user's previous message; may be cut)\n\n{c['context']}"
     if arm == "N":
         return turn
     if arm == "L":
         log = plain_log(c["repo"], ms(c["ts"]))
         return (f"## Earlier corrections by users of this repository (oldest first)\n\n{log or '(none)'}\n\n{turn}")
-    if arm == "H":
-        return f"## Memory\n\n{hs[c['id']]['text']}\n\n{turn}"
     raise ValueError(arm)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("arm", choices=["N", "L", "H"])
+    ap.add_argument("arm", choices=["N", "L"])
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--kind", default="")
     a = ap.parse_args()
     path = OUT / f"arm_{a.arm}.jsonl"
     have = {r["id"] for r in jl(path) if not r.get("error")}
-    hs = {r["id"]: r for r in jl(OUT / "hs_recall.jsonl")}
-    todo = [c for c in jl(OUT / "cases.jsonl") if c["id"] not in have and (not a.kind or c["kind"] == a.kind)
-            and (a.arm != "H" or c["id"] in hs)]
+    todo = [c for c in jl(OUT / "cases.jsonl") if c["id"] not in have and (not a.kind or c["kind"] == a.kind)]
     # Same repo together (prompt-cache reuse of the shared prefix).
     todo.sort(key=lambda c: (c["repo"], c["id"]))
 
     def job(c):
         try:
-            r = claude(prompt(a.arm, c, hs), f"arm:{a.arm}:{c['id']}", schema=SCHEMA, system=SYSTEM)
+            r = claude(prompt(a.arm, c), f"arm:{a.arm}:{c['id']}", schema=SCHEMA, system=SYSTEM)
         except RuntimeError as e:
             return {"id": c["id"], "error": str(e), "stop": True}
         out = r["out"] or {}

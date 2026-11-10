@@ -73,7 +73,7 @@ def main():
     ap.add_argument("--kind", default="")
     ap.add_argument("--only", default="")
     a = ap.parse_args()
-    arms = {x: {r["id"]: r for r in jl(OUT / f"arm_{x}.jsonl") if not r.get("error")} for x in ("N", "L", "H")}
+    arms = {x: {r["id"]: r for r in jl(OUT / f"arm_{x}.jsonl") if not r.get("error")} for x in ("N", "L")}
     arms["B"] = {r["id"]: r for r in jl(OUT / "borg_hook.jsonl") if not r.get("error")}
     path = OUT / "judge.jsonl"
     have = {r["id"] for r in jl(path) if not r.get("error")}

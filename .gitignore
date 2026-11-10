@@ -26,7 +26,6 @@ node_modules/
 !/reports/b0-vanilla-sonnet.md
 !/reports/dogfood-e2e.md
 !/reports/regress.md
-!/reports/swe-chat.md
 !/reports/swe-chat-engineering.md
 !/reports/swe-chat-engineering-transfer.md
 # borg-eval's optional replay modules (build.rs compiles them when present): not published

@@ -20,13 +20,11 @@ Intervals are 95% paired-bootstrap confidence intervals unless the row names ano
 |---|---|---|
 | Lessons at the turn end, 15 real decisions, sealed sandbox | engineer points 25% → 34% on all 15 cases, +8.8 [−1.4, +22.2], not significant (7 won, 5 tied, 3 lost). Subgroup of the 4 cases that had a directly relevant lesson: 34% → 63%, +29.2 [+4.2, +68.8] | internal |
 | Graded turn end vs. the earlier shortlist | relevant lessons reaching the agent 45% → 64% (+0.17 [+0.09, +0.25]); extra rounds with nothing relevant 8 → 3 of 16 | internal |
-| What a memory keeps, 10 real sessions | Borg 21 of 21 lessons useful (95% Wilson interval 84.5–100%); Hindsight 169 of 543 items | internal |
-| Against Hindsight, same memory model, 15 cases | accuracy tied (no comparison significant). With Sonnet-built lessons, Borg over a plain agent: +8.8 [−1.4, +22.2] on all 15 (not significant), +29.2 [+4.2, +68.8] on the 4 lesson cases | internal |
+| What a memory keeps, 10 real sessions | 21 of 21 lessons useful (95% Wilson interval 84.5–100%) | internal |
 | Team documents condensed into lessons, 3 cases × 3 runs (n = 9) | +1.7 [+0.8, +2.4] knowledge checks per run over a plain agent; against the hand-written skill +0.11 [−0.56, +0.78]. The pre-registered rule (non-inferior to the skill, lower bound ≥ −0.5) was **not met**. The comparison arms are recorded runs from an earlier experiment, not concurrent | internal |
 | System gate, real cross-system session | wrong-system deliveries 83 → 0; no relevant lesson lost | internal |
 | Free gate, 1,117 real turn ends | 78% skipped at 0 tokens | internal |
 | Vectors | shortlist recall +0.09, +0.14 on German work, ~120 ms | internal |
-| Public data, 150 corrections in 15 strangers' repos | no memory helped, Borg included; only ~3% of corrections repeat an earlier one | [swe-chat](../reports/swe-chat.md) |
 | End-to-end run in a sandboxed home | all 18 plumbing checks pass; no measurable gain on that task | [dogfood](../reports/dogfood-e2e.md) |
 | Live vs hook mode, internal task benchmark, 3 tasks × 3 seeds per mode (8 pairs) | live +0.38 criteria per task [0, +0.88], p = 0.50, 0 redo rounds vs 0.5; directional only (2 pairs differ, both in live's favour); the knowledge criteria tied in 8 of 8. Live was the default until 0.7.6, which removed it ([details](delivery.md#live-mode-removed-in-076)) | internal |
 | Decision → fix links, replay of a scripted repo with known answers | fix links 4 of 5 right, 4 of 5 reachable fixes found (subject and revert signals only; tests and prompts are not measured); no real-repo precision yet | [regress](../reports/regress.md) |

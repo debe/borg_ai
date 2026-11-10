@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SWE-chat follow-up (reports/swe-chat.md, "Follow-up"): recurrence of corrections (no model calls) and arm F
+"""SWE-chat follow-up (follow-up): recurrence of corrections (no model calls) and arm F
 (Sonnet given the lessons Borg's Stop selected).
 
   python3 eval/swe-chat/followup.py recur              # -> run/followup/recur.json
@@ -308,7 +308,7 @@ def cmd_report(a):
     s = {"catch": {}, "pairs": {}, "pairs_genuine": {}, "pairs_lenient": {}, "false_alarms": {}, "by_source": {}}
     f_strict = lambda r, x: 1 if R.caught(r, x) else 0
     f_len = lambda r, x: 1 if R.caught(r, x, True) else 0
-    for arm in ["F*", "N", "L", "H5", "H", "B-block", "B-all"]:
+    for arm in ["F*", "N", "L", "B-block", "B-all"]:
         P = [r for r in pos if R.arm_present(r, arm)]
         G = [r for r in gen if R.arm_present(r, arm)]
         k, kl, kg = sum(f_strict(r, arm) for r in P), sum(f_len(r, arm) for r in P), sum(f_strict(r, arm) for r in G)
@@ -321,7 +321,7 @@ def cmd_report(a):
                            "items_per_case": round(sum(sum(1 for x in r["items"] if R.srcs(x, arm)) for r in P) / max(1, len(P)), 2)}
         s["false_alarms"][arm] = {"n": len(Nn), "items": round(sum(its) / max(1, len(its)), 2), "fa": round(sum(fa) / max(1, len(fa)), 2),
                                   "any_pct": round(100 * sum(1 for x in fa if x) / max(1, len(fa)), 1)}
-    for b in ["N", "L", "H5", "H", "B-all", "B-block"]:
+    for b in ["N", "L", "B-all", "B-block"]:
         s["pairs"][f"F - {b}"] = R.boot(pos, "F*", b, f_strict)
         s["pairs_genuine"][f"F - {b}"] = R.boot(gen, "F*", b, f_strict)
         s["pairs_lenient"][f"F - {b}"] = R.boot(pos, "F*", b, f_len)

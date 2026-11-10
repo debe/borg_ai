@@ -371,8 +371,7 @@ sessions, so the data is not here):
 - lessons at the turn end, 15 real decisions in a sealed sandbox: 25% → 34% engineer points on all 15,
   +8.8 [−1.4, +22.2], not significant; 34% → 63% on the subgroup of 4 cases with a directly relevant
   lesson, +29.2 [+4.2, +68.8];
-- a memory of 21 lessons from 10 sessions held 21 useful ones; accuracy tied with Hindsight on the same
-  memory model;
+- a memory of 21 lessons from 10 sessions held 21 useful ones;
 - the system gate cut wrong-system deliveries from 83 to 0;
 - live mode: not worse than hook (+0.38 criteria per task [0, +0.88], 8 pairs, p = 0.50, directional
   only: 2 pairs differ; 0 redo rounds), but the knowledge criteria tied in all 8 pairs, at 8× borg's
@@ -401,7 +400,7 @@ time. So the learned policy is the default; until 0.7.6 it differed from the fix
 question-count test on live checks, which runs no more without them, and `BORG_SELECT=fixed` keeps the
 fixed rule ([Lesson selection](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)).
 
-**Not shown:** that Borg helps strangers on public data (SWE-chat: no memory helped, Borg included);
+**Not shown:** that Borg helps strangers on public data;
 decision → fix precision on real history (so `BORG_REGRESS` stays `links`); whether the regret credit
 improves the belief (the check was inconclusive: no data yet); the weights of vetoes and green tests. omp,
 opencode and Codex get no early delivery of ordinary lessons, and there a hand-over's evidence is the

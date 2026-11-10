@@ -150,9 +150,6 @@ pub(crate) struct Extra {
     /// Read-write file binds (source, absolute destination), mounted last: e.g. a credentials copy
     /// kept outside `sandbox_home` and visible inside it only while the sandbox runs.
     pub file_rw: Vec<(PathBuf, PathBuf)>,
-    /// Read-only binds (source, absolute destination) mounted after `file_rw`, so they can sit inside one of
-    /// its directories (preempt's real-code layout: the vector model inside the bound borg home).
-    pub ro_last: Vec<(PathBuf, PathBuf)>,
     /// Variables set inside a sandbox with its own HOME (`sandbox_home`), after the environment is
     /// cleared; ignored otherwise.
     pub env: Vec<(String, String)>,
@@ -208,20 +205,6 @@ fn model_proxy_env(url: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Loopback services a proxied sandbox reaches besides the model proxy (preempt: the Hindsight gate):
-/// added with [`allow_net`] or listed in `BORG_EVAL_NET_ALLOW` (comma-separated loopback URLs).
-static NET_ALLOW: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-
-/// Let every later proxied sandbox reach the loopback service at `url` (its port only).
-#[cfg(replay_evals)] // preempt only
-pub(crate) fn allow_net(url: &str) {
-    let port = loopback_port(url).unwrap_or_else(|e| panic!("{e}"));
-    let mut v = NET_ALLOW.lock().unwrap();
-    if !v.contains(&port) {
-        v.push(port);
-    }
-}
-
 /// The port of a plain-http loopback URL (`http://127.0.0.1:4000`, `http://localhost:8891/t/...`): the
 /// only kind of address the sandbox's bridge carries.
 fn loopback_port(url: &str) -> Result<u16, String> {
@@ -234,13 +217,13 @@ fn loopback_port(url: &str) -> Result<u16, String> {
     port.parse().map_err(|_| format!("{url}: bad port"))
 }
 
-/// The host ports a proxied sandbox reaches: the model proxy's and the allowed ones, nothing else.
+/// The host ports a proxied sandbox reaches: the model proxy's and the loopback services listed in
+/// `BORG_EVAL_NET_ALLOW` (comma-separated loopback URLs), nothing else.
 fn net_ports(proxy: &str) -> Vec<u16> {
     let mut ports = vec![loopback_port(proxy).unwrap_or_else(|e| panic!("--model-proxy {e}"))];
     for u in std::env::var("BORG_EVAL_NET_ALLOW").unwrap_or_default().split(',').map(str::trim).filter(|u| !u.is_empty()) {
         ports.push(loopback_port(u).unwrap_or_else(|e| panic!("BORG_EVAL_NET_ALLOW {e}")));
     }
-    ports.extend(NET_ALLOW.lock().unwrap().iter());
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -351,10 +334,9 @@ fn proxy_unset(vars: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::
 /// variable of the caller is dropped, and the proxy's address and key are set instead
 /// ([`model_proxy_env`]): the hooks inherit them, so a model call borg makes inside goes there too.
 /// The sandbox then also has no network and no view of the host's processes (`--unshare-net`,
-/// `--unshare-pid`): it reaches only the proxy and the [`allow_net`] services, through
+/// `--unshare-pid`): it reaches only the proxy and the `BORG_EVAL_NET_ALLOW` services ([`net_ports`]), through
 /// [`host_bridge`] sockets and `borg-eval net-bridge` (this binary, bound read-only) wrapping the command.
-/// So no drone can fetch a public repo's later history, query another Hindsight, or read another
-/// sandbox's arguments.
+/// So no drone can fetch a public repo's later history or read another sandbox's arguments.
 pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], extra: &Extra, timeout_s: u32) -> (Command, PathBuf) {
     let home = PathBuf::from(std::env::var("HOME").unwrap());
     let proxy = model_proxy();
@@ -439,7 +421,7 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
             cmd.arg("--ro-bind").arg(src).arg(home.join(rel));
         }
     }
-    // A cwd that a `file_rw` bind provides (preempt's real-code layout maps a copy onto the real path) is never
+    // A cwd that a `file_rw` bind provides (a copy mounted onto another path) is never
     // bound from the host: the host's own directory there is the real repository.
     if !writable.iter().any(|w| cwd.starts_with(w)) && !extra.file_rw.iter().any(|(_, dst)| cwd.starts_with(dst)) {
         cmd.arg("--ro-bind").arg(cwd).arg(cwd);
@@ -457,9 +439,6 @@ pub(crate) fn sandbox_with(cwd: &Path, writable: &[&Path], readonly: &[&Path], e
     }
     for (src, dst) in &extra.file_rw {
         cmd.arg("--bind").arg(src).arg(dst);
-    }
-    for (src, dst) in &extra.ro_last {
-        cmd.arg("--ro-bind").arg(src).arg(dst);
     }
     // The proxy's network (none for a sandbox asked to have none at all).
     let bridge: Vec<(u16, PathBuf)> = match proxy {
@@ -575,14 +554,13 @@ pub(crate) fn bwrap_claude_wake(
     stream: &Path,
     timeout_s: u32,
     (driver, state, rounds, wait_s): (&Path, &Path, u32, u32),
-    log_at: Option<(&Path, &Path)>,
 ) -> Woken {
-    // The driver's log: beside the stream, or `log_at` (its host path, and the path the sandbox sees it at).
-    let (log, inside) = log_at.map_or_else(|| (stream.with_file_name("wake.log"), None), |(h, i)| (h.to_path_buf(), Some(i)));
+    // The driver's log, beside the stream.
+    let log = stream.with_file_name("wake.log");
     let _ = fs::remove_file(&log);
     fs::write(&log, "").unwrap();
     let (mut cmd, private) = sandbox_with(cwd, writable, readonly, extra, timeout_s);
-    cmd.arg("sh").arg(driver).arg(state).arg(inside.unwrap_or(&log)).arg(rounds.to_string()).arg(wait_s.to_string()).arg("--");
+    cmd.arg("sh").arg(driver).arg(state).arg(&log).arg(rounds.to_string()).arg(wait_s.to_string()).arg("--");
     cmd.arg("claude").args(claude_args);
     cmd.args(["--output-format", "stream-json", "--verbose"]);
     cmd.args(["--setting-sources", extra.setting_sources.as_deref().unwrap_or("project"), "--strict-mcp-config"]);
