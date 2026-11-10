@@ -229,7 +229,8 @@ for the adapter's answer) and ends on SIGINT, SIGHUP or
 SIGTERM, on `borg listen --off`, or once the session is gone. Exit codes: 0 after a wake (`--wait`),
 after `--off` or when the session is gone; 2 after a wake (`--rewake`, Claude Code's wake code); 1 when
 the session does not listen; 2 on bad arguments;
-128 + the signal when stopped. `borg top` shows `on` (listens, no waiter yet) or `waiter` in its WAKE
+128 + the signal when stopped. `borg listen --off` itself exits 1 when it cannot write the session's
+`.off` mark (otherwise the next prompt would opt it in again). `borg top` shows `on` (listens, no waiter yet) or `waiter` in its WAKE
 column, and the same in `borg top --json` as each session's `listen`.
 
 ## Saying no

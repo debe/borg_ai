@@ -1499,7 +1499,11 @@ fn off(home: &Path, session: &str) -> i32 {
     let was = listening(home, session);
     // Marked first, so a prompt meanwhile does not opt it in again (`auto_opt_in`); its end or prune
     // clears the mark (`forget`).
-    let _ = std::fs::create_dir_all(dir(home)).and_then(|()| std::fs::write(file(home, session, "off"), ""));
+    // Unmarked, the session's next prompt would opt it in again: the `--off` fails rather than says it held.
+    if let Err(e) = std::fs::create_dir_all(dir(home)).and_then(|()| std::fs::write(file(home, session, "off"), "")) {
+        eprintln!("borg listen --off: cannot mark the session off: {e}");
+        return 1;
+    }
     // Forgotten next: the waiter, signalled then, finds the session off and takes its lock and log along.
     forget_but(home, session, "off");
     stop_waiter(home, session);
@@ -1659,6 +1663,11 @@ mod tests {
         assert_eq!(off(&home, "s1"), 0);
         touch(&home, "end", "s1", 4);
         assert!(!opted_out(&home, "s1") && !listening(&home, "s1"), "the session's end forgets its `--off` too");
+        let _ = std::fs::remove_dir_all(&home);
+        // A mark that cannot be written fails the `--off`: unmarked, the next prompt would opt it in again.
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(dir(&home), "not a directory").unwrap();
+        assert_eq!(off(&home, "s1"), 1);
         let _ = std::fs::remove_dir_all(home);
     }
 
