@@ -35,6 +35,8 @@ function env() {
 	process.env.BORG_LEARN = "on";
 	// No release check from a test: it would ask GitHub (borg update.rs).
 	process.env.BORG_UPDATE_CHECK = "off";
+	// No automatic listening (listen.rs `auto_opt_in`): its stop would start a stream that outlives the test; a test that listens runs `borg listen`.
+	process.env.BORG_LISTEN = "off";
 	delete process.env.BORG_CONSCIENCE;
 	const ctx = { cwd: join(dir, "relay"), sessionManager: { getSessionId: () => SESSION } };
 	const ctxFile = () => readFileSync(join(dir, "state", `${SESSION}.ctx`), "utf8");

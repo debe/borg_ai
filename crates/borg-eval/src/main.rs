@@ -326,7 +326,8 @@ fn net_bridge(raw: &[String]) {
     let argv = &raw[split + 1..];
     let mut cmd = Command::new(argv.first().expect("net-bridge: no command"));
     cmd.args(&argv[1..]);
-    // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
+    // SAFETY: prctl is async-signal-safe and touches no memory of the parent. Linux only, as bwrap is.
+    #[cfg(target_os = "linux")]
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {

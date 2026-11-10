@@ -76,6 +76,8 @@ function world(tag: string, grade = 3) {
     BORG_LEARN: "off",
     // No release check from a test: it would ask GitHub (update.rs).
     BORG_UPDATE_CHECK: "off",
+    // No automatic listening (listen.rs `auto_opt_in`): its stop would start a stream that outlives the test; a test that listens runs `borg listen`.
+    BORG_LISTEN: "off",
     BORG_VECTORS: "off",
     BORG_PREFILTER: "off",
     BORG_EARLY: "off",
