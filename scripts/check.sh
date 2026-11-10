@@ -36,10 +36,12 @@ cargo test --workspace
 step "harness architecture gates (scripts/arch.sh; rows of a missing tool are skipped)"
 scripts/arch.sh
 
-step "cargo test -p borg-ai --no-default-features"
-cargo test -p borg-ai --no-default-features --no-run
+# The lean build (no vectors) differs only where code is cfg(feature = "vectors"): its unit tests, and the
+# command surface of the lean binary. The other integration suites never branch on the feature and ran above.
+step "cargo test -p borg-ai --no-default-features (lib, cli_surface)"
+cargo test -p borg-ai --no-default-features --lib --test cli_surface --no-run
 sync
-cargo test -p borg-ai --no-default-features
+cargo test -p borg-ai --no-default-features --lib --test cli_surface
 
 # The adapter contract tests drive the borg just built, wherever cargo puts it (the conformance suite
 # fails without one). They are TypeScript run directly by `node --test` (Node 23.6+ strips types by

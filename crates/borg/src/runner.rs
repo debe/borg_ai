@@ -625,20 +625,7 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
 /// so a stop always reaches a thread that may trap it, and one sent while that thread holds them blocked
 /// (reexec.rs, across an exec) stays pending for the process.
 fn helper(f: impl FnOnce() + Send + 'static) {
-    // SAFETY: both sets are live locals and a zeroed `sigset_t` (a plain integer array) is a valid
-    // value; sigemptyset(3) initialises `set` before sigaddset(3) and pthread_sigmask(3) read it, and
-    // pthread_sigmask writes `old` before the second call reads it. The mask is this thread's own, and
-    // the old one is restored right after the spawn.
-    unsafe {
-        let (mut set, mut old): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
-        libc::sigemptyset(&mut set);
-        for s in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM] {
-            libc::sigaddset(&mut set, s);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-        std::thread::spawn(f);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
+    drop(crate::reexec::spawn_without_stops(f));
 }
 
 /// Kills a process group once this process is gone, however it went (SIGKILL included): a `sh` in a

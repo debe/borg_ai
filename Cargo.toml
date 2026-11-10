@@ -23,3 +23,8 @@ regex = "1"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
 missing_safety_doc = "warn"
+
+# Tests run the numeric selection code (posterior draws) many thousand times: unoptimised it took CI
+# 4+ minutes per suite run. `cargo build` (dev) is unchanged; only `cargo test` builds at opt-level 1.
+[profile.test]
+opt-level = 1
