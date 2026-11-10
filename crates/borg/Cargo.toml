@@ -60,3 +60,6 @@ no-default-features = true
 # Vectors are on by default; `--no-default-features` builds a lean binary (BM25 only).
 default = ["vectors"]
 vectors = ["dep:seekstorm", "dep:tokio", "dep:tokenizers", "dep:safetensors", "dep:memmap2", "dep:half"]
+
+[lints]
+workspace = true

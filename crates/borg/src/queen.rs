@@ -1391,8 +1391,10 @@ pub(crate) fn width() -> usize {
     }
     #[cfg(unix)]
     {
-        // SAFETY: TIOCGWINSZ only writes a winsize into the zeroed struct we own.
+        // SAFETY: `libc::winsize` is four `c_ushort` fields, so all-zero bytes are a valid value.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ takes a `*mut winsize`, and `ws` is a live, correctly typed local that
+        // outlives the call; the ioctl writes only that struct.
         if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 20 {
             return ws.ws_col as usize;
         }

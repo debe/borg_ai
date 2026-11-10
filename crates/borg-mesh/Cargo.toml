@@ -31,3 +31,6 @@ data-encoding = "2"
 
 [dev-dependencies]
 iroh = { version = "1.3", features = ["platform-verifier", "test-utils"] }
+
+[lints]
+workspace = true

@@ -24,7 +24,7 @@
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -348,22 +348,33 @@ extern "C" fn on_stop(_: libc::c_int) {
 /// and SIGTERM trapped (`stopped` says whether one came), and, when a previous image restarted it,
 /// the stop signals unblocked only then, so a stop that came across the exec is seen now (a SIGHUP
 /// then ends it, as it would have the old one).
-pub fn trap_stops() {
-    on_signals(&[libc::SIGINT, libc::SIGTERM], on_stop);
+///
+/// # Safety
+///
+/// The process runs one thread: no other thread may read or write the environment while this removes
+/// a variable from it (`std::env::remove_var`).
+pub unsafe fn trap_stops() {
+    // SAFETY: `on_stop` only stores to an atomic, which is async-signal-safe.
+    unsafe { on_signals(&[libc::SIGINT, libc::SIGTERM], on_stop) };
     if std::env::var_os(RESTARTED).is_some() {
-        // SAFETY: called while the process runs one thread (the doc above); no other reads the
-        // environment.
+        // SAFETY: this function's contract: the process runs one thread, so no other reads or writes
+        // the environment.
         unsafe { std::env::remove_var(RESTARTED) };
         unblock_stops();
     }
 }
 
 /// `handler` for each of `sigs`, by sigaction(2): it stays installed across deliveries, and a call it
-/// interrupts restarts. `handler` must be async-signal-safe (store to an atomic, no more).
-pub fn on_signals(sigs: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
+/// interrupts restarts.
+///
+/// # Safety
+///
+/// `handler` must be async-signal-safe (store to an atomic, no more): it runs on whatever thread the
+/// signal interrupts, at any instruction, with any lock held.
+pub(crate) unsafe fn on_signals(sigs: &[libc::c_int], handler: extern "C" fn(libc::c_int)) {
     for &sig in sigs {
         // SAFETY: a zeroed sigaction is valid; only its handler, its empty mask and SA_RESTART are set
-        // before sigaction(2) reads it.
+        // before sigaction(2) reads it. The handler is async-signal-safe (this function's contract).
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handler as libc::sighandler_t;
@@ -386,6 +397,21 @@ pub fn stopped() -> bool {
     STOPPED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `f` on a new thread that starts with the stop signals (`stop_set`) blocked: a new thread inherits
+/// its spawner's mask, so they are blocked here only around the spawn. A stop then never lands on that
+/// thread, so it reaches one that traps it, and one sent while the main thread holds them blocked
+/// (`Image::reexec`, across the exec) stays pending for the process instead of being taken and lost.
+pub(crate) fn spawn_without_stops<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    let (set, mut old) = (stop_set(), stop_set());
+    // SAFETY: pthread_sigmask(3) on this thread with a set built by sigemptyset/sigaddset; the old mask
+    // is written to `old`, an initialised sigset_t.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut old) };
+    let h = std::thread::spawn(f);
+    // SAFETY: pthread_sigmask(3) on this thread, restoring the mask saved above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut()) };
+    h
+}
+
 fn stop_set() -> libc::sigset_t {
     // SAFETY: sigemptyset(3)/sigaddset(3) initialise the zeroed set before it is read.
     unsafe {
@@ -401,25 +427,36 @@ fn stop_set() -> libc::sigset_t {
 /// The first step of a waiter (listen.rs), once it trapped its stop signals: when a previous image
 /// re-exec'd it (`Image::reexec`), the inherited lock fd, its variable gone from the environment, the
 /// stop signals unblocked only now, so a stop that came across the exec is seen; None for a fresh
-/// start. The fd is the waiter's lock only once `adopt` checked it.
-pub fn inherited() -> Option<RawFd> {
-    let fd = std::env::var_os(ADOPT_FD)?;
-    // SAFETY: the waiter is single-threaded this early; no other thread reads the environment.
+/// start (or a variable naming no open fd above 2). The variable may be forged or stale, so the fd is
+/// the waiter's lock only once `adopt` checked it; until then it is owned here, and closed when dropped.
+///
+/// # Safety
+///
+/// Called once, as the waiter's first step after `on_signals`, while the process runs one thread and
+/// before anything in it opened or took ownership of an fd above 2: no other thread reads or writes the
+/// environment, and no other owner of the named fd exists in this process.
+pub(crate) unsafe fn inherited() -> Option<OwnedFd> {
+    let var = std::env::var_os(ADOPT_FD)?;
+    // SAFETY: this function's contract: the process runs one thread, so no other reads or writes the
+    // environment.
     unsafe { std::env::remove_var(ADOPT_FD) };
     unblock_stops();
-    fd.to_str().and_then(|s| s.parse::<RawFd>().ok()).filter(|fd| *fd > 2)
-}
-
-/// The inherited `fd` as the lock of `path`, when it is that file's open description and holds its lock
-/// (a try_lock on the same description succeeds); else None (a forged or stale variable: the waiter
-/// takes the lock as a fresh one does). Close-on-exec again from here.
-pub fn adopt(fd: RawFd, path: &Path) -> Option<std::fs::File> {
-    // SAFETY: fcntl(2) F_GETFD only asks whether `fd` is open, so an fd that is not is never owned.
+    let fd = var.to_str().and_then(|s| s.parse::<RawFd>().ok()).filter(|fd| *fd > 2)?;
+    // SAFETY: fcntl(2) F_GETFD only asks whether `fd` is open; it neither reads nor changes the file.
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return None;
     }
-    // SAFETY: `fd` is open and was handed to this process for it alone (`Image::reexec`): owned here.
-    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: `fd` is open (F_GETFD above) and above 2, and this function's contract holds: called once,
+    // before anything in this process owned an fd above 2, so nothing else owns or will close it. Taken
+    // here once; whatever file it is (a forged or stale variable), this OwnedFd is its sole owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The inherited `fd` as the lock of `path`, when it is that file's open description and holds its lock
+/// (a try_lock on the same description succeeds); else None, the fd closed (a forged or stale variable:
+/// the waiter takes the lock as a fresh one does). Close-on-exec again from here.
+pub(crate) fn adopt(fd: OwnedFd, path: &Path) -> Option<std::fs::File> {
+    let f = std::fs::File::from(fd);
     let same = match (f.metadata(), std::fs::metadata(path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
@@ -427,7 +464,7 @@ pub fn adopt(fd: RawFd, path: &Path) -> Option<std::fs::File> {
     if !same || f.try_lock().is_err() {
         return None;
     }
-    // SAFETY: fcntl(2) F_SETFD on the fd owned above.
+    // SAFETY: fcntl(2) F_SETFD on the open fd `f` owns; it only sets the close-on-exec flag.
     unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     Some(f)
 }
@@ -508,24 +545,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// A thread spawned without stops holds them blocked from its start; its spawner's mask is unchanged.
+    #[test]
+    fn a_thread_spawned_without_stops_never_takes_one() {
+        let blocked = || {
+            let mut cur = stop_set();
+            // SAFETY: pthread_sigmask(3) with a null set only reads this thread's mask into `cur`.
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut cur) };
+            // SAFETY: sigismember(3) on the initialised set read above.
+            [libc::SIGINT, libc::SIGHUP, libc::SIGTERM].map(|s| unsafe { libc::sigismember(&raw const cur, s) } == 1)
+        };
+        let before = blocked();
+        assert_eq!(spawn_without_stops(blocked).join().unwrap(), [true; 3], "SIGINT, SIGHUP and SIGTERM blocked");
+        assert_eq!(blocked(), before, "the spawner's mask restored");
+    }
+
     /// An inherited fd is a waiter's lock only when it is that file's description holding its lock.
     #[test]
     fn an_inherited_fd_of_another_file_is_not_adopted() {
-        use std::os::unix::io::IntoRawFd;
         let d = temp("adopt");
         let (lock, other) = (d.join("w.lock"), d.join("other"));
         std::fs::write(&lock, "").unwrap();
         std::fs::write(&other, "").unwrap();
-        let fd = |p: &Path| std::fs::OpenOptions::new().write(true).open(p).unwrap();
-        assert!(adopt(fd(&other).into_raw_fd(), &lock).is_none(), "another file");
-        let held = fd(&lock);
+        let fd = |p: &Path| OwnedFd::from(std::fs::OpenOptions::new().write(true).open(p).unwrap());
+        assert!(adopt(fd(&other), &lock).is_none(), "another file");
+        let held = std::fs::File::from(fd(&lock));
         held.lock().unwrap();
-        assert!(adopt(fd(&lock).into_raw_fd(), &lock).is_none(), "another description, the lock held by it");
+        assert!(adopt(fd(&lock), &lock).is_none(), "another description, the lock held by it");
         drop(held);
-        let mine = fd(&lock);
+        let mine = std::fs::File::from(fd(&lock));
         mine.lock().unwrap();
-        assert!(adopt(mine.into_raw_fd(), &lock).is_some(), "the description that holds the lock");
-        assert!(adopt(9999, &lock).is_none(), "no open fd");
+        assert!(adopt(mine.into(), &lock).is_some(), "the description that holds the lock");
         let _ = std::fs::remove_dir_all(d);
     }
 }

@@ -255,6 +255,11 @@ pub fn auto_opt_in(home: &Path, h: &dyn Harness, event: &str, session: &str, inp
     }
     let (pid, pid_start) = own_harness(h, input).unwrap_or_default();
     let _ = save(home, &Record { session: session.to_string(), harness: h.name().to_string(), ms: now, pid, pid_start, auto: true });
+    // An `--off` between the check above and the save marked the session first (`off`): the save must not
+    // undo it.
+    if opted_out(home, session) {
+        forget_but(home, session, "off");
+    }
 }
 
 pub fn read(home: &Path, session: &str) -> Option<Record> {
@@ -759,7 +764,8 @@ extern "C" fn on_stop(sig: libc::c_int) {
 }
 
 fn trap() {
-    reexec::on_signals(&[libc::SIGINT, libc::SIGHUP, libc::SIGTERM], on_stop);
+    // SAFETY: `on_stop` only stores to an atomic, which is async-signal-safe.
+    unsafe { reexec::on_signals(&[libc::SIGINT, libc::SIGHUP, libc::SIGTERM], on_stop) };
 }
 
 fn signal() -> Option<i32> {
@@ -800,10 +806,13 @@ fn lesson_ids(ids: &[String]) -> Vec<String> {
 
 /// `f` with the session's store and state routed as its hooks route them (hook.rs `main`): `BORG_HOME` the
 /// collective's store `home`, `BORG_STATE` its `state` unless set; restored after, so a re-exec routes
-/// from the root store again. The waiter's other thread reads only stdin (`answers`).
+/// from the root store again. The waiter's other threads never touch the environment: `answers` reads
+/// stdin, and the helpers a `queue` call may leave (runner.rs `run_bounded`) only do pipe I/O.
 fn routed<T>(home: &Path, f: impl FnOnce() -> T) -> T {
     let (was_home, was_state) = (std::env::var_os("BORG_HOME"), std::env::var_os("BORG_STATE"));
-    // SAFETY: no other thread of the waiter reads the environment (`answers` reads stdin alone).
+    // SAFETY: the waiter's main thread is the only one that reads or writes the environment: its other
+    // threads are `answers`'s reader (stdin alone) and, after a `queue` call, `run_bounded`'s helpers
+    // (pipe reads and writes alone), and `f` starts no thread that outlives it and reads it.
     unsafe {
         std::env::set_var("BORG_HOME", home);
         if was_state.is_none() {
@@ -998,10 +1007,12 @@ impl Answer {
 
 /// The adapter's answers, read from stdin on a thread of their own: the waiter takes them at its next
 /// pass. An adapter that answers nothing (or an older one, its stdin closed) leaves every wake as sent.
+/// The thread holds the stop signals blocked: one that came between a re-exec's `stopped` check and the
+/// exec would otherwise set `STOP` in the old image and be lost; blocked, it stays pending across it.
 fn answers() -> std::sync::mpsc::Receiver<Answer> {
     use std::io::BufRead as _;
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    reexec::spawn_without_stops(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
             if let Some(a) = Answer::parse(&line)
                 && tx.send(a).is_err()
@@ -1315,7 +1326,7 @@ impl<'a> Waiter<'a> {
 
 /// The waiter's lock, `inherited` from a previous image or taken now; Err with the exit code when
 /// another waiter holds it or the file cannot be made.
-fn take_lock(home: &Path, session: &str, mode: Mode, inherited: Option<std::os::unix::io::RawFd>) -> Result<std::fs::File, i32> {
+fn take_lock(home: &Path, session: &str, mode: Mode, inherited: Option<std::os::unix::io::OwnedFd>) -> Result<std::fs::File, i32> {
     let path = file(home, session, "lock");
     if let Some(lock) = inherited.and_then(|fd| reexec::adopt(fd, &path)) {
         note(mode, &format!("[borg listen] the wait runs the reinstalled borg {} now", env!("CARGO_PKG_VERSION")));
@@ -1356,7 +1367,10 @@ fn take_lock(home: &Path, session: &str, mode: Mode, inherited: Option<std::os::
 fn wait(home: &Path, session: &str, mode: Mode, cwd: &str) -> i32 {
     // Its stops trapped first; re-exec'd by its previous image (reexec.rs), they are unblocked only then.
     trap();
-    let inherited = reexec::inherited();
+    // SAFETY: called once, first thing after `trap`: the waiter runs one thread (nothing before it in
+    // `main` spawns one) and nothing in it owns an fd above 2 yet.
+    let inherited = unsafe { reexec::inherited() };
+    let reexecd = inherited.is_some();
     if !listening(home, session) {
         end(mode, "this session does not listen (`borg listen` in it first)");
         return 1;
@@ -1366,7 +1380,7 @@ fn wait(home: &Path, session: &str, mode: Mode, cwd: &str) -> i32 {
         Err(code) => return code,
     };
     // Asks a waiter that died had reserved go back on the queue; one re-executed keeps its own.
-    if inherited.is_none() {
+    if !reexecd {
         routed(home, || crate::hook::release_asks(session, None));
     }
     let mut w = Waiter::new(home, session, mode, lock, cwd);

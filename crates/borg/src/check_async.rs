@@ -138,7 +138,9 @@ pub(crate) fn spawn(job: &Path) -> bool {
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new(crate::reexec::exe_path());
     c.arg("check").arg("--job").arg(job).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
+    // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe calls are
+    // allowed: it calls setsid(2) alone, which is, and allocates nothing, takes no lock and captures
+    // nothing.
     unsafe {
         c.pre_exec(|| {
             libc::setsid();
@@ -391,8 +393,11 @@ fn p95(mut v: Vec<u64>) -> u64 {
 /// its `check` event.
 #[must_use]
 pub fn rss_kb() -> u64 {
-    // SAFETY: getrusage only writes the struct it is given, zeroed here.
+    // SAFETY: `rusage` holds only integers (`timeval`s and `c_long`s), so all-zero bytes are a valid
+    // value.
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `&mut u` points to a live, writable, correctly sized `rusage` local; getrusage(2) only
+    // writes it and keeps no pointer past the call.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
         return 0;
     }

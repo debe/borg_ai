@@ -210,16 +210,7 @@ pub fn main(args: &[&str]) -> i32 {
     #[cfg(feature = "vectors")]
     {
         if args.contains(&"--fetch") {
-            return match engine::fetch(&model_dir()) {
-                Ok(()) => {
-                    println!("model ready at {}", model_dir().display());
-                    0
-                }
-                Err(e) => {
-                    eprintln!("borg vectors --fetch: {e}");
-                    1
-                }
-            };
+            return fetch(std::env::var("BORG_VECTOR_URL").ok().as_deref());
         }
         if args.contains(&"--query") {
             use std::io::Read;
@@ -267,6 +258,31 @@ pub fn main(args: &[&str]) -> i32 {
             Err(e) => println!("index: {e}"),
         }
         0
+    }
+}
+
+/// `borg vectors --fetch` from `mirror` (a base URL serving the model's files; None: Hugging Face at
+/// the pinned revision). `main` passes `BORG_VECTOR_URL`; setup passes the mirror it asked for. The
+/// exit code.
+pub fn fetch(mirror: Option<&str>) -> i32 {
+    #[cfg(not(feature = "vectors"))]
+    {
+        let _ = mirror;
+        eprintln!("borg vectors: this borg is a lean build (--no-default-features); reinstall without that flag: cargo install borg-ai --locked --force");
+        1
+    }
+    #[cfg(feature = "vectors")]
+    {
+        match engine::fetch(&model_dir(), mirror) {
+            Ok(()) => {
+                println!("model ready at {}", model_dir().display());
+                0
+            }
+            Err(e) => {
+                eprintln!("borg vectors --fetch: {e}");
+                1
+            }
+        }
     }
 }
 
@@ -336,7 +352,12 @@ pub mod engine {
                 None => Tok::Full(json.parse().map_err(|e| format!("tokenizer: {e}"))?),
             };
             let file = File::open(dir.join("model.safetensors")).map_err(|e| format!("model: {e}"))?;
-            // SAFETY: the model file is read-only data that borg never writes; `--fetch` replaces it by rename.
+            // SAFETY: `Mmap::map` is unsafe because the mapping aliases the file: a write to it through
+            // another handle would change bytes behind `&[u8]`, and a truncation would make reads SIGBUS.
+            // Borg never writes `model.safetensors` in place: `fetch` downloads into `.part` and renames it
+            // over the old file, so a mapping keeps the old inode intact. Only an outside in-place rewrite
+            // or truncation of the model breaks this, which borg does not guard against. Every read goes
+            // through `self.map.get(range)` (`value`), so a corrupt header cannot read past the mapping.
             let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("model: {e}"))?;
             let (header, meta) = safetensors::SafeTensors::read_metadata(&map).map_err(|e| format!("model: {e}"))?;
             let tensor = |name: &str| meta.info(name).map(|i| Tensor { dtype: i.dtype, shape: i.shape.clone(), start: 8 + header + i.data_offsets.0 });
@@ -454,41 +475,40 @@ pub mod engine {
     /// leaving stdout muted for good (threads in one process, as in the test harness).
     static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct Quiet(Option<i32>, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    /// The original stdout (a CLOEXEC duplicate, closed on drop) while stdout points at /dev/null.
+    struct Quiet(Option<std::os::fd::OwnedFd>, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     impl Quiet {
         fn new() -> Quiet {
             use std::io::Write;
+            use std::os::fd::{AsFd, AsRawFd};
             let guard = QUIET.lock().unwrap_or_else(|e| e.into_inner());
             let _ = std::io::stdout().flush();
-            // SAFETY: plain fd calls on stdout and a /dev/null descriptor this function opens and closes.
-            unsafe {
-                let saved = libc::dup(1);
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-                if saved < 0 || null < 0 || libc::dup2(null, 1) < 0 {
-                    for fd in [saved, null] {
-                        if fd >= 0 {
-                            libc::close(fd);
-                        }
-                    }
-                    return Quiet(None, guard);
-                }
-                libc::close(null);
-                Quiet(Some(saved), guard)
+            let saved = std::io::stdout().as_fd().try_clone_to_owned();
+            // Write mode: a read-only descriptor on 1 would make every `println!` fail.
+            let null = std::fs::OpenOptions::new().write(true).open("/dev/null");
+            let (Ok(saved), Ok(null)) = (saved, null) else { return Quiet(None, guard) };
+            // SAFETY: both descriptors are open for the whole call (`null` is a live `File`, 1 is the
+            // process's stdout). dup2 swaps fd 1 atomically: it is never closed in between, so no other
+            // open can take number 1, and no `OwnedFd` owns fd 1 (std's stdout only borrows it), so no
+            // owner sees its descriptor replaced. `null` is closed when it drops; fd 1 keeps the file.
+            if unsafe { libc::dup2(null.as_raw_fd(), 1) } < 0 {
+                return Quiet(None, guard);
             }
+            Quiet(Some(saved), guard)
         }
     }
 
     impl Drop for Quiet {
         fn drop(&mut self) {
             use std::io::Write;
+            use std::os::fd::AsRawFd;
             let _ = std::io::stdout().flush();
-            if let Some(saved) = self.0 {
-                // SAFETY: restores the descriptor saved in `new`.
-                unsafe {
-                    libc::dup2(saved, 1);
-                    libc::close(saved);
-                }
+            if let Some(saved) = self.0.take() {
+                // SAFETY: `saved` is the open duplicate of the original stdout made in `new`, alive until
+                // the end of this block; dup2 swaps it onto fd 1 atomically, which no `OwnedFd` owns (see
+                // `new`). `saved` itself is closed when it drops right after.
+                unsafe { libc::dup2(saved.as_raw_fd(), 1) };
             }
         }
     }
@@ -500,13 +520,35 @@ pub mod engine {
     /// An advisory lock beside the index (`vectors.lock`): exclusive while writing, shared while reading.
     struct Lock(#[allow(dead_code)] File);
 
+    /// None when the lock is held elsewhere (`wait` false) or cannot be taken. Released when the file
+    /// closes (std's `File::lock` family: flock(2) on Linux and macOS).
     fn lock(index: &Path, exclusive: bool, wait: bool) -> Option<Lock> {
-        use std::os::fd::AsRawFd;
         let path = index.with_file_name("vectors.lock");
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
-        let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH } | if wait { 0 } else { libc::LOCK_NB };
-        // SAFETY: flock on a file descriptor this function owns; released when the file is closed.
-        (unsafe { libc::flock(f.as_raw_fd(), op) } == 0).then_some(Lock(f))
+        let locked = match (exclusive, wait) {
+            (true, true) => f.lock().is_ok(),
+            (false, true) => f.lock_shared().is_ok(),
+            (true, false) => f.try_lock().is_ok(),
+            (false, false) => f.try_lock_shared().is_ok(),
+        };
+        locked.then_some(Lock(f))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn readers_share_the_lock_and_a_writer_waits_for_none_of_them() {
+        let dir = std::env::temp_dir().join(format!("borg-vectors-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let index = dir.join("index");
+        let a = lock(&index, false, false).expect("a reader");
+        let b = lock(&index, false, false).expect("readers share it");
+        assert!(lock(&index, true, false).is_none(), "no writer while readers hold it");
+        drop((a, b));
+        let w = lock(&index, true, false).expect("a writer once they are gone");
+        assert!(lock(&index, false, false).is_none(), "no reader while a writer holds it");
+        drop(w);
+        assert!(lock(&index, false, true).is_some(), "a waiting reader gets a free lock");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn read_manifest(index: &Path) -> Option<Manifest> {
@@ -715,9 +757,10 @@ pub mod engine {
 
     /// Download the model's files at the pinned revision into `dir`, each checked against its sha256
     /// before it replaces anything (curl; never called by a hook).
-    pub fn fetch(dir: &Path) -> Result<(), String> {
+    /// `base` is a mirror serving the same files (`BORG_VECTOR_URL`); None: Hugging Face.
+    pub fn fetch(dir: &Path, base: Option<&str>) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let base = std::env::var("BORG_VECTOR_URL").unwrap_or_else(|_| format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}"));
+        let base = base.map_or_else(|| format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}"), str::to_string);
         for (name, sha) in MODEL_FILES {
             let path = dir.join(name);
             let part = dir.join(format!("{name}.part"));
@@ -882,7 +925,13 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         let lessons = store.join("lessons.jsonl");
         write_lessons(&lessons, &[("dl", "deadlock"), ("rt", "retry"), ("ca", "cache")]);
-        // SAFETY: only this test sets these variables (see above).
+        // SAFETY: set_var/remove_var are unsafe because another thread may read the environment at the
+        // same time. libtest runs tests on threads, but every std reader (`std::env::var*`, which is how
+        // `model_dir` and `enabled` read these) takes std's environment lock, as do these writes, so no
+        // std read sees a torn environment; only this test writes these two variables. What stays
+        // unexcluded: a `getenv` from outside std (a C library, e.g. curl or the resolver) on another test
+        // thread at that moment. No test in this crate calls one while this runs, which is a convention,
+        // not a guarantee. The same holds for every env write below.
         unsafe {
             std::env::set_var("BORG_VECTOR_MODEL", &model);
             std::env::remove_var("BORG_VECTORS");
@@ -906,26 +955,33 @@ mod tests {
         assert_eq!(refresh(&lessons), 4, "a changed lesson rebuilds the index");
         assert_eq!(recall(&lessons, "verklemmung", 1), ["ca"]);
         // BORG_VECTORS=off: BM25 only.
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
         unsafe { std::env::set_var("BORG_VECTORS", "off") };
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
         let (list, added) = shortlist(&lessons, &pool, "verklemmung", "", 20);
         assert_eq!((list.len(), added), (0, 0));
         let off = doctor::checks(&[]);
         assert!(off.len() == 1 && off[0].0 == crate::harness::Level::Ok && off[0].1.contains("off"), "{off:?}");
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
         unsafe { std::env::set_var("BORG_VECTOR_MODEL", root.join("no-model")) };
         assert_eq!(doctor::hint(), None, "off by choice: no hint");
-        unsafe { std::env::set_var("BORG_VECTOR_MODEL", &model) };
-        unsafe { std::env::remove_var("BORG_VECTORS") };
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
+        unsafe {
+            std::env::set_var("BORG_VECTOR_MODEL", &model);
+            std::env::remove_var("BORG_VECTORS");
+        }
         // Fail open: another model's index, a missing model, a missing index.
         std::fs::write(model.join("REVISION"), "another").unwrap();
         assert!(recall(&lessons, "verklemmung", 5).is_empty(), "vectors of another model are not compared");
         std::fs::remove_file(model.join("REVISION")).unwrap();
         assert_eq!(recall(&lessons, "verklemmung", 1), ["ca"]);
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
         unsafe { std::env::set_var("BORG_VECTOR_MODEL", root.join("no-model")) };
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
         assert_eq!(refresh(&lessons), 0);
         assert!(doctor::hint().is_some_and(|h| h.contains("borg vectors --fetch")));
         assert_eq!(doctor::checks(&[])[0].0, crate::harness::Level::Warn);
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
         unsafe { std::env::set_var("BORG_VECTOR_MODEL", &model) };
         std::fs::remove_dir_all(index_dir(&lessons)).unwrap();
         assert!(recall(&lessons, "verklemmung", 5).is_empty());
@@ -935,6 +991,7 @@ mod tests {
         let n = rt.block_on(async { tokio::task::spawn_blocking(move || refresh(&path)).await.unwrap() });
         assert_eq!(n, 4, "a lost index is rebuilt by the next refresh");
         assert_eq!(recall(&lessons, "verklemmung", 1), ["ca"]);
+        // SAFETY: as at the first write above (std readers serialized; non-std getenv not excluded).
         unsafe { std::env::remove_var("BORG_VECTOR_MODEL") };
         let _ = std::fs::remove_dir_all(&root);
     }

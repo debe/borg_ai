@@ -24,6 +24,7 @@
 //! and `borg doctor` say the rest; `--json` leaves it out.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 
 use serde::Serialize;
@@ -1284,8 +1285,7 @@ pub fn main(args: &[&str]) -> i32 {
             a => return usage(&format!("unknown flag {a}")),
         }
     }
-    // SAFETY: isatty only inspects the descriptor.
-    if !json_out && !once && unsafe { libc::isatty(1) } == 1 {
+    if !json_out && !once && std::io::stdout().is_terminal() {
         return crate::top_live::run(dir);
     }
     match screen(dir, json_out, learn::now_ms()) {

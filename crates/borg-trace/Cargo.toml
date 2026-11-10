@@ -16,3 +16,6 @@ description = "Parse Claude Code / omp transcripts into canonical touch streams"
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
+
+[lints]
+workspace = true

@@ -14,6 +14,11 @@ What changed in each release and what you need to do about it. The details live 
 - Claude Code: a background Stop hook (`asyncRewake`) waits for messages, so the model is no longer asked to
   start `borg listen --wait`.
 
+### Fixed
+
+- A stop signal sent to `borg listen --stream` while it restarted itself after an update could be lost.
+- `borg listen --off` fails when it cannot record the opt-out, instead of saying it held.
+
 ## 0.7.10 (2026-11-08)
 
 ### Fixed

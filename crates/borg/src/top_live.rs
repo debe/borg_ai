@@ -10,7 +10,7 @@
 //! `borg top` prints once instead (top.rs).
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -110,7 +110,11 @@ impl Ln {
 /// Local wall-clock time of `ms` as HH:MM:SS.
 fn clock(ms: i64) -> String {
     let t = (ms / 1000) as libc::time_t;
+    // SAFETY: `libc::tm` holds only integers and a `*const c_char` (`tm_zone`), so all-zero bytes are a
+    // valid value (null pointer, zero fields).
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers come from live, correctly typed locals that outlive the call;
+    // `localtime_r` is the reentrant variant and writes only into `tm`.
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
         return "--:--:--".into();
     }
@@ -268,19 +272,29 @@ struct Term {
 impl Term {
     fn enter() -> Term {
         let mut saved = None;
-        if unsafe { libc::isatty(0) } == 1 {
+        if std::io::stdin().is_terminal() {
+            // SAFETY: `libc::termios` is a plain struct of integer fields and integer arrays, so all-zero
+            // bytes are a valid value; `tcgetattr` overwrites it before it is read.
             let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `t` is a live, correctly typed local that outlives the call; fd 0 is a terminal
+            // (checked above), and on failure the struct is not used.
             if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
                 saved = Some(t);
                 t.c_lflag &= !(libc::ICANON | libc::ECHO);
                 t.c_cc[libc::VMIN] = 0;
                 t.c_cc[libc::VTIME] = 0;
+                // SAFETY: `t` is a live `termios` that `tcgetattr` filled; `tcsetattr` only reads it.
                 unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
             }
         }
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
+            // SAFETY: `libc::sigaction` holds a handler address, a `sigset_t` bit set, integer flags and an
+            // optional restorer pointer; all-zero is valid (empty mask, no flags, no restorer).
             let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
             sa.sa_sigaction = on_signal as *const () as usize;
+            // SAFETY: `sa` is a live, fully initialised local; a null old-action pointer is allowed.
+            // `on_signal` is an `extern "C" fn(c_int)` matching `sa_handler` (no SA_SIGINFO) and only
+            // does an atomic store, which is async-signal-safe.
             unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) };
         }
         print!("\x1b[?1049h\x1b[?25l");
@@ -294,13 +308,18 @@ impl Drop for Term {
         print!("\x1b[0m\x1b[?25h\x1b[?1049l");
         let _ = std::io::stdout().flush();
         if let Some(t) = self.saved {
+            // SAFETY: `t` is a live copy of the `termios` that `tcgetattr` returned; `tcsetattr` only
+            // reads it.
             unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
         }
     }
 }
 
 fn size() -> (usize, usize) {
+    // SAFETY: `libc::winsize` is four `c_ushort` fields, so all-zero bytes are a valid value.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ takes a `*mut winsize`, and `ws` is a live, correctly typed local that outlives
+    // the call; the ioctl writes only that struct.
     if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
         (ws.ws_col as usize, ws.ws_row as usize)
     } else {
@@ -315,10 +334,13 @@ fn key(d: Duration, keys: bool) -> bool {
         return false;
     }
     let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    // SAFETY: `fd` is one live, initialised `pollfd` and nfds is 1, so poll touches only that struct.
     if unsafe { libc::poll(&mut fd, 1, d.as_millis() as libc::c_int) } <= 0 {
         return false;
     }
     let mut buf = [0u8; 16];
+    // SAFETY: `buf` is a live, writable local array and the length passed is exactly its length, so
+    // `read` cannot write past it.
     let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
     let got = &buf[..n.max(0) as usize];
     got == [27] || got.iter().any(|&b| b == b'q' || b == b'Q' || b == 3)

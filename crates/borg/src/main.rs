@@ -48,10 +48,9 @@ fn cues_for_written(store: &std::path::Path, from: u64) {
     }
 }
 
-/// Whether file descriptor `fd` is a terminal (bold headings only there, and never with NO_COLOR).
-fn atty(fd: i32) -> bool {
-    // SAFETY: isatty only inspects the descriptor.
-    std::env::var_os("NO_COLOR").is_none() && unsafe { libc::isatty(fd) } == 1
+/// Whether `stream` is a terminal (bold headings only there, and never with NO_COLOR).
+fn atty(stream: impl std::io::IsTerminal) -> bool {
+    std::env::var_os("NO_COLOR").is_none() && stream.is_terminal()
 }
 
 /// `borg help` (`debug`: `borg debug help`): the table's commands by group, one line per help row.
@@ -266,9 +265,9 @@ fn debug_cmd(args: &[&str]) {
         ["vectors", rest @ ..] if rest.contains(&"--query") => std::process::exit(borg::vectors::main(rest)),
         ["ope", rest @ ..] => std::process::exit(borg::ope::main(rest)),
         ["select", rest @ ..] => std::process::exit(borg::select::replay::main(rest)),
-        [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), true)),
+        [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(std::io::stdout()), true)),
         _ => {
-            eprint!("{}", help(atty(2), true));
+            eprint!("{}", help(atty(std::io::stderr()), true));
             std::process::exit(2);
         }
     }
@@ -350,9 +349,9 @@ fn main() {
         // A newer release, and installing it (update.rs); the prompt hook runs `--check --quiet` daily.
         ["update", rest @ ..] => std::process::exit(borg::update::main(rest)),
         ["version" | "--version" | "-V"] => println!("borg {}", env!("CARGO_PKG_VERSION")),
-        [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(1), false)),
+        [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(std::io::stdout()), false)),
         _ => {
-            eprint!("{}", help(atty(2), false));
+            eprint!("{}", help(atty(std::io::stderr()), false));
             std::process::exit(2);
         }
     }

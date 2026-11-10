@@ -53,3 +53,6 @@ path = "src/bin/hs-concepts.rs"
 [[bin]]
 name = "hs-whole"
 path = "src/bin/hs-whole.rs"
+
+[lints]
+workspace = true

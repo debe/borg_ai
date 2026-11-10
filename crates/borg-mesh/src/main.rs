@@ -431,7 +431,9 @@ fn main() {
     }
     if args.first().map(String::as_str) == Some("serve") {
         // Its stops trapped while one thread runs; one held across a restart (`RESTART`) ends it here.
-        reexec::trap_stops();
+        // SAFETY: the process runs one thread here: `main` spawned none so far, and the tokio runtime
+        // is built only below.
+        unsafe { reexec::trap_stops() };
         if reexec::stopped() {
             println!("stopped");
             return;

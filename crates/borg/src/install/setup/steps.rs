@@ -116,9 +116,7 @@ fn fetch(ask: &mut Prompt) -> bool {
     if mirror == "-" {
         return false;
     }
-    // SAFETY: single-threaded CLI; nothing reads the environment concurrently.
-    unsafe { std::env::set_var("BORG_VECTOR_URL", &mirror) };
-    crate::vectors::main(&["--fetch"]) == 0
+    crate::vectors::fetch(Some(&mirror)) == 0
 }
 
 /// The lessons files of the configured stores whose index is missing or another model's.

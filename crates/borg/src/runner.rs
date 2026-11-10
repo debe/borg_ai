@@ -555,12 +555,14 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     cmd.process_group(0);
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) between fork and exec.
-        let parent = unsafe { libc::getpid() };
+        let parent = std::process::id();
+        // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe calls are
+        // allowed: prctl(2), getppid(2) (`parent_id`) and _exit(2) are, and the closure allocates
+        // nothing, takes no lock and only reads `parent`, a `u32` copied in before the fork.
         unsafe {
             cmd.pre_exec(move || {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                if libc::getppid() != parent {
+                if std::os::unix::process::parent_id() != parent {
                     libc::_exit(1); // borg already died between fork and prctl
                 }
                 Ok(())
@@ -570,13 +572,17 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
     let mut child = cmd.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let group = child.id() as libc::pid_t;
-    let watchdog = Watchdog::start(group);
-    // SAFETY: kill(2) on the child's own process group (a negative pid), which this process created.
+    let mut watchdog = Watchdog::start(group);
     // The watchdog goes first: it must never outlive the group and later hit a reused id.
-    let kill_group = || {
-        if let Some(w) = &watchdog {
+    let mut kill_group = || {
+        if let Some(w) = &mut watchdog {
             w.stop();
         }
+        // SAFETY: kill(2) takes no pointers and touches no memory of this process, so the call is sound
+        // for any id. `-group` names the process group `cmd` leads (`process_group(0)`); after
+        // `try_wait` reaped the leader the id may already be free (ESRCH, ignored), and the kernel
+        // does not hand a pid out again while a group still uses it as its id (only a group already
+        // empty could in theory be reused within that instant: a wrong target, never unsoundness).
         unsafe { libc::kill(-group, libc::SIGKILL) }
     };
     if let (Some(data), Some(mut pipe)) = (input, child.stdin.take()) {
@@ -619,8 +625,10 @@ pub fn run_bounded(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
 /// so a stop always reaches a thread that may trap it, and one sent while that thread holds them blocked
 /// (reexec.rs, across an exec) stays pending for the process.
 fn helper(f: impl FnOnce() + Send + 'static) {
-    // SAFETY: sigemptyset(3)/sigaddset(3) initialise the zeroed sets; pthread_sigmask(3) on this thread,
-    // its old mask restored right after the spawn.
+    // SAFETY: both sets are live locals and a zeroed `sigset_t` (a plain integer array) is a valid
+    // value; sigemptyset(3) initialises `set` before sigaddset(3) and pthread_sigmask(3) read it, and
+    // pthread_sigmask writes `old` before the second call reads it. The mask is this thread's own, and
+    // the old one is restored right after the spawn.
     unsafe {
         let (mut set, mut old): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
         libc::sigemptyset(&mut set);
@@ -639,7 +647,7 @@ fn helper(f: impl FnOnce() + Send + 'static) {
 /// the read returns, and the group is killed. Linux's `PR_SET_PDEATHSIG` reaches only the direct
 /// child; this reaches the whole group, and works where that does not exist (macOS).
 struct Watchdog {
-    pid: libc::pid_t,
+    child: std::process::Child,
     _writer: std::io::PipeWriter,
 }
 
@@ -656,16 +664,13 @@ impl Watchdog {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        Some(Watchdog { pid: child.id() as libc::pid_t, _writer: writer })
+        Some(Watchdog { child, _writer: writer })
     }
 
     /// Ends the watchdog without its kill, and reaps it.
-    fn stop(&self) {
-        // SAFETY: kill(2) and waitpid(2) on the watchdog this process started and has not reaped.
-        unsafe {
-            if libc::kill(self.pid, libc::SIGKILL) == 0 {
-                libc::waitpid(self.pid, std::ptr::null_mut(), 0);
-            }
+    fn stop(&mut self) {
+        if self.child.kill().is_ok() {
+            let _ = self.child.wait();
         }
     }
 }
@@ -706,7 +711,7 @@ mod tests {
     fn group_alive_after(stop_first: bool) -> bool {
         use std::os::unix::process::CommandExt as _;
         let mut sleeper = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
-        let w = Watchdog::start(sleeper.id() as libc::pid_t).expect("a watchdog");
+        let mut w = Watchdog::start(sleeper.id() as libc::pid_t).expect("a watchdog");
         if stop_first {
             w.stop();
         }

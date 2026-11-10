@@ -21,3 +21,6 @@ regex.workspace = true
 rayon.workspace = true
 # sandbox-exec: the sandbox dies with its caller (PR_SET_PDEATHSIG)
 libc = "0.2"
+
+[lints]
+workspace = true
