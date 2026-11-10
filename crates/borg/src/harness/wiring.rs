@@ -21,6 +21,8 @@ pub struct Hooks {
     pub events: &'static [(&'static str, &'static str)],
     /// (canonical event, `timeout` in seconds) for the events given one.
     pub timeouts: &'static [(&'static str, u64)],
+    /// The canonical events whose hook runs in the background and wakes the model on exit code 2.
+    pub rewake: &'static [&'static str],
     /// (native event, canonical event) an older borg installed and this one removes.
     pub retired: &'static [(&'static str, &'static str)],
     /// The config file's name, for messages ("settings.json").
@@ -61,9 +63,9 @@ pub fn render(m: Map<String, Value>, original: Option<&str>) -> String {
 impl Hooks {
     /// `h`'s command hooks; None for a harness wired otherwise.
     pub fn of(h: &dyn Harness) -> Option<Hooks> {
-        let Wiring::CommandHooks { events, timeouts, retired, .. } = h.wiring() else { return None };
+        let Wiring::CommandHooks { events, timeouts, rewake, retired, .. } = h.wiring() else { return None };
         let file = h.target(Path::new(""), &|_| None).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        Some(Hooks { harness: h.name(), events, timeouts, retired, file })
+        Some(Hooks { harness: h.name(), events, timeouts, rewake, retired, file })
     }
 
     pub fn command(&self, bin: &Path, event: &str) -> String {
@@ -85,6 +87,9 @@ impl Hooks {
         let mut e = json!({"type": "command", "command": self.command(bin, ev)});
         if let Some((_, s)) = self.timeouts.iter().find(|(x, _)| *x == ev) {
             e["timeout"] = json!(s);
+        }
+        if self.rewake.contains(&ev) {
+            e["asyncRewake"] = json!(true);
         }
         e
     }
@@ -211,8 +216,11 @@ impl Hooks {
     pub fn wired(&self, text: Option<&str>) -> Vec<(&'static str, PathBuf)> {
         let Ok(m) = self.parse(text) else { return Vec::new() };
         let mut out = Vec::new();
-        for (event, _) in self.events {
-            for g in m.get("hooks").and_then(|h| h.get(*event)).and_then(Value::as_array).into_iter().flatten() {
+        // Each native event once: two canonical events may share one (Claude Code's Stop: stop, wait).
+        let mut natives: Vec<&str> = self.events.iter().map(|(e, _)| *e).collect();
+        natives.dedup();
+        for event in natives {
+            for g in m.get("hooks").and_then(|h| h.get(event)).and_then(Value::as_array).into_iter().flatten() {
                 for h in g.get("hooks").and_then(Value::as_array).into_iter().flatten() {
                     if let Some((bin, ev)) = h.get("command").and_then(Value::as_str).and_then(|c| self.recognise(c)) {
                         out.push((ev, bin));
@@ -268,6 +276,33 @@ mod tests {
         let v: Value = serde_json::from_str(&k.install(None, Path::new("/b/borg")).unwrap().unwrap()).unwrap();
         let timeout = |native: &str| v["hooks"][native][0]["hooks"][0].get("timeout").cloned();
         assert_eq!((timeout("SimPrompt"), timeout("SimStop"), timeout("SimEnd")), (Some(json!(30)), Some(json!(90)), None));
+    }
+
+    #[test]
+    fn a_rewake_hook_is_a_second_group_of_its_native_event_and_a_stale_one_is_replaced() {
+        let k = Hooks {
+            events: &[("SimStop", "stop"), ("SimStop", "wait")],
+            timeouts: &[("wait", 600)],
+            rewake: &["wait"],
+            ..Hooks::of(&crate::harness::sim::Sim).unwrap()
+        };
+        let text = k.install(None, Path::new("/b/borg")).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["hooks"]["SimStop"],
+            json!([
+                {"hooks": [{"type": "command", "command": "/b/borg hook sim stop"}]},
+                {"hooks": [{"type": "command", "command": "/b/borg hook sim wait", "timeout": 600, "asyncRewake": true}]}
+            ])
+        );
+        assert_eq!(k.install(Some(&text), Path::new("/b/borg")).unwrap(), None, "then nothing to do");
+        // An install from before the flag: its entry is replaced where it stands.
+        let old = text.replace(",\n            \"asyncRewake\": true", "");
+        assert_ne!(old, text);
+        assert_eq!(k.install(Some(&old), Path::new("/b/borg")).unwrap().as_deref(), Some(text.as_str()));
+        assert_eq!(k.wired(Some(&text)).len(), 2, "each hook once, though they share their native event");
+        assert_eq!(k.missing(&k.wired(Some(&text))), Vec::<&str>::new());
+        assert_eq!(k.uninstall(Some(&text)).unwrap(), Some(None), "both go, and the file with them");
     }
 
     #[test]

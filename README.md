@@ -242,22 +242,24 @@ by a sender's window.
 From another member's machine they count only if that member has the `admin` or `steer` role. A pause
 lapses after a day.
 
-A session that is idle sees a message when it next runs, unless it listens. Inside a session:
+Every session listens from its first prompt: a message that arrives while it is idle wakes it. Inside a
+session:
 
 ```sh
-borg listen         # wake this session when a message arrives while it is idle
-borg listen --off
+borg listen --off   # this session is no longer woken
+borg listen         # woken again, and also for the questions borg's turn-end check leaves waiting
 ```
 
-The opt-in lasts until `--off` or the session's end.
+`BORG_LISTEN=off` keeps sessions from listening by themselves.
 
-When its turn ends, borg wakes it in the way its harness allows. On Claude Code the model starts
-`borg listen --wait` in the background. The omp and opencode adapters keep a stream running. On codex a
-detached waiter queues a turn with `codex queue`. The wake names who wrote and how many messages wait,
-and the session's next prompt hook shows the messages themselves. Questions a turn-end check left
-waiting wake a listening session too, and the wake carries them itself; a wake that fails puts them
-back, so the next prompt still asks them. Nothing wakes a session while the
-engineer's own turn runs. `borg top` shows who listens in its WAKE column.
+When its turn ends, borg wakes it in the way its harness allows, with no model call. On Claude Code a
+background Stop hook (`asyncRewake`) waits and starts the next turn. The omp and opencode adapters keep
+a stream running. On codex a detached waiter queues a turn with `codex queue`. The wake names who wrote
+and how many messages wait, and the session's next prompt hook shows the messages themselves. In a
+session where `borg listen` ran, questions a turn-end check left waiting wake it too, and the wake
+carries them itself; a wake that fails puts them back, so the next prompt still asks them. Elsewhere
+they arrive with the next prompt or tool call. Nothing wakes a session while the engineer's own turn
+runs. `borg top` shows who listens in its WAKE column.
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
 
 ## Handing knowledge to an outside store

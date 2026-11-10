@@ -164,7 +164,10 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             ),
             cmd(
                 "listen",
-                &[("[--off]", "wake this session when a message arrives while it is idle"), ("--wait|--stream|--queue", "the waiter (started by borg)")],
+                &[
+                    ("[--off]", "every session listens by itself; listen: also for borg's questions; --off: no wakes"),
+                    ("--wait|--rewake|--stream|--queue", "the waiter (started by borg)"),
+                ],
                 &[],
                 crate::listen::FLAGS,
             ),

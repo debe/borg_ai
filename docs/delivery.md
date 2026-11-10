@@ -33,7 +33,7 @@ Borg spends tokens only where a lesson is likely to matter.
    stop, so the next prompt's lines never reach what it judges. It calls the model holding no lock and
    takes the session lock only to write its answer. Its questions wait for the next prompt or tool call,
    which shows them as questions about the turn they judged (its message's first 160 characters), and
-   the agent may skip one the work since then already settled; a session that listens (`borg listen`)
+   the agent may skip one the work since then already settled; a session where `borg listen` ran
    is woken with them while idle ([Talking to other sessions](../README.md#talking-to-other-sessions)).
    Their channel is `live`: asked, delivered later, no extra round.
    - **One check per session.** A stop while a check runs leaves its job waiting, replacing an older

@@ -3,6 +3,17 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.11 (unreleased)
+
+### Changed
+
+- Every session listens by itself: a message wakes it while it is idle, with no `borg listen`. Before,
+  no session was woken unless it ran `borg listen`, so messages waited for the engineer's next prompt
+  (68 and 216 minutes on the author's machine). `borg listen --off` or `BORG_LISTEN=off` opts out
+  ([Waking a session](docs/commands.md#waking-a-session)). Run `borg install` again on Claude Code.
+- Claude Code: a background Stop hook (`asyncRewake`) waits for messages, so the model is no longer asked to
+  start `borg listen --wait`.
+
 ## 0.7.10 (2026-11-08)
 
 ### Fixed

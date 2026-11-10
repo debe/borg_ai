@@ -277,39 +277,44 @@ impl Drop for Waiter {
     }
 }
 
+/// Claude Code's async Stop hook (`borg hook claude wait`, `asyncRewake`) on the recorded stop of
+/// `session`: the waiter it execs into, running.
+fn rewake_hook(root: &Path, work: &Path, session: &str) -> Child {
+    let mut c = command(root, root, &["hook", "claude", "wait"], &[]).spawn().unwrap();
+    let mut stop = fixture("claude", "stop", session, work);
+    stop["pid"] = json!(host());
+    c.stdin.take().unwrap().write_all(stop.to_string().as_bytes()).unwrap();
+    c
+}
+
 #[test]
-fn an_idle_claude_session_is_asked_once_for_the_wait_which_ends_with_the_message() {
+fn an_idle_claude_session_listens_from_its_first_prompt_and_its_stop_hook_wakes_it() {
     let (root, work) = setup("claude");
     claude(&root, &work, "prompt", "prompt", "s-claude");
-    claude(&root, &work, "prompt", "prompt", "s-plain");
-    let told = opt_in(&root, &work, "s-claude");
-    assert!(told.contains("borg listen --wait --session 's-claude'") && told.contains("run_in_background now"), "{told}");
+    assert!(listen_dir(&root).join("s-claude.json").exists(), "its first prompt opted it in, no command");
+    let stop = claude(&root, &work, "stop", "stop", "s-claude");
+    assert!(!stop.to_string().contains("borg listen"), "the model is asked for nothing: {stop}");
 
-    let wait = format!("borg listen --wait --session 's-claude' --dir '{}'", work.display());
-    let asked = claude(&root, &work, "stop", "stop", "s-claude");
-    assert!(context(&asked).contains(&wait) && context(&asked).contains("run_in_background"), "{asked}");
-    assert_eq!(asked["hookSpecificOutput"]["hookEventName"], "Stop", "Stop feedback, not a hook error: {asked}");
-    assert!(asked.get("decision").is_none(), "{asked}");
-    assert!(!context(&claude(&root, &work, "stop", "stop_again", "s-claude")).contains("borg listen"), "asked once");
-    for _ in 0..2 {
-        assert!(!claude(&root, &work, "stop", "stop", "s-plain").to_string().contains("borg listen"), "a plain session is never asked");
-    }
-    assert!(!listen_dir(&root).join("s-plain.json").exists());
-
-    // The model runs what it was asked: it ends with the summary once a message arrives.
-    let w = Waiter::start(&root, &work, "--wait", "s-claude");
+    // The async Stop hook waits; a tell ends it with Claude Code's wake code and the summary on stderr.
+    let hook = rewake_hook(&root, &work, "s-claude");
+    let pid = i32::try_from(hook.id()).unwrap();
+    until("the hook's waiter holds the lock", || lock_pid(&root, "s-claude") == Some(pid));
     let id = send(&root, &work, "tell", "s-claude", "the schema froze");
-    let (code, out) = w.exit();
-    assert_eq!(code, Some(0), "{out:?}");
-    let out = out.join("\n");
-    assert!(out.contains("[borg listen] 1 message from other sessions waits for you (alice@x tells)"), "{out}");
-    assert!(out.contains("run `borg inbox`") && !out.contains("schema") && !out.contains(&id), "never the text: {out}");
-
-    // The hook shows it once, labelled; a started wait answered the ask, so the next stop may ask again.
+    let out = hook.wait_with_output().unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("1 message from other sessions waits for you (alice@x tells)") && !stderr.contains("schema"), "never the text: {stderr}");
     let shown = context(&claude(&root, &work, "prompt", "prompt", "s-claude"));
     assert!(shown.contains(&format!("[{id}]: the schema froze")), "{shown}");
-    assert!(context(&claude(&root, &work, "stop", "stop", "s-claude")).contains(&wait), "asked again after a wait ran");
-    assert!(!claude(&root, &work, "stop", "stop", "s-plain").to_string().contains("borg listen"));
+
+    // `borg listen --off` holds: the next prompt does not opt it back in, and its stop hook ends at once.
+    let r = borg(&root, &work, &["listen", "--off", "--session", "s-claude"], &[], "");
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    claude(&root, &work, "prompt", "prompt", "s-claude");
+    assert!(!listen_dir(&root).join("s-claude.json").exists());
+    let out = rewake_hook(&root, &work, "s-claude").wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -532,7 +537,8 @@ fn a_failed_codex_queue_is_logged_and_backed_off() {
 #[test]
 fn a_waiter_ends_cleanly_on_sigint_and_refuses_a_session_that_does_not_listen() {
     let (root, work) = setup("sigint");
-    claude(&root, &work, "prompt", "prompt", "s-claude");
+    // Opted out of the automatic listening (`BORG_LISTEN=off`): a session that never listened.
+    hook(&root, "claude", "prompt", &fixture("claude", "prompt", "s-claude", &work), &[("BORG_LISTEN", "off")]);
     let dir = work.display().to_string();
     let r = borg(&root, &work, &["listen", "--wait", "--session", "s-claude", "--dir", &dir], &[], "");
     assert_eq!(r.code, Some(1), "not listening: {}", r.out);
@@ -560,7 +566,8 @@ fn under_a_binding_plugin_the_shells_listen_binds_no_session_by_pid() {
     // Two root sessions of one opencode process: both drones name its pid; s-b's hook touched last.
     let pid = std::process::id().to_string();
     for s in ["s-a", "s-b"] {
-        hook(&root, "opencode", "prompt", &plain(s, &work, &json!({"pid": std::process::id(), "prompt": "hi"})), &[]);
+        // Opted out of the automatic listening (`BORG_LISTEN=off`): only a `borg listen` opts in here.
+        hook(&root, "opencode", "prompt", &plain(s, &work, &json!({"pid": std::process::id(), "prompt": "hi"})), &[("BORG_LISTEN", "off")]);
     }
     let listens = |s: &str| listen_dir(&root).join(format!("{s}.json")).exists();
     let shell = [("OPENCODE_PID", pid.as_str()), ("BORG_LISTEN_BINDER", "opencode")];

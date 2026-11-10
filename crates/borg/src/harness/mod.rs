@@ -253,9 +253,10 @@ pub fn longest_stop() -> Duration {
 /// How an idle session of a harness is woken with a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DroneWake {
-    /// Its stop asks the model to run a waiter in the background, whose end starts the next turn
-    /// (Claude Code).
-    Model,
+    /// A hook of its stop runs the waiter in the background, and its exit starts the next turn
+    /// (Claude Code's `asyncRewake`: the hook's exit code 2 wakes the model with its stderr). No model
+    /// call starts it, so it runs whatever the model does.
+    Rewake,
     /// Its adapter keeps a waiter for the session's life and wakes the session by the harness's own
     /// path (omp `pi.sendMessage`, opencode `session.promptAsync`/`prompt`).
     Plugin,
@@ -285,6 +286,9 @@ pub enum Wiring {
     CommandHooks {
         events: &'static [(&'static str, &'static str)],
         timeouts: &'static [(&'static str, u64)],
+        /// The canonical events whose hook runs in the background and wakes the model on exit code 2
+        /// (Claude Code's `asyncRewake`).
+        rewake: &'static [&'static str],
         retired: &'static [(&'static str, &'static str)],
         through_links: bool,
     },
@@ -465,8 +469,19 @@ mod tests {
         let budgets = [("claude", None), ("omp", Some(28)), ("opencode", Some(90)), ("codex", Some(90)), ("sim", None)];
         let got: Vec<(&str, Option<u64>)> = ALL.iter().map(|h| (h.name(), h.caps().stop_budget.map(|d| d.as_secs()))).collect();
         assert_eq!(got, budgets, "every harness's stop budget");
-        let Wiring::CommandHooks { timeouts, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
-        assert_eq!((timeouts, through_links), (&[("stop", 90)][..], true), "a timeout on the stop only");
+        let Wiring::CommandHooks { timeouts, rewake, through_links, .. } = by_name("claude").unwrap().wiring() else { panic!("claude has command hooks") };
+        assert_eq!((timeouts, rewake, through_links), (&[("stop", 90), ("wait", 604_800)][..], &["wait"][..], true), "a timeout on the stop and the waiter");
+        let wakes: Vec<(&str, DroneWake)> = ALL.iter().map(|h| (h.name(), h.caps().drone_wake)).collect();
+        assert_eq!(
+            wakes,
+            [
+                ("claude", DroneWake::Rewake),
+                ("omp", DroneWake::Plugin),
+                ("opencode", DroneWake::Plugin),
+                ("codex", DroneWake::Queue),
+                ("sim", DroneWake::Rewake)
+            ]
+        );
         // Claude Code's and Codex's own limit; omp and opencode set none: the guard, the strictest of those.
         let chars: Vec<(&str, usize)> = ALL.iter().map(|h| (h.name(), h.caps().context_chars())).collect();
         assert_eq!(chars, [("claude", 10_000), ("omp", 10_000), ("opencode", 10_000), ("codex", 10_000), ("sim", 10_000)]);

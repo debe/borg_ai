@@ -9,15 +9,27 @@ use serde_json::Value;
 use super::{Caps, DroneWake, Harness, Probe, Run, STOP_TIMEOUT_S, SubAgent, Transcript, Wiring};
 
 /// Claude Code hook events and the canonical borg events they become.
-pub const EVENTS: [(&str, &str); 6] = [
+pub const EVENTS: [(&str, &str); 7] = [
     ("UserPromptSubmit", "prompt"),
     // Only a paused drone's tool calls are refused here (steer.rs); otherwise a stat and out.
     ("PreToolUse", "pre_tool"),
     ("PostToolUse", "post_tool"),
     ("PostToolUseFailure", "post_tool_failure"),
     ("Stop", "stop"),
+    // A second Stop hook, in the background (`asyncRewake`): a listening session's waiter (listen.rs),
+    // whose exit code 2 starts the next turn with its stderr. One stat for a session that does not listen.
+    ("Stop", "wait"),
     ("SessionEnd", "end"),
 ];
+
+/// Protocol (Claude Code's): a hook past its `timeout` is ended with SIGTERM, an `asyncRewake` one too,
+/// silently. Guard: a week, so an idle session's waiter outlives any break; one ended by it waits again
+/// from the session's next stop. Under 2^31 ms, a JavaScript timer's limit (Claude Code 2.1.319 kept
+/// 2,147,483 s; measured 2026-11-09).
+pub const WAIT_TIMEOUT_S: u64 = 7 * 24 * 3600;
+
+/// The hooks that get a `timeout` of their own (canonical event, seconds).
+const TIMEOUTS: [(&str, u64); 2] = [("stop", STOP_TIMEOUT_S), ("wait", WAIT_TIMEOUT_S)];
 
 /// Hooks an older borg installed: `SessionStart` served the hive's drones (0.3.0 and before).
 pub const RETIRED: [(&str, &str); 1] = [("SessionStart", "start")];
@@ -55,12 +67,12 @@ impl Harness for Claude {
             context_chars: CONTEXT_CHARS,
             session_env: Some("CLAUDE_CODE_SESSION_ID"),
             pid_env: None,
-            drone_wake: DroneWake::Model,
+            drone_wake: DroneWake::Rewake,
         }
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], retired: &RETIRED, through_links: true }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &TIMEOUTS, rewake: &["wait"], retired: &RETIRED, through_links: true }
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {

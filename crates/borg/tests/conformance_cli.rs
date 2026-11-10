@@ -147,6 +147,8 @@ impl<'a> Drone<'a> {
             .flatten()
             .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
             .filter_map(|h| h["command"].as_str().map(String::from))
+            // Two canonical events may share a native one (Claude Code's Stop: stop, wait).
+            .filter(|c| c.ends_with(&format!(" hook {} {event}", self.p.h.name())))
             .collect();
         assert_eq!(cmds.len(), 1, "{native}: {cmds:?}");
         cmds[0].clone()

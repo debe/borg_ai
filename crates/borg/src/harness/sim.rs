@@ -41,7 +41,7 @@ pub fn caps_of(list: &str) -> Caps {
         context_chars: CONTEXT_GUARD,
         session_env: None,
         pid_env: None,
-        drone_wake: DroneWake::Model,
+        drone_wake: DroneWake::Rewake,
     }
 }
 
@@ -55,7 +55,7 @@ impl Harness for Sim {
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], retired: &[], through_links: false }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &[("stop", STOP_TIMEOUT_S)], rewake: &[], retired: &[], through_links: false }
     }
 
     fn target(&self, home: &Path, _var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {

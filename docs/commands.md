@@ -67,7 +67,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | `borg inbox [--all] [--json] [--show ID] [--from SESSION] [--dir DIR]` | In a session: its messages, new or shown, then marks them shown and acknowledges them. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to; those to the engineer are acknowledged. `--show ID`: one message whole, with the line that replies |
 | `borg pause <drone\|session\|local\|collective> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
 | `borg resume <drone\|session\|local\|collective> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Lets a paused session's tool calls run again |
-| `borg listen [--off] [--session S] [--dir DIR]` | Wakes this session when a message arrives while it is idle, until `--off` or the session's end ([Waking a session](#waking-a-session)) |
+| `borg listen [--off] [--session S] [--dir DIR]` | Every session listens by itself; `borg listen` also wakes it for the questions a turn-end check leaves waiting, `--off` stops all wakes for the rest of the session ([Waking a session](#waking-a-session)) |
 
 **Shell completion:**
 
@@ -191,17 +191,25 @@ and the tool calls a pause refused.
 
 ### Waking a session
 
-`borg listen`, run inside a session, opts it in. The opt-in lives in `<store>/listen/<session>.json`,
-is never synced, and ends with `borg listen --off`, the session's end or the prune of its presence
-record. A plain session is never woken. Without `--session`, the session comes from the harness's
-variables, or on opencode from `OPENCODE_PID`.
+Every session listens from its first prompt (since 0.7.11; before, only one where `borg listen` ran).
+The opt-in lives in `<store>/listen/<session>.json`, is never synced, and ends with `borg listen --off`,
+the session's end or the prune of its presence record. After `--off` the session's later prompts do not
+opt it in again. `BORG_LISTEN=off` keeps sessions from opting in by themselves. A headless Claude Code
+(`claude -p`, the SDK: `CLAUDE_CODE_ENTRYPOINT` other than `cli`) neither opts in nor starts a waiter:
+it waits for its background hooks before it exits.
+
+A session that listens by itself is woken for messages. One where `borg listen` ran is also woken for
+the questions a detached turn-end check left waiting, and the wake carries them
+([When a lesson arrives](delivery.md#when-a-lesson-arrives)); elsewhere they arrive with the next prompt
+or tool call. Without `--session`, the session comes from the harness's variables, or on opencode from
+`OPENCODE_PID`.
 
 When a listening session's turn ends without being blocked, its stop starts a waiter in the way the
 harness allows:
 
 | Harness | How the waiter runs | How the wake arrives |
 |---|---|---|
-| Claude Code | The stop asks the model, once a turn, to run `borg listen --wait` in the background | The waiter exits with a summary, and Claude Code starts the next turn with it |
+| Claude Code | A second Stop hook, `borg hook claude wait`, runs in the background (`asyncRewake`, a week's `timeout`) and becomes `borg listen --rewake`. No model call starts it | The waiter exits 2 with the summary on stderr, and Claude Code starts the next turn with it. One the timeout ended waits again from the session's next stop |
 | omp, opencode | The stop's answer carries `"listen": true`; the adapter keeps `borg listen --stream` running for the session's life | One JSON line per wake (`{"wake": "<text>", "n": <messages>, "ids": [...]}`), sent in as a new turn: omp `pi.sendMessage`, opencode 1.x `session.promptAsync`, 2.x `session.prompt` with `delivery: "queue"`. A wake that arrives during a turn waits for its end, and is dropped once that turn's hooks handed the model every message it names (borg's answer names them, `"shown_ids"`). The adapter answers on the waiter's stdin, `{"sent": ids}` or `{"failed": ids}`; after a failed one the waiter wakes the session again 10 s later, doubling up to 5 minutes |
 | Codex CLI | The stop starts `borg listen --queue` detached, logging to `<store>/listen/<session>.log` | `codex queue --thread <session> --message <text>`, 30 s at most; a failure waits 10 s, doubling up to 5 minutes, before the same messages are tried again |
 
@@ -219,7 +227,8 @@ A paused session is not woken, nor asked for a wait, until it is resumed.
 There is one waiter per session. It follows a reinstall of borg in place (once no wake's questions wait
 for the adapter's answer) and ends on SIGINT, SIGHUP or
 SIGTERM, on `borg listen --off`, or once the session is gone. Exit codes: 0 after a wake (`--wait`),
-after `--off` or when the session is gone; 1 when the session does not listen; 2 on bad arguments;
+after `--off` or when the session is gone; 2 after a wake (`--rewake`, Claude Code's wake code); 1 when
+the session does not listen; 2 on bad arguments;
 128 + the signal when stopped. `borg top` shows `on` (listens, no waiter yet) or `waiter` in its WAKE
 column, and the same in `borg top --json` as each session's `listen`.
 

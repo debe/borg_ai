@@ -875,8 +875,9 @@ mod tests {
         // An install from before the timeout is brought up to it.
         let old = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/b/borg hook claude stop"}]}]}}"#;
         let up: Value = serde_json::from_str(&claude_hooks().install(Some(old), Path::new("/b/borg")).unwrap().unwrap()).unwrap();
-        assert_eq!(up["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(up["hooks"]["Stop"].as_array().unwrap().len(), 2, "the stop, then the waiter");
         assert_eq!(up["hooks"]["Stop"][0]["hooks"][0]["timeout"], harness::STOP_TIMEOUT_S);
+        assert_eq!(up["hooks"]["Stop"][1]["hooks"][0]["asyncRewake"], true);
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["model", "permissions", "hooks", "zz_last"], "key order kept");
         let wired = claude_hooks().wired(Some(&std::fs::read_to_string(t.path(CLAUDE)).unwrap()));

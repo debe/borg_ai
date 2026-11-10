@@ -1,13 +1,15 @@
 //! `borg listen`: a session that listens is woken when a message for it (msg.rs) arrives while it is
-//! idle. Run inside a session, it opts that session in (`<store>/listen/<session>.json`, never synced)
-//! until `borg listen --off`, the session's end, or its presence record's prune (presence.rs `prune`).
-//! A plain session is never woken.
+//! idle. Every session listens from its first prompt (`auto`, `<store>/listen/<session>.json`, never
+//! synced) until `borg listen --off` (which leaves `<session>.off`, so its next prompt does not opt it
+//! in again), the session's end, or its presence record's prune (presence.rs `prune`). `BORG_LISTEN=off`
+//! opts no session in by itself. `borg listen`, run inside a session, opts it in explicitly: only then
+//! do a detached check's asks wake it too (below); an automatic one is woken for messages alone.
 //!
 //! A wake only says that messages wait: the hook shows them (msg.rs `deliver`, its shown-once claim). A
 //! message is not exclusive, so a wake the session never took leaves it unread, and the next message
 //! wakes it again. Each message wakes a session once (`<session>.woke`).
 //!
-//! A detached check's asks (check_async.rs, hook.rs `ASK_NEXT`) wake an idle session too, and the wake
+//! A detached check's asks (check_async.rs, hook.rs `ASK_NEXT`) wake an explicitly listening idle session too, and the wake
 //! carries their questions itself: a wake's turn may fire no prompt hook to show them. The waiter
 //! watches the session's `.queued` and `.checked` files beside its state file. Before the wake it
 //! reserves the asks (hook.rs `reserve_asks`: off the queue, so no prompt shows them meanwhile), and
@@ -17,9 +19,10 @@
 //! adapter treats as it treats message ids; a prompt that shows them names them in `shown_ids`.
 //!
 //! How an idle session is woken follows its harness (`Caps::drone_wake`, `after_stop`):
-//! - Claude Code (`Model`): a stop with no waiter asks the model once to start `borg listen --wait` in
-//!   the background. It exits printing a summary once a message waits and the engineer's turn is not
-//!   running, and Claude Code starts the next turn with that output.
+//! - Claude Code (`Rewake`): a second Stop hook (`borg hook claude wait`, harness/claude.rs) runs in the
+//!   background with `asyncRewake`, and execs `borg listen --rewake --session <id> --dir <cwd>`. It exits
+//!   2 with the wake on stderr once a message waits and the engineer's turn is not running, and Claude
+//!   Code starts the next turn with that text. No model call starts it.
 //! - omp, opencode (`Plugin`): the stop's answer carries `"listen": true` while no waiter runs, and the
 //!   adapter starts `borg listen --stream --session <id>`: one JSON line per wake (`{"wake": text, "n":
 //!   count, "ids": [message ids]}`), for the session's life, which it sends in by the harness's own path.
@@ -58,7 +61,7 @@ use serde_json::{Value, json};
 use crate::harness::{self, DroneWake, Harness};
 use crate::msg::{self, Message};
 use crate::presence::{self, safe};
-use crate::{collective, learn, queen, reexec, top};
+use crate::{collective, learn, reexec, top};
 
 /// The opt-in records and the waiters' files, in the collective's store.
 pub const DIR: &str = "listen";
@@ -107,9 +110,13 @@ const LOCK_TRIES: u32 = 10;
 const LOCK_RETRY: Duration = Duration::from_millis(5);
 
 pub const USAGE: &str = "usage: borg listen [--off] [--session S] [--dir D]
-       borg listen --wait|--stream|--queue [--session S] [--dir D]";
+       borg listen --wait|--rewake|--stream|--queue [--session S] [--dir D]";
 /// `borg listen`'s flags (completions.rs).
-pub const FLAGS: &[&str] = &["--off", "--wait", "--stream", "--queue", "--session", "--dir"];
+pub const FLAGS: &[&str] = &["--off", "--wait", "--rewake", "--stream", "--queue", "--session", "--dir"];
+
+/// Protocol (Claude Code's `asyncRewake`): the exit code of a background hook that wakes the model, its
+/// stderr the text the model gets.
+pub const REWAKE: i32 = 2;
 
 /// A session's opt-in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,10 +131,9 @@ pub struct Record {
     pub pid: u32,
     #[serde(default)]
     pub pid_start: u64,
-    /// A stop asked the model to start its wait, and no waiter or engineer's prompt came since (`Model`:
-    /// asked once a turn).
+    /// Opted in by its first prompt, not by `borg listen`: woken for messages, never for a check's asks.
     #[serde(default)]
-    pub asked: bool,
+    pub auto: bool,
 }
 
 /// What `borg top` shows of a session (`status`), its WAKE column and its JSON spelled alike (`name`).
@@ -153,8 +159,11 @@ impl Status {
 /// Who runs the waiter, and so how it says a wake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// The model, in the background (`--wait`): it prints the wake and exits.
+    /// In the background (`--wait`): it prints the wake and exits.
     Print,
+    /// Claude Code's `asyncRewake` hook (`--rewake`): the wake on stderr, exit 2, which starts the next
+    /// turn with it. Says nothing else: anything on its stderr would join the wake.
+    Rewake,
     /// A harness adapter (`--stream`): one JSON line per wake, for the session's life.
     Stream,
     /// codex's stop (`--queue`): each wake through `codex queue`, for the session's life.
@@ -162,9 +171,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// It waits on after a wake, where the model's exits with it.
+    /// It waits on after a wake, where `--wait`'s and `--rewake`'s exit with it.
     fn lives(self) -> bool {
-        self != Mode::Print
+        !matches!(self, Mode::Print | Mode::Rewake)
     }
 
     /// The least a quiet turn of its session holds a wake off, whatever the session's own gaps.
@@ -216,6 +225,38 @@ pub fn listening(home: &Path, session: &str) -> bool {
     !safe(session).is_empty() && file(home, session, "json").exists()
 }
 
+/// Whether `borg listen --off` ran in `session` (`<session>.off`): its prompts opt it in no more.
+fn opted_out(home: &Path, session: &str) -> bool {
+    file(home, session, "off").exists()
+}
+
+/// Protocol (Claude Code's): the variable its hooks get naming how it runs, `cli` for an interactive
+/// session (`sdk-cli` for `claude -p`, `sdk-ts`/`sdk-py` for the SDK; 2.1.319, read 2026-11-09).
+const CLAUDE_ENTRYPOINT: &str = "CLAUDE_CODE_ENTRYPOINT";
+
+/// Whether this hook runs under a headless Claude Code (`claude -p`, the SDK): one that waits for its
+/// background hooks before it exits (measured: `claude -p` waited for an `asyncRewake` hook until it was
+/// killed), so it gets no waiter, and no engineer waits at it to be woken.
+fn claude_headless() -> bool {
+    std::env::var(CLAUDE_ENTRYPOINT).is_ok_and(|e| !e.trim().is_empty() && e.trim() != "cli")
+}
+
+/// Whether sessions opt in by themselves (`BORG_LISTEN`, on unless `off`).
+fn auto_on() -> bool {
+    !std::env::var("BORG_LISTEN").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"))
+}
+
+/// A prompt of a session that does not listen opts it in (`Record::auto`), unless it opted out or
+/// `BORG_LISTEN=off` (hook.rs `main`, before `touch`); its harness process from the hook's event or its
+/// ancestry, as `borg listen` finds it. One stat for a session that listens; nothing at other events.
+pub fn auto_opt_in(home: &Path, h: &dyn Harness, event: &str, session: &str, input: &Value, now: i64) {
+    if event != "prompt" || safe(session).is_empty() || listening(home, session) || opted_out(home, session) || !auto_on() || claude_headless() {
+        return;
+    }
+    let (pid, pid_start) = own_harness(h, input).unwrap_or_default();
+    let _ = save(home, &Record { session: session.to_string(), harness: h.name().to_string(), ms: now, pid, pid_start, auto: true });
+}
+
 pub fn read(home: &Path, session: &str) -> Option<Record> {
     if safe(session).is_empty() {
         return None;
@@ -244,10 +285,15 @@ fn save(home: &Path, r: &Record) -> std::io::Result<()> {
 /// its lock and log too once no waiter holds the lock. A waiter that runs sees the record gone at its
 /// next look and exits.
 pub fn forget(home: &Path, session: &str) {
+    forget_but(home, session, "");
+}
+
+/// `forget`, keeping the file of extension `keep` (`off` keeps its own mark).
+fn forget_but(home: &Path, session: &str, keep: &str) {
     if safe(session).is_empty() {
         return;
     }
-    for ext in ["json", "busy", "stopping", "woke", "gaps"] {
+    for ext in ["json", "busy", "stopping", "woke", "gaps", "off"].into_iter().filter(|e| *e != keep) {
         let _ = std::fs::remove_file(file(home, session, ext));
     }
     if !waiter_runs(home, session) {
@@ -322,7 +368,7 @@ fn turn(home: &Path, session: &str) -> Turn {
 /// lengthened by the session's own gaps (`gaps`) where they run longer, never shortened (`hold`): a
 /// turn's gaps are heavy-tailed (a build, a test run), so a hold read from them alone would release
 /// one ordinary pause or tool call in 20, and a wake released into a running turn costs a round or a
-/// turn (Claude Code's wait exits into it, and its stop asks the model to start the wait again; codex
+/// turn (Claude Code's wait exits into it, and the turn's own hooks showed its messages already; codex
 /// runs the queued wake after it, for messages the turn's own hooks showed). Holding an Esc'd turn's
 /// wake to the floor costs only its delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,10 +545,10 @@ fn paused(home: &Path, session: &str, started: impl FnOnce() -> Option<i64>, now
 }
 
 /// The hook's bookkeeping of a listening session's turn at `event` (hook.rs `main`, every event but the
-/// stop, `after_stop`): a prompt starts it (and lets its stop ask for the wait again), a tool call's
-/// start and end move it on, each recording the gap it ends (`observe`: the quiet one before a tool
-/// call, a tool call's own at its end), a halted turn ends it, the session's end forgets the opt-in.
-/// One stat for a session that does not listen.
+/// stop, `after_stop`): a prompt starts it, a tool call's start and end move it on, each recording the
+/// gap it ends (`observe`: the quiet one before a tool call, a tool call's own at its end), a halted turn
+/// ends it, the session's end forgets the opt-in or its `--off`. One stat for a session that does not listen
+/// (its end: the removals).
 pub fn touch(home: &Path, event: &str, session: &str, now: i64) {
     let tool = match event {
         "prompt" | "post_tool" | "post_tool_failure" => Some(false),
@@ -510,15 +556,15 @@ pub fn touch(home: &Path, event: &str, session: &str, now: i64) {
         "halted" | "end" => None,
         _ => return,
     };
+    // The end forgets an opted-out session too: its `.off` mark lives as long as the session.
+    if event == "end" {
+        return forget(home, session);
+    }
     if !listening(home, session) {
         return;
     }
     match (event, tool) {
-        ("end", _) => forget(home, session),
-        ("prompt", _) => {
-            set_turn(home, session, false, now);
-            amend(home, session, |r| std::mem::take(&mut r.asked));
-        }
+        ("prompt", _) => set_turn(home, session, false, now),
         (_, Some(tool)) => {
             match (turn(home, session), tool) {
                 (Turn::Thinking(ms), true) => observe(home, session, Gap::Idle, now.saturating_sub(ms)),
@@ -543,19 +589,10 @@ fn blocks(o: Option<&Value>) -> bool {
     o.is_some_and(|o| o.get("decision").and_then(Value::as_str) == Some("block"))
 }
 
-/// Whether the stop's input shows a `borg listen --wait` running in the background (Claude Code's
-/// `background_tasks`).
-fn wait_armed(input: &Value) -> bool {
-    input
-        .get("background_tasks")
-        .and_then(Value::as_array)
-        .is_some_and(|ts| ts.iter().any(|t| t.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("listen --wait"))))
-}
-
 /// A listening session's stop, after everything else answered (`out`). A stop that ends the turn (no
-/// block) ends the engineer's turn mark, and when no waiter runs: Claude Code's model is asked once to
-/// start `borg listen --wait` in the background (as Stop feedback, never a hook error); an adapter is
-/// told to start its stream (`"listen": true`); codex's waiter is started detached. A block passes as it
+/// block) ends the engineer's turn mark, and when no waiter runs: an adapter is told to start its stream
+/// (`"listen": true`); codex's waiter is started detached; Claude Code's starts by itself (its Stop
+/// `wait` hook, `Rewake`). A block passes as it
 /// is: the turn goes on from now (its next gap starts after the stop's own time), and its next stop
 /// decides. A paused session's stop starts and asks for nothing: it waits for the engineer. `stop` is
 /// `stopping`'s mark: None (a plain session, or not a stop) returns `out` without a stat.
@@ -591,38 +628,28 @@ pub fn after_stop(home: &Path, h: &dyn Harness, stop: Option<&Stopping>, input: 
             let _ = spawn_queue(home, session, cwd);
             out
         }
-        DroneWake::Model if wait_armed(input) => out,
-        DroneWake::Model if amend(home, session, |r| !std::mem::replace(&mut r.asked, true)) => Some(ask(out, &arm_text(session, cwd))),
-        DroneWake::Model => out,
+        DroneWake::Rewake => out,
     }
 }
 
-/// What a stop with no waiter asks Claude Code's model to run.
-fn arm_text(session: &str, cwd: &str) -> String {
-    format!(
-        "[borg listen] This session listens for messages from other sessions. To be woken when one arrives, without spending tokens meanwhile, \
-run `{}` with the Bash tool's run_in_background set to true, then end your turn. When it exits, its output says what arrived.",
-        command("--wait", session, cwd)
-    )
-}
-
-/// `borg listen <flag> --session S --dir D`, quoted for a shell.
-fn command(flag: &str, session: &str, cwd: &str) -> String {
-    let dir = if cwd.is_empty() { String::new() } else { format!(" --dir {}", queen::sh_quote(cwd)) };
-    format!("borg listen {flag} --session {}{dir}", queen::sh_quote(session))
-}
-
-/// `text` as Claude Code's Stop feedback (`hookSpecificOutput.additionalContext`), after any context
-/// `out` carried: the turn goes on with it, shown as hook feedback, not as "Stop hook error".
-fn ask(out: Option<Value>, text: &str) -> Value {
-    let mut o = out.filter(Value::is_object).unwrap_or_else(|| json!({}));
-    let theirs = o.get("hookSpecificOutput").and_then(|h| h.get("additionalContext")).and_then(Value::as_str).filter(|t| !t.is_empty());
-    let text = match theirs {
-        Some(t) => format!("{t}\n\n{text}"),
-        None => text.to_string(),
-    };
-    o["hookSpecificOutput"] = json!({"hookEventName": "Stop", "additionalContext": text});
-    o
+/// Claude Code's background Stop hook of `session` (hook.rs `main`, `wait`): a session that listens and
+/// has no waiter yet gets one, this process exec'd as `borg listen --rewake --session S --dir D`, so its
+/// pid stays the hook's (Claude Code ends it at the session's end or the hook's timeout) and a re-exec
+/// (reexec.rs) finds all it needs in its arguments, the hook's stdin being read. Otherwise it returns at
+/// once, and the hook exits 0: no wake. Never under a headless Claude Code (`claude_headless`), which
+/// would wait for the waiter before it exits.
+pub fn rewake(home: &Path, session: &str, cwd: &str) {
+    use std::os::unix::process::CommandExt;
+    if claude_headless() || !listening(home, session) || waiter_runs(home, session) {
+        return;
+    }
+    let mut c = std::process::Command::new(reexec::exe_path());
+    c.args(["listen", "--rewake", "--session", session]);
+    if !cwd.is_empty() {
+        c.args(["--dir", cwd]);
+    }
+    // Returns only when the exec failed: then no waiter, as when the session does not listen.
+    let _ = c.exec();
 }
 
 /// Starts codex's waiter of `session` (`--queue`), detached: a session of its own (setsid), stdin from
@@ -742,8 +769,9 @@ fn signal() -> Option<i32> {
 /// What the waiter found at a look at the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Look {
-    /// It listens; its start (presence.rs), for the broadcasts it gets.
-    Listens { started: i64 },
+    /// It listens; its start (presence.rs), for the broadcasts it gets, and whether a check's asks wake
+    /// it (`borg listen` ran in it, `Record::auto`).
+    Listens { started: i64, asks: bool },
     /// `--off`, or its end event: the record is gone.
     Off,
     /// Its harness process is gone with no end event (a closed terminal, a crash).
@@ -756,7 +784,7 @@ fn look(home: &Path, session: &str) -> Look {
     if harness_gone(&rec) || p.as_ref().is_some_and(|p| p.event == "end" || p.pid.is_some_and(|pid| !presence::alive(pid))) {
         return Look::Gone;
     }
-    Look::Listens { started: p.map_or(i64::MAX, |p| p.started) }
+    Look::Listens { started: p.map_or(i64::MAX, |p| p.started), asks: !rec.auto }
 }
 
 /// Whether `id` names what a wake is for: a message (msg.rs `is_id`) or a detached check's ask (hook.rs
@@ -889,6 +917,7 @@ fn note(mode: Mode, text: &str) {
         }
         Mode::Queue => println!("{} {text}", learn::now_ms()),
         Mode::Print => eprintln!("{text}"),
+        Mode::Rewake => {}
     }
 }
 
@@ -900,6 +929,7 @@ fn end(mode: Mode, why: &str) {
         }
         Mode::Queue => println!("{} [borg listen] ends: {why}", learn::now_ms()),
         Mode::Print => println!("[borg listen] the wait ends: {why}"),
+        Mode::Rewake => {}
     }
 }
 
@@ -914,6 +944,10 @@ fn say(mode: Mode, session: &str, text: &str, ids: &[&str]) -> Result<(), WakeEr
     match mode {
         Mode::Print => {
             println!("{text}");
+            Ok(())
+        }
+        Mode::Rewake => {
+            eprintln!("{text}");
             Ok(())
         }
         Mode::Stream => emit(&json!({"wake": text, "n": ids.len(), "ids": ids})),
@@ -1156,7 +1190,7 @@ impl<'a> Waiter<'a> {
                 Err(_) => {}
             }
         }
-        let started = match look(self.home, self.session) {
+        let (started, asks) = match look(self.home, self.session) {
             Look::Off => {
                 self.release_all();
                 end(self.mode, "this session listens no more");
@@ -1170,7 +1204,7 @@ impl<'a> Waiter<'a> {
                 self.leave();
                 return Pass::Exit(0);
             }
-            Look::Listens { started } => started,
+            Look::Listens { started, asks } => (started, asks),
         };
         // Read before any hold-off, so `idle` waits for the log's next change, not this one. The talk is
         // taken before the read, so a write in between moves it past what the waiter holds.
@@ -1191,7 +1225,7 @@ impl<'a> Waiter<'a> {
         let (new, mine) = news(self.home, &self.msgs, &self.here, self.session, started, now, &self.woke);
         // A detached check's asks waiting (hook.rs `asks_waiting`), read only once the queue holds any, and
         // not again while it holds only asks none could be reserved of.
-        let looked = self.asks_seen[0].is_some() && self.unreservable != Some(self.asks_seen);
+        let looked = asks && self.asks_seen[0].is_some() && self.unreservable != Some(self.asks_seen);
         let waiting = if looked { routed(self.home, || crate::hook::asks_waiting(self.session)) } else { Vec::new() };
         // Paused: a wake's turn could only have its tool calls refused; the resume moves the log.
         if (new.is_empty() && waiting.is_empty()) || paused(self.home, self.session, || Some(started), now) {
@@ -1227,7 +1261,11 @@ impl<'a> Waiter<'a> {
                     self.retry = None;
                     self.commit(&lesson_ids);
                 }
-                if self.mode.lives() { Pass::Again } else { Pass::Exit(0) }
+                match self.mode {
+                    Mode::Rewake => Pass::Exit(REWAKE),
+                    m if m.lives() => Pass::Again,
+                    _ => Pass::Exit(0),
+                }
             }
             Err(WakeError::Closed) => {
                 self.release(&lesson_ids);
@@ -1312,9 +1350,9 @@ fn take_lock(home: &Path, session: &str, mode: Mode, inherited: Option<std::os::
     Ok(lock)
 }
 
-/// `borg listen --wait|--stream|--queue`: waits for messages of `session` (module doc). 0 once it woke
-/// the session (`--wait`), it listens no more, or the session is gone; 1 when it does not listen; 128 +
-/// the signal that stopped it.
+/// `borg listen --wait|--rewake|--stream|--queue`: waits for messages of `session` (module doc). 0 once
+/// it woke the session (`--wait`), it listens no more, or the session is gone; `REWAKE` once it woke it
+/// (`--rewake`); 1 when it does not listen; 128 + the signal that stopped it.
 fn wait(home: &Path, session: &str, mode: Mode, cwd: &str) -> i32 {
     // Its stops trapped first; re-exec'd by its previous image (reexec.rs), they are unblocked only then.
     trap();
@@ -1327,8 +1365,6 @@ fn wait(home: &Path, session: &str, mode: Mode, cwd: &str) -> i32 {
         Ok(l) => l,
         Err(code) => return code,
     };
-    // The stop's ask is answered: once this waiter ends, a stop may ask again.
-    amend(home, session, |r| std::mem::take(&mut r.asked));
     // Asks a waiter that died had reserved go back on the queue; one re-executed keeps its own.
     if inherited.is_none() {
         routed(home, || crate::hook::release_asks(session, None));
@@ -1369,7 +1405,7 @@ enum ArgError<'a> {
 impl fmt::Display for ArgError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ArgError::Conflict => f.write_str("give one of --off, --wait, --stream, --queue"),
+            ArgError::Conflict => f.write_str("give one of --off, --wait, --rewake, --stream, --queue"),
             ArgError::Missing(w) => write!(f, "{w} needs a value"),
             ArgError::Unknown(w) => write!(f, "unknown argument {w:?}"),
         }
@@ -1390,6 +1426,7 @@ fn parse<'a>(args: &[&'a str]) -> Result<Args<'a>, ArgError<'a>> {
         match w {
             "--off" => set(&mut a, Action::Off)?,
             "--wait" => set(&mut a, Action::Wait(Mode::Print))?,
+            "--rewake" => set(&mut a, Action::Wait(Mode::Rewake))?,
             "--stream" => set(&mut a, Action::Wait(Mode::Stream))?,
             "--queue" => set(&mut a, Action::Wait(Mode::Queue))?,
             "--session" | "--dir" => {
@@ -1424,21 +1461,22 @@ fn caller(drones: &[top::Drone], by_pid: bool) -> Result<Option<(String, &'stati
 }
 
 /// What `borg listen` tells the session about how it is woken.
-fn told(wake: DroneWake, session: &str, cwd: &str) -> String {
+fn told(wake: DroneWake) -> String {
     let how = match wake {
-        DroneWake::Model => format!("Start `{}` with run_in_background now, or the next stop asks for it.", command("--wait", session, cwd)),
+        DroneWake::Rewake => "borg wakes this session once its turn ends.".to_string(),
         DroneWake::Plugin => "The borg adapter wakes this session once its turn ends.".to_string(),
         DroneWake::Queue => "borg wakes this session through `codex queue` once its turn ends.".to_string(),
     };
     format!("[borg listen] This session listens: a message for it wakes it while it is idle. {how} `borg listen --off` stops it.")
 }
 
-/// `borg listen` in `session` of harness `h`: the opt-in recorded (its asked mark cleared, its
-/// harness process kept or found).
-fn on(home: &Path, session: &str, h: Option<&'static dyn Harness>, cwd: &str, now: i64) -> i32 {
+/// `borg listen` in `session` of harness `h`: the opt-in recorded, explicit (a check's asks wake it too,
+/// an earlier `--off` undone), its harness process kept or found.
+fn on(home: &Path, session: &str, h: Option<&'static dyn Harness>, now: i64) -> i32 {
     let h = h.or_else(|| presence::read(home, session).and_then(|p| harness::by_name(&p.harness)));
     let mut rec = read(home, session).unwrap_or_else(|| Record { session: session.to_string(), ms: now, ..Record::default() });
-    rec.asked = false;
+    rec.auto = false;
+    let _ = std::fs::remove_file(file(home, session, "off"));
     if let Some(h) = h {
         rec.harness = h.name().to_string();
         if rec.pid == 0
@@ -1452,15 +1490,18 @@ fn on(home: &Path, session: &str, h: Option<&'static dyn Harness>, cwd: &str, no
         eprintln!("borg listen: {e}");
         return 1;
     }
-    let wake = h.map_or(DroneWake::Model, |h| h.caps().drone_wake);
-    println!("{}", told(wake, session, cwd));
+    let wake = h.map_or(DroneWake::Rewake, |h| h.caps().drone_wake);
+    println!("{}", told(wake));
     0
 }
 
 fn off(home: &Path, session: &str) -> i32 {
     let was = listening(home, session);
-    // Forgotten first: the waiter, signalled then, finds the session off and takes its lock and log along.
-    forget(home, session);
+    // Marked first, so a prompt meanwhile does not opt it in again (`auto_opt_in`); its end or prune
+    // clears the mark (`forget`).
+    let _ = std::fs::create_dir_all(dir(home)).and_then(|()| std::fs::write(file(home, session, "off"), ""));
+    // Forgotten next: the waiter, signalled then, finds the session off and takes its lock and log along.
+    forget_but(home, session, "off");
     stop_waiter(home, session);
     println!("[borg listen] {}", if was { "this session listens no more" } else { "this session did not listen" });
     0
@@ -1472,7 +1513,8 @@ pub fn main(args: &[&str]) -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("borg listen: {e}\n{USAGE}");
-            return 2;
+            // Not 2 under `--rewake`: Claude Code would start a turn with this error (`REWAKE`).
+            return if args.contains(&"--rewake") { 1 } else { 2 };
         }
     };
     let dir = a.dir.map_or_else(|| std::env::current_dir().unwrap_or_default(), PathBuf::from);
@@ -1512,7 +1554,7 @@ pub fn main(args: &[&str]) -> i32 {
         return 1;
     };
     match a.action {
-        Action::On => on(home, &session, h, &cwd, now),
+        Action::On => on(home, &session, h, now),
         Action::Off => off(home, &session),
         Action::Wait(mode) => wait(home, &session, mode, &cwd),
     }
@@ -1584,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn claudes_stop_asks_once_for_the_wait_and_a_block_passes() {
+    fn claudes_stop_asks_the_model_for_nothing_and_a_block_passes() {
         let home = temp("claude-stop");
         let h = harness::by_name("claude").unwrap();
         opt_in(&home, "s1", "claude");
@@ -1593,16 +1635,55 @@ mod tests {
         let block = json!({"decision": "block", "reason": "a question"});
         assert_eq!(after_stop(&home, h, stopping(&home, "stop", "s1", 1).as_ref(), &input, Some(block.clone())), Some(block), "a block passes as it is");
         assert_ne!(turn(&home, "s1"), Turn::Over, "and the turn goes on");
-        let out = after_stop(&home, h, stopping(&home, "stop", "s1", 1).as_ref(), &input, None).unwrap();
-        let text = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert!(text.contains("borg listen --wait --session 's1' --dir '/w'") && out.get("decision").is_none(), "{out}");
+        assert_eq!(after_stop(&home, h, stopping(&home, "stop", "s1", 1).as_ref(), &input, None), None, "its Stop `wait` hook starts the waiter");
         assert_eq!(turn(&home, "s1"), Turn::Over, "a stop that ends the turn ends its mark");
-        assert_eq!(after_stop(&home, h, stopping(&home, "stop", "s1", 1).as_ref(), &input, None), None, "asked once");
-        touch(&home, "prompt", "s1", 2);
-        assert!(after_stop(&home, h, stopping(&home, "stop", "s1", 2).as_ref(), &input, None).is_some(), "asked once a turn: the next turn's stop asks again");
-        touch(&home, "prompt", "s1", 3);
-        let armed = json!({"session_id": "s1", "background_tasks": [{"command": "borg listen --wait --session s1"}]});
-        assert_eq!(after_stop(&home, h, stopping(&home, "stop", "s1", 1).as_ref(), &armed, None), None, "a wait in the background is not asked for again");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_prompt_opts_a_session_in_until_it_says_off() {
+        let home = temp("auto");
+        let h = harness::by_name("claude").unwrap();
+        for ev in ["pre_tool", "post_tool", "stop", "end"] {
+            auto_opt_in(&home, h, ev, "s1", &Value::Null, 1);
+        }
+        assert!(!listening(&home, "s1"), "only a prompt opts in");
+        auto_opt_in(&home, h, "prompt", "s1", &Value::Null, 1);
+        let rec = read(&home, "s1").unwrap();
+        assert!(rec.auto && rec.harness == h.name() && rec.ms == 1, "{rec:?}");
+        assert_eq!(off(&home, "s1"), 0);
+        auto_opt_in(&home, h, "prompt", "s1", &Value::Null, 2);
+        assert!(!listening(&home, "s1"), "`--off` holds for the session's later prompts");
+        assert_eq!(on(&home, "s1", Some(h), 3), 0);
+        assert!(!read(&home, "s1").unwrap().auto && !opted_out(&home, "s1"), "an explicit `borg listen` undoes the `--off`");
+        assert_eq!(off(&home, "s1"), 0);
+        touch(&home, "end", "s1", 4);
+        assert!(!opted_out(&home, "s1") && !listening(&home, "s1"), "the session's end forgets its `--off` too");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An automatic opt-in is woken for messages, never for a detached check's asks; an explicit one for both.
+    #[test]
+    fn only_an_explicit_listener_is_looked_at_for_asks() {
+        let home = temp("asks-gate");
+        save(&home, &Record { session: "s1".into(), harness: "claude".into(), ms: 1, auto: true, ..Record::default() }).unwrap();
+        assert!(matches!(look(&home, "s1"), Look::Listens { asks: false, .. }));
+        opt_in(&home, "s1", "claude");
+        assert!(matches!(look(&home, "s1"), Look::Listens { asks: true, .. }));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// `--rewake` says the wake on stderr and exits 2 (Claude Code's `asyncRewake`); nothing on stdout.
+    #[test]
+    fn a_rewake_waiter_exits_with_the_wake_code() {
+        let home = temp("rewake");
+        opt_in(&home, "s1", "claude");
+        let to = format!("s1@{}", msg::node(&home));
+        let _ = message(&home, &to, learn::now_ms() - 1, "hello");
+        let mut w = waiter(&home, Mode::Rewake);
+        assert_eq!(w.pass(), Pass::Exit(REWAKE));
+        assert!(!Mode::Rewake.lives());
+        assert_eq!(parse(&["--rewake", "--session", "s1"]).unwrap().action, Action::Wait(Mode::Rewake));
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -1789,7 +1870,6 @@ mod tests {
         steer(msg::Kind::Pause, t - 2);
         let h = harness::by_name("claude").unwrap();
         assert_eq!(after_stop(&home, h, stopping(&home, "stop", "s1", t).as_ref(), &json!({"session_id": "s1"}), None), None, "a paused stop asks for no wait");
-        assert!(!read(&home, "s1").unwrap().asked);
         let mut w = waiter(&home, Mode::Stream);
         assert_eq!(w.pass(), Pass::Wait, "paused: not woken");
         assert!(woken(&home, "s1").is_empty());

@@ -80,7 +80,7 @@ impl Harness for Codex {
     }
 
     fn wiring(&self) -> Wiring {
-        Wiring::CommandHooks { events: &EVENTS, timeouts: &TIMEOUTS, retired: &RETIRED, through_links: true }
+        Wiring::CommandHooks { events: &EVENTS, timeouts: &TIMEOUTS, rewake: &[], retired: &RETIRED, through_links: true }
     }
 
     fn target(&self, home: &Path, var: &dyn Fn(&str) -> Option<PathBuf>) -> PathBuf {

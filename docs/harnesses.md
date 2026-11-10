@@ -69,7 +69,7 @@ effect of a refactor.
 | `sends_pid` | A drone whose process is gone reads as ended (otherwise an event's `pid` is dropped) | no | yes | yes | no |
 | `session_env` | The variable the harness sets to its session's id in every command its model runs, so `borg listen`, `tell` and `inbox` know the session | `CLAUDE_CODE_SESSION_ID` | `PI_SESSION_ID` | none: the shell gets no session id, so the plugin binds the session itself | `CODEX_THREAD_ID` |
 | `pid_env` | For a harness without `session_env`: the variable that carries its pid, which its events carry too, so presence names the session | none | none | `OPENCODE_PID` | none |
-| `drone_wake` | How `borg listen` wakes an idle session ([Waking a session](commands.md#waking-a-session)) | `Model`: the model runs `borg listen --wait` in the background | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
+| `drone_wake` | How a listening idle session is woken ([Waking a session](commands.md#waking-a-session)) | `Rewake`: a background Stop hook (`asyncRewake`) runs `borg listen --rewake`, whose exit code 2 starts the next turn | `Plugin`: the adapter runs `borg listen --stream` | `Plugin`, as omp | `Queue`: a detached `borg listen --queue` runs `codex queue` |
 | `stop_budget` | The stop's budget when `BORG_STOP_BUDGET_MS` is unset: the stop's model call and the expert drone keep inside it | none | 28 s: omp's fixed 30 s handler limit less 2 s for the adapter | 90 s, borg's stop timeout (opencode sets no limit) | 90 s, the Stop hook's timeout |
 | `context_chars` | The characters of context one hook answer may inject and have arrive whole, shared by everything that event delivers (messages, lessons) | 10,000: Claude Code saves a longer `additionalContext` to a file and gives the model a preview (2.1.312) | 10,000, the guard: omp injects it whole, with no limit of its own (18.13.1) | 10,000, the guard: no limit of its own (1.19.0; 2.x not measured) | 10,000: Codex's default `additionalContextLimit`; a longer one is cut to its head and tail (0.153.2) |
 
@@ -118,7 +118,7 @@ install and uninstall alike.
 
 | Wiring | Harness | Installs |
 |---|---|---|
-| `CommandHooks` | Claude Code | Hook groups merged into `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`), written through a symlink |
+| `CommandHooks` | Claude Code | Hook groups merged into `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`), written through a symlink; Stop gets two, the stop and the background waiter (`wait`, `asyncRewake`) |
 | `AdapterFile` | omp | `~/.omp/agent/extensions/borg.ts` (`$PI_CODING_AGENT_DIR/extensions`) |
 | `AdapterFile` | opencode | `~/.config/opencode/plugins/borg.ts` (`$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`) |
 | `CommandHooks` | Codex CLI | Hook groups appended to `~/.codex/hooks.json` (`$CODEX_HOME`), written through a symlink, each with its own timeout |

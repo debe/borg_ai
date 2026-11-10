@@ -3696,6 +3696,11 @@ pub fn main(name: &str, event: &str) {
         Err(_) => collective::Route::Off,
     };
     let collective::Route::Collective { home, name, .. } = route else { return };
+    // Claude Code's background Stop hook: becomes the session's waiter (listen.rs `Rewake`), or exits.
+    if event == "wait" {
+        crate::listen::rewake(&home, input.get("session_id").and_then(Value::as_str).unwrap_or_default(), cwd);
+        return;
+    }
     // SAFETY: single-threaded at this point; everything below (and the background `borg learn` it
     // spawns) inherits the collective's own store and scratch state.
     unsafe {
@@ -3712,6 +3717,7 @@ pub fn main(name: &str, event: &str) {
     // The turn of a session that listens for wakes (listen.rs): one stat of its opt-in for any other, at
     // a prompt, a tool call's start or end, a halted turn and the end. With steering's stat below, an idle
     // tool call costs two failed stats: the opt-in is per session, the admissions are per store.
+    crate::listen::auto_opt_in(&home, h, event, session, &input, now);
     crate::listen::touch(&home, event, session, now);
     // A session's start (a hook of an older install) and a halted turn read and write nothing more.
     if matches!(event, "start" | "halted") {
