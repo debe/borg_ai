@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.7.13 (unreleased)
+## 0.7.13 (2026-11-13)
 
 A mesh session does about a tenth of 0.7.12's work, and borg web keeps its rollups between requests.
 
