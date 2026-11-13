@@ -12,13 +12,15 @@
 //! Recording fails open and costs one append: a broken store never disturbs the drone.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+use crate::follow::{Follow, Held, Mark, Read, follow};
 use crate::jsonl::{Scalar, Str, Text, slot};
 
 /// A turn end the conscience saw (one per Stop that was not the rework after its own block).
@@ -962,32 +964,170 @@ impl<'n> Folder<'n> {
 
 /// The latest version of every bucket in `stats.jsonl` (every node's, after the mesh merged them). Two
 /// lines of one version (two rollups at once) are ranked as borg-mesh lines.rs `settle` ranks them, by
-/// the line's blake3 hash, so every node shows the same one whatever order the lines arrived in.
+/// the line's blake3 hash, so every node shows the same one whatever order the lines arrived in; a line
+/// that is no `Bucket` is passed over.
 ///
-/// Most lines are superseded versions (94% on one store), so it reads each line's leading `id` and
-/// `version` first (`jsonl::lead`) and parses only each id's newest line whole; a newest line that is no
-/// `Bucket` gives way to the next.
+/// The file is read whole once per process and then followed (`latest`): borg-web asks on every request,
+/// and reads only what was appended since.
 pub fn rollups(home: &Path) -> BTreeMap<String, Bucket> {
-    let text = std::fs::read_to_string(rollups_path(home)).unwrap_or_default();
-    let head = |l| match crate::jsonl::lead(l, ["id", "version"])? {
+    latest(home).buckets().map(|b| (b.id.clone(), b.clone())).collect()
+}
+
+/// A line's `id` and `version`, the head `Rollups::fold` ranks a line by before it parses it whole.
+fn head(line: &str) -> Option<(Cow<'_, str>, u64)> {
+    match crate::jsonl::lead(line, ["id", "version"])? {
         [Scalar::Str(id), version] => Some((id, version.as_u64()?)),
         _ => None,
-    };
-    let mut out = BTreeMap::new();
-    for (_, mut lines) in crate::jsonl::by_id(&text, head) {
-        lines.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
-        // Newest version first; lines of one version by hash, hashed only when there are several.
-        for tied in lines.chunk_by_mut(|a, b| a.0 == b.0) {
-            if tied.len() > 1 {
-                tied.sort_by_cached_key(|(_, l)| std::cmp::Reverse(*blake3::hash(l.as_bytes()).as_bytes()));
-            }
-            if let Some(b) = tied.iter().find_map(|(_, l)| serde_json::from_str::<Bucket>(l).ok()) {
-                out.insert(b.id.clone(), b);
-                break;
+    }
+}
+
+/// An id's latest bucket (`Rollups`), and its line's blake3 hash, which ranks lines of one version.
+#[derive(Debug, Clone)]
+struct Latest {
+    hash: [u8; 32],
+    bucket: Bucket,
+}
+
+impl Latest {
+    /// The bucket on `line`, if its head reads and it parses whole.
+    fn of(line: &str) -> Option<Latest> {
+        head(line)?;
+        let bucket = serde_json::from_str(line).ok()?;
+        Some(Latest { hash: *blake3::hash(line.as_bytes()).as_bytes(), bucket })
+    }
+
+    /// Whether a line of `version` and `hash` ranks above this one.
+    fn outranked_by(&self, version: u64, hash: &[u8; 32]) -> bool {
+        (version, hash) > (self.bucket.version, &self.hash)
+    }
+}
+
+/// `stats.jsonl` folded to the latest bucket per id (`rollups`), followed (follow.rs): read whole once,
+/// then only what was appended. It keeps no text, only each id's winner and the unterminated last line's
+/// bucket, which the next tail reads again.
+#[derive(Debug, Clone, Default)]
+struct Rollups {
+    latest: BTreeMap<String, Latest>,
+    /// The bucket on the unterminated last line, if it is one: ranked with the others when they are read,
+    /// and dropped when the line is read again with the tail.
+    open: Option<Latest>,
+    mark: Mark,
+    end: usize,
+    parsed: usize,
+    guard: Vec<u8>,
+}
+
+impl Rollups {
+    /// Folds the lines of `text` (which starts at the file's byte `self.parsed`) in, and moves `parsed`
+    /// to its unterminated last line.
+    ///
+    /// Most lines are superseded versions (94% on one store), so it reads each line's `head` first and
+    /// parses whole only the lines that could win: per id, from the newest version down, the lines of a
+    /// version by hash, until one is a `Bucket` that ranks above the id's winner so far.
+    fn fold(&mut self, text: &str) {
+        let last = if text.ends_with('\n') { text.len() } else { text.rfind('\n').map_or(0, |i| i + 1) };
+        let (done, open) = text.split_at(last);
+        for (id, mut lines) in crate::jsonl::by_id(done, head) {
+            let bar = self.latest.get(&*id).map(|l| (l.bucket.version, l.hash));
+            lines.retain(|(v, _)| bar.is_none_or(|(at, _)| *v >= at));
+            lines.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+            let won = lines.chunk_by(|a, b| a.0 == b.0).find_map(|tied| {
+                let mut ranked: Vec<([u8; 32], &str)> = tied.iter().map(|(_, l)| (*blake3::hash(l.as_bytes()).as_bytes(), *l)).collect();
+                ranked.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
+                ranked.into_iter().filter(|(h, _)| bar.is_none_or(|(at, ah)| (tied[0].0, h) > (at, &ah))).find_map(|(hash, l)| {
+                    let bucket = serde_json::from_str::<Bucket>(l).ok()?;
+                    Some(Latest { hash, bucket })
+                })
+            });
+            if let Some(w) = won {
+                self.latest.insert(w.bucket.id.clone(), w);
             }
         }
+        self.open = open.lines().next().and_then(Latest::of);
+        self.guard = crate::follow::guard_after(&self.guard, done.as_bytes());
+        self.parsed += last;
+        self.end = self.parsed + open.len();
     }
-    out
+
+    /// Every id's latest bucket, the unterminated last line's among them.
+    fn buckets(&self) -> impl Iterator<Item = &Bucket> {
+        let open = self.open.as_ref().filter(|o| self.latest.get(&o.bucket.id).is_none_or(|l| l.outranked_by(o.bucket.version, &o.hash)));
+        self.latest.values().filter(move |l| open.is_none_or(|o| o.bucket.id != l.bucket.id)).chain(open).map(|l| &l.bucket)
+    }
+}
+
+impl Follow for Rollups {
+    fn whole(mark: Mark, text: String) -> Rollups {
+        let mut r = Rollups { mark, ..Rollups::default() };
+        r.fold(&text);
+        r
+    }
+
+    fn held(&self) -> Held<'_> {
+        Held { mark: self.mark, end: self.end, parsed: self.parsed, guard: &self.guard }
+    }
+
+    fn extend(&mut self, mark: Mark, tail: String) {
+        self.mark = mark;
+        self.fold(&tail);
+    }
+}
+
+/// What this process holds of one store's `stats.jsonl` (`latest`), and how often it read the file whole
+/// and in part.
+#[derive(Default)]
+struct Followed {
+    rollups: Option<Arc<Rollups>>,
+    whole: usize,
+    tail: usize,
+}
+
+/// The `stats.jsonl` of every store this process read (`latest`), each behind a lock of its own.
+static FOLLOWED: Mutex<Vec<(PathBuf, Arc<Mutex<Followed>>)>> = Mutex::new(Vec::new());
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The rollups of the store `home` as its `stats.jsonl` is now: read whole on first use, then a stat per
+/// call and a read of what was appended (follow.rs). The file's slot stays locked while the file is read,
+/// so requests at once read it whole once between them, not once each; a caller that still holds an
+/// older snapshot keeps it, and the next extension is a copy.
+fn latest(home: &Path) -> Arc<Rollups> {
+    let path = rollups_path(home);
+    let slot = {
+        let mut all = lock(&FOLLOWED);
+        match all.iter().find(|(p, _)| *p == path) {
+            Some((_, s)) => Arc::clone(s),
+            None => {
+                let s = Arc::default();
+                all.push((path.clone(), Arc::clone(&s)));
+                s
+            }
+        }
+    };
+    let mut f = lock(&slot);
+    let r = match f.rollups.take() {
+        None => {
+            f.whole += 1;
+            let (mark, text) = crate::follow::whole(&path);
+            Arc::new(Rollups::whole(mark, text))
+        }
+        Some(mut r) => match follow(&path, r.held()) {
+            Read::Same => r,
+            Read::Tail(mark, tail) => {
+                f.tail += 1;
+                Arc::make_mut(&mut r).extend(mark, tail);
+                r
+            }
+            Read::Whole(mark, text) => {
+                f.whole += 1;
+                Arc::new(Rollups::whole(mark, text))
+            }
+        },
+    };
+    f.rollups = Some(Arc::clone(&r));
+    r
 }
 
 /// Publishes this node's buckets whose counts changed since their last line in `stats.jsonl`, each
@@ -1001,14 +1141,15 @@ pub fn rollup(home: &Path) -> usize {
         return 0;
     }
     let me = node(home);
-    let published = rollups(home);
+    let latest = latest(home);
+    let published: HashMap<&str, &Bucket> = latest.buckets().map(|b| (b.id.as_str(), b)).collect();
     // This engineer's personal lessons (reach.rs) are no team's business, not even by id.
     let personal = crate::reach::personal_ids(home);
     let fresh: Vec<Bucket> = fold(&me, &evs)
         .into_values()
         .filter_map(|mut b| {
             b.lessons.retain(|id, _| !personal.contains(id));
-            let old = published.get(&b.id);
+            let old = published.get(b.id.as_str());
             if old.is_some_and(|o| o.same(&b)) {
                 return None;
             }
@@ -1031,7 +1172,7 @@ pub fn current(home: &Path) -> Vec<Bucket> {
     backfill(home);
     recount_ignores(home);
     let me = node(home);
-    let mut all: BTreeMap<String, Bucket> = rollups(home).into_iter().filter(|(_, b)| b.node != me).collect();
+    let mut all: BTreeMap<String, Bucket> = latest(home).buckets().filter(|b| b.node != me).map(|b| (b.id.clone(), b.clone())).collect();
     // `fold(&me, &events(home))`, folded as read: one log's text at a time, no event kept.
     let mut f = Folder::new(&me);
     for path in [backfill_path(home), events_path(home), ignores_path(home)] {
@@ -1505,23 +1646,182 @@ mod tests {
     }
 
     /// The two passes keep exactly what a whole parse of every line keeps, on the edges and on every
-    /// line of a real store (`BORG_BENCH_STORE`), in file order and reversed.
+    /// line of a real store (`BORG_BENCH_STORE`), in file order and reversed. Each text is renamed in as a
+    /// new file, so each is read whole: written in place at the same size within one ctime tick, the
+    /// reversed text would be taken for the one before it.
     #[test]
     fn rollups_keep_what_a_whole_parse_keeps() {
         let home = tmp("rollups-oracle");
+        let put = |text: &str| {
+            let before = reads(&home).0;
+            std::fs::write(home.join("tmp"), text).unwrap();
+            std::fs::rename(home.join("tmp"), rollups_path(&home)).unwrap();
+            let got = rollups(&home);
+            assert_eq!(reads(&home).0, before + 1, "read whole");
+            got
+        };
         let real = crate::jsonl::store_lines(&["stats.jsonl"]);
         for mut lines in [bucket_edges(), real.clone(), [real, bucket_edges()].concat()] {
             for _ in 0..2 {
                 let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-                std::fs::write(rollups_path(&home), &text).unwrap();
-                assert_eq!(rollups(&home), rollups_whole(&text));
+                assert_eq!(put(&text), rollups_whole(&text));
                 lines.reverse();
             }
         }
-        std::fs::write(rollups_path(&home), bucket_edges().iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
-        let got: Vec<(String, u64)> = rollups(&home).into_iter().map(|(id, b)| (id, b.version)).collect();
+        let got = put(&bucket_edges().iter().map(|l| format!("{l}\n")).collect::<String>());
+        let got: Vec<(String, u64)> = got.into_iter().map(|(id, b)| (id, b.version)).collect();
         let got: Vec<(&str, u64)> = got.iter().map(|(id, v)| (id.as_str(), *v)).collect();
         assert_eq!(got, [("A", 2), ("B", 4), ("C", 2), ("D", 1), ("E", 5_000_000_000), ("F", 3), ("G", 4), ("H", 1)]);
+    }
+
+    /// `rollups` before it followed the file: read whole on every call, each line's head read, each id's
+    /// newest line parsed whole, a newest line that is no `Bucket` giving way to the next.
+    fn rollups_two_pass(text: &str) -> BTreeMap<String, Bucket> {
+        let head = |l| match crate::jsonl::lead(l, ["id", "version"])? {
+            [Scalar::Str(id), version] => Some((id, version.as_u64()?)),
+            _ => None,
+        };
+        let mut out = BTreeMap::new();
+        for (_, mut lines) in crate::jsonl::by_id(text, head) {
+            lines.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+            for tied in lines.chunk_by_mut(|a, b| a.0 == b.0) {
+                if tied.len() > 1 {
+                    tied.sort_by_cached_key(|(_, l)| std::cmp::Reverse(*blake3::hash(l.as_bytes()).as_bytes()));
+                }
+                if let Some(b) = tied.iter().find_map(|(_, l)| serde_json::from_str::<Bucket>(l).ok()) {
+                    out.insert(b.id.clone(), b);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// How often this process read the `stats.jsonl` of `home` whole, and in part (`latest`).
+    fn reads(home: &Path) -> (usize, usize) {
+        let path = rollups_path(home);
+        lock(&FOLLOWED).iter().find(|(p, _)| *p == path).map_or((0, 0), |(_, s)| {
+            let f = lock(s);
+            (f.whole, f.tail)
+        })
+    }
+
+    fn append(path: &Path, text: &str) {
+        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+    }
+
+    /// Oracle: followed as it grows, the rollups are what the two passes over the whole file give after
+    /// every append, on the edges and on the lines of a real store (`BORG_BENCH_STORE`) appended in pieces
+    /// that cut lines anywhere (torn lines, CRLF ends), then on an unterminated newest line completed,
+    /// spoilt and ended later. In file order and reversed, so lines tied on a version reach a tail in both
+    /// hash orders. The file is read whole once, then only in part.
+    #[test]
+    fn followed_rollups_keep_what_the_two_passes_keep() {
+        let home = tmp("rollups-follow");
+        let path = rollups_path(&home);
+        let real = crate::jsonl::store_lines(&["stats.jsonl"]);
+        let bucket = |id: &str, version: u64| serde_json::to_string(&Bucket { id: id.into(), version, ..Default::default() }).unwrap();
+        let both = |lines: Vec<String>| [lines.clone(), lines.into_iter().rev().collect()];
+        for lines in [both(bucket_edges()), both([real, bucket_edges()].concat())].into_iter().flatten() {
+            let text: String = lines.iter().enumerate().map(|(i, l)| format!("{l}{}", if i % 7 == 3 { "\r\n" } else { "\n" })).collect();
+            let _ = std::fs::remove_file(&path);
+            append(&path, "");
+            let (whole, tail) = reads(&home);
+            assert_eq!(rollups(&home), BTreeMap::new());
+            let (mut at, mut pieces) = (0, 0);
+            while at < text.len() {
+                let mut to = (at + text.len() / 40 + 13 * (pieces % 9) + 1).min(text.len());
+                while !text.is_char_boundary(to) {
+                    to += 1;
+                }
+                append(&path, &text[at..to]);
+                (at, pieces) = (to, pieces + 1);
+                assert_eq!(rollups(&home), rollups_two_pass(&text[..at]), "after {at} bytes");
+            }
+            let steps = [
+                bucket("A", 100),
+                "\n".into(),
+                bucket("A", 101),
+                " x".into(),
+                "\n".into(),
+                bucket("A", 102).trim_end_matches('}').into(),
+                "}\r".into(),
+                "\n".into(),
+                bucket("Z", 1),
+            ];
+            for s in &steps {
+                append(&path, s);
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(rollups(&home), rollups_two_pass(&text), "after {s:?}");
+            }
+            assert_eq!(reads(&home), (whole + 1, tail + pieces + steps.len()), "read whole once, then in part");
+        }
+    }
+
+    /// The rollups follow `stats.jsonl` as borg-web's requests see it change: unchanged, nothing is read;
+    /// appended to (a peer's merge, this node's `rollup`), only the tail; renamed over (the quarantine) or
+    /// written in place at its size with a new mtime, all of it. A caller keeps the rollups it was given.
+    #[test]
+    fn rollups_read_an_append_in_part_and_a_rename_whole() {
+        let home = tmp("rollups-reads");
+        let path = rollups_path(&home);
+        let line = |id: &str, version: u64, n: u64| {
+            let mut b = Bucket { id: id.into(), version, node: "peer".into(), ..Default::default() };
+            b.counts.insert(TURN_END.into(), n);
+            serde_json::to_string(&b).unwrap() + "\n"
+        };
+        std::fs::write(&path, line("A", 1, 1)).unwrap();
+        let held = latest(&home);
+        let step = |what: &str, change: &dyn Fn(), want: (usize, usize)| {
+            let before = reads(&home);
+            change();
+            assert_eq!(rollups(&home), rollups_two_pass(&std::fs::read_to_string(&path).unwrap()), "{what}");
+            let after = reads(&home);
+            assert_eq!((after.0 - before.0, after.1 - before.1), want, "{what}: (whole, tail) reads");
+        };
+        step("unchanged", &|| (), (0, 0));
+        step("a line appended", &|| append(&path, &line("A", 2, 2)), (0, 1));
+        step(
+            "this node's rollup",
+            &|| {
+                record(&home, &ev(TURN_END, 10, "a@x", &[], 0));
+                assert_eq!(rollup(&home), 1);
+            },
+            (0, 1),
+        );
+        step(
+            "renamed over",
+            &|| {
+                std::fs::write(home.join("tmp"), line("A", 3, 3)).unwrap();
+                std::fs::rename(home.join("tmp"), &path).unwrap();
+            },
+            (1, 0),
+        );
+        step(
+            "the same size in place, a new mtime",
+            &|| {
+                let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                (&f).write_all(line("B", 3, 4).as_bytes()).unwrap();
+                f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1)).unwrap();
+            },
+            (1, 0),
+        );
+        assert_eq!(held.buckets().map(|b| (b.id.as_str(), b.version)).collect::<Vec<_>>(), [("A", 1)], "kept as given");
+    }
+
+    /// Requests at once on a store not read yet read its `stats.jsonl` whole once between them.
+    #[test]
+    fn requests_at_once_read_the_rollups_whole_once() {
+        let home = tmp("rollups-at-once");
+        let line = |i: u64| serde_json::to_string(&Bucket { id: format!("b{}", i % 20), version: i, ..Default::default() }).unwrap() + "\n";
+        let text: String = (0..200).map(line).collect();
+        std::fs::write(rollups_path(&home), &text).unwrap();
+        let got: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| rollups(&home))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(got.iter().all(|r| *r == rollups_two_pass(&text)));
+        assert_eq!(reads(&home), (1, 0));
     }
 
     /// The feed before `newest`: every event parsed whole, filtered, sorted, cut.

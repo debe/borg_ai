@@ -201,20 +201,19 @@ ask).
 Measured on 2026-11-12, counting fixed work rather than wall-clock time, on a copy of a team store
 (a 16 MB statistics log). Reading the store is no longer the cost; what is left:
 
-- **The vector model is loaded again by every session that stores a lesson.** That is 95% of a session
-  with vectors on: 1.37 G instructions against 64 M for the session's mesh work. Done means a
-  serve process loads it once.
-- **Reconciliation fingerprints every hash on every session.** That is 17% of a session, and it grows
-  with the store: a 10× store costs 3.7× per session. A cached tree of range fingerprints makes it
-  grow only with what changed.
-- **Membership is verified again on every session.** That is 9% of a session, mostly ed25519. Verify
-  each signed version once and keep the result.
+- **A session that stores a lesson reads every lesson to index it.** The model is loaded once per
+  process now, and a session without a lesson does no vector work, but one lesson still costs 2.85× the
+  mesh work (104 M instructions against 36.5 M): `vectors::engine::update` parses all of
+  `lessons.jsonl`, hashes every lesson's text and opens and commits the index. Following the file
+  (`follow`) would embed only the appended lessons. A process that indexes also peaks at 1.88 GB of
+  heap, mostly SeekStorm buffers it never touches (RSS peaks near 0.5 GB).
 - **The statistics log keeps every version.** 94% of its lines are superseded. Dropping them locally
   does not work: reconciliation compares hash sets, so peers send them back. This needs a protocol
   decision.
-- **borg-web reads the whole statistics log on every request.** The queen, usage, lessons and learning
-  views each read the 16 MB `stats.jsonl` whole for the rollups: 154 of the 158 MB heap peak with 8
-  requests at once. Reading only what was appended since the last request removes that peak.
+- **The web page's heap peak is the stats view's decisions.** With 8 requests at once the peak is
+  94.4 MB; `ope::decisions_in` holds 46.9 MB of it. `stats::current` reads this node's
+  `stats/{backfill,events,ignores}.jsonl` whole on every request: 93% of its instructions (222 of
+  236 M per call). The statistics log itself is now read whole once, then only what was appended.
 
 ## Context borg reads
 

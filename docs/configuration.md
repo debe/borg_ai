@@ -345,7 +345,8 @@ command. No hook downloads the model; without model or index, Borg matches words
 
 A detached check also logs each eligible lesson's cosine to the work, and whether the shortlist would
 hold it, in its pool log ([The pool log](learning.md#the-pool-log)). Logged only: it never changes what
-the model is shown. A process loads the model once, however many queries it makes.
+the model is shown. A process loads the model once, however many queries and index updates it
+makes, and again only when the model's files change (a new `--fetch`).
 
 **Behind a proxy or offline.** `--fetch` downloads with `curl`, which honours `HTTPS_PROXY` and
 `CURL_CA_BUNDLE`. `BORG_VECTOR_URL` points it at a mirror that serves the same three files

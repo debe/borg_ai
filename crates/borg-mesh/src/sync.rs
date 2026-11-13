@@ -82,7 +82,7 @@ use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::addr::{self, Hint, Relay, Target};
-use crate::cache::{self, Cache};
+use crate::cache::{Cache, Fingerprints};
 use crate::identity::Identity;
 use crate::invite::{self, Invite, Ticket};
 use crate::lines::{self, Hash, REASONING, SYNCED, Snapshot, log_name, logs};
@@ -286,6 +286,9 @@ pub struct Report {
     /// Lines this node sent / newly stored (lessons and reasoning).
     pub sent: usize,
     pub received: usize,
+    /// Of `received`, the lines newly stored in `lessons.jsonl`: a session brings the vector index up to
+    /// date only when it stored a lesson or quarantined lines (sync/vectors.rs `changes_lessons`).
+    pub lessons: usize,
     /// Lines the peer sent that were refused (bad origin, or an origin the membership no longer admits).
     pub rejected: usize,
     /// Lines moved to quarantine because a newer membership revoked their origin.
@@ -1053,7 +1056,7 @@ impl Node {
         let (got, want) = {
             let set = offered_from(&self.cache, &self.home, path, mine, borg::learn::now_ms(), v1);
             self.gate()?; // read first, then gate: a line written after a switch to local is never sent
-            let mut r = Recon::new(set.set());
+            let mut r = set.recon();
             loop {
                 let m = r.message();
                 let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else {
@@ -1209,7 +1212,11 @@ impl Store<'_> {
             let records: Vec<&Origin> = keep.iter().filter(|(h, _)| !known.contains(h)).map(|(_, s)| &s.origin).collect();
             drop(known);
             self.cache.record(self.home, records)?;
-            report.received += self.cache.merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
+            let new = self.cache.merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
+            report.received += new;
+            if file == SYNCED[0] {
+                report.lessons += new;
+            }
             return Ok(());
         }
         // Messages: decided over the log as read now (`stored`), before its lock, so a hook's `ack` or a
@@ -1258,7 +1265,7 @@ impl Store<'_> {
             let whole;
             let mut text = held.text();
             if d.body.is_some() {
-                whole = cache::whole(path).1;
+                whole = borg::follow::whole(path).1;
                 if whole != text {
                     d = stored(&whole, &keep, now);
                 }
@@ -1342,12 +1349,22 @@ fn stored(text: &str, keep: &BTreeMap<Hash, Signed>, now: i64) -> Stored {
 pub struct Offered {
     log: Arc<Snapshot>,
     set: Arc<BTreeMap<Hash, Range<usize>>>,
+    /// The fingerprints of `set`'s ranges the cache keeps with it (cache.rs `Fingerprints`).
+    fps: Option<Arc<Fingerprints>>,
 }
 
 impl Offered {
     /// The offered lines' hashes, as a reconciliation reads them (recon.rs `Recon::new`).
     pub fn set(&self) -> &BTreeMap<Hash, Range<usize>> {
         &self.set
+    }
+
+    /// A reconciliation of the offered lines, with the cache's fingerprints of them where it keeps them.
+    fn recon(&self) -> Recon<'_, Range<usize>> {
+        match &self.fps {
+            Some(fps) => Recon::memoized(&self.set, fps),
+            None => Recon::new(&self.set),
+        }
     }
 
     /// The offered line `h` names.
@@ -1383,7 +1400,7 @@ pub fn offered(path: &Path, log: Arc<Snapshot>, origins: &Index, m: &Membership,
     let key = |h: &Hash| origins.signer(h).filter(|(k, ms)| m.admits(k, *ms)).map(|(k, _)| k);
     if file != borg::msg::FILE {
         let set = log.ranges().filter(|(h, r)| key(h).is_some_and(|k| lines::travels(file, log.line(r), k, now))).map(|(h, r)| (*h, r.clone())).collect();
-        return Offered { log, set: Arc::new(set) };
+        return Offered { log, set: Arc::new(set), fps: None };
     }
     let (held, all): (Vec<(&Hash, &Range<usize>)>, Vec<LineRef>) = log.ranges().filter_map(|(h, r)| LineRef::parse(log.line(r)).map(|x| ((h, r), x))).unzip();
     let mut set: BTreeMap<Hash, Range<usize>> = held
@@ -1398,19 +1415,20 @@ pub fn offered(path: &Path, log: Arc<Snapshot>, origins: &Index, m: &Membership,
         let w = v1_window(set.iter().map(|(h, r)| (*h, log.line(r))), v1_share(m));
         set.retain(|h, _| w.contains(h));
     }
-    Offered { log, set: Arc::new(set) }
+    Offered { log, set: Arc::new(set), fps: None }
 }
 
 /// `offered` as a node's session takes it, from its cache: a log whose lines travel whatever the time
 /// (lines.rs `travels`: all but the messages and the absorbs) offers what the membership admits, which the
-/// cache decides only for what changed since (cache.rs `Cache::admitted`); the messages and the absorbs,
-/// bounded and few, are decided whole.
+/// cache decides only for what changed since (cache.rs `Cache::admitted`) and keeps the fingerprints of;
+/// the messages and the absorbs, bounded and few, are decided whole.
 fn offered_from(cache: &Cache, home: &Path, path: &Path, m: &Membership, now: i64, v1: bool) -> Offered {
     let (log, origins) = (cache.log(path), cache.origins(home));
     if [borg::msg::FILE, lines::ABSORBED].contains(&log_name(path)) {
         return offered(path, log, &origins, m, now, v1);
     }
-    Offered { set: cache.admitted(path, &log, &origins, m), log }
+    let (set, fps) = cache.admits(path, &log, &origins, m);
+    Offered { log, set, fps }
 }
 
 /// The message lines of `set` within their pacing: every steer and seen line, and each tell or ask
@@ -1910,6 +1928,80 @@ mod tests {
         assert!(holds(&a, PLAYBOOKS, &edit), "alice's leftover stays untouched");
         alice.close().await;
         bob.close().await;
+    }
+
+    /// Only a session that changed the lessons brings the vector index up to date (sync/vectors.rs
+    /// `changes_lessons`): one that brings usage alone leaves it unread and unbuilt, though Bob holds a
+    /// lesson of his own the index lacks; one that stores a lesson adds it; one that only quarantines a
+    /// revoked member's lesson takes it out. With the model installed the index shows it; without, the gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_session_that_changes_the_lessons_touches_the_vector_index() {
+        let p = crew("vectors-gate", &["alice", "bob", "carol"]);
+        let (a, b, c) = (home(&p[0]), home(&p[1]), home(&p[2]));
+        let lessons = b.join("lessons.jsonl");
+        let index = borg::vectors::index_dir(&lessons);
+        let model = borg::vectors::enabled() && borg::vectors::model_present(&borg::vectors::model_dir());
+        // The index's lessons: a query runs its own runtime, so off this test's.
+        let held = || {
+            let lessons = lessons.clone();
+            async move {
+                let mut ids = tokio::task::spawn_blocking(move || borg::vectors::recall(&lessons, "lock order?", 10)).await.unwrap();
+                ids.sort();
+                ids
+            }
+        };
+        write(&b, "lessons.jsonl", &[lesson("B0", 1, "bob's own?")]);
+        write(&a, "stats.jsonl", &[rollup("n1", 1, 3)]);
+        let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
+        let carol = Node::bind(&p[2], LOCAL.parse().unwrap()).await.unwrap();
+        let (ta, tb) = (alice.ticket(), bob.ticket());
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ta));
+        served.unwrap();
+        let r = synced.unwrap();
+        assert_eq!((r.received, r.lessons, r.quarantined), (1, 0, 0), "the usage line, no lesson");
+        assert!(!vectors::changes_lessons(&r), "usage leaves the index alone");
+        assert!(!index.exists() && !index.with_file_name("vectors.lock").exists(), "no index read or built for usage");
+
+        append_lines(&a, "lessons.jsonl", &[lesson("L1", 1, "lock order?")]);
+        append_lines(&a, "stats.jsonl", &[rollup("n1", 2, 4)]);
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ta));
+        served.unwrap();
+        let r = synced.unwrap();
+        assert_eq!((r.received, r.lessons), (2, 1), "the lesson counted among what arrived");
+        assert!(vectors::changes_lessons(&r));
+        if model {
+            assert_eq!(held().await, ["B0", "L1"], "the session that stored a lesson built the index");
+        }
+
+        // Alice revokes carol; bob, not told yet, takes a lesson carol writes after it.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut m = Membership::load(&a).unwrap().unwrap();
+        m.revoke(&Identity::load_or_create(&a).unwrap(), &carol.public(), borg::learn::now_ms()).unwrap();
+        m.save(&a).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let late = lesson("Lc", 1, "carol's lesson after her revocation?");
+        write(&c, "lessons.jsonl", std::slice::from_ref(&late));
+        let (served, synced) = tokio::join!(bob.accept(), carol.sync(&tb));
+        synced.unwrap();
+        assert_eq!(served.unwrap().lessons, 1);
+        if model {
+            assert_eq!(held().await, ["B0", "L1", "Lc"]);
+        }
+
+        // Bob's next session with alice brings the revocation and nothing else: the quarantine alone.
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ta));
+        served.unwrap();
+        let r = synced.unwrap();
+        assert_eq!((r.received, r.lessons, r.quarantined), (0, 0, 1), "carol's late lesson set aside, nothing stored");
+        assert!(!holds(&b, "lessons.jsonl", &late));
+        assert!(vectors::changes_lessons(&r), "a quarantine brings the index up to date");
+        if model {
+            assert_eq!(held().await, ["B0", "L1"], "the revoked member's lesson left the index");
+        }
+        for n in [alice, bob, carol] {
+            n.close().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2589,6 +2681,15 @@ mod tests {
         let quiet = Report { rounds: SYNCED.len(), fps: SYNCED.len(), ..Report::default() };
         assert_eq!(synced.unwrap(), quiet, "re-sync: one fingerprint per log, nothing new");
         assert_eq!(served.unwrap(), quiet);
+
+        // Nothing changed since: each side's fingerprints come from its cache's memo, none hashed.
+        let before = [alice.cache.decisions().fingerprints, bob.cache.decisions().fingerprints];
+        let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+        assert_eq!((synced.unwrap(), served.unwrap()), (quiet, quiet));
+        for (who, n, b) in [("alice", &alice, before[0]), ("bob", &bob, before[1])] {
+            let now = n.cache.decisions().fingerprints;
+            assert!(now.part > b.part && now.whole == b.whole, "{who}: fingerprints from the memo: {b:?} then {now:?}");
+        }
         alice.close().await;
         bob.close().await;
     }
@@ -3225,23 +3326,97 @@ mod tests {
         lines::read(&home.join(file)).contains_key(&lines::hash(line))
     }
 
-    async fn eventually(what: &str, limit: std::time::Duration, f: impl Fn() -> bool) {
-        let start = std::time::Instant::now();
-        while !f() {
-            assert!(start.elapsed() < limit, "timed out waiting for: {what}");
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    }
-
     fn addr_of(n: &Node) -> String {
         n.ticket().split_once('@').unwrap().1.to_string()
     }
 
+    /// Liveness only: every wait on `serve` loops ends on an event they report; this bounds a hung test.
+    /// Generous: at load 200 two of these tests took 80 s. The dial timeouts and intervals they rely on exceed it.
+    const LIVENESS: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// `serve` loops, each stopped by its sender, and what they report, tagged with who and in the
+    /// order they report it: a test waits for an event, never for a time.
+    struct Serving {
+        stops: Vec<tokio::sync::oneshot::Sender<()>>,
+        loops: Vec<tokio::task::JoinHandle<()>>,
+        tx: tokio::sync::mpsc::UnboundedSender<(&'static str, crate::daemon::Event)>,
+        events: tokio::sync::mpsc::UnboundedReceiver<(&'static str, crate::daemon::Event)>,
+    }
+
+    fn serving(nodes: Vec<(&'static str, std::sync::Arc<Node>)>, opts: crate::daemon::Options) -> Serving {
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let s = Serving { stops: Vec::new(), loops: Vec::new(), tx, events };
+        nodes.into_iter().fold(s, |mut s, (who, n)| {
+            s.add(who, n, opts);
+            s
+        })
+    }
+
+    impl Serving {
+        fn add(&mut self, who: &'static str, n: std::sync::Arc<Node>, opts: crate::daemon::Options) {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            self.stops.push(tx);
+            let events = self.tx.clone();
+            self.loops.push(tokio::spawn(crate::daemon::serve(
+                n,
+                opts,
+                async move {
+                    let _ = rx.await;
+                },
+                move |e| {
+                    let _ = events.send((who, e));
+                },
+            )));
+        }
+
+        /// Waits for the next event `wanted(who, event)` matches; the ones before it are passed over.
+        async fn next(&mut self, what: &str, wanted: impl Fn(&str, &crate::daemon::Event) -> bool) {
+            let events = &mut self.events;
+            let found = async {
+                // `self.tx` keeps the channel open: `recv` ends only with an event.
+                while let Some((who, e)) = events.recv().await {
+                    if wanted(who, &e) {
+                        return;
+                    }
+                }
+            };
+            tokio::time::timeout(LIVENESS, found).await.unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+        }
+
+        /// The events reported so far and not yet read.
+        fn drain(&mut self) -> Vec<(&'static str, crate::daemon::Event)> {
+            std::iter::from_fn(|| self.events.try_recv().ok()).collect()
+        }
+
+        /// Stops every loop; each must return (its grace, then the endpoint's close), however long that takes.
+        async fn stop(self) {
+            for s in self.stops {
+                let _ = s.send(());
+            }
+            for l in self.loops {
+                tokio::time::timeout(LIVENESS, l).await.expect("serve returns after its stop").unwrap();
+            }
+        }
+    }
+
+    /// A session that stored at least one line, served or dialled.
+    fn received(e: &crate::daemon::Event) -> bool {
+        use crate::daemon::Event;
+        matches!(e, Event::Served(Ok(r)) | Event::Synced { result: Ok(r), .. } if r.received > 0)
+    }
+
+    /// A dial to `to` that failed (refused, closed or timed out).
+    fn dial_failed(e: &crate::daemon::Event, to: &str) -> bool {
+        matches!(e, crate::daemon::Event::Synced { peer, result: Err(_) } if peer == to)
+    }
+
     /// Two `serve` loops: a lesson either side writes reaches the other with no manual sync, and
-    /// once alice's collective turns local, her next lesson stays home. Both stop cleanly.
+    /// once alice's collective turns local, her next lesson stays home. Both stop cleanly. Ordered by
+    /// events, not by time: the dial timeout is far past the test, so a dial that also builds the
+    /// vector index under load still ends in the `Synced` it reports.
     #[tokio::test(flavor = "multi_thread")]
     async fn serve_spreads_new_lessons_without_a_manual_sync() {
-        use crate::daemon::{self, Event, Options};
+        use crate::daemon::{Event, Options};
         use std::sync::Arc;
         use std::time::Duration;
         let p = crew("daemon", &["alice", "bob"]);
@@ -3254,98 +3429,34 @@ mod tests {
             interval: Duration::from_millis(300),
             poll: Duration::from_millis(50),
             backoff_max: Duration::from_millis(600),
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(600),
             grace: Duration::from_secs(1),
         };
-        let synced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut stops = Vec::new();
-        let mut loops = Vec::new();
-        for n in [alice.clone(), bob.clone()] {
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            stops.push(tx);
-            let count = synced.clone();
-            loops.push(tokio::spawn(daemon::serve(
-                n,
-                opts,
-                async move {
-                    let _ = rx.await;
-                },
-                move |e| {
-                    if matches!(e, Event::Synced { result: Ok(_), .. }) {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                },
-            )));
-        }
+        let mut serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
         let l1 = lesson("L1", 1, "who owns the lock?");
         append_lines(&a, "lessons.jsonl", std::slice::from_ref(&l1));
-        eventually("alice's lesson at bob", Duration::from_secs(10), || holds(&b, "lessons.jsonl", &l1)).await;
+        serve.next("alice's lesson at bob", |who, e| who == "bob" && received(e) && holds(&b, "lessons.jsonl", &l1)).await;
         let l2 = lesson("L2", 1, "is the retry idempotent?");
         append_lines(&b, "lessons.jsonl", std::slice::from_ref(&l2));
-        eventually("bob's lesson at alice", Duration::from_secs(10), || holds(&a, "lessons.jsonl", &l2)).await;
+        serve.next("bob's lesson at alice", |who, e| who == "alice" && received(e) && holds(&a, "lessons.jsonl", &l2)).await;
         assert_eq!(peers::load(&a).get(&bob.public()), Some(&addr_of(&bob)), "alice learned bob's address from his hello");
         // The receiver holds a lesson once its served session wrote it; the dialler's round reports
         // `Synced` only after it closes, a moment later.
-        eventually("a successful sync round", Duration::from_secs(10), || synced.load(std::sync::atomic::Ordering::Relaxed) > 0).await;
+        serve.next("a successful sync round", |_, e| matches!(e, Event::Synced { result: Ok(_), .. })).await;
 
         // Alice's collective turns local: her loops stop dialling, bob is turned away.
         configure(&p[0], "local");
+        serve.next("alice's gate closed", |who, e| who == "alice" && matches!(e, Event::Gate(Err(_)))).await;
         let l3 = lesson("L3", 1, "private now?");
         append_lines(&a, "lessons.jsonl", std::slice::from_ref(&l3));
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        serve.drain();
+        // Bob dials alice one dial at a time: the second that fails from here began after l3 was written.
+        let key = alice.public();
+        for _ in 0..2 {
+            serve.next("bob's dial to alice failed", |who, e| who == "bob" && dial_failed(e, &key)).await;
+        }
         assert!(!holds(&b, "lessons.jsonl", &l3), "a local collective's lesson never leaves");
-
-        for s in stops {
-            let _ = s.send(());
-        }
-        for l in loops {
-            tokio::time::timeout(Duration::from_secs(5), l).await.expect("serve stops within its grace").unwrap();
-        }
-    }
-
-    /// `serve` loops for `nodes`, each stopped by its sender; the failures they report, with who and when.
-    struct Serving {
-        stops: Vec<tokio::sync::oneshot::Sender<()>>,
-        loops: Vec<tokio::task::JoinHandle<()>>,
-        failed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    fn serving(nodes: Vec<(&'static str, std::sync::Arc<Node>)>, opts: crate::daemon::Options) -> Serving {
-        let s = Serving { stops: Vec::new(), loops: Vec::new(), failed: Default::default() };
-        nodes.into_iter().fold(s, |mut s, (who, n)| {
-            s.add(who, n, opts);
-            s
-        })
-    }
-
-    impl Serving {
-        fn add(&mut self, who: &'static str, n: std::sync::Arc<Node>, opts: crate::daemon::Options) {
-            use crate::daemon::{self, Event};
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            self.stops.push(tx);
-            let failed = self.failed.clone();
-            self.loops.push(tokio::spawn(daemon::serve(
-                n,
-                opts,
-                async move {
-                    let _ = rx.await;
-                },
-                move |e| {
-                    if matches!(e, Event::Served(Err(_)) | Event::Synced { result: Err(_), .. } | Event::Gate(Err(_))) {
-                        failed.lock().unwrap().push(format!("{who} at {}: {e:?}", borg::learn::now_ms()));
-                    }
-                },
-            )));
-        }
-
-        async fn stop(self) {
-            for s in self.stops {
-                let _ = s.send(());
-            }
-            for l in self.loops {
-                tokio::time::timeout(std::time::Duration::from_secs(10), l).await.expect("serve stops within its grace").unwrap();
-            }
-        }
+        serve.stop().await;
     }
 
     /// Carol is a member alice dials, and she takes the dial and never answers: she reads alice's hello
@@ -3382,40 +3493,66 @@ mod tests {
         });
         let opts =
             crate::daemon::Options { poll: Duration::from_millis(100), timeout: Duration::from_secs(600), grace: Duration::from_secs(1), ..Default::default() };
-        let serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
-        let limit = Duration::from_secs(60); // liveness only: every wait below ends on an event
-        tokio::time::timeout(limit, held).await.expect("carol holds alice's dial").unwrap();
+        let mut serve = serving(vec![("alice", alice.clone()), ("bob", bob.clone())], opts);
+        tokio::time::timeout(LIVENESS, held).await.expect("carol holds alice's dial").unwrap();
 
         let l = rollup("n1", 1, 1);
         append_lines(&a, "stats.jsonl", std::slice::from_ref(&l));
-        eventually("alice's line at bob", limit, || holds(&b, "stats.jsonl", &l)).await;
-        assert!(serve.failed.lock().unwrap().iter().all(|f| !f.contains(&key)), "carol's dial has not ended");
+        let ended = |e: &crate::daemon::Event| matches!(e, crate::daemon::Event::Synced { peer, .. } if *peer == key);
+        // Every event since the loops started is looked at: those the wait passes over, then the rest.
+        serve
+            .next("alice's line at bob", |who, e| {
+                assert!(!ended(e), "carol's dial has not ended");
+                who == "bob" && received(e) && holds(&b, "stats.jsonl", &l)
+            })
+            .await;
+        assert!(!serve.drain().iter().any(|(_, e)| ended(e)), "carol's dial has not ended");
         release.send(()).unwrap();
         assert!(deaf.await.unwrap(), "alice's dial to carol was still open when bob got the line");
 
-        eventually("alice's dial to carol failed", limit, || serve.failed.lock().unwrap().iter().any(|f| f.contains(&key))).await;
-        eventually("carol's record dropped", limit, || !borg::presence::synced(&a).contains_key(&key)).await;
+        serve.next("alice's dial to carol failed", |who, e| who == "alice" && dial_failed(e, &key)).await;
+        assert!(!borg::presence::synced(&a).contains_key(&key), "carol's record dropped with the failure");
         serve.stop().await;
     }
 
-    /// Alice's first dial to bob fails (his node runs no `serve` yet); the lesson it was to carry reaches
-    /// him a `poll` later, with no new change and bob never dialling in: not after a 2-minute backoff.
+    /// Alice's first dial to bob fails at once (his node takes it and closes it); the lesson it was to
+    /// carry reaches him a `poll` later, with no new change and bob never dialling: he serves the one
+    /// session that follows the close, so the retry never waits for him to accept. Not at the next
+    /// `interval` nor after a second failure's backoff, both far past the liveness limit. Ordered by
+    /// events, not by time: the dial timeout is far past the test.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_dial_is_retried_soon_with_what_it_missed() {
+        use crate::daemon::Event;
         use std::sync::Arc;
         use std::time::Duration;
         let p = crew("retry", &["alice", "bob"]);
         let (a, b) = (home(&p[0]), home(&p[1]));
         let alice = Arc::new(Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap());
-        let bob = Arc::new(Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap());
-        assert!(peers::remember(&a, &bob.public(), &addr_of(&bob)).unwrap());
+        let bob = Node::bind(&p[1], LOCAL.parse().unwrap()).await.unwrap();
+        let key = bob.public();
+        assert!(peers::remember(&a, &key, &addr_of(&bob)).unwrap());
         let l1 = lesson("L1", 1, "who owns the lock?");
         append_lines(&a, "lessons.jsonl", std::slice::from_ref(&l1));
-        let opts = crate::daemon::Options { timeout: Duration::from_secs(1), grace: Duration::from_secs(1), ..Default::default() };
+        let bob_side = tokio::spawn(async move {
+            let conn = bob.incoming().await.expect("alice dials bob").await.expect("handshake");
+            conn.close(1u32.into(), b"not yet");
+            let report = bob.accept().await;
+            bob.close().await;
+            report
+        });
+        // Only the first failure's `poll` wait can bring the retry within the liveness limit.
+        let opts = crate::daemon::Options {
+            interval: Duration::from_secs(600),
+            timeout: Duration::from_secs(600),
+            grace: Duration::from_secs(1),
+            ..Default::default()
+        };
         let mut serve = serving(vec![("alice", alice.clone())], opts);
-        eventually("alice's dial to bob failed", Duration::from_secs(10), || !serve.failed.lock().unwrap().is_empty()).await;
-        serve.add("bob", bob.clone(), opts);
-        eventually("alice's lesson at bob", Duration::from_secs(10), || holds(&b, "lessons.jsonl", &l1)).await;
+        serve.next("alice's dial to bob failed", |who, e| who == "alice" && dial_failed(e, &key)).await;
+        serve.next("alice's retry to bob", |who, e| who == "alice" && matches!(e, Event::Synced { peer, result: Ok(_) } if *peer == key)).await;
+        let served = tokio::time::timeout(LIVENESS, bob_side).await.expect("bob served alice's retry").unwrap();
+        assert!(served.expect("bob's served session").received > 0, "bob stored what the retry carried");
+        assert!(holds(&b, "lessons.jsonl", &l1), "the retry carried the lesson the failed dial missed");
         serve.stop().await;
     }
 
@@ -4271,8 +4408,7 @@ mod tests {
         let bob = Node::open(&pb, None, false, trust).await.unwrap().quiet();
         assert!(matches!(alice.relay(), Relay::Custom(_)));
         assert!(alice.tickets().is_empty() && bob.tickets().is_empty(), "no direct address on either side");
-        let wait = std::time::Duration::from_secs(10);
-        assert!(alice.online(wait).await && bob.online(wait).await, "both reach the relay");
+        assert!(alice.online(LIVENESS).await && bob.online(LIVENESS).await, "both reach the relay");
         answer(alice.clone());
 
         let mut t = ticket(&alice, "member", 60_000, 1);

@@ -8,11 +8,17 @@
 //! and it closes. Both sides decide from the same two messages, so they stay in step without a
 //! leader. Nothing differs: one round of one fingerprint. `d` lines differ among `n`: about
 //! `log16(n / LEAF)` rounds, with at most `16·d` fingerprints and `LEAF·d` hashes per round.
+//!
+//! A node's sessions take the fingerprints of a log's admitted set from a memo kept with the set
+//! (cache.rs `Fingerprints`): a range an earlier session hashed is not hashed again until a line in it
+//! changes, so after an append only the ranges that hold a new line are (the root among them: blake3
+//! does not combine).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::Fingerprints;
 use crate::lines::Hash;
 use crate::{from_hex, to_hex};
 
@@ -23,6 +29,14 @@ pub const LEAF: usize = 8;
 /// A peer that keeps claiming differences beyond this is broken or hostile. Guard: bounds the open
 /// ranges one session holds in memory (65 536, far past what two honest stores of a team differ by).
 const MAX_OPEN: usize = 1 << 16;
+/// The deepest a range splits to: one at this depth that differs closes as a leaf. 63 of the 64 nibbles
+/// of a hash fixed leave at most 16 hashes in it.
+const DEEPEST: usize = 63;
+
+/// A range as a memo names it: its depth and its low end, which fix it (`Range::children`).
+pub(crate) type Key = (u8, Hash);
+/// A range's fingerprint before it is written out: blake3 of its sorted hashes, and their count.
+pub(crate) type Fp = (Hash, u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Range {
@@ -47,6 +61,29 @@ impl Range {
     fn contains(&self, h: &Hash) -> bool {
         *h >= self.lo && self.hi.is_none_or(|hi| *h < hi)
     }
+
+    fn key(&self) -> Key {
+        (self.depth as u8, self.lo)
+    }
+}
+
+/// The ranges that hold `h`, one per depth: what a line added to or taken from a set changes the
+/// fingerprint of (cache.rs `Fingerprints::forget`).
+pub(crate) fn ranges_of(h: &Hash) -> impl Iterator<Item = Key> + '_ {
+    (0..=DEEPEST).map(|depth| {
+        let (full, half) = (depth / 2, depth % 2 == 1);
+        let mut lo = [0; 32];
+        lo[..full].copy_from_slice(&h[..full]);
+        if half {
+            lo[full] = h[full] & 0xf0;
+        }
+        (depth as u8, lo)
+    })
+}
+
+/// A fingerprint as a round carries it: "0" for an empty range, else the digest in hex.
+fn written((digest, n): Fp) -> (String, u32) {
+    (if n == 0 { "0".into() } else { to_hex(&digest) }, n)
 }
 
 /// One round's message: fingerprints of the open ranges, hashes of the leaf ranges (both in the
@@ -67,6 +104,8 @@ pub struct Cost {
 
 pub struct Recon<'a, V> {
     set: &'a BTreeMap<Hash, V>,
+    /// Fingerprints of `set`'s ranges kept between its reconciliations (`memoized`).
+    memo: Option<&'a Fingerprints>,
     open: Vec<Range>,
     leaves: Vec<Range>,
     /// Hashes the peer holds and this side lacks / this side holds and the peer lacks.
@@ -79,12 +118,19 @@ impl<'a, V> Recon<'a, V> {
     pub fn new(set: &'a BTreeMap<Hash, V>) -> Self {
         Recon {
             set,
+            memo: None,
             open: vec![Range { lo: [0; 32], hi: None, depth: 0 }],
             leaves: Vec::new(),
             want: BTreeSet::new(),
             give: BTreeSet::new(),
             cost: Cost::default(),
         }
+    }
+
+    /// `new`, taking fingerprints from `memo` and leaving in it the ones it hashes: `memo` must hold
+    /// fingerprints of `set` (cache.rs `Fingerprints`). The rounds are the same, byte for byte.
+    pub(crate) fn memoized(set: &'a BTreeMap<Hash, V>, memo: &'a Fingerprints) -> Self {
+        Recon { memo: Some(memo), ..Recon::new(set) }
     }
 
     fn keys(&self, r: &Range) -> impl Iterator<Item = &Hash> {
@@ -95,19 +141,43 @@ impl<'a, V> Recon<'a, V> {
         range.map(|(k, _)| k)
     }
 
-    fn fingerprint(&self, r: &Range) -> (String, u32) {
+    fn fingerprint(&self, r: &Range) -> Fp {
         let mut h = blake3::Hasher::new();
         let mut n = 0u32;
         for k in self.keys(r) {
             h.update(k);
             n += 1;
         }
-        (if n == 0 { "0".into() } else { to_hex(h.finalize().as_bytes()) }, n)
+        (*h.finalize().as_bytes(), n)
+    }
+
+    /// The fingerprints of the open ranges: from the memo where it holds them, else hashed (and, with a
+    /// memo, kept in it).
+    fn fingerprints(&self) -> Vec<Fp> {
+        let Some(memo) = self.memo else {
+            return self.open.iter().map(|r| self.fingerprint(r)).collect();
+        };
+        let held = memo.get(self.open.iter().map(Range::key));
+        let mut hashed = Vec::new();
+        let fps = self
+            .open
+            .iter()
+            .zip(held)
+            .map(|(r, fp)| {
+                fp.unwrap_or_else(|| {
+                    let fp = self.fingerprint(r);
+                    hashed.push((r.key(), fp));
+                    fp
+                })
+            })
+            .collect();
+        memo.put(hashed);
+        fps
     }
 
     /// This side's message for the current round.
     pub fn message(&mut self) -> Round {
-        let fps: Vec<(String, u32)> = self.open.iter().map(|r| self.fingerprint(r)).collect();
+        let fps: Vec<(String, u32)> = self.fingerprints().into_iter().map(written).collect();
         let leaves: Vec<Vec<String>> = self.leaves.iter().map(|r| self.keys(r).map(|k| to_hex(k)).collect()).collect();
         self.cost.rounds += 1;
         self.cost.fps += fps.len();
@@ -137,7 +207,7 @@ impl<'a, V> Recon<'a, V> {
             if my == their {
                 continue;
             }
-            if (my.1 as usize) <= LEAF || (their.1 as usize) <= LEAF || r.depth >= 63 {
+            if (my.1 as usize) <= LEAF || (their.1 as usize) <= LEAF || r.depth >= DEEPEST {
                 leaves.push(*r);
             } else {
                 open.extend(r.children());
@@ -196,6 +266,22 @@ mod tests {
         // 7 differences among 20k: a few rounds, hashes ≤ 2·LEAF·d, nowhere near 20k.
         assert!(cost.hashes <= 2 * LEAF * 7 && cost.fps <= 2 * (1 + 16 * 7 * cost.rounds), "{cost:?}");
         assert!(cost.rounds <= 6, "{cost:?}");
+    }
+
+    /// `ranges_of` names exactly the ranges a reconciliation walks down to a hash: from the root, at each
+    /// depth the child that holds it.
+    #[test]
+    fn ranges_of_a_hash_are_the_ranges_that_hold_it() {
+        for h in set(0..64).into_keys().chain([[0; 32], [0xff; 32]]) {
+            let mut r = Range { lo: [0; 32], hi: None, depth: 0 };
+            for k in ranges_of(&h) {
+                assert!(r.contains(&h));
+                assert_eq!(k, r.key());
+                if r.depth < DEEPEST {
+                    r = r.children().into_iter().find(|c| c.contains(&h)).expect("a child holds it");
+                }
+            }
+        }
     }
 
     #[test]

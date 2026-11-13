@@ -14,12 +14,13 @@
 //! - **Shadow:** a detached check also logs every eligible lesson's cosine to the work (`scored`,
 //!   pools.rs `cos`), and whether the shortlist would hold it, even when the pool fits. Logged only:
 //!   it never changes what the model is shown.
-//! - **One embedder per process:** `engine::Embedder::shared` loads the model once and keeps it for
-//!   the process's life; `engine::query_scored` searches with it and keeps each hit's score.
+//! - **One embedder per process:** `engine::Embedder::shared` loads the model once and keeps it while
+//!   the model's files are unchanged; queries (`engine::query_scored`, which keeps each hit's score) and
+//!   index updates use it.
 //! - **Index:** an embedded SeekStorm vector index per store (`<store>/vectors/`), one vector per lesson
 //!   (question + situations + consequence), updated after `borg learn` / `borg assimilate --apply`, after a
-//!   mesh sync brings new lessons, and by `borg vectors --rebuild`; a missing index is built by the first
-//!   update. A lesson without a vector is simply BM25-only.
+//!   mesh sync brings new lessons or quarantines a revoked member's, and by `borg vectors --rebuild`; a
+//!   missing index is built by the first update. A lesson without a vector is simply BM25-only.
 //! - **Model:** Model2Vec potion-multilingual-128M from a local directory (`BORG_VECTOR_MODEL`), fetched
 //!   once by `borg vectors --fetch`; never downloaded inside a hook. The embedding matrix is mapped, not
 //!   read: a query touches only the rows of its own tokens.
@@ -144,7 +145,7 @@ pub fn scored(lessons: &Path, text: &str, n: usize) -> Option<Vec<(String, f32)>
             return None;
         }
         let text = text.to_string();
-        std::panic::catch_unwind(move || engine::Embedder::shared(&model).and_then(|e| engine::query_scored(e, &index, &model, &text, n)).ok()).ok().flatten()
+        std::panic::catch_unwind(move || engine::Embedder::shared(&model).and_then(|e| engine::query_scored(&e, &index, &model, &text, n)).ok()).ok().flatten()
     }
     #[cfg(not(feature = "vectors"))]
     {
@@ -292,7 +293,8 @@ pub mod engine {
 
     use std::collections::BTreeMap;
     use std::fs::File;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use seekstorm::commit::Commit;
     use seekstorm::index::{
@@ -309,6 +311,7 @@ pub mod engine {
     use super::model::identity;
     use super::{MODEL_FILES, MODEL_REPO, MODEL_REVISION, lesson_text};
     use crate::conscience;
+    use crate::follow::Mark;
 
     #[derive(Serialize, Deserialize, Default)]
     struct Manifest {
@@ -571,22 +574,42 @@ pub mod engine {
         Ok(hits?.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// The stat of each file a model directory's embedder comes from (`MODEL_FILES`) and of its
+    /// `REVISION`: unchanged, the loaded embedder is the model's.
+    type Marks = [Mark; 4];
+
+    /// The embedders `Embedder::shared` loaded: one per model directory, with the marks it was loaded under.
+    static LOADED: Mutex<Vec<(PathBuf, Marks, Arc<Embedder>)>> = Mutex::new(Vec::new());
+
+    fn marks(dir: &Path) -> Marks {
+        let [a, b, c] = MODEL_FILES.map(|(name, _)| Mark::at(&dir.join(name)));
+        [a, b, c, Mark::at(&dir.join("REVISION"))]
+    }
+
     impl Embedder {
-        /// The process's embedder for the model in `dir`, loaded on first use and kept for the
-        /// process's life, one per model directory and identity (`identity`: a fetched revision is a
-        /// new one): a detached check's shortlist and its logged cosines share one load.
-        pub fn shared(dir: &Path) -> Result<&'static Embedder, String> {
-            type Loaded = Vec<(std::path::PathBuf, String, &'static Embedder)>;
-            static LOADED: std::sync::Mutex<Loaded> = std::sync::Mutex::new(Vec::new());
-            let id = identity(dir);
+        /// The process's embedder for the model in `dir`, loaded on first use and kept while the stats of
+        /// its files and `REVISION` are unchanged (four stats per call, no read): a detached check's
+        /// shortlist and its logged cosines, and every index update of a long-running process (the mesh
+        /// daemon's sessions, `update`), share one load. A changed model (`fetch` renames new files in) is
+        /// loaded again and replaces the old one, which is freed when its last user lets go of it. The stats
+        /// are taken before the load, so a file replaced during it is loaded again at the next call.
+        pub fn shared(dir: &Path) -> Result<Arc<Embedder>, String> {
+            let marks = marks(dir);
             let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((_, _, e)) = loaded.iter().find(|(d, i, _)| d == dir && *i == id) {
-                return Ok(e);
+            if let Some((_, _, e)) = loaded.iter().find(|(d, m, _)| d == dir && *m == marks) {
+                return Ok(Arc::clone(e));
             }
-            let e: &'static Embedder = Box::leak(Box::new(Embedder::load(dir)?));
-            loaded.push((dir.to_path_buf(), id, e));
+            let e = Arc::new(Embedder::load(dir)?);
+            loaded.retain(|(d, _, _)| d != dir);
+            loaded.push((dir.to_path_buf(), marks, Arc::clone(&e)));
             Ok(e)
         }
+    }
+
+    /// The embedder `Embedder::shared` holds for `dir`, as it is: neither loaded nor checked.
+    #[cfg(test)]
+    pub(super) fn loaded(dir: &Path) -> Option<Arc<Embedder>> {
+        LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(d, _, _)| d == dir).map(|(_, _, e)| Arc::clone(e))
     }
 
     /// `query` with a loaded `embedder` (`Embedder::shared`): the hits with their scores, the dot
@@ -649,7 +672,8 @@ pub mod engine {
 
     /// Bring the index of `lessons` up to date: new lessons are added; a changed or removed lesson, a model
     /// change or `rebuild` rebuilds it (into a fresh directory, swapped in under the lock). The number of
-    /// lessons embedded.
+    /// lessons embedded. The model is the process's (`Embedder::shared`), loaded only when there is
+    /// something to embed.
     pub fn update(lessons: &Path, model: &Path, rebuild: bool) -> Result<usize, String> {
         let index = super::index_dir(lessons);
         let _lock = lock(&index, true, true).ok_or("cannot lock the index")?;
@@ -664,7 +688,7 @@ pub mod engine {
         if add.is_empty() && !fresh {
             return Ok(0);
         }
-        let embedder = Embedder::load(model)?;
+        let embedder = Embedder::shared(model)?;
         manifest.dims = embedder.dims();
         let docs: Vec<Document> = add
             .iter()
@@ -910,6 +934,47 @@ mod tests {
         std::fs::write(model.join("REVISION"), "another").unwrap();
         let other = doctor::against(&routes, &model);
         assert!(levels(&other) == [Level::Ok, Level::Warn] && other[1].1.contains("another model"), "{other:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Index updates share the process's embedder (`engine::Embedder::shared`): loaded by the first update
+    /// that embeds, kept by the next and by queries, loaded again once a model file is renamed over or the
+    /// revision changes, and the replaced one freed, not kept for the process's life.
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn updates_share_one_embedder_until_the_model_changes() {
+        use std::sync::Arc;
+        let root = std::env::temp_dir().join(format!("borg-vectors-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (model, store) = (root.join("model"), root.join("store"));
+        fake_model(&model);
+        std::fs::create_dir_all(&store).unwrap();
+        let lessons = store.join("lessons.jsonl");
+        write_lessons(&lessons, &[("dl", "deadlock")]);
+        assert!(engine::loaded(&model).is_none());
+        assert_eq!(engine::update(&lessons, &model, false).unwrap(), 1);
+        let first = engine::loaded(&model).expect("the update loaded the shared embedder");
+        write_lessons(&lessons, &[("dl", "deadlock"), ("rt", "retry")]);
+        assert_eq!(engine::update(&lessons, &model, false).unwrap(), 1);
+        assert!(Arc::ptr_eq(&first, &engine::loaded(&model).unwrap()), "the next update loaded nothing");
+        assert!(Arc::ptr_eq(&first, &engine::Embedder::shared(&model).unwrap()), "nor does a query");
+
+        // A fetched model: the new file renamed over the old one (`fetch`).
+        let part = model.join("model.safetensors.part");
+        std::fs::copy(model.join("model.safetensors"), &part).unwrap();
+        std::fs::rename(&part, model.join("model.safetensors")).unwrap();
+        assert_eq!(engine::update(&lessons, &model, false).unwrap(), 0);
+        assert!(Arc::ptr_eq(&first, &engine::loaded(&model).unwrap()), "nothing to embed: no load");
+        write_lessons(&lessons, &[("dl", "deadlock"), ("rt", "retry"), ("ca", "cache")]);
+        assert_eq!(engine::update(&lessons, &model, false).unwrap(), 1);
+        let second = engine::loaded(&model).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second), "the changed model was loaded again");
+        assert_eq!(Arc::strong_count(&first), 1, "and replaced: only this test still holds the old one");
+        drop(first);
+
+        std::fs::write(model.join("REVISION"), "another").unwrap();
+        assert_eq!(engine::update(&lessons, &model, false).unwrap(), 3, "another model's index is rebuilt");
+        assert!(!Arc::ptr_eq(&second, &engine::loaded(&model).unwrap()), "with the model loaded again");
         let _ = std::fs::remove_dir_all(&root);
     }
 

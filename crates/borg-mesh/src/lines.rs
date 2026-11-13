@@ -19,9 +19,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::Path;
 
+use borg::follow::{self, Follow, Held, Mark};
 use borg::jsonl::Scalar;
 
-use crate::cache::{self, Cache, Follow, Held, Mark};
+use crate::cache::Cache;
 
 /// The logs a mesh syncs, relative to the collective's store.
 ///
@@ -160,7 +161,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// The log at `path`, read whole now (what `read` and the one-shot `merge` and `settle` read).
     pub fn read(path: &Path) -> Snapshot {
-        let (mark, text) = cache::whole(path);
+        let (mark, text) = follow::whole(path);
         Snapshot::whole(mark, text)
     }
 
@@ -271,13 +272,13 @@ impl Snapshot {
 
 impl Follow for Snapshot {
     fn whole(mark: Mark, text: String) -> Snapshot {
-        let mut s = Snapshot { text, mark, generation: cache::generation(), ..Snapshot::default() };
+        let mut s = Snapshot { text, mark, generation: follow::generation(), ..Snapshot::default() };
         s.index(0);
         s
     }
 
     fn held(&self) -> Held<'_> {
-        let guard = &self.text.as_bytes()[self.parsed.saturating_sub(cache::GUARD)..self.parsed];
+        let guard = &self.text.as_bytes()[self.parsed.saturating_sub(follow::GUARD)..self.parsed];
         Held { mark: self.mark, end: self.text.len(), parsed: self.parsed, guard }
     }
 

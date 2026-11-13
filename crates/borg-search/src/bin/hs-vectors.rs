@@ -82,7 +82,7 @@ fn rank(out: &Path, root: &Path, files: &[String]) {
         let t = std::time::Instant::now();
         // One embedder for the whole run (`query` loads and leaks one per call).
         let embedder = vectors::engine::Embedder::shared(&model).expect("embedder");
-        let vec: Vec<String> = vectors::engine::query_scored(embedder, &vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), VECTOR_TOP)
+        let vec: Vec<String> = vectors::engine::query_scored(&embedder, &vectors::index_dir(&lessons), &model, &vectors::query_tail(&q.query), VECTOR_TOP)
             .expect("query")
             .into_iter()
             .map(|(id, _)| id)

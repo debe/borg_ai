@@ -2,171 +2,28 @@
 //! (lines.rs `Snapshot`) and the origin records as a compact index (origin.rs `Index`), shared by the
 //! concurrent sessions of `serve`.
 //!
-//! A file is read whole once. After that one stat per use says whether it changed: unchanged, nothing is
-//! read; grown in place (the logs and the records are appended to), only what was appended is read and
-//! parsed; anything else (a quarantine or a message bound renames a new file in, a same-size write moves
-//! the ctime) reads it whole again. So a session's cost grows with what changed, not with the store.
-//! The writers this node runs keep it so under the lock they write under: a merge or a settle extends the
-//! log's snapshot after its append, a rewrite forgets it. A rewrite itself is built from the file read
-//! whole under that lock, never from what is held: a write the stat cannot tell would be reverted.
+//! A file is read whole once (borg follow.rs). After that one stat per use says whether it changed:
+//! unchanged, nothing is read; grown in place (the logs and the records are appended to), only what was
+//! appended is read and parsed; anything else (a quarantine or a message bound renames a new file in, a
+//! same-size write moves the ctime) reads it whole again. So a session's cost grows with what changed,
+//! not with the store. The writers this node runs keep it so under the lock they write under: a merge or
+//! a settle extends the log's snapshot after its append, a rewrite forgets it. A rewrite itself is built
+//! from the file read whole under that lock, never from what is held: a write the stat cannot tell would
+//! be reverted.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{File, Metadata};
-use std::io::{Read as _, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::SystemTime;
+
+use borg::follow::{Follow, Read, follow, whole};
 
 use crate::identity::Identity;
 use crate::lines::{self, Hash, Snapshot};
 use crate::membership::Membership;
 use crate::origin::{self, Index, Origin, Stamped};
-
-/// How many bytes before the point a file was parsed to must read the same for an extension to be
-/// trusted (`follow`). Method: one page, read with the tail anyway; a rewrite that grows the file in
-/// place and keeps the page before the old end byte for byte is not one this store's writers make
-/// (they append, or rename a new file in, which the inode tells).
-pub(crate) const GUARD: usize = 4096;
-
-/// A file as a stat saw it: which file (device and inode), its size, its mtime and its ctime. A missing
-/// file is the default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Mark {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: Option<SystemTime>,
-    /// The inode's change time (seconds, nanoseconds): the kernel moves it at every write, truncation and
-    /// mtime change, and no caller can set it, so a same-size write that puts the mtime back still shows.
-    ctime: (i64, i64),
-}
-
-impl Mark {
-    fn of(m: &Metadata) -> Mark {
-        #[cfg(unix)]
-        let (dev, ino, ctime) = {
-            use std::os::unix::fs::MetadataExt;
-            (m.dev(), m.ino(), (m.ctime(), m.ctime_nsec()))
-        };
-        #[cfg(not(unix))]
-        let (dev, ino, ctime) = (0, 0, (0, 0));
-        Mark { dev, ino, len: m.len(), mtime: m.modified().ok(), ctime }
-    }
-
-    fn same_file(&self, other: &Mark) -> bool {
-        self.ino != 0 && (self.dev, self.ino) == (other.dev, other.ino)
-    }
-}
-
-/// What a reader of a followed file holds of it (`Follow::held`).
-pub(crate) struct Held<'a> {
-    /// The stat it was read under.
-    pub mark: Mark,
-    /// How many bytes it holds.
-    pub end: usize,
-    /// Where its unterminated last line starts (`end` when it ends with a newline): an extension reads
-    /// from here, as that line may have been half written.
-    pub parsed: usize,
-    /// The bytes before `parsed`, at most `GUARD` of them.
-    pub guard: &'a [u8],
-}
-
-/// What a followed file holds now (`follow`).
-pub(crate) enum Read {
-    /// What was read: nothing changed.
-    Same,
-    /// The text from the held `parsed` on, under the new stat.
-    Tail(Mark, String),
-    /// The whole text (empty when the file is missing or not UTF-8, as `read_to_string` gives nothing).
-    Whole(Mark, String),
-}
-
-/// A file read whole once and then followed (`follow`): a log's snapshot, the origin index.
-pub(crate) trait Follow: Clone {
-    /// What a whole read of the file gives.
-    fn whole(mark: Mark, text: String) -> Self;
-    /// What it holds, for `follow` to read on from.
-    fn held(&self) -> Held<'_>;
-    /// `tail`, the text from `held().parsed` on, read under `mark`.
-    fn extend(&mut self, mark: Mark, tail: String);
-}
-
-/// Reads of `path` past `held`: nothing when one stat says it is unchanged, the appended tail when it is
-/// the same file grown past what was read and the `GUARD` bytes before `held.parsed` still read the same,
-/// else all of it (a same-size write with a new ctime among them).
-/// The stat recorded is the open file's, taken before it is read, and the read stops at the size it saw:
-/// what is appended during the read is the next call's tail, so what is held always ends where its stat
-/// says.
-pub(crate) fn follow(path: &Path, held: Held<'_>) -> Read {
-    let now = std::fs::metadata(path).map(|m| Mark::of(&m)).unwrap_or_default();
-    if held.mark == now {
-        return Read::Same;
-    }
-    let Ok(mut f) = File::open(path) else { return Read::Whole(Mark::default(), String::new()) };
-    let (mark, len) = stat(&f);
-    if held.mark.same_file(&mark)
-        && mark.len > held.end as u64
-        && let Some(tail) = tail(&mut f, &held, len)
-    {
-        return Read::Tail(mark, tail);
-    }
-    let text = if f.seek(SeekFrom::Start(0)).is_ok() { read_text(&mut f, len) } else { String::new() };
-    Read::Whole(mark, text)
-}
-
-/// The whole text of `path` and the stat it was read under (empty when it is missing or not UTF-8), up to
-/// the size that stat saw.
-pub(crate) fn whole(path: &Path) -> (Mark, String) {
-    let Ok(mut f) = File::open(path) else { return (Mark::default(), String::new()) };
-    let (mark, len) = stat(&f);
-    (mark, read_text(&mut f, len))
-}
-
-/// The open file's stat, and how far to read it: the size the stat saw (to the end, when it failed).
-fn stat(f: &File) -> (Mark, u64) {
-    f.metadata().map_or((Mark::default(), u64::MAX), |m| (Mark::of(&m), m.len()))
-}
-
-/// The first `len` bytes of `f`, read from its start, as text, or nothing, as `read_to_string(..)
-/// .unwrap_or_default()` reads it.
-fn read_text(f: &mut File, len: u64) -> String {
-    let mut text = String::new();
-    if f.take(len).read_to_string(&mut text).is_err() {
-        text.clear();
-    }
-    text
-}
-
-/// The text of `f` from `h.parsed` up to offset `end`, if the guard bytes before it are unchanged and it
-/// is UTF-8.
-fn tail(f: &mut File, h: &Held<'_>, end: u64) -> Option<String> {
-    let from = h.parsed.checked_sub(h.guard.len())?;
-    f.seek(SeekFrom::Start(from as u64)).ok()?;
-    let mut bytes = Vec::new();
-    f.take(end.saturating_sub(from as u64)).read_to_end(&mut bytes).ok()?;
-    if !bytes.starts_with(h.guard) {
-        return None;
-    }
-    String::from_utf8(bytes.split_off(h.guard.len())).ok()
-}
-
-/// The last `GUARD` bytes of `before` (the text up to a parse point), or of `kept` followed by it when
-/// `before` is shorter: the guard of a reader that keeps no text (origin.rs `Index`).
-pub(crate) fn guard_after(kept: &[u8], before: &[u8]) -> Vec<u8> {
-    let take = |b: &[u8]| b[b.len().saturating_sub(GUARD)..].to_vec();
-    if before.len() >= GUARD {
-        return take(before);
-    }
-    take(&[kept, before].concat())
-}
-
-/// A new generation for a whole read: a reader whose generation is unchanged holds the same prefix.
-pub(crate) fn generation() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
+use crate::recon::{self, Fp, Key};
 
 /// How often a cache read its files whole and in part (`Cache::reads`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +42,9 @@ pub struct Decisions {
     pub stamped: Ways,
     /// `Cache::settle`: the versions read on from the last settle, or the whole text read for them.
     pub settled: Ways,
+    /// A reconciliation's fingerprints of an admitted set's ranges (`Fingerprints`): from the memo, or
+    /// hashed.
+    pub fingerprints: Ways,
 }
 
 /// One kind of decision, counted (`Decisions`).
@@ -195,7 +55,7 @@ pub struct Ways {
 }
 
 /// A counter of decisions in part and whole (`Ways`).
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Count {
     part: AtomicUsize,
     whole: AtomicUsize,
@@ -220,6 +80,9 @@ struct Stamp {
     index: u64,
 }
 
+/// Lines of a log by hash, as ranges of its text.
+type Ranges = BTreeMap<Hash, Range<usize>>;
+
 /// The lines of one log whose origin a membership admits (`Cache::admitted`), with what they were decided
 /// from: the log's generation and where it was read up to, the index's generation, the membership.
 #[derive(Debug, Clone)]
@@ -233,11 +96,13 @@ struct Admitted {
     pending: BTreeSet<Hash>,
     /// The log's unterminated last line, if it is in `set` or `pending`: decided again with the tail.
     open: Option<Hash>,
+    /// The fingerprints of `set`'s ranges, as its reconciliations hashed them.
+    fps: Arc<Fingerprints>,
 }
 
 impl Admitted {
-    /// Decides every line of `log`.
-    fn whole(log: &Snapshot, origins: &Index, m: &Membership) -> Admitted {
+    /// Decides every line of `log`; its fingerprints are counted in `count`.
+    fn whole(log: &Snapshot, origins: &Index, m: &Membership, count: &Arc<Count>) -> Admitted {
         Admitted {
             log: log.generation(),
             at: log.parsed(),
@@ -246,19 +111,67 @@ impl Admitted {
             set: Arc::new(log.ranges().filter(|(h, _)| origins.admits(m, h)).map(|(h, r)| (*h, r.clone())).collect()),
             pending: log.hashes().filter(|h| !origins.contains(h)).copied().collect(),
             open: None,
+            fps: Arc::new(Fingerprints { held: Mutex::default(), count: count.clone() }),
         }
     }
 
-    /// Decides line `h` of `log`: admitted, pending a record, or neither.
-    fn decide(&mut self, h: Hash, log: &Snapshot, origins: &Index, m: &Membership) {
-        let Some(r) = log.range(&h) else { return };
+    /// Decides line `h` of `log`: admitted, pending a record, or neither. True if it was added to `set`.
+    fn decide(&mut self, h: Hash, log: &Snapshot, origins: &Index, m: &Membership) -> bool {
+        let Some(r) = log.range(&h) else { return false };
         match origins.signer(&h) {
-            Some((key, ms)) if m.admits(key, ms) => {
-                Arc::make_mut(&mut self.set).insert(h, r.clone());
-            }
-            Some(_) => {}
+            Some((key, ms)) if m.admits(key, ms) => Arc::make_mut(&mut self.set).insert(h, r.clone()).is_none(),
+            Some(_) => false,
             None => {
                 self.pending.insert(h);
+                false
+            }
+        }
+    }
+}
+
+/// The fingerprints of the ranges of one admitted set (`Admitted`), as reconciliations of it hashed them
+/// (recon.rs `Recon::memoized`). A fingerprint depends only on the hashes in its range, so a line added to
+/// or taken from the set forgets the ranges that hold it, one per depth, and keeps the rest: a range an
+/// earlier reconciliation hashed is hashed again only after such a change in it. A session
+/// holds the memo of the set it reconciles; a change while it does so changes a copy, as for the set.
+#[derive(Debug)]
+pub(crate) struct Fingerprints {
+    held: Mutex<HashMap<Key, Fp>>,
+    /// The cache's counter (`Decisions::fingerprints`), shared by every copy.
+    count: Arc<Count>,
+}
+
+impl Clone for Fingerprints {
+    fn clone(&self) -> Self {
+        Fingerprints { held: Mutex::new(lock(&self.held).clone()), count: self.count.clone() }
+    }
+}
+
+impl Fingerprints {
+    /// The fingerprints held of the ranges `keys` names, in order, `None` for each not held; counted.
+    pub(crate) fn get(&self, keys: impl Iterator<Item = Key>) -> Vec<Option<Fp>> {
+        let held = lock(&self.held);
+        keys.map(|k| {
+            let fp = held.get(&k).copied();
+            self.count.add(fp.is_some());
+            fp
+        })
+        .collect()
+    }
+
+    /// Keeps the fingerprints a reconciliation hashed.
+    pub(crate) fn put(&self, hashed: Vec<(Key, Fp)>) {
+        if !hashed.is_empty() {
+            lock(&self.held).extend(hashed);
+        }
+    }
+
+    /// Forgets the fingerprints of every range that holds `h`: it was added to the set or taken from it.
+    fn forget(&mut self, h: &Hash) {
+        let held = self.held.get_mut().unwrap_or_else(|e| e.into_inner());
+        if !held.is_empty() {
+            for k in recon::ranges_of(h) {
+                held.remove(&k);
             }
         }
     }
@@ -276,6 +189,8 @@ pub struct Cache {
     decided_admitted: Count,
     decided_stamped: Count,
     decided_settled: Count,
+    /// Shared with every `Fingerprints` this cache keeps.
+    fingerprinted: Arc<Count>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -308,7 +223,12 @@ impl Cache {
 
     /// How many times this cache decided in part, and whole (`Decisions`).
     pub fn decisions(&self) -> Decisions {
-        Decisions { admitted: self.decided_admitted.get(), stamped: self.decided_stamped.get(), settled: self.decided_settled.get() }
+        Decisions {
+            admitted: self.decided_admitted.get(),
+            stamped: self.decided_stamped.get(),
+            settled: self.decided_settled.get(),
+            fingerprints: self.fingerprinted.get(),
+        }
     }
 
     /// Drops what is held of the log at `path`: its writer rewrote it, so the next use reads it whole.
@@ -428,37 +348,55 @@ impl Cache {
     /// copy, which keeps the generation) is decided whole and leaves the memo as it is: the memo's ranges
     /// may lie past its end.
     pub fn admitted(&self, path: &Path, log: &Snapshot, origins: &Index, m: &Membership) -> Arc<BTreeMap<Hash, Range<usize>>> {
+        self.admits(path, log, origins, m).0
+    }
+
+    /// `admitted`, with the memo of its ranges' fingerprints (`Fingerprints`); none for an older snapshot.
+    pub(crate) fn admits(&self, path: &Path, log: &Snapshot, origins: &Index, m: &Membership) -> (Arc<Ranges>, Option<Arc<Fingerprints>>) {
         let mut memo = lock(&self.admitted);
         let same = |a: &Admitted| a.log == log.generation() && a.index == origins.generation() && a.members == *m;
         if memo.get(path).is_some_and(|a| same(a) && a.at > log.parsed()) {
             self.decided_admitted.add(false);
-            return Admitted::whole(log, origins, m).set;
+            return (Admitted::whole(log, origins, m, &self.fingerprinted).set, None);
         }
         let held = memo.remove(path).filter(same);
         self.decided_admitted.add(held.is_some());
         let mut a = match held {
             Some(mut a) => {
-                if let Some(h) = a.open.take() {
+                // The unterminated last line is decided again with the tail. It was pending or in the set, never
+                // both; reopened only if in the set: a pending one admitted now is a line added.
+                let reopened = a.open.take().filter(|h| !a.pending.remove(h));
+                if let Some(h) = reopened {
                     Arc::make_mut(&mut a.set).remove(&h);
-                    a.pending.remove(&h);
                 }
+                let mut added = Vec::new();
                 for h in std::mem::take(&mut a.pending) {
-                    a.decide(h, log, origins, m);
+                    if a.decide(h, log, origins, m) {
+                        added.push(h);
+                    }
                 }
                 for h in log.lines_from(a.at).map(lines::hash) {
-                    if !a.set.contains_key(&h) && !a.pending.contains(&h) {
-                        a.decide(h, log, origins, m);
+                    if !a.set.contains_key(&h) && !a.pending.contains(&h) && a.decide(h, log, origins, m) {
+                        added.push(h);
                     }
+                }
+                // The set's hashes changed by those added, but the reopened line decided back into it, and by
+                // the reopened line if it left.
+                let left = reopened.filter(|h| !a.set.contains_key(h));
+                let changed: Vec<Hash> = added.into_iter().filter(|h| Some(*h) != reopened).chain(left).collect();
+                if !changed.is_empty() {
+                    let fps = Arc::make_mut(&mut a.fps);
+                    changed.iter().for_each(|h| fps.forget(h));
                 }
                 a.at = log.parsed();
                 a
             }
-            None => Admitted::whole(log, origins, m),
+            None => Admitted::whole(log, origins, m, &self.fingerprinted),
         };
         a.open = log.open().filter(|h| a.set.contains_key(h) || a.pending.contains(h));
-        let set = a.set.clone();
+        let held = (a.set.clone(), Some(a.fps.clone()));
         memo.insert(path.to_path_buf(), a);
-        set
+        held
     }
 
     /// Appends `records` to the store's origins (origin.rs `append`) and extends the index by them, which
@@ -474,7 +412,10 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
+    use borg::follow::GUARD;
+
     use super::*;
+    use crate::recon::Recon;
 
     /// `lines::read` as it was before the cache: the file read whole, a `Value` parse per line.
     fn read_whole(path: &Path) -> BTreeMap<Hash, String> {
@@ -592,30 +533,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// What is appended while a file is read is left to the next read, which takes it as a tail: a whole
-    /// read and a tail read both stop at the size their stat saw.
-    #[test]
-    fn a_write_during_a_read_is_read_next_as_a_tail() {
-        let d = std::env::temp_dir().join(format!("borg-mesh-cache-during-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("lessons.jsonl");
-        add(&p, "{\"a\":1}\n");
-        let mut f = File::open(&p).unwrap();
-        let (mark, len) = stat(&f);
-        add(&p, "{\"b\":2}\n");
-        let s = Snapshot::whole(mark, read_text(&mut f, len));
-        assert_eq!(s.text(), "{\"a\":1}\n", "the whole read stops where its stat ended");
-        let mut f = File::open(&p).unwrap();
-        let (mark, len) = stat(&f);
-        add(&p, "{\"c\":3}\n");
-        assert_eq!(tail(&mut f, &s.held(), len).as_deref(), Some("{\"b\":2}\n"), "and so does a tail read");
-        let mut s = s;
-        s.extend(mark, "{\"b\":2}\n".into());
-        assert!(matches!(follow(&p, s.held()), Read::Tail(_, t) if t == "{\"c\":3}\n"), "the rest is the next tail");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     /// A session that read a snapshot before another session's read extended a copy of it (the same
     /// generation, a longer text) is admitted what its own snapshot holds, ranges inside it, though the
     /// memo was moved on past it; and the memo still serves the newer snapshot from where it left off.
@@ -648,5 +565,143 @@ mod tests {
         assert_eq!(*c.admitted(&p, &newer, &origins, &m), whole(&newer));
         assert_eq!(c.decisions().admitted, Ways { part: before.part + 1, whole: before.whole + 1 }, "the memo kept for the newer one");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What one side of a reconciliation sent and found, `mine` run to the end against a plain one of
+    /// `peer`: its rounds as the wire carries them (serde_json bytes), what it wants and what it gives.
+    fn reconciled<V>(mut mine: Recon<'_, V>, peer: &BTreeMap<Hash, ()>) -> (Vec<Vec<u8>>, BTreeSet<Hash>, BTreeSet<Hash>) {
+        let mut theirs = Recon::new(peer);
+        let mut sent = Vec::new();
+        loop {
+            let (a, b) = (mine.message(), theirs.message());
+            sent.push(serde_json::to_vec(&a).unwrap());
+            let done = mine.absorb(&a, b.clone()).unwrap();
+            assert_eq!(theirs.absorb(&b, a).unwrap(), done, "both sides stay in step");
+            if done {
+                return (sent, mine.want, mine.give);
+            }
+        }
+    }
+
+    /// A peer of `set`: it lacks every 41st hash and holds three of its own.
+    fn peer_of<V>(set: &BTreeMap<Hash, V>) -> BTreeMap<Hash, ()> {
+        let own = (0..3u32).map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes());
+        set.keys().enumerate().filter(|(i, _)| i % 41 != 7).map(|(_, h)| *h).chain(own).map(|h| (h, ())).collect()
+    }
+
+    /// The memo across sessions: after every kind of change an admitted set sees, a reconciliation with the
+    /// cache's fingerprints sends the same rounds, byte for byte, as one that hashes every range, and finds
+    /// the same difference; and it takes from the memo every range the change did not touch (`Decisions::
+    /// fingerprints`): all of them for an unchanged set, a line that leaves it unchanged (an unterminated one
+    /// decided again, the same one ended, one still without a record, an outsider's) included; and a
+    /// session that holds the old memo across a change leaves the new one as it was.
+    #[test]
+    fn memoized_rounds_are_the_hashed_ones() {
+        let d = std::env::temp_dir().join(format!("borg-mesh-cache-fps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let me = Identity::load_or_create(&d).unwrap();
+        let outsider = Identity::load_or_create(&d.join("outsider")).unwrap();
+        let m = Membership::found("work", &me);
+        let p = d.join("lessons.jsonl");
+        let line = |i: usize| format!(r#"{{"id":"L{i}","q":"{}"}}"#, "q".repeat(i % 13));
+        let record = |who: &Identity, l: &str| origin::append(&d, &[Origin::new(who, &lines::hash(l), 1)]).unwrap();
+        let write = |ls: std::ops::Range<usize>| {
+            for i in ls {
+                add(&p, &format!("{}\n", line(i)));
+                record(&me, &line(i));
+            }
+        };
+        write(0..600);
+        let c = Cache::default();
+        type Step<'a> = (&'a str, Box<dyn Fn() + 'a>, Option<usize>);
+        let unterminated = line(9001);
+        let steps: Vec<Step> = vec![
+            ("first", Box::new(|| ()), None),
+            ("unchanged", Box::new(|| ()), Some(0)),
+            ("a line", Box::new(|| write(600..601)), None),
+            ("lines", Box::new(|| write(601..621)), None),
+            ("unterminated", Box::new(|| (add(&p, &unterminated), record(&me, &unterminated)).0), None),
+            ("unterminated, decided again", Box::new(|| ()), Some(0)),
+            ("ended", Box::new(|| add(&p, "\n")), Some(0)),
+            ("unterminated, no record", Box::new(|| add(&p, &line(9004))), Some(0)),
+            ("still no record", Box::new(|| ()), Some(0)),
+            ("its record", Box::new(|| record(&me, &line(9004))), None),
+            ("that one ended", Box::new(|| add(&p, "\n")), Some(0)),
+            ("no record yet", Box::new(|| add(&p, &format!("{}\n", line(9002)))), Some(0)),
+            ("recorded", Box::new(|| record(&me, &line(9002))), None),
+            ("an outsider's", Box::new(|| (add(&p, &format!("{}\n", line(9003))), record(&outsider, &line(9003))).0), Some(0)),
+        ];
+        for (what, change, hashed) in steps {
+            change();
+            let (log, origins) = (c.log(&p), c.origins(&d));
+            let (set, fps) = c.admits(&p, &log, &origins, &m);
+            let fps = fps.expect("a memo for the current snapshot");
+            let peer = peer_of(&set);
+            let before = c.decisions().fingerprints;
+            let memoized = reconciled(Recon::memoized(&set, &fps), &peer);
+            let after = c.decisions().fingerprints;
+            let plain = reconciled(Recon::new(&set), &peer);
+            assert_eq!(memoized, plain, "{what}: the same rounds, byte for byte");
+            let (part, whole) = (after.part - before.part, after.whole - before.whole);
+            if let Some(n) = hashed {
+                assert_eq!(whole, n, "{what}: every fingerprint from the memo");
+            } else if what != "first" {
+                assert!(whole > 0 && part > whole, "{what}: only the ranges on a new line's path hashed: {part} from the memo, {whole} hashed");
+            }
+        }
+        // A session still reconciling the old set when a line is added: the change went to a copy of the
+        // memo, so what that session hashes of the old set never reaches the new set's memo.
+        let held = c.admits(&p, &c.log(&p), &c.origins(&d), &m);
+        let (old_set, old_fps) = (held.0, held.1.expect("a memo"));
+        write(700..701);
+        let (set, fps) = c.admits(&p, &c.log(&p), &c.origins(&d), &m);
+        let fps = fps.expect("a memo for the current snapshot");
+        assert!(!Arc::ptr_eq(&old_fps, &fps), "a held memo is copied on change");
+        let old_peer = peer_of(&old_set);
+        assert_eq!(reconciled(Recon::memoized(&old_set, &old_fps), &old_peer), reconciled(Recon::new(&old_set), &old_peer), "the old session");
+        let peer = peer_of(&set);
+        assert_eq!(reconciled(Recon::memoized(&set, &fps), &peer), reconciled(Recon::new(&set), &peer), "the new set's memo untouched by it");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// On the real store copy (`BORG_BENCH_STORE`): each log's hashes grown in file order by chunks, as
+    /// appends grow them, each added hash forgotten as `Cache::admits` forgets it; after each, a
+    /// reconciliation with the memo sends what one without it sends, byte for byte, against a peer that holds
+    /// the next line and one that lacks the last chunk.
+    #[test]
+    fn memoized_rounds_on_the_real_store() {
+        let Some(store) = std::env::var_os("BORG_BENCH_STORE") else {
+            eprintln!("BORG_BENCH_STORE unset: the real-store oracle is skipped");
+            return;
+        };
+        let mut hits = 0;
+        for f in lines::SYNCED {
+            let text = std::fs::read_to_string(Path::new(&store).join(f)).unwrap_or_default();
+            let mut seen = HashSet::new();
+            let order: Vec<Hash> = text.lines().filter(|l| !l.trim().is_empty()).map(lines::hash).filter(|h| seen.insert(*h)).collect();
+            if order.len() < 20 {
+                continue;
+            }
+            let count = Arc::new(Count::default());
+            let mut fps = Fingerprints { held: Mutex::default(), count: count.clone() };
+            let start = order.len() * 9 / 10;
+            let mut set: BTreeMap<Hash, ()> = order[..start].iter().map(|h| (*h, ())).collect();
+            let mut bounds = vec![start, start + 1];
+            bounds.extend((1..=5).map(|k| start + 1 + (order.len() - start - 1) * k / 5));
+            for w in bounds.windows(2) {
+                let chunk = &order[w[0]..w[1]];
+                for h in chunk {
+                    set.insert(*h, ());
+                    fps.forget(h);
+                }
+                let next: BTreeMap<Hash, ()> = set.keys().chain(order.get(w[1])).map(|h| (*h, ())).collect();
+                let lacks: BTreeMap<Hash, ()> = set.keys().filter(|h| !chunk.contains(h)).map(|h| (*h, ())).collect();
+                for peer in [&next, &lacks, &set] {
+                    assert_eq!(reconciled(Recon::memoized(&set, &fps), peer), reconciled(Recon::new(&set), peer), "{f} at {}", w[1]);
+                }
+            }
+            hits += count.get().part;
+        }
+        assert!(hits > 0, "the memo served fingerprints");
     }
 }

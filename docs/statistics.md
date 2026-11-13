@@ -117,7 +117,9 @@ reads `/api/update` and follows the release check and the mesh's version records
 3. **Rollups, shared.** At each session end, and once a minute while `borg web` runs, the events
    become one line per machine, engineer and UTC day in `<store>/stats.jsonl`. A rollup holds counts,
    cost and lesson ids. The mesh syncs this file like lessons, and the newest version of each line
-   wins everywhere. Team members' activity appears after their next rollup reaches you.
+   wins everywhere. Team members' activity appears after their next rollup reaches you. A process
+   reads `stats.jsonl` whole once and then, per request, only the lines appended since; a file renamed
+   over it (the mesh's quarantine) or rewritten in place is read whole again.
 
 ## What is counted
 

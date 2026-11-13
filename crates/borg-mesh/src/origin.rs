@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{self, Cache, Follow, Held, Mark};
+use borg::follow::{self, Follow, Held, Mark};
+
+use crate::cache::Cache;
 use crate::identity::{self, Identity};
 use crate::lines::{self, Hash, Snapshot};
 use crate::membership::Membership;
@@ -117,7 +119,7 @@ pub struct Index {
 impl Index {
     /// The records of the store `home`, read whole now.
     pub fn read(home: &Path) -> Index {
-        let (mark, text) = cache::whole(&path(home));
+        let (mark, text) = follow::whole(&path(home));
         Index::whole(mark, text)
     }
 
@@ -182,7 +184,7 @@ impl Index {
                 self.open = Some(h);
             }
         }
-        self.guard = cache::guard_after(&self.guard, &text.as_bytes()[..last]);
+        self.guard = follow::guard_after(&self.guard, &text.as_bytes()[..last]);
         self.parsed += last;
         self.end = self.parsed + (text.len() - last);
     }
@@ -223,7 +225,7 @@ impl Index {
 
 impl Follow for Index {
     fn whole(mark: Mark, text: String) -> Index {
-        let mut i = Index { mark, generation: cache::generation(), ..Index::default() };
+        let mut i = Index { mark, generation: follow::generation(), ..Index::default() };
         i.index(&text);
         i
     }
@@ -261,7 +263,7 @@ pub fn quarantine(home: &Path, log: &Path, m: &Membership, origins: &Index, cach
     // `locked`: the lessons' learn, the jsonl appends): a line appended meanwhile is never lost. Read
     // whole, not from the cache: a write its stat cannot tell would be reverted by the rename.
     let moved = borg::live::locked(log, || -> Result<usize, String> {
-        let (_, text) = cache::whole(log);
+        let (_, text) = follow::whole(log);
         let (out, keep): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| refused(l));
         if out.is_empty() {
             return Ok(0);

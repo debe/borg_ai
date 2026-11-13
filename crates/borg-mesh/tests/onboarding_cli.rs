@@ -3,10 +3,12 @@
 //! `join <ticket> --apply`, and holds the admin's lesson. Relays are off: the test stays on
 //! localhost and never touches the network.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use serde_json::json;
 
 fn tmp(name: &str) -> PathBuf {
@@ -38,13 +40,45 @@ fn ok(root: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into()
 }
 
+/// Liveness only: bounds a hung `serve`; every wait on it ends on what it does.
+const LIVENESS: Duration = Duration::from_secs(60);
+
+/// A running `borg-mesh serve`, stopped as an engineer stops it: Ctrl-C.
 struct Serve(Child);
+
+impl Serve {
+    /// Sends SIGINT and waits for the exit; `None` if `serve` is still running after `LIVENESS`.
+    fn interrupt(&mut self) -> Option<ExitStatus> {
+        let _ = Command::new("kill").args(["-INT", &self.0.id().to_string()]).status();
+        let start = Instant::now();
+        while start.elapsed() < LIVENESS {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+}
 
 impl Drop for Serve {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if matches!(self.0.try_wait(), Ok(None)) && self.interrupt().is_none() && !std::thread::panicking() {
+            panic!("serve did not stop on Ctrl-C");
+        }
     }
+}
+
+/// `mesh/addr.json` as `invite` reads it.
+#[derive(Deserialize)]
+struct Reach<'a> {
+    #[serde(borrow)]
+    hints: Cow<'a, str>,
+}
+
+/// `serve` wrote its address in full: the file is created before its content is written.
+fn reach_written(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|t| serde_json::from_str::<Reach>(&t).is_ok_and(|r| !r.hints.is_empty()))
 }
 
 #[test]
@@ -56,11 +90,12 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
     let lesson = json!({"id": "L1", "origin_ms": 1, "question": "who owns the lock?", "version": 1}).to_string();
     std::fs::write(admin.join("base/collectives/corp/lessons.jsonl"), format!("{lesson}\n")).unwrap();
 
-    let _serve = Serve(cmd(&admin, &["serve", "--bind", "127.0.0.1:0", "--interval", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut serve = Serve(cmd(&admin, &["serve", "--bind", "127.0.0.1:0", "--interval", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let reach = admin.join("base/collectives/corp/mesh/addr.json");
     let start = Instant::now();
-    while !reach.exists() {
-        assert!(start.elapsed() < Duration::from_secs(20), "serve never wrote its address");
+    // A ready `serve` is one whose address `invite` can read.
+    while !reach_written(&reach) {
+        assert!(start.elapsed() < LIVENESS, "serve never wrote its address");
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -92,6 +127,8 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
     assert!(ok(&admin, &["invites"]).contains("no open invites"));
     let members = ok(&admin, &["members"]);
     assert_eq!(members.lines().filter(|l| l.ends_with(" steer")).count(), 1, "{members}");
+    let stopped = serve.interrupt().expect("serve stops on Ctrl-C");
+    assert!(stopped.success(), "serve exits cleanly on Ctrl-C: {stopped}");
 }
 
 #[test]

@@ -25,6 +25,7 @@ pub mod expert;
 pub(crate) mod expert_route;
 pub mod facets;
 pub mod facts;
+pub mod follow;
 pub mod harness;
 pub mod hook;
 pub mod install;

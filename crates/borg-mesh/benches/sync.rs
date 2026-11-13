@@ -6,6 +6,8 @@
 //! same lines but one lesson the dialler's hook just wrote: each iteration appends a new one, so every
 //! session moves exactly one line, as the session after a hook's write does. It runs the product's own
 //! `Node::exchange`, so whatever a node caches between sessions counts here too.
+//! `exchange/no_lesson` is the same session moving one new usage line (`stats.jsonl`) instead: no lesson
+//! arrives, so the vector index is not touched.
 //! `exchange/two_at_once` is two such sessions served at the same time, Bob's and Carol's, each moving the
 //! line its own hook wrote: what one session holds of the listener's cache while the other stores (a copy
 //! of what is held) counts there.
@@ -115,6 +117,7 @@ struct Session {
     carol: Node,
     ticket: String,
     bob_lessons: PathBuf,
+    bob_stats: PathBuf,
     carol_lessons: PathBuf,
     written: Cell<usize>,
 }
@@ -126,8 +129,8 @@ impl Session {
         let bind = |m: &Machine, who: &str| rt.block_on(Node::bind(&m.place, local)).unwrap_or_else(|e| panic!("{who}'s node: {e}"));
         let (alice, bob, carol) = (bind(a, "alice"), bind(b, "bob"), bind(c, "carol"));
         let ticket = alice.ticket();
-        let (bob_lessons, carol_lessons) = (b.home.join("lessons.jsonl"), c.home.join("lessons.jsonl"));
-        Session { rt, alice, bob, carol, ticket, bob_lessons, carol_lessons, written: Cell::new(0) }
+        let (bob_lessons, bob_stats, carol_lessons) = (b.home.join("lessons.jsonl"), b.home.join("stats.jsonl"), c.home.join("lessons.jsonl"));
+        Session { rt, alice, bob, carol, ticket, bob_lessons, bob_stats, carol_lessons, written: Cell::new(0) }
     }
 
     /// A lesson Bob's hook just wrote: a line no store held.
@@ -143,6 +146,15 @@ impl Session {
             "version": 1});
         let mut f = std::fs::OpenOptions::new().append(true).open(lessons).expect("the lessons");
         std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).expect("append a lesson");
+    }
+
+    /// A usage bucket Bob's node just published: a line no store held, in `stats.jsonl`.
+    fn stat(&self) {
+        let n = self.written.replace(self.written.get() + 1);
+        let line = serde_json::json!({"id": format!("stat:bench:bob:{n}"), "version": 1, "day": "2026-11-13", "node": "bench", "engineer": "bob",
+            "counts": {"asked": 1}});
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.bob_stats).expect("the usage log");
+        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).expect("append a usage line");
     }
 
     /// One session: Bob dials, Alice serves. Returns what Alice and Bob moved.
@@ -249,6 +261,16 @@ fn main() {
             s.write();
             let (served, _) = s.exchange();
             assert_eq!(served.received, 1, "each session moves the one new line");
+        });
+        s.close();
+    }
+    if r.wants("exchange", "no_lesson") {
+        let s = Session::open(&a, &b, &c);
+        s.exchange();
+        r.bench("exchange", "no_lesson", || {
+            s.stat();
+            let (served, _) = s.exchange();
+            assert_eq!(served.received, 1, "each session moves the one new usage line");
         });
         s.close();
     }

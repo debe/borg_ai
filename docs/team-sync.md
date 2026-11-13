@@ -126,7 +126,10 @@ then has reached that member; a failed dial removes the member from it.
 **Membership.** Each machine holds one ed25519 key per collective; the key is also its network address,
 so a connection proves who is on the other end. The member list is a JSON document signed by an admin.
 A peer accepts a new version only if an admin of the version it holds signed it, so a stranger cannot
-add themselves, and two admins editing at once resolve the same way everywhere.
+add themselves, and two admins editing at once resolve the same way everywhere. A process checks each
+signed version's signature once. Once a session found that the held version stands, a session with
+the same membership files and the same versions from the peer checks no signature and does not walk
+the chain again.
 
 **Reconciliation.** A blake3 hash names each lesson line, so peers compare hashes, not contents. Both
 sides split the hash space into 16 ranges and swap one fingerprint per range; differing ranges split
@@ -138,8 +141,16 @@ downloads three weeks of lessons.
 **What a peer keeps between sessions.** `borg mesh serve` reads each synced log and the origin records
 whole once, then holds them in memory and reads only what was appended; a log rewritten in place (a
 quarantine, the message bound) is read whole again once. A session that brings nothing new reads no
-log. The price is memory of about the store's size: about 25 MB for a store with a 16 MB statistics
-log.
+log. It also keeps the reconciliation fingerprints of every log but the messages and the absorbs: a
+range an earlier session hashed is not hashed again until a line in it changes; after an append, only
+the ranges that hold a new line are hashed again, the whole hash space among them. The price is memory
+of about the store's size: about 25 MB for a store with a 16 MB statistics log. The fingerprints come
+on top, fewer than one per line: at most 1.8 MB for that store.
+
+A session that stored a lesson then brings the store's vector index up to date, with the model the
+process loaded at its first such session and loads again only when the model's files change. So does a
+session that quarantined lines: a revoked member's lessons leave the index with it. A session that
+brought neither (usage, outcomes, messages) leaves the index alone.
 
 **What travels.** Six logs, each line signed by the machine that wrote it and quarantined when that
 machine is revoked:

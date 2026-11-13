@@ -3,6 +3,22 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.13 (unreleased)
+
+A mesh session does about a tenth of 0.7.12's work, and borg web keeps its rollups between requests.
+
+### Changed
+
+- `borg mesh serve` loads the vector model once per process and touches the index only when a session
+  brought lessons (or quarantined some): a session that stores a lesson costs ×0.076 the instructions
+  of 0.7.12, one without ×0.45.
+- A mesh session checks each membership signature once and keeps the reconciliation fingerprints of
+  ranges that did not change: ×0.57 the work with vectors off, and a 10× store costs 1.3× per session
+  instead of 3.9× ([What a peer keeps](docs/team-sync.md#how-a-sync-works)).
+- borg web reads the statistics log whole once, then only what was appended: the page rests at about
+  170 MB after load instead of 320 MB.
+- The serve process holds the model it loaded (about 40 MB of heap plus the mapped model file).
+
 ## 0.7.12 (2026-11-13)
 
 The mesh and the page cost a fraction of the CPU and memory they did, and messages wait at most a
