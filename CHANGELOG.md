@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.7.12 (unreleased)
+## 0.7.12 (2026-11-13)
 
 The mesh and the page cost a fraction of the CPU and memory they did, and messages wait at most a
 minute.
