@@ -141,7 +141,7 @@ async fn stats_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
     let nodes = buckets.iter().map(|b| b.node.as_str()).collect::<std::collections::BTreeSet<_>>().len();
     // `borg debug ope`'s support, one pass over this machine's log (pools are never shared); the estimate itself
     // derives beliefs per decision, too heavy to poll.
-    let (ds, skipped) = borg::ope::decisions(&outcome::read(&m.home.join("outcomes.jsonl")));
+    let (ds, skipped) = borg::ope::decisions_in(&m.home.join("outcomes.jsonl"));
     let ope = json!({"decisions": ds.len(), "no_p": skipped.no_p, "no_pool": skipped.no_pool});
     Json(json!({"collective": m.name, "totals": totals(&all), "days": days, "engineers": engineers, "nodes": nodes, "ope": ope})).into_response()
 }
@@ -150,8 +150,10 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let path = m.home.join("lessons.jsonl");
     let list = conscience::load_unweighted(&path, None);
-    let outcomes = outcome::read_team(&path);
-    let mem = memory::derive(&outcomes, &list, None);
+    // The outcomes as folded beside the store (borg facts.rs), as the conscience weighs them: what
+    // `read_team` would read, at the cost of what was appended since the last fold.
+    let facts = borg::facts::load(&path);
+    let mem = memory::derive_folded(facts.view(outcome::on()).folded, &list, None);
     // How often each lesson took part in what stats.rs counted (asked in a block, so far), team-wide.
     let mut usage: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     for b in stats::current(&m.home) {
@@ -163,7 +165,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
         }
     }
     let aliases = collective::aliases();
-    let stored: BTreeMap<String, (u32, String)> = learn::lessons(&path).into_iter().map(|l| (l.id, (l.version, l.repo))).collect();
+    let stored = learn::stored(&path);
     let mut out: Vec<Value> = list
         .iter()
         .map(|c| {
@@ -255,10 +257,7 @@ async fn feed(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Respon
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
     stats::backfill(&m.home);
     let aliases = collective::aliases();
-    let mut evs: Vec<stats::Event> = stats::events(&m.home).into_iter().filter(|e| NOTABLE.contains(&e.kind.as_str())).collect();
-    evs.sort_by_key(|e| std::cmp::Reverse(e.ms));
-    evs.truncate(q.limit.unwrap_or(PAGE).min(PAGE_MAX));
-    let out: Vec<Value> = evs
+    let out: Vec<Value> = stats::newest(&m.home, &NOTABLE, q.limit.unwrap_or(PAGE).min(PAGE_MAX))
         .into_iter()
         .map(|e| {
             json!({"ms": e.ms, "kind": e.kind, "engineer": aliases.display(&e.engineer), "repo": e.repo, "lessons": e.lessons,

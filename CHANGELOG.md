@@ -3,6 +3,31 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.7.12 (unreleased)
+
+The mesh and the page cost a fraction of the CPU and memory they did, and messages wait at most a
+minute.
+
+### Changed
+
+- Message pacing is looser and learns across sessions: the window is earned between machines, so a
+  new session starts with the trust its machine's earlier sessions earned, and nobody waits longer
+  than a minute (was 10 minutes, or 7 days for a session that ended unread)
+  ([Pacing](docs/commands.md#messages)).
+- `borg mesh serve` does about 1/300 of the sync work per session (19 G → 64 M instructions, 3.3 GB →
+  2 MB allocated on a team store; 1/15 with the vector model, which each storing session still
+  loads): logs are parsed without a JSON value per line, and each log and the origin records are read
+  whole once, then only what was appended ([What a peer keeps](docs/team-sync.md#how-a-sync-works)).
+- borg-web parses only what a page shows and folds logs as it reads them: 8 requests at once peak at
+  158 MB of heap instead of 447 MB, and the page rests at about 200 MB instead of 270-320 MB (glibc
+  capped at 4 malloc arenas; `MALLOC_ARENA_MAX` overrides).
+
+### Fixed
+
+- Two borg-web requests saving the outcomes fold at once could collide on one temp file.
+- 0.7.10 and 0.7.11 counted no judge's ignore in the statistics, so the learning page's asked→changed
+  share read 100%. Ignores count again, and the missed ones are recounted once from the outcomes log.
+
 ## 0.7.11 (2026-11-10)
 
 ### Changed

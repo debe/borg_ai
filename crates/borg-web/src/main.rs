@@ -9,8 +9,27 @@ use borg_web::{App, USAGE, minds, publish, router};
 /// print; one fixed port so a bookmark keeps working.
 const PORT: u16 = 7979;
 
+/// glibc's malloc arenas for this process. glibc keeps one per thread that met contention (up to 8 per
+/// core) and keeps what a request freed in each, so after eight requests at once the page rested at
+/// the peak (324 MB on a team store with a 25 MB live heap). Four arenas rest at 186-202 MB for about
+/// 6% more instructions; two save 30 MB more for 15-18% (benches/load.rs).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const ARENAS: libc::c_int = 4;
+
+fn main() {
+    // Before the runtime starts its threads, so no arena beyond the cap exists yet. An engineer's own
+    // MALLOC_ARENA_MAX wins.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: mallopt(3) only sets an allocator parameter; it takes plain integers, and it runs here
+        // on the main thread before any other thread exists.
+        unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENAS) };
+    }
+    serve();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     if args.iter().any(|a| a == "-h" || a == "--help") {

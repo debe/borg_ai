@@ -12,11 +12,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use borg::msg::{Author, Line, Pace};
+use borg_mesh::cache::Cache;
 use borg_mesh::identity::Identity;
 use borg_mesh::lines;
 use borg_mesh::live;
 use borg_mesh::membership::Membership;
-use borg_mesh::origin::{self, Origin};
+use borg_mesh::origin::{self, Index, Origin};
 use borg_mesh::recon::Recon;
 use borg_mesh::sync::{self, Report, Signed, Store};
 use serde_json::{Value, json};
@@ -50,13 +51,14 @@ fn borg_bin() -> &'static Path {
     })
 }
 
-/// One machine: its root (config, `BORG_HOME`, a repo at work/app), its node key and the lock its
-/// store's writes take, as `Node` holds them.
+/// One machine: its root (config, `BORG_HOME`, a repo at work/app), its node key, the lock its
+/// store's writes take and what its sessions read of it, as `Node` holds them.
 struct Machine {
     root: PathBuf,
     home: PathBuf,
     me: Identity,
     lock: Mutex<()>,
+    cache: Cache,
 }
 
 impl Machine {
@@ -73,7 +75,7 @@ impl Machine {
         let home = root.join("base/collectives").join(COLLECTIVE);
         // Also publishes the key as this node's name in messages (msg.rs `node`).
         let me = Identity::load_or_create(&home).unwrap();
-        Machine { root, home, me, lock: Mutex::new(()) }
+        Machine { root, home, me, lock: Mutex::new(()), cache: Cache::default() }
     }
 
     fn key(&self) -> String {
@@ -86,7 +88,7 @@ impl Machine {
 
     /// The store as a sync session merges into it.
     fn store(&self) -> Store<'_> {
-        Store { home: &self.home, lock: &self.lock, me: &self.me }
+        Store { home: &self.home, lock: &self.lock, me: &self.me, cache: &self.cache }
     }
 
     fn log(&self) -> PathBuf {
@@ -179,10 +181,11 @@ fn session(a: &Machine, b: &Machine) -> (Report, Report) {
     let (ma, mb) = (held(a), held(b));
     a.store().stamp().unwrap();
     b.store().stamp().unwrap();
-    let (oa, ob) = (origin::load(&a.home), origin::load(&b.home));
+    let (oa, ob) = (a.cache.origins(&a.home), b.cache.origins(&b.home));
     let now = borg::learn::now_ms();
-    let (sa, sb) = (sync::offered(&a.log(), &oa, &ma, now, false), sync::offered(&b.log(), &ob, &mb, now, false));
-    let (mut ra, mut rb) = (Recon::new(&sa), Recon::new(&sb));
+    let offer = |m: &Machine, o: &Index, held: &Membership| sync::offered(&m.log(), m.cache.log(&m.log()), o, held, now, false);
+    let (sa, sb) = (offer(a, &oa, &ma), offer(b, &ob, &mb));
+    let (mut ra, mut rb) = (Recon::new(sa.set()), Recon::new(sb.set()));
     loop {
         let (x, y) = (ra.message(), rb.message());
         let done = ra.absorb(&x, y.clone()).unwrap();
@@ -238,8 +241,15 @@ fn a_claude_session_and_an_opencode_session_converse_across_two_nodes() {
     // A's session tells B's; a second tell is refused: B's node has acknowledged nothing of A's yet.
     let one = a.tell(&[&to_b, "the", "schema", "is", "frozen"], &claude).unwrap();
     let refused = a.tell(&[&to_b, "and", "the", "API"], &claude).unwrap_err();
-    assert!(refused.contains("has acknowledged no message yet"), "{refused}");
-    let window = |at: &Machine| borg::msg::window_for(&at.lines(), Author { node: &a.key(), by: "s-claude" }, &to_b, borg::learn::now_ms());
+    assert!(refused.contains("has acknowledged no message from this machine yet"), "{refused}");
+    let window = |at: &Machine| {
+        borg::msg::window_for(
+            &at.lines().iter().map(Line::borrowed).collect::<Vec<_>>(),
+            Author { node: &a.key(), by: "s-claude" },
+            &to_b,
+            borg::learn::now_ms(),
+        )
+    };
     assert_eq!(window(&a).pace, Pace::Rate);
 
     // Sync: the tell reaches B, signed by A.
@@ -274,7 +284,7 @@ fn a_claude_session_and_an_opencode_session_converse_across_two_nodes() {
 
     // A's window to B's session: paced by acknowledgements now, and one acknowledged doubled it.
     let w = window(&a);
-    assert_eq!((w.pace, w.window, w.outstanding), (Pace::Window, 2, 0), "{w:?}");
+    assert_eq!((w.pace, w.window, w.outstanding), (Pace::Floor, 2, 0), "{w:?}");
     let two = a.tell(&[&to_b, "and", "the", "API"], &claude).expect("the window opened");
     let (_, at_b) = session(&a, &b);
     assert_eq!((at_b.received, at_b.rejected), (2, 0), "A's seen line for the reply, and the second tell");
@@ -302,8 +312,8 @@ fn a_claude_session_and_an_opencode_session_converse_across_two_nodes() {
     // Nor does A offer it, held and stamped as its own.
     std::fs::OpenOptions::new().append(true).open(a.log()).unwrap().write_all(format!("{claim}\n").as_bytes()).unwrap();
     a.store().stamp().unwrap();
-    let offer = sync::offered(&a.log(), &origin::load(&a.home), &Membership::load(&a.home).unwrap().unwrap(), now, false);
-    assert!(!offer.contains_key(&lines::hash(&claim)) && offer.values().any(|l| l.contains(&three)), "A offers its tell, not the claim");
+    let offer = sync::offered(&a.log(), a.cache.log(&a.log()), &a.cache.origins(&a.home), &Membership::load(&a.home).unwrap().unwrap(), now, false);
+    assert!(!offer.contains_key(&lines::hash(&claim)) && offer.iter().any(|(_, l)| l.contains(&three)), "A offers its tell, not the claim");
 
     let _ = std::fs::remove_dir_all(&a.root);
     let _ = std::fs::remove_dir_all(&b.root);

@@ -11,22 +11,24 @@
 //! lesson as stored (id, version, repo, question, situations, consequence, area, scope, reach `team` or
 //! `repo`, overrides, supersedes and the computed `superseded_by`, source, origin, support, engineers
 //! under this machine's aliases, history: the old versions' wording); its memory exactly as the
-//! conscience weighs it (memory.rs `derive` over outcome.rs `read_team`, as conscience.rs `load`): the
-//! Beta belief's α, β, mean and 95% equal-tailed credible interval, the per-session result counts,
-//! activation, consolidated and dormant; its breadth: the distinct sessions that changed their work on
-//! it and the distinct repos of those changes (team lines carry hashed repos, so counts, never names);
-//! the raw counts of its placebo and tail-sample judgements from this machine's outcome log (`Judged`),
-//! no estimate and no threshold; whether it is absorbed (`{note, ms, by, version}`, else null) and,
-//! absorbed, its recurrence: the episodes merged into it since the absorbed version.
+//! conscience weighs it (memory.rs `derive` over outcome.rs `read_team`'s view as facts.rs folds it, as
+//! conscience.rs `load`): the Beta belief's α, β, mean and 95% equal-tailed credible interval, the
+//! per-session result counts, activation, consolidated and dormant; its breadth: the distinct sessions
+//! that changed their work on it and the distinct repos of those changes (team lines carry hashed repos,
+//! so counts, never names); the raw counts of its placebo and tail-sample judgements from this machine's
+//! outcome log (`Judged`), no estimate and no threshold; whether it is absorbed
+//! (`{note, ms, by, version}`, else null) and, absorbed, its recurrence: the episodes merged into it
+//! since the absorbed version.
 //!
 //! Every text field but the ids (`id`, `supersedes`, `superseded_by`) and `reach` goes through notes.rs
-//! `redact`, the engineers and an absorb's `by` too. A personal lesson's tombstone (reach
-//! `personal`) is left out, and the store's `personal.jsonl` is never read. A field the logs do not hold is omitted, never guessed:
-//! `version`, `support` and `history` for a lesson line without them (an older or hand-written line),
-//! `placebo` and `tail` when the log holds no such judgement of the lesson, `recurrence` when the
-//! absorb named no version (the lesson was not in the store yet) or the store no longer holds that
-//! version's line.
+//! `redact`, the engineers and an absorb's `by` too. A personal lesson's tombstone (reach `personal`) is
+//! left out, and the store's `personal.jsonl` is never read. A field the logs do not hold is omitted,
+//! never guessed: `version`, `support` and `history` for a lesson line without them (an older or
+//! hand-written line), `placebo` and `tail` when the log holds no such judgement of the lesson,
+//! `recurrence` when the absorb named no version (the lesson was not in the store yet) or the store no
+//! longer holds that version's line.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -35,8 +37,9 @@ use serde_json::{Value, json};
 
 use crate::absorb::{self, Record};
 use crate::conscience::{self, Challenge};
+use crate::jsonl::{self, Scalar};
 use crate::notes::redact;
-use crate::outcome::{self, Outcome};
+use crate::outcome;
 use crate::{collective, learn, reach};
 
 /// Protocol: the export's schema version. A change to a field's meaning or a removed field raises it;
@@ -138,41 +141,66 @@ pub struct Absorbed {
     pub version: Option<u32>,
 }
 
-/// Every line of the lessons file per id, in file order: the last is the lesson as the conscience
-/// reads it (conscience.rs `load_unweighted`).
-fn lines_by_id(lessons: &Path) -> HashMap<String, Vec<Value>> {
-    let mut by: HashMap<String, Vec<Value>> = HashMap::new();
-    for v in std::fs::read_to_string(lessons).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
-        if let Some(id) = v["id"].as_str().filter(|i| !i.is_empty()) {
-            by.entry(id.to_string()).or_default().push(v);
+/// Every line of the lessons file `text` per id, in file order, borrowed from it: the last is the lesson
+/// as the conscience reads it (conscience.rs `load_unweighted`). A line counts as `Value` reads it: one
+/// that parses, with a string `id` that is not empty. Only its `id` is read here (`jsonl::pick`); `value`
+/// parses the few lines a record shows.
+fn lines_by_id(text: &str) -> HashMap<Cow<'_, str>, Vec<&str>> {
+    let mut by: HashMap<Cow<'_, str>, Vec<&str>> = HashMap::new();
+    for l in text.lines() {
+        if let Some([Scalar::Str(id)]) = jsonl::pick(l, ["id"])
+            && !id.is_empty()
+        {
+            by.entry(id).or_default().push(l);
         }
     }
     by
 }
 
+/// A line `lines_by_id` kept, as `Value` (it parses: `lines_by_id` kept only such lines).
+fn value(line: &str) -> Value {
+    serde_json::from_str(line).unwrap_or_default()
+}
+
+/// The last of an id's kept lines as `Value`, `Null` for none.
+fn last_value(lines: &[&str]) -> Value {
+    lines.last().map_or(Value::Null, |l| value(l))
+}
+
+/// A kept line's `version` as `Value::as_u64` reads it.
+fn version_of(line: &str) -> Option<u64> {
+    jsonl::pick(line, ["version"]).and_then(|[v]| v.as_u64())
+}
+
 /// The lesson's current version (its last line's `version`), None for an id the lines lack or a line
 /// without one.
-fn current_version(lines: &HashMap<String, Vec<Value>>, id: &str) -> Option<u32> {
-    lines.get(id).and_then(|v| v.last()).and_then(|l| l["version"].as_u64()).and_then(|n| u32::try_from(n).ok())
+fn current_version(lines: &HashMap<Cow<'_, str>, Vec<&str>>, id: &str) -> Option<u32> {
+    lines.get(id).and_then(|v| v.last()).and_then(|l| version_of(l)).and_then(|n| u32::try_from(n).ok())
 }
 
 fn episodes(line: &Value) -> impl Iterator<Item = &str> {
     line["episodes"].as_array().into_iter().flatten().filter_map(Value::as_str)
 }
 
-/// The episodes merged into the lesson since its absorb: the latest line's episodes beyond those of the
-/// last line at the absorbed version. None when the absorb named no version or no line has it.
-fn recurrence(lines: &[Value], r: &Record) -> Option<usize> {
+/// The episodes merged into the lesson since its absorb: the latest line's (`last`, `last_value` of
+/// `lines`, which the caller has parsed already) episodes beyond those of the last line at the absorbed
+/// version. None when the absorb named no version or no line has it.
+fn recurrence(lines: &[&str], last: &Value, r: &Record) -> Option<usize> {
     let v = u64::from(r.version?);
-    let at = lines.iter().rev().find(|l| l["version"].as_u64() == Some(v))?;
-    let then: HashSet<&str> = episodes(at).collect();
-    Some(lines.last().map_or(0, |l| episodes(l).filter(|e| !then.contains(e)).count()))
+    let at = value(lines.iter().rev().find(|l| version_of(l) == Some(v))?);
+    let then: HashSet<&str> = episodes(&at).collect();
+    Some(episodes(last).filter(|e| !then.contains(e)).count())
 }
 
-/// The ms of this machine's episodes (`episodes.jsonl`), by id.
-fn episode_ms(store: &Path) -> HashMap<String, i64> {
-    let text = std::fs::read_to_string(store.join("episodes.jsonl")).unwrap_or_default();
-    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| Some((v["id"].as_str()?.to_string(), v["ms"].as_i64()?))).collect()
+/// The ms of this machine's episodes (`episodes.jsonl`, its text `text`), by id, borrowed from it: the
+/// last line of an id, each line read as `Value` reads its `id` and `ms` (`jsonl::pick`).
+fn episode_ms(text: &str) -> HashMap<Cow<'_, str>, i64> {
+    text.lines()
+        .filter_map(|l| match jsonl::pick(l, ["id", "ms"])? {
+            [Scalar::Str(id), ms] => Some((id, ms.as_i64()?)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn redact_value(v: &Value) -> Value {
@@ -184,28 +212,48 @@ fn redact_value(v: &Value) -> Value {
     }
 }
 
-/// The placebo and tail judgements of every lesson in this machine's outcome log (`Judged`).
-fn judgements(local: &[Outcome]) -> (HashMap<&str, Judged>, HashMap<&str, Judged>) {
-    let (mut placebo, mut tail): (HashMap<&str, Judged>, HashMap<&str, Judged>) = Default::default();
-    for o in local {
-        // A placebo's verdicts: changed, ignored, or its point never came up (`asked_not_arisen`, 0.7.5 on:
-        // nothing in the work, no change). Unclear and a remaining consequence are no judgement.
-        if o.channel == outcome::PLACEBO && matches!(o.kind.as_str(), outcome::CHANGED | outcome::IGNORED | outcome::NOT_ARISEN) {
-            for l in &o.lessons {
-                let j = placebo.entry(l.as_str()).or_default();
-                j.count += 1;
-                j.applied += u32::from(o.kind == outcome::CHANGED);
-            }
-        }
-        if o.kind == outcome::GRADED {
-            for l in &o.tail {
-                let j = tail.entry(l.as_str()).or_default();
-                j.count += 1;
-                j.applied += u32::from(o.lessons.contains(l));
-            }
+/// What the export reads of the outcome logs, per lesson: the placebo and tail judgements in this machine's
+/// log (`Judged`), and the latest ms of the outcomes naming it in both (what `read_team` reads).
+#[derive(Debug, Default, PartialEq)]
+struct Outcomes {
+    placebo: HashMap<String, Judged>,
+    tail: HashMap<String, Judged>,
+    last: HashMap<String, i64>,
+}
+
+/// `Outcomes` of the logs beside `lessons`, folded as read (outcome.rs `fold_parts`): no record kept, a
+/// lesson id copied once per map.
+fn outcomes(lessons: &Path, on: bool) -> Outcomes {
+    fn latest(last: &mut HashMap<String, i64>, lessons: &[jsonl::Text], ms: i64) {
+        for l in lessons {
+            let m = jsonl::slot(last, l, || ms);
+            *m = (*m).max(ms);
         }
     }
-    (placebo, tail)
+    let mut out = Outcomes::default();
+    outcome::fold_parts(lessons, on, |part| match part {
+        outcome::Part::Local(o) => {
+            // A placebo's verdicts: changed, ignored, or its point never came up (`asked_not_arisen`, 0.7.5
+            // on: nothing in the work, no change). Unclear and a remaining consequence are no judgement.
+            if o.channel == outcome::PLACEBO && matches!(o.kind.as_ref(), outcome::CHANGED | outcome::IGNORED | outcome::NOT_ARISEN) {
+                for l in &o.lessons {
+                    let j = jsonl::slot(&mut out.placebo, l, Judged::default);
+                    j.count += 1;
+                    j.applied += u32::from(o.kind == outcome::CHANGED);
+                }
+            }
+            if o.kind == outcome::GRADED {
+                for l in &o.tail {
+                    let j = jsonl::slot(&mut out.tail, l, Judged::default);
+                    j.count += 1;
+                    j.applied += u32::from(o.lessons.contains(l));
+                }
+            }
+            latest(&mut out.last, &o.lessons, o.ms);
+        }
+        outcome::Part::Team(x) => latest(&mut out.last, x.lessons, x.ms),
+    });
+    out
 }
 
 /// The evidence records of the store `store` (the directory of its `lessons.jsonl`) that `filter`
@@ -213,27 +261,21 @@ fn judgements(local: &[Outcome]) -> (HashMap<&str, Judged>, HashMap<&str, Judged
 pub fn evidence(store: &Path, filter: &Filter) -> Vec<Evidence> {
     let path = store.join("lessons.jsonl");
     let lessons: Vec<Challenge> = conscience::load_unweighted(&path, None);
-    let outcomes = outcome::read_team(&path);
-    let memory = crate::memory::derive(&outcomes, &lessons, None);
-    let local = outcome::read(&outcome::path_beside(&path));
-    let (placebo, tail) = judgements(&local);
-    let lines = lines_by_id(&path);
+    // Each outcome log read once and folded as read (`outcomes`: what `read_team` reads), and the memory
+    // and breadth from their fold as the conscience weighs it (facts.rs, conscience.rs `load_as`).
+    let on = outcome::on();
+    let Outcomes { placebo, tail, last: last_outcome } = outcomes(&path, on);
+    let facts = crate::facts::load(&path);
+    let folded = facts.view(on).folded;
+    // Per lesson: the sessions whose result was a change and the repos of those changes (`Folded::uses`).
+    let changes: HashMap<&str, Breadth> =
+        folded.uses.iter().map(|(l, s)| (*l, Breadth { sessions: s.len(), repos: folded.repos.get(l).map_or(0, HashSet::len) })).collect();
+    let memory = crate::memory::derive_folded(folded, &lessons, None);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let lines = lines_by_id(&text);
     let log = absorb::latest(&absorb::path(store), None);
-    let episode_ms = episode_ms(store);
-    // Per lesson: the sessions and repos of its changes, and its outcomes' latest ms.
-    let mut changes: HashMap<&str, (HashSet<&str>, HashSet<&str>)> = HashMap::new();
-    let mut last_outcome: HashMap<&str, i64> = HashMap::new();
-    for o in &outcomes {
-        for l in &o.lessons {
-            let m = last_outcome.entry(l.as_str()).or_insert(o.ms);
-            *m = (*m).max(o.ms);
-            if o.kind == outcome::CHANGED && outcome::is_result(o) {
-                let (s, r) = changes.entry(l.as_str()).or_default();
-                s.insert(o.session.as_str());
-                r.insert(o.repo.as_str());
-            }
-        }
-    }
+    let episodes_text = std::fs::read_to_string(store.join("episodes.jsonl")).unwrap_or_default();
+    let episode_ms = episode_ms(&episodes_text);
     let live: Vec<&Challenge> = lessons.iter().filter(|c| c.reach != reach::PERSONAL).collect();
     let mut by: HashMap<&str, BTreeSet<String>> = HashMap::new();
     for c in &live {
@@ -249,8 +291,8 @@ pub fn evidence(store: &Path, filter: &Filter) -> Vec<Evidence> {
             if filter.absorbed && absorbed.is_none() {
                 return None;
             }
-            let all = lines.get(&c.id).map(Vec::as_slice).unwrap_or_default();
-            let line = all.last().cloned().unwrap_or(Value::Null);
+            let all = lines.get(c.id.as_str()).map(Vec::as_slice).unwrap_or_default();
+            let line = last_value(all);
             let mut last = c.origin_ms.max(c.joined.values().copied().max().unwrap_or(0));
             last = last.max(episodes(&line).filter_map(|e| episode_ms.get(e).copied()).max().unwrap_or(0));
             last = last.max(last_outcome.get(c.id.as_str()).copied().unwrap_or(0)).max(rec.map_or(0, |r| r.ms));
@@ -260,7 +302,7 @@ pub fn evidence(store: &Path, filter: &Filter) -> Vec<Evidence> {
             let m = &memory[&c.id];
             let (alpha, beta) = (m.alpha(), m.beta());
             let (lo, hi) = interval(alpha, beta, 0.95);
-            let breadth = changes.get(c.id.as_str()).map_or_else(Breadth::default, |(s, r)| Breadth { sessions: s.len(), repos: r.len() });
+            let breadth = changes.get(c.id.as_str()).copied().unwrap_or_default();
             Some((
                 c.origin_ms,
                 Evidence {
@@ -300,7 +342,7 @@ pub fn evidence(store: &Path, filter: &Filter) -> Vec<Evidence> {
                     placebo: placebo.get(c.id.as_str()).copied(),
                     tail: tail.get(c.id.as_str()).copied(),
                     absorbed: absorbed.map(|r| Absorbed { note: r.note.as_deref().map(redact), ms: r.ms, by: redact(&r.by), version: r.version }),
-                    recurrence: absorbed.and_then(|r| recurrence(all, r)),
+                    recurrence: absorbed.and_then(|r| recurrence(all, &line, r)),
                     last_change_ms: last,
                 },
             ))
@@ -320,14 +362,15 @@ pub fn document(collective: &str, store: &Path, filter: &Filter) -> Value {
 /// merged into one since its absorb, `recurrence`). An absorbed id the store does not hold yet is not
 /// counted.
 pub fn summary(store: &Path) -> (usize, usize) {
-    let lines = lines_by_id(&store.join("lessons.jsonl"));
+    let text = std::fs::read_to_string(store.join("lessons.jsonl")).unwrap_or_default();
+    let lines = lines_by_id(&text);
     let state = absorb::state(&absorb::path(store), None);
-    let held: Vec<(&Record, &[Value])> = state
+    let held: Vec<(&Record, &[&str])> = state
         .values()
-        .filter_map(|r| lines.get(&r.id).map(|l| (r, l.as_slice())))
-        .filter(|(_, l)| l.last().is_some_and(|x| x["reach"].as_str() != Some(reach::PERSONAL)))
+        .filter_map(|r| lines.get(r.id.as_str()).map(|l| (r, l.as_slice())))
+        .filter(|(_, l)| l.last().and_then(|x| jsonl::pick(x, ["reach"])).is_some_and(|[r]| r.as_str() != Some(reach::PERSONAL)))
         .collect();
-    (held.len(), held.iter().filter(|(r, l)| recurrence(l, r).is_some_and(|n| n > 0)).count())
+    (held.len(), held.iter().filter(|(r, l)| recurrence(l, &last_value(l), r).is_some_and(|n| n > 0)).count())
 }
 
 // ---------------------------------------------------------------- the Beta interval
@@ -554,14 +597,17 @@ fn absorb_cmd(sub: &str, home: &Path, cwd: &str, a: &Args) -> i32 {
     let by = learn::engineer(cwd);
     // Under learn's lock on the lessons: no merge lands between reading a lesson's version and the
     // absorb that names it, and two commands here stamp in the order they write.
-    let (lines, before, written) = crate::live::locked(&home.join("lessons.jsonl"), || {
-        let lines = lines_by_id(&home.join("lessons.jsonl"));
+    let (known, before, written) = crate::live::locked(&home.join("lessons.jsonl"), || {
+        let text = std::fs::read_to_string(home.join("lessons.jsonl")).unwrap_or_default();
+        let lines = lines_by_id(&text);
         let seen = absorb::latest(&absorb::path(home), None);
         let before: HashSet<String> = seen.values().filter(|r| r.absorbed()).map(|r| r.id.clone()).collect();
         // Stamped after what it sees: a peer's clock a little ahead never makes this command lose to it.
         let now = absorb::stamp(&seen, &a.ids, learn::now_ms());
         let written = absorb::write(home, &a.ids, kind, note.as_deref(), &by, now, &|id| current_version(&lines, id));
-        (lines, before, written)
+        // Past the lock, the lines tell only which written ids the store holds a lesson of.
+        let known: HashSet<String> = written.iter().flatten().filter(|r| lines.contains_key(r.id.as_str())).map(|r| r.id.clone()).collect();
+        (known, before, written)
     });
     let written = match written {
         Ok(w) => w,
@@ -571,7 +617,7 @@ fn absorb_cmd(sub: &str, home: &Path, cwd: &str, a: &Args) -> i32 {
         }
     };
     for r in &written {
-        if !lines.contains_key(&r.id) {
+        if !known.contains(r.id.as_str()) {
             eprintln!("borg memory {sub}: {} is not a lesson of this collective (yet): recorded, it applies when the lesson arrives", r.id);
         } else if kind == absorb::RELEASE && !before.contains(r.id.as_str()) {
             eprintln!("borg memory release: {} was not absorbed here (yet): recorded", r.id);
@@ -582,7 +628,7 @@ fn absorb_cmd(sub: &str, home: &Path, cwd: &str, a: &Args) -> i32 {
             .iter()
             .map(|r| {
                 let mut v = serde_json::to_value(r).unwrap_or_default();
-                v["known"] = json!(lines.contains_key(&r.id));
+                v["known"] = json!(known.contains(r.id.as_str()));
                 v
             })
             .collect();
@@ -708,14 +754,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(store);
     }
 
+    /// `lines_by_id` before borrowing: every line parsed into a `Value`.
+    fn lines_by_id_value(text: &str) -> HashMap<String, Vec<Value>> {
+        let mut by: HashMap<String, Vec<Value>> = HashMap::new();
+        for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+            if let Some(id) = v["id"].as_str().filter(|i| !i.is_empty()) {
+                by.entry(id.to_string()).or_default().push(v);
+            }
+        }
+        by
+    }
+
+    /// `recurrence` over `Value`s, as before.
+    fn recurrence_value(lines: &[Value], r: &Record) -> Option<usize> {
+        let v = u64::from(r.version?);
+        let at = lines.iter().rev().find(|l| l["version"].as_u64() == Some(v))?;
+        let then: HashSet<&str> = episodes(at).collect();
+        Some(lines.last().map_or(0, |l| episodes(l).filter(|e| !then.contains(e)).count()))
+    }
+
+    /// `episode_ms` before borrowing: every line parsed into a `Value`.
+    fn episode_ms_value(text: &str) -> HashMap<String, i64> {
+        text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| Some((v["id"].as_str()?.to_string(), v["ms"].as_i64()?))).collect()
+    }
+
+    /// Lessons and episode lines at every edge `Value` decides.
+    fn value_edges() -> Vec<String> {
+        [
+            r#"{"id":"L1","version":1,"episodes":["e1"],"ms":1}"#,
+            r#"{"id":"L1","version":2,"episodes":["e1","e2"],"ms":2}"#,
+            r#"{"id":"L1","version":3,"episodes":["e1","e2","e3"],"ms":3}"#,
+            r#"{"id":"L2","id":"L3","version":1,"ms":5}"#,
+            r#"{"id":"L2","version":2,"version":"x","ms":6,"ms":7}"#,
+            r#"{"id":"L2","version":5000000000,"ms":8}"#,
+            r#"{"id":"L2","version":18446744073709551615,"ms":-9}"#,
+            r#"{"id":"L2","version":-1,"ms":1.5}"#,
+            r#"{"id":"L2","version":2.0,"episodes":"e1"}"#,
+            r#"{"id":"","version":1,"ms":1}"#,
+            r#"{"id":5,"version":1,"ms":1}"#,
+            r#"{"id":null}"#,
+            r#"{"id":"L4","x":"\ud800"}"#,
+            r#"{"id":"L4","version":1,"episodes":["\ud800"]}"#,
+            r#"{"id":"L4","version":1"#,
+            r#"{"id":"L4","version":1} x"#,
+            r#"{"id":"L4","version":2} "#,
+            r#"[{"id":"L5"}]"#,
+            " ",
+            "",
+            "null",
+        ]
+        .map(str::to_string)
+        .into_iter()
+        // An escaped id: L1 again.
+        .chain([format!(r#"{{"id":"{}","version":4,"episodes":["e4"],"ms":4}}"#, jsonl::escaped("L1"))])
+        .collect()
+    }
+
+    /// The borrowed readers keep exactly the lines and read exactly the values the `Value` parse did, on
+    /// edge lines and the lessons and episodes of a real store (`BORG_BENCH_STORE`).
+    #[test]
+    fn the_borrowed_readers_read_what_value_read() {
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        for lines in [value_edges(), real("lessons.jsonl"), real(reach::PERSONAL_FILE), real("episodes.jsonl"), [real("lessons.jsonl"), value_edges()].concat()]
+        {
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            let (new, old) = (lines_by_id(&text), lines_by_id_value(&text));
+            assert_eq!(new.len(), old.len());
+            for (id, want) in &old {
+                let got = &new[id.as_str()];
+                assert_eq!(got.iter().map(|l| value(l)).collect::<Vec<_>>(), *want, "{id}");
+                let version = want.last().and_then(|l| l["version"].as_u64()).and_then(|n| u32::try_from(n).ok());
+                assert_eq!(current_version(&new, id), version, "{id}");
+                for v in [None, Some(1), Some(2), Some(3), Some(4)] {
+                    let r = Record { id: id.clone(), kind: absorb::ABSORB.into(), ms: 1, by: String::new(), note: None, version: v };
+                    assert_eq!(recurrence(got, &last_value(got), &r), recurrence_value(want, &r), "{id} {v:?}");
+                }
+            }
+            let got: HashMap<String, i64> = episode_ms(&text).into_iter().map(|(k, v)| (k.into_owned(), v)).collect();
+            assert_eq!(got, episode_ms_value(&text));
+        }
+    }
+
+    /// The export reads each lesson's breadth, last change and memory as it did from the whole team view
+    /// (outcome.rs `read_team`, memory.rs `derive`): breadth and last change exactly, the memory's counts
+    /// exactly and its rounded floats to the last decimal (the facts fold equals `derive` to 1e-9), on
+    /// the test store and a copy of a real one (`BORG_BENCH_STORE`).
+    #[test]
+    fn the_export_reads_what_the_whole_team_view_read() {
+        let store = temp("team-view-oracle");
+        let files = ["lessons.jsonl", "outcomes.jsonl", outcome::TEAM_FILE, "episodes.jsonl"];
+        let real: Vec<Vec<String>> = files.iter().map(|f| crate::jsonl::store_lines(&[f])).collect();
+        let lesson = |id: &str, ms: i64| json!({"id": id, "origin_ms": ms, "question": "q", "episodes": ["e1"], "version": 1}).to_string();
+        let edge: Vec<Vec<String>> = vec![
+            vec![lesson("La", 10), lesson("Lb", 20)],
+            [
+                o("asked_then_changed", "s1", &["La"], 110, "app", "stop"),
+                o("asked_then_changed", "s2", &["La", "Lb"], 120, "web", "stop"),
+                o("asked_then_changed", "s3", &["La"], 130, "app", "placebo"),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect(),
+            vec![json!({"kind": "asked_then_changed", "s": "t9", "lessons": ["Lb"], "ms": 500, "node": "m", "r": "x"}).to_string()],
+            vec![json!({"id": "e1", "ms": 300}).to_string()],
+        ];
+        for set in [edge, real] {
+            for (f, lines) in files.iter().zip(&set) {
+                std::fs::write(store.join(f), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            }
+            let path = store.join("lessons.jsonl");
+            let lessons = conscience::load_unweighted(&path, None);
+            let outcomes = outcome::read_team(&path);
+            let memory = crate::memory::derive(&outcomes, &lessons, None);
+            let mut changes: HashMap<&str, (HashSet<&str>, HashSet<&str>)> = HashMap::new();
+            let mut last_outcome: HashMap<&str, i64> = HashMap::new();
+            for o in &outcomes {
+                for l in &o.lessons {
+                    let m = last_outcome.entry(l.as_str()).or_insert(o.ms);
+                    *m = (*m).max(o.ms);
+                    if o.kind == outcome::CHANGED && outcome::is_result(o) {
+                        let (s, r) = changes.entry(l.as_str()).or_default();
+                        s.insert(o.session.as_str());
+                        r.insert(o.repo.as_str());
+                    }
+                }
+            }
+            let lines = lines_by_id_value(&std::fs::read_to_string(&path).unwrap());
+            let eps = episode_ms_value(&std::fs::read_to_string(store.join("episodes.jsonl")).unwrap());
+            let got = evidence(&store, &Filter::default());
+            assert_eq!(got.len(), lessons.iter().filter(|c| c.reach != reach::PERSONAL).count());
+            for e in &got {
+                let c = lessons.iter().find(|c| c.id == e.id).unwrap();
+                let breadth = changes.get(c.id.as_str()).map_or_else(Breadth::default, |(s, r)| Breadth { sessions: s.len(), repos: r.len() });
+                assert_eq!(e.breadth, breadth, "{}", e.id);
+                let line = lines.get(&c.id).and_then(|l| l.last()).cloned().unwrap_or(Value::Null);
+                let last = [
+                    c.origin_ms,
+                    c.joined.values().copied().max().unwrap_or(0),
+                    episodes(&line).filter_map(|x| eps.get(x).copied()).max().unwrap_or(0),
+                    last_outcome.get(c.id.as_str()).copied().unwrap_or(0),
+                ];
+                assert_eq!(e.last_change_ms, last.into_iter().max().unwrap(), "{}", e.id);
+                let (m, v) = (&memory[&c.id], &e.memory);
+                assert_eq!(
+                    (m.changed, m.ignored, m.corrected, m.vetoed, m.tested, m.consolidated, m.dormant),
+                    (v.changed, v.ignored, v.corrected, v.vetoed, v.tested, v.consolidated, v.dormant),
+                    "{}",
+                    e.id
+                );
+                let near = |a: f64, b: f64| (outcome::round_p(a) - b).abs() <= 1.0001e-4;
+                assert!(
+                    near(m.alpha(), v.alpha) && near(m.beta(), v.beta) && near(m.activation, v.activation) && near(m.regretted, v.regretted),
+                    "{}: {m:?} {v:?}",
+                    e.id
+                );
+            }
+            let _ = std::fs::remove_file(crate::facts::path_beside(&path));
+            let _ = std::fs::remove_file(crate::facts::regrets_beside(&path));
+        }
+        let _ = std::fs::remove_dir_all(store);
+    }
+
+    /// `outcomes` before it folded as read: both logs collected whole (`team_parts`), lesson ids borrowed.
+    fn outcomes_owned(lessons: &Path, on: bool) -> Outcomes {
+        let (local, team) = outcome::team_parts(lessons, on);
+        let (mut placebo, mut tail): (HashMap<&str, Judged>, HashMap<&str, Judged>) = Default::default();
+        for o in &local {
+            if o.channel == outcome::PLACEBO && matches!(o.kind.as_str(), outcome::CHANGED | outcome::IGNORED | outcome::NOT_ARISEN) {
+                for l in &o.lessons {
+                    let j = placebo.entry(l.as_str()).or_default();
+                    j.count += 1;
+                    j.applied += u32::from(o.kind == outcome::CHANGED);
+                }
+            }
+            if o.kind == outcome::GRADED {
+                for l in &o.tail {
+                    let j = tail.entry(l.as_str()).or_default();
+                    j.count += 1;
+                    j.applied += u32::from(o.lessons.contains(l));
+                }
+            }
+        }
+        let mut last: HashMap<&str, i64> = HashMap::new();
+        for o in local.iter().chain(&team) {
+            for l in &o.lessons {
+                let m = last.entry(l.as_str()).or_insert(o.ms);
+                *m = (*m).max(o.ms);
+            }
+        }
+        let own = |m: HashMap<&str, Judged>| m.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        Outcomes { placebo: own(placebo), tail: own(tail), last: last.into_iter().map(|(k, v)| (k.to_string(), v)).collect() }
+    }
+
+    /// `outcomes` folds exactly what it read from the collected logs, on and off: on placebo verdicts,
+    /// graded tails, a team line and lines no record reads, and on a real store's outcome logs
+    /// (`BORG_BENCH_STORE`).
+    #[test]
+    fn the_outcomes_fold_reads_what_the_collected_logs_gave() {
+        let store = temp("outcomes-oracle");
+        let path = store.join("lessons.jsonl");
+        let graded = json!({"kind": "graded", "session": "s5", "lessons": ["La"], "ms": 140, "repo": "app", "tail": ["La", "Lb"]});
+        let edge = [
+            [
+                o("asked_then_changed", "s1", &["La"], 110, "app", "placebo"),
+                o("asked_ignored", "s2", &["La", "Lb"], 120, "web", "placebo"),
+                o("asked_not_arisen", "s3", &["Lb"], 130, "app", "placebo"),
+                o("asked_unclear", "s3", &["Lb"], 131, "app", "placebo"),
+                o("asked_then_changed", "s4", &["Lc"], 135, "app", "stop"),
+                graded,
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>(),
+            vec!["{".into(), String::new(), r#"{"kind":"graded","session":"s6","lessons":["La"],"ms":1,"repo":"r","tail":"La"}"#.into()],
+        ]
+        .concat();
+        let team = vec![json!({"kind": "asked_then_changed", "s": "t9", "lessons": ["Lb"], "ms": 500, "node": "m"}).to_string()];
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        for (i, (local, team)) in [(edge, team), (real("outcomes.jsonl"), real(outcome::TEAM_FILE))].into_iter().enumerate() {
+            std::fs::write(store.join("outcomes.jsonl"), local.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            std::fs::write(store.join(outcome::TEAM_FILE), team.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            for on in [true, false] {
+                assert_eq!(outcomes(&path, on), outcomes_owned(&path, on), "on={on}");
+            }
+            if i == 0 {
+                let got = outcomes(&path, true);
+                assert_eq!((got.placebo["La"], got.placebo["Lb"]), (Judged { count: 2, applied: 1 }, Judged { count: 2, applied: 0 }));
+                assert_eq!((got.tail["La"], got.tail["Lb"]), (Judged { count: 1, applied: 1 }, Judged { count: 1, applied: 0 }));
+                assert_eq!((got.last["Lb"], outcomes(&path, false).last["Lb"]), (500, 131), "the team line counts with sharing on only");
+            }
+        }
+        let _ = std::fs::remove_dir_all(store);
+    }
+
     #[test]
     fn recurrence_needs_the_absorbed_version() {
-        let lines = vec![json!({"id": "L", "version": 1, "episodes": ["e1"]}), json!({"id": "L", "version": 3, "episodes": ["e1", "e2", "e3"]})];
+        let lines = [r#"{"id": "L", "version": 1, "episodes": ["e1"]}"#, r#"{"id": "L", "version": 3, "episodes": ["e1", "e2", "e3"]}"#];
         let r = |v: Option<u32>| Record { id: "L".into(), kind: absorb::ABSORB.into(), ms: 1, by: String::new(), note: None, version: v };
-        assert_eq!(recurrence(&lines, &r(Some(1))), Some(2));
-        assert_eq!(recurrence(&lines, &r(Some(3))), Some(0));
-        assert_eq!(recurrence(&lines, &r(Some(2))), None, "no line at that version: not guessed");
-        assert_eq!(recurrence(&lines, &r(None)), None, "absorbed before the lesson arrived");
+        let last = last_value(&lines);
+        assert_eq!(recurrence(&lines, &last, &r(Some(1))), Some(2));
+        assert_eq!(recurrence(&lines, &last, &r(Some(3))), Some(0));
+        assert_eq!(recurrence(&lines, &last, &r(Some(2))), None, "no line at that version: not guessed");
+        assert_eq!(recurrence(&lines, &last, &r(None)), None, "absorbed before the lesson arrived");
     }
 
     #[test]
@@ -725,7 +1005,7 @@ mod tests {
             "consequence": "a slow client stalls senders", "support": 1, "episodes": ["e1"], "history": [], "version": 1});
         write_lines(&store.join("lessons.jsonl"), &[lesson]);
         absorb::write(&store, &["La"], absorb::ABSORB, Some("skills/review@1"), "lead@x", 5, &|id| {
-            current_version(&lines_by_id(&store.join("lessons.jsonl")), id)
+            current_version(&lines_by_id(&std::fs::read_to_string(store.join("lessons.jsonl")).unwrap_or_default()), id)
         })
         .unwrap();
         let e = learn::Episode {

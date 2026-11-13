@@ -24,7 +24,7 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
-borg-trace = { path = "../borg-trace", version = "=0.7.11" }
+borg-trace = { path = "../borg-trace", version = "=0.7.12" }
 serde.workspace = true
 # preserve_order: merging into settings.json keeps the engineer's key order (install.rs)
 # float_roundtrip: a float read back from the selection cache is the one written, so a hook's decision
@@ -51,6 +51,13 @@ half = { version = "2", optional = true }
 [dev-dependencies]
 # The skill's frontmatter is read as YAML, the way strict harnesses read it (install/skill.rs tests).
 serde_norway = "0.9"
+criterion.workspace = true
+
+# The readers borg-web runs per page, on a store of a real team's shape (`BORG_BENCH_STORE`, else
+# generated): `cargo bench -p borg-ai`.
+[[bench]]
+name = "stores"
+harness = false
 
 # docs.rs builds the lean library, without the vectors stack (SeekStorm, tokenizers).
 [package.metadata.docs.rs]

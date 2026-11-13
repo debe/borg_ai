@@ -36,6 +36,7 @@ use std::time::Duration;
 use borg::collective::Route;
 use borg::reexec::{self, Image};
 use borg_mesh::addr::Relay;
+use borg_mesh::cache::Cache;
 use borg_mesh::daemon::{self, Event, Options};
 use borg_mesh::identity::Identity;
 use borg_mesh::invite::{self, Ticket, join_config};
@@ -218,7 +219,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             let file = args.get(1).ok_or("join <membership.json|membership-history.jsonl>")?;
             let (name, home) = store(&r)?;
             let docs = membership::parse_docs(&std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?).map_err(|e| format!("{file}: {e}"))?;
-            let (doc, moved) = origin::join(&home, &name, &docs).map_err(|e| format!("{file}: {e}"))?;
+            let (doc, moved) = origin::join(&home, &name, &docs, &Cache::default()).map_err(|e| format!("{file}: {e}"))?;
             borg_mesh::steer::enforce(&home, &doc, borg::learn::now_ms());
             let me = Identity::load_or_create(&home)?.public();
             println!("joined {name} v{} as {}", doc.version, doc.role_of(&me).unwrap_or("NOT LISTED: ask the admin to invite your `borg mesh id`"));
@@ -232,7 +233,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             if Membership::load(&home)?.is_none() {
                 return Err(format!("{name} has no membership"));
             }
-            let (m, moved) = origin::revoke(&home, &Identity::load_or_create(&home)?, key, borg::learn::now_ms())?;
+            let (m, moved) = origin::revoke(&home, &Identity::load_or_create(&home)?, key, borg::learn::now_ms(), &Cache::default())?;
             // The revoked signer's pause stops holding here now, not at the next daemon round.
             borg_mesh::steer::enforce(&home, &m, borg::learn::now_ms());
             println!("{key} is revoked from {name} (version {}); every member that syncs learns it", m.version);

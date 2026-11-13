@@ -204,6 +204,12 @@ fn the_next_model_call_judges_earlier_questions_into_changed_and_ignored() {
     assert_eq!(prompt.matches("### Work").count(), 1, "one block, one shared evidence");
     assert_eq!(kind(&root, "asked_then_changed"), ["Llock"]);
     assert_eq!(kind(&root, "asked_ignored"), ["Ldrain"]);
+    // Both verdicts reach the usage statistics: today's judge's ignore is a result, never censored as
+    // an old judge's (outcome.rs `ambiguous`), or the learning page's asked→changed reads 100%.
+    let counted: Vec<Value> = store_file(&root, "stats/events.jsonl").lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    for (k, id) in [("changed", "Llock"), ("ignored", "Ldrain")] {
+        assert!(counted.iter().any(|e| e["kind"] == k && e["lessons"] == json!([id])), "{k} {id}: {counted:?}");
+    }
     // Each declaration reaches the judge unless its question's coin stripped it (the result says which):
     // then neither the annotation nor the answer's line shows it.
     for (k, id, end, word) in [

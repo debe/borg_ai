@@ -43,16 +43,17 @@
 //! fits `V1_TEXT` is written as a v1 line, which 0.5.0 readers read too.
 //!
 //! Pacing (`window_for`): a sender may have a window of tells and asks to one recipient that it has not
-//! acknowledged, by a `Seen` line its recipient wrote when shown them or by a reply. The window starts
-//! at 1, doubles per acknowledged message, halves per message that expired unacknowledged, and is capped
-//! (`WINDOW_CAP`). Acknowledgements pace only a recipient they can be expected from (`Pace`): a
-//! broadcast (whoever runs when it is sent, maybe nobody) and the engineer (who may read where nothing
-//! acknowledges) are never paced more strictly than 0.5.0 paced them (`V1_RATE_MS`), and a session of
-//! another node is paced by that rate alone until its node acknowledges one of the sender's messages
-//! to it (it may run 0.5.0, which never does). That cold start reads the pair's own lines, which sync,
-//! not the mesh's record of what each node reads (presence.rs `reads`, local and different on every
-//! node), so the window is a function of the lines alone, and once a `Seen` line of that node lists one
-//! of the pair's messages, that pair is under its window on every node holding it.
+//! acknowledged, by a `Seen` line its recipient wrote when shown them or by a reply. The window is
+//! earned by the sender's node with the recipient's side (its node, for a session): it starts at 1,
+//! doubles per acknowledged message between them, halves per message that expired unacknowledged, and
+//! is capped (`WINDOW_CAP`), so trust earned by earlier sessions carries to every new pair. Nobody waits
+//! longer than `FLOOR_MS` for a full window: that long after the sender's previous message to the same
+//! recipient, the next goes whatever the window holds (a recipient that ended, a broadcast that reached
+//! nobody, the engineer reading where nothing acknowledges). A session of another node that has
+//! acknowledged no message of the sender's node is paced by that floor alone (`Pace::Rate`: it may run
+//! 0.5.0, which never acknowledges). That reads synced lines only, not the mesh's record of what each
+//! node reads (presence.rs `reads`, local and different on every node), so the window is a function of
+//! the lines alone, the same on every node holding them.
 //! `send` decides by the window, over the log it writes to (under its lock), and also refuses a message
 //! that would push out one admitted before it (an earlier stamp, from a clock that stepped back or a
 //! send that took the lock later) or one of its sender's unread messages to the same recipient
@@ -65,6 +66,7 @@
 //! Bounded on write (`bound`): a line past `TTL_MS` goes, and of each member's lines the newest of each
 //! class (conversation, steers, seen) stay while they fit `MEMBER_BYTES`, byte for byte as they were.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -77,7 +79,7 @@ use crate::collective;
 use crate::harness::{self, Caps};
 use crate::presence::safe;
 use crate::steer::{self, Roles};
-use crate::{learn, stats, top};
+use crate::{jsonl, learn, stats, top};
 
 /// The log, in the collective's store.
 pub const FILE: &str = "messages.jsonl";
@@ -134,15 +136,17 @@ pub const MEMBER_BYTES: usize = 1 << 20;
 /// `V1_RATE_MS` (`within_windows`): no window lets more.
 pub const WINDOW_CAP: usize = MEMBER_BYTES / WIRE_TEXT;
 /// Protocol: 0.5.0's pacing (its `RATE_MS`), one tell or ask per sender and recipient this often, the
-/// earliest first: all a `borg/mesh/13` node takes (borg-mesh sync.rs `v1_window`). It paces a session
-/// of a node that acknowledges nothing (`Pace::Rate`) and floors the window of a recipient whose reading
-/// may write no acknowledgement (`Pace::Floor`), so where an acknowledgement may never come no sender
-/// is paced more strictly than 0.5.0 paced it. Also the span over which the mesh bounds one sender's
-/// unread messages to one recipient (`within_windows`).
+/// earliest first: all a `borg/mesh/13` node takes (borg-mesh sync.rs `v1_window`). Also the span over
+/// which the mesh bounds one sender's unread messages to one recipient (`within_windows`). It paces no
+/// sender: `FLOOR_MS` does.
 pub const V1_RATE_MS: i64 = 10 * 60 * 1000;
 /// Protocol and guard: the most ids one `Seen` line lists (a delivery that shows more writes more
 /// lines), so a line stays under ~4 KB and a forged one cannot list millions.
 pub const SEEN_IDS: usize = 256;
+/// The longest a sender waits for a full window (`window_for`): the engineer's ceiling on any pacing
+/// wait. Whatever the window holds, a message this long after the sender's previous one to the same
+/// recipient goes, while the mesh carries it (`within_windows`).
+pub const FLOOR_MS: i64 = 60_000;
 /// Display: the characters of a node key a label shows (`short_node`, the one routine every label of a
 /// node key calls: a delivered line, steer.rs `who`, presence.rs `Mismatch::line`, borg-mesh main.rs
 /// `short`): enough to tell the members of a team apart.
@@ -245,7 +249,7 @@ pub struct Sender {
     pub node: String,
 }
 
-fn id_of(m: &Message) -> String {
+fn id_of(m: &MessageRef) -> String {
     let mut h = blake3::Hasher::new();
     let ms = m.ms.to_string();
     for part in [m.kind.as_str(), &m.by, &m.name, &m.harness, &m.node, &m.to, m.re.as_deref().unwrap_or_default(), &ms, &m.text] {
@@ -266,25 +270,26 @@ fn token(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && s.len() <= TOKEN && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@+".contains(c))
 }
 
-/// Whom a message is for, as its `to` says it (`parse`; `Display` writes it back).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Address {
+/// Whom a message is for, as its `to` says it (`parse`; `Display` writes it back). It borrows the parts
+/// from that text: a token holds no escape, and the windows parse one per message and acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Address<'a> {
     /// Every session of the collective on every member's machine: `all`, as `collective` or `all` on
     /// the command line.
     All,
     /// The sessions of one node, `local@<node>`: `local` on the command line, for this node. It counts
     /// only on a line of that node (`Message::well_formed`), and it never travels (`Message::stays_here`).
-    Local { node: String },
+    Local { node: &'a str },
     /// `engineer`, or `engineer:<email>`; `email` is empty for the former.
-    Engineer { email: String },
+    Engineer { email: &'a str },
     /// `<session>@<node>`. A line written without the node (by hand) reaches that session on any node;
     /// `address` never writes one.
-    Session { id: String, node: Option<String> },
+    Session { id: &'a str, node: Option<&'a str> },
 }
 
-impl Address {
+impl<'a> Address<'a> {
     /// The address `s` names: a token, with neither its session nor its node empty.
-    pub fn parse(s: &str) -> Option<Address> {
+    pub fn parse(s: &'a str) -> Option<Address<'a>> {
         if !token(s) {
             return None;
         }
@@ -294,19 +299,19 @@ impl Address {
         if let Some(rest) = s.strip_prefix(ENGINEER)
             && (rest.is_empty() || rest.starts_with(':'))
         {
-            return Some(Address::Engineer { email: rest.strip_prefix(':').unwrap_or_default().into() });
+            return Some(Address::Engineer { email: rest.strip_prefix(':').unwrap_or_default() });
         }
         match s.rsplit_once('@') {
             Some((id, node)) if id.is_empty() || node.is_empty() || id == ALL => None,
-            Some((LOCAL, node)) => Some(Address::Local { node: node.into() }),
-            Some((id, node)) => Some(Address::Session { id: id.into(), node: Some(node.into()) }),
-            None => Some(Address::Session { id: s.into(), node: None }),
+            Some((LOCAL, node)) => Some(Address::Local { node }),
+            Some((id, node)) => Some(Address::Session { id, node: Some(node) }),
+            None => Some(Address::Session { id: s, node: None }),
         }
     }
 
     /// Whether it names `session` of the node `here` (a broadcast is not checked here: `applies`).
     pub fn reaches(&self, here: &str, session: &str) -> bool {
-        matches!(self, Address::Session { id, node } if id == session && node.as_deref().is_none_or(|n| n == here))
+        matches!(self, Address::Session { id, node } if *id == session && node.is_none_or(|n| n == here))
     }
 
     /// Whether it is a broadcast: to the collective or to the sessions of one node (`applies` checks it).
@@ -318,7 +323,7 @@ impl Address {
     /// session without its node, the engineer.
     pub fn name(&self) -> String {
         match self {
-            Address::Session { id, .. } => id.clone(),
+            Address::Session { id, .. } => (*id).to_string(),
             Address::All => COLLECTIVE.into(),
             Address::Local { .. } => LOCAL.into(),
             a => a.to_string(),
@@ -326,12 +331,12 @@ impl Address {
     }
 }
 
-impl fmt::Display for Address {
+impl fmt::Display for Address<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Address::All => f.write_str(ALL),
             Address::Local { node } => write!(f, "{LOCAL}@{node}"),
-            Address::Engineer { email } if email.is_empty() => f.write_str(ENGINEER),
+            Address::Engineer { email: "" } => f.write_str(ENGINEER),
             Address::Engineer { email } => write!(f, "{ENGINEER}:{email}"),
             Address::Session { id, node: None } => f.write_str(id),
             Address::Session { id, node: Some(n) } => write!(f, "{id}@{n}"),
@@ -378,7 +383,7 @@ pub fn sender_label(m: &Message) -> String {
 
 /// `text` redacted and on one line.
 fn flat(text: &str) -> String {
-    crate::notes::redact(text).chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    crate::notes::redacted(text).chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// A text as a v1 line keeps it: redacted, on one line, cut to `V1_TEXT` characters (0.5.0's `cut`).
@@ -409,8 +414,25 @@ impl Message {
             ms,
             text,
         };
-        m.id = id_of(&m);
+        m.id = id_of(&m.borrowed());
         m
+    }
+
+    /// The message as a `MessageRef` borrowing every field.
+    pub fn borrowed(&self) -> MessageRef<'_> {
+        MessageRef {
+            v: self.v,
+            id: Cow::Borrowed(&self.id),
+            kind: self.kind,
+            by: Cow::Borrowed(&self.by),
+            name: Cow::Borrowed(&self.name),
+            harness: Cow::Borrowed(&self.harness),
+            node: Cow::Borrowed(&self.node),
+            to: Cow::Borrowed(&self.to),
+            re: self.re.as_deref().map(Cow::Borrowed),
+            ms: self.ms,
+            text: Cow::Borrowed(&self.text),
+        }
     }
 
     pub fn asks(&self) -> bool {
@@ -419,6 +441,80 @@ impl Message {
 
     /// Whether it is for the sessions of its own node only (`local`): it never travels to another
     /// member (borg-mesh lines.rs `travels`).
+    pub fn stays_here(&self) -> bool {
+        self.borrowed().stays_here()
+    }
+
+    /// Whether the line is one `new` could have written (`MessageRef::well_formed`).
+    pub fn well_formed(&self) -> bool {
+        self.borrowed().well_formed()
+    }
+
+    /// Who sent it, as the line names it.
+    pub fn author(&self) -> Author<'_> {
+        Author { node: &self.node, by: &self.by }
+    }
+}
+
+/// A `Message` read from a line without copying it (`LineRef::parse`): each field borrows the line, and
+/// only one that holds a JSON escape is unescaped into a string of its own. What the windows and the
+/// mesh read of every message line at every round; `Message` stays the form the commands hold. Its
+/// fields, defaults and so the lines it accepts are `Message`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MessageRef<'a> {
+    pub v: u8,
+    #[serde(borrow)]
+    pub id: Cow<'a, str>,
+    pub kind: Kind,
+    #[serde(borrow)]
+    pub by: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub name: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub harness: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub node: Cow<'a, str>,
+    #[serde(borrow)]
+    pub to: Cow<'a, str>,
+    #[serde(borrow, default, deserialize_with = "cow_opt")]
+    pub re: Option<Cow<'a, str>>,
+    pub ms: i64,
+    #[serde(borrow)]
+    pub text: Cow<'a, str>,
+}
+
+/// A string field that borrows its line unless it holds an escape (serde borrows a bare `Cow` field
+/// only, not one inside an `Option` or a `Vec`).
+#[derive(Deserialize)]
+struct CowStr<'a>(#[serde(borrow)] Cow<'a, str>);
+
+fn cow_opt<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Cow<'a, str>>, D::Error> {
+    Ok(Option::<CowStr<'a>>::deserialize(d)?.map(|s| s.0))
+}
+
+fn cow_vec<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Cow<'a, str>>, D::Error> {
+    Ok(Vec::<CowStr<'a>>::deserialize(d)?.into_iter().map(|s| s.0).collect())
+}
+
+impl MessageRef<'_> {
+    /// The owned `Message`.
+    pub fn into_owned(self) -> Message {
+        Message {
+            v: self.v,
+            id: self.id.into_owned(),
+            kind: self.kind,
+            by: self.by.into_owned(),
+            name: self.name.into_owned(),
+            harness: self.harness.into_owned(),
+            node: self.node.into_owned(),
+            to: self.to.into_owned(),
+            re: self.re.map(Cow::into_owned),
+            ms: self.ms,
+            text: self.text.into_owned(),
+        }
+    }
+
+    /// `Message::stays_here`.
     pub fn stays_here(&self) -> bool {
         matches!(Address::parse(&self.to), Some(Address::Local { .. }))
     }
@@ -431,13 +527,16 @@ impl Message {
     /// longer than `V1_TEXT` and whole up to `WIRE_TEXT` (`clean`).
     pub fn well_formed(&self) -> bool {
         [&self.by, &self.harness, &self.node].into_iter().all(|f| token(f))
-            && Address::parse(&self.to).is_some_and(|a| self.kind.may_address(&a) && !matches!(&a, Address::Local { node } if *node != self.node))
+            && Address::parse(&self.to).is_some_and(|a| self.kind.may_address(&a) && !matches!(a, Address::Local { node } if node != self.node))
             && self.re.as_deref().is_none_or(is_id)
             && self.name == label(&self.name)
             && (!self.text.is_empty() || self.kind.switch())
             && match self.v {
                 1 => cut_v1(&self.text) == self.text,
-                2 => clean(&self.text) == (2, self.text.clone()),
+                2 => {
+                    let (v, t) = clean(&self.text);
+                    v == 2 && t == *self.text
+                }
                 _ => false,
             }
             && self.id == id_of(self)
@@ -475,7 +574,54 @@ impl Seen {
         Seen { v: 2, kind: SEEN.into(), by: by.into(), node: node.into(), ms, ids: ids.iter().map(|i| i.to_string()).collect() }
     }
 
-    /// Whether the line is one `new` could have written: tokens for its names, one to `SEEN_IDS`
+    /// Whether the line is one `new` could have written (`SeenRef::well_formed`).
+    pub fn well_formed(&self) -> bool {
+        self.borrowed().well_formed()
+    }
+
+    /// The line as a `SeenRef` borrowing every field.
+    pub fn borrowed(&self) -> SeenRef<'_> {
+        SeenRef {
+            v: self.v,
+            kind: Cow::Borrowed(&self.kind),
+            by: Cow::Borrowed(&self.by),
+            node: Cow::Borrowed(&self.node),
+            ms: self.ms,
+            ids: self.ids.iter().map(|i| Cow::Borrowed(i.as_str())).collect(),
+        }
+    }
+}
+
+/// A `Seen` read from a line without copying it, as `MessageRef` is a `Message`; the lines it accepts
+/// are `Seen`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SeenRef<'a> {
+    pub v: u8,
+    #[serde(borrow)]
+    pub kind: Cow<'a, str>,
+    #[serde(borrow)]
+    pub by: Cow<'a, str>,
+    #[serde(borrow)]
+    pub node: Cow<'a, str>,
+    pub ms: i64,
+    #[serde(borrow, deserialize_with = "cow_vec")]
+    pub ids: Vec<Cow<'a, str>>,
+}
+
+impl SeenRef<'_> {
+    /// The owned `Seen`.
+    pub fn into_owned(self) -> Seen {
+        Seen {
+            v: self.v,
+            kind: self.kind.into_owned(),
+            by: self.by.into_owned(),
+            node: self.node.into_owned(),
+            ms: self.ms,
+            ids: self.ids.into_iter().map(Cow::into_owned).collect(),
+        }
+    }
+
+    /// Whether the line is one `Seen::new` could have written: tokens for its names, one to `SEEN_IDS`
     /// message ids.
     pub fn well_formed(&self) -> bool {
         self.v == 2
@@ -495,13 +641,17 @@ pub enum Line {
 }
 
 impl Line {
-    /// The line `text` holds, if it is well formed (`Message::well_formed`, `Seen::well_formed`); a
-    /// line without its `ms` is not.
+    /// The line `text` holds, if it is well formed (`LineRef::parse`).
     pub fn parse(text: &str) -> Option<Line> {
-        if let Ok(m) = serde_json::from_str::<Message>(text) {
-            return m.well_formed().then_some(Line::Message(m));
+        LineRef::parse(text).map(LineRef::into_owned)
+    }
+
+    /// The line as a `LineRef` borrowing every field.
+    pub fn borrowed(&self) -> LineRef<'_> {
+        match self {
+            Line::Message(m) => LineRef::Message(m.borrowed()),
+            Line::Seen(s) => LineRef::Seen(s.borrowed()),
         }
-        serde_json::from_str::<Seen>(text).ok().filter(Seen::well_formed).map(Line::Seen)
     }
 
     pub fn ms(&self) -> i64 {
@@ -527,6 +677,58 @@ impl Line {
     }
 }
 
+/// A `Line` borrowed from the text it was read from: what the windows (`window_for`,
+/// `within_windows`) and the mesh (borg-mesh lines.rs `travels`) read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineRef<'a> {
+    Message(MessageRef<'a>),
+    Seen(SeenRef<'a>),
+}
+
+impl<'a> LineRef<'a> {
+    /// The line `text` holds, if it is well formed (`MessageRef::well_formed`, `SeenRef::well_formed`); a
+    /// line without its `ms` is not. A line parsing as a message is that message or nothing; else it is
+    /// the seen line it parses as, if any. A seen line fails as a message at its `kind`, its second key
+    /// (`SEEN` is no `Kind`), so trying the message first costs a seen line a few bytes and a message
+    /// line nothing.
+    pub fn parse(text: &'a str) -> Option<LineRef<'a>> {
+        match serde_json::from_str::<MessageRef>(text) {
+            Ok(m) => m.well_formed().then_some(LineRef::Message(m)),
+            Err(_) => serde_json::from_str::<SeenRef>(text).ok().filter(SeenRef::well_formed).map(LineRef::Seen),
+        }
+    }
+
+    /// The owned `Line`.
+    pub fn into_owned(self) -> Line {
+        match self {
+            LineRef::Message(m) => Line::Message(m.into_owned()),
+            LineRef::Seen(s) => Line::Seen(s.into_owned()),
+        }
+    }
+
+    pub fn ms(&self) -> i64 {
+        match self {
+            LineRef::Message(m) => m.ms,
+            LineRef::Seen(s) => s.ms,
+        }
+    }
+
+    /// The node the line names: its author's.
+    pub fn node(&self) -> &str {
+        match self {
+            LineRef::Message(m) => &m.node,
+            LineRef::Seen(s) => &s.node,
+        }
+    }
+
+    pub fn message(&self) -> Option<&MessageRef<'a>> {
+        match self {
+            LineRef::Message(m) => Some(m),
+            LineRef::Seen(_) => None,
+        }
+    }
+}
+
 /// Who wrote a line: its sender (or the recipient a `Seen` speaks for) on the node the line names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Author<'a> {
@@ -535,34 +737,48 @@ pub struct Author<'a> {
 }
 
 /// How one sender's tells and asks to one recipient are paced (`window_for`): by acknowledgements
-/// where they can be expected, else never more strictly than 0.5.0 paced them (`V1_RATE_MS`).
+/// where they can be expected, and never so that the sender waits longer than `FLOOR_MS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pace {
-    /// By acknowledgements alone: a session of the sender's own node, of a node that has acknowledged
-    /// one of the sender's messages to it (a `Seen` line of that node lists one), or named without a node.
-    Window,
-    /// By acknowledgements, and also one per `V1_RATE_MS` whatever the window holds: a recipient whose
-    /// reading may write no acknowledgement. A broadcast reaches whoever runs when it is sent, which may
-    /// be nobody, and every one of them may end before its next prompt; the engineer may read where
+    /// By acknowledgements, and also one per `FLOOR_MS` whatever the window holds: every recipient
+    /// but a session of a node that never acknowledged anything. A recipient may end before it reads
+    /// (a session that stopped, a broadcast that reached nobody), and the engineer may read where
     /// nothing acknowledges (`borg top --json`, a drone's `borg top`, the web page outside its messages
-    /// view, a view whose acknowledgement failed).
+    /// view, a view whose acknowledgement failed): its unread messages hold the window until their TTL,
+    /// and the floor keeps the sender from waiting on them.
     Floor,
-    /// By `V1_RATE_MS` alone: a session of another node that has acknowledged none of the sender's
-    /// messages to it. It may run 0.5.0 (`borg/mesh/13`), which writes no `Seen` line and takes one
-    /// message per rate slot (borg-mesh sync.rs `v1_window`); the first `Seen` line of its node that
-    /// lists one puts it under its window. Until then a 0.6 node's session is paced as 0.5.0 paced it.
+    /// By `FLOOR_MS` alone: a session of another node that has acknowledged none of the messages of the
+    /// sender's node (`Seen` lines of that node list none). It may run 0.5.0 (`borg/mesh/13`), which
+    /// writes no `Seen` line and takes one message per `V1_RATE_MS` (borg-mesh sync.rs `v1_window`); the
+    /// first `Seen` line of its node that lists one of them puts it under its window.
     Rate,
 }
 
 impl Pace {
-    /// The pace of `by`'s messages to `to`, whose ids are `sent`, given `lines`. Only lines about those
-    /// messages decide it (the pair's cold start: synced lines, never this node's own record).
-    fn of(to: &Address, by: Author, lines: &[Line], sent: &HashSet<&str>) -> Pace {
-        let acknowledging = |n: &str| lines.iter().any(|l| matches!(l, Line::Seen(s) if s.node == n && s.ids.iter().any(|i| sent.contains(i.as_str()))));
-        match to {
-            Address::All | Address::Local { .. } | Address::Engineer { .. } => Pace::Floor,
-            Address::Session { node: Some(n), .. } if *n != by.node && !acknowledging(n) => Pace::Rate,
-            Address::Session { .. } => Pace::Window,
+    /// The pace of `by`'s messages to `to`, given `lines` and the ids `sent` of the messages of `by`'s
+    /// node to `to`'s side (`Side`). Only synced lines decide it, never this node's own record.
+    fn of(to: &Address, by: Author, lines: &[LineRef], sent: &HashSet<&str>) -> Pace {
+        let acknowledging = |n: &str| lines.iter().any(|l| matches!(l, LineRef::Seen(s) if s.node == n && s.ids.iter().any(|i| sent.contains(i.as_ref()))));
+        match *to {
+            Address::Session { node: Some(n), .. } if n != by.node && !acknowledging(n) => Pace::Rate,
+            _ => Pace::Floor,
+        }
+    }
+}
+
+/// Whom a window's trust is earned with (`window_for`): a node, for its sessions; else the address
+/// itself (a broadcast, the engineer, a session written without its node).
+#[derive(Debug, PartialEq, Eq)]
+enum Side<'a> {
+    Node(&'a str),
+    To(&'a str),
+}
+
+impl<'a> Side<'a> {
+    fn of(to: &'a str) -> Side<'a> {
+        match to.rsplit_once('@') {
+            Some((_, node)) if matches!(Address::parse(to), Some(Address::Session { .. })) => Side::Node(node),
+            _ => Side::To(to),
         }
     }
 }
@@ -573,16 +789,17 @@ pub struct Window {
     /// The sender's tells and asks to the recipient that the lines hold, neither acknowledged nor
     /// expired (one the window did not admit too).
     pub outstanding: usize,
-    /// How many may be outstanding at once: under `Pace::Window`, a message is sent while
-    /// `outstanding < window`.
+    /// How many may be outstanding at once, earned by the sender's node with the recipient's side: a
+    /// message is sent while `outstanding < window` (under `Pace::Floor`), or else from `next` on.
     pub window: usize,
     /// The ids of the sender's tells and asks to the recipient within the window, oldest first.
     pub admitted: Vec<String>,
     /// The ids of the outstanding ones, oldest first.
     pub unread: Vec<String>,
     pub pace: Pace,
-    /// Under `Pace::Floor` and `Pace::Rate`: the stamp from which `V1_RATE_MS` admits the next message,
-    /// that long after the sender's last one (`None`: it admits one now, nothing having been sent).
+    /// The stamp from which the next message is admitted whatever the window holds: `FLOOR_MS` after
+    /// the sender's last one, later only while the mesh would carry no more of the pair's unread ones
+    /// (`within_windows`). `None`: it admits one now, nothing having been sent.
     pub next: Option<i64>,
 }
 
@@ -591,7 +808,6 @@ impl Window {
     pub fn open(&self, at: i64) -> bool {
         let slot = self.next.is_none_or(|n| n <= at);
         match self.pace {
-            Pace::Window => self.outstanding < self.window,
             Pace::Floor => self.outstanding < self.window || slot,
             Pace::Rate => slot,
         }
@@ -611,87 +827,113 @@ fn acknowledges(to: &Address, from: Author, who: Author) -> bool {
     if who == from {
         return false;
     }
-    match to {
-        Address::Session { id, node } => who.by == id && node.as_deref().is_none_or(|n| n == who.node),
+    match *to {
+        Address::Session { id, node } => who.by == id && node.is_none_or(|n| n == who.node),
         Address::All => !is_engineer(who.by),
-        Address::Local { node } => *node == who.node && !is_engineer(who.by),
+        Address::Local { node } => node == who.node && !is_engineer(who.by),
         Address::Engineer { email } => {
-            matches!(Address::parse(who.by), Some(Address::Engineer { email: e }) if email.is_empty() || e == *email)
+            matches!(Address::parse(who.by), Some(Address::Engineer { email: e }) if email.is_empty() || e == email)
         }
     }
 }
 
 /// The window of `by`'s tells and asks to `to` (written as a line writes it) in `lines` at `now`.
 ///
-/// The sender's messages to `to` are replayed by stamp, then id, each id once, so the result does not
-/// depend on the order lines arrived in. The window starts at 1. A message is within it when, at its
-/// stamp, fewer of the earlier ones are outstanding than the window holds: every earlier one the lines
-/// hold, within the window or not (one a writer put past its window is unread at its recipient all the
-/// same). One that is acknowledged, by a `Seen` that lists it or a reply to it (`re`) from a recipient
-/// (`acknowledges`), whatever the acknowledgement's stamp, doubles the window up to `WINDOW_CAP`; one
-/// that passes `TTL_MS` unacknowledged halves it, to 1 at least. An ask is acknowledged as a tell is, so
-/// it leaves the window on its answer (or when shown), or at its TTL. Where no acknowledgement may come
-/// (`Pace`), `V1_RATE_MS` also admits (`Floor`), or alone admits (`Rate`), the first message and then
-/// each one at least that long after the sender's previous one, whatever was acknowledged, so those
-/// admissions depend on the stamps alone and an acknowledgement only ever adds to what is admitted.
-/// Steers and seen lines are not paced. Pure: `send` decides by it alone. Its numbers are protocol, as
-/// every node must replay them alike: 1, the least window that lets a message reach a recipient that
-/// has read none; doubling and halving, so a reading recipient's window grows to the cap within a few
-/// messages and an absent one's falls back as fast.
+/// The window is earned by `by`'s node with `to`'s side (`Side`: the recipient's node for a session,
+/// else the address): every tell and ask of that node's senders to that side is replayed by stamp, then
+/// id, each id once, so the result does not depend on the order lines arrived in. The window starts
+/// at 1. One that is acknowledged, by a `Seen` that lists it or a reply to it (`re`) from a recipient
+/// (`acknowledges`), whatever the acknowledgement's stamp, doubles it up to `WINDOW_CAP`; one that passes
+/// `TTL_MS` unacknowledged halves it, to 1 at least. So the more a node's sessions talk with a side that
+/// reads them, the wider every new pair between them starts, and a side that stops reading closes it as
+/// fast.
+///
+/// Of those, `by`'s messages to `to` are the pair's: one is within the window when, at its stamp, fewer
+/// of the pair's earlier ones are outstanding than the window holds: every earlier one the lines hold,
+/// within the window or not (one a writer put past its window is unread at its recipient all the same).
+/// An ask is acknowledged as a tell is, so it leaves the window on its answer (or when shown), or at its
+/// TTL. Whatever the window holds, `FLOOR_MS` also admits (`Floor`), or alone admits (`Rate`), the
+/// first message and then each one at least that long after the sender's previous one, while fewer
+/// than `WINDOW_CAP` of the pair's outstanding ones are stamped within `V1_RATE_MS` before it, so the
+/// mesh carries it (`within_windows`). Steers and seen lines are not paced. Pure: `send` decides by it
+/// alone, and only `send` does: no node drops a line by it.
 ///
 /// What it admits depends on the earlier lines, which the TTL and the bound remove: a replay later can
 /// admit less than `send` did. So no node decides a line by it after `send`: what every window admits
 /// has a bound that depends on no earlier line (`within_windows`), which the mesh checks instead.
-pub fn window_for(lines: &[Line], by: Author<'_>, to: &str, now: i64) -> Window {
-    let mut sent: Vec<&Message> = lines.iter().filter_map(Line::message).filter(|m| !m.kind.privileged() && m.author() == by && m.to == to).collect();
+pub fn window_for(lines: &[LineRef], by: Author<'_>, to: &str, now: i64) -> Window {
+    let side = Side::of(to);
+    let mut sent: Vec<&MessageRef> =
+        lines.iter().filter_map(LineRef::message).filter(|m| !m.kind.privileged() && m.node == by.node && Side::of(&m.to) == side).collect();
     sent.sort_by(|a, b| (a.ms, &a.id).cmp(&(b.ms, &b.id)));
     sent.dedup_by(|a, b| a.id == b.id);
-    let ids: HashSet<&str> = sent.iter().map(|m| m.id.as_str()).collect();
+    let of: HashMap<&str, &MessageRef> = sent.iter().map(|m| (m.id.as_ref(), *m)).collect();
+    let ids: HashSet<&str> = of.keys().copied().collect();
     let mut acked: HashSet<&str> = HashSet::new();
-    let addr = Address::parse(to);
-    if let Some(addr) = &addr {
-        for l in lines {
-            let (who, of): (Author, Vec<&str>) = match l {
-                Line::Seen(s) => (Author { node: &s.node, by: &s.by }, s.ids.iter().map(String::as_str).filter(|i| ids.contains(i)).collect()),
-                Line::Message(r) if !r.kind.privileged() => match r.re.as_deref() {
-                    Some(re) if ids.contains(re) => (r.author(), vec![re]),
-                    _ => continue,
-                },
-                Line::Message(_) => continue,
-            };
-            if !of.is_empty() && acknowledges(addr, by, who) {
-                acked.extend(of);
+    for l in lines {
+        let (who, those): (Author, Vec<&str>) = match l {
+            LineRef::Seen(s) => (Author { node: &s.node, by: &s.by }, s.ids.iter().map(AsRef::as_ref).filter(|i| ids.contains(i)).collect()),
+            LineRef::Message(r) if !r.kind.privileged() => match r.re.as_deref() {
+                Some(re) if ids.contains(re) => (r.author(), vec![re]),
+                _ => continue,
+            },
+            LineRef::Message(_) => continue,
+        };
+        for id in those {
+            let m = of[id];
+            if Address::parse(&m.to).is_some_and(|a| acknowledges(&a, m.author(), who)) {
+                acked.insert(id);
             }
         }
     }
-    let pace = addr.as_ref().map_or(Pace::Window, |a| Pace::of(a, by, lines, &ids));
+    let pace = Address::parse(to).map_or(Pace::Floor, |a| Pace::of(&a, by, lines, &ids));
     let mut window = 1usize;
+    // The side's outstanding messages (they halve the window at their TTL), and the pair's.
+    let mut unseen: Vec<(i64, &str)> = Vec::new();
     let mut open: Vec<(i64, &str)> = Vec::new();
     let mut admitted = Vec::new();
-    // The sender's previous message to `to`: under `Floor` and `Rate`, `V1_RATE_MS` after it admits.
+    // The sender's previous message to `to`: `FLOOR_MS` after it admits.
     let mut last: Option<i64> = None;
     for m in sent {
-        expire(m.ms, &mut window, &mut open);
-        let rate = pace != Pace::Window && last.is_none_or(|s| m.ms.saturating_sub(s) >= V1_RATE_MS);
-        let within = match pace {
-            Pace::Window => open.len() < window,
-            Pace::Floor => open.len() < window || rate,
-            Pace::Rate => rate,
-        };
-        if within {
-            admitted.push(m.id.clone());
+        expire(m.ms, &mut window, &mut unseen);
+        open.retain(|&(ms, _)| m.ms - ms <= TTL_MS);
+        let mine = m.author() == by && m.to == to;
+        if mine {
+            let floor = floor_at(last, &open, m.ms).is_none_or(|n| n <= m.ms);
+            let within = match pace {
+                Pace::Floor => open.len() < window || floor,
+                Pace::Rate => floor,
+            };
+            if within {
+                admitted.push(m.id.to_string());
+            }
+            last = Some(m.ms);
         }
-        last = Some(m.ms);
         // Admitted or not, as its recipient sees it: one written past its window is unread there too.
-        if acked.contains(m.id.as_str()) {
+        if acked.contains(m.id.as_ref()) {
             window = (window * 2).min(WINDOW_CAP);
         } else {
-            open.push((m.ms, &m.id));
+            unseen.push((m.ms, &m.id));
+            if mine {
+                open.push((m.ms, &m.id));
+            }
         }
     }
-    expire(now, &mut window, &mut open);
-    let next = last.filter(|_| pace != Pace::Window).map(|s| s.saturating_add(V1_RATE_MS));
+    expire(now, &mut window, &mut unseen);
+    open.retain(|&(ms, _)| now - ms <= TTL_MS);
+    let next = floor_at(last, &open, now);
     Window { outstanding: open.len(), window, admitted, unread: open.into_iter().map(|(_, id)| id.to_string()).collect(), pace, next }
+}
+
+/// From when `FLOOR_MS` admits the pair's next message, at `t`, after its last one at `last` with the
+/// outstanding ones `open` (oldest first): `FLOOR_MS` after the last, and no sooner than the mesh would
+/// carry it, fewer than `WINDOW_CAP` of `open` stamped within `V1_RATE_MS` before it (`within_windows`).
+/// `None`: nothing sent, it admits now.
+fn floor_at(last: Option<i64>, open: &[(i64, &str)], t: i64) -> Option<i64> {
+    let last = last?;
+    let recent: Vec<i64> = open.iter().map(|&(ms, _)| ms).filter(|&ms| ms > t.saturating_sub(V1_RATE_MS)).collect();
+    let carried = recent.len().checked_sub(WINDOW_CAP).map_or(i64::MIN, |i| recent[i].saturating_add(V1_RATE_MS));
+    Some(last.saturating_add(FLOOR_MS).max(carried))
 }
 
 /// The ids of the tells and asks of `lines` within what every window admits (`window_for`): each one
@@ -700,20 +942,20 @@ pub fn window_for(lines: &[Line], by: Author<'_>, to: &str, now: i64) -> Window 
 ///
 /// No window lets more through: of the messages a sender wrote within one `V1_RATE_MS`, the last unread
 /// one went with fewer than `WINDOW_CAP` unread before it (its window held them all, `outstanding`), or
-/// by the rate alone, `V1_RATE_MS` after the sender's previous message. So it never refuses what `send`
-/// wrote, and a writer that ignores its window gets at most this through. It reads only a message, its
+/// by the floor, which admits only while fewer than `WINDOW_CAP` are unread within that span. So it
+/// never refuses what `send` wrote, and a writer that ignores its window gets at most this through. It reads only a message, its
 /// pair's later ones and their acknowledgements, never an earlier line, so the TTL and the bound, which
 /// cut the oldest first, never take a line out of it while the line is held (an acknowledgement cut by
 /// its node's share before the message it lists aside), and it is a function of the lines alone: every
 /// node holding the same lines decides the same, whatever order they arrived in (borg-mesh sync.rs
 /// `window`, on offer and on receipt).
-pub fn within_windows(lines: &[Line]) -> HashSet<&str> {
+pub fn within_windows<'l>(lines: &'l [LineRef]) -> HashSet<&'l str> {
     type Pair<'a> = (&'a str, &'a str, &'a str);
-    let talk = || lines.iter().filter_map(Line::message).filter(|m| !m.kind.privileged());
+    let talk = || lines.iter().filter_map(LineRef::message).filter(|m| !m.kind.privileged());
     // Ids are hashes of a line's fields, so an id names one message; a forged collision may name more.
-    let mut of: HashMap<&str, Vec<&Message>> = HashMap::new();
+    let mut of: HashMap<&str, Vec<&MessageRef>> = HashMap::new();
     for m in talk() {
-        let same = of.entry(m.id.as_str()).or_default();
+        let same = of.entry(m.id.as_ref()).or_default();
         if !same.contains(&m) {
             same.push(m);
         }
@@ -721,15 +963,15 @@ pub fn within_windows(lines: &[Line]) -> HashSet<&str> {
     let mut acked: HashSet<&str> = HashSet::new();
     for l in lines {
         let (who, ids): (Author, Vec<&str>) = match l {
-            Line::Seen(s) => (Author { node: &s.node, by: &s.by }, s.ids.iter().map(String::as_str).collect()),
-            Line::Message(r) if !r.kind.privileged() => match r.re.as_deref() {
+            LineRef::Seen(s) => (Author { node: &s.node, by: &s.by }, s.ids.iter().map(AsRef::as_ref).collect()),
+            LineRef::Message(r) if !r.kind.privileged() => match r.re.as_deref() {
                 Some(re) => (r.author(), vec![re]),
                 None => continue,
             },
-            Line::Message(_) => continue,
+            LineRef::Message(_) => continue,
         };
         for id in ids {
-            let recipient = |m: &&Message| Address::parse(&m.to).is_some_and(|a| acknowledges(&a, m.author(), who));
+            let recipient = |m: &&MessageRef| Address::parse(&m.to).is_some_and(|a| acknowledges(&a, m.author(), who));
             if of.get(id).is_some_and(|ms| ms.iter().any(recipient)) {
                 acked.insert(id);
             }
@@ -738,7 +980,7 @@ pub fn within_windows(lines: &[Line]) -> HashSet<&str> {
     let mut unread: HashMap<Pair, Vec<i64>> = HashMap::new();
     for (id, ms) in &of {
         for m in ms.iter().filter(|_| !acked.contains(id)) {
-            unread.entry((&m.node, &m.by, &m.to)).or_default().push(m.ms);
+            unread.entry((m.node.as_ref(), m.by.as_ref(), m.to.as_ref())).or_default().push(m.ms);
         }
     }
     for v in unread.values_mut() {
@@ -748,7 +990,7 @@ pub fn within_windows(lines: &[Line]) -> HashSet<&str> {
     for (id, ms) in &of {
         for m in ms {
             let later = unread
-                .get(&(m.node.as_str(), m.by.as_str(), m.to.as_str()))
+                .get(&(m.node.as_ref(), m.by.as_ref(), m.to.as_ref()))
                 .map_or(0, |v| v.partition_point(|&t| t < m.ms.saturating_add(V1_RATE_MS)) - v.partition_point(|&t| t < m.ms));
             if acked.contains(id) || later <= WINDOW_CAP {
                 out.insert(*id);
@@ -778,8 +1020,8 @@ pub enum SendError {
     /// A field `well_formed` refuses: every reader would drop the line.
     Malformed,
     /// The sender's window to this recipient is full (`window_for`): `outstanding` of its messages there
-    /// are unread, as many as `window` allows, or, under `pace` `Rate` or `Floor`, `V1_RATE_MS` admits
-    /// the next one in `wait` ms. Also a message stamped before one already admitted that it would push
+    /// are unread, as many as `window` allows (under `pace` `Floor`), and the floor admits the next one
+    /// in `wait` ms (`FLOOR_MS`). Also a message stamped before one already admitted that it would push
     /// out (a clock that stepped back, a send that took the lock later). `to` as a command names it
     /// (`Address::name`).
     Window {
@@ -888,8 +1130,8 @@ impl fmt::Display for SendError {
             SendError::Malformed => write!(f, "a sender or recipient holds characters a message cannot carry, or --re names no message id"),
             SendError::Window { to, pace: Pace::Rate, wait: Some(w), .. } => write!(
                 f,
-                "{to}'s node has acknowledged no message yet, as a node on 0.5.0 never does: one message to it per {}; send again in {}",
-                ago(V1_RATE_MS),
+                "{to}'s node has acknowledged no message from this machine yet, as a node on 0.5.0 never does: one message to it per {}; send again in {}",
+                ago(FLOOR_MS),
                 ago(*w)
             ),
             SendError::Window { to, outstanding, window, wait, .. } => {
@@ -1010,7 +1252,7 @@ pub fn send(home: &Path, m: Message, now: i64) -> Result<Message, SendError> {
 /// its last session with that node); `None` when unknown, or for an address that names no other node.
 fn reads_at(home: &Path, to: &Address) -> Option<u8> {
     match to {
-        Address::Session { node: Some(n), .. } => crate::presence::reads(home).get(n).copied(),
+        Address::Session { node: Some(n), .. } => crate::presence::reads(home).get(*n).copied(),
         _ => None,
     }
 }
@@ -1094,7 +1336,7 @@ fn paced(text: &str, m: &Message, to: &Address) -> Decided {
     if m.kind.privileged() {
         return Ok(None);
     }
-    let held: Vec<Line> = text.lines().filter_map(Line::parse).chain([Line::Message(m.clone())]).collect();
+    let held: Vec<LineRef> = text.lines().filter_map(LineRef::parse).chain([LineRef::Message(m.borrowed())]).collect();
     let before = window_for(&held[..held.len() - 1], m.author(), &m.to, m.ms);
     let w = window_for(&held, m.author(), &m.to, m.ms);
     let still: HashSet<&str> = w.admitted.iter().map(String::as_str).collect();
@@ -1182,13 +1424,20 @@ enum Class {
     LocalSteer,
 }
 
-/// A line's `ms`, its node and its class, if it is a JSON object with an `ms` (a newer format keeps
-/// its place in the log).
-fn meta(line: &str) -> Option<(i64, String, Class)> {
-    let v = serde_json::from_str::<Value>(line).ok()?;
-    let kind = v.get("kind").and_then(Value::as_str);
-    let here = v.get("to").and_then(Value::as_str).and_then(Address::parse).is_some_and(|a| matches!(a, Address::Local { .. }));
-    let class = match kind {
+/// What `bound` reads of a line: its `ms`, its node and its class.
+struct Meta<'a> {
+    ms: i64,
+    node: Cow<'a, str>,
+    class: Class,
+}
+
+/// A line's `Meta`, if it is a JSON object with an `ms` (a newer format keeps its place in the log). Read
+/// as a `Value` reads it (jsonl.rs `pick`), so whatever the fields hold, a line is kept or cut as
+/// before: a `kind` or `to` that is no string is no kind or address, a field given twice counts last.
+fn meta(line: &str) -> Option<Meta<'_>> {
+    let [kind, to, node, ms] = jsonl::pick(line, ["kind", "to", "node", "ms"])?;
+    let here = to.as_str().and_then(Address::parse).is_some_and(|a| matches!(a, Address::Local { .. }));
+    let class = match kind.as_str() {
         Some(SEEN) => Class::Seen,
         k if k.and_then(Kind::parse).is_some_and(Kind::privileged) => {
             if here {
@@ -1200,8 +1449,11 @@ fn meta(line: &str) -> Option<(i64, String, Class)> {
         _ if here => Class::LocalTalk,
         _ => Class::Talk,
     };
-    let node = v.get("node").and_then(Value::as_str).unwrap_or_default().to_string();
-    Some((v.get("ms")?.as_i64()?, node, class))
+    let node = match node {
+        jsonl::Scalar::Str(n) => n,
+        _ => Cow::Borrowed(""),
+    };
+    Some(Meta { ms: ms.as_i64()?, node, class })
 }
 
 /// What the log keeps of `lines` (its lines in order) at `now`: none past `TTL_MS` (with steer.rs
@@ -1212,15 +1464,15 @@ fn meta(line: &str) -> Option<(i64, String, Class)> {
 /// lines that travel. The kept lines stay byte for byte, in their order. Returns them and how many the
 /// bytes bound cut. `send` and the mesh (borg-mesh sync.rs `store_lines`) bound the log by it alone.
 pub fn bound<'a>(lines: impl IntoIterator<Item = &'a str>, now: i64) -> (Vec<&'a str>, usize) {
-    let v: Vec<(&str, i64, String, Class)> =
-        lines.into_iter().filter_map(|l| meta(l).map(|(ms, node, class)| (l, ms, node, class))).filter(|x| !expired(x.1, now)).collect();
+    let v: Vec<(&str, i64, Cow<str>, Class)> =
+        lines.into_iter().filter_map(|l| meta(l).map(|m| (l, m.ms, m.node, m.class))).filter(|x| !expired(x.1, now)).collect();
     let mut order: Vec<usize> = (0..v.len()).collect();
     order.sort_by(|&a, &b| (v[b].1, v[b].0).cmp(&(v[a].1, v[a].0)));
     let mut used: HashMap<(&str, Class), usize> = HashMap::new();
     let gone: HashSet<usize> = order
         .into_iter()
         .filter(|&i| {
-            let u = used.entry((v[i].2.as_str(), v[i].3)).or_default();
+            let u = used.entry((v[i].2.as_ref(), v[i].3)).or_default();
             *u += v[i].0.len() + 1;
             *u > MEMBER_BYTES
         })
@@ -1457,7 +1709,7 @@ impl Change {
     #[must_use]
     pub fn rewrite(from: &str, to: &str, now: i64) -> Change {
         let kept: HashSet<&str> = to.lines().collect();
-        let spent = |l: &str| meta(l).is_none_or(|(ms, ..)| expired(ms, now));
+        let spent = |l: &str| meta(l).is_none_or(|m| expired(m.ms, now));
         if from.lines().filter(|l| !kept.contains(l)).all(spent) { Change::Expired(to.len()) } else { Change::Cut }
     }
 }
@@ -1838,10 +2090,10 @@ fn engineer_of(cwd: &str) -> (String, String) {
 ///
 /// # Errors
 /// What names no one, or more than one.
-fn address(drones: &[top::Drone], msgs: &[Message], here: &str, raw: &str, re: Option<&str>) -> Result<Address, SendError> {
+fn address<'a>(drones: &'a [top::Drone], msgs: &'a [Message], here: &'a str, raw: &'a str, re: Option<&str>) -> Result<Address<'a>, SendError> {
     let t = raw.trim();
-    let at = |id: &str, node: &str| Address::Session { id: id.into(), node: Some(node.into()) };
-    let this = || Address::Local { node: here.into() };
+    let at = |id: &'a str, node: &'a str| Address::Session { id, node: Some(node) };
+    let this = || Address::Local { node: here };
     if t.eq_ignore_ascii_case(LOCAL) {
         return Ok(this());
     }
@@ -1856,7 +2108,7 @@ fn address(drones: &[top::Drone], msgs: &[Message], here: &str, raw: &str, re: O
         }
         Some(Address::Session { id, node: Some(n) }) => {
             let known = n == here || drones.iter().any(|d| d.node == n) || msgs.iter().any(|m| m.node == n);
-            return if known { Ok(at(&id, &n)) } else { Err(SendError::Address(format!("{t:?}: no drone or message here names node {n}"))) };
+            return if known { Ok(at(id, n)) } else { Err(SendError::Address(format!("{t:?}: no drone or message here names node {n}"))) };
         }
         _ => {}
     }
@@ -2181,10 +2433,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// `lines` as the windows read them.
+    fn refs(lines: &[Line]) -> Vec<LineRef<'_>> {
+        lines.iter().map(Line::borrowed).collect()
+    }
+
     impl Message {
         fn clone_with_text(&self, text: &str) -> Message {
             let mut x = Message { text: text.into(), ..self.clone() };
-            x.id = id_of(&x);
+            x.id = id_of(&x.borrowed());
             x
         }
     }
@@ -2197,7 +2454,7 @@ mod tests {
         let good = m("s1", ALL, 5);
         let line = |x: &Message| serde_json::to_string(x).unwrap_or_default();
         let rehash = |mut x: Message| {
-            x.id = id_of(&x);
+            x.id = id_of(&x.borrowed());
             x
         };
         let mut wrong_types = serde_json::to_value(&good).expect("a value");
@@ -2301,12 +2558,12 @@ mod tests {
     fn an_address_parses_in_one_place_and_writes_back() {
         let cases = [
             ("all", Address::All),
-            ("local@n1", Address::Local { node: "n1".into() }),
-            ("engineer", Address::Engineer { email: String::new() }),
-            ("engineer:e@x", Address::Engineer { email: "e@x".into() }),
-            ("s1", Address::Session { id: "s1".into(), node: None }),
-            ("s1@abc", Address::Session { id: "s1".into(), node: Some("abc".into()) }),
-            ("engineering-42", Address::Session { id: "engineering-42".into(), node: None }),
+            ("local@n1", Address::Local { node: "n1" }),
+            ("engineer", Address::Engineer { email: "" }),
+            ("engineer:e@x", Address::Engineer { email: "e@x" }),
+            ("s1", Address::Session { id: "s1", node: None }),
+            ("s1@abc", Address::Session { id: "s1", node: Some("abc") }),
+            ("engineering-42", Address::Session { id: "engineering-42", node: None }),
         ];
         for (raw, want) in cases {
             assert_eq!(Address::parse(raw).as_ref(), Some(&want), "{raw}");
@@ -2315,10 +2572,10 @@ mod tests {
         for bad in ["", "s1@", "@n1", "all@n1", "local@", "a b", "-x", "s1;id"] {
             assert_eq!(Address::parse(bad), None, "{bad}");
         }
-        let a = Address::Session { id: "s1".into(), node: Some("n1".into()) };
+        let a = Address::Session { id: "s1", node: Some("n1") };
         assert!(a.reaches("n1", "s1") && !a.reaches("n2", "s1") && !a.reaches("n1", "s2"));
         assert_eq!(a.name(), "s1");
-        assert_eq!((Address::All.name(), Address::Local { node: "n1".into() }.name()), (COLLECTIVE.into(), LOCAL.into()), "the words a command takes back");
+        assert_eq!((Address::All.name(), Address::Local { node: "n1" }.name()), (COLLECTIVE.into(), LOCAL.into()), "the words a command takes back");
     }
 
     /// 0.4.0's `parse` and `reaches`, kept to check the claim: it reads `local@<node>` as the session
@@ -2485,7 +2742,7 @@ mod tests {
         assert_eq!((kept.len(), cut), (2, 0), "both kept");
         assert_eq!(bound(lines.iter().map(String::as_str), 1_000 + TTL_MS + crate::steer::SLACK_MS + 1).0, [lines[1].as_str()], "the ask past its TTL");
         let parsed: Vec<Line> = lines.iter().filter_map(|l| Line::parse(l)).collect();
-        assert_eq!(window_for(&parsed, ask.author(), &ask.to, 3_000).outstanding, 0, "out of the window on its answer");
+        assert_eq!(window_for(&refs(&parsed), ask.author(), &ask.to, 3_000).outstanding, 0, "out of the window on its answer");
     }
 
     /// `bound` keeps of each member's lines of each class the newest that fit `MEMBER_BYTES`, in their
@@ -2877,7 +3134,7 @@ mod tests {
 
     /// `window_for` over `lines` for s1 on node A to `to` at `now`: (outstanding, window, admitted texts).
     fn w(lines: &[Line], to: &str, now: i64) -> (usize, usize, usize) {
-        let w = window_for(lines, Author { node: "A", by: "s1" }, to, now);
+        let w = window_for(&refs(lines), Author { node: "A", by: "s1" }, to, now);
         (w.outstanding, w.window, w.admitted.len())
     }
 
@@ -2959,11 +3216,11 @@ mod tests {
         let mut l: Vec<Line> = ms.iter().chain([&tie]).cloned().map(Line::Message).collect();
         l.push(seen_by_at("B", "s2", 900, &[&ms[0], &tie]));
         l.push(seen_by_at("B", "s2", 1030, &[&ms[2]]));
-        let forward = window_for(&l, Author { node: "A", by: "s1" }, to, 5000);
+        let forward = window_for(&refs(&l), Author { node: "A", by: "s1" }, to, 5000);
         l.reverse();
-        let backward = window_for(&l, Author { node: "A", by: "s1" }, to, 5000);
+        let backward = window_for(&refs(&l), Author { node: "A", by: "s1" }, to, 5000);
         l.swap(1, 4);
-        let swapped = window_for(&l, Author { node: "A", by: "s1" }, to, 5000);
+        let swapped = window_for(&refs(&l), Author { node: "A", by: "s1" }, to, 5000);
         assert_eq!((&forward, &forward), (&backward, &swapped));
         let first = if (tie.ms, &tie.id) < (ms[0].ms, &ms[0].id) { &tie } else { &ms[0] };
         assert_eq!(forward.admitted.first(), Some(&first.id), "by stamp, then id");
@@ -3096,12 +3353,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A session of a node that has acknowledged none of the sender's messages (0.5.0 never does) is
-    /// paced as 0.5.0 paced it, one message per `V1_RATE_MS`, read or not; the first `Seen` line of that
-    /// node listing one puts it under its window. A session of the sender's own node is always under its
-    /// window.
+    /// A session of a node that has acknowledged none of this machine's messages (0.5.0 never does) is
+    /// paced by `FLOOR_MS` alone, read or not. The first `Seen` line of that node listing a message of
+    /// this machine, from any of its sessions to any of that node's, puts it under its window, and every
+    /// acknowledgement between the two machines widens the window a new pair starts with.
     #[test]
-    fn a_session_of_a_node_that_acknowledges_nothing_is_paced_as_0_5_0_paced_it() {
+    fn a_node_that_acknowledges_nothing_is_paced_by_the_floor_and_trust_carries_across_sessions() {
         let home = tmp("v1-pace");
         let here = node(&home);
         let old = "cd".repeat(32);
@@ -3109,36 +3366,50 @@ mod tests {
         let to = format!("s9@{old}");
         let at = |to: &str, ms: i64, text: &str| Message::new(TELL, &from("s1", &here), to, None, ms, text);
         let first = send(&home, at(&to, t, "first"), t).expect("first");
-        let err = send(&home, at(&to, t + 60_000, "second"), t + 60_000).expect_err("within one rate slot");
-        assert!(matches!(err, SendError::Window { pace: Pace::Rate, wait: Some(w), .. } if w == V1_RATE_MS - 60_000), "{err:?}");
-        assert!(err.to_string().contains("acknowledged no message yet") && err.to_string().ends_with("send again in 9m"), "{err}");
-        send(&home, at(&to, t + V1_RATE_MS, "second"), t + V1_RATE_MS).expect("a slot later, though unread: as 0.5.0 sent it");
-        let w = window_for(&lines(&home), Author { node: &here, by: "s1" }, &to, t + V1_RATE_MS + 1);
-        assert_eq!((w.pace, w.admitted.len(), w.open(t + V1_RATE_MS + 1), w.open(t + 2 * V1_RATE_MS)), (Pace::Rate, 2, false, true));
-        // Another pair's acknowledgement from that node is not this pair's: still 0.5.0's rate.
-        let other = serde_json::to_string(&Seen::new("s5", &old, t + V1_RATE_MS + 2, &["m000000000000"])).expect("a line");
+        let err = send(&home, at(&to, t + 1_000, "second"), t + 1_000).expect_err("within one floor");
+        assert!(matches!(err, SendError::Window { pace: Pace::Rate, wait: Some(w), .. } if w == FLOOR_MS - 1_000), "{err:?}");
+        assert!(err.to_string().contains("acknowledged no message from this machine yet") && err.to_string().ends_with("send again in 59s"), "{err}");
+        send(&home, at(&to, t + FLOOR_MS, "second"), t + FLOOR_MS).expect("a minute later, though unread");
+        let w = window_for(&refs(&lines(&home)), Author { node: &here, by: "s1" }, &to, t + FLOOR_MS + 1);
+        assert_eq!((w.pace, w.admitted.len(), w.open(t + FLOOR_MS + 1), w.open(t + 2 * FLOOR_MS)), (Pace::Rate, 2, false, true));
+        // A `Seen` line of that node listing no message of this machine: still the floor alone.
+        let other = serde_json::to_string(&Seen::new("s5", &old, t + FLOOR_MS + 2, &["m000000000000"])).expect("a line");
         learn::append_line(&path(&home), &other).expect("the log");
-        let soon = t + V1_RATE_MS + 1_000;
+        let soon = t + FLOOR_MS + 1_000;
         assert!(matches!(send(&home, at(&to, soon, "third"), soon), Err(SendError::Window { pace: Pace::Rate, .. })));
-        // s9 acknowledges the first: its window paces it now, doubled, with the second unread.
-        let seen_first = serde_json::to_string(&Seen::new("s9", &old, t + V1_RATE_MS + 3, &[&first.id])).expect("a line");
+        // Another session of this machine is read there: the node acknowledges, and its trust is the
+        // pair's too. The window, doubled once, holds the pair's two unread.
+        let hello = send(&home, Message::new(TELL, &from("s2", &here), &format!("s7@{old}"), None, t, "hello"), t).expect("hello");
+        let seen_hello = serde_json::to_string(&Seen::new("s7", &old, t + FLOOR_MS + 3, &[&hello.id])).expect("a line");
+        learn::append_line(&path(&home), &seen_hello).expect("the log");
+        let err = send(&home, at(&to, soon, "third"), soon).expect_err("two unread, window two");
+        assert!(matches!(err, SendError::Window { pace: Pace::Floor, outstanding: 2, window: 2, wait: Some(w), .. } if w == FLOOR_MS - 1_000), "{err:?}");
+        // s9 acknowledges the first: the window doubles again, to four, with the second unread.
+        let seen_first = serde_json::to_string(&Seen::new("s9", &old, t + FLOOR_MS + 4, &[&first.id])).expect("a line");
         learn::append_line(&path(&home), &seen_first).expect("the log");
-        send(&home, at(&to, soon, "third"), soon).expect("within one rate slot, but its window holds two");
-        let err = send(&home, at(&to, soon + 1, "fourth"), soon + 1).expect_err("two unread");
-        assert!(matches!(err, SendError::Window { pace: Pace::Window, outstanding: 2, window: 2, wait: None, .. }), "{err:?}");
-        // This node's own session: its window, from the first message.
+        for (i, text) in ["third", "fourth", "fifth"].into_iter().enumerate() {
+            send(&home, at(&to, soon + i as i64, text), soon + i as i64).expect("within the window");
+        }
+        let err = send(&home, at(&to, soon + 3, "sixth"), soon + 3).expect_err("four unread");
+        assert!(matches!(err, SendError::Window { pace: Pace::Floor, outstanding: 4, window: 4, .. }), "{err:?}");
+        send(&home, at(&to, soon + 2 + FLOOR_MS, "sixth"), soon + 2 + FLOOR_MS).expect("a minute after the last, unread or not");
+        // A new session of this machine starts with the trust the two machines earned, not at one.
+        let w = window_for(&refs(&lines(&home)), Author { node: &here, by: "s4" }, &format!("s8@{old}"), soon + 3 + FLOOR_MS);
+        assert_eq!((w.pace, w.window, w.outstanding), (Pace::Floor, 4, 0), "{w:?}");
+        // This node's own session: the window, and the floor a minute after.
         let mine = format!("s3@{here}");
         send(&home, at(&mine, t, "one"), t).expect("one");
-        let err = send(&home, at(&mine, t + V1_RATE_MS, "two"), t + V1_RATE_MS).expect_err("one unread");
-        assert!(matches!(err, SendError::Window { pace: Pace::Window, outstanding: 1, .. }), "{err:?}");
+        let err = send(&home, at(&mine, t + 1_000, "two"), t + 1_000).expect_err("one unread");
+        assert!(matches!(err, SendError::Window { pace: Pace::Floor, outstanding: 1, .. }), "{err:?}");
+        send(&home, at(&mine, t + FLOOR_MS, "two"), t + FLOOR_MS).expect("a session that ended holds its sender a minute, not a week");
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A broadcast reaches whoever runs when it is sent, maybe nobody, and the engineer may read where
-    /// nothing acknowledges: one that nobody acknowledges holds its sender for one `V1_RATE_MS` slot,
-    /// not a week; an acknowledgement still opens the window at once.
+    /// A recipient that may never acknowledge (a broadcast that reached nobody, the engineer reading
+    /// where nothing acknowledges) holds its sender for one `FLOOR_MS` at most, not a week; an
+    /// acknowledgement still opens the window at once.
     #[test]
-    fn a_recipient_that_may_never_acknowledge_holds_its_sender_one_rate_slot_at_most() {
+    fn a_recipient_that_may_never_acknowledge_holds_its_sender_one_floor_at_most() {
         let home = tmp("floor");
         let here = node(&home);
         let engineer = Sender { by: "engineer:e@x".into(), name: "e@x".into(), harness: "terminal".into(), node: here.clone() };
@@ -3148,13 +3419,13 @@ mod tests {
         for (by, to) in [(&engineer, ALL), (&engineer, local.as_str()), (&session, "engineer:e@x")] {
             let at = |ms: i64, text: &str| Message::new(TELL, by, to, None, ms, text);
             send(&home, at(t, "deploy freeze till 3pm"), t).expect("sent, though nobody runs to read it");
-            let err = send(&home, at(t + 1_000, "and the lexer"), t + 1_000).expect_err("within one rate slot");
+            let err = send(&home, at(t + 1_000, "and the lexer"), t + 1_000).expect_err("within one floor");
             assert!(matches!(err, SendError::Window { pace: Pace::Floor, outstanding: 1, .. }), "{to}: {err:?}");
-            assert!(err.to_string().ends_with("or in 9m"), "{to}: {err}");
-            send(&home, at(t + V1_RATE_MS, "freeze lifted"), t + V1_RATE_MS).expect("a slot later, not a week");
+            assert!(err.to_string().ends_with("or in 59s"), "{to}: {err}");
+            send(&home, at(t + FLOOR_MS, "freeze lifted"), t + FLOOR_MS).expect("a minute later, not a week");
         }
         assert!(
-            send(&home, Message::new(TELL, &session, "engineer:e@x", None, t + V1_RATE_MS + 1, "x"), t)
+            send(&home, Message::new(TELL, &session, "engineer:e@x", None, t + FLOOR_MS + 1, "x"), t)
                 .is_err_and(|e| e.to_string().contains("the engineer reads one (`borg inbox`)"))
         );
         // A session shown a broadcast acknowledges it: the next goes at once.
@@ -3163,6 +3434,26 @@ mod tests {
         assert!(deliver(&home, caps("claude"), "prompt", &ev("s3"), Some(t - 1), t + 1, None).is_some(), "s3 ran when it was sent");
         send(&home, Message::new(TELL, &s2, ALL, None, t + 2, "two"), t + 2).expect("acknowledged: the window doubled");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The floor admits only what the mesh carries (`within_windows`): with `WINDOW_CAP` of the pair's
+    /// messages unread within one `V1_RATE_MS`, it waits until the oldest of them leaves that span.
+    #[test]
+    fn the_floor_never_admits_more_than_the_mesh_carries() {
+        let by = Author { node: "A", by: "s1" };
+        let to = "s2@A";
+        let t = 10 * TTL_MS;
+        let s1 = Sender { by: "s1".into(), name: "s1".into(), harness: "claude".into(), node: "A".into() };
+        let m = |i: i64| Line::Message(Message::new(TELL, &s1, to, None, t + i, &format!("m{i}")));
+        // `WINDOW_CAP` unread a second apart: within one span the floor admitted one after another.
+        let lines: Vec<Line> = (0..WINDOW_CAP as i64).map(|i| m(i * 1_000)).collect();
+        let last = t + (WINDOW_CAP as i64 - 1) * 1_000;
+        let w = window_for(&refs(&lines), by, to, last + FLOOR_MS);
+        assert_eq!(w.next, Some(t + V1_RATE_MS), "{w:?}");
+        assert!(!w.open(last + FLOOR_MS) && w.open(t + V1_RATE_MS));
+        let mut more = lines.clone();
+        more.push(m(V1_RATE_MS));
+        assert!(within_windows(&refs(&more)).len() == more.len(), "what the floor admits, the mesh carries");
     }
 
     /// The window is decided before the log's lock and holds under it only for the log it was decided
@@ -3399,5 +3690,160 @@ mod tests {
         assert_eq!(pick(Vec::new(), &[(7, "opencode")], &ds), Ok(None), "another opencode process: a terminal");
         assert!(pick(vars(), &[], &[]).is_err(), "nothing tells them apart: --from");
         assert_eq!(pick(vec![("c1".into(), "claude")], &[], &[]), Ok(Some(("c1".into(), "claude"))));
+    }
+
+    /// Lines at the edges of what a message line can be, built from well-formed ones.
+    fn message_edges() -> Vec<String> {
+        let tell = Message::new(TELL, &from("s1", "n1"), "s2@n2", None, 5_000, "say \"hi\"\nthen\tgo é \u{1F600}");
+        let veto = Message::new(Kind::Veto, &from("s1", "n1"), "s2@n2", None, 5_000, "no");
+        let seen = Seen::new("s2", "n2", 6_000, &[&tell.id]);
+        let t = serde_json::to_string(&tell).expect("a line");
+        let v = serde_json::to_string(&veto).expect("a line");
+        let s = serde_json::to_string(&seen).expect("a line");
+        let positional = |m: &Message| json!([m.v, m.id, m.kind, m.by, m.name, m.harness, m.node, m.to, m.re, m.ms, m.text]).to_string();
+        let mut out = vec![
+            t.clone(),
+            v.clone(),
+            s.clone(),
+            String::new(),
+            " ".into(),
+            "{}".into(),
+            "[]".into(),
+            "null".into(),
+            t[..t.len() - 1].to_string(),
+            s[..s.len() / 2].to_string(),
+            format!(" {t} "),
+            format!("{t}x"),
+            positional(&tell),
+            positional(&veto),
+            json!([2, "seen", "s2", "n2", 6_000, [tell.id]]).to_string(),
+            json!(["seen"]).to_string(),
+            json!(["tell"]).to_string(),
+            t.replacen("\"kind\":\"tell\"", "\"kind\":{\"tell\":null}", 1),
+            v.replacen("\"kind\":\"veto\"", "\"kind\":{\"veto\":null}", 1),
+            t.replacen("\"kind\":\"tell\"", "\"kind\":\"t\\u0065ll\"", 1),
+            s.replacen("\"kind\":\"seen\"", "\"kind\":\"se\\u0065n\"", 1),
+            t.replacen("\"kind\":\"tell\"", "\"kind\":\"tell\",\"kind\":\"tell\"", 1),
+            s.replacen("\"kind\":\"seen\"", "\"kind\":\"seen\",\"kind\":\"seen\"", 1),
+            s.replacen("\"kind\":\"seen\"", "\"kind\":\"tell\",\"kind\":\"seen\"", 1),
+            t.replacen("\"kind\":\"tell\"", "\"kind\":7", 1),
+            t.replacen("\"kind\":\"tell\"", "\"kind\":\"seen\"", 1),
+            s.replacen("\"kind\":\"seen\"", "\"kind\":\"tell\"", 1),
+            t.replacen("\"kind\":\"tell\",", "", 1),
+            t.replacen("\"by\":\"s1\"", "\"by\":\"\\u00731\"", 1),
+            t.replacen("\"node\":\"n1\"", "\"node\":\"n\\u0031\"", 1),
+            s.replacen(&format!("\"{}\"", tell.id), &format!("\"\\u006d{}\"", &tell.id[1..]), 1),
+            t.replacen("\"ms\":5000", "\"ms\":5000.0", 1),
+            t.replacen("\"ms\":5000", "\"ms\":99999999999999999999", 1),
+            t.replacen("\"v\":1", "\"v\":300", 1),
+            t.replacen("\"v\":1", "\"v\":4294967297", 1),
+            t.replacen("\"to\":\"s2@n2\"", "\"to\":\"local@n1\"", 1),
+            t.replacen("\"to\":\"s2@n2\"", "\"to\":5", 1),
+            t.replacen("\"to\":\"s2@n2\"", "\"to\":\"s2@n2\",\"to\":\"local@n1\"", 1),
+            t.replacen("\"node\":\"n1\"", "\"node\":null", 1),
+            t.replacen("\"node\":\"n1\"", "\"node\":\"n1\",\"node\":\"n9\"", 1),
+            t.replacen("{", "{\"x\":\"\\ud800\",", 1),
+            t.replacen("{", "{\"x\":1e400,", 1),
+            t.replacen("{", "{\"re\":null,", 1),
+            s.replacen("{", "{\"x\":[1,{\"y\":2}],", 1),
+        ];
+        out.push(t.replacen("\"ms\":5000", "\"ms\":5000,\"ms\":6000", 1));
+        out
+    }
+
+    /// Line::parse as it was: a message first, a seen line only for what is no message, with the old
+    /// `well_formed`.
+    fn old_parse(text: &str) -> Option<Line> {
+        let old_well_formed = |m: &Message| {
+            [&m.by, &m.harness, &m.node].into_iter().all(|f| token(f))
+                && Address::parse(&m.to).is_some_and(|a| m.kind.may_address(&a) && !matches!(a, Address::Local { node } if node != m.node))
+                && m.re.as_deref().is_none_or(is_id)
+                && m.name == label(&m.name)
+                && (!m.text.is_empty() || m.kind.switch())
+                && match m.v {
+                    1 => cut_v1(&m.text) == m.text,
+                    2 => clean(&m.text) == (2, m.text.clone()),
+                    _ => false,
+                }
+                && m.id == id_of(&m.borrowed())
+        };
+        let seen_well_formed =
+            |s: &Seen| s.v == 2 && s.kind == SEEN && token(&s.by) && token(&s.node) && (1..=SEEN_IDS).contains(&s.ids.len()) && s.ids.iter().all(|i| is_id(i));
+        if let Ok(m) = serde_json::from_str::<Message>(text) {
+            return old_well_formed(&m).then_some(Line::Message(m));
+        }
+        serde_json::from_str::<Seen>(text).ok().filter(seen_well_formed).map(Line::Seen)
+    }
+
+    /// Oracle: the borrowed parse accepts exactly the lines the old one did, and
+    /// reads the same message or seen line from each, on every line of a real store and at the edges.
+    #[test]
+    fn the_borrowed_parse_accepts_what_the_old_one_did() {
+        let lines: Vec<String> = message_edges().into_iter().chain(jsonl::store_lines(&[FILE, "lessons.jsonl", "outcomes-team.jsonl"])).collect();
+        let mut parsed = 0;
+        for l in &lines {
+            let old = old_parse(l);
+            parsed += usize::from(old.is_some());
+            assert_eq!(LineRef::parse(l).map(LineRef::into_owned), old, "{l}");
+            assert_eq!(Line::parse(l), old, "{l}");
+            if let Some(old) = old {
+                assert_eq!(old.borrowed().into_owned(), old, "a borrowed view of an owned line is that line");
+            }
+        }
+        assert!(parsed >= 5, "the edges hold well-formed lines of both kinds: {parsed}");
+        let object_kind = &message_edges()[17];
+        assert_eq!(jsonl::pick(object_kind, ["kind"]), Some([jsonl::Scalar::Other]), "the {{\"tell\": null}} edge is in");
+        assert!(Line::parse(object_kind).is_some(), "and still a message, as Kind reads it");
+    }
+
+    /// `meta` as it was: a full `Value`.
+    fn old_meta(line: &str) -> Option<(i64, String, Class)> {
+        let v = serde_json::from_str::<Value>(line).ok()?;
+        let kind = v.get("kind").and_then(Value::as_str);
+        let here = v.get("to").and_then(Value::as_str).and_then(Address::parse).is_some_and(|a| matches!(a, Address::Local { .. }));
+        let class = match kind {
+            Some(SEEN) => Class::Seen,
+            k if k.and_then(Kind::parse).is_some_and(Kind::privileged) => {
+                if here {
+                    Class::LocalSteer
+                } else {
+                    Class::Steer
+                }
+            }
+            _ if here => Class::LocalTalk,
+            _ => Class::Talk,
+        };
+        let node = v.get("node").and_then(Value::as_str).unwrap_or_default().to_string();
+        Some((v.get("ms")?.as_i64()?, node, class))
+    }
+
+    /// Oracle: `bound` reads each line's stamp, node and class as the `Value` it built did, so it keeps
+    /// and cuts the same lines.
+    #[test]
+    fn bound_reads_a_line_as_value_did() {
+        let lines: Vec<String> = message_edges().into_iter().chain(jsonl::store_lines(&[FILE, "reasoning.jsonl", "lessons.jsonl"])).collect();
+        for l in &lines {
+            assert_eq!(meta(l).map(|m| (m.ms, m.node.into_owned(), m.class)), old_meta(l), "{l}");
+        }
+        let old_bound = |now: i64| {
+            let v: Vec<(&str, i64, String, Class)> =
+                lines.iter().filter_map(|l| old_meta(l).map(|(ms, node, class)| (l.as_str(), ms, node, class))).filter(|x| !expired(x.1, now)).collect();
+            let mut order: Vec<usize> = (0..v.len()).collect();
+            order.sort_by(|&a, &b| (v[b].1, v[b].0).cmp(&(v[a].1, v[a].0)));
+            let mut used: HashMap<(&str, Class), usize> = HashMap::new();
+            let gone: HashSet<usize> = order
+                .into_iter()
+                .filter(|&i| {
+                    let u = used.entry((v[i].2.as_str(), v[i].3)).or_default();
+                    *u += v[i].0.len() + 1;
+                    *u > MEMBER_BYTES
+                })
+                .collect();
+            let kept: Vec<&str> = v.iter().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, x)| x.0).collect();
+            (kept, gone.len())
+        };
+        for now in [0, 5_000, learn::now_ms()] {
+            assert_eq!(bound(lines.iter().map(String::as_str), now), old_bound(now), "at {now}");
+        }
     }
 }

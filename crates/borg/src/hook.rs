@@ -974,7 +974,18 @@ fn record_verdicts(session: &str, repo: &str, at: &str, pending: &[predict::Pend
         for ((kind, channel), lessons) in counted {
             outcome::count_result(
                 &home,
-                &outcome::Outcome { kind: kind.into(), session: session.into(), lessons, ms, repo: repo.into(), channel: channel.into(), ..Default::default() },
+                // Today's judge: without its version an ignore reads as an old judge's and is not counted
+                // (outcome.rs `ambiguous`).
+                &outcome::Outcome {
+                    kind: kind.into(),
+                    session: session.into(),
+                    lessons,
+                    ms,
+                    repo: repo.into(),
+                    channel: channel.into(),
+                    judge: predict::JUDGE_VERSION,
+                    ..Default::default()
+                },
             );
         }
     }

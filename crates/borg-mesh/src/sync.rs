@@ -66,25 +66,28 @@
 //! **Joining** (invite.rs) is a second ALPN: a node that is not a member yet presents a signed
 //! invite to the admin that issued it, and gets the membership history back (`join`, `admit`).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use borg::collective::{self, Config, Route};
-use borg::msg::{Line, V1_RATE_MS};
+use borg::msg::{LineRef, V1_RATE_MS};
 use iroh::Endpoint;
 use iroh::endpoint::{Builder, ConnectOptions, Connection, ConnectionError, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
 use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::addr::{self, Hint, Relay, Target};
+use crate::cache::{self, Cache};
 use crate::identity::Identity;
 use crate::invite::{self, Invite, Ticket};
-use crate::lines::{self, Hash, REASONING, SYNCED, logs};
+use crate::lines::{self, Hash, REASONING, SYNCED, Snapshot, log_name, logs};
 use crate::membership::Membership;
-use crate::origin::{self, Origin};
+use crate::origin::{self, Index, Origin};
 use crate::recon::{self, Recon};
 use crate::{from_hex, peers, to_hex};
 use crate::{live, steer};
@@ -311,6 +314,36 @@ pub struct Signed {
     pub origin: Origin,
 }
 
+/// A `Signed` that borrows the line from what a session read, to be written into a frame without
+/// copying it; its origin is written back from the index (origin.rs `Index::origin`) for the lines a
+/// frame gives, or borrowed. Serialises as `Signed` does: the same fields, in the same order.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignedRef<'a> {
+    pub line: &'a str,
+    pub origin: Cow<'a, Origin>,
+}
+
+impl Signed {
+    /// The line and its origin borrowed.
+    pub fn borrowed(&self) -> SignedRef<'_> {
+        SignedRef { line: &self.line, origin: Cow::Borrowed(&self.origin) }
+    }
+}
+
+impl SignedRef<'_> {
+    /// The owned `Signed`.
+    pub fn into_owned(self) -> Signed {
+        Signed { line: self.line.to_string(), origin: self.origin.into_owned() }
+    }
+}
+
+/// `Msg::Lines` as a session sends it: borrowed lines (`SignedRef`), the same bytes on the wire.
+#[derive(Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+enum MsgRef<'a> {
+    Lines { lines: &'a [SignedRef<'a>] },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Msg {
@@ -403,6 +436,8 @@ pub struct Node {
     endpoint: Endpoint,
     /// Serialises this node's writes to its store (sessions run concurrently under `serve`).
     store: Mutex<()>,
+    /// The store's logs and origin records as its sessions last read them (cache.rs), shared by them.
+    cache: Cache,
     /// Whether peers are told where this node listens (false for a one-shot dial).
     announce: bool,
     /// How peers are reached (addr.rs), fixed when the endpoint was built.
@@ -485,6 +520,7 @@ impl Node {
             me,
             endpoint,
             store: Mutex::new(()),
+            cache: Cache::default(),
             announce: true,
             relay,
             legacy: Mutex::default(),
@@ -582,7 +618,7 @@ impl Node {
         let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let m = members(&self.home)?;
         steer::enforce(&self.home, &m, borg::learn::now_ms());
-        origin::apply_if_new(&self.home, &m)
+        origin::apply_if_new(&self.home, &m, &self.cache)
     }
 
     /// Stamps the lines this node's hooks wrote since the last call as its own (`Store::stamp`).
@@ -592,7 +628,7 @@ impl Node {
 
     /// This node's store, as a merge writes it (`Store`).
     fn local(&self) -> Store<'_> {
-        Store { home: &self.home, lock: &self.store, me: &self.me }
+        Store { home: &self.home, lock: &self.store, me: &self.me, cache: &self.cache }
     }
 
     /// Records a completed session with `remote` on `alpn` that started at `started` (borg presence.rs
@@ -770,7 +806,7 @@ impl Node {
             let Msg::Welcome { docs } = swap(true, &mut tx, &mut rx, ask).await? else { return Err("protocol: expected welcome".into()) };
             let _ = tx.finish();
             let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let installed = match origin::join(home, name, &docs) {
+            let installed = match origin::join(home, name, &docs, &self.cache) {
                 Ok((m, _)) => m,
                 // Joined before (a lost answer, a second ticket): the held version already lists us.
                 Err(e) => Membership::load(home)?.filter(|m| m.role_of(&me).is_some()).ok_or(e)?,
@@ -901,22 +937,21 @@ impl Node {
         let mine = {
             let _w = self.store.lock().unwrap_or_else(|e| e.into_inner());
             let (held, _) = Membership::adopt(home, &docs).unwrap_or((mine, false));
-            report.quarantined += origin::apply_if_new(home, &held)?;
+            report.quarantined += origin::apply_if_new(home, &held, &self.cache)?;
             steer::enforce(home, &held, borg::learn::now_ms()); // a node that lost the right to steer, or an expired steer, stops here
             held
         };
         if mine.role_of(remote).is_none() {
             return Err(format!("{remote} is no longer a member of {}", mine.collective));
         }
-        self.stamp()?;
-        let origins = origin::load(home);
+        self.local().stamp()?;
 
         // Lessons, and the other synced logs: reconcile with everyone. The playbooks: followed, nothing kept.
         for file in synced(alpn) {
             if file == PLAYBOOKS {
                 self.skip(dialler, tx, rx, (remote.to_string(), file.to_string(), 0)).await?;
             } else {
-                self.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, alpn == V13_ALPN, &mut report).await?;
+                self.reconcile(dialler, tx, rx, &home.join(file), &mine, alpn == V13_ALPN, &mut report).await?;
             }
         }
 
@@ -932,27 +967,36 @@ impl Node {
 
         // Reasoning: each author hands its excerpts to their replicas.
         let path = home.join(REASONING);
-        let held = lines::read(&path);
-        let set = origin::admitted(held.clone(), &origins, &mine);
-        self.gate()?;
         let me = self.me.public();
-        let offer: BTreeSet<Hash> =
-            set.keys().filter(|h| origins.get(*h).is_some_and(|o| o.key == me) && replicas(h, &mine, &me).iter().any(|k| k == remote)).copied().collect();
-        let Msg::Offer { hashes } = swap(dialler, tx, rx, Msg::Offer { hashes: offer.iter().map(|h| to_hex(h)).collect() }).await? else {
-            return Err("protocol: expected offer".into());
-        };
-        let offered: BTreeSet<Hash> = hashes.iter().map(|h| from_hex::<32>(h)).collect::<Result<_, _>>()?;
-        let want: BTreeSet<Hash> = offered.into_iter().filter(|h| !held.contains_key(h)).collect();
-        let Msg::Want { hashes } = swap(dialler, tx, rx, Msg::Want { hashes: want.iter().map(|h| to_hex(h)).collect() }).await? else {
-            return Err("protocol: expected want".into());
-        };
-        let wanted: Vec<Hash> = hashes.iter().map(|h| from_hex::<32>(h)).collect::<Result<Vec<_>, _>>()?.into_iter().filter(|h| offer.contains(h)).collect();
-        let give = signed(&set, &origins, wanted.iter());
-        report.replicated += give.len();
-        self.gate()?; // again just before lines leave
-        let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
-            return Err("protocol: expected lines".into());
-        };
+        let (got, want) = {
+            // The records are held only between awaits: a store of another session copies what is held.
+            let held = self.cache.log(&path);
+            let (set, offer) = {
+                let origins = self.cache.origins(home);
+                let set = origin::admitted(&held, &origins, &mine);
+                let offer: BTreeSet<Hash> =
+                    set.keys().filter(|h| origins.signer(h).is_some_and(|(k, _)| k == me) && replicas(h, &mine, &me).any(|k| k == remote)).copied().collect();
+                (set, offer)
+            };
+            self.gate()?;
+            let Msg::Offer { hashes } = swap(dialler, tx, rx, Msg::Offer { hashes: offer.iter().map(|h| to_hex(h)).collect() }).await? else {
+                return Err("protocol: expected offer".into());
+            };
+            let offered: BTreeSet<Hash> = hashes.iter().map(|h| from_hex::<32>(h)).collect::<Result<_, _>>()?;
+            let want: BTreeSet<Hash> = offered.into_iter().filter(|h| !held.contains(h)).collect();
+            let Msg::Want { hashes } = swap(dialler, tx, rx, Msg::Want { hashes: want.iter().map(|h| to_hex(h)).collect() }).await? else {
+                return Err("protocol: expected want".into());
+            };
+            let wanted: Vec<Hash> =
+                hashes.iter().map(|h| from_hex::<32>(h)).collect::<Result<Vec<_>, _>>()?.into_iter().filter(|h| offer.contains(h)).collect();
+            let give: Vec<SignedRef> = signed(|h| set.get(h).copied(), &self.cache.origins(home), wanted.iter()).collect();
+            report.replicated += give.len();
+            self.gate()?; // again just before lines leave
+            let Msg::Lines { lines: got } = swap(dialler, tx, rx, MsgRef::Lines { lines: &give }).await? else {
+                return Err("protocol: expected lines".into());
+            };
+            (got, want)
+        }; // what was read is let go before the store grows, so the cache extends it in place
         self.store_lines(&path, got, &want, &mine, Some(remote), &mut report)?;
 
         // Excerpts by commit: any holder answers, whoever wrote them.
@@ -960,16 +1004,22 @@ impl Node {
         let Msg::Ask { commits: theirs } = swap(dialler, tx, rx, Msg::Ask { commits: ask.clone() }).await? else {
             return Err("protocol: expected ask".into());
         };
-        let held = lines::read(&path);
-        let set = origin::admitted(held.clone(), &origin::load(home), &mine);
-        let answer: Vec<&Hash> = set.iter().filter(|(_, l)| about(&theirs, l)).map(|(h, _)| h).take(MAX_ASK).collect();
-        let give = signed(&set, &origin::load(home), answer.into_iter());
-        report.answered += give.len();
-        self.gate()?; // again just before lines leave
-        let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
-            return Err("protocol: expected lines".into());
+        let (got, want) = {
+            let held = self.cache.log(&path);
+            let give: Vec<SignedRef> = {
+                let origins = self.cache.origins(home);
+                let set = origin::admitted(&held, &origins, &mine);
+                let answer = set.iter().filter(|(_, l)| about(&theirs, l)).map(|(h, _)| h).take(MAX_ASK);
+                signed(|h| set.get(h).copied(), &origins, answer).collect()
+            };
+            report.answered += give.len();
+            self.gate()?; // again just before lines leave
+            let Msg::Lines { lines: got } = swap(dialler, tx, rx, MsgRef::Lines { lines: &give }).await? else {
+                return Err("protocol: expected lines".into());
+            };
+            let want: BTreeSet<Hash> = got.iter().filter(|s| about(&ask, &s.line)).map(|s| lines::hash(&s.line)).filter(|h| !held.contains(h)).collect();
+            (got, want)
         };
-        let want: BTreeSet<Hash> = got.iter().filter(|s| about(&ask, &s.line)).map(|s| lines::hash(&s.line)).filter(|h| !held.contains_key(h)).collect();
         self.store_lines(&path, got, &want, &mine, None, &mut report)?;
 
         // Live: presence, ephemeral (live.rs).
@@ -986,7 +1036,9 @@ impl Node {
 
     /// One log reconciled with the peer (step 3): the admitted set, recon rounds, then the lines each
     /// side lacks, signed, stored when their origin verifies and is admitted. `v1`: the peer speaks
-    /// `V13_ALPN` (`offered`).
+    /// `V13_ALPN` (`offered`). The log and the records come from the node's cache, and are let go before
+    /// what the peer gave is stored, so the cache extends them in place; the records are held only while
+    /// a frame is written, never across an await, as a store of another session's copies what is held.
     #[allow(clippy::too_many_arguments)] // one step of a session: its stream, its log, what it checks against
     async fn reconcile(
         &self,
@@ -994,31 +1046,33 @@ impl Node {
         tx: &mut SendStream,
         rx: &mut RecvStream,
         path: &Path,
-        origins: &HashMap<Hash, Origin>,
         mine: &Membership,
         v1: bool,
         report: &mut Report,
     ) -> Result<(), String> {
-        let set = offered(path, origins, mine, borg::learn::now_ms(), v1);
-        self.gate()?; // read first, then gate: a line written after a switch to local is never sent
-        let mut r = Recon::new(&set);
-        loop {
-            let m = r.message();
-            let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else {
-                return Err("protocol: expected a reconciliation round".into());
-            };
-            if r.absorb(&m, round)? {
-                break;
+        let (got, want) = {
+            let set = offered_from(&self.cache, &self.home, path, mine, borg::learn::now_ms(), v1);
+            self.gate()?; // read first, then gate: a line written after a switch to local is never sent
+            let mut r = Recon::new(set.set());
+            loop {
+                let m = r.message();
+                let Msg::Round { round } = swap(dialler, tx, rx, Msg::Round { round: m.clone() }).await? else {
+                    return Err("protocol: expected a reconciliation round".into());
+                };
+                if r.absorb(&m, round)? {
+                    break;
+                }
             }
-        }
-        (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
-        let give = frame(&set, origins, r.give.iter());
-        report.sent += give.len();
-        self.gate()?; // again just before lines leave
-        let Msg::Lines { lines: got } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else {
-            return Err("protocol: expected lines".into());
+            (report.rounds, report.fps, report.hashes) = (report.rounds + r.cost.rounds, report.fps + r.cost.fps, report.hashes + r.cost.hashes);
+            let give = frame_ref(&set, &self.cache.origins(&self.home), r.give.iter());
+            report.sent += give.len();
+            self.gate()?; // again just before lines leave
+            let Msg::Lines { lines: got } = swap(dialler, tx, rx, MsgRef::Lines { lines: &give }).await? else {
+                return Err("protocol: expected lines".into());
+            };
+            (got, std::mem::take(&mut r.want))
         };
-        self.store_lines(path, got, &r.want, mine, None, report)
+        self.store_lines(path, got, &want, mine, None, report)
     }
 
     /// One log a peer reconciles and this node no longer keeps (the `PLAYBOOKS` step, or a log of a
@@ -1078,7 +1132,7 @@ impl Node {
         &self,
         path: &Path,
         keep: BTreeMap<Hash, Signed>,
-        decided: (&str, Stored),
+        decided: (Arc<Snapshot>, Stored),
         m: &Membership,
         now: i64,
         report: &mut Report,
@@ -1087,8 +1141,8 @@ impl Node {
     }
 }
 
-/// One node's store as a session reads and writes it: where it is, the lock its writes take, and the
-/// key that stamps its lines. `Node` stamps and merges through it alone; built over a store directly,
+/// One node's store as a session reads and writes it: where it is, the lock its writes take, the key
+/// that stamps its lines, and what its sessions read of it (cache.rs). `Node` stamps and merges through it alone; built over a store directly,
 /// it does the same without an endpoint, for simulation and tests (tests/two_nodes_cli.rs), so they
 /// run the merge a session runs.
 pub struct Store<'a> {
@@ -1098,15 +1152,25 @@ pub struct Store<'a> {
     pub lock: &'a Mutex<()>,
     /// This node's key: its own lines are stamped with it, and steering it receives admitted under it.
     pub me: &'a Identity,
+    /// The store's logs and origin records as last read (`Node`'s, shared by its sessions): every read
+    /// and write here goes through it.
+    pub cache: &'a Cache,
 }
 
 impl Store<'_> {
-    /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs).
+    /// Stamps the lines this node's hooks wrote since the last call as its own (origin.rs), and settles
+    /// the logs they wrote to (`settled`). Returns how many lines it stamped.
     pub fn stamp(&self) -> Result<usize, String> {
         let _w = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // Fresh outcomes first, so they are stamped in the same step.
         borg::outcome::publish(self.home);
-        origin::stamp(self.home, self.me, &logs(self.home), borg::learn::now_ms())
+        let logs = logs(self.home);
+        let done = self.cache.stamp(self.home, self.me, &logs, borg::learn::now_ms())?;
+        // Settles the versioned logs this node's hooks wrote to: a hook may append an older version after
+        // a merge settled the log, and a merge that brings nothing new no longer settles it, so it is
+        // settled where the hook's line is first seen. Not the messages: they hold no versions.
+        done.grown.iter().filter(|p| log_name(p) != borg::msg::FILE).try_for_each(|p| self.cache.settle(p))?;
+        Ok(done.new)
     }
 
     /// Stores the lines that were asked for, whose origin verifies and is admitted (and, for
@@ -1136,18 +1200,23 @@ impl Store<'_> {
                 report.rejected += 1;
             }
         }
+        if file != borg::msg::FILE && keep.is_empty() {
+            return Ok(()); // nothing to store: no lock, no read of the origins or the log
+        }
         let _w = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if file != borg::msg::FILE {
-            let known = origin::load(self.home);
-            origin::append(self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
-            report.received += lines::merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
+            let known = self.cache.origins(self.home);
+            let records: Vec<&Origin> = keep.iter().filter(|(h, _)| !known.contains(h)).map(|(_, s)| &s.origin).collect();
+            drop(known);
+            self.cache.record(self.home, records)?;
+            report.received += self.cache.merge(path, &keep.into_values().map(|s| s.line).collect::<Vec<_>>())?;
             return Ok(());
         }
         // Messages: decided over the log as read now (`stored`), before its lock, so a hook's `ack` or a
         // `send` never waits on the window's arithmetic.
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let decided = stored(&text, &keep, now);
-        let a = self.store_messages(path, keep, (&text, decided), m, now, report)?;
+        let held = self.cache.log(path);
+        let decided = stored(held.text(), &keep, now);
+        let a = self.store_messages(path, keep, (held, decided), m, now, report)?;
         (report.steered, report.dropped) = (report.steered + a.new, report.dropped + a.dropped);
         drop(_w);
         // Outside both locks: it rereads the log and the outcomes, and a `send` must not wait on it.
@@ -1157,18 +1226,20 @@ impl Store<'_> {
         Ok(())
     }
 
-    /// Writes what `stored` decided over the message log at `path` as it read (`decided`: that text, and
-    /// what it takes of the offered `keep`), under the log's lock (borg msg.rs `send` and `ack` take it
+    /// Writes what `stored` decided over the message log at `path` as it read (`decided`: that snapshot,
+    /// and what it takes of the offered `keep`), under the log's lock (borg msg.rs `send` and `ack` take it
     /// too). A log that a `send` or an `ack` changed since is decided again first, so a line written in
     /// between counts in the window and is never lost to a rewrite. A decision that writes nothing takes
     /// no lock: it holds as of its read. The write is recorded for the log's readers (msg.rs `wrote`): seen
     /// lines alone leave its talk, so they make no hook or waiter read it again. Then the privileged lines
-    /// taken are admitted (steer.rs `admit`).
+    /// taken are admitted (steer.rs `admit`). The log is read through the cache, which a rewrite leaves to
+    /// read it whole again and an append extends, under the log's lock; a rewrite is decided over the file
+    /// read whole there, as a write the cache's stat cannot tell would otherwise be reverted.
     fn store_messages(
         &self,
         path: &Path,
         mut keep: BTreeMap<Hash, Signed>,
-        decided: (&str, Stored),
+        decided: (Arc<Snapshot>, Stored),
         m: &Membership,
         now: i64,
         report: &mut Report,
@@ -1178,21 +1249,36 @@ impl Store<'_> {
             report.rejected += first.refused;
             return Ok(steer::Admitted::default());
         }
-        let known = origin::load(self.home);
-        borg::live::locked(path, || {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            let d = if text == read { first } else { stored(&text, &keep, now) };
+        borg::live::locked(path, move || {
+            let held = self.cache.log(path);
+            // The cache hands back the very snapshot read when the log is unchanged: one held is never
+            // extended in place.
+            let mut d = if Arc::ptr_eq(&held, &read) { first } else { stored(held.text(), &keep, now) };
+            drop(read);
+            let whole;
+            let mut text = held.text();
+            if d.body.is_some() {
+                whole = cache::whole(path).1;
+                if whole != text {
+                    d = stored(&whole, &keep, now);
+                }
+                text = &whole;
+            }
             keep.retain(|h, _| d.taken.contains(h));
             report.rejected += d.refused;
             let new: Vec<borg::msg::Message> = keep.values().filter_map(|s| serde_json::from_str(&s.line).ok()).collect();
-            origin::append(self.home, &keep.iter().filter(|(h, _)| !known.contains_key(*h)).map(|(_, s)| s.origin.clone()).collect::<Vec<_>>())?;
+            let known = self.cache.origins(self.home);
+            let records: Vec<&Origin> = keep.iter().filter(|(h, _)| !known.contains(h)).map(|(_, s)| &s.origin).collect();
+            drop(known);
+            self.cache.record(self.home, records)?;
             let io = |e: std::io::Error| format!("{}: {e}", path.display());
             let before = borg::msg::mark_of(path);
-            let talk = keep.values().any(|s| !matches!(Line::parse(&s.line), Some(Line::Seen(_))));
+            let talk = keep.values().any(|s| !matches!(LineRef::parse(&s.line), Some(LineRef::Seen(_))));
             match &d.body {
                 Some(body) => {
                     borg::steer::rewrite(path, body).map_err(io)?;
-                    borg::msg::wrote(path, before.as_deref(), borg::msg::Change::rewrite(&text, body, now), talk);
+                    self.cache.forget(path);
+                    borg::msg::wrote(path, before.as_deref(), borg::msg::Change::rewrite(text, body, now), talk);
                 }
                 None if keep.is_empty() => {}
                 None => {
@@ -1206,6 +1292,8 @@ impl Store<'_> {
                         .and_then(|mut f| std::io::Write::write_all(&mut f, out.as_bytes()))
                         .map_err(io)?;
                     borg::msg::wrote(path, before.as_deref(), borg::msg::Change::Appended(out.len()), talk);
+                    drop(held);
+                    self.cache.log(path);
                 }
             }
             report.received += keep.len();
@@ -1238,7 +1326,7 @@ fn stored(text: &str, keep: &BTreeMap<Hash, Signed>, now: i64) -> Stored {
     let paced: Vec<(&Hash, &Signed)> = if new.is_empty() {
         new
     } else {
-        let all: BTreeMap<Hash, String> = file.iter().map(|(h, l)| (*h, l.to_string())).chain(new.iter().map(|(h, s)| (**h, s.line.clone()))).collect();
+        let all: BTreeMap<Hash, &str> = file.iter().map(|(h, l)| (*h, *l)).chain(new.iter().map(|(h, s)| (**h, s.line.as_str()))).collect();
         let w = window(&all);
         new.into_iter().filter(|(h, _)| w.contains(*h)).collect()
     };
@@ -1249,29 +1337,80 @@ fn stored(text: &str, keep: &BTreeMap<Hash, Signed>, now: i64) -> Stored {
     Stored { refused: lacked - taken.len(), taken, body }
 }
 
-/// The lines of the log at `path` this node offers at `now`: `travelling`, and for the messages those
-/// within their `window`; to a `V13_ALPN` peer (`v1`) only what 0.5.0's window takes of them
-/// (`v1_window`). Public for simulation and tests: it is the set a session reconciles (step 3).
-pub fn offered(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64, v1: bool) -> BTreeMap<Hash, String> {
-    let mut set = travelling(path, origins, m, now);
-    if log_name(path) == borg::msg::FILE {
-        let w = window(&lines::read(path));
-        set.retain(|h, _| w.contains(h));
-        if v1 {
-            let w = v1_window(&set, v1_share(m));
-            set.retain(|h, _| w.contains(h));
-        }
-    }
-    set
+/// The lines a node offers of one log (`offered`): ranges of its snapshot, which they keep alive, so a
+/// session borrows every line it gives instead of copying it.
+pub struct Offered {
+    log: Arc<Snapshot>,
+    set: Arc<BTreeMap<Hash, Range<usize>>>,
 }
 
-/// The lines of the log at `path` that are admitted and may travel under their origin at `now`
-/// (lines.rs `travels`).
-fn travelling(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64) -> BTreeMap<Hash, String> {
+impl Offered {
+    /// The offered lines' hashes, as a reconciliation reads them (recon.rs `Recon::new`).
+    pub fn set(&self) -> &BTreeMap<Hash, Range<usize>> {
+        &self.set
+    }
+
+    /// The offered line `h` names.
+    pub fn get(&self, h: &Hash) -> Option<&str> {
+        self.set.get(h).map(|r| self.log.line(r))
+    }
+
+    pub fn contains_key(&self, h: &Hash) -> bool {
+        self.set.contains_key(h)
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// The offered lines by hash, in hash order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Hash, &str)> {
+        self.set.iter().map(|(h, r)| (h, self.log.line(r)))
+    }
+}
+
+/// The lines of the log at `path`, held as `log`, this node offers at `now`: those admitted that may
+/// travel under their origin (lines.rs `travels`), and for the messages those within their `window`; to
+/// a `V13_ALPN` peer (`v1`) only what 0.5.0's window takes of them (`v1_window`). Public for simulation
+/// and tests: it is the set a session reconciles (step 3). Each message line is parsed once.
+pub fn offered(path: &Path, log: Arc<Snapshot>, origins: &Index, m: &Membership, now: i64, v1: bool) -> Offered {
     let file = log_name(path);
-    let mut set = origin::admitted(lines::read(path), origins, m);
-    set.retain(|h, l| origins.get(h).is_some_and(|o| lines::travels(file, l, &o.key, now)));
-    set
+    // The key a line travels under, if its origin is admitted.
+    let key = |h: &Hash| origins.signer(h).filter(|(k, ms)| m.admits(k, *ms)).map(|(k, _)| k);
+    if file != borg::msg::FILE {
+        let set = log.ranges().filter(|(h, r)| key(h).is_some_and(|k| lines::travels(file, log.line(r), k, now))).map(|(h, r)| (*h, r.clone())).collect();
+        return Offered { log, set: Arc::new(set) };
+    }
+    let (held, all): (Vec<(&Hash, &Range<usize>)>, Vec<LineRef>) = log.ranges().filter_map(|(h, r)| LineRef::parse(log.line(r)).map(|x| ((h, r), x))).unzip();
+    let mut set: BTreeMap<Hash, Range<usize>> = held
+        .into_iter()
+        .zip(&all)
+        .zip(paced(&all))
+        .filter(|(((h, _), l), within)| *within && key(h).is_some_and(|k| lines::message_travels(l, k, now)))
+        .map(|(((h, r), _), _)| (*h, r.clone()))
+        .collect();
+    drop(all);
+    if v1 {
+        let w = v1_window(set.iter().map(|(h, r)| (*h, log.line(r))), v1_share(m));
+        set.retain(|h, _| w.contains(h));
+    }
+    Offered { log, set: Arc::new(set) }
+}
+
+/// `offered` as a node's session takes it, from its cache: a log whose lines travel whatever the time
+/// (lines.rs `travels`: all but the messages and the absorbs) offers what the membership admits, which the
+/// cache decides only for what changed since (cache.rs `Cache::admitted`); the messages and the absorbs,
+/// bounded and few, are decided whole.
+fn offered_from(cache: &Cache, home: &Path, path: &Path, m: &Membership, now: i64, v1: bool) -> Offered {
+    let (log, origins) = (cache.log(path), cache.origins(home));
+    if [borg::msg::FILE, lines::ABSORBED].contains(&log_name(path)) {
+        return offered(path, log, &origins, m, now, v1);
+    }
+    Offered { set: cache.admitted(path, &log, &origins, m), log }
 }
 
 /// The message lines of `set` within their pacing: every steer and seen line, and each tell or ask
@@ -1282,18 +1421,18 @@ fn travelling(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now:
 /// and a node that missed a line takes it later, its acknowledged predecessors pruned or not. It depends
 /// on the lines alone, so nodes holding the same lines take the same, whatever order they arrived in. A
 /// line that is not well formed is outside.
-fn window(set: &BTreeMap<Hash, String>) -> BTreeSet<Hash> {
-    let (hashes, all): (Vec<Hash>, Vec<Line>) = set.iter().filter_map(|(h, l)| Line::parse(l).map(|x| (*h, x))).unzip();
-    let admitted = borg::msg::within_windows(&all);
-    hashes
-        .into_iter()
-        .zip(&all)
-        .filter(|(_, l)| match l {
-            Line::Seen(_) => true,
-            Line::Message(m) => m.kind.privileged() || admitted.contains(m.id.as_str()),
-        })
-        .map(|(h, _)| h)
-        .collect()
+fn window(set: &BTreeMap<Hash, impl AsRef<str>>) -> BTreeSet<Hash> {
+    let (hashes, all): (Vec<Hash>, Vec<LineRef>) = set.iter().filter_map(|(h, l)| LineRef::parse(l.as_ref()).map(|x| (*h, x))).unzip();
+    hashes.into_iter().zip(paced(&all)).filter_map(|(h, within)| within.then_some(h)).collect()
+}
+
+/// For each of `lines`, the well-formed lines of a message log, whether it is within its pacing (`window`).
+fn paced<'l>(lines: &'l [LineRef]) -> impl Iterator<Item = bool> + 'l {
+    let admitted = borg::msg::within_windows(lines);
+    lines.iter().map(move |l| match l {
+        LineRef::Seen(_) => true,
+        LineRef::Message(m) => m.kind.privileged() || admitted.contains(m.id.as_ref()),
+    })
 }
 
 /// How many messages of one node a `V13_ALPN` peer keeps: an equal share of `V1_KEEP` per member (its
@@ -1315,11 +1454,9 @@ fn v1_slot_held(messages: &[borg::msg::Message], from: &borg::msg::Sender, now: 
 /// seen line), per node, sender and recipient one tell or ask per `V1_RATE_MS` (the earliest wins; a
 /// steer is not paced), then for conversation and for steers apart the `per_node` newest per node and
 /// the `V1_KEEP` newest of those. Ordered by (ms, hash), as that peer orders them.
-fn v1_window(set: &BTreeMap<Hash, String>, per_node: usize) -> BTreeSet<Hash> {
-    let mut all: Vec<(i64, Hash, borg::msg::Message)> = set
-        .iter()
-        .filter_map(|(h, l)| serde_json::from_str::<borg::msg::Message>(l).ok().filter(|m| m.v == 1 && m.well_formed()).map(|m| (m.ms, *h, m)))
-        .collect();
+fn v1_window<'a>(set: impl Iterator<Item = (Hash, &'a str)>, per_node: usize) -> BTreeSet<Hash> {
+    let mut all: Vec<(i64, Hash, borg::msg::Message)> =
+        set.filter_map(|(h, l)| serde_json::from_str::<borg::msg::Message>(l).ok().filter(|m| m.v == 1 && m.well_formed()).map(|m| (m.ms, h, m))).collect();
     all.sort_by_key(|x| (x.0, x.1));
     let mut last: HashMap<(String, String, String), i64> = HashMap::new();
     let mut paced: Vec<(Hash, String, bool)> = Vec::new();
@@ -1351,11 +1488,6 @@ fn v1_window(set: &BTreeMap<Hash, String>, per_node: usize) -> BTreeSet<Hash> {
         })
         .map(|(h, _, _)| h)
         .collect()
-}
-
-/// A log's file name, as lines.rs `SYNCED` lists it.
-fn log_name(path: &Path) -> &str {
-    path.file_name().and_then(|f| f.to_str()).unwrap_or_default()
 }
 
 /// The goals a 0.3.0 peer reconciles after naming `ids` while this node names none, in its order: the
@@ -1394,9 +1526,14 @@ fn heard(home: &Path, key: &str, listen: Option<String>, relay: Option<String>, 
 
 /// Whether a line of reasoning.jsonl is about one of `commits`: an excerpt by its `commit`, a
 /// decision → fix link record (borg notes/links.rs) by either side, so fetching the fix brings it too.
+/// Read as a `Value` reads them (borg jsonl.rs `pick`: a field that is no string is no commit, one given
+/// twice counts last), borrowed from the line; nothing asked, nothing read.
 fn about(commits: &[String], line: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
-    ["commit", "fix"].iter().filter_map(|k| v.get(k)?.as_str()).any(|c| asked(commits, c))
+    if commits.is_empty() {
+        return false;
+    }
+    let Some(fields) = borg::jsonl::pick(line, ["commit", "fix"]) else { return false };
+    fields.iter().filter_map(borg::jsonl::Scalar::as_str).any(|c| asked(commits, c))
 }
 
 /// Whether `commit` is one of `asked` (full ids, or abbreviations of at least 7 characters).
@@ -1408,15 +1545,19 @@ fn asked(asked: &[String], commit: &str) -> bool {
 /// (`offered`) named by `hashes`, the ones the peer lacks (`Recon::give`), each with its signed origin,
 /// as many as the frame's budget takes (`within_budget`). Public for simulation and tests, which hand
 /// it to the peer instead of a stream.
-pub fn frame<'a>(set: &BTreeMap<Hash, String>, origins: &HashMap<Hash, Origin>, hashes: impl Iterator<Item = &'a Hash>) -> Vec<Signed> {
-    within_budget(signed(set, origins, hashes))
+pub fn frame<'h>(set: &Offered, origins: &Index, hashes: impl Iterator<Item = &'h Hash>) -> Vec<Signed> {
+    frame_ref(set, origins, hashes).into_iter().map(SignedRef::into_owned).collect()
+}
+
+/// `frame` as a session sends it: the lines borrowed from `set`, the origins written back for them alone.
+fn frame_ref<'a, 'h>(set: &'a Offered, origins: &Index, hashes: impl Iterator<Item = &'h Hash>) -> Vec<SignedRef<'a>> {
+    within_budget(signed(|h| set.get(h), origins, hashes))
 }
 
 /// The first of `lines` whose sizes add up to at most `MAX_GIVE` (at least one).
-fn within_budget(lines: Vec<Signed>) -> Vec<Signed> {
+fn within_budget<'a>(lines: impl Iterator<Item = SignedRef<'a>>) -> Vec<SignedRef<'a>> {
     let mut used = 0;
     lines
-        .into_iter()
         .enumerate()
         .take_while(|(i, s)| {
             used += s.line.len();
@@ -1426,14 +1567,16 @@ fn within_budget(lines: Vec<Signed>) -> Vec<Signed> {
         .collect()
 }
 
-fn signed<'a>(set: &BTreeMap<Hash, String>, origins: &HashMap<Hash, Origin>, hashes: impl Iterator<Item = &'a Hash>) -> Vec<Signed> {
-    hashes.filter_map(|h| Some(Signed { line: set.get(h)?.clone(), origin: origins.get(h)?.clone() })).collect()
+/// The lines `line` gives for `hashes` that have an origin, each with it, written back from `origins` as
+/// the iterator reaches it.
+fn signed<'a, 'h>(line: impl Fn(&Hash) -> Option<&'a str>, origins: &Index, hashes: impl Iterator<Item = &'h Hash>) -> impl Iterator<Item = SignedRef<'a>> {
+    hashes.filter_map(move |h| Some(SignedRef { line: line(h)?, origin: Cow::Owned(origins.origin(h)?) }))
 }
 
 /// The members (other than `author`) that hold a replica of excerpt `h`: the `REPLICAS` highest
 /// `blake3(h, key)` (rendezvous hashing: every node computes the same choice, and a membership
 /// change moves only the excerpts of the members it touches).
-pub fn replicas(h: &Hash, m: &Membership, author: &str) -> Vec<String> {
+pub fn replicas<'m>(h: &Hash, m: &'m Membership, author: &str) -> impl Iterator<Item = &'m str> {
     let mut keys: Vec<(Hash, &str)> = m
         .members
         .iter()
@@ -1446,7 +1589,7 @@ pub fn replicas(h: &Hash, m: &Membership, author: &str) -> Vec<String> {
         })
         .collect();
     keys.sort_by(|a, b| b.cmp(a));
-    keys.into_iter().take(REPLICAS).map(|(_, k)| k.to_string()).collect()
+    keys.into_iter().take(REPLICAS).map(|(_, k)| k)
 }
 
 fn members(home: &Path) -> Result<Membership, String> {
@@ -1463,8 +1606,9 @@ fn authorise(conn: &Connection, membership: &Membership, name: &str) -> Result<S
     }
 }
 
-/// The dialler sends then reads; the listener reads (and could refuse) then sends.
-async fn swap(dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, m: Msg) -> Result<Msg, String> {
+/// The dialler sends then reads; the listener reads (and could refuse) then sends. `m` is a `Msg`, or
+/// a `MsgRef` that writes the same bytes.
+async fn swap(dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, m: impl Serialize) -> Result<Msg, String> {
     if dialler {
         send(tx, &m).await?;
         recv(rx).await
@@ -1475,7 +1619,7 @@ async fn swap(dialler: bool, tx: &mut SendStream, rx: &mut RecvStream, m: Msg) -
     }
 }
 
-async fn send(tx: &mut SendStream, m: &Msg) -> Result<(), String> {
+async fn send(tx: &mut SendStream, m: &impl Serialize) -> Result<(), String> {
     let body = serde_json::to_vec(m).map_err(|e| e.to_string())?;
     tx.write_all(&(body.len() as u32).to_be_bytes()).await.map_err(|e| format!("send: {e}"))?;
     tx.write_all(&body).await.map_err(|e| format!("send: {e}"))
@@ -1499,7 +1643,153 @@ async fn recv(rx: &mut RecvStream) -> Result<Msg, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Ways;
     use serde_json::json;
+
+    /// The lines of `file` in the bench store (lines.rs `bench_store`), or none.
+    fn bench_lines(file: &str) -> Vec<String> {
+        lines::bench_store(file).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
+    }
+
+    /// Oracle: `about` reads `commit` and `fix` as the `Value` it built did, on a real store's reasoning
+    /// and at the edges, for every kind of ask.
+    #[test]
+    fn about_reads_a_line_as_value_did() {
+        fn old_about(commits: &[String], line: &str) -> bool {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+            ["commit", "fix"].iter().filter_map(|k| v.get(k)?.as_str()).any(|c| asked(commits, c))
+        }
+        let real = bench_lines(REASONING);
+        let edges: Vec<String> = [
+            r#"{"commit":"d0d0d0d0d0"}"#,
+            r#"{"fix":"d0d0d0d0d0","commit":5}"#,
+            r#"{"commit":"d0d0d0d0d0","commit":"aaaaaaaaaa"}"#,
+            r#"{"commit":"aaaaaaaaaa","commit":"d0d0d0d0d0"}"#,
+            r#"{"commit":"d0d0d0d0d0","commit":null}"#,
+            r#"{"commit":"d0d0d0d0d0"}"#,
+            r#"{"commit":"d0d0d0d0d0","x":"\ud800"}"#,
+            r#"{"commit":"d0d0d0d0d0","x":1e400}"#,
+            r#"[{"commit":"d0d0d0d0d0"}]"#,
+            r#"{"nested":{"commit":"d0d0d0d0d0"}}"#,
+            r#"{"commit":"d0d0d0d0d0""#,
+            "not json",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(real.iter().cloned())
+        .collect();
+        let from_real: Vec<String> =
+            real.iter().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()?.get("commit")?.as_str().map(str::to_string)).take(3).collect();
+        let asks: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["d0d0d0d".into()],
+            vec!["d0d0d0".into()],
+            vec!["aaaaaaaaaa".into(), "f1f1f1f".into()],
+            from_real.iter().map(|c| c.chars().take(7).collect()).collect(),
+            from_real.clone(),
+        ];
+        for ask in &asks {
+            for l in &edges {
+                assert_eq!(about(ask, l), old_about(ask, l), "{ask:?} {l}");
+            }
+        }
+    }
+
+    /// Oracle: a `Lines` frame written from a snapshot and the compact index (`frame_ref`: the lines
+    /// borrowed, the origins written back) is byte for byte the frame `Msg::Lines` wrote of the owned
+    /// lines and records, and reads back as it: lines with escapes, non-ASCII text and a real store's
+    /// lessons, each with a signed origin, and records only a peer could have written (a capital or padded
+    /// hash, a signature not in lowercase hex), given on as received. `offered` and `admitted` keep what
+    /// the owned records admitted, and `replicas` gives what it gave as owned values.
+    #[test]
+    fn a_frame_of_borrowed_lines_is_the_frame_of_owned_ones() {
+        let home = std::env::temp_dir().join(format!("borg-mesh-frame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let me = Identity::load_or_create(&home).unwrap();
+        let mut m = Membership::found("work", &me);
+        let other = Identity::load_or_create(&home.join("other")).unwrap();
+        m.invite(&me, &other.public(), "member").unwrap();
+        let edges: Vec<String> = vec![
+            json!({"id": "L1", "q": "quotes \" and \\ and \n and \t", "version": 1}).to_string(),
+            json!({"id": "L2", "q": "é ü \u{1F600} \u{7f} \u{2028}", "version": 1}).to_string(),
+            r#"{"id":"L3","q":"é escaped as written","version":1}"#.to_string(),
+            r#"{"id":"L4","q":"a capital hash","version":1}"#.to_string(),
+            r#"{"id":"L5","q":"a padded hash","version":1}"#.to_string(),
+            r#"{"id":"L6","q":"a capital signature","version":1}"#.to_string(),
+        ];
+        let all: Vec<String> = edges.into_iter().chain(bench_lines("lessons.jsonl").into_iter().take(400)).collect();
+        let log = home.join("lessons.jsonl");
+        write(&home, "lessons.jsonl", &all);
+        // A peer's records as it wrote them, first for their lines; then every line signed: every other one
+        // by a member, the rest by a key the membership does not list.
+        let hex = |l: &str| to_hex(&lines::hash(l));
+        let raw = |h: String, sig: String| json!({"h": h, "key": me.public(), "ms": 5, "sig": sig}).to_string();
+        let sig = to_hex(&[0xab; 64]);
+        let peers = [raw(hex(&all[3]).to_uppercase(), sig.clone()), raw(format!(" {}", hex(&all[4])), sig.clone()), raw(hex(&all[5]), sig.to_uppercase())];
+        let stranger = Identity::load_or_create(&home.join("stranger")).unwrap();
+        let signed_all: Vec<Origin> = all.iter().enumerate().map(|(i, l)| Origin::new(if i % 2 == 0 { &me } else { &stranger }, &lines::hash(l), 5)).collect();
+        std::fs::write(origin::path(&home), peers.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        origin::append(&home, &signed_all).unwrap();
+
+        // The owned way: every record parsed whole, the first per hash.
+        let mut origins: HashMap<Hash, Origin> = HashMap::new();
+        for l in std::fs::read_to_string(origin::path(&home)).unwrap().lines() {
+            let o: Origin = serde_json::from_str(l).unwrap();
+            origins.entry(from_hex::<32>(&o.h).unwrap()).or_insert(o);
+        }
+        let old_set: BTreeMap<Hash, String> =
+            all.iter().map(|l| (lines::hash(l), l.clone())).filter(|(h, _)| origins.get(h).is_some_and(|o| m.admits(&o.key, o.ms))).collect();
+        assert!(old_set.len() < all.len() && old_set.len() > 3, "a strict subset is admitted, the peer's records among it");
+        let hashes: Vec<Hash> = all.iter().map(|l| lines::hash(l)).collect();
+        let old: Vec<Signed> = hashes.iter().filter_map(|h| Some(Signed { line: old_set.get(h)?.clone(), origin: origins.get(h)?.clone() })).collect();
+        let old = serde_json::to_vec(&Msg::Lines { lines: within_budget(old.iter().map(Signed::borrowed)).into_iter().map(SignedRef::into_owned).collect() })
+            .unwrap();
+
+        let (snap, index) = (Arc::new(Snapshot::read(&log)), Index::read(&home));
+        let set = offered(&log, snap.clone(), &index, &m, borg::learn::now_ms(), false);
+        assert_eq!(set.iter().map(|(h, l)| (*h, l.to_string())).collect::<BTreeMap<_, _>>(), old_set, "the same lines offered");
+        let owned = serde_json::to_vec(&Msg::Lines { lines: frame(&set, &index, hashes.iter()) }).unwrap();
+        let borrowed = serde_json::to_vec(&MsgRef::Lines { lines: &frame_ref(&set, &index, hashes.iter()) }).unwrap();
+        assert!(owned == old && borrowed == old, "the same bytes on the wire");
+        let holds = |t: &str| old.windows(t.len()).any(|w| w == t.as_bytes());
+        assert!(
+            holds(&hex(&all[3]).to_uppercase()) && holds(&format!("\" {}\"", hex(&all[4]))) && holds(&sig.to_uppercase()),
+            "the peer's records as it wrote them"
+        );
+        let Ok(Msg::Lines { lines: back }) = serde_json::from_slice::<Msg>(&borrowed) else { panic!("a lines frame") };
+        assert_eq!(
+            back.iter().map(|s| (&s.line, &s.origin)).collect::<Vec<_>>(),
+            frame(&set, &index, hashes.iter()).iter().map(|s| (&s.line, &s.origin)).collect::<Vec<_>>()
+        );
+        let empty = serde_json::to_vec(&MsgRef::Lines { lines: &[] }).unwrap();
+        assert_eq!(empty, serde_json::to_vec(&Msg::Lines { lines: vec![] }).unwrap(), "an empty frame too");
+
+        let new_admitted = origin::admitted(&snap, &index, &m);
+        assert_eq!(new_admitted.into_iter().map(|(h, l)| (h, l.to_string())).collect::<BTreeMap<_, _>>(), old_set);
+
+        let old_replicas = |h: &Hash, author: &str| {
+            let mut keys: Vec<(Hash, &str)> = m
+                .members
+                .iter()
+                .filter(|x| x.key != author)
+                .map(|x| {
+                    let mut s = blake3::Hasher::new();
+                    s.update(h);
+                    s.update(x.key.as_bytes());
+                    (*s.finalize().as_bytes(), x.key.as_str())
+                })
+                .collect();
+            keys.sort_by(|a, b| b.cmp(a));
+            keys.into_iter().take(REPLICAS).map(|(_, k)| k.to_string()).collect::<Vec<_>>()
+        };
+        for h in &hashes {
+            for author in [me.public(), other.public()] {
+                assert_eq!(replicas(h, &m, &author).collect::<Vec<_>>(), old_replicas(h, &author));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// An excerpt is asked for by its commit; a link record by its decision or by its fix.
     #[test]
@@ -1519,10 +1809,10 @@ mod tests {
             let l = "x".repeat(n);
             Signed { origin: Origin::new(&me, &lines::hash(&l), 1), line: l }
         };
-        let give = within_budget(vec![line(MAX_GIVE / 2), line(MAX_GIVE / 2), line(1)]);
-        assert_eq!(give.len(), 2);
-        assert_eq!(within_budget(vec![line(MAX_GIVE + 1), line(1)]).len(), 1);
-        assert!(within_budget(Vec::new()).is_empty());
+        let budget = |all: &[Signed]| within_budget(all.iter().map(Signed::borrowed)).len();
+        assert_eq!(budget(&[line(MAX_GIVE / 2), line(MAX_GIVE / 2), line(1)]), 2);
+        assert_eq!(budget(&[line(MAX_GIVE + 1), line(1)]), 1);
+        assert!(within_budget(std::iter::empty()).is_empty());
     }
 
     /// One node's machine: a root store (`BORG_HOME`), a config (`BORG_CONFIG`) and a repo that
@@ -1696,8 +1986,8 @@ mod tests {
         let got: Vec<Signed> =
             std::iter::once(&ok).chain(&bad).map(|l| Signed { origin: Origin::new(&alice, &lines::hash(l), now), line: l.clone() }).collect();
         let want: BTreeSet<Hash> = got.iter().map(|s| lines::hash(&s.line)).collect();
-        let lock = Mutex::new(());
-        let store = Store { home: &b, lock: &lock, me: &bob };
+        let (lock, cache) = (Mutex::new(()), Cache::default());
+        let store = Store { home: &b, lock: &lock, me: &bob, cache: &cache };
         let mut report = Report::default();
         store.store_lines(&b.join(lines::ABSORBED), got, &want, &members(&b).unwrap(), None, &mut report).unwrap();
         assert_eq!((report.received, report.rejected), (1, bad.len()));
@@ -1843,7 +2133,7 @@ mod tests {
         bob.store_lines(&path, got, &want, &members(&b).unwrap(), None, &mut twice).unwrap();
         assert_eq!((twice.received, twice.rejected), (0, n - fits), "nothing cut comes back");
         assert_eq!(lines::read(&path).len(), fits);
-        assert_eq!(offered(&path, &origin::load(&b), &members(&b).unwrap(), now, false).len(), fits);
+        assert_eq!(offered_now(&path, &members(&b).unwrap(), now, false).len(), fits);
         bob.close().await;
     }
 
@@ -1903,20 +2193,47 @@ mod tests {
         let path = b.join(borg::msg::FILE);
         let keep: BTreeMap<Hash, Signed> =
             [&next, &other].into_iter().map(|l| (lines::hash(l), Signed { origin: Origin::new(&alice, &lines::hash(l), now), line: l.clone() })).collect();
-        let read = std::fs::read_to_string(&path).unwrap();
-        let decided = stored(&read, &keep, now);
+        let bob_node = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let read = bob_node.cache.log(&path);
+        let decided = stored(read.text(), &keep, now);
         assert_eq!((decided.taken.len(), decided.refused, decided.body.is_some()), (1, 1, true), "one more unread tell to r1 than any window lets through");
         // Bob's r1 is shown one of them in between.
         let seen = seen_of(&bob, "r1", now - 500, &[&burst[0].0.id]);
         append_lines(&b, borg::msg::FILE, std::slice::from_ref(&seen));
-        let bob_node = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
         let mut report = Report::default();
-        bob_node.store_messages(&path, keep, (&read, decided), &members(&b).unwrap(), now, &mut report).unwrap();
+        bob_node.store_messages(&path, keep, (read, decided), &members(&b).unwrap(), now, &mut report).unwrap();
         assert!(holds(&b, borg::msg::FILE, &seen), "the acknowledgement written in between stays");
         assert!(holds(&b, borg::msg::FILE, &next) && holds(&b, borg::msg::FILE, &other), "and it let the earlier tell in");
         assert!(!holds(&b, borg::msg::FILE, &expired), "the bound still pruned");
         assert_eq!((report.received, report.rejected), (2, 0));
         bob_node.close().await;
+    }
+
+    /// A peer's message taken is appended and the log's snapshot extended in place: the snapshot it was
+    /// decided over is let go before the append, so the cache copies neither its text nor its line map.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_message_extends_the_snapshot_in_place() {
+        let (_, pb) = team("in-place");
+        let b = home(&pb);
+        let alice = Identity::load_or_create(&b.join("alice")).unwrap();
+        let bob = Identity::load_or_create(&b).unwrap().public();
+        let now = borg::learn::now_ms();
+        let held = line_of(&alice.public(), "s1", &format!("r1@{bob}"), now - 2000, "held").1;
+        append_lines(&b, borg::msg::FILE, std::slice::from_ref(&held));
+        let path = b.join(borg::msg::FILE);
+        let new = line_of(&alice.public(), "s1", &format!("r1@{bob}"), now - 1000, "new").1;
+        let keep = BTreeMap::from([(lines::hash(&new), Signed { origin: Origin::new(&alice, &lines::hash(&new), now), line: new.clone() })]);
+        let node = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let read = node.cache.log(&path);
+        let at = Arc::as_ptr(&read);
+        let decided = stored(read.text(), &keep, now);
+        assert_eq!((decided.taken.len(), decided.body.is_some()), (1, false), "taken, appended");
+        let mut report = Report::default();
+        node.store_messages(&path, keep, (read, decided), &members(&b).unwrap(), now, &mut report).unwrap();
+        assert!(holds(&b, borg::msg::FILE, &new));
+        let after = node.cache.log(&path);
+        assert!(Arc::as_ptr(&after) == at && after.contains(&lines::hash(&new)), "extended in place, not copied");
+        node.close().await;
     }
 
     /// A message of `node`'s session `by` to `to` at `ms`, as a line.
@@ -2001,7 +2318,7 @@ mod tests {
         borg::msg::ack(&a, "s7", &[&second.id], now).unwrap();
         let held = borg::msg::lines(&a);
         assert!(held.iter().all(|l| l.message().is_none_or(|m| m.id != first.id)), "the first is pruned");
-        let w = borg::msg::window_for(&held, Author { node: &key, by: "s1" }, &to, now);
+        let w = borg::msg::window_for(&held.iter().map(borg::msg::Line::borrowed).collect::<Vec<_>>(), Author { node: &key, by: "s1" }, &to, now);
         assert!(w.admits(&second.id) && !w.admits(&third.id), "a replay over what is left admits less than send did");
         let (alice, bob, carol) = (
             Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap(),
@@ -2047,7 +2364,7 @@ mod tests {
         served.unwrap();
         assert_eq!(synced.unwrap().rejected, 0);
         assert!(
-            lines::read(&borg::msg::path(&a)).values().any(|l| matches!(Line::parse(l), Some(Line::Seen(s)) if s.ids == [x.id.clone()])),
+            lines::read(&borg::msg::path(&a)).values().any(|l| matches!(borg::msg::Line::parse(l), Some(borg::msg::Line::Seen(s)) if s.ids == [x.id.clone()])),
             "the seen line merged"
         );
         assert_ne!(borg::msg::mark_of(&borg::msg::path(&a)), log, "the log moved");
@@ -2693,6 +3010,196 @@ mod tests {
     }
 
     /// Alice founds the collective and invites everyone else; all install the same document.
+    /// `offered` as it was: the log read twice, each message line parsed twice, the window taken
+    /// straight from `within_windows`.
+    fn old_offered(path: &Path, origins: &HashMap<Hash, Origin>, m: &Membership, now: i64, v1: bool) -> BTreeMap<Hash, String> {
+        let file = log_name(path);
+        let mut set = lines::read(path);
+        set.retain(|h, l| origins.get(h).is_some_and(|o| m.admits(&o.key, o.ms) && lines::travels(file, l, &o.key, now)));
+        if file == borg::msg::FILE {
+            let held = lines::read(path);
+            let (hashes, all): (Vec<Hash>, Vec<LineRef>) = held.iter().filter_map(|(h, l)| LineRef::parse(l).map(|x| (*h, x))).unzip();
+            let admitted = borg::msg::within_windows(&all);
+            let w: BTreeSet<Hash> = hashes
+                .into_iter()
+                .zip(&all)
+                .filter(|(_, l)| match l {
+                    LineRef::Seen(_) => true,
+                    LineRef::Message(m) => m.kind.privileged() || admitted.contains(m.id.as_ref()),
+                })
+                .map(|(h, _)| h)
+                .collect();
+            set.retain(|h, _| w.contains(h));
+            if v1 {
+                let w = v1_window(set.iter().map(|(h, l)| (*h, l.as_str())), v1_share(m));
+                set.retain(|h, _| w.contains(h));
+            }
+        }
+        set
+    }
+
+    /// `offered` of the log at `path` as read now, under the records of its store, owned.
+    fn offered_now(path: &Path, m: &Membership, now: i64, v1: bool) -> BTreeMap<Hash, String> {
+        let home = path.parent().unwrap();
+        offered(path, Arc::new(Snapshot::read(path)), &Index::read(home), m, now, v1).iter().map(|(h, l)| (*h, l.to_string())).collect()
+    }
+
+    /// Oracle: `offered`, reading the log once, offers what it offered before: a message log with a
+    /// burst past the window, a forged node, an expired line, a `local` line, a seen line, a line
+    /// without a record and a torn one, to a current and to a `V13_ALPN` peer; a lesson log; and a real
+    /// store's message and lesson logs under its own records and membership.
+    #[test]
+    fn offered_reads_once_and_offers_what_it_offered_before() {
+        let p = crew("offered-oracle", &["alice", "bob", "carol"]);
+        let a = home(&p[0]);
+        let ids: Vec<Identity> = p.iter().map(|x| Identity::load_or_create(&home(x)).unwrap()).collect();
+        let (alice, bob, carol) = (&ids[0], &ids[1], &ids[2]);
+        let now = borg::learn::now_ms();
+        let to_bob = format!("s2@{}", bob.public());
+        let n = borg::msg::WINDOW_CAP + 3;
+        let mut mine: Vec<String> = (0..n).map(|i| message(&a, &alice.public(), &to_bob, now - (n - i) as i64 * 10, &format!("tell {i}"))).collect();
+        mine.push(message(&a, &alice.public(), &to_bob, now - borg::msg::TTL_MS - 1, "expired"));
+        mine.push(message(&a, &alice.public(), &format!("local@{}", alice.public()), now - 5, "for this machine"));
+        let forged = message(&a, &alice.public(), &to_bob, now - 4, "carol's, naming alice's node");
+        let seen = serde_json::to_string(&borg::msg::Seen {
+            v: 2,
+            kind: borg::msg::SEEN.into(),
+            by: "s2".into(),
+            node: alice.public(),
+            ms: now - 3,
+            ids: vec![serde_json::from_str::<borg::msg::Message>(&mine[0]).unwrap().id],
+        })
+        .unwrap();
+        append_lines(&a, borg::msg::FILE, &[seen.clone(), "{\"torn\":".into()]);
+        let unrecorded = message(&a, &alice.public(), &to_bob, now - 2, "no record");
+        let rec = |who: &Identity, l: &str| Origin::new(who, &lines::hash(l), now - 100);
+        let records: Vec<Origin> = mine.iter().chain([&seen]).map(|l| rec(alice, l)).chain([rec(carol, &forged)]).collect();
+        origin::append(&a, &records).unwrap();
+        write(&a, "lessons.jsonl", &[lesson("L1", 1, "one"), lesson("L1", 2, "two")]);
+        origin::append(&a, &[rec(alice, &lesson("L1", 1, "one"))]).unwrap();
+        let m = members(&a).unwrap();
+        let origins = origin::load(&a);
+        let msgs = a.join(borg::msg::FILE);
+        for v1 in [false, true] {
+            let new = offered_now(&msgs, &m, now, v1);
+            assert_eq!(new, old_offered(&msgs, &origins, &m, now, v1), "v1 {v1}");
+            assert!(!new.is_empty() && new.len() < mine.len(), "the window and the checks cut some, not all: {} of {}", new.len(), mine.len());
+            assert_eq!(new.contains_key(&lines::hash(&seen)), !v1, "a seen line, which 0.5.0 knows not");
+            assert!(!new.contains_key(&lines::hash(&unrecorded)) && !new.contains_key(&lines::hash(&forged)));
+        }
+        let lessons = a.join("lessons.jsonl");
+        assert_eq!(offered_now(&lessons, &m, now, false), old_offered(&lessons, &origins, &m, now, false));
+        assert_eq!(offered_now(&lessons, &m, now, false).len(), 1, "the line with a record");
+
+        let Some(store) = std::env::var_os("BORG_BENCH_STORE").map(PathBuf::from) else {
+            eprintln!("BORG_BENCH_STORE unset: only the built logs are checked");
+            return;
+        };
+        let (Ok(Some(m)), origins) = (Membership::load(&store), origin::load(&store)) else {
+            eprintln!("BORG_BENCH_STORE holds no membership: only the built logs are checked");
+            return;
+        };
+        let msgs = store.join(borg::msg::FILE);
+        let latest = std::fs::read_to_string(&msgs).unwrap_or_default().lines().filter_map(LineRef::parse).map(|l| l.ms()).max().unwrap_or(now);
+        for (path, at) in [(&msgs, now), (&msgs, latest + 1), (&store.join("lessons.jsonl"), now)] {
+            for v1 in [false, true] {
+                assert_eq!(offered_now(path, &m, at, v1), old_offered(path, &origins, &m, at, v1), "{} at {at}, v1 {v1}", path.display());
+            }
+        }
+    }
+
+    /// Oracle: what a session offers from the cache (`offered_from`, which decides only what changed) is
+    /// what `offered` decides over the log and records read whole, step after step: lines with and without
+    /// a record, a stranger's, lines a hook appends and a stamp then records, a torn line completed, a
+    /// record appended for a held line, a revocation, and a real store's lessons and outcomes.
+    #[test]
+    fn offering_from_the_cache_offers_what_a_whole_read_offers() {
+        use std::io::Write;
+        let p = crew("offered-cache", &["alice", "bob"]);
+        let a = home(&p[0]);
+        let (alice, bob) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&home(&p[1])).unwrap());
+        let stranger = Identity::load_or_create(&a.join("stranger")).unwrap();
+        let now = borg::learn::now_ms();
+        let real: Vec<String> = ["lessons.jsonl", borg::outcome::TEAM_FILE].iter().flat_map(|f| bench_lines(f)).collect();
+        let first: Vec<String> = (0..20).map(|i| lesson(&format!("L{i}"), 1, "?")).chain(real.iter().take(real.len() / 2).cloned()).collect();
+        write(&a, "lessons.jsonl", &first);
+        let rec = |who: &Identity, l: &str, ms: i64| Origin::new(who, &lines::hash(l), ms);
+        origin::append(
+            &a,
+            &first.iter().enumerate().filter(|(i, _)| i % 5 != 0).map(|(i, l)| rec(if i % 7 == 0 { &stranger } else { &bob }, l, 1)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let (cache, log) = (Cache::default(), a.join("lessons.jsonl"));
+        let mut m = members(&a).unwrap();
+        let check = |what: &str, m: &Membership| {
+            let from_cache = offered_from(&cache, &a, &log, m, now, false);
+            let whole = offered(&log, Arc::new(Snapshot::read(&log)), &Index::read(&a), m, now, false);
+            let owned = |o: &Offered| o.iter().map(|(h, l)| (*h, l.to_string())).collect::<BTreeMap<_, _>>();
+            assert_eq!(owned(&from_cache), owned(&whole), "{what}");
+        };
+        check("read whole", &m);
+        let (reads, decided) = (cache.reads(), cache.decisions().admitted);
+        let hooked: Vec<String> = (0..5).map(|i| lesson(&format!("H{i}"), 1, "hooked?")).chain(real.iter().skip(real.len() / 2).cloned()).collect();
+        append_lines(&a, "lessons.jsonl", &hooked);
+        check("appended, no record yet", &m);
+        origin::append(&a, &hooked.iter().map(|l| rec(&alice, l, 2)).chain(first.iter().step_by(5).map(|l| rec(&bob, l, 2))).collect::<Vec<_>>()).unwrap();
+        check("recorded", &m);
+        let torn = lesson("T1", 1, "torn?");
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(&torn.as_bytes()[..9]).unwrap();
+        check("torn", &m);
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(format!("{}\n", &torn[9..]).as_bytes()).unwrap();
+        origin::append(&a, &[rec(&alice, &torn, 3)]).unwrap();
+        check("completed and recorded", &m);
+        assert_eq!(cache.reads().whole, reads.whole, "followed, never read whole again");
+        assert_eq!(cache.decisions().admitted, Ways { part: decided.part + 4, whole: decided.whole }, "decided from the memo each time");
+        m.revoke(&alice, &bob.public(), 2).unwrap();
+        check("bob revoked", &m);
+        assert_eq!(cache.decisions().admitted, Ways { part: decided.part + 4, whole: decided.whole + 1 }, "a new membership decided whole once");
+    }
+
+    /// A hook appends an older version of a lesson after a merge settled the log (no lock is shared
+    /// between them). A session that brings nothing new no longer settles it (lines.rs `merge`), and a
+    /// frame whose lines are all refused touches neither the log nor the records: the stamp that first
+    /// sees the hook's line settles the log, as the stamp at the start of a session does.
+    #[test]
+    fn a_hook_s_older_version_is_settled_where_it_is_stamped() {
+        let p = crew("stamp-settles", &["alice", "bob"]);
+        let a = home(&p[0]);
+        let (me, bob) = (Identity::load_or_create(&a).unwrap(), Identity::load_or_create(&home(&p[1])).unwrap());
+        let (lock, cache) = (Mutex::new(()), Cache::default());
+        let store = Store { home: &a, lock: &lock, me: &me, cache: &cache };
+        let log = a.join("lessons.jsonl");
+        let ordered = |x: String, y: String| if lines::hash(&x) > lines::hash(&y) { (x, y) } else { (y, x) };
+        let last = || std::fs::read_to_string(&log).unwrap().lines().last().unwrap().to_string();
+        for (round, (peer, hook)) in
+            [ordered(lesson("L1", 4, "the peer's"), lesson("L1", 4, "this node's")), ordered(lesson("L2", 2, "x"), lesson("L2", 2, "y"))]
+                .into_iter()
+                .enumerate()
+        {
+            append_lines(&a, "lessons.jsonl", std::slice::from_ref(&peer));
+            store.stamp().unwrap();
+            append_lines(&a, "lessons.jsonl", std::slice::from_ref(&hook));
+            assert_eq!(last(), hook, "unsettled: the conscience asks the hook's line");
+
+            let before = std::fs::read(&log).unwrap();
+            let records = std::fs::metadata(origin::path(&a)).unwrap().modified().unwrap();
+            let (stray, mut report) = (lesson("L9", 1, "not asked for"), Report::default());
+            let got = vec![Signed { origin: Origin::new(&bob, &lines::hash(&stray), 1), line: stray }];
+            store.store_lines(&log, got, &BTreeSet::new(), &members(&a).unwrap(), None, &mut report).unwrap();
+            assert_eq!((report.rejected, report.received), (1, 0));
+            assert!(std::fs::read(&log).unwrap() == before, "an all-refused frame leaves the log as it is");
+            assert_eq!(std::fs::metadata(origin::path(&a)).unwrap().modified().unwrap(), records, "and writes no record");
+
+            if round == 0 {
+                assert_eq!(store.stamp().unwrap(), 1, "the hook's line stamped");
+            } else {
+                assert_eq!(store.stamp().unwrap(), 1, "the hook's line stamped, by a store that stamped before");
+                assert!(cache.origins(&a).contains(&lines::hash(&hook)), "in the records it holds");
+            }
+            assert_eq!(last(), peer, "settled: the winner is last again");
+        }
+    }
+
     fn crew(tag: &str, names: &[&str]) -> Vec<Place> {
         let places: Vec<Place> = names.iter().map(|n| node(&format!("{tag}-{n}"), "team")).collect();
         let ids: Vec<Identity> = places.iter().map(|p| Identity::load_or_create(&home(p)).unwrap()).collect();
@@ -2961,9 +3468,9 @@ mod tests {
         let mine = members(home)?;
         let Msg::Membership { .. } = swap(dialler, tx, rx, Msg::Membership { docs: Membership::history(home) }).await? else { return Err("membership".into()) };
         n.stamp()?;
-        let (origins, mut report) = (origin::load(home), Report::default());
+        let mut report = Report::default();
         for file in OLD_SYNCED {
-            n.reconcile(dialler, tx, rx, &home.join(file), &origins, &mine, false, &mut report).await?;
+            n.reconcile(dialler, tx, rx, &home.join(file), &mine, false, &mut report).await?;
         }
         let ids = ["g1", "g1", "Bad Id"].map(String::from).to_vec();
         let Msg::Goals { ids: theirs } = swap(dialler, tx, rx, Msg::Goals { ids }).await? else { return Err("goals".into()) };
@@ -2978,9 +3485,9 @@ mod tests {
                     break;
                 }
             }
-            let give = within_budget(signed(set, &goal.origins, r.give.iter()));
+            let give = within_budget(r.give.iter().filter_map(|h| Some(SignedRef { line: set.get(h)?, origin: Cow::Borrowed(goal.origins.get(h)?) })));
             gave += give.len();
-            let Msg::Lines { lines } = swap(dialler, tx, rx, Msg::Lines { lines: give }).await? else { return Err("lines".into()) };
+            let Msg::Lines { lines } = swap(dialler, tx, rx, MsgRef::Lines { lines: &give }).await? else { return Err("lines".into()) };
             assert!(lines.is_empty(), "a new node gives no hive line");
         }
         for m in [
@@ -3160,6 +3667,79 @@ mod tests {
         bob.close().await;
     }
 
+    /// The cache as sessions use it: once both nodes have read their store, a session after a hook appended
+    /// a lesson reads no file whole, on either side (the logs and the records are followed from where they
+    /// were read), decides nothing over a whole log (admitted, stamped, settled: each from where it left
+    /// off), and moves the line. A log renamed over (a quarantine, a message bound) is read whole exactly
+    /// once, and its admitted set and stamp decided whole once; so is one written over in place with its
+    /// size kept and its mtime moved, whose changed line then travels.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_reads_only_what_changed() {
+        let (pa, pb) = team("reads");
+        let (a, b) = (home(&pa), home(&pb));
+        let common: Vec<String> = (0..50).map(|i| lesson(&format!("L{i}"), 1, &format!("question {i}?"))).collect();
+        for h in [&a, &b] {
+            write(h, "lessons.jsonl", &common);
+            write(h, "stats.jsonl", &[rollup("n1", 1, 3), rollup("n1", 2, 5)]);
+        }
+        let alice = Node::bind(&pa, LOCAL.parse().unwrap()).await.unwrap();
+        let bob = Node::bind(&pb, LOCAL.parse().unwrap()).await.unwrap();
+        let ticket = alice.ticket();
+        let session = || async {
+            let (served, synced) = tokio::join!(alice.accept(), bob.sync(&ticket));
+            (served.unwrap(), synced.unwrap())
+        };
+        session().await;
+        let whole = |n: &Node| n.cache.reads().whole;
+        let (at_a, at_b) = (whole(&alice), whole(&bob));
+        let decided = |n: &Node| n.cache.decisions();
+        let (was_a, was_b) = (decided(&alice), decided(&bob));
+
+        let hooked = lesson("B1", 1, "written by bob's hook?");
+        append_lines(&b, "lessons.jsonl", std::slice::from_ref(&hooked));
+        let (served, _) = session().await;
+        assert_eq!(served.received, 1, "the hook's lesson moved");
+        assert!(holds(&a, "lessons.jsonl", &hooked));
+        assert_eq!((whole(&alice) - at_a, whole(&bob) - at_b), (0, 0), "no file read whole on either side");
+        for (who, was, now) in [("alice", was_a, decided(&alice)), ("bob", was_b, decided(&bob))] {
+            assert_eq!(
+                (now.admitted.whole, now.stamped.whole, now.settled.whole),
+                (was.admitted.whole, was.stamped.whole, was.settled.whole),
+                "{who}: nothing decided over a whole log"
+            );
+            assert!(now.admitted.part > was.admitted.part && now.stamped.part > was.stamped.part, "{who}: admitted and stamped from where they left off");
+            assert!(now.settled.part > was.settled.part, "{who}: settled from the versions read before ({who} merged or stamped the lesson)");
+        }
+
+        let stats = a.join("stats.jsonl");
+        let tmp = a.join("stats.jsonl.tmp");
+        std::fs::copy(&stats, &tmp).unwrap();
+        std::fs::rename(&tmp, &stats).unwrap();
+        let (at_a, was_a) = (whole(&alice), decided(&alice));
+        session().await;
+        assert_eq!(whole(&alice) - at_a, 1, "a log renamed over is read whole once");
+        let now = decided(&alice);
+        assert_eq!(
+            (now.admitted.whole - was_a.admitted.whole, now.stamped.whole - was_a.stamped.whole, now.settled.whole - was_a.settled.whole),
+            (1, 1, 0),
+            "and its admitted set and stamp decided whole once (nothing new in it to settle)"
+        );
+
+        let log = a.join("lessons.jsonl");
+        let text = std::fs::read_to_string(&log).unwrap();
+        let changed = text.replace("question 7?", "question 8?");
+        assert_eq!(changed.len(), text.len());
+        let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut &f, changed.as_bytes()).unwrap();
+        f.set_modified(std::fs::metadata(&log).unwrap().modified().unwrap() + std::time::Duration::from_secs(1)).unwrap();
+        let at_a = whole(&alice);
+        session().await;
+        assert_eq!(whole(&alice) - at_a, 1, "a same-size write with a new mtime is read whole once");
+        assert!(holds(&b, "lessons.jsonl", &lesson("L7", 1, "question 8?")), "and what it changed travels");
+        alice.close().await;
+        bob.close().await;
+    }
+
     /// A reasoning excerpt goes from its author to exactly its 2 rendezvous replicas, and no
     /// member accepts another member's excerpt passed off as a replica.
     #[tokio::test(flavor = "multi_thread")]
@@ -3170,7 +3750,7 @@ mod tests {
         write(&a, REASONING, std::slice::from_ref(&excerpt));
         let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
         let m = Membership::load(&a).unwrap().unwrap();
-        let chosen = replicas(&lines::hash(&excerpt), &m, &alice.public());
+        let chosen: Vec<String> = replicas(&lines::hash(&excerpt), &m, &alice.public()).map(String::from).collect();
         assert_eq!(chosen.len(), 2);
         let mut holders = Vec::new();
         for q in &p[1..] {
@@ -3238,7 +3818,7 @@ mod tests {
         write(&c, "lessons.jsonl", std::slice::from_ref(&early));
         carol.stamp().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let (m, _) = origin::revoke(&a, &Identity::load_or_create(&a).unwrap(), &carol.public(), borg::learn::now_ms()).unwrap();
+        let (m, _) = origin::revoke(&a, &Identity::load_or_create(&a).unwrap(), &carol.public(), borg::learn::now_ms(), &Cache::default()).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let late = lesson("Lc2", 1, "carol's lesson after her revocation?");
         append_lines(&c, "lessons.jsonl", std::slice::from_ref(&late));
@@ -3251,10 +3831,10 @@ mod tests {
         }
 
         let handed = std::fs::read_to_string(crate::membership::path(&a)).unwrap();
-        let (got, moved) = origin::join(&b, "work", &crate::membership::parse_docs(&handed).unwrap()).unwrap();
+        let (got, moved) = origin::join(&b, "work", &crate::membership::parse_docs(&handed).unwrap(), &Cache::default()).unwrap();
         assert_eq!((got.version, moved), (m.version, 1));
         assert!(!holds(&b, "lessons.jsonl", &late) && holds(&b, "lessons.jsonl", &early), "quarantined at join");
-        assert!(origin::join(&b, "work", &crate::membership::parse_docs(&handed).unwrap()).is_err(), "nothing newer the second time");
+        assert!(origin::join(&b, "work", &crate::membership::parse_docs(&handed).unwrap(), &Cache::default()).is_err(), "nothing newer the second time");
 
         m.save(&d).unwrap(); // installed behind the daemon's back
         assert_eq!(dave.enforce().unwrap(), 1);
@@ -3294,7 +3874,7 @@ mod tests {
         .to_string();
         write(&a, REASONING, std::slice::from_ref(&excerpt));
         let alice = Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap();
-        let chosen = replicas(&lines::hash(&excerpt), &Membership::load(&a).unwrap().unwrap(), &alice.public());
+        let chosen: Vec<String> = replicas(&lines::hash(&excerpt), &Membership::load(&a).unwrap().unwrap(), &alice.public()).map(String::from).collect();
         let mut others = Vec::new();
         for q in &p[1..] {
             let n = Node::bind(q, LOCAL.parse().unwrap()).await.unwrap();
@@ -3521,7 +4101,7 @@ mod tests {
         let seen = seen_of(&node, "s1", 2001, &[&ms[1].id]);
         let mut set: BTreeMap<Hash, String> = ms.iter().chain([&long]).map(|m| serde_json::to_string(m).unwrap()).map(|l| (lines::hash(&l), l)).collect();
         set.insert(lines::hash(&seen), seen.clone());
-        let w = v1_window(&set, per);
+        let w = v1_window(set.iter().map(|(h, l)| (*h, l.as_str())), per);
         let kept = |m: &borg::msg::Message| w.contains(&lines::hash(&serde_json::to_string(m).unwrap()));
         assert!(kept(&ms[0]), "the pause travels");
         assert_eq!((kept(&ms[1]), ms[2..].iter().filter(|m| kept(m)).count()), (false, per), "the oldest tell went");
@@ -3551,22 +4131,22 @@ mod tests {
         let start = 10 * borg::msg::TTL_MS;
         let (mut ms, mut sent, mut acks, mut refused) = (start, Vec::<Message>::new(), 0, 0);
         while ms < start + 3 * borg::msg::TTL_MS {
-            ms += [1_000, 1_000, borg::msg::V1_RATE_MS, 3_600_000, 6 * 3_600_000][pick(5)];
+            ms += [1_000, 1_000, 1_000, 1_000, borg::msg::FLOOR_MS, borg::msg::V1_RATE_MS, 3_600_000, 6 * 3_600_000][pick(8)];
             let from = Sender { by: senders[pick(senders.len())].into(), name: "One of One".into(), harness: "claude".into(), node: here.clone() };
             // One of the latest, so acknowledgements and answers open windows still in use.
             let earlier = (!sent.is_empty()).then(|| sent[sent.len() - 1 - pick(sent.len().min(4))].clone());
             // Its recipient here shown it (a broadcast: any other session here), or answering it.
             let recipient = earlier.as_ref().and_then(|m| match Address::parse(&m.to) {
-                Some(Address::Session { id, node: Some(n) }) if n == here => Some(id),
+                Some(Address::Session { id, node: Some(n) }) if n == here => Some(id.to_string()),
                 Some(Address::All) => Some("r9".to_string()),
                 _ => None,
             });
-            match (pick(6), earlier, recipient) {
-                (0 | 1, Some(m), Some(who)) => {
+            match (pick(8), earlier, recipient) {
+                (0, Some(m), Some(who)) => {
                     borg::msg::ack(&home, &who, &[&m.id], ms).unwrap();
                     acks += 1;
                 }
-                (2, Some(m), Some(who)) if !borg::msg::is_engineer(&m.by) => {
+                (1, Some(m), Some(who)) if !borg::msg::is_engineer(&m.by) => {
                     let from = Sender { by: who, name: "Two of Two".into(), harness: "omp".into(), node: here.clone() };
                     let _ = borg::msg::send(&home, Message::new(Kind::Tell, &from, &format!("{}@{here}", m.by), Some(&m.id), ms, "re"), ms);
                 }
@@ -3578,12 +4158,12 @@ mod tests {
             }
         }
         let held: Vec<String> = std::fs::read_to_string(borg::msg::path(&home)).unwrap().lines().map(String::from).collect();
-        let talk = |l: &str| Line::parse(l).and_then(|x| x.message().cloned()).filter(|m| !m.kind.privileged());
+        let talk = |l: &str| borg::msg::Line::parse(l).and_then(|x| x.message().cloned()).filter(|m| !m.kind.privileged());
         assert!(acks > 10 && refused > 10 && held.iter().filter(|l| talk(l).is_some()).count() < sent.len(), "{acks} acks, {refused} refused, pruned");
         let mut fewer = 0;
         for cut in (0..held.len()).step_by(5) {
             let set: BTreeMap<Hash, String> = held[cut..].iter().map(|l| (lines::hash(l), l.clone())).collect();
-            let (w, parsed) = (window(&set), held[cut..].iter().filter_map(|l| Line::parse(l)).collect::<Vec<Line>>());
+            let (w, parsed) = (window(&set), held[cut..].iter().filter_map(|l| LineRef::parse(l)).collect::<Vec<LineRef>>());
             for (l, m) in held[cut..].iter().filter_map(|l| talk(l).map(|m| (l, m))) {
                 assert!(w.contains(&lines::hash(l)), "from line {cut} on: {l}");
                 fewer += usize::from(!borg::msg::window_for(&parsed, m.author(), &m.to, ms).admits(&m.id));

@@ -19,7 +19,7 @@ name = "borg-mesh"
 path = "src/main.rs"
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "=0.7.11" }
+borg = { package = "borg-ai", path = "../borg", version = "=0.7.12" }
 serde.workspace = true
 serde_json.workspace = true
 iroh = { version = "1.3", features = ["platform-verifier"] }
@@ -31,6 +31,13 @@ data-encoding = "2"
 
 [dev-dependencies]
 iroh = { version = "1.3", features = ["platform-verifier", "test-utils"] }
+criterion.workspace = true
+
+# One session between two in-process nodes and its parts, on a store of a real team's shape
+# (`BORG_BENCH_STORE`, else generated): `cargo bench -p borg-mesh`.
+[[bench]]
+name = "sync"
+harness = false
 
 [lints]
 workspace = true

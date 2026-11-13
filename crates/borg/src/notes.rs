@@ -29,6 +29,7 @@
 //! decisions whose lines they changed; a note then lists them under `borg fixed in:` (on the
 //! decision) and `borg fixes:` (on the fix), links.rs.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
@@ -120,11 +121,22 @@ fn looks_random(s: &str) -> bool {
 
 /// `text` with every secret the list recognises replaced (module doc).
 pub fn redact(text: &str) -> String {
-    let mut out = text.to_string();
+    redacted(text).into_owned()
+}
+
+/// `redact`, borrowing `text` when nothing in it is a secret: a pattern that matches nothing copies
+/// nothing, so a clean text (most of them) is never copied.
+pub fn redacted(text: &str) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(text);
     for (re, with) in SECRETS.iter() {
-        out = re.replace_all(&out, *with).into_owned();
+        if let Cow::Owned(s) = re.replace_all(&out, *with) {
+            out = Cow::Owned(s);
+        }
     }
-    TOKENISH.replace_all(&out, |c: &Captures| if looks_random(&c[0]) { REDACTED.to_string() } else { c[0].to_string() }).into_owned()
+    if !TOKENISH.find_iter(&out).any(|m| looks_random(m.as_str())) {
+        return out;
+    }
+    Cow::Owned(TOKENISH.replace_all(&out, |c: &Captures| if looks_random(&c[0]) { REDACTED.to_string() } else { c[0].to_string() }).into_owned())
 }
 
 /// The per-session scratch directory (as the hook uses it).
@@ -600,6 +612,39 @@ fn run(args: &[&str], after: Option<After>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `redact` as it was: a copy of the text per pattern.
+    fn old_redact(text: &str) -> String {
+        let mut out = text.to_string();
+        for (re, with) in SECRETS.iter() {
+            out = re.replace_all(&out, *with).into_owned();
+        }
+        TOKENISH.replace_all(&out, |c: &Captures| if looks_random(&c[0]) { REDACTED.to_string() } else { c[0].to_string() }).into_owned()
+    }
+
+    /// Oracle: `redacted` returns what the old `redact` did on every text of a real store's logs and at
+    /// the edges, and borrows a text no pattern matched.
+    #[test]
+    fn redacted_is_the_old_redact_and_borrows_a_clean_text() {
+        let edges = [
+            "",
+            "plain words",
+            "postgres://admin:hunter2@db:5432/app",
+            "random Zx9Qk2LmPw8RtYv3NbHs6JdFgKa1Bc4D blob",
+            "a long path /home/user/src/borg-ai/crates/borg-mesh/src/sync.rs and 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "API_KEY: 12345abcdef and Zx9Qk2LmPw8RtYv3NbHs6JdFgKa1Bc4D",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+        ];
+        let lines = crate::jsonl::store_lines(&["lessons.jsonl", "messages.jsonl", "reasoning.jsonl", "episodes.jsonl", "cues.jsonl"]);
+        let mut borrowed = 0;
+        for t in edges.iter().copied().chain(lines.iter().map(String::as_str)) {
+            let new = redacted(t);
+            assert_eq!(new, old_redact(t), "{t}");
+            assert_eq!(redact(t), old_redact(t));
+            borrowed += usize::from(matches!(new, Cow::Borrowed(_)));
+        }
+        assert!(borrowed >= 2, "clean texts are borrowed");
+    }
     use links::Link;
 
     #[test]

@@ -32,10 +32,12 @@
 //! never the session's task and never doubles as a correction. BORG_VETO=off makes such a prompt an
 //! ordinary one (the command still works).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::msg::{self, Address, Kind, Message};
@@ -189,9 +191,8 @@ pub fn apply(home: &Path, m: &Message, here: &str) -> std::io::Result<Option<Vet
         return Ok(None);
     }
     // A session unknown here is another node's, or none.
-    let session = session.as_str();
     let p = presence::read(home, session);
-    if p.is_none() && !outcome::read(&home.join("outcomes.jsonl")).iter().any(|o| o.session == session) {
+    if p.is_none() && !has_outcome(&home.join("outcomes.jsonl"), session) {
         return Ok(None);
     }
     let dir = msg::dir(home).join("vetoed");
@@ -208,9 +209,9 @@ pub fn apply(home: &Path, m: &Message, here: &str) -> std::io::Result<Option<Vet
     // The engineer's email when an engineer sent it, else the sending session's name.
     let engineer = match Address::parse(&m.by) {
         Some(Address::Engineer { email }) if !email.is_empty() => email,
-        _ => m.name.clone(),
+        _ => &m.name,
     };
-    let said = Said { session, repo: &repo, engineer: &engineer, task: &task, agent: "", reason: &reason, ms: m.ms, via: "mesh" };
+    let said = Said { session, repo: &repo, engineer, task: &task, agent: "", reason: &reason, ms: m.ms, via: "mesh" };
     record(home, &said).map(Some).inspect_err(|_| {
         let _ = std::fs::remove_file(&marker);
     })
@@ -228,12 +229,47 @@ pub fn apply_messages(home: &Path, now: i64) -> usize {
         return 0;
     }
     let here = msg::node(home);
-    let lines: Vec<Message> = crate::jsonl::read_lines(&msg::path(home));
-    lines
-        .iter()
+    std::fs::read_to_string(msg::path(home))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| may_be_veto(l))
+        .filter_map(|l| serde_json::from_str::<Message>(l).ok())
         .filter(|m| m.kind == Kind::Veto && roles.has(&m.id) && m.well_formed() && roles.of(m, &here, now).is_some())
-        .filter_map(|m| apply(home, m, &here).ok().flatten())
+        .filter_map(|m| apply(home, &m, &here).ok().flatten())
         .count()
+}
+
+/// Whether `line` may parse as a veto `Message`, read from its `kind` alone: a line whose one `kind` is
+/// a string other than `veto` is no veto, so it is never parsed whole. Any other line is (a `kind` that
+/// is no string, which `Kind` may read as `{"veto": null}`, or one this cannot read alone).
+fn may_be_veto(line: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Head<'a> {
+        #[serde(borrow)]
+        kind: crate::jsonl::Scalar<'a>,
+    }
+    serde_json::from_str::<Head>(line).map_or(true, |h| h.kind.as_str().is_none_or(|k| k == Kind::Veto.as_str()))
+}
+
+/// Whether the outcomes log `path` holds an `Outcome` of `session` (outcome.rs `read`), without
+/// building the others (`of_session`).
+fn has_outcome(path: &Path, session: &str) -> bool {
+    std::fs::read_to_string(path).unwrap_or_default().lines().any(|l| of_session(l, session))
+}
+
+/// Whether `line` parses as an `Outcome` of `session`: its `session` read first, and only a line of
+/// that session parsed whole.
+fn of_session(line: &str, session: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Of<'a> {
+        #[serde(borrow)]
+        session: Cow<'a, str>,
+    }
+    match serde_json::from_str::<Of>(line) {
+        Ok(o) => o.session == session && serde_json::from_str::<Outcome>(line).is_ok(),
+        // One this cannot read alone (no session, or a form other than an object): parsed whole.
+        Err(_) => serde_json::from_str::<Outcome>(line).is_ok_and(|o| o.session == session),
+    }
 }
 
 /// What the drone is told when the engineer vetoes in the session.
@@ -351,7 +387,7 @@ const USAGE: &str = "usage: borg no [--session ID|DRONE] [--dir DIR] [--json] <r
 /// A veto of the drone `d` on another node: a veto message to its session of its node (the drone's node
 /// records it, `apply_messages`).
 fn remote(home: &Path, drones: &[top::Drone], d: &top::Drone, cwd: &str, reason: &str, now: i64) -> i32 {
-    let to = Address::Session { id: d.p.session.clone(), node: Some(d.node.clone()) };
+    let to = Address::Session { id: &d.p.session, node: Some(&d.node) };
     let sent = msg::sender(home, drones, None, cwd).and_then(|from| msg::send(home, Message::new(Kind::Veto, &from, &to.to_string(), None, now, reason), now));
     match sent {
         Ok(m) => {
@@ -449,6 +485,53 @@ pub fn main(args: &[&str]) -> i32 {
 mod tests {
     use super::*;
     use crate::presence::Presence;
+
+    /// Oracle: reading `kind` first skips only lines the old full parse found no veto in, and reading
+    /// `session` first answers what the old `outcome::read` scan did, line by line, on a real store's
+    /// logs and at the edges.
+    #[test]
+    fn the_projections_skip_only_what_the_full_parse_refused() {
+        let from = msg::Sender { by: "s1".into(), name: "One".into(), harness: "claude".into(), node: "n1".into() };
+        let veto = serde_json::to_string(&Message::new(Kind::Veto, &from, "s2@n2", None, 5, "no")).unwrap();
+        let tell = serde_json::to_string(&Message::new(Kind::Tell, &from, "s2@n2", None, 5, "hi")).unwrap();
+        let m: Message = serde_json::from_str(&veto).unwrap();
+        let positional = json!([m.v, m.id, m.kind, m.by, m.name, m.harness, m.node, m.to, m.re, m.ms, m.text]).to_string();
+        let outcome = r#"{"kind":"changed","session":"s1","lessons":["L1"],"ms":5,"repo":"r"}"#;
+        let edges: Vec<String> = [
+            veto.clone(),
+            tell.clone(),
+            veto.replacen("\"kind\":\"veto\"", "\"kind\":{\"veto\":null}", 1),
+            veto.replacen("\"kind\":\"veto\"", "\"kind\":\"v\\u0065to\"", 1),
+            veto.replacen("\"kind\":\"veto\"", "\"kind\":\"veto\",\"kind\":\"veto\"", 1),
+            veto.replacen("\"kind\":\"veto\",", "", 1),
+            positional,
+            outcome.into(),
+            outcome.replacen("\"s1\"", "\"s\\u0031\"", 1),
+            outcome.replacen("\"s1\"", "1", 1),
+            outcome.replacen("\"session\":\"s1\"", "\"session\":\"s1\",\"session\":\"s1\"", 1),
+            outcome.replacen("\"session\":\"s1\",", "", 1),
+            json!(["changed", "s1", ["L1"], 5, "r"]).to_string(),
+            json!(["s1"]).to_string(),
+            "{}".into(),
+            String::new(),
+            "not json".into(),
+        ]
+        .into_iter()
+        .collect();
+        let lines: Vec<String> = edges.into_iter().chain(crate::jsonl::store_lines(&[msg::FILE, "outcomes.jsonl"])).collect();
+        let mut vetoes = 0;
+        for l in &lines {
+            let old = serde_json::from_str::<Message>(l).ok().filter(|m| m.kind == Kind::Veto);
+            vetoes += usize::from(old.is_some());
+            assert!(old.is_none() || may_be_veto(l), "a veto is never skipped: {l}");
+            let sessions = serde_json::from_str::<serde_json::Value>(l).ok().and_then(|v| v.get("session")?.as_str().map(str::to_string));
+            for s in sessions.iter().map(String::as_str).chain(["s1", "elsewhere"]) {
+                let old = serde_json::from_str::<Outcome>(l).is_ok_and(|o| o.session == s);
+                assert_eq!(of_session(l, s), old, "{s} in {l}");
+            }
+        }
+        assert!(vetoes >= 3, "the edges hold vetoes in each form: {vetoes}");
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-veto-{name}-{}", std::process::id()));

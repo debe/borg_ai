@@ -90,10 +90,13 @@
 //! memory.rs derives activation and the usefulness belief from these results; `weight` below is the
 //! earlier, single-number view (kept for reporting and for comparison in the R1 replay).
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::jsonl::{Each, Str, Text};
 
 pub const ASKED: &str = "asked";
 pub const CORRECTED: &str = "asked_then_corrected";
@@ -643,8 +646,6 @@ pub fn publish(home: &Path) -> usize {
     let mine = std::fs::read_to_string(&local).unwrap_or_default();
     let node = crate::stats::node(home);
     let text = std::fs::read_to_string(&team).unwrap_or_default();
-    let mut have: std::collections::HashSet<String> = text.lines().map(str::to_string).collect();
-    let mut out = String::new();
     // This engineer's personal lessons (reach.rs) are no team's business, not even by id.
     let personal = crate::reach::personal_ids(home);
     let records = mine.lines().filter_map(|l| serde_json::from_str::<Outcome>(l).ok()).filter_map(|mut o| {
@@ -652,9 +653,13 @@ pub fn publish(home: &Path) -> usize {
         o.lessons.retain(|id| !personal.contains(id));
         (!named || !o.lessons.is_empty()).then_some(o)
     });
-    for line in records.filter_map(|o| share(&o, &node)).filter_map(|x| serde_json::to_string(&x).ok()) {
-        if have.insert(line.clone()) {
-            out.push_str(&line);
+    let shared: Vec<String> = records.filter_map(|o| share(&o, &node)).filter_map(|x| serde_json::to_string(&x).ok()).collect();
+    // The lines the team file holds and the ones added here, borrowed: none is copied to be compared.
+    let mut have: std::collections::HashSet<&str> = text.lines().collect();
+    let mut out = String::new();
+    for line in &shared {
+        if have.insert(line) {
+            out.push_str(line);
             out.push('\n');
         }
     }
@@ -710,42 +715,291 @@ pub fn team_parts(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
     if !on {
         return (local, Vec::new());
     }
-    let mine: std::collections::HashSet<String> = local.iter().map(|o| tag(&o.session)).collect();
+    // Each of this machine's sessions tagged once, however many records it has.
+    let sessions: std::collections::HashSet<&str> = local.iter().map(|o| o.session.as_str()).collect();
+    let mine: std::collections::HashSet<String> = sessions.into_iter().map(tag).collect();
     let text = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
-    let lines: Vec<Shared> = text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()).collect();
-    // The lessons each team session's shared records name: a green run credits only lessons it was given.
-    let mut given: std::collections::HashMap<&str, std::collections::HashSet<&str>> = std::collections::HashMap::new();
-    for x in lines.iter().filter(|x| SHARED_KINDS.contains(&x.kind.as_str()) && x.kind != TESTED) {
-        given.entry(x.s.as_str()).or_default().extend(x.lessons.iter().map(String::as_str));
-    }
-    let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String, u8)> = std::collections::HashSet::new();
     let mut team = Vec::new();
-    for x in lines.iter() {
-        // The judge in the key: an ignore's versioned copy is kept beside an older node's line (`Shared::judge`).
-        if !SHARED_KINDS.contains(&x.kind.as_str())
-            || mine.contains(&x.s)
-            || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone(), x.judge))
-        {
-            continue;
-        }
-        if x.kind == TESTED && !x.lessons.iter().all(|l| given.get(x.s.as_str()).is_some_and(|g| g.contains(l.as_str()))) {
-            continue;
-        }
+    team_lines(&text, &mine, |x| {
         team.push(Outcome {
-            kind: x.kind.clone(),
-            session: x.s.clone(),
-            lessons: x.lessons.clone(),
+            kind: x.kind.to_string(),
+            session: x.s.to_string(),
+            lessons: x.lessons.iter().map(|l| l.to_string()).collect(),
             ms: x.ms,
-            repo: x.r.clone(),
-            p: x.p.clone(),
-            channel: x.channel.clone(),
-            cause: x.c.clone(),
+            repo: x.r.to_string(),
+            p: x.p.to_vec(),
+            channel: x.channel.to_string(),
+            cause: x.c.to_string(),
             credit: x.credit,
             judge: x.judge,
             ..Default::default()
         });
-    }
+    });
     (local, team)
+}
+
+/// A record `fold_parts` hands over: one of this machine's, or a team line `team_parts` keeps.
+pub(crate) enum Part<'r, 'a> {
+    Local(&'r OutcomeRef<'a>),
+    Team(&'r Team<'r, 'a>),
+}
+
+/// `team_parts` as a fold, for a reader that only folds them: `f` sees each of this machine's records,
+/// then (on) each team line `team_parts` keeps, in its order, borrowed from the line. Neither log's
+/// records are kept: this machine's log is read once, its sessions tagged once, and its text is gone before
+/// the team's is read; of the team's lines only what `team_lines` must remember stays.
+pub(crate) fn fold_parts(lessons: &Path, on: bool, mut f: impl FnMut(Part)) {
+    let mine: HashSet<String> = {
+        let text = std::fs::read_to_string(path_beside(lessons)).unwrap_or_default();
+        let mut sessions: HashSet<Cow<str>> = HashSet::new();
+        for o in text.lines().filter_map(|l| serde_json::from_str::<OutcomeRef>(l).ok()) {
+            f(Part::Local(&o));
+            if on && !sessions.contains(&o.session) {
+                sessions.insert(o.session);
+            }
+        }
+        sessions.iter().map(|s| tag(s)).collect()
+    };
+    if !on {
+        return;
+    }
+    let team = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
+    team_lines(&team, &mine, |x| f(Part::Team(x)));
+}
+
+/// A `TEAM_FILE` line `team_lines` keeps, borrowed: its `SharedRef` fields but the unread `node`.
+pub(crate) struct Team<'r, 'a> {
+    pub(crate) kind: &'r str,
+    pub(crate) s: &'r str,
+    pub(crate) lessons: &'r [Text<'a>],
+    pub(crate) ms: i64,
+    pub(crate) r: &'r str,
+    pub(crate) p: &'r [f64],
+    pub(crate) channel: &'r str,
+    pub(crate) c: &'r str,
+    pub(crate) credit: f64,
+    pub(crate) judge: u8,
+}
+
+/// The `TEAM_FILE` lines of `text` that count (`team_parts`), in file order: of a shared kind, of no
+/// session tagged in `mine`, the first of their (kind, session, lessons, ms, cause, judge), and a `tested`
+/// line only when the team's records show its session was given each of its lessons.
+///
+/// One read, no line kept whole: each is handed over as it is parsed. What stays is the lessons each
+/// session was given and the dedup keys, both moved or borrowed out of their lines (a string copied only
+/// when it held an escape). A `tested` line whose session was not given its lessons yet waits, and the
+/// lines after it with it, until a later line gives them or the log ends: what a session was given only
+/// grows, so each is decided as a read of the whole log decides it.
+fn team_lines<'a>(text: &'a str, mine: &HashSet<String>, mut f: impl FnMut(&Team<'_, 'a>)) {
+    let mut given: HashMap<Cow<str>, HashSet<Cow<str>>> = HashMap::new();
+    // A map for its entry API, which lends the key out before it is kept.
+    let mut seen: HashMap<TeamKey, ()> = HashMap::new();
+    // From the first `tested` line not yet due on, the lines waiting their turn, in file order.
+    let mut held: std::collections::VecDeque<Held> = std::collections::VecDeque::new();
+    for x in text.lines().filter_map(|l| serde_json::from_str::<SharedRef>(l).ok()) {
+        if !SHARED_KINDS.contains(&x.kind.as_ref()) {
+            continue;
+        }
+        // The lessons each session's shared records name: a green run credits only lessons it was given.
+        if x.kind != TESTED {
+            given.entry(x.s.clone()).or_default().extend(x.lessons.iter().map(|l| l.0.clone()));
+        }
+        if !mine.contains(x.s.as_ref()) {
+            let SharedRef { kind, s, lessons, ms, p, channel, r, c, credit, judge, .. } = x;
+            // The judge in the key: an ignore's versioned copy is kept beside an older node's line (`Shared::judge`).
+            if let std::collections::hash_map::Entry::Vacant(new) = seen.entry((kind, s, lessons, ms, c, judge)) {
+                if held.is_empty() && due(new.key(), &given) {
+                    f(&Held::view(new.key(), &r, &p, &channel, credit));
+                } else {
+                    held.push_back(Held { key: new.key().clone(), r, p, channel, credit });
+                }
+                new.insert(());
+            }
+        }
+        while let Some(h) = held.front().filter(|h| due(&h.key, &given)) {
+            f(&Held::view(&h.key, &h.r, &h.p, &h.channel, h.credit));
+            held.pop_front();
+        }
+    }
+    // The whole log read: a `tested` line still waiting was not given its lessons.
+    for h in held.iter().filter(|h| due(&h.key, &given)) {
+        f(&Held::view(&h.key, &h.r, &h.p, &h.channel, h.credit));
+    }
+}
+
+/// A team line's dedup key in `team_lines`: (kind, session, lessons, ms, cause, judge).
+type TeamKey<'a> = (Cow<'a, str>, Cow<'a, str>, Vec<Text<'a>>, i64, Cow<'a, str>, u8);
+
+/// Whether the line keyed `key` may be handed over by what is known of `given`: any but a `tested` line,
+/// and a `tested` line once its session was given each of its lessons.
+fn due(key: &TeamKey, given: &HashMap<Cow<str>, HashSet<Cow<str>>>) -> bool {
+    let (kind, s, lessons, ..) = key;
+    kind != TESTED || lessons.iter().all(|l| given.get(s).is_some_and(|g| g.contains(&l.0)))
+}
+
+/// A team line `team_lines` holds until it may be handed over: its key and the rest of what `Team` reads.
+struct Held<'a> {
+    key: TeamKey<'a>,
+    r: Cow<'a, str>,
+    p: Vec<f64>,
+    channel: Cow<'a, str>,
+    credit: f64,
+}
+
+impl Held<'_> {
+    /// The `Team` a line's key and the rest of it make, held or not.
+    fn view<'r, 'a>(key: &'r TeamKey<'a>, r: &'r str, p: &'r [f64], channel: &'r str, credit: f64) -> Team<'r, 'a> {
+        let (kind, s, lessons, ms, c, judge) = key;
+        Team { kind, s, lessons, ms: *ms, r, p, channel, c, credit, judge: *judge }
+    }
+}
+
+/// A `TEAM_FILE` line as `team_parts` reads it, borrowed from the line (a string with an escape is
+/// copied): every line `Shared` reads, field for field, so the two take the same lines.
+#[derive(Deserialize)]
+struct SharedRef<'a> {
+    #[serde(borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    s: Cow<'a, str>,
+    #[serde(borrow)]
+    lessons: Vec<Text<'a>>,
+    ms: i64,
+    /// Never read: required as in `Shared`.
+    #[serde(borrow, rename = "node")]
+    _node: Cow<'a, str>,
+    #[serde(default)]
+    p: Vec<f64>,
+    #[serde(default, borrow)]
+    channel: Cow<'a, str>,
+    #[serde(default, borrow)]
+    r: Cow<'a, str>,
+    #[serde(default, borrow)]
+    c: Cow<'a, str>,
+    #[serde(default)]
+    credit: f64,
+    #[serde(default)]
+    judge: u8,
+}
+
+/// A record of this machine's log as a fold reads it (`fold_parts`), borrowed from its line (a string with
+/// an escape is copied): every field `Outcome` reads, in its order and with its types, so the two take the
+/// same lines; the fields no fold reads are checked, not kept.
+#[derive(Deserialize)]
+pub(crate) struct OutcomeRef<'a> {
+    #[serde(borrow)]
+    pub(crate) kind: Cow<'a, str>,
+    #[serde(borrow)]
+    pub(crate) session: Cow<'a, str>,
+    #[serde(borrow)]
+    pub(crate) lessons: Vec<Text<'a>>,
+    pub(crate) ms: i64,
+    #[serde(rename = "repo")]
+    _repo: Str,
+    #[serde(default, rename = "groups")]
+    _groups: Each<Each<Str>>,
+    #[serde(default, borrow)]
+    pub(crate) channel: Cow<'a, str>,
+    #[serde(default, rename = "grades")]
+    _grades: Each<u8>,
+    #[serde(default, rename = "ranks")]
+    _ranks: Each<u16>,
+    #[serde(default, rename = "applied")]
+    _applied: u16,
+    #[serde(default, rename = "chosen")]
+    _chosen: Each<Str>,
+    #[serde(default, rename = "explore")]
+    _explore: bool,
+    #[serde(default, rename = "cause")]
+    _cause: Str,
+    #[serde(default, rename = "credit")]
+    _credit: f64,
+    #[serde(default)]
+    pub(crate) p: Vec<f64>,
+    #[serde(default, borrow)]
+    pub(crate) pool: Vec<Text<'a>>,
+    #[serde(default)]
+    pub(crate) base: Vec<f64>,
+    #[serde(default)]
+    pub(crate) scoped: Vec<bool>,
+    #[serde(default, rename = "check")]
+    _check: Str,
+    #[serde(default, rename = "policy")]
+    _policy: Str,
+    #[serde(default, rename = "fit")]
+    _fit: Str,
+    #[serde(default, rename = "seen")]
+    _seen: Str,
+    #[serde(default, rename = "source")]
+    _source: Str,
+    #[serde(default, rename = "free")]
+    _free: Each<Str>,
+    #[serde(default, rename = "pf")]
+    _pf: Each<f64>,
+    #[serde(default, rename = "placebo")]
+    _placebo: Each<Str>,
+    #[serde(default, rename = "psi")]
+    _psi: f64,
+    #[serde(default, rename = "nofree")]
+    _nofree: Each<Str>,
+    #[serde(default, rename = "xk")]
+    _xk: Option<u32>,
+    #[serde(default, rename = "xs")]
+    _xs: Option<u32>,
+    #[serde(default, rename = "alpha")]
+    _alpha: Option<f64>,
+    #[serde(default, borrow)]
+    pub(crate) tail: Vec<Text<'a>>,
+    #[serde(default, rename = "pt")]
+    _pt: f64,
+    #[serde(default, rename = "rel")]
+    _rel: Each<f64>,
+    #[serde(default, rename = "route")]
+    _route: Str,
+    #[serde(default, rename = "reason")]
+    _reason: Str,
+    #[serde(default, rename = "eligible")]
+    _eligible: u32,
+    #[serde(default, rename = "shown")]
+    _shown: u32,
+    #[serde(default, rename = "tokens")]
+    _tokens: u32,
+    #[serde(default, rename = "budget")]
+    _budget: u32,
+    #[serde(default, rename = "fill")]
+    _fill: Each<u16>,
+    #[serde(default, rename = "model")]
+    _model: Str,
+    #[serde(default, rename = "prompt_hash")]
+    _prompt_hash: Str,
+    #[serde(default, rename = "harness")]
+    _harness: Str,
+    #[serde(default, rename = "version")]
+    _version: Str,
+    #[serde(default, rename = "dur_ms")]
+    _dur_ms: u64,
+    #[serde(default, rename = "failed")]
+    _failed: bool,
+    #[serde(default, rename = "usd")]
+    _usd: f64,
+    #[serde(default)]
+    pub(crate) judge: u8,
+    #[serde(default, rename = "stripped")]
+    _stripped: bool,
+    #[serde(default, rename = "reasons")]
+    _reasons: Each<Str>,
+    #[serde(default, rename = "at")]
+    _at: Str,
+    #[serde(default, rename = "moves")]
+    _moves: Each<Str>,
+    #[serde(default, rename = "whys")]
+    _whys: Each<Str>,
+    #[serde(default, rename = "xtokens")]
+    _xtokens: u32,
+    #[serde(default, rename = "line")]
+    _line: Str,
+    #[serde(default, rename = "run")]
+    _run: Str,
 }
 
 pub fn read(path: &Path) -> Vec<Outcome> {
@@ -829,7 +1083,12 @@ pub fn contradicted(outcomes: &[Outcome], session: &str, ms: i64, target: Option
 
 /// Was `o` a free delivery (channel `early` or `queued`): lessons handed over as context, no question?
 pub fn free(o: &Outcome) -> bool {
-    o.channel == "early" || o.channel == "queued"
+    free_channel(&o.channel)
+}
+
+/// Whether a record of `channel` was a free delivery (`free`).
+pub(crate) fn free_channel(channel: &str) -> bool {
+    channel == "early" || channel == "queued"
 }
 
 /// The lessons a correction at `ms` in `session` shows were needed and not asked: of the lessons it
@@ -1879,6 +2138,356 @@ mod tests {
         let plain = serde_json::to_string(&o(GRADED, "s", &["A"], 5)).unwrap();
         for field in ["moves", "whys", "xtokens", "\"line\"", "\"run\""] {
             assert!(!plain.contains(field), "empty: not written, older lines write back unchanged: {plain}");
+        }
+    }
+
+    /// `team_parts` before `SharedRef`: every team line parsed into an owned `Shared`, owned dedup keys.
+    fn team_parts_owned(lessons: &Path, on: bool) -> (Vec<Outcome>, Vec<Outcome>) {
+        let local = read(&path_beside(lessons));
+        if !on {
+            return (local, Vec::new());
+        }
+        let mine: std::collections::HashSet<String> = local.iter().map(|o| tag(&o.session)).collect();
+        let text = std::fs::read_to_string(lessons.with_file_name(TEAM_FILE)).unwrap_or_default();
+        let lines: Vec<Shared> = text.lines().filter_map(|l| serde_json::from_str::<Shared>(l).ok()).collect();
+        let mut given: HashMap<&str, std::collections::HashSet<&str>> = HashMap::new();
+        for x in lines.iter().filter(|x| SHARED_KINDS.contains(&x.kind.as_str()) && x.kind != TESTED) {
+            given.entry(x.s.as_str()).or_default().extend(x.lessons.iter().map(String::as_str));
+        }
+        let mut seen: std::collections::HashSet<(String, String, Vec<String>, i64, String, u8)> = std::collections::HashSet::new();
+        let mut team = Vec::new();
+        for x in lines.iter() {
+            if !SHARED_KINDS.contains(&x.kind.as_str())
+                || mine.contains(&x.s)
+                || !seen.insert((x.kind.clone(), x.s.clone(), x.lessons.clone(), x.ms, x.c.clone(), x.judge))
+            {
+                continue;
+            }
+            if x.kind == TESTED && !x.lessons.iter().all(|l| given.get(x.s.as_str()).is_some_and(|g| g.contains(l.as_str()))) {
+                continue;
+            }
+            team.push(Outcome {
+                kind: x.kind.clone(),
+                session: x.s.clone(),
+                lessons: x.lessons.clone(),
+                ms: x.ms,
+                repo: x.r.clone(),
+                p: x.p.to_vec(),
+                channel: x.channel.clone(),
+                cause: x.c.clone(),
+                credit: x.credit,
+                judge: x.judge,
+                ..Default::default()
+            });
+        }
+        (local, team)
+    }
+
+    /// `TEAM_FILE` lines at every edge `Shared` and `SharedRef` could decide apart; `mine` is a session
+    /// of this machine's log.
+    fn team_edges(mine: &str) -> Vec<String> {
+        let x = |kind: &str, s: &str, lessons: &[&str], ms: i64| {
+            serde_json::to_string(&Shared {
+                kind: kind.into(),
+                s: s.into(),
+                lessons: lessons.iter().map(|l| l.to_string()).collect(),
+                ms,
+                node: "n".into(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let a = x(CHANGED, "t1", &["L1"], 1);
+        vec![
+            // A `tested` line before what its session was given; one with its kind and session escaped;
+            // one whose session was given only in the positional form, which `jsonl::lead` cannot read.
+            x(TESTED, "t6", &["L1"], 0),
+            x(TESTED, "t6", &["L2"], 0)
+                .replace(r#""kind":"tested""#, &format!(r#""kind":"{}""#, crate::jsonl::escaped(TESTED)))
+                .replace(r#""s":"t6""#, &format!(r#""s":"{}""#, crate::jsonl::escaped("t6"))),
+            x(TESTED, "t7", &["L1"], 0),
+            x(ASKED, "t6", &["L1", "L2"], 0),
+            r#"["asked","t7",["L1"],0,"n"]"#.into(),
+            a.clone(),
+            a.clone(),
+            x(ASKED, "t1", &["L1", "L2"], 1),
+            x(TESTED, "t1", &["L1"], 2),
+            x(TESTED, "t1", &["L3"], 2),
+            x(TESTED, "t2", &["L1"], 2),
+            x(CHANGED, &tag(mine), &["L1"], 3),
+            x(GRADED, "t3", &["L1"], 3),
+            // Escapes: the same session and lesson as `a`, one ms later.
+            x(CHANGED, "t1", &["L1"], 4)
+                .replace(r#""s":"t1""#, &format!(r#""s":"{}""#, crate::jsonl::escaped("t1")))
+                .replace(r#""lessons":["L1"]"#, &format!(r#""lessons":["{}"]"#, crate::jsonl::escaped("L1"))),
+            x(IGNORED, "t4", &["L1"], 5).replacen('{', r#"{"judge":3,"#, 1),
+            x(IGNORED, "t4", &["L1"], 5).replacen('{', r#"{"judge":300,"#, 1),
+            x(REGRETTED, "t5", &["L1"], 6).replacen('{', r#"{"c":"cause","credit":0.5,"r":"repo","channel":"stop","p":[0.25],"#, 1),
+            // Duplicate keys, wrong types, missing or wrong `node`, a lone surrogate in it.
+            a.replacen('{', r#"{"kind":"asked","#, 1),
+            a.replacen('{', r#"{"node":"m","#, 1),
+            a.replacen('{', r#"{"x":1,"x":2,"#, 1),
+            a.replace(r#""kind":"asked_then_changed""#, r#""kind":5"#),
+            a.replace(r#","node":"n""#, ""),
+            a.replace(r#""node":"n""#, r#""node":5"#),
+            a.replace(r#""node":"n""#, r#""node":"\ud800""#),
+            a.replace(r#""ms":1"#, r#""ms":1.5"#),
+            a.replace(r#""lessons":["L1"]"#, r#""lessons":"L1""#),
+            a.replacen('{', r#"{"p":["x"],"#, 1),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            a.trim_end_matches('}').to_string(),
+            a.clone() + " x",
+            a.clone() + " ",
+            " ".into(),
+            String::new(),
+            "[]".into(),
+            "null".into(),
+        ]
+    }
+
+    /// `team_parts` keeps exactly the team lines and gives exactly the outcomes the owned parse did, on edge
+    /// lines and on the outcome logs of a real store (`BORG_BENCH_STORE`), on and off.
+    #[test]
+    fn team_parts_read_what_the_owned_parse_read() {
+        let dir = tmp("team-parts-oracle");
+        let lessons = dir.join("lessons.jsonl");
+        let mine = o(ASKED, "mine", &["L1"], 1);
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        let local = [vec![serde_json::to_string(&mine).unwrap()], real("outcomes.jsonl")].concat();
+        for team in [team_edges("mine"), real("outcomes-team.jsonl"), [real("outcomes-team.jsonl"), team_edges("mine")].concat()] {
+            lines(&path_beside(&lessons), &local);
+            lines(&lessons.with_file_name(TEAM_FILE), &team);
+            for on in [true, false] {
+                assert_eq!(team_parts(&lessons, on), team_parts_owned(&lessons, on), "on={on}");
+            }
+        }
+        lines(&lessons.with_file_name(TEAM_FILE), &team_edges("mine"));
+        lines(&path_beside(&lessons), &[serde_json::to_string(&mine).unwrap()]);
+        let (_, team) = team_parts(&lessons, true);
+        assert_eq!(team.iter().filter(|o| o.session == "t1" && o.kind == CHANGED).count(), 2, "a line and its copies once, the escaped line apart");
+        assert!(!team.iter().any(|o| o.session == tag("mine")), "this machine's own copy");
+        let tested = |s: &str| team.iter().filter(|o| o.kind == TESTED && o.session == s).count();
+        assert_eq!((tested("t6"), tested("t7")), (2, 1), "given after the test, escaped, in the positional form");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Local outcome lines at every edge `Outcome` and `OutcomeRef` could decide apart: each kind of field
+    /// with a wrong type or a number past its type, duplicate keys read and unread, escapes, the positional
+    /// form, and lines that are no record.
+    fn local_edges() -> Vec<String> {
+        let g = Outcome {
+            channel: PLACEBO.into(),
+            tail: vec!["T1".into(), "L1".into()],
+            groups: vec![vec!["L1".into()]],
+            grades: vec![3],
+            p: vec![0.5],
+            xk: Some(2),
+            alpha: Some(0.1),
+            ..o(GRADED, "s1", &["L1"], 7)
+        };
+        let a = serde_json::to_string(&g).unwrap();
+        let esc = crate::jsonl::escaped;
+        let with = |field: &str| a.replacen('{', &format!("{{{field},"), 1);
+        let mut out = vec![
+            a.clone(),
+            serde_json::to_string(&o(CHANGED, "s2", &["L1", "L2"], 8)).unwrap(),
+            // Escapes in every string a fold reads.
+            a.replace(r#""kind":"graded""#, &format!(r#""kind":"{}""#, esc("graded")))
+                .replace(r#""session":"s1""#, &format!(r#""session":"{}""#, esc("s1")))
+                .replace(r#""channel":"placebo""#, &format!(r#""channel":"{}""#, esc("placebo")))
+                .replace(r#""tail":["T1","L1"]"#, &format!(r#""tail":["{}","L1"]"#, esc("T1")))
+                .replace(r#""lessons":["L1"]"#, &format!(r#""lessons":["{}"]"#, esc("L1"))),
+            // Duplicate keys, read, unread and unknown.
+            with(r#""kind":"asked""#),
+            with(r#""model":"m","model":"n""#),
+            with(r#""x":1,"x":2"#),
+            // Wrong types and numbers past their type in the fields no fold reads.
+            with(r#""groups":[[1]]"#),
+            with(r#""grades":[256]"#),
+            with(r#""ranks":[-1]"#),
+            with(r#""applied":70000"#),
+            with(r#""explore":1"#),
+            with(r#""credit":"1""#),
+            with(r#""scoped":[1]"#),
+            with(r#""pool":"L1""#),
+            with(r#""fill":[65536]"#),
+            with(r#""xs":5000000000"#),
+            with(r#""xs":null"#),
+            with(r#""eligible":-1"#),
+            with(r#""tokens":4294967296"#),
+            with(r#""dur_ms":18446744073709551616"#),
+            with(r#""judge":256"#),
+            with(r#""stripped":null"#),
+            with(r#""reasons":[null]"#),
+            with(r#""at":5"#),
+            with(r#""line":"\ud800""#),
+            with(r#""psi":true"#),
+            // Wrong types and missing fields among those a fold reads, and the required `repo`.
+            a.replace(r#""ms":7"#, r#""ms":7.5"#),
+            a.replace(r#""ms":7"#, r#""ms":9223372036854775808"#),
+            a.replace(r#""lessons":["L1"]"#, r#""lessons":["L1",1]"#),
+            a.replace(r#""tail":["T1","L1"]"#, r#""tail":"T1""#),
+            a.replace(r#""session":"s1","#, ""),
+            a.replace(r#""repo":"r","#, ""),
+            a.replace(r#""repo":"r""#, r#""repo":null"#),
+            // The positional form serde reads a struct from too.
+            r#"["asked","s3",["L1"],9,"r"]"#.into(),
+            r#"["asked","s3",["L1"],9]"#.into(),
+            r#"["asked","s3",["L1"],9,"r",[],"placebo"]"#.into(),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            a.trim_end_matches('}').to_string(),
+            format!("{a} x"),
+            format!("{a} "),
+            " ".into(),
+            String::new(),
+            "{}".into(),
+            "[]".into(),
+            "null".into(),
+        ];
+        out.push(serde_json::to_string(&Outcome { channel: PLACEBO.into(), ..o(IGNORED, "s4", &["L2"], 9) }).unwrap());
+        out
+    }
+
+    /// What a fold reads of a record, owned, from either kind of line.
+    type Read = (String, String, Vec<String>, i64, String, Vec<String>);
+
+    fn owned_read(o: &Outcome) -> Read {
+        (o.kind.clone(), o.session.clone(), o.lessons.clone(), o.ms, o.channel.clone(), o.tail.clone())
+    }
+
+    fn borrowed_read(o: &OutcomeRef) -> Read {
+        let strings = |v: &[Text]| v.iter().map(|t| t.to_string()).collect();
+        (o.kind.to_string(), o.session.to_string(), strings(&o.lessons), o.ms, o.channel.to_string(), strings(&o.tail))
+    }
+
+    /// `OutcomeRef` takes exactly the lines `Outcome` takes and reads the same values from them, on the
+    /// edges and every line of a real store's local log (`BORG_BENCH_STORE`).
+    #[test]
+    fn the_borrowed_record_reads_what_the_owned_one_read() {
+        let mut taken = 0;
+        for line in local_edges().iter().chain(&crate::jsonl::store_lines(&["outcomes.jsonl"])) {
+            let owned = serde_json::from_str::<Outcome>(line).ok();
+            let borrowed = serde_json::from_str::<OutcomeRef>(line).ok();
+            assert_eq!(owned.is_some(), borrowed.is_some(), "{line:?}");
+            if let (Some(o), Some(r)) = (owned, borrowed) {
+                assert_eq!(borrowed_read(&r), owned_read(&o), "{line:?}");
+                taken += 1;
+            }
+        }
+        assert!(taken > 3, "the edges hold records");
+    }
+
+    /// `fold_parts` hands over exactly the records `team_parts` returns, in its order, on and off: on the
+    /// edges and on the outcome logs of a real store (`BORG_BENCH_STORE`).
+    #[test]
+    fn fold_parts_folds_what_team_parts_returns() {
+        let dir = tmp("fold-parts-oracle");
+        let lessons = dir.join("lessons.jsonl");
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        let mine = serde_json::to_string(&o(ASKED, "mine", &["L1"], 1)).unwrap();
+        for (local, team) in [
+            ([vec![mine.clone()], local_edges()].concat(), team_edges("mine")),
+            ([vec![mine.clone()], real("outcomes.jsonl")].concat(), [real("outcomes-team.jsonl"), team_edges("mine")].concat()),
+        ] {
+            lines(&path_beside(&lessons), &local);
+            lines(&lessons.with_file_name(TEAM_FILE), &team);
+            for on in [true, false] {
+                let (mut l, mut t) = (Vec::new(), Vec::new());
+                fold_parts(&lessons, on, |part| match part {
+                    Part::Local(o) => l.push(borrowed_read(o)),
+                    Part::Team(x) => t.push((x.kind.to_string(), x.s.to_string(), x.lessons.iter().map(|l| l.to_string()).collect(), x.ms)),
+                });
+                let (want_l, want_t) = team_parts(&lessons, on);
+                assert_eq!(l, want_l.iter().map(owned_read).collect::<Vec<_>>(), "on={on}");
+                let want_t: Vec<(String, String, Vec<String>, i64)> = want_t.into_iter().map(|o| (o.kind, o.session, o.lessons, o.ms)).collect();
+                assert_eq!(t, want_t, "on={on}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `publish` before its borrowed set: every team line copied into the set.
+    fn publish_owned(home: &Path) -> usize {
+        let local = home.join("outcomes.jsonl");
+        let team = home.join(TEAM_FILE);
+        let mark = home.join(PUBLISHED);
+        let len = std::fs::metadata(&local).map_or(0, |m| m.len());
+        if !on() || len == 0 {
+            return 0;
+        }
+        let published = std::fs::read_to_string(&mark).ok().and_then(|t| t.trim().parse::<u64>().ok());
+        if team.exists() && published == Some(len) {
+            return 0;
+        }
+        let mine = std::fs::read_to_string(&local).unwrap_or_default();
+        let node = crate::stats::node(home);
+        let text = std::fs::read_to_string(&team).unwrap_or_default();
+        let mut have: std::collections::HashSet<String> = text.lines().map(str::to_string).collect();
+        let mut out = String::new();
+        let personal = crate::reach::personal_ids(home);
+        let records = mine.lines().filter_map(|l| serde_json::from_str::<Outcome>(l).ok()).filter_map(|mut o| {
+            let named = !o.lessons.is_empty();
+            o.lessons.retain(|id| !personal.contains(id));
+            (!named || !o.lessons.is_empty()).then_some(o)
+        });
+        for line in records.filter_map(|o| share(&o, &node)).filter_map(|x| serde_json::to_string(&x).ok()) {
+            if have.insert(line.clone()) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            let _ = std::fs::write(&mark, mine.len().to_string());
+            return 0;
+        }
+        use std::io::Write;
+        let open = text.as_bytes().last().is_some_and(|c| *c != b'\n');
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&team)
+            .and_then(|mut f| f.write_all(format!("{}{out}", if open { "\n" } else { "" }).as_bytes()));
+        if written.is_err() {
+            return 0;
+        }
+        let _ = std::fs::write(&mark, mine.len().to_string());
+        out.lines().count()
+    }
+
+    /// `publish` appends exactly the lines the owned set appended: to no team file, one without its last
+    /// newline, one holding some of them already, with the same record twice in the log, on edge records
+    /// and a real store's logs (`BORG_BENCH_STORE`).
+    #[test]
+    fn publish_appends_what_the_owned_set_appended() {
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        let shared = |x: &Outcome| serde_json::to_string(&share(x, "n").unwrap()).unwrap();
+        let (a, b) = (o(CHANGED, "s1", &["A"], 1), o(IGNORED, "s2", &["B"], 2));
+        let edge_log: Vec<String> = [&a, &a, &b, &o(GRADED, "s1", &["A"], 3)].iter().map(|x| serde_json::to_string(x).unwrap()).collect();
+        let cases: Vec<(Vec<String>, Option<String>)> = vec![
+            (edge_log.clone(), None),
+            (edge_log.clone(), Some(String::new())),
+            (edge_log.clone(), Some(shared(&a))),
+            (edge_log.clone(), Some(format!("{}\n{}\n", shared(&b), shared(&a)))),
+            (real("outcomes.jsonl"), None),
+            (real("outcomes.jsonl"), real("outcomes-team.jsonl").first().map(|l| format!("{l}\n"))),
+            (real("outcomes.jsonl"), Some(real("outcomes-team.jsonl").iter().map(|l| format!("{l}\n")).collect())),
+        ];
+        for (i, (log, team)) in cases.into_iter().enumerate() {
+            let homes = [tmp(&format!("publish-new-{i}")), tmp(&format!("publish-old-{i}"))];
+            for h in &homes {
+                std::fs::create_dir_all(h.join("stats")).unwrap();
+                std::fs::write(h.join("stats").join("node"), "n").unwrap();
+                lines(&h.join("outcomes.jsonl"), &log);
+                if let Some(t) = &team {
+                    std::fs::write(h.join(TEAM_FILE), t).unwrap();
+                }
+            }
+            assert_eq!(publish(&homes[0]), publish_owned(&homes[1]), "case {i}");
+            let team_of = |h: &Path| std::fs::read_to_string(h.join(TEAM_FILE)).ok();
+            assert_eq!(team_of(&homes[0]), team_of(&homes[1]), "case {i}");
+            for h in homes {
+                let _ = std::fs::remove_dir_all(h);
+            }
         }
     }
 

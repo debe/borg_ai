@@ -34,9 +34,10 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/msg.rs` | `TTL_MS` | 7 days (`7 × clock::DAY_MS`) | A message is shown and kept this long; every member drops a line older than it |
 | `borg/src/msg.rs` | `SKEW_MS` | 60 s | The one clock skew between members; steer.rs `SLACK_MS` and borg-mesh live.rs's presence freshness derive from it |
 | `borg/src/msg.rs` | `SEEN_IDS` | 256 ids | The most ids one `seen` line lists (protocol and guard: a line stays under about 4 KB, a forged one cannot list millions) |
-| `borg/src/msg.rs` | `window_for` | 1 at first, doubled per acknowledgement up to `WINDOW_CAP`, halved per expiry, at least 1 | The unacknowledged tells and asks one sender may have to one recipient; `send` decides by it, under the log's lock. Where no acknowledgement may come (`Pace`) `V1_RATE_MS` also admits (a broadcast, the engineer) or alone admits (a session of a node that acknowledged none of the pair's messages) |
+| `borg/src/msg.rs` | `window_for` | 1 at first, doubled per acknowledgement up to `WINDOW_CAP`, halved per expiry, at least 1 | The unacknowledged tells and asks one sender may have to one recipient, earned by the sender's node with the recipient's side (its node, for a session; else the address), so trust carries to new sessions; `send` decides by it, under the log's lock. `FLOOR_MS` also admits (`Pace::Floor`), or alone admits (`Pace::Rate`: a session of a node that acknowledged none of the sender node's messages), within the `within_windows` bound |
 | `borg/src/msg.rs` | `within_windows` | acknowledged, or at most `WINDOW_CAP` unread of a pair within `V1_RATE_MS` | What the mesh carries (borg-mesh sync.rs `window`, on offer and on receipt): the bound every window keeps, reading no earlier line, so the TTL and the bound never take a held line out of it |
-| `borg/src/msg.rs` | `V1_RATE_MS` | 10 min | 0.5.0's pacing, one tell or ask per sender and recipient: all a `/13` node takes (borg-mesh `v1_window`, which imports it), the pace of a node that acknowledges nothing (`Pace::Rate`), the floor where no acknowledgement may come (`Pace::Floor`), and the span `within_windows` bounds |
+| `borg/src/msg.rs` | `V1_RATE_MS` | 10 min | 0.5.0's pacing, one tell or ask per sender and recipient: all a `/13` node takes (borg-mesh `v1_window`, which imports it), and the span `within_windows` bounds. It paces no sender |
+| `borg/src/msg.rs` | `FLOOR_MS` | 1 min | The engineer's ceiling on any pacing wait: a full window still admits a message this long after the sender's previous one to the same recipient, while `within_windows` carries it |
 | `borg-mesh/src/sync.rs` | `ALPN` | `borg/mesh/15` | The session protocol: `borg/mesh/14`'s session with `absorbed.jsonl` as its last log |
 | `borg-mesh/src/sync.rs` | `V14_ALPN` | `borg/mesh/14` | 0.6.x's protocol, still spoken whole except for the absorbs: messages v2, `seen` lines, the acknowledgement window |
 | `borg-mesh/src/sync.rs` | `V13_ALPN` | `borg/mesh/13` | 0.4.0's and 0.5.x's protocol, still spoken; such a peer is offered only what 0.5.0 takes (`v1_window`) |
@@ -346,6 +347,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/notes/regress_cosmetic.rs` | `MOVE_MIN`, `MOVE_NEAR` | 8 chars, 3 lines | The cosmetic-change classifier's heuristics |
 | `borg-mesh/src/recon.rs` | `LEAF` | 8 hashes | Trades rounds against message size; both sides must use the same value, so it is part of the protocol |
 | `borg-mesh/src/daemon.rs` | `Options::poll` | 2 s | A `stat` per synced file; a local change is dialled within it |
+| `borg-mesh/src/cache.rs` | `GUARD` | 4,096 bytes | The bytes before where a log was read up to that must read the same for the cache to read only what was appended; one page, read with the tail anyway |
 | `borg-mesh/src/main.rs` | `STOP_TICK`, `IMAGE_EVERY` | 100 ms, 10 ticks | How soon `serve` sees Ctrl-C, and a reinstalled binary |
 
 ## Baseline
@@ -452,6 +454,7 @@ labelled.
 | 120 / 200 chars | top.rs `MESSAGE_CHARS`, escalation.rs `ANSWER_CHARS`, notify.rs `BODY_CHARS`; veto.rs `EVIDENCE_CHARS`, conscience.rs `EARLY_CONSEQUENCE_CHARS`, the opencode adapter's `LOG_CHARS` (display), assimilate.rs `NOTICE_CHARS` (method) | Each labelled |
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
 | 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method), sweep.rs `HASHED` (method, bytes), assimilate.rs `OPEN_CALLS` (guard, calls) | A window's ceiling; the gaps a hold reads; the bytes whose hash says a transcript is unchanged; the open tool calls kept between sweeps |
+| 1 min | msg.rs `FLOOR_MS` (the engineer's ceiling) | The longest a sender waits on a full message window |
 | 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor), update.rs `CHECKING_MS` (guard) | 0.5.0's message rate; a tool call's hold; one release check at a time |
 | 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` and `SAME` (method) | A probability kept off 0 and 1; a prediction that is 1/2; two recalls that are equal |
 | 300 and 30 | select/replay.rs `READOUT_UNITS`, `READOUT_SESSIONS`; `TEST_CHECKS`, `TEST_SESSIONS` (method) | The online readout's labelled units and sessions; the question-count test's checks (in `TEST_MIN_SESSIONS` 15 sessions) and sessions |

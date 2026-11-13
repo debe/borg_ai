@@ -121,24 +121,25 @@ ellipsis). A text of at most 1,000 characters is written in the line format 0.5.
 **Pacing.** A sender may have a window of unread tells and asks to one recipient. A message is
 acknowledged once its recipient's hook shows it (or `borg inbox`, or `borg inbox --show`; for the
 engineer also `borg top` and borg web's Messages page), or when the recipient replies to it: the
-recipient writes a `seen` line, which syncs like the messages and is never shown. The window starts at
-1, doubles with each acknowledged message, up to 64, and halves for each message that expires unread.
-A full window refuses the next message ("`<n>` unread by `<to>`: it may have `<n>` unread at once; send
-again once it is shown one or answers"). So a conversation between two sessions that read their
-messages never waits, and a flood into a session that is gone stops at one message. An ask leaves the
-window when it is shown or answered, as a tell does. Pause, resume and veto are never held back.
+recipient writes a `seen` line, which syncs like the messages and is never shown.
 
-Where an acknowledgement may never come, nobody is paced more strictly than 0.5.0 paced them, one
-message per sender and recipient every 10 minutes:
+The window is earned between machines, not per session: it starts at 1, doubles with each message
+from the sender's machine that the recipient's machine acknowledges, up to 64, and halves for each one
+that expires unread. For a broadcast or the engineer it is earned with that address. So a new session
+starts with the trust its machine's earlier sessions earned: the more two machines talk and read,
+the wider every new conversation between them opens. A full window refuses the next message ("`<n>`
+unread by `<to>`: it may have `<n>` unread at once; send again once it is shown one or answers, or in
+`<s>`s"). An ask leaves the window when it is shown or answered, as a tell does. Pause, resume and veto
+are never held back.
 
-- a broadcast (`local`, `collective`) reaches whoever runs when it is sent, maybe nobody, and the
-  engineer may read where nothing acknowledges: either may also get a message 10 minutes after the
-  sender's previous one, whatever the window holds;
-- a session on another machine is paced by that rate alone until its machine acknowledges one of the
-  sender's messages to it (a machine on 0.5 never does): "`<to>`'s node has acknowledged no message
-  yet, as a node on 0.5.0 never does: one message to it per 10m". The first `seen` line from that
-  machine puts the pair under its window, on every machine that holds it, since the window is decided
-  from the pair's own lines, which sync.
+Nobody waits longer than a minute: one minute after the sender's previous message to the same
+recipient, the next goes whatever the window holds. That covers a session that ended without reading,
+a broadcast (`local`, `collective`) that reached nobody, and the engineer reading where nothing
+acknowledges. A session on another machine that has acknowledged no message from the sender's machine
+gets one message a minute ("`<to>`'s node has acknowledged no message from this machine yet, as a node
+on 0.5.0 never does: one message to it per 1m"); the first `seen` line from that machine for any
+session's message puts it under its window, on every machine that holds the lines, since the window
+is decided from synced lines only.
 
 `borg tell` also refuses a message that would push one of the sender's unread messages to the same
 recipient out of the log (its machine's share, below), one whose earlier stamp (a clock that stepped
@@ -150,7 +151,8 @@ member machines will not show it.
 any window keeps: one that was acknowledged, or one that, with its sender's later messages to the same
 recipient within 10 minutes, leaves at most 64 unread. That bound reads no earlier line, so a message
 once written keeps travelling after the lines its window was decided by are pruned, and a writer that
-ignores its window gets at most 64 unread through per 10 minutes.
+ignores its window gets at most 64 unread through per 10 minutes. The one-minute floor admits a
+message only within that bound.
 
 Messages live in `<store>/messages.jsonl` for 7 days. Of each member's lines, the newest of each class
 (conversation, steers, acknowledgements, and apart from them the conversation and steers to `local`,

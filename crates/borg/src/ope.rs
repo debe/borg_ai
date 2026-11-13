@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use crate::conscience::{self, Challenge};
 use crate::memory::{self, Memory, Weights};
-use crate::outcome::{self, Outcome};
+use crate::outcome::{self, Outcome, OutcomeRef};
 use crate::{collective, learn};
 
 /// One hand-set weight: its name, current value, the outcome kinds it weighs (its evidence), and how a
@@ -118,23 +118,87 @@ pub(crate) fn rank(kind: &str) -> Option<u8> {
 /// ignore by a judge that could not tell it from one (outcome.rs `ambiguous`) have no rank: none
 /// rewards anything.
 pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
+    decide(outcomes.iter().enumerate(), |o| Logged {
+        kind: &o.kind,
+        session: &o.session,
+        lessons: &o.lessons,
+        ms: o.ms,
+        channel: &o.channel,
+        judge: o.judge,
+        p: &o.p,
+        pool: &o.pool,
+        base: &o.base,
+        scoped: &o.scoped,
+    })
+}
+
+/// `decisions(&outcome::read(path))`, each record borrowed from its line (outcome.rs `OutcomeRef`) and
+/// kept only when `decide` reads more of it than its kind: an ask that is not free, a result that ranks.
+/// Graded checks are counted as read. Only the decisions' own lessons are copied. What borg web's usage
+/// view counts on every request.
+pub fn decisions_in(path: &Path) -> (Vec<Decision>, Skipped) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut graded = 0;
+    let mut read = |o: &OutcomeRef| {
+        graded += usize::from(o.kind == outcome::GRADED);
+        (o.kind == outcome::ASKED && !outcome::free_channel(&o.channel))
+            || (rank(&o.kind).is_some() && o.channel != outcome::PLACEBO && !outcome::ambiguous(&o.kind, o.judge))
+    };
+    let records: Vec<(usize, OutcomeRef)> =
+        text.lines().filter_map(|l| serde_json::from_str::<OutcomeRef>(l).ok()).enumerate().filter(|(_, o)| read(o)).collect();
+    let (out, mut skipped) = decide(records.iter().map(|(at, o)| (*at, o)), |o| Logged {
+        kind: &o.kind,
+        session: &o.session,
+        lessons: &o.lessons,
+        ms: o.ms,
+        channel: &o.channel,
+        judge: o.judge,
+        p: &o.p,
+        pool: &o.pool,
+        base: &o.base,
+        scoped: &o.scoped,
+    });
+    skipped.graded += graded;
+    (out, skipped)
+}
+
+/// What `decide` reads of a logged record, owned (`Outcome`) or borrowed from its line (`OutcomeRef`).
+struct Logged<'r, L> {
+    kind: &'r str,
+    session: &'r str,
+    lessons: &'r [L],
+    ms: i64,
+    channel: &'r str,
+    judge: u8,
+    p: &'r [f64],
+    pool: &'r [L],
+    base: &'r [f64],
+    scoped: &'r [bool],
+}
+
+/// `decisions` of `records`, each with its index in the log, read through `view` whichever way they were
+/// read; a record that only counts (a graded check) or that `decide` skips by kind may be left out.
+fn decide<'r, R: 'r, L: std::ops::Deref<Target = str> + 'r>(
+    records: impl Iterator<Item = (usize, &'r R)> + Clone,
+    view: impl Fn(&'r R) -> Logged<'r, L>,
+) -> (Vec<Decision>, Skipped) {
     let mut results: HashMap<(&str, &str), Vec<(i64, u8)>> = HashMap::new();
-    for o in outcomes.iter().filter(|o| o.channel != outcome::PLACEBO && !outcome::ambiguous(&o.kind, o.judge)) {
-        if let Some(r) = rank(&o.kind) {
-            for l in &o.lessons {
-                results.entry((o.session.as_str(), l.as_str())).or_default().push((o.ms, r));
+    for o in records.clone().map(|(_, r)| view(r)).filter(|o| o.channel != outcome::PLACEBO && !outcome::ambiguous(o.kind, o.judge)) {
+        if let Some(r) = rank(o.kind) {
+            for l in o.lessons {
+                results.entry((o.session, l)).or_default().push((o.ms, r));
             }
         }
     }
     let mut skipped = Skipped::default();
     let mut out = Vec::new();
-    for (at, o) in outcomes.iter().enumerate() {
+    for (at, o) in records.map(|(at, r)| (at, view(r))) {
         if o.kind == outcome::GRADED {
             skipped.graded += 1;
             continue;
         }
         // A free delivery (early, queued) asks nothing and draws from no pool the weights move.
-        if o.kind != outcome::ASKED || outcome::free(o) {
+        if o.kind != outcome::ASKED || outcome::free_channel(o.channel) {
             continue;
         }
         if o.p.is_empty() || o.p.len() != o.lessons.len() {
@@ -142,25 +206,25 @@ pub fn decisions(outcomes: &[Outcome]) -> (Vec<Decision>, Skipped) {
             continue;
         }
         let aligned = o.pool.len() == o.base.len() && o.pool.len() == o.scoped.len();
-        if o.pool.is_empty() || !aligned || !o.lessons.iter().all(|l| o.pool.contains(l)) {
+        if o.pool.is_empty() || !aligned || !o.lessons.iter().all(|l| o.pool.iter().any(|p| **p == **l)) {
             skipped.no_pool += 1;
             continue;
         }
         let mut asked = Vec::new();
-        for (l, &p) in o.lessons.iter().zip(&o.p) {
+        for (l, &p) in o.lessons.iter().zip(o.p) {
             if p <= 0.0 {
                 skipped.zero_p += 1;
                 continue;
             }
-            let after = results.get(&(o.session.as_str(), l.as_str())).and_then(|v| v.iter().filter(|(ms, _)| *ms >= o.ms).map(|(_, r)| *r).max());
+            let after = results.get(&(o.session, &**l)).and_then(|v| v.iter().filter(|(ms, _)| *ms >= o.ms).map(|(_, r)| *r).max());
             match after {
-                Some(r) => asked.push((l.clone(), p, if r == 1 { 1.0 } else { 0.0 })),
+                Some(r) => asked.push((l.to_string(), p, if r == 1 { 1.0 } else { 0.0 })),
                 None => skipped.pending += 1,
             }
         }
         if !asked.is_empty() {
-            let pool = o.pool.iter().zip(&o.base).zip(&o.scoped).map(|((id, b), s)| (id.clone(), *b, *s)).collect();
-            out.push(Decision { at, ms: o.ms, session: o.session.clone(), asked, pool });
+            let pool = o.pool.iter().zip(o.base).zip(o.scoped).map(|((id, b), s)| (id.to_string(), *b, *s)).collect();
+            out.push(Decision { at, ms: o.ms, session: o.session.to_string(), asked, pool });
         }
     }
     (out, skipped)
@@ -558,6 +622,44 @@ mod tests {
 
     fn json(x: &Outcome) -> String {
         serde_json::to_string(x).unwrap()
+    }
+
+    /// `decisions_in` decides exactly as `decisions` over the owned log: on asks with and without p, pools
+    /// misaligned or missing a lesson, free and placebo records, results before and after, escapes in
+    /// the pool's ids, wrong types in the fields a decision reads, and every line of a real store's log
+    /// (`BORG_BENCH_STORE`).
+    #[test]
+    fn decisions_read_borrowed_decide_as_the_owned_log() {
+        let dir = tmp("decisions-in");
+        let path = dir.join("outcomes.jsonl");
+        let a = json(&ask("s", &["A", "B"], &[0.5, 0.0], &["A", "B", "C"], 100));
+        let records = vec![
+            a.clone(),
+            json(&ask("s", &["C"], &[0.25], &["C"], 90)),
+            json(&ask("t", &["A"], &[], &["A"], 100)),
+            json(&ask("t", &["A"], &[0.5], &["B"], 100)),
+            json(&Outcome { base: vec![1.0], ..ask("t", &["A"], &[0.5], &["A", "B"], 100) }),
+            json(&Outcome { channel: "early".into(), ..ask("u", &["A"], &[0.5], &["A"], 100) }),
+            json(&o(CHANGED, "s", &["A"], 120)),
+            json(&o(VETOED, "s", &["C"], 80)),
+            json(&o(IGNORED, "s", &["C"], 95)),
+            json(&Outcome { channel: crate::outcome::PLACEBO.into(), ..o(CHANGED, "s", &["C"], 99) }),
+            json(&Outcome { judge: 0, ..o(IGNORED, "u", &["A"], 120) }),
+            json(&o(GRADED, "s", &["A"], 100)),
+            a.replace(r#""pool":["A","B","C"]"#, &format!(r#""pool":["{}","B","C"]"#, crate::jsonl::escaped("A"))),
+            a.replace(r#""p":[0.5,0.0]"#, r#""p":[0.5,"x"]"#),
+            a.replace(r#""scoped":[false,false,false]"#, r#""scoped":[0,false,false]"#),
+            a.replace(r#""pool":["A","B","C"]"#, r#""pool":["A",null,"C"]"#),
+            a.replacen('{', r#"{"judge":256,"#, 1),
+            a.replacen('{', r#"{"pool":[],"#, 1),
+            a.trim_end_matches('}').to_string(),
+            String::new(),
+        ];
+        write(&path, &[records, crate::jsonl::store_lines(&["outcomes.jsonl"])].concat());
+        let (want, got) = (decisions(&outcome::read(&path)), decisions_in(&path));
+        assert_eq!(got, want);
+        assert!(!want.0.is_empty() && want.1.no_p > 0 && want.1.no_pool > 0, "{want:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

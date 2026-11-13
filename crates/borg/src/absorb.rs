@@ -94,10 +94,26 @@ pub fn beside(lessons: &Path) -> PathBuf {
 /// a peer's line in only through it (borg-mesh lines.rs `travels`), so a line it stores is one every
 /// node folds.
 pub fn written(line: &str, now: i64) -> Option<Record> {
-    let r = serde_json::from_str::<Record>(line).ok().filter(|r| r.well_formed() && r.ms <= now.saturating_add(crate::msg::SKEW_MS))?;
-    let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(line) else { return None };
-    let known = ["id", "kind", "ms", "by", "note", "version"];
-    (o.contains_key("by") && o.keys().all(|k| known.contains(&k.as_str()))).then_some(r)
+    /// `Record` as borg writes it: an object with `by` given and no other field. One parse decides what
+    /// a `Record` parse and a second one to a `Value` for its keys decided.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Written {
+        id: String,
+        kind: String,
+        ms: i64,
+        by: String,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        version: Option<u32>,
+    }
+    // An object only: serde also reads a struct from an array.
+    if !line.trim_start_matches([' ', '\t', '\n', '\r']).starts_with('{') {
+        return None;
+    }
+    let Written { id, kind, ms, by, note, version } = serde_json::from_str(line).ok()?;
+    Some(Record { id, kind, ms, by, note, version }).filter(|r| r.well_formed() && r.ms <= now.saturating_add(crate::msg::SKEW_MS))
 }
 
 /// Every lesson id's last record in the log `file` (written before `before_ms`, when given): the one
@@ -229,6 +245,62 @@ pub fn write(
 mod tests {
     use super::*;
     use crate::conscience;
+
+    /// `written` as it was: a `Record`, then a second parse to a `Value` for its keys.
+    fn old_written(line: &str, now: i64) -> Option<Record> {
+        let r = serde_json::from_str::<Record>(line).ok().filter(|r| r.well_formed() && r.ms <= now.saturating_add(crate::msg::SKEW_MS))?;
+        let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(line) else { return None };
+        let known = ["id", "kind", "ms", "by", "note", "version"];
+        (o.contains_key("by") && o.keys().all(|k| known.contains(&k.as_str()))).then_some(r)
+    }
+
+    /// Oracle: the one parse of `written` takes exactly the lines the two parses took, and reads the
+    /// same record, on a real store's logs and at the edges (an absorb log is rare: the edges carry it).
+    #[test]
+    fn written_in_one_parse_takes_what_two_took() {
+        let now = 1_000_000;
+        let ok = line("L1", ABSORB, 5, Some("skills/review@1"));
+        let edges: Vec<String> = [
+            ok.as_str(),
+            r#"{"id":"L1","kind":"release","ms":6,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"release","ms":6,"by":"a@x","note":null,"version":null}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":"a@x","version":2}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":"a@x","version":5000000000}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":null}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":"a@x","reach":"team"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"b\u0079":"a@x"}"#,
+            r#"{"i\u0064":"L\u0031","kind":"absorb","ms":6,"by":"a@x"}"#,
+            r#"{"id":"A","id":"B","kind":"absorb","ms":1,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":1,"by":"a@x","by":"b@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":"1","by":"a@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":1.5,"by":"a@x"}"#,
+            r#"{"id":1,"kind":"absorb","ms":1,"by":"a@x"}"#,
+            r#"{"id":" ","kind":"absorb","ms":1,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"delete","ms":1,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":9999999999,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":1,"by":"a@x","note":{"x":1}}"#,
+            r#"["L1","absorb",5,"a@x"]"#,
+            r#"["L1","absorb",5,"a@x",null,null]"#,
+            r#"  {"id":"L1","kind":"absorb","ms":6,"by":"a@x"}"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":"a@x"} x"#,
+            r#"{"id":"L1","kind":"absorb","ms":6,"by":"a@x""#,
+            "",
+            " ",
+            "null",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([line("L1", ABSORB, 1, Some(&"n".repeat(NOTE_CHARS + 1))), line("L1", ABSORB, 1, Some(&"é".repeat(NOTE_CHARS)))])
+        .collect();
+        let mut taken = 0;
+        for l in edges.iter().chain(&crate::jsonl::store_lines(&[FILE, "lessons.jsonl", "messages.jsonl"])) {
+            let old = old_written(l, now);
+            taken += usize::from(old.is_some());
+            assert_eq!(written(l, now), old, "{l}");
+        }
+        assert!(taken >= 5, "the edges hold lines it takes: {taken}");
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-absorb-{name}-{}", std::process::id()));

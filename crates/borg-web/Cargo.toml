@@ -21,16 +21,27 @@ name = "borg-web"
 path = "src/main.rs"
 
 [dependencies]
-borg = { package = "borg-ai", path = "../borg", version = "=0.7.11", default-features = false }
+borg = { package = "borg-ai", path = "../borg", version = "=0.7.12", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 futures-util = { version = "0.3", default-features = false }
 
+# mallopt(M_ARENA_MAX) at start (main.rs ARENAS).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # tests/drones_api.rs drives the router in process (ServiceExt::oneshot).
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# The generated bench store (borg's benches/shape/mod.rs) hashes its lines.
+blake3 = "1.8"
+
+# Eight requests at once to every view of a real team's store: peak and retained memory (benches/load.rs).
+[[bench]]
+name = "load"
+harness = false
 
 [lints]
 workspace = true

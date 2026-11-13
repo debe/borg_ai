@@ -24,6 +24,7 @@
 //! an earlier veto made counts as `veto_repeat`; an invariant of a lesson placed in this store becomes
 //! a proposed constraint in the queen's queue (`veto::propose`), never a constraint.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::conscience::{self, Challenge};
+use crate::jsonl::{Each, Entries, Str, Valid};
 use crate::outcome;
 // After `MAX_FAILURES` failed model calls in a row `borg learn` stops (runner.rs: the model is
 // unavailable, and asking about every remaining episode would only burn time and quota).
@@ -436,17 +438,75 @@ pub fn learned_episodes(home: &Path) -> HashSet<String> {
     lessons(&home.join("lessons.jsonl")).into_iter().chain(mine).flat_map(|l| l.episodes).collect()
 }
 
-/// The latest version of every lesson.
+/// The latest version of every lesson (of one version, the last line), by origin; lessons of one origin in
+/// the order of their first line (`latest`).
 pub fn lessons(path: &Path) -> Vec<Lesson> {
-    let mut by: HashMap<String, Lesson> = HashMap::new();
-    for l in read_jsonl::<Lesson>(path) {
-        if by.get(&l.id).is_none_or(|o| o.version <= l.version) {
-            by.insert(l.id.clone(), l);
-        }
-    }
-    let mut v: Vec<Lesson> = by.into_values().collect();
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut v: Vec<Lesson> = latest(&text, |l| serde_json::from_str(l).ok()).map(|(_, l)| l).collect();
     v.sort_by_key(|l| l.origin_ms);
     v
+}
+
+/// Each lesson's latest `version` and `repo`, by id: what `lessons` gives of them, without building the
+/// rest of each `Lesson` (borg-web's Lessons page).
+pub fn stored(path: &Path) -> HashMap<String, (u32, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    latest(&text, |l| serde_json::from_str::<Stored>(l).ok()).map(|(id, s)| (id.into_owned(), (s.version, s.repo.into_owned()))).collect()
+}
+
+/// The latest line of each id in the lessons `text` that `parse` takes, in the order of the ids' first
+/// lines. Each line's `id` and `version` are read first (`jsonl::lead`), and an id's lines are then tried
+/// newest version first, of one version the last line first, so only the winner is parsed whole (a
+/// latest line that is no `Lesson` gives way to the next).
+fn latest<'a, T>(text: &'a str, parse: impl Fn(&'a str) -> Option<T>) -> impl Iterator<Item = (Cow<'a, str>, T)> {
+    let head = |l| match crate::jsonl::lead(l, ["id", "version"])? {
+        [crate::jsonl::Scalar::Str(id), version] => Some((id, u32::try_from(version.as_u64()?).ok()?)),
+        _ => None,
+    };
+    crate::jsonl::by_id(text, head).into_iter().filter_map(move |(id, mut lines)| {
+        lines.reverse();
+        lines.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+        lines.iter().find_map(|(_, l)| parse(l)).map(|t| (id, t))
+    })
+}
+
+/// A lesson line as `stored` reads it: every field of `Lesson` with its type, so it takes exactly the
+/// lines `Lesson` takes, but checked in place (`jsonl::Str`, `Each`, `Valid` for a `Value`) and only
+/// `version` and `repo` kept. A field added to `Lesson` is added here.
+#[derive(Deserialize)]
+#[expect(dead_code, reason = "the fields but version and repo are only checked, as `Lesson` checks them")]
+struct Stored<'a> {
+    id: Str,
+    origin_ms: i64,
+    #[serde(borrow)]
+    repo: Cow<'a, str>,
+    question: Str,
+    situations: Each<Str>,
+    consequence: Str,
+    support: u32,
+    episodes: Each<Str>,
+    history: Each<Valid>,
+    version: u32,
+    #[serde(default)]
+    engineers: Each<Str>,
+    #[serde(default)]
+    joined: Entries<Str, i64>,
+    #[serde(default)]
+    area: Str,
+    #[serde(default)]
+    supersedes: Each<Str>,
+    #[serde(default)]
+    source: Str,
+    #[serde(default)]
+    scope: Each<Str>,
+    #[serde(default)]
+    overrides: Str,
+    #[serde(default)]
+    origin: Str,
+    #[serde(default)]
+    facets: Each<Str>,
+    #[serde(default)]
+    reach: Str,
 }
 
 /// The correction prompt's opening.
@@ -1874,6 +1934,101 @@ mod tests {
         assert!(held(&work, Some(&back)).is_empty());
         assert_eq!(learn_in_config(&work, Some(&back), None, &ask, false, 5, &mut |_| {}), (2, 0, 0));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// `lessons` before its two passes: every line parsed whole, the latest version per id kept.
+    fn lessons_whole(path: &Path) -> Vec<Lesson> {
+        let mut by: HashMap<String, Lesson> = HashMap::new();
+        for l in read_jsonl::<Lesson>(path) {
+            if by.get(&l.id).is_none_or(|o| o.version <= l.version) {
+                by.insert(l.id.clone(), l);
+            }
+        }
+        let mut v: Vec<Lesson> = by.into_values().collect();
+        v.sort_by_key(|l| l.origin_ms);
+        v
+    }
+
+    /// The two passes keep exactly the lessons a whole parse of every line kept, on edge lines and the
+    /// lessons of a real store (`BORG_BENCH_STORE`). Lessons of one origin came in the map's order
+    /// before, so they are compared as a set; the new order is the order of their first lines.
+    #[test]
+    fn lessons_keep_what_the_whole_parse_kept() {
+        let home = temp_home("lessons-oracle");
+        let path = home.join("lessons.jsonl");
+        let l = |id: &str, version: u32, q: &str| {
+            json!({"id": id, "origin_ms": 1, "repo": "r", "question": q, "situations": [], "consequence": "c", "support": 1, "episodes": [], "history": [], "version": version})
+                .to_string()
+        };
+        let edges = vec![
+            l("L1", 1, "one"),
+            l("L1", 2, "one, merged"),
+            l("L1", 2, "one, merged again"),
+            l("L1", 1, "one, late"),
+            // Newest, but no `Lesson` (no question): the one before stands.
+            r#"{"id":"L1","version":9}"#.into(),
+            // An escaped id: L2's lines are one lesson.
+            l("L2", 1, "two"),
+            l("L2", 3, "two, escaped").replace(r#""id":"L2""#, &format!(r#""id":"{}""#, crate::jsonl::escaped("L2"))),
+            // Duplicate keys, a version above u32, wrong types, an escape the whole parse refuses.
+            l("L3", 1, "three"),
+            l("L3", 4, "x").replacen('{', r#"{"version":5,"#, 1),
+            l("L3", 4, "x").replacen('{', r#"{"id":"L3","#, 1),
+            l("L3", 4, "x").replacen('{', r#"{"question":"q","#, 1),
+            l("L3", 4, "x").replace(r#""version":4"#, r#""version":5000000000"#),
+            l("L3", 4, "x").replace(r#""version":4"#, r#""version":-4"#),
+            l("L3", 4, "x").replace(r#""id":"L3""#, r#""id":3"#),
+            l("L3", 4, "x").replace(r#""question":"x""#, r#""question":"\ud800""#),
+            l("L3", 4, "x").replacen('{', r#"{"z":"\ud800","#, 1),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            l("L4", 1, "four").trim_end_matches('}').to_string(),
+            l("L4", 2, "four") + " x",
+            l("L4", 3, "four") + " ",
+            " ".into(),
+            String::new(),
+            "[]".into(),
+            // Optional and list fields of the wrong type, or holding what `Value` or `String` refuses.
+            l("L5", 1, "five"),
+            l("L5", 2, "x").replacen('{', r#"{"joined":"x","#, 1),
+            l("L5", 2, "x").replacen('{', r#"{"joined":{"a":1.5},"#, 1),
+            l("L5", 2, "x").replacen('{', r#"{"engineers":null,"#, 1),
+            l("L5", 2, "x").replacen('{', r#"{"area":1,"#, 1),
+            l("L5", 2, "x").replacen('{', r#"{"facets":[1],"#, 1),
+            l("L5", 2, "x").replace(r#""situations":[]"#, r#""situations":["\ud800"]"#),
+            l("L5", 2, "x").replace(r#""history":[]"#, r#""history":[1e999]"#),
+            l("L5", 2, "x").replace(r#""history":[]"#, r#""history":[{"a":"\udc00"}]"#),
+            l("L5", 2, "x").replace(r#""repo":"r""#, r#""repo":null"#),
+            // Taken: escapes, a map of engineers' joins, a history of anything `Value` reads.
+            l("L6", 1, "six"),
+            l("L6", 2, "x")
+                .replace(r#""repo":"r""#, r#""repo":"r\u00e9po \"x\"""#)
+                .replacen('{', r#"{"joined":{"e\n":-3},"engineers":["\u0041"],"#, 1)
+                .replace(r#""history":[]"#, r#""history":[{"a":[1,2.5,null,true,"\t"]},-1]"#),
+        ];
+        let real = crate::jsonl::store_lines(&["lessons.jsonl"]);
+        let personal = crate::jsonl::store_lines(&[crate::reach::PERSONAL_FILE]);
+        let set = |v: Vec<Lesson>| {
+            let mut v: Vec<(i64, String)> = v.iter().map(|l| (l.origin_ms, serde_json::to_string(l).unwrap())).collect();
+            v.sort();
+            v
+        };
+        for mut lines in [edges.clone(), real.clone(), personal, [&real[..], &edges[..]].concat()] {
+            for _ in 0..2 {
+                std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+                let got = lessons(&path);
+                assert!(got.is_sorted_by_key(|l| l.origin_ms));
+                let whole = lessons_whole(&path);
+                let want: HashMap<String, (u32, String)> = whole.iter().map(|l| (l.id.clone(), (l.version, l.repo.clone()))).collect();
+                assert_eq!(stored(&path), want);
+                assert_eq!(set(got), set(whole));
+                lines.reverse();
+            }
+        }
+        std::fs::write(&path, edges.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let got: Vec<(String, u32, String)> = lessons(&path).into_iter().map(|l| (l.id, l.version, l.question)).collect();
+        let want = [("L1", 2, "one, merged again"), ("L2", 3, "two, escaped"), ("L3", 4, "x"), ("L4", 3, "four"), ("L5", 1, "five"), ("L6", 2, "x")];
+        assert_eq!(got, want.map(|(i, v, q)| (i.to_string(), v, q.to_string())));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn temp_home(name: &str) -> PathBuf {

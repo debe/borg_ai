@@ -43,14 +43,14 @@
 //! hash of borg's version: a snapshot of another version fails `decode` and is folded afresh, once.
 //! Every change to those rules ships with a new version.
 //!
-//! **Concurrency.** Hooks run as many short processes at once. None takes a lock: each writes a
-//! `.<pid>.tmp` file beside the snapshot and renames it over it, the last writer winning, the regrets
-//! file first.
-//! Every saved snapshot is the fold of a prefix of each log, so an older one only costs the next hook a
-//! longer tail. One whose regrets file was since replaced by another generation (two hooks folded at
-//! once) is void as soon as a fold needs its regrets: that hook folds afresh. A file that is truncated,
-//! corrupt or of another version fails to decode and is rebuilt. They are read whole, never mapped (a
-//! mapped file truncated under a reader faults).
+//! **Concurrency.** Hooks run as many short processes at once, and borg-web folds from several requests
+//! in one. None takes a lock: each writes a `.<pid>.<n>.tmp` file of its own beside the snapshot and
+//! renames it over it, the last writer winning, the regrets file first. Every saved snapshot is the
+//! fold of a prefix of each log, so an older one only costs the next hook a longer tail. One whose
+//! regrets file was since replaced by another generation (two hooks folded at once) is void as soon as a
+//! fold needs its regrets: that hook folds afresh. A file that is truncated, corrupt or of another
+//! version fails to decode and is rebuilt. They are read whole, never mapped (a mapped file truncated
+//! under a reader faults).
 //!
 //! **Place.** Local to the store, like the selection cache (select/summary.rs): borg-mesh syncs an
 //! allowlist (lines.rs `SYNCED`) that names neither.
@@ -717,9 +717,18 @@ pub fn rebuild(lessons: &Path) {
     }
 }
 
-/// Writes `bytes` to `path`: a temp file, then a rename (module doc).
+/// This process's writes so far: numbers each temp file and regrets generation, so two threads saving at
+/// once (borg-web's requests) never share one.
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next number of `WRITES`.
+fn next_write() -> u64 {
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Writes `bytes` to `path`: a temp file of its own (process, write), then a rename (module doc).
 fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), next_write()));
     let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
@@ -729,11 +738,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
 
 /// A new generation of the regrets file: unique per write (process, time, a counter), never 0.
 fn new_generation() -> u128 {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut h = blake3::Hasher::new();
     h.update(&std::process::id().to_le_bytes());
     h.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()).to_le_bytes());
-    h.update(&N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    h.update(&next_write().to_le_bytes());
     u128::from_le_bytes(h.finalize().as_bytes()[..16].try_into().expect("16 bytes")).max(1)
 }
 
@@ -1425,6 +1433,34 @@ mod tests {
         same(&lessons, &cs, &load(&lessons), "other generation");
         assert_eq!(PARSED.with(|c| c.replace(0)), 1 + local.lines().count() + 1 + team.lines().count(), "its line, then all afresh");
         same(&lessons, &cs, &load(&lessons), "warm after");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Threads of one process saving at once (borg-web's requests) each write a temp file of their own:
+    /// every rename lands, no temp file is left, and what they saved is a fold the next load agrees with.
+    #[test]
+    fn threads_saving_at_once_never_share_a_temp_file() {
+        let d = dir("threads");
+        let path = d.join("x.bin");
+        std::thread::scope(|s| {
+            for t in 0..4u8 {
+                let path = &path;
+                s.spawn(move || (0..200).for_each(|i| assert!(write_atomic(path, &[t; 4096]), "write {i} of thread {t}")));
+            }
+        });
+        let b = std::fs::read(&path).unwrap();
+        assert!(b.len() == 4096 && b.iter().all(|x| *x == b[0]), "one thread's bytes, whole");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no temp file left");
+        let lessons = d.join("lessons.jsonl");
+        let (local, team, cs) = (0..40).map(logs).find(|(l, _, _)| l.contains("\"regretted\"")).expect("a store with regrets");
+        std::fs::write(outcome::path_beside(&lessons), &local).unwrap();
+        std::fs::write(d.join(outcome::TEAM_FILE), &team).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| same(&lessons, &cs, &load(&lessons), "a thread"));
+            }
+        });
+        same(&lessons, &cs, &load(&lessons), "after the threads");
         let _ = std::fs::remove_dir_all(d);
     }
 

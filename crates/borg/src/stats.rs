@@ -11,11 +11,15 @@
 //!
 //! Recording fails open and costs one append: a broken store never disturbs the drone.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::jsonl::{Scalar, Str, Text, slot};
 
 /// A turn end the conscience saw (one per Stop that was not the rework after its own block).
 pub const TURN_END: &str = "turn_end";
@@ -301,11 +305,30 @@ fn read_events(path: &Path) -> Vec<Event> {
     std::fs::read_to_string(path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
-/// Every local event: the history derived once from the older logs (`backfill`) and the live ones.
+/// Every local event: the history derived once from the older logs (`backfill`), the live ones and
+/// the ignores live counting dropped (`recount_ignores`).
 pub fn events(home: &Path) -> Vec<Event> {
     let mut all = read_events(&backfill_path(home));
     all.extend(read_events(&events_path(home)));
+    all.extend(read_events(&ignores_path(home)));
     all
+}
+
+/// The newest `limit` of the events `events` returns whose kind is one of `kinds`, newest first, those of
+/// one ms in `events`' order: the feed. Reads each line's leading `ms` and `kind` first (`jsonl::lead`)
+/// and parses whole only the lines it returns (a line that is no `Event` gives way to the next).
+pub fn newest(home: &Path, kinds: &[&str], limit: usize) -> Vec<Event> {
+    let texts = [backfill_path(home), events_path(home), ignores_path(home)].map(|p| std::fs::read_to_string(p).unwrap_or_default());
+    let mut heads: Vec<(i64, &str)> = texts
+        .iter()
+        .flat_map(|t| t.lines())
+        .filter_map(|l| match crate::jsonl::lead(l, ["ms", "kind"])? {
+            [ms, Scalar::Str(kind)] if kinds.contains(&kind.as_ref()) => Some((ms.as_i64()?, l)),
+            _ => None,
+        })
+        .collect();
+    heads.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
+    heads.into_iter().filter_map(|(_, l)| serde_json::from_str(l).ok()).take(limit).collect()
 }
 
 /// The live events only (stats/events.jsonl), without the derived history.
@@ -313,15 +336,70 @@ pub fn live(home: &Path) -> Vec<Event> {
     read_events(&events_path(home))
 }
 
+/// The live events `live` reads, each borrowed from its line and handed to `f` as read: a reader that only
+/// folds them keeps none.
+pub fn each_live(home: &Path, f: impl FnMut(&EventRef)) {
+    each_in(&events_path(home), f);
+}
+
+/// Every event of the log at `path` that `read_events` reads, borrowed from its line, handed to `f`.
+fn each_in(path: &Path, mut f: impl FnMut(&EventRef)) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    for e in text.lines().filter_map(|l| serde_json::from_str::<EventRef>(l).ok()) {
+        f(&e);
+    }
+}
+
 /// When live counting began in `home`: its first live event (None: none yet). A repeated veto is
 /// dated when it was said, earlier than its line, so it never marks the start. What `backfill`
 /// derives is before it; a series backfill cannot derive (merges, repeated vetoes) is unknown there.
 pub fn live_since(home: &Path) -> Option<i64> {
-    live(home).iter().filter(|e| e.kind != VETO_REPEAT).map(|e| e.ms).min()
+    let mut first: Option<i64> = None;
+    each_live(home, |e| {
+        if e.kind != VETO_REPEAT {
+            first = Some(first.map_or(e.ms, |f| f.min(e.ms)));
+        }
+    });
+    first
 }
 
 pub fn backfill_path(home: &Path) -> PathBuf {
     home.join("stats").join("backfill.jsonl")
+}
+
+/// The ignores live counting dropped (`recount_ignores`), derived once.
+pub fn ignores_path(home: &Path) -> PathBuf {
+    home.join("stats").join("ignores.jsonl")
+}
+
+/// Once per store: the judge's ignores 0.7.10 and 0.7.11 left out of live counting. The judge counted its
+/// verdicts without its version, so `count_result` took today's ignores for an old judge's and dropped
+/// them, and the asked→changed share read 100%. Derived from outcomes.jsonl as `backfill` derives
+/// history: each ignore since live counting began whose (session, lesson) no live `ignored` event has.
+/// Returns how many events it wrote.
+pub fn recount_ignores(home: &Path) -> usize {
+    let path = ignores_path(home);
+    if path.exists() {
+        return 0;
+    }
+    let live = live(home);
+    let Some(from) = live.iter().filter(|e| e.kind != VETO_REPEAT).map(|e| e.ms).min() else { return 0 };
+    let counted: std::collections::HashSet<(&str, &str)> =
+        live.iter().filter(|e| e.kind == IGNORED).flat_map(|e| e.lessons.iter().map(|l| (e.session.as_str(), l.as_str()))).collect();
+    let mut out: Vec<Event> = derive_history(home)
+        .into_iter()
+        .filter(|e| e.kind == IGNORED && e.ms >= from)
+        .filter_map(|mut e| {
+            e.lessons.retain(|l| !counted.contains(&(e.session.as_str(), l.as_str())));
+            (!e.lessons.is_empty()).then_some(e)
+        })
+        .collect();
+    out.sort_by_key(|e| e.ms);
+    let text: String = out.iter().map(|e| serde_json::to_string(e).unwrap_or_default() + "\n").collect();
+    if std::fs::create_dir_all(path.parent().unwrap_or(home)).is_err() || std::fs::write(&path, text).is_err() {
+        return 0;
+    }
+    out.len()
 }
 
 fn lines(path: &Path) -> Vec<serde_json::Value> {
@@ -713,22 +791,137 @@ pub fn per_session(events: &[Event]) -> BTreeMap<String, Said> {
 
 /// The local events folded into this node's buckets, keyed by bucket id (version 0).
 pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
-    let mut out: BTreeMap<String, Bucket> = BTreeMap::new();
+    let mut f = Folder::new(node);
     for e in events {
-        let day = day(e.ms);
-        let id = format!("stat:{node}:{}:{day}", e.engineer);
-        let b = out.entry(id.clone()).or_insert_with(|| Bucket { id, day, node: node.into(), engineer: e.engineer.clone(), ..Default::default() });
+        f.add(&Head {
+            ms: e.ms,
+            kind: &e.kind,
+            engineer: &e.engineer,
+            lessons: &e.lessons,
+            n: e.n,
+            usd: e.usd,
+            dur_ms: e.dur_ms,
+            why: &e.why,
+            mode: &e.mode,
+            channel: &e.channel,
+        });
+    }
+    f.out
+}
+
+/// What `fold` reads of an event, from an owned `Event` or borrowed from its line (`EventRef`).
+struct Head<'e, L> {
+    ms: i64,
+    kind: &'e str,
+    engineer: &'e str,
+    lessons: &'e [L],
+    n: u64,
+    usd: f64,
+    dur_ms: u64,
+    why: &'e str,
+    mode: &'e str,
+    channel: &'e str,
+}
+
+/// A local event as a fold reads it (`current`, `each_live`), borrowed from its line (a string with an
+/// escape is copied): every field `Event` reads, in its order and with its types, so the two take the same
+/// lines; the strings no fold reads are checked, not kept.
+#[derive(Deserialize)]
+pub struct EventRef<'a> {
+    pub ms: i64,
+    #[serde(borrow)]
+    pub kind: Cow<'a, str>,
+    #[serde(default, rename = "session")]
+    _session: Str,
+    #[serde(default, borrow)]
+    pub engineer: Cow<'a, str>,
+    #[serde(default, rename = "repo")]
+    _repo: Str,
+    #[serde(default, borrow)]
+    pub lessons: Vec<Text<'a>>,
+    #[serde(default)]
+    pub n: u64,
+    #[serde(default)]
+    pub usd: f64,
+    #[serde(default)]
+    pub dur_ms: u64,
+    #[serde(default, borrow)]
+    pub why: Cow<'a, str>,
+    #[serde(default, rename = "text")]
+    _text: Str,
+    #[serde(default, borrow)]
+    pub mode: Cow<'a, str>,
+    #[serde(default, borrow)]
+    pub channel: Cow<'a, str>,
+    #[serde(default, rename = "source")]
+    _source: Str,
+    #[serde(default, rename = "rss_kb")]
+    _rss_kb: u64,
+    #[serde(default, rename = "limit_ms")]
+    _limit_ms: u64,
+}
+
+impl EventRef<'_> {
+    fn head(&self) -> Head<'_, Text<'_>> {
+        Head {
+            ms: self.ms,
+            kind: &self.kind,
+            engineer: &self.engineer,
+            lessons: &self.lessons,
+            n: self.n,
+            usd: self.usd,
+            dur_ms: self.dur_ms,
+            why: &self.why,
+            mode: &self.mode,
+            channel: &self.channel,
+        }
+    }
+}
+
+/// `fold` one event at a time. An event allocates only for a bucket, a key or a lesson it is the first
+/// of: its bucket id and `<kind>…` keys are written into reused buffers, and the UTC day is made once per
+/// run of events on one day (events are logged in time order), not per event.
+struct Folder<'n> {
+    node: &'n str,
+    out: BTreeMap<String, Bucket>,
+    /// The last event's day: its number since 1970-01-01 (`day` depends on nothing else) and `day` of it.
+    day: Option<(i64, String)>,
+    id: String,
+    key: String,
+}
+
+impl<'n> Folder<'n> {
+    fn new(node: &'n str) -> Self {
+        Folder { node, out: BTreeMap::new(), day: None, id: String::new(), key: String::new() }
+    }
+
+    fn add<L: std::ops::Deref<Target = str>>(&mut self, e: &Head<'_, L>) {
+        let Folder { node, out, day: last, id, key } = self;
+        let number = e.ms.div_euclid(crate::clock::DAY_MS);
+        let date = match last {
+            Some((at, d)) if *at == number => d,
+            _ => &last.insert((number, day(e.ms))).1,
+        };
+        id.clear();
+        let _ = write!(id, "stat:{node}:{}:{date}", e.engineer);
+        let b = slot(out, id, Bucket::default);
+        // A new bucket: no id is empty.
+        if b.id.is_empty() {
+            *b = Bucket { id: id.clone(), day: date.clone(), node: (*node).into(), engineer: e.engineer.into(), ..Default::default() };
+        }
         // An answer to the drone's question is counted apart, so "correction" keeps its meaning.
-        let kind = if e.kind == CORRECTION && e.why == crate::learn::ANSWER { ANSWERED } else { e.kind.as_str() };
-        *b.counts.entry(kind.to_string()).or_default() += 1;
+        let kind = if e.kind == CORRECTION && e.why == crate::learn::ANSWER { ANSWERED } else { e.kind };
+        *slot(&mut b.counts, kind, Default::default) += 1;
         if e.n > 0 {
-            *b.counts.entry(format!("{}_n", e.kind)).or_default() += e.n;
+            key.clear();
+            let _ = write!(key, "{}_n", e.kind);
+            *slot(&mut b.counts, key, Default::default) += e.n;
         }
         // Reasons folded as `<kind>:<why>` into `why`, so the page can say why a turn end passed free,
         // why a check was dropped, how many failed and which asks a detached check made (the raw `why`
         // stays on the event; a score folds to `score`, `live_covered` is live mode's skip before 0.7.6,
         // a skip without a reason folds to none).
-        let why = match (e.kind.as_str(), e.why.as_str()) {
+        let why = match (e.kind, e.why) {
             (GATE_SKIP, w @ ("noedit" | "empty" | "live_covered")) => w,
             (GATE_SKIP, w) if w.parse::<f64>().is_ok() => "score",
             (GATE_SKIP, w) if !w.is_empty() => "other",
@@ -738,52 +931,70 @@ pub fn fold(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
             _ => "",
         };
         if !why.is_empty() {
-            *b.why.entry(format!("{}:{why}", e.kind)).or_default() += 1;
+            key.clear();
+            let _ = write!(key, "{}:{why}", e.kind);
+            *slot(&mut b.why, key, Default::default) += 1;
         }
         // A turn-end check's time, summed with the checks that report one: the page's average.
         if e.kind == CHECK && e.dur_ms > 0 {
-            *b.why.entry("check_ms".into()).or_default() += e.dur_ms;
-            *b.why.entry("check_timed".into()).or_default() += 1;
+            *slot(&mut b.why, "check_ms", Default::default) += e.dur_ms;
+            *slot(&mut b.why, "check_timed", Default::default) += 1;
         }
         b.usd += e.usd;
         if e.usd > 0.0 {
-            *b.usd_by.entry(e.kind.clone()).or_default() += e.usd;
+            *slot(&mut b.usd_by, e.kind, Default::default) += e.usd;
         }
         // Checks from before modes existed were all turn-end checks: hook mode.
         if e.usd > 0.0 && (e.kind == CHECK || e.kind == LIVE_CHECK) {
-            let mode = if e.mode.is_empty() { "hook" } else { e.mode.as_str() };
-            *b.usd_mode.entry(mode.into()).or_default() += e.usd;
+            *slot(&mut b.usd_mode, if e.mode.is_empty() { "hook" } else { e.mode }, Default::default) += e.usd;
         }
         if !e.channel.is_empty() {
-            *b.channels.entry(format!("{}@{}", e.kind, e.channel)).or_default() += 1;
+            key.clear();
+            let _ = write!(key, "{}@{}", e.kind, e.channel);
+            *slot(&mut b.channels, key, Default::default) += 1;
         }
         b.dur_ms += e.dur_ms;
-        for l in &e.lessons {
-            *b.lessons.entry(l.clone()).or_default().entry(e.kind.clone()).or_default() += 1;
+        for l in e.lessons {
+            *slot(slot(&mut b.lessons, l, BTreeMap::new), e.kind, Default::default) += 1;
         }
     }
-    out
 }
 
 /// The latest version of every bucket in `stats.jsonl` (every node's, after the mesh merged them). Two
 /// lines of one version (two rollups at once) are ranked as borg-mesh lines.rs `settle` ranks them, by
 /// the line's blake3 hash, so every node shows the same one whatever order the lines arrived in.
+///
+/// Most lines are superseded versions (94% on one store), so it reads each line's leading `id` and
+/// `version` first (`jsonl::lead`) and parses only each id's newest line whole; a newest line that is no
+/// `Bucket` gives way to the next.
 pub fn rollups(home: &Path) -> BTreeMap<String, Bucket> {
-    let mut out: BTreeMap<String, (Bucket, [u8; 32])> = BTreeMap::new();
-    for l in std::fs::read_to_string(rollups_path(home)).unwrap_or_default().lines() {
-        let Ok(b) = serde_json::from_str::<Bucket>(l) else { continue };
-        let h = *blake3::hash(l.as_bytes()).as_bytes();
-        if out.get(&b.id).is_none_or(|(old, oh)| (b.version, h) > (old.version, *oh)) {
-            out.insert(b.id.clone(), (b, h));
+    let text = std::fs::read_to_string(rollups_path(home)).unwrap_or_default();
+    let head = |l| match crate::jsonl::lead(l, ["id", "version"])? {
+        [Scalar::Str(id), version] => Some((id, version.as_u64()?)),
+        _ => None,
+    };
+    let mut out = BTreeMap::new();
+    for (_, mut lines) in crate::jsonl::by_id(&text, head) {
+        lines.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+        // Newest version first; lines of one version by hash, hashed only when there are several.
+        for tied in lines.chunk_by_mut(|a, b| a.0 == b.0) {
+            if tied.len() > 1 {
+                tied.sort_by_cached_key(|(_, l)| std::cmp::Reverse(*blake3::hash(l.as_bytes()).as_bytes()));
+            }
+            if let Some(b) = tied.iter().find_map(|(_, l)| serde_json::from_str::<Bucket>(l).ok()) {
+                out.insert(b.id.clone(), b);
+                break;
+            }
         }
     }
-    out.into_iter().map(|(id, (b, _))| (id, b)).collect()
+    out
 }
 
 /// Publishes this node's buckets whose counts changed since their last line in `stats.jsonl`, each
 /// with the next version. Returns how many lines it appended (0 when nothing changed).
 pub fn rollup(home: &Path) -> usize {
     backfill(home);
+    recount_ignores(home);
     // No events, nothing to publish: and no node id created in a store that never counted anything.
     let evs = events(home);
     if evs.is_empty() {
@@ -818,9 +1029,15 @@ pub fn rollup(home: &Path) -> usize {
 /// fresh from its local events, so local activity shows before the next rollup.
 pub fn current(home: &Path) -> Vec<Bucket> {
     backfill(home);
+    recount_ignores(home);
     let me = node(home);
     let mut all: BTreeMap<String, Bucket> = rollups(home).into_iter().filter(|(_, b)| b.node != me).collect();
-    all.extend(fold(&me, &events(home)));
+    // `fold(&me, &events(home))`, folded as read: one log's text at a time, no event kept.
+    let mut f = Folder::new(&me);
+    for path in [backfill_path(home), events_path(home), ignores_path(home)] {
+        each_in(&path, |e| f.add(&e.head()));
+    }
+    all.extend(f.out);
     all.into_values().collect()
 }
 
@@ -1154,6 +1371,33 @@ mod tests {
         assert_eq!(events(&home).len(), all.len() + 1, "history and live events together");
     }
 
+    /// 0.7.10 and 0.7.11 counted the judge's changes live but not its ignores. The recount adds each ignore
+    /// by today's judge since live counting began that no live event has, once; an old judge's ignore,
+    /// a placebo's and one counted live stay out.
+    #[test]
+    fn recount_adds_the_ignores_live_counting_dropped_once() {
+        let home = tmp("recount");
+        use serde_json::json;
+        let rec = |kind: &str, s: &str, lessons: &[&str], ms: i64, channel: &str, judge: u8| json!({"kind": kind, "session": s, "lessons": lessons, "ms": ms, "repo": "app", "channel": channel, "judge": judge});
+        let log = [
+            rec("asked_ignored", "s0", &["L0"], 50, "stop", 3),
+            rec("asked_then_changed", "s1", &["L1"], 1100, "live", 3),
+            rec("asked_ignored", "s1", &["L2", "L3"], 1100, "live", 3),
+            rec("asked_ignored", "s1", &["L4"], 1100, "queued", 3),
+            rec("asked_ignored", "s1", &["L5"], 1200, "live", 2),
+            rec("asked_ignored", "s1", &["L6"], 1300, crate::outcome::PLACEBO, 3),
+        ];
+        std::fs::write(home.join("outcomes.jsonl"), log.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+        record(&home, &ev(TURN_END, 1000, "a@x", &[], 0));
+        record(&home, &Event { session: "s1".into(), ..ev(CHANGED, 1101, "a@x", &["L1"], 0) });
+        record(&home, &Event { session: "s1".into(), ..ev(IGNORED, 1101, "a@x", &["L3"], 0) });
+        assert_eq!(recount_ignores(&home), 2);
+        let got: Vec<(i64, Vec<String>)> = read_events(&ignores_path(&home)).into_iter().map(|e| (e.ms, e.lessons)).collect();
+        assert_eq!(got, [(1100, vec!["L2".to_string()]), (1100, vec!["L4".to_string()])], "before live counting, counted live, old judge, placebo: out");
+        assert_eq!(recount_ignores(&home), 0, "once");
+        assert_eq!(events(&home).iter().filter(|e| e.kind == IGNORED).count(), 3, "live and recounted together");
+    }
+
     /// A stop's block asked lessons that two checks routed, a live ask delivered two checks' questions,
     /// and the judge's call wrote one verdict record per check: each is one record per check in the log
     /// and one event live, so one event in the history too, its lessons joined. Records of separate
@@ -1192,11 +1436,366 @@ mod tests {
         );
     }
 
+    /// `rollups` before its two passes: every line parsed whole, the newest version per id kept, ties by hash.
+    fn rollups_whole(text: &str) -> BTreeMap<String, Bucket> {
+        let mut out: BTreeMap<String, (Bucket, [u8; 32])> = BTreeMap::new();
+        for l in text.lines() {
+            let Ok(b) = serde_json::from_str::<Bucket>(l) else { continue };
+            let h = *blake3::hash(l.as_bytes()).as_bytes();
+            if out.get(&b.id).is_none_or(|(old, oh)| (b.version, h) > (old.version, *oh)) {
+                out.insert(b.id.clone(), (b, h));
+            }
+        }
+        out.into_iter().map(|(id, (b, _))| (id, b)).collect()
+    }
+
+    /// `stats.jsonl` lines at every edge a head and a whole parse could decide apart.
+    fn bucket_edges() -> Vec<String> {
+        let b = |id: &str, version: u64, n: u64| {
+            serde_json::json!({"id": id, "version": version, "day": "2026-11-01", "node": "n", "engineer": "e", "counts": {"turn_end": n}, "usd": 0.5, "dur_ms": 1})
+                .to_string()
+        };
+        let mut v = vec![
+            b("A", 1, 1),
+            b("A", 2, 2),
+            b("A", 2, 3),
+            b("A", 2, 4),
+            // Newest, but no `Bucket` (no `counts`): the whole parse never sees it, so version 2 wins.
+            r#"{"id":"A","version":9,"day":"d","node":"n","engineer":"e","usd":0,"dur_ms":0}"#.into(),
+            // Newest twice, both no `Bucket`: the next version down.
+            r#"{"id":"B","version":5,"counts":{}}"#.into(),
+            r#"{"id":"B","version":5,"day":"d"}"#.into(),
+            b("B", 4, 1),
+            b("B", 3, 1),
+            // Escaped id: the same id as `C`.
+            b("C", 1, 1),
+            b("C", 1, 1).replace(r#""id":"C""#, &format!(r#""id":"{}""#, crate::jsonl::escaped("C"))).replace(r#""version":1"#, r#""version":2"#),
+            // Duplicate keys: a typed parse refuses them.
+            b("D", 1, 1),
+            b("D", 1, 1).replacen('{', r#"{"version":7,"#, 1),
+            b("D", 1, 1).replacen('{', r#"{"id":"D","#, 1),
+            b("D", 1, 1).replacen('{', r#"{"counts":{},"#, 1),
+            // Version above u32, above u64, negative, a float, a string; an id that is no string.
+            b("E", 5_000_000_000, 1),
+            b("E", 1, 1).replace(r#""version":1"#, r#""version":18446744073709551616"#),
+            b("E", 1, 1).replace(r#""version":1"#, r#""version":-1"#),
+            b("E", 1, 1).replace(r#""version":1"#, r#""version":9.0"#),
+            b("E", 1, 1).replace(r#""version":1"#, r#""version":"9""#),
+            b("E", 1, 1).replace(r#""id":"E""#, r#""id":5"#),
+            // A lone surrogate in a field only the whole parse reads, and in one neither reads.
+            b("F", 1, 1),
+            b("F", 2, 1).replace(r#""engineer":"e""#, r#""engineer":"\ud800""#),
+            b("F", 3, 1).replacen('{', r#"{"x":"\ud800","#, 1),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            b("G", 1, 1),
+            b("G", 2, 1).trim_end_matches('}').to_string(),
+            b("G", 3, 1) + " x",
+            b("G", 4, 1) + " ",
+            " ".into(),
+            "\t".into(),
+            String::new(),
+            "{}".into(),
+            "[]".into(),
+            "null".into(),
+            r#"[{"id":"G","version":9}]"#.into(),
+        ];
+        // Identical lines of one version.
+        v.extend([b("H", 1, 1), b("H", 1, 1)]);
+        v
+    }
+
+    /// The two passes keep exactly what a whole parse of every line keeps, on the edges and on every
+    /// line of a real store (`BORG_BENCH_STORE`), in file order and reversed.
+    #[test]
+    fn rollups_keep_what_a_whole_parse_keeps() {
+        let home = tmp("rollups-oracle");
+        let real = crate::jsonl::store_lines(&["stats.jsonl"]);
+        for mut lines in [bucket_edges(), real.clone(), [real, bucket_edges()].concat()] {
+            for _ in 0..2 {
+                let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+                std::fs::write(rollups_path(&home), &text).unwrap();
+                assert_eq!(rollups(&home), rollups_whole(&text));
+                lines.reverse();
+            }
+        }
+        std::fs::write(rollups_path(&home), bucket_edges().iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let got: Vec<(String, u64)> = rollups(&home).into_iter().map(|(id, b)| (id, b.version)).collect();
+        let got: Vec<(&str, u64)> = got.iter().map(|(id, v)| (id.as_str(), *v)).collect();
+        assert_eq!(got, [("A", 2), ("B", 4), ("C", 2), ("D", 1), ("E", 5_000_000_000), ("F", 3), ("G", 4), ("H", 1)]);
+    }
+
+    /// The feed before `newest`: every event parsed whole, filtered, sorted, cut.
+    fn newest_whole(home: &Path, kinds: &[&str], limit: usize) -> Vec<Event> {
+        let mut evs: Vec<Event> = events(home).into_iter().filter(|e| kinds.contains(&e.kind.as_str())).collect();
+        evs.sort_by_key(|e| std::cmp::Reverse(e.ms));
+        evs.truncate(limit);
+        evs
+    }
+
+    /// `newest` returns exactly what parsing every event whole returns, on edge lines and on the event
+    /// logs of a real store (`BORG_BENCH_STORE`), for every limit around the logs' size.
+    #[test]
+    fn newest_is_the_whole_feed_cut() {
+        let home = tmp("newest-oracle");
+        let e = |kind: &str, ms: i64, why: &str| serde_json::to_string(&Event { why: why.into(), ..Event::new(kind, ms) }).unwrap();
+        let edges = [
+            e(CHANGED, 10, "first file"),
+            e(CHANGED, 10, "tie"),
+            e(BLOCK, 30, ""),
+            // Newest, but no `Event` (`lessons` no array): gives way to the next.
+            r#"{"ms":99,"kind":"changed","lessons":"L1"}"#.into(),
+            // Escaped kind: a shown kind.
+            format!(r#"{{"ms":40,"kind":"{}"}}"#, crate::jsonl::escaped(CHANGED)),
+            // Duplicate keys, a kind that is no string, a missing kind, a float ms, truncated, empty.
+            r#"{"ms":50,"kind":"changed","kind":"block"}"#.into(),
+            r#"{"ms":50,"ms":51,"kind":"changed"}"#.into(),
+            r#"{"ms":60,"kind":5}"#.into(),
+            r#"{"ms":60}"#.into(),
+            r#"{"ms":60.5,"kind":"changed"}"#.into(),
+            r#"{"ms":61,"kind":"changed""#.into(),
+            String::new(),
+            " ".into(),
+            e(TURN_END, 70, "not shown"),
+        ];
+        let real = |f: &str| crate::jsonl::store_lines(&[f]);
+        let files = [backfill_path(&home), events_path(&home), ignores_path(&home)];
+        std::fs::create_dir_all(home.join("stats")).unwrap();
+        let sets = [
+            [edges[..2].to_vec(), edges[1..].to_vec(), edges.to_vec()],
+            [real("stats/backfill.jsonl"), real("stats/events.jsonl"), real("stats/ignores.jsonl")],
+        ];
+        let kinds = [CORRECTION, VETO, BLOCK, CHANGED, IGNORED, LESSON_NEW, MODEL_CALL, MSG_SENT, QUEEN_QUEUED];
+        for set in sets {
+            for (f, lines) in files.iter().zip(&set) {
+                std::fs::write(f, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            }
+            let n: usize = set.iter().map(Vec::len).sum();
+            for limit in [0, 1, 2, 5, 200, 2000, n, n + 1] {
+                assert_eq!(newest(&home, &kinds, limit), newest_whole(&home, &kinds, limit), "limit {limit}");
+            }
+        }
+    }
+
     #[test]
     fn node_id_is_stable() {
         let home = tmp("node");
         let a = node(&home);
         assert_eq!(a.len(), 16);
         assert_eq!(node(&home), a);
+    }
+
+    /// `fold` before `Folder`: a `format!` of the day and the bucket id per event, a key copied per count.
+    fn fold_owned(node: &str, events: &[Event]) -> BTreeMap<String, Bucket> {
+        let mut out: BTreeMap<String, Bucket> = BTreeMap::new();
+        for e in events {
+            let day = day(e.ms);
+            let id = format!("stat:{node}:{}:{day}", e.engineer);
+            let b = out.entry(id.clone()).or_insert_with(|| Bucket { id, day, node: node.into(), engineer: e.engineer.clone(), ..Default::default() });
+            let kind = if e.kind == CORRECTION && e.why == crate::learn::ANSWER { ANSWERED } else { e.kind.as_str() };
+            *b.counts.entry(kind.to_string()).or_default() += 1;
+            if e.n > 0 {
+                *b.counts.entry(format!("{}_n", e.kind)).or_default() += e.n;
+            }
+            let why = match (e.kind.as_str(), e.why.as_str()) {
+                (GATE_SKIP, w @ ("noedit" | "empty" | "live_covered")) => w,
+                (GATE_SKIP, w) if w.parse::<f64>().is_ok() => "score",
+                (GATE_SKIP, w) if !w.is_empty() => "other",
+                (CHECK | LIVE_CHECK, "failed") => "failed",
+                (CHECK_DROPPED, w) if !w.is_empty() => w,
+                (LIVE_ASK, _) if e.mode == crate::check_async::MODE => crate::check_async::MODE,
+                _ => "",
+            };
+            if !why.is_empty() {
+                *b.why.entry(format!("{}:{why}", e.kind)).or_default() += 1;
+            }
+            if e.kind == CHECK && e.dur_ms > 0 {
+                *b.why.entry("check_ms".into()).or_default() += e.dur_ms;
+                *b.why.entry("check_timed".into()).or_default() += 1;
+            }
+            b.usd += e.usd;
+            if e.usd > 0.0 {
+                *b.usd_by.entry(e.kind.clone()).or_default() += e.usd;
+            }
+            if e.usd > 0.0 && (e.kind == CHECK || e.kind == LIVE_CHECK) {
+                let mode = if e.mode.is_empty() { "hook" } else { e.mode.as_str() };
+                *b.usd_mode.entry(mode.into()).or_default() += e.usd;
+            }
+            if !e.channel.is_empty() {
+                *b.channels.entry(format!("{}@{}", e.kind, e.channel)).or_default() += 1;
+            }
+            b.dur_ms += e.dur_ms;
+            for l in &e.lessons {
+                *b.lessons.entry(l.clone()).or_default().entry(e.kind.clone()).or_default() += 1;
+            }
+        }
+        out
+    }
+
+    /// `current` before it folded as read: every local event kept in a `Vec<Event>`, then `fold_owned`.
+    fn current_owned(home: &Path) -> Vec<Bucket> {
+        backfill(home);
+        recount_ignores(home);
+        let me = node(home);
+        let mut all: BTreeMap<String, Bucket> = rollups(home).into_iter().filter(|(_, b)| b.node != me).collect();
+        all.extend(fold_owned(&me, &events(home)));
+        all.into_values().collect()
+    }
+
+    /// Event lines at every edge `Event` and `EventRef` could decide apart, and through every branch of the
+    /// fold.
+    fn event_edges() -> Vec<String> {
+        let e = r#"{"ms":1700000000000,"kind":"check","engineer":"a@x","lessons":["L1","L2"],"n":2,"usd":0.5,"dur_ms":300,"why":"failed","mode":"async","channel":"stop"}"#;
+        let esc = crate::jsonl::escaped;
+        let with = |field: &str| e.replacen('{', &format!("{{{field},"), 1);
+        let mut out: Vec<String> = vec![
+            e.into(),
+            // Escapes in every string the fold reads.
+            format!(
+                r#"{{"ms":1700000000001,"kind":"{}","engineer":"{}","lessons":["{}"],"why":"{}","mode":"{}","channel":"{}"}}"#,
+                esc("check"),
+                esc("a@x"),
+                esc("L1"),
+                esc("failed"),
+                esc("async"),
+                esc("stop")
+            ),
+            // Duplicate keys, read and unread and unknown.
+            with(r#""kind":"veto""#),
+            with(r#""text":"a","text":"b""#),
+            with(r#""x":1,"x":2"#),
+            // Wrong types in fields read and unread; numbers past their type.
+            with(r#""session":5"#),
+            with(r#""text":null"#),
+            with(r#""repo":[]"#),
+            with(r#""source":{}"#),
+            with(r#""text":"\ud800""#),
+            e.replace(r#""ms":1700000000000"#, r#""ms":"1""#),
+            e.replace(r#""ms":1700000000000"#, r#""ms":1.5"#),
+            e.replace(r#""ms":1700000000000"#, r#""ms":9223372036854775808"#),
+            e.replace(r#""ms":1700000000000"#, r#""ms":9223372036854775807"#),
+            e.replace(r#""ms":1700000000000"#, r#""ms":-86400001"#),
+            e.replace(r#""n":2"#, r#""n":-1"#),
+            e.replace(r#""n":2"#, r#""n":5000000000"#),
+            e.replace(r#""n":2"#, r#""n":18446744073709551616"#),
+            e.replace(r#""usd":0.5"#, r#""usd":"1""#),
+            e.replace(r#""usd":0.5"#, r#""usd":-0.0"#),
+            with(r#""rss_kb":-1"#),
+            with(r#""limit_ms":1e3"#),
+            e.replace(r#"["L1","L2"]"#, r#""L1""#),
+            e.replace(r#"["L1","L2"]"#, r#"["L1",2]"#),
+            e.replace(r#""kind":"check","#, ""),
+            e.replace(r#""kind":"check""#, r#""kind":null"#),
+            // The positional form serde reads a struct from too.
+            r#"[1700000000000,"check"]"#.into(),
+            r#"[1700000000000,"check","s","a@x","r",["L1"],3]"#.into(),
+            r#"[1700000000000]"#.into(),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            e.trim_end_matches('}').into(),
+            format!("{e} x"),
+            format!("{e} "),
+            " ".into(),
+            String::new(),
+            "{}".into(),
+            "[]".into(),
+            "null".into(),
+        ];
+        // Each branch of the reasons, costs and channels.
+        for (kind, why, mode, usd) in [
+            (GATE_SKIP, "noedit", "", 0.0),
+            (GATE_SKIP, "0.25", "", 0.0),
+            (GATE_SKIP, "zzz", "", 0.0),
+            (GATE_SKIP, "", "", 0.0),
+            (CHECK_DROPPED, crate::check_async::WHY_GONE, "", 0.0),
+            (LIVE_ASK, "", crate::check_async::MODE, 0.0),
+            (LIVE_CHECK, "failed", "", 0.25),
+            (CHECK, "", "", 0.125),
+            (CORRECTION, crate::learn::ANSWER, "", 0.0),
+            (MODEL_CALL, "", "", 0.75),
+        ] {
+            out.push(
+                serde_json::json!({"ms": 1_700_086_400_000_i64, "kind": kind, "engineer": "b@x", "why": why, "mode": mode, "usd": usd, "dur_ms": 5})
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    /// The local event logs of the store `BORG_BENCH_STORE` names, line by line (none when unset).
+    const LOCAL: [&str; 3] = ["stats/backfill.jsonl", "stats/events.jsonl", "stats/ignores.jsonl"];
+
+    /// `EventRef` takes exactly the lines `Event` takes, and `Folder` folds each, and all of them in a row,
+    /// exactly as `fold_owned` did, on the edges and every local event line of a real store.
+    #[test]
+    fn the_borrowed_fold_folds_what_the_owned_one_did() {
+        let lines = [event_edges(), crate::jsonl::store_lines(&LOCAL)].concat();
+        let mut all = Vec::new();
+        let mut f = Folder::new("n");
+        for line in &lines {
+            let owned = serde_json::from_str::<Event>(line).ok();
+            let borrowed = serde_json::from_str::<EventRef>(line).ok();
+            assert_eq!(owned.is_some(), borrowed.is_some(), "{line:?}");
+            if let (Some(o), Some(r)) = (owned, borrowed) {
+                let mut one = Folder::new("n");
+                one.add(&r.head());
+                assert_eq!(one.out, fold_owned("n", std::slice::from_ref(&o)), "{line:?}");
+                f.add(&r.head());
+                all.push(o);
+            }
+        }
+        assert_eq!(f.out, fold_owned("n", &all));
+        assert_eq!(fold("n", &all), fold_owned("n", &all), "the owned events' fold");
+    }
+
+    /// `current` gives exactly what it gave when it kept every event, on a store of the edges beside a
+    /// peer's rollup, and on a copy of a real store's rollups and local events (`BORG_BENCH_STORE`).
+    #[test]
+    fn current_folds_as_read_what_it_folded_whole() {
+        let home = tmp("current-oracle");
+        std::fs::create_dir_all(home.join("stats")).unwrap();
+        std::fs::write(home.join("stats").join("node"), "me").unwrap();
+        std::fs::write(backfill_path(&home), "").unwrap();
+        std::fs::write(ignores_path(&home), event_edges().join("\n")).unwrap();
+        std::fs::write(events_path(&home), event_edges().join("\n") + "\n").unwrap();
+        let peer = Bucket { id: "stat:other:b@x:2023-11-14".into(), version: 1, node: "other".into(), ..Default::default() };
+        std::fs::write(rollups_path(&home), serde_json::to_string(&peer).unwrap() + "\n").unwrap();
+        let edges = current(&home);
+        assert_eq!(edges, current_owned(&home));
+        assert!(edges.len() > 2 && edges.iter().any(|b| b.node == "other"), "{edges:?}");
+        if let Some(src) = std::env::var_os("BORG_BENCH_STORE").map(PathBuf::from) {
+            let real = tmp("current-oracle-real");
+            std::fs::create_dir_all(real.join("stats")).unwrap();
+            for f in LOCAL.iter().chain(&["stats/node", "stats.jsonl"]) {
+                let _ = std::fs::copy(src.join(f), real.join(f));
+            }
+            assert_eq!(current(&real), current_owned(&real));
+            let _ = std::fs::remove_dir_all(real);
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// `each_live` hands over exactly the events `live` reads, in order, and `live_since` finds what it
+    /// found from them (a repeated veto, dated earlier than its line, never the start), on the edges and
+    /// a real store's live log (`BORG_BENCH_STORE`).
+    #[test]
+    fn the_live_events_read_borrowed_are_the_owned_ones() {
+        let home = tmp("each-live");
+        std::fs::create_dir_all(home.join("stats")).unwrap();
+        // Dated before every other line, so only skipping it keeps it from being the start.
+        let said = -10_i64.pow(15);
+        let repeat = serde_json::to_string(&Event::new(VETO_REPEAT, said)).unwrap();
+        let real = crate::jsonl::store_lines(&["stats/events.jsonl"]);
+        for (i, lines) in [event_edges(), [vec![repeat], event_edges(), real].concat()].into_iter().enumerate() {
+            std::fs::write(events_path(&home), lines.join("\n")).unwrap();
+            let mut got = Vec::new();
+            each_live(&home, |e| got.push((e.ms, e.kind.to_string(), e.why.to_string())));
+            let live = live(&home);
+            assert_eq!(got, live.iter().map(|e| (e.ms, e.kind.clone(), e.why.clone())).collect::<Vec<_>>());
+            assert_eq!(live_since(&home), live.iter().filter(|e| e.kind != VETO_REPEAT).map(|e| e.ms).min());
+            assert_ne!(live_since(&home), Some(said), "the repeated veto");
+            if i == 0 {
+                assert_eq!(live_since(&home), Some(-86_400_001), "the earliest edge");
+            }
+        }
+        let _ = std::fs::remove_dir_all(home);
     }
 }

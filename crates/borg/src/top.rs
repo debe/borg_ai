@@ -217,8 +217,8 @@ fn drone_at<'a>(drones: &'a [Drone], here: &str, node: &str, session: &str) -> O
 /// short key (as msg.rs `line`).
 pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
     let name = match Address::parse(&m.by) {
-        Some(Address::Engineer { email }) if email.is_empty() => msg::ENGINEER.into(),
-        Some(Address::Engineer { email }) => collective::aliases().display(&email),
+        Some(Address::Engineer { email: "" }) => msg::ENGINEER.into(),
+        Some(Address::Engineer { email }) => collective::aliases().display(email),
         _ => match drone_at(drones, here, &m.node, &m.by) {
             Some(d) => d.designation.clone(),
             None => msg::sender_label(m),
@@ -233,16 +233,16 @@ pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
 /// (msg.rs `short_node`).
 pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
     match Address::parse(to) {
-        Some(Address::Engineer { email }) if !email.is_empty() => collective::aliases().display(&email),
+        Some(Address::Engineer { email }) if !email.is_empty() => collective::aliases().display(email),
         Some(Address::Local { node }) if node == here => msg::LOCAL.into(),
-        Some(Address::Local { node }) => format!("{} @{}", msg::LOCAL, msg::short_node(&node)),
+        Some(Address::Local { node }) => format!("{} @{}", msg::LOCAL, msg::short_node(node)),
         Some(Address::All) => msg::COLLECTIVE.into(),
         Some(Address::Session { id, node }) => {
             let d = match node {
-                Some(n) => drone_at(drones, here, &n, &id),
+                Some(n) => drone_at(drones, here, n, id),
                 None => drones.iter().find(|d| d.p.session == id),
             };
-            d.map_or_else(|| msg::short_session(&id), |d| d.designation.clone())
+            d.map_or_else(|| msg::short_session(id), |d| d.designation.clone())
         }
         Some(a) => a.to_string(),
         None => msg::short_session(to),

@@ -14,6 +14,8 @@
 //!   their author to two member replicas, and any holder answers a member asking for a commit's.
 //! - **Sync** (sync.rs, recon.rs): iroh QUIC between two nodes, trust first (membership and
 //!   revocations before any data), then range-based set reconciliation, cost ∝ difference.
+//! - **Cache** (cache.rs): what a node's sessions read of its store, shared between them: each log read
+//!   whole once and then only past where it was read, so a session's reads grow with what changed.
 //! - **Live** (live.rs): presence of the members' drones, ephemeral, carried in every session after
 //!   the logs; never reconciled into a log.
 //! - **Steering** (steer.rs): a pause, resume or veto is a message line, authenticated by its origin;
@@ -34,6 +36,7 @@
 //! crates, which pin it `=` to the same version. Any release may change or remove any item.
 
 pub mod addr;
+pub mod cache;
 pub mod daemon;
 pub mod identity;
 pub mod invite;
@@ -46,9 +49,16 @@ pub mod recon;
 pub mod steer;
 pub mod sync;
 
-/// Lowercase hex, the form keys and hashes take in files, tickets and on the wire.
+/// Lowercase hex, the form keys and hashes take in files, tickets and on the wire. Written into one
+/// string sized up front, each byte through a table (a `format!` per byte was a string per byte).
 pub fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 * bytes.len());
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0xf)]));
+    }
+    out
 }
 
 pub fn from_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -63,8 +73,48 @@ pub fn from_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
+/// The bytes of exactly `2 · N` lowercase hex digits, the form `to_hex` writes; `None` for any other text
+/// (which `from_hex` may still read: it trims and takes capitals).
+pub(crate) fn from_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let b = s.as_bytes();
+    if b.len() != 2 * N {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (nibble(b[2 * i])? << 4) | nibble(b[2 * i + 1])?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Lowercase hex reads back exactly what `to_hex` wrote, and only that.
+    #[test]
+    fn lower_hex_reads_only_what_to_hex_writes() {
+        let all: Vec<u8> = (0..=255).collect();
+        for b in &all {
+            assert_eq!(super::from_lower_hex::<1>(&super::to_hex(&[*b])), Some([*b]));
+        }
+        for bad in ["AB", " ab", "ab ", "a", "abc", "zz", "é"] {
+            assert_eq!(super::from_lower_hex::<1>(bad), None, "{bad:?}");
+        }
+        assert_eq!(super::from_hex::<1>("AB"), Ok([0xab]), "which from_hex reads");
+    }
+
+    /// The table writes what `format!("{b:02x}")` wrote, for every byte.
+    #[test]
+    fn hex_is_what_format_wrote() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(super::to_hex(&all), all.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        assert_eq!(super::to_hex(&[]), "");
+    }
+
     #[test]
     fn hex_round_trips_and_rejects_garbage() {
         let b = [0u8, 1, 0xab, 0xff];

@@ -196,6 +196,26 @@ ask).
   forged stamp near `i64::MIN` (release wraps and keeps the line). Changing it changes which lines every
   node keeps, so it needs a protocol decision.
 
+## What a mesh session and the web page still cost
+
+Measured on 2026-11-12, counting fixed work rather than wall-clock time, on a copy of a team store
+(a 16 MB statistics log). Reading the store is no longer the cost; what is left:
+
+- **The vector model is loaded again by every session that stores a lesson.** That is 95% of a session
+  with vectors on: 1.37 G instructions against 64 M for the session's mesh work. Done means a
+  serve process loads it once.
+- **Reconciliation fingerprints every hash on every session.** That is 17% of a session, and it grows
+  with the store: a 10× store costs 3.7× per session. A cached tree of range fingerprints makes it
+  grow only with what changed.
+- **Membership is verified again on every session.** That is 9% of a session, mostly ed25519. Verify
+  each signed version once and keep the result.
+- **The statistics log keeps every version.** 94% of its lines are superseded. Dropping them locally
+  does not work: reconciliation compares hash sets, so peers send them back. This needs a protocol
+  decision.
+- **borg-web reads the whole statistics log on every request.** The queen, usage, lessons and learning
+  views each read the 16 MB `stats.jsonl` whole for the rollups: 154 of the 158 MB heap peak with 8
+  requests at once. Reading only what was appended since the last request removes that peak.
+
 ## Context borg reads
 
 - borg judges a session by its prompt, its tool calls, its edits and the agent's last message. It never

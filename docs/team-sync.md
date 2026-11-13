@@ -135,6 +135,12 @@ append-only files, so nothing is overwritten; when two machines improved the sam
 version wins everywhere. Cost grows with what changed: a laptop back from three weeks' vacation
 downloads three weeks of lessons.
 
+**What a peer keeps between sessions.** `borg mesh serve` reads each synced log and the origin records
+whole once, then holds them in memory and reads only what was appended; a log rewritten in place (a
+quarantine, the message bound) is read whole again once. A session that brings nothing new reads no
+log. The price is memory of about the store's size: about 25 MB for a store with a 16 MB statistics
+log.
+
 **What travels.** Six logs, each line signed by the machine that wrote it and quarantined when that
 machine is revoked:
 

@@ -217,13 +217,12 @@ nothing here matches, or as the sender a reply answers; `collective` reaches eve
 collective on every member's machine and may wake them, so it is for what concerns their work. The message is shown once, at the recipient's next prompt or tool call, marked as
 peer data rather than the user's words, with the command that replies (`borg tell <session> --re <id>`).
 Text is redacted and kept whole; a message longer than one prompt or tool call has room for shows its
-head and `borg inbox --show <id>`. A sender may have a window of unread messages to one recipient: it
-starts at one and doubles each time the recipient reads one, so sessions that read their messages
-converse without waiting, and a flood into a session that is gone stops at one. Where an
-acknowledgement may never come, nobody is paced more strictly than 0.5.0 paced them, one message per 10
-minutes: a broadcast or a message to the engineer may go at that rate whatever the window holds, and a
-session on another machine is paced by that rate alone until its machine acknowledges one of the
-sender's messages (a 0.5 machine never does). `borg inbox`, `borg top` and borg web's Messages page
+head and `borg inbox --show <id>`. A sender may have a window of unread messages to one recipient. It
+is earned between machines: it doubles each time the recipient's machine reads a message from the
+sender's machine, up to 64, so the more two machines talk, the wider a new session's conversation
+opens. Nobody waits longer than a minute: a minute after the sender's previous message the next one
+goes whatever the window holds. A session on another machine that has read nothing from the sender's
+machine gets one message a minute (a 0.5 machine never acknowledges). `borg inbox`, `borg top` and borg web's Messages page
 acknowledge the messages to the engineer they show. Messages are kept 7 days. One to `local` stays on
 this machine; one to `collective`, to `<session>@<node>` or a reply syncs to the team collective's
 members.

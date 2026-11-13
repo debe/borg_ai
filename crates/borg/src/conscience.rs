@@ -329,26 +329,34 @@ pub fn load_unweighted(path: &Path, before_ms: Option<i64>) -> Vec<Challenge> {
 }
 
 /// `load_unweighted` under explicit aliases.
+///
+/// One lesson per id, its last line known before `before_ms`, in the order of each id's first such line.
+/// Most ids have one line, but a lesson's every merge adds one: each line's leading `id` and `origin_ms`
+/// are read first (`jsonl::lead`) and only the last line of an id is parsed whole and canonicalised (a
+/// last line that is no `Challenge` gives way to the one before). Where the id has older lines, the
+/// first of them is parsed too, only to know whether it is a `Challenge` and so where the id stands.
 pub fn load_unweighted_with(path: &Path, before_ms: Option<i64>, aliases: &Aliases) -> Vec<Challenge> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    // Index by id: a linear scan per line made loading O(n²) (29 s at 100k lessons).
-    let mut out: Vec<Challenge> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for mut c in text.lines().filter_map(|l| serde_json::from_str::<Challenge>(l).ok()) {
+    let mut n = 0usize;
+    let head = |l| {
+        n += 1;
+        let [crate::jsonl::Scalar::Str(id), origin] = crate::jsonl::lead(l, ["id", "origin_ms"])? else { return None };
+        let origin = origin.as_i64()?;
+        before_ms.is_none_or(|b| origin < b).then_some((id, n))
+    };
+    let parse = |l: &str| serde_json::from_str::<Challenge>(l).ok();
+    let groups = crate::jsonl::by_id(&text, head);
+    let mut out: Vec<(usize, Challenge)> = Vec::with_capacity(groups.len());
+    out.extend(groups.into_iter().filter_map(|(_, lines)| {
+        let (last, mut c) = lines.iter().rev().find_map(|(at, l)| Some((*at, parse(l)?)))?;
+        let first = lines.iter().take_while(|(at, _)| *at < last).find(|(_, l)| parse(l).is_some()).map_or(last, |(at, _)| *at);
         c.area = trust::area(&c.area).into();
         canonical(&mut c, aliases);
-        if before_ms.is_some_and(|b| c.origin_ms >= b) {
-            continue;
-        }
-        match at.get(&c.id) {
-            Some(&i) => out[i] = c,
-            None => {
-                at.insert(c.id.clone(), out.len());
-                out.push(c);
-            }
-        }
-    }
-    out
+        Some((first, c))
+    }));
+    // Already in order unless an id's first line was no `Challenge`.
+    out.sort_by_key(|(first, _)| *first);
+    out.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Map a lesson's engineers to who they are (`Aliases::canon`), at read time: the store keeps the
@@ -1155,6 +1163,99 @@ mod tests {
 
     fn ch(id: &str, q: &str) -> Challenge {
         Challenge { id: id.into(), origin_ms: 1, question: q.into(), ..Default::default() }
+    }
+
+    /// `load_unweighted_with` before its two passes: every line parsed whole and canonicalised.
+    fn load_unweighted_whole(path: &Path, before_ms: Option<i64>, aliases: &Aliases) -> Vec<Challenge> {
+        let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+        let mut out: Vec<Challenge> = Vec::new();
+        let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for mut c in text.lines().filter_map(|l| serde_json::from_str::<Challenge>(l).ok()) {
+            c.area = trust::area(&c.area).into();
+            canonical(&mut c, aliases);
+            if before_ms.is_some_and(|b| c.origin_ms >= b) {
+                continue;
+            }
+            match at.get(&c.id) {
+                Some(&i) => out[i] = c,
+                None => {
+                    at.insert(c.id.clone(), out.len());
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Lessons lines at every edge a head and a whole parse could decide apart.
+    fn lesson_edges() -> Vec<String> {
+        let l = |id: &str, ms: i64, q: &str| {
+            serde_json::json!({"id": id, "origin_ms": ms, "question": q, "area": "Concurrency", "engineers": ["a@x", "A@x"]}).to_string()
+        };
+        vec![
+            l("L1", 1, "one"),
+            // L2's first line is no `Challenge` (no question): L2 stands where its first whole line is, after L3.
+            r#"{"id":"L2","origin_ms":2}"#.into(),
+            l("L3", 3, "three"),
+            l("L2", 2, "two"),
+            l("L1", 1, "one, merged"),
+            // An escaped id: L1 again.
+            l("L1", 1, "one, escaped").replace(r#""id":"L1""#, &format!(r#""id":"{}""#, crate::jsonl::escaped("L1"))),
+            // A later version known only after a cut, and one before it.
+            l("L4", 10, "four"),
+            l("L4", 100, "four, later"),
+            // A last line that is no `Challenge`: the one before it stands.
+            l("L5", 5, "five"),
+            r#"{"id":"L5","origin_ms":5,"question":7}"#.into(),
+            // Duplicate keys, wrong types, an escape the whole parse refuses: no L6 line is a `Challenge`.
+            l("L6", 6, "six").replacen('{', r#"{"id":"L7","#, 1),
+            l("L6", 6, "six").replacen('{', r#"{"origin_ms":9,"#, 1),
+            l("L6", 6, "six").replacen('{', r#"{"question":"q","#, 1),
+            l("L6", 6, "six").replace(r#""id":"L6""#, r#""id":6"#),
+            l("L6", 6, "six").replace(r#""origin_ms":6"#, r#""origin_ms":6.5"#),
+            l("L6", 6, "six").replace(r#""origin_ms":6"#, r#""origin_ms":9223372036854775808"#),
+            l("L6", 6, "six").replace(r#""question":"six""#, r#""question":"\ud800""#),
+            l("L6", 6, "six").replacen('{', r#"{"version":5000000000,"#, 1),
+            l("L8", 8, "eight").replacen('{', r#"{"x":"\ud800","#, 1),
+            // Truncated, trailing characters, whitespace, empty, not an object.
+            l("L9", 9, "nine").trim_end_matches('}').to_string(),
+            l("L9", 9, "nine") + " x",
+            l("L9", 9, "nine") + " ",
+            " ".into(),
+            String::new(),
+            "[]".into(),
+            "null".into(),
+        ]
+    }
+
+    /// The two passes keep exactly the lessons, in exactly the order, a whole parse of every line kept,
+    /// on edge lines and the lessons of a real store (`BORG_BENCH_STORE`), for cuts before, inside and
+    /// after them.
+    #[test]
+    fn load_unweighted_keeps_what_the_whole_parse_kept() {
+        let dir = std::env::temp_dir().join(format!("borg-conscience-oracle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lessons.jsonl");
+        let real = crate::jsonl::store_lines(&["lessons.jsonl"]);
+        let personal = crate::jsonl::store_lines(&[crate::reach::PERSONAL_FILE]);
+        let mid = real.iter().filter_map(|l| serde_json::from_str::<Challenge>(l).ok()).map(|c| c.origin_ms).nth(real.len() / 2);
+        let aliases = Aliases::default();
+        for mut lines in [lesson_edges(), real.clone(), personal, [real, lesson_edges()].concat()] {
+            for _ in 0..2 {
+                std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+                for before in [None, Some(0), Some(50), mid, Some(i64::MAX)] {
+                    let (got, want) = (load_unweighted_with(&path, before, &aliases), load_unweighted_whole(&path, before, &aliases));
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "before {before:?}");
+                }
+                lines.reverse();
+            }
+        }
+        std::fs::write(&path, lesson_edges().iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let got: Vec<(String, String)> = load_unweighted_with(&path, Some(50), &aliases).into_iter().map(|c| (c.id, c.question)).collect();
+        let want = [("L1", "one, escaped"), ("L3", "three"), ("L2", "two"), ("L4", "four"), ("L5", "five"), ("L8", "eight"), ("L9", "nine")];
+        assert_eq!(got, want.map(|(i, q)| (i.to_string(), q.to_string())));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `tokens` (by way of `tokens_at`) yields 0.7.7's tokens, and each offset is its word's.

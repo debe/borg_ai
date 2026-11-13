@@ -86,11 +86,11 @@ fn view_at(name: &str, home: &Path, share: Share, now: i64) -> Value {
     let live_week = stats::live_since(home).map(week);
     // Lessons written by source: the live events keep the source (`why`), the rollups do not.
     let mut sources = Weekly::default();
-    for e in stats::live(home) {
+    stats::each_live(home, |e| {
         if e.kind == stats::LESSON_NEW {
             sources.add(if e.why.is_empty() { "session" } else { &e.why }, week(e.ms), 1);
         }
-    }
+    });
     // Team-wide counts from every node's daily rollups.
     let mut team = Weekly::default();
     const KINDS: [&str; 7] = [stats::LESSON_MERGED, stats::CHANGED, stats::IGNORED, stats::CORRECTED, stats::NOT_CORRECTED, stats::VETO, stats::VETO_REPEAT];
