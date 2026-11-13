@@ -582,8 +582,8 @@ fn map<const K: usize, const F: usize>(
                     d += wt[i];
                     gl += r[i];
                     let o = &obs[i];
-                    for k in 0..K {
-                        add_sparse(&mut b, k, wt[i] * o.x[k]);
+                    for (k, xk) in o.x.iter().enumerate() {
+                        add_sparse(&mut b, k, wt[i] * xk);
                     }
                     for f in (0..F).filter(|&f| f != e) {
                         if let Some(lv) = o.lv[f] {
@@ -969,8 +969,9 @@ impl Data {
         }
         // Every apply's levels among the labelled ones (the monitor's predictions): an unseen one has none.
         for c in &s.checks {
-            for i in c.first as usize..(c.first as usize + c.n as usize).min(s.applies.len()) {
-                let n = names_of(c, &s.applies[i]);
+            let end = c.first as usize + c.n as usize;
+            for (i, a) in s.applies.iter().enumerate().take(end).skip(c.first as usize) {
+                let n = names_of(c, a);
                 d.lv_of.insert(i, std::array::from_fn(|f| n[f].as_ref().and_then(|(_, n)| index[f].get(n).copied())));
             }
         }
@@ -1012,8 +1013,8 @@ pub(crate) fn judged(s: &Summary) -> HashMap<usize, f64> {
     }
     let mut rows: Vec<(usize, Obs<K, 0>)> = Vec::new();
     for (ci, c) in s.checks.iter().enumerate() {
-        for i in c.first as usize..(c.first as usize + c.n as usize).min(s.applies.len()) {
-            let a = &s.applies[i];
+        let end = c.first as usize + c.n as usize;
+        for (i, a) in s.applies.iter().enumerate().take(end).skip(c.first as usize) {
             if model_route(a).is_none() || a.label == Label::Open {
                 continue;
             }
