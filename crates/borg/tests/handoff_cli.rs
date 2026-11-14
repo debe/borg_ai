@@ -28,6 +28,9 @@ fn setup(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("work")).unwrap();
     std::fs::create_dir_all(root.join("home")).unwrap();
+    // The paths borg prints are git's, which resolve symlinks: on macOS the temp dir `/var/folders`
+    // is `/private/var/folders`, so the test compares against the resolved root.
+    let root = std::fs::canonicalize(&root).unwrap();
     git(&root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
     let app = root.join("work/app");
     git(&root, &["init", "-q", "-b", "main", &app.to_string_lossy()]);
