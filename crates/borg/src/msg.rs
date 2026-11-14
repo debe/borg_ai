@@ -98,6 +98,9 @@ pub const LOCAL: &str = "local";
 pub const ENGINEER: &str = "engineer";
 /// The kind a `Seen` line names: not a `Kind`, so it never parses as a `Message`.
 pub const SEEN: &str = "seen";
+/// The kind a `HandoffLine` names: neither a `Kind` nor `SEEN`, so it parses as neither, and a reader
+/// of a version without hand-offs (which knows only those) drops it.
+pub const HANDOFF: &str = "handoff";
 /// A message is conversation: shown and kept for a week. Protocol: every member drops a line older than
 /// this (`fresh`), so they keep the same lines.
 pub const TTL_MS: i64 = 7 * crate::clock::DAY_MS;
@@ -266,7 +269,7 @@ pub fn is_id(s: &str) -> bool {
 
 /// A session id, node or address: shell-safe characters only, since the reply command names `by`,
 /// and no leading `-`, which that command would read as a flag.
-fn token(s: &str) -> bool {
+pub(crate) fn token(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && s.len() <= TOKEN && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@+".contains(c))
 }
 
@@ -488,11 +491,11 @@ pub struct MessageRef<'a> {
 #[derive(Deserialize)]
 struct CowStr<'a>(#[serde(borrow)] Cow<'a, str>);
 
-fn cow_opt<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Cow<'a, str>>, D::Error> {
+pub(crate) fn cow_opt<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Cow<'a, str>>, D::Error> {
     Ok(Option::<CowStr<'a>>::deserialize(d)?.map(|s| s.0))
 }
 
-fn cow_vec<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Cow<'a, str>>, D::Error> {
+pub(crate) fn cow_vec<'de: 'a, 'a, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Cow<'a, str>>, D::Error> {
     Ok(Vec::<CowStr<'a>>::deserialize(d)?.into_iter().map(|s| s.0).collect())
 }
 
@@ -633,11 +636,59 @@ impl SeenRef<'_> {
     }
 }
 
+/// News of a hand-off (handoff/log.rs `Event`) in the message log, so the mesh carries it as it carries
+/// the messages: written by its event's own node (`well_formed`: a member speaks only for itself, as a
+/// claim on the remote it could also make), signed by that node's origin, fresh for `TTL_MS`, bounded
+/// per member in a class of its own (`Class::Handoff`), never paced, never shown or counted as a message
+/// (handoff/log.rs `derive` reads it). `ms` is its writer's clock, which bounds its life and nothing else.
+/// A version without hand-offs parses it as no line (its kind is neither a `Kind` nor `SEEN`): its mesh
+/// neither stores nor relays it, and counts it as rejected at each session it is offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffLine<'a> {
+    /// Always 1.
+    pub v: u8,
+    /// `HANDOFF`.
+    #[serde(borrow)]
+    pub kind: Cow<'a, str>,
+    /// The writer's node: the one field the mesh checks, and its event's node.
+    #[serde(borrow)]
+    pub node: Cow<'a, str>,
+    pub ms: i64,
+    #[serde(borrow)]
+    event: crate::handoff::Event<'a>,
+}
+
+/// Protocol: the longest hand-off line, its event's bound (handoff/log.rs `LINE_BYTES`) and the fields
+/// around it: a node of `TOKEN` characters and a stamp of up to 20.
+pub const HANDOFF_BYTES: usize = crate::handoff::LINE_BYTES + r#"{"v":1,"kind":"handoff","node":"","ms":,"event":}"#.len() + TOKEN + 20;
+
+impl<'a> HandoffLine<'a> {
+    /// The line `node` writes at `ms` for its own `event`.
+    pub(crate) fn new(node: &'a str, ms: i64, event: crate::handoff::Event<'a>) -> HandoffLine<'a> {
+        HandoffLine { v: 1, kind: Cow::Borrowed(HANDOFF), node: Cow::Borrowed(node), ms, event }
+    }
+
+    pub(crate) fn event(&self) -> &crate::handoff::Event<'a> {
+        &self.event
+    }
+
+    /// Whether the line is one `new` could have written: `HANDOFF`, a token for its node, a well-formed
+    /// event (handoff/log.rs `Event::well_formed`) of that same node.
+    pub fn well_formed(&self) -> bool {
+        self.v == 1 && self.kind == HANDOFF && token(&self.node) && self.event.node == self.node && self.event.well_formed()
+    }
+}
+
 /// One well-formed line of messages.jsonl as this version reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
     Message(Message),
     Seen(Seen),
+    /// A hand-off line (`HandoffLine`), by what every reader of lines uses: its node and stamp.
+    Handoff {
+        node: String,
+        ms: i64,
+    },
 }
 
 impl Line {
@@ -646,11 +697,13 @@ impl Line {
         LineRef::parse(text).map(LineRef::into_owned)
     }
 
-    /// The line as a `LineRef` borrowing every field.
-    pub fn borrowed(&self) -> LineRef<'_> {
+    /// The line as a `LineRef` borrowing every field; a hand-off line has none to give but its node and
+    /// stamp, which windows never read: None for it.
+    pub fn borrowed(&self) -> Option<LineRef<'_>> {
         match self {
-            Line::Message(m) => LineRef::Message(m.borrowed()),
-            Line::Seen(s) => LineRef::Seen(s.borrowed()),
+            Line::Message(m) => Some(LineRef::Message(m.borrowed())),
+            Line::Seen(s) => Some(LineRef::Seen(s.borrowed())),
+            Line::Handoff { .. } => None,
         }
     }
 
@@ -658,6 +711,7 @@ impl Line {
         match self {
             Line::Message(m) => m.ms,
             Line::Seen(s) => s.ms,
+            Line::Handoff { ms, .. } => *ms,
         }
     }
 
@@ -666,13 +720,14 @@ impl Line {
         match self {
             Line::Message(m) => &m.node,
             Line::Seen(s) => &s.node,
+            Line::Handoff { node, .. } => node,
         }
     }
 
     pub fn message(&self) -> Option<&Message> {
         match self {
             Line::Message(m) => Some(m),
-            Line::Seen(_) => None,
+            Line::Seen(_) | Line::Handoff { .. } => None,
         }
     }
 }
@@ -683,18 +738,27 @@ impl Line {
 pub enum LineRef<'a> {
     Message(MessageRef<'a>),
     Seen(SeenRef<'a>),
+    /// Boxed: rare, and as large as an offer's event; a message line, the common one, stays small.
+    Handoff(Box<HandoffLine<'a>>),
 }
 
 impl<'a> LineRef<'a> {
-    /// The line `text` holds, if it is well formed (`MessageRef::well_formed`, `SeenRef::well_formed`); a
-    /// line without its `ms` is not. A line parsing as a message is that message or nothing; else it is
-    /// the seen line it parses as, if any. A seen line fails as a message at its `kind`, its second key
-    /// (`SEEN` is no `Kind`), so trying the message first costs a seen line a few bytes and a message
-    /// line nothing.
+    /// The line `text` holds, if it is well formed (`MessageRef::well_formed`, `SeenRef::well_formed`,
+    /// `HandoffLine::well_formed`, a hand-off line within `HANDOFF_BYTES`); a line without its `ms` is
+    /// not. A line parsing as a message is that message or nothing; else it is the seen line it parses
+    /// as, else the hand-off line, if any. Either fails as a message at its `kind`, its second key (`SEEN`
+    /// and `HANDOFF` are no `Kind`), and a hand-off line fails as a seen line there too, so trying the
+    /// message first costs the others a few bytes and a message line nothing.
     pub fn parse(text: &'a str) -> Option<LineRef<'a>> {
         match serde_json::from_str::<MessageRef>(text) {
             Ok(m) => m.well_formed().then_some(LineRef::Message(m)),
-            Err(_) => serde_json::from_str::<SeenRef>(text).ok().filter(SeenRef::well_formed).map(LineRef::Seen),
+            Err(_) => match serde_json::from_str::<SeenRef>(text) {
+                Ok(s) => s.well_formed().then_some(LineRef::Seen(s)),
+                Err(_) if text.len() <= HANDOFF_BYTES => {
+                    serde_json::from_str::<HandoffLine>(text).ok().filter(HandoffLine::well_formed).map(|h| LineRef::Handoff(Box::new(h)))
+                }
+                Err(_) => None,
+            },
         }
     }
 
@@ -703,6 +767,7 @@ impl<'a> LineRef<'a> {
         match self {
             LineRef::Message(m) => Line::Message(m.into_owned()),
             LineRef::Seen(s) => Line::Seen(s.into_owned()),
+            LineRef::Handoff(h) => Line::Handoff { node: h.node.into_owned(), ms: h.ms },
         }
     }
 
@@ -710,6 +775,7 @@ impl<'a> LineRef<'a> {
         match self {
             LineRef::Message(m) => m.ms,
             LineRef::Seen(s) => s.ms,
+            LineRef::Handoff(h) => h.ms,
         }
     }
 
@@ -718,13 +784,14 @@ impl<'a> LineRef<'a> {
         match self {
             LineRef::Message(m) => &m.node,
             LineRef::Seen(s) => &s.node,
+            LineRef::Handoff(h) => &h.node,
         }
     }
 
     pub fn message(&self) -> Option<&MessageRef<'a>> {
         match self {
             LineRef::Message(m) => Some(m),
-            LineRef::Seen(_) => None,
+            LineRef::Seen(_) | LineRef::Handoff(_) => None,
         }
     }
 }
@@ -877,7 +944,7 @@ pub fn window_for(lines: &[LineRef], by: Author<'_>, to: &str, now: i64) -> Wind
                 Some(re) if ids.contains(re) => (r.author(), vec![re]),
                 _ => continue,
             },
-            LineRef::Message(_) => continue,
+            LineRef::Message(_) | LineRef::Handoff(_) => continue,
         };
         for id in those {
             let m = of[id];
@@ -968,7 +1035,7 @@ pub fn within_windows<'l>(lines: &'l [LineRef]) -> HashSet<&'l str> {
                 Some(re) => (r.author(), vec![re]),
                 None => continue,
             },
-            LineRef::Message(_) => continue,
+            LineRef::Message(_) | LineRef::Handoff(_) => continue,
         };
         for id in ids {
             let recipient = |m: &&MessageRef| Address::parse(&m.to).is_some_and(|a| acknowledges(&a, m.author(), who));
@@ -1347,9 +1414,9 @@ fn paced(text: &str, m: &Message, to: &Address) -> Decided {
     Ok(Some((before.outstanding, w.unread)))
 }
 
-/// Adds the `Seen` line `line` to the log at `p` holding `text`, under its lock: an append, or a
-/// rewrite when `bound` cuts a line (then the claims of sessions gone past the TTL go too). Returns how
-/// many it cut.
+/// Adds `line`, a `Seen` or hand-off line (no talk: `store`), to the log at `p` holding `text`, under
+/// its lock: an append, or a rewrite when `bound` cuts a line (then the claims of sessions gone past
+/// the TTL go too). Returns how many it cut.
 fn append_bounded(p: &Path, text: &str, line: &str, now: i64) -> std::io::Result<usize> {
     let (kept, cut) = bound(text.lines().chain([line]), now);
     store(p, text, line, &kept, now, false)?;
@@ -1407,6 +1474,24 @@ pub fn ack(home: &Path, by: &str, ids: &[&str], now: i64) -> std::io::Result<()>
     Ok(())
 }
 
+/// Writes `line`, a hand-off line of this node (`HandoffLine`), into the log of `home` at `now`, under
+/// the log's lock and bounded as `send` bounds it (`bound`, in its own class); never paced: it is news of
+/// what the git remote decided, not conversation. It is no talk for the readers of messages (`wrote`).
+///
+/// # Errors
+/// A line that is not well formed, or a write failure.
+pub(crate) fn announce(home: &Path, line: &HandoffLine, now: i64) -> std::io::Result<()> {
+    if !line.well_formed() {
+        return Err(std::io::Error::other("not a well-formed hand-off line"));
+    }
+    let text = serde_json::to_string(line).map_err(std::io::Error::other)?;
+    std::fs::create_dir_all(home)?;
+    let p = path(home);
+    let cut = crate::live::locked(&p, || append_bounded(&p, &text_of(&p)?, &text, now))?;
+    count_cut(home, cut);
+    Ok(())
+}
+
 /// The bound class of a line (`bound`): each member's lines of one class share `MEMBER_BYTES`, so no
 /// class pushes another out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1422,6 +1507,8 @@ enum Class {
     /// lines that travel, that node would cut lines its peers keep and offer back at every session.
     LocalTalk,
     LocalSteer,
+    /// Hand-off lines (`HandoffLine`): no flood of them pushes out talk, and no talk pushes them out.
+    Handoff,
 }
 
 /// What `bound` reads of a line: its `ms`, its node and its class.
@@ -1439,6 +1526,7 @@ fn meta(line: &str) -> Option<Meta<'_>> {
     let here = to.as_str().and_then(Address::parse).is_some_and(|a| matches!(a, Address::Local { .. }));
     let class = match kind.as_str() {
         Some(SEEN) => Class::Seen,
+        Some(HANDOFF) => Class::Handoff,
         k if k.and_then(Kind::parse).is_some_and(Kind::privileged) => {
             if here {
                 Class::LocalSteer
@@ -1843,6 +1931,44 @@ pub fn deliver(home: &Path, caps: Caps, event: &str, input: &Value, started: Opt
     Some(answer)
 }
 
+/// Notes borg gives a prompt of others' work (handoff/ `notice`: a hand-off waiting for the clone),
+/// joining the context ahead of `deliver`, which then shares the rest of the budget with the messages:
+/// each of `lines`, whole, that fits the harness's budget (`Caps::context_chars`) less what `out` holds,
+/// the peer-data label and the lines before it, under that label; at a prompt only, as `deliver` shows
+/// (not where the harness drops the context, nor in a subagent's event or a block). Returns the answer
+/// and which lines joined it; the rest wait for a later prompt.
+pub(crate) fn with_peer_notes(caps: Caps, input: &Value, out: Option<Value>, lines: &[String]) -> (Option<Value>, Vec<usize>) {
+    let dropped = input.get("context") == Some(&Value::Bool(false));
+    let subagent = input.get("agent_id").and_then(Value::as_str).is_some_and(|a| !a.is_empty());
+    if lines.is_empty() || !caps.prompt_context || dropped || subagent || out.as_ref().is_some_and(|o| o.get("decision").is_some()) {
+        return (out, Vec::new());
+    }
+    let theirs = out
+        .as_ref()
+        .and_then(|o| o.pointer("/hookSpecificOutput/additionalContext"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map_or(0, |t| t.chars().count() + 2);
+    let mut left = caps.context_chars().saturating_sub(theirs + PEER_DATA.chars().count());
+    let mut text = String::new();
+    let mut joined = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let c = l.chars().count() + 1;
+        if c > left {
+            continue;
+        }
+        left -= c;
+        text.push_str(l);
+        text.push('\n');
+        joined.push(i);
+    }
+    if joined.is_empty() {
+        return (out, joined);
+    }
+    text.push_str(PEER_DATA);
+    (Some(with_context(out, "UserPromptSubmit", &text)), joined)
+}
+
 /// How one event shows its messages: to whom, on which harness, under which steering roles.
 pub struct Shows<'a> {
     pub caps: Caps,
@@ -2075,7 +2201,7 @@ pub fn sender(home: &Path, drones: &[top::Drone], from: Option<&str>, cwd: &str)
 
 /// The engineer of the repo at `cwd` as a line names them, `engineer:<git user.email>` (`engineer`
 /// without one), and the email.
-fn engineer_of(cwd: &str) -> (String, String) {
+pub(crate) fn engineer_of(cwd: &str) -> (String, String) {
     let email: String = learn::engineer(cwd).chars().filter(|c| c.is_ascii_alphanumeric() || "-_.@+".contains(*c)).collect();
     (if email.is_empty() { ENGINEER.to_string() } else { format!("{ENGINEER}:{email}") }, email)
 }
@@ -2435,7 +2561,7 @@ mod tests {
 
     /// `lines` as the windows read them.
     fn refs(lines: &[Line]) -> Vec<LineRef<'_>> {
-        lines.iter().map(Line::borrowed).collect()
+        lines.iter().filter_map(Line::borrowed).collect()
     }
 
     impl Message {
@@ -3787,7 +3913,7 @@ mod tests {
             assert_eq!(LineRef::parse(l).map(LineRef::into_owned), old, "{l}");
             assert_eq!(Line::parse(l), old, "{l}");
             if let Some(old) = old {
-                assert_eq!(old.borrowed().into_owned(), old, "a borrowed view of an owned line is that line");
+                assert_eq!(old.borrowed().map(LineRef::into_owned), Some(old.clone()), "a borrowed view of an owned line is that line");
             }
         }
         assert!(parsed >= 5, "the edges hold well-formed lines of both kinds: {parsed}");
@@ -3803,6 +3929,7 @@ mod tests {
         let here = v.get("to").and_then(Value::as_str).and_then(Address::parse).is_some_and(|a| matches!(a, Address::Local { .. }));
         let class = match kind {
             Some(SEEN) => Class::Seen,
+            Some(HANDOFF) => Class::Handoff,
             k if k.and_then(Kind::parse).is_some_and(Kind::privileged) => {
                 if here {
                     Class::LocalSteer
@@ -3845,5 +3972,67 @@ mod tests {
         for now in [0, 5_000, learn::now_ms()] {
             assert_eq!(bound(lines.iter().map(String::as_str), now), old_bound(now), "at {now}");
         }
+    }
+
+    /// A hand-off line of `node` with an offer event of its own (handoff/log.rs `Event`), stamped `ms`.
+    fn handoff_line(node: &str, event_node: &str, ms: i64) -> String {
+        let nonce = "0011223344556677";
+        let id = crate::handoff::id_for(event_node, "s1", nonce);
+        let h = "1".repeat(40);
+        let event = format!(
+            r#"{{"v":1,"id":"{id}","kind":"offer","node":"{event_node}","session":"s1","engineer":"a@x","nonce":"{nonce}","ms":{ms},"repos":[{{"name":"app","remote":"/r","branch":"main","head":"{h}","state":"{h}","tree":"{h}"}}],"note":"next","brief":"{h}"}}"#
+        );
+        format!(r#"{{"v":1,"kind":"handoff","node":"{node}","ms":{ms},"event":{event}}}"#)
+    }
+
+    /// Mixed versions: a hand-off line is no line at all to a version without hand-offs (it reads
+    /// `Message` and `Seen` lines, whose types are unchanged), so its mesh neither stores nor relays it
+    /// (borg-mesh lines.rs `travels` parses with `LineRef::parse`); here it is no message: nothing reads,
+    /// shows, counts or paces it as one, and a flood of them cuts no tell. A line of another node's event,
+    /// a newer format or an unknown kind of event is dropped here, as an older version drops this one.
+    #[test]
+    fn a_handoff_line_is_no_message_and_an_older_reader_drops_it() {
+        let node = "a".repeat(64);
+        let now = learn::now_ms();
+        let line = handoff_line(&node, &node, now);
+        assert!(matches!(LineRef::parse(&line), Some(LineRef::Handoff(h)) if h.node == node && h.ms == now));
+        assert_eq!(Line::parse(&line), Some(Line::Handoff { node: node.clone(), ms: now }));
+        // What an older version reads: neither a message nor a seen line, so no line (`LineRef::parse`).
+        assert!(serde_json::from_str::<Message>(&line).is_err() && serde_json::from_str::<Seen>(&line).is_err());
+        // Dropped here: another node's event (a member speaks only for itself), a newer line or event.
+        let other = "b".repeat(64);
+        for bad in [
+            handoff_line(&node, &other, now),
+            line.replacen("\"v\":1", "\"v\":2", 1),
+            line.replace("\"kind\":\"offer\"", "\"kind\":\"aborted\""),
+            line.replace("\"kind\":\"handoff\"", "\"kind\":\"handoff2\""),
+        ] {
+            assert_eq!(LineRef::parse(&bad), None, "{bad}");
+        }
+        // In a store: no message, nothing unread, no window moved; its own bound class.
+        let home = std::env::temp_dir().join(format!("borg-msg-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // As many hand-off lines as overflow one member's share, every one newer than the tell: in one
+        // class with it, the bound would cut the tell first.
+        let n = MEMBER_BYTES / line.len() + 2;
+        let tell = Message::new(TELL, &from("s9", &node), "s2@n2", None, now - n as i64 - 1, "the schema is frozen");
+        let mut log = format!("{}\n", serde_json::to_string(&tell).unwrap());
+        for i in 0..n {
+            log.push_str(&handoff_line(&node, &node, now - i as i64));
+            log.push('\n');
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(path(&home), &log).unwrap();
+        assert_eq!(read(&home), vec![tell.clone()], "the messages are the tell alone");
+        assert_eq!(unread(&home, &read(&home), "n2", "s2", 0, now), 1);
+        let held: Vec<LineRef> = log.lines().filter_map(LineRef::parse).collect();
+        assert_eq!(held.len(), n + 1);
+        let w = window_for(&held, tell.author(), &tell.to, now);
+        assert_eq!(w.outstanding, 1, "{w:?}");
+        assert_eq!(meta(&line).map(|m| m.class), Some(Class::Handoff));
+        let (kept, cut) = bound(log.lines(), now);
+        assert!(cut > 0 && kept.contains(&serde_json::to_string(&tell).unwrap().as_str()), "the tell stays");
+        assert!(log.lines().filter(|l| !kept.contains(l)).all(|l| meta(l).is_some_and(|m| m.class == Class::Handoff)), "the bound cuts hand-off lines alone");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

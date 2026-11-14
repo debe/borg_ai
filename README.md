@@ -35,6 +35,7 @@ between engineers' machines over the mesh, across NATs. Tested on Linux and macO
 - [How it works in one session](#how-it-works-in-one-session)
 - [The team](#the-team)
 - [Talking to other sessions](#talking-to-other-sessions)
+- [Handing work off](#handing-work-off)
 - [Handing knowledge to an outside store](#handing-knowledge-to-an-outside-store)
 - [Monitoring](#monitoring)
 - [Cost](#cost)
@@ -261,6 +262,41 @@ they arrive with the next prompt or tool call. Nothing wakes a session while the
 runs. `borg top` shows who listens in its WAKE column.
 [Commands](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
 
+## Handing work off
+
+A session can pass its work in progress to another drone, like a transferred call:
+
+```sh
+borg handoff "parser: error paths" --brief brief.md   # offer this session's work with its brief
+borg handoff "…" --brief brief.md --to anna@x.example # ask someone in particular
+borg handoff                                          # the hand-offs of the whole team
+borg handoff take h3f09a1c2b7d4                       # take one over
+borg handoff abort h3f09a1c2b7d4 --why "wrong base"   # close it (owner, admin or steerer)
+borg handoff done h3f09a1c2b7d4                       # finished: delete its refs
+```
+
+The agent writes the brief (goal, where it stands, the plan, the next step, decisions, open questions,
+how to verify); it comes from a file or stdin, never the command line. The offer pushes the working
+tree of the repo it runs in and of each repo the session started or wrote in that holds work (never one
+it only read; untracked files included; ignored files, changes that add a secret, new binaries of a
+kind the repo does not track and files past git's big-file threshold left out) to that repo's own
+remote as hand-off refs,
+the brief with borg's metadata beside the first one's in the same atomic push. The engineer's branch,
+index and stash stay as they were. The original keeps working until someone takes it, and each of its
+stops refreshes the offer. The remote decides who takes it: a take creates the hand-off's `taken` ref
+there, and git refuses the second create, so exactly one take wins. The taker gets branch
+`borg/handoff/<id>` in each repo it has a clone of (the clone URL of each it has not) and reads the
+whole brief. From then on, the original session's edits in those repos are refused, while its reads
+still pass, and it is told which of its changes came after the state taken. The offering engineer's own take is the take-back. The news travels over the mesh: other machines
+list the offer, a session in a clone of the repo is told at a prompt, and a take on another machine
+fences the original at once (one off the mesh learns it from the remote at its next stop). `--to` first
+checks the team's signed presence (one of their machines seen, on a borg that takes hand-offs, with a
+clone of the repo), then asks; `borg handoff decline <id>` says no. An abort by the owner, an admin or a
+steerer races a take through the same ref; after a take it fences both sides until `borg handoff done`,
+which deletes the refs. An admin can switch hand-offs off for the collective (`borg handoff off`).
+`borg top` and borg web show them. Hand-offs exist in team collectives only.
+[Hand-off](https://github.com/debe/borg_ai/blob/main/docs/handoff.md)
+
 ## Handing knowledge to an outside store
 
 A team may keep its settled knowledge outside Borg, for example in a reviewed skills repo. Once a
@@ -337,7 +373,7 @@ spend), `borg doctor` (what is broken), `borg queen`, `borg top`.
 
 **Stays on your machine:** everything from off repos and private collectives; your personal lessons,
 in every collective; raw episodes (your exact corrections, except what the model provider receives,
-below), transcripts, the shell output adapters hand to borg, source code, `collectives.json`,
+below), transcripts, the shell output adapters hand to borg, source code (unless you hand work off, below), `collectives.json`,
 per-session state.
 
 **Goes to team members,** for team collectives only, each line signed and dropped on revocation:
@@ -345,7 +381,18 @@ lessons (with author emails and repo names); redacted reasoning excerpts of land
 two members; decision → fix links; presence for `borg top` (harness, email, repo, the redacted first line
 of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them, and which messages a session was shown (the acknowledgements that pace them); the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
-and ratified constraints (the invariant, its lesson and who ratified it, never the veto's words).
+and ratified constraints (the invariant, its lesson and who ratified it, never the veto's words). With
+each drone's presence, its machine's borg version and the repos it holds clones of (hashes of their
+remote URLs, and the clones' names); and, when you hand work off, its redacted offer line (note, the
+brief's head, repo name, remote URL without credentials, branch, commit ids, names of files left out)
+and its outcome.
+
+**Goes to the repo's git remote,** only when you hand work off (`borg handoff`, team collectives only):
+each repo's working tree as a commit under `refs/borg/handoff/<id>/` (untracked files included; ignored
+files, changes that add a secret, new binaries of a kind the repo does not track and files past git's
+big-file threshold left out), refreshed at your
+stops while it is open, the brief with borg's redacted metadata of the session, a taker's claim with
+its node key, session id and git email, and an abort with who aborted it and why ([What a hand-off pushes](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#what-a-hand-off-pushes)).
 
 **A mesh relay** sees node ids, IP addresses and traffic volume, never content; run your own to keep even
 that in-house ([Privacy on the mesh](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#privacy-on-the-mesh), [Own relay](https://github.com/debe/borg_ai/blob/main/docs/relay.md)).

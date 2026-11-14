@@ -30,6 +30,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 |---|---|---|---|
 | `borg/src/msg.rs` | `WIRE_TEXT` | 16,384 chars | A v2 line's text, kept whole up to it, plus an ellipsis past it; part of `well_formed`. Also a guard: about 4,000 tokens, more than any harness takes into one event, so the delivery budget decides what shows |
 | `borg/src/msg.rs` | `V1_TEXT` | 1,000 chars | A v1 line's text, 0.5.0's bound. A text that fits is written as v1, so 0.5.0 readers and `borg/mesh/13` peers read it |
+| `borg/src/msg.rs` | `HANDOFF_BYTES` | `LINE_BYTES` + the wrapper's fields | The longest hand-off line in the message log: its event (handoff/log.rs `LINE_BYTES`, 16 × `WIRE_TEXT` bytes) and a node of the longest token |
+| `borg/src/handoff/mod.rs` | `PROTOCOL` | 1 | The hand-off protocol a machine's presence says it speaks; `--to` asks only a machine that speaks it |
 | `borg/src/msg.rs` | `NAME`, `TOKEN` | 64, 128 chars | The longest sender name, and the longest session id, node or address, a line holds |
 | `borg/src/msg.rs` | `TTL_MS` | 7 days (`7 × clock::DAY_MS`) | A message is shown and kept this long; every member drops a line older than it |
 | `borg/src/msg.rs` | `SKEW_MS` | 60 s | The one clock skew between members; steer.rs `SLACK_MS` and borg-mesh live.rs's presence freshness derive from it |
@@ -157,6 +159,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/steer.rs` | `KEEP` | 500 entries | The admissions file every tool call reads while anyone steers |
 | `borg/src/steer.rs` | `DROPPED_BYTES` | 128 KiB | A flood of refused steers filling the disk (past twice it, the older half goes) |
 | `borg/src/presence.rs` | `PRUNE_MS` | 24 h (`clock::DAY_MS`) | Presence files of every session ever run |
+| `borg/src/handoff/log.rs` | `LINE_BYTES` | 16 × msg.rs `WIRE_TEXT` bytes | One hand-off line: a note and a brief's head of a message's bound each, and as much again for its repos and left-out names (`fit` drops names past it) |
+| `borg/src/handoff/git.rs` | `BIG_FILE` | 512 MiB (git's default `core.bigFileThreshold`), or the repo's setting; at least the largest file HEAD tracks | An untracked dataset or dump read whole into a hand-off's snapshot and pushed to the team's remote: past it the file is listed, never read |
 | `borg/src/outcome.rs` | `IDLE_MS` | 24 h (`clock::DAY_MS`) | A session whose `end` hook never ran never settling |
 | `borg/src/veto.rs` | `REASON_CHARS` | learn.rs `EXCERPT_CHARS` (1,500) | A veto's episode, as a correction's is bounded |
 | `borg/src/veto.rs` | `REASON_MIN` | 4 chars | A stray "borg no" becoming a veto |
@@ -252,6 +256,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/clock.rs` | `DAY_MS` | 24 h | A unit. Every "a day" or "a week" in borg is a multiple of it |
 | `borg-web/ui/src/util.rs` | `DAY_MS`, `DAY_S` | 24 h | clock.rs `DAY_MS` (the page is a wasm workspace of its own) |
 | `borg/src/notes/regress.rs` | `DAY` | 86,400 s | clock.rs `DAY_MS`, in git's seconds |
+| `borg/src/handoff/mod.rs` | `reannounce` | msg.rs `TTL_MS` / 2 | An open offer's mesh line (and this node's decline of one) is announced again past half the messages' TTL, so a member that syncs once in that time never loses it |
 | `borg/src/msg.rs` | `WINDOW_CAP` | 64 | `MEMBER_BYTES / WIRE_TEXT`: as many full texts as one member's share of the log holds (it promises no room: `send` refuses a message that would push one of its sender's unread messages to the same recipient out). Also what the mesh lets through unread from one sender to one recipient within `V1_RATE_MS` (`within_windows`) |
 | `borg/src/steer.rs` | `SLACK_MS` | 1 h | 60 × msg.rs `SKEW_MS`: kept past its TTL before pruning |
 | `borg/src/harness/mod.rs` | `Caps::context_chars` | 10,000 chars on every harness | The harness's own limit (claude.rs, codex.rs `CONTEXT_CHARS`), else `CONTEXT_GUARD`; shared by everything one event delivers |

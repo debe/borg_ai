@@ -1,4 +1,5 @@
-//! Drones: the agent sessions of the collective, local and remote, live.
+//! Drones: the agent sessions of the collective, local and remote, live; a drone that offered its work,
+//! took a hand-off over, or whose taken work is fenced is badged (borg handoff/).
 
 use leptos::prelude::*;
 
@@ -22,6 +23,22 @@ pub fn Drones() -> impl IntoView {
                     if ds.is_empty() {
                         return view! { <p class="empty">"No drone is running. Start an agent session in a repo of this collective."</p> }.into_any();
                     }
+                    let hs = d.handoffs.with(|h| h.clone());
+                    // A drone's node as hand-offs name it: this one's key for a local drone.
+                    let node_of = |x: &crate::api::Drone| if x.node.is_empty() { hs.here.clone() } else { x.node.clone() };
+                    let badges = |x: &crate::api::Drone| -> Vec<(&'static str, String, String)> {
+                        let n = node_of(x);
+                        hs.list.iter().filter_map(|h| {
+                            let took = h.by.as_ref().is_some_and(|(_, bn, bs)| *bn == n && *bs == x.session);
+                            let offered = h.node == n && h.session == x.session;
+                            match (offered, took, h.state.as_str()) {
+                                (_, true, _) => Some(("answered", format!("took {}", h.id), format!("took hand-off {} over: {}", h.id, h.note))),
+                                (true, _, "open" | "asked" | "declined") => Some(("waiting", format!("offers {}", h.id), format!("offers its work as hand-off {}: {}", h.id, h.note))),
+                                (true, _, _) if h.fenced => Some(("paused", "handed off".into(), format!("hand-off {} was taken: its edits in {} are refused", h.id, h.repos.join(", ")))),
+                                _ => None,
+                            }
+                        }).collect()
+                    };
                     ds.into_iter().map(|x| view! {
                         <article class=format!("drone {}", x.state)>
                             <div class="drone-head">
@@ -29,6 +46,7 @@ pub fn Drones() -> impl IntoView {
                                 <span class=format!("badge {}", x.state)>{x.state.clone()}</span>
                                 {x.paused.then(|| view! { <span class="badge paused">"paused"</span> })}
                                 {x.remote.then(|| view! { <span class="badge remote">"remote"</span> })}
+                                {badges(&x).into_iter().map(|(class, label, title)| view! { <span class=format!("badge {class}") title=title>{label}</span> }).collect_view()}
                                 {x.unread.filter(|n| *n > 0.0).map(|n| view! { <span class="badge waiting" title="messages its next prompt or tool call shows (borg inbox)">{format!("{n} unread")}</span> })}
                             </div>
                             <div class="drone-who">{format!("{} · {} · {}", who(&x.engineer), if x.repo.is_empty() { "?" } else { &x.repo }, x.harness)}</div>

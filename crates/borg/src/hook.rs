@@ -3119,6 +3119,8 @@ fn on_post_tool(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> 
         session,
         &if tool == "Bash" { bash_read_paths(tool_input.get("command").and_then(Value::as_str).unwrap_or_default()).join(" ") } else { touch.clone() },
     );
+    // Where it wrote: an offer of this session hands off the repos it wrote in (handoff/).
+    crate::handoff::note_written(session, input);
     // BORG_STOP_GATE=edits: this turn changed something, so its Stop asks the model.
     if prefilter::edits_gate() && prefilter::changes(tool, tool_input) {
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(changes_file(session)).and_then(|mut f| writeln!(f, "{tool}"));
@@ -3726,8 +3728,9 @@ pub fn main(name: &str, event: &str) {
     let now = learn::now_ms();
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     // The turn of a session that listens for wakes (listen.rs): one stat of its opt-in for any other, at
-    // a prompt, a tool call's start or end, a halted turn and the end. With steering's stat below, an idle
-    // tool call costs two failed stats: the opt-in is per session, the admissions are per store.
+    // a prompt, a tool call's start or end, a halted turn and the end. With steering's and the fences' stats
+    // below, an idle tool call costs three failed stats: the opt-in is per session, the admissions and the
+    // fences are per store.
     crate::listen::auto_opt_in(&home, h, event, session, &input, now);
     crate::listen::touch(&home, event, session, now);
     // A session's start (a hook of an older install) and a halted turn read and write nothing more.
@@ -3735,19 +3738,26 @@ pub fn main(name: &str, event: &str) {
         return;
     }
     // Not at pre_tool (every tool call): there only steering reads, once someone steered (steer.rs
-    // `active`, the second stat).
+    // `active`, the second stat) or a hand-off of this machine was taken (handoff/fence.rs, the third).
     let me = match event {
         "pre_tool" => {
-            if !crate::steer::active(&home) {
+            if !crate::steer::active(&home) && !crate::handoff::fenced(&home) {
                 return;
             }
             crate::presence::read(&home, session)
         }
         _ => crate::presence::touch(&home, &name, h.name(), event, &input, now),
     };
+    // A hand-off operation of this session that was interrupted is finished in the background; at a
+    // stop, an open offer of it asks the remote whether it was taken, in the background too.
+    match event {
+        "prompt" => crate::handoff::resume_interrupted(&home, session, cwd),
+        "stop" => crate::handoff::at_stop(&home, session, cwd),
+        _ => {}
+    }
     // Steering (steer.rs) wraps the answer: a pause refuses tools and lets the stop wait.
     // At a stop, the routed collective's experts join the conscience's block (expert_route.rs).
-    let started = me.map(|p| p.started);
+    let started = me.as_ref().map(|p| p.started);
     // A listening session's stop holds its wakes off until its answer is out (listen.rs).
     let stopping = crate::listen::stopping(&home, event, session, now);
     let out = crate::steer::around(&home, event, &input, started, now, || crate::expert_route::checkpoint(h, event, &input, || dispatch(h, event, &input)));
@@ -3755,6 +3765,8 @@ pub fn main(name: &str, event: &str) {
     let out = crate::listen::after_stop(&home, h, stopping.as_ref(), &input, out);
     // An adapter that asked learns its wait budgets from the answer (harness.rs `Budgets`).
     let out = harness::with_budgets(h, &input, out);
+    // A hand-off waiting for this clone (handoff/), once per session, ahead of the messages' share.
+    let out = if event == "prompt" { crate::handoff::notice(&home, h.caps(), &input, me.as_ref(), out) } else { out };
     // Messages from other sessions (msg.rs) join a prompt's or tool call's context, each once.
     if let Some(out) = crate::msg::deliver(&home, h.caps(), event, &input, started, now, out) {
         println!("{}", for_harness(h, out));

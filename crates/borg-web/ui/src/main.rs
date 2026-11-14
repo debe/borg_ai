@@ -16,11 +16,11 @@ use leptos::prelude::*;
 use crate::banner::Banner;
 use crate::drawer::Drawer;
 use crate::views::{
-    conscience::Conscience, cost::Cost, drones::Drones, knowledge::Knowledge, learning::Learning, messages::Messages, overview::Overview, queen::Queen,
-    steering::Steering,
+    conscience::Conscience, cost::Cost, drones::Drones, handoffs::HandOffs, knowledge::Knowledge, learning::Learning, messages::Messages, overview::Overview,
+    queen::Queen, steering::Steering,
 };
 
-const TABS: [(&str, &str); 9] = [
+const TABS: [(&str, &str); 10] = [
     ("overview", "Overview"),
     ("knowledge", "Knowledge"),
     ("conscience", "Conscience"),
@@ -30,6 +30,7 @@ const TABS: [(&str, &str); 9] = [
     ("queen", "Queen"),
     ("cost", "Cost"),
     ("drones", "Drones"),
+    ("handoffs", "Hand-offs"),
 ];
 
 fn tab_now() -> String {
@@ -84,6 +85,7 @@ fn App() -> impl IntoView {
                 "queen" => view! { <Queen /> }.into_any(),
                 "cost" => view! { <Cost /> }.into_any(),
                 "drones" => view! { <Drones /> }.into_any(),
+                "handoffs" => view! { <HandOffs /> }.into_any(),
                 _ => view! { <Overview /> }.into_any(),
             }}
         </main>

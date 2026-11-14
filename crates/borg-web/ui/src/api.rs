@@ -454,6 +454,9 @@ pub struct Drone {
     pub started: f64,
     pub ms: f64,
     pub remote: bool,
+    /// The node it runs on (empty: this one) and its session, which hand-offs name.
+    pub node: String,
+    pub session: String,
     /// Messages not shown to it yet; `None` for a remote drone (its reads are claimed on its node).
     pub unread: Option<f64>,
 }
@@ -475,9 +478,87 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
             started: f(&d["started"]),
             ms: f(&d["ms"]),
             remote: !s(&d["node"]).is_empty(),
+            node: s(&d["node"]),
+            session: s(&d["session"]),
             unread: d["unread"].as_f64(),
         })
         .collect()
+}
+
+/// A hand-off (borg handoff/), as `/api/handoffs` lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandOff {
+    pub id: String,
+    /// `open`, `asked`, `declined`, `contested`, `taken` or `taken back`.
+    pub state: String,
+    pub engineer: String,
+    pub node: String,
+    pub session: String,
+    pub repos: Vec<String>,
+    pub note: String,
+    /// The offering node's clock; 0 when its line names none.
+    pub ms: f64,
+    /// Whom it asks, empty for none.
+    pub to: String,
+    /// Who took it (engineer, node, session), when a claim holds.
+    pub by: Option<(String, String, String)>,
+    pub claim: String,
+    /// Whether the remote was seen holding the claim (else a line says so).
+    pub confirmed: bool,
+    pub declined: Vec<String>,
+    /// Engineers with a machine that could take it.
+    pub takers: Vec<String>,
+    /// Whether this machine refuses the original's edits.
+    pub fenced: bool,
+}
+
+/// A machine of the team as the presence shows it: who works on it, its borg and the repos it holds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Host {
+    pub node: String,
+    pub engineers: Vec<String>,
+    /// Empty for a borg that tells no machine record (one without hand-offs).
+    pub borg: String,
+    pub handoff: f64,
+    pub repos: Vec<String>,
+}
+
+/// `/api/handoffs`: this node's key, the hand-offs and the machines.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HandOffs {
+    pub here: String,
+    pub list: Vec<HandOff>,
+    pub hosts: Vec<Host>,
+}
+
+pub fn parse_handoffs(v: &Value) -> HandOffs {
+    HandOffs {
+        here: s(&v["here"]),
+        list: list(&v["handoffs"], |h| HandOff {
+            id: s(&h["id"]),
+            state: s(&h["state"]),
+            engineer: s(&h["engineer"]),
+            node: s(&h["node"]),
+            session: s(&h["session"]),
+            repos: strs(&h["repos"]),
+            note: s(&h["note"]),
+            ms: f(&h["ms"]),
+            to: s(&h["to"]),
+            by: h["by"].as_object().map(|_| (s(&h["by"]["engineer"]), s(&h["by"]["node"]), s(&h["by"]["session"]))),
+            claim: s(&h["claim"]),
+            confirmed: h["confirmed"].as_bool().unwrap_or(false),
+            declined: list(&h["declined"], |d| s(&d["engineer"])),
+            takers: strs(&h["takers"]),
+            fenced: h["fenced"].as_bool().unwrap_or(false),
+        }),
+        hosts: list(&v["machines"], |m| Host {
+            node: s(&m["node"]),
+            engineers: strs(&m["engineers"]),
+            borg: s(&m["borg"]),
+            handoff: f(&m["handoff"]),
+            repos: strs(&m["repos"]),
+        }),
+    }
 }
 
 /// A message between sessions (borg msg.rs), as `/api/messages` lists it.
@@ -979,7 +1060,7 @@ pub struct Data {
     pub live: RwSignal<bool>,
     /// The raw JSON of every view; `learning` (learning health, views/learning.rs) is read from its source,
     /// `memory` (the absorbed lessons' evidence) is joined into `lessons`.
-    pub sources: [Source; 10],
+    pub sources: [Source; 11],
     pub stats: Memo<Stats>,
     pub lessons: Memo<Vec<Lesson>>,
     pub feed: Memo<Vec<FeedEvent>>,
@@ -994,6 +1075,8 @@ pub struct Data {
     pub select: Memo<Selection>,
     /// borg itself: the release check and the members by version (the banner).
     pub update: Memo<Update>,
+    /// Hand-offs and the machines that could take them.
+    pub handoffs: Memo<HandOffs>,
     /// The newest feed time before the last refresh: newer items are new.
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
@@ -1027,8 +1110,9 @@ pub fn provide() -> Data {
         Source::new("select"),
         Source::new("memory"),
         Source::new("update"),
+        Source::new("handoffs"),
     ];
-    let [st, le, fe, qu, dr, _, me, se, mo, up] = sources;
+    let [st, le, fe, qu, dr, _, me, se, mo, up, ho] = sources;
     let d = Data {
         collective: RwSignal::new(String::new()),
         collectives: RwSignal::new(Vec::new()),
@@ -1044,6 +1128,7 @@ pub fn provide() -> Data {
         unread: Memo::new(move |_| f(&me.raw.get()["unread"])),
         select: Memo::new(move |_| parse_select(&se.raw.get())),
         update: Memo::new(move |_| parse_update(&up.raw.get())),
+        handoffs: Memo::new(move |_| parse_handoffs(&ho.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
     };

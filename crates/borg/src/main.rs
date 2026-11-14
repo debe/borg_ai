@@ -344,6 +344,7 @@ fn main() {
         ["no", rest @ ..] => std::process::exit(borg::veto::main(rest)),
         [cmd @ ("tell" | "ask" | "pause" | "resume" | "inbox"), rest @ ..] => std::process::exit(borg::msg::main(cmd, rest)),
         ["listen", rest @ ..] => std::process::exit(borg::listen::main(rest)),
+        ["handoff", rest @ ..] => std::process::exit(borg::handoff::main(rest)),
         ["why", rest @ ..] => std::process::exit(borg::why::main(rest)),
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         // A newer release, and installing it (update.rs); the prompt hook runs `--check --quiet` daily.

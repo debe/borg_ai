@@ -1510,3 +1510,98 @@ test("real borg, opencode 1: the plugin binds the session that ran `borg listen`
     Object.assign(process.env, saved)
   }
 })
+
+/** A team collective over `work` with a bare remote and two clones of one repo: alice's `app` (work in
+ *  progress) and bob's `app2`; `run` is real borg in a directory. */
+function handoffWorld(): { root: string; app: string; app2: string; run: (cwd: string, args: string[]) => string } {
+  const root = mkdtempSync(join(tmpdir(), "borg-oc-handoff-"))
+  const work = join(root, "work")
+  for (const d of [work, join(root, "home"), join(root, "store")]) mkdirSync(d, { recursive: true })
+  writeFileSync(join(root, "collectives.json"), JSON.stringify({ default: "off", collectives: [{ name: "corp", paths: [work], share: "team" }] }))
+  const env = { ...process.env, HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1" }
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { env, encoding: "utf8" })
+  const app = join(work, "app")
+  const app2 = join(work, "app2")
+  git(root, "init", "-q", "--bare", "-b", "main", "remote.git")
+  git(root, "init", "-q", "-b", "main", app)
+  git(app, "config", "user.email", "alice@x")
+  git(app, "config", "user.name", "alice")
+  writeFileSync(join(app, "lib.rs"), "fn a() {}\n")
+  git(app, "add", "-A")
+  git(app, "commit", "-q", "-m", "start")
+  git(app, "remote", "add", "origin", join(root, "remote.git"))
+  git(app, "push", "-q", "-u", "origin", "main")
+  git(work, "clone", "-q", join(root, "remote.git"), "app2")
+  git(app2, "config", "user.email", "bob@y")
+  writeFileSync(join(app, "lib.rs"), "fn a() { b() }\n")
+  writeFileSync(join(root, "brief.md"), "# Lib calls b\n\n## Next step\ntests for b\n")
+  const run = (cwd: string, args: string[]) => execFileSync(BORG, args, { cwd, env: process.env, encoding: "utf8" })
+  return { root, app, app2, run }
+}
+
+/** Real borg's env for a hand-off world `root`; returns the restore. */
+function handoffEnv(root: string): () => void {
+  const saved = { ...process.env }
+  for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID"]) delete process.env[k]
+  Object.assign(process.env, {
+    BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1",
+    BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+  })
+  return () => {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]
+    Object.assign(process.env, saved)
+  }
+}
+
+/** Offers alice's work as `session`, taken by bob when `take`; the id. */
+function handOff(w: ReturnType<typeof handoffWorld>, session: string, take: boolean): string {
+  const id = /hand-off (h[0-9a-f]{12})/.exec(w.run(w.app, ["handoff", "lib calls b", "--brief", join(w.root, "brief.md"), "--from", session]))![1]
+  if (take) assert.match(w.run(w.app2, ["handoff", "take", id, "--from", "bob-oc"]), /took hand-off/)
+  return id
+}
+
+test("real borg, opencode 1: a hand-off's refusal stops the original's edit; an open one's notice joins a prompt in a clone", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)`, timeout: 30_000 }, async () => {
+  const w = handoffWorld()
+  const restore = handoffEnv(w.root)
+  try {
+    const id = handOff(w, "ses_alice", true)
+    const { client } = fakeClient(() => PLAN)
+    const alice = await load(client, w.app)
+    const edit = () => alice["tool.execute.before"]!({ tool: "edit", sessionID: "ses_alice", callID: "e1" }, { args: { filePath: join(w.app, "lib.rs") } })
+    await assert.rejects(edit, new RegExp(`Hand-off ${id} of this work was taken by bob@y`))
+    await alice["tool.execute.before"]!({ tool: "read", sessionID: "ses_alice", callID: "r1" }, { args: { filePath: join(w.app, "lib.rs") } })
+    const open = handOff(w, "ses_alice2", false)
+    const carol = await load(client, w.app2)
+    const msg = { message: {} as any, parts: [{ id: "prt_c1", sessionID: "ses_carol", messageID: "msg_c", type: "text", text: "what is open here" }] as any[] }
+    await carol["chat.message"]!({ sessionID: "ses_carol" }, msg as any)
+    assert.equal(msg.parts.length, 2)
+    assert.match(msg.parts[1].text, new RegExp(`Hand-off ${open} from alice@x .*waits for this repo.*borg handoff take ${open}`))
+  } finally {
+    restore()
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})
+
+test("real borg, opencode 2: a hand-off's refusal stops the original's edit; an open one's notice reaches a prompt in a clone", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)`, timeout: 30_000 }, async () => {
+  const w = handoffWorld()
+  const restore = handoffEnv(w.root)
+  try {
+    const id = handOff(w, "ses_alice", true)
+    const a = fakeCtx(() => PLAN, w.app)
+    const doneA = await plugin.setup(a.ctx)
+    const edit = () => a.hooks["tool.execute.before"]({ tool: "edit", sessionID: "ses_alice", id: "e1", input: { path: join(w.app, "lib.rs") } })
+    await assert.rejects(edit, new RegExp(`Hand-off ${id} of this work was taken by bob@y`))
+    await a.hooks["tool.execute.before"]({ tool: "read", sessionID: "ses_alice", id: "r1", input: { path: join(w.app, "lib.rs") } })
+    await doneA()
+    const open = handOff(w, "ses_alice2", false)
+    const c = fakeCtx(() => PLAN, w.app2)
+    const doneC = await plugin.setup(c.ctx)
+    await c.hooks["session.prompt"]({ sessionID: "ses_carol", messageID: "msg_c", prompt: { text: "what is open here" }, delivery: "steer" })
+    assert.equal(c.synthetics.length, 1)
+    assert.match(c.synthetics[0].text, new RegExp(`Hand-off ${open} from alice@x .*waits for this repo.*borg handoff take ${open}`))
+    await doneC()
+  } finally {
+    restore()
+    rmSync(w.root, { recursive: true, force: true })
+  }
+})

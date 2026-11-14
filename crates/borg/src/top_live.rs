@@ -4,7 +4,7 @@
 //! Under the header, a line on borg itself when it has news (top.rs `version_line`: a newer release, a
 //! member on another mesh protocol). The screen per collective: a header with the drones by state, then the drones as a table with what
 //! each is doing and its unread messages, its lesson selection line (top.rs `Selection`) when it has
-//! one, then the collective's last few messages. `frame` is pure over its inputs (`Coll`); `run` is
+//! one, its hand-offs not taken yet, then the collective's last few messages. `frame` is pure over its inputs (`Coll`); `run` is
 //! the terminal around it, and acknowledges the messages to the engineer a frame showed when no
 //! session runs it (`acknowledge_shown`, top.rs `engineer_looks`). Piped or with `--once` / `--json`,
 //! `borg top` prints once instead (top.rs).
@@ -31,6 +31,8 @@ pub struct Coll {
     pub inbox: Inbox,
     /// Its lesson selection line (top.rs `selection_line`), when `borg top` shows one.
     pub select: Option<String>,
+    /// Its hand-offs not taken yet, a line each (handoff/ `top_lines`).
+    pub handoffs: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -209,6 +211,12 @@ pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: u
         }
         if let Some(l) = &c.select {
             lines.push(Ln::default().add(St::Bold, "  SELECTION ").add(St::Dim, l.as_str()));
+        }
+        if !c.handoffs.is_empty() {
+            lines.push(Ln::default().add(St::Bold, "  HAND-OFFS").add(St::Dim, format!("  {} not taken (borg handoff)", c.handoffs.len())));
+            for l in &c.handoffs {
+                lines.push(Ln::default().add(St::Plain, "  ").add(St::Cyan, l.as_str()));
+            }
         }
         if !c.inbox.recent.is_empty() {
             lines.push(Ln::default().add(St::Bold, "  MESSAGES").add(St::Dim, format!("  {} in the last day", c.inbox.day)));
@@ -410,6 +418,7 @@ mod tests {
             drones: crate::top::tests_fixture(),
             inbox: crate::top::tests_inbox(),
             select: None,
+            handoffs: Vec::new(),
         }];
         let f = frame(&cs, None, 10_000_000, 100, 6, false).0;
         assert_eq!(f.len(), 6, "{f:#?}");
@@ -440,6 +449,7 @@ mod tests {
             drones: crate::top::tests_fixture(),
             inbox: crate::top::tests_inbox(),
             select: None,
+            handoffs: Vec::new(),
         }];
         let ids = |h: usize, w: usize| frame(&cs, None, 10_000_000, w, h, false).1.into_iter().map(|(i, m)| (i, m.id.clone())).collect::<Vec<_>>();
         let all: Vec<(usize, String)> = cs[0].inbox.recent.iter().map(|m| (0, m.id.clone())).collect();
@@ -475,6 +485,7 @@ mod tests {
             drones: crate::top::tests_fixture(),
             inbox: Inbox { recent: vec![m.clone()], ..crate::top::tests_inbox() },
             select: None,
+            handoffs: Vec::new(),
         }];
         let (lines, shown) = frame(&cs, None, 10_000_000, 30, 40, false);
         let at = lines.iter().position(|l| l.starts_with("  MESSAGES")).expect("the messages section");
@@ -521,8 +532,17 @@ mod tests {
                 drones: Vec::new(),
                 inbox: Inbox { recent: vec![m.clone()], here, ..Inbox::default() },
                 select: None,
+                handoffs: Vec::new(),
             },
-            Coll { name: "side".into(), home: base.join("side"), share: Share::Local, drones: side, inbox: Inbox::default(), select: None },
+            Coll {
+                name: "side".into(),
+                home: base.join("side"),
+                share: Share::Local,
+                drones: side,
+                inbox: Inbox::default(),
+                select: None,
+                handoffs: Vec::new(),
+            },
         ];
         let (_, shown) = frame(&cs, None, 10_000_000, 100, 40, false);
         assert_eq!(shown.iter().map(|(i, m)| (*i, m.id.as_str())).collect::<Vec<_>>(), [(0, m.id.as_str())], "the frame shows it");
@@ -552,6 +572,7 @@ mod tests {
             drones: crate::top::tests_fixture(),
             inbox: crate::top::tests_inbox(),
             select: Some(line.into()),
+            handoffs: Vec::new(),
         }];
         let full = frame(&cs, None, 10_000_000, 200, 40, false).0;
         let at = full.iter().position(|l| l.starts_with("  SELECTION ")).expect("the selection line");
@@ -571,6 +592,7 @@ mod tests {
             drones: crate::top::tests_fixture(),
             inbox: crate::top::tests_inbox(),
             select: None,
+            handoffs: Vec::new(),
         }];
         let v = "borg 9.0.0 is released, this is 0.7.0: borg update";
         let with = frame(&cs, Some(v), 10_000_000, 200, 40, false).0;

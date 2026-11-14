@@ -3,6 +3,39 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.8.0 (unreleased)
+
+A session can hand its work over to another drone, like a transferred call: the repo's git remote
+decides who takes it, and the original's edits there are refused from then on.
+
+### Added
+
+- `borg handoff "<note>" --brief FILE|-` offers the session's work: the repo it runs in and each repo
+  it started or wrote in that holds work is snapshotted (untracked files in; ignored files, secrets, new
+  binaries of an untracked kind and files past git's big-file threshold out) and pushed with the brief
+  under `refs/borg/handoff/<id>/` ([Hand-off](docs/handoff.md)).
+- `borg handoff take <id>`: exactly one take wins; the work is checked out as `borg/handoff/<id>` and
+  the brief printed. The offering engineer's take is the take-back; a repo with no clone is listed
+  with its clone URL.
+- An open offer is refreshed at each stop of its session; a take that crosses a refresh keeps the
+  state it claimed, the remote's refs are put back to it, and the original is told which of its
+  changes came after it.
+- `--to ENGINEER|NODE` asks someone, after checking one of their machines can take it;
+  `borg handoff decline <id>` says no.
+- `borg handoff abort <id> [--why TEXT]` (the owner, an admin or a steerer) and `borg handoff done <id>`
+  (deletes the hand-off's refs and the clean work tree a take made).
+- `borg handoff off|on`: an admin switches the collective's hand-offs; open offers are aborted.
+- `borg handoff`, `borg top`, borg web (Hand-offs tab, Drones badges) and a session's prompt in a clone
+  show the team's hand-offs; `borg doctor` names branches left by done ones.
+
+### Upgrading
+
+- Older borgs neither see nor carry hand-offs; the remote still decides, so nothing breaks. A
+  membership version that switches hand-offs off is adopted by 0.8.0 nodes only: an older node stops
+  following membership changes from then on, revocations included. `borg handoff off` is refused while
+  such a machine was seen in the last day; upgrade every machine first
+  ([Switching hand-offs off](docs/handoff.md#switching-hand-offs-off)).
+
 ## 0.7.13 (2026-11-13)
 
 A mesh session does about a tenth of 0.7.12's work, and borg web keeps its rollups between requests.

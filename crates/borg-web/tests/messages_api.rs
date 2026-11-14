@@ -44,7 +44,7 @@ fn seen(home: &std::path::Path) -> Vec<(String, Vec<String>)> {
         .into_iter()
         .filter_map(|l| match l {
             msg::Line::Seen(s) => Some((s.by, s.ids)),
-            msg::Line::Message(_) => None,
+            msg::Line::Message(_) | msg::Line::Handoff { .. } => None,
         })
         .collect()
 }

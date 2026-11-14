@@ -14,9 +14,10 @@ use super::change::{Action, Change, read};
 use crate::harness::{Harness, Level};
 
 /// The skill's files, relative to its directory, and their content.
-pub const FILES: [(&str, &str); 5] = [
+pub const FILES: [(&str, &str); 6] = [
     ("SKILL.md", include_str!("../../assets/skills/borg/SKILL.md")),
     ("references/collectives.md", include_str!("../../assets/skills/borg/references/collectives.md")),
+    ("references/handoff.md", include_str!("../../assets/skills/borg/references/handoff.md")),
     ("references/team.md", include_str!("../../assets/skills/borg/references/team.md")),
     ("references/vectors.md", include_str!("../../assets/skills/borg/references/vectors.md")),
     ("references/troubleshooting.md", include_str!("../../assets/skills/borg/references/troubleshooting.md")),

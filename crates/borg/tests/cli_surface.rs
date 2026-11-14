@@ -98,6 +98,7 @@ const PROBES: &[(&str, &[&str])] = &[
     ("resume", &["--dir"]),
     ("inbox", &["--re"]),
     ("listen", &["--zz-probe"]),
+    ("handoff", &["--zz-probe"]),
 ];
 
 const DEBUG_PROBES: &[(&str, &[&str])] = &[

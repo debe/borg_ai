@@ -589,6 +589,12 @@ fn doctor(t: &Targets) -> i32 {
         // What the harnesses' transcripts name against what Borg captured (sweep.rs).
         checks.extend(crate::sweep::doctor(c.as_ref(), &learn::home(), &t.home, learn::now_ms()));
         checks.extend(crate::presence::mesh_checks(&routes));
+        // Hand-offs switched off, and what done hand-offs left in this machine's clones (handoff/).
+        for r in &routes {
+            if let Route::Collective { home, .. } = r {
+                checks.extend(crate::handoff::doctor(home).into_iter().map(|w| (Level::Warn, w)));
+            }
+        }
         // Lessons and evidence outside the collective their repo routes to, with the `borg move` that
         // fixes each (moves.rs): shown, never acted on.
         let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();

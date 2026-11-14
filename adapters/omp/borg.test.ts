@@ -5,7 +5,7 @@
 
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -781,6 +781,70 @@ test(
 			await h.session_shutdown({ type: "session_shutdown" }, ctx);
 			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
 			Object.assign(process.env, saved);
+		}
+	},
+);
+
+/** A team collective over `work` with a bare remote and two clones of one repo: alice's `app` (work in
+ *  progress) and bob's `app2`; the env real borg and git run with. */
+function handoffWorld(): { root: string; app: string; app2: string; run: (cwd: string, args: string[]) => string } {
+	const root = mkdtempSync(join(tmpdir(), "borg-omp-handoff-"));
+	const work = join(root, "work");
+	for (const d of [work, join(root, "home"), join(root, "store")]) mkdirSync(d, { recursive: true });
+	writeFileSync(join(root, "collectives.json"), JSON.stringify({ default: "off", collectives: [{ name: "corp", paths: [work], share: "team" }] }));
+	const env = { ...process.env, HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1" };
+	const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { env, encoding: "utf8" });
+	const app = join(work, "app");
+	const app2 = join(work, "app2");
+	git(root, "init", "-q", "--bare", "-b", "main", "remote.git");
+	git(root, "init", "-q", "-b", "main", app);
+	git(app, "config", "user.email", "alice@x");
+	git(app, "config", "user.name", "alice");
+	writeFileSync(join(app, "lib.rs"), "fn a() {}\n");
+	git(app, "add", "-A");
+	git(app, "commit", "-q", "-m", "start");
+	git(app, "remote", "add", "origin", join(root, "remote.git"));
+	git(app, "push", "-q", "-u", "origin", "main");
+	git(work, "clone", "-q", join(root, "remote.git"), "app2");
+	git(app2, "config", "user.email", "bob@y");
+	writeFileSync(join(app, "lib.rs"), "fn a() { b() }\n");
+	writeFileSync(join(root, "brief.md"), "# Lib calls b\n\n## Next step\ntests for b\n");
+	const run = (cwd: string, args: string[]) => execFileSync(BORG, args, { cwd, env: { ...process.env, PI_SESSION_ID: "" }, encoding: "utf8" });
+	return { root, app, app2, run };
+}
+
+test(
+	"real borg: a hand-off's refusal blocks the original omp session's edit, and the notice of an open one joins a prompt in a clone",
+	{ skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)`, timeout: 30_000 },
+	async () => {
+		const saved = { ...process.env };
+		const { root, app, app2, run } = handoffWorld();
+		for (const k of ["BORG_STATE", "BORG_CONSCIENCE", "PI_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_PID"]) delete process.env[k];
+		Object.assign(process.env, {
+			BORG_BIN: BORG, BORG_HOME: join(root, "store"), BORG_CONFIG: join(root, "collectives.json"), HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1",
+			BORG_QUEEN: "off", BORG_LEARN: "off", BORG_VECTORS: "off", BORG_STOP_ATTENTION: "off", BORG_MATCH: "bm25", BORG_PREDICT_MODEL: "off",
+		});
+		try {
+			const brief = join(root, "brief.md");
+			const offered = run(app, ["handoff", "lib calls b", "--brief", brief, "--from", "omp-alice"]);
+			const id = /hand-off (h[0-9a-f]{12})/.exec(offered)![1];
+			assert.match(run(app2, ["handoff", "take", id, "--from", "omp-bob"]), /took hand-off/);
+			const h = load();
+			const ctx = { cwd: app, sessionManager: { getSessionId: () => "omp-alice" } };
+			const edit = await h.tool_call({ type: "tool_call", toolName: "edit", toolCallId: "e1", input: { path: join(app, "lib.rs"), input: "x" } }, ctx);
+			assert.equal(edit?.block, true);
+			assert.match(edit.reason, new RegExp(`Hand-off ${id} of this work was taken by bob@y`));
+			assert.equal(await h.tool_call({ type: "tool_call", toolName: "read", toolCallId: "r1", input: { path: join(app, "lib.rs") } }, ctx), undefined, "reads pass");
+			// A second offer, open: a prompt of a session in a clone of the repo is told of it once.
+			const open = /hand-off (h[0-9a-f]{12})/.exec(run(app, ["handoff", "next one", "--brief", brief, "--from", "omp-alice2"]))![1];
+			const carol = { cwd: app2, sessionManager: { getSessionId: () => "omp-carol" } };
+			await h.input({ type: "input", text: "what is open here", source: "interactive" }, carol);
+			const out = await h.before_agent_start({ type: "before_agent_start", prompt: "what is open here", systemPrompt: [] }, carol);
+			assert.match(out?.message?.content ?? "", new RegExp(`Hand-off ${open} from alice@x .*waits for this repo.*borg handoff take ${open}`));
+		} finally {
+			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+			Object.assign(process.env, saved);
+			rmSync(root, { recursive: true, force: true });
 		}
 	},
 );

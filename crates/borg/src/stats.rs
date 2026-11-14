@@ -89,6 +89,10 @@ pub const STEER_ISSUED: &str = "steer_issued";
 pub const STEER_DELIVERED: &str = "steer_delivered";
 pub const STEER_DROPPED: &str = "steer_dropped";
 pub const PAUSE_REFUSED: &str = "pause_refused";
+/// Hand-offs (handoff/): one offered or claimed by a session of this machine (`why`: offer, take or
+/// back; `repo`), and a tool call of an original refused because its work was taken (`why`: the tool).
+pub const HANDOFF: &str = "handoff";
+pub const HANDOFF_REFUSED: &str = "handoff_refused";
 /// Messages between sessions (msg.rs): one sent (`why`: tell/ask), shown to a session (`why`: its kind),
 /// and dropped (`why`: `window`, the sender's window to its recipient was full, msg.rs `window_for`;
 /// events before 0.6.0 say `rate`; `bounds`, `n` lines the log's bound, msg.rs `MEMBER_BYTES`, cut).

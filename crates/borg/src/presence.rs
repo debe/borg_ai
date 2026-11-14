@@ -11,6 +11,7 @@
 //! are pruned (at a prompt and by `borg top`). Remote drones (other members' sessions, carried by the
 //! mesh daemon when the collective may sync) are in `<store>/mesh/presence.jsonl`, never in lessons.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -174,6 +175,8 @@ pub fn update(
 pub fn touch(home: &Path, collective: &str, harness: &str, event: &str, input: &Value, now: i64) -> Option<Presence> {
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let p = update(read(home, session), collective, harness, event, input, now, |cwd| {
+        // A session's first hook: its clone joins this machine's clone list too (handoff/clones.rs).
+        crate::handoff::note_clone(home, cwd);
         (learn::engineer(cwd), borg_trace::repo_key(cwd).rsplit('/').next().unwrap_or_default().to_string())
     });
     write(home, &p).ok()?;
@@ -230,12 +233,51 @@ pub fn local(home: &Path, now: i64) -> Vec<Presence> {
 }
 
 /// A remote record as the mesh daemon stored it: the drone's presence and the member key that
-/// signed it (the daemon verified it on receipt).
+/// signed it (the daemon verified it on receipt), with what its machine can take (`machine`), signed
+/// apart (`msig`): a node of a version without it drops both fields and still verifies `sig`, which
+/// covers the presence alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remote {
     pub p: Presence,
     pub key: String,
     pub sig: String,
+    /// The machine record (`Machine`) as the JSON text its node signed, kept byte for byte: the
+    /// signature never depends on the fields this version knows, so a newer node's record still verifies
+    /// here (`Remote::machine` reads what this version knows of it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub msig: String,
+}
+
+impl Remote {
+    /// The machine record, read borrowed from its signed text; fields of a newer version are ignored.
+    pub fn machine(&self) -> Option<Machine<'_>> {
+        serde_json::from_str(self.machine.as_deref()?).ok()
+    }
+}
+
+/// What the machine a drone runs on can take over (handoff/clones.rs `machine`): the borg it runs, the
+/// hand-off protocol it speaks (0: none, as a record without a `Machine` says), and the repos it holds
+/// clones of. An offer's check (`borg handoff --to`) reads it from the signed presence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine<'a> {
+    #[serde(borrow)]
+    pub borg: Cow<'a, str>,
+    #[serde(default)]
+    pub handoff: u8,
+    #[serde(borrow, default)]
+    pub clones: Vec<Cloned<'a>>,
+}
+
+/// One repo a machine holds a clone of: a remote URL's hash (handoff/clones.rs `url_hash`) and the
+/// clone's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cloned<'a> {
+    #[serde(borrow)]
+    pub url: Cow<'a, str>,
+    #[serde(borrow)]
+    pub name: Cow<'a, str>,
 }
 
 /// The remote records not yet due for pruning (latest per member and session).
@@ -542,7 +584,9 @@ mod tests {
             started: 1,
             pid: None,
         };
-        let line = |s: &str, ms: i64, key: &str| serde_json::to_string(&Remote { p: p(s, ms), key: key.into(), sig: "00".into() }).unwrap();
+        let line = |s: &str, ms: i64, key: &str| {
+            serde_json::to_string(&Remote { p: p(s, ms), key: key.into(), sig: "00".into(), machine: None, msig: String::new() }).unwrap()
+        };
         let text = [line("a", 10, "k1"), line("a", 30, "k1"), line("a", 20, "k1"), line("a", 5, "k2"), "garbage".into()].join("\n");
         std::fs::write(remote_path(&home), text).unwrap();
         let r = remote(&home, 40);

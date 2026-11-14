@@ -290,6 +290,50 @@ The relay's and the address lookup's TLS certificates are checked against the sy
 machine therefore sees the relay traffic: the metadata above, but not the content, which stays
 end-to-end encrypted between member keys.
 
+### What a hand-off pushes
+
+A hand-off ([Hand-off](handoff.md)) keeps its code off the mesh: it goes to the git remote of each repo
+of the session, which every clone of that repo can read. `borg handoff` pushes there:
+
+- each repo's working tree as a commit under `refs/borg/handoff/<id>/state`, on its own remote: tracked
+  and untracked files, never ignored ones, never a change whose added lines hold a secret (an untracked
+  file stays out, a tracked one goes in as HEAD has it), never a new binary of a kind HEAD tracks no
+  file of (borg cannot screen it), never an untracked file larger than git's big-file threshold and
+  every file the repo tracks; what stays out is listed. The repos are the one `borg handoff` runs in and
+  those the session started or wrote in that hold work, never one it only read. A submodule goes in as
+  the commit it is on, a file under git LFS as its pointer (git's clean filter runs as for any add);
+- the brief under `refs/borg/handoff/<id>/brief`, on the first repo's remote: the agent's `HANDOFF.md`
+  and borg's `state.json` (each repo with its remote, branch and commit ids, the session id, node key,
+  harness, git email, task, latest prompt, last proposal, touched and changed files, test runs), every
+  text redacted like a message.
+
+While the offer is open, each stop of its session pushes the working tree again over the last state
+when it changed, with a new brief; the earlier states stay on the remote as unreachable objects until it
+prunes them. A take pushes a claim commit to `refs/borg/handoff/<id>/taken`, naming the taker's node key,
+session id, git email and harness and the state of each repo it took. An abort pushes one too (an open
+offer's, then its `state` and `brief` are deleted) or, after a take, a commit to
+`refs/borg/handoff/<id>/abort`; both name the one who aborted and the reason (redacted). `borg handoff
+done` deletes every `refs/borg/handoff/<id>/*` ref. Anyone who can read the remote can read these refs,
+and a remote may keep the objects after the refs are deleted. The statistics events `handoff` and
+`handoff_refused` (with the session, the repos' names and the verb or tool) sync with the collective's
+other statistics. Only team collectives hand off; a `share: "local"` collective refuses. An admin's
+switch (`borg handoff off`) is a field of the signed membership, `handoffs_off`, with the admin's key
+and the time; a node on a borg before 0.8.0 cannot verify a version that carries it, stays on the
+version before and follows no later one, revocations included, so the switch is refused while such a
+machine was seen in the last day.
+
+Over the mesh go the news, never the code: hand-off lines in the message log, signed by the node that
+wrote each, kept a week like messages and bounded per member. An offer line holds the note, the head of
+the brief (redacted), the repo's name, its remote URL without credentials, the branch, the commit ids,
+the names of files left out, and whom it asks (each repo's when there are several); an outcome line the
+claim and who made it; an abort line also its reason; a done line the claim it closes; a decline who
+declined. A member on a borg without hand-offs drops these lines (and counts them as rejected at each
+session). And each drone's presence carries its machine's record, signed apart from it over the exact
+text sent (a member on an older borg verifies the presence and drops the record; one on a newer borg
+keeps fields it does not know): the borg version, the hand-off protocol, and the repos the machine holds
+clones of, each as a hash of its normalized remote URL (as git resolves it) with the clone's name, never
+a path or a URL. `--to` reads them to check whom it asks.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |

@@ -80,6 +80,7 @@ borg mesh invite --role steer --expires 2d --uses 1 --png invite.png
 borg mesh invites                                        # open tickets
 borg mesh invites --revoke <id>                          # withdraw one
 borg mesh revoke <key>                                   # remove a member
+borg handoff off                                         # switch hand-offs off for the collective (`on` again)
 ```
 
 Roles: `member`, `steer` (may also pause, resume and veto other members' sessions, as the admin may),

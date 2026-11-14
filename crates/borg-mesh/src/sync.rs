@@ -1238,10 +1238,11 @@ impl Store<'_> {
     /// too). A log that a `send` or an `ack` changed since is decided again first, so a line written in
     /// between counts in the window and is never lost to a rewrite. A decision that writes nothing takes
     /// no lock: it holds as of its read. The write is recorded for the log's readers (msg.rs `wrote`): seen
-    /// lines alone leave its talk, so they make no hook or waiter read it again. Then the privileged lines
-    /// taken are admitted (steer.rs `admit`). The log is read through the cache, which a rewrite leaves to
-    /// read it whole again and an append extends, under the log's lock; a rewrite is decided over the file
-    /// read whole there, as a write the cache's stat cannot tell would otherwise be reverted.
+    /// lines and hand-off lines alone leave its talk, so they make no hook or waiter read it again. Then
+    /// the privileged lines taken are admitted (steer.rs `admit`), and hand-off lines fence an original
+    /// here (borg handoff `merged`). The log is read through the cache, which a rewrite leaves to read it
+    /// whole again and an append extends, under the log's lock; a rewrite is decided over the file read
+    /// whole there, as a write the cache's stat cannot tell would otherwise be reverted.
     fn store_messages(
         &self,
         path: &Path,
@@ -1256,7 +1257,9 @@ impl Store<'_> {
             report.rejected += first.refused;
             return Ok(steer::Admitted::default());
         }
-        borg::live::locked(path, move || {
+        // A peer's hand-off line fences an original here at once (borg handoff `merged`), after the write.
+        let handoff = keep.values().any(|s| matches!(LineRef::parse(&s.line), Some(LineRef::Handoff(_))));
+        let admitted = borg::live::locked(path, move || {
             let held = self.cache.log(path);
             // The cache hands back the very snapshot read when the log is unchanged: one held is never
             // extended in place.
@@ -1280,7 +1283,7 @@ impl Store<'_> {
             self.cache.record(self.home, records)?;
             let io = |e: std::io::Error| format!("{}: {e}", path.display());
             let before = borg::msg::mark_of(path);
-            let talk = keep.values().any(|s| !matches!(LineRef::parse(&s.line), Some(LineRef::Seen(_))));
+            let talk = keep.values().any(|s| !matches!(LineRef::parse(&s.line), Some(LineRef::Seen(_) | LineRef::Handoff(_))));
             match &d.body {
                 Some(body) => {
                     borg::steer::rewrite(path, body).map_err(io)?;
@@ -1306,7 +1309,11 @@ impl Store<'_> {
             report.received += keep.len();
             // After the write: a hook that sees the line before its admission shows it at its next call.
             steer::admit(self.home, m, &self.me.public(), &new, now).map_err(|e| format!("admissions: {e}"))
-        })
+        });
+        if handoff {
+            borg::handoff::merged(self.home);
+        }
+        admitted
     }
 }
 
@@ -1448,7 +1455,7 @@ fn window(set: &BTreeMap<Hash, impl AsRef<str>>) -> BTreeSet<Hash> {
 fn paced<'l>(lines: &'l [LineRef]) -> impl Iterator<Item = bool> + 'l {
     let admitted = borg::msg::within_windows(lines);
     lines.iter().map(move |l| match l {
-        LineRef::Seen(_) => true,
+        LineRef::Seen(_) | LineRef::Handoff(_) => true,
         LineRef::Message(m) => m.kind.privileged() || admitted.contains(m.id.as_ref()),
     })
 }
@@ -2410,7 +2417,7 @@ mod tests {
         borg::msg::ack(&a, "s7", &[&second.id], now).unwrap();
         let held = borg::msg::lines(&a);
         assert!(held.iter().all(|l| l.message().is_none_or(|m| m.id != first.id)), "the first is pruned");
-        let w = borg::msg::window_for(&held.iter().map(borg::msg::Line::borrowed).collect::<Vec<_>>(), Author { node: &key, by: "s1" }, &to, now);
+        let w = borg::msg::window_for(&held.iter().filter_map(borg::msg::Line::borrowed).collect::<Vec<_>>(), Author { node: &key, by: "s1" }, &to, now);
         assert!(w.admits(&second.id) && !w.admits(&third.id), "a replay over what is left admits less than send did");
         let (alice, bob, carol) = (
             Node::bind(&p[0], LOCAL.parse().unwrap()).await.unwrap(),
@@ -3125,7 +3132,7 @@ mod tests {
                 .into_iter()
                 .zip(&all)
                 .filter(|(_, l)| match l {
-                    LineRef::Seen(_) => true,
+                    LineRef::Seen(_) | LineRef::Handoff(_) => true,
                     LineRef::Message(m) => m.kind.privileged() || admitted.contains(m.id.as_ref()),
                 })
                 .map(|(h, _)| h)

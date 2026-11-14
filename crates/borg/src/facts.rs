@@ -727,7 +727,7 @@ fn next_write() -> u64 {
 }
 
 /// Writes `bytes` to `path`: a temp file of its own (process, write), then a rename (module doc).
-fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), next_write()));
     let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok();
     if !ok {

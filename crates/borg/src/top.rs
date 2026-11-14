@@ -1133,6 +1133,19 @@ pub fn render_with(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, se
     s
 }
 
+/// The hand-offs not taken yet under a collective's screen (handoff/ `top_lines`), each cut to a
+/// message's width; nothing when there are none.
+pub fn handoffs_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut s = format!("  hand-offs: {} not taken (borg handoff)\n", lines.len());
+    for l in lines {
+        s.push_str(&format!("    {}\n", cut(l, MESSAGE_CHARS)));
+    }
+    s
+}
+
 /// The line over the collectives when borg itself needs the engineer, none otherwise: a newer release
 /// than this borg (`checked`, the last release check; ignored while `check` is off,
 /// `BORG_UPDATE_CHECK=off`), then per store in `stores` (only one with `mesh/`) each member nothing
@@ -1191,7 +1204,8 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<(Vec<crate::top_live::Coll>
             d.p.engineer = collective::aliases().display(&d.p.engineer);
         }
         let inbox = inbox(home, &ds, now);
-        if ds.is_empty() && inbox.recent.is_empty() && dir.is_none() {
+        let handoffs = crate::handoff::top_lines(home, now);
+        if ds.is_empty() && inbox.recent.is_empty() && handoffs.is_empty() && dir.is_none() {
             continue;
         }
         // Every frame: the cache and its tail, never a rebuild of the whole log (select/summary.rs `peek`);
@@ -1199,7 +1213,7 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<(Vec<crate::top_live::Coll>
         let lessons = home.join("lessons.jsonl");
         let summary = select::summary::peek(&lessons);
         let select = Some(Selection::of(&summary, select::policy(), select::risk_of(&lessons))).filter(Selection::shown).map(|s| selection_line(&s));
-        out.push(crate::top_live::Coll { name: name.clone(), home: home.clone(), share: *share, drones: ds, inbox, select });
+        out.push(crate::top_live::Coll { name: name.clone(), home: home.clone(), share: *share, drones: ds, inbox, select, handoffs });
     }
     Ok((out, version))
 }
@@ -1245,12 +1259,15 @@ fn screen_of(
         }
         let inbox = inbox(home, &ds, now);
         let sel = selection(&home.join("lessons.jsonl"), select::policy());
+        let handoffs = crate::handoff::top_lines(home, now);
         if json_out {
             let mut v = to_json_with(name, *share, &ds, &inbox);
             v["select"] = json!(sel);
+            v["handoffs"] = crate::handoff::board(home, now)["handoffs"].take();
             all.push(v);
-        } else if !ds.is_empty() || !inbox.recent.is_empty() || one {
+        } else if !ds.is_empty() || !inbox.recent.is_empty() || !handoffs.is_empty() || one {
             text.push_str(&render_with(name, *share, &ds, &inbox, Some(&sel), now));
+            text.push_str(&handoffs_text(&handoffs));
             text.push('\n');
             printed.push((home, inbox.recent.into_iter().filter(|m| prints_text(&ds, &inbox.here, m)).collect::<Vec<_>>()));
         }
@@ -1369,6 +1386,8 @@ mod tests {
             p: p("bbbb2222-y", "bob@y", 200, NOW - 120_000, "stop", "review PR 42", &["README.md"]),
             key: "beefcafe".repeat(8),
             sig: String::new(),
+            machine: None,
+            msig: String::new(),
         }];
         assemble(local, remote, NOW, |_| true, |p| p.session.starts_with("aaaa"))
     }
@@ -2082,7 +2101,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
             .into_iter()
             .filter_map(|l| match l {
                 msg::Line::Seen(s) => Some((s.by, s.ids)),
-                msg::Line::Message(_) => None,
+                msg::Line::Message(_) | msg::Line::Handoff { .. } => None,
             })
             .collect()
     }
@@ -2295,6 +2314,8 @@ corp (team): 3 drone(s), 2 active, 1 remote
             p: p(s, "bob@y", 50, NOW - 5_000, "post_tool", "b", &[]),
             key: "beefcafe".repeat(8),
             sig: String::new(),
+            machine: None,
+            msig: String::new(),
         });
         let ds = assemble(local, remote.into(), NOW, |_| true, |_| false);
         for t in ["aaaa", "aaaa1111", "aaaa1111-x"] {
@@ -2309,8 +2330,13 @@ corp (team): 3 drone(s), 2 active, 1 remote
     #[test]
     fn a_name_matching_an_ended_drone_here_and_a_live_member_names_the_live_one() {
         let local = vec![p("aaaa1111-x", "alice@x", 100, NOW - 5_000, "end", "a", &[])];
-        let remote =
-            vec![presence::Remote { p: p("aaaa2222-z", "bob@y", 50, NOW - 5_000, "post_tool", "b", &[]), key: "beefcafe".repeat(8), sig: String::new() }];
+        let remote = vec![presence::Remote {
+            p: p("aaaa2222-z", "bob@y", 50, NOW - 5_000, "post_tool", "b", &[]),
+            key: "beefcafe".repeat(8),
+            sig: String::new(),
+            machine: None,
+            msig: String::new(),
+        }];
         let ds = assemble(local, remote, NOW, |_| true, |_| false);
         let d = resolve(&ds, "aaaa").unwrap().unwrap();
         assert_eq!((d.p.session.as_str(), d.node.as_str()), ("aaaa2222-z", "beefcafe".repeat(8).as_str()), "the live one, though remote");

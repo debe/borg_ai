@@ -172,6 +172,23 @@ pub const GROUPS: &[(&str, &[Command])] = &[
                 crate::listen::FLAGS,
             ),
             cmd(
+                "handoff",
+                &[
+                    (
+                        "[\"<note>\"] --brief <file>|- [--to <engineer|node>]",
+                        "offer this session's work with its brief (`-`: stdin): its working trees go to their repos' remotes, another drone takes it over; --to asks someone",
+                    ),
+                    ("", "the hand-offs of the whole team"),
+                    ("take <id> [--resume]", "take a hand-off over (the offering engineer's take takes it back)"),
+                    ("decline <id>", "say no to a hand-off that asks you"),
+                    ("abort <id> [--why <text>]", "close a hand-off: its owner, an admin or a steerer"),
+                    ("done <id>", "a finished hand-off: delete its refs and the clean work tree a take made"),
+                    ("off|on", "an admin switches the collective's hand-offs off, or on again"),
+                ],
+                crate::handoff::SUBS,
+                crate::handoff::FLAGS,
+            ),
+            cmd(
                 "pause",
                 &[("<session|drone|local|collective> [note]", "refuse a session's tool calls until it is resumed")],
                 &["local", "collective", "all"],

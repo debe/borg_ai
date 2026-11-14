@@ -102,6 +102,19 @@ static SECRETS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     .collect()
 });
 
+/// How many of `SECRETS`, at its end, know a secret by the name it is assigned to (`key = value`, `.env`
+/// lines) rather than by its own shape: in prose and config a hit, in source code mostly a variable.
+const NAMED: usize = 2;
+
+/// Whether `text` holds a secret `SECRETS` knows by its shape (a private key, a provider token, a
+/// credential in a URL or an auth header); with `named` also one assigned to a secret-named key. The
+/// unlabelled-token guess (`looks_random`) is left out: in a file it mostly hits lock files and
+/// fixtures, which then would be missing from a hand-off's snapshot (handoff/git.rs).
+pub(crate) fn has_secret(text: &str, named: bool) -> bool {
+    let n = if named { SECRETS.len() } else { SECRETS.len() - NAMED };
+    SECRETS[..n].iter().any(|(re, _)| re.is_match(text))
+}
+
 /// Candidates for an unlabelled random token (checked by `looks_random`).
 static TOKENISH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/_=-]{32,}").unwrap());
 
@@ -612,6 +625,18 @@ fn run(args: &[&str], after: Option<After>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_is_known_by_its_shape_and_by_its_name_only_when_asked() {
+        for shaped in ["-----BEGIN RSA PRIVATE KEY-----", "x = ghp_0123456789abcdefghijABCD", "https://u:hunter2@db/x", "Bearer abcdefghijkl0123"] {
+            assert!(has_secret(shaped, false), "{shaped}");
+        }
+        for named in ["password = form.get(\"pw\")", "API_KEY=12345", "let key = map.get(k);"] {
+            assert!(!has_secret(named, false) && has_secret(named, true), "{named}");
+        }
+        let lock = "\"integrity\": \"sha512-Zx9Qk2LmPw8RtYv3NbHs6JdFgKa1Bc4DZx9Qk2LmPw8RtYv3NbHs6JdFgKa1Bc4D==\"";
+        assert!(!has_secret(lock, false) && !has_secret(lock, true), "the random-token guess is not used");
+    }
 
     /// `redact` as it was: a copy of the text per pattern.
     fn old_redact(text: &str) -> String {

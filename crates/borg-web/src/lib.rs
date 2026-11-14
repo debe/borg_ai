@@ -207,7 +207,7 @@ async fn memory_of(State(app): State<Arc<App>>, Query(q): Query<MemoryQuery>) ->
 }
 
 /// What the feed shows: what people and drones did, not the routine of every turn end.
-const NOTABLE: [&str; 28] = [
+const NOTABLE: [&str; 30] = [
     stats::CORRECTION,
     stats::VETO,
     stats::VETO_REPEAT,
@@ -225,6 +225,8 @@ const NOTABLE: [&str; 28] = [
     stats::STEER_DELIVERED,
     stats::STEER_DROPPED,
     stats::PAUSE_REFUSED,
+    stats::HANDOFF,
+    stats::HANDOFF_REFUSED,
     stats::QUEEN_QUEUED,
     stats::QUEEN_DELIVERED,
     stats::QUEEN_ANSWERED,
@@ -285,6 +287,34 @@ async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response 
     }
     let inbox = top::inbox(&m.home, &ds, now);
     Json(top::to_json_with(&m.name, m.share, &ds, &inbox)).into_response()
+}
+
+/// Hand-offs (borg handoff `board`): every one this node knows, with its state, whom it asks, who took
+/// or declined it and which engineers have a machine that could take it, and every machine the presence
+/// shows with its borg and clones ("who can take what"). Engineers show as their aliases. No remote is
+/// asked: what the store holds.
+async fn handoffs(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
+    let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
+    let mut v = borg::handoff::board(&m.home, learn::now_ms());
+    let aliases = collective::aliases();
+    let show = |x: &mut Value| {
+        if let Some(e) = x.as_str().map(|e| aliases.display(e)) {
+            *x = json!(e);
+        }
+    };
+    for h in v["handoffs"].as_array_mut().into_iter().flatten() {
+        show(&mut h["engineer"]);
+        if let Some(by) = h.get_mut("by").filter(|b| b.is_object()) {
+            show(&mut by["engineer"]);
+        }
+        h["takers"].as_array_mut().into_iter().flatten().for_each(&show);
+        h["declined"].as_array_mut().into_iter().flatten().for_each(|d| show(&mut d["engineer"]));
+    }
+    for x in v["machines"].as_array_mut().into_iter().flatten() {
+        x["engineers"].as_array_mut().into_iter().flatten().for_each(&show);
+    }
+    v["collective"] = json!(m.name);
+    Json(v).into_response()
 }
 
 /// Messages between sessions (borg msg.rs) on this node, newest first: who sent each to whom, as `borg
@@ -439,6 +469,9 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         // A drone's unread count moves with the log and the shown-once claims.
         ("drones", vec![home.join("presence"), presence::remote_path(home), msg::path(home), msg::seen_path(home)]),
         ("messages", vec![msg::path(home), msg::seen_path(home)]),
+        // The hand-off log, the peers' lines derived from the messages, the remote's answers and the
+        // fences (borg handoff/), and the presence that says who can take what.
+        ("handoffs", vec![home.join("handoffs.jsonl"), home.join("handoff"), home.join("presence"), presence::remote_path(home)]),
         ("feed", vec![stats::events_path(home)]),
         ("queen", vec![home.join("queen"), home.join("stats.jsonl"), stats::events_path(home)]),
         // Learning health folds the lessons, the rollups and the local events.
@@ -505,6 +538,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/queen", get(queen))
         .route("/api/messages", get(messages))
         .route("/api/messages/seen", post(messages_seen))
+        .route("/api/handoffs", get(handoffs))
         .route("/api/learning", get(learning_of))
         .route("/api/select", get(select_of))
         .route("/api/update", get(update_of))

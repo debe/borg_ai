@@ -279,21 +279,27 @@ pub fn pause_reason(m: &Message, role: Role) -> String {
 /// The hook's call around everything else the hook would answer (`inner`: the checkpoint). At a tool
 /// call it refuses while paused and says nothing otherwise (`inner` is not called); at a stop while
 /// paused it neither blocks nor runs `inner`. `started` is the session's start (presence.rs).
+///
+/// The same refusal fences a session whose hand-off someone else took (handoff/fence.rs), scoped to
+/// the repos it handed off: there only its edits are refused, and its stop runs as ever.
 pub fn around(home: &Path, event: &str, input: &Value, started: Option<i64>, now: i64, inner: impl FnOnce() -> Option<Value>) -> Option<Value> {
     // Fast path: nobody ever steered this collective on this machine.
-    if !active(home) {
-        return if event == "pre_tool" { None } else { inner() };
+    let steered = active(home);
+    if !steered && event != "pre_tool" {
+        return inner();
     }
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or_default();
+    let tool = || input.get("tool_name").and_then(Value::as_str).unwrap_or_default().into();
+    let deny = |why: String| json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}});
     match event {
         "pre_tool" => {
-            let (m, role) = pause(home, session, started, now)?;
-            crate::stats::count(home, crate::stats::PAUSE_REFUSED, session, |ev| {
-                ev.why = input.get("tool_name").and_then(Value::as_str).unwrap_or_default().into();
-            });
-            Some(
-                json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": pause_reason(&m, role)}}),
-            )
+            if let Some((m, role)) = steered.then(|| pause(home, session, started, now)).flatten() {
+                crate::stats::count(home, crate::stats::PAUSE_REFUSED, session, |ev| ev.why = tool());
+                return Some(deny(pause_reason(&m, role)));
+            }
+            let why = crate::handoff::refusal(home, session, input)?;
+            crate::stats::count(home, crate::stats::HANDOFF_REFUSED, session, |ev| ev.why = tool());
+            Some(deny(why))
         }
         // Paused: the session stopping is the session waiting; no conscience round, no question.
         "stop" if paused(home, session, started, now) => None,

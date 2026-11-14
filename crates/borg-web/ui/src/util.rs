@@ -179,6 +179,8 @@ pub fn kind(k: &str) -> (&'static str, &'static str, &'static str) {
         "msg_sent" => ("messages sent", "var(--c-sky)", "✉"),
         "msg_delivered" => ("messages shown", "var(--c-teal)", "✉"),
         "msg_dropped" => ("messages dropped", "var(--c-heat)", "⨯"),
+        "handoff" => ("hand-offs", "var(--c-violet)", "⇆"),
+        "handoff_refused" => ("edits refused after a hand-off", "var(--c-pink)", "⇆"),
         _ => ("other", "var(--c-muted)", "•"),
     }
 }

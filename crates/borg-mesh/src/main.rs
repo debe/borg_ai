@@ -241,6 +241,24 @@ async fn run(args: &[String]) -> Result<(), String> {
                 println!("{moved} line(s) it stamped since quarantined here");
             }
         }
+        // `borg handoff off|on` runs this (the borg crate holds no key to sign with): not listed here.
+        Some("handoffs") => {
+            let (name, home) = store(&r)?;
+            let mut m = Membership::load(&home)?.ok_or(format!("{name} has no membership: `borg mesh init`"))?;
+            let off = match args.get(1).map(String::as_str) {
+                Some("off") => true,
+                Some("on") => false,
+                _ => return Err("handoffs on|off".into()),
+            };
+            let state = if off { "off" } else { "on" };
+            if !m.switch_handoffs(&Identity::load_or_create(&home)?, off, borg::learn::now_ms())? {
+                println!("hand-offs are {state} in {name} already");
+                return Ok(());
+            }
+            m.save(&home)?;
+            let then = if off { "; every node aborts its open offers and refuses new offers and takes once it syncs" } else { "; nothing aborted is reopened" };
+            println!("hand-offs are {state} in {name} (version {}){then}", m.version);
+        }
         Some("members") => {
             let (name, home) = store(&r)?;
             let m = Membership::load(&home)?.ok_or(format!("{name} has no membership"))?;

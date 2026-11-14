@@ -23,6 +23,11 @@
 //! A revocation therefore always survives a race; an invitation on the losing branch has to be
 //! repeated.
 //!
+//! **Hand-offs** (`switch_handoffs`): an admin can switch the collective's hand-offs off
+//! (`handoffs_off`, naming the admin and when); absent, they are on, so every document signed before the
+//! switch existed verifies as it did. borg reads it (handoff/close.rs): while off, offers and takes are
+//! refused and each node aborts its own open offers.
+//!
 //! **Revocation** (`revoke`): the key leaves `members` and is listed in `revoked` with the time of
 //! revocation. Data originating from it (sync.rs: every synced line carries a signed origin) is
 //! admitted only if stamped before that time. A revoked node could backdate its stamps; it can no
@@ -61,6 +66,9 @@ pub struct Membership {
     /// The losing fork branches (their first document's `id`) whose revocations this version folded in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged: Vec<String>,
+    /// Hand-offs switched off for the collective: by which admin, since when. Absent: on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoffs_off: Option<HandoffsOff>,
     #[serde(default)]
     pub sig: String,
     /// Not signed: revocations of losing fork branches applied on top of this version (module doc).
@@ -73,6 +81,13 @@ pub struct Membership {
 pub struct Revoked {
     pub key: String,
     /// Epoch ms of the revocation: data this key stamped from then on is refused.
+    pub at_ms: i64,
+}
+
+/// Who switched the collective's hand-offs off, and when (epoch ms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffsOff {
+    pub by: String,
     pub at_ms: i64,
 }
 
@@ -98,6 +113,8 @@ struct Unsigned<'a> {
     revoked: &'a [Revoked],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     merged: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoffs_off: Option<&'a HandoffsOff>,
     sig: &'a str,
 }
 
@@ -111,6 +128,7 @@ fn body(m: &Membership) -> Vec<u8> {
         members: &m.members,
         revoked: &m.revoked,
         merged: &m.merged,
+        handoffs_off: m.handoffs_off.as_ref(),
         sig: "",
     };
     let mut b = b"borg-membership-v1\n".to_vec();
@@ -152,6 +170,7 @@ impl Membership {
             members: vec![Member { key: admin.public(), role: "admin".into() }],
             revoked: Vec::new(),
             merged: Vec::new(),
+            handoffs_off: None,
             sig: String::new(),
             also: Vec::new(),
         };
@@ -179,9 +198,9 @@ impl Membership {
 
     /// Whether `other` is this document as signed, `also` aside.
     fn same_signed(&self, other: &Membership) -> bool {
-        let Membership { collective, admin, version, prev, members, revoked, merged, sig, also: _ } = self;
-        (version, sig, collective, admin, prev, members, revoked, merged)
-            == (&other.version, &other.sig, &other.collective, &other.admin, &other.prev, &other.members, &other.revoked, &other.merged)
+        let Membership { collective, admin, version, prev, members, revoked, merged, handoffs_off, sig, also: _ } = self;
+        (version, sig, collective, admin, prev, members, revoked, merged, handoffs_off)
+            == (&other.version, &other.sig, &other.collective, &other.admin, &other.prev, &other.members, &other.revoked, &other.merged, &other.handoffs_off)
     }
 
     /// Signed by its admin, and the admin is listed as admin. Both follow from what `id` hashes, so a
@@ -245,6 +264,18 @@ impl Membership {
         self.revoked.retain(|r| r.key != key);
         self.revoked.push(Revoked { key: key.into(), at_ms: now_ms });
         self.resign(admin, parent)
+    }
+
+    /// Switches the collective's hand-offs off (naming `admin` and `now_ms`) or on again; only an admin
+    /// can, and the document is re-signed. Nothing to do when they are as asked already.
+    pub fn switch_handoffs(&mut self, admin: &Identity, off: bool, now_ms: i64) -> Result<bool, String> {
+        self.check_admin(admin, "switch hand-offs")?;
+        if self.handoffs_off.is_some() == off {
+            return Ok(false);
+        }
+        let parent = self.id();
+        self.handoffs_off = off.then(|| HandoffsOff { by: admin.public(), at_ms: now_ms });
+        self.resign(admin, parent).map(|()| true)
     }
 
     fn check_admin(&self, admin: &Identity, what: &str) -> Result<(), String> {
@@ -629,6 +660,33 @@ mod tests {
         d.admin = admin.public();
         d.sig = admin.sign(&body(&d));
         d
+    }
+
+    /// The hand-off switch: only an admin flips it, each flip is the next signed version a member
+    /// adopts, and a document from before the switch existed signs the same bytes as ever.
+    #[test]
+    fn only_an_admin_switches_handoffs_and_older_documents_stay_valid() {
+        let ((ha, admin), (hb, bob)) = (node("ho-a"), node("ho-b"));
+        let mut m = Membership::found("work", &admin);
+        m.invite(&admin, &bob.public(), "steer").unwrap();
+        let before = m.clone();
+        let raw = serde_json::to_string(&before).unwrap();
+        assert!(!raw.contains("handoffs_off"), "absent while on: {raw}");
+        let old: Membership = serde_json::from_str(&raw).unwrap();
+        old.verify().unwrap();
+        assert!(m.clone().switch_handoffs(&bob, true, 5).is_err(), "a steerer is no admin");
+        assert!(m.switch_handoffs(&admin, true, 5).unwrap());
+        assert_eq!(m.handoffs_off, Some(HandoffsOff { by: admin.public(), at_ms: 5 }));
+        assert!(adopts(&before, &m), "the next version");
+        assert!(!m.switch_handoffs(&admin, true, 6).unwrap(), "off already: no new version");
+        let off = m.clone();
+        let mut forged = off.clone();
+        forged.handoffs_off = None;
+        assert!(forged.verify().is_err(), "the switch is signed");
+        assert!(m.switch_handoffs(&admin, false, 7).unwrap() && m.handoffs_off.is_none() && adopts(&off, &m));
+        for h in [ha, hb] {
+            let _ = std::fs::remove_dir_all(h);
+        }
     }
 
     #[test]
