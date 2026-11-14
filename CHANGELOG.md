@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.8.0 (unreleased)
+## 0.8.0 (2026-11-14)
 
 A session can hand its work over to another drone, like a transferred call: the repo's git remote
 decides who takes it, and the original's edits there are refused from then on.
