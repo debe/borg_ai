@@ -94,6 +94,29 @@ pub(crate) struct Repo<'a> {
     pub state: Cow<'a, str>,
     #[serde(borrow)]
     pub tree: Cow<'a, str>,
+    /// The root commits of its history (git.rs `roots`): a taker asks the clones holding one of them
+    /// whether their remote holds the hand-off (mod.rs `reach`). A hint, never an identity: a successor
+    /// repo copied from a retired one shares them. Absent in an offer of 0.8.0, and dropped by `fit`
+    /// before a line outgrows `LINE_BYTES`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<Cow<'a, str>>,
+    /// The push URL with the offering machine's ssh host alias resolved, credentials redacted, when it
+    /// differs from `remote` (which names the repo as that machine's git does): another machine matches
+    /// either (clones.rs `keys_of`), and is told to clone this one. Absent in an offer of 0.8.0.
+    #[serde(borrow, default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<Cow<'a, str>>,
+}
+
+impl Repo<'_> {
+    /// The URLs that name the repo: `remote`, and `resolved` when there is one.
+    pub(crate) fn urls(&self) -> Vec<&str> {
+        std::iter::once(self.remote.as_ref()).chain(self.resolved.as_deref()).collect()
+    }
+
+    /// The URL another machine clones it by: `resolved`, else `remote`.
+    pub(crate) fn clone_url(&self) -> &str {
+        self.resolved.as_deref().unwrap_or(&self.remote)
+    }
 }
 
 /// One line of the log.
@@ -196,8 +219,12 @@ impl<'a> Event<'a> {
     pub(crate) fn well_formed(&self) -> bool {
         let text = |t: &str| t.chars().count() <= crate::msg::WIRE_TEXT;
         let plain = |t: &str| !t.is_empty() && !t.starts_with('-') && !t.chars().any(char::is_control);
-        let repo =
-            |r: &Repo| crate::msg::token(&r.name) && [&r.head, &r.state, &r.tree].into_iter().all(|s| is_oid(s)) && plain(&r.branch) && url_shaped(&r.remote);
+        let repo = |r: &Repo| {
+            crate::msg::token(&r.name)
+                && [&r.head, &r.state, &r.tree].into_iter().chain(&r.roots).all(|s| is_oid(s))
+                && plain(&r.branch)
+                && url_shaped(&r.remote)
+        };
         self.v == 1
             && super::is_id(&self.id)
             && crate::msg::token(&self.node)
@@ -235,12 +262,19 @@ impl<'a> Event<'a> {
     }
 
     /// The line as it is written, dropping left-out names until it fits `LINE_BYTES` (each counted in
-    /// `more_left_out`).
+    /// `more_left_out`), then the repos' root commits (a hint only).
     pub(crate) fn fit(mut self) -> String {
         loop {
             let line = serde_json::to_string(&self).unwrap_or_default();
-            if line.len() <= LINE_BYTES || self.left_out.is_empty() {
+            if line.len() <= LINE_BYTES {
                 return line;
+            }
+            if self.left_out.is_empty() {
+                if self.repos.iter().all(|r| r.roots.is_empty()) {
+                    return line;
+                }
+                self.repos.iter_mut().for_each(|r| r.roots.clear());
+                continue;
             }
             // Drop at least as many names as their quoted bytes exceed the bound, then measure again.
             let mut over = line.len() - LINE_BYTES;
@@ -768,8 +802,16 @@ mod tests {
     }
 
     fn offer_to(ms: i64, state: char, to: Option<&str>) -> String {
-        let repo =
-            Repo { name: "app".into(), remote: "/r".into(), branch: "main".into(), head: sha('1').into(), state: sha(state).into(), tree: sha('2').into() };
+        let repo = Repo {
+            name: "app".into(),
+            remote: "/r".into(),
+            branch: "main".into(),
+            head: sha('1').into(),
+            state: sha(state).into(),
+            tree: sha('2').into(),
+            roots: Vec::new(),
+            resolved: None,
+        };
         let e = Event {
             v: 1,
             id: id().into(),

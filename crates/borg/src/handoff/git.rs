@@ -141,21 +141,196 @@ pub(crate) fn remote_urls(dir: &Path) -> Vec<String> {
     out.lines().filter_map(|l| Some(l.split_once('\t')?.1.rsplit_once(' ')?.0.to_string())).collect()
 }
 
-/// The remote of `root` that is the arbiter `url` (an offer's push URL, credentials redacted), with
-/// the URL every hand-off call then uses: a remote whose push URL names that repo, else one whose fetch
-/// URL does (then its fetch URL, which names the arbiter).
-pub(crate) fn arbiter(root: &Path, url: &str) -> Option<(String, String)> {
-    let want = normal_url(url);
-    let names: Vec<String> = run(root, &["remote"]).unwrap_or_default().lines().map(str::to_string).collect();
-    let get = |n: &str, push: bool| run(root, &["remote", "get-url", if push { "--push" } else { "--all" }, n]).ok();
-    let by = |push: bool| {
-        names.iter().find_map(|n| {
-            let u = get(n, push)?;
-            let u = u.lines().next()?.to_string();
-            (normal_url(&u) == want).then(|| (n.clone(), u))
-        })
-    };
+/// The remote of `root` that is one of `urls` (an offer's URL and the host its ssh alias stands for,
+/// credentials redacted), with the URL every hand-off call then uses: a remote whose push URL names that
+/// repo, else one whose fetch URL does (then its fetch URL, which names the arbiter). A remote's URL
+/// counts as written and with its own ssh alias resolved (`resolved_url`), each `normal_url`.
+pub(crate) fn arbiter(root: &Path, urls: &[&str]) -> Option<(String, String)> {
+    let want: Vec<String> = urls.iter().map(|u| normal_url(u)).collect();
+    let remotes = remotes(root);
+    let names = |u: &str| want.contains(&normal_url(u)) || want.contains(&normal_url(&resolved_url(u)));
+    let by = |push: bool| remotes.iter().find(|r| names(r.url(push))).map(|r| (r.name.clone(), r.url(push).to_string()));
     by(true).or_else(|| by(false))
+}
+
+/// One remote of a clone: its name and its first push and fetch URLs as git resolves them.
+struct Remote {
+    name: String,
+    push: String,
+    fetch: String,
+}
+
+impl Remote {
+    fn url(&self, push: bool) -> &str {
+        if push { &self.push } else { &self.fetch }
+    }
+}
+
+/// Every remote of the clone at `root`, from one `git remote -v` (`insteadOf` rules applied): the first
+/// fetch and push URL each lists.
+fn remotes(root: &Path) -> Vec<Remote> {
+    let out = run(root, &["remote", "-v"]).unwrap_or_default();
+    let mut all: Vec<Remote> = Vec::new();
+    for l in out.lines() {
+        let Some((name, rest)) = l.split_once('\t') else { continue };
+        let Some((url, kind)) = rest.rsplit_once(' ') else { continue };
+        let i = all.iter().position(|r| r.name == name).unwrap_or_else(|| {
+            all.push(Remote { name: name.to_string(), push: String::new(), fetch: String::new() });
+            all.len() - 1
+        });
+        let slot = if kind == "(push)" { &mut all[i].push } else { &mut all[i].fetch };
+        if slot.is_empty() {
+            *slot = url.to_string();
+        }
+    }
+    all.retain(|r| !r.fetch.is_empty() || !r.push.is_empty());
+    for r in &mut all {
+        if r.push.is_empty() {
+            r.push = r.fetch.clone();
+        } else if r.fetch.is_empty() {
+            r.fetch = r.push.clone();
+        }
+    }
+    all
+}
+
+/// The remote of `root` whose refs of hand-off `id` (`leaf`, sha) satisfy `holds` (one `ls-remote` per
+/// remote URL, push URL first), with the URL that answered: the proof that this clone's remote is one of
+/// the offer's repos whatever URL spells it (mod.rs `Holds` says which one). Two repos of one history (a
+/// retired one and its successor) share root commits, but only the one the offer was pushed to holds its
+/// refs. None once the refs are deleted (`done`).
+pub(crate) fn holding(root: &Path, id: &str, holds: impl Fn(&[(String, String)]) -> bool) -> Option<(String, String)> {
+    remotes(root).into_iter().find_map(|r| {
+        let urls = if r.push == r.fetch { vec![r.push.clone()] } else { vec![r.push.clone(), r.fetch.clone()] };
+        let url = urls.into_iter().find(|u| ls_remote_all(root, u, id).is_ok_and(|refs| holds(&refs)))?;
+        Some((r.name, url))
+    })
+}
+
+/// The root commits of `rev` in the repo at `root`: the history it descends from, which a fork, a copy
+/// or a successor repo shares (so they find candidates, never a repo: `holding` decides). Empty in a
+/// shallow clone, whose cut-off commits look like roots.
+pub(crate) fn roots(root: &Path, rev: &str) -> Vec<String> {
+    if run(root, &["rev-parse", "--is-shallow-repository"]).is_ok_and(|s| s == "true") {
+        return Vec::new();
+    }
+    run(root, &["rev-list", "--max-parents=0", "--end-of-options", rev])
+        .map(|out| out.lines().filter(|l| is_oid(l)).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the repo at `root` holds one of the commits `shas` (one `cat-file --batch-check`).
+pub(crate) fn has_any(root: &Path, shas: &[impl AsRef<str>]) -> bool {
+    let input: String = shas.iter().map(|s| format!("{}^{{commit}}\n", s.as_ref())).collect();
+    !shas.is_empty()
+        && run_raw(root, &["cat-file", "--batch-check"], &[], Some(input.as_bytes()))
+            .is_ok_and(|out| String::from_utf8_lossy(&out).lines().any(|l| l.contains(" commit ")))
+}
+
+/// What ssh's config makes of a host (`ssh -G`): the host it connects to, the user and the port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshHost {
+    pub hostname: String,
+    pub user: String,
+    pub port: String,
+}
+
+/// A host no ssh config names (`.invalid` never resolves): what ssh makes of it is the default user and
+/// port, which an alias's own are told apart from.
+const NO_HOST: &str = "borg-no-such-host.invalid";
+
+/// An ssh URL taken apart: scp-like `[user@]host:path`, or `ssh://[user@]host[:port]/path` (also
+/// `git+ssh://`, `ssh+git://`; then `path` is without its leading `/`).
+struct SshUrl<'a> {
+    scp: bool,
+    user: Option<&'a str>,
+    host: &'a str,
+    port: Option<&'a str>,
+    path: &'a str,
+}
+
+fn ssh_url(url: &str) -> Option<SshUrl<'_>> {
+    let url = url.trim();
+    let (rest, scp) = match url.split_once("://") {
+        Some(("ssh" | "git+ssh" | "ssh+git", r)) => (r, false),
+        Some(_) => return None,
+        None if url.starts_with('/') || url.starts_with('.') => return None,
+        None => (url, true),
+    };
+    let (auth, path) = if scp {
+        let (a, p) = rest.split_once(':')?;
+        if a.contains('/') {
+            return None;
+        }
+        (a, p)
+    } else {
+        rest.split_once('/').unwrap_or((rest, ""))
+    };
+    let (user, hostport) = auth.rsplit_once('@').map_or((None, auth), |(u, h)| (Some(u), h));
+    let (host, port) = if scp { (hostport, None) } else { hostport.split_once(':').map_or((hostport, None), |(h, p)| (h, Some(p))) };
+    let plain = |h: &str| !h.is_empty() && !h.starts_with('-') && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    plain(host).then_some(SshUrl { scp, user, host, port, path })
+}
+
+/// `url` with an ssh host alias replaced by what it stands for, as `resolve` (ssh's config) says: the
+/// host, and the user and port the alias sets beyond ssh's defaults (what it says of `NO_HOST`) when the
+/// URL names none, in the URL's own form (an scp-like one turns `ssh://` only for a port, its path then
+/// under `~/` unless absolute), so it works on any machine. Any other URL, a host ssh connects to under
+/// its own name, or one it names by an address with `:` (IPv6) stays as it is.
+pub(crate) fn resolved_url_with(url: &str, resolve: impl Fn(&str) -> Option<SshHost>) -> String {
+    let Some(u) = ssh_url(url) else { return url.to_string() };
+    let Some(h) = resolve(u.host).filter(|h| !h.hostname.is_empty() && !h.hostname.contains(':') && !h.hostname.eq_ignore_ascii_case(u.host)) else {
+        return url.to_string();
+    };
+    let default = resolve(NO_HOST);
+    let set = |own: &str, of: fn(&SshHost) -> &str| (!own.is_empty() && default.as_ref().is_none_or(|d| of(d) != own)).then(|| own.to_string());
+    let user = u.user.map(str::to_string).or_else(|| set(&h.user, |d| &d.user));
+    let port = u.port.map(str::to_string).or_else(|| set(&h.port, |d| &d.port).filter(|p| p != "22"));
+    let at = user.map_or_else(String::new, |u| format!("{u}@"));
+    let host = &h.hostname;
+    match (u.scp, port) {
+        (true, None) => format!("{at}{host}:{}", u.path),
+        (true, Some(p)) => match u.path.strip_prefix('/') {
+            Some(abs) => format!("ssh://{at}{host}:{p}/{abs}"),
+            None => format!("ssh://{at}{host}:{p}/~/{}", u.path),
+        },
+        (false, Some(p)) => format!("ssh://{at}{host}:{p}/{}", u.path),
+        (false, None) => format!("ssh://{at}{host}/{}", u.path),
+    }
+}
+
+/// `resolved_url_with` by the ssh config of this machine (`ssh -G <host>`, no connection). Each host is
+/// asked once while the ssh configs stay as they are (the mesh daemon lives long); no ssh, or an answer
+/// without a host name: the URL as it is. Never on a hook's path: `ssh -G` runs `Match exec` commands.
+pub(crate) fn resolved_url(url: &str) -> String {
+    type Memo = std::collections::HashMap<String, (String, Option<SshHost>)>;
+    static HOSTS: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let mark = ssh_mark();
+    resolved_url_with(url, |host| {
+        let memo = HOSTS.get_or_init(Default::default);
+        if let Some((m, h)) = memo.lock().ok().and_then(|m| m.get(host).cloned())
+            && m == mark
+        {
+            return h;
+        }
+        let out = Command::new("ssh").args(["-G", "--", host]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok().filter(|o| o.status.success());
+        let h = out.map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix(' ')).unwrap_or_default().trim().to_string();
+            SshHost { hostname: field("hostname"), user: field("user"), port: field("port") }
+        });
+        if let Ok(mut m) = memo.lock() {
+            m.insert(host.to_string(), (mark.clone(), h.clone()));
+        }
+        h
+    })
+}
+
+/// The marks (msg.rs `mark_of`) of the ssh configs `ssh -G` reads: the user's and the system's. What
+/// `resolved_url` answered holds while they stay.
+pub(crate) fn ssh_mark() -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    [home.join(".ssh/config"), PathBuf::from("/etc/ssh/ssh_config")].iter().map(|p| crate::msg::mark_of(p).unwrap_or_default()).collect::<Vec<_>>().join(" ")
 }
 
 /// A remote URL as two clones of one repo name it alike: no credentials, user, scheme or `.git`
@@ -610,6 +785,39 @@ pub(crate) fn check_out(root: &Path, branch: &str, exists: bool, state: &str, in
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ssh host alias is the host it stands for, in the URL's own form: the URL another machine can
+    /// clone, and one key with the plain spelling. The URL's own user or port wins; an alias's user or
+    /// port counts only where it differs from ssh's defaults; a URL ssh does not read, a real host, or a
+    /// host ssh names by an IPv6 address stays as it is.
+    #[test]
+    fn an_ssh_alias_resolves_to_the_host_it_stands_for() {
+        let host = |h: &str, user: &str, port: &str| Some(SshHost { hostname: h.into(), user: user.into(), port: port.into() });
+        let ssh = |name: &str| match name {
+            NO_HOST => host(NO_HOST, "me", "22"),
+            "gh-work" => host("github.com", "git", "22"),
+            "gh-mine" => host("github.com", "me", "22"),
+            "box" => host("git.example.com", "git", "2222"),
+            "v6" => host("fe80::1", "git", "22"),
+            "github.com" => host("github.com", "me", "22"),
+            h => panic!("asked ssh about {h}"),
+        };
+        let resolved = |u: &str| resolved_url_with(u, ssh);
+        assert_eq!(resolved("gh-work:team/app.git"), "git@github.com:team/app.git");
+        assert_eq!(normal_url(&resolved("gh-work:team/app.git")), normal_url("git@github.com:team/app"), "one repo, one key");
+        assert_eq!(resolved("me@gh-work:team/app"), "me@github.com:team/app", "the URL's user wins");
+        assert_eq!(resolved("gh-mine:team/app"), "github.com:team/app", "ssh's default user is this machine's, never published");
+        assert_eq!(resolved("gh-work:/srv/app"), "git@github.com:/srv/app", "an absolute path stays absolute");
+        assert_eq!(resolved("ssh://gh-work/srv/git/app"), "ssh://git@github.com/srv/git/app", "an ssh:// URL keeps its form and path");
+        assert_eq!(resolved("box:team/app"), "ssh://git@git.example.com:2222/~/team/app", "a port needs ssh://, the path stays under home");
+        assert_eq!(resolved("box:/srv/app"), "ssh://git@git.example.com:2222/srv/app");
+        assert_eq!(resolved("ssh://gh-work:2200/team/app"), "ssh://git@github.com:2200/team/app", "the URL's port wins");
+        assert_eq!(resolved("git@github.com:team/app.git"), "git@github.com:team/app.git", "a real host stays as written");
+        assert_eq!(resolved("v6:team/app"), "v6:team/app", "an IPv6 host name is not written into a URL");
+        for untouched in ["https://gh-work/team/app", "/srv/app.git", "./app", "file:///srv/app", "-oProxyCommand=x:app", "[::1]:app"] {
+            assert_eq!(resolved(untouched), untouched);
+        }
+    }
 
     #[test]
     fn a_url_reads_alike_from_every_clone() {

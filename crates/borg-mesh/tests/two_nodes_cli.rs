@@ -198,7 +198,11 @@ fn session(a: &Machine, b: &Machine) -> (Report, Report) {
     let (mut at_a, mut at_b) = (Report::default(), Report::default());
     a.store().store_lines(&a.log(), to_a, &ra.want, &ma, None, &mut at_a).unwrap();
     b.store().store_lines(&b.log(), to_b, &rb.want, &mb, None, &mut at_b).unwrap();
-    // Live: presence both ways, received under the store's lock as a session does.
+    // Live: presence both ways, after each records the clones in its collective's paths, received under
+    // the store's lock as a session does.
+    for m in [a, b] {
+        borg::handoff::discover(&m.home, &m.root.join("collectives.json"));
+    }
     let (pa, pb) = (live::outgoing(&a.home, &a.me, now), live::outgoing(&b.home, &b.me, now));
     {
         let _w = a.lock.lock().unwrap();
@@ -475,6 +479,33 @@ fn an_offer_on_one_node_is_asked_of_and_taken_on_the_other_and_the_original_is_f
     assert!(notice.contains(&format!("Hand-off {id} was taken by take-b@x")), "{notice}");
     let (_, listed, _) = p.handoff(a, "s-a", &[]);
     assert!(listed.contains("taken ") && listed.contains("by take-b@x") && listed.contains("the remote holds it"), "{listed}");
+    p.clean();
+}
+
+/// The receiver's borg never recorded its clone (no session opened it since), and its remote names the
+/// repo by another spelling: B's mesh records the clone from the collective's paths before its presence
+/// leaves; A's ask, finding no clone of that URL among B's, goes out with a warning instead of a
+/// refusal; B takes it in that clone, its remote proven by holding the hand-off.
+#[test]
+fn an_ask_reaches_a_clone_no_session_opened_under_another_spelling() {
+    let p = Pair::new("unopened");
+    let (a, b) = (&p.a, &p.b);
+    std::fs::remove_file(b.home.join("handoff/clones.json")).unwrap();
+    std::os::unix::fs::symlink(&a.root, b.root.join("link")).unwrap();
+    git(&b.work(), &p.gh(), &["remote", "set-url", "origin", &b.root.join("link/remote.git").to_string_lossy()], &[]);
+    session(a, b);
+    let recorded = std::fs::read_to_string(b.home.join("handoff/clones.json")).unwrap();
+    assert!(recorded.contains("\"name\":\"app\""), "B's mesh recorded the clone: {recorded}");
+    let brief = a.root.join("brief.md");
+    std::fs::write(&brief, "# Lib calls b\n\n## Next step\ntests for b\n").unwrap();
+    let (code, out, err) = p.handoff(a, "s-a", &["lib calls b", "--brief", brief.to_str().unwrap(), "--to", "unopened-b@x"]);
+    assert_eq!(code, Some(0), "an ask, not a refusal: {out}{err}");
+    assert!(err.contains("asking unopened-b@x although no machine of theirs told the team it holds a clone of"), "{err}");
+    let id = out[out.find("hand-off h").unwrap() + "hand-off ".len()..][..13].to_string();
+    session(a, b);
+    let (code, out, err) = p.handoff(b, "s-b", &["take", &id]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert_eq!(std::fs::read_to_string(b.work().join("lib.rs")).unwrap(), "fn a() { b() }\n", "A's work, on B");
     p.clean();
 }
 

@@ -45,9 +45,15 @@
 //! is told once, at a prompt, as peer data (`notice`).
 //!
 //! **Asking** (`--to <engineer|node>`): checked first against the team's signed presence (one of
-//! their machines seen in the last day, speaking `PROTOCOL`, holding a clone of the repo: clones.rs),
-//! and refused with the gap; then the offer names whom it asks, the engineer gets a message, and
-//! their take is the answer; `borg handoff decline <id>` says no, and the owner is told.
+//! their machines seen in the last day, speaking `PROTOCOL`), and refused with the gap; a clone of the
+//! repo none of their machines lists only warns (clones.rs: the list lags behind the disk). Then the
+//! offer names whom it asks, the engineer gets a message, and their take is the answer; `borg handoff
+//! decline <id>` says no, and the owner is told.
+//!
+//! **Finding the clone** (`reach`): by URL (ssh host aliases resolved), else by the hand-off itself, a
+//! remote that holds its refs; candidates are the clone it runs in and the recorded clones of the
+//! repo's history (its root commits, which the offer names), and the collective's paths are searched
+//! once when none fits (clones.rs `discover`).
 //!
 //! Hand-offs exist only in team collectives (collective.rs `may_sync`): a hand-off pushes the working
 //! tree to the team's remote. Notes, briefs and metadata are redacted like messages (notes.rs
@@ -586,20 +592,35 @@ fn offer(ctx: &Ctx, note: Option<&str>, brief_from: &str, to: Option<&str>) -> i
             );
             return 1;
         }
+        // The URL its ssh alias stands for, read once here: the offer line names it beside `url`.
+        let resolved = Some(git::resolved_url(&url)).filter(|r| *r != url && log::url_shaped(&notes::redact(r))).unwrap_or_default();
         plans.push(Plan {
             name: repo_name(&root).into(),
             root: root.to_string_lossy().into_owned().into(),
             remote: remote.into(),
             url: url.into(),
+            resolved: resolved.into(),
+            roots: git::roots(&root, &base.head).into_iter().map(Into::into).collect(),
             branch: base.branch.into(),
             head: base.head.into(),
         });
     }
     // The ask's check, before anything is pushed: the gap, or whom it asks.
-    let urls: Vec<&str> = plans.iter().map(|p| p.url.as_ref()).collect();
-    let to = match to.map(|t| check_to(&ctx.home, t, &urls, ctx.now)) {
+    let named: Vec<(String, Vec<String>)> = plans
+        .iter()
+        .map(|p| {
+            let urls = [p.url.as_ref(), p.resolved.as_ref()].into_iter().filter(|u| !u.is_empty()).map(notes::redact).collect::<Vec<_>>();
+            (urls.last().cloned().unwrap_or_default(), clones::keys_of(urls.iter().map(String::as_str)))
+        })
+        .collect();
+    let to = match to.map(|t| check_to(&ctx.home, t, &named, ctx.now)) {
         None => None,
-        Some(Ok(t)) => Some(t),
+        Some(Ok(Asked { to, unknown })) => {
+            if let Some(u) = unknown {
+                eprintln!("borg handoff: {u}");
+            }
+            Some(to)
+        }
         Some(Err(gap)) => {
             eprintln!("borg handoff: no offer, nobody asked: {gap}");
             return 1;
@@ -679,7 +700,10 @@ fn offer(ctx: &Ctx, note: Option<&str>, brief_from: &str, to: Option<&str>) -> i
     }
     match &to {
         Some(t) => println!("  asked {t}: their take is the answer, `borg handoff decline {id}` theirs to say no; it shows as asked until then"),
-        None => println!("  to take it, in a session in a clone of {}: borg handoff take {id}", notes::redact(&arb.url)),
+        None => println!(
+            "  to take it, in a session in a clone of {}: borg handoff take {id}",
+            notes::redact(if arb.resolved.is_empty() { &arb.url } else { &arb.resolved })
+        ),
     }
     let roots: Vec<&str> = plans.iter().map(|p| p.root.as_ref()).collect();
     println!(
@@ -967,10 +991,12 @@ fn offer_line(id: &str, text: &str, current: Option<&str>) -> Option<String> {
         .map(|(p, l)| log::Repo {
             name: p.name.clone(),
             remote: notes::redact(&p.url).into(),
+            resolved: (!p.resolved.is_empty()).then(|| notes::redact(&p.resolved).into()),
             branch: l.branch.clone(),
             head: l.head.clone(),
             state: l.state.clone(),
             tree: l.tree.clone(),
+            roots: p.roots.clone(),
         })
         .collect();
     let mut e = log::Event::of(id, log::Kind::Offer, &by.node, &by.session, &by.engineer, &by.harness);
@@ -1373,10 +1399,108 @@ fn earlier_checkout(home: &Path, me: &Who, id: &str, repo: usize) -> Option<(Str
         })
 }
 
-/// A clone of the repo `url` names on this machine: the one `borg handoff` runs in when it is one, else
-/// one a session's hook recorded (clones.rs `clone_of`).
-fn clone_for(ctx: &Ctx, url: &str) -> Option<PathBuf> {
-    git::toplevel(&ctx.cwd).filter(|r| git::arbiter(r, url).is_some()).or_else(|| clones::clone_of(&ctx.home, url).filter(|r| git::arbiter(r, url).is_some()))
+/// One repo of an offer as this machine reaches it: a clone of it, and the remote of that clone that is
+/// the offer's (its name, and the URL every call to it uses: git.rs module doc).
+#[derive(Debug, Clone)]
+pub(crate) struct Reach {
+    pub root: PathBuf,
+    pub remote: String,
+    pub url: String,
+}
+
+/// What the remote of a clone must hold of a hand-off to be the remote of one of its repos (every repo
+/// of an offer holds refs under its one id): the arbiter's `brief` (or `taken`, `abort`, which only the
+/// arbiter gets), or another repo's `state` at one of the shas the offer or its brief names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Holds<'a> {
+    Arbiter,
+    State(&'a [&'a str]),
+}
+
+impl Holds<'_> {
+    fn by(self, refs: &[(String, String)]) -> bool {
+        match self {
+            Holds::Arbiter => refs.iter().any(|(leaf, _)| matches!(leaf.as_str(), "brief" | "taken" | "abort")),
+            Holds::State(shas) => refs.iter().any(|(leaf, sha)| leaf == "state" && shas.contains(&sha.as_str())),
+        }
+    }
+}
+
+/// How hard `reach` looks for a clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Look {
+    /// By URL alone: what a listing, a stop or a refresh asks, which must not walk the disk or ask
+    /// remotes that may not be the repo.
+    Named,
+    /// By URL, else by proof (the remote holds the hand-off), searching the collective's paths once:
+    /// what a take, an abort and a done ask, run by the engineer for this hand-off.
+    Proven,
+}
+
+/// Where `repo` of hand-off `id` is reached from here.
+///
+/// - **By URL**: a clone whose remote the offer names (git.rs `arbiter`: the offer's URL, or the one its
+///   ssh alias stands for, against each remote as written and with its own alias resolved), tried in
+///   order: `first` (the clone it was offered from), the one `borg handoff` runs in, the clones recorded
+///   here with one of the repo's keys (clones.rs).
+/// - **By proof** (`Look::Proven`): a clone with a remote that holds what `holds` says of the hand-off's
+///   refs, asked with `ls-remote` (git.rs `holding`), whatever URL this machine reaches it by. Asked are
+///   `first`, the one it runs in, and the recorded clones holding one of the repo's root commits: a root
+///   names a history, which a successor repo copied from a retired one shares, so it only picks whom to
+///   ask. None fits: the clones in the collective's paths are recorded (once per process,
+///   `discover_once`) and both are tried again.
+///
+/// The error names the clones asked.
+fn reach(ctx: &Ctx, id: &str, repo: &log::Repo, first: Option<&Path>, holds: Holds, look: Look) -> Result<Reach, String> {
+    let urls = repo.urls();
+    let keys = clones::keys_of(urls.iter().copied());
+    let here: Vec<PathBuf> = first.map(Path::to_path_buf).into_iter().chain(git::toplevel(&ctx.cwd)).collect();
+    let named = || {
+        here.iter()
+            .cloned()
+            .chain(clones::clones_of(&ctx.home, &keys))
+            .find_map(|root| git::arbiter(&root, &urls).map(|(remote, url)| Reach { root, remote, url }))
+    };
+    // One path per clone: a work tree named through a link is asked once.
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut asked: Vec<PathBuf> = Vec::new();
+    let proven = |asked: &mut Vec<PathBuf>| {
+        let mine: Vec<PathBuf> = here.iter().map(|p| real(p)).collect();
+        let kin = clones::recorded(&ctx.home).into_iter().map(|p| real(&p)).filter(|r| !mine.contains(r) && git::has_any(r, &repo.roots));
+        for root in mine.iter().cloned().chain(kin) {
+            if asked.contains(&root) {
+                continue;
+            }
+            asked.push(root.clone());
+            if let Some((remote, url)) = git::holding(&root, id, |refs| holds.by(refs)) {
+                return Some(Reach { root, remote, url });
+            }
+        }
+        None
+    };
+    let found = match look {
+        Look::Named => named(),
+        Look::Proven => named().or_else(|| proven(&mut asked)).or_else(|| discover_once(&ctx.home).then(|| named().or_else(|| proven(&mut asked))).flatten()),
+    };
+    found.ok_or_else(|| {
+        let url = notes::redact(repo.clone_url());
+        match asked.as_slice() {
+            [] => format!("no clone of {} ({url}) here: clone it into the collective's paths, or run it in your clone of it", repo.name),
+            tried => format!(
+                "no clone of {} ({url}) here: {} {} asked, and no remote of theirs holds {id}: run it in your clone of {url}",
+                repo.name,
+                tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                if tried.len() == 1 { "was" } else { "were" }
+            ),
+        }
+    })
+}
+
+/// Records the clones in the collective's paths (clones.rs `discover`, under the config this run reads),
+/// the first time a run asks; later asks find what it recorded. Whether it recorded a new one.
+fn discover_once(home: &Path) -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) && collective::load().ok().flatten().is_some_and(|cfg| clones::discover(home, &cfg))
 }
 
 /// Where a fresh checkout of `state` in the clone `root` goes: the branch (and whether it exists, at
@@ -1407,12 +1531,7 @@ fn place(root: &Path, id: &str, state: &str, offered_branch: &str) -> Result<(St
 fn take_steps(ctx: &Ctx, h: &log::HandOff, resume: bool) -> Result<Took, Halt> {
     let id = h.id();
     let arb = &h.offer.repos[0];
-    let Some(root) = clone_for(ctx, &arb.remote) else {
-        return fail(format!("no clone of {} ({}) here: run it in a clone of it, the repo whose remote decides the take", arb.name, arb.remote));
-    };
-    let Some((remote, url)) = git::arbiter(&root, &arb.remote) else {
-        return fail(format!("{} has no remote for {} ({}): run it in a clone of it", root.display(), arb.name, arb.remote));
-    };
+    let Reach { root, remote, url } = reach(ctx, id, arb, None, Holds::Arbiter, Look::Proven).map_err(Halt::Failed)?;
     let me = &ctx.me;
     let owner = (!me.engineer.is_empty() && h.offer.engineer.eq_ignore_ascii_case(&me.engineer)) || (h.offer.node == me.node && h.offer.session == me.session);
     let verb = if owner { Verb::Back } else { Verb::Take };
@@ -1465,8 +1584,8 @@ fn more_repos(ctx: &Ctx, h: &log::HandOff, states: &[(String, String)]) -> Vec<w
         .zip(states)
         .skip(1)
         .map(|(r, (state, tree))| {
-            let clone = clone_for(ctx, &r.remote).and_then(|root| git::arbiter(&root, &r.remote).map(|(_, url)| (root, url)));
-            let (root, url) = clone.map_or_else(|| (String::new(), r.remote.to_string()), |(root, url)| (root.to_string_lossy().into_owned(), url));
+            let (root, url) = reach(ctx, h.id(), r, None, Holds::State(&[r.state.as_ref(), state.as_str()]), Look::Proven)
+                .map_or_else(|_| (String::new(), r.remote.to_string()), |c| (c.root.to_string_lossy().into_owned(), c.url));
             wal::TakeRepo {
                 name: own(&r.name),
                 root: root.into(),
@@ -1894,21 +2013,18 @@ fn report(ctx: &Ctx, h: &log::HandOff, t: &Took) {
 // ---------------------------------------------------------------------------------------------------
 // Listing and recovery
 
-/// A clone of the arbiter repo of `h` here (the offering one, else the one `borg handoff` runs in,
-/// else a recorded one) and the URL every call to its remote uses.
-fn arbiter_clone(ctx: &Ctx, h: &log::HandOff) -> Option<(PathBuf, String)> {
-    let arb = &h.offer.repos[0].remote;
+/// The arbiter repo of `h` as this machine reaches it by URL (`reach`, `Look::Named`: the clone it was
+/// offered from first): a listing, a stop or a refresh asks no remote that might not be the repo.
+fn arbiter_clone(ctx: &Ctx, h: &log::HandOff) -> Option<Reach> {
     let offering = offered_from(&ctx.home, h).map(PathBuf::from).filter(|r| r.is_dir());
-    let root = offering.filter(|r| git::arbiter(r, arb).is_some()).or_else(|| clone_for(ctx, arb))?;
-    let (_, url) = git::arbiter(&root, arb)?;
-    Some((root, url))
+    reach(ctx, h.id(), &h.offer.repos[0], offering.as_deref(), Holds::Arbiter, Look::Named).ok()
 }
 
 /// Asks the arbiter remote of `h` which of its refs it holds (one `ls-remote`), through a clone of its
 /// repo on this machine, and keeps the answer (`learned`: an original off the mesh learns of a take
 /// here, either side of an abort, anyone of its end). Nothing when it cannot be asked.
 fn ask_remote(ctx: &Ctx, h: &log::HandOff) {
-    let Some((root, url)) = arbiter_clone(ctx, h) else { return };
+    let Some(Reach { root, url, .. }) = arbiter_clone(ctx, h) else { return };
     let Ok(refs) = git::ls_remote_all(&root, &url, h.id()) else { return };
     let leaf = |l: &str| refs.iter().find(|(k, _)| k == l).map(|(_, v)| v.as_str());
     learned(ctx, h, &root, &url, log::Heard { taken: leaf("taken"), abort: leaf("abort"), gone: refs.is_empty(), ..log::Heard::default() });
@@ -2357,6 +2473,36 @@ pub fn machine(home: &Path) -> presence::Machine<'static> {
     clones::machine(home)
 }
 
+/// Records the clones in the paths the config at `config` gives the collective of `home` (clones.rs
+/// `discover`), so the machine record tells the team of clones no session opened: the mesh daemon runs
+/// it at its sessions, in the background, off every hook's path. One at a time per store and process: a
+/// call while one runs for `home` returns at once (the running one records the same). A missing or broken
+/// config records nothing.
+pub fn discover(home: &Path, config: &Path) {
+    static RUNNING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    fn running() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+        RUNNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The store's place among the running ones, given up however the run ends.
+    struct Held<'a>(&'a Path);
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            running().retain(|h| h != self.0);
+        }
+    }
+    {
+        let mut r = running();
+        if r.iter().any(|h| h == home) {
+            return;
+        }
+        r.push(home.to_path_buf());
+    }
+    let _held = Held(home);
+    if let Ok(Some(cfg)) = collective::load_from(config) {
+        clones::discover(home, &cfg);
+    }
+}
+
 /// Where the notices a session was given live: `<store>/handoff/shown/<session>/<id>`, one per
 /// hand-off, made exclusively (two hooks at once tell it once), and `.stamp`, the marks of the logs
 /// it read last with nothing left to tell.
@@ -2408,8 +2554,8 @@ pub(crate) fn notice(
     for h in log::fold(&text) {
         let o = &h.offer;
         let own = o.node == here && o.session == session;
-        let here_too = o.repos.iter().any(|r| urls.contains(&clones::url_hash(&r.remote)));
-        if own || !here_too || !is_open(&h, known.get(h.id())) || off || dir.join(o.id.as_ref()).exists() {
+        let here_too = || o.repos.iter().any(|r| clones::keys_of(r.urls()).iter().any(|k| urls.contains(k)));
+        if own || off || !is_open(&h, known.get(h.id())) || dir.join(o.id.as_ref()).exists() || !here_too() {
             continue;
         }
         if !nodes.insert(o.node.to_string()) {
@@ -2498,11 +2644,21 @@ fn hosts<'r>(home: &Path, now: i64, remote: &'r [presence::Remote]) -> Vec<Host<
     out
 }
 
+/// Whom an ask names (`check_to`), and what is not known of their clones: the repos none of their
+/// machines told the team it holds, a warning, never a refusal (a clone made since, or one its borg has
+/// not recorded, takes it as well).
+struct Asked {
+    to: String,
+    unknown: Option<String>,
+}
+
 /// The check before an ask (`--to`): whom `raw` names (an engineer by email or the name the
 /// collective's aliases give them, or a node by its key or a prefix only it has) among the machines
 /// seen, as the offer records it (an email, or the whole key), when one of their machines speaks
-/// `PROTOCOL` and holds a clone of every repo of `urls`; else the gap, named.
-fn check_to(home: &Path, raw: &str, urls: &[&str], now: i64) -> Result<String, String> {
+/// `PROTOCOL`; else the gap, named. Their clones of the repos (`repos`: each one's clone URL and keys,
+/// clones.rs `keys_of`) only warn: the presence tells the clones their borg recorded, which can lag
+/// behind what they hold.
+fn check_to(home: &Path, raw: &str, repos: &[(String, Vec<String>)], now: i64) -> Result<Asked, String> {
     let remote = presence::remote(home, now);
     let seen = hosts(home, now, &remote);
     let aliases = collective::aliases();
@@ -2534,15 +2690,17 @@ fn check_to(home: &Path, raw: &str, urls: &[&str], now: i64) -> Result<String, S
             theirs.iter().map(|h| h.machine.as_ref().map_or_else(|| "a borg without hand-offs".to_string(), |m| format!("borg {}", m.borg))).collect();
         return Err(format!("{raw} runs {}, which takes no hand-off: they need borg {} or newer", versions.join(", "), env!("CARGO_PKG_VERSION")));
     }
-    let wanted: Vec<String> = urls.iter().map(|u| clones::url_hash(u)).collect();
-    let missing = |m: &presence::Machine| wanted.iter().filter(|w| !m.clones.iter().any(|c| c.url == **w)).count();
-    match speaking.iter().min_by_key(|(_, m)| missing(m)) {
-        Some((_, m)) if missing(m) == 0 => Ok(to),
-        _ => Err(format!(
-            "no machine of {raw} has a clone of {}: they can take it once they clone it, so offer it without --to",
-            urls.iter().map(|u| notes::redact(u)).collect::<Vec<_>>().join(", ")
-        )),
-    }
+    let holds = |m: &presence::Machine, keys: &[String]| m.clones.iter().any(|c| keys.contains(&c.url.to_string()));
+    let missing = |m: &presence::Machine| repos.iter().filter(|(_, keys)| !holds(m, keys)).count();
+    let best = speaking.iter().map(|(_, m)| m).min_by_key(|m| missing(m));
+    let unknown = best.filter(|m| missing(m) > 0).map(|m| {
+        let gaps: Vec<&str> = repos.iter().filter(|(_, keys)| !holds(m, keys)).map(|(url, _)| url.as_str()).collect();
+        format!(
+            "asking {raw} although no machine of theirs told the team it holds a clone of {}: they take it in any clone of it (one made since, or under the collective's paths, counts)",
+            gaps.join(", ")
+        )
+    });
+    Ok(Asked { to, unknown })
 }
 
 /// The hand-offs `borg top` lists under a collective's drones: the ones not taken, one line each, from
@@ -2578,10 +2736,11 @@ pub fn board(home: &Path, now: i64) -> serde_json::Value {
         .map(|h| {
             let o = &h.offer;
             let k = known.get(h.id());
-            let wanted: Vec<String> = o.repos.iter().map(|r| clones::url_hash(&r.remote)).collect();
+            let wanted: Vec<Vec<String>> = o.repos.iter().map(|r| clones::keys_of(r.urls())).collect();
+            let holds = |m: &presence::Machine| wanted.iter().all(|keys| m.clones.iter().any(|c| keys.iter().any(|k| *k == c.url)));
             let mut takers: Vec<&str> = seen
                 .iter()
-                .filter(|s| s.machine.as_ref().is_some_and(|m| m.handoff >= PROTOCOL && wanted.iter().all(|w| m.clones.iter().any(|c| c.url == *w))))
+                .filter(|s| s.machine.as_ref().is_some_and(|m| m.handoff >= PROTOCOL && holds(m)))
                 .flat_map(|s| s.engineers.iter().map(String::as_str))
                 .collect();
             takers.sort_unstable();

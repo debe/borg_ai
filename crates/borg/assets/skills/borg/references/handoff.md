@@ -65,7 +65,7 @@ and pushes nothing, when:
 | `… holds whitespace or starts with '-'` (a push URL) | The remote's URL cannot travel in an offer line: use a URL without spaces with the engineer |
 | `no machine of X was seen in the last day` (with `--to`) | Their presence has not reached this machine: they may be offline, or not syncing. Tell the engineer; offer without `--to` on their word |
 | `X runs borg …, which takes no hand-off` | Their borg is older: they need to update before they can be asked |
-| `no machine of X has a clone of …` | They can take it once they clone the repo; offer without `--to` on the engineer's word |
+| `asking X although no machine of theirs told the team it holds a clone of …` (a warning; the ask went out) | Nothing to do: their take finds their clone. Tell the engineer that X may need to clone the repo first |
 | `… is a local collective` | Hand-offs exist in team collectives only |
 
 What goes in: each repo's working tree as a commit on its HEAD (tracked and untracked files; never
@@ -79,8 +79,9 @@ changes or unpushed commits, in the same collective; never one it only read.
 
 ## Take: `borg handoff take <id>`
 
-Run it in a clone of the offer's first repo (or on a machine with one: the clones its sessions started
-in). The remote decides: the claim is a ref git refuses to create twice, so exactly one take wins. Every
+Run it anywhere in the collective. borg finds the engineer's clone itself: by its remote URL (ssh
+aliases included), else by asking candidate clones' remotes whether they hold the hand-off, after it
+recorded the clones in the collective's paths. The remote decides: the claim is a ref git refuses to create twice, so exactly one take wins. Every
 other repo it has a clone of is checked out too; each it has none of is listed with its clone URL. Read
 the whole brief it prints, then continue from its "Next step".
 
@@ -94,7 +95,7 @@ the whole brief it prints, then continue from its "Next step".
 | `the claim was sent but … could not confirm it` | Run the same take again: it finds its claim |
 | `claimed, but the checkout failed` | The take stands. Fix the reason with the engineer and run the same take again: it redoes only the checkout |
 | `the work tree would be …, which belongs to another collective` | Make the clone clean and on the offer's branch, or have the engineer add that path to the collective |
-| `is in no git repo`, `has no remote for …`, `no clone of … here` | Run it in a clone of the offer's first repo (borg never clones) |
+| `no clone of … here` (with the clones asked, if any) | borg looked in the clone it runs in, the recorded clones and the collective's paths. Clone the repo into the collective's paths, or run it in the engineer's clone of it (borg never clones) |
 | `<repo>: no clone of it here; \`git clone <url>\`, then run … again` | The rest is checked out. Tell the engineer; once they cloned it, the same take checks it out |
 | `…'s hand-off state is …, the brief names …: its owner is refreshing it` | Nothing claimed; a refresh is between its pushes: run the same take again once |
 | `… was closed (done) after this take read it: the claim is withdrawn` | Someone finished it meanwhile; nothing was taken |

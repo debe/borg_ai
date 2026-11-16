@@ -567,8 +567,11 @@ fn a_forged_outcome_lifts_no_fence() {
         listed.out
     );
     assert!(edit(), "fenced by the real claim");
-    // What the remote said is kept: with it out of reach the real claim still holds.
-    git(&app, &["remote", "set-url", "origin", &root.join("gone.git").to_string_lossy()]);
+    // What the remote said is kept: with it out of reach (from every clone of it here, the taker's too)
+    // the real claim still holds.
+    for clone in [&app, &app2] {
+        git(clone, &["remote", "set-url", "origin", &root.join("gone.git").to_string_lossy()]);
+    }
     let listed = borg(&root, &app, "s1", &["handoff"]);
     assert!(listed.out.contains("by bob@y"), "{}", listed.out);
     // The remote refuted it: this machine's log keeps it no more.
@@ -914,9 +917,14 @@ fn a_session_in_two_repos_hands_off_both_and_a_missing_clone_is_listed() {
     assert!(r.out.contains("and lib (main at") && !r.out.contains("and other"), "{}", r.out);
     let lib_state = at(&root, "lib.git", &format!("refs/borg/handoff/{id}/state"));
     assert!(!lib_state.is_empty() && at(&root, "lib.git", &format!("refs/borg/handoff/{id}/brief")).is_empty(), "the brief on the arbiter only");
-    // The taker's machine: a store of its own, which knows no clone of lib.
+    // The taker's machine: a store of its own, which knows no clone of lib, and whose collective's paths
+    // hold none (this test's machines share one disk: the offering lib is not the taker's).
     carry(&root, "b");
-    let t = borg_in(&root, "b", &app2, Some("s2"), &["handoff", "take", &id], &[]);
+    let cfg_b = root.join("collectives-b.json");
+    let paths = [root.join("work/app2"), root.join("work/lib2")];
+    std::fs::write(&cfg_b, json!({"default": "off", "collectives": [{"name": "corp", "paths": paths, "share": "team"}]}).to_string()).unwrap();
+    let on_b = [("BORG_CONFIG", cfg_b.to_str().unwrap())];
+    let t = borg_in(&root, "b", &app2, Some("s2"), &["handoff", "take", &id], &on_b);
     assert_eq!(t.code, Some(0), "{}{}", t.out, t.err);
     assert!(t.out.contains(&format!("lib: no clone of it here; `git clone {}`", root.join("lib.git").display())), "{}", t.out);
     assert_eq!(git(&app2, &["branch", "--show-current"]), format!("borg/handoff/{id}"));
@@ -927,12 +935,55 @@ fn a_session_in_two_repos_hands_off_both_and_a_missing_clone_is_listed() {
     git(&root.join("work"), &["clone", "-q", &root.join("lib.git").to_string_lossy(), "lib2"]);
     let lib2 = root.join("work/lib2");
     first_hook(&root, "b", "s2-lib", &lib2);
-    let again = borg_in(&root, "b", &app2, Some("s2"), &["handoff", "take", &id], &[]);
+    let again = borg_in(&root, "b", &app2, Some("s2"), &["handoff", "take", &id], &on_b);
     assert_eq!(again.code, Some(0), "{}{}", again.out, again.err);
     assert!(again.out.contains(&format!("lib: branch borg/handoff/{id} in {}", lib2.display())) && !again.out.contains("no clone"), "{}", again.out);
     assert_eq!(files(&lib2, &[]), files(&lib, &[]), "the taker's lib is the offering lib");
     borg(&root, &app, "s1", &["handoff"]);
     assert!(refused(&root, "s1", &lib, "Edit", json!({"file_path": lib.join("api.rs")})), "the original is fenced in both repos");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The taker's clone was never opened in a session, its remote spelled another way than the offer's,
+/// and beside it sits a retired repo copied from the same history (one root commit, as a successor repo
+/// and the one it replaced share): the take finds the clone in the collective's paths and proves it by
+/// its remote holding the hand-off, and never touches the retired one. An offer without root commits (as
+/// borg 0.8.0 wrote them) leaves only the clone the take runs in to ask.
+#[test]
+fn a_take_finds_an_unopened_clone_by_its_remote_and_never_the_retired_one() {
+    let root = setup("unopened");
+    let app = root.join("work/app");
+    work_in_progress(&app);
+    let id = id_in(&offer(&root, &app, "s1", "note").out);
+    let line = std::fs::read_to_string(store_of(&root, "store").join("handoffs.jsonl")).unwrap();
+    assert!(line.contains("\"roots\":["), "the offer names its history: {line}");
+    // The taker's machine: its own paths, a retired repo of the same history, and the current one cloned
+    // through another spelling of its URL (a link to the same remote), neither opened in a session.
+    git(&root, &["clone", "-q", "--bare", &root.join("remote.git").to_string_lossy(), "retired.git"]);
+    std::os::unix::fs::symlink(&root, root.join("link")).unwrap();
+    let takers = root.join("takers");
+    std::fs::create_dir_all(&takers).unwrap();
+    git(&takers, &["clone", "-q", &root.join("retired.git").to_string_lossy(), "old-app"]);
+    git(&takers, &["clone", "-q", &root.join("link/remote.git").to_string_lossy(), "new-app"]);
+    let (retired, current) = (takers.join("old-app"), takers.join("new-app"));
+    let cfg_b = root.join("collectives-b.json");
+    std::fs::write(&cfg_b, json!({"default": "off", "collectives": [{"name": "corp", "paths": [&takers], "share": "team"}]}).to_string()).unwrap();
+    let on_b = [("BORG_CONFIG", cfg_b.to_str().unwrap())];
+    // An offer of 0.8.0 names no root commits: from outside any clone, nobody is asked.
+    let mut old: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    old["repos"][0].as_object_mut().unwrap().remove("roots");
+    std::fs::create_dir_all(store_of(&root, "c")).unwrap();
+    std::fs::write(store_of(&root, "c").join("handoffs.jsonl"), format!("{old}\n")).unwrap();
+    let t = borg_in(&root, "c", &takers, Some("s3"), &["handoff", "take", &id], &on_b);
+    assert!(t.code != Some(0) && t.err.contains("no clone of app") && !t.err.contains("asked"), "{}{}", t.out, t.err);
+    // With them, the clones of its history are asked, and the one whose remote holds it takes it.
+    carry(&root, "b");
+    let t = borg_in(&root, "b", &takers, Some("s2"), &["handoff", "take", &id], &on_b);
+    assert_eq!(t.code, Some(0), "{}{}", t.out, t.err);
+    assert_eq!(git(&current, &["branch", "--show-current"]), format!("borg/handoff/{id}"), "{}", t.out);
+    assert_eq!(std::fs::read_to_string(current.join("lib.rs")).unwrap(), std::fs::read_to_string(app.join("lib.rs")).unwrap());
+    assert_eq!(git(&retired, &["branch", "--list", &format!("borg/handoff/{id}")]), "", "the retired repo is untouched");
+    assert_eq!(git(&root.join("retired.git"), &["for-each-ref", "refs/borg"]), "", "and its remote too");
     let _ = std::fs::remove_dir_all(&root);
 }
 

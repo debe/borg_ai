@@ -57,7 +57,7 @@ pub(super) fn run(ctx: &Ctx, h: &log::HandOff) {
         Err(Halt::Failed(why)) => {
             if let Some(held) = why.strip_prefix(TAKEN) {
                 println!("borg handoff: {id} was taken while it was refreshed: the remote holds the state the claim names again");
-                if let Some((root, url)) = super::arbiter_clone(ctx, h) {
+                if let Some(super::Reach { root, url, .. }) = super::arbiter_clone(ctx, h) {
                     super::learned(ctx, h, &root, &url, log::Heard { taken: Some(held), ..log::Heard::default() });
                     super::fence::refresh(&ctx.home);
                 }

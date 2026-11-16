@@ -1025,7 +1025,11 @@ impl Node {
         };
         self.store_lines(&path, got, &want, &mine, None, &mut report)?;
 
-        // Live: presence, ephemeral (live.rs).
+        // Live: presence, ephemeral (live.rs). The clones in the collective's paths are recorded in the
+        // background (git and ssh run: off the async workers, and the peer never waits for it), so the
+        // machine record names those no session opened from the next session on.
+        let (at, config) = (home.to_path_buf(), self.place.config.clone());
+        drop(tokio::task::spawn_blocking(move || borg::handoff::discover(&at, &config)));
         let now = borg::learn::now_ms();
         let live = Msg::Live { presence: live::outgoing(home, &self.me, now), directives: Directives };
         self.gate()?; // again just before anything leaves

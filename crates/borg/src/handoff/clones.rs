@@ -1,15 +1,23 @@
-//! Which repos this machine holds clones of, for the check before an ask (`--to`, mod.rs): a session
-//! offered to an engineer is pushed only when one of their machines can take every repo of it.
+//! Which repos this machine holds clones of: for the check before an ask (`--to`, mod.rs), the notice
+//! in a clone, and a take finding its clone (mod.rs `reach`).
 //!
 //! `<store>/handoff/clones.json` maps each clone's git directory (its common one: a linked work tree
-//! is its clone) to its name and the hashes of its remotes' URLs (`url_hash`: blake3 of git.rs
-//! `normal_url`, so two clones of one repo match whatever URL form each uses and no URL leaves the
-//! machine), each URL as git resolves it (`insteadOf` and `pushInsteadOf` rules, the global config):
-//! the form the offering side's `git remote get-url` gives too. A session's first hook in a clone
-//! records it (`note`): one `git remote -v` when the clone's config or the global one changed since,
-//! else the `stat`s of those files alone (an included file's change is read at their next change). What
-//! leaves the machine is `machine` (presence.rs `Machine`): the hashes and names of the clones that
-//! still exist, never a path.
+//! is its clone) to its name and the keys of its remotes: `url_hash` (blake3 of git.rs `normal_url`) of
+//! each URL as git resolves it (`insteadOf` and `pushInsteadOf` rules, the global config), the form the
+//! offering side's `git remote get-url` gives too; and, beside them, of each URL with its ssh host alias
+//! resolved (git.rs `resolved_url`), which an offer names as well. Both sides derive both keys, so a
+//! match needs one shared key: an alias on either side, or a `Hostname` rewrite of a real host on one,
+//! still finds the repo, and every key one machine derives another can derive from the same URL. No URL
+//! leaves the machine.
+//!
+//! Two ways in. A session's first hook in a clone records it (`note`): one `git remote -v` when the
+//! clone's config or the global one changed since, else the `stat`s of those files alone (an included
+//! file's change is read at their next change); never ssh, which a hook does not wait for. And
+//! `discover` records every clone in the paths the collective's config gives it, to
+//! `collective::REPO_DEPTH` deep, whether a harness ever ran there or not, with the resolved keys (read
+//! again once the ssh configs change): the mesh daemon runs it in the background, and a take that finds
+//! no clone runs it once. What leaves the machine is `machine` (presence.rs `Machine`): the keys and
+//! names of the clones that still exist, never a path.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +33,19 @@ struct Clone {
     /// The marks of the configs when they were read (`marks`): read again once one changes.
     #[serde(default)]
     mark: String,
+    /// `url_hash` of every remote URL with its ssh host alias resolved, where that differs (`discover`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resolved: Vec<String>,
+    /// The ssh configs' marks (git.rs `ssh_mark`) when `resolved` was made; empty: never made.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    ssh: String,
+}
+
+impl Clone {
+    /// Every key of the clone: its URLs' as git resolves them, and with ssh aliases resolved.
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.urls.iter().chain(&self.resolved)
+    }
 }
 
 fn path(home: &Path) -> PathBuf {
@@ -38,6 +59,14 @@ fn read(home: &Path) -> BTreeMap<String, Clone> {
 /// A remote URL as a clone list names it: 32 hex of blake3 over git.rs `normal_url`.
 pub(crate) fn url_hash(url: &str) -> String {
     blake3::hash(super::git::normal_url(url).as_bytes()).to_hex()[..32].to_string()
+}
+
+/// The keys of a repo an offer names by `urls` (its URL, and the one its ssh alias stands for).
+pub(crate) fn keys_of<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<String> = urls.into_iter().map(url_hash).collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// The work tree `cwd` is in, its git directory and its common one (where the config is), found by
@@ -89,18 +118,15 @@ fn config_urls(text: &str) -> Vec<String> {
 
 /// `url_hash` of each of `urls`, sorted, once each.
 fn hashed(urls: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = urls.iter().map(|u| url_hash(u)).collect();
-    v.sort();
-    v.dedup();
-    v
+    keys_of(urls.iter().map(String::as_str))
 }
 
-/// The URL hashes of the clone `cwd` is in: as `note` recorded them (git's resolved URLs), else, for a
-/// clone not recorded yet, its config's URLs as written.
+/// The keys of the clone `cwd` is in: as recorded (git's resolved URLs, with ssh aliases resolved once
+/// `discover` saw it), else, for a clone not recorded yet, its config's URLs as written. No process runs.
 pub(crate) fn urls_at(home: &Path, cwd: &Path) -> Vec<String> {
     let Some((_, common)) = git_dirs(cwd) else { return Vec::new() };
     if let Some(c) = read(home).remove(common.to_string_lossy().as_ref()) {
-        return c.urls;
+        return c.keys().cloned().collect();
     }
     hashed(&config_urls(&std::fs::read_to_string(common.join("config")).unwrap_or_default()))
 }
@@ -135,47 +161,156 @@ pub(crate) fn note(home: &Path, cwd: &str) {
     if read(home).get(&key).is_some_and(|c| c.mark == mark) {
         return;
     }
-    let urls = hashed(&super::git::remote_urls(&root));
-    if urls.is_empty() {
+    let entry = entry(&root, &common, mark, false);
+    if entry.urls.is_empty() {
         return;
     }
+    write(home, |all| {
+        all.insert(key, entry);
+        true
+    });
+}
+
+/// The record of the clone with work tree `root` and common git directory `common`, its configs read
+/// at `mark`: one `git remote -v`, and with `resolve` each remote's ssh alias resolved (`ssh -G`, once
+/// per host while the ssh configs stay). A clone without a remote has no keys.
+fn entry(root: &Path, common: &Path, mark: String, resolve: bool) -> Clone {
+    let raw = super::git::remote_urls(root);
+    let urls = hashed(&raw);
+    let (resolved, ssh) = if resolve {
+        let ssh = super::git::ssh_mark();
+        let other: Vec<String> = raw.iter().map(|u| super::git::resolved_url(u)).filter(|r| !raw.contains(r)).collect();
+        (hashed(&other).into_iter().filter(|k| !urls.contains(k)).collect(), ssh)
+    } else {
+        (Vec::new(), String::new())
+    };
     // A linked work tree's name is its clone's: the directory holding the common git directory.
-    let main = if common.file_name().is_some_and(|n| n == ".git") { common.parent().unwrap_or(&root) } else { root.as_path() };
+    let main = if common.file_name().is_some_and(|n| n == ".git") { common.parent().unwrap_or(root) } else { root };
     let name = main.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Clone { name, urls, mark, resolved, ssh }
+}
+
+/// Changes the file under its lock with `change`, which says whether it changed anything; written
+/// only then. Returns what `change` said.
+fn write(home: &Path, change: impl FnOnce(&mut BTreeMap<String, Clone>) -> bool) -> bool {
     let p = path(home);
     let _ = std::fs::create_dir_all(super::wal::dir(home));
     crate::live::locked(&p, || {
         let mut all = read(home);
-        all.insert(key, Clone { name, urls, mark });
-        crate::facts::write_atomic(&p, serde_json::to_string(&all).unwrap_or_default().as_bytes());
-    });
+        let changed = change(&mut all);
+        if changed {
+            crate::facts::write_atomic(&p, serde_json::to_string(&all).unwrap_or_default().as_bytes());
+        }
+        changed
+    })
 }
 
-/// The work trees of the clones recorded here that still exist (a bare one has none).
-pub(crate) fn roots(home: &Path) -> Vec<PathBuf> {
+/// Records every clone in the paths `cfg` gives the collectives whose store is `home`, whether a
+/// session ever ran in it or not, and forgets the recorded ones that are gone. Returns whether it
+/// recorded a clone it did not know before. A path's clones: the path itself when it is one, else the
+/// directories in it that are one, to `collective::REPO_DEPTH` levels (hidden ones skipped, as
+/// `collective::places_of` does); each kept only when its route is `home` (a nested path of another
+/// collective, or an `off` one, is not this collective's). A clone recorded as its configs are costs
+/// their `stat`s alone; nothing is written while nothing changed.
+pub(crate) fn discover(home: &Path, cfg: &crate::collective::Config) -> bool {
+    use crate::collective::{self, Route};
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if dir.join(".git").exists() {
+            out.push(dir.to_path_buf());
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        for d in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if !d.file_name().to_string_lossy().starts_with('.') && d.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(&d.path(), depth - 1, out);
+            }
+        }
+    }
+    let base = collective::root_of(home);
+    let mut found = Vec::new();
+    for c in cfg.collectives.iter().filter(|c| collective::store(&base, &c.name) == home) {
+        for p in &c.paths {
+            walk(&collective::expand(p), collective::REPO_DEPTH, &mut found);
+        }
+    }
+    let ours = |d: &Path| matches!(collective::route(Some(cfg), &d.to_string_lossy(), &base), Route::Collective { home: h, .. } if h == home);
+    let mut seen: Vec<(PathBuf, PathBuf, String)> = found
+        .iter()
+        .filter(|d| ours(d))
+        .filter_map(|d| {
+            let (root, common) = git_dirs(d)?;
+            let mark = marks(&common)?;
+            Some((root, common, mark))
+        })
+        .collect();
+    seen.sort_by(|a, b| a.1.cmp(&b.1));
+    seen.dedup_by(|a, b| a.1 == b.1);
+    let held = read(home);
+    let ssh = super::git::ssh_mark();
+    let stale: Vec<&(PathBuf, PathBuf, String)> =
+        seen.iter().filter(|(_, common, mark)| held.get(common.to_string_lossy().as_ref()).is_none_or(|c| c.mark != *mark || c.ssh != ssh)).collect();
+    let gone = held.keys().any(|d| !Path::new(d).is_dir());
+    if stale.is_empty() && !gone {
+        return false;
+    }
+    // `git remote -v` and `ssh -G` run outside the lock; what they read is written only while the clone's
+    // configs are still as they were then (a hook's `note` meanwhile read them as they are now). A clone
+    // without a remote is recorded too, without keys: asked again only once its config changes.
+    let fresh: Vec<(PathBuf, Clone)> = stale.into_iter().map(|(root, common, mark)| (common.clone(), entry(root, common, mark.clone(), true))).collect();
+    let mut new = false;
+    write(home, |all| {
+        let before = all.len();
+        all.retain(|d, _| Path::new(d).is_dir());
+        let mut changed = all.len() != before;
+        for (common, c) in fresh {
+            if marks(&common).as_deref() != Some(c.mark.as_str()) {
+                continue;
+            }
+            let key = common.to_string_lossy().into_owned();
+            new |= !c.urls.is_empty() && !all.contains_key(&key);
+            all.insert(key, c);
+            changed = true;
+        }
+        changed
+    });
+    new
+}
+
+/// The work trees of the clones recorded here with a remote that still exist (a bare one has none).
+pub(crate) fn recorded(home: &Path) -> Vec<PathBuf> {
     read(home)
-        .into_keys()
-        .map(PathBuf::from)
+        .into_iter()
+        .filter(|(_, c)| !c.urls.is_empty())
+        .map(|(d, _)| PathBuf::from(d))
         .filter(|d| d.is_dir())
         .filter_map(|d| (d.file_name()? == ".git").then(|| d.parent().map(Path::to_path_buf)).flatten())
         .collect()
 }
 
-/// A clone recorded here of the repo `url` names (its URL hash among its remotes'), by its work tree.
-pub(crate) fn clone_of(home: &Path, url: &str) -> Option<PathBuf> {
-    let want = url_hash(url);
-    let all = read(home);
-    let dirs = all.iter().filter(|(_, c)| c.urls.contains(&want)).map(|(d, _)| PathBuf::from(d));
-    dirs.filter(|d| d.is_dir()).find_map(|d| (d.file_name()? == ".git").then(|| d.parent().map(Path::to_path_buf)).flatten())
+/// The clones recorded here of the repo with the keys `keys` (`keys_of`): one shared key, by work tree.
+pub(crate) fn clones_of(home: &Path, keys: &[String]) -> Vec<PathBuf> {
+    read(home)
+        .into_iter()
+        .filter(|(_, c)| c.keys().any(|k| keys.contains(k)))
+        .map(|(d, _)| PathBuf::from(d))
+        .filter(|d| d.is_dir())
+        .filter_map(|d| (d.file_name()? == ".git").then(|| d.parent().map(Path::to_path_buf)).flatten())
+        .collect()
 }
 
 /// This machine as its presence tells the team (presence.rs `Machine`): its borg, the hand-off protocol
-/// it speaks, and the clones recorded that still exist, by URL hash and name.
+/// it speaks, and the clones recorded that still exist, by key (both kinds: an older borg reads them as
+/// URL hashes) and name.
 pub(crate) fn machine(home: &Path) -> crate::presence::Machine<'static> {
     let mut clones: Vec<crate::presence::Cloned> = read(home)
         .into_iter()
         .filter(|(dir, _)| Path::new(dir).is_dir())
-        .flat_map(|(_, c)| c.urls.into_iter().map(move |url| crate::presence::Cloned { url: url.into(), name: c.name.clone().into() }))
+        .flat_map(|(_, c)| {
+            let name = c.name;
+            c.urls.into_iter().chain(c.resolved).map(move |url| crate::presence::Cloned { url: url.into(), name: name.clone().into() })
+        })
         .collect();
     clones.sort_by(|a, b| (&a.url, &a.name).cmp(&(&b.url, &b.name)));
     clones.dedup_by(|a, b| a.url == b.url);
@@ -185,6 +320,70 @@ pub(crate) fn machine(home: &Path) -> crate::presence::Machine<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keys match across machines whatever ssh config each has: the offer names its URL and the one its
+    /// alias stands for, a clone keeps its URLs and their resolved forms, one shared key is a match. A
+    /// `Hostname` rewrite of a real host on one side (port 443) leaves the plain key on both.
+    #[test]
+    fn keys_match_across_machines_whatever_ssh_config_each_has() {
+        let shared = |a: &[String], b: &[String]| a.iter().any(|k| b.contains(k));
+        let offer_alias = keys_of(["gh-work:team/app.git", "git@github.com:team/app.git"]);
+        let offer_443 = keys_of(["git@github.com:team/app.git", "ssh://git@ssh.github.com:443/team/app.git"]);
+        let taker_plain = keys_of(["https://github.com/team/app"]);
+        let taker_alias = keys_of(["github.com-me:team/app", "git@github.com:team/app"]);
+        let retired = keys_of(["git@github.com:team/old-app.git"]);
+        for offer in [&offer_alias, &offer_443] {
+            assert!(shared(offer, &taker_plain) && shared(offer, &taker_alias), "{offer:?}");
+            assert!(!shared(offer, &retired), "another repo of the same history is no match");
+        }
+    }
+
+    /// Discovery records the clones in this collective's paths that no session ever opened: one in the
+    /// path, one a group deeper, a work tree as its clone; not one deeper still, hidden, without a remote,
+    /// in another collective's nested path or an `off` one. A clone that is gone is forgotten.
+    #[test]
+    fn discovery_records_unopened_clones_of_this_collective_only() {
+        let d = std::env::temp_dir().join(format!("borg-handoff-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let git = |dir: &Path, a: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir).args(a).output().unwrap().status.success());
+        let w = d.join("work");
+        let clone = |rel: &str, remote: Option<&str>| {
+            let p = w.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            git(&p, &["init", "-q", "-b", "main"]);
+            if let Some(r) = remote {
+                git(&p, &["remote", "add", "origin", r]);
+            }
+            p
+        };
+        let app = clone("app", Some("git@example.com:acme/app.git"));
+        clone("group/lib", Some("git@example.com:acme/lib.git"));
+        clone("a/b/deep", Some("git@example.com:acme/deep.git"));
+        clone(".hidden/x", Some("git@example.com:acme/hidden.git"));
+        clone("loose", None);
+        clone("oss/tool", Some("git@example.com:oss/tool.git"));
+        clone("secret/key", Some("git@example.com:acme/key.git"));
+        git(&app, &["-c", "user.email=a@x", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&app, &["worktree", "add", "-q", "-b", "wt", &w.join("app-wt").to_string_lossy()]);
+        let cfg: crate::collective::Config = serde_json::from_value(serde_json::json!({
+            "default": "off",
+            "off": [w.join("secret")],
+            "collectives": [{"name": "corp", "paths": [w], "share": "team"}, {"name": "oss", "paths": [w.join("oss")], "share": "team"}]
+        }))
+        .unwrap();
+        let home = crate::collective::store(&d.join("base"), "corp");
+        assert!(discover(&home, &cfg), "new clones");
+        let keyed: Vec<String> = read(&home).into_values().filter(|c| !c.urls.is_empty()).map(|c| c.name).collect();
+        assert_eq!(keyed, ["app", "lib"], "{:?}", read(&home));
+        assert!(read(&home).values().any(|c| c.name == "loose" && c.urls.is_empty()), "a clone without a remote is kept, keyless, so it is not asked again");
+        assert!(machine(&home).clones.iter().all(|c| c.name != "loose"), "and is never told");
+        assert_eq!(clones_of(&home, &keys_of(["ssh://git@example.com/acme/lib"])), [w.join("group/lib")]);
+        assert!(!discover(&home, &cfg), "nothing new: nothing written");
+        std::fs::remove_dir_all(w.join("group")).unwrap();
+        assert!(!discover(&home, &cfg), "a gone clone is no new one");
+        assert_eq!(read(&home).into_values().filter(|c| !c.urls.is_empty()).map(|c| c.name).collect::<Vec<_>>(), ["app"], "and is forgotten");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn a_config_gives_every_remote_url_and_nothing_else() {

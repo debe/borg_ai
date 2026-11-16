@@ -61,6 +61,14 @@ pub(crate) struct Plan<'a> {
     pub branch: Cow<'a, str>,
     #[serde(borrow)]
     pub head: Cow<'a, str>,
+    /// `url` with its ssh host alias resolved (git.rs `resolved_url`), read once at the offer so every
+    /// run builds the same offer line; empty when it is `url` itself, and in a log of 0.8.0.
+    #[serde(borrow, default, skip_serializing_if = "str::is_empty")]
+    pub resolved: Cow<'a, str>,
+    /// The root commits of `head` (git.rs `roots`): which clones a taker asks first. Absent in a log of
+    /// 0.8.0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<Cow<'a, str>>,
 }
 
 /// The acting session as an operation records it.

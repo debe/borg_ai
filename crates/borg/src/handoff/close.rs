@@ -160,10 +160,9 @@ pub(super) fn abort_switched(ctx: &Ctx, h: &log::HandOff) {
 fn abort_steps(ctx: &Ctx, h: &log::HandOff, why: &str) -> Result<String, Halt> {
     let id = h.id();
     let arb = &h.offer.repos[0];
-    let Some((root, url)) = super::arbiter_clone(ctx, h) else {
-        return super::fail(format!("no clone of {} ({}) here: run it in a clone of it, the repo whose remote decides", arb.name, arb.remote));
-    };
-    let remote = git::arbiter(&root, &arb.remote).map_or_else(|| arb.remote.to_string(), |(n, _)| n);
+    let offering = super::offered_from(&ctx.home, h).map(PathBuf::from).filter(|r| r.is_dir());
+    let super::Reach { root, remote, url } =
+        super::reach(ctx, id, arb, offering.as_deref(), super::Holds::Arbiter, super::Look::Proven).map_err(Halt::Failed)?;
     let op = Op::begin(&ctx.home, id).map_err(Halt::Io)?;
     let held = git::ls_remote_all(&root, &url, id).map_err(|e| Halt::Failed(format!("cannot reach {remote} ({e}): nothing aborted")))?;
     let leaf = |l: &str| held.iter().find(|(k, _)| k == l).map(|(_, v)| v.clone());
@@ -344,8 +343,9 @@ fn clear(ctx: &Ctx, h: &log::HandOff, op: &Op, leaves: &[&str]) -> Result<Vec<St
     let roots = super::offered_roots(&ctx.home, h);
     let mut left = Vec::new();
     for (i, r) in h.offer.repos.iter().enumerate() {
-        let here = roots.get(i).map(PathBuf::from).filter(|p| git::arbiter(p, &r.remote).is_some()).or_else(|| super::clone_for(ctx, &r.remote));
-        let Some((root, (remote, url))) = here.and_then(|p| git::arbiter(&p, &r.remote).map(|a| (p, a))) else {
+        let first = roots.get(i).map(PathBuf::from).filter(|p| p.is_dir());
+        let holds = if i == 0 { super::Holds::Arbiter } else { super::Holds::State(&[r.state.as_ref()]) };
+        let Ok(super::Reach { root, remote, url }) = super::reach(ctx, id, r, first.as_deref(), holds, super::Look::Proven) else {
             left.push(notes::redact(&r.remote));
             continue;
         };
@@ -605,7 +605,7 @@ pub fn doctor(home: &Path) -> Vec<String> {
     let text = log::read(home);
     let all = log::fold(&text);
     let known = log::known(home);
-    for clone in super::clones::roots(home) {
+    for clone in super::clones::recorded(home) {
         for id in git::local_ids(&clone) {
             let state = match all.iter().find(|h| h.id() == id) {
                 Some(h) if h.closed(known.get(&id)) => "done",

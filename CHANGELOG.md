@@ -3,6 +3,19 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.8.1 (unreleased)
+
+A hand-off finds the taker's clone even when no session opened it since 0.8 or its remote is spelled
+another way.
+
+### Fixed
+
+- The mesh records every clone in the collective's paths, not only those a session started in, so
+  `--to` and borg web see them ([Take](docs/handoff.md#take)).
+- An offer names its push URL and the one its ssh host alias stands for; a take with no URL match asks
+  candidate clones' remotes whether they hold the hand-off. A repo sharing root commits is never taken.
+- `--to` warns instead of refusing when no clone of the repo is known on the receiver's machine.
+
 ## 0.8.0 (2026-11-14)
 
 A session can hand its work over to another drone, like a transferred call: the repo's git remote

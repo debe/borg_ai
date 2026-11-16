@@ -133,9 +133,33 @@ The original is then told which of its changes came after the state taken
 
 ## Take
 
-`borg handoff take <id>` runs in a session, in a clone of the first repo (a remote whose push URL, or
-else fetch URL, names the arbiter) or with one recorded on the machine (the clones its sessions started
-in).
+`borg handoff take <id>` runs in a session, anywhere in the collective. It finds the clone of each repo
+on its own:
+
+- **By URL.** The clone it runs in, then the clones recorded on the machine, when a remote's push URL (or
+  else fetch URL) names the repo. URLs compare normalized (no user, scheme, port or `.git`). An ssh host
+  alias counts as written and as the host it stands for (`ssh -G`, read on the offering machine when it
+  offers and on the taking one when it takes or records its clones), so `gh-work:team/app` and
+  `git@github.com:team/app.git` are one repo. The offer line names the push URL as the offering machine's
+  git gives it and, beside it, the URL its alias stands for; one match is enough. An offer of borg 0.8.0
+  names only the first.
+- **By the hand-off itself.** When no URL fits (a mirror, a different spelling the machine cannot
+  resolve), borg asks the remotes of candidate clones with `ls-remote`. A remote is that repo's when it
+  holds the hand-off: the first repo's `brief` (or `taken`, `abort`), another repo's `state` at the state
+  the offer or its brief names. The candidates are the clone it runs in and the recorded clones that hold
+  one of the repo's root commits, which the offer names. A root commit only picks whom to ask. A successor
+  repo copied from a retired one shares its root commits, but only the remote the offer was pushed to
+  holds its refs. An offer of borg 0.8.0 names no root commits: there only the clone the take runs in is
+  asked.
+- **Recorded first.** A machine records its clones in two ways. A session's first hook records the clone
+  it starts in. Every clone in the paths the collective's config gives it (`paths`, two directory levels
+  deep, as for experts) is recorded too, whether a harness ever opened it or not: the mesh daemon does
+  this before it tells the team its clones, and a take that finds no clone does it once and looks again.
+  A clone in another collective's nested path, or an `off` one, is not this collective's.
+
+A listing, a stop and a refresh ask the remote only through a clone found by URL: they never walk the
+disk or ask a remote that may not be the repo. The proof trusts any remote that holds the hand-off's
+refs, so a writable mirror that copies them both ways would count as the arbiter too.
 
 1. **Claim.** borg fetches the first repo's state and brief and checks that the brief is this
    hand-off's, sits on that state and names it (an offer refreshed since the listing is taken as it is
@@ -244,14 +268,21 @@ a node key, or a prefix of it only one node has.
 **Check, before anything is pushed.** borg reads the team's signed presence, which each machine sends
 with its drones over the mesh: the borg it runs, the hand-off protocol it speaks, and the repos it holds
 clones of, each as a hash of its normalized remote URL and the clone's name (no path, no URL). The ask
-goes ahead when one of their machines was seen in the last day (presence is kept a day), speaks
-hand-off, and has a clone of the repo. Otherwise borg names the gap and offers nothing: nobody of that
-name seen, a borg without hand-offs (with its version), or no clone of the repo. A machine records its
-clones as its sessions start in them: each session's first hook keeps the hashes of the clone's remote
-URLs in `<store>/handoff/clones.json`, as git resolves them (`insteadOf` rules and the global config
-applied, so a shorthand or a mirror rewrite names the same repo as the offering side's URL). It runs
-`git remote -v` only when the clone's config or the global one changed since; a clone that is gone is
-not told.
+goes ahead when one of their machines was seen in the last day (presence is kept a day) and speaks
+hand-off. Otherwise borg names the gap and offers nothing: nobody of that name seen, or a borg without
+hand-offs (with its version). When none of their machines lists a clone of the repo, the ask still goes
+out, with a warning. The list can lag behind the disk (a clone made since, a borg before 0.8.1 that knew
+only the clones its sessions opened, a remote spelled another way), and the take finds the clone itself
+([Take](#take)).
+
+A machine keeps its clones in `<store>/handoff/clones.json`: the hashes of each clone's remote URLs as git
+resolves them (`insteadOf` rules and the global config applied), so a shorthand or a mirror rewrite names
+the same repo as the offering side's URL; and, recorded by the mesh daemon or a take, the hashes of those
+URLs with their ssh host alias resolved. Its presence names both, so an offer matches a clone when one hash is
+shared. Clones are recorded at a session's first hook (without ssh: a hook waits for no `ssh -G`), and
+from the collective's paths by the mesh daemon, in the background ([Take](#take)). `git remote -v` runs
+only when a clone's config or the global one changed since, and `ssh -G` only when the ssh config did; a
+clone that is gone is forgotten and not told.
 
 **Ask.** The offer line names whom it asks, and the listing shows it as `asked` with its age. An
 engineer asked also gets a message (`engineer:<email>`, in `borg inbox` and on the web page), and their
