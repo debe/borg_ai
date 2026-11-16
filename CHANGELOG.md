@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.8.1 (unreleased)
+## 0.8.1 (2026-11-16)
 
 A hand-off finds the taker's clone even when no session opened it since 0.8 or its remote is spelled
 another way.
