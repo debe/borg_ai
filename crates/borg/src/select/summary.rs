@@ -88,8 +88,9 @@ use crate::outcome::{self, Outcome};
 /// `Check::xk`, `xs`, `Session::tested`; 8: a stop's results on a live check's hand-overs it asked
 /// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`;
 /// 9: the judge's `not_arisen` and `consequence_remains` verdicts, `Label::NotArisen`, `Label::Remains`,
-/// `Apply::jv`, the session-end judge's own judge level; 10: `Delivered::Superseded`, out of `counted`).
-pub const SV: u32 = 10;
+/// `Apply::jv`, the session-end judge's own judge level; 10: `Delivered::Superseded`, out of `counted`;
+/// 11: `Pool::stop_last`).
+pub const SV: u32 = 11;
 /// The cache beside the lessons file. Protocol.
 pub const CACHE: &str = "select-summary.json";
 /// The monitor's auto-revert mark beside the lessons file: while it exists the store keeps the fixed
@@ -335,8 +336,8 @@ pub struct Fresh {
 /// shown and applied; tokens and lessons shown in all; the model calls' (tokens, ms), the pool's tokens
 /// (`tokens`, what select/policy.rs `pool_feasible` predicts a budget at; the draws past it, outcome.rs
 /// `xtokens`, stay out, so the fit and its prediction read one size); and per
-/// harness, its stops' model calls (ms, failed), what borg top shows against the harness's stop
-/// budget (top.rs `Latency`).
+/// harness, its stops' model calls (ms, failed) and the newest one's time, what borg top shows against
+/// the harness's stop budget (top.rs `Latency`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pool {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -350,6 +351,10 @@ pub struct Pool {
     /// Keyed by a harness borg knows (harness/mod.rs `ALL`), the newest `LATENCY_KEEP` of each.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stops: BTreeMap<String, Vec<(u32, bool)>>,
+    /// Per harness in `stops`, its newest stop call's time (epoch ms): since 0.7.7 a check blocks only
+    /// under `BORG_ASYNC=off`, so a reader must see how old the latency is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stop_last: BTreeMap<String, i64>,
     /// The tail samples' lessons, shown past the pool, and those applied (`tail_of`), as borg top shows
     /// them; also in `bins`.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -859,6 +864,8 @@ impl Summary {
                 calls.remove(0);
             }
             calls.push((u32::try_from(o.dur_ms).unwrap_or(u32::MAX), o.failed));
+            let last = self.pool.stop_last.entry(o.harness.clone()).or_default();
+            *last = (*last).max(o.ms);
         }
         let learned = o.policy == "learned";
         self.era |= learned;

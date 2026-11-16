@@ -211,6 +211,22 @@ fn drone_at<'a>(drones: &'a [Drone], here: &str, node: &str, session: &str) -> O
     drones.iter().find(|d| d.p.session == session && if d.node.is_empty() { node == here } else { d.node == node })
 }
 
+/// The drone that sent `m` (its node and `by`), as `sender` names it; None for the engineer or a
+/// session borg top does not list (`here`: this node).
+pub fn sender_drone<'a>(drones: &'a [Drone], here: &str, m: &Message) -> Option<&'a Drone> {
+    drone_at(drones, here, &m.node, &m.by)
+}
+
+/// The drone `to` names, as `recipient` finds it; None for a broadcast, the engineer or a session
+/// borg top does not list (`here`: this node).
+pub fn recipient_drone<'a>(drones: &'a [Drone], here: &str, to: &str) -> Option<&'a Drone> {
+    match Address::parse(to) {
+        Some(Address::Session { id, node: Some(n) }) => drone_at(drones, here, n, id),
+        Some(Address::Session { id, node: None }) => drones.iter().find(|d| d.p.session == id),
+        _ => None,
+    }
+}
+
 /// Who sent `m`, as the screen says it: the drone its (node, `by`) pair is, else its label (msg.rs
 /// `sender_label`: the name it was sent under, else the start of `by`); the engineer by email. Every
 /// part but the node is the sender's claim, so a line from another node than `here` carries that node's
@@ -219,7 +235,7 @@ pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
     let name = match Address::parse(&m.by) {
         Some(Address::Engineer { email: "" }) => msg::ENGINEER.into(),
         Some(Address::Engineer { email }) => collective::aliases().display(email),
-        _ => match drone_at(drones, here, &m.node, &m.by) {
+        _ => match sender_drone(drones, here, m) {
             Some(d) => d.designation.clone(),
             None => msg::sender_label(m),
         },
@@ -237,13 +253,7 @@ pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
         Some(Address::Local { node }) if node == here => msg::LOCAL.into(),
         Some(Address::Local { node }) => format!("{} @{}", msg::LOCAL, msg::short_node(node)),
         Some(Address::All) => msg::COLLECTIVE.into(),
-        Some(Address::Session { id, node }) => {
-            let d = match node {
-                Some(n) => drone_at(drones, here, n, id),
-                None => drones.iter().find(|d| d.p.session == id),
-            };
-            d.map_or_else(|| msg::short_session(id), |d| d.designation.clone())
-        }
+        Some(Address::Session { id, .. }) => recipient_drone(drones, here, to).map_or_else(|| msg::short_session(id), |d| d.designation.clone()),
         Some(a) => a.to_string(),
         None => msg::short_session(to),
     }
@@ -689,6 +699,9 @@ pub struct Latency {
     /// Calls that failed: they answered nothing (ran out of the time the budget left them, or the CLI
     /// erred), so their checks asked nothing.
     pub over: u64,
+    /// The newest call's time (epoch ms; 0: none logged one): a blocking check is rare since 0.7.7
+    /// (`BORG_ASYNC=off`), so the reading may be old.
+    pub last_ms: i64,
 }
 
 /// Display: the latency quantiles shown, the median and the 95th percentile (the tail a stop budget
@@ -827,6 +840,7 @@ impl Selection {
                     p95_ms: quantile(&ms, QUANTILES[1]),
                     budget_ms: budget.map(|b| u64::try_from(b.as_millis()).unwrap_or(u64::MAX)),
                     over: calls.iter().filter(|(_, failed)| *failed).count() as u64,
+                    last_ms: s.pool.stop_last.get(harness).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -1040,7 +1054,8 @@ pub fn selection_line(s: &Selection) -> String {
             .map(|l| {
                 let budget = l.budget_ms.map_or_else(String::new, |b| format!(" of {}", secs(b)));
                 let failed = if l.over > 0 { format!(", {} failed", l.over) } else { String::new() };
-                format!("{} {}{budget}{failed}", l.harness, secs(l.p95_ms))
+                let last = if l.last_ms > 0 { format!(", last {}", crate::stats::day(l.last_ms)) } else { String::new() };
+                format!("{} {}{budget}{failed}{last}", l.harness, secs(l.p95_ms))
             })
             .collect();
         parts.push(format!("stop p95 {}", each.join("; ")));
@@ -1557,11 +1572,14 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let line = selection_line(&early);
         assert!(line.contains(" · monitor +0.000 over 3 sessions, no bound yet, ESS 12 of 40 weighed, largest weight 3.0× the mean · "), "{line}");
         early.latency = vec![
-            Latency { harness: "codex".into(), checks: 20, p50_ms: 10_000, p95_ms: 19_000, budget_ms: Some(30_000), over: 1 },
-            Latency { harness: "claude".into(), checks: 1, p50_ms: 4_000, p95_ms: 4_000, budget_ms: None, over: 0 },
+            Latency { harness: "codex".into(), checks: 20, p50_ms: 10_000, p95_ms: 19_000, budget_ms: Some(30_000), over: 1, last_ms: 1_793_711_932_342 },
+            Latency { harness: "claude".into(), checks: 1, p50_ms: 4_000, p95_ms: 4_000, budget_ms: None, over: 0, last_ms: 0 },
         ];
         let line = selection_line(&early);
-        assert!(line.contains(" · stop p95 codex 19.0 s of 30.0 s, 1 failed; claude 4.0 s · $"), "per harness, against its stop budget: {line}");
+        assert!(
+            line.contains(" · stop p95 codex 19.0 s of 30.0 s, 1 failed, last 2026-11-03; claude 4.0 s · $"),
+            "per harness, against its stop budget, dated: {line}"
+        );
         s.budget = Some(Budget { tokens: 30_000.0, spent: 24_000.0, price: 0.0002 });
         assert!(selection_line(&s).ends_with(" · budget 30000 pool tokens per session: 24000 read, price 2.00e-4 per token"), "{}", selection_line(&s));
         s.source = select::REVERTED_SOURCE;
@@ -1881,6 +1899,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
                 channel: channel.into(),
                 harness: harness.into(),
                 dur_ms,
+                ms: dur_ms as i64,
                 failed,
                 tokens: 6_000,
                 ..Default::default()
@@ -1909,8 +1928,8 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let budget = |h: &str| crate::harness::ALL.iter().find(|x| x.name() == h).and_then(|x| x.caps().stop_budget).map(|b| b.as_millis() as u64);
         assert!(budget("codex").is_some() && budget("claude").is_none(), "codex names a stop budget, claude none");
         let want = vec![
-            Latency { harness: "claude".into(), checks: 1, p50_ms: 4_000, p95_ms: 4_000, budget_ms: None, over: 0 },
-            Latency { harness: "codex".into(), checks: 20, p50_ms: 10_000, p95_ms: 19_000, budget_ms: budget("codex"), over: 1 },
+            Latency { harness: "claude".into(), checks: 1, p50_ms: 4_000, p95_ms: 4_000, budget_ms: None, over: 0, last_ms: 4_000 },
+            Latency { harness: "codex".into(), checks: 20, p50_ms: 10_000, p95_ms: 19_000, budget_ms: budget("codex"), over: 1, last_ms: 20_000 },
         ];
         assert_eq!(sel.latency, want);
         let e = sel.evaluation.as_ref().expect("the monitor weighed labelled applies");
