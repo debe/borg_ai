@@ -579,6 +579,33 @@ pub struct Message {
     pub text: String,
     /// How many sessions on this node it was shown to.
     pub shown_to: f64,
+    /// How many running sessions on this node it still waits for (a broadcast can wait for several);
+    /// the rows sum to the view's unread total.
+    pub unread: f64,
+    /// The sender's session id, or its engineer address, to answer with `borg tell`.
+    pub by: String,
+    /// Whether it was sent from this machine.
+    pub mine: bool,
+    /// The sender's stable key: `<session>@<node>` or the engineer address.
+    pub from_key: String,
+    /// The recipient's conversation key: `<session>@<node>`, `engineer`, or the broadcast address.
+    pub to_key: String,
+    /// The conversation it belongs to: the sorted participant pair, or the broadcast address.
+    pub conversation: String,
+    /// `broadcast`, `engineer`, `read`, `unread`, `missed` or `elsewhere`.
+    pub status: String,
+    /// The sender's repo, when borg top lists it.
+    pub from_repo: String,
+    /// The sender's engineer, aliased.
+    pub from_engineer: String,
+    /// The sender's presence state (`working`, `waiting`, `idle`, `ended`).
+    pub from_state: String,
+    /// The recipient's repo, when borg top lists it.
+    pub to_repo: String,
+    /// The recipient's engineer, aliased.
+    pub to_engineer: String,
+    /// The recipient's presence state.
+    pub to_state: String,
 }
 
 pub fn parse_messages(v: &Value) -> Vec<Message> {
@@ -597,6 +624,33 @@ pub fn parse_messages(v: &Value) -> Vec<Message> {
             ms: f(&m["ms"]),
             text: s(&m["text"]),
             shown_to: f(&m["shown_to"]),
+            // An older borg web sends no count: its direct `unread` status is one waiting session.
+            unread: m["unread"].as_f64().unwrap_or(if m["status"] == "unread" { 1.0 } else { 0.0 }),
+            by: s(&m["by"]),
+            mine: m["mine"].as_bool().unwrap_or(false),
+            from_key: s(&m["from_key"]),
+            to_key: s(&m["to_key"]),
+            conversation: s(&m["conversation"]),
+            status: s(&m["status"]),
+            from_repo: s(&m["from_repo"]),
+            from_engineer: s(&m["from_engineer"]),
+            from_state: s(&m["from_state"]),
+            to_repo: s(&m["to_repo"]),
+            to_engineer: s(&m["to_engineer"]),
+            to_state: s(&m["to_state"]),
+        })
+        .map(|mut m| {
+            // An older borg web sends none of the keys: fall back to the names it does send.
+            if m.from_key.is_empty() {
+                m.from_key = m.from.clone();
+            }
+            if m.to_key.is_empty() {
+                m.to_key = m.to.clone();
+            }
+            if m.conversation.is_empty() {
+                m.conversation = format!("{} {}", m.from, m.to);
+            }
+            m
         })
         .collect()
 }
@@ -766,6 +820,8 @@ pub struct Latency {
     pub p95_ms: f64,
     pub budget_ms: Option<f64>,
     pub over: f64,
+    /// The newest check's time (epoch ms; 0: none logged one).
+    pub last_ms: f64,
 }
 
 /// The learned policy's randomised question-count test (borg top.rs `Test`), all-time as the summary
@@ -962,6 +1018,7 @@ pub fn parse_select(v: &Value) -> Selection {
             p95_ms: f(&l["p95_ms"]),
             budget_ms: l["budget_ms"].as_f64(),
             over: f(&l["over"]),
+            last_ms: f(&l["last_ms"]),
         }),
         judge: list(&x["judge"], |j| JudgeLength {
             model: s(&j["model"]),
@@ -1033,6 +1090,8 @@ impl Source {
             let extra = match self.path {
                 "feed" => "&limit=300",
                 "memory" => "&absorbed=true",
+                // The whole 7-day log (borg-web's `PAGE_MAX`), so conversations group all of it.
+                "messages" => "&limit=2000",
                 _ => "",
             };
             match get(format!("/api/{}?c={collective}{extra}", self.path)).await {

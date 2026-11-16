@@ -60,6 +60,54 @@ pub fn long_day(n: i64) -> String {
     format!("{} {d}, {y}", MONTHS[(m - 1) as usize])
 }
 
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+fn local_date(ms: f64) -> js_sys::Date {
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms))
+}
+
+/// Local "HH:MM" of a time in ms.
+pub fn clock(ms: f64) -> String {
+    let d = local_date(ms);
+    format!("{:02}:{:02}", d.get_hours(), d.get_minutes())
+}
+
+/// (year, month, date) of the local calendar day of a time in ms, for comparing days.
+pub fn local_day_key(ms: f64) -> (u32, u32, u32) {
+    let d = local_date(ms);
+    (d.get_full_year(), d.get_month(), d.get_date())
+}
+
+/// "Today", "Yesterday" or "Mon, Oct 12": the local calendar day of a time in ms.
+pub fn day_label(ms: f64) -> String {
+    let (d, today) = (local_date(ms), local_date(now_ms()));
+    let ymd = |d: &js_sys::Date| (d.get_full_year(), d.get_month(), d.get_date());
+    let day = ymd(&d);
+    if day == ymd(&today) {
+        return "Today".into();
+    }
+    // Local midnight today, minus 1 ms, is in yesterday whatever the month, year or DST.
+    let midnight = js_sys::Date::new_with_year_month_day(today.get_full_year(), today.get_month() as i32, today.get_date() as i32);
+    if day == local_day_key(midnight.get_time() - 1.0) {
+        return "Yesterday".into();
+    }
+    format!("{}, {} {}", WEEKDAYS[d.get_day() as usize % 7], MONTHS[d.get_month() as usize % 12], d.get_date())
+}
+
+/// A stable avatar colour for a key: `palette` of its FNV-1a 64-bit hash.
+pub fn hue(key: &str) -> &'static str {
+    let h = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    palette((h % 8) as usize)
+}
+
+/// Two uppercase initials of a name: an email's local part, or a designation's first word; "?" when empty.
+pub fn initials(name: &str) -> String {
+    let src =
+        if name.contains('@') && !name.contains(' ') { name.split('@').next().unwrap_or_default() } else { name.split_whitespace().next().unwrap_or_default() };
+    let s: String = src.chars().filter(|c| c.is_alphanumeric()).take(2).flat_map(char::to_uppercase).collect();
+    if s.is_empty() { "?".into() } else { s }
+}
+
 /// "3m ago", "5h ago", "Oct 12": the page's one "ago". Display: a date from 30 days on.
 pub fn ago(ms: f64) -> String {
     let s = ((now_ms() - ms) / 1000.0).max(0.0);

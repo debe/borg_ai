@@ -105,6 +105,17 @@ async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     assert_eq!((ms[1]["text"].as_str(), ms[1]["shown_to"].as_u64()), (Some("the parser test is flaky"), Some(0)), "{v}");
     assert_eq!((ms[0]["to_kind"].as_str(), ms[1]["to_kind"].as_str()), (Some("session"), Some("session")), "{v}");
     assert_eq!(v["unread"].as_u64(), Some(1), "the tell waits for bbbb's next prompt: {v}");
+    let pair = format!("aaaa1111-web@{here} bbbb2222-web@{here}");
+    assert_eq!((ms[0]["conversation"].as_str(), ms[1]["conversation"].as_str()), (Some(pair.as_str()), Some(pair.as_str())), "A→B and B→A share one: {v}");
+    assert_eq!(ms[0]["mine"].as_bool(), Some(true), "sent from this node: {v}");
+    assert_eq!(
+        (ms[0]["status"].as_str(), ms[1]["status"].as_str()),
+        (Some("read"), Some("unread")),
+        "the ask was shown, the tell waits on a live session: {v}"
+    );
+    assert_eq!((ms[1]["from_repo"].as_str(), ms[1]["from_engineer"].as_str()), (Some("app"), Some("ann@x")), "{v}");
+    assert!(matches!(ms[1]["to_state"].as_str(), Some("working" | "waiting" | "idle")), "the recipient is live: {v}");
+    assert_eq!((ms[0]["unread"].as_u64(), ms[1]["unread"].as_u64()), (Some(0), Some(1)), "only the tell waits, for bbbb: {v}");
     let (_, v) = get(app("corp", corp.clone()), "/api/messages?c=corp&limit=1").await;
     assert_eq!(v["messages"].as_array().map(Vec::len), Some(1));
 
@@ -126,6 +137,14 @@ async fn messages_show_who_sent_what_to_whom_and_what_is_unread() {
     let (_, v) = get(app("corp", corp), "/api/messages?c=corp").await;
     let m0 = &v["messages"][0];
     assert_eq!((m0["from"].as_str(), m0["to_kind"].as_str()), (Some("One of Two @eeeeeeeeeeee"), Some("all")), "{v}");
+    assert_eq!(
+        (m0["conversation"].as_str(), m0["status"].as_str(), m0["mine"].as_bool()),
+        (Some("all"), Some("broadcast"), Some(false)),
+        "another node's broadcast: {v}"
+    );
+    let rows: u64 = v["messages"].as_array().unwrap().iter().filter_map(|m| m["unread"].as_u64()).sum();
+    assert!(m0["unread"].as_u64() > Some(0), "the broadcast waits for the live sessions here: {v}");
+    assert_eq!(Some(rows), v["unread"].as_u64(), "the rows' waiting sessions sum to the unread total, a broadcast counted per session: {v}");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -146,7 +165,7 @@ async fn the_messages_view_acknowledges_what_it_showed_the_engineer() {
     let here = msg::node(&corp);
     let from = |by: &str| Sender { by: by.into(), name: "One of Two".into(), harness: "claude".into(), node: here.clone() };
     let to_me = Message::new(msg::TELL, &from("aaaa1111-web"), msg::ENGINEER, None, now - 3_000, "the build is green");
-    let to_drone = Message::new(msg::TELL, &from("aaaa1111-web"), "bbbb2222-web", None, now - 2_000, "the parser test is flaky");
+    let to_drone = Message::new(msg::TELL, &from("aaaa1111-web"), &format!("bbbb2222-web@{here}"), None, now - 2_000, "the parser test is flaky");
     msg::send(&corp, to_me.clone(), now).unwrap();
     msg::send(&corp, to_drone.clone(), now).unwrap();
     let again = Message::new(msg::TELL, &from("aaaa1111-web"), msg::ENGINEER, None, now - 1_000, "and the docs");
@@ -161,5 +180,25 @@ async fn the_messages_view_acknowledges_what_it_showed_the_engineer() {
     assert_eq!(post(app, "/api/messages/seen?c=corp", "application/json", &body).await, StatusCode::OK);
     assert_eq!(seen(&corp).len(), 1, "acknowledged once");
     msg::send(&corp, again, now).expect("seen: the sender's window is open again");
+
+    // The engineer's reply from a terminal is `engineer:<email>`: it keys as `engineer`, as the tell does.
+    let me = Sender { by: "engineer:ann@x".into(), name: "ann@x".into(), harness: "terminal".into(), node: here.clone() };
+    let reply = Message::new(msg::TELL, &me, &format!("aaaa1111-web@{here}"), Some(to_me.id.as_str()), now, "thanks");
+    msg::send(&corp, reply.clone(), now).unwrap();
+    let (_, v) = get(app_in("corp", corp.clone(), String::new()), "/api/messages?c=corp").await;
+    let row = |id: &str| v["messages"].as_array().and_then(|ms| ms.iter().find(|m| m["id"] == id)).unwrap_or_else(|| panic!("{id} listed: {v}"));
+    let (to_me, to_drone, reply) = (row(&to_me.id), row(&to_drone.id), row(&reply.id));
+    assert_eq!(
+        (to_me["status"].as_str(), to_drone["status"].as_str()),
+        (Some("engineer"), Some("missed")),
+        "to the engineer, and never shown to a session no drone answers to: {v}"
+    );
+    let pair = format!("aaaa1111-web@{here} engineer");
+    assert_eq!(
+        (to_me["conversation"].as_str(), reply["conversation"].as_str()),
+        (Some(pair.as_str()), Some(pair.as_str())),
+        "a tell to `engineer` and the `engineer:ann@x` reply share one: {v}"
+    );
+    assert_eq!((reply["from_key"].as_str(), to_me["to_key"].as_str()), (Some("engineer"), Some("engineer")), "{v}");
     let _ = std::fs::remove_dir_all(&base);
 }

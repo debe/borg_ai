@@ -15,7 +15,7 @@ serde_json = "1"
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["EventSource", "MessageEvent", "Location", "HashChangeEvent", "KeyboardEvent"] }
+web-sys = { version = "0.3", features = ["EventSource", "MessageEvent", "Location", "HashChangeEvent", "KeyboardEvent", "Element", "Navigator", "Clipboard"] }
 console_error_panic_hook = "0.1"
 
 [profile.release]

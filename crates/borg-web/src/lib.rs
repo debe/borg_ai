@@ -12,7 +12,8 @@
 //!
 //! The binary (main.rs) parses the command line and serves [`router`]; tests drive it in process.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -323,6 +324,15 @@ async fn handoffs(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
 /// `engineer` or `session`, from msg.rs `Address`; `to_name`, top.rs `recipient`, tells them apart),
 /// and how many sessions here it was shown to. Listing acknowledges nothing: the page fetches every
 /// view whichever is open, so the messages view says what it showed (`messages_seen`).
+/// `from_key`/`to_key` name each end as `<session>@<node>` (a session `to` without a node takes its
+/// drone's) or `engineer` for any engineer address, so a tell to `engineer` and an `engineer:<email>`
+/// reply meet, and `conversation` is the broadcast address or both keys sorted and space-joined, so
+/// A→B and B→A share one; `mine` is a line sent from this node. `status` is `broadcast`, `engineer`,
+/// `read`/`unread`/`missed` for a session here (shown, waiting on a live one, never shown and ended or
+/// unknown) or `elsewhere` for one on another node. `from_*`/`to_*` carry each end's drone context as
+/// borg top lists it (repo, engineer alias, state), empty when it lists none. `unread` is how many
+/// running sessions here it still waits for (a broadcast may wait for several); the rows sum to the
+/// top-level `unread`, the Unread now tile.
 async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
     let now = learn::now_ms();
@@ -330,20 +340,80 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
     let shown = msg::seen_by(&m.home);
     let here = msg::node(&m.home);
     let mut all: Vec<msg::Message> = msg::read(&m.home).into_iter().filter(|x| now - x.ms <= msg::TTL_MS).collect();
-    let unread: usize = top::unread_of(&m.home, &ds, &here, &all, now).values().sum();
+    // Per message, the live sessions here it still waits for (`unread_of` per message, from the same
+    // seen records): a broadcast unread by eight sessions counts eight, so the rows sum to `unread`.
+    let mut waiting: HashMap<String, usize> = HashMap::new();
+    for d in ds.iter().filter(|d| d.node.is_empty() && d.state != presence::State::Ended) {
+        let session = presence::safe(&d.p.session);
+        for x in msg::for_session(&all, &here, &d.p.session, d.p.started, now) {
+            if !shown.get(&presence::safe(&x.id)).is_some_and(|v| v.contains(&session)) {
+                *waiting.entry(x.id.clone()).or_default() += 1;
+            }
+        }
+    }
+    let unread: usize = waiting.values().sum();
     all.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
     all.truncate(q.limit.unwrap_or(PAGE).min(PAGE_MAX));
+    let aliases = collective::aliases();
+    /// A drone's (repo, engineer alias, state) as a row lists them; empty strings without one.
+    fn context<'a>(d: Option<&'a top::Drone>, aliases: &collective::Aliases) -> (&'a str, String, &'static str) {
+        d.map_or(("", String::new(), ""), |d| (d.p.repo.as_str(), aliases.display(&d.p.engineer), d.state.name()))
+    }
     let out: Vec<Value> = all
         .iter()
         .map(|x| {
             let to = shown.get(&presence::safe(&x.id)).map_or(0, Vec::len);
-            let to_kind = match msg::Address::parse(&x.to) {
-                Some(a) if a.broadcast() => "all",
-                Some(msg::Address::Engineer { .. }) => "engineer",
-                _ => "session",
+            let waits = waiting.get(&x.id).copied().unwrap_or(0);
+            let addr = msg::Address::parse(&x.to);
+            let (sd, rd) = (top::sender_drone(&ds, &here, x), top::recipient_drone(&ds, &here, &x.to));
+            let broadcast = addr.as_ref().is_some_and(msg::Address::broadcast);
+            let engineer = matches!(addr, Some(msg::Address::Engineer { .. }));
+            let to_kind = if broadcast {
+                "all"
+            } else if engineer {
+                "engineer"
+            } else {
+                "session"
             };
+            let from_key: Cow<str> = match msg::Address::parse(&x.by) {
+                Some(msg::Address::Engineer { .. }) => Cow::Borrowed(msg::ENGINEER),
+                _ => Cow::Owned(format!("{}@{}", x.by, x.node)),
+            };
+            // A session named without its node keys as the drone it resolves to, so A→B and B→A meet.
+            let to_key: Cow<str> = match (&addr, rd) {
+                (Some(msg::Address::Engineer { .. }), _) => Cow::Borrowed(msg::ENGINEER),
+                (Some(msg::Address::Session { node: None, .. }), Some(d)) => {
+                    Cow::Owned(format!("{}@{}", d.p.session, if d.node.is_empty() { here.as_str() } else { d.node.as_str() }))
+                }
+                _ => Cow::Borrowed(x.to.as_str()),
+            };
+            let conversation: Cow<str> = if broadcast {
+                Cow::Borrowed(x.to.as_str())
+            } else {
+                let mut ends = [&*from_key, &*to_key];
+                ends.sort_unstable();
+                Cow::Owned(ends.join(" "))
+            };
+            let local = rd.is_some_and(|d| d.node.is_empty()) || matches!(addr, Some(msg::Address::Session { node: Some(n), .. }) if n == here);
+            let status = if broadcast {
+                "broadcast"
+            } else if engineer {
+                "engineer"
+            } else if !local {
+                "elsewhere"
+            } else if to > 0 {
+                "read"
+            } else if rd.is_some_and(|d| d.node.is_empty() && d.state != presence::State::Ended) {
+                "unread"
+            } else {
+                "missed"
+            };
+            let ((from_repo, from_engineer, from_state), (to_repo, to_engineer, to_state)) = (context(sd, aliases), context(rd, aliases));
             json!({"id": x.id, "kind": x.kind, "by": x.by, "from": top::sender(&ds, &here, x), "harness": x.harness, "node": x.node,
-                "to": x.to, "to_name": top::recipient(&ds, &here, &x.to), "to_kind": to_kind, "re": x.re, "ms": x.ms, "text": x.text, "shown_to": to})
+                "to": x.to, "to_name": top::recipient(&ds, &here, &x.to), "to_kind": to_kind, "re": x.re, "ms": x.ms, "text": x.text, "shown_to": to, "unread": waits,
+                "mine": x.node == here, "from_key": from_key, "to_key": to_key, "conversation": conversation, "status": status,
+                "from_repo": from_repo, "from_engineer": from_engineer, "from_state": from_state,
+                "to_repo": to_repo, "to_engineer": to_engineer, "to_state": to_state})
         })
         .collect();
     Json(json!({"collective": m.name, "messages": out, "unread": unread})).into_response()

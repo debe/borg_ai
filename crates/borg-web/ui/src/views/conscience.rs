@@ -10,7 +10,7 @@ use leptos::prelude::*;
 
 use crate::api::{Count, Estimate, Lesson, Selection, Totals, data};
 use crate::charts::{Donut, Help, Row, Series, StackBar, StackedChart, Tile};
-use crate::util::{duration, num, pct, short_day, trunc, usd};
+use crate::util::{ago, duration, num, pct, short_day, trunc, usd};
 use crate::views::overview::delta;
 
 /// The judged placebos needed before leaving a lesson for later is learned, for a server that names
@@ -1562,7 +1562,8 @@ fn Diagnostics() -> impl IntoView {
             .map(|l| {
                 let share = l.budget_ms.map_or(l.p95_ms / top, |b| l.p95_ms / b.max(1.0));
                 let budget = l.budget_ms.map_or("the harness names no time limit".to_string(), |b| format!("time limit {}", duration(b)));
-                let title = format!("{} checks: median {}, 95th percentile {}; {budget}", num(l.checks), duration(l.p50_ms), duration(l.p95_ms));
+                let last = if l.last_ms > 0.0 { format!(" · last {}", ago(l.last_ms)) } else { String::new() };
+                let title = format!("{} checks: median {}, 95th percentile {}; {budget}{last}", num(l.checks), duration(l.p50_ms), duration(l.p95_ms));
                 let failed = l.over > 0.0;
                 view! {
                     <div class="hbar wrap" title=title>
@@ -1573,6 +1574,7 @@ fn Diagnostics() -> impl IntoView {
                     <p class="how">
                         {format!("p50 {} · p95 {} · ", duration(l.p50_ms), duration(l.p95_ms))}
                         <span class:few=!failed style=if failed { "color:var(--c-heat)" } else { "" }><b>{format!("{} of {} failed", num(l.over), num(l.checks))}</b></span>
+                        {last}
                     </p>
                 }
             })

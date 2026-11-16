@@ -425,7 +425,7 @@ later value would be compared against.
 | `borg/src/escalation.rs` | `ANSWER_CHARS` | 120 chars | An escalation's answer in the feed |
 | `borg/src/reach.rs` | `PLAN_CHARS` | 110 chars | A line of `borg reach`'s plan |
 | `borg/src/conscience.rs` | `EARLY_QUESTION_CHARS`, `EARLY_CONSEQUENCE_CHARS`, `EARLY_OVERRIDES_CHARS` | 300, 200, 150 chars | An early lesson's question, its consequence and the team rule it replaces (`render_early`) |
-| `borg-web/ui/src/views/messages.rs` | `SHOWN` | 60 messages | The conversation the Messages view lists, newest first |
+| `borg-web/ui/src/views/messages.rs` | `GROUP_GAP_MS` | 10 min | The Messages chat starts a new bubble group after this gap between one sender's messages |
 | opencode adapter | `LOG_CHARS`, `LOG_ARGS` | 200 chars, 2 arguments | What a line of `$BORG_OPENCODE_LOG` keeps of borg's answer and of the command it ran |
 
 ## Experiment
@@ -460,7 +460,7 @@ labelled.
 | 2 per check | select.rs `PLACEBO_SLOTS`, whole.rs `TAIL_SAMPLE` | The judge's extra lessons; the grader's |
 | 64 | msg.rs `WINDOW_CAP` (derived), listen.rs `GAPS_KEPT` (method), sweep.rs `HASHED` (method, bytes), assimilate.rs `OPEN_CALLS` (guard, calls) | A window's ceiling; the gaps a hold reads; the bytes whose hash says a transcript is unchanged; the open tool calls kept between sweeps |
 | 1 min | msg.rs `FLOOR_MS` (the engineer's ceiling) | The longest a sender waits on a full message window |
-| 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor), update.rs `CHECKING_MS` (guard) | 0.5.0's message rate; a tool call's hold; one release check at a time |
+| 10 min | msg.rs `V1_RATE_MS` (protocol), listen.rs `TOOL_MS` (a learned hold's floor), update.rs `CHECKING_MS` (guard), borg-web ui messages.rs `GROUP_GAP_MS` (display) | 0.5.0's message rate; a tool call's hold; one release check at a time; a chat bubble group's gap |
 | 10⁻⁹ | select/replay.rs `CLAMP` (guard), `COIN` and `SAME` (method) | A probability kept off 0 and 1; a prediction that is 1/2; two recalls that are equal |
 | 300 and 30 | select/replay.rs `READOUT_UNITS`, `READOUT_SESSIONS`; `TEST_CHECKS`, `TEST_SESSIONS` (method) | The online readout's labelled units and sessions; the question-count test's checks (in `TEST_MIN_SESSIONS` 15 sessions) and sessions |
 | 5 | select/policy.rs `ROUTE_LABELS_MIN` (guard, labels); conscience.rs `EARLY_CAP` (baseline, lessons) | A route's labels before its residual counts; an early delivery's lessons |

@@ -3,10 +3,31 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.8.2 (unreleased)
+
+borg web's Messages tab becomes a chat, and a detached turn-end check gets a time limit that fits its
+own harness, so omp's slow checks stop failing at the limit.
+
+### Changed
+
+- borg web's Messages tab is a chat: conversations on the left (each pair of sessions, or a session and
+  the engineer, plus one per broadcast address), the thread on the right with day separators, reply
+  quotes and a button that copies the `borg tell <session> --re <id> "…"` reply. Filters for text,
+  tells or asks, recipient, this machine or teammates, repo and unread. The Timeline panel is gone;
+  refused sends are under the tiles ([Statistics](docs/statistics.md#the-page)). `/api/messages` rows
+  carry the conversation, a `status` and each end's repo, engineer and state.
+  Only the messages to the engineer in the open conversation are acknowledged now, not the newest 60.
+
+### Fixed
+
+- `borg status` ("stop p95") and borg web's "Blocking turn-end check speed" date each harness's newest
+  blocking check: since 0.7.7 a check blocks only under `BORG_ASYNC=off`, so their failures can be
+  weeks old (an omp store showed 21 of 26 failed, all from 0.7.6 and before).
 - A detached turn-end check's call limit is derived per harness (`BORG_HARNESS`). It counts calls that
   failed at the limit, and is capped at four times `BORG_PREDICT_TIMEOUT_S` (180 s). Claude's ~9 s
   calls set omp's limit, and timeouts never raised it, so omp failed 17 of 19 checks in a day; on that
   store omp's limit is now 142 s and Claude's 45 s.
+
 ## 0.8.1 (2026-11-16)
 
 A hand-off finds the taker's clone even when no session opened it since 0.8 or its remote is spelled
