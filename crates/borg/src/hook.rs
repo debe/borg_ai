@@ -3411,7 +3411,7 @@ pub(crate) fn run_job(job: &crate::check_async::Job) -> Option<crate::check_asyn
         judge,
         budget: None,
         started: std::time::Instant::now(),
-        detached: Some(crate::check_async::call_limit(&model)),
+        detached: Some(crate::check_async::call_limit(&model, &std::env::var("BORG_HARNESS").unwrap_or_default())),
         edits: job.edits,
         check: &job.check,
         summary: &summary,

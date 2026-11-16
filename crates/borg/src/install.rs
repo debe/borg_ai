@@ -233,7 +233,7 @@ fn print_status(t: &Targets) {
         let line = crate::top::async_line(
             &crate::stats::async_tally(&crate::stats::live(home)),
             crate::check_async::on(),
-            crate::check_async::call_limit_in(home, &model),
+            crate::check_async::call_limit_in(home, &model, &std::env::var("BORG_HARNESS").unwrap_or_default()),
             crate::whole::line_format().name(),
         );
         println!("  turn check   {line}");

@@ -329,6 +329,42 @@ fn a_detached_checks_record_keeps_moves_whys_and_its_lesson_line() {
     assert_ne!(a1["prompt_hash"], a2["prompt_hash"], "a1 and a2 never mix in what is learned of the grader");
 }
 
+/// A detached check's call limit (check_async.rs `call_limit`) is its own harness's: the hook sets
+/// `BORG_HARNESS`, the detached `borg check --job` inherits it, and only that harness's checks raise the
+/// limit, never above `LIMIT_CEILING` × the 45 s floor. Seeded: ten omp checks of the same model that
+/// took 1000 s each.
+#[test]
+fn a_detached_checks_limit_is_its_own_harnesss_and_capped() {
+    let root = Root(setup("async-limit"));
+    let log = root.join("store/collectives/corp/outcomes.jsonl");
+    let mut text = std::fs::read_to_string(&log).unwrap_or_default();
+    for i in 0..10 {
+        text.push_str(&format!("{}\n", json!({"kind": "graded", "session": "s0", "ms": i + 1, "model": "claude:", "harness": "omp", "dur_ms": 1_000_000})));
+    }
+    std::fs::write(&log, text).unwrap();
+    let env = [ASYNC[0], ASYNC[1], ASYNC[2], ("BORG_LEARN", "on")];
+    let limit = |harness: &str, session: &str| -> (u64, Value) {
+        let ev = |extra: Value| {
+            let mut ev = json!({"session_id": session, "cwd": root.join("harbor_orion")});
+            ev.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            ev
+        };
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/x/net.rs", "new_string": "reset arc"}});
+        let last = json!({"last_assistant_message": "I drop the budget token with a reset arc.", "stop_hook_active": false});
+        common::borg_as(&root, harness, "prompt", &ev(json!({"prompt": "Tidy the budget handling of the Orion net"})), &env);
+        common::borg_as(&root, harness, "post_tool", &ev(edit), &env);
+        common::borg_as(&root, harness, "stop", &ev(last), &env);
+        let check = checks(&root, session)[0].clone();
+        checked_by(&root, session, &check);
+        quiet(&root, session);
+        let graded = outcomes(&root).into_iter().find(|o| o["kind"] == "graded" && o["check"] == check.as_str()).expect("graded");
+        let event = events(&root).into_iter().rfind(|e| e["kind"] == "check" && e["mode"] == "async").expect("a detached check event");
+        (event["limit_ms"].as_u64().expect("limit_ms"), graded["harness"].clone())
+    };
+    assert_eq!(limit("claude", "c1"), (45_000, json!("claude")), "omp's slow checks leave claude's limit at the floor");
+    assert_eq!(limit("omp", "o1"), (180_000, json!("omp")), "omp's slow checks raise omp's limit, capped at four times the floor");
+}
+
 fn events(root: &Path) -> Vec<Value> {
     std::fs::read_to_string(root.join("store/collectives/corp/stats/events.jsonl"))
         .unwrap_or_default()

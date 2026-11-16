@@ -3,6 +3,10 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+- A detached turn-end check's call limit is derived per harness (`BORG_HARNESS`). It counts calls that
+  failed at the limit, and is capped at four times `BORG_PREDICT_TIMEOUT_S` (180 s). Claude's ~9 s
+  calls set omp's limit, and timeouts never raised it, so omp failed 17 of 19 checks in a day; on that
+  store omp's limit is now 142 s and Claude's 45 s.
 ## 0.8.1 (2026-11-16)
 
 A hand-off finds the taker's clone even when no session opened it since 0.8 or its remote is spelled

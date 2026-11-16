@@ -48,11 +48,12 @@ Borg spends tokens only where a lesson is likely to matter.
      and each route's `delivery` record say so. A check that never ran logs `check_dropped`, why `gone`.
    - **Leftovers.** A check removes its job file when it exits; a later stop, and `borg learn` for an
      idle session, removes those of a check that died. Nothing else is left: no log, no lock.
-   - **Time limit.** The call may take the larger of `BORG_PREDICT_TIMEOUT_S` (45 s) and twice the
-     95th percentile of the same model's last 64 answered checks (set, `BORG_PREDICT_TIMEOUT_S` is the
-     limit as given). No hook waits for it: it bounds a hung call, never a slow answer. `borg status`
-     shows the limit now, the checks that reached it, those superseded or too late, and the largest
-     peak memory (`turn check`).
+   - **Time limit.** The call may take twice the 95th percentile of the same model and harness's last
+     64 checks, at least `BORG_PREDICT_TIMEOUT_S` (45 s) and at most four times it (180 s). A failed
+     call that ran at least 45 s hit its limit, so its duration counts as a lower bound; a faster
+     failure does not (set, `BORG_PREDICT_TIMEOUT_S` is the limit as given). No hook waits for it: it
+     bounds a hung call, never a slow answer. `borg status` shows the limit now, the checks that
+     reached it, those superseded or too late, and the largest peak memory (`turn check`).
 
    `BORG_ASYNC=off` keeps the stop's own check: it takes the session lock, calls the model within the
    harness's stop budget, and a grade 3 blocks the stop for one more round.

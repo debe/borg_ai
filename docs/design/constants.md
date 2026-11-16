@@ -267,7 +267,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/live.rs` | `call_limit` | budget − time spent − `AFTER_CALL`, at most predict.rs `timeout` | omp gives at most 25 s |
 | `borg/src/live.rs` | `stale_ms` | 2 × predict.rs `timeout` + 30 s | A holder's longest model call and `STALE_SLACK_MS` |
 | `borg/src/hook.rs` | `end_timeout` | min(learn.rs `learn_timeout`, 2 × predict.rs `timeout`): 90 s | Each session-end batch's call holds the session lock, renewed before each call (live.rs `Guard::renew`): it ends before the lock reads stale (`stale_ms`) |
-| `borg/src/check_async.rs` | `call_limit` | max(predict.rs `timeout`, 2 × p95 of the model's last `listen::GAPS_KEPT` answered checks) | A detached check's call: as `stale_ms`, twice what the model takes; `BORG_PREDICT_TIMEOUT_S` set is the limit as given |
+| `borg/src/check_async.rs` | `call_limit`, `LIMIT_CEILING` | max(predict.rs `timeout`, 2 × p95 of the model and harness's last `listen::GAPS_KEPT` checks), at most `LIMIT_CEILING` (4) × predict.rs `timeout`: 180 s | A detached check's call: as `stale_ms`, twice what the model takes; a failed call of at least `timeout` counts (it hit its limit), so timeouts raise the limit up to the ceiling; `BORG_PREDICT_TIMEOUT_S` set is the limit as given |
 | `borg/src/whole.rs` | `explore`'s τ and replays | τ = the lessons a greedy fill of the window places; 512 replays | The boundary draw's scale, from measured per-lesson cost; conscience.rs `P_DRAWS` replays estimate π_b |
 | `borg/src/cues.rs` | `INCIDENT_CHARS` | 1,500 chars | learn.rs `EXCERPT_CHARS`: what an episode keeps of a correction |
 | `borg/src/listen.rs` | `stop_ms` | `longest_stop` + 30 s | A stop's mark outlives the longest stop by `STOP_SLACK_MS` |

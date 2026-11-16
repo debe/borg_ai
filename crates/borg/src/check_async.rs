@@ -338,30 +338,38 @@ pub(crate) fn finish(session: &str, out: &mut Checked, called: bool) {
     }
 }
 
+/// Guard: the detached check's call limit is at most this many times the predict timeout (180 s at the
+/// default 45 s), so timeouts that raise it cannot raise it without bound.
+const LIMIT_CEILING: u32 = 4;
+
 /// How long a detached check's model call may take: `BORG_PREDICT_TIMEOUT_S` when set, else the stop's
-/// limit (predict.rs `timeout`) or twice the 95th percentile of the call's durations, the larger: the
-/// latest `listen::GAPS_KEPT` answered checks of `model` in the store's outcomes (`dur_ms` of each
-/// `graded` record that did not fail). Derived as the session lock's staleness is (live.rs `stale_ms`):
-/// no hook waits for it, so it bounds a hung call, never a slow model's answer.
+/// limit (predict.rs `timeout`) or twice the 95th percentile of the call's durations, the larger, capped
+/// at `LIMIT_CEILING` times that limit. The durations are the latest `listen::GAPS_KEPT` checks of
+/// `model` and `harness` in the store's outcomes (`dur_ms` of each `graded` record); `harness` is
+/// `BORG_HARNESS`, as the `graded` record's `harness` is written (hook.rs), and an empty one reads every
+/// harness. A failed call that ran at least the stop's limit counts (it ran into a limit). Derived as
+/// the session lock's staleness is (live.rs `stale_ms`): no hook waits for it, so it bounds a hung
+/// call, never a slow model's answer.
 #[must_use]
-pub fn call_limit(model: &str) -> Duration {
-    call_limit_in(&learn::home(), model)
+pub fn call_limit(model: &str, harness: &str) -> Duration {
+    call_limit_in(&learn::home(), model, harness)
 }
 
 /// `call_limit` from the outcomes of the store `home` (`borg status` shows each collective's).
 #[must_use]
-pub fn call_limit_in(home: &Path, model: &str) -> Duration {
+pub fn call_limit_in(home: &Path, model: &str, harness: &str) -> Duration {
     let floor = crate::predict::timeout();
     if std::env::var_os("BORG_PREDICT_TIMEOUT_S").is_some() {
         return floor;
     }
-    let p95 = p95(durations(&home.join("outcomes.jsonl"), model));
-    floor.max(Duration::from_millis(p95.saturating_mul(2)))
+    let p95 = p95(durations(&home.join("outcomes.jsonl"), model, harness, u64::try_from(floor.as_millis()).unwrap_or(u64::MAX)));
+    floor.max(Duration::from_millis(p95.saturating_mul(2))).min(floor.saturating_mul(LIMIT_CEILING))
 }
 
-/// The `dur_ms` of the latest `listen::GAPS_KEPT` answered `graded` records of `model` in `log`, oldest
-/// first; read line by line.
-fn durations(log: &Path, model: &str) -> Vec<u64> {
+/// The `dur_ms` of the latest `listen::GAPS_KEPT` `graded` records of `model` and `harness` (empty: any
+/// harness) in `log`, oldest first; read line by line. A failed call that ran at least `floor_ms` ran
+/// into a limit, so its duration is a lower bound and counts; a faster failure is an error and does not.
+fn durations(log: &Path, model: &str, harness: &str, floor_ms: u64) -> Vec<u64> {
     let Ok(f) = std::fs::File::open(log) else { return Vec::new() };
     let mut kept = std::collections::VecDeque::with_capacity(crate::listen::GAPS_KEPT);
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
@@ -370,10 +378,16 @@ fn durations(log: &Path, model: &str) -> Vec<u64> {
             continue;
         }
         let Ok(o) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-        if o["kind"] != crate::outcome::GRADED || o["failed"] == true || o["model"].as_str().unwrap_or_default() != model {
+        if o["kind"] != crate::outcome::GRADED || o["model"].as_str().unwrap_or_default() != model {
+            continue;
+        }
+        if !harness.is_empty() && o["harness"].as_str() != Some(harness) {
             continue;
         }
         let Some(ms) = o["dur_ms"].as_u64().filter(|ms| *ms > 0) else { continue };
+        if o["failed"] == true && ms < floor_ms {
+            continue;
+        }
         if kept.len() == crate::listen::GAPS_KEPT {
             kept.pop_front();
         }
@@ -457,7 +471,8 @@ pub fn sweep(session: &str) {
                 let old = age > least
                     && age
                         > *limit.get_or_insert_with(|| {
-                            ms(call_limit(&std::env::var("BORG_PREDICT_MODEL").unwrap_or_default())).saturating_add(live::STALE_SLACK_MS)
+                            ms(call_limit(&std::env::var("BORG_PREDICT_MODEL").unwrap_or_default(), &std::env::var("BORG_HARNESS").unwrap_or_default()))
+                                .saturating_add(live::STALE_SLACK_MS)
                         });
                 old && !(running && name.ends_with(".job.next"))
             }
@@ -485,22 +500,50 @@ mod tests {
     }
 
     #[test]
-    fn the_limit_reads_the_latest_answered_checks_of_the_same_model() {
+    fn the_limit_reads_the_latest_checks_of_the_same_model_and_harness() {
         let d = std::env::temp_dir().join(format!("borg-check-async-limit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let log = d.join("outcomes.jsonl");
         let mut text = String::new();
         for i in 0..100u64 {
-            text.push_str(&format!("{{\"kind\":\"graded\",\"session\":\"s\",\"ms\":{i},\"model\":\"m\",\"dur_ms\":{}}}\n", 1000 + i));
+            text.push_str(&format!("{{\"kind\":\"graded\",\"session\":\"s\",\"ms\":{i},\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":{}}}\n", 1000 + i));
         }
-        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":200,\"model\":\"m\",\"dur_ms\":900000,\"failed\":true}\n");
-        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":201,\"model\":\"other\",\"dur_ms\":800000}\n");
-        text.push_str("{\"kind\":\"asked\",\"session\":\"s\",\"ms\":202,\"model\":\"m\",\"dur_ms\":700000}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":200,\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":900000,\"failed\":true}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":200,\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":45000,\"failed\":true}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":200,\"model\":\"m\",\"dur_ms\":700001}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":201,\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":2000,\"failed\":true}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":202,\"model\":\"m\",\"harness\":\"claude\",\"dur_ms\":800000}\n");
+        text.push_str("{\"kind\":\"graded\",\"session\":\"s\",\"ms\":203,\"model\":\"other\",\"harness\":\"omp\",\"dur_ms\":700000}\n");
+        text.push_str("{\"kind\":\"asked\",\"session\":\"s\",\"ms\":204,\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":600000}\n");
         std::fs::write(&log, text).unwrap();
-        let got = durations(&log, "m");
+        let got = durations(&log, "m", "omp", 45_000);
         assert_eq!(got.len(), crate::listen::GAPS_KEPT, "the latest only");
-        assert_eq!((got[0], *got.last().unwrap()), (1036, 1099), "failed calls, other models and other kinds left out");
+        assert!(got.contains(&900_000), "a timeout past the floor counts");
+        assert_eq!(got.last(), Some(&45_000), "a failure exactly at the floor counts");
+        assert!(!got.contains(&700_001), "a record without a harness does not match a named one");
+        assert!(!got.contains(&2000), "a failure faster than the floor is an error and does not count");
+        assert!(!got.contains(&800_000), "another harness's checks are left out");
+        assert!(!got.contains(&700_000) && !got.contains(&600_000), "other models and other kinds left out");
+        assert!(durations(&log, "m", "", 45_000).contains(&800_000), "an empty harness reads every harness");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_limit_is_capped_at_four_times_the_floor() {
+        // The variable short-circuits to the floor by design; setting or removing it would race other tests.
+        if std::env::var_os("BORG_PREDICT_TIMEOUT_S").is_some() {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("borg-check-async-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut text = String::new();
+        for i in 0..10u64 {
+            text.push_str(&format!("{{\"kind\":\"graded\",\"session\":\"s\",\"ms\":{i},\"model\":\"m\",\"harness\":\"omp\",\"dur_ms\":1000000}}\n"));
+        }
+        std::fs::write(d.join("outcomes.jsonl"), text).unwrap();
+        assert_eq!(call_limit_in(&d, "m", "omp"), crate::predict::timeout() * LIMIT_CEILING, "slow calls raise the limit only up to the ceiling");
         let _ = std::fs::remove_dir_all(d);
     }
 }
