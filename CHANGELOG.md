@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.8.2 (unreleased)
+## 0.8.2 (2026-11-16)
 
 borg web's Messages tab becomes a chat, and a detached turn-end check gets a time limit that fits its
 own harness, so omp's slow checks stop failing at the limit.
