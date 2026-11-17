@@ -102,6 +102,7 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
     let out = ok(&admin, &["invite", "--role", "steer", "--expires", "1h"]);
     let ticket = out.lines().find(|l| l.starts_with("BORG1")).expect("a ticket line").to_string();
     assert!(out.contains('█'), "a QR code is printed");
+    assert!(out.contains("`borg service` shows it") && !out.contains("borg mesh serve"), "the daemon is a service, not a terminal to keep open: {out}");
     assert!(ok(&admin, &["invites"]).contains("steer 1 use(s) left"));
 
     // The new member: no config yet. The dry run shows the diff and changes nothing.
@@ -114,6 +115,8 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
 
     let done = ok(&joiner, &["join", &ticket, "--apply"]);
     assert!(done.contains("joined corp") && done.contains("as steer"), "{done}");
+    let next = done.lines().find(|l| l.contains("mesh daemon")).unwrap_or_default();
+    assert!(next.starts_with("next: `borg service install`"), "a service first, `borg mesh serve` only without a manager: {done}");
     let store = joiner.join("base/collectives/corp");
     assert!(std::fs::read_to_string(store.join("lessons.jsonl")).unwrap().contains("who owns the lock?"), "synced at once");
     let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
@@ -129,6 +132,60 @@ fn an_admin_invites_and_a_new_member_joins_with_one_ticket() {
     assert_eq!(members.lines().filter(|l| l.ends_with(" steer")).count(), 1, "{members}");
     let stopped = serve.interrupt().expect("serve stops on Ctrl-C");
     assert!(stopped.success(), "serve exits cleanly on Ctrl-C: {stopped}");
+}
+
+/// An address no machine has (RFC 5737), in a `mesh/addr.json` this test wrote, not `serve`.
+const NOWHERE: &str = "192.0.2.1";
+
+/// The port `serve` wrote to `reach` (`mesh/addr.json`) once it has, waiting while `serve` runs.
+fn served_port(serve: &mut Serve, reach: &Path) -> u16 {
+    let start = Instant::now();
+    while !reach_written(reach) || std::fs::read_to_string(reach).is_ok_and(|t| t.contains(NOWHERE)) {
+        if let Ok(Some(status)) = serve.0.try_wait() {
+            panic!("serve exited before it listened: {status}");
+        }
+        assert!(start.elapsed() < LIVENESS, "serve never wrote its address");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = std::fs::read_to_string(reach).unwrap();
+    let r: Reach = serde_json::from_str(&text).unwrap();
+    let direct = r.hints.split(',').find_map(|h| h.parse::<std::net::SocketAddr>().ok()).unwrap_or_else(|| panic!("no direct address in {text}"));
+    direct.port()
+}
+
+/// Two team collectives on one machine, each with its mesh daemon as the services run it: no `--bind`.
+/// The default port is held (by this test, or by whatever holds it already), so neither may take it.
+#[test]
+fn every_collectives_daemon_runs_at_once_on_one_machine() {
+    let root = tmp("two");
+    let cfg = json!({"default": "off", "collectives": [
+        {"name": "acme", "paths": [root.join("work/acme")], "share": "team", "relay": "disabled"},
+        {"name": "corp", "paths": [root.join("work/corp")], "share": "team", "relay": "disabled"},
+    ]});
+    std::fs::write(root.join("collectives.json"), cfg.to_string()).unwrap();
+    // Bound to the default port: what another collective's daemon (or any program) is to `serve`.
+    let _held = std::net::UdpSocket::bind("0.0.0.0:7878");
+    let serve = |name: &str| {
+        ok(&root, &["init", "--collective", name]);
+        Serve(cmd(&root, &["serve", "--collective", name, "--interval", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap())
+    };
+    let reach = |name: &str| root.join("base/collectives").join(name).join("mesh/addr.json");
+    let (mut acme, mut corp) = (serve("acme"), serve("corp"));
+    let (a, c) = (served_port(&mut acme, &reach("acme")), served_port(&mut corp, &reach("corp")));
+    assert!(a != 7878 && c != 7878 && a != c, "each daemon on a free port of its own: acme {a}, corp {c}");
+    assert!(matches!(acme.0.try_wait(), Ok(None)) && matches!(corp.0.try_wait(), Ok(None)), "both keep running");
+
+    // Restarted, a daemon listens where its tickets and its members' peer lists say it does.
+    let stopped = acme.interrupt().expect("serve stops on Ctrl-C");
+    assert!(stopped.success(), "serve exits cleanly on Ctrl-C: {stopped}");
+    // Its last address as it was, on an IP `serve` never writes: rewritten once the new one listens.
+    std::fs::write(reach("acme"), json!({"hints": format!("{NOWHERE}:{a}")}).to_string()).unwrap();
+    let mut again = Serve(cmd(&root, &["serve", "--collective", "acme", "--interval", "1"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    assert_eq!(served_port(&mut again, &reach("acme")), a, "the port it served on last");
+    for mut s in [again, corp] {
+        let stopped = s.interrupt().expect("serve stops on Ctrl-C");
+        assert!(stopped.success(), "serve exits cleanly on Ctrl-C: {stopped}");
+    }
 }
 
 #[test]
