@@ -1,7 +1,7 @@
 //! Borg's own background services: `borg service [status|install|restart|remove]`.
 //!
-//! Borg runs two kinds of long-lived process: one mesh daemon per team collective that has a mesh
-//! identity (`<store>/mesh/node.key`), and `borg web`. Here they become services of the machine's own
+//! Borg runs two kinds of long-lived process: one mesh daemon per team collective this machine is a
+//! member of (`<store>/mesh/node.key` and `membership.json`), and `borg web`. Here they become services of the machine's own
 //! manager, as the engineer's user:
 //!
 //! - **systemd** (Linux): user units `borg-mesh-<collective>.service` and `borg-web.service` in
@@ -11,28 +11,34 @@
 //!   installed, and borg says so.
 //! - **launchd** (macOS): agents `borg.mesh.<collective>.plist` and `borg.web.plist` in
 //!   `~/Library/LaunchAgents`, logging to `~/Library/Logs/borg/<label>.log`; loaded with
-//!   `launchctl bootstrap gui/<uid>`, a changed one `bootout` first, restarted with `kickstart -k`.
+//!   `launchctl bootstrap gui/<uid>`, a changed one `bootout` first (and waited for until launchd let
+//!   go of its label), restarted with `kickstart -k`.
 //!
 //! Each runs `<borg> mesh serve --collective <c>` or `<borg> web`, `<borg>` being the resolved
 //! install.rs `bin` (the path an update replaces in place); a build under `target/` installs none. The
 //! PATH a unit sets is the one at its first write (kept after, so callers with other PATHs never churn
-//! it), with borg's directory first. Mesh and web stop on SIGINT under systemd and on SIGTERM under
-//! launchd; both trap either.
+//! it), with borg's directory first, only absolute entries and a hand-written unit's `%h` expanded. The
+//! variables that locate the store and the mesh (`BORG_HOME`, `BORG_CONFIG`, `BORG_RELAY`) are the
+//! caller's: the units serve the store whose collectives decided them. Mesh and web stop on SIGINT
+//! under systemd and on SIGTERM under launchd; both trap either.
 //!
-//! **Ownership.** Every file starts with a marker ("managed by borg X: rewritten by borg; edits are
-//! lost"). A same-named file without it is the engineer's: install renames it to `<file>.bak` (once: an
+//! **Ownership.** Every file starts with a marker ("managed by borg: rewritten by borg; edits are
+//! lost"; an older borg's carries its version). A same-named file without it is the engineer's: install renames it to `<file>.bak` (once: an
 //! existing `.bak` is kept) and writes borg's. Borg's own files that no wanted service names (a
-//! collective gone, or without a mesh identity now) are stopped and removed.
+//! collective gone, or not a member now) are stopped and removed.
 //!
 //! **Restarts.** `<root store>/services.json` records the borg version that last (re)started the
-//! services, and `off`. A unit is restarted when its file changed or that version is not this borg's,
-//! started when it does not run, so the several `borg install <h> --apply` of one update restart once.
+//! services, and `off`; the files carry no version, so an update restarts (systemd `restart`, launchd
+//! `kickstart -k`) instead of reloading every file. A unit is restarted when its file changed or that
+//! version is not this borg's, started when it does not run (a unit systemd restarts after failures
+//! does not), so the several `borg install <h> --apply` of one update restart once.
 //! `borg service remove` writes `off: true` and removes the units; `borg setup` and `borg install <h>
 //! --apply` (`auto`) then leave them off, and `borg update` skips its `borg service install` step.
-//! `borg service install` turns them on again.
+//! `borg service install` turns them on again: it records that first, whatever its steps do.
 //!
 //! Every path comes from HOME (and XDG_CONFIG_HOME) and every command goes through a `Run`, so tests
-//! use a temporary home and stub managers; a systemd user manager whose HOME is another is left alone.
+//! use a temporary home and stub managers; a systemd user manager whose HOME is another is left alone,
+//! by `remove` too (it removes the files only).
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -56,13 +62,12 @@ const STOP_SECS: u32 = 30;
 /// `ThrottleInterval`): a crash loop costs one start per 10 s.
 const RESTART_SECS: u32 = 10;
 
-/// The marker's fixed part, in every file borg writes.
-const MARK: &str = "managed by borg ";
+/// The marker's fixed part, in every file borg writes (an older borg's put its version after it).
+const MARK: &str = "managed by borg";
 
-/// The marker line's text for this borg.
-fn marker() -> String {
-    format!("{MARK}{VERSION}: rewritten by borg; edits are lost")
-}
+/// The marker line's text. It names no version: a file changes only when what it runs changes, so an
+/// update restarts the services instead of reloading their files.
+const MARKER: &str = "managed by borg: rewritten by borg; edits are lost";
 
 /// Whether `text` is a file borg wrote (its marker in the first lines).
 fn owned(text: &str) -> bool {
@@ -88,6 +93,14 @@ impl Service {
         }
     }
 
+    /// The same process started by hand, which a service of it competes with (a port, a store).
+    fn by_hand(&self) -> String {
+        match self {
+            Service::Mesh(c) => format!("a `borg mesh serve --collective {c}`"),
+            Service::Web => "a `borg web`".into(),
+        }
+    }
+
     fn what(&self) -> String {
         match self {
             Service::Mesh(c) => format!("the mesh daemon of collective {c}"),
@@ -102,13 +115,21 @@ fn id(collective: &str) -> String {
     collective::store(Path::new(""), collective).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// The services this machine wants: a mesh daemon per team collective with a mesh identity, then
+/// Whether this machine is a member of the collective stored at `home`: its mesh identity and the
+/// membership `borg mesh serve` needs (borg-mesh membership.rs `path`). The key alone is no proof:
+/// `borg mesh id` and a failed `join` write it.
+fn member(home: &Path) -> bool {
+    let mesh = home.join("mesh");
+    mesh.join("node.key").is_file() && mesh.join("membership.json").is_file()
+}
+
+/// The services this machine wants: a mesh daemon per team collective it is a member of, then
 /// `borg web` while any collective exists (with none it has nothing to show and exits).
 #[must_use]
 pub fn wanted(cfg: Option<&collective::Config>, base: &Path) -> Vec<Service> {
     let routes = crate::install::collectives(cfg, base);
     let mesh = routes.iter().filter_map(|r| match r {
-        Route::Collective { name, home, share: Share::Team } if home.join("mesh/node.key").is_file() => Some(Service::Mesh(name.clone())),
+        Route::Collective { name, home, share: Share::Team } if member(home) => Some(Service::Mesh(name.clone())),
         _ => None,
     });
     let mut out: Vec<Service> = mesh.collect();
@@ -171,35 +192,41 @@ impl Backend {
         }
     }
 
-    /// The file borg writes for `s`, run as `bin` with `path` as PATH.
-    fn render(self, s: &Service, bin: &Path, path: &str, home: &Path) -> String {
+    /// The file borg writes for `s` on `h`, with `path` as PATH.
+    fn render(self, s: &Service, h: &Host, path: &str) -> String {
         match self {
-            Backend::Systemd => systemd_unit(s, bin, path),
-            Backend::Launchd => plist(&self.name(s), s, bin, path, home),
+            Backend::Systemd => systemd_unit(s, &h.bin, path, &h.env),
+            Backend::Launchd => plist(&self.name(s), s, &h.bin, path, &h.env, &h.home),
         }
     }
 
-    /// The PATH a file sets, as written there (borg's form, or a hand-written `Environment=PATH=`).
-    fn path_in(self, text: &str) -> Option<String> {
+    /// The PATH a file sets, as its process sees it (borg's form, or a hand-written `Environment=PATH=`
+    /// with its specifiers expanded against `home`).
+    fn path_in(self, text: &str, home: &Path) -> Option<String> {
         match self {
-            Backend::Systemd => systemd_path(text),
+            Backend::Systemd => systemd_path(text, home),
             Backend::Launchd => plist_path(text),
         }
     }
 }
 
-/// `s` as a systemd user unit.
-fn systemd_unit(s: &Service, bin: &Path, path: &str) -> String {
+/// The variables a unit sets besides PATH, as `KEY=value` pairs.
+type Env = [(&'static str, String)];
+
+/// `s` as a systemd user unit, PATH then `env` set.
+fn systemd_unit(s: &Service, bin: &Path, path: &str, env: &Env) -> String {
     let exec: Vec<String> = std::iter::once(bin.display().to_string()).chain(s.args().into_iter().map(str::to_string)).map(|a| sd_word(&a, true)).collect();
     let (what, after, dir) = match s {
         Service::Mesh(c) => (format!("borg mesh daemon of collective {}", id(c)), "After=network-online.target\nWants=network-online.target\n", ""),
         Service::Web => ("borg web, the live page on 127.0.0.1".to_string(), "", "WorkingDirectory=%h\n"),
     };
+    let vars: String = std::iter::once(("PATH", path))
+        .chain(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .map(|(k, v)| format!("Environment={}\n", sd_word(&format!("{k}={v}"), false)))
+        .collect();
     format!(
-        "# {}\n[Unit]\nDescription={what}\n{after}\n[Service]\nExecStart={}\n{dir}Environment={}\nKillSignal=SIGINT\nTimeoutStopSec={STOP_SECS}\nRestart=on-failure\nRestartSec={RESTART_SECS}\n\n[Install]\nWantedBy=default.target\n",
-        marker(),
+        "# {MARKER}\n[Unit]\nDescription={what}\n{after}\n[Service]\nExecStart={}\n{dir}{vars}KillSignal=SIGINT\nTimeoutStopSec={STOP_SECS}\nRestart=on-failure\nRestartSec={RESTART_SECS}\n\n[Install]\nWantedBy=default.target\n",
         exec.join(" "),
-        sd_word(&format!("PATH={path}"), false)
     )
 }
 
@@ -224,19 +251,39 @@ fn sd_word(w: &str, exec: bool) -> String {
     out
 }
 
-/// The value of an `Environment=PATH=...` line, quoted (borg's form) or bare (a hand-written one).
-fn systemd_path(text: &str) -> Option<String> {
-    text.lines().filter_map(|l| l.trim().strip_prefix("Environment=")).find_map(|v| {
+/// The PATH of an `Environment=PATH=...` line, quoted (borg's form) or bare (a hand-written one), as
+/// systemd hands it to the process: C escapes undone, then each entry's specifiers expanded
+/// (`specifiers`, `%h` as `home`); an entry with a specifier borg cannot tell is left out.
+fn systemd_path(text: &str, home: &Path) -> Option<String> {
+    let value = text.lines().filter_map(|l| l.trim().strip_prefix("Environment=")).find_map(|v| {
         let v = v.trim();
-        let v = match v.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
-            Some(q) => unescape(q),
-            None => v.replace("%%", "%"),
-        };
+        let v = v.strip_prefix('"').and_then(|q| q.strip_suffix('"')).map_or_else(|| v.to_string(), unescape);
         v.strip_prefix("PATH=").map(str::to_string)
-    })
+    })?;
+    let home = home.display().to_string();
+    Some(value.split(':').filter_map(|d| specifiers(d, &home)).collect::<Vec<_>>().join(":"))
 }
 
-/// `sd_word`'s quoting undone (without `$$`, which an `Environment=` value never has).
+/// `word` with systemd's specifiers `%%` and `%h` (`home`) expanded; none when it holds another.
+fn specifiers(word: &str, home: &str) -> Option<String> {
+    let mut out = String::with_capacity(word.len());
+    let mut cs = word.chars();
+    while let Some(c) = cs.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match cs.next()? {
+            '%' => out.push('%'),
+            'h' => out.push_str(home),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// `sd_word`'s C escapes undone (without `$$`, which an `Environment=` value never has); its `%%` is a
+/// specifier, left to `specifiers`.
 fn unescape(q: &str) -> String {
     let mut out = String::new();
     let mut cs = q.chars();
@@ -250,24 +297,21 @@ fn unescape(q: &str) -> String {
                 Some(e) => out.push(e),
                 None => {}
             },
-            '%' => {
-                out.push('%');
-                let mut peek = cs.clone();
-                if peek.next() == Some('%') {
-                    cs = peek;
-                }
-            }
             c => out.push(c),
         }
     }
     out
 }
 
-/// `s` as a launchd agent labelled `label`.
-fn plist(label: &str, s: &Service, bin: &Path, path: &str, home: &Path) -> String {
+/// `s` as a launchd agent labelled `label`, PATH then `env` set.
+fn plist(label: &str, s: &Service, bin: &Path, path: &str, env: &Env, home: &Path) -> String {
     let args: String = std::iter::once(bin.display().to_string())
         .chain(s.args().into_iter().map(str::to_string))
         .map(|a| format!("    <string>{}</string>\n", xml(&a)))
+        .collect();
+    let vars: String = std::iter::once(("PATH", path))
+        .chain(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .map(|(k, v)| format!("    <key>{k}</key>\n    <string>{}</string>\n", xml(v)))
         .collect();
     let log = xml(&logs(home).join(format!("{label}.log")).display().to_string());
     format!(
@@ -294,9 +338,7 @@ fn plist(label: &str, s: &Service, bin: &Path, path: &str, home: &Path) -> Strin
   <integer>{STOP_SECS}</integer>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>{path}</string>
-  </dict>
+{vars}  </dict>
   <key>WorkingDirectory</key>
   <string>{home}</string>
   <key>StandardOutPath</key>
@@ -306,9 +348,8 @@ fn plist(label: &str, s: &Service, bin: &Path, path: &str, home: &Path) -> Strin
 </dict>
 </plist>
 "#,
-        marker = marker(),
+        marker = MARKER,
         label = xml(label),
-        path = xml(path),
         home = xml(&home.display().to_string()),
     )
 }
@@ -330,10 +371,11 @@ fn plist_path(text: &str) -> Option<String> {
     Some(value.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"))
 }
 
-/// The PATH a unit sets: `from` with `bin`'s directory first (and nowhere else).
+/// The PATH a unit sets: `from`'s absolute entries (a relative one would resolve against the service's
+/// working directory), `bin`'s directory first (and nowhere else).
 fn unit_path(bin: &Path, from: &str) -> String {
     let dir = bin.parent().map(|d| d.display().to_string()).unwrap_or_default();
-    let rest = from.split(':').filter(|d| !d.is_empty() && *d != dir);
+    let rest = from.split(':').filter(|d| d.starts_with('/') && *d != dir);
     std::iter::once(dir.as_str()).chain(rest).collect::<Vec<_>>().join(":")
 }
 
@@ -412,6 +454,8 @@ pub struct Host<'a> {
     pub bin: PathBuf,
     /// PATH now: a new unit's.
     pub path: String,
+    /// The variables of `LOCATING` set now, every unit's (paths made absolute).
+    pub env: Vec<(&'static str, String)>,
     pub uid: u32,
     /// Whether a user session's bus can be there at all (systemd: `XDG_RUNTIME_DIR` or
     /// `DBUS_SESSION_BUS_ADDRESS` set, without which `systemctl --user` cannot connect); launchd: always.
@@ -421,6 +465,26 @@ pub struct Host<'a> {
 
 fn var(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+/// The variables that tell a service which store, config and relay to use: a daemon started without
+/// them would serve the default store, not the one whose collectives decided which services run.
+/// The paths among them (all but `BORG_RELAY`, a URL) are made absolute.
+const LOCATING: &[&str] = &["BORG_HOME", "BORG_CONFIG", "BORG_RELAY"];
+
+/// The `LOCATING` variables set now.
+fn locating() -> Vec<(&'static str, String)> {
+    LOCATING
+        .iter()
+        .filter_map(|&k| {
+            let v = var(k)?;
+            let v = match k {
+                "BORG_RELAY" => v,
+                _ => std::path::absolute(&v).map_or(v, |p| p.display().to_string()),
+            };
+            Some((k, v))
+        })
+        .collect()
 }
 
 impl<'a> Host<'a> {
@@ -436,7 +500,7 @@ impl<'a> Host<'a> {
         let uid = unsafe { libc::getuid() };
         let base = collective::root_of(&crate::learn::home());
         let session = backend == Backend::Launchd || var("XDG_RUNTIME_DIR").is_some() || var("DBUS_SESSION_BUS_ADDRESS").is_some();
-        Ok(Host { backend, dir, base, bin: crate::install::real_bin(), path: var("PATH").unwrap_or_default(), uid, session, run, home })
+        Ok(Host { backend, dir, base, bin: crate::install::real_bin(), path: var("PATH").unwrap_or_default(), env: locating(), uid, session, run, home })
     }
 
     /// Why this borg installs no services: a development build.
@@ -515,7 +579,7 @@ impl<'a> Host<'a> {
         }
         match self.backend {
             Backend::Systemd => {
-                let args = [&["show", "--property=Id,ActiveState,UnitFileState,MainPID"], names].concat();
+                let args = [&["show", "--property=Id,ActiveState,SubState,NRestarts,UnitFileState,MainPID"], names].concat();
                 self.call(&args).filter(|o| o.ok).map(|o| systemd_states(&o.stdout)).unwrap_or_default()
             }
             Backend::Launchd => names
@@ -542,11 +606,17 @@ struct State {
     /// The manager's word for it (systemd `ActiveState`; launchd `state`).
     active: String,
     running: bool,
+    /// It failed and its manager starts it again (systemd `activating`/`auto-restart`): a crash loop,
+    /// which does not run.
+    looping: bool,
+    /// How often its manager restarted it after a failure (systemd `NRestarts`).
+    restarts: u32,
     enabled: bool,
     pid: Option<u32>,
 }
 
-/// `systemctl show`'s blocks, one per unit, by `Id`.
+/// `systemctl show`'s blocks, one per unit, by `Id`. Only `active` (and `reloading`) runs: between the
+/// starts of a crash loop systemd says `activating` with the sub-state `auto-restart`.
 fn systemd_states(out: &str) -> std::collections::HashMap<String, State> {
     let mut map = std::collections::HashMap::new();
     for block in out.split("\n\n") {
@@ -555,7 +625,9 @@ fn systemd_states(out: &str) -> std::collections::HashMap<String, State> {
         let active = field("ActiveState").unwrap_or_default();
         let state = State {
             active: active.to_string(),
-            running: matches!(active, "active" | "activating" | "reloading"),
+            running: matches!(active, "active" | "reloading"),
+            looping: field("SubState") == Some("auto-restart"),
+            restarts: field("NRestarts").and_then(|n| n.parse().ok()).unwrap_or_default(),
             enabled: matches!(field("UnitFileState"), Some("enabled" | "enabled-runtime")),
             pid: field("MainPID").and_then(|p| p.parse().ok()).filter(|p| *p != 0),
         };
@@ -568,7 +640,7 @@ fn systemd_states(out: &str) -> std::collections::HashMap<String, State> {
 fn launchd_state(out: &str) -> State {
     let field = |k: &str| out.lines().find_map(|l| l.trim().strip_prefix(k)?.trim_start().strip_prefix('=').map(str::trim));
     let active = field("state").unwrap_or("loaded");
-    State { active: active.to_string(), running: active == "running", enabled: true, pid: field("pid").and_then(|p| p.parse().ok()) }
+    State { active: active.to_string(), running: active == "running", enabled: true, pid: field("pid").and_then(|p| p.parse().ok()), ..State::default() }
 }
 
 // ---------------------------------------------------------------- plans
@@ -608,8 +680,8 @@ fn units(h: &Host, wanted: &[Service]) -> Vec<Unit> {
             let name = h.backend.name(s);
             let path = h.dir.join(h.backend.file(&name));
             let now = std::fs::read_to_string(&path).ok();
-            let from = now.as_deref().and_then(|t| h.backend.path_in(t)).unwrap_or_else(|| h.path.clone());
-            let text = h.backend.render(s, &h.bin, &unit_path(&h.bin, &from), &h.home);
+            let from = now.as_deref().and_then(|t| h.backend.path_in(t, &h.home)).unwrap_or_else(|| h.path.clone());
+            let text = h.backend.render(s, h, &unit_path(&h.bin, &from));
             Unit { service: s.clone(), name, path, text, now }
         })
         .collect()
@@ -709,12 +781,14 @@ fn put(h: &Host, u: &Unit) -> Result<String, String> {
     Ok(line)
 }
 
-/// Stops and removes borg's files `files` (name, path).
-fn take_down(h: &Host, files: &[(String, PathBuf)], why: &str, r: &mut Report) {
+/// Stops and removes borg's files `files` (name, path); with `manager` false only removes them (the
+/// manager here is not this HOME's, or there is none to ask).
+fn take_down(h: &Host, files: &[(String, PathBuf)], why: &str, manager: bool, r: &mut Report) {
     if files.is_empty() {
         return;
     }
     match h.backend {
+        _ if !manager => {}
         Backend::Systemd => {
             let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
             r.call(h, &[&["disable", "--now"], &names[..]].concat(), "stopping");
@@ -736,14 +810,37 @@ fn take_down(h: &Host, files: &[(String, PathBuf)], why: &str, r: &mut Report) {
             r.lines.push(format!("service {n}: the unit borg took over is still at {}", b.display()));
         }
     }
-    if h.backend == Backend::Systemd {
+    if manager && h.backend == Backend::Systemd {
         r.call(h, &["daemon-reload"], "reloading");
     }
 }
 
+/// How often `unload` asks whether launchd let go of a label.
+const UNLOAD_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Unloads agent `label` and waits until launchd let go of it: `bootout` returns while a stopping
+/// daemon still holds the label (up to `STOP_SECS`), and a `bootstrap` then fails ("5: Input/output
+/// error"), leaving the agent unloaded.
+fn unload(h: &Host, label: &str, r: &mut Report) -> bool {
+    let target = h.target(label);
+    if !r.call(h, &["bootout", &target], "unloading") {
+        return false;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(STOP_SECS.into()) + UNLOAD_POLL * 10;
+    while h.call(&["print", &target]).is_some_and(|o| o.ok) {
+        if std::time::Instant::now() >= until {
+            r.fail(format!("unloading failed: {label} is still loaded {STOP_SECS} s after launchctl bootout"));
+            return false;
+        }
+        std::thread::sleep(UNLOAD_POLL);
+    }
+    true
+}
+
 /// `borg service install` on a reachable host: every wanted unit written, enabled and running, the
-/// changed ones (or all, after another borg) restarted, borg's others removed; the record updated
-/// once every step worked.
+/// changed ones (or all, after another borg) restarted, borg's others removed. The record is saved
+/// whatever the steps did, with this borg's version once every start and restart worked: a unit whose
+/// file could not be written is restarted when it is, and one whose restart failed is tried again.
 fn install(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
     let mut r = Report::default();
     let units = units(h, wanted);
@@ -758,7 +855,7 @@ fn install(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
             Err(e) => r.fail(format!("service {}: {e}", u.name)),
         }
     }
-    take_down(h, &orphans, " (no wanted service names it)", &mut r);
+    take_down(h, &orphans, " (no wanted service names it)", true, &mut r);
     if h.backend == Backend::Systemd && !written.is_empty() {
         r.call(h, &["daemon-reload"], "reloading");
     }
@@ -768,6 +865,8 @@ fn install(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
     let states = h.states(&names);
     let state = |u: &Unit| states.get(&u.name).cloned().unwrap_or_default();
     let decide = |u: &Unit| act(state(u).running, written.contains(&u.name.as_str()), other);
+    // Every start and restart worked: the services run this borg.
+    let mut moved = true;
     match h.backend {
         Backend::Systemd => {
             let pick = |f: &dyn Fn(&Unit) -> bool| -> Vec<&str> { live.iter().filter(|u| f(u)).map(|u| u.name.as_str()).collect() };
@@ -776,9 +875,14 @@ fn install(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
                 ("start", pick(&|u| decide(u) == Act::Start), "started"),
                 ("restart", pick(&|u| decide(u) == Act::Restart), "restarted"),
             ] {
-                if !names.is_empty() && r.call(h, &[&[verb], &names[..]].concat(), verb) {
+                if names.is_empty() {
+                    continue;
+                }
+                let ok = r.call(h, &[&[verb], &names[..]].concat(), verb);
+                if ok {
                     r.lines.push(format!("{done} {}", names.join(", ")));
                 }
+                moved &= ok || verb == "enable";
             }
         }
         Backend::Launchd => {
@@ -788,25 +892,26 @@ fn install(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
                 let done = match (decide(u), loaded) {
                     (Act::Keep, _) => continue,
                     // A changed file is read again only by loading it again.
-                    (_, true) if written.contains(&u.name.as_str()) => {
-                        r.call(h, &["bootout", &h.target(&u.name)], "unloading") && r.call(h, &["bootstrap", &h.domain(), &file], "loading")
-                    }
+                    (_, true) if written.contains(&u.name.as_str()) => unload(h, &u.name, &mut r) && r.call(h, &["bootstrap", &h.domain(), &file], "loading"),
                     (_, false) => r.call(h, &["bootstrap", &h.domain(), &file], "loading"),
                     (_, true) => r.call(h, &["kickstart", "-k", &h.target(&u.name)], "restarting"),
                 };
                 if done {
                     r.lines.push(format!("{} {}", if loaded { "restarted" } else { "started" }, u.name));
                 }
+                moved &= done;
             }
         }
     }
-    if !r.failed {
+    if moved {
         rec.version = Some(VERSION.to_string());
-        if let Err(e) = rec.save(&h.base) {
-            r.fail(format!("services: {e}"));
-        }
     }
-    if names.is_empty() && orphans.is_empty() {
+    if let Err(e) = rec.save(&h.base) {
+        r.fail(format!("services: {e}"));
+    }
+    // Decided by what is wanted, not by what was written: a unit that could not be written is a
+    // failure above, not "none wanted".
+    if units.is_empty() && orphans.is_empty() {
         r.skipped = true;
         r.lines.push("services: none wanted (no collective here)".into());
     } else if r.lines.is_empty() {
@@ -851,7 +956,7 @@ fn restart(h: &Host, wanted: &[Service], rec: &mut Record) -> Report {
 }
 
 /// `borg service remove`: off recorded, every borg unit stopped and removed (the engineer's `.bak`
-/// stays).
+/// stays). A manager that is not this HOME's (or none) is not asked: the files go, nothing is stopped.
 fn remove(h: &Host, rec: &mut Record) -> Report {
     let mut r = Report::default();
     rec.off = true;
@@ -863,7 +968,15 @@ fn remove(h: &Host, rec: &mut Record) -> Report {
     if files.is_empty() {
         r.lines.push("services: none installed".into());
     }
-    take_down(h, &files, "", &mut r);
+    let manager = match h.reach() {
+        Ok(()) => true,
+        Err(why) if !files.is_empty() => {
+            r.lines.push(format!("services: nothing stopped, only the files removed ({why})"));
+            false
+        }
+        Err(_) => false,
+    };
+    take_down(h, &files, "", manager, &mut r);
     r.lines.push("services: off; updates leave them off, `borg service install` turns them on again".into());
     r
 }
@@ -894,6 +1007,15 @@ fn checks_on(h: &Host, wanted: Result<Vec<Service>, String>) -> Vec<(Level, Stri
             Some(_) if u.changed() => (Level::Warn, format!("service {n}: {p} is another borg's or was edited (borg service install)")),
             Some(_) => match states.get(n.as_str()) {
                 Some(s) if s.running => (Level::Ok, format!("service {n}: {} runs", u.service.what())),
+                Some(s) if s.looping => (
+                    Level::Warn,
+                    format!(
+                        "service {n}: {} keeps failing, restarted {} times so far; `journalctl --user -u {n}` says why (often {} started by hand holds what it needs: stop that one)",
+                        u.service.what(),
+                        s.restarts,
+                        u.service.by_hand()
+                    ),
+                ),
                 s => (Level::Warn, format!("service {n}: {} (borg service restart)", s.map_or("not loaded", |s| s.active.as_str()))),
             },
         });
@@ -905,7 +1027,7 @@ fn checks_on(h: &Host, wanted: Result<Vec<Service>, String>) -> Vec<(Level, Stri
     for (n, p) in orphans(h, &units) {
         out.push((
             Level::Warn,
-            format!("service {n}: {} names no wanted service (a collective gone, or without a mesh identity; borg service install removes it)", p.display()),
+            format!("service {n}: {} names no wanted service (a collective gone, or not a member now; borg service install removes it)", p.display()),
         ));
     }
     if h.backend == Backend::Systemd
@@ -1018,10 +1140,16 @@ pub fn main(args: &[&str]) -> i32 {
             }
             return i32::from(checks.iter().any(|(l, _)| *l == Level::Fail));
         }
-        "install" => {
+        // On before anything else: a step that fails, or an install that cannot run here, must not
+        // leave `off` on disk (updates would leave the services alone).
+        "install" if rec.off => {
             rec.off = false;
-            ensure(&h, &mut rec)
+            match rec.save(&h.base) {
+                Ok(()) => ensure(&h, &mut rec),
+                Err(e) => Report::failure(format!("services: {e}")),
+            }
         }
+        "install" => ensure(&h, &mut rec),
         "restart" if rec.off => Report::skip("services: off (borg service remove); `borg service install` turns them on".into()),
         "restart" => match (h.dev(), h.reach(), wanted_here(&h.base)) {
             (Some(why), _, _) => Report::skip(format!("services: none, {why}")),
@@ -1044,7 +1172,7 @@ pub fn main(args: &[&str]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("borg-service-{tag}-{}", std::process::id()));
@@ -1054,12 +1182,17 @@ mod tests {
     }
 
     /// A stub manager: logs each call, answers from `running`/`enabled`/`loaded` sets it keeps as the
-    /// real one would.
+    /// real one would. `looping` units are in systemd's crash loop; the verbs in `fail` fail; a launchd
+    /// label booted out stays loaded for `linger` more `print`s, and a `bootstrap` of it fails until then.
     #[derive(Default)]
     struct Stub {
         log: RefCell<Vec<String>>,
         running: RefCell<Vec<String>>,
         enabled: RefCell<Vec<String>>,
+        looping: RefCell<Vec<String>>,
+        fail: RefCell<Vec<&'static str>>,
+        linger: Cell<u32>,
+        leaving: RefCell<Option<(String, u32)>>,
         no_bus: bool,
         home: PathBuf,
     }
@@ -1068,9 +1201,14 @@ mod tests {
         fn run(&self, prog: &str, args: &[&str]) -> Option<Out> {
             self.log.borrow_mut().push(format!("{prog} {}", args.join(" ")));
             let ok = |stdout: String| Some(Out { ok: true, stdout, stderr: String::new() });
+            let no = |stderr: &str| Some(Out { ok: false, stdout: String::new(), stderr: stderr.into() });
             let (mut run, mut en) = (self.running.borrow_mut(), self.enabled.borrow_mut());
             let names = || args.iter().filter(|a| !a.starts_with('-') && a.contains('.')).map(|a| a.to_string()).collect::<Vec<_>>();
             let verb = if prog == "systemctl" { args.get(1) } else { args.first() };
+            if verb.is_some_and(|v| self.fail.borrow().contains(v)) {
+                return no("Bootstrap failed: 5: Input/output error");
+            }
+            let label = || args.get(1).and_then(|a| a.rsplit('/').next()).unwrap_or_default().to_string();
             match (prog, verb.copied()) {
                 ("systemctl", Some("show-environment")) if self.no_bus => {
                     Some(Out { ok: false, stdout: String::new(), stderr: "Failed to connect to bus".into() })
@@ -1079,9 +1217,14 @@ mod tests {
                 ("systemctl", Some("show")) => ok(names()
                     .iter()
                     .map(|n| {
-                        let a = if run.contains(n) { "active" } else { "inactive" };
+                        let (a, sub, restarts) = match (run.contains(n), self.looping.borrow().contains(n)) {
+                            (true, _) => ("active", "running", 0),
+                            (false, true) => ("activating", "auto-restart", 7),
+                            (false, false) => ("inactive", "dead", 0),
+                        };
                         let e = if en.contains(n) { "enabled" } else { "disabled" };
-                        format!("MainPID={}\nId={n}\nActiveState={a}\nUnitFileState={e}\n\n", if run.contains(n) { 42 } else { 0 })
+                        let pid = if run.contains(n) { 42 } else { 0 };
+                        format!("MainPID={pid}\nId={n}\nActiveState={a}\nSubState={sub}\nNRestarts={restarts}\nUnitFileState={e}\n\n")
                     })
                     .collect()),
                 ("systemctl", Some("enable")) => {
@@ -1089,7 +1232,9 @@ mod tests {
                     ok(String::new())
                 }
                 ("systemctl", Some("start" | "restart")) => {
-                    run.extend(names());
+                    let names = names();
+                    self.looping.borrow_mut().retain(|n| !names.contains(n));
+                    run.extend(names);
                     ok(String::new())
                 }
                 ("systemctl", Some("disable")) => {
@@ -1100,16 +1245,32 @@ mod tests {
                 }
                 ("launchctl", Some("managername")) => ok("Aqua\n".into()),
                 ("launchctl", Some("print")) => {
-                    let label = args[1].rsplit('/').next().unwrap().to_string();
+                    let label = label();
+                    let mut leaving = self.leaving.borrow_mut();
+                    match leaving.as_mut() {
+                        Some((l, 0)) if *l == label => *leaving = None,
+                        Some((l, left)) if *l == label => {
+                            *left -= 1;
+                            return ok("\tstate = stopping\n".into());
+                        }
+                        _ => {}
+                    }
                     run.contains(&label).then(|| Out { ok: true, stdout: "\tstate = running\n\tpid = 7\n".into(), stderr: String::new() })
                 }
                 ("launchctl", Some("bootstrap")) => {
-                    run.push(Path::new(args[2]).file_stem().unwrap().to_string_lossy().into_owned());
+                    let label = Path::new(args[2]).file_stem().unwrap().to_string_lossy().into_owned();
+                    if self.leaving.borrow().as_ref().is_some_and(|(l, _)| *l == label) {
+                        return no("Bootstrap failed: 5: Input/output error");
+                    }
+                    run.push(label);
                     ok(String::new())
                 }
                 ("launchctl", Some("bootout")) => {
-                    let label = args[1].rsplit('/').next().unwrap().to_string();
+                    let label = label();
                     run.retain(|n| *n != label);
+                    if self.linger.get() > 0 {
+                        *self.leaving.borrow_mut() = Some((label, self.linger.get()));
+                    }
                     ok(String::new())
                 }
                 _ => ok(String::new()),
@@ -1135,6 +1296,7 @@ mod tests {
             base: root.join("store"),
             bin: PathBuf::from("/opt/borg/bin/borg"),
             path: "/usr/bin:/bin".into(),
+            env: Vec::new(),
             uid: 501,
             session: true,
             run,
@@ -1147,31 +1309,36 @@ mod tests {
 
     #[test]
     fn units_render_with_the_marker_the_command_and_the_path() {
-        let unit = systemd_unit(&Service::Mesh("corp".into()), Path::new("/opt/b dir/borg"), "/opt/b dir:/usr/bin");
+        let unit = systemd_unit(&Service::Mesh("corp".into()), Path::new("/opt/b dir/borg"), "/opt/b dir:/usr/bin", &[]);
         assert!(owned(&unit), "{unit}");
-        assert!(unit.starts_with(&format!("# managed by borg {VERSION}: rewritten by borg; edits are lost\n")), "{unit}");
+        assert!(unit.starts_with("# managed by borg: rewritten by borg; edits are lost\n"), "{unit}");
+        assert!(owned("# managed by borg 0.8.3: rewritten by borg; edits are lost\n[Unit]\n"), "an older borg's file is borg's");
         assert!(unit.contains("\nExecStart=\"/opt/b dir/borg\" mesh serve --collective corp\n"), "{unit}");
         assert!(unit.contains("\nEnvironment=\"PATH=/opt/b dir:/usr/bin\"\n"), "{unit}");
         for line in ["KillSignal=SIGINT", "TimeoutStopSec=30", "Restart=on-failure", "RestartSec=10", "After=network-online.target", "WantedBy=default.target"]
         {
             assert!(unit.lines().any(|l| l == line), "{line}: {unit}");
         }
-        assert_eq!(systemd_path(&unit).as_deref(), Some("/opt/b dir:/usr/bin"), "read back");
-        let web = systemd_unit(&Service::Web, Path::new("/b/borg"), "/b");
+        assert_eq!(systemd_path(&unit, Path::new("/home/ann")).as_deref(), Some("/opt/b dir:/usr/bin"), "read back");
+        let web = systemd_unit(&Service::Web, Path::new("/b/borg"), "/b", &[]);
         assert!(web.contains("\nExecStart=/b/borg web\nWorkingDirectory=%h\n") && web.contains("KillSignal=SIGINT"), "{web}");
         // A name that is not a plain word is quoted, its specifiers and variables escaped.
         assert_eq!(sd_word("a b%c$d\"e", true), "\"a b%%c$$d\\\"e\"");
-        assert_eq!(unescape("PATH=/a%%b \\\"c\\\\ \\x07"), "PATH=/a%b \"c\\ \u{7}");
+        assert_eq!(unescape("PATH=/a%%b \\\"c\\\\ \\x07"), "PATH=/a%%b \"c\\ \u{7}");
         // A hand-written unit's bare PATH.
-        assert_eq!(systemd_path("[Service]\nEnvironment=PATH=/home/ann/.cargo/bin:/usr/bin\n").as_deref(), Some("/home/ann/.cargo/bin:/usr/bin"));
+        let home = Path::new("/home/ann");
+        assert_eq!(systemd_path("[Service]\nEnvironment=PATH=/home/ann/.cargo/bin:/usr/bin\n", home).as_deref(), Some("/home/ann/.cargo/bin:/usr/bin"));
+        // A path borg wrote with a `%` in it reads back as written.
+        let odd = systemd_unit(&Service::Web, Path::new("/b/borg"), "/b:/x%y", &[]);
+        assert_eq!(systemd_path(&odd, home).as_deref(), Some("/b:/x%y"), "{odd}");
         assert!(!owned("[Unit]\nDescription=mine\n"));
     }
 
     #[test]
     fn a_plist_has_the_agent_settings_and_escapes_its_strings() {
-        let p = plist("borg.mesh.a&b", &Service::Mesh("a&b".into()), Path::new("/Users/ann/bin/borg"), "/Users/ann/bin:/usr/bin", Path::new("/Users/ann"));
+        let p = plist("borg.mesh.a&b", &Service::Mesh("a&b".into()), Path::new("/Users/ann/bin/borg"), "/Users/ann/bin:/usr/bin", &[], Path::new("/Users/ann"));
         assert!(owned(&p), "{p}");
-        assert!(p.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- managed by borg "), "the declaration stays first: {p}");
+        assert!(p.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- managed by borg: "), "the declaration stays first: {p}");
         assert!(p.contains("<string>/Users/ann/bin/borg</string>\n    <string>mesh</string>\n    <string>serve</string>\n    <string>--collective</string>\n    <string>a&amp;b</string>"), "{p}");
         assert!(p.contains("<key>RunAtLoad</key>\n  <true/>") && p.contains("<key>SuccessfulExit</key>\n    <false/>"), "{p}");
         assert!(p.contains("<string>/Users/ann/Library/Logs/borg/borg.mesh.a&amp;b.log</string>"), "{p}");
@@ -1188,6 +1355,8 @@ mod tests {
     fn the_path_puts_borg_first_once() {
         assert_eq!(unit_path(Path::new("/o/bin/borg"), "/usr/bin:/o/bin::/bin"), "/o/bin:/usr/bin:/bin");
         assert_eq!(unit_path(Path::new("/o/bin/borg"), ""), "/o/bin");
+        // A relative entry would resolve against the service's working directory.
+        assert_eq!(unit_path(Path::new("/o/bin/borg"), ".:bin:%h/x:/usr/bin"), "/o/bin:/usr/bin");
     }
 
     #[test]
@@ -1197,12 +1366,16 @@ mod tests {
             r#"{"collectives":[{"name":"corp","paths":["/w"]},{"name":"idle","paths":["/i"]},{"name":"mine","paths":["/p"],"share":"local"}]}"#,
         )
         .unwrap();
-        for c in ["corp", "mine"] {
-            let key = collective::store(&base, c).join("mesh/node.key");
-            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
-            std::fs::write(key, "k").unwrap();
+        for c in ["corp", "mine", "idle"] {
+            let mesh = collective::store(&base, c).join("mesh");
+            std::fs::create_dir_all(&mesh).unwrap();
+            std::fs::write(mesh.join("node.key"), "k").unwrap();
+            if c != "idle" {
+                std::fs::write(mesh.join("membership.json"), "{}").unwrap();
+            }
         }
-        assert_eq!(wanted(Some(&cfg), &base), corp(), "idle has no identity, mine is local");
+        // idle has a key (`borg mesh id`, a failed join) but no membership: its daemon would exit.
+        assert_eq!(wanted(Some(&cfg), &base), corp(), "idle is no member yet, mine is local");
         assert_eq!(wanted(None, &base), [Service::Web], "default without a mesh");
         let none: collective::Config = serde_json::from_str(r#"{"collectives":[]}"#).unwrap();
         assert_eq!(wanted(Some(&none), &base), [], "no collective: borg web would exit");
@@ -1412,9 +1585,189 @@ mod tests {
     fn manager_answers_parse() {
         let shown = "MainPID=1051993\nId=borg-web.service\nActiveState=active\nUnitFileState=enabled\n\nMainPID=0\nId=borg-mesh-x.service\nActiveState=inactive\nUnitFileState=\n";
         let s = systemd_states(shown);
-        assert_eq!(s["borg-web.service"], State { active: "active".into(), running: true, enabled: true, pid: Some(1_051_993) });
-        assert_eq!(s["borg-mesh-x.service"], State { active: "inactive".into(), running: false, enabled: false, pid: None });
+        assert_eq!(s["borg-web.service"], State { active: "active".into(), running: true, enabled: true, pid: Some(1_051_993), ..State::default() });
+        assert_eq!(s["borg-mesh-x.service"], State { active: "inactive".into(), running: false, enabled: false, pid: None, ..State::default() });
         let printed = "gui/501/borg.web = {\n\tactive count = 1\n\tpath = /Users/ann/Library/LaunchAgents/borg.web.plist\n\tstate = running\n\n\tprogram = /Users/ann/.local/bin/borg\n\tpid = 812\n}\n";
-        assert_eq!(launchd_state(printed), State { active: "running".into(), running: true, enabled: true, pid: Some(812) });
+        assert_eq!(launchd_state(printed), State { active: "running".into(), running: true, enabled: true, pid: Some(812), ..State::default() });
+    }
+
+    /// Systemd's crash loop: `activating` between the starts of a unit that keeps failing.
+    #[test]
+    fn a_crash_loop_is_not_running() {
+        let shown = "Id=borg-web.service\nActiveState=activating\nSubState=auto-restart\nNRestarts=12\nUnitFileState=enabled\nMainPID=0\n";
+        let s = &systemd_states(shown)["borg-web.service"];
+        assert!(!s.running && s.looping && s.restarts == 12, "{s:?}");
+        // A unit that starts (no failure yet) is not a loop either.
+        let starting = "Id=borg-web.service\nActiveState=activating\nSubState=start\nNRestarts=0\nUnitFileState=enabled\n";
+        assert!(!systemd_states(starting)["borg-web.service"].looping);
+    }
+
+    #[test]
+    fn checks_name_a_crash_loop_and_where_to_look() {
+        let root = tmp("loop-checks");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        install(&h, &corp(), &mut Record::default());
+        stub.running.borrow_mut().retain(|n| n != "borg-web.service");
+        stub.looping.borrow_mut().push("borg-web.service".into());
+        let c = checks_on(&h, Ok(corp()));
+        let web: Vec<&(Level, String)> = c.iter().filter(|(_, m)| m.contains("borg-web.service")).collect();
+        assert!(
+            matches!(web.as_slice(), [(Level::Warn, m)] if m.contains("keeps failing") && m.contains("restarted 7 times") && m.contains("journalctl --user -u borg-web.service") && m.contains("a `borg web`")),
+            "{c:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_starts_a_unit_in_a_crash_loop_instead_of_keeping_it() {
+        let root = tmp("loop-install");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        let mut rec = Record::default();
+        install(&h, &corp(), &mut rec);
+        stub.running.borrow_mut().retain(|n| n != "borg-web.service");
+        stub.looping.borrow_mut().push("borg-web.service".into());
+        stub.log.borrow_mut().clear();
+        install(&h, &corp(), &mut rec);
+        assert_eq!(stub.changes(), ["systemctl --user start borg-web.service"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn units_carry_the_store_config_and_relay_they_were_decided_for() {
+        let root = tmp("env");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let mut h = host(Backend::Systemd, &root, &run);
+        h.env = vec![("BORG_HOME", "/s/store".into()), ("BORG_CONFIG", "/s/my config.json".into()), ("BORG_RELAY", "https://relay.example.com".into())];
+        let mut rec = Record::default();
+        install(&h, &corp(), &mut rec);
+        let mesh = std::fs::read_to_string(h.dir.join("borg-mesh-corp.service")).unwrap();
+        for line in [
+            "Environment=PATH=/opt/borg/bin:/usr/bin:/bin",
+            "Environment=BORG_HOME=/s/store",
+            "Environment=\"BORG_CONFIG=/s/my config.json\"",
+            "Environment=BORG_RELAY=https://relay.example.com",
+        ] {
+            assert!(mesh.lines().any(|l| l == line), "{line}: {mesh}");
+        }
+        assert_eq!(systemd_path(&mesh, &h.home).as_deref(), Some("/opt/borg/bin:/usr/bin:/bin"), "PATH still reads back");
+        // Another store: the files change, so the services restart on it.
+        h.env.truncate(1);
+        h.env[0].1 = "/t/store".into();
+        stub.log.borrow_mut().clear();
+        install(&h, &corp(), &mut rec);
+        let mesh = std::fs::read_to_string(h.dir.join("borg-mesh-corp.service")).unwrap();
+        assert!(mesh.contains("\nEnvironment=BORG_HOME=/t/store\n") && !mesh.contains("BORG_CONFIG"), "{mesh}");
+        assert_eq!(stub.changes(), ["systemctl --user daemon-reload", "systemctl --user restart borg-mesh-corp.service borg-web.service"]);
+        let p = plist("borg.web", &Service::Web, Path::new("/b/borg"), "/b", &[("BORG_CONFIG", "/s/a&b.json".into())], Path::new("/Users/ann"));
+        assert!(
+            p.contains("<dict>\n    <key>PATH</key>\n    <string>/b</string>\n    <key>BORG_CONFIG</key>\n    <string>/s/a&amp;b.json</string>\n  </dict>"),
+            "{p}"
+        );
+        assert_eq!(plist_path(&p).as_deref(), Some("/b"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_taken_over_units_specifiers_are_expanded_not_kept() {
+        let root = tmp("specifiers");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        std::fs::create_dir_all(&h.dir).unwrap();
+        std::fs::write(
+            h.dir.join("borg-web.service"),
+            "[Service]\nExecStart=%h/.cargo/bin/borg web\nEnvironment=PATH=%h/.cargo/bin:/usr/bin:/srv/%u/bin:/a%%b\n",
+        )
+        .unwrap();
+        install(&h, &corp(), &mut Record::default());
+        let web = std::fs::read_to_string(h.dir.join("borg-web.service")).unwrap();
+        let path = format!("/opt/borg/bin:{}/.cargo/bin:/usr/bin:/a%b", h.home.display());
+        assert_eq!(systemd_path(&web, &h.home).as_deref(), Some(path.as_str()), "{web}");
+        assert!(!web.contains("%%h") && !web.contains("%u"), "no specifier kept as text: {web}");
+        // Quoted, as systemd reads it too: unquoted first, then the specifiers.
+        assert_eq!(systemd_path("Environment=\"PATH=%h/bin:/x\"\n", Path::new("/home/ann")).as_deref(), Some("/home/ann/bin:/x"));
+        assert_eq!(specifiers("/a%", "/h"), None, "a lone % is no value borg can tell");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_step_still_saves_the_record_and_the_version_follows_the_restarts() {
+        let root = tmp("partial");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        // An enable that fails: the services were still started by this borg.
+        stub.fail.borrow_mut().push("enable");
+        let r = install(&h, &corp(), &mut Record::default());
+        assert!(r.failed, "{:?}", r.lines);
+        assert_eq!(Record::read(&h.base), Record { version: Some(VERSION.into()), off: false });
+        // A restart that fails after `borg service remove` (`off` on disk, `borg service install` turned
+        // it on in memory): the record is saved, its version left so the next install tries again.
+        Record { version: Some("0.0.1".into()), off: true }.save(&h.base).unwrap();
+        stub.fail.borrow_mut().push("restart");
+        let mut rec = Record { version: Some("0.0.1".into()), off: false };
+        let r = install(&h, &corp(), &mut rec);
+        assert!(r.failed, "{:?}", r.lines);
+        assert_eq!(Record::read(&h.base), Record { version: Some("0.0.1".into()), off: false });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launchd_waits_for_a_booted_out_agent_before_loading_it_again() {
+        let root = tmp("linger");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Launchd, &root, &run);
+        let mut rec = Record::default();
+        install(&h, &corp(), &mut rec);
+        std::fs::write(h.dir.join("borg.web.plist"), "<plist>mine</plist>").unwrap();
+        // launchd holds the label for two more answers while the daemon stops.
+        stub.linger.set(2);
+        stub.log.borrow_mut().clear();
+        let r = install(&h, &corp(), &mut rec);
+        assert!(!r.failed, "{:?}", r.lines);
+        let prints = stub.log.borrow().iter().filter(|l| l.as_str() == "launchctl print gui/501/borg.web").count();
+        assert!(prints >= 3, "asked until launchd let go: {:?}", stub.log.borrow());
+        assert_eq!(h.web_pid(), Some(7), "loaded again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_leaves_another_homes_manager_alone() {
+        let root = tmp("remove-other");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        install(&host(Backend::Systemd, &root, &run), &corp(), &mut Record::default());
+        // The manager here is another HOME's (a sandbox's HOME on the engineer's session).
+        let other = Stub { home: root.join("elsewhere"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| other.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        let r = remove(&h, &mut Record::default());
+        assert!(!r.failed, "{:?}", r.lines);
+        assert_eq!(other.changes(), Vec::<String>::new(), "nothing stopped");
+        assert!(!h.dir.join("borg-web.service").exists() && Record::read(&h.base).off, "{:?}", r.lines);
+        assert!(r.lines.iter().any(|l| l.contains("nothing stopped")), "{:?}", r.lines);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_unit_that_cannot_be_written_is_a_failure_not_none_wanted() {
+        let root = tmp("unwritable");
+        let stub = Stub { home: root.join("home"), ..Stub::default() };
+        let run = |p: &str, a: &[&str]| stub.run(p, a);
+        let h = host(Backend::Systemd, &root, &run);
+        // A directory where each file goes: no write lands.
+        for f in ["borg-mesh-corp.service", "borg-web.service"] {
+            std::fs::create_dir_all(h.dir.join(f)).unwrap();
+        }
+        let r = install(&h, &corp(), &mut Record::default());
+        assert!(r.failed && !r.skipped, "{:?}", r.lines);
+        assert!(!r.lines.iter().any(|l| l.contains("none wanted")), "{:?}", r.lines);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

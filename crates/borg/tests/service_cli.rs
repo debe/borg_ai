@@ -21,6 +21,7 @@ fn script(path: &Path, body: &str) {
 const SYSTEMCTL: &str = r#"echo "systemctl $*" >> "$SERVICE_LOG"
 [ "$1" = --user ] && shift
 verb=$1; shift
+[ -f "$SERVICE_STATE/fail.$verb" ] && { echo "Failed to $verb: Unit failed" >&2; exit 1; }
 case "$verb" in
   show-environment)
     [ -f "$SERVICE_STATE/nobus" ] && { echo "Failed to connect to bus: No medium found" >&2; exit 1; }
@@ -38,6 +39,7 @@ case "$verb" in
 esac"#;
 
 const LAUNCHCTL: &str = r#"echo "launchctl $*" >> "$SERVICE_LOG"
+[ -f "$SERVICE_STATE/fail.$1" ] && { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
 case "$1" in
   managername) echo Aqua ;;
   print) [ -f "$SERVICE_STATE/${2##*/}.loaded" ] || exit 113; printf '\tstate = running\n' ;;
@@ -45,8 +47,8 @@ case "$1" in
   bootout) rm -f "$SERVICE_STATE/${2##*/}.loaded" ;;
 esac"#;
 
-/// A machine: a team collective `corp` with a mesh identity and a local one `mine`, an installed
-/// borg (a stub file: only its path is written into the units), the stub managers.
+/// A machine: a team collective `corp` this machine is a member of and a local one `mine`, an
+/// installed borg (a stub file: only its path is written into the units), the stub managers.
 fn machine(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("borg-service-cli-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -58,9 +60,10 @@ fn machine(name: &str) -> PathBuf {
         {"name": "mine", "paths": [root.join("mine")], "share": "local"},
     ]});
     std::fs::write(root.join("collectives.json"), cfg.to_string()).unwrap();
-    let key = root.join("store/collectives/corp/mesh/node.key");
-    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
-    std::fs::write(key, "00").unwrap();
+    let mesh = root.join("store/collectives/corp/mesh");
+    std::fs::create_dir_all(&mesh).unwrap();
+    std::fs::write(mesh.join("node.key"), "00").unwrap();
+    std::fs::write(mesh.join("membership.json"), "{}").unwrap();
     script(&root.join("inst/borg"), "exit 0");
     script(&root.join("bin/systemctl"), SYSTEMCTL);
     script(&root.join("bin/launchctl"), LAUNCHCTL);
@@ -139,7 +142,15 @@ fn install_takes_over_a_hand_written_unit_then_does_nothing_and_restarts_on_anot
     assert_eq!(std::fs::read_to_string(dir.join(format!("{web}.bak"))).unwrap(), mine, "the engineer's unit kept");
     for f in [mesh, web] {
         let t = std::fs::read_to_string(dir.join(f)).unwrap();
-        assert!(t.contains(&format!("managed by borg {}", env!("CARGO_PKG_VERSION"))) && t.contains(&root.join("inst/borg").display().to_string()), "{f}: {t}");
+        assert!(t.contains("managed by borg: rewritten by borg") && t.contains(&root.join("inst/borg").display().to_string()), "{f}: {t}");
+        // The daemons serve the store and config this borg ran with, not the default ones.
+        for (k, v) in [("BORG_HOME", root.join("store")), ("BORG_CONFIG", root.join("collectives.json"))] {
+            let set = match LAUNCHD {
+                true => format!("<key>{k}</key>\n    <string>{}</string>", v.display()),
+                false => format!("\nEnvironment={k}={}\n", v.display()),
+            };
+            assert!(t.contains(&set), "{f} sets {k}: {t}");
+        }
     }
     assert!(!dir.join(if LAUNCHD { "borg.mesh.mine.plist" } else { "borg-mesh-mine.service" }).exists(), "a local collective has no mesh daemon");
     let did = changes(&root);
@@ -229,6 +240,36 @@ fn remove_stays_off_through_install_apply_until_service_install() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `borg service install` turns the services on before its steps run: a step that fails leaves them on,
+/// so the next update refreshes them.
+#[test]
+fn install_after_remove_is_on_even_when_a_step_fails() {
+    if !supported() {
+        return;
+    }
+    let root = machine("remove-fail");
+    let (dir, _, web) = units(&root);
+    assert_eq!(borg(&root, &["service", "remove"]).status.code(), Some(0));
+    assert_eq!(record(&root)["off"], true);
+    std::fs::write(root.join("state").join(if LAUNCHD { "fail.bootstrap" } else { "fail.start" }), "").unwrap();
+    let out = borg(&root, &["service", "install"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(dir.join(web).is_file(), "{}", text(&out));
+    assert_eq!(record(&root)["off"], false, "{}", text(&out));
+    assert!(record(&root).get("version").is_none(), "nothing started, so no borg (re)started them");
+    let out = borg(&root, &["service"]);
+    assert!(!text(&out).contains("services: off"), "{}", text(&out));
+    // An install that cannot run here (a development build) turns them on too.
+    assert_eq!(borg(&root, &["service", "remove"]).status.code(), Some(0));
+    let dev = root.join("repo/target/release");
+    std::fs::create_dir_all(&dev).unwrap();
+    script(&dev.join("borg"), "exit 0");
+    let out = borg_as(&root, &["service", "install"], &dev.join("borg"));
+    assert!(text(&out).contains("development build"), "{}", text(&out));
+    assert_eq!(record(&root)["off"], false, "{}", text(&out));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An older borg's `borg update` runs only `borg install <h> --apply` and `borg doctor` on the new
 /// binary: that install is what sets the services up.
 #[test]
@@ -264,8 +305,8 @@ fn an_older_borgs_update_path_installs_the_units() {
         assert!(!text(&out).contains("services"), "{args:?}: {}", text(&out));
     }
     assert_eq!(changes(&root), Vec::<String>::new());
-    // The collective loses its mesh identity: its daemon goes.
-    std::fs::remove_file(root.join("store/collectives/corp/mesh/node.key")).unwrap();
+    // The collective loses its membership (the key alone, as `borg mesh id` leaves it): its daemon goes.
+    std::fs::remove_file(root.join("store/collectives/corp/mesh/membership.json")).unwrap();
     let out = borg(&root, &["service", "install"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!dir.join(mesh).exists() && dir.join(web).is_file(), "{}", text(&out));
