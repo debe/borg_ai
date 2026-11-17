@@ -83,9 +83,9 @@ borg handoff take <id>       # in a session in a clone"</pre>
                 let here = d.handoffs.with(|h| h.here.clone());
                 view! {
                     <table class="ltable">
-                        <tr><th>"Engineers"</th><th title="the node's key, shortened">"Machine"</th><th>"borg"</th><th title="the repos it holds clones of">"Clones"</th></tr>
+                        <tr><th>"Engineers"</th><th title="its hostname, else the node's key, shortened">"Machine"</th><th>"borg"</th><th title="the repos it holds clones of">"Clones"</th></tr>
                         {hosts.into_iter().map(|m| {
-                            let node = if m.node == here { "this one".to_string() } else { m.node.chars().take(12).collect() };
+                            let node = if m.node == here { "this one".to_string() } else if !m.host.is_empty() { m.host.clone() } else { m.node.chars().take(12).collect() };
                             let borg = if m.borg.is_empty() { "no hand-offs".to_string() } else if m.handoff >= 1.0 { m.borg.clone() } else { format!("{} (no hand-offs)", m.borg) };
                             view! {
                                 <tr>

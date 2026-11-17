@@ -72,6 +72,8 @@ fn setup(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let root = tmp(name);
     let (work, private, secret) = (root.join("work/app"), root.join("private/diary"), root.join("secret/x"));
     repo(&work, "alice@x");
+    let name = Command::new("git").arg("-C").arg(&work).args(["config", "user.name", "Alice Example"]).env("GIT_CONFIG_NOSYSTEM", "1").status().unwrap();
+    assert!(name.success());
     repo(&private, "alice@home");
     std::fs::create_dir_all(&secret).unwrap();
     let cfg = json!({"default": "off", "off": [root.join("secret")],
@@ -99,20 +101,27 @@ fn hooks_keep_presence_and_top_lists_the_drones() {
     assert_eq!(p["prompt"], "fix the login redirect");
     assert_eq!(p["files"], json!(["src/login.rs"]));
     assert_eq!(p["event"], "post_tool");
+    // The session's first hook learned the engineer's git user.name (names.rs).
+    let names: Value = serde_json::from_slice(&std::fs::read(store(&root, "corp").join("names.json")).unwrap()).unwrap();
+    assert_eq!(names, json!({"alice@x": "Alice Example"}));
 
     let (out, code) = borg(&root, &["top"], "");
     assert_eq!(code, Some(0));
     assert!(out.contains("corp (team): 2 drone(s), 2 active, 0 remote"), "{out}");
     assert!(out.contains("mine (local, never leaves this machine): 1 drone(s)"), "{out}");
     let one = out.lines().find(|l| l.contains("s-one")).unwrap();
-    assert!(one.contains("One of Two") && one.contains("alice@x") && one.contains("fix the login redirect") && one.contains("src/login.rs"), "{one}");
+    assert!(
+        one.contains("Alice Example · app · claude") && one.contains("here") && one.contains("fix the login redirect") && one.contains("src/login.rs"),
+        "{one}"
+    );
 
     let (out, _) = borg(&root, &["top", "--json", "--dir", &w], "");
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 1, "--dir: only the collective it routes to");
     assert_eq!(v[0]["collective"], "corp");
     assert_eq!(v[0]["drones"][1]["session"], "s-two");
-    assert_eq!(v[0]["drones"][1]["designation"], "Two of Two");
+    assert_eq!(v[0]["drones"][1]["designation"], "Alice Example · app · omp");
+    assert_eq!((v[0]["drones"][1]["number"].as_u64(), v[0]["drones"][1]["engineer"].as_str()), (Some(2), Some("Alice Example")));
     assert_eq!(v[0]["drones"][1]["harness"], "omp");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -161,7 +170,7 @@ fn a_pause_holds_until_resumed_and_each_steer_is_shown_once() {
     let (_, code) = borg(&root, &["tell", "s-one", "the staging db is down, use the mock", "--dir", &w], "");
     assert_eq!(code, Some(0));
     let ctx = context(&hook(&root, "claude", "post_tool", ev(json!({"tool_name": "Read", "tool_input": {"file_path": "x"}}))));
-    assert!(ctx.starts_with("[borg] Message from alice@x") && ctx.contains("the staging db is down, use the mock"), "{ctx}");
+    assert!(ctx.starts_with("[borg] Message from Alice Example (terminal") && ctx.contains("the staging db is down, use the mock"), "{ctx}");
     assert_eq!(hook(&root, "claude", "post_tool", ev(json!({"tool_name": "Read"}))), None, "once");
 
     // Pause: tools refused, the stop lets the drone wait, the next prompt says why once.

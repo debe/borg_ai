@@ -26,6 +26,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use borg::collective::{self, Route, Share};
+use borg::names::Book;
 use borg::{absorb, conscience, install, learn, memory, memory_export, msg, outcome, presence, protocol, stats, top, update};
 use futures_util::{Stream, StreamExt};
 
@@ -128,14 +129,14 @@ async fn stats_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
     for b in &buckets {
         all.add(b);
     }
-    let aliases = collective::aliases();
+    let names = Book::load(&m.home, learn::now_ms());
     let first = buckets.iter().map(|b| b.day.as_str()).min().unwrap_or_default().to_string();
     let last = buckets.iter().map(|b| b.day.as_str()).max().unwrap_or_default().to_string();
     let days = series(&buckets, &first, &last);
-    let engineers: Vec<Value> = sum_by(&buckets, |b| aliases.display(&b.engineer))
+    let engineers: Vec<Value> = sum_by(&buckets, |b| names.display(&b.engineer))
         .into_iter()
         .map(|(e, t)| {
-            let mine: Vec<stats::Bucket> = buckets.iter().filter(|b| aliases.display(&b.engineer) == e).cloned().collect();
+            let mine: Vec<stats::Bucket> = buckets.iter().filter(|b| names.display(&b.engineer) == e).cloned().collect();
             json!({"engineer": e, "totals": totals(&t), "days": series(&mine, &first, &last)})
         })
         .collect();
@@ -165,7 +166,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
             }
         }
     }
-    let aliases = collective::aliases();
+    let names = Book::load(&m.home, learn::now_ms());
     let stored = learn::stored(&path);
     let mut out: Vec<Value> = list
         .iter()
@@ -174,7 +175,7 @@ async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response
             json!({
                 "id": c.id, "question": c.question, "situations": c.situations, "consequence": c.consequence,
                 "area": c.area, "scope": c.scope, "source": c.source, "origin_ms": c.origin_ms,
-                "engineers": c.engineers.iter().map(|e| aliases.display(e)).collect::<Vec<_>>(),
+                "engineers": c.engineers.iter().map(|e| names.display(e)).collect::<Vec<_>>(),
                 "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
                 "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
                 "regretted": mm.map_or(0.0, |x| x.regretted),
@@ -259,11 +260,11 @@ const PAGE_MAX: usize = 2000;
 async fn feed(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
     stats::backfill(&m.home);
-    let aliases = collective::aliases();
+    let names = Book::load(&m.home, learn::now_ms());
     let out: Vec<Value> = stats::newest(&m.home, &NOTABLE, q.limit.unwrap_or(PAGE).min(PAGE_MAX))
         .into_iter()
         .map(|e| {
-            json!({"ms": e.ms, "kind": e.kind, "engineer": aliases.display(&e.engineer), "repo": e.repo, "lessons": e.lessons,
+            json!({"ms": e.ms, "kind": e.kind, "engineer": names.display(&e.engineer), "repo": e.repo, "lessons": e.lessons,
                 "n": e.n, "usd": e.usd, "dur_ms": e.dur_ms, "why": e.why, "text": e.text, "source": e.source})
         })
         .collect();
@@ -274,6 +275,12 @@ async fn queen(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let mut entries = borg::queen::entries(&m.home);
     entries.sort_by_key(|e| std::cmp::Reverse(e.ms));
+    // Engineers by name (names.rs), who asked and who answered.
+    let names = Book::load(&m.home, learn::now_ms());
+    for e in &mut entries {
+        e.engineer = names.display(&e.engineer);
+        e.answered_by = e.answered_by.as_deref().map(|a| names.display(a));
+    }
     // The queen's attention reward (escalation.rs), the team's: folded from every stats bucket.
     let attention = borg::escalation::team(&m.home);
     Json(json!({"collective": m.name, "entries": entries, "attention": attention})).into_response()
@@ -282,29 +289,35 @@ async fn queen(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
 async fn drones(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
     let now = learn::now_ms();
-    let mut ds = top::drones(&m.home, m.share == Share::Team, now);
+    let (mut ds, names) = top::named(&m.home, m.share == Share::Team, now);
     for d in &mut ds {
-        d.p.engineer = collective::aliases().display(&d.p.engineer);
+        d.p.engineer = names.display(&d.p.engineer);
     }
-    let inbox = top::inbox(&m.home, &ds, now);
+    let inbox = top::inbox(&m.home, &ds, names, now);
     Json(top::to_json_with(&m.name, m.share, &ds, &inbox)).into_response()
 }
 
 /// Hand-offs (borg handoff `board`): every one this node knows, with its state, whom it asks, who took
 /// or declined it and which engineers have a machine that could take it, and every machine the presence
-/// shows with its borg and clones ("who can take what"). Engineers show as their aliases. No remote is
+/// shows with its borg and clones ("who can take what"). Engineers show by name (names.rs), whom an
+/// offer asks too, by name or as its machine. No remote is
 /// asked: what the store holds.
 async fn handoffs(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
-    let mut v = borg::handoff::board(&m.home, learn::now_ms());
-    let aliases = collective::aliases();
+    let now = learn::now_ms();
+    let mut v = borg::handoff::board(&m.home, now);
+    let names = Book::load(&m.home, now);
     let show = |x: &mut Value| {
-        if let Some(e) = x.as_str().map(|e| aliases.display(e)) {
+        if let Some(e) = x.as_str().map(|e| names.display(e)) {
             *x = json!(e);
         }
     };
     for h in v["handoffs"].as_array_mut().into_iter().flatten() {
         show(&mut h["engineer"]);
+        // An ask names an engineer by email or a machine by its key.
+        if let Some(to) = h["to"].as_str().map(|t| if t.contains('@') { names.display(t) } else { names.host(t) }) {
+            h["to"] = json!(to);
+        }
         if let Some(by) = h.get_mut("by").filter(|b| b.is_object()) {
             show(&mut by["engineer"]);
         }
@@ -319,8 +332,8 @@ async fn handoffs(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
 }
 
 /// Messages between sessions (borg msg.rs) on this node, newest first: who sent each to whom, as `borg
-/// top` names them (a sender from another node with that node's short key: the one part the mesh
-/// checked), what the recipient is (`to_kind`: `all` for a broadcast, `local` or `collective`,
+/// top` names them (a sender as its drone is labelled now, from another node with that node's machine:
+/// the one part the mesh checked), what the recipient is (`to_kind`: `all` for a broadcast, `local` or `collective`,
 /// `engineer` or `session`, from msg.rs `Address`; `to_name`, top.rs `recipient`, tells them apart),
 /// and how many sessions here it was shown to. Listing acknowledges nothing: the page fetches every
 /// view whichever is open, so the messages view says what it showed (`messages_seen`).
@@ -330,13 +343,13 @@ async fn handoffs(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
 /// A→B and B→A share one; `mine` is a line sent from this node. `status` is `broadcast`, `engineer`,
 /// `read`/`unread`/`missed` for a session here (shown, waiting on a live one, never shown and ended or
 /// unknown) or `elsewhere` for one on another node. `from_*`/`to_*` carry each end's drone context as
-/// borg top lists it (repo, engineer alias, state), empty when it lists none. `unread` is how many
+/// borg top lists it (repo, engineer by name, state), empty when it lists none. `unread` is how many
 /// running sessions here it still waits for (a broadcast may wait for several); the rows sum to the
 /// top-level `unread`, the Unread now tile.
 async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Response {
     let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
     let now = learn::now_ms();
-    let ds = top::drones(&m.home, m.share == Share::Team, now);
+    let (ds, names) = top::named(&m.home, m.share == Share::Team, now);
     let shown = msg::seen_by(&m.home);
     let here = msg::node(&m.home);
     let mut all: Vec<msg::Message> = msg::read(&m.home).into_iter().filter(|x| now - x.ms <= msg::TTL_MS).collect();
@@ -354,10 +367,9 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
     let unread: usize = waiting.values().sum();
     all.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
     all.truncate(q.limit.unwrap_or(PAGE).min(PAGE_MAX));
-    let aliases = collective::aliases();
-    /// A drone's (repo, engineer alias, state) as a row lists them; empty strings without one.
-    fn context<'a>(d: Option<&'a top::Drone>, aliases: &collective::Aliases) -> (&'a str, String, &'static str) {
-        d.map_or(("", String::new(), ""), |d| (d.p.repo.as_str(), aliases.display(&d.p.engineer), d.state.name()))
+    /// A drone's (repo, engineer by name, state) as a row lists them; empty strings without one.
+    fn context<'a>(d: Option<&'a top::Drone>, names: &Book) -> (&'a str, String, &'static str) {
+        d.map_or(("", String::new(), ""), |d| (d.p.repo.as_str(), names.display(&d.p.engineer), d.state.name()))
     }
     let out: Vec<Value> = all
         .iter()
@@ -408,9 +420,9 @@ async fn messages(State(app): State<Arc<App>>, Query(q): Query<FeedQuery>) -> Re
             } else {
                 "missed"
             };
-            let ((from_repo, from_engineer, from_state), (to_repo, to_engineer, to_state)) = (context(sd, aliases), context(rd, aliases));
-            json!({"id": x.id, "kind": x.kind, "by": x.by, "from": top::sender(&ds, &here, x), "harness": x.harness, "node": x.node,
-                "to": x.to, "to_name": top::recipient(&ds, &here, &x.to), "to_kind": to_kind, "re": x.re, "ms": x.ms, "text": x.text, "shown_to": to, "unread": waits,
+            let ((from_repo, from_engineer, from_state), (to_repo, to_engineer, to_state)) = (context(sd, &names), context(rd, &names));
+            json!({"id": x.id, "kind": x.kind, "by": x.by, "from": top::sender(&ds, &names, &here, x), "harness": x.harness, "node": x.node,
+                "to": x.to, "to_name": top::recipient(&ds, &names, &here, &x.to), "to_kind": to_kind, "re": x.re, "ms": x.ms, "text": x.text, "shown_to": to, "unread": waits,
                 "mine": x.node == here, "from_key": from_key, "to_key": to_key, "conversation": conversation, "status": status,
                 "from_repo": from_repo, "from_engineer": from_engineer, "from_state": from_state,
                 "to_repo": to_repo, "to_engineer": to_engineer, "to_state": to_state})
@@ -460,8 +472,8 @@ async fn learning_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Resp
 /// What `/api/update` serves for the collective `name` at `home`: this borg (`borg`, its mesh protocol
 /// `protocol`), the last release check (`latest`, `checked_ms`, `error`; all null before the first) and
 /// whether its release is newer (`update`, false while `check` is off: `BORG_UPDATE_CHECK=off`), then
-/// the members this node knows of. Each member has its `key`, its `engineer` when known and `name` (the
-/// engineer, else its short key), `borg` (null: older than 0.7, it sent none), the `protocol` its last
+/// the members this node knows of. Each member has its `key`, its `engineer` when known (by name,
+/// names.rs) and `name` (the engineer, else its short key), `host` (its machine, else its short key), `borg` (null: older than 0.7, it sent none), the `protocol` its last
 /// session agreed on, `syncs` (false: nothing syncs with it, it speaks a protocol this node does not)
 /// and `note`: what it misses on an older protocol (protocol.rs `NOTES`), or why nothing syncs; null
 /// on this node's footing. Without `mesh/` there are no members.
@@ -471,10 +483,10 @@ pub fn update_view(name: &str, home: &Path) -> Value {
     let on = update::on();
     let newer = on && latest.as_deref().is_some_and(|l| update::newer(l, update::VERSION));
     let ours = protocol::current();
-    let aliases = collective::aliases();
+    let names = Book::load(home, learn::now_ms());
     let versions = protocol::versions(home);
     let mismatches = protocol::mismatches(home);
-    let engineer = |v: Option<&protocol::PeerVersion>| v.and_then(|v| v.engineer.as_deref()).filter(|e| !e.is_empty()).map(|e| aliases.display(e));
+    let engineer = |v: Option<&protocol::PeerVersion>| v.and_then(|v| v.engineer.as_deref()).filter(|e| !e.is_empty()).map(|e| names.display(e));
     let named = |key: &str, e: &Option<String>| e.clone().unwrap_or_else(|| protocol::member(key, None));
     // A member nothing syncs with is told by its mismatch, the newer state: its version record is from
     // the last session that completed.
@@ -484,14 +496,14 @@ pub fn update_view(name: &str, home: &Path) -> Value {
         .map(|(key, v)| {
             let missed = protocol::misses(v.protocol, ours);
             let e = engineer(Some(v));
-            json!({"key": key, "engineer": e, "name": named(key, &e), "borg": v.borg, "protocol": v.protocol, "ms": v.ms, "syncs": true,
+            json!({"key": key, "engineer": e, "name": named(key, &e), "host": names.host(key), "borg": v.borg, "protocol": v.protocol, "ms": v.ms, "syncs": true,
                 "note": (!missed.is_empty()).then_some(missed)})
         })
         .collect();
     members.extend(mismatches.iter().map(|(key, m)| {
         let v = versions.get(key);
         let e = engineer(v);
-        json!({"key": key, "engineer": e, "name": named(key, &e), "borg": v.and_then(|v| v.borg.clone()), "protocol": protocol::number(&m.theirs),
+        json!({"key": key, "engineer": e, "name": named(key, &e), "host": names.host(key), "borg": v.and_then(|v| v.borg.clone()), "protocol": protocol::number(&m.theirs),
             "ms": m.ms, "syncs": false, "note": m.line(key)})
     }));
     json!({

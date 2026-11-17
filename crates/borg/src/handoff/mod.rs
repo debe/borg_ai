@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::names::Book;
 use crate::{clock, collective, learn, msg, notes, presence, stats, top};
 use wal::{Halt, Op, Plan, Step, Verb, Who};
 
@@ -135,13 +136,14 @@ pub(crate) fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
-/// The writer of a line as a label names them: the engineer, the session and the node, shortened.
-pub(crate) fn who(e: &log::Event) -> String {
-    label(&e.engineer, &e.session, &e.node)
+/// The writer of a line as a label names them: the engineer as `names` names them (names.rs), the
+/// session and the node, shortened.
+pub(crate) fn who(names: &Book, e: &log::Event) -> String {
+    label(names, &e.engineer, &e.session, &e.node)
 }
 
-fn label(engineer: &str, session: &str, node: &str) -> String {
-    let name = if engineer.is_empty() { "an engineer" } else { engineer };
+fn label(names: &Book, engineer: &str, session: &str, node: &str) -> String {
+    let name = if engineer.is_empty() { "an engineer".to_string() } else { names.display(engineer) };
     format!("{name} (session {}, node {})", msg::short_session(session), msg::short_node(node))
 }
 
@@ -187,6 +189,8 @@ struct Ctx {
     cwd: PathBuf,
     me: Who<'static>,
     now: i64,
+    /// Who is who in the store, for every label of a writer (`who`).
+    names: Book,
 }
 
 /// `borg handoff …`.
@@ -255,7 +259,7 @@ pub fn main(args: &[&str]) -> i32 {
         None => None,
     };
     let now = learn::now_ms();
-    let drones = top::drones(home, true, now);
+    let (drones, names) = top::named(home, true, now);
     let sender = match msg::sender(home, &drones, a.from, &cwd_s) {
         Ok(s) if msg::token(&s.by) => s,
         Ok(s) => {
@@ -269,7 +273,7 @@ pub fn main(args: &[&str]) -> i32 {
     };
     let (_, email) = msg::engineer_of(&cwd_s);
     let me = Who { node: sender.node.clone().into(), session: sender.by.clone().into(), engineer: email.into(), harness: sender.harness.clone().into() };
-    let ctx = Ctx { home: home.clone(), cwd, me, now };
+    let ctx = Ctx { home: home.clone(), cwd, me, now, names };
     match cmd {
         Cmd::List => list(&ctx),
         Cmd::Take(id) => take(&ctx, id, a.resume),
@@ -1057,7 +1061,7 @@ fn ask(ctx: &Ctx, line: &str) {
     let text = format!(
         "Hand-off {} from {} asks you to take it over ({}): {}. In a session in a clone of it: `borg handoff take {}`; to say no: `borg handoff decline {}`.",
         o.id,
-        who(&o),
+        who(&ctx.names, &o),
         repos.join(", "),
         o.note,
         o.id,
@@ -1610,7 +1614,7 @@ fn adopt(ctx: &Ctx, h: &log::HandOff, op: &Op, t: &Target, v: &str, resume: bool
         // A claim this session did not make: known here now, so its original is fenced at once.
         learned(ctx, h, &t.root, &t.url, log::Heard { taken: Some(v), ..log::Heard::default() });
         fence::refresh(&ctx.home);
-        let by = label(&c.engineer, &c.session, &c.node);
+        let by = label(&ctx.names, &c.engineer, &c.session, &c.node);
         let why = if c.why.is_empty() { String::new() } else { format!(": {}", c.why) };
         return fail(match (c.verb, my_engineer) {
             (Verb::Abort, _) => format!("{id} was aborted by {by}{why}; nobody takes it"),
@@ -1684,7 +1688,7 @@ fn claim(ctx: &Ctx, h: &log::HandOff, op: &Op, t: &Target) -> Result<String, Hal
     op.log(Step::Claim { sha: sha.clone().into() })?;
     let pushed = git::push(&t.root, &t.url, &[(&sha, &refs.taken)]);
     op.log(Step::Sent)?;
-    match decide(&ctx.me, op, t, id, &sha, "taken")? {
+    match decide(&ctx.names, &ctx.me, op, t, id, &sha, "taken")? {
         Decided::Won(v) => match still_offered(op, t, id, &v)? {
             None => Ok(v),
             Some(why) => fail(why),
@@ -1769,7 +1773,7 @@ enum Decided {
 
 /// After the claim `sha` of `me` was sent to the ref `leaf` (`taken`, or `abort`): the remote's ref
 /// decides. Unreadable: an error, and the operation stays open for the next run.
-fn decide(me: &Who, op: &Op, t: &Target, id: &str, sha: &str, leaf: &str) -> Result<Decided, Halt> {
+fn decide(names: &Book, me: &Who, op: &Op, t: &Target, id: &str, sha: &str, leaf: &str) -> Result<Decided, Halt> {
     match git::ls_remote(&t.root, &t.url, &git::remote_ref(id, leaf)) {
         Ok(Some(v)) => {
             let c = if v == sha {
@@ -1783,7 +1787,7 @@ fn decide(me: &Who, op: &Op, t: &Target, id: &str, sha: &str, leaf: &str) -> Res
                 op.log(Step::Won { sha: v.clone().into() })?;
                 return Ok(Decided::Won(v));
             }
-            let by = c.as_ref().map_or_else(|| format!("claim {}", short(&v)), |c| label(&c.engineer, &c.session, &c.node));
+            let by = c.as_ref().map_or_else(|| format!("claim {}", short(&v)), |c| label(names, &c.engineer, &c.session, &c.node));
             let what = match c.map(|c| c.verb) {
                 Some(Verb::Abort) => "aborted",
                 _ => "taken",
@@ -1945,7 +1949,7 @@ fn tell_original(ctx: &Ctx, h: &log::HandOff, claim: &str, t: &Intent) -> bool {
     let text = format!(
         "Hand-off {} was {how} by {} (claim {}, state {}): this session's edits in {} are refused from now on; reading still works. Changes made here after that state stay in this tree; `borg handoff` lists them.",
         o.id,
-        label(&by.engineer, &by.session, &by.node),
+        label(&ctx.names, &by.engineer, &by.session, &by.node),
         short(claim),
         short(&t.state),
         repos.join(", ")
@@ -1969,7 +1973,7 @@ fn tell_original(ctx: &Ctx, h: &log::HandOff, claim: &str, t: &Intent) -> bool {
 /// clone of), then the brief whole and borg's metadata (peer data), and what the offer left out.
 fn report(ctx: &Ctx, h: &log::HandOff, t: &Took) {
     let o = &h.offer;
-    let from = who(o);
+    let from = who(&ctx.names, o);
     let told = if t.told { "" } else { "; the offering session is told by the next `borg handoff`" };
     if t.in_place {
         println!("took back hand-off {} (claim {}): the offer is closed; nothing was checked out, the tree is as you left it{told}", o.id, short(&t.claim));
@@ -2152,24 +2156,24 @@ fn list(ctx: &Ctx) -> i32 {
         let k = known.get(h.id());
         let yours = if o.node == ctx.me.node && o.session == ctx.me.session { ", yours" } else { "" };
         let repos: Vec<&str> = o.repos.iter().map(|r| r.name.as_ref()).collect();
-        println!("{}  {:<10} {} from {}{yours}, {}: {}", o.id, h.state(k), repos.join(", "), who(o), age(o.ms, ctx.now), o.note);
+        println!("{}  {:<10} {} from {}{yours}, {}: {}", o.id, h.state(k), repos.join(", "), who(&ctx.names, o), age(o.ms, ctx.now), o.note);
         if h.closed(k) {
             println!("    done; refs the remote may still hold go with `borg handoff done {}` in a clone of it", o.id);
             continue;
         }
         if let Some(a) = h.post_abort(k) {
-            let by = a.by.map_or_else(|| format!("the abort {} on the remote", short(a.sha)), who);
+            let by = a.by.map_or_else(|| format!("the abort {} on the remote", short(a.sha)), |e| who(&ctx.names, e));
             let why = a.by.map(|e| e.why.as_ref()).filter(|w| !w.is_empty()).map_or_else(String::new, |w| format!(": {w}"));
             println!("    aborted after its take by {by}{why}; both sides' edits are refused until `borg handoff done {}`", o.id);
         }
         match h.end_with(k) {
             log::End::Claim { by: Some(e), .. } if e.kind == log::Kind::Aborted => {
                 let why = if e.why.is_empty() { String::new() } else { format!(": {}", e.why) };
-                println!("    by {}{why}; nobody takes it; `borg handoff done {}` deletes its refs", who(e), o.id);
+                println!("    by {}{why}; nobody takes it; `borg handoff done {}` deletes its refs", who(&ctx.names, e), o.id);
             }
             log::End::Claim { claim, by, confirmed } => {
                 let whose = match (by, h.named(claim)) {
-                    (Some(e), _) => who(e),
+                    (Some(e), _) => who(&ctx.names, e),
                     (None, 0) => "a claim no line here names".to_string(),
                     (None, n) => format!("one of the {n} writers lines name for it"),
                 };
@@ -2190,7 +2194,7 @@ fn list(ctx: &Ctx) -> i32 {
                     let you = if asks_me(to, &ctx.me) { " (you)" } else { "" };
                     match &h.decline {
                         None => println!("    asks {to}{you}: no answer yet, asked {}", age(o.ms, ctx.now)),
-                        Some(d) => println!("    declined by {}, {}", who(d), age(d.ms, ctx.now)),
+                        Some(d) => println!("    declined by {}, {}", who(&ctx.names, d), age(d.ms, ctx.now)),
                     }
                 }
                 if off.is_none() {
@@ -2247,7 +2251,7 @@ fn decline(ctx: &Ctx, id: &str) -> i32 {
         return 1;
     }
     if let Some(d) = &h.decline {
-        eprintln!("borg handoff decline: {id} was declined already, by {}", who(d));
+        eprintln!("borg handoff decline: {id} was declined already, by {}", who(&ctx.names, d));
         return 1;
     }
     let mut e = log::Event::of(id, log::Kind::Declined, &me.node, &me.session, &me.engineer, &me.harness);
@@ -2262,14 +2266,14 @@ fn decline(ctx: &Ctx, id: &str) -> i32 {
     let owner = format!("{}@{}", o.session, o.node);
     let text = format!(
         "Hand-off {id} was declined by {}: it stays yours. Take it back with `borg handoff take {id}`, or offer it to someone else.",
-        label(&me.engineer, &me.session, &me.node)
+        label(&ctx.names, &me.engineer, &me.session, &me.node)
     );
     let from = msg::Sender { by: me.session.to_string(), name: me.engineer.to_string(), harness: me.harness.to_string(), node: me.node.to_string() };
     let told = match msg::send(&ctx.home, msg::Message::new(msg::TELL, &from, &owner, None, ctx.now, &text), ctx.now) {
         Ok(_) => "they are told".to_string(),
         Err(e) => format!("they see it in `borg handoff`; no message went ({e})"),
     };
-    println!("declined hand-off {id} from {}: it stays theirs; {told}", who(o));
+    println!("declined hand-off {id} from {}: it stays theirs; {told}", who(&ctx.names, o));
     0
 }
 
@@ -2340,7 +2344,7 @@ fn recover_take(ctx: &Ctx, id: &str, op: &Op, steps: &[Step]) -> Result<String, 
         Some((sha, true)) => sha,
         Some((sha, false)) => {
             let target = Target { root: t.root.clone(), remote: t.remote.clone(), url: t.url.clone(), verb: t.verb, in_place: t.in_place };
-            let why = match decide(&t.by, op, &target, id, &sha, "taken")? {
+            let why = match decide(&ctx.names, &t.by, op, &target, id, &sha, "taken")? {
                 Decided::Won(v) => v,
                 Decided::Lost { why, held } => {
                     let text = log::read(&ctx.home);
@@ -2552,6 +2556,8 @@ pub(crate) fn notice(
     // out the messages or another member's notice.
     let mut nodes = std::collections::HashSet::new();
     let mut held_back = false;
+    // Who offered: read only for a hand-off that waits.
+    let names = std::cell::OnceCell::new();
     for h in log::fold(&text) {
         let o = &h.offer;
         let own = o.node == here && o.session == session;
@@ -2573,7 +2579,7 @@ pub(crate) fn notice(
             format!(
                 "Hand-off {} from {} waits for this repo{mark}: {}. If the engineer wants to take it over: `borg handoff take {}`.",
                 o.id,
-                who(o),
+                who(names.get_or_init(|| Book::load(home, learn::now_ms())), o),
                 // A peer's note may be as long as a message: its first line, as an offer here cuts it.
                 presence::first_line(&o.note),
                 o.id
@@ -2654,7 +2660,7 @@ struct Asked {
 }
 
 /// The check before an ask (`--to`): whom `raw` names (an engineer by email or the name the
-/// collective's aliases give them, or a node by its key or a prefix only it has) among the machines
+/// name book gives them, names.rs, or a node by its key or a prefix only it has) among the machines
 /// seen, as the offer records it (an email, or the whole key), when one of their machines speaks
 /// `PROTOCOL`; else the gap, named. Their clones of the repos (`repos`: each one's clone URL and keys,
 /// clones.rs `keys_of`) only warn: the presence tells the clones their borg recorded, which can lag
@@ -2662,13 +2668,13 @@ struct Asked {
 fn check_to(home: &Path, raw: &str, repos: &[(String, Vec<String>)], now: i64) -> Result<Asked, String> {
     let remote = presence::remote(home, now);
     let seen = hosts(home, now, &remote);
-    let aliases = collective::aliases();
-    let (to, theirs): (String, Vec<&Host>) = if raw.contains('@') || seen.iter().any(|h| h.engineers.iter().any(|e| aliases.display(e) == raw)) {
-        let theirs: Vec<&Host> = seen.iter().filter(|h| h.engineers.iter().any(|e| e.eq_ignore_ascii_case(raw) || aliases.display(e) == raw)).collect();
+    let names = Book::of(home, &remote);
+    let (to, theirs): (String, Vec<&Host>) = if raw.contains('@') || seen.iter().any(|h| h.engineers.iter().any(|e| names.display(e) == raw)) {
+        let theirs: Vec<&Host> = seen.iter().filter(|h| h.engineers.iter().any(|e| e.eq_ignore_ascii_case(raw) || names.display(e) == raw)).collect();
         let email = if raw.contains('@') {
             raw.to_string()
         } else {
-            theirs.iter().flat_map(|h| &h.engineers).find(|e| aliases.display(e) == raw).cloned().unwrap_or_else(|| raw.to_string())
+            theirs.iter().flat_map(|h| &h.engineers).find(|e| names.display(e) == raw).cloned().unwrap_or_else(|| raw.to_string())
         };
         (email, theirs)
     } else {
@@ -2708,6 +2714,7 @@ fn check_to(home: &Path, raw: &str, repos: &[(String, Vec<String>)], now: i64) -
 /// what this machine knows (no remote is asked).
 pub fn top_lines(home: &Path, now: i64) -> Vec<String> {
     let text = log::read(home);
+    let names = std::cell::OnceCell::new();
     let known = log::known(home);
     log::fold(&text)
         .iter()
@@ -2716,7 +2723,15 @@ pub fn top_lines(home: &Path, now: i64) -> Vec<String> {
             let o = &h.offer;
             let to = o.to.as_deref().map_or_else(String::new, |t| format!(" (asks {t})"));
             let repos: Vec<&str> = o.repos.iter().map(|r| r.name.as_ref()).collect();
-            format!("{} {} {} from {}, {}{to}: {}", o.id, h.state(known.get(h.id())), repos.join(", "), who(o), age(o.ms, now), o.note)
+            format!(
+                "{} {} {} from {}, {}{to}: {}",
+                o.id,
+                h.state(known.get(h.id())),
+                repos.join(", "),
+                who(names.get_or_init(|| Book::load(home, now)), o),
+                age(o.ms, now),
+                o.note
+            )
         })
         .collect()
 }
@@ -2724,8 +2739,8 @@ pub fn top_lines(home: &Path, now: i64) -> Vec<String> {
 /// What borg web shows of hand-offs (`/api/handoffs`): every hand-off this machine knows, with its
 /// state, who offered it and whom it asks, its outcome, who declined, and which engineers have a
 /// machine that could take it (seen within the presence's day, speaking `PROTOCOL`, a clone of every
-/// repo); and every machine seen, with its engineers, borg, protocol and clones by name. No remote is
-/// asked.
+/// repo); and every machine seen, with its hostname, engineers, borg, protocol and clones by name. No
+/// remote is asked.
 pub fn board(home: &Path, now: i64) -> serde_json::Value {
     let text = log::read(home);
     let known = log::known(home);
@@ -2774,7 +2789,9 @@ pub fn board(home: &Path, now: i64) -> serde_json::Value {
             let mut repos: Vec<&str> = m.map(|m| m.clones.iter().map(|c| c.name.as_ref()).collect()).unwrap_or_default();
             repos.sort_unstable();
             repos.dedup();
-            serde_json::json!({"node": s.node, "engineers": s.engineers, "borg": m.map(|m| m.borg.as_ref()), "handoff": m.map_or(0, |m| m.handoff), "repos": repos})
+            // A peer's hostname, cleaned (names.rs `clean`); empty from a node of a version without it.
+            let host = m.map(|m| crate::names::clean(&m.host)).unwrap_or_default();
+            serde_json::json!({"node": s.node, "host": host, "engineers": s.engineers, "borg": m.map(|m| m.borg.as_ref()), "handoff": m.map_or(0, |m| m.handoff), "repos": repos})
         })
         .collect();
     serde_json::json!({"here": msg::node(home), "handoffs": handoffs, "machines": machines})

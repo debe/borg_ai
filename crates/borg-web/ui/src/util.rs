@@ -100,11 +100,18 @@ pub fn hue(key: &str) -> &'static str {
     palette((h % 8) as usize)
 }
 
-/// Two uppercase initials of a name: an email's local part, or a designation's first word; "?" when empty.
+/// Two uppercase initials of a name, a drone's label ("Ann Example · borg-ai · claude": its name part)
+/// or an email: the first letters of its first two words, else the first two of its one word (an
+/// email's local part); "?" when empty.
 pub fn initials(name: &str) -> String {
-    let src =
-        if name.contains('@') && !name.contains(' ') { name.split('@').next().unwrap_or_default() } else { name.split_whitespace().next().unwrap_or_default() };
-    let s: String = src.chars().filter(|c| c.is_alphanumeric()).take(2).flat_map(char::to_uppercase).collect();
+    let name = name.split(" · ").next().unwrap_or_default();
+    let first = |w: &str| w.chars().find(|c| c.is_alphanumeric());
+    let words: Vec<&str> = name.split_whitespace().filter(|w| first(w).is_some()).collect();
+    let s: String = match words.as_slice() {
+        [a, b, ..] => [first(a), first(b)].into_iter().flatten().flat_map(char::to_uppercase).collect(),
+        [one] => one.split('@').next().unwrap_or_default().chars().filter(|c| c.is_alphanumeric()).take(2).flat_map(char::to_uppercase).collect(),
+        [] => String::new(),
+    };
     if s.is_empty() { "?".into() } else { s }
 }
 
@@ -167,9 +174,10 @@ pub fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() > n { format!("{}…", t.trim_end()) } else { t }
 }
 
-/// "ann@example.com" → "ann"; names stay as they are.
+/// A person as the server names them (borg names.rs: an alias, a git user.name, else the whole email),
+/// shown as it is; "someone" when empty.
 pub fn who(e: &str) -> String {
-    if e.is_empty() { "someone".into() } else { e.split('@').next().unwrap_or(e).to_string() }
+    if e.is_empty() { "someone".into() } else { e.to_string() }
 }
 
 /// A rounded-up axis maximum: 1, 2, 5 × 10^k.

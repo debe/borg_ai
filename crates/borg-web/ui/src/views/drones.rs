@@ -4,7 +4,7 @@
 use leptos::prelude::*;
 
 use crate::api::data;
-use crate::util::{ago, trunc, who};
+use crate::util::{ago, num, trunc, who};
 
 #[component]
 pub fn Drones() -> impl IntoView {
@@ -49,7 +49,7 @@ pub fn Drones() -> impl IntoView {
                                 {badges(&x).into_iter().map(|(class, label, title)| view! { <span class=format!("badge {class}") title=title>{label}</span> }).collect_view()}
                                 {x.unread.filter(|n| *n > 0.0).map(|n| view! { <span class="badge waiting" title="messages its next prompt or tool call shows (borg inbox)">{format!("{n} unread")}</span> })}
                             </div>
-                            <div class="drone-who">{format!("{} · {} · {}", who(&x.engineer), if x.repo.is_empty() { "?" } else { &x.repo }, x.harness)}</div>
+                            <div class="drone-who">{format!("#{} · {} · {}", num(x.number), who(&x.engineer), if x.remote { format!("on {}", x.host) } else { "here".to_string() })}</div>
                             {(!x.prompt.is_empty()).then(|| view! { <div class="drone-doing">{trunc(&x.prompt, 140)}</div> })}
                             {(!x.files.is_empty()).then(|| view! {
                                 <div class="drone-files">{x.files.iter().map(|f| view! { <span class="mono">{f.rsplit('/').next().unwrap_or(f).to_string()}</span> }).collect_view()}</div>

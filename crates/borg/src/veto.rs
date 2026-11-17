@@ -19,8 +19,8 @@
 //! - **A missed escalation**, when the vetoed work had already merged and the queen never escalated
 //!   from that session (escalation.rs, the queen's attention reward; logged and shown, never optimised).
 //!
-//! **Across the mesh.** A drone on another node is vetoed by naming it (`--session`, a designation or a
-//! session id, as `borg pause` takes it): `borg no` then sends a `veto` message to that session of that
+//! **Across the mesh.** A drone on another node is vetoed by naming it (`--session`, a label, a number or
+//! a session id, as `borg pause` takes it): `borg no` then sends a `veto` message to that session of that
 //! node (msg.rs `Kind::Veto`). It counts there only under a steering role the mesh admitted this node
 //! with (steer.rs), as any pause. The drone's node records it once when it arrives (`apply_messages`):
 //! the credit, the episode and the stat land where the shown lessons and the session are, and its
@@ -284,7 +284,7 @@ fn short(session: &str) -> String {
     crate::msg::short_session(session)
 }
 
-/// The drone a terminal veto names (pure). `named`: a designation, number or session id (prefix), as
+/// The drone a terminal veto names (pure). `named`: a label, number or session id (prefix), as
 /// `borg pause` takes it, of a local drone or one on another node (`main` then sends it as a veto
 /// message). Otherwise the local drone working in `repo`: the one not ended, else the most recently
 /// seen ended one (a veto right after the session ended); several active ones are an error, never a
@@ -305,7 +305,7 @@ pub fn target<'a>(drones: &'a [top::Drone], repo: &str, named: Option<&str>) -> 
         [d] => Ok(d),
         [] => here.into_iter().max_by_key(|d| d.p.ms).ok_or_else(|| format!("no drone in {repo} (`borg top`): name a session with --session")),
         many => {
-            let names: Vec<String> = many.iter().map(|d| format!("{} {}", d.designation, short(&d.p.session))).collect();
+            let names: Vec<String> = many.iter().map(|d| format!("{}: {} {}", d.number, d.designation, short(&d.p.session))).collect();
             Err(format!("{} drones work in {repo}: name one with --session ({})", many.len(), names.join(", ")))
         }
     }
@@ -392,9 +392,10 @@ fn remote(home: &Path, drones: &[top::Drone], d: &top::Drone, cwd: &str, reason:
     match sent {
         Ok(m) => {
             println!(
-                "vetoed {} ({}) on another machine: {}, recorded there after the next mesh round (`borg mesh serve`)",
+                "vetoed {} ({}) on {}: {}, recorded there after the next mesh round (`borg mesh serve`)",
                 d.designation,
                 short(&d.p.session),
+                d.host,
                 m.id
             );
             0
@@ -445,7 +446,7 @@ pub fn main(args: &[&str]) -> i32 {
         return 0;
     }
     let now = learn::now_ms();
-    // The same drones and designations as `borg top`; remote ones are listed but never targeted.
+    // The same drones and labels as `borg top`; remote ones are listed but never targeted.
     let drones = top::drones(home, collective::may_sync(&route), now);
     let d = match target(&drones, &queen::repo_name(&cwd), value("--session")) {
         Ok(d) => d,
@@ -554,9 +555,10 @@ mod tests {
 
     fn drone(session: &str, repo: &str, state: State, ms: i64, node: &str, number: usize) -> top::Drone {
         top::Drone {
-            designation: format!("{} of Five", top::word(number)),
+            designation: format!("Ann · {repo} · claude"),
             number,
             node: node.into(),
+            host: if node.is_empty() { String::new() } else { "ann-desk".into() },
             state,
             paused: false,
             p: Presence {
@@ -582,7 +584,10 @@ mod tests {
         assert!(target(&one, "nope", None).unwrap_err().contains("no drone in nope"));
         let two = vec![drone("aaaa1111", "app", State::Working, 10, "", 1), drone("cccc3333", "app", State::Idle, 30, "", 2)];
         let err = target(&two, "app", None).unwrap_err();
-        assert!(err.contains("2 drones work in app") && err.contains("aaaa1111") && err.contains("cccc3333") && err.contains("One of Five"), "{err}");
+        assert!(
+            err.contains("2 drones work in app") && err.contains("aaaa1111") && err.contains("cccc3333") && err.contains("1: Ann · app · claude aaaa1111"),
+            "{err}"
+        );
         assert_eq!(target(&two, "app", Some("Two")).unwrap().p.session, "cccc3333");
         assert_eq!(target(&two, "app", Some("aaaa")).unwrap().p.session, "aaaa1111");
         assert!(["all", "collective", "local"].iter().all(|w| target(&two, "app", Some(w)).is_err()), "a veto names one drone");

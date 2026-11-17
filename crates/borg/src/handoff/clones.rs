@@ -302,7 +302,8 @@ pub(crate) fn clones_of(home: &Path, keys: &[String]) -> Vec<PathBuf> {
 
 /// This machine as its presence tells the team (presence.rs `Machine`): its borg, the hand-off protocol
 /// it speaks, and the clones recorded that still exist, by key (both kinds: an older borg reads them as
-/// URL hashes) and name.
+/// URL hashes) and name; its hostname, and the names learned (names.rs) of the engineers its drones
+/// name.
 pub(crate) fn machine(home: &Path) -> crate::presence::Machine<'static> {
     let mut clones: Vec<crate::presence::Cloned> = read(home)
         .into_iter()
@@ -314,7 +315,14 @@ pub(crate) fn machine(home: &Path) -> crate::presence::Machine<'static> {
         .collect();
     clones.sort_by(|a, b| (&a.url, &a.name).cmp(&(&b.url, &b.name)));
     clones.dedup_by(|a, b| a.url == b.url);
-    crate::presence::Machine { borg: env!("CARGO_PKG_VERSION").into(), handoff: super::PROTOCOL, clones }
+    let engineers: std::collections::BTreeSet<String> =
+        crate::presence::local(home, crate::learn::now_ms()).into_iter().map(|p| p.engineer.trim().to_lowercase()).collect();
+    let names = crate::names::local(home)
+        .into_iter()
+        .filter(|(email, _)| engineers.contains(email))
+        .map(|(email, name)| crate::presence::Named { email: email.into(), name: name.into() })
+        .collect();
+    crate::presence::Machine { borg: env!("CARGO_PKG_VERSION").into(), handoff: super::PROTOCOL, clones, host: crate::names::hostname().into(), names }
 }
 
 #[cfg(test)]
@@ -421,5 +429,38 @@ mod tests {
         std::fs::remove_dir_all(d.join("app")).unwrap();
         assert!(machine(&home).clones.is_empty(), "a clone that is gone");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The machine record names its host and the engineers of its drones, no one else; a record of an
+    /// older version (no host, no names) still reads, and an older version reads a new one.
+    #[test]
+    fn the_machine_record_names_its_host_and_its_engineers() {
+        let home = std::env::temp_dir().join(format!("borg-handoff-machine-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        crate::names::note(&home, "ann@example.com", "Ann Example").unwrap();
+        crate::names::note(&home, "bob@example.com", "Bob Example").unwrap();
+        let now = crate::learn::now_ms();
+        let p = crate::presence::update(None, "team", "claude", "prompt", &serde_json::json!({"session_id": "s1"}), now, |_| {
+            ("Ann@Example.com".into(), "app".into())
+        });
+        crate::presence::write(&home, &p).unwrap();
+        let m = machine(&home);
+        assert_eq!(m.host, crate::names::hostname());
+        assert_eq!(m.names, [crate::presence::Named { email: "ann@example.com".into(), name: "Ann Example".into() }], "only its drones' engineers");
+        let text = serde_json::to_string(&m).unwrap();
+        // 0.8.3's record, as it parsed one: unknown fields ignored.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Old<'a> {
+            #[serde(borrow)]
+            borg: std::borrow::Cow<'a, str>,
+            #[serde(default)]
+            handoff: u8,
+        }
+        assert!(serde_json::from_str::<Old>(&text).is_ok(), "{text}");
+        let old: crate::presence::Machine = serde_json::from_str(r#"{"borg":"0.8.3","handoff":1,"clones":[]}"#).unwrap();
+        assert!(old.host.is_empty() && old.names.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("host"), "an empty host is not written");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

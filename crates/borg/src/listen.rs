@@ -888,10 +888,10 @@ fn news<'a>(
     (new, mine)
 }
 
-/// What a wake says: how many messages wait and from whom, as peer data, and how to read them. Never
-/// their text: the hook shows that, labelled, once.
-fn summary(new: &[&Message]) -> String {
-    let mut who: Vec<String> = new.iter().map(|m| format!("{} {}s", m.name, m.kind.as_str())).collect();
+/// What a wake says: how many messages wait and from whom (`name`: top.rs `sender_name`), as peer data,
+/// and how to read them. Never their text: the hook shows that, labelled, once.
+fn summary(new: &[&Message], name: impl Fn(&Message) -> String) -> String {
+    let mut who: Vec<String> = new.iter().map(|m| format!("{} {}s", name(m), m.kind.as_str())).collect();
     let mut once = HashSet::new();
     who.retain(|w| once.insert(w.clone()));
     let more = who.len().saturating_sub(NAMES);
@@ -1251,9 +1251,12 @@ impl<'a> Waiter<'a> {
         let msg_ids: Vec<&str> = new.iter().map(|m| m.id.as_str()).collect();
         let (lesson_text, lesson_ids) = lessons.unwrap_or_default();
         let ids: Vec<&str> = msg_ids.iter().copied().chain(lesson_ids.iter().map(String::as_str)).collect();
+        // The senders as they are named now: read only when a message wakes.
+        let named = (!new.is_empty()).then(|| top::roster(self.home, now));
+        let name = |m: &Message| named.as_ref().map_or_else(|| msg::sender_label(m), |(ds, names)| top::sender_name(ds, names, &self.here, m));
         let text = match (new.is_empty(), lesson_text.is_empty()) {
-            (false, false) => format!("{}\n\n{lesson_text}", summary(&new)),
-            (false, true) => summary(&new),
+            (false, false) => format!("{}\n\n{lesson_text}", summary(&new, name)),
+            (false, true) => summary(&new, name),
             (true, _) => lesson_text,
         };
         self.cut_log();
@@ -1736,8 +1739,12 @@ mod tests {
         let msgs = msg::read(&home);
         let (new, mine) = news(&home, &msgs, &here, "s1", 0, 2_000, &HashSet::new());
         assert_eq!(new.iter().map(|m| &m.id).collect::<Vec<_>>(), vec![&a.id]);
-        assert!(summary(&new).starts_with("[borg listen] 1 message from other sessions waits for you (Two of Five tells)"), "{}", summary(&new));
-        assert!(!summary(&new).contains("first"), "never the text");
+        assert!(
+            summary(&new, msg::sender_label).starts_with("[borg listen] 1 message from other sessions waits for you (Two of Five tells)"),
+            "{}",
+            summary(&new, msg::sender_label)
+        );
+        assert!(!summary(&new, msg::sender_label).contains("first"), "never the text");
         note_woken(&home, "s1", &[a.id.as_str()], &mine);
         assert!(news(&home, &msgs, &here, "s1", 0, 2_000, &HashSet::new()).0.is_empty(), "woken once");
         std::fs::remove_file(file(&home, "s1", "woke")).unwrap();
@@ -2104,6 +2111,6 @@ mod tests {
         let who = |name: &str| Sender { by: format!("peer-{name}"), name: name.into(), harness: "omp".into(), node: "n".into() };
         let ms: Vec<Message> = ["A", "B", "A", "C"].iter().map(|n| Message::new(msg::Kind::Tell, &who(n), "s1", None, 1, "t")).collect();
         let refs: Vec<&Message> = ms.iter().collect();
-        assert!(summary(&refs).contains("(A tells, B tells, C tells)"), "{}", summary(&refs));
+        assert!(summary(&refs, msg::sender_label).contains("(A tells, B tells, C tells)"), "{}", summary(&refs, msg::sender_label));
     }
 }

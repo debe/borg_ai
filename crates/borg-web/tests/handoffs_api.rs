@@ -60,7 +60,9 @@ async fn an_ask_shows_with_who_could_take_it() {
     std::fs::write(home.join("handoffs.jsonl"), format!("{offer}\n")).unwrap();
     // A clone list names a repo by blake3 of its normalized URL (a local path, without its `.git`).
     let app = blake3::hash(b"/srv/app").to_hex()[..32].to_string();
-    let with = |url: &str, handoff: u8| Some(Machine { borg: "x".into(), handoff, clones: vec![Cloned { url: url.to_string().into(), name: "app".into() }] });
+    let with = |url: &str, handoff: u8| {
+        Some(Machine { borg: "x".into(), handoff, clones: vec![Cloned { url: url.to_string().into(), name: "app".into() }], ..Machine::default() })
+    };
     let lines = [
         remote(&"b".repeat(64), "bob@y", now, with(&app, 1)),
         remote(&"c".repeat(64), "carol@z", now, with(&"0".repeat(32), 1)),

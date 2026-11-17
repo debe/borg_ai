@@ -171,11 +171,16 @@ mod tests {
         m.invite(&alice, &bob.public(), "member").unwrap();
         let now = borg::learn::now_ms();
         presence::write(&a, &p("s1", now - 10, "work")).unwrap();
+        borg::names::note(&a, "a@x", "Ann Example").unwrap();
         let sent = outgoing(&a, &alice, now);
         let machine = sent[0].machine().expect("a machine record");
         assert_eq!((machine.borg.as_ref(), machine.handoff), (env!("CARGO_PKG_VERSION"), borg::handoff::PROTOCOL));
+        assert_eq!(machine.host, borg::names::hostname(), "it names its host (borg names.rs)");
+        assert_eq!(machine.names, [presence::Named { email: "a@x".into(), name: "Ann Example".into() }], "and its drones' engineers");
         assert_eq!(receive(&b, &m, &bob.public(), sent.clone(), now), Ok(1));
-        assert_eq!(presence::remote(&b, now)[0].machine(), Some(machine.clone()));
+        assert_eq!(presence::remote(&b, now)[0].machine(), Some(machine.clone()), "and still verifies");
+        let names = borg::names::Book::load(&b, now);
+        assert_eq!((names.display("a@x"), names.host(&alice.public())), ("Ann Example".to_string(), borg::names::hostname()), "named on the member's side");
         // A newer node's record, with a field this version does not know: it verifies over the text sent.
         let mut newer = sent[0].clone();
         let text = newer.machine.as_deref().unwrap().replacen('{', "{\"lanes\":[1,2],", 1);

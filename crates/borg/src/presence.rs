@@ -3,7 +3,7 @@
 //!
 //! `<store>/presence/<session>.json`, rewritten whole by every hook call (one small write to a temp
 //! file, then a rename: a reader never sees half a record). No extra process, no network: the
-//! engineer (git user.email) and the repo are looked up once, on the session's first hook, and then
+//! engineer (git user.email, with user.name for names.rs) and the repo are looked up once, on the session's first hook, and then
 //! carried over from the previous record.
 //!
 //! A session is `working` until its turn ends (`stop`: `waiting`), `idle` after 30 minutes without a
@@ -50,7 +50,7 @@ pub struct Presence {
     /// The canonical hook event last seen, and when (epoch ms).
     pub event: String,
     pub ms: i64,
-    /// When this record was first written: the drone's start, for its designation.
+    /// When this record was first written: the drone's start, for its number and label order (top.rs).
     pub started: i64,
     /// The harness process, if the harness gave it (`pid` in the hook event).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,9 +175,12 @@ pub fn update(
 pub fn touch(home: &Path, collective: &str, harness: &str, event: &str, input: &Value, now: i64) -> Option<Presence> {
     let session = input.get("session_id").and_then(Value::as_str).unwrap_or("unknown");
     let p = update(read(home, session), collective, harness, event, input, now, |cwd| {
-        // A session's first hook: its clone joins this machine's clone list too (handoff/clones.rs).
+        // A session's first hook: its clone joins this machine's clone list too (handoff/clones.rs), and
+        // its engineer's git user.name the store's names (names.rs).
         crate::handoff::note_clone(home, cwd);
-        (learn::engineer(cwd), borg_trace::repo_key(cwd).rsplit('/').next().unwrap_or_default().to_string())
+        let (email, name) = learn::identity(cwd);
+        let _ = crate::names::note(home, &email, &name);
+        (email, borg_trace::repo_key(cwd).rsplit('/').next().unwrap_or_default().to_string())
     });
     write(home, &p).ok()?;
     if event == "prompt" {
@@ -259,7 +262,10 @@ impl Remote {
 
 /// What the machine a drone runs on can take over (handoff/clones.rs `machine`): the borg it runs, the
 /// hand-off protocol it speaks (0: none, as a record without a `Machine` says), and the repos it holds
-/// clones of. An offer's check (`borg handoff --to`) reads it from the signed presence.
+/// clones of. An offer's check (`borg handoff --to`) reads it from the signed presence. Also who it is
+/// (names.rs): its hostname and the git user.name of each engineer its drones name, absent from a node
+/// of a version before them. A version that does not know a field ignores it, and the signature covers
+/// the text as sent (`Remote::machine`), so a field added here never breaks an older node's check.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Machine<'a> {
     #[serde(borrow)]
@@ -268,6 +274,19 @@ pub struct Machine<'a> {
     pub handoff: u8,
     #[serde(borrow, default)]
     pub clones: Vec<Cloned<'a>>,
+    #[serde(borrow, default, skip_serializing_if = "str::is_empty")]
+    pub host: Cow<'a, str>,
+    #[serde(borrow, default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<Named<'a>>,
+}
+
+/// One engineer of a machine's drones: their git email and git user.name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Named<'a> {
+    #[serde(borrow)]
+    pub email: Cow<'a, str>,
+    #[serde(borrow)]
+    pub name: Cow<'a, str>,
 }
 
 /// One repo a machine holds a clone of: a remote URL's hash (handoff/clones.rs `url_hash`) and the

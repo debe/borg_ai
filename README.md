@@ -195,7 +195,8 @@ flowchart LR
 
 Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
-What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones, like Unix `top`;
+What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones, like Unix `top`,
+each labelled by who runs it where (`Ann Example · borg-ai · claude`, with the host for a colleague's);
 `borg pause` and `borg resume` hold or release any of them ([Talking to other sessions](#talking-to-other-sessions)). Set up: `borg setup --team <name>` or `--join <ticket>`, or
 [Team sync](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md); for a company, [Company collective](https://github.com/debe/borg_ai/blob/main/docs/team-sync.md#company-collective).
 
@@ -205,14 +206,15 @@ Sessions in one collective can message each other, whatever harness runs them an
 machine they are on. A session or the engineer's terminal sends:
 
 ```sh
-borg tell Two "the schema change is merged, rebase before you touch migrations"
+borg tell 2 "the schema change is merged, rebase before you touch migrations"
 borg ask local "is anyone editing crates/borg/src/hook.rs?"        # the sessions on this machine
 borg tell collective "the staging database is down until noon"     # every session, every member's machine
 borg inbox      # in a session: its messages; in a terminal: every message of the last 7 days
 ```
 
-The recipient is a drone as `borg top` names it, a session id, `local`, `collective` (or `all`, the
-same) or `engineer`. Local first: `local` reaches the sessions running on this machine, and a drone or
+The recipient is a drone as `borg top` names it (its number, or its label, such as
+`"Ann Example · borg-ai · claude"`), a session id, `local`, `collective` (or `all`, the same) or
+`engineer`. Local first: `local` reaches the sessions running on this machine, and a drone or
 session id that matches one here names it. A colleague's session is reached by `<session>@<node>`, when
 nothing here matches, or as the sender a reply answers; `collective` reaches every session of the
 collective on every member's machine and may wake them, so it is for what concerns their work. The message is shown once, at the recipient's next prompt or tool call, marked as
@@ -382,8 +384,9 @@ two members; decision → fix links; presence for `borg top` (harness, email, re
 of your latest prompt, touched paths); redacted messages between sessions, pauses, resumes and vetoes among them, and which messages a session was shown (the acknowledgements that pace them); the signed member list; daily usage counts per
 engineer; outcomes with session, repo and regret hashed (`BORG_SHARE_OUTCOMES=off` keeps them local);
 and ratified constraints (the invariant, its lesson and who ratified it, never the veto's words). With
-each drone's presence, its machine's borg version and the repos it holds clones of (hashes of their
-remote URLs, and the clones' names); and, when you hand work off, its redacted offer line (note, the
+each drone's presence, its machine's borg version, hostname, the git `user.name` of the engineers of its
+drones (so others see names, not emails) and the repos it holds clones of (hashes of their remote URLs,
+and the clones' names); and, when you hand work off, its redacted offer line (note, the
 brief's head, repo name, remote URL without credentials, branch, commit ids, names of files left out)
 and its outcome.
 

@@ -343,7 +343,8 @@ fn a_busy_session_is_not_woken_until_its_turn_ends() {
     let out = out.join("\n");
     assert_eq!(code, Some(0), "{out}");
     assert!(out.contains("[borg listen] 1 message from other sessions waits for you (") && out.contains(" tells)"), "{out}");
-    assert!(!out.contains("asks") && !out.contains("alice@x"), "{out}");
+    // The peer named as its drone is labelled now (engineer · repo · harness), never the engineer's ask.
+    assert!(!out.contains("asks") && out.contains(" · app · claude #2 tells)"), "{out}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -397,7 +398,7 @@ fn the_stream_says_each_message_once_on_one_json_line() {
     let (code, rest) = w.stop(libc::SIGINT);
     assert_eq!(code, Some(128 + libc::SIGINT));
     assert_eq!(rest, vec![r#"{"end":"stopped"}"#.to_string()], "no wake twice, the end last");
-    assert!(wakes[0].contains("(alice@x tells)") && !wakes[1].contains("alice@x"), "each wake for its own message: {wakes:?}");
+    assert!(wakes[0].contains("(alice@x tells)") && wakes[1].contains("· app · claude tells)"), "each wake for its own message: {wakes:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -366,6 +366,37 @@ pub fn engineer(cwd: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The engineer working in `cwd` and their name: git user.email and user.name, read in one call;
+/// each empty when unknown.
+pub fn identity(cwd: &str) -> (String, String) {
+    if cwd.is_empty() {
+        return (String::new(), String::new());
+    }
+    Command::new("git")
+        .args(["-C", cwd, "config", "--get-regexp", r"^user\.(email|name)$"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| identity_of(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// The email and name `git config --get-regexp` printed (`key value` lines; the last of a key wins, as
+/// git reads it).
+fn identity_of(text: &str) -> (String, String) {
+    let (mut email, mut name) = (String::new(), String::new());
+    for (k, v) in text.lines().filter_map(|l| l.split_once(' ')) {
+        match k {
+            "user.email" => email = v.trim().to_string(),
+            "user.name" => name = v.trim().to_string(),
+            _ => {}
+        }
+    }
+    (email, name)
+}
+
 /// Records the hook's episode `e` in this session's store (`record_episode_locked`).
 ///
 /// # Errors
@@ -1293,6 +1324,25 @@ fn learn_unlocked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One git call gives the email and the name; the last value of a key wins, as git reads it.
+    #[test]
+    fn the_identity_is_the_git_email_and_name() {
+        let text = "user.name Old Name\nuser.email ann@example.com\nuser.name Ann Example\n";
+        assert_eq!(identity_of(text), ("ann@example.com".into(), "Ann Example".into()));
+        assert_eq!(identity_of(""), (String::new(), String::new()));
+        let dir = std::env::temp_dir().join(format!("borg-learn-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "ann@example.com"]);
+        git(&["config", "user.name", "Ann Example"]);
+        let d = dir.display().to_string();
+        assert_eq!(identity(&d), ("ann@example.com".into(), "Ann Example".into()));
+        assert_eq!(identity(&d).0, engineer(&d), "the same email as `engineer`");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn concurrent_jsonl_appends_keep_every_line() {

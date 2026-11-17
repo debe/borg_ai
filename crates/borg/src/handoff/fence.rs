@@ -76,8 +76,8 @@ fn taken_say(id: &str, by: &str, claim: &str, root: &str, after: &[String]) -> S
 }
 
 /// The refusal on both sides after an abort that followed the take.
-fn aborted_say(id: &str, a: &log::PostAbort, root: &str, branch: Option<&str>) -> String {
-    let by = a.by.map_or_else(|| format!("the abort {} on the remote", super::short(a.sha)), super::who);
+fn aborted_say(names: &crate::names::Book, id: &str, a: &log::PostAbort, root: &str, branch: Option<&str>) -> String {
+    let by = a.by.map_or_else(|| format!("the abort {} on the remote", super::short(a.sha)), |e| super::who(names, e));
     let why = a.by.map(|e| e.why.as_ref()).filter(|w| !w.is_empty()).map_or_else(String::new, |w| format!(" ({w})"));
     let at = branch.map_or_else(|| root.to_string(), |b| format!("branch {b} in {root}"));
     format!(
@@ -98,6 +98,7 @@ pub(crate) fn refresh(home: &Path) {
         let text = log::read(home);
         let known = log::known(home);
         let here = crate::msg::node(home);
+        let names = crate::names::Book::load(home, crate::learn::now_ms());
         let mut rows = Vec::new();
         let mut push = |f: Fence| rows.push(serde_json::to_string(&f).unwrap_or_default());
         for h in log::fold(&text).iter() {
@@ -112,7 +113,7 @@ pub(crate) fn refresh(home: &Path) {
                     _ => continue,
                 };
                 for (session, root, branch) in taken_here(&own) {
-                    let say = aborted_say(h.id(), &a, &root, Some(&branch));
+                    let say = aborted_say(&names, h.id(), &a, &root, Some(&branch));
                     push(Fence {
                         id: h.id().into(),
                         session: session.into(),
@@ -131,7 +132,7 @@ pub(crate) fn refresh(home: &Path) {
             let (claim, by) = match h.end_with(k) {
                 log::End::Open => continue,
                 log::End::Claim { by: Some(e), .. } if !theirs(e) => continue,
-                log::End::Claim { claim, by: Some(e), .. } => (claim.to_string(), super::who(e)),
+                log::End::Claim { claim, by: Some(e), .. } => (claim.to_string(), super::who(&names, e)),
                 log::End::Claim { claim, by: None, confirmed: true } => (claim.to_string(), format!("the claim {} on the remote", super::short(claim))),
                 // Fails closed: lines that cite the claim name different writers.
                 log::End::Claim { claim, by: None, confirmed: false } => (
@@ -155,7 +156,7 @@ pub(crate) fn refresh(home: &Path) {
             let aborted = h.post_abort(k);
             for root in roots.into_iter().flatten() {
                 let say = match &aborted {
-                    Some(a) => aborted_say(h.id(), a, &root, None),
+                    Some(a) => aborted_say(&names, h.id(), a, &root, None),
                     None => taken_say(h.id(), &by, &claim, &root, after),
                 };
                 push(Fence { id: h.id().into(), session: o.session.clone(), root: root.into(), claim: claim.as_str().into(), branch: None, say: say.into() });

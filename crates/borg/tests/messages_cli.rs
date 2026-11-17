@@ -96,7 +96,7 @@ fn context(v: &Value) -> String {
     v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
 }
 
-/// The designation `borg top` gives `session` ("Two of Three").
+/// The label `borg top` gives `session` ("Ann Example · app · claude").
 fn designation(root: &Path, work: &Path, session: &str) -> String {
     let r = borg(root, work, &["top", "--json"], &[], "");
     let v: Value = serde_json::from_str(&r.out).unwrap_or_else(|_| panic!("{}", r.out));

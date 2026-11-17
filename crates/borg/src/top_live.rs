@@ -123,6 +123,9 @@ fn clock(ms: i64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
+/// Display: the columns of a drone's label in the table: a name, a repo and a harness of common length.
+const LABEL: usize = 34;
+
 fn pad(s: &str, n: usize) -> String {
     let c = s.chars().count();
     if c > n { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" } else { format!("{s}{}", " ".repeat(n - c)) }
@@ -187,21 +190,31 @@ pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: u
         lines.push(Ln::default().add(St::Head, format!(" {} ", c.name)).add(St::Head, format!("· {share} · {} drone(s)", c.drones.len())));
         lines.push(Ln::default().add(
             St::Bold,
-            format!("  {}{}{}{}{}{}{}", pad("DRONE", 16), pad("HARNESS", 9), pad("NODE", 8), pad("STATE", 13), pad("WAKE", 7), pad("IDLE", 6), pad("MSG", 5))
-                + "DOING",
+            format!(
+                "  {}{}{}{}{}{}{}",
+                pad("#", 4),
+                pad("DRONE", LABEL + 1),
+                pad("ON", top::HOST_CHARS + 1),
+                pad("STATE", 13),
+                pad("WAKE", 7),
+                pad("IDLE", 6),
+                pad("MSG", 5)
+            ) + "DOING",
         ));
         let mut rows: Vec<&Drone> = c.drones.iter().collect();
         rows.sort_by_key(|d| (d.state == State::Ended, d.number));
         for d in rows {
             let word = if d.paused { "paused" } else { d.state.name() };
-            let node = if d.node.is_empty() { "here".to_string() } else { top::column_node(&d.node) };
+            let host = if d.node.is_empty() { "here" } else { d.host.as_str() };
             let ended = d.state == State::Ended;
             lines.push(
                 Ln::default()
                     .add(St::Plain, "  ")
-                    .add(if ended { St::Dim } else { St::Bold }, pad(&d.designation, 16))
-                    .add(St::Plain, pad(&d.p.harness, 9))
-                    .add(St::Dim, pad(&node, 8))
+                    .add(St::Dim, pad(&d.number.to_string(), 4))
+                    .add(if ended { St::Dim } else { St::Bold }, pad(&d.designation, LABEL))
+                    .add(St::Plain, " ")
+                    .add(St::Dim, pad(host, top::HOST_CHARS))
+                    .add(St::Plain, " ")
                     .add(state_style(word), pad(&format!("● {word}"), 13))
                     .add(if c.inbox.listen.contains_key(&d.p.session) { St::Cyan } else { St::Dim }, pad(top::wake_cell(&c.inbox, d), 7))
                     .add(St::Dim, pad(&ago(now - d.p.ms), 6))
@@ -222,7 +235,7 @@ pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: u
             lines.push(Ln::default().add(St::Bold, "  MESSAGES").add(St::Dim, format!("  {} in the last day", c.inbox.day)));
             for m in &c.inbox.recent {
                 let st = if m.asks() { St::Cyan } else { St::Plain };
-                let whole = top::message_line(&c.drones, &c.inbox.here, m);
+                let whole = top::message_line(&c.drones, &c.inbox.names, &c.inbox.here, m);
                 // The columns of its text, which `message_line` ends with (none when it does not, so
                 // that only a line shown whole counts).
                 let text = if whole.ends_with(m.text.as_str()) { m.text.chars().count() } else { 0 };
@@ -426,12 +439,16 @@ mod tests {
         assert!(frame(&cs, None, 10_000_000, 40, 6, false).0.iter().all(|l| l.chars().count() <= 40));
         assert!(f[0].contains("3 drone(s): 0 working 1 waiting 1 idle 0 ended") && f[0].ends_with("q quit"), "{}", f[0]);
         assert!(f[2].starts_with(" corp · team · 3 drone(s)"), "{}", f[2]);
-        assert!(f[4].contains("One of Three") && f[4].contains("● paused"), "{}", f[4]);
-        assert!(f[5].contains("Two of Three") && !f[5].contains('@') && f[5].contains("beefca"), "{}", f[5]);
+        assert!(f[4].contains("Alice · borg-ai · claude") && f[4].contains("● paused"), "{}", f[4]);
+        assert!(f[5].contains("Bob · borg-ai · claude") && !f[5].contains('@') && f[5].contains("bob-laptop"), "{}", f[5]);
         assert!(f[4].contains(" 2    fix"), "the unread count: {}", f[4]);
         let full = frame(&cs, None, 10_000_000, 100, 40, false).0;
         let at = full.iter().position(|l| l.starts_with("  MESSAGES  3 in the last day")).expect("the messages section");
-        assert!(full[at + 1].contains("1m") && full[at + 1].ends_with("Three of Three asks -> One of Three: which test flakes?"), "{}", full[at + 1]);
+        assert!(
+            full[at + 1].contains("1m") && full[at + 1].ends_with("Alice · borg-ai · claude #2 asks -> Alice · borg-ai · claude: which test flakes?"),
+            "{}",
+            full[at + 1]
+        );
         assert_eq!(full.len(), at + 4, "{full:#?}");
         let empty = frame(&[], None, 0, 60, 10, false).0;
         assert!(empty[2].starts_with("no drones yet"), "{empty:#?}");
@@ -458,18 +475,20 @@ mod tests {
         let at = lines.iter().position(|l| l.starts_with("  MESSAGES")).expect("the messages section");
         assert_eq!(ids(at + 2, 200), all[..1], "the first message line only");
         assert!(ids(at + 1, 200).is_empty(), "the section's head, no message");
-        // The lines: "  1m    Three of Three asks -> One of Three: " (45 columns) then 18 of text,
-        // "  2m    alice@x -> collective: " (31) then 15, "  3m    Six of Six @feedfeedfeed -> zzzz9999: "
-        // (46) then 4.
+        // The lines: "  1m    Alice · borg-ai · claude #2 asks -> Alice · borg-ai · claude: " (70 columns)
+        // then 18 of text, "  2m    Alice -> collective: " (29) then 15, "  3m    Six of Six on feedfeedfeed
+        // -> zzzz9999: " (48) then 4.
         let line = |w: usize, k: usize| frame(&cs, None, 10_000_000, w, 40, false).0[at + 1 + k].clone();
         assert!(ids(40, 30).is_empty(), "each cut before its text: {:?}", line(30, 0));
         assert_eq!(ids(40, 40), all[1..2], "only the second shows any text: {:?}", line(40, 1));
-        assert!(line(46, 0).ends_with("One of Three: …") && line(46, 1).ends_with("release at five"), "{:?}", line(46, 0));
-        assert_eq!(ids(40, 46), all[1..2], "the first's cut leaves only its `…` after the recipient");
-        assert!(line(47, 0).ends_with("One of Three: w…"), "{:?}", line(47, 0));
-        assert_eq!(ids(40, 47), all[..2], "the first shows its text's first character");
-        assert!(line(48, 2).ends_with("zzzz9999: d…"), "{:?}", line(48, 2));
-        assert_eq!(ids(40, 48), all);
+        assert!(line(49, 2).ends_with("zzzz9999: …") && line(49, 1).ends_with("release at five"), "{:?}", line(49, 2));
+        assert_eq!(ids(40, 49), all[1..2], "the third's cut leaves only its `…` after the recipient");
+        assert!(line(50, 2).ends_with("zzzz9999: d…"), "{:?}", line(50, 2));
+        assert_eq!(ids(40, 50), all[1..], "the third shows its text's first character");
+        assert!(line(71, 0).ends_with("Alice · borg-ai · claude: …"), "{:?}", line(71, 0));
+        assert_eq!(ids(40, 71), all[1..]);
+        assert!(line(72, 0).ends_with("Alice · borg-ai · claude: w…"), "{:?}", line(72, 0));
+        assert_eq!(ids(40, 72), all);
     }
 
     /// The live screen acknowledges the messages to the engineer a frame shows (`run`, top.rs
@@ -487,12 +506,12 @@ mod tests {
             select: None,
             handoffs: Vec::new(),
         }];
-        let (lines, shown) = frame(&cs, None, 10_000_000, 30, 40, false);
+        let (lines, shown) = frame(&cs, None, 10_000_000, 47, 40, false);
         let at = lines.iter().position(|l| l.starts_with("  MESSAGES")).expect("the messages section");
-        assert_eq!(lines[at + 1], "  1m    One of Three -> engin…");
+        assert_eq!(lines[at + 1], "  1m    Alice · borg-ai · claude -> engineer: …", "the sender as its drone is named now");
         assert!(shown.is_empty(), "{shown:?}", shown = shown.iter().map(|(_, m)| &m.id).collect::<Vec<_>>());
-        let (lines, shown) = frame(&cs, None, 10_000_000, 36, 40, false);
-        assert_eq!(lines[at + 1], "  1m    One of Three -> engineer: p…");
+        let (lines, shown) = frame(&cs, None, 10_000_000, 48, 40, false);
+        assert_eq!(lines[at + 1], "  1m    Alice · borg-ai · claude -> engineer: p…");
         assert_eq!(shown.iter().map(|(i, m)| (*i, m.id.clone())).collect::<Vec<_>>(), [(0, m.id.clone())]);
     }
 
@@ -577,7 +596,7 @@ mod tests {
         let full = frame(&cs, None, 10_000_000, 200, 40, false).0;
         let at = full.iter().position(|l| l.starts_with("  SELECTION ")).expect("the selection line");
         assert_eq!(full[at], format!("  SELECTION {line}"));
-        assert!(full[at - 1].contains("Three of Three") && full[at + 1].starts_with("  MESSAGES"), "{full:#?}");
+        assert!(full[at - 1].contains("Alice · borg-ai · claude #2") && full[at + 1].starts_with("  MESSAGES"), "{full:#?}");
         assert!(frame(&cs, None, 10_000_000, 40, 40, false).0.iter().all(|l| l.chars().count() <= 40));
     }
 

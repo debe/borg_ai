@@ -1,15 +1,18 @@
 //! `borg top [--dir DIR] [--once] [--json]`: the drones of each collective, one screen.
 //!
 //! Local drones come from presence records (presence.rs), remote ones from what the mesh daemon
-//! last heard from members (only for a collective that may sync). Drones are designated by start
-//! order across both, Borg style: "Two of Five". `--dir` shows only the collective DIR routes to;
+//! last heard from members (only for a collective that may sync). A drone is labelled by who runs it
+//! where: "Ann Example · borg-ai · claude" (names.rs names the engineer), with "#2", "#3" by start order
+//! when live drones share a label, and numbered by start order across both, the short handle to type; a
+//! remote one shows the host it runs on. `--dir` shows only the collective DIR routes to;
 //! otherwise every collective on this machine that has drones. On a terminal it is a live screen until
 //! `q` (top_live.rs); piped, or with `--once`, it prints the text once; `--json` prints the same data
 //! for scripts.
 //!
 //! Messages (msg.rs): each local drone's unread count (what its next prompt or tool call shows), and
 //! the collective's last few messages, one line each. A remote drone's reads are claimed on its node.
-//! A sender is named by what its line claims, with the node the mesh checked it against (`sender`).
+//! A sender is named as the drone it is now, else by what its line claims, with the machine the mesh
+//! checked it against (`sender`).
 //! The messages to the engineer the screen shows some of the text of are acknowledged as theirs when no
 //! session runs it, as `borg inbox` acknowledges what it lists from a terminal (`engineer_looks`,
 //! `acknowledge`): a drone's `borg top`, printed or live, acknowledges nothing; `--json` acknowledges
@@ -33,17 +36,21 @@ use serde_json::{Value, json};
 use crate::clock::{DAY_MS, ago};
 use crate::collective::{self, Route, Share};
 use crate::msg::{self, Address, Message};
+use crate::names::{self, Book};
 use crate::presence::{self, Presence, State};
 use crate::{install, learn, protocol, select, steer, update};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Drone {
-    /// "Two of Five".
+    /// Its label, "Ann Example · borg-ai · claude" (`label`), "#2" on when a live drone started earlier
+    /// under the same one.
     pub designation: String,
-    /// 1-based start order.
+    /// 1-based start order: the short handle to type.
     pub number: usize,
     /// The member key of the node it runs on; empty for this machine.
     pub node: String,
+    /// The node's machine as names.rs `Book::host` names it; empty for this machine.
+    pub host: String,
     pub state: State,
     /// Paused by a steering directive (local drones only).
     pub paused: bool,
@@ -63,12 +70,18 @@ pub struct Inbox {
     /// This node as messages name it (msg.rs `node`).
     #[serde(skip)]
     pub here: String,
+    /// Who is who, for the lines of `recent` (names.rs).
+    #[serde(skip)]
+    pub names: Book,
     /// Per local drone's session that listens for wakes (listen.rs), whether its waiter runs.
     pub listen: BTreeMap<String, crate::listen::Status>,
 }
 
 /// Display: how many messages the screen lists.
 pub const RECENT: usize = 5;
+
+/// What separates a drone label's parts (`label`).
+pub const SEP: &str = " · ";
 
 const NUMBERS: [&str; 20] = [
     "One",
@@ -97,8 +110,36 @@ pub fn word(n: usize) -> String {
     NUMBERS.get(n.wrapping_sub(1)).map(|s| s.to_string()).unwrap_or_else(|| n.to_string())
 }
 
-/// The drones of the collective stored at `home` (pure over its inputs, for tests).
-pub fn assemble(local: Vec<Presence>, remote: Vec<presence::Remote>, now: i64, alive: impl Fn(u32) -> bool, paused: impl Fn(&Presence) -> bool) -> Vec<Drone> {
+/// A drone's label: its engineer as `names` names them, its repo and its harness. Every part may be a
+/// peer's, so each is cleaned (names.rs `clean`).
+pub fn label(names: &Book, p: &Presence) -> String {
+    let part = |s: &str, none: &str| Some(names::clean(s)).filter(|s| !s.is_empty()).unwrap_or_else(|| none.to_string());
+    let who = if p.engineer.is_empty() { String::new() } else { names.display(&p.engineer) };
+    format!("{}{SEP}{}{SEP}{}", part(&who, "someone"), part(&p.repo, "?"), part(&p.harness, "?"))
+}
+
+/// A label as a message line carries it (msg.rs `Message::name`, which a node of any version checks
+/// against msg.rs `label`): its separators as " - ", then only what that keeps, e.g. "Ann Example -
+/// borg-ai - claude". Readers name the sender anew (`sender_name`); this is what one that cannot shows.
+pub fn wire(label: &str) -> String {
+    msg::label(&label.replace(SEP, " - ")).trim_matches(|c| c == ' ' || c == '-').to_string()
+}
+
+/// A label as typed or carried, for comparing: separators and case aside.
+fn typed(s: &str) -> String {
+    s.replace(SEP, " - ").replace(" #", " ").to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The drones of the collective stored at `home` (pure over its inputs, for tests), labelled with
+/// `names`.
+pub fn assemble(
+    local: Vec<Presence>,
+    remote: Vec<presence::Remote>,
+    names: &Book,
+    now: i64,
+    alive: impl Fn(u32) -> bool,
+    paused: impl Fn(&Presence) -> bool,
+) -> Vec<Drone> {
     let mut all: Vec<(String, Presence, State, bool)> = local
         .into_iter()
         .map(|p| {
@@ -113,25 +154,52 @@ pub fn assemble(local: Vec<Presence>, remote: Vec<presence::Remote>, now: i64, a
         (r.key, r.p, s, false)
     }));
     all.sort_by(|a, b| (a.1.started, &a.0, &a.1.session).cmp(&(b.1.started, &b.0, &b.1.session)));
-    let n = all.len();
+    // Live drones sharing a label are told apart by start order; an ended one keeps its label.
+    let mut live: BTreeMap<String, usize> = BTreeMap::new();
     all.into_iter()
         .enumerate()
-        .map(|(i, (node, p, state, paused))| Drone { designation: format!("{} of {}", word(i + 1), word(n)), number: i + 1, node, state, paused, p })
+        .map(|(i, (node, p, state, paused))| {
+            let mut designation = label(names, &p);
+            if state != State::Ended {
+                let n = live.entry(designation.clone()).or_default();
+                *n += 1;
+                if *n > 1 {
+                    designation = format!("{designation} #{n}");
+                }
+            }
+            let host = if node.is_empty() { String::new() } else { names.host(&node) };
+            Drone { designation, number: i + 1, node, host, state, paused, p }
+        })
         .collect()
 }
 
 /// The drones of the collective stored at `home` as of `now`; remote ones only if it may sync.
 pub fn drones(home: &Path, may_sync: bool, now: i64) -> Vec<Drone> {
+    named(home, may_sync, now).0
+}
+
+/// `drones`, with the name book they were labelled with (names.rs), for naming what they say.
+pub fn named(home: &Path, may_sync: bool, now: i64) -> (Vec<Drone>, Book) {
     let remote = if may_sync { presence::remote(home, now) } else { Vec::new() };
-    assemble(presence::local(home, now), remote, now, presence::alive, |p| steer::paused(home, &p.session, Some(p.started), now))
+    let names = Book::of(home, &remote);
+    let ds = assemble(presence::local(home, now), remote, &names, now, presence::alive, |p| steer::paused(home, &p.session, Some(p.started), now));
+    (ds, names)
+}
+
+/// The drones and the name book a reader names a message's sender with (`sender_name`): every one the
+/// store holds, without asking whether one is paused.
+pub fn roster(home: &Path, now: i64) -> (Vec<Drone>, Book) {
+    let remote = presence::remote(home, now);
+    let names = Book::of(home, &remote);
+    (assemble(presence::local(home, now), remote, &names, now, presence::alive, |_| false), names)
 }
 
 /// The messages of the store at `home` for its `drones` as of `now` (one read of the log, one
-/// directory listing per local drone that has a message).
-pub fn inbox(home: &Path, drones: &[Drone], now: i64) -> Inbox {
+/// directory listing per local drone that has a message), named with `names`.
+pub fn inbox(home: &Path, drones: &[Drone], names: Book, now: i64) -> Inbox {
     let listen = listen_of(home, drones);
     if std::fs::metadata(msg::path(home)).is_err() {
-        return Inbox { listen, ..Inbox::default() };
+        return Inbox { listen, names, ..Inbox::default() };
     }
     let all: Vec<Message> = msg::read(home).into_iter().filter(|m| now - m.ms <= msg::TTL_MS).collect();
     let here = msg::node(home);
@@ -140,7 +208,7 @@ pub fn inbox(home: &Path, drones: &[Drone], now: i64) -> Inbox {
     let mut recent = all;
     recent.sort_by(|a, b| (b.ms, &b.id).cmp(&(a.ms, &a.id)));
     recent.truncate(RECENT);
-    Inbox { unread, recent, day, here, listen }
+    Inbox { unread, recent, day, here, names, listen }
 }
 
 /// Acknowledges the messages to the engineer among `shown`, the ones a screen of the store at `home`
@@ -227,31 +295,34 @@ pub fn recipient_drone<'a>(drones: &'a [Drone], here: &str, to: &str) -> Option<
     }
 }
 
-/// Who sent `m`, as the screen says it: the drone its (node, `by`) pair is, else its label (msg.rs
-/// `sender_label`: the name it was sent under, else the start of `by`); the engineer by email. Every
-/// part but the node is the sender's claim, so a line from another node than `here` carries that node's
-/// short key (as msg.rs `line`).
-pub fn sender(drones: &[Drone], here: &str, m: &Message) -> String {
-    let name = match Address::parse(&m.by) {
+/// Who sent `m`, by name alone: the drone its (node, `by`) pair is now (its label), the engineer as
+/// `names` names them, else the name it was sent under (msg.rs `sender_label`, the start of `by`
+/// without one). Every reader of a message names its sender so (msg.rs `line` and `inbox`, listen.rs
+/// `summary`): a label sent under shifts, the drone's own stays.
+pub fn sender_name(drones: &[Drone], names: &Book, here: &str, m: &Message) -> String {
+    match Address::parse(&m.by) {
         Some(Address::Engineer { email: "" }) => msg::ENGINEER.into(),
-        Some(Address::Engineer { email }) => collective::aliases().display(email),
-        _ => match sender_drone(drones, here, m) {
-            Some(d) => d.designation.clone(),
-            None => msg::sender_label(m),
-        },
-    };
-    if m.node == here { name } else { format!("{name} @{}", msg::short_node(&m.node)) }
+        Some(Address::Engineer { email }) => names.display(email),
+        _ => sender_drone(drones, here, m).map_or_else(|| msg::sender_label(m), |d| d.designation.clone()),
+    }
+}
+
+/// Who sent `m`, as the screen says it (`sender_name`). Every part but the node is the sender's claim,
+/// so a line from another node than `here` says which machine it came from (names.rs `Book::host`:
+/// signed by that node's key, as the line is).
+pub fn sender(drones: &[Drone], names: &Book, here: &str, m: &Message) -> String {
+    let name = sender_name(drones, names, here, m);
+    if m.node == here { name } else { format!("{name} on {}", names.host(&m.node)) }
 }
 
 /// Whom `to` names, as the screen says it: `local` (this machine's sessions), `collective` (every
 /// member's), the engineer, the drone it is, else the start of the session id (msg.rs `short_session`).
-/// Another node's `local` (it never travels, msg.rs `stays_here`) is named with that node's short key
-/// (msg.rs `short_node`).
-pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
+/// Another node's `local` (it never travels, msg.rs `stays_here`) is named with that node's machine.
+pub fn recipient(drones: &[Drone], names: &Book, here: &str, to: &str) -> String {
     match Address::parse(to) {
-        Some(Address::Engineer { email }) if !email.is_empty() => collective::aliases().display(email),
+        Some(Address::Engineer { email }) if !email.is_empty() => names.display(email),
         Some(Address::Local { node }) if node == here => msg::LOCAL.into(),
-        Some(Address::Local { node }) => format!("{} @{}", msg::LOCAL, msg::short_node(node)),
+        Some(Address::Local { node }) => format!("{} on {}", msg::LOCAL, names.host(node)),
         Some(Address::All) => msg::COLLECTIVE.into(),
         Some(Address::Session { id, .. }) => recipient_drone(drones, here, to).map_or_else(|| msg::short_session(id), |d| d.designation.clone()),
         Some(a) => a.to_string(),
@@ -261,9 +332,9 @@ pub fn recipient(drones: &[Drone], here: &str, to: &str) -> String {
 
 /// One message as one screen line (without its age): `sender -> recipient: text` (msg.rs keeps the
 /// text on one line, its whitespace collapsed).
-pub fn message_line(drones: &[Drone], here: &str, m: &Message) -> String {
+pub fn message_line(drones: &[Drone], names: &Book, here: &str, m: &Message) -> String {
     let ask = if m.asks() { " asks" } else { "" };
-    format!("{}{ask} -> {}: {}", sender(drones, here, m), recipient(drones, here, &m.to), m.text)
+    format!("{}{ask} -> {}: {}", sender(drones, names, here, m), recipient(drones, names, here, &m.to), m.text)
 }
 
 /// A drone's unread count as the screen shows it: `-` where this node cannot tell (a remote or ended one).
@@ -271,22 +342,36 @@ pub fn unread_cell(inbox: &Inbox, d: &Drone) -> String {
     inbox.unread.get(&d.p.session).map_or_else(|| "-".into(), usize::to_string)
 }
 
-/// Which drone `target` names: "local", "collective" or "all", a designation ("Two", "Two of Five", "2") or a session
-/// id (or a unique prefix of at least 4 characters). `Ok(None)` is every drone. Live first, then local:
-/// an id or prefix that matches a running drone names it over an ended one (which never reads a message),
-/// and among those one on this machine over one on another node; a remote drone is named only when
-/// none here matches as well (or by its number, which names one drone of all).
+/// Which drone `target` names: "local", "collective" or "all", a label (any case, its separators as
+/// " · " or " - ", as `wire` carries it), a number ("2", or "Two" and "Two of Five" as before labels) or
+/// a session id (or a unique prefix of at least 4 characters). `Ok(None)` is every drone. Live first,
+/// then local: a label, id or prefix that matches a running drone names it over an ended one (which
+/// never reads a message), and among those one on this machine over one on another node; a remote drone
+/// is named only when none here matches as well (or by its number, which names one drone of all).
 pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone>, String> {
     let t = target.trim();
     if [msg::ALL, msg::COLLECTIVE, msg::LOCAL].iter().any(|w| t.eq_ignore_ascii_case(w)) {
         return Ok(None);
+    }
+    let key = typed(t);
+    let labelled: Vec<&Drone> = drones.iter().filter(|d| typed(&d.designation) == key).collect();
+    if !labelled.is_empty() {
+        return pick(labelled, target, "drones");
     }
     let first = t.split_whitespace().next().unwrap_or_default();
     let number = first.parse::<usize>().ok().or_else(|| NUMBERS.iter().position(|w| w.eq_ignore_ascii_case(first)).map(|i| i + 1));
     if let Some(n) = number {
         return drones.iter().find(|d| d.number == n).map(Some).ok_or_else(|| format!("no drone {target}: there are {} (`borg top`)", drones.len()));
     }
-    let mut hits: Vec<&Drone> = drones.iter().filter(|d| d.p.session == t || (t.len() >= 4 && d.p.session.starts_with(t))).collect();
+    let hits: Vec<&Drone> = drones.iter().filter(|d| d.p.session == t || (t.len() >= 4 && d.p.session.starts_with(t))).collect();
+    if hits.is_empty() {
+        return Err(format!("no drone or session {target:?} (`borg top`)"));
+    }
+    pick(hits, target, "sessions")
+}
+
+/// The one of `hits` that `target` names: live over ended, then this machine's over a member's.
+fn pick<'a>(mut hits: Vec<&'a Drone>, target: &str, what: &str) -> Result<Option<&'a Drone>, String> {
     if hits.iter().any(|d| d.state != State::Ended) {
         hits.retain(|d| d.state != State::Ended);
     }
@@ -295,19 +380,8 @@ pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone
     }
     match hits.as_slice() {
         [d] => Ok(Some(d)),
-        [] => Err(format!("no drone or session {target:?} (`borg top`)")),
-        _ => Err(format!("{target:?} names {} sessions: give more of the id", hits.len())),
+        _ => Err(format!("{target:?} names {} {what}: give the number or more of the session id (`borg top`)", hits.len())),
     }
-}
-
-/// Display: the characters of a node key in a drone table's column (here, and top_live.rs's `NODE`
-/// column): enough to tell a collective's few members apart, short enough for the column. A message
-/// names its node longer (msg.rs `NODE_CHARS`), where the key is the one part the mesh checked.
-pub const COLUMN_NODE_CHARS: usize = 6;
-
-/// A node key as a drone table's column shows it: its first `COLUMN_NODE_CHARS`.
-pub fn column_node(node: &str) -> String {
-    node.chars().take(COLUMN_NODE_CHARS).collect()
 }
 
 /// Display: the characters of one message line on the printed screen (`render`): about one wide
@@ -329,8 +403,8 @@ pub fn shows_last(total: usize, last: usize, width: usize) -> bool {
 /// Whether the printed screen's line for `m` (`render`: its `message_line` cut to `MESSAGE_CHARS`)
 /// shows some of its text, as a live screen's must (top_live.rs `frame`): only then did the engineer
 /// read it there, and only then does the printed screen acknowledge it (`screen_of`).
-fn prints_text(drones: &[Drone], here: &str, m: &Message) -> bool {
-    shows_last(message_line(drones, here, m).chars().count(), m.text.chars().count(), MESSAGE_CHARS)
+fn prints_text(drones: &[Drone], names: &Book, here: &str, m: &Message) -> bool {
+    shows_last(message_line(drones, names, here, m).chars().count(), m.text.chars().count(), MESSAGE_CHARS)
 }
 
 /// One collective's screen.
@@ -348,26 +422,31 @@ pub fn render(name: &str, share: Share, drones: &[Drone], inbox: &Inbox, now: i6
     if !inbox.recent.is_empty() {
         s.push_str(&format!("  messages: {} in the last day, {} unread\n", inbox.day, inbox.unread.values().sum::<usize>()));
         for m in &inbox.recent {
-            s.push_str(&format!("  {:>6}  {}\n", ago(now - m.ms), cut(&message_line(drones, &inbox.here, m), MESSAGE_CHARS)));
+            s.push_str(&format!("  {:>6}  {}\n", ago(now - m.ms), cut(&message_line(drones, &inbox.names, &inbox.here, m), MESSAGE_CHARS)));
         }
     }
     s
 }
 
+/// Display: the characters of a drone's label in the printed table (`drone_table`): a name, a repo and
+/// a harness of common length.
+const LABEL_CHARS: usize = 36;
+/// Display: the characters of a host in a drone table (here and top_live.rs).
+pub const HOST_CHARS: usize = 14;
+
 fn drone_table(drones: &[Drone], inbox: &Inbox, now: i64) -> String {
     let mut s = format!(
-        "  {:<18} {:<8} {:<24} {:<14} {:<8} {:<6} {:>6} {:>6}  {:<40} {}\n",
-        "DRONE", "SESSION", "ENGINEER", "REPO", "STATE", "WAKE", "IDLE", "UNREAD", "DOING", "FILES"
+        "  {:>3}  {:<LABEL_CHARS$} {:<8} {:<HOST_CHARS$} {:<8} {:<6} {:>6} {:>6}  {:<40} {}\n",
+        "#", "DRONE", "SESSION", "ON", "STATE", "WAKE", "IDLE", "UNREAD", "DOING", "FILES"
     );
     for d in drones {
         let state = if d.paused { "paused" } else { d.state.name() };
-        let engineer = if d.node.is_empty() { d.p.engineer.clone() } else { format!("{} @{}", d.p.engineer, column_node(&d.node)) };
         let line = format!(
-            "  {:<18} {:<8} {:<24} {:<14} {:<8} {:<6} {:>6} {:>6}  {:<40} {}",
-            d.designation,
+            "  {:>3}  {:<LABEL_CHARS$} {:<8} {:<HOST_CHARS$} {:<8} {:<6} {:>6} {:>6}  {:<40} {}",
+            d.number,
+            cut(&d.designation, LABEL_CHARS),
             cut(&d.p.session, 8),
-            cut(if engineer.is_empty() { "?" } else { &engineer }, 24),
-            cut(&d.p.repo, 14),
+            cut(if d.node.is_empty() { "here" } else { &d.host }, HOST_CHARS),
             state,
             wake_cell(inbox, d),
             ago(now - d.p.ms),
@@ -1214,11 +1293,11 @@ pub fn gather(dir: Option<&str>, now: i64) -> Result<(Vec<crate::top_live::Coll>
     for r in &routes {
         let Route::Collective { name, home, share } = r else { continue };
         presence::prune(home, now);
-        let mut ds = drones(home, collective::may_sync(r), now);
+        let (mut ds, names) = named(home, collective::may_sync(r), now);
         for d in &mut ds {
-            d.p.engineer = collective::aliases().display(&d.p.engineer);
+            d.p.engineer = names.display(&d.p.engineer);
         }
-        let inbox = inbox(home, &ds, now);
+        let inbox = inbox(home, &ds, names, now);
         let handoffs = crate::handoff::top_lines(home, now);
         if ds.is_empty() && inbox.recent.is_empty() && handoffs.is_empty() && dir.is_none() {
             continue;
@@ -1267,12 +1346,12 @@ fn screen_of(
     for r in routes {
         let Route::Collective { name, home, share } = r else { continue };
         presence::prune(home, now);
-        let mut ds = drones(home, collective::may_sync(r), now);
-        // An engineer's several emails show as their name (collective.rs "Engineers"), peers' too.
+        let (mut ds, names) = named(home, collective::may_sync(r), now);
+        // An engineer shows by name (names.rs: their alias, else their git user.name), peers' too.
         for d in &mut ds {
-            d.p.engineer = collective::aliases().display(&d.p.engineer);
+            d.p.engineer = names.display(&d.p.engineer);
         }
-        let inbox = inbox(home, &ds, now);
+        let inbox = inbox(home, &ds, names, now);
         let sel = selection(&home.join("lessons.jsonl"), select::policy());
         let handoffs = crate::handoff::top_lines(home, now);
         if json_out {
@@ -1284,7 +1363,7 @@ fn screen_of(
             text.push_str(&render_with(name, *share, &ds, &inbox, Some(&sel), now));
             text.push_str(&handoffs_text(&handoffs));
             text.push('\n');
-            printed.push((home, inbox.recent.into_iter().filter(|m| prints_text(&ds, &inbox.here, m)).collect::<Vec<_>>()));
+            printed.push((home, inbox.recent.into_iter().filter(|m| prints_text(&ds, &inbox.names, &inbox.here, m)).collect::<Vec<_>>()));
         }
         gathered.push(ds);
     }
@@ -1397,14 +1476,21 @@ mod tests {
             p("aaaa1111-x", "alice@x", 100, NOW - 5_000, "post_tool", "fix the flaky sync test", &["crates/borg-mesh/src/sync.rs", "src/recon.rs"]),
             p("cccc3333-x", "alice@x", 300, NOW - presence::IDLE_MS - 60_000, "stop", "write the release notes for the mesh daemon and more words", &[]),
         ];
-        let remote = vec![presence::Remote {
-            p: p("bbbb2222-y", "bob@y", 200, NOW - 120_000, "stop", "review PR 42", &["README.md"]),
-            key: "beefcafe".repeat(8),
-            sig: String::new(),
-            machine: None,
-            msig: String::new(),
-        }];
-        assemble(local, remote, NOW, |_| true, |p| p.session.starts_with("aaaa"))
+        let remote = vec![bobs(p("bbbb2222-y", "bob@y", 200, NOW - 120_000, "stop", "review PR 42", &["README.md"]))];
+        assemble(local, remote, &book(), NOW, |_| true, |p| p.session.starts_with("aaaa"))
+    }
+
+    /// A drone of Bob's node, whose machine record names its host and Bob.
+    fn bobs(p: Presence) -> presence::Remote {
+        let names = vec![presence::Named { email: "bob@y".into(), name: "Bob".into() }];
+        let machine = presence::Machine { host: "bob-laptop".into(), names, ..presence::Machine::default() };
+        presence::Remote { p, key: "beefcafe".repeat(8), sig: String::new(), machine: Some(serde_json::to_string(&machine).unwrap()), msig: String::new() }
+    }
+
+    /// The fixture's names: Alice learned here, Bob from his machine record.
+    pub(crate) fn book() -> Book {
+        let remote = [bobs(p("bbbb2222-y", "bob@y", 200, NOW - 120_000, "stop", "", &[]))];
+        Book::from_parts([("alice@x".to_string(), "Alice".to_string())].into(), &remote)
     }
 
     fn message(by: &str, name: &str, to: &str, kind: msg::Kind, ms: i64, text: &str) -> Message {
@@ -1426,6 +1512,7 @@ mod tests {
             ],
             day: 3,
             here: "n1".into(),
+            names: book(),
             listen: [("aaaa1111-x".to_string(), crate::listen::Status::Waits), ("cccc3333-x".to_string(), crate::listen::Status::Listens)]
                 .into_iter()
                 .collect(),
@@ -1437,14 +1524,14 @@ mod tests {
         let out = render("corp", Share::Team, &fixture(), &inbox_fixture(), NOW);
         let expected = "\
 corp (team): 3 drone(s), 2 active, 1 remote
-  DRONE              SESSION  ENGINEER                 REPO           STATE    WAKE     IDLE UNREAD  DOING                                    FILES
-  One of Three       aaaa111… alice@x                  borg-ai        paused   waiter     5s      2  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
-  Two of Three       bbbb222… bob@y @beefca            borg-ai        waiting  -          2m      -  review PR 42                             README.md
-  Three of Three     cccc333… alice@x                  borg-ai        idle     on        31m      0  write the release notes for the mesh da…
+    #  DRONE                                SESSION  ON             STATE    WAKE     IDLE UNREAD  DOING                                    FILES
+    1  Alice · borg-ai · claude             aaaa111… here           paused   waiter     5s      2  fix the flaky sync test                  crates/borg-mesh/src/sync.rs, src/recon.rs
+    2  Bob · borg-ai · claude               bbbb222… bob-laptop     waiting  -          2m      -  review PR 42                             README.md
+    3  Alice · borg-ai · claude #2          cccc333… here           idle     on        31m      0  write the release notes for the mesh da…
   messages: 3 in the last day, 2 unread
-      1m  Three of Three asks -> One of Three: which test flakes?
-      2m  alice@x -> collective: release at five
-      3m  Six of Six @feedfeedfeed -> zzzz9999: done
+      1m  Alice · borg-ai · claude #2 asks -> Alice · borg-ai · claude: which test flakes?
+      2m  Alice -> collective: release at five
+      3m  Six of Six on feedfeedfeed -> zzzz9999: done
 ";
         assert_eq!(out, expected, "\n{out}");
         let none = Inbox::default();
@@ -2098,11 +2185,11 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let ds = fixture();
-        assert!(inbox(&home, &ds, NOW).recent.is_empty());
+        assert!(inbox(&home, &ds, book(), NOW).recent.is_empty());
         let here = msg::node(&home);
         msg::send(&home, message_on(&here, "cccc3333-x", "Three of Three", "aaaa1111-x", msg::TELL, NOW - 3_000, "look at recon"), NOW).unwrap();
         msg::send(&home, message_on(&here, "cccc3333-x", "Three of Three", msg::ALL, msg::TELL, NOW - 2_000, "lunch"), NOW).unwrap();
-        let i = inbox(&home, &ds, NOW);
+        let i = inbox(&home, &ds, book(), NOW);
         assert_eq!(i.unread.get("aaaa1111-x"), Some(&2), "{i:?}");
         assert_eq!(i.unread.get("cccc3333-x"), Some(&0), "its own broadcast");
         assert!(!i.unread.contains_key(&ds[1].p.session), "remote: claimed on its node");
@@ -2110,7 +2197,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let caps = crate::harness::by_name("claude").expect("a harness").caps();
         let ev = json!({"session_id": "aaaa1111-x"});
         assert!(msg::deliver(&home, caps, "prompt", &ev, Some(100), NOW, None).is_some());
-        assert_eq!(inbox(&home, &ds, NOW).unread.get("aaaa1111-x"), Some(&0));
+        assert_eq!(inbox(&home, &ds, book(), NOW).unread.get("aaaa1111-x"), Some(&0));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2241,7 +2328,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         msg::send(&home, first.clone(), NOW).unwrap();
         let cwd = base.display().to_string();
         let mut done = HashSet::new();
-        let recent = |now: i64| inbox(&home, &[], now).recent;
+        let recent = |now: i64| inbox(&home, &[], Book::default(), now).recent;
         acknowledge(&home, &cwd, &recent(NOW).iter().collect::<Vec<_>>(), &mut done, NOW);
         assert_eq!(seen_lines(&home).len(), 1, "{:?}", seen_lines(&home));
         assert!(done.contains(&first.id));
@@ -2260,21 +2347,53 @@ corp (team): 3 drone(s), 2 active, 1 remote
     }
 
     /// A line's `by` and `name` are its sender's claims: one from another node that names a local drone's
-    /// session is not shown as that drone, and carries its node's key.
+    /// session is not shown as that drone, and carries its node's machine.
     #[test]
     fn a_sender_is_tied_to_the_node_its_line_names() {
-        let ds = fixture();
+        let (ds, b) = (fixture(), book());
         let own = message("aaaa1111-x", "anything", msg::ALL, msg::TELL, NOW, "hi");
-        assert_eq!(sender(&ds, "n1", &own), "One of Three", "this node's drone");
-        let forged = message_on("evil0123456789", "aaaa1111-x", "One of Three", msg::ALL, msg::TELL, NOW, "hi");
-        assert_eq!(sender(&ds, "n1", &forged), "One of Three @evil01234567", "the claim, with the node it came from");
+        assert_eq!(sender(&ds, &b, "n1", &own), "Alice · borg-ai · claude", "this node's drone, as it is named now");
+        let forged = message_on("evil0123456789", "aaaa1111-x", "Alice - borg-ai - claude", msg::ALL, msg::TELL, NOW, "hi");
+        assert_eq!(sender(&ds, &b, "n1", &forged), "Alice - borg-ai - claude on evil01234567", "the claim, with the node it came from");
         let remote = message_on(&"beefcafe".repeat(8), &ds[1].p.session, "x", msg::ALL, msg::TELL, NOW, "hi");
-        assert_eq!(sender(&ds, "n1", &remote), "Two of Three @beefcafebeef", "the remote drone on its own node");
-        assert_eq!(recipient(&ds, "n1", "aaaa1111-x@n1"), "One of Three");
-        assert_eq!(recipient(&ds, "n1", "aaaa1111-x@evil"), "aaaa1111", "not the local drone of that id");
-        assert_eq!((recipient(&ds, "n1", "engineer"), recipient(&ds, "n1", msg::ALL)), ("engineer".into(), "collective".into()), "an `all` line");
-        assert_eq!(recipient(&ds, "n1", "local@n1"), "local");
-        assert_eq!(recipient(&ds, "n1", "local@beefcafebeefcafe00"), "local @beefcafebeef");
+        assert_eq!(sender(&ds, &b, "n1", &remote), "Bob · borg-ai · claude on bob-laptop", "the remote drone on its own machine");
+        let bob = message_on(&"beefcafe".repeat(8), "engineer:bob@y", "bob@y", msg::ALL, msg::TELL, NOW, "hi");
+        assert_eq!(sender(&ds, &b, "n1", &bob), "Bob on bob-laptop", "an engineer by name");
+        assert_eq!(recipient(&ds, &b, "n1", "aaaa1111-x@n1"), "Alice · borg-ai · claude");
+        assert_eq!(recipient(&ds, &b, "n1", "aaaa1111-x@evil"), "aaaa1111", "not the local drone of that id");
+        assert_eq!((recipient(&ds, &b, "n1", "engineer"), recipient(&ds, &b, "n1", msg::ALL)), ("engineer".into(), "collective".into()), "an `all` line");
+        assert_eq!(recipient(&ds, &b, "n1", "engineer:bob@y"), "Bob");
+        assert_eq!(recipient(&ds, &b, "n1", "engineer:git@carol.example"), "git@carol.example", "an unknown engineer's whole email");
+        assert_eq!(recipient(&ds, &b, "n1", "local@n1"), "local");
+        assert_eq!(recipient(&ds, &b, "n1", &format!("local@{}", "beefcafe".repeat(8))), "local on bob-laptop");
+        assert_eq!(recipient(&ds, &b, "n1", "local@abcdefabcdefabcdef"), "local on abcdefabcdef", "an older node: its key's start");
+    }
+
+    /// Drones are labelled by who runs them where; live ones sharing a label are numbered by start
+    /// order, an ended one keeps its label; the label a line carries stays one any node accepts.
+    #[test]
+    fn drones_are_labelled_by_engineer_repo_and_harness() {
+        let ds = fixture();
+        let labels: Vec<&str> = ds.iter().map(|d| d.designation.as_str()).collect();
+        assert_eq!(labels, ["Alice · borg-ai · claude", "Bob · borg-ai · claude", "Alice · borg-ai · claude #2"]);
+        assert_eq!(ds.iter().map(|d| (d.number, d.host.as_str())).collect::<Vec<_>>(), [(1, ""), (2, "bob-laptop"), (3, "")]);
+        let ended = |s: &str, started| p(s, "alice@x", started, NOW - 5_000, "end", "", &[]);
+        let live = |s: &str, started| p(s, "alice@x", started, NOW - 5_000, "prompt", "", &[]);
+        let ds = assemble(vec![ended("e1", 1), live("l1", 2), ended("e2", 3), live("l2", 4), live("l3", 5)], vec![], &book(), NOW, |_| true, |_| false);
+        let labels: Vec<&str> = ds.iter().map(|d| d.designation.as_str()).collect();
+        let a = "Alice · borg-ai · claude";
+        assert_eq!(labels, [a, a, a, &format!("{a} #2"), &format!("{a} #3")]);
+        let unknown = Presence { engineer: String::new(), repo: String::new(), ..p("u", "", 1, NOW, "prompt", "", &[]) };
+        assert_eq!(label(&Book::default(), &unknown), "someone · ? · claude");
+        let peer = Presence { engineer: "x\u{202E}@y".into(), repo: "r\nepo".into(), ..unknown.clone() };
+        assert_eq!(label(&Book::default(), &peer), "x@y · r epo · claude", "a peer's parts are cleaned");
+        // On the wire: ASCII a node of any version accepts.
+        assert_eq!(wire("Alice · borg-ai · claude #2"), "Alice - borg-ai - claude 2");
+        assert_eq!(wire("Jürgen Ä · app · omp"), "Jrgen - app - omp");
+        assert_eq!(wire("李 · app · omp"), "app - omp");
+        let from = msg::Sender { by: "s1".into(), name: wire("Jürgen Ä · borg-ai · claude #2"), harness: "claude".into(), node: "n1".into() };
+        let m = Message::new(msg::TELL, &from, msg::ALL, None, NOW, "hi");
+        assert!(m.well_formed() && m.name == from.name, "{m:?}");
     }
 
     /// The line on borg itself: a newer release (while the check is on), a member nothing syncs with and
@@ -2315,7 +2434,8 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(v["collective"], "corp");
         let d = &v["drones"];
         assert_eq!(d.as_array().unwrap().len(), 3);
-        assert_eq!(d[0]["designation"], "One of Three");
+        assert_eq!(d[0]["designation"], "Alice · borg-ai · claude");
+        assert_eq!((d[0]["number"].as_u64(), d[1]["host"].as_str()), (Some(1), Some("bob-laptop")));
         assert_eq!(d[0]["session"], "aaaa1111-x");
         assert_eq!(d[0]["state"], "working");
         assert_eq!(d[0]["paused"], true);
@@ -2336,7 +2456,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
             machine: None,
             msig: String::new(),
         });
-        let ds = assemble(local, remote.into(), NOW, |_| true, |_| false);
+        let ds = assemble(local, remote.into(), &Book::default(), NOW, |_| true, |_| false);
         for t in ["aaaa", "aaaa1111", "aaaa1111-x"] {
             let d = resolve(&ds, t).unwrap().unwrap();
             assert!(d.node.is_empty() && d.p.session == "aaaa1111-x", "{t}");
@@ -2356,15 +2476,20 @@ corp (team): 3 drone(s), 2 active, 1 remote
             machine: None,
             msig: String::new(),
         }];
-        let ds = assemble(local, remote, NOW, |_| true, |_| false);
+        let ds = assemble(local, remote, &Book::default(), NOW, |_| true, |_| false);
         let d = resolve(&ds, "aaaa").unwrap().unwrap();
         assert_eq!((d.p.session.as_str(), d.node.as_str()), ("aaaa2222-z", "beefcafe".repeat(8).as_str()), "the live one, though remote");
         assert!(resolve(&ds, "aaaa1111").unwrap().unwrap().node.is_empty(), "an ended drone is still named by its own id");
     }
 
     #[test]
-    fn resolves_drones_by_designation_or_session() {
+    fn resolves_drones_by_label_number_or_session() {
         let ds = fixture();
+        assert_eq!(resolve(&ds, "Alice · borg-ai · claude").unwrap().unwrap().p.session, "aaaa1111-x");
+        assert_eq!(resolve(&ds, "alice - BORG-AI - claude #2").unwrap().unwrap().p.session, "cccc3333-x", "any case, as the wire carries it");
+        assert_eq!(resolve(&ds, "Alice - borg-ai - claude 2").unwrap().unwrap().p.session, "cccc3333-x", "the wire's form of #2");
+        assert_eq!(resolve(&ds, "bob · borg-ai · claude").unwrap().unwrap().p.session, "bbbb2222-y");
+        assert!(resolve(&ds, "Carol · borg-ai · claude").is_err());
         assert_eq!(resolve(&ds, "Two").unwrap().unwrap().p.session, "bbbb2222-y");
         assert_eq!(resolve(&ds, "two of three").unwrap().unwrap().p.session, "bbbb2222-y");
         assert_eq!(resolve(&ds, "3").unwrap().unwrap().p.session, "cccc3333-x");

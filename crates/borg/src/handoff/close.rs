@@ -148,6 +148,7 @@ pub(super) fn abort_switched(ctx: &Ctx, h: &log::HandOff) {
             harness: o.harness.to_string().into(),
         },
         now: ctx.now,
+        names: ctx.names.clone(),
     };
     match abort_steps(&owner, h, &format!("hand-offs were switched off for the collective by admin {by}")) {
         Ok(s) => println!("borg handoff: {s}"),
@@ -181,7 +182,7 @@ fn abort_steps(ctx: &Ctx, h: &log::HandOff, why: &str) -> Result<String, Halt> {
         (Some(v), None) => {
             let c = super::claimer(&root, &url, id, v).ok_or_else(|| Halt::Failed(format!("{id} is claimed by {}, a commit borg cannot read", short(v))))?;
             if c.verb == Verb::Abort {
-                return super::fail(format!("{id} was aborted already by {}", label(&c.engineer, &c.session, &c.node)));
+                return super::fail(format!("{id} was aborted already by {}", label(&ctx.names, &c.engineer, &c.session, &c.node)));
             }
             Some(v.clone())
         }
@@ -218,7 +219,7 @@ fn abort_steps(ctx: &Ctx, h: &log::HandOff, why: &str) -> Result<String, Halt> {
     let pushed = git::push(&root, &url, &[(&sha, &git::remote_ref(id, leaf))]);
     op.log(Step::Sent)?;
     let target = Target { root: root.clone(), remote: remote.clone(), url: url.clone(), verb: Verb::Abort, in_place: false };
-    match super::decide(&ctx.me, &op, &target, id, &sha, leaf)? {
+    match super::decide(&ctx.names, &ctx.me, &op, &target, id, &sha, leaf)? {
         Decided::Won(v) => finish(ctx, h, &op, &root, &url, &v),
         Decided::Lost { why, held } => {
             let heard = if leaf == "taken" {
@@ -268,7 +269,7 @@ fn finish(ctx: &Ctx, h: &log::HandOff, op: &Op, root: &Path, url: &str, sha: &st
     let c = git::message(root, sha).and_then(|m| super::parse_claim(&m, id)).ok_or_else(|| Halt::Failed(format!("the abort {} cannot be read", short(sha))))?;
     super::keep_offer(ctx, h).map_err(Halt::Io)?;
     let why = if c.why.is_empty() { String::new() } else { format!(" ({})", c.why) };
-    let by = label(&c.engineer, &c.session, &c.node);
+    let by = label(&ctx.names, &c.engineer, &c.session, &c.node);
     let (line, heard, mut said) = match &c.after {
         None => {
             let state = git::rev_parse(root, &format!("{sha}^")).unwrap_or_default();
@@ -387,7 +388,7 @@ pub(super) fn recover_abort(ctx: &Ctx, id: &str, op: &Op, steps: &[Step]) -> Res
         Some((sha, false)) => {
             let leaf = if after.is_some() { "abort" } else { "taken" };
             let target = Target { root: root.clone(), remote: remote.to_string(), url: url.to_string(), verb: Verb::Abort, in_place: false };
-            match super::decide(by, op, &target, id, &sha, leaf)? {
+            match super::decide(&ctx.names, by, op, &target, id, &sha, leaf)? {
                 Decided::Won(v) => v,
                 Decided::Lost { why, .. } => {
                     op.log(Step::Ended { why: why.as_str().into() })?;
@@ -400,7 +401,7 @@ pub(super) fn recover_abort(ctx: &Ctx, id: &str, op: &Op, steps: &[Step]) -> Res
             }
         }
     };
-    let me = Ctx { home: ctx.home.clone(), cwd: ctx.cwd.clone(), me: owned(by), now: ctx.now };
+    let me = Ctx { home: ctx.home.clone(), cwd: ctx.cwd.clone(), me: owned(by), now: ctx.now, names: ctx.names.clone() };
     finish(&me, h, op, &root, url, &sha)
 }
 
@@ -634,7 +635,7 @@ pub(super) fn recover_close(ctx: &Ctx, id: &str, op: &Op, steps: &[Step]) -> Res
     let text = log::read(&ctx.home);
     let all = log::fold(&text);
     let h = all.iter().find(|h| h.id() == id).ok_or_else(|| Halt::Failed("its offer is not in the log".into()))?;
-    let me = Ctx { home: ctx.home.clone(), cwd: ctx.cwd.clone(), me: owned(by), now: ctx.now };
+    let me = Ctx { home: ctx.home.clone(), cwd: ctx.cwd.clone(), me: owned(by), now: ctx.now, names: ctx.names.clone() };
     close_steps(&me, h, op)
 }
 

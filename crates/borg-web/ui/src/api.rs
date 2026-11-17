@@ -443,7 +443,10 @@ pub fn parse_attention(v: &Value) -> Attention {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drone {
+    /// Its label, "Ann Example · borg-ai · claude" (borg top.rs `label`), and its number, the handle
+    /// `borg tell` and `borg pause` take.
     pub designation: String,
+    pub number: f64,
     pub state: String,
     pub paused: bool,
     pub engineer: String,
@@ -457,6 +460,8 @@ pub struct Drone {
     /// The node it runs on (empty: this one) and its session, which hand-offs name.
     pub node: String,
     pub session: String,
+    /// The machine it runs on, by hostname (empty: this one).
+    pub host: String,
     /// Messages not shown to it yet; `None` for a remote drone (its reads are claimed on its node).
     pub unread: Option<f64>,
 }
@@ -468,6 +473,7 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
         .flatten()
         .map(|d| Drone {
             designation: s(&d["designation"]),
+            number: f(&d["number"]),
             state: s(&d["state"]),
             paused: d["paused"].as_bool().unwrap_or(false),
             engineer: s(&d["engineer"]),
@@ -480,6 +486,7 @@ pub fn parse_drones(v: &Value) -> Vec<Drone> {
             remote: !s(&d["node"]).is_empty(),
             node: s(&d["node"]),
             session: s(&d["session"]),
+            host: s(&d["host"]),
             unread: d["unread"].as_f64(),
         })
         .collect()
@@ -516,6 +523,8 @@ pub struct HandOff {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Host {
     pub node: String,
+    /// Its hostname; empty from a borg before 0.9.
+    pub host: String,
     pub engineers: Vec<String>,
     /// Empty for a borg that tells no machine record (one without hand-offs).
     pub borg: String,
@@ -553,6 +562,7 @@ pub fn parse_handoffs(v: &Value) -> HandOffs {
         }),
         hosts: list(&v["machines"], |m| Host {
             node: s(&m["node"]),
+            host: s(&m["host"]),
             engineers: strs(&m["engineers"]),
             borg: s(&m["borg"]),
             handoff: f(&m["handoff"]),
@@ -567,8 +577,8 @@ pub struct Message {
     pub id: String,
     /// `tell` or `ask`.
     pub kind: String,
-    /// The sender and recipient as `borg top` names them (a designation, `all`, the engineer); a sender
-    /// from another node with that node's short key.
+    /// The sender and recipient as `borg top` names them (a drone's label, `all`, the engineer by name);
+    /// a sender from another node with that node's machine.
     pub from: String,
     pub to: String,
     /// What the recipient is, as borg msg.rs `Address` parses it: `all`, `engineer` or `session`.
@@ -596,13 +606,13 @@ pub struct Message {
     pub status: String,
     /// The sender's repo, when borg top lists it.
     pub from_repo: String,
-    /// The sender's engineer, aliased.
+    /// The sender's engineer, by name.
     pub from_engineer: String,
     /// The sender's presence state (`working`, `waiting`, `idle`, `ended`).
     pub from_state: String,
     /// The recipient's repo, when borg top lists it.
     pub to_repo: String,
-    /// The recipient's engineer, aliased.
+    /// The recipient's engineer, by name.
     pub to_engineer: String,
     /// The recipient's presence state.
     pub to_state: String,

@@ -218,7 +218,12 @@ impl Aliases {
 
     /// For display: the listed name, else the email as written.
     pub fn display(&self, email: &str) -> String {
-        self.by_email.get(&email.trim().to_lowercase()).cloned().unwrap_or_else(|| email.to_string())
+        self.name(email).map_or_else(|| email.to_string(), str::to_string)
+    }
+
+    /// The listed name of a raw git email, if the config lists it.
+    pub fn name(&self, email: &str) -> Option<&str> {
+        self.by_email.get(&email.trim().to_lowercase()).map(String::as_str)
     }
 
     /// Whether two raw emails are the same engineer.

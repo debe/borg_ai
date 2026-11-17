@@ -64,11 +64,11 @@ async fn the_update_view_names_the_release_and_the_members_by_version() {
     let note = protocol::misses(older, ours);
     assert_eq!(
         members[0],
-        json!({"key": "k-old", "engineer": null, "name": "peer k-old", "borg": null, "protocol": older, "ms": 2, "syncs": true, "note": note})
+        json!({"key": "k-old", "engineer": null, "name": "peer k-old", "host": "k-old", "borg": null, "protocol": older, "ms": 2, "syncs": true, "note": note})
     );
     assert_eq!(
         members[1],
-        json!({"key": "k-same", "engineer": "ann@x", "name": "ann@x", "borg": update::VERSION, "protocol": ours, "ms": 1, "syncs": true, "note": null})
+        json!({"key": "k-same", "engineer": "ann@x", "name": "ann@x", "host": "k-same", "borg": update::VERSION, "protocol": ours, "ms": 1, "syncs": true, "note": null})
     );
     let m = &members[2];
     assert_eq!((m["syncs"].as_bool(), m["protocol"].as_u64(), m["name"].as_str()), (Some(false), Some(u64::from(ours + 1)), Some("bob@x")), "{m}");

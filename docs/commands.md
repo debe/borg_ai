@@ -54,7 +54,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 
 | Command | Shows or does |
 |---|---|
-| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), the last day's messages below, and a `selection:` line once the collective has a graded check (or a switch or the monitor's revert decides). Over the collectives, one line on borg itself when a newer release exists or a member's mesh protocol differs from this node's (not in `--json`). The messages to the engineer it shows are acknowledged, as `borg inbox` does; `--json` acknowledges nothing. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
+| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its number (the handle to type), its label (engineer · repo · harness, `#2` on a second live one; the engineer by alias, else git `user.name`, else email), the host it runs on, its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), the last day's messages below, and a `selection:` line once the collective has a graded check (or a switch or the monitor's revert decides). Over the collectives, one line on borg itself when a newer release exists or a member's mesh protocol differs from this node's (not in `--json`). The messages to the engineer it shows are acknowledged, as `borg inbox` does; `--json` acknowledges nothing. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
 | `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: an overview, knowledge, checks and lesson selection (Conscience), learning week by week, steering and refusals, messages (those to the engineer it lists are acknowledged), the queen, cost and drones, with a banner over the tabs while a newer release exists or a member's mesh protocol differs ([details](statistics.md)) |
 
 ### Team
@@ -94,8 +94,9 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 `borg tell` and `borg ask` send from the calling session, or from the engineer in a plain terminal
 (`engineer:<git user.email>`). The recipient is one of:
 
-- a drone as `borg top` names it, or a session id prefix, resolved to the session id and its machine when
-  the message is sent. This machine comes first: a prefix that matches a session here and one on a
+- a drone as `borg top` names it (its number, or its label `"Ann Example · borg-ai · claude"`, any case,
+  `-` for `·` as a message carries it), or a session id prefix, resolved to the session id and its
+  machine when the message is sent. This machine comes first: a prefix that matches a session here and one on a
   member's machine names the one here. A member's session is reached when nothing here matches, or by
   `<session>@<node>`, which names both;
 - `local`: the sessions running on this machine then. Its line never leaves this machine;
@@ -106,7 +107,9 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 
 A reply goes to the sender's session on the machine its message came from, even when the session has
 ended here. A sender's name and session are its own claims; `borg top` and borg web show a message from
-another machine with that machine's short key, the part the mesh checks.
+another machine with that machine's hostname (from its signed presence; the key's start for a machine
+before 0.9), the part the mesh checks. Every reader names the sender as its drone is labelled now, else
+by the name it was sent under (ASCII, `Ann Example - borg-ai - claude`, which every borg accepts).
 
 `collective` and `all` are written `all` in the log, as 0.4.0 wrote `all`, so a line from 0.4.0 or an
 older peer means the same. `local` is written `local@<node>` and counts only on a line from that node:
@@ -249,13 +252,13 @@ borg learns from, at 0 tokens.
 
 ```console
 $ borg no never look merges up in the commit log, use the review API
-vetoed One of Two (3f9c2a1b): 2 shown lesson(s) lose credit (L17, L42); the reason becomes a lesson when borg learn runs
+vetoed Ann Example · borg-ai · claude (3f9c2a1b): 2 shown lesson(s) lose credit (L17, L42); the reason becomes a lesson when borg learn runs
 to stop it now: borg pause 3f9c2a1b
 ```
 
 **Which drone.** Without `--session`, the one local drone working in the current repo (or `--dir`), or,
 with none running, the most recently seen one. With several running it lists them; name one with
-`--session` (as `borg top` shows it, its number, a session id or a prefix of 4+ characters). A drone on
+`--session` (its label as `borg top` shows it, its number, a session id or a prefix of 4+ characters). A drone on
 another member's machine is named with `--session`, and the veto travels as a message to
 `<session>@<node>` ([Pause and resume](#pause-and-resume)); it counts there only if you have the
 `admin` or `steer` role, and that machine records it once.

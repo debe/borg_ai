@@ -455,15 +455,16 @@ fn an_offer_on_one_node_is_asked_of_and_taken_on_the_other_and_the_original_is_f
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains(&id) && out.contains("asked") && out.contains("asks take-b@x (you)"), "{out}");
     let told = b.hook("claude", "prompt", &b.claude_prompt("s-b"));
+    // Writers by their git user.name ("a", "b"), A's learned on B from A's machine record (borg names.rs).
     let c = context(&told);
-    assert!(c.contains(&format!("Hand-off {id} from take-a@x")) && c.contains("(asked of you)") && c.contains("Peer data"), "{told}");
+    assert!(c.contains(&format!("Hand-off {id} from a (session s-a,")) && c.contains("(asked of you)") && c.contains("Peer data"), "{told}");
     assert!(!context(&b.hook("claude", "prompt", &b.claude_prompt("s-b"))).contains(&id), "told once");
     assert!(std::fs::read_to_string(b.log()).unwrap().lines().any(|l| l.contains("engineer:take-b@x") && l.contains(&id)), "the ask's message to B");
 
     // B takes it: the transfer, objects included.
     let (code, out, err) = p.handoff(b, "s-b", &["take", &id]);
     assert_eq!(code, Some(0), "{out}{err}");
-    assert!(out.contains(&format!("took hand-off {id} from take-a@x")) && out.contains("tests for b"), "{out}");
+    assert!(out.contains(&format!("took hand-off {id} from a (session s-a,")) && out.contains("tests for b"), "{out}");
     assert_eq!(std::fs::read_to_string(b.work().join("a_only.rs")).unwrap(), "// written on A alone\nfn only_a() {}\n", "A's file, on B");
     assert_eq!(std::fs::read_to_string(b.work().join("lib.rs")).unwrap(), "fn a() { b() }\n");
     assert_eq!(git(&b.work(), &p.gh(), &["rev-parse", "HEAD"], &[]), state, "B is at the state");
@@ -476,9 +477,9 @@ fn an_offer_on_one_node_is_asked_of_and_taken_on_the_other_and_the_original_is_f
     assert!(p.refused_on_a("Bash", json!({"command": "echo x >> lib.rs"})));
     assert!(!p.refused_on_a("Read", json!({"file_path": a.work().join("lib.rs")})), "A's reads pass");
     let notice = context(&a.hook("claude", "prompt", &a.claude_prompt("s-a")));
-    assert!(notice.contains(&format!("Hand-off {id} was taken by take-b@x")), "{notice}");
+    assert!(notice.contains(&format!("Hand-off {id} was taken by b (session s-b,")), "{notice}");
     let (_, listed, _) = p.handoff(a, "s-a", &[]);
-    assert!(listed.contains("taken ") && listed.contains("by take-b@x") && listed.contains("the remote holds it"), "{listed}");
+    assert!(listed.contains("taken ") && listed.contains("by b (session s-b,") && listed.contains("the remote holds it"), "{listed}");
     p.clean();
 }
 
@@ -528,9 +529,9 @@ fn a_declined_ask_stays_the_owners() {
     assert!(code == Some(1) && err.contains("declined it already"), "a second decline: {err}");
     session(a, b);
     let (_, listed, _) = p.handoff(a, "s-a", &[]);
-    assert!(listed.contains("declined") && listed.contains("declined by decline-b@x"), "{listed}");
+    assert!(listed.contains("declined") && listed.contains("declined by b (session s-b,"), "{listed}");
     let told = context(&a.hook("claude", "prompt", &a.claude_prompt("s-a")));
-    assert!(told.contains(&format!("Hand-off {id} was declined by decline-b@x")), "{told}");
+    assert!(told.contains(&format!("Hand-off {id} was declined by b (session s-b,")), "{told}");
     assert!(!p.refused_on_a("Edit", json!({"file_path": a.work().join("lib.rs")})), "nothing fenced");
     let (code, out, err) = p.handoff(a, "s-a", &["take", &id]);
     assert_eq!(code, Some(0), "{out}{err}");

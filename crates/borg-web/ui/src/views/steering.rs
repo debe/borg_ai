@@ -42,7 +42,7 @@ pub fn Steering() -> impl IntoView {
                 <h2>"No drone has been steered yet"</h2>
                 <p>"Steering pauses, resumes or vetoes running sessions, yours or a teammate's. A session sees it at its next prompt or tool call; a pause holds its tool calls until resumed, and every refused call is counted here."</p>
                 <pre>"borg top                                # find the drone
-borg tell \"Three of Five\" \"use the shared retry helper\"
+borg tell 3 \"use the shared retry helper\"
 borg pause all                          # hold every drone
 borg resume all"</pre>
             </section>

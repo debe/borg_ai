@@ -39,6 +39,7 @@ pub mod memory;
 pub mod memory_export;
 pub mod moves;
 pub mod msg;
+pub mod names;
 pub mod notes;
 pub(crate) mod notify;
 pub mod ope;

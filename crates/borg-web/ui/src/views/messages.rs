@@ -365,7 +365,8 @@ pub fn Messages() -> impl IntoView {
                 let ask = m.kind == "ask";
                 let meta = [clock(m.ms), m.harness.clone(), status_label(m)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
                 let (hl_id, copied_id, by, copy_id) = (m.id.clone(), m.id.clone(), m.by.clone(), m.id.clone());
-                let who = if !m.from_engineer.is_empty() { format!("{} · {}", m.from, m.from_engineer) } else { m.from.clone() };
+                // A drone's label names its engineer already.
+                let who = if !m.from_engineer.is_empty() && !m.from.starts_with(&m.from_engineer) { format!("{} · {}", m.from, m.from_engineer) } else { m.from.clone() };
                 view! {
                     {sep}
                     <div class="msg" class:mine=m.mine class:start=start id=format!("msg-{}", m.id) class:hl=move || focus.with(|f| f.as_deref() == Some(hl_id.as_str()))>
@@ -417,7 +418,7 @@ pub fn Messages() -> impl IntoView {
                     <h2>"No session has sent a message yet"</h2>
                     <p>"Sessions on any harness tell and ask each other. A message is shown once to its recipient, at its next prompt or tool call, labelled as peer data with the command that answers it."</p>
                     <pre>"borg top                               # find the session
-borg tell \"Two of Five\" \"the parser test is flaky\"
+borg tell 2 \"the parser test is flaky\"
 borg ask all \"who touches the mesh today?\"
 borg inbox                             # what was sent, and whom it was shown to"</pre>
                 </section>

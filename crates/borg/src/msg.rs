@@ -11,9 +11,9 @@
 //! machine they need no mesh. A `borg pause`, `borg resume` or a remote `borg no` is a message too, of
 //! a privileged `Kind` that counts only under an admitted role (steer.rs).
 //!
-//! A drone named on the command line (a designation as `borg top` shows it, or a session id prefix) is
-//! resolved to its session id when the message is sent: designations ("Two of Five") shift as sessions
-//! start and end and differ per node, a session id does not. A line's `by`, `name` and `harness` are its
+//! A drone named on the command line (its label or number as `borg top` shows it, or a session id
+//! prefix) is resolved to its session id when the message is sent: numbers shift as sessions start and
+//! end and differ per node, and labels can, a session id does not. A line's `by`, `name` and `harness` are its
 //! sender's claims; only its `node` is checked (borg-mesh lines.rs `travels`), so a session is addressed
 //! with its node, and a reply goes to the (node, `by`) pair of what it answers (`address`): a `by` that
 //! names a local session from another node never routes a reply here.
@@ -225,7 +225,8 @@ pub struct Message {
     pub kind: Kind,
     /// The sending session, or `engineer[:<email>]` from a terminal.
     pub by: String,
-    /// The sender as a label names it: its designation when sent, or the engineer's email.
+    /// The sender as a label names it: its drone's label when sent (top.rs `wire`), or the engineer's
+    /// email. Readers name the sender anew (top.rs `sender_name`); this is what one shows that cannot.
     #[serde(default)]
     pub name: String,
     /// The sender's harness, `terminal` for the engineer.
@@ -363,7 +364,7 @@ pub fn fresh_at(ms: i64, now: i64) -> bool {
 }
 
 /// A sender name as a label shows it: email-like characters and spaces, at most `NAME`.
-fn label(s: &str) -> String {
+pub(crate) fn label(s: &str) -> String {
     let kept: String = s.chars().filter(|c| c.is_ascii_alphanumeric() || " @._+-".contains(*c)).take(NAME).collect();
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1897,7 +1898,10 @@ pub fn deliver(home: &Path, caps: Caps, event: &str, input: &Value, started: Opt
     let mut talk: Vec<&Message> = mine.iter().filter(|m| !m.kind.privileged() && !shown.contains(&safe(&m.id))).collect();
     oldest_first(&mut talk);
     new.extend(talk.into_iter().rev());
-    let view = Shows { caps, session, roles: &roles, here: &here, now };
+    // The senders as they are named now (top.rs `sender_name`): read only when there is news to show.
+    let named = (!new.is_empty()).then(|| top::roster(home, now));
+    let sender_of = |m: &Message| named.as_ref().map_or_else(|| sender_label(m), |(ds, names)| top::sender_name(ds, names, &here, m));
+    let view = Shows { caps, session, roles: &roles, here: &here, now, name: &sender_of };
     // What the hook already answers shares the budget, with the separator `with_context` puts between.
     let theirs = out
         .as_ref()
@@ -1969,13 +1973,15 @@ pub(crate) fn with_peer_notes(caps: Caps, input: &Value, out: Option<Value>, lin
     (Some(with_context(out, "UserPromptSubmit", &text)), joined)
 }
 
-/// How one event shows its messages: to whom, on which harness, under which steering roles.
+/// How one event shows its messages: to whom, on which harness, under which steering roles, and who
+/// sent each (`name`: top.rs `sender_name`, or `sender_label` where nothing names them anew).
 pub struct Shows<'a> {
     pub caps: Caps,
     pub session: &'a str,
     pub roles: &'a Roles,
     pub here: &'a str,
     pub now: i64,
+    pub name: &'a dyn Fn(&Message) -> String,
 }
 
 /// One message as an event shows it: whole, or `head`, the start of its text (`capped`).
@@ -2038,8 +2044,9 @@ fn with_context(out: Option<Value>, event: &str, text: &str) -> Value {
     out
 }
 
-/// One message as its recipient `session` sees it: the labelled line, then how to answer. The name and
-/// harness are what the sender wrote, which no member vouches for; the node is the key the mesh checked
+/// One message as its recipient `session` sees it: the labelled line, then how to answer. The name (the
+/// sender's drone as it is named now, else what the sender wrote) and the harness are claims no member
+/// vouches for; the node is the key the mesh checked
 /// the line against, so the label shows as much of it as steer.rs `who` does (`short_node`). A harness
 /// whose shell names no session (`Caps::session_env`) answers `--from` the session. A steer is labelled
 /// with its role (steer.rs `label`). With a `head`, the text (a steer's note or reason) is that head, and
@@ -2055,7 +2062,7 @@ fn line(m: &Message, shows: &Shows, head: Option<&str>) -> String {
         };
         return format!("{label}{rest}");
     }
-    let (name, node) = (sender_label(m), short_node(&m.node));
+    let (name, node) = ((shows.name)(m), short_node(&m.node));
     let re = m.re.as_ref().map_or_else(String::new, |r| format!(" (re {r})"));
     let how = if m.asks() { "They asked for a reply" } else { "To reply" };
     let text = head.unwrap_or(&m.text);
@@ -2192,7 +2199,7 @@ pub fn sender(home: &Path, drones: &[top::Drone], from: Option<&str>, cwd: &str)
     if let Some((by, h)) = session {
         let d = drones.iter().find(|d| d.node.is_empty() && d.p.session == by);
         let harness = h.map(str::to_string).or_else(|| d.map(|d| d.p.harness.clone())).unwrap_or_else(|| "unknown".into());
-        let name = d.map_or_else(|| short_session(&by), |d| d.designation.clone());
+        let name = d.map_or_else(|| short_session(&by), |d| top::wire(&d.designation));
         return Ok(Sender { by, name, harness, node });
     }
     let (by, email) = engineer_of(cwd);
@@ -2277,9 +2284,9 @@ pub fn main(cmd: &str, args: &[&str]) -> i32 {
         return 1;
     };
     let now = learn::now_ms();
-    let drones = top::drones(home, collective::may_sync(&route), now);
+    let (drones, names) = top::named(home, collective::may_sync(&route), now);
     if cmd == "inbox" {
-        return inbox(home, &a, &drones, &cwd, now);
+        return inbox(home, &a, &drones, &names, &cwd, now);
     }
     match Kind::parse(cmd) {
         Some(kind) if kind != Kind::Veto => tell(home, kind, &a, &drones, &cwd, now),
@@ -2361,11 +2368,11 @@ fn collective_pause_left(home: &Path, lines: &[Message], m: &Message) -> bool {
         .is_some_and(|x| x.kind == Kind::Pause)
 }
 
-/// `borg inbox`: in a session, its messages, marked shown when the session has a hook record here
+/// `borg inbox`: in a session, its messages (each sender named as top.rs `sender_name` names it), marked shown when the session has a hook record here
 /// (else another session's would be) and acknowledged (`ack`); from a terminal or with `--all`, every
 /// recent message on this node with whom it was shown to, the ones to the engineer acknowledged as the
 /// engineer's (`engineer_acks`). `--show <id>`: that message whole (`show`).
-fn inbox(home: &Path, a: &Args, drones: &[top::Drone], cwd: &str, now: i64) -> i32 {
+fn inbox(home: &Path, a: &Args, drones: &[top::Drone], names: &crate::names::Book, cwd: &str, now: i64) -> i32 {
     let me = match a.from {
         Some(s) => Some(s.to_string()),
         None => match caller(drones) {
@@ -2380,8 +2387,9 @@ fn inbox(home: &Path, a: &Args, drones: &[top::Drone], cwd: &str, now: i64) -> i
     let shown = seen_by(home);
     let here = node(home);
     let local = |to: &str| Address::parse(to).is_some_and(|a| drones.iter().any(|d| d.node.is_empty() && a.reaches(&here, &d.p.session)));
+    let name = |m: &Message| top::sender_name(drones, names, &here, m);
     if a.show.is_some() {
-        return show(home, a, &all, me.as_deref(), cwd, now, local);
+        return show(home, a, &all, me.as_deref(), cwd, now, local, &name);
     }
     let rows: Vec<(&Message, String)> = if let Some(s) = me.as_deref().filter(|_| !a.all) {
         let started = crate::presence::read(home, s).map_or(i64::MAX, |p| p.started);
@@ -2423,7 +2431,7 @@ fn inbox(home: &Path, a: &Args, drones: &[top::Drone], cwd: &str, now: i64) -> i
     for (m, state) in &rows {
         let re = m.re.as_ref().map_or_else(String::new, |r| format!(" re {r}"));
         let to: String = Address::parse(&m.to).map_or_else(|| m.to.clone(), |a| a.name()).chars().take(24).collect();
-        println!("{:>6} {} {:<4} {} -> {to} [{state}]{re}: {}", ago(now - m.ms), m.id, m.kind, m.name, m.text);
+        println!("{:>6} {} {:<4} {} -> {to} [{state}]{re}: {}", ago(now - m.ms), m.id, m.kind, name(m), m.text);
     }
     0
 }
@@ -2461,7 +2469,8 @@ pub fn ack_engineer(home: &Path, cwd: &str, shown: &[&Message], now: i64) -> std
 /// `borg inbox --show <id>`: the message `id` of `all` (this node's recent messages) whole, with how
 /// to answer it. Shown to its recipient (the session `me`, with a hook record here, or the engineer at
 /// a terminal) it is claimed and acknowledged, as a delivery would.
-fn show(home: &Path, a: &Args, all: &[Message], me: Option<&str>, cwd: &str, now: i64, local: impl Fn(&str) -> bool) -> i32 {
+#[allow(clippy::too_many_arguments)]
+fn show(home: &Path, a: &Args, all: &[Message], me: Option<&str>, cwd: &str, now: i64, local: impl Fn(&str) -> bool, name: &dyn Fn(&Message) -> String) -> i32 {
     let id = a.show.unwrap_or_default();
     let Some(m) = all.iter().find(|m| m.id == id) else {
         eprintln!("borg inbox: no recent message {id} here");
@@ -2489,7 +2498,7 @@ fn show(home: &Path, a: &Args, all: &[Message], me: Option<&str>, cwd: &str, now
     let re = m.re.as_ref().map_or_else(String::new, |r| format!(" re {r}"));
     let to = Address::parse(&m.to).map_or_else(|| m.to.clone(), |a| a.name());
     let node = short_node(&m.node);
-    println!("{} {} from {} ({}, node {node}) -> {to}{re}, {} ago", m.id, m.kind, m.name, m.harness, ago(now - m.ms));
+    println!("{} {} from {} ({}, node {node}) -> {to}{re}, {} ago", m.id, m.kind, name(m), m.harness, ago(now - m.ms));
     println!("{}", m.text);
     if !m.kind.privileged() {
         let from = me.map_or_else(String::new, |s| format!(" --from {s}"));
@@ -2991,7 +3000,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         let c = caps("claude");
         let roles = Roles::default();
-        let shows = Shows { caps: c, session: "s-r", roles: &roles, here: "n1", now: 1000 };
+        let shows = Shows { caps: c, session: "s-r", roles: &roles, here: "n1", now: 1000, name: &sender_label };
         // Senders of one length, so every line costs the same.
         let per = line(&m("s000", "s-r", 100), &shows, None).chars().count() + 1;
         let fit = (c.context_chars() - PEER_DATA.chars().count()) / per;
@@ -3799,7 +3808,15 @@ mod tests {
             started: 0,
             pid,
         };
-        top::Drone { designation: format!("{session} drone"), number: 1, node: String::new(), state: crate::presence::State::Working, paused: false, p }
+        top::Drone {
+            designation: format!("{session} drone"),
+            number: 1,
+            node: String::new(),
+            host: String::new(),
+            state: crate::presence::State::Working,
+            paused: false,
+            p,
+        }
     }
 
     /// A harness started in another's shell inherits its session variable: the inner session, whose
