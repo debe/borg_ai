@@ -55,7 +55,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 
 | Command | Shows or does |
 |---|---|
-| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its number (the handle to type), its label (engineer · repo · harness, `#2` on a second live one; the engineer by alias, else git `user.name`, else email), the host it runs on, its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), the last day's messages below, and a `selection:` line once the collective has a graded check (or a switch or the monitor's revert decides). Over the collectives, one line on borg itself when a newer release exists or a member's mesh protocol differs from this node's (not in `--json`). The messages to the engineer it shows are acknowledged, as `borg inbox` does; `--json` acknowledges nothing. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
+| `borg top [--once] [--json] [--dir DIR]` | A live screen, like Unix `top`: the drones of each collective (local and remote), each with its number (the handle to type), its label (engineer · repo · harness, `#2` on a second one, ended or not; the engineer by alias, else git `user.name`, else email), the host it runs on, its state (`paused` while paused), whether it listens (WAKE), its unread messages (UNREAD), the last day's messages below, and a `selection:` line once the collective has a graded check (or a switch or the monitor's revert decides). Over the collectives, one line on borg itself when a newer release exists or a member's mesh protocol differs from this node's (not in `--json`). The messages to the engineer it shows are acknowledged, as `borg inbox` does; `--json` acknowledges nothing. Quits on `q`, Esc or Ctrl-C. Piped, or with `--once`, it prints the plain text once |
 | `borg web [--port PORT] [--dir DIR]` | A live page on 127.0.0.1: an overview, knowledge, checks and lesson selection (Conscience), learning week by week, steering and refusals, messages (those to the engineer it lists are acknowledged), the queen, cost and drones, with a banner over the tabs while a newer release exists or a member's mesh protocol differs ([details](statistics.md)). Runs as a service once `borg setup` (or `borg service install`) is done; Ctrl-C, SIGINT or SIGTERM stops it |
 
 ### Team
@@ -96,7 +96,8 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 (`engineer:<git user.email>`). The recipient is one of:
 
 - a drone as `borg top` names it (its number, or its label `"Ann Example · borg-ai · claude"`, any case,
-  `-` for `·` as a message carries it), or a session id prefix, resolved to the session id and its
+  `-` for `·`, or as a message carries it: ASCII only, at most 64 characters; a label naming more than
+  one drone that way needs the number), or a session id prefix, resolved to the session id and its
   machine when the message is sent. This machine comes first: a prefix that matches a session here and one on a
   member's machine names the one here. A member's session is reached when nothing here matches, or by
   `<session>@<node>`, which names both;

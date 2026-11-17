@@ -65,7 +65,8 @@ async fn an_ask_shows_with_who_could_take_it() {
     };
     let lines = [
         remote(&"b".repeat(64), "bob@y", now, with(&app, 1)),
-        remote(&"c".repeat(64), "carol@z", now, with(&"0".repeat(32), 1)),
+        // A member whose host reads as this machine in the page's own words.
+        remote(&"c".repeat(64), "carol@z", now, with(&"0".repeat(32), 1).map(|m| Machine { host: "this one".into(), ..m })),
         remote(&"d".repeat(64), "dave@w", now, with(&app, 0)),
         remote(&"e".repeat(64), "erin@v", now, None),
     ];
@@ -84,6 +85,8 @@ async fn an_ask_shows_with_who_could_take_it() {
     assert_eq!(machines.len(), 4, "{v}");
     let erin = machines.iter().find(|m| m["engineers"] == json!(["erin@v"])).unwrap();
     assert_eq!((erin["handoff"].as_u64(), erin["borg"].is_null()), (Some(0), true), "a borg without hand-offs: {erin}");
+    let carol = machines.iter().find(|m| m["engineers"] == json!(["carol@z"])).unwrap();
+    assert_eq!(carol["host"], format!("this one {}", "c".repeat(12)), "never standing alone as this machine: {carol}");
     let (status, _) = get(app, "/api/handoffs?c=nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let _ = std::fs::remove_dir_all(&home);

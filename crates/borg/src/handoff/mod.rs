@@ -2651,6 +2651,38 @@ fn hosts<'r>(home: &Path, now: i64, remote: &'r [presence::Remote]) -> Vec<Host<
     out
 }
 
+/// Whom `raw` names among the machines `seen`, as an offer records it (an email, or the whole key), with
+/// their machines: an engineer by email (any case) or by the name `names` gives them (any case: an
+/// alias, else a git user.name), else a node by its key or a prefix only it has. A git user.name is the
+/// engineer's own and need not be unique: a name more than one engineer goes by (emails `aliases` does
+/// not join) names none of them, and the error lists their emails to give instead.
+fn whom<'h, 'r>(seen: &'h [Host<'r>], names: &Book, aliases: &collective::Aliases, raw: &str) -> Result<(String, Vec<&'h Host<'r>>), String> {
+    if raw.contains('@') {
+        return Ok((raw.to_string(), seen.iter().filter(|h| h.engineers.iter().any(|e| e.eq_ignore_ascii_case(raw))).collect()));
+    }
+    let wanted = raw.to_lowercase();
+    let named: Vec<&str> =
+        seen.iter().flat_map(|h| &h.engineers).map(String::as_str).filter(|e| names.display_with(aliases, e).to_lowercase() == wanted).collect();
+    if let Some(first) = named.first() {
+        let mut people: Vec<String> = named.iter().map(|e| aliases.canon(e)).collect();
+        people.sort_unstable();
+        people.dedup();
+        if people.len() > 1 {
+            let mut emails: Vec<String> = named.iter().map(|e| e.to_lowercase()).collect();
+            emails.sort_unstable();
+            emails.dedup();
+            return Err(format!("{raw} is the name of {} engineers ({}): give the email of the one to ask", people.len(), emails.join(", ")));
+        }
+        return Ok((first.to_string(), seen.iter().filter(|h| h.engineers.iter().any(|e| named.contains(&e.as_str()))).collect()));
+    }
+    let theirs: Vec<&Host> = seen.iter().filter(|h| h.node.starts_with(raw)).collect();
+    match theirs.as_slice() {
+        [h] => Ok((h.node.clone(), theirs)),
+        [] => Ok((raw.to_string(), theirs)),
+        more => Err(format!("{raw} names {} nodes: give more of the key", more.len())),
+    }
+}
+
 /// Whom an ask names (`check_to`), and what is not known of their clones: the repos none of their
 /// machines told the team it holds, a warning, never a refusal (a clone made since, or one its borg has
 /// not recorded, takes it as well).
@@ -2659,9 +2691,9 @@ struct Asked {
     unknown: Option<String>,
 }
 
-/// The check before an ask (`--to`): whom `raw` names (an engineer by email or the name the
-/// name book gives them, names.rs, or a node by its key or a prefix only it has) among the machines
-/// seen, as the offer records it (an email, or the whole key), when one of their machines speaks
+/// The check before an ask (`--to`): whom `raw` names (`whom`: an engineer by email or by a name only
+/// they go by in the name book, names.rs, or a node by its key or a prefix only it has) among the
+/// machines seen, as the offer records it (an email, or the whole key), when one of their machines speaks
 /// `PROTOCOL`; else the gap, named. Their clones of the repos (`repos`: each one's clone URL and keys,
 /// clones.rs `keys_of`) only warn: the presence tells the clones their borg recorded, which can lag
 /// behind what they hold.
@@ -2669,22 +2701,7 @@ fn check_to(home: &Path, raw: &str, repos: &[(String, Vec<String>)], now: i64) -
     let remote = presence::remote(home, now);
     let seen = hosts(home, now, &remote);
     let names = Book::of(home, &remote);
-    let (to, theirs): (String, Vec<&Host>) = if raw.contains('@') || seen.iter().any(|h| h.engineers.iter().any(|e| names.display(e) == raw)) {
-        let theirs: Vec<&Host> = seen.iter().filter(|h| h.engineers.iter().any(|e| e.eq_ignore_ascii_case(raw) || names.display(e) == raw)).collect();
-        let email = if raw.contains('@') {
-            raw.to_string()
-        } else {
-            theirs.iter().flat_map(|h| &h.engineers).find(|e| names.display(e) == raw).cloned().unwrap_or_else(|| raw.to_string())
-        };
-        (email, theirs)
-    } else {
-        let theirs: Vec<&Host> = seen.iter().filter(|h| h.node.starts_with(raw)).collect();
-        match theirs.as_slice() {
-            [h] => (h.node.clone(), theirs),
-            [] => (raw.to_string(), theirs),
-            more => return Err(format!("{raw} names {} nodes: give more of the key", more.len())),
-        }
-    };
+    let (to, theirs) = whom(&seen, &names, collective::aliases(), raw)?;
     if theirs.is_empty() {
         return Err(format!(
             "no machine of {raw} was seen in the last day (borg checks whom it asks by the team's signed presence): offer it without --to, or once they are back"
@@ -2739,13 +2756,14 @@ pub fn top_lines(home: &Path, now: i64) -> Vec<String> {
 /// What borg web shows of hand-offs (`/api/handoffs`): every hand-off this machine knows, with its
 /// state, who offered it and whom it asks, its outcome, who declined, and which engineers have a
 /// machine that could take it (seen within the presence's day, speaking `PROTOCOL`, a clone of every
-/// repo); and every machine seen, with its hostname, engineers, borg, protocol and clones by name. No
-/// remote is asked.
+/// repo); and every machine seen, with its host (a member's as names.rs `Book::host` names it), engineers,
+/// borg, protocol and clones by name. No remote is asked.
 pub fn board(home: &Path, now: i64) -> serde_json::Value {
     let text = log::read(home);
     let known = log::known(home);
     let remote = presence::remote(home, now);
     let seen = hosts(home, now, &remote);
+    let (names, here) = (Book::of(home, &remote), msg::node(home));
     let fenced = fence::ids(home);
     let handoffs: Vec<serde_json::Value> = log::fold(&text)
         .iter()
@@ -2789,12 +2807,13 @@ pub fn board(home: &Path, now: i64) -> serde_json::Value {
             let mut repos: Vec<&str> = m.map(|m| m.clones.iter().map(|c| c.name.as_ref()).collect()).unwrap_or_default();
             repos.sort_unstable();
             repos.dedup();
-            // A peer's hostname, cleaned (names.rs `clean`); empty from a node of a version without it.
-            let host = m.map(|m| crate::names::clean(&m.host)).unwrap_or_default();
+            // This machine's hostname; a member's as the name book shows it (names.rs `Book::host`:
+            // cleaned, its key beside one that cannot stand alone, else its key's start).
+            let host = if s.node == here { m.map(|m| crate::names::clean(&m.host)).unwrap_or_default() } else { names.host(&s.node) };
             serde_json::json!({"node": s.node, "host": host, "engineers": s.engineers, "borg": m.map(|m| m.borg.as_ref()), "handoff": m.map_or(0, |m| m.handoff), "repos": repos})
         })
         .collect();
-    serde_json::json!({"here": msg::node(home), "handoffs": handoffs, "machines": machines})
+    serde_json::json!({"here": here, "handoffs": handoffs, "machines": machines})
 }
 
 #[cfg(test)]
@@ -2822,6 +2841,32 @@ mod tests {
         assert_ne!(claim_message("h0123456789ab", &want), claim_message("h0123456789ab", &want), "a nonce each");
         (want.verb, want.why, want.after, want.states) = (Verb::Abort, "the release is frozen".into(), Some("e".repeat(40)), Vec::new());
         assert_eq!(parse_claim(&claim_message("h0123456789ab", &want), "h0123456789ab"), Some(want), "an abort after a take, with its reason");
+    }
+
+    /// A name two engineers go by names neither: the ask is refused with their emails. One that only one
+    /// goes by (any case), or the emails of one engineer the alias config joins, names them.
+    #[test]
+    fn a_name_two_engineers_go_by_names_neither() {
+        let host = |node: &str, engineer: &str| Host { node: node.into(), engineers: vec![engineer.into()], machine: None };
+        let seen = [host("k1", "david.a@example.com"), host("k2", "david.b@example.com"), host("k3", "ann@example.com"), host("k4", "ann@home.example")];
+        let local = [("david.a@example.com", "David"), ("david.b@example.com", "David"), ("ann@example.com", "Ann Example")];
+        let names = Book::from_parts(local.iter().map(|(e, n)| (e.to_string(), n.to_string())).collect(), &[]);
+        let aliases =
+            collective::Aliases::new(&[collective::Engineer { name: "Ann".into(), emails: vec!["ann@example.com".into(), "ann@home.example".into()] }]);
+        let Err(err) = whom(&seen, &names, &aliases, "david") else { panic!("a name two go by") };
+        assert!(err.contains("2 engineers") && err.contains("david.a@example.com, david.b@example.com"), "{err}");
+        let (to, theirs) = whom(&seen, &names, &aliases, "DAVID.B@example.com").unwrap();
+        assert_eq!((to.as_str(), theirs.iter().map(|h| h.node.as_str()).collect::<Vec<_>>()), ("DAVID.B@example.com", vec!["k2"]));
+        let (to, theirs) = whom(&seen, &names, &aliases, "ann").unwrap();
+        assert_eq!(
+            (to.as_str(), theirs.iter().map(|h| h.node.as_str()).collect::<Vec<_>>()),
+            ("ann@example.com", vec!["k3", "k4"]),
+            "one engineer, two emails"
+        );
+        let names = Book::from_parts([("david.a@example.com".to_string(), "David".to_string())].into(), &[]);
+        let (to, theirs) = whom(&seen, &names, &collective::Aliases::default(), "David").unwrap();
+        assert_eq!((to.as_str(), theirs.len()), ("david.a@example.com", 1), "a name only one goes by");
+        assert_eq!(whom(&seen, &names, &collective::Aliases::default(), "k3").unwrap().0, "k3", "a node by its key");
     }
 
     /// A value from a peer prints as one shell word: plain when nothing in it is special, else quoted

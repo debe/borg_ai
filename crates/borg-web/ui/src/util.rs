@@ -101,10 +101,12 @@ pub fn hue(key: &str) -> &'static str {
 }
 
 /// Two uppercase initials of a name, a drone's label ("Ann Example · borg-ai · claude": its name part)
-/// or an email: the first letters of its first two words, else the first two of its one word (an
-/// email's local part); "?" when empty.
+/// or an email, without the machine a sender from another node comes with ("Bob on bob-laptop": the
+/// server adds " on <host>" last): the first letters of its first two words, else the first two of its
+/// one word (an email's local part); "?" when empty.
 pub fn initials(name: &str) -> String {
     let name = name.split(" · ").next().unwrap_or_default();
+    let name = name.rsplit_once(" on ").map_or(name, |(who, _)| who);
     let first = |w: &str| w.chars().find(|c| c.is_alphanumeric());
     let words: Vec<&str> = name.split_whitespace().filter(|w| first(w).is_some()).collect();
     let s: String = match words.as_slice() {
@@ -246,4 +248,19 @@ pub fn palette(i: usize) -> &'static str {
     const P: [&str; 8] =
         ["var(--c-accent)", "var(--c-good)", "var(--c-violet)", "var(--c-amber)", "var(--c-teal)", "var(--c-heat)", "var(--c-sky)", "var(--c-pink)"];
     P[i % P.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sender from another node comes with its machine: the initials are the name's, never "on".
+    #[test]
+    fn initials_leave_the_machine_out() {
+        assert_eq!(initials("Bob Example on bob-laptop"), "BE");
+        assert_eq!(initials("Ann on ann-desk"), "AN", "one word: its first two letters");
+        assert_eq!(initials("git@carol.example on carol-mbp"), "GI", "an email's local part");
+        assert_eq!(initials("Ann Example · app · claude on ann-desk"), "AE");
+        assert_eq!(initials("Ann Example"), "AE");
+    }
 }
