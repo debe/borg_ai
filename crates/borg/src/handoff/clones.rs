@@ -377,7 +377,8 @@ mod tests {
         assert_eq!(keyed, ["app", "lib"], "{:?}", read(&home));
         assert!(read(&home).values().any(|c| c.name == "loose" && c.urls.is_empty()), "a clone without a remote is kept, keyless, so it is not asked again");
         assert!(machine(&home).clones.iter().all(|c| c.name != "loose"), "and is never told");
-        assert_eq!(clones_of(&home, &keys_of(["ssh://git@example.com/acme/lib"])), [w.join("group/lib")]);
+        // A clone is recorded by its real path (macOS's temp dir is behind the /var symlink).
+        assert_eq!(clones_of(&home, &keys_of(["ssh://git@example.com/acme/lib"])), [std::fs::canonicalize(w.join("group/lib")).unwrap()]);
         assert!(!discover(&home, &cfg), "nothing new: nothing written");
         std::fs::remove_dir_all(w.join("group")).unwrap();
         assert!(!discover(&home, &cfg), "a gone clone is no new one");

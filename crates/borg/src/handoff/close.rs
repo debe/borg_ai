@@ -557,7 +557,16 @@ fn left_in(clone: &Path, id: &str) -> Left {
     let mut kept = Vec::new();
     for (branch, sha) in git::branches_of(clone, id) {
         if let Some(w) = git::worktree_of(clone, &branch) {
-            kept.push(format!("branch {branch} stays in {}: it is checked out in {}", clone.display(), w.display()));
+            let leave = if std::fs::canonicalize(&w).ok() == std::fs::canonicalize(clone).ok() {
+                format!("switch {} to another branch", clone.display())
+            } else {
+                format!("`git worktree remove {}`", super::quote(&w.to_string_lossy()))
+            };
+            kept.push(format!(
+                "branch {branch} stays in {}: it is checked out in {}; once you are done there, {leave} and `borg handoff` deletes it if its work is merged",
+                clone.display(),
+                w.display()
+            ));
         } else if git::held_elsewhere(clone, &sha, id) {
             gone.push((format!("refs/heads/{branch}"), sha));
         } else {
@@ -724,8 +733,10 @@ mod tests {
     fn only_what_loses_nothing_goes() {
         let root = std::env::temp_dir().join(format!("borg-close-left-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        // git names work trees by their real path (macOS's temp dir is behind the /var symlink).
+        let root = std::fs::canonicalize(&root).unwrap();
         let clone = root.join("app");
-        std::fs::create_dir_all(&clone).unwrap();
         let id = "h0123456789ab";
         let base = git::branch_of(id);
         git(&clone, &["init", "-q", "-b", "main"]);
@@ -743,9 +754,18 @@ mod tests {
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(kept[0].contains(&format!("branch {base} stays")) && kept[0].contains("`git branch -D"), "{kept:?}");
         assert!(kept[1].contains(&format!("branch {base}-2 stays")) && kept[1].contains(&format!("checked out in {}", wt.display())), "{kept:?}");
+        assert!(kept[1].contains("`git worktree remove "), "a work tree of its own: removing it frees the branch: {kept:?}");
         assert!(git::local_refs(&clone, id).is_empty(), "the local refs go");
 
         git(&clone, &["worktree", "remove", &wt.to_string_lossy()]);
+        // Checked out in the clone itself: switching away frees it.
+        git(&clone, &["switch", "-q", &format!("{base}-2")]);
+        let kept = remove_left(&clone, id);
+        assert!(
+            kept.iter().any(|k| k.contains(&format!("branch {base}-2 stays")) && k.contains(&format!("switch {} to another branch", clone.display()))),
+            "{kept:?}"
+        );
+        git(&clone, &["switch", "-q", "main"]);
         git(&clone, &["merge", "-q", "--ff-only", &base]);
         assert_eq!(remove_left(&clone, id), Vec::<String>::new());
         assert!(git::branches_of(&clone, id).is_empty(), "merged and checked out nowhere: both go");

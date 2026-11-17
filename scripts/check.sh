@@ -47,6 +47,8 @@ cargo test -p borg-ai --no-default-features --lib --test cli_surface
 # fails without one). They are TypeScript run directly by `node --test` (Node 23.6+ strips types by
 # default) or by bun.
 cargo build -p borg-ai
+# The adapters give borg 5 s per call: a binary still being written back fails their first tests (see above).
+sync
 BORG_TEST_BIN="$(cargo metadata --format-version 1 --no-deps | sed -E 's/.*"target_directory":"([^"]*)".*/\1/')/debug/borg"
 export BORG_TEST_BIN
 if command -v node >/dev/null 2>&1 && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 23 || (a === 23 && b >= 6) ? 0 : 1)'; then
