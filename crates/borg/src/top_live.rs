@@ -205,7 +205,7 @@ pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: u
         rows.sort_by_key(|d| (d.state == State::Ended, d.number));
         for d in rows {
             let word = if d.paused { "paused" } else { d.state.name() };
-            let host = if d.node.is_empty() { "here" } else { d.host.as_str() };
+            let host = c.inbox.names.host_cell(&d.node, top::HOST_CHARS);
             let ended = d.state == State::Ended;
             lines.push(
                 Ln::default()
@@ -213,7 +213,7 @@ pub fn frame<'a>(cs: &'a [Coll], version: Option<&str>, now: i64, w: usize, h: u
                     .add(St::Dim, pad(&d.number.to_string(), 4))
                     .add(if ended { St::Dim } else { St::Bold }, pad(&d.designation, LABEL))
                     .add(St::Plain, " ")
-                    .add(St::Dim, pad(host, top::HOST_CHARS))
+                    .add(St::Dim, pad(&host, top::HOST_CHARS))
                     .add(St::Plain, " ")
                     .add(state_style(word), pad(&format!("● {word}"), 13))
                     .add(if c.inbox.listen.contains_key(&d.p.session) { St::Cyan } else { St::Dim }, pad(top::wake_cell(&c.inbox, d), 7))

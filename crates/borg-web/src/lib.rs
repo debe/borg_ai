@@ -103,6 +103,36 @@ fn sum_by(buckets: &[stats::Bucket], key: impl Fn(&stats::Bucket) -> String) -> 
     out.into_iter().collect()
 }
 
+/// One row per engineer, in label order: their label, their buckets summed and the buckets themselves.
+/// An engineer is who `aliases` says (collective.rs `Aliases::canon`: the alias, else the email in lower
+/// case), so two people who share a git user.name stay two rows. The label is the name `names` gives
+/// them (names.rs), with the email after it where another row would show the same.
+fn engineer_rows(buckets: &[stats::Bucket], names: &Book, aliases: &collective::Aliases) -> Vec<(String, stats::Bucket, Vec<stats::Bucket>)> {
+    let mut by: BTreeMap<String, Vec<stats::Bucket>> = BTreeMap::new();
+    for b in buckets {
+        by.entry(aliases.canon(&b.engineer)).or_default().push(b.clone());
+    }
+    let label = |mine: &[stats::Bucket]| names.display_with(aliases, mine.first().map_or("", |b| b.engineer.as_str()));
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for mine in by.values() {
+        *count.entry(label(mine)).or_default() += 1;
+    }
+    let mut rows: Vec<(String, stats::Bucket, Vec<stats::Bucket>)> = by
+        .into_iter()
+        .map(|(who, mine)| {
+            let name = label(&mine);
+            let name = if count[&name] > 1 && name != who { format!("{name} ({who})") } else { name };
+            let mut sum = stats::Bucket::default();
+            for b in &mine {
+                sum.add(b);
+            }
+            (name, sum, mine)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
 /// A bucket's totals for the page; the reasons (stats.rs `Bucket::why`) read as counts there.
 fn totals(b: &stats::Bucket) -> Value {
     let mut counts = b.counts.clone();
@@ -133,12 +163,9 @@ async fn stats_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
     let first = buckets.iter().map(|b| b.day.as_str()).min().unwrap_or_default().to_string();
     let last = buckets.iter().map(|b| b.day.as_str()).max().unwrap_or_default().to_string();
     let days = series(&buckets, &first, &last);
-    let engineers: Vec<Value> = sum_by(&buckets, |b| names.display(&b.engineer))
+    let engineers: Vec<Value> = engineer_rows(&buckets, &names, collective::aliases())
         .into_iter()
-        .map(|(e, t)| {
-            let mine: Vec<stats::Bucket> = buckets.iter().filter(|b| names.display(&b.engineer) == e).cloned().collect();
-            json!({"engineer": e, "totals": totals(&t), "days": series(&mine, &first, &last)})
-        })
+        .map(|(e, t, mine)| json!({"engineer": e, "totals": totals(&t), "days": series(&mine, &first, &last)}))
         .collect();
     let nodes = buckets.iter().map(|b| b.node.as_str()).collect::<std::collections::BTreeSet<_>>().len();
     // `borg debug ope`'s support, one pass over this machine's log (pools are never shared); the estimate itself
@@ -681,6 +708,28 @@ mod tests {
         }
         let cost = include_str!("../ui/src/views/cost.rs");
         assert!(cost.contains(&format!("\"{}\"", borg::check_async::MODE)), "the cost view's mode");
+    }
+
+    /// Two engineers who share a git user.name stay two rows, told apart by their emails; the emails of
+    /// one engineer the alias config joins (or one email in two cases) are one row.
+    #[test]
+    fn engineers_who_share_a_name_stay_apart() {
+        let bucket =
+            |engineer: &str, turns: u64| stats::Bucket { engineer: engineer.into(), counts: [("turn_end".to_string(), turns)].into(), ..Default::default() };
+        let buckets = [
+            bucket("david.a@example.com", 1),
+            bucket("david.b@example.com", 2),
+            bucket("ann@example.com", 4),
+            bucket("Ann@home.example", 8),
+            bucket("ann@home.example", 16),
+        ];
+        let names =
+            Book::from_parts([("david.a@example.com", "David"), ("david.b@example.com", "David")].map(|(e, n)| (e.to_string(), n.to_string())).into(), &[]);
+        let aliases =
+            collective::Aliases::new(&[collective::Engineer { name: "Ann".into(), emails: vec!["ann@example.com".into(), "ann@home.example".into()] }]);
+        let rows: Vec<(String, u64, usize)> =
+            engineer_rows(&buckets, &names, &aliases).into_iter().map(|(e, t, mine)| (e, t.counts["turn_end"], mine.len())).collect();
+        assert_eq!(rows, [("Ann".into(), 28, 3), ("David (david.a@example.com)".into(), 1, 1), ("David (david.b@example.com)".into(), 2, 1)]);
     }
 
     /// The page refetches the selection when its summary cache, the outcome log the summary folds, or

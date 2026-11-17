@@ -15,7 +15,7 @@ on this machine unless the collective they belong to is synced with a team over 
 
 | Word | Meaning |
 |---|---|
-| drone | One running agent session wired to borg (this one, if the hooks are installed). `borg top` labels it by who runs it where, `Ann Example · borg-ai · claude` (`#2` on a second live one), and numbers it; either names it in a command |
+| drone | One running agent session wired to borg (this one, if the hooks are installed). `borg top` labels it by who runs it where, `Ann Example · borg-ai · claude` (`#2` on a second one, ended or not), and numbers it; either names it in a command |
 | collective | A separate memory: one store of lessons, episodes and outcomes. Every repo path routes to one collective, or to none (`off`) |
 | lesson | A learned rule: a question to ask, the situations it applies in, and the consequence of ignoring it |
 | reach | Who hears a lesson: `team` (everyone in the collective), `repo` (only that repo) or `personal` (only the engineer: it stays in the collective it was learned in, on this machine only, never synced) |
