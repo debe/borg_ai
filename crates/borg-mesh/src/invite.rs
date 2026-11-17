@@ -18,6 +18,7 @@
 //! carries. Hence one use and seven days by default.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use data_encoding::BASE32_NOPAD;
@@ -267,6 +268,25 @@ pub fn load_reach(home: &Path) -> Vec<Hint> {
     v.and_then(|v| v.get("hints")?.as_str().map(str::to_string)).and_then(|h| addr::hints(&h).ok()).unwrap_or_default()
 }
 
+/// Where `serve` without `--bind` tries to listen, in order, each on `default`'s address: the port it
+/// last found this node reachable on (`load_reach`: the tickets out there and the members' peer lists
+/// name it), `default`'s port, then any free one. So the daemons of several collectives on one
+/// machine each get a port of their own, and each keeps it across restarts while it is free.
+#[must_use]
+pub fn serve_binds(home: &Path, default: SocketAddr) -> Vec<SocketAddr> {
+    let last = load_reach(home).into_iter().find_map(|h| match h {
+        Hint::Direct(a) => Some(SocketAddr::new(default.ip(), a.port())),
+        Hint::Relay(_) => None,
+    });
+    let mut out: Vec<SocketAddr> = Vec::with_capacity(3);
+    for a in last.into_iter().chain([default, SocketAddr::new(default.ip(), 0)]) {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
 /// The path `join` writes for a new collective: routes nothing (it does not exist) until replaced.
 pub fn placeholder(name: &str) -> String {
     format!("~/CHANGE-ME/repos-of-{name}")
@@ -460,5 +480,20 @@ mod tests {
         let png = qr_png("BORG1ABC").unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(crc32(b"IEND"), 0xae42_6082, "the CRC every PNG ends with");
+    }
+
+    #[test]
+    fn serve_tries_its_last_port_then_the_default_then_any() {
+        let home = std::env::temp_dir().join(format!("borg-mesh-binds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let default: SocketAddr = "0.0.0.0:7878".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        assert_eq!(serve_binds(&home, default), vec![default, any], "never served: the default first, any free port after it");
+        save_reach(&home, &addr::hints("https://relay.example.org,192.168.1.5:41234,10.0.0.2:41234").unwrap()).unwrap();
+        let last: SocketAddr = "0.0.0.0:41234".parse().unwrap();
+        assert_eq!(serve_binds(&home, default), vec![last, default, any], "the port it served on last comes first, on the default's address");
+        save_reach(&home, &addr::hints("192.168.1.5:7878").unwrap()).unwrap();
+        assert_eq!(serve_binds(&home, default), vec![default, any], "each address once");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

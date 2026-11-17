@@ -475,16 +475,19 @@ commands printed instead, and nothing changes. Then the new borg refreshes every
 (`borg install <h> --apply`: adapter, skill and hooks; it never wires a new one) and borg's services
 (`borg service install`), and runs `borg doctor`. The services restart on the new version; the
 `borg listen` waiters restart on their own, and so does a mesh daemon started by hand. A `borg web`
-started by hand keeps the old version until you restart it, which `borg update` names. Before 0.7 there
+started by hand keeps the old version, and `borg update` names it: stop it where the `borg web` service
+is installed (it holds the port the service needs), else restart it. Before 0.7 there
 is no `borg update`: run `install.sh` again or
 `cargo install borg-mesh borg-web borg-ai --locked --force`, then `borg install all --apply` and
 `borg doctor`.
 
 **Services.** Borg runs its long-lived processes as services of your user: a mesh daemon per team
-collective that has a mesh identity, and `borg web`. On Linux they are systemd user units
+collective that has a mesh identity (each on a port of its own, so all of them run at once), and
+`borg web`. On Linux they are systemd user units
 (`~/.config/systemd/user/borg-mesh-<collective>.service`, `borg-web.service`), on macOS launchd agents
 (`~/Library/LaunchAgents/borg.mesh.<collective>.plist`, `borg.web.plist`, logging to
-`~/Library/Logs/borg/`). `borg setup` installs them at its end, and every `borg install <h> --apply`
+`~/Library/Logs/borg/`). `borg setup` installs them at its end (its plan names that step when it
+would change them, so you confirm it), and every `borg install <h> --apply`
 and `borg update` brings them up to date: written, enabled, running, and restarted when their file
 changed or another borg started them. A unit of the same name that borg did not write is taken over and
 kept as `<file>.bak`. Each file says it is borg's and is rewritten, so edits are lost; units of a

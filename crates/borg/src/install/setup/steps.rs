@@ -44,17 +44,29 @@ fn run_mesh(args: &[String], warns: &mut Vec<String>) -> bool {
 }
 
 /// The team's mesh command; whether it finished. Its admin may print a first invite right away, unless
-/// the collective's relay is `disabled`: an invite then needs `borg mesh serve` running first.
-pub fn mesh(m: &Mesh, ask: &mut Prompt, warns: &mut Vec<String>) -> bool {
+/// the collective's relay is `disabled`: an invite then needs the mesh daemon running first
+/// (`direct_note`; `services`: setup's services step starts it).
+pub fn mesh(m: &Mesh, services: bool, ask: &mut Prompt, warns: &mut Vec<String>) -> bool {
     let ok = run_mesh(&m.args(), warns);
     let Mesh::Init(name) = m else { return ok };
-    let invite = format!("borg mesh invite --collective {name}");
     if ok && direct_only(name) {
-        println!("relay disabled: start `borg mesh serve --collective {name}` first, then `{invite}`");
+        println!("{}", direct_note(name, services));
     } else if ok && ask.yes_no("Print an invite ticket for a teammate now?", false) {
         run_mesh(&["invite".into(), "--collective".into(), name.clone()], warns);
     }
     ok
+}
+
+/// Why a founded collective with relays disabled gets no invite yet, and what comes first: with the
+/// services step (`services`), the daemon it starts; without, `borg mesh serve` by hand. Never a
+/// second daemon beside the service's for the same key.
+fn direct_note(name: &str, services: bool) -> String {
+    let invite = format!("borg mesh invite --collective {name}");
+    if services {
+        format!("relay disabled: an invite needs the mesh daemon running; setup starts it as a service at its end (or says to run it by hand), then `{invite}`")
+    } else {
+        format!("relay disabled: start `borg mesh serve --collective {name}` first, then `{invite}`")
+    }
 }
 
 /// Whether the configured collective `name` reaches its members by direct addresses only.
@@ -147,5 +159,18 @@ pub fn import(ask: &mut Prompt) {
     let question = format!("Import corrections from your past sessions now (borg assimilate --apply --limit {IMPORT_LIMIT}; model calls)?");
     if ask.yes_no(&question, false) {
         crate::assimilate::main(&["--apply", "--limit", IMPORT_LIMIT], &learn::ask_claude);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_founder_without_relays_is_not_sent_to_run_a_second_daemon() {
+        let with = direct_note("acme", true);
+        assert!(!with.contains("mesh serve") && with.contains("borg mesh invite --collective acme"), "the service is the daemon: {with}");
+        let without = direct_note("acme", false);
+        assert!(without.contains("borg mesh serve --collective acme"), "no services step: by hand: {without}");
     }
 }

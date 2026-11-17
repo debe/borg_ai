@@ -32,7 +32,7 @@ borg mesh init       # you become the collective's admin
 borg service install # runs borg mesh serve as a service (syncs every 60 s and on local change), and borg web
 ```
 
-**2. Admin, per new member.** In a second terminal:
+**2. Admin, per new member:**
 
 ```sh
 borg mesh invite                                            # prints a QR code and a ticket
@@ -54,17 +54,21 @@ borg mesh join BORG1... --paths ~/work --apply    # writes it (with a backup), d
 
 `--paths` names your repo directories for the team collective. Without it, `join` adds the
 placeholder path `~/CHANGE-ME/repos-of-<name>`, which routes no repo: replace it, or join again with
-`--paths`. Then keep `borg mesh serve` running in one of those repos (or with `--collective <name>`).
+`--paths`. Then run `borg service install`: the mesh daemon and borg web as services. Without a service
+manager, keep `borg mesh serve --collective <name>` running instead.
 
-The admin's `serve` must run while the member joins. It checks the ticket's signature, expiry and
+The admin's mesh daemon must run while the member joins. It checks the ticket's signature, expiry and
 remaining uses, adds the member's key to the signed membership and hands over the history. Other
 members learn of the newcomer at their next sync. Spent, expired and withdrawn tickets fail. A revoked
 key cannot rejoin with an old ticket; an admin must re-invite it by key.
 
 **Other commands:** `borg mesh members`, `borg mesh revoke <key>` (admin), `borg mesh id`,
 `borg mesh sync <key>` (once), `borg mesh peer [<key>[@<ip:port>]]`, `borg mesh fetch [<commit>...]`
-(reasoning notes from members). `borg mesh serve` listens on `0.0.0.0:7878` and syncs every 60 s;
-`--bind IP:PORT` and `--interval SECS` change that. `borg mesh invite <key> [--role R]` adds or
+(reasoning notes from members). `borg mesh serve` syncs every 60 s and listens on `0.0.0.0`: on the
+port it served on last, else `7878`, else any free port. So the daemons of several team collectives
+run side by side on one machine, each on a port of its own that it keeps across restarts; tickets and
+the members' peer lists carry it. `--bind IP:PORT` (that address or none) and `--interval SECS` change
+that. `borg mesh invite <key> [--role R]` adds or
 changes a member by key; with `borg mesh join membership-history.jsonl` it is the older manual flow.
 
 ## Company collective

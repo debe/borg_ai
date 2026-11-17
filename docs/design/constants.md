@@ -49,6 +49,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-mesh/src/sync.rs` | `JOIN_ALPN` | `borg/join/1` | The join handshake |
 | `borg-mesh/src/sync.rs` | `older` | `/11` down to `/1` | Offered only so a mismatch is named, not silent |
 | `borg-mesh/src/sync.rs` | `STEPS` | 7 logs | The order a session steps through the logs |
+| `borg-mesh/src/sync.rs` | `MISMATCH_CLOSE` | 2 | The close code of a session on a protocol this node does not speak, its reason protocol.rs `Mismatch::told`; the other end reads both (`refused`) |
+| `borg-mesh/src/main.rs` | `BIND` | `0.0.0.0:7878` | Where `serve` listens without `--bind`: every interface, the port members and tickets use by default. Taken (another collective's daemon on this machine), invite.rs `serve_binds` tries the port it served on last, then any free one |
 | `borg/src/absorb.rs` | `NOTE_CHARS` | 1,000 chars | The longest note an absorb carries: `borg memory absorb` refuses a longer one, and borg-mesh lines.rs `travels` refuses a longer line from a peer (absorb.rs `written`) |
 | `borg/src/memory_export.rs` | `SCHEMA` | 1 | The export's schema version: a changed meaning or a removed field raises it, an added field does not |
 | `borg/src/protocol.rs` | `NOTES` | one line per spoken protocol, `/15` down to `/12` | What a member on an older protocol misses, the one statement doctor, status, top, web, the drone notice and the announcement quote; each protocol bump adds its line (borg-mesh sync.rs test `every_spoken_protocol_has_a_note`) |
@@ -100,6 +102,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 
 | File | Name | Value | Meaning |
 |---|---|---|---|
+| `borg/src/listen.rs` | `REWAKE` | 2 | Claude Code's `asyncRewake`: the exit code of a background hook that wakes the model, its stderr the text the model gets |
+| `borg/src/harness/claude.rs` | `WAIT_TIMEOUT_S` | 7 days | Claude Code ends a hook past its `timeout` silently; a week, so an idle session's waiter outlives any break (also a guard), under 2^31 ms, a JavaScript timer's limit (measured 2026-11-09) |
 | `borg/src/harness/claude.rs` | `CONTEXT_CHARS` | 10,000 chars | Claude Code saves a longer `additionalContext` to a file and gives the model a preview (2.1.312, read 2026-10-28) |
 | `borg/src/harness/codex.rs` | `CONTEXT_CHARS` | 10,000 chars | Codex's default `additionalContextLimit`: a longer one is cut to its head and tail (measured on 0.153.2, 2026-10-28) |
 | `borg/src/harness/omp.rs` | `HANDLER_LIMIT`, `SHUTDOWN_LIMIT` | 30 s, 2 s | How long omp waits for an extension's handler, and for `session_shutdown`'s (18.13.1); no setting changes them |
@@ -212,11 +216,13 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-mesh/src/live.rs` | `MAX_RECEIVED` | 10,000 records | A peer sending an endless presence list |
 | `borg-mesh/src/daemon.rs` | `Options` | interval 60 s, backoff_max 30 min, timeout 30 s, grace 5 s | Staleness when no change triggered a dial, an unbounded backoff, a peer that never answers, a hung session at Ctrl-C. The CLI's defaults read them from `Options::default` |
 | `borg-mesh/src/main.rs` | `JOIN_TIMEOUT`, `ONLINE_WAIT` | 60 s, 10 s | A join whose admin node is down hanging; an unreachable relay blocking a command |
+| `borg/src/protocol.rs` | `ENGINEER_CHARS` | 254 chars | A member filling drones' and engineers' context through the engineer its version record names (an email's limit, RFC 5321) |
 
 ### Release check
 
 | File | Name | Value | Runaway it stops |
 |---|---|---|---|
+| `borg/src/update.rs` | `VERSION_CHARS` | 64 chars | Text riding along in a version string borg reads (a release tag, a member's hello): longer than any release name |
 | `borg/src/update.rs` | `CHECK_SECS` | 10 s | A hung connection keeping the background release check alive (curl `--max-time`) |
 | `borg/src/update.rs` | `DOWNLOAD_SECS` | 600 s | A release download that never ends: a tarball of three binaries on a slow link still fits |
 | `borg/src/update.rs` | `CHECKING_MS` | 10 min | Every prompt starting a check: a started check (`update.checking`) holds the others off, so at most one curl per machine per 10 minutes, even when every check fails |
@@ -390,6 +396,8 @@ later value would be compared against.
 | `borg/src/concepts.rs` | `BETA` | 0.5 (`BORG_CONCEPTS_BETA`) | The concept boost's untuned start; an experiment parameter while `BORG_CONCEPTS` is off |
 | `borg/src/update.rs` | `STALE_MS` | 24 h (`clock::DAY_MS`) | How old `update.json` may be before a prompt starts another release check: a release a day late is news enough, and an idle prompt reads one small file |
 | `borg/src/update.rs` | `FAILING_WARN_MS` | 3 days (`3 × clock::DAY_MS`) | How long the release check may keep failing before `borg doctor` warns: an offline day is no news, a check that never works is |
+| `borg/src/service.rs` | `STOP_SECS` | 30 s | How long a stopping service may take before its manager kills it (systemd `TimeoutStopSec`, launchd `ExitTimeOut`): a mesh daemon finishing a sync round |
+| `borg/src/service.rs` | `RESTART_SECS` | 10 s | The pause before a failed service starts again (systemd `RestartSec`, launchd `ThrottleInterval`): a crash loop costs one start per 10 s |
 | `borg/src/judge_length.rs` | `EXPLORE_SHARE` | 0.2 of session-end passes | The chance a pass uses the size step above the judge's effective length while that step is open, logged per pass (`psi=`); once the step holds the budget moves up, once it fails `FAILED_EXPLORE_SHARE` takes over (0.7.6 pre-registration, 2026-11-01) |
 | `borg/src/judge_length.rs` | `FAILED_EXPLORE_SHARE` | 0.05 of session-end passes (`EXPLORE_SHARE` / 4) | The chance a pass uses the step above the budget once that step failed, logged like `EXPLORE_SHARE`: only session-end calls reach it, so without it a failed step (by early bad luck, or a judge that reads longer prompts better later) could never hold again |
 | `borg/src/hook.rs` | `END_START_BUDGET` | 72,000 chars | A session-end batch's whole prompt before any evidence of the judge's effective length: 0.7.5's 24,000 work chars and its 40 lessons at `JUDGE_PART` (1,200) each. Not 0.7.5's largest prompt: with every lesson's full evidence (1,200 before, 3,600 after, question and consequence) its call could send about 220,000; the value is kept, well below that, so batching never asks more of the judge than 0.7.5 could (0.7.6 pre-registration, 2026-11-01) |
@@ -402,13 +410,16 @@ later value would be compared against.
 | `borg/src/presence.rs` | `FILES`, `PROMPT_CHARS` | 3 files, 100 chars | A presence record's recent files and prompt |
 | `borg/src/top.rs` | `RECENT` | 5 | Messages `borg top` lists |
 | `borg/src/top.rs` | `MESSAGE_CHARS` | 120 chars | One message line on `borg top`'s printed screen; `borg inbox --show` prints the whole text |
-| `borg/src/top.rs` | `COLUMN_NODE_CHARS` | 6 chars | A node key in the drone table's column (top.rs and top_live.rs) |
+| `borg/src/top.rs` | `LABEL_CHARS` | 36 chars | A drone's label (name, repo, harness) in `borg top`'s printed table: a name, a repo and a harness of common length |
+| `borg/src/top_live.rs` | `LABEL` | 34 chars | The same label in the live screen's table, two narrower for its columns |
+| `borg/src/top.rs` | `HOST_CHARS` | 14 chars | The machine a drone runs on, in both drone tables (top.rs and top_live.rs): a short hostname whole, a long one cut |
+| `borg/src/names.rs` | `CHARS` | 64 chars | The most a name or a host keeps (`clean`), here and from peers. Also a guard: a peer's name or hostname cannot flood a label |
 | `borg/src/top.rs` | `QUANTILES` | 0.50, 0.95 | The stop latency quantiles the selection line and the page show, the median and the tail a stop budget must hold |
 | `borg/src/msg.rs` | `NODE_CHARS`, `SESSION_CHARS` | 12, 8 chars | A node key in every label of a node (`short_node`: a delivered line, steer.rs, presence.rs, top.rs, borg-mesh main.rs), and the session id of a sender that gave no name (`sender_label`) |
 | `borg/src/clock.rs` | `ago` | `45s`, `12m`, `3h05m`, `2d` | A relative time in at most 6 characters (msg.rs, top.rs, top_live.rs); borg-web's ui has its own copy |
 | `borg/src/stats.rs` | `FEED_CHARS` | 160 chars | An event's text in the feed and borg web |
 | `borg/src/update.rs` | `INSTALL_SH` | install.sh's one-line `curl … \| sh` | The install for a machine without `borg update`, in the commands `borg update` prints when it cannot install |
-| `borg/src/protocol.rs` | `UPDATE_COMMANDS` | `borg update`, else install.sh or `cargo install … --force` | The update commands the announcement offers, for an install of 0.7 or newer and for an older one |
+| `borg/src/protocol.rs` | `update_commands` | `borg update`, else install.sh or `cargo install … --force` | The update commands the announcement offers, for an install of 0.7 or newer and for an older one |
 | `borg-web/src/lib.rs` | `PAGE` | 200 rows | A listing without `limit` (`/api/feed`, `/api/messages`) |
 | `borg/src/listen.rs` | `NAMES` | 3 | Senders a wake names |
 | `borg/src/notify.rs` | `BODY_CHARS` | 120 chars | A notification's question |

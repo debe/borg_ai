@@ -19,8 +19,11 @@
 //!        borg-mesh serve [--bind IP:PORT] [--interval SECS]
 //!                                             (run until Ctrl-C / SIGTERM: answer members, sync with
 //!                                              every known peer each interval and on local change;
-//!                                              default 0.0.0.0:7878, 60 s; a reinstalled borg-mesh
-//!                                              runs in its place, same process)
+//!                                              default 0.0.0.0 on the port it served on last, else
+//!                                              7878, else any free one (so each collective's daemon
+//!                                              on a machine gets a port), 60 s; a reinstalled
+//!                                              borg-mesh runs in its place, same process. Normally a
+//!                                              service: `borg service install`)
 //!        borg-mesh sync <key>[@<hints>]       (reconcile with one member, once)
 //!        borg-mesh fetch [<commit>...]        (ask every known member for the reasoning excerpts of these
 //!                                              commits, default: recent commits without a note, and
@@ -29,6 +32,7 @@
 //! routes to (collective.rs); or `--collective NAME` names one listed in collectives.json. An off
 //! repo or a local collective is refused by every networked command.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,9 +55,10 @@ fn show(r: &Report) -> String {
     )
 }
 
-/// Where `serve` listens unless `--bind` says otherwise. Protocol: the port members and tickets use
-/// by default (docs/team-sync.md); every interface, so another machine can dial it.
-const BIND: &str = "0.0.0.0:7878";
+/// Where `serve` listens unless `--bind` says otherwise, or another socket holds it (invite.rs
+/// `serve_binds`: then the port it served on last, else any free one). Protocol: the port members
+/// and tickets use by default (docs/team-sync.md); every interface, so another machine can dial it.
+const BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7878);
 
 /// How long a command waits for its endpoint to reach the home relay before it goes on without one.
 /// Guard: an unreachable relay delays a command by this much, never blocks it; a member behind
@@ -94,6 +99,9 @@ fn positional(args: &[String]) -> Option<&str> {
     args.get(1).map(String::as_str).filter(|a| !a.starts_with("--"))
 }
 
+/// How the mesh daemon is started: a service first, by hand only without a service manager.
+const RUN_DAEMON: &str = "`borg service install`, or `borg mesh serve` without a service manager";
+
 /// How long a ticket stays usable unless `--expires` says otherwise. Guard: a ticket that leaked (a
 /// chat log, a screenshot of its QR code) admits nobody after a week.
 const TICKET_EXPIRES: &str = "7d";
@@ -110,7 +118,7 @@ fn invite_ticket(place: &Place, args: &[String]) -> Result<(), String> {
     let relay = place.relay()?;
     let hints = invite::load_reach(&home);
     if relay == Relay::Disabled && hints.is_empty() {
-        return Err("relays are disabled and no address of this node is known: start `borg mesh serve` once, then invite".into());
+        return Err(format!("relays are disabled and no address of this node is known: start the mesh daemon once ({RUN_DAEMON}), then invite"));
     }
     let now = borg::learn::now_ms();
     let inv = invite::issue(&home, &Identity::load_or_create(&home)?, &m, role, ttl, uses, now)?;
@@ -125,9 +133,9 @@ fn invite_ticket(place: &Place, args: &[String]) -> Result<(), String> {
         println!("QR code written to {png}");
     }
     if !invite::reach_path(&home).exists() {
-        println!("note: `borg mesh serve` has not run here yet; it must be running when they join");
+        println!("note: the mesh daemon has not run here yet; it must run when they join ({RUN_DAEMON})");
     } else {
-        println!("keep `borg mesh serve` running here until they have joined; `borg mesh invites` lists open tickets");
+        println!("the mesh daemon must run here until they have joined (`borg service` shows it); `borg mesh invites` lists open tickets");
     }
     println!("anyone holding this ticket can join as {role} until it is used or expires: send it privately");
     Ok(())
@@ -151,8 +159,8 @@ async fn join_ticket(place: &Place, text: &str, apply: bool, paths: &[String]) -
     node.online(ONLINE_WAIT).await;
     let result = tokio::time::timeout(JOIN_TIMEOUT, node.join(&t)).await;
     node.close().await;
-    let (m, rep) =
-        result.map_err(|_| format!("the admin's node did not answer within {} s: is `borg mesh serve` running there?", JOIN_TIMEOUT.as_secs()))??;
+    let (m, rep) = result
+        .map_err(|_| format!("the admin's node did not answer within {} s: does its mesh daemon run (`borg service` there)?", JOIN_TIMEOUT.as_secs()))??;
     let me = node.public();
     println!("joined {name} v{} as {}; first sync: {}", m.version, m.role_of(&me).unwrap_or("?"), show(&rep));
     if paths.is_empty() {
@@ -162,7 +170,9 @@ async fn join_ticket(place: &Place, text: &str, apply: bool, paths: &[String]) -
             place.config.display()
         );
     }
-    println!("next: keep `borg mesh serve --collective {name}` running (or `borg mesh serve` inside one of those repos)");
+    println!(
+        "next: `borg service install` runs the mesh daemon as a service (`borg setup` does it at its end); without a service manager keep `borg mesh serve --collective {name}` running"
+    );
     Ok(())
 }
 
@@ -288,11 +298,19 @@ async fn run(args: &[String]) -> Result<(), String> {
         Some("serve") => {
             // What it runs, before anything: a reinstall of borg-mesh from here on replaces it.
             let image = Image::now();
-            let bind = flag(args, "--bind").unwrap_or(BIND).parse().map_err(|e| format!("--bind: {e}"))?;
+            let asked = flag(args, "--bind").map(|b| b.parse::<SocketAddr>().map_err(|e| format!("--bind: {e}"))).transpose()?;
             let default = Options::default();
             let interval =
                 flag(args, "--interval").map(|s| s.parse::<u64>().map_err(|e| format!("--interval: {e}"))).transpose()?.unwrap_or(default.interval.as_secs());
-            let node = Arc::new(Node::bind(&place, bind).await?);
+            let binds = match (asked, &r) {
+                // An address asked for is that one or none.
+                (Some(a), _) => vec![a],
+                (None, Route::Collective { home, .. }) => invite::serve_binds(home, BIND),
+                // Refused by the gate, before any socket.
+                (None, Route::Off) => vec![BIND],
+            };
+            let node = Arc::new(Node::bind_free(&place, &binds).await?);
+            let bind = node.addr().map_or_else(|| BIND.to_string(), |a| a.to_string());
             let relay = node.relay().clone();
             let online = node.online(ONLINE_WAIT).await;
             let hints = node.hints();
@@ -410,7 +428,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("join TICKET [--paths DIR...] [--apply]", "join with a ticket; DIR: your repos for it (a dry run without --apply)"),
             ("join FILE", "join with a membership history file (the manual flow)"),
-            ("serve [--bind IP:PORT] [--interval SECS]", "keep syncing; leave it running"),
+            ("serve [--bind IP:PORT] [--interval SECS]", "keep syncing by hand (normally a service: borg service install)"),
             ("sync KEY[@HINTS]", "sync once with one member"),
             ("peer [KEY[@HINTS]]", "the peers this node dials, or add one"),
         ],

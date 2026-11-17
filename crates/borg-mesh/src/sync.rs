@@ -77,7 +77,9 @@ use std::time::Duration;
 use borg::collective::{self, Config, Route};
 use borg::msg::{LineRef, V1_RATE_MS};
 use iroh::Endpoint;
-use iroh::endpoint::{Builder, ConnectOptions, Connection, ConnectionError, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::endpoint::{
+    BindError, Builder, ConnectOptions, Connection, ConnectionError, Incoming, IncomingAddr, PortmapperConfig, RecvStream, SendStream, presets,
+};
 use iroh::tls::CaTlsConfig;
 use serde::{Deserialize, Serialize};
 
@@ -478,6 +480,39 @@ fn tells(var: Option<&str>) -> bool {
     var != Some("off")
 }
 
+/// Why an endpoint did not bind; `in_use`: its address is held by another socket.
+struct Unbound {
+    message: String,
+    in_use: bool,
+}
+
+/// `me`'s endpoint for `relay` (addr.rs) on `addr` (`None`: relay only); `tweak` adjusts the builder.
+async fn endpoint(relay: &Relay, me: &Identity, addr: Option<SocketAddr>, tweak: impl FnOnce(Builder) -> Builder) -> Result<Endpoint, Unbound> {
+    let builder = match relay {
+        // n0's relays and DNS address lookup (pkarr): found by key alone, hole-punched across NAT.
+        Relay::Default => Endpoint::builder(presets::N0),
+        // A self-hosted relay and no public lookup: nothing about this node reaches n0.
+        Relay::Custom(_) => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()),
+        // Direct addresses only: no relay, no lookup, no probing of the LAN's router.
+        Relay::Disabled => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()).portmapper_config(PortmapperConfig::Disabled),
+    };
+    let mut builder = builder
+        .secret_key(me.iroh_secret())
+        .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), V14_ALPN.to_vec(), V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat())
+        .clear_ip_transports()
+        .ca_tls_config(ca_trust());
+    if let Some(a) = addr {
+        builder = builder.bind_addr(a).map_err(|e| Unbound { message: e.to_string(), in_use: false })?;
+    }
+    let at = addr.map_or_else(|| "relay".to_string(), |a| a.to_string());
+    tweak(builder).bind().await.map_err(|e| match e {
+        BindError::Sockets { source, .. } if source.kind() == std::io::ErrorKind::AddrInUse => {
+            Unbound { message: format!("bind {at}: {source}"), in_use: true }
+        }
+        e => Unbound { message: format!("bind {at}: {e}"), in_use: false },
+    })
+}
+
 impl Node {
     /// Opens the endpoint for `place` on `addr` — only after the gate, so a local collective or an
     /// off repo never even gets a socket.
@@ -494,30 +529,41 @@ impl Node {
     /// direct paths (`None`: relay only, for tests); `member`: refuse without a membership;
     /// `tweak` adjusts the builder (tests trust a local relay's self-signed certificate).
     pub async fn open(place: &Place, addr: Option<SocketAddr>, member: bool, tweak: impl FnOnce(Builder) -> Builder) -> Result<Node, String> {
+        let (home, relay, me) = Node::prepare(place, member)?;
+        let endpoint = endpoint(&relay, &me, addr, tweak).await.map_err(|f| f.message)?;
+        Ok(Node::with(place, home, me, relay, endpoint))
+    }
+
+    /// A member's node on the first of `addrs` no other socket holds (`serve` without `--bind`: the
+    /// daemons of several collectives on one machine each get a port). Any other failure ends it at
+    /// once; every address taken, the last refusal.
+    pub async fn bind_free(place: &Place, addrs: &[SocketAddr]) -> Result<Node, String> {
+        let (home, relay, me) = Node::prepare(place, true)?;
+        let mut last = "no address to bind".to_string();
+        for &a in addrs {
+            match endpoint(&relay, &me, Some(a), |b| b).await {
+                Ok(endpoint) => return Ok(Node::with(place, home, me, relay, endpoint)),
+                Err(f) if f.in_use => last = f.message,
+                Err(f) => return Err(f.message),
+            }
+        }
+        Err(last)
+    }
+
+    /// The gate (a local collective or an off repo is refused here), the relay setting and this
+    /// node's identity; with `member`, refused without a membership.
+    fn prepare(place: &Place, member: bool) -> Result<(PathBuf, Relay, Identity), String> {
         let (_, home) = place.gate()?;
         let relay = place.relay()?;
         let me = Identity::load_or_create(&home)?;
         if member {
             members(&home)?;
         }
-        let builder = match &relay {
-            // n0's relays and DNS address lookup (pkarr): found by key alone, hole-punched across NAT.
-            Relay::Default => Endpoint::builder(presets::N0),
-            // A self-hosted relay and no public lookup: nothing about this node reaches n0.
-            Relay::Custom(_) => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()),
-            // Direct addresses only: no relay, no lookup, no probing of the LAN's router.
-            Relay::Disabled => Endpoint::builder(presets::Minimal).relay_mode(relay.mode()).portmapper_config(PortmapperConfig::Disabled),
-        };
-        let mut builder = builder
-            .secret_key(me.iroh_secret())
-            .alpns([vec![ALPN.to_vec(), JOIN_ALPN.to_vec(), V14_ALPN.to_vec(), V13_ALPN.to_vec(), LEGACY_ALPN.to_vec()], older()].concat())
-            .clear_ip_transports()
-            .ca_tls_config(ca_trust());
-        if let Some(a) = addr {
-            builder = builder.bind_addr(a).map_err(|e| e.to_string())?;
-        }
-        let endpoint = tweak(builder).bind().await.map_err(|e| format!("bind {}: {e}", addr.map(|a| a.to_string()).unwrap_or("relay".into())))?;
-        Ok(Node {
+        Ok((home, relay, me))
+    }
+
+    fn with(place: &Place, home: PathBuf, me: Identity, relay: Relay, endpoint: Endpoint) -> Node {
+        Node {
             place: place.clone(),
             home,
             me,
@@ -529,7 +575,7 @@ impl Node {
             legacy: Mutex::default(),
             speaks: Speaks::this(),
             announcing: Mutex::new(()),
-        })
+        }
     }
 
     /// Waits until the endpoint holds a connection to its home relay (at most `within`); true if
@@ -579,7 +625,8 @@ impl Node {
         self.me.public()
     }
 
-    fn addr(&self) -> Option<SocketAddr> {
+    /// The UDP socket it listens on (with port 0 asked for, the one the system gave it).
+    pub fn addr(&self) -> Option<SocketAddr> {
         self.endpoint.bound_sockets().first().copied()
     }
 

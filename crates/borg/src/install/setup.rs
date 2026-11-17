@@ -24,7 +24,7 @@ mod steps;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::harness::{self, Harness};
+use crate::harness::{self, Harness, Level};
 use crate::install::{self, Action, Change, Targets};
 use crate::{collective, learn, runner};
 use collectives::Mesh;
@@ -155,6 +155,8 @@ struct Plan {
     wiring: Vec<Wire>,
     /// Whether the services step runs (not under `--home`, not after `borg service remove`).
     services: bool,
+    /// Whether that step would change anything (`services_pending`), so the confirmation covers it.
+    services_change: bool,
 }
 
 fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
@@ -168,7 +170,8 @@ fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
     let wiring = wiring(&harnesses(o, ask, &found)?, &t)?;
     let mesh = mesh.filter(|m| !steps::done(m));
     let services = o.home.is_none() && !crate::service::off();
-    let plan = Plan { config, mesh, vectors: steps::vectors_plan(o.no_vectors), wiring, services };
+    let services_change = services && services_pending(&crate::service::checks());
+    let plan = Plan { config, mesh, vectors: steps::vectors_plan(o.no_vectors), wiring, services, services_change };
     ask.heading("4. The plan");
     if !show(&plan, &t) {
         println!("nothing to change");
@@ -201,7 +204,7 @@ fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
 /// After the config is written: the mesh command, the vectors, the wiring, the import. The exit code (1
 /// for a failed mesh command or write) and the mesh command that finished.
 fn act<'p>(o: &Opts, plan: &'p Plan, ask: &mut Prompt, stamp: &str, warns: &mut Vec<String>) -> (i32, Option<&'p Mesh>) {
-    let mesh = plan.mesh.as_ref().filter(|m| steps::mesh(m, ask, warns));
+    let mesh = plan.mesh.as_ref().filter(|m| steps::mesh(m, plan.services, ask, warns));
     let failed = i32::from(plan.mesh.is_some() && mesh.is_none());
     steps::vectors(o.no_vectors, ask, warns);
     let code = steps::wire(&plan.wiring, stamp).max(failed);
@@ -296,10 +299,18 @@ fn show(p: &Plan, t: &Targets) -> bool {
         println!("then: borg mesh {}", m.args().join(" "));
     }
     p.vectors.iter().for_each(|v| println!("then: {v}"));
-    if p.services {
+    if p.services_change {
         println!("then: borg service install (a mesh daemon per team collective, and borg web, as services)");
     }
-    p.config.is_some() || !p.wiring.is_empty() || p.mesh.is_some() || p.vectors.is_some()
+    p.config.is_some() || !p.wiring.is_empty() || p.mesh.is_some() || p.vectors.is_some() || p.services_change
+}
+
+/// Whether `borg service install` would change anything, from `borg doctor`'s service lines
+/// (service.rs `checks`): each WARN is a unit it writes, takes over, removes or starts, or a manager it
+/// cannot reach, which it then names. All ok: the services run as borg writes them, or none can run
+/// here (a development build, no manager borg knows).
+fn services_pending(checks: &[(Level, String)]) -> bool {
+    checks.iter().any(|(l, _)| *l != Level::Ok)
 }
 
 /// Whether `c` writes borg's own compiled-in text: a skill file, or an adapter where there was none.
@@ -346,6 +357,20 @@ mod tests {
         assert!(parse(&["--join", "notaticket"]).unwrap_err().contains("BORG1"));
         assert!(parse(&["--team"]).unwrap_err().contains("needs a value"));
         assert!(parse(&["--bogus"]).unwrap_err().contains("unknown flag"));
+    }
+
+    #[test]
+    fn services_that_would_change_are_in_the_plan_and_need_the_confirmation() {
+        let runs = (Level::Ok, "service borg-web.service: borg web runs".to_string());
+        let missing = (Level::Warn, "service borg-mesh-acme.service: not installed".to_string());
+        assert!(!services_pending(std::slice::from_ref(&runs)), "running as borg writes them: nothing to do");
+        assert!(!services_pending(&[]), "none wanted");
+        assert!(services_pending(&[runs, missing]), "a unit to write and start");
+
+        let t = Targets::under(Path::new("/nonexistent-borg-setup-test"));
+        let plan = |services_change| Plan { config: None, mesh: None, vectors: None, wiring: Vec::new(), services: true, services_change };
+        assert!(!show(&plan(false), &t), "a second run: nothing to change");
+        assert!(show(&plan(true), &t), "only the services change: still asked before anything is written or started");
     }
 
     #[test]

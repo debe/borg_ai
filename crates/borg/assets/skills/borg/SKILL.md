@@ -167,7 +167,8 @@ Lifecycle, checks and failures: [handoff](references/handoff.md).
   `borg install all --apply`, `borg vectors --fetch`, `borg doctor`.
 - **A team or company:** a `share: "team"` collective plus the mesh. One admin runs `borg mesh init`;
   everyone else joins with an invite ticket. Setup runs `borg mesh serve` and `borg web` as services
-  (`borg service`); after a mesh init or join outside setup, `borg service install`. Relays, a
+  (`borg service`; one mesh daemon per team collective, all at once); after a mesh init or join outside
+  setup, `borg service install`, never a second `borg mesh serve` by hand. Relays, a
   self-hosted `iroh-relay`, LAN-only mode and corporate networks: [team](references/team.md).
 - **Vectors** are on by default once the model is fetched: [vectors](references/vectors.md).
 - `borg install` writes the hook files, the adapters and this skill; rerun it rather than editing them

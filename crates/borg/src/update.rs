@@ -641,26 +641,55 @@ fn refresh(bin: &Path) -> i32 {
     println!("\nborg doctor");
     let code = std::process::Command::new(bin).arg("doctor").status().ok().and_then(|s| s.code()).unwrap_or(1);
     println!("\nThe mesh daemon and listen waiters restart on their own.");
-    match web_outside() {
-        Some(true) => println!("borg web is running outside its service: restart it (borg web) to serve the new version."),
-        Some(false) => {}
-        None => println!("If borg web is running outside its service, restart it (borg web) to serve the new version."),
+    if let Some(line) = web_advice(web_outside().as_deref(), web_unit()) {
+        println!("{line}");
     }
     code
 }
 
-/// Whether a `borg-web` process other than the `borg web` service's runs here (pgrep; the service
+/// What to do about a `borg web` started by hand (`outside`: their pids, none when that cannot be
+/// told), given whether a `borg web` service is installed (`unit`). With one, the hand-started process
+/// holds the port the service needs, so it is stopped, never restarted; without, it is restarted.
+fn web_advice(outside: Option<&[u32]>, unit: bool) -> Option<String> {
+    let pids = |p: &[u32]| p.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    match (outside, unit) {
+        (Some([]), _) => None,
+        (Some(p), true) => {
+            Some(format!("borg web runs outside its service (pid {}): stop it, so the borg-web service serves the new version on its port.", pids(p)))
+        }
+        (Some(p), false) => Some(format!("borg web runs outside a service (pid {}): restart it (borg web) to serve the new version.", pids(p))),
+        (None, true) => Some("If you started borg web by hand, stop it: the borg-web service serves the new version.".into()),
+        (None, false) => Some("If borg web runs outside a service, restart it (borg web) to serve the new version.".into()),
+    }
+}
+
+/// Whether borg's `borg web` service is installed: its file (service.rs: `borg-web.service`, launchd
+/// `borg.web.plist`) is in the manager's directory. `borg service install` ran just before, so a file
+/// of that name is borg's unless it could not install here.
+fn web_unit() -> bool {
+    use crate::service::{Backend, Host, system};
+    Host::from_env(&system).is_ok_and(|h| {
+        h.dir
+            .join(match h.backend {
+                Backend::Systemd => "borg-web.service",
+                Backend::Launchd => "borg.web.plist",
+            })
+            .is_file()
+    })
+}
+
+/// The `borg-web` processes other than the `borg web` service's that run here (pgrep; the service
 /// install restarted that one); none when that cannot be told.
-fn web_outside() -> Option<bool> {
+fn web_outside() -> Option<Vec<u32>> {
     let out =
         std::process::Command::new("pgrep").args(["-x", "borg-web"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
     match out.status.code() {
         Some(0) => {}
-        Some(1) => return Some(false),
+        Some(1) => return Some(Vec::new()),
         _ => return None,
     }
     let managed = crate::service::web_pid();
-    Some(String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|p| p.parse::<u32>().ok()).any(|p| Some(p) != managed))
+    Some(String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|p| p.parse::<u32>().ok()).filter(|p| Some(*p) != managed).collect())
 }
 
 // ---------------------------------------------------------------- CLI
@@ -782,6 +811,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_hand_started_web_is_stopped_where_its_service_is_installed() {
+        let managed = web_advice(Some(&[4242]), true).unwrap();
+        assert!(managed.contains("stop it") && managed.contains("4242") && !managed.contains("restart it"), "it holds the service's port: {managed}");
+        let unknown = web_advice(None, true).unwrap();
+        assert!(unknown.contains("stop it") && !unknown.contains("restart it"), "{unknown}");
+        let alone = web_advice(Some(&[4242]), false).unwrap();
+        assert!(alone.contains("restart it (borg web)"), "no service to serve it: {alone}");
+        assert!(web_advice(None, false).unwrap().contains("restart it (borg web)"));
+        assert_eq!(web_advice(Some(&[]), true), None, "none by hand: nothing to say");
     }
 
     #[test]

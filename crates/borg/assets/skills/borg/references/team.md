@@ -47,16 +47,19 @@ Inside a repo that routes to the team collective (check with `borg collective .`
 
 ```sh
 borg mesh init                      # you become the collective's admin
-borg mesh serve                     # syncs every 60 s and on local change; normally a service (below)
+borg service install                # runs `borg mesh serve` (syncs every 60 s and on local change) as a service
 ```
 
 `borg setup --team NAME --paths DIR... [--relay URL|disabled]` does this in one pass: it writes the
 team entry (asking for off paths), runs `borg mesh init` and offers a first invite (with
-`--relay disabled`, an invite needs `borg mesh serve` running first, so it says that instead).
+`--relay disabled`, an invite needs the mesh daemon running first, which setup starts as a service at
+its end, so it says that instead).
 
-Keep `serve` running as a service: `borg setup` installs one at its end, and
-`borg install <h> --apply` and `borg update` keep it up to date (a systemd user unit
-`borg-mesh-<collective>.service` on Linux, a launchd agent `borg.mesh.<collective>.plist` on macOS,
+Never start `borg mesh serve` by hand beside the service: it is the same node twice. Each team
+collective's daemon gets a port of its own (the one it served on last, else 7878, else any free one),
+so all of them run at once on one machine. `borg setup` installs the services at its end (its plan
+names that step, so the engineer confirms it), and `borg install <h> --apply` and `borg update` keep
+them up to date (a systemd user unit `borg-mesh-<collective>.service` on Linux, a launchd agent `borg.mesh.<collective>.plist` on macOS,
 beside one for `borg web`). After a `borg mesh init` or `borg mesh join` outside setup, run
 `borg service install`. `borg service` shows their state; `borg service remove` stops them and keeps
 them off (ask the engineer first). A unit of the same name the engineer wrote is taken over and kept as
