@@ -68,6 +68,8 @@ const PROBES: &[(&str, &[&str])] = &[
     ("uninstall", &[]),
     ("status", &[]),
     ("doctor", &[]),
+    // An unknown verb is a usage error: no manager is asked.
+    ("service", &["--zz-probe"]),
     ("collective", &["."]),
     ("vectors", &[]),
     ("completions", &[]),

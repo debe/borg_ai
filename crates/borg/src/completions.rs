@@ -32,6 +32,12 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             cmd("uninstall", &[("<HARNESS|all> [--apply]", "unwire them")], &[HARNESSES, "all"], &["--apply", "--home"]),
             cmd("status", &[("", "each collective's lessons, outcomes and wiring")], &[], &["--home"]),
             cmd("doctor", &[("", "what is broken: config, hooks, adapters, the model CLI")], &[], &["--home"]),
+            cmd(
+                "service",
+                &[("[status|install|restart|remove]", "borg's background services: a mesh daemon per team collective, and borg web")],
+                crate::service::SUBS,
+                &[],
+            ),
             Command { path: true, ..cmd("collective", &[("[DIR]", "which collective a directory belongs to")], &[], &[]) },
             cmd("vectors", &[("[--fetch|--rebuild] [--store LESSONS]", "the vector model and index")], &[], &["--fetch", "--rebuild", "--store"]),
             cmd("completions", &[("<bash|zsh|fish>", "a shell completion script")], &["bash", "zsh", "fish"], &[]),

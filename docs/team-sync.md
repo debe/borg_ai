@@ -28,8 +28,8 @@ with a ticket. The steps below are what it runs, for doing them by hand.
 **1. Admin, once.** Inside a repo of the team collective (or with `--collective NAME`):
 
 ```sh
-borg mesh init      # you become the collective's admin
-borg mesh serve     # keep it running; syncs every 60 s and on local change
+borg mesh init       # you become the collective's admin
+borg service install # runs borg mesh serve as a service (syncs every 60 s and on local change), and borg web
 ```
 
 **2. Admin, per new member.** In a second terminal:
@@ -77,13 +77,15 @@ for the vector model.
 
 ```sh
 borg setup --team acme --paths ~/work/acme --relay https://relay.acme.example
-borg mesh serve --collective acme      # keep it running, as a service
 borg mesh invite --collective acme     # one ticket per member
 ```
 
 Setup asks for the repos no collective may ever see (`off`) and where every other repo goes; it then
 runs `borg mesh init` and offers a first invite (with `--relay disabled` it names the next step instead:
-`borg mesh serve`, then `borg mesh invite`). Without `--relay` it asks: n0's public relays,
+`borg mesh invite`, once the mesh daemon runs). At its end it installs the mesh daemon (`borg mesh serve
+--collective acme`) and `borg web` as services of your user (`borg service`: systemd on Linux, launchd
+on macOS); without a service manager it says so, and you keep `borg mesh serve --collective acme`
+running yourself. Without `--relay` it asks: n0's public relays,
 `disabled` (LAN or VPN only), or a company relay URL. Choose the relay before the first invite: each
 ticket carries it and `join` copies it, and every member must use the same one.
 
@@ -94,7 +96,8 @@ borg setup --join BORG1... --paths ~/work/acme
 ```
 
 Setup runs `borg mesh join BORG1... --paths ~/work/acme --apply`, which writes the collective with the
-admin's relay, joins and syncs. Then keep `borg mesh serve --collective acme` running.
+admin's relay, joins and syncs, and installs the mesh daemon as a service as the admin's setup does
+(`borg service` shows it).
 
 **Relay.** A company relay keeps even the metadata in-house: the `iroh-relay` binary
 (`cargo install iroh-relay@1.3.0 --features server --locked`) on a host with a DNS name and a TLS

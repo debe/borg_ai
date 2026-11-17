@@ -610,18 +610,17 @@ fn doctor(t: &Targets) -> i32 {
         let aliases = c.as_ref().map(collective::Config::aliases).unwrap_or_default();
         checks.extend(alias_hints(&emails, &git_identities(), &aliases).into_iter().map(|h| (Level::Warn, h)));
     }
+    // Borg's background services (service.rs); not under `--home`, a sandbox no manager serves.
+    if t.env {
+        checks.extend(crate::service::checks());
+    }
     let spec = std::env::var("BORG_PREDICT_MODEL").ok();
     checks.push(match crate::runner::availability(spec.as_deref(), &crate::runner::on_path) {
         Ok(m) => (Level::Ok, m),
         Err(m) => (Level::Warn, m),
     });
     for (l, msg) in &checks {
-        let tag = match l {
-            Level::Ok => "ok  ",
-            Level::Warn => "WARN",
-            Level::Fail => "FAIL",
-        };
-        println!("{tag} {msg}");
+        println!("{} {msg}", l.tag());
     }
     i32::from(checks.iter().any(|(l, _)| *l == Level::Fail))
 }
@@ -665,7 +664,13 @@ pub fn main(cmd: &str, args: &[&str]) -> i32 {
         "install" | "uninstall" => {
             let Some(hs) = which_h.and_then(parse) else { return usage() };
             let action = if cmd == "install" { Action::Install } else { Action::Uninstall };
-            run(action, &hs, &targets, &bin(), apply_flag)
+            let code = run(action, &hs, &targets, &bin(), apply_flag);
+            // The services too (service.rs): how a borg updated by an older one gets them, since its
+            // update runs this on the new binary. Never under `--home`, a sandbox no manager serves.
+            if action == Action::Install && apply_flag && home.is_none() {
+                crate::service::auto();
+            }
+            code
         }
         _ => usage(),
     }
@@ -677,6 +682,19 @@ pub(crate) fn bin() -> PathBuf {
         Some(b) => PathBuf::from(b),
         None => std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_else(|_| PathBuf::from("borg")),
     }
+}
+
+/// Where `bin` really lives: a `BORG_BIN` symlink resolved to the build it names (what an update
+/// replaces, and what a service runs).
+pub(crate) fn real_bin() -> PathBuf {
+    let b = bin();
+    std::fs::canonicalize(&b).unwrap_or(b)
+}
+
+/// Whether `dir` lies under a `target/` directory: a development build, which no update replaces and
+/// no service runs.
+pub(crate) fn under_target(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == "target")
 }
 
 /// Variables `--home` removes, so every path borg resolves falls under the given HOME: the store

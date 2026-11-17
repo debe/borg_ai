@@ -37,7 +37,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | Everything set up in one guided pass | `borg setup` (interactive; run it in the engineer's own terminal) |
 | To know what is wired and how big each collective is | `borg status` |
 | To know what is broken | `borg doctor`, then [troubleshooting](references/troubleshooting.md) |
-| borg says an update exists (a newer release, or a member nothing syncs with) | Tell the engineer; on their yes run `borg update` (it installs the release, refreshes the wired harnesses and runs `borg doctor`); `borg update --check` shows who runs what |
+| borg says an update exists (a newer release, or a member nothing syncs with) | Tell the engineer; on their yes run `borg update` (it installs the release, refreshes the wired harnesses and borg's services and runs `borg doctor`); `borg update --check` shows who runs what |
 | To know which collective a repo belongs to | `borg collective <dir>` |
 | Misplaced: the engineer says a lesson belongs in another collective | `borg move <id> --to <collective>` prints a dry run: show it, and on their yes run it again with `--apply`. The source keeps a tombstone unless another engineer is on the lesson (then it is only copied); `--personal` keeps it for the engineer alone there. For a repo that changed collectives, `borg move <repo-path> --to <collective>` moves its waiting corrections. `borg doctor` lists suggested moves; nothing moves on its own |
 | Correction for another collective: the engineer corrects something about another collective's repo or project (an open-source library during team work) | `borg correct --collective <name> [--repo <repo>] "<the correction>"`, learned in that collective when this session ends. One command per collective the correction concerns, this session's own included: once `borg correct` runs, the words the hooks captured in this session's collective are set aside, so a part that belongs here needs its own `borg correct --collective <this one>`. State each in that collective's own terms, never the other's; `--repo` names the repo it is about. Into another collective goes only what you write: no task, proposal or work email of this session. Without the command a correction stays in this session's collective. `borg collective <dir>` and `borg status` show the names |
@@ -67,10 +67,11 @@ on this machine unless the collective they belong to is synced with a team over 
 | An admin wants hand-offs off (or on again) for the whole collective | `borg handoff off` (`borg handoff on`), only on their word; a refusal naming machines on an older borg means those must upgrade first |
 | To see the drones running across the team, live | `borg top` (`--once` prints one frame) |
 | A local page of lessons, checks, the queen, learning and cost | `borg web` (127.0.0.1) |
+| Whether the mesh daemon and borg web run as services, or the engineer wants them restarted, installed or gone | `borg service` (status), `borg service restart`, `borg service install`; `borg service remove` only on their word (it keeps them off) |
 | To learn waiting corrections now, not at session end | `borg learn` |
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |
 | Lessons from past sessions | `borg assimilate`, then `borg assimilate --apply --limit 50` |
-| Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` |
+| Team sync | `borg mesh init`, `borg mesh invite`, `borg mesh join <ticket>`, `borg mesh serve` (by hand; normally a service) |
 | Every command | `borg help`, `borg mesh --help` |
 
 ## Hand over long-term memory
@@ -164,8 +165,9 @@ Lifecycle, checks and failures: [handoff](references/handoff.md).
 
 - **One engineer:** `borg setup`, or by hand: write collectives.json, `borg install all` (dry run),
   `borg install all --apply`, `borg vectors --fetch`, `borg doctor`.
-- **A team or company:** a `share: "team"` collective plus the mesh. One admin runs `borg mesh init`
-  and keeps `borg mesh serve` running; everyone else joins with an invite ticket. Relays, a
+- **A team or company:** a `share: "team"` collective plus the mesh. One admin runs `borg mesh init`;
+  everyone else joins with an invite ticket. Setup runs `borg mesh serve` and `borg web` as services
+  (`borg service`); after a mesh init or join outside setup, `borg service install`. Relays, a
   self-hosted `iroh-relay`, LAN-only mode and corporate networks: [team](references/team.md).
 - **Vectors** are on by default once the model is fetched: [vectors](references/vectors.md).
 - `borg install` writes the hook files, the adapters and this skill; rerun it rather than editing them

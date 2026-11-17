@@ -9,7 +9,8 @@
 //! mesh command, the vector model, the wiring diff, and nothing is written before the engineer confirms
 //! it. After that (setup/steps.rs): the config, with a backup (setup/config.rs: an existing one is only
 //! ever extended); `borg mesh init` or `join`; the vector model and indexes, on by default (a failure is a
-//! WARN, never the end of setup); the wiring; an optional import; `borg doctor`.
+//! WARN, never the end of setup); the wiring; an optional import; borg's background services (service.rs,
+//! not under `--home`); `borg doctor`.
 //!
 //! Questions read stdin (setup/prompt.rs); without a terminal setup refuses unless `--yes` takes every
 //! default. Flags answer their question. A second run changes nothing. `--home DIR` isolates as `borg
@@ -152,6 +153,8 @@ struct Plan {
     /// What the vector step will do, if anything.
     vectors: Option<String>,
     wiring: Vec<Wire>,
+    /// Whether the services step runs (not under `--home`, not after `borg service remove`).
+    services: bool,
 }
 
 fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
@@ -164,7 +167,8 @@ fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
     ask.heading("3. Wiring");
     let wiring = wiring(&harnesses(o, ask, &found)?, &t)?;
     let mesh = mesh.filter(|m| !steps::done(m));
-    let plan = Plan { config, mesh, vectors: steps::vectors_plan(o.no_vectors), wiring };
+    let services = o.home.is_none() && !crate::service::off();
+    let plan = Plan { config, mesh, vectors: steps::vectors_plan(o.no_vectors), wiring, services };
     ask.heading("4. The plan");
     if !show(&plan, &t) {
         println!("nothing to change");
@@ -175,16 +179,23 @@ fn run(o: &Opts, ask: &mut Prompt) -> Result<i32, String> {
     let stamp = format!("{}Z", install::utc(learn::now_ms()));
     let mut warns = Vec::new();
     // Wiring without the config would put every repo into the implicit `default` team collective.
-    let (code, mesh) = match plan.config.as_ref().map_or(0, |c| steps::config(c, &stamp)) {
-        0 => act(o, &plan, ask, &stamp, &mut warns),
+    let (code, mesh, services) = match plan.config.as_ref().map_or(0, |c| steps::config(c, &stamp)) {
+        0 => {
+            let (code, mesh) = act(o, &plan, ask, &stamp, &mut warns);
+            // Borg's background services (service.rs): a mesh daemon per team collective, and borg web.
+            // Not under `--home`, a sandbox no service manager serves; not after `borg service remove`.
+            (code, mesh, plan.services && crate::service::auto())
+        }
         code => {
-            warns
-                .push("nothing else was done (mesh, vectors, wiring): the collectives config could not be written; fix that and run `borg setup` again".into());
-            (code, None)
+            warns.push(
+                "nothing else was done (mesh, vectors, wiring, services): the collectives config could not be written; fix that and run `borg setup` again"
+                    .into(),
+            );
+            (code, None, false)
         }
     };
     ask.heading("5. Check");
-    Ok(verify(o, &warns, mesh).max(code))
+    Ok(verify(o, &warns, mesh, services).max(code))
 }
 
 /// After the config is written: the mesh command, the vectors, the wiring, the import. The exit code (1
@@ -285,6 +296,9 @@ fn show(p: &Plan, t: &Targets) -> bool {
         println!("then: borg mesh {}", m.args().join(" "));
     }
     p.vectors.iter().for_each(|v| println!("then: {v}"));
+    if p.services {
+        println!("then: borg service install (a mesh daemon per team collective, and borg web, as services)");
+    }
     p.config.is_some() || !p.wiring.is_empty() || p.mesh.is_some() || p.vectors.is_some()
 }
 
@@ -293,8 +307,9 @@ fn own(h: &dyn Harness, c: &Change, skill: Option<&Path>) -> bool {
     skill.is_some_and(|d| c.path.starts_with(d)) || (c.before.is_none() && c.after.as_deref() == Some(h.wiring().adapter()))
 }
 
-/// Step 5: `borg doctor`, the WARNs of the steps above, what to do next. Doctor's exit code.
-fn verify(o: &Opts, warns: &[String], mesh: Option<&Mesh>) -> i32 {
+/// Step 5: `borg doctor`, the WARNs of the steps above, what to do next (`services`: whether the mesh
+/// daemon and borg web run as services now). Doctor's exit code.
+fn verify(o: &Opts, warns: &[String], mesh: Option<&Mesh>, services: bool) -> i32 {
     let home: Vec<&str> = o.home.as_deref().map(|h| vec!["--home", h]).unwrap_or_default();
     let code = install::main("doctor", &home);
     for w in warns {
@@ -302,10 +317,12 @@ fn verify(o: &Opts, warns: &[String], mesh: Option<&Mesh>) -> i32 {
     }
     println!("\nnext:\n  borg status                 what each collective holds\n  borg collective [DIR]       which collective a repo belongs to");
     match mesh {
+        Some(Mesh::Init(name)) if services => println!("  borg mesh invite --collective {name}   a ticket per member (the mesh daemon runs as a service)"),
         Some(Mesh::Init(name)) => {
-            println!("  borg mesh serve --collective {name}   keep it running (a service); then `borg mesh invite --collective {name}`");
+            println!("  borg mesh serve --collective {name}   keep it running (borg service install); then `borg mesh invite --collective {name}`");
         }
-        Some(Mesh::Join { .. }) => println!("  borg mesh serve             keep it running inside one of the team's repos"),
+        Some(Mesh::Join { .. }) if services => {}
+        Some(Mesh::Join { .. }) => println!("  borg mesh serve             keep it running inside one of the team's repos (borg service install)"),
         None => {}
     }
     code
