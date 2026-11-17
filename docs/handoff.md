@@ -233,15 +233,19 @@ machine. Other machines lift theirs once they ask the remote: a fenced session's
 background, and so does any `borg handoff` there. Then it removes what this machine's take left: each
 work tree it made when it is clean and holds no ignored file (`git worktree remove` would delete those;
 such a tree is listed with them), not the one you are in, and the local `refs/borg/handoff/<id>/*`
-refs. The branch `borg/handoff/<id>` stays
-and is listed: it holds the work until it is merged. An open offer is not done: take it back or abort it.
+refs. The branch `borg/handoff/<id>` goes too once no work tree has it checked out and another branch,
+a remote-tracking branch or a tag holds its commits (merged or pushed); otherwise it stays and is
+listed: it holds the work until it is merged. An open offer is not done: take it back or abort it.
 
 `borg handoff` lists a hand-off whose refs remain on the remote though it is aborted or done, with the
 command that deletes them, and, in a repo, the hand-off refs its remote holds of hand-offs the machine
 does not know, with the `git push --delete` that deletes them by hand once you know they are over (only
 the refs borg makes, `state`, `brief`, `taken`, `abort` and `probe`, every value in the command quoted).
-`borg doctor` names the branches and local hand-off refs a clone still holds of a hand-off that is done
-or unknown on the machine.
+Each listing (`borg handoff`, also the one a stop starts in the background) does the same in each clone
+recorded on the machine, for every hand-off this machine knows is done, wherever `done` ran; local refs of
+a hand-off it does not know stay. `borg doctor` names what a clone still holds of a hand-off that is done or unknown on
+the machine: of a done one, what `borg handoff` deletes, and each branch that stays with why (checked out
+in a work tree, or holding commits nothing else has, with the `git branch -D` that drops them).
 
 ## Switching hand-offs off
 

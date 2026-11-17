@@ -2136,6 +2136,7 @@ fn list(ctx: &Ctx) -> i32 {
     let text = log::read(&ctx.home);
     let known = log::known(&ctx.home);
     close::compact(ctx, &known);
+    close::tidy(&ctx.home);
     let all = log::fold(&text);
     reannounce(ctx, &all, &known);
     fence::refresh(&ctx.home);

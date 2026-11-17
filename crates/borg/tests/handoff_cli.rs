@@ -1230,8 +1230,9 @@ fn switching_hand_offs_off_aborts_open_offers_and_refuses_new_ones() {
 
 /// `done` deletes every ref of the hand-off, removes the clean work tree the take made and the local
 /// refs, lists the branch, and lifts the fence; an open offer is not done; refs the remote holds of an
-/// aborted hand-off, or of one this machine never heard of, are listed with what deletes them; and
-/// `borg doctor` names a branch left from a done hand-off.
+/// aborted hand-off, or of one this machine never heard of, are listed with what deletes them; `borg
+/// doctor` names a branch left from a done hand-off; once it is merged, `borg handoff` deletes it and
+/// the local refs a `done` elsewhere left.
 #[test]
 fn done_deletes_the_refs_and_what_the_take_left() {
     let root = setup("done");
@@ -1262,20 +1263,40 @@ fn done_deletes_the_refs_and_what_the_take_left() {
     assert_eq!(borg(&root, &app, "s3", &["handoff", "done", &other]).code, Some(0));
     assert!(!remote_refs(&root).contains(&other));
     first_hook(&root, "store", "s2-doctor", &app2);
-    let doctor = Command::new(env!("CARGO_BIN_EXE_borg"))
-        .arg("doctor")
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", root.join("home"))
-        .env("BORG_UPDATE_CHECK", "off")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("BORG_HOME", root.join("store"))
-        .env("BORG_CONFIG", root.join("collectives.json"))
-        .current_dir(&app2)
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&doctor.stdout);
-    assert!(text.contains(&format!("hand-off {id} is done, but {} still holds its branch", app2.display())), "{text}");
+    let doctor = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_borg"))
+            .arg("doctor")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", root.join("home"))
+            .env("BORG_UPDATE_CHECK", "off")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("BORG_HOME", root.join("store"))
+            .env("BORG_CONFIG", root.join("collectives.json"))
+            .current_dir(&app2)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let branch = format!("borg/handoff/{id}");
+    let text = doctor();
+    assert!(text.contains(&format!("hand-off {id} is done: branch {branch} stays in {}: it holds commits no other branch", app2.display())), "{text}");
+    // Merged, and with local refs a `done` elsewhere left: doctor names them, `borg handoff` deletes them.
+    git(&app2, &["-c", "user.name=t", "-c", "user.email=t@example.com", "merge", "-q", "--no-edit", &branch]);
+    git(&app2, &["update-ref", &format!("refs/borg/handoff/{id}/state"), &branch]);
+    // A hand-off unknown here may be an offer this machine never heard of: named, never deleted.
+    git(&app2, &["update-ref", "refs/borg/handoff/h0123456789ab/state", &branch]);
+    let text = doctor();
+    assert!(
+        text.contains(&format!("hand-off {id} is done, but {} still holds 2 of its refs or merged branches: `borg handoff` deletes them", app2.display())),
+        "{text}"
+    );
+    assert_eq!(borg(&root, &app2, "s2", &["handoff"]).code, Some(0));
+    let left = git(&app2, &["for-each-ref", "--format=%(refname)", "refs/heads/borg/handoff/", "refs/borg/handoff/"]);
+    assert_eq!(left, "refs/borg/handoff/h0123456789ab/state", "merged branch and local refs gone, the unknown one's kept");
+    let text = doctor();
+    assert!(!text.contains(&id), "nothing left to name: {text}");
+    assert!(text.contains(&format!("hand-off h0123456789ab is unknown here, but {} still holds its branch or refs", app2.display())), "{text}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

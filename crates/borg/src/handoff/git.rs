@@ -457,6 +457,32 @@ pub(crate) fn local_ids(root: &Path) -> Vec<String> {
     ids
 }
 
+/// The branches a take of `id` made in the clone `root`, `borg/handoff/<id>` and `borg/handoff/<id>-<n>`
+/// (`branch_for`), each with the commit it points at.
+pub(crate) fn branches_of(root: &Path, id: &str) -> Vec<(String, String)> {
+    let base = branch_of(id);
+    let (exact, numbered) = (format!("refs/heads/{base}"), format!("refs/heads/{base}-*"));
+    let out = run(root, &["for-each-ref", "--format=%(refname) %(objectname)", &exact, &numbered]).unwrap_or_default();
+    out.lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(r, s)| Some((r.strip_prefix("refs/heads/")?, s)))
+        .filter(|(b, _)| {
+            b.strip_prefix(base.as_str())
+                .is_some_and(|n| n.is_empty() || n.strip_prefix('-').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())))
+        })
+        .map(|(b, s)| (b.to_string(), s.to_string()))
+        .collect()
+}
+
+/// Whether every commit of `sha` is held by a branch, a remote-tracking branch or a tag other than the
+/// branches of `id` (`branches_of`): merged, or pushed. Deleting a branch of `id` at `sha` loses nothing then.
+/// False when git cannot tell.
+pub(crate) fn held_elsewhere(root: &Path, sha: &str, id: &str) -> bool {
+    let base = branch_of(id);
+    let (exact, numbered) = (format!("--exclude={base}"), format!("--exclude={base}-*"));
+    run(root, &["rev-list", "-n1", sha, "--not", &exact, &numbered, "--branches", "--remotes", "--tags"]).is_ok_and(|s| s.trim().is_empty())
+}
+
 /// Deletes the local ref `name` while it holds `sha`.
 pub(crate) fn delete_local_ref(root: &Path, name: &str, sha: &str) -> Result<(), String> {
     run(root, &["update-ref", "-d", name, sha]).map(drop)
@@ -844,5 +870,33 @@ mod tests {
     fn names_count_in_env_files_and_dotfiles_only() {
         assert!(names_secrets(".env") && names_secrets("conf/.env.local") && names_secrets("prod.env") && names_secrets(".npmrc"));
         assert!(names_secrets("aws/credentials") && !names_secrets("src/auth.rs") && !names_secrets("package-lock.json") && !names_secrets(".gitignore.bak"));
+    }
+
+    /// A take's branches are `borg/handoff/<id>` and `-<n>`, nothing else under the name; one is held
+    /// elsewhere once another branch has its commits, never by the id's own other branches.
+    #[test]
+    fn a_takes_branches_and_whether_another_branch_holds_them() {
+        let root = std::env::temp_dir().join(format!("borg-git-branches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "h0123456789ab";
+        let base = branch_of(id);
+        let git = |args: &[&str]| run_in(&root, args, &[("GIT_CONFIG_NOSYSTEM", "1".as_ref()), ("HOME", root.as_os_str())], None).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "a"]);
+        for b in [base.clone(), format!("{base}-2"), format!("{base}-x"), format!("{base}0"), "borg/handoff/h0123456789ac".into()] {
+            git(&["branch", &b]);
+        }
+        git(&["switch", "-q", &base]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "b"]);
+        git(&["branch", "-f", &format!("{base}-2")]);
+        let names: Vec<String> = branches_of(&root, id).into_iter().map(|(b, _)| b).collect();
+        assert_eq!(names, [base.clone(), format!("{base}-2")]);
+        let tip = rev_parse(&root, &format!("refs/heads/{base}")).unwrap();
+        assert!(!held_elsewhere(&root, &tip, id), "only the id's own branches hold it");
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--ff-only", &base]);
+        assert!(held_elsewhere(&root, &tip, id), "merged");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

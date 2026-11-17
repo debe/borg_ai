@@ -499,9 +499,9 @@ fn close_steps(ctx: &Ctx, h: &log::HandOff, op: &Op) -> Result<String, Halt> {
 }
 
 /// Removes what a take of `id` left on this machine: each work tree it made (only when clean and holding
-/// no ignored file, and not the one `borg handoff` runs in), the local `refs/borg/handoff/<id>/*` refs of
-/// each clone; lists the rest (a work tree with changes or ignored files, the branches: they hold the
-/// work until it is merged).
+/// no ignored file, and not the one `borg handoff` runs in), then in each clone what loses nothing
+/// (`left_in`: the local refs, a branch whose commits are merged or pushed); lists the rest (a work tree
+/// with changes or ignored files, a branch holding commits nothing else has).
 fn leftovers(ctx: &Ctx, id: &str) -> Vec<String> {
     let text = wal::read(&ctx.home, id);
     let mut out = Vec::new();
@@ -511,7 +511,7 @@ fn leftovers(ctx: &Ctx, id: &str) -> Vec<String> {
         let roots: Vec<PathBuf> =
             std::iter::once(PathBuf::from(root.as_ref())).chain(more.iter().filter(|r| !r.root.is_empty()).map(|r| PathBuf::from(r.root.as_ref()))).collect();
         for s in &steps {
-            let Step::Checkout { repo, branch, path } = s else { continue };
+            let Step::Checkout { repo, path, .. } = s else { continue };
             let (Some(clone), path) = (roots.get(*repo), PathBuf::from(path.as_ref())) else { continue };
             if !clones.contains(clone) {
                 clones.push(clone.clone());
@@ -535,19 +535,88 @@ fn leftovers(ctx: &Ctx, id: &str) -> Vec<String> {
                     }
                 }
             }
-            if git::rev_parse(clone, &format!("refs/heads/{branch}")).is_some() {
-                out.push(format!("branch {branch} stays in {}: delete it once it is merged (`git branch -d {}`)", clone.display(), super::quote(branch)));
-            }
         }
     }
     for clone in clones {
-        for (name, sha) in git::local_refs(&clone, id) {
-            if git::delete_local_ref(&clone, &name, &sha).is_err() {
-                out.push(format!("{name} stays in {}", clone.display()));
+        out.extend(remove_left(&clone, id));
+    }
+    out
+}
+
+/// What a done hand-off `id` left in `clone`: what deleting loses nothing (`gone`: the local
+/// `refs/borg/handoff/<id>/*` refs, copies of what `done` deletes from the remote; each branch of the
+/// take no work tree has checked out whose commits another branch, a remote-tracking branch or a tag
+/// holds), and why each other branch stays (`kept`).
+struct Left {
+    gone: Vec<(String, String)>,
+    kept: Vec<String>,
+}
+
+fn left_in(clone: &Path, id: &str) -> Left {
+    let mut gone = git::local_refs(clone, id);
+    let mut kept = Vec::new();
+    for (branch, sha) in git::branches_of(clone, id) {
+        if let Some(w) = git::worktree_of(clone, &branch) {
+            kept.push(format!("branch {branch} stays in {}: it is checked out in {}", clone.display(), w.display()));
+        } else if git::held_elsewhere(clone, &sha, id) {
+            gone.push((format!("refs/heads/{branch}"), sha));
+        } else {
+            kept.push(format!(
+                "branch {branch} stays in {}: it holds commits no other branch, remote-tracking branch or tag has; merge them, or drop them with `git branch -D {}`",
+                clone.display(),
+                super::quote(&branch)
+            ));
+        }
+    }
+    Left { gone, kept }
+}
+
+/// Deletes what `left_in` finds loses nothing, each only while it holds what was read (a commit made on
+/// a branch since keeps it); returns what stays. One a concurrent run (another listing, a background
+/// one) deleted first is gone, not kept.
+fn remove_left(clone: &Path, id: &str) -> Vec<String> {
+    let Left { gone, mut kept } = left_in(clone, id);
+    for (name, sha) in gone {
+        if let Err(e) = git::delete_local_ref(clone, &name, &sha)
+            && git::rev_parse(clone, &name).is_some()
+        {
+            kept.push(format!("{name} stays in {}: {e}", clone.display()));
+        }
+    }
+    kept
+}
+
+/// How a hand-off whose leftovers a clone holds stands here, as `doctor` and `tidy` read it.
+#[derive(PartialEq)]
+enum Over {
+    Done,
+    /// Maybe an offer this machine never heard of: never tidied.
+    Unknown,
+}
+
+/// `None`: the hand-off is not over.
+fn over(all: &[log::HandOff], known: &std::collections::BTreeMap<String, log::Known>, id: &str) -> Option<Over> {
+    match all.iter().find(|h| h.id() == id) {
+        Some(h) if h.closed(known.get(id)) => Some(Over::Done),
+        Some(_) => None,
+        None if known.get(id).is_some_and(|k| k.gone) => Some(Over::Done),
+        None => Some(Over::Unknown),
+    }
+}
+
+/// At each `borg handoff`: removes from the clones recorded here what hand-offs done here left that
+/// loses nothing (`left_in`), wherever `done` ran; `doctor` names the rest.
+pub(super) fn tidy(home: &Path) {
+    let text = log::read(home);
+    let all = log::fold(&text);
+    let known = log::known(home);
+    for clone in super::clones::recorded(home) {
+        for id in git::local_ids(&clone) {
+            if over(&all, &known, &id) == Some(Over::Done) {
+                remove_left(&clone, &id);
             }
         }
     }
-    out
 }
 
 /// A `done` that was interrupted: run again (every step is idempotent).
@@ -596,7 +665,8 @@ pub(super) fn stray_refs(ctx: &Ctx, all: &[log::HandOff], known: &std::collectio
 
 /// What `borg doctor` reports of hand-offs in the collective of `home`: hand-offs switched off, and
 /// what takes left in the clones recorded here (branches `borg/handoff/<id>`, local hand-off refs)
-/// whose hand-off is done or unknown here.
+/// whose hand-off is done or unknown here. Of a done one: what `borg handoff` removes (`tidy`), and each
+/// branch that stays, with why.
 pub fn doctor(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(why) = switched_off(home) {
@@ -607,17 +677,79 @@ pub fn doctor(home: &Path) -> Vec<String> {
     let known = log::known(home);
     for clone in super::clones::recorded(home) {
         for id in git::local_ids(&clone) {
-            let state = match all.iter().find(|h| h.id() == id) {
-                Some(h) if h.closed(known.get(&id)) => "done",
-                Some(_) => continue,
-                None if known.get(&id).is_some_and(|k| k.gone) => "done",
-                None => "unknown here",
-            };
-            out.push(format!(
-                "hand-off {id} is {state}, but {} still holds its branch or refs: delete them once its work is merged (`git branch -d borg/handoff/{id}`; `git update-ref -d refs/borg/handoff/{id}/<ref>`)",
-                clone.display()
-            ));
+            match over(&all, &known, &id) {
+                None => {}
+                Some(Over::Done) => {
+                    let Left { gone, kept } = left_in(&clone, &id);
+                    if !gone.is_empty() {
+                        out.push(format!(
+                            "hand-off {id} is done, but {} still holds {} of its refs or merged branches: `borg handoff` deletes them",
+                            clone.display(),
+                            gone.len()
+                        ));
+                    }
+                    out.extend(kept.into_iter().map(|k| format!("hand-off {id} is done: {k}")));
+                }
+                Some(Over::Unknown) => out.push(format!(
+                    "hand-off {id} is unknown here, but {} still holds its branch or refs: delete them once you know it is over (`git branch -D borg/handoff/{id}`; `git update-ref -d refs/borg/handoff/{id}/<ref>`)",
+                    clone.display()
+                )),
+            }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Of what a done hand-off left: the local refs go; a branch goes only once another branch holds
+    /// its commits and no work tree has it checked out; an unmerged one stays with the `git branch -D`
+    /// that drops it, a checked-out one with its work tree.
+    #[test]
+    fn only_what_loses_nothing_goes() {
+        let root = std::env::temp_dir().join(format!("borg-close-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let clone = root.join("app");
+        std::fs::create_dir_all(&clone).unwrap();
+        let id = "h0123456789ab";
+        let base = git::branch_of(id);
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(&clone, &["update-ref", &git::remote_ref(id, "state"), "HEAD"]);
+        // borg/handoff/<id>: a commit nothing else has; -2: merged, but checked out in a work tree.
+        git(&clone, &["switch", "-q", "-c", &base]);
+        git(&clone, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        git(&clone, &["switch", "-q", "main"]);
+        git(&clone, &["branch", &format!("{base}-2")]);
+        let wt = root.join("wt");
+        git(&clone, &["worktree", "add", "-q", &wt.to_string_lossy(), &format!("{base}-2")]);
+
+        let kept = remove_left(&clone, id);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[0].contains(&format!("branch {base} stays")) && kept[0].contains("`git branch -D"), "{kept:?}");
+        assert!(kept[1].contains(&format!("branch {base}-2 stays")) && kept[1].contains(&format!("checked out in {}", wt.display())), "{kept:?}");
+        assert!(git::local_refs(&clone, id).is_empty(), "the local refs go");
+
+        git(&clone, &["worktree", "remove", &wt.to_string_lossy()]);
+        git(&clone, &["merge", "-q", "--ff-only", &base]);
+        assert_eq!(remove_left(&clone, id), Vec::<String>::new());
+        assert!(git::branches_of(&clone, id).is_empty(), "merged and checked out nowhere: both go");
+        assert!(remove_left(&clone, id).is_empty(), "nothing left, nothing kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

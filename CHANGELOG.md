@@ -3,6 +3,18 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.8.3 (unreleased)
+
+A finished hand-off no longer leaves branches and refs behind that `borg doctor` warns about forever.
+
+### Fixed
+
+- The `borg handoff` listing and `borg handoff done` delete what a done hand-off left in this
+  machine's clones if deleting it loses nothing: local hand-off refs, and `borg/handoff/<id>` branches
+  whose commits another branch, remote-tracking branch or tag holds. This also works when `done` ran
+  on another machine. `borg doctor` names only the branches that hold unmerged work or are checked out
+  ([Done](https://github.com/debe/borg_ai/blob/main/docs/handoff.md#done)).
+
 ## 0.8.2 (2026-11-16)
 
 borg web's Messages tab becomes a chat, and a detached turn-end check gets a time limit that fits its
