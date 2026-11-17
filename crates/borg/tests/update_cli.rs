@@ -163,8 +163,8 @@ fn a_release_tarball_replaces_all_three_and_refreshes_only_the_wired_harness() {
         let body = std::fs::read_to_string(inst.join(b)).unwrap();
         assert!(body.contains(&format!("{b}@new")), "{b} was replaced: {body}");
     }
-    // The new borg refreshed the wired harness, then ran doctor; nothing else.
-    assert_eq!(log(&root), "borg@new install claude --apply\nborg@new doctor\n");
+    // The new borg refreshed the wired harness and the services, then ran doctor; nothing else.
+    assert_eq!(log(&root), "borg@new install claude --apply\nborg@new service install\nborg@new doctor\n");
     let left: Vec<_> = std::fs::read_dir(&inst).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(left.len(), 3, "no temporary directory left beside the binaries, an earlier one's neither: {left:?}");
     let _ = std::fs::remove_dir_all(&root);
@@ -200,8 +200,24 @@ fn a_cargo_install_runs_cargo_for_the_three_crates() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     // `borg-ai` last: a borg on the release means the mesh and web beside it are installed too.
     let want: String = ["borg-mesh", "borg-web", "borg-ai"].iter().map(|c| format!("cargo@stub install {c} --locked --force --version {LATEST}\n")).collect();
-    // No harness is wired here: the new borg runs doctor only.
-    assert_eq!(log(&root), format!("{want}borg@old doctor\n"));
+    // No harness is wired here: the new borg refreshes the services and runs doctor.
+    assert_eq!(log(&root), format!("{want}borg@old service install\nborg@old doctor\n"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `borg service remove` turned the services off: an update leaves them off.
+#[test]
+fn an_update_leaves_services_that_are_off_alone() {
+    let root = tmp("services-off");
+    let cargo_bin = root.join("cargo/bin");
+    installed(&cargo_bin);
+    stub(&root.join("bin/cargo"), "cargo", "stub");
+    feed(&root, &format!("v{LATEST}"));
+    std::fs::write(root.join("store/services.json"), r#"{"version": "0.0.1", "off": true}"#).unwrap();
+    let out = borg(&root, &["update"], &cargo_bin.join("borg"), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(text(&out).contains("services: off (borg service remove), left alone"), "{}", text(&out));
+    assert!(log(&root).ends_with("borg-ai --locked --force --version 99.0.0\nborg@old doctor\n"), "{}", log(&root));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -221,7 +237,7 @@ fn an_install_that_stopped_part_way_is_completed() {
     let out = borg(&root, &["update"], &cargo_bin.join("borg"), &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(text(&out).contains("borg-mesh beside it is not"), "{}", text(&out));
-    assert_eq!(log(&root), format!("cargo@stub install borg-mesh --locked --force --version {version}\nborg@old doctor\n"));
+    assert_eq!(log(&root), format!("cargo@stub install borg-mesh --locked --force --version {version}\nborg@old service install\nborg@old doctor\n"));
 
     // All three on the release: current, nothing runs.
     script(&cargo_bin.join("borg-mesh"), &format!("[ \"$1\" = --version ] && echo \"borg-mesh {version}\""));

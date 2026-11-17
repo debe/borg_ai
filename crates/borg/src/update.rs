@@ -16,8 +16,8 @@
 //! it runs `cargo install` for the three crates; elsewhere, on a target scripts/install.sh serves, it
 //! downloads the release tarball beside the binaries, checks its sha256 and renames each binary into
 //! place; anything else (a `target/` build, another OS) gets the commands printed and nothing changed.
-//! Then the new borg refreshes the harnesses already wired (`borg install <h> --apply`) and runs
-//! `borg doctor`.
+//! Then the new borg refreshes the harnesses already wired (`borg install <h> --apply`) and borg's
+//! services (`borg service install`, unless they are off), and runs `borg doctor`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -209,7 +209,8 @@ fn check_into(update: &Path, url: &str, now: i64) -> Checked {
     record.checked
 }
 
-fn write_atomic(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `bytes` to `p` through a temporary file beside it and a rename (its directory made first).
+pub(crate) fn write_atomic(p: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
@@ -448,7 +449,7 @@ fn method(bin: &Path, target: Option<&'static str>) -> Method {
     if dir == canon(&cargo_bin()) {
         return Method::Cargo;
     }
-    if dir.components().any(|c| c.as_os_str() == "target") {
+    if crate::install::under_target(&dir) {
         return Method::Manual(format!("{} is a development build (under target/)", bin.display()));
     }
     match target {
@@ -613,7 +614,8 @@ fn behind(bin: &Path) -> Vec<&'static str> {
 }
 
 /// After an install, as the new borg at `bin`: `borg install <h> --apply` for every harness wired now
-/// (never one that is not), then `borg doctor`; its exit code.
+/// (never one that is not), `borg service install` unless `borg service remove` turned the services off
+/// (service.rs: so a machine with no harness wired gets them too), then `borg doctor`; its exit code.
 fn refresh(bin: &Path) -> i32 {
     let t = crate::install::Targets::from_env();
     for &h in crate::harness::ALL {
@@ -627,31 +629,38 @@ fn refresh(bin: &Path) -> i32 {
             eprintln!("borg update: refreshing {} failed; run borg install {} --apply", h.name(), h.name());
         }
     }
+    if crate::service::off() {
+        println!("\nservices: off (borg service remove), left alone");
+    } else {
+        println!("\nborg service install");
+        let ok = std::process::Command::new(bin).args(["service", "install"]).status().is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("borg update: refreshing the services failed; run borg service install");
+        }
+    }
     println!("\nborg doctor");
     let code = std::process::Command::new(bin).arg("doctor").status().ok().and_then(|s| s.code()).unwrap_or(1);
     println!("\nThe mesh daemon and listen waiters restart on their own.");
-    match running_web() {
-        Some(true) => println!("borg web is running: restart it (borg web) to serve the new version."),
+    match web_outside() {
+        Some(true) => println!("borg web is running outside its service: restart it (borg web) to serve the new version."),
         Some(false) => {}
-        None => println!("If borg web is running, restart it (borg web) to serve the new version."),
+        None => println!("If borg web is running outside its service, restart it (borg web) to serve the new version."),
     }
     code
 }
 
-/// Whether a `borg-web` process runs here (pgrep); none when that cannot be told.
-fn running_web() -> Option<bool> {
-    let s = std::process::Command::new("pgrep")
-        .args(["-x", "borg-web"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    match s.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
+/// Whether a `borg-web` process other than the `borg web` service's runs here (pgrep; the service
+/// install restarted that one); none when that cannot be told.
+fn web_outside() -> Option<bool> {
+    let out =
+        std::process::Command::new("pgrep").args(["-x", "borg-web"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) => return Some(false),
+        _ => return None,
     }
+    let managed = crate::service::web_pid();
+    Some(String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|p| p.parse::<u32>().ok()).any(|p| Some(p) != managed))
 }
 
 // ---------------------------------------------------------------- CLI
@@ -738,8 +747,7 @@ pub fn main(args: &[&str]) -> i32 {
     }
     // Where this borg really lives: a `BORG_BIN` symlink names a build elsewhere (install.rs `bin`), and
     // that build is what gets replaced, or refused when it is a development build.
-    let bin = crate::install::bin();
-    let bin = std::fs::canonicalize(&bin).unwrap_or(bin);
+    let bin = crate::install::real_bin();
     let latest = c.latest.as_deref().unwrap_or("unknown");
     let (version, crates): (&str, Vec<&str>) = if newer(latest, VERSION) {
         println!("borg {latest} is released; this is {VERSION}");

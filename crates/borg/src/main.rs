@@ -349,6 +349,8 @@ fn main() {
         [cmd @ ("install" | "uninstall" | "status" | "doctor"), rest @ ..] => std::process::exit(install::main(cmd, rest)),
         // A newer release, and installing it (update.rs); the prompt hook runs `--check --quiet` daily.
         ["update", rest @ ..] => std::process::exit(borg::update::main(rest)),
+        // The mesh daemons and borg web as services of the machine's manager (service.rs).
+        ["service", rest @ ..] => std::process::exit(borg::service::main(rest)),
         ["version" | "--version" | "-V"] => println!("borg {}", env!("CARGO_PKG_VERSION")),
         [] | ["help" | "-h" | "--help"] => print!("{}", help(atty(std::io::stdout()), false)),
         _ => {

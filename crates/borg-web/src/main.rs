@@ -71,11 +71,21 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    println!("borg web: http://{addr}/  ({} collectives, showing {first}; Ctrl-C stops)", minds.len());
+    println!("borg web: http://{addr}/  ({} collectives, showing {first}; Ctrl-C or SIGTERM stops)", minds.len());
     let (stopping, stop) = tokio::sync::watch::channel(false);
     let app = Arc::new(App { minds, first, cwd: dir, stop });
+    // Ctrl-C, systemd's SIGINT, or launchd's SIGTERM (borg's services, service.rs): a graceful stop.
     let stop = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        let term = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => drop(s.recv().await),
+                Err(_) => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = term => {}
+        }
         let _ = stopping.send(true);
     };
     if let Err(e) = axum::serve(listener, router(app)).with_graceful_shutdown(stop).await {

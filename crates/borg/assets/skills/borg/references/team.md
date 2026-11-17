@@ -47,30 +47,21 @@ Inside a repo that routes to the team collective (check with `borg collective .`
 
 ```sh
 borg mesh init                      # you become the collective's admin
-borg mesh serve                     # keep it running: syncs every 60 s and on local change
+borg mesh serve                     # syncs every 60 s and on local change; normally a service (below)
 ```
 
 `borg setup --team NAME --paths DIR... [--relay URL|disabled]` does this in one pass: it writes the
 team entry (asking for off paths), runs `borg mesh init` and offers a first invite (with
 `--relay disabled`, an invite needs `borg mesh serve` running first, so it says that instead).
 
-Keep `serve` running as a service. A systemd user unit, for example
-`~/.config/systemd/user/borg-mesh-acme.service`:
-
-```ini
-[Unit]
-Description=borg mesh for the acme collective
-
-[Service]
-ExecStart=%h/.cargo/bin/borg mesh serve --collective acme
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-then `systemctl --user enable --now borg-mesh-acme`. On macOS use a launchd agent with the same
-command. Show the engineer the unit before enabling it.
+Keep `serve` running as a service: `borg setup` installs one at its end, and
+`borg install <h> --apply` and `borg update` keep it up to date (a systemd user unit
+`borg-mesh-<collective>.service` on Linux, a launchd agent `borg.mesh.<collective>.plist` on macOS,
+beside one for `borg web`). After a `borg mesh init` or `borg mesh join` outside setup, run
+`borg service install`. `borg service` shows their state; `borg service remove` stops them and keeps
+them off (ask the engineer first). A unit of the same name the engineer wrote is taken over and kept as
+`.bak`. Without a user service manager (WSL, a container) borg says so: then `borg mesh serve` runs by
+hand.
 
 ## Admin, per new member
 
@@ -98,7 +89,8 @@ borg mesh join BORG1... --paths ~/work --apply    # writes it (with a backup), d
 directories for the team collective; without it the join writes the placeholder path
 `~/CHANGE-ME/repos-of-<name>`, which routes no repo: replace it (show the diff first), or join again
 with `--paths`. Then check with `borg collective <repo>`: it must name the team collective with `may sync: true`.
-Then keep `borg mesh serve --collective <name>` running, as a service like the admin's.
+Then the mesh daemon runs as a service like the admin's (`borg service install` if the join ran
+outside setup).
 
 ## Other commands
 
@@ -114,5 +106,5 @@ Then keep `borg mesh serve --collective <name>` running, as a service like the a
 | `no relay connection yet` at `serve` start | The machine cannot reach the relay (offline, firewall, wrong URL). LAN peers still sync. Behind a re-signing proxy, its CA must be in the system trust store |
 | `no direct address ... relays are disabled` | With `"relay": "disabled"`, give peers as `<key>@<ip:port>` (`borg mesh peer <key>@<ip:port>`) |
 | `collective "x" is not in collectives.json` | Run `join` with `--apply`, or add the entry by hand |
-| Nothing syncs after joining | The placeholder path is still there, or `serve` is not running; `borg collective <repo>` must say `may sync: true` |
+| Nothing syncs after joining | The placeholder path is still there, or `serve` is not running (`borg service` says; `borg service install`); `borg collective <repo>` must say `may sync: true` |
 | A revoked member cannot rejoin with an old ticket | By design: the admin re-invites the key (`borg mesh invite <key>`) |

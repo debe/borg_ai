@@ -193,7 +193,7 @@ flowchart LR
   TA <-->|"borg mesh serve: signed lines, peer to peer, encrypted"| TB
 ```
 
-Each machine runs `borg mesh serve`. Peers find each other by key over iroh, through NAT or a relay, and
+Each machine runs `borg mesh serve`, a service once `borg setup` is done ([Services](#upgrade-and-uninstall)). Peers find each other by key over iroh, through NAT or a relay, and
 reconcile append-only files by hash. Hooks only read and write local files, so nothing waits on the mesh.
 What syncs and what stays is under [Privacy](#privacy). `borg top` is a live screen of the team's drones, like Unix `top`;
 `borg pause` and `borg resume` hold or release any of them ([Talking to other sessions](#talking-to-other-sessions)). Set up: `borg setup --team <name>` or `--join <ticket>`, or
@@ -456,8 +456,9 @@ Full table, the regret check and every known limit: [Evidence and limits](https:
 ## Upgrade and uninstall
 
 ```sh
-borg update            # install the latest release, refresh the wiring, run borg doctor
+borg update            # install the latest release, refresh the wiring and services, run borg doctor
 borg update --check    # only ask: exit 10 when a newer release exists, and who on the team runs what
+borg service           # borg's background services: status (also install, restart, remove)
 ```
 
 `borg update` installs the way borg was installed: under `~/.cargo/bin` (`$CARGO_HOME/bin`) it runs
@@ -468,11 +469,28 @@ last, so an install that stopped part way leaves the old `borg`, and the next `b
 again; on the current release it also reinstalls a `borg-mesh` or `borg-web` beside `borg` that
 reports another version. A build under `target/` or a platform without release binaries gets the
 commands printed instead, and nothing changes. Then the new borg refreshes every harness that is wired now
-(`borg install <h> --apply`: adapter, skill and hooks; it never wires a new one) and runs
-`borg doctor`. The mesh daemon and `borg listen` waiters restart on their own; restart a running
-`borg web`, which `borg update` names. Before 0.7 there is no `borg update`: run `install.sh` again or
+(`borg install <h> --apply`: adapter, skill and hooks; it never wires a new one) and borg's services
+(`borg service install`), and runs `borg doctor`. The services restart on the new version; the
+`borg listen` waiters restart on their own, and so does a mesh daemon started by hand. A `borg web`
+started by hand keeps the old version until you restart it, which `borg update` names. Before 0.7 there
+is no `borg update`: run `install.sh` again or
 `cargo install borg-mesh borg-web borg-ai --locked --force`, then `borg install all --apply` and
 `borg doctor`.
+
+**Services.** Borg runs its long-lived processes as services of your user: a mesh daemon per team
+collective that has a mesh identity, and `borg web`. On Linux they are systemd user units
+(`~/.config/systemd/user/borg-mesh-<collective>.service`, `borg-web.service`), on macOS launchd agents
+(`~/Library/LaunchAgents/borg.mesh.<collective>.plist`, `borg.web.plist`, logging to
+`~/Library/Logs/borg/`). `borg setup` installs them at its end, and every `borg install <h> --apply`
+and `borg update` brings them up to date: written, enabled, running, and restarted when their file
+changed or another borg started them. A unit of the same name that borg did not write is taken over and
+kept as `<file>.bak`. Each file says it is borg's and is rewritten, so edits are lost; units of a
+collective that is gone are removed. `borg service` shows their state, `borg service restart` restarts
+them, and `borg service remove` stops and removes them and keeps them off: later updates leave them
+alone until `borg service install`. Without a systemd user session (WSL, containers) or for a build under
+`target/`, nothing is installed and borg says why; run `borg mesh serve` and `borg web` yourself then.
+On Linux the services stop when you log out unless `loginctl enable-linger` is on (`borg doctor` says
+so).
 
 **You hear of an update without asking.** Once a day the prompt hook starts `borg update --check` in
 the background; it never waits for the network. When a newer release exists, the drone hears it once
@@ -499,6 +517,7 @@ and absorbs; nothing syncs with an older one, and `borg doctor` names that membe
 to upgrade.
 
 ```sh
+borg service remove           # stops and removes borg's services, and keeps them off
 borg uninstall all --apply    # removes only what install added; keeps a backup
 cargo uninstall borg-ai borg-mesh borg-web    # or delete them from ~/.local/bin after install.sh
 ```

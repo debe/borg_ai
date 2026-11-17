@@ -56,6 +56,7 @@ pub mod review_fix;
 #[doc(hidden)]
 pub mod runner;
 pub mod select;
+pub mod service;
 pub mod stats;
 pub mod steer;
 pub mod sweep;

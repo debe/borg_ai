@@ -323,6 +323,18 @@ pub enum Level {
     Fail,
 }
 
+impl Level {
+    /// The tag `borg doctor` prints before a finding.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Level::Ok => "ok  ",
+            Level::Warn => "WARN",
+            Level::Fail => "FAIL",
+        }
+    }
+}
+
 /// Guard: the stop's budget assumed where a harness names none: 60 s, Claude Code's default command-hook
 /// timeout before it became 600 s (claude.rs), so a hook installed with no `timeout` on an older Claude
 /// Code is never cut off. A safe floor, not a measured limit: `borg install` gives the Stop hook
