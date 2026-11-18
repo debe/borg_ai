@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.9.0 (unreleased)
+## 0.9.0 (2026-11-18)
 
 Engineers, drones and machines get readable names, and borg runs the mesh daemons and borg web as
 services of your user that every update restarts.
