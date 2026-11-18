@@ -449,7 +449,7 @@ fn method(bin: &Path, target: Option<&'static str>) -> Method {
     if dir == canon(&cargo_bin()) {
         return Method::Cargo;
     }
-    if crate::install::under_target(&dir) {
+    if under_target(&dir) {
         return Method::Manual(format!("{} is a development build (under target/)", bin.display()));
     }
     match target {
@@ -647,6 +647,19 @@ fn refresh(bin: &Path) -> i32 {
     code
 }
 
+/// Where `install::bin` really lives: a `BORG_BIN` symlink resolved to the build it names (what an
+/// update replaces, and what a service runs).
+pub(crate) fn real_bin() -> PathBuf {
+    let b = crate::install::bin();
+    std::fs::canonicalize(&b).unwrap_or(b)
+}
+
+/// Whether `dir` lies under a `target/` directory: a development build, which no update replaces and
+/// no service runs.
+pub(crate) fn under_target(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == "target")
+}
+
 /// What to do about a `borg web` started by hand (`outside`: their pids, none when that cannot be
 /// told), given whether a `borg web` service is installed (`unit`). With one, the hand-started process
 /// holds the port the service needs, so it is stopped, never restarted; without, it is restarted.
@@ -776,7 +789,7 @@ pub fn main(args: &[&str]) -> i32 {
     }
     // Where this borg really lives: a `BORG_BIN` symlink names a build elsewhere (install.rs `bin`), and
     // that build is what gets replaced, or refused when it is a development build.
-    let bin = crate::install::real_bin();
+    let bin = real_bin();
     let latest = c.latest.as_deref().unwrap_or("unknown");
     let (version, crates): (&str, Vec<&str>) = if newer(latest, VERSION) {
         println!("borg {latest} is released; this is {VERSION}");

@@ -500,14 +500,14 @@ impl<'a> Host<'a> {
         let uid = unsafe { libc::getuid() };
         let base = collective::root_of(&crate::learn::home());
         let session = backend == Backend::Launchd || var("XDG_RUNTIME_DIR").is_some() || var("DBUS_SESSION_BUS_ADDRESS").is_some();
-        Ok(Host { backend, dir, base, bin: crate::install::real_bin(), path: var("PATH").unwrap_or_default(), env: locating(), uid, session, run, home })
+        Ok(Host { backend, dir, base, bin: crate::update::real_bin(), path: var("PATH").unwrap_or_default(), env: locating(), uid, session, run, home })
     }
 
     /// Why this borg installs no services: a development build.
     fn dev(&self) -> Option<String> {
         self.bin
             .parent()
-            .is_some_and(crate::install::under_target)
+            .is_some_and(crate::update::under_target)
             .then(|| format!("{} is a development build (under target/); an installed borg sets them up", self.bin.display()))
     }
 
@@ -995,6 +995,8 @@ fn checks_on(h: &Host, wanted: Result<Vec<Service>, String>) -> Vec<(Level, Stri
     // An invalid config is a FAIL of its own (install.rs `collective_checks`); nothing to compare.
     let Ok(wanted) = wanted else { return Vec::new() };
     let units = units(h, &wanted);
+    // The borg the running units were last (re)started with: another one, and install restarts them.
+    let ran = Record::read(&h.base).version.filter(|v| v != VERSION);
     // Only borg's own units are asked about: none installed, nothing to ask.
     let names: Vec<&str> = units.iter().filter(|u| u.now.as_deref().is_some_and(owned)).map(|u| u.name.as_str()).collect();
     let states = h.states(&names);
@@ -1006,7 +1008,10 @@ fn checks_on(h: &Host, wanted: Result<Vec<Service>, String>) -> Vec<(Level, Stri
             Some(t) if !owned(t) => (Level::Warn, format!("service {n}: {p} was not written by borg (borg service install takes it over, keeping a .bak)")),
             Some(_) if u.changed() => (Level::Warn, format!("service {n}: {p} is another borg's or was edited (borg service install)")),
             Some(_) => match states.get(n.as_str()) {
-                Some(s) if s.running => (Level::Ok, format!("service {n}: {} runs", u.service.what())),
+                Some(s) if s.running => match &ran {
+                    None => (Level::Ok, format!("service {n}: {} runs", u.service.what())),
+                    Some(v) => (Level::Warn, format!("service {n}: {} runs borg {v}, not this borg {VERSION} (borg service restart)", u.service.what())),
+                },
                 Some(s) if s.looping => (
                     Level::Warn,
                     format!(
@@ -1543,6 +1548,11 @@ mod tests {
         let mut rec = Record::default();
         install(&h, &corp(), &mut rec);
         assert!(warns(&checks_on(&h, Ok(corp()))).is_empty());
+        // Units another borg (re)started still run that one (borg installed without `borg update`).
+        Record { version: Some("0.0.1".into()), off: false }.save(&h.base).unwrap();
+        let w = warns(&checks_on(&h, Ok(corp())));
+        assert!(w.len() == 2 && w.iter().all(|m| m.contains("runs borg 0.0.1, not this borg") && m.contains("borg service restart")), "{w:?}");
+        rec.save(&h.base).unwrap();
         std::fs::write(h.dir.join("borg-web.service"), std::fs::read_to_string(h.dir.join("borg-web.service")).unwrap() + "# edited\n").unwrap();
         let w = warns(&checks_on(&h, Ok(corp())));
         assert!(matches!(w.as_slice(), [m] if m.contains("edited")), "{w:?}");

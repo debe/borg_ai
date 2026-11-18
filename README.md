@@ -482,7 +482,7 @@ is no `borg update`: run `install.sh` again or
 `borg doctor`.
 
 **Services.** Borg runs its long-lived processes as services of your user: a mesh daemon per team
-collective that has a mesh identity (each on a port of its own, so all of them run at once), and
+collective this machine is a member of (each on a port of its own, so all of them run at once), and
 `borg web`. On Linux they are systemd user units
 (`~/.config/systemd/user/borg-mesh-<collective>.service`, `borg-web.service`), on macOS launchd agents
 (`~/Library/LaunchAgents/borg.mesh.<collective>.plist`, `borg.web.plist`, logging to

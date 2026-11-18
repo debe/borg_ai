@@ -684,19 +684,6 @@ pub(crate) fn bin() -> PathBuf {
     }
 }
 
-/// Where `bin` really lives: a `BORG_BIN` symlink resolved to the build it names (what an update
-/// replaces, and what a service runs).
-pub(crate) fn real_bin() -> PathBuf {
-    let b = bin();
-    std::fs::canonicalize(&b).unwrap_or(b)
-}
-
-/// Whether `dir` lies under a `target/` directory: a development build, which no update replaces and
-/// no service runs.
-pub(crate) fn under_target(dir: &Path) -> bool {
-    dir.components().any(|c| c.as_os_str() == "target")
-}
-
 /// Variables `--home` removes, so every path borg resolves falls under the given HOME: the store
 /// (`$BORG_HOME`, default `HOME/.local/share/borg`), the collectives config (`$BORG_CONFIG`, default
 /// `HOME/.config/borg/collectives.json`) and the vector model (`$BORG_VECTOR_MODEL`, default under

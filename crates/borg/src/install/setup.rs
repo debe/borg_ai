@@ -306,7 +306,7 @@ fn show(p: &Plan, t: &Targets) -> bool {
 }
 
 /// Whether `borg service install` would change anything, from `borg doctor`'s service lines
-/// (service.rs `checks`): each WARN is a unit it writes, takes over, removes or starts, or a manager it
+/// (service.rs `checks`): each WARN is a unit it writes, takes over, removes, starts or restarts, or a manager it
 /// cannot reach, which it then names. All ok: the services run as borg writes them, or none can run
 /// here (a development build, no manager borg knows).
 fn services_pending(checks: &[(Level, String)]) -> bool {

@@ -25,8 +25,17 @@ pub const CHARS: usize = 64;
 /// `s` as a label may show it: no bidi characters (a peer's value cannot reorder the text around it),
 /// control characters as spaces, whitespace collapsed, at most `CHARS` characters.
 pub fn clean(s: &str) -> String {
-    let kept: String = s.chars().filter(|c| !bidi(*c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let kept: String = s.chars().filter(|c| !bidi(*c) && !invisible(*c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
     kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(CHARS).collect::<String>().trim_end().to_string()
+}
+
+/// Characters that draw nothing (zero-width spaces and joiners, word joiner, soft hyphen, BOM, Hangul
+/// fillers, invisible operators): a peer's "here\u{200B}" would otherwise read as "here".
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{180E}' | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}' | '\u{3164}' | '\u{FEFF}' | '\u{FFA0}'
+    )
 }
 
 /// The Unicode bidi controls (marks, embeddings, overrides, isolates).
@@ -322,10 +331,10 @@ mod tests {
     /// key never stands alone: its key's start goes beside it.
     #[test]
     fn a_host_that_reads_as_this_machine_or_another_key_keeps_its_key() {
-        for host in ["here", "This One", "k2bbbbbbbbbb"] {
+        for (host, shown) in [("here", "here"), ("This One", "This One"), ("k2bbbbbbbbbb", "k2bbbbbbbbbb"), ("he\u{200B}re\u{FEFF}", "here")] {
             let rs = [remote("k1aaaaaaaaaaaaaa", "a@x", Some(machine(host, &[]))), remote("k2bbbbbbbbbbbbbb", "b@x", None)];
             let book = Book::from_parts(BTreeMap::new(), &rs);
-            assert_eq!(book.host("k1aaaaaaaaaaaaaa"), format!("{host} k1aaaaaaaaaa"), "{host}");
+            assert_eq!(book.host("k1aaaaaaaaaaaaaa"), format!("{shown} k1aaaaaaaaaa"), "{host:?}");
         }
         let rs = [remote("k1aaaaaaaaaaaaaa", "a@x", Some(machine("Box", &[]))), remote("k2bbbbbbbbbbbbbb", "b@x", Some(machine("box", &[])))];
         assert_eq!(Book::from_parts(BTreeMap::new(), &rs).host("k1aaaaaaaaaaaaaa"), "Box k1aaaaaaaaaa", "twins in any case");
@@ -347,10 +356,11 @@ mod tests {
         assert!(cells.iter().all(|c| c.chars().count() <= 14));
     }
 
-    /// A peer's name or host cannot carry control or bidi characters, nor run long.
+    /// A peer's name or host cannot carry control, bidi or invisible characters, nor run long.
     #[test]
     fn peer_values_are_cleaned() {
         assert_eq!(clean("Ann\u{202E}moc.evil\n\tExample\u{7}"), "Annmoc.evil Example");
+        assert_eq!(clean("\u{00AD}B\u{200D}o\u{2060}b\u{3164}"), "Bob", "nothing that draws nothing");
         assert_eq!(clean(&"x".repeat(200)).chars().count(), CHARS);
         let rs = [remote("k1aaaaaaaaaaaaaa", "bob@example.com", Some(machine("bad\u{2066}host\r\n", &[("bob@example.com", "\u{202D}Bob")])))];
         let book = Book::from_parts(BTreeMap::new(), &rs);

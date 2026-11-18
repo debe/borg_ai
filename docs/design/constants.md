@@ -414,6 +414,7 @@ later value would be compared against.
 | `borg/src/top_live.rs` | `LABEL` | 34 chars | The same label in the live screen's table, two narrower for its columns |
 | `borg/src/top.rs` | `HOST_CHARS` | 14 chars | The machine a drone runs on, in both drone tables (top.rs and top_live.rs): a short hostname whole, a long one cut |
 | `borg/src/names.rs` | `CHARS` | 64 chars | The most a name or a host keeps (`clean`), here and from peers. Also a guard: a peer's name or hostname cannot flood a label |
+| `borg/src/names.rs` | `CELL_KEY` | 6 chars | The key characters a table cell keeps beside a twin or reserved-looking host (`Book::host_cell`); the rest of the screen and the web show 12 |
 | `borg/src/top.rs` | `QUANTILES` | 0.50, 0.95 | The stop latency quantiles the selection line and the page show, the median and the tail a stop budget must hold |
 | `borg/src/msg.rs` | `NODE_CHARS`, `SESSION_CHARS` | 12, 8 chars | A node key in every label of a node (`short_node`: a delivered line, steer.rs, presence.rs, top.rs, borg-mesh main.rs), and the session id of a sender that gave no name (`sender_label`) |
 | `borg/src/clock.rs` | `ago` | `45s`, `12m`, `3h05m`, `2d` | A relative time in at most 6 characters (msg.rs, top.rs, top_live.rs); borg-web's ui has its own copy |

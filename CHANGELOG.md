@@ -3,6 +3,34 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.9.0 (unreleased)
+
+Engineers, drones and machines get readable names, and borg runs the mesh daemons and borg web as
+services of your user that every update restarts.
+
+### Changed
+
+- An engineer is named by the `engineers` alias, else their git `user.name`, else the whole email,
+  never the part before the "@". Members tell each other the names with their signed machine record.
+- A drone is "Name · repo · harness" (`#2` for a second with the same label) instead of "Two of
+  Five", and runs "on <hostname>" instead of "@<key>". `borg top` and `borg msg` take the label
+  as well as the number ([Drones](https://github.com/debe/borg_ai/blob/main/docs/commands.md)).
+- Each team collective's mesh daemon serves on a port of its own (its last one, else 7878, else a free
+  one), so several run on one machine.
+
+### Added
+
+- `borg service [status|install|restart|remove]`: a mesh daemon per team collective and `borg web`
+  as systemd user units (Linux) or launchd agents (macOS). `borg setup`, `borg install <h> --apply`
+  and `borg update` install them and restart them on a new version; `borg doctor` reports them.
+
+### Upgrading
+
+- The update from 0.8.x installs the services and restarts them. Same-named units borg did not write
+  (a hand-written `borg-mesh-<c>.service` or `borg-web.service`) are taken over; the old file is kept
+  as `<file>.bak`. Stop a `borg web` or `borg mesh serve` you started by hand.
+- `borg service remove` removes the services and keeps them off through later updates.
+
 ## 0.8.3 (2026-11-17)
 
 A finished hand-off no longer leaves branches and refs behind that `borg doctor` warns about forever.
