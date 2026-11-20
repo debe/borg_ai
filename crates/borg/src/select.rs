@@ -13,8 +13,22 @@
 //! session already had delivered (`Ctx::had`) may still be asked but never takes a free slot, which its
 //! delivery would drop as given before. It also draws up to `PLACEBO_SLOTS` of the applies it delivers
 //! neither way for the placebo arm (`draw_placebo`): judged blindly where a free delivery would be, never
-//! shown, so what not delivering is worth gets labels at no cost to quality. Those are the labels the
-//! learned policy cannot get from the fixed rule's history, which asks and hands over by grade alone.
+//! shown, so what not delivering is worth gets labels at no cost to quality. Such applies exist only
+//! past `conscience::CAP`, so the fixed rule alone almost never draws one.
+//!
+//! **Placebos.** A placebo is an apply judged blindly where a free delivery would be, never shown. The
+//! learned policy's are of two kinds, both listed in `Routed::placebo`, the withheld ones first:
+//! - **withheld** (select/policy.rs `choose`, withholding): an apply its decision would deliver, withheld
+//!   with ψ_j, the posterior chance that delivering it is worth ≤ 0, under the conservative gate, or one
+//!   the fixed rule delivers that its decision leaves undelivered; its chance is `Routed::pw`. It stays
+//!   eligible for later checks (not now). Never a stop's 3, a lesson the session had, or under the
+//!   fixed rule's fallbacks, a reverted store or α 0;
+//! - **drawn** (`draw_placebo`): up to `PLACEBO_SLOTS` among the applies left for later, as the fixed rule
+//!   draws them, never a withheld one, each with the chance `Log::psi`.
+//!
+//! A placebo's chance is then pw + (1 − p − pf − pw)·psi (select/summary.rs `placebo_p`). These are the
+//! labels the learned policy cannot get from the fixed rule's history, which asks and hands over by
+//! grade alone: what a lesson changes when it is not delivered.
 //!
 //! **The learned policy** (select/policy.rs `choose`, policy v2) leaves the fixed rule only on evidence
 //! from a fitted value model, and on live checks (live mode, removed in 0.7.6: the test runs no more)
@@ -22,9 +36,9 @@
 //! over (nothing withheld), both under a
 //! conservative gate rationed by the collective's tolerance (`alpha`); cold start (no fit, or a gate
 //! that may risk nothing yet) is exactly the fixed rule, and so is a store the monitor reverted
-//! (select/summary.rs `REVERTED`). It draws its placebos
-//! among the applies it leaves for later, as the fixed rule does. The evaluation switches decide
-//! exactly as the hook did before this module (0.5.0's attention.rs `graded`) and draw no placebo.
+//! (select/summary.rs `REVERTED`). It withholds placebos from what it would deliver and draws more
+//! among the applies it leaves for later (Placebos above). The evaluation switches decide exactly as
+//! the hook did before this module (0.5.0's attention.rs `graded`) and draw no placebo.
 //!
 //! **What it reads.** Only `Ctx`: the summary the hook loaded once (select/summary.rs `load`, beside
 //! the lessons file), and for the `Attention` sub-policy the outcomes beside the lessons file
@@ -181,6 +195,9 @@ pub struct Ctx<'a> {
     /// replay decides under the α the hook had (`alpha_of` the record's), not whatever the config says
     /// for the replayed path now (a store copy maps to no collective).
     pub alpha: f64,
+    /// Whether the learned policy may withhold (select/policy.rs `choose_with`): always in the hook; a
+    /// replay of a record from before withholding (0.10.0) decides without, as its hook did.
+    pub withhold: bool,
 }
 
 /// The pool tokens of a check whose model call was shown `shown` (hook.rs `Call::order`): whole.rs
@@ -255,6 +272,16 @@ pub struct Log {
     /// Each placebo candidate's chance of the draw (`draw_placebo`, outcome.rs `psi`); 0 without a candidate
     /// and under the evaluation switches, which draw none.
     pub psi: f64,
+    /// The learned policy's withholding on the routing it played (select/policy.rs `Decision::psi_w`,
+    /// `dropped`, `refused`, `fallback`): per apply its ψ as offered to the withhold draw (None for an
+    /// apply that was no candidate), the candidates with ψ > 0 the worst-case fallback dropped, whether
+    /// the gate refused the subset the draw took, and whether the routing took the fallback
+    /// (select/policy.rs `WITHHOLD_EXACT_MAX`). Replayed, not logged: `borg debug select` P3 reports
+    /// them. Empty, 0 and false under every other policy.
+    pub psi_w: Vec<Option<f64>>,
+    pub dropped: u32,
+    pub refused: bool,
+    pub fallback: bool,
 }
 
 impl Log {
@@ -268,8 +295,10 @@ impl Log {
 }
 
 /// A graded check's decision: what to ask (in the order to ask it), to hand over free (in the order
-/// to deliver it), and to judge as placebo; per apply (aligned with the applies) its probability of
-/// being asked (`p`) and of being handed over free (`pf`) under the policy in force; and what to log.
+/// to deliver it), and to judge as placebo (the withheld ones first, then the draw's: module doc,
+/// Placebos); per apply (aligned with the applies) its probability of being asked (`p`), of being
+/// handed over free (`pf`) and of being withheld as a judged placebo (`pw`, outcome.rs `pw`; 0 under
+/// every policy but the learned one) under the policy in force; and what to log.
 #[derive(Debug, Clone)]
 pub struct Routed<'a> {
     pub ask: Vec<&'a Challenge>,
@@ -277,10 +306,22 @@ pub struct Routed<'a> {
     pub placebo: Vec<&'a Challenge>,
     pub p: Vec<f64>,
     pub pf: Vec<f64>,
+    pub pw: Vec<f64>,
     pub log: Log,
 }
 
 impl Routed<'_> {
+    /// Whether withholding had a candidate at this check (rules v3: "a check with a candidate"): an
+    /// apply offered to the withhold draw on the routing played (`Log::psi_w`, one at ψ 0 or that the
+    /// worst-case fallback dropped included), or one with a chance of being withheld above 0 (`pw`).
+    /// Protocol: the graded record logs `pw` exactly then, zeros included (outcome.rs `pw`), so the
+    /// withholding readout (select/replay.rs `held`) counts the checks P3's what-if counts (`Withheld`),
+    /// the ones where the gate starved withholding among them.
+    #[must_use]
+    pub fn could_withhold(&self) -> bool {
+        self.log.psi_w.iter().any(Option::is_some) || self.pw.iter().any(|x| *x > 0.0)
+    }
+
     /// The route of lesson `id`: `Not` for a lesson the check neither asks, hands over nor judges.
     #[must_use]
     pub fn route(&self, id: &str) -> Route {
@@ -304,17 +345,18 @@ impl Routed<'_> {
 /// outcomes beside `ctx.lessons`, with the explore mixture's propensities, and by the fixed rule
 /// otherwise; `Learned` on every check by select/policy.rs `choose` (the fixed rule at cold start or
 /// while the store is reverted), with its exact propensities (`learned`). `Fixed`
-/// and `Learned` draw placebos among the applies they deliver neither way (`draw_placebo`); the asked
-/// and free lists never depend on that draw, so the fixed rule's decision is the same with or without
-/// it (P0).
+/// and `Learned` draw placebos among the applies they deliver neither way (`draw_placebo`), `Learned`
+/// after the placebos its decision withheld (module doc: Placebos); the asked and free lists never
+/// depend on the placebo draw, so the fixed rule's decision is the same with or without it (P0).
 #[must_use]
 pub fn graded_under<'a>(policy: Policy, applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
     let three = applied.iter().any(|(_, g)| *g == 3);
     let fixed = |source: &'static str, placebos: bool, (ask, free): (Vec<&'a Challenge>, Vec<&'a Challenge>)| {
-        let (placebo, psi) = if placebos { draw_placebo(applied, &ask, &free, ctx) } else { (Vec::new(), 0.0) };
+        let (placebo, psi) = if placebos { draw_placebo(applied, &ask, &free, &[], ctx) } else { (Vec::new(), 0.0) };
         Routed {
             p: attention::fixed_p(applied, &ask),
             pf: attention::fixed_p(applied, &free),
+            pw: vec![0.0; applied.len()],
             ask,
             free,
             placebo,
@@ -336,14 +378,17 @@ pub fn graded_under<'a>(policy: Policy, applied: &[(&'a Challenge, u8)], ctx: &C
 /// blindly (`Routed::placebo`). Guard: bounds the judge's extra work per check.
 pub const PLACEBO_SLOTS: usize = 2;
 
-/// The placebo draw of a check that asks `ask` and hands over `free` (`Fixed`, `Learned`): its
-/// candidates are the applies whose lesson it delivers neither way, in no copy, and the session never
-/// had (`Ctx::had`: a placebo measures not delivering, and the delivery drops a placebo of a lesson
-/// given before, hook.rs `queued`), each lesson once; up to `PLACEBO_SLOTS` of them drawn uniformly on
-/// the placebo's own stream of the check's seed, in the applies' order. With each candidate's chance
-/// of the draw, min(1, `PLACEBO_SLOTS` / their number), 0 without one.
-fn draw_placebo<'a>(applied: &[(&'a Challenge, u8)], ask: &[&Challenge], free: &[&Challenge], ctx: &Ctx) -> (Vec<&'a Challenge>, f64) {
-    let delivered = |id: &str| ask.iter().chain(free).any(|c| c.id == id);
+/// The placebo draw of a check that asks `ask`, hands over `free` and withheld `withheld` as judged
+/// placebos (`Fixed`, `Learned`; module doc: Placebos): its candidates are the applies whose lesson it
+/// delivers neither way and did not withhold, in no copy, and the session never had (`Ctx::had`: a
+/// placebo measures not delivering, and the delivery drops a placebo of a lesson given before, hook.rs
+/// `queued`), each lesson once; up to `PLACEBO_SLOTS` of them drawn uniformly on the placebo's own
+/// stream of the check's seed, in the applies' order. With each candidate's chance of the draw,
+/// min(1, `PLACEBO_SLOTS` / their number), 0 without one. The candidates are the applies every routing
+/// of the check leaves for later (a withheld apply is one a routing delivers), so that chance does not
+/// depend on the withhold draw (select/summary.rs `placebo_p`).
+fn draw_placebo<'a>(applied: &[(&'a Challenge, u8)], ask: &[&Challenge], free: &[&Challenge], withheld: &[&Challenge], ctx: &Ctx) -> (Vec<&'a Challenge>, f64) {
+    let delivered = |id: &str| ask.iter().chain(free).chain(withheld).any(|c| c.id == id);
     let mut later: Vec<usize> = Vec::new();
     for (j, (c, _)) in applied.iter().enumerate() {
         if !delivered(&c.id) && !ctx.had.contains(&c.id) && !later.iter().any(|&i| applied[i].0.id == c.id) {
@@ -369,9 +414,11 @@ pub const REVERTED_SOURCE: &str = "reverted";
 
 /// `Learned`: select/policy.rs `choose` on the summary's fit and gate at the check's pool tokens under
 /// the collective's tolerance in force (`Ctx::alpha`), never handing over free a lesson the session had (`Ctx::had`;
-/// the fixed rule while the store is reverted), then the placebo draw among the applies it delivers
-/// neither way (`draw_placebo`). The randomised question-count test's k and s go to the log (`Log::xk`,
-/// `xs`), which the graded record carries.
+/// the fixed rule while the store is reverted, withholding nothing). Its placebos are the applies it
+/// withheld (`Route::Placebo`, in the applies' order), then the placebo draw among the applies it
+/// delivers neither way and did not withhold (`draw_placebo`). The randomised question-count test's k
+/// and s go to the log (`Log::xk`, `xs`), which the graded record carries, and so does each apply's
+/// chance of being withheld (`Routed::pw`).
 fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
     let us = units(applied);
     let s = ctx.summary;
@@ -380,18 +427,35 @@ fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
         true => {
             let base = policy::fixed_routes(&us, ctx.had);
             let p = |r: Route| base.iter().map(|x| f64::from(u8::from(*x == r))).collect();
-            policy::Decision { p: p(Route::Ask), pf: p(Route::Free), routes: base, source: REVERTED_SOURCE, gate: 0.0, risk: 0.0, xk: None, xs: None }
+            policy::Decision {
+                p: p(Route::Ask),
+                pf: p(Route::Free),
+                pw: vec![0.0; base.len()],
+                psi_w: vec![None; base.len()],
+                routes: base,
+                source: REVERTED_SOURCE,
+                gate: 0.0,
+                risk: 0.0,
+                xk: None,
+                xs: None,
+                dropped: 0,
+                refused: false,
+                fallback: false,
+            }
         }
-        false => policy::choose(&us, &check, &s.fit, &s.gate, ctx.alpha, seed(ctx), ctx.had),
+        false => policy::choose_with(&us, &check, &s.fit, &s.gate, ctx.alpha, seed(ctx), ctx.had, ctx.withhold),
     };
     let (ask, free) = ordered(applied, &d.routes);
-    let (placebo, psi) = draw_placebo(applied, &ask, &free, ctx);
+    let mut placebo: Vec<&Challenge> = applied.iter().zip(&d.routes).filter(|(_, r)| **r == Route::Placebo).map(|((c, _), _)| *c).collect();
+    let (drawn, psi) = draw_placebo(applied, &ask, &free, &placebo, ctx);
+    placebo.extend(drawn);
     Routed {
         ask,
         free,
         placebo,
         p: d.p,
         pf: d.pf,
+        pw: d.pw,
         log: Log {
             policy: Policy::Learned.name(),
             source: d.source,
@@ -404,6 +468,10 @@ fn learned<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
             alpha: None,
             attention: None,
             psi,
+            psi_w: d.psi_w,
+            dropped: d.dropped,
+            refused: d.refused,
+            fallback: d.fallback,
         },
     }
 }
@@ -431,7 +499,7 @@ fn by_cut<'a>(applied: &[(&'a Challenge, u8)], ctx: &Ctx) -> Routed<'a> {
         attention: Some(attention::line(&cut, applied.len())),
         ..Log::default()
     };
-    Routed { ask, free, placebo: Vec::new(), p, pf, log }
+    Routed { ask, free, placebo: Vec::new(), pw: vec![0.0; applied.len()], p, pf, log }
 }
 
 /// The learned cut's chance that rank r of `n` applies goes free under the base cut `k`: with
@@ -579,7 +647,7 @@ mod tests {
     }
 
     fn ctx<'a>(lessons: &'a Path, s: &'a summary::Summary) -> Ctx<'a> {
-        Ctx { session: "s", check: "0123456789ab", channel: "stop", lessons, summary: s, tokens: 0, had: &[], alpha: policy::ALPHA }
+        Ctx { session: "s", check: "0123456789ab", channel: "stop", lessons, summary: s, tokens: 0, had: &[], alpha: policy::ALPHA, withhold: true }
     }
 
     /// Every grade sequence of up to `n` applies over {1, 2, 3}.
@@ -1014,9 +1082,10 @@ mod tests {
     /// The gate's guarantee on the hook's path: a learned check decides at its pool tokens, for the
     /// lessons its session had, and the ledger (select/summary.rs fold, select/policy.rs `ledger`)
     /// re-values it at the same logged tokens against the same fixed rule (`ledger_add_without` with the
-    /// record's `nofree`), so each check's risk is what its ledger entry takes and the budget never falls
-    /// below 0. The fit has a pool slope and every pool is a quarter of the baseline's: deciding at the
-    /// baseline's pool instead admits gains the ledger then does not record.
+    /// record's `nofree`), so each check's risk is what its ledger entry takes, what the withhold draw
+    /// took included (at most, under the worst-case fallback: the risk is its worst case), and the
+    /// budget never falls below 0. The fit has a pool slope and every pool is a quarter of the
+    /// baseline's: deciding at the baseline's pool instead admits gains the ledger then does not record.
     #[test]
     fn the_gate_admits_at_the_pool_its_ledger_records() {
         let at = |name: &str| policy::NAMES.iter().position(|n| *n == name).unwrap();
@@ -1043,7 +1112,7 @@ mod tests {
         let tokens = u32::try_from(crate::whole::TOKENS / 4).unwrap();
         let (ls, none) = (lessons(10), std::path::PathBuf::from("/nonexistent/borg-select/lessons.jsonl"));
         let mut rng = crate::memory::Rng::new(77);
-        let mut deviated = 0;
+        let (mut deviated, mut withheld) = (0, 0);
         for c in 0..400u64 {
             let (n, from) = (1 + (rng.next_u64() % 3) as usize, (rng.next_u64() % 10) as usize);
             let applied: Vec<(&Challenge, u8)> = (0..n).map(|i| (&ls[(from + i) % 10], 1 + (rng.next_u64() % 3) as u8)).collect();
@@ -1059,6 +1128,7 @@ mod tests {
                 tokens,
                 had: &had,
                 alpha: policy::ALPHA,
+                withhold: true,
             };
             let r = graded_under(Policy::Learned, &applied, &ctx);
             let us = units(&applied);
@@ -1085,6 +1155,7 @@ mod tests {
                 placebo: ids(&r.placebo),
                 p: r.p.clone(),
                 pf: r.pf.clone(),
+                pw: r.pw.clone(),
                 psi: r.log.psi,
                 nofree,
                 policy: r.log.policy.into(),
@@ -1094,15 +1165,21 @@ mod tests {
                 ..Default::default()
             };
             s = summary::fold(&format!("{}\n", serde_json::to_string(&o).unwrap()), s);
+            // The risk is the take of the routes played, what the withhold draw took included (the
+            // exact admission, select/policy.rs `exact`); under the worst-case fallback it is withholding's
+            // worst case, which what the draw took never exceeds.
+            let take = (before - held(&s.gate)).max(0.0);
+            let offered = r.log.psi_w.iter().any(|x| x.is_some_and(|x| x > 0.0));
             assert!(
-                (r.log.risk - (before - held(&s.gate)).max(0.0)).abs() < 1e-9,
-                "check {c}: risked {} but the ledger took {}",
+                if r.log.fallback { take <= r.log.risk + 1e-9 } else { (r.log.risk - take).abs() < 1e-9 },
+                "check {c}: risked {} but the ledger took {take}",
                 r.log.risk,
-                before - held(&s.gate)
             );
+            withheld += usize::from(offered);
             assert!(policy::remaining(&s.gate) >= -1e-9, "check {c}: the gate overspent, {}", policy::remaining(&s.gate));
         }
         assert!(deviated > 0, "the learned policy deviated, so the gate was put to the test");
+        assert!(withheld > 0, "withholding was offered, so its exact admission was put to the test");
         // A refit replays the ledger over the summary (select/policy.rs `ledger`) as the folds built it,
         // under each check's `nofree`.
         assert_eq!(policy::ledger(&s), s.gate, "the refit's ledger is the folds'");
@@ -1152,10 +1229,85 @@ mod tests {
     #[test]
     fn a_seed_depends_on_session_channel_and_check() {
         let (s, none) = (summary::Summary::default(), std::path::PathBuf::new());
-        let at = |session, channel, check| seed(&Ctx { session, check, channel, lessons: &none, summary: &s, tokens: 0, had: &[], alpha: policy::ALPHA });
+        let at = |session, channel, check| {
+            seed(&Ctx { session, check, channel, lessons: &none, summary: &s, tokens: 0, had: &[], alpha: policy::ALPHA, withhold: true })
+        };
         assert_eq!(at("s", "stop", "a1"), at("s", "stop", "a1"));
         assert_ne!(at("s", "stop", "a1"), at("s", "live", "a1"));
         assert_ne!(at("s", "stop", "a1"), at("s", "stop", "a2"));
         assert_ne!(at("s", "stop", "a1"), at("t", "stop", "a1"));
+    }
+
+    /// A store whose fit withholds often (its posterior on not delivering centred on a hand-over's
+    /// value and wide) under an open gate, reverted by its monitor or not.
+    fn withholding_summary(reverted: bool) -> summary::Summary {
+        let at = |name: &str| policy::NAMES.iter().position(|n| *n == name).unwrap();
+        let mut beta = vec![0.0; policy::P];
+        beta[at("intercept")] = -0.5;
+        let mut chol = vec![0.0; policy::P * policy::P];
+        for k in 0..policy::P {
+            chol[k * policy::P + k] = if k == at("not") { 1.0 } else { 0.1 };
+        }
+        let model = policy::Model { beta, chol, sd: vec![1.0; policy::P], spread: [0.1; 3], ..policy::Model::default() };
+        let rates = policy::Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
+        let fit = policy::Fit { key: "9-withhold".into(), model: Some(model), rates, ..policy::Fit::default() };
+        let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: 5.0, ..summary::Gate::default() };
+        summary::Summary { fit, gate, monitor: policy::Monitor { reverted, ..policy::Monitor::default() }, ..summary::Summary::default() }
+    }
+
+    /// The learned policy's decision for `applied` at 40 live checks of `s`, with each check's own.
+    fn learned_at<'a>(applied: &[(&'a Challenge, u8)], s: &summary::Summary) -> Vec<(Routed<'a>, policy::Decision)> {
+        let none = std::path::PathBuf::from("/nonexistent/borg-select/lessons.jsonl");
+        (0..40)
+            .map(|i| {
+                let check = format!("{i:012x}");
+                let ctx = Ctx { check: &check, channel: "live", ..ctx(&none, s) };
+                let us = units(applied);
+                let d = policy::choose(&us, &policy::Check { session: ctx.session, stop: false, tokens: 0 }, &s.fit, &s.gate, ctx.alpha, seed(&ctx), ctx.had);
+                (graded_under(Policy::Learned, applied, &ctx), d)
+            })
+            .collect()
+    }
+
+    /// Guard: a store the monitor reverted withholds nothing (the fixed rule, source `reverted`, every
+    /// `pw` 0, no placebo where the fixed rule leaves nothing for later); the same store unreverted
+    /// withholds.
+    #[test]
+    fn a_reverted_store_withholds_nothing() {
+        let ls = lessons(3);
+        let applied: Vec<(&Challenge, u8)> = ls.iter().zip([2, 1, 1]).collect();
+        for (r, _) in learned_at(&applied, &withholding_summary(true)) {
+            assert_eq!((r.log.source, r.placebo.len(), r.free.len()), (REVERTED_SOURCE, 0, 3), "{r:?}");
+            assert!(r.pw.iter().all(|x| *x == 0.0), "{r:?}");
+        }
+        assert!(learned_at(&applied, &withholding_summary(false)).iter().any(|(r, _)| !r.placebo.is_empty()), "the scenario: unreverted it withholds");
+    }
+
+    /// Every apply the learned decision withheld (`Route::Placebo`) is a placebo, first and in the
+    /// applies' order, its `pw` the decision's; the placebo draw then takes only among the applies left
+    /// for later, never a withheld one, at a chance (`psi`) the withhold draw does not move.
+    #[test]
+    fn withheld_applies_are_always_placebos_and_the_draw_takes_none_of_them() {
+        // Twelve 1s: the fixed rule hands `CAP` over and leaves two for later, the draw's candidates.
+        let ls = lessons(12);
+        let applied: Vec<(&Challenge, u8)> = ls.iter().map(|c| (c, 1)).collect();
+        let (mut withheld_any, mut drawn_any) = (false, false);
+        let mut psis = std::collections::BTreeSet::new();
+        for (r, d) in learned_at(&applied, &withholding_summary(false)) {
+            assert_eq!(r.pw, d.pw, "{r:?}");
+            let withheld: Vec<String> = applied.iter().zip(&d.routes).filter(|(_, x)| **x == Route::Placebo).map(|((c, _), _)| c.id.clone()).collect();
+            let placebo = ids(&r.placebo);
+            assert_eq!(placebo[..withheld.len()], withheld[..], "withheld first: {r:?}");
+            let later: Vec<&String> = applied.iter().zip(&d.routes).filter(|(_, x)| **x == Route::Not).map(|((c, _), _)| &c.id).collect();
+            for id in &placebo[withheld.len()..] {
+                assert!(later.contains(&id) && !withheld.contains(id), "{id} drawn among the applies left for later: {r:?}");
+            }
+            assert_eq!(r.log.psi, if later.is_empty() { 0.0 } else { outcome::round_p((PLACEBO_SLOTS as f64 / later.len() as f64).min(1.0)) }, "{r:?}");
+            withheld_any |= !withheld.is_empty();
+            drawn_any |= placebo.len() > withheld.len();
+            psis.insert(r.log.psi.to_bits());
+        }
+        assert!(withheld_any && drawn_any, "the scenario: withheld {withheld_any}, drawn {drawn_any}");
+        assert_eq!(psis.len(), 1, "the draw's chance depends on the check alone");
     }
 }

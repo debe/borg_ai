@@ -1,10 +1,11 @@
 # Roadmap
 
-What 0.7.3 leaves open, each with what would show it done. Selection changes follow the rule of
+What 0.10.0 leaves open, each with what would show it done. Selection changes follow the rule of
 0.6.0: checks written and dated before the change is built ([Evidence](evidence.md#lesson-selection)),
-quality the objective, no cost cap. The numbers below were measured on 2026-10-31 at 0 tokens, on
-copies of the author's stores (`borg status`, `borg debug select --replay`, `borg debug ope` and the
-outcome logs).
+quality the objective, no cost cap. The numbers below were measured on 2026-11-19 at 0 tokens, on
+copies of the author's two main stores (`borg status`, `borg debug select --replay`, `borg debug ope`
+and the outcome logs); "a / b" gives the team store, then the open-source store. Older numbers carry
+their date.
 
 ## Lesson selection: the path to fully adaptive
 
@@ -16,14 +17,17 @@ outcome logs).
 - The gate is open in the main stores (a team store and an open-source store), and the monitor has a
   harm bound.
 
-**Today:** the learned policy is the default. Its gate reads 0.023 in the open-source store and is
-spent in the team store. No learnable number has a readout yet.
+**Today** (2026-11-19): the learned policy is the default. Its gate is open in both main stores (4.606
+/ 7.148), and the monitor's bound shows no harm (+0.070 over 43 sessions / +0.032 over 24). P2 passes
+with the full model. One readout is in: the question-count test, no effect (step 2). The placebo arm
+had drawn 0 placebos in 626 checks since 0.7.6, 33 placebo verdicts ever; 0.10.0's withholding
+replaces it as the not-now measurement, its readout due at 93 arisen placebos (step 5).
 
 **Since live mode was removed (0.7.6, [why](delivery.md#live-mode-removed-in-076)) every readout comes
 later.** Live checks were most of the graded checks: about 10× as many as the stops' in the live-mode
 months (5,862 live calls). A session now makes only its stops' checks, so each target below that
 counts checks or labels takes about that much longer to reach; the sessions targets are unchanged. The
-question-count test ran on live checks only, so it draws no more (step 2).
+question-count test draws on detached checks (channel `live`) since 0.7.7 (411 / 407 drawn).
 
 The steps are ordered by what unblocks the rest.
 
@@ -48,23 +52,25 @@ Every later readout reads these labels, this monitor and this status line.
 - The replay counts records copied from another store's log instead of failing P1 (open-source store:
   PASS, 50 imported), and `borg assimilate` no longer duplicates an episode a turn end captured.
 
+**Done by 2026-11-19:**
+
+- **The monitor's harm bound.** +0.070 over 43 learned sessions / +0.032 over 24.
+- **Missing verdicts are explained.** The session-end judge leaves 1–3% of the lessons it is sent
+  without a verdict. Per-check calls leave 40–42% without one; the session end then judges those.
+
 **Still open:**
 
+- **Delivered lessons get a verdict.** 90% / 88% of the lessons delivered in ended sessions are judged.
+  Target: 95%.
 - **Fresh copies confirm the verdict fix.** Done when copies taken after new sessions show no free
   verdict after a later question and no delivered lesson left open in an ended session. The 15 stuck questions
   settled before 0.7.3 stay open in the team store's summary, so the replay still reproduces the
   decisions made on it; closing them needs a dated re-settle.
-- **Missing verdicts are explained.** The judge returns no verdict for 29–44% of the lessons it is sent
-  (team store: 2,370 sent, 39% nothing). Decide on a schema or instruction change after 100 calls with
-  the new `returned=` and `unmatched=` fields. Done when the share with no verdict is under 10%, or its
-  cause is documented.
 - **omp's stop answers in time.** The faster model is an expectation, not a measurement. Kill: revert
   it if more than 20% of the next 20 omp stops fail, or P2 on omp's labels worsens by more than 0.01
   log-loss. Status counts a failed call at its deadline, so its p95 ("omp 24.8 s of 28.0 s") is the
   deadline, not the tail: show "p95 ≥ deadline" when failures reach the top 5%. The model calls' log
   does not name the model that answered.
-- **The monitor's harm bound.** It needs 10 learned sessions: the team store has 7, the open-source
-  store 4.
 - **Each store's log describes its own work.** 726 of the team store's 1,104 graded checks are this
   project's history from before the stores were split; a dated note decides whether it stays. A third
   store holds 698 of its 699 checks copied from the open-source store; pooled readouts leave it out by
@@ -75,36 +81,42 @@ Every later readout reads these labels, this monitor and this status line.
 - **Amended 2026-10-31:** due at 300 checks in at least 15 sessions with a draw, or 30 sessions; pooled
   over the two main stores, stratified by collective; intent-to-treat, with the share played per drawn
   count (`borg debug select --replay --file A --file B`, records copied from another store's log left
-  out). Today: 243 checks in 7 sessions.
+  out). Then: 243 checks in 7 sessions.
 - **Stalled 2026-11-01:** the test ran on live checks only, and live mode was removed in 0.7.6, so no
   check draws a count now and the readout is no longer due on a date. Its draws so far stay in the log
   and count toward it. Done needs either a readout on what exists (243 checks, under the bar) labelled
   as such, or a stop design of the test (a stop's question blocks, so it is not the live test moved),
   pre-registered before it is built.
-- **Done** when the readout is in [Evidence](evidence.md#lesson-selection) and the evidence rule deviates
-  on it, or it shows no effect. The readout reads only the top tested lesson; pooling lower positions
-  would add power.
+- **Drawing again since 0.7.7:** the test runs on detached checks (channel `live`), 411 / 407 drawn.
+- **Done 2026-11-19: no effect** ([Evidence](evidence.md#lesson-selection)). Pooled over both stores,
+  811 drawn checks in 56 sessions. Asking a grade 2 against handing it over: +0.041 [−0.121, +0.314]
+  over 398 grade-2 lessons; per store +0.184 [−0.042, +0.498] / −0.082 [−0.294, +0.267]. Every
+  dilution comparison, 2 to 7 asked against 1, has an interval spanning 0. The test keeps running. The
+  readout reads only the top tested lesson; pooling lower positions would add power.
 
 ### 3. Decisions the data already answers
 
 **Dated 2026-10-31** in [Evidence](evidence.md#lesson-selection) and
 [Numeric constants](design/constants.md): the gate's allowance keeps scaling with the fixed rule's
 modelled value at `risk` 0.1; the pool stays 12,000 tokens, and grows only on a gain above 0 with
-latency measured near the larger size (0.7.3); withholding is not learned and `NOT_PRIOR` is fixed;
-the stop's prefilter stays at 8.0.
+latency measured near the larger size (0.7.3); the stop's prefilter stays at 8.0. The decision that
+withholding is not learned and `NOT_PRIOR` fixed is superseded (Rules v3 amendment, 2026-11-19):
+`NOT_PRIOR` is a prior with a fixed sd and the not-now coefficient is MAP-fitted; `NOT_LEARNED_UNTIL`
+is display only.
 
-- **The gate reopens.** Played as the fixed rule, the team store reopens after about 60 learned checks,
-  then hovers near 0. Done when `borg status` shows a positive gate in both main stores.
+**Done by 2026-11-19:**
+
+- **The gate reopens.** `borg status` shows a positive gate in both main stores: 4.606 / 7.148.
+- **One model for calibration and decisions.** P2 passes with the full model: log-loss difference
+  −0.022 [−0.045, +0.001] over 1,485 units in 49 sessions / −0.026 [−0.059, −0.007] over 1,125 in 24.
+
+**Still open:**
+
 - **The pool's size.** The graded record logs the budget a check chose (`budget`, 0.7.3); the
-  selection summary does not count a pool deviation yet. Revisit the pool with 30 judged applies past the budget,
-  about 2026-11-07. Kill for any pool exploration: revert if the stop's p95 at the larger budget exceeds
-  the harness's stop budget, or more than 2% of stop calls fail, over 20 calls.
-- **Withholding reopens** when the placebo's unclear rate falls under 50% (step 5) or 100 judged
-  placebos exist. Kill: drop the placebo arm if the next 60 placebos give fewer than 15 changed or
-  ignored verdicts.
-- **One model for calibration and decisions.** P2 passed only with the pruned model (grade, route,
-  dilution), while decisions use the full one. Either decide with the pruned model, or rerun P2 once
-  the store has enough sessions for the full model to pass on its own.
+  selection summary does not count a pool deviation yet. The revisit set for 30 judged applies past the
+  budget is due: 126 / 102 tail lessons applied past it. Kill for any pool exploration: revert if the
+  stop's p95 at the larger budget exceeds the harness's stop budget, or more than 2% of stop calls
+  fail, over 20 calls.
 
 ### 4. Learning weights
 
@@ -113,6 +125,9 @@ through the Thompson slot draw over a pool, which the default graded check never
 doc). `VETOED_W` and `CORRECTED_W` are fixed by dated decision (0 vetoes, 1–2 corrections after an
 ask).
 
+- **Proposed 2026-11-19: date `REGRET` and `TESTED_W` fixed.** `borg debug ope` still finds 0 usable
+  decisions; the tail sample applied 126 / 102 lessons, but the off-policy mode over pool membership
+  below is not built. Needs the engineer's decision.
 - **`REGRET` and `TESTED_W` learn through the tail sample.** All regret credit comes from one session
   in the team store and two in the open-source store. The weights decide which lessons fill the pool
   when its budget forces a choice (173 of 195 pool checks in the team store), and the tail sample
@@ -135,7 +150,7 @@ ask).
   deliveries after release. Kill: revert the session-end judge if that free and placebo share is not
   below 40% by then; review the verdicts if lessons' belief means move by more than 0.05 on average
   against a replay without `not_arisen`. Cost: one extra model call per session with something open
-  ([Evidence](evidence.md#lesson-selection)).
+  ([Evidence](evidence.md#lesson-selection)). **Met:** pure unclear 1–5% per channel since 2026-11-01.
 - **The session-end judge judges everything, sized by what it reads well** (0.7.6). 0.7.5's one call
   saw at most 40 open deliveries and the newest 24,000 work characters, both unmeasured. 0.7.6 judges
   every open delivery in batches, one call each, each prompt within the judge's effective length per
@@ -144,19 +159,27 @@ ask).
   delivery on until a paid backtest of the three cuts (newest, after, ends) picks the default. Target:
   at least 95% of open deliveries judged, pure unclear below 10%. Kill: one call per pass again if
   batched passes are more than 10% unclear or more than 5% of batch calls fail
-  ([Evidence](evidence.md#lesson-selection)).
+  ([Evidence](evidence.md#lesson-selection)). Open: 90% / 88% of delivered lessons in ended sessions
+  are judged (step 1).
 - **A check's work and lessons, measured the same way.** A check still reads the newest 24,000
   characters of the turn's work (`TAIL`) and judges at most 10 lessons (`MAX_PENDING`), two unmeasured
   guards kept for the stop's latency. Since 0.7.6 a check's cost line logs its prompt's size, so its
   answered share per size step can be read as the session end's is. Done when `TAIL` and
   `MAX_PENDING` are each either derived from the judge's effective length within the stop's latency
   budget or fixed by a dated decision with that evidence.
-- **Placebos from the lessons the budget cuts.** A placebo is never a lesson the session already had,
-  and 414 of 419 not-now applies in the team store (1,219 of 1,224 in the open-source store) are such
-  lessons. Meanwhile the character budget cut 469 free hand-overs in the open-source store (29 in the
-  team store), unjudged: a "not now" nobody measures. Build: draw placebos at random among the cut
-  lessons, with their chance logged. Kill: revert if placebos per check do not rise from about 1.2% to
-  10% over 300 checks.
+- **Relevance is the bottleneck.** 63–88% of verdicts now say the point never came up (early
+  deliveries 87–88%). Withholding (below) measures what such a lesson is worth; a better pool or early
+  bar (step 6) would deliver fewer of them.
+- **Withholding as learned, gate-rationed placebos** (0.10.0, [Evidence](evidence.md#lesson-selection),
+  Rules v3 amendment 2026-11-19). The fixed rule's placebo draw needs more than 10 applies in a check:
+  0 placebos in 626 checks since 0.7.6, 33 placebo verdicts ever, all at rank ≥ 10. The learned policy
+  now withholds a lesson it would deliver with ψ, the posterior chance that delivering it is worth 0
+  or less, as a judged placebo; the gate bounds the cost. Value metric: the lift of delivering over
+  withholding per grade among arisen verdicts, IPW, session bootstrap, pooled over both stores. Due at
+  93 arisen placebos, about 310 draws. Kill: the monitor's revert; fewer than 5% of checks with a
+  candidate withhold over the first 300 (retune or drop); fewer than 20 of the first 100 withheld
+  placebos arose (drop). Flagged as not trusted if the arisen rate differs by more than 0.15 between
+  arms or more than 30% of placebos are censored.
 - **omp's labels catch up.** Labelled share of omp's questions: 27% against Claude's 39%; omp's free
   hand-overs end unclear 71% of the time, Claude's 49%. 18 omp questions saw no judge call after them.
   Re-measure over 10 omp sessions; if more than 10% of omp's questions still see no judge call, check
@@ -169,13 +192,14 @@ ask).
 ### 6. Hand-set delivery cutoffs
 
 - **Early delivery learns its bar.** It keeps today's rule (`RELATIVE` 0.5 of the best match's score,
-  `EARLY_CAP` 5 lessons). Only 7 early lessons carry their relative score (`rel`); a bar of 0.8 would
-  have dropped 5 of them, among them the only one judged "changed". Lessons below the bar are never
-  logged, so a lower bar cannot be judged. Build: a blind-judged sample of 1–2 lessons just below the
-  bar (`rel` 0.3 to 0.5) per early delivery, with its chance logged, then a learned bar under the gate.
+  `EARLY_CAP` 5 lessons). 233 early lessons carry their relative score (`rel`; 7 on 2026-10-31).
+  Lessons below the bar are never logged, so a lower bar cannot be judged; the below-bar sample is not
+  built. Build: a blind-judged sample of 1–2 lessons just below the bar (`rel` 0.3 to 0.5) per early
+  delivery, with its chance logged, then a learned bar under the gate.
   Kill: stop if after 30 sessions there are fewer than 30 judged below-bar labels, or the judge calls
   more than half of them unclear; until then a dated note keeps 0.5.
-- **The other baselines.** The stop block's 10 lessons (`CAP`), the placebo's and tail's 2 slots, and
+- **The other baselines.** The stop block's 10 lessons (`CAP`), the fixed rule's placebo draw's and the
+  tail's 2 slots, and
   the judge's 2 tries stay baselines until steps 1–5 hold; each then gets a test or a dated decision.
 
 ### Smaller items

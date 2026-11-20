@@ -127,13 +127,15 @@ added nothing measurable. [Delivery](https://github.com/debe/borg_ai/blob/main/d
 ask it, hand it over free or leave it for later. The reference is 0.5.0's fixed rule, by grade (it no
 longer hands over free a lesson the session already had; `BORG_SELECT=fixed`). Every check also
 measures what a learned policy needs and the fixed rule's history cannot show: a placebo arm judges
-blindly up to two lessons the check does not deliver, a pool its budget cuts fills its last 15% by a
+blindly up to two lessons the check does not deliver (under the fixed rule, those past its 10), a pool its budget cuts fills its last 15% by a
 draw and grades a tail sample of the lessons past it that fit in 15% of the budget (at least two), each at a logged chance,
 and the records say which lessons the session already had. The learned policy, the
 default, routes by the mistakes it expects each route to avoid, learned from the logged outcomes, and
-deviates from the fixed rule only where the outcomes show it gains. Until 0.7.6 it also learned how
-many lessons to ask by a randomised test on live checks, which moved lessons between asked and handed
-over, never withholding one. A conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
+deviates from the fixed rule only where the outcomes show it gains. It withholds a lesson it would
+deliver, as a judged placebo, at the posterior chance that delivering it is worth nothing (ψ), its
+chance logged and its cost bounded by the gate, so not delivering gets a measured value (0.10.0). A randomised test moves lessons between asked
+and handed over on checks that do not block the stop; its readout showed no effect (2026-11-19). A
+conservative gate, rationed by the collective's optional `risk` (10% of the fixed rule's quality
 by default), keeps it on the fixed rule until the outcomes support a deviation, and a monitor puts the
 fixed rule back for good if it sees harm. [Which lessons are asked](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
 
@@ -338,7 +340,7 @@ source, the share of asked lessons that changed the work, repeated vetoes), Stee
 (corrections, rejected tool calls, pauses and vetoes, the tool calls a pause refused), Messages (the last
 7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost and Drones.
 The Conscience tab also shows lesson selection: the policy and the default, what the checks measure
-for the learned policy (placebos drawn and judged, tail lessons shown and applied), spend per session,
+for the learned policy (placebos drawn, withheld and judged, tail lessons shown and applied), spend per session,
 effects with their intervals, label health, the fitted delivery rates, pool yield and stop latency per
 harness against its stop budget, and the learned decisions a guard gave the fixed rule; under the
 learned policy also its gate, the checks it deviated from the fixed rule on (on evidence or by a test draw), the question-count test (checks drawn,

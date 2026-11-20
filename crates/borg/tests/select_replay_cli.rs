@@ -97,7 +97,8 @@ fn a_fixed_rule_log_is_reproduced_with_its_propensities() {
     let (text, v, code) = run(&root, &fixed_log(), &[]);
     assert_eq!(code, exit_of(&v), "{text}");
     assert!(
-        text.starts_with("file ") && text.contains("\nrules 2026-10-28, amendment 2026-10-29, rules v2 2026-10-29 (docs/evidence.md#lesson-selection: "),
+        text.starts_with("file ")
+            && text.contains("\nrules 2026-10-28, amendment 2026-10-29, rules v2 2026-10-29, rules v3 2026-11-19 (docs/evidence.md#lesson-selection: "),
         "the rules it checked, where to read them: {text}"
     );
     assert!(text.contains(" here, the checks replay the learned policy; summary v"), "{text}");
@@ -122,13 +123,22 @@ fn a_fixed_rule_log_is_reproduced_with_its_propensities() {
         text.contains("question-count test readout (rules v2, amendment 2026-10-31): not due (0 checks that drew a count in 0 sessions with one, due at 300 checks in 15 sessions or 30 sessions; 0 of them the control arm, 0 refused by the gate)\n"),
         "{text}"
     );
+    // A log under the fixed rule withholds nothing: nothing to read, and nothing the cold start withheld.
+    assert!(
+        text.contains("withholding readout (rules v3 2026-11-19): not due (0 of 93 arisen withheld placebos; 0 withheld at 0 of 0 checks with a candidate, in 0 sessions)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  withholding: 0 placebos withheld at 0 of 0 checks with a candidate (-), 0 outright (chance 1), mean ψ - over 0 candidates offered;"),
+        "{text}"
+    );
     assert!(text.contains("P4 full-information recall: NOT RUN: pass --eval RUNS_DIR --qrels FILE"), "{text}");
     assert!(text.contains("P5 off-policy: REPORTED (non-decisive): 2 judged units"), "{text}");
     let c = &v["report"]["checks"];
     assert_eq!((c["p1"]["replayed"].as_u64(), c["p1"]["max_delta"].as_f64(), c["p0"]["differ"].as_u64()), (Some(3), Some(0.0), Some(0)), "{v}");
     assert_eq!(
-        (&v["report"]["rules"], &v["report"]["amendment"], &v["report"]["rules_v2"]),
-        (&json!("2026-10-28"), &json!("2026-10-29"), &json!("2026-10-29"))
+        (&v["report"]["rules"], &v["report"]["amendment"], &v["report"]["rules_v2"], &v["report"]["rules_v3"]),
+        (&json!("2026-10-28"), &json!("2026-10-29"), &json!("2026-10-29"), &json!("2026-11-19"))
     );
     // Without --replay: the state only, under the policy this process decides by.
     let out = borg(&["debug", "select", "--file", root.join("outcomes.jsonl").to_str().unwrap()], &root);
@@ -520,7 +530,8 @@ fn the_bench_times_each_check_that_applies_a_lesson_and_writes_nothing_beside_th
 
 /// Several stores' logs, each a collective named by its directory: the question-count test's readout
 /// pooled over them, stratified by collective (amendment 2026-10-31), never their checks; a collective
-/// with no drawn count still counts as one, and each file's imported records are counted.
+/// with no drawn count still counts as one, and each file's imported records are counted. The
+/// withholding readout (rules v3) pooled the same way follows.
 #[test]
 fn several_files_read_the_question_count_test_pooled_by_collective() {
     let root = tmp("pooled");
@@ -540,12 +551,19 @@ fn several_files_read_the_question_count_test_pooled_by_collective() {
             && text.contains("\n  team: 0 drawn in 0 sessions (0 of them the control arm, 0 refused by the gate); no count drawn\n")
             && text.contains("\n  open: 0 drawn in 0 sessions")
             && text.contains("\n  pooled: no count drawn\n")
+            && text.contains("\nwithholding readout (rules v3 2026-11-19), pooled over 2 collectives, stratified by collective: not due (0 of 93 arisen withheld placebos;")
+            && text.contains("\n  team: 0 withheld at 0 checks with a candidate, 0 arisen\n")
             && !text.contains("P0 baseline identity"),
         "{text}"
     );
     let json_args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
     let v: Value = serde_json::from_slice(&borg(&json_args, &root).stdout).unwrap();
     assert_eq!((v["pooled"]["due"].as_bool(), v["pooled"]["strata"][1]["collective"].as_str()), (Some(false), Some("open")), "{v}");
+    assert_eq!(
+        (v["pooled"]["withholding"]["due"].as_bool(), v["pooled"]["withholding"]["strata"][0]["collective"].as_str()),
+        (Some(false), Some("team")),
+        "{v}"
+    );
     let missing = root.join("absent").join("outcomes.jsonl");
     let out = borg(&["debug", "select", "--replay", "--file", &files[0], "--file", missing.to_str().unwrap()], &root);
     assert_eq!(out.status.code(), Some(1), "an unreadable file: {out:?}");

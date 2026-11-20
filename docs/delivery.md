@@ -151,9 +151,12 @@ learned policy cannot tell from it what not delivering is worth, or what lessons
 yield. The checks therefore also collect, at no cost to the fixed rule's quality:
 
 - **Placebo.** Of the applies a check delivers neither way (under the fixed rule, those past its 10),
-  up to two are judged blindly at the point a free delivery would be, though the agent never sees
-  them; the evaluation switches draw none. A lesson the session already had is never drawn. Each
-  candidate's chance of the draw, min(1, 2 / candidates), is logged (`psi`). Their "changed" rate is
+  up to two (`PLACEBO_SLOTS`) are drawn uniformly and judged blindly at the point a free delivery
+  would be, though the agent never sees them; the evaluation switches draw none. A lesson the session
+  already had is never drawn. Each candidate's chance of the draw, min(1, 2 / candidates), is logged
+  (`psi`). Since 0.7.6 a check applies 2.6 lessons on average, so this draw is rare: 0 of 626 checks
+  drew one. The learned policy therefore also withholds lessons it would deliver (*Withholding*,
+  below); each one is a placebo too, judged, its chance logged (`pw`). A placebo's "changed" rate is
   the judge's floor: what it calls a change that would have happened anyway. A route's value is its
   lift over not delivering. Placebo results never reach the beliefs, trust, statistics, the team file
   or the offline estimates.
@@ -168,8 +171,9 @@ yield. The checks therefore also collect, at no cost to the fixed rule's quality
   match (`rel`), for a learned early rule. Early delivery itself keeps its rule: lessons at half the
   best match, at most 5.
 
-`borg status`, `borg top` and the Conscience page of `borg web` count the placebos drawn and judged and
-the tail lessons shown and applied.
+`borg status`, `borg top` and the Conscience page of `borg web` count the placebos drawn (of them
+withheld, with the mean ψ) and judged, when the withholding readout is due, and the tail lessons shown
+and applied.
 
 **The learned policy** is the default, since its pre-registered checks passed (see *Why the
 learned policy is the default*, below). It fits one model of what each route is worth from the
@@ -187,16 +191,39 @@ An effect the outcomes do not pin down keeps a wide posterior, and a wide poster
 rule at no quantile, so no prior decides alone. That matters because the fixed rule's history cannot
 identify two effects: how much each further question dilutes the others, and what a lesson not
 delivered still changes. The dilution prior assumes none (its mode is 0). A new store, with no
-outcomes, decides exactly as the fixed rule. Nothing in this decision is drawn at random, so each
-lesson's logged chance of its route is exact: 1 or 0. A lesson the session already had is never handed
+outcomes, decides exactly as the fixed rule. Nothing in the evidence rule is drawn at random;
+withholding (below) draws per lesson at a logged chance, so each lesson's logged chance of its route
+is exact. A lesson the session already had is never handed
 over free. A conservative gate keeps the fixed rule's routes unless the policy has room: a deviation
 is admitted only while the replayed quality of the policy's checks stays at most 10% of the fixed
 rule's own replayed value below the fixed rule, at the 5% quantile. The 10% is the engineer's
 tolerance for learning, the collective's `risk` in `collectives.json` when it sets one
 ([Collectives](configuration.md#collectives)). Exploration is rationed by quality, never by a fixed
 rate. A grade 3 at the stop is always asked, and a check with more than 16
-lessons that apply takes the fixed rule. It draws its placebos as the fixed rule does, among the
-applies it leaves for later.
+lessons that apply takes the fixed rule. It draws the fixed rule's placebos among the applies it
+leaves for later, then withholds some of those it would deliver.
+
+**Withholding** (0.10.0). For each lesson a learned check would ask or hand over, ψ is the share of
+the 512 draws under which delivering it is worth 0 or less. The lesson is withheld with chance ψ, by a
+draw seeded by the check and the lesson, apart from the count and placebo draws, and judged blindly as
+a placebo. Withheld means not now: the lesson stays eligible, and a later delivery before its verdict
+censors it (`UNJUDGED_LATER`). Never withheld: a stop's grade 3, a lesson the session had, and any
+check the fixed rule decides (cold start, `size`, reverted, `risk` 0). A spent gate withholds only a
+set that costs nothing at the 5% quantile, at risk 0. The gate bounds
+the cost of the set drawn: each candidate is drawn independently, and the gate admits the drawn set
+exactly as it admits a routing, on the routing with that set withheld at the 5% quantile. A set it
+refuses is delivered as the routing says, nothing withheld. Every subset of the candidates is valued,
+so each lesson's chance of being withheld (`pw`) is exact: the sum of P(S) over the admitted sets S
+that hold it, P(S) the product of ψ over S and of 1 − ψ over the rest. A placebo's chance is
+pw + (1 − p − pf − pw)·psi: withheld, or left for later and drawn. Above 10 candidates with ψ above 0
+(a guard on a check's time) the gate falls back to the worst case, every candidate withheld at its
+full value in every draw (dilution slopes are at most 0, so withholding never lowers the others'
+value), and drops the candidate with the highest mean value until that fits. `borg debug select
+--replay` P3 reports how often the gate refused a drawn set and how often the fallback ran. Under the question-count test
+withholding applies within each of the k + 1 counts, and `p`, `pf` and `pw` are their exact mixture;
+never to the test's top lesson, whose change rate the dilution readout compares across the counts.
+ψ moves as the not-now effect is fitted (`NOT_PRIOR` is its prior), so withholding adapts with every
+placebo verdict. The readout, its due date and the kill rules: [Evidence](evidence.md#lesson-selection).
 
 **The question-count test.** The fixed rule never varies how many lessons a check asks: with a grade
 3 it asks every lesson it delivers, without one it asks none and hands the 2s and 1s over. Whether
@@ -216,8 +243,9 @@ control (`experiment_control`), every other draw an `experiment`. Each s has the
 each lesson's logged chance of being asked or handed over (`p`, `pf`) is its exact share of the k + 1
 counts, and the graded record logs k and s (`xk`, `xs`).
 
-The test never withholds a lesson. Every lesson the fixed rule delivers is still delivered, asked or
-handed over, and every lesson it leaves out stays out: only the route changes, so the right lesson
+The test itself never withholds a lesson (withholding, above, applies within each count). Every
+lesson the fixed rule delivers is still delivered, asked or handed over, and every lesson it leaves
+out stays out: only the route changes, so the right lesson
 reaches the agent as often as under the fixed rule (P4c checks it). On a check with a grade 3, the
 lessons the test hands over are ones the fixed rule would have asked, so they wait in the queue marked
 as handed over in place of questions (an `instead` line). The free delivery carries them whatever its
@@ -321,12 +349,15 @@ P4b was NOT TESTED: under the store's posterior the decision rule deviated on no
 evaluation's checks, so there it is the fixed rule. That made the learned policy the default, as the
 rules say. It differs from the fixed rule by the question-count test on checks that do not block the
 stop (live checks before 0.7.6, detached checks since 0.7.7), which withholds no lesson and which the
-gate rations by `risk`, and on evidence once the outcomes show a gain ([Evidence](evidence.md#lesson-selection)).
+gate rations by `risk`, on evidence once the outcomes show a gain, and since 0.10.0 by withholding,
+which the gate rations too ([Evidence](evidence.md#lesson-selection)).
 
 **Readout.** Under the learned policy the monitor guards the policy, and after 300 randomised
 checks in 15 sessions, or 30 sessions, a readout reports dilution (for each number m ≥ 2 of the test's questions
 asked, how often the top tested lesson changed the work against it asked alone) and asking against
-handing over a grade 2, with session-bootstrap 95% intervals ([Evidence](evidence.md#lesson-selection)).
+handing over a grade 2, with session-bootstrap 95% intervals. Read on 2026-11-19, pooled over two
+stores (811 checks in 56 sessions): no effect. Withholding's readout, the lift of delivering over
+withholding per grade, is due at 93 placebos whose point arose ([Evidence](evidence.md#lesson-selection)).
 
 **Switches.** The learned policy decides with no switch set (`BORG_SELECT=learned` names it);
 `BORG_SELECT=fixed` keeps the fixed rule whatever else is set. `BORG_STOP_ASK_CAP` and `BORG_STOP_ATTENTION=on` are evaluation arms.

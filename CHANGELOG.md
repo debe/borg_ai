@@ -3,6 +3,35 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.10.0 (2026-11-19)
+
+Placebos no longer wait for a check with more than 10 applies: the learned policy withholds lessons it
+would deliver, at a logged chance the gate rations, so not delivering gets a measured value.
+
+### Changed
+
+- The learned policy withholds a lesson it would deliver as a judged placebo, at ψ, the posterior
+  chance that delivering it is worth 0 or less; the gate admits exactly the set drawn, and a stop's
+  grade 3 or a lesson the session had is never withheld. Replayed on both stores, 8% (team) and 7%
+  (open source) of checks with a candidate withhold one: 273 random placebos where the history holds
+  33 placebo verdicts. [Withholding](https://github.com/debe/borg_ai/blob/main/docs/delivery.md#which-lessons-are-asked)
+- The model's chance that a lesson is judged keeps 0.9.0's features: grade and rank terms broke P1's
+  replay on both stores, and withholding's arms share their relevance by design.
+- The selection summary is version 12; the first hook after the update rebuilds it from the log.
+- The question-count test's readout is in: no effect (811 checks in 56 sessions). The test keeps
+  running. [Evidence](https://github.com/debe/borg_ai/blob/main/docs/evidence.md#lesson-selection)
+
+### Added
+
+- The graded record logs each apply's chance of being withheld (`pw`).
+- `borg debug select --replay` reads withholding: lift over not delivering per grade, arisen rate per
+  arm, censored share and due status, pooled with `--file A --file B`.
+- `borg status` and `borg top` count placebos drawn, withheld and judged, and when the readout is due.
+
+### Upgrading
+
+- Nothing to do. Records written before 0.10.0 replay with withholding off.
+
 ## 0.9.0 (2026-11-18)
 
 Engineers, drones and machines get readable names, and borg runs the mesh daemons and borg web as

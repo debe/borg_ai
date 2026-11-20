@@ -759,15 +759,28 @@ pub struct Evaluation {
 /// counts its placebo rows (select/summary.rs `Apply`, its route and label).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Measurement {
-    /// Placebos drawn: applies no route delivered, judged blindly where a free delivery would be.
+    /// Placebos drawn: applies no route delivered, judged blindly where a free delivery would be; the
+    /// fixed rule's draw and the learned policy's withheld ones (select.rs module doc: Placebos).
     pub placebos: u64,
     /// Of them, those the judge gave a verdict that says something (changed or ignored).
     pub judged: u64,
+    /// Of the placebos, those withheld from a delivery (a chance of being withheld above 0,
+    /// select/summary.rs `Apply::pw`); and the mean of that chance over the applies with one, 0 for
+    /// none (no check could withhold).
+    pub withheld: u64,
+    pub psi: f64,
+    /// The withheld placebos whose point arose (changed, ignored, or the consequence remains) that could
+    /// also have been delivered (p + pf above 0; not one withheld at a chance of 1), and how many make
+    /// the withholding readout due (select/replay.rs `LIFT_ARISEN`, pooled over stores there; this
+    /// store's alone here).
+    pub arisen: u64,
+    pub arisen_needed: u64,
     /// The tail samples' lessons shown past the pool budget, and those that applied (whole.rs `tail`,
     /// select/summary.rs `Pool::tail`): the yield past the budget, learned under every policy.
     pub tail_shown: u64,
     pub tail_applied: u64,
-    /// The judged placebos needed before not now is learned (policy.rs `NOT_LEARNED_UNTIL`).
+    /// The judged placebos after which not now's fit rests mostly on its labels (policy.rs
+    /// `NOT_LEARNED_UNTIL`): display only.
     pub placebos_needed: u64,
 }
 
@@ -875,11 +888,21 @@ impl Selection {
         }
         let later = s.applies.iter().filter(|a| matches!(a.route, select::Route::Not | select::Route::Placebo)).count();
         let (placebos_judged, placebos) = of(select::Route::Placebo);
+        // Withholding: the applies with a chance of being withheld, those withheld (placebos), and of
+        // these the ones whose point arose among those that could also have been delivered (p + pf
+        // above 0), as the lift readout's due counts them (select/replay.rs `withholding`).
+        let chances: Vec<f64> = s.applies.iter().map(|a| a.pw).filter(|w| *w > 0.0).collect();
+        let withheld: Vec<_> = s.applies.iter().filter(|a| a.route == select::Route::Placebo && a.pw > 0.0).collect();
+        let arisen = withheld.iter().filter(|a| a.p + a.pf > 0.0 && matches!(a.label, Label::Changed | Label::Ignored | Label::Remains)).count();
         labels.push(count("placebo", placebos, later));
         labels.retain(|c| c.whole > 0);
         let measurement = (checks > 0).then_some(Measurement {
             placebos: placebos as u64,
             judged: placebos_judged as u64,
+            withheld: withheld.len() as u64,
+            psi: if chances.is_empty() { 0.0 } else { chances.iter().sum::<f64>() / chances.len() as f64 },
+            arisen: arisen as u64,
+            arisen_needed: select::replay::LIFT_ARISEN,
             tail_shown: s.pool.tail.0,
             tail_applied: s.pool.tail.1,
             placebos_needed: select::policy::NOT_LEARNED_UNTIL,
@@ -1128,7 +1151,17 @@ pub fn selection_line(s: &Selection) -> String {
         parts.push(test_line(t));
     }
     if let Some(m) = &s.measurement {
-        parts.push(format!("placebos {} drawn, {} judged", m.placebos, m.judged));
+        // Withholding's share and the lift readout's progress, once a check could withhold.
+        match m.psi > 0.0 {
+            true => {
+                parts.push(format!("placebos {} drawn ({} withheld, mean withhold chance {:.0}%), {} judged", m.placebos, m.withheld, 100.0 * m.psi, m.judged));
+                parts.push(match m.arisen >= m.arisen_needed {
+                    true => format!("lift readout due: {} arisen withheld placebos (borg debug select --replay)", m.arisen),
+                    false => format!("lift readout due at {} arisen withheld placebos, {} so far", m.arisen_needed, m.arisen),
+                });
+            }
+            false => parts.push(format!("placebos {} drawn, {} judged", m.placebos, m.judged)),
+        }
         if m.tail_shown > 0 {
             parts.push(format!("tail {} shown past the pool, {} applied", m.tail_shown, m.tail_applied));
         }
@@ -1572,7 +1605,17 @@ corp (team): 3 drone(s), 2 active, 1 remote
             deviations: vec![Count { name: "route".into(), part: 5, whole: 400 }],
             spend: vec![spend("stop", 4, 3.0), spend("live", 0, 2.04)],
             evaluation: Some(evaluation),
-            measurement: Some(Measurement { placebos: 40, judged: 31, tail_shown: 12, tail_applied: 3, placebos_needed: 100 }),
+            measurement: Some(Measurement {
+                placebos: 40,
+                judged: 31,
+                withheld: 12,
+                psi: 0.08,
+                arisen: 5,
+                arisen_needed: 93,
+                tail_shown: 12,
+                tail_applied: 3,
+                placebos_needed: 100,
+            }),
             test: Some(Test {
                 risk: 0.1,
                 ran: 30,
@@ -1669,7 +1712,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let line = selection_line(&s);
         assert_eq!(
             line,
-            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · question-count test 30 drawn (9 control, 4 refused by the gate) in 6 sessions, risk 0.10; readout after 300 checks in 15 sessions, or 30 sessions · placebos 40 drawn, 31 judged · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
+            "learned (opt-in, BORG_SELECT=learned), gate 0.120 (quality it may still risk below the fixed rule) · 480 checks · deviated: route 5/400 · question-count test 30 drawn (9 control, 4 refused by the gate) in 6 sessions, risk 0.10; readout after 300 checks in 15 sessions, or 30 sessions · placebos 40 drawn (12 withheld, mean withhold chance 8%), 31 judged · lift readout due at 93 arisen withheld placebos, 5 so far · tail 12 shown past the pool, 3 applied · monitor +0.004, bound +0.031 over 12 sessions (below 0 reverts), ESS 180 of 300 weighed, largest weight 6.5× the mean · $0.42 and 0.3 extra rounds per session (12 sessions)"
         );
         assert!(!line.contains("budget") && !line.contains("price"), "no budget set: spend measured, never priced: {line}");
         let mut early = learned();
@@ -1764,7 +1807,10 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(keys, ["ess", "max_weight", "mean", "sessions", "truncated", "ucb", "units"]);
         assert_eq!(
             (&v["default"], &v["measurement"]),
-            (&json!("fixed"), &json!({"placebos": 40, "judged": 31, "tail_shown": 12, "tail_applied": 3, "placebos_needed": 100}))
+            (
+                &json!("fixed"),
+                &json!({"placebos": 40, "judged": 31, "withheld": 12, "psi": 0.08, "arisen": 5, "arisen_needed": 93, "tail_shown": 12, "tail_applied": 3, "placebos_needed": 100})
+            )
         );
         let mut keys: Vec<&str> = v["test"].as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -1942,11 +1988,76 @@ corp (team): 3 drone(s), 2 active, 1 remote
         let sel = Selection::of(&fold(&text, Summary::default()), select::Policy::Fixed, None);
         assert_eq!(
             sel.measurement,
-            Some(Measurement { placebos: 2, judged: 1, tail_shown: 2, tail_applied: 1, placebos_needed: select::policy::NOT_LEARNED_UNTIL }),
+            Some(Measurement {
+                placebos: 2,
+                judged: 1,
+                withheld: 0,
+                psi: 0.0,
+                arisen: 0,
+                arisen_needed: select::replay::LIFT_ARISEN,
+                tail_shown: 2,
+                tail_applied: 1,
+                placebos_needed: select::policy::NOT_LEARNED_UNTIL
+            }),
             "{sel:?}"
         );
         assert!(selection_line(&sel).contains(" · 2 checks · placebos 2 drawn, 1 judged · tail 2 shown past the pool, 1 applied"), "{}", selection_line(&sel));
         assert_eq!(Selection::of(&Summary::default(), select::Policy::Fixed, None).measurement, None, "nothing folded: not measured");
+    }
+
+    /// The learned policy's withheld placebos (a chance of being withheld, `pw`, above 0) beside its
+    /// drawn ones, as the summary folds them: counted apart, the mean chance over the applies with one,
+    /// and those whose point arose toward the lift readout's due; the line says so. A drawn placebo
+    /// (`pw` 0) and a delivered apply with a chance are no withheld placebo; one withheld at a chance of
+    /// 1 (E, never deliverable) is, but its point arising counts nothing toward the due.
+    #[test]
+    fn the_measurement_counts_withheld_placebos_and_the_lift_readouts_progress() {
+        use crate::outcome::{self, Outcome};
+        use select::summary::{Summary, fold};
+        let rec = |kind: &str, lessons: &[&str], channel: &str, ms: i64| Outcome {
+            kind: kind.into(),
+            session: "s".into(),
+            lessons: lessons.iter().map(|l| l.to_string()).collect(),
+            check: "c1".into(),
+            channel: channel.into(),
+            ms,
+            ..Default::default()
+        };
+        // A withheld (pw ½), D asked though it could have been (pw ¼), C handed over, B drawn (pw 0), E
+        // withheld outright (pw 1).
+        let graded = Outcome {
+            grades: vec![2, 1, 1, 2, 1],
+            ranks: vec![0, 1, 2, 3, 4],
+            applied: 5,
+            chosen: vec!["D".into()],
+            free: vec!["C".into()],
+            placebo: vec!["A".into(), "E".into(), "B".into()],
+            p: vec![0.25, 0.0, 0.0, 0.75, 0.0],
+            pf: vec![0.25, 0.0, 1.0, 0.0, 0.0],
+            pw: vec![0.5, 0.0, 0.0, 0.25, 1.0],
+            psi: 1.0,
+            policy: "learned".into(),
+            ..rec(outcome::GRADED, &["A", "B", "C", "D", "E"], "live", 10)
+        };
+        let log = [
+            graded,
+            Outcome { judge: 3, ..rec(outcome::IGNORED, &["A"], outcome::PLACEBO, 12) },
+            Outcome { judge: 3, ..rec(outcome::CHANGED, &["B"], outcome::PLACEBO, 12) },
+            Outcome { judge: 3, ..rec(outcome::CHANGED, &["E"], outcome::PLACEBO, 12) },
+        ];
+        let text: String = log.iter().map(|o| format!("{}\n", serde_json::to_string(o).unwrap())).collect();
+        let m = Selection::of(&fold(&text, Summary::default()), select::Policy::Learned, None).measurement.unwrap();
+        assert_eq!((m.placebos, m.judged, m.withheld, m.psi, m.arisen, m.arisen_needed), (3, 3, 2, 1.75 / 3.0, 1, select::replay::LIFT_ARISEN), "{m:?}");
+        let sel = Selection { measurement: Some(m.clone()), ..learned() };
+        assert!(
+            selection_line(&sel).contains(
+                " · placebos 3 drawn (2 withheld, mean withhold chance 58%), 3 judged · lift readout due at 93 arisen withheld placebos, 1 so far · "
+            ),
+            "{}",
+            selection_line(&sel)
+        );
+        let due = Selection { measurement: Some(Measurement { arisen: 93, ..m }), ..learned() };
+        assert!(selection_line(&due).contains(" · lift readout due: 93 arisen withheld placebos (borg debug select --replay) · "), "{}", selection_line(&due));
     }
 
     /// The learned decisions the fixed rule took over, per reason, as the summary folds them from the

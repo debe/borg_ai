@@ -13,8 +13,8 @@ use crate::charts::{Donut, Help, Row, Series, StackBar, StackedChart, Tile};
 use crate::util::{ago, duration, num, pct, short_day, trunc, usd};
 use crate::views::overview::delta;
 
-/// The judged placebos needed before leaving a lesson for later is learned, for a server that names
-/// none (borg select/policy.rs `NOT_LEARNED_UNTIL`, next to `NOT_PRIOR`).
+/// The judged placebos after which not now's fit rests mostly on its labels, for a server that names
+/// none (borg select/policy.rs `NOT_LEARNED_UNTIL`, next to `NOT_PRIOR`): display only.
 const PLACEBOS_NEEDED: f64 = 100.0;
 /// Below this many, a share is marked "few": too few to read.
 const FEW: f64 = 20.0;
@@ -1136,10 +1136,25 @@ fn LessonSelection() -> impl IntoView {
         let controls = s.measurement.clone().map(|m| {
             let needed = if m.placebos_needed > 0.0 { m.placebos_needed } else { PLACEBOS_NEEDED };
             let later = s.labels.iter().find(|c| c.name == "placebo").cloned().unwrap_or_default();
+            // Withholding (0.10.0): placebos taken from the lessons a check would deliver, and the lift
+            // readout's progress; said only once a check could withhold.
+            let withheld = (m.psi > 0.0).then(|| {
+                let due = if m.arisen_needed > 0.0 && m.arisen >= m.arisen_needed {
+                    format!("the lift readout is due ({} withheld placebos whose point arose).", num(m.arisen))
+                } else {
+                    format!("the lift readout is due at {} withheld placebos whose point arose, {} so far.", num(m.arisen_needed), num(m.arisen))
+                };
+                format!(
+                    " Of them, {} were withheld from a delivery, at a mean chance of {:.0}% over the lessons that could be (each its ψ, thinned where the safety budget refuses the draw); {due}",
+                    num(m.withheld),
+                    100.0 * m.psi
+                )
+            });
             view! {
-                <p class="how" title="A placebo is a lesson borg would leave for later anyway: it is withheld and still judged as if delivered. These are the only labels that say what leaving a lesson out costs. Every judged placebo updates the model's starting assumption; with few, it barely moves. (raw: measurement placebos / judged, label placebo)">
-                    "Leaving a lesson for later: "<b>{num(m.judged)}</b>" judged placebos so far; until about "<b>{num(needed)}</b>" (a dated decision) its effect is essentially the starting assumption. "
-                    {format!("{} placebos drawn = {} of the lessons left for later.", num(m.placebos), pct(later.part, later.whole))}
+                <p class="how" title="A placebo is a lesson a check does not deliver but still judges as if delivered: one left for later anyway (drawn), or, since 0.10.0, one the check would deliver, withheld at random with the chance its model gives that delivering it is worth nothing (ψ), within the safety budget. These are the only labels that say what not delivering a lesson costs. Every judged placebo updates the model's starting assumption; with few, it barely moves. The lift readout compares how often a delivered and a withheld lesson change the work once their point arose. (raw: measurement placebos / judged / withheld / psi / arisen, label placebo)">
+                    "Not delivering a lesson: "<b>{num(m.judged)}</b>" judged placebos so far; until about "<b>{num(needed)}</b>" (display only) its effect is essentially the starting assumption. "
+                    {format!("{} placebos = {} of the lessons not delivered.", num(m.placebos), pct(later.part, later.whole))}
+                    {withheld}
                 </p>
             }
         });

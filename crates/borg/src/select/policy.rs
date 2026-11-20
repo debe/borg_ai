@@ -4,7 +4,8 @@
 //!
 //! **The value model.** One logistic model of the judge's verdict "the lesson changed the work and the
 //! change avoids its consequence" (`asked_then_changed`), per graded apply j and route a: ask (Q),
-//! free (F) or not now (D, measured by the placebo arm, select.rs `PLACEBO_SLOTS`):
+//! free (F) or not now (D, measured by the placebo arm: withheld placebos, `withhold`, and the draw
+//! among the applies left for later, select.rs `draw_placebo`):
 //! - η_j = β₀ + β₂[g=2] + β₃[g=3] + β_rank·ln(1+rank) + β_stop[stop] + β_three[a 3 in the check]
 //!   + β_three_stop[a 3 in a stop's check] + β_pool·ln(tokens/12k) + u_session + w_lesson + γ_judge;
 //! - P(changed | a, m) = σ(η_j + δ_a + κ_a·ln m_a + interactions), δ_F = 0 (the reference), m_a the
@@ -46,7 +47,8 @@
 //!   draws), a lesson the session already had never handed over free (its delivery would drop it).
 //!   Without evidence nothing passes the quantile, so the prior alone never leaves the fixed rule: the
 //!   effects the fixed rule's history cannot identify (how much each question dilutes the others, what
-//!   a lesson not delivered still changes) cannot decide from their priors. No Thompson play.
+//!   a lesson not delivered still changes) cannot decide from their priors. No Thompson play of the
+//!   routes; withholding (below) is the one draw from the posterior.
 //! - **The randomised question-count test**, on a live check (never the stop) whose evidence keeps the
 //!   fixed rule: of the fixed rule's k delivered non-3 lessons that may go free (`tested`), the first s
 //!   in its order are asked and the rest handed over, s uniform in 0..=k drawn from the check's seed
@@ -57,14 +59,34 @@
 //!   It measures what the fixed rule's history never varies: how many questions to ask.
 //! - **The fixed rule** otherwise.
 //!
+//! **Withholding** (`withhold`, policy v3: docs/evidence.md, Rules v3) follows each of these routings
+//! (inside each of the test's k + 1 counts, never of the test's top lesson, whose outcome its dilution
+//! readout compares across them): a unit the routing asks or hands over is withheld as a
+//! judged placebo (`Route::Placebo`: judged blindly where a free delivery would be, never shown, still
+//! eligible for later checks) with ψ_j, the share of the `DRAWS` joint draws in which delivering it is
+//! worth ≤ 0 (τ_jk ≤ 0), drawn on its own stream of the check's seed (`withhold_draw`). So a lesson the
+//! posterior says is surely worth delivering is almost never withheld, and ψ moves as δ_D is fitted
+//! from the placebos' own labels. The draw takes each candidate independently, and the gate admits the
+//! subset it took exactly as it admits a routing, on the routing with that subset withheld (`exact`);
+//! a subset it refuses plays the routing with nothing withheld. Every subset is valued, so the
+//! propensities are exact; past `WITHHOLD_EXACT_MAX` live candidates (a guard on a check's time) the
+//! gate bounds the worst case instead, every candidate's positive τ lost in every draw at once, and
+//! drops the candidates with the highest mean τ first until it fits (`worst_case`). Never withheld: a
+//! stop's 3 (`forced`), a lesson the session had or named twice at the check (`withholdable`), and
+//! nothing under `FIXED`, `SIZE`, a reverted store, α 0 or a replay of a check from before it
+//! (`choose_with`; P0: cold start stays exactly the fixed rule). With withholding on, a unit the
+//! fixed rule delivers that a routing leaves undelivered is a judged placebo too; off, it is not now.
+//!
 //! The conservative gate (in `choose`) keeps the fixed rule unless the deviation leaves the replayed
 //! value of the policy's checks, at the `DELTA` quantile over `DRAWS` joint draws, at most α × the
 //! fixed rule's own replayed value below the fixed rule (select/summary.rs `Gate`), α the engineer's
 //! tolerance (`ALPHA` unless the collective sets `risk`, select.rs `risk_of`; 0 turns the test off):
 //! cold start is exactly the fixed rule, and the test is rationed by quality, not by an ε. A stop's
-//! grade 3 is always asked (`forced`). Propensities are exact: 0 or 1 on evidence and under the fixed
-//! rule, and under the test each unit's share of the k + 1 values of s that ask it or hand it over (a
-//! value the gate refuses counting as the fixed rule's routes). Spend is not an objective: only the
+//! grade 3 is always asked (`forced`). Propensities are exact (`played`): each unit's share of the
+//! equally likely routings (one on evidence and under the fixed rule, the test's k + 1 values of s, a
+//! value the gate refuses counting as the fixed rule's routes) that ask it or hand it over, times
+//! 1 − w_j of that routing, w_j its chance of being withheld there (Σ P(S) over the admitted subsets S
+//! that hold it), and its withheld share `pw`. Spend is not an objective: only the
 //! pool's size has a price, and only under a budget an engineer set for the collective (`price`);
 //! without one the price is 0.
 //!
@@ -77,7 +99,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use super::summary::{Apply, Check as Logged, Gate, Label, Summary};
+use super::summary::{self, Apply, Check as Logged, Gate, Label, Summary};
 use super::{ARMS, Route, Unit};
 use crate::conscience::{self, Challenge};
 use crate::memory::Rng;
@@ -100,6 +122,12 @@ pub const DRAWS: usize = conscience::P_DRAWS;
 /// table) and the valuing of the evidence rule's and the test's routes (O(n) per draw, `DRAWS` draws,
 /// k + 2 routings); its hit rate is the share of `size` checks.
 pub const SOLVE_MAX: usize = 16;
+/// Withholding candidates (ψ > 0) up to which a routing's drawn set is admitted exactly (`withhold`):
+/// every subset of them is valued, 2^c subsets over the `DRAWS` joint draws and the check's units.
+/// Guard: bounds a check's time (10: 1024 subsets per routing, each a sum over n ≤ `SOLVE_MAX` units
+/// and a quantile of `DRAWS` values); a routing with more takes the worst-case fallback
+/// (`worst_case`), whose hit rate `borg debug select` P3 reports (select/replay.rs `Withheld`).
+pub const WITHHOLD_EXACT_MAX: usize = 10;
 
 /// Prior sd of every identified effect (intercept, grades, channel, a 3 in the check, a 3 at the
 /// stop): N(0, 2.5²). Method: the weakly informative default for logistic coefficients (Gelman et al.
@@ -109,12 +137,14 @@ pub const PRIOR_SD: f64 = 2.5;
 /// +6.3, handed over +7.3 points against the plain agent) puts them within a few points; wide.
 pub const ASK_PRIOR: (f64, f64) = (0.0, 0.35);
 /// Not now against free, N(−0.3, 0.25²). Learned, dated prior: the same evaluation, a lesson not
-/// delivered changes less than one handed over. Fixed by dated decision (2026-10-31, docs/evidence.md):
-/// 8 placebos drawn, 1 judged, the fitted effect is this prior; withholding is not learned until 100
-/// judged placebos exist.
+/// delivered changes less than one handed over. A prior with a fixed sd (automatic relevance never
+/// shrinks it); the coefficient itself is MAP-fitted at every fit and never fixed, so withholding's ψ
+/// moves with it (Rules v3 amendment 2026-11-19, docs/evidence.md, superseding 2026-10-31's "fixed
+/// until 100 judged placebos").
 pub const NOT_PRIOR: (f64, f64) = (-0.3, 0.25);
-/// The judged placebos needed before not now is learned rather than fixed at [`NOT_PRIOR`] (the same
-/// dated decision, 2026-10-31): shown as progress on the Conscience tab.
+/// The judged placebos after which not now's fit rests mostly on its labels rather than on
+/// [`NOT_PRIOR`]. Display only (Rules v3 amendment 2026-11-19): progress on the Conscience tab; it
+/// gates nothing.
 pub const NOT_LEARNED_UNTIL: u64 = 100;
 /// Dilution slope per ln(m) of asks or free lessons, N(0, 0.1²) truncated ≤ 0 (half-normal, its mode
 /// at 0). Learned, dated prior: the 2026-10-22 estimate (0.04 [0, 0.12] less per extra question on the
@@ -1738,25 +1768,43 @@ pub const EXPERIMENT_CONTROL: &str = "experiment_control";
 /// gate refused its draw) carries `xk`, the fixed rule's delivered non-3 lessons that may go free, and
 /// `xs`, the drawn number of them to ask (on `GATE` the draw the gate refused: the routes are the fixed
 /// rule's); both None on every other check (outcome.rs `xk`, `xs`).
+///
+/// Withholding (module doc): `routes` carry `Route::Placebo` for a unit withheld as a judged placebo,
+/// and `pw` is each unit's chance of that (by the withhold draw where the gate admits the subset drawn,
+/// or left undelivered by a routing although the fixed rule delivers it); `p` and `pf` are the chances
+/// of being delivered so, after the withhold draw. `source` names the routing, whatever was withheld
+/// from it, and `risk` is the risk of the routes played, what was withheld included (under the
+/// worst-case fallback, its worst case: `worst_case`). Of the routing played, `psi_w` is per unit its ψ
+/// as offered to the withhold draw (None for a unit that is no candidate; 0 for one whose ψ is 0 or
+/// that the fallback dropped), `dropped` the candidates with ψ > 0 the fallback dropped, `refused`
+/// whether the gate refused the subset the draw took (the routing then played with nothing withheld)
+/// and `fallback` whether the routing took the worst-case fallback (`WITHHOLD_EXACT_MAX`): replayed,
+/// not logged (`borg debug select` P3 reports them).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub routes: Vec<Route>,
     pub p: Vec<f64>,
     pub pf: Vec<f64>,
+    pub pw: Vec<f64>,
     pub source: &'static str,
     pub gate: f64,
     pub risk: f64,
     pub xk: Option<u32>,
     pub xs: Option<u32>,
+    pub psi_w: Vec<Option<f64>>,
+    pub dropped: u32,
+    pub refused: bool,
+    pub fallback: bool,
 }
 
-/// The `DELTA` quantile of `v` (the ⌈δ·n⌉-th smallest: the lower side, cautious).
+/// The `DELTA` quantile of `v` (the ⌈δ·n⌉-th smallest: the lower side, cautious), `v` reordered
+/// around it (a selection, not a sort: the exact admission takes one per subset, `exact`).
 fn lower_quantile(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(f64::total_cmp);
-    v[((DELTA * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1]
+    let at = ((DELTA * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1;
+    *v.select_nth_unstable_by(at, f64::total_cmp).1
 }
 
 /// The quality `gate` may still risk below the fixed rule at `ALPHA`: its allowance plus the ledger's
@@ -1805,13 +1853,15 @@ struct Draws<'a> {
     feats: Vec<Feat>,
     rates: &'a Rates,
     base: Vec<f64>,
+    /// `col`'s table, computed on its first read.
+    cols: std::cell::OnceCell<Vec<f64>>,
 }
 
 impl<'a> Draws<'a> {
     fn of(model: &Model, fit: &'a Fit, units: &[Unit], check: &Check, lv: &Levels, base: &[Route]) -> Draws<'a> {
         let feats = Feat::of(units, check.stop, check.tokens);
         let thetas: Vec<Theta> = (0..DRAWS).map(|k| theta(model, &feats, units, lv, gate_seed(fit, k))).collect();
-        let mut d = Draws { thetas, feats, rates: &fit.rates, base: Vec::new() };
+        let mut d = Draws { thetas, feats, rates: &fit.rates, base: Vec::new(), cols: std::cell::OnceCell::new() };
         d.base = (0..DRAWS).map(|k| d.value(k, base)).collect();
         d
     }
@@ -1824,6 +1874,29 @@ impl<'a> Draws<'a> {
     /// Per draw, the value of `routes` minus the fixed rule's.
     fn gains(&self, routes: &[Route]) -> Vec<f64> {
         self.base.iter().enumerate().map(|(k, b)| self.value(k, routes) - b).collect()
+    }
+
+    /// Unit `j`'s value on the route `arm` (`Route::arm`: ask 0, free 1) at the route's size `m` ≥ 1, in
+    /// every draw (`Valuer::ask`, `free`), contiguous over the draws: the exact admission's sums
+    /// (`exact`) read it per subset. The whole table (2 × n² × `DRAWS` values) is computed once per check,
+    /// on the first read.
+    fn col(&self, arm: usize, m: usize, j: usize) -> &[f64] {
+        let n = self.feats.len();
+        let cols = self.cols.get_or_init(|| {
+            let mut v = vec![0.0; 2 * (n + 1) * n * DRAWS];
+            for (k, t) in self.thetas.iter().enumerate() {
+                let val = Valuer { t, feats: &self.feats, rates: self.rates };
+                for m in 1..=n {
+                    for j in 0..n {
+                        v[(m * n + j) * DRAWS + k] = val.ask(j, m);
+                        v[((n + 1 + m) * n + j) * DRAWS + k] = val.free(j, m);
+                    }
+                }
+            }
+            v
+        });
+        let at = ((arm * (n + 1) + m) * n + j) * DRAWS;
+        &cols[at..at + DRAWS]
     }
 }
 
@@ -1864,6 +1937,255 @@ fn draw_count(seed: u64, k: usize) -> usize {
     (hash(&[b"question-count", &seed.to_le_bytes()]) % (k as u64 + 1)) as usize
 }
 
+/// Whether unit `j` of `units` may be withheld as a judged placebo (module doc: withholding): not
+/// forced (a stop's 3, at a check on `stop`), its lesson not one the session had (`had`: the delivery
+/// drops a placebo of a lesson given before, hook.rs `queued`), and named once at the check (a
+/// placebo is judged by lesson, so a copy delivered beside it would deliver it). Guard: select.rs
+/// `draw_placebo`'s exclusions, so every unit withheld is judged and its `pw` stays exact.
+fn withholdable(units: &[Unit], had: &[String], stop: bool, j: usize) -> bool {
+    let u = &units[j];
+    !(stop && u.grade == 3) && !had.iter().any(|h| h == u.lesson) && units.iter().filter(|x| x.lesson == u.lesson).count() == 1
+}
+
+/// One routing's withholding (`withhold`): per unit its ψ as offered to the withhold draw (`psi`: None
+/// for a unit that is no candidate; 0 for a candidate whose ψ is 0 or that the fallback dropped) and
+/// its chance of being withheld in this routing (`pw`: ψ thinned by the subsets the gate refuses); the
+/// units the draw can take (`live`, ψ > 0: bit i of a subset is `live[i]`). Under the exact admission,
+/// per subset of `live` (`admitted`, indexed by its bits) the risk the gate takes for the routing with
+/// that subset withheld, None when it refuses it (subset 0 is the routing itself, played at its own
+/// risk, `Play::risk`). Under the worst-case fallback (`fallback`: past `WITHHOLD_EXACT_MAX`), the
+/// candidates with ψ > 0 it dropped (`dropped`) and its `DELTA` quantile (`q`: None when no candidate
+/// is left to withhold).
+#[derive(Debug, Clone)]
+struct Withhold {
+    psi: Vec<Option<f64>>,
+    pw: Vec<f64>,
+    live: Vec<usize>,
+    admitted: Vec<Option<f64>>,
+    fallback: bool,
+    dropped: u32,
+    q: Option<f64>,
+}
+
+impl Withhold {
+    /// Nothing withheld from a routing of `n` units.
+    fn none(n: usize) -> Withhold {
+        Withhold { psi: vec![None; n], pw: vec![0.0; n], live: Vec::new(), admitted: Vec::new(), fallback: false, dropped: 0, q: None }
+    }
+
+    /// Unit `j`'s chance of the withhold draw (its ψ as offered).
+    fn at(&self, j: usize) -> f64 {
+        self.psi.get(j).copied().flatten().unwrap_or(0.0)
+    }
+
+    /// The subset of `live` the withhold draw takes at the check whose seed is `seed` (`withhold_draw`
+    /// per unit, independent), as bits.
+    fn drawn(&self, seed: u64) -> usize {
+        self.live.iter().enumerate().filter(|(_, j)| withhold_draw(seed, **j, self.at(**j))).fold(0, |s, (i, _)| s | 1 << i)
+    }
+}
+
+/// The withholding of the routing `routes` (aligned with `units`; module doc): its candidates are the
+/// units it asks or hands over that may be judged as placebos (`withholdable`), each with ψ_j, the
+/// share of the joint draws `d` in which delivering it is worth ≤ 0 (τ_jk at its route and the
+/// routing's sizes, `Valuer::ask`, `free`), rounded (outcome.rs `round_p`). The draw takes each
+/// candidate with ψ > 0 independently (`withhold_draw`); the gate (`gate`, at `allowance`) admits the
+/// subset it took exactly as it admits a routing (`choose`'s `admit`), on the routing with that subset
+/// withheld (`exact`), and a subset it refuses plays the routing with nothing withheld. Its propensities
+/// are exact because every subset is valued: past `WITHHOLD_EXACT_MAX` live candidates, which would
+/// make that too slow for a check, the worst-case rule decides instead (`worst_case`, the fallback).
+/// The unit `keep` is no candidate: the question-count test's top lesson (`tested`'s first), whose
+/// outcome its dilution readout compares across the counts (select/replay.rs `test_units`; Rules v3
+/// amendment 2026-11-19): withheld at a ψ that moves with the count, its contrast would measure
+/// withholding too.
+fn withhold(d: &Draws, routes: &[Route], units: &[Unit], had: &[String], gate: &Gate, allowance: f64, keep: Option<usize>) -> Withhold {
+    let n = routes.len();
+    let stop = d.feats.first().is_some_and(|f| f.stop);
+    let m_q = routes.iter().filter(|r| **r == Route::Ask).count();
+    let m_f = routes.iter().filter(|r| **r == Route::Free).count();
+    let candidates: Vec<usize> =
+        (0..n).filter(|&j| matches!(routes[j], Route::Ask | Route::Free) && Some(j) != keep && withholdable(units, had, stop, j)).collect();
+    let mut out = Withhold::none(n);
+    if candidates.is_empty() {
+        return out;
+    }
+    // τ_jk per candidate and draw: what delivering it is worth on its route.
+    let tau: Vec<Vec<f64>> = candidates
+        .iter()
+        .map(|&j| {
+            (0..DRAWS)
+                .map(|k| {
+                    let v = Valuer { t: &d.thetas[k], feats: &d.feats, rates: d.rates };
+                    if routes[j] == Route::Ask { v.ask(j, m_q) } else { v.free(j, m_f) }
+                })
+                .collect()
+        })
+        .collect();
+    for (c, &j) in candidates.iter().enumerate() {
+        out.psi[j] = Some(crate::outcome::round_p(tau[c].iter().filter(|t| **t <= 0.0).count() as f64 / DRAWS as f64));
+    }
+    out.live = candidates.iter().copied().filter(|&j| out.at(j) > 0.0).collect();
+    if out.live.len() > WITHHOLD_EXACT_MAX {
+        worst_case(d, routes, gate, allowance, &candidates, &tau, &mut out);
+    } else {
+        exact(d, routes, gate, allowance, &mut out);
+    }
+    out
+}
+
+/// The exact admission of `out.live`'s subsets on the routing `routes` (`withhold`): per subset S, the
+/// gate's `DELTA` quantile after the routing with S withheld (per draw k, the ledger's gain plus the
+/// routing's value with S not delivered, the rest at the sizes S leaves, minus the fixed rule's: `col`),
+/// admitted at `allowance` as `choose`'s `admit` admits a routing, its risk the ledger's quantile minus
+/// it (`Decision::risk`). Each live unit's chance of being withheld is Σ over the admitted S that hold
+/// it of P(S) = Π_{i∈S} ψ_i Π_{i∉S} (1 − ψ_i), the draw's independent chances.
+fn exact(d: &Draws, routes: &[Route], gate: &Gate, allowance: f64, out: &mut Withhold) {
+    let held = lower_quantile(&mut gate.gain.clone());
+    let live = &out.live;
+    let sizes = [Route::Ask, Route::Free].map(|r| routes.iter().filter(|x| **x == r).count());
+    let delivered: Vec<(usize, usize, Option<usize>)> =
+        (0..routes.len()).filter(|&j| matches!(routes[j], Route::Ask | Route::Free)).map(|j| (j, routes[j].arm(), live.iter().position(|x| *x == j))).collect();
+    let start: Vec<f64> = gate.gain.iter().zip(&d.base).map(|(g, b)| g - b).collect();
+    let mut acc = vec![0.0; DRAWS];
+    out.admitted = (0..1usize << live.len())
+        .map(|s| {
+            let mut m = sizes;
+            for &j in live.iter().enumerate().filter(|(i, _)| s >> i & 1 == 1).map(|(_, j)| j) {
+                m[routes[j].arm()] -= 1;
+            }
+            acc.copy_from_slice(&start);
+            for &(j, arm, _) in delivered.iter().filter(|(_, _, i)| i.is_none_or(|i| s >> i & 1 == 0)) {
+                for (x, v) in acc.iter_mut().zip(d.col(arm, m[arm], j)) {
+                    *x += v;
+                }
+            }
+            let q = lower_quantile(&mut acc);
+            (q >= -allowance).then(|| (held - q).max(0.0))
+        })
+        .collect();
+    for (s, _) in out.admitted.iter().enumerate().filter(|(_, a)| a.is_some()) {
+        let p: f64 = live.iter().enumerate().map(|(i, &j)| if s >> i & 1 == 1 { out.psi[j].unwrap_or(0.0) } else { 1.0 - out.psi[j].unwrap_or(0.0) }).product();
+        for (_, &j) in live.iter().enumerate().filter(|(i, _)| s >> i & 1 == 1) {
+            out.pw[j] += p;
+        }
+    }
+}
+
+/// The worst-case fallback (`withhold` past `WITHHOLD_EXACT_MAX` live candidates): per draw k, the gain
+/// of the ledger and the routing `routes`, minus Σ max(τ_jk, 0) over the `candidates` with ψ > 0 (`tau`
+/// aligned with them). That bounds every subset the draw can withhold, because a unit withheld lowers
+/// its route's size and the dilution slopes are ≤ 0, so no other unit loses by it; so every subset it
+/// admits the exact rule would admit too, and the draw's ψ is each unit's chance of being withheld.
+/// Admitted when its `DELTA` quantile is ≥ −`allowance`; else the candidate with the highest mean τ
+/// is dropped (ψ 0), then the next, until it is (ties: the earlier unit first). Deterministic, so the
+/// propensities over it are exact; conservative, so it withholds less than the exact rule would.
+fn worst_case(d: &Draws, routes: &[Route], gate: &Gate, allowance: f64, candidates: &[usize], tau: &[Vec<f64>], out: &mut Withhold) {
+    out.fallback = true;
+    // The candidates the draw can take, in the order the fallback drops them: the highest mean τ first.
+    let mean = |c: usize| tau[c].iter().sum::<f64>() / DRAWS as f64;
+    let mut live: Vec<usize> = (0..candidates.len()).filter(|&c| out.at(candidates[c]) > 0.0).collect();
+    live.sort_by(|&a, &b| mean(b).total_cmp(&mean(a)).then(a.cmp(&b)));
+    let after: Vec<f64> = d.gains(routes).iter().zip(&gate.gain).map(|(x, g)| g + x).collect();
+    for (i, &c) in live.iter().enumerate() {
+        let mut worst: Vec<f64> = (0..DRAWS).map(|k| after[k] - live[i..].iter().map(|&x| tau[x][k].max(0.0)).sum::<f64>()).collect();
+        let q = lower_quantile(&mut worst);
+        if q >= -allowance {
+            out.q = Some(q);
+            break;
+        }
+        out.psi[candidates[c]] = Some(0.0);
+        out.dropped += 1;
+    }
+    out.live.retain(|&j| out.psi[j].is_some_and(|x| x > 0.0));
+    for &j in candidates {
+        out.pw[j] = out.at(j);
+    }
+}
+
+/// Whether the withhold draw takes unit `j` of the check whose seed is `seed` at the chance `psi`: a
+/// uniform in [0, 1) from the top 53 bits of `hash` over the tag, the seed and j, on its own stream
+/// (apart from the count's, `draw_count`, and the placebo's, select.rs `draw_placebo`), below `psi`.
+fn withhold_draw(seed: u64, j: usize, psi: f64) -> bool {
+    // Derived: the bits of an f64's mantissa, so every value of the uniform is exact.
+    const BITS: u32 = f64::MANTISSA_DIGITS;
+    let u = (hash(&[b"withhold", &seed.to_le_bytes(), &(j as u64).to_le_bytes()]) >> (u64::BITS - BITS)) as f64 / (1u64 << BITS) as f64;
+    u < psi
+}
+
+/// One routing of a check as `choose` plays it: its routes before the withhold draw, their
+/// withholding (`withhold`) and the risk the gate takes for the routing with nothing withheld (under
+/// the worst-case fallback, for it with its withholding at the worst case).
+struct Play {
+    routes: Vec<Route>,
+    w: Withhold,
+    risk: f64,
+}
+
+/// The play `played` drew: its routes, every unit's propensities (`p`, `pf`, `pw`), the risk the gate
+/// takes for the routes (`Decision::risk`) and whether the gate refused the subset the withhold draw
+/// took (`Decision::refused`).
+struct Played {
+    routes: Vec<Route>,
+    props: [Vec<f64>; 3],
+    risk: f64,
+    refused: bool,
+}
+
+/// The play `s` of the equally likely `plays` (one, or the test's k + 1 counts) at the check whose seed
+/// is `seed`, with each unit's propensities over all of them (module doc). The withhold draw takes a
+/// subset of the play's live candidates (`Withhold::drawn`); admitted (`Withhold::admitted`, always
+/// under the fallback), it is withheld and the risk is the routing's with it withheld; refused, the
+/// play's routes are played with nothing withheld at the play's own risk. With withholding on (`on`),
+/// a unit the play leaves undelivered though the fixed rule `base` delivers it is withheld outright
+/// when it may be a placebo (`withholdable` at a check on `stop`, else not now). Per unit, with w its
+/// chance of being withheld in a play (`Withhold::pw`): p = mean over the plays of [asked]·(1 − w), pf
+/// the same of [free], pw = mean of [asked or free]·w + [on, left undelivered, delivered by `base`,
+/// withholdable]; each rounded (outcome.rs `round_p`). Off (α 0, or a replay of a record from before
+/// withholding), every w is 0 and nothing is withheld outright: p and pf are the plays' exact shares
+/// and a unit left undelivered is not now, as policy v2 routed it.
+#[allow(clippy::too_many_arguments)]
+fn played(plays: &[Play], s: usize, base: &[Route], units: &[Unit], had: &[String], stop: bool, seed: u64, on: bool) -> Played {
+    let n = base.len();
+    let judged = |j: usize| on && matches!(base[j], Route::Ask | Route::Free) && withholdable(units, had, stop, j);
+    let mut sums = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for play in plays {
+        for (j, r) in play.routes.iter().enumerate() {
+            let w = play.w.pw[j];
+            match r {
+                Route::Ask | Route::Free => {
+                    sums[r.arm()][j] += 1.0 - w;
+                    sums[2][j] += w;
+                }
+                _ if judged(j) => sums[2][j] += 1.0,
+                _ => {}
+            }
+        }
+    }
+    let k = plays.len().max(1) as f64;
+    let props = sums.map(|v| v.into_iter().map(|x| crate::outcome::round_p(x / k)).collect());
+    let drawn = &plays[s];
+    let w = &drawn.w;
+    let subset = w.drawn(seed);
+    let (taken, risk, refused) = match w.admitted.get(subset) {
+        _ if w.fallback || subset == 0 => (subset, drawn.risk, false),
+        Some(Some(risk)) => (subset, *risk, false),
+        _ => (0, drawn.risk, true),
+    };
+    let withheld = |j: usize| w.live.iter().position(|x| *x == j).is_some_and(|i| taken >> i & 1 == 1);
+    let routes = drawn
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(j, r)| match r {
+            Route::Ask | Route::Free if withheld(j) => Route::Placebo,
+            Route::Ask | Route::Free => *r,
+            _ if judged(j) => Route::Placebo,
+            _ => Route::Not,
+        })
+        .collect();
+    Played { routes, props, risk, refused }
+}
+
 /// The routes of `units` at `check` for a session that already had the lessons `had` (module doc: the
 /// decision), none of those handed over free (its `pf` 0) and the fixed rule they are gated against
 /// the same (`fixed_routes` with `had`). Without a model, with an empty gate or past `SOLVE_MAX`
@@ -1875,23 +2197,47 @@ fn draw_count(seed: u64, k: usize) -> usize {
 ///
 /// `alpha` is the share of the fixed rule's value the engineer tolerates risking for learning (select.rs
 /// `risk_of`, `ALPHA` unless the collective sets `risk`): the gate's allowance in this decision is the
-/// ledger's (accrued at `ALPHA`) scaled to it, for the evidence rule's deviations and the test's alike.
-/// The randomised question-count test runs on a live check (`check.stop` false) whose evidence keeps
-/// the fixed rule (an evidence deviation the gate refuses is not tested either), only while `alpha` is
-/// above 0, its count drawn from `seed`.
+/// ledger's (accrued at `ALPHA`) scaled to it, for the evidence rule's deviations, the test's and
+/// withholding alike. The randomised question-count test runs on a live check (`check.stop` false)
+/// whose evidence keeps the fixed rule (an evidence deviation the gate refuses is not tested either),
+/// only while `alpha` is above 0, its count drawn from `seed`. Withholding (`withhold`) follows every
+/// routing but the fixed rule's fallbacks (`FIXED`, `SIZE`), inside each of the test's counts, only
+/// while `alpha` is above 0, its draws from `seed` (`withhold_draw`).
 #[must_use]
 pub fn choose(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, alpha: f64, seed: u64, had: &[String]) -> Decision {
+    choose_with(units, check, fit, gate, alpha, seed, had, true)
+}
+
+/// `choose`, withholding only when `withholding` is set: unset, the decision of policy v2 (Rules v2),
+/// which a check logged before withholding (0.10.0) made, so `borg debug select` replays such a
+/// record with it (select.rs `Ctx::withhold`).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn choose_with(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, alpha: f64, seed: u64, had: &[String], withholding: bool) -> Decision {
     let base = fixed_routes(units, had);
-    let fixed = |source: &'static str| Decision {
-        p: share(&[&base], Route::Ask),
-        pf: share(&[&base], Route::Free),
-        routes: base.clone(),
-        source,
-        gate: 0.0,
-        risk: 0.0,
-        xk: None,
-        xs: None,
+    let on = withholding && alpha > 0.0;
+    let decision = |plays: &[Play], s: usize, source: &'static str, gate: f64, test: Option<(usize, usize)>| {
+        let Played { routes, props: [p, pf, pw], risk, refused } = played(plays, s, &base, units, had, check.stop, seed, on);
+        let count = |x: usize| Some(u32::try_from(x).unwrap_or(u32::MAX));
+        let w = &plays[s].w;
+        Decision {
+            routes,
+            p,
+            pf,
+            pw,
+            source,
+            gate,
+            risk,
+            xk: test.and_then(|t| count(t.0)),
+            xs: test.and_then(|t| count(t.1)),
+            psi_w: w.psi.clone(),
+            dropped: w.dropped,
+            refused,
+            fallback: w.fallback,
+        }
     };
+    let plain = |routes: Vec<Route>, risk: f64| Play { w: Withhold::none(routes.len()), routes, risk };
+    let fixed = |source: &'static str| decision(&[plain(base.clone(), 0.0)], 0, source, 0.0, None);
     let Some(model) = fit.model.as_ref().filter(|m| m.current()) else { return fixed(FIXED) };
     if gate.allowance <= 0.0 || gate.gain.len() != DRAWS || units.is_empty() {
         return fixed(FIXED);
@@ -1915,54 +2261,49 @@ pub fn choose(units: &[Unit], check: &Check, fit: &Fit, gate: &Gate, alpha: f64,
         let q = lower_quantile(&mut after);
         (q >= -allowance).then_some((held - q).max(0.0))
     };
+    // A routing the gate admitted at `risk`, with its withholding (none at α 0 or unset; never of
+    // `keep`): under the worst-case fallback its risk is the worst case's, else the routing's own (the
+    // subset the draw takes carries its own, `Withhold::admitted`).
+    let play = |routes: Vec<Route>, risk: f64, keep: Option<usize>| -> Play {
+        if !on {
+            return plain(routes, risk);
+        }
+        let w = withhold(&d, &routes, units, had, gate, allowance, keep);
+        let risk = w.q.map_or(risk, |q| (held - q).max(0.0));
+        Play { routes, w, risk }
+    };
     if let Some(best) = evident(model, &d, units, &lv, &base, &nofree_of(units, had)) {
         return match admit(&best) {
-            Some(risk) => Decision {
-                p: share(&[&best], Route::Ask),
-                pf: share(&[&best], Route::Free),
-                routes: best,
-                source: EVIDENCE,
-                gate: remaining,
-                risk,
-                xk: None,
-                xs: None,
-            },
-            None => Decision { gate: remaining, ..fixed(GATE) },
+            Some(risk) => decision(&[play(best, risk, None)], 0, EVIDENCE, remaining, None),
+            None => decision(&[play(base.clone(), 0.0, None)], 0, GATE, remaining, None),
         };
     }
     let order = tested(units, &base, had);
     if check.stop || alpha <= 0.0 || order.is_empty() {
-        return Decision { gate: remaining, ..fixed(EVIDENCE) };
+        return decision(&[play(base.clone(), 0.0, None)], 0, EVIDENCE, remaining, None);
     }
-    // Every count's routes as played (a count the gate refuses plays the fixed rule's), so each unit's
-    // propensity is its exact share over the k + 1 equally likely counts.
+    // Every count's routes as played (a count the gate refuses plays the fixed rule's), each with its
+    // withholding, so each unit's propensity is its exact share over the k + 1 equally likely counts;
+    // the top lesson, whose outcome the dilution readout compares across counts, never withheld.
     let k = order.len();
-    let arms: Vec<(Vec<Route>, Option<f64>)> = (0..=k)
+    let keep = order.first().copied();
+    let arms: Vec<(Play, bool)> = (0..=k)
         .map(|s| {
             let routes = test_routes(&base, &order, s);
-            let risk = admit(&routes);
-            (if risk.is_some() { routes } else { base.clone() }, risk)
+            match admit(&routes) {
+                Some(risk) => (play(routes, risk, keep), true),
+                None => (play(base.clone(), 0.0, keep), false),
+            }
         })
         .collect();
-    let played: Vec<&Vec<Route>> = arms.iter().map(|(r, _)| r).collect();
     let s = draw_count(seed, k);
-    let (routes, risk) = &arms[s];
-    let source = match risk {
-        None => GATE,
-        Some(_) if *routes == base => EXPERIMENT_CONTROL,
-        Some(_) => EXPERIMENT,
+    let source = match arms[s] {
+        (_, false) => GATE,
+        (ref p, true) if p.routes == base => EXPERIMENT_CONTROL,
+        _ => EXPERIMENT,
     };
-    let count = |x: usize| Some(u32::try_from(x).unwrap_or(u32::MAX));
-    Decision {
-        p: share(&played, Route::Ask),
-        pf: share(&played, Route::Free),
-        routes: routes.clone(),
-        source,
-        gate: remaining,
-        risk: risk.unwrap_or(0.0),
-        xk: count(k),
-        xs: count(s),
-    }
+    let plays: Vec<Play> = arms.into_iter().map(|(p, _)| p).collect();
+    decision(&plays, s, source, remaining, Some((k, s)))
 }
 
 /// The decision rule without the randomised question-count test, for a session that already had `had`
@@ -1983,13 +2324,6 @@ pub fn decide_on_evidence(units: &[Unit], check: &Check, fit: &Fit, had: &[Strin
     let lv = Levels::of(check.session, &model.judge, units);
     let d = Draws::of(model, fit, units, check, &lv, &base);
     evident(model, &d, units, &lv, &base, &nofree_of(units, had)).unwrap_or(base)
-}
-
-/// Per unit, the share of the equally likely routings `draws` that give it `route`, rounded (outcome.rs
-/// `round_p`): one routing's 0 or 1, the test's k + 1 counts' exact shares.
-fn share(draws: &[&Vec<Route>], route: Route) -> Vec<f64> {
-    let n = draws.first().map_or(0, |d| d.len());
-    (0..n).map(|j| crate::outcome::round_p(draws.iter().filter(|d| d[j] == route).count() as f64 / draws.len() as f64)).collect()
 }
 
 /// `gate` with one more check of the learned policy, decided for a session that already had `had`
@@ -2140,11 +2474,16 @@ pub fn monitor(s: &Summary) -> Monitor {
                 Label::Ignored | Label::NotArisen => Some(0.0),
                 Label::Unclear | Label::Remains | Label::Open | Label::Censored => None,
             };
-            // Floors: a logged ψ or μ of 0 for a route that happened is rounding (outcome.rs `round_p`),
-            // so the least the log can say (ψ at 1/1000, μ at one draw of `DRAWS`).
-            let psi = if a.route == Route::Placebo { a.psi.max(PSI_FLOOR) } else { 1.0 };
+            // A placebo's chance is its route's (select/summary.rs `placebo_p`: withheld, or left for
+            // later and drawn). Floors: a logged ψ or μ of 0 for a route that happened is rounding
+            // (outcome.rs `round_p`), so the least the log can say (ψ at 1/1000, μ at one draw of
+            // `DRAWS`, a placebo's at both).
+            let route_p = match a.route {
+                Route::Placebo => summary::placebo_p(a.p, a.pf, a.pw, a.psi.max(PSI_FLOOR)).max(PSI_FLOOR / DRAWS as f64),
+                _ => mu[taken].max(1.0 / DRAWS as f64),
+            };
             let judged_p = d.judged_p.get(&i).copied().unwrap_or(1.0).max(1.0 / MAX_IPW);
-            let w = if y.is_some() { 1.0 / (mu[taken].max(1.0 / DRAWS as f64) * judged_p * psi) } else { 0.0 };
+            let w = if y.is_some() { 1.0 / (route_p * judged_p) } else { 0.0 };
             let vb = p_hat[fixed] - p_hat[2];
             terms.push(Term { tick: c.tick, diff, p_hat, taken, y, w, vb });
         }
@@ -2884,48 +3223,129 @@ mod tests {
         }
     }
 
-    /// A decision is a function of its inputs; the seed moves only the randomised test's count, so at
-    /// the stop, where the test never runs, no seed changes it.
+    /// A decision is a function of its inputs; the seed moves only the randomised test's count and the
+    /// withhold draw, so at the stop, where the test never runs, a seed changes a route only by
+    /// withholding a unit offered to the draw (`psi_w` above 0), and never a propensity. The risk is the
+    /// routes' (the exact admission, `exact`), so it moves only with them.
     #[test]
     fn decisions_are_deterministic_and_only_the_test_varies() {
-        let f = fit(&planted(8, 20, 3), None);
-        let gate = open_gate();
-        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 3, 2)];
-        let check = Check { session: "new", stop: false, tokens: 0 };
-        let a = choose(&units, &check, &f, &gate, ALPHA, 42, &[]);
-        assert_eq!(a, choose(&units, &check, &f, &gate, ALPHA, 42, &[]));
-        let plays: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &check, &f, &gate, ALPHA, s, &[]).routes).collect();
-        assert!(plays.len() > 1, "the test's count varies with the check: {plays:?}");
-        let stop = Check { stop: true, ..check };
-        let at_stop: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &stop, &f, &gate, ALPHA, s, &[]).routes).collect();
-        assert_eq!(at_stop.len(), 1, "no Thompson play: {at_stop:?}");
+        for f in [fit(&planted(8, 20, 3), None), withholding_fit()] {
+            let gate = open_gate();
+            let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 3, 2)];
+            let check = Check { session: "new", stop: false, tokens: 0 };
+            let a = choose(&units, &check, &f, &gate, ALPHA, 42, &[]);
+            assert_eq!(a, choose(&units, &check, &f, &gate, ALPHA, 42, &[]));
+            let plays: std::collections::HashSet<Vec<Route>> = (0..60).map(|s| choose(&units, &check, &f, &gate, ALPHA, s, &[]).routes).collect();
+            assert!(plays.len() > 1, "the test's count varies with the check: {plays:?}");
+            let stop = Check { stop: true, ..check };
+            let at_stop: Vec<Decision> = (0..60).map(|s| choose(&units, &stop, &f, &gate, ALPHA, s, &[])).collect();
+            let first = &at_stop[0];
+            for d in &at_stop {
+                assert_eq!((&d.p, &d.pf, &d.pw, d.source, &d.psi_w), (&first.p, &first.pf, &first.pw, first.source, &first.psi_w));
+                for e in at_stop.iter().filter(|e| e.routes == d.routes) {
+                    assert_eq!(e.risk, d.risk, "the same routes take the same risk: {d:?}");
+                }
+                for j in 0..units.len() {
+                    let withheld = d.routes[j] == Route::Placebo || first.routes[j] == Route::Placebo;
+                    assert!(d.routes[j] == first.routes[j] || (withheld && d.psi_w[j].is_some_and(|x| x > 0.0)), "no Thompson play of the routes: {d:?}");
+                }
+            }
+        }
     }
 
+    /// A model whose posterior on not delivering is centred on a hand-over's value and wide: each
+    /// unit's ψ is far from 0 and 1, so the withhold draw takes some units and leaves others.
+    fn withholding_fit() -> Fit {
+        let spec = coefs();
+        let mut beta: Vec<f64> = spec.iter().map(|c| c.mean).collect();
+        beta[B0] = -0.5;
+        beta[NOT] = 0.0;
+        let mut chol = vec![0.0; P * P];
+        for k in 0..P {
+            chol[k * P + k] = if k == NOT { 1.0 } else { 0.1 };
+        }
+        let model = Model { beta, chol, sd: spec.iter().map(|c| c.sd).collect(), spread: [0.1; FAMILIES], ..Model::default() };
+        let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
+        Fit { key: "withhold".into(), model: Some(model), rates, ..Fit::default() }
+    }
+
+    /// Each unit's propensities are the frequencies of its play over seeds, within four standard
+    /// errors: asked (`p`), handed over (`pf`) and withheld as a placebo (`pw`), on a fitted world and
+    /// on one whose ψ withholds often, inside the test's counts and at the stop, under an open gate and
+    /// under one tight enough to refuse some drawn subsets (`exact`: a refused draw delivers).
     #[test]
     fn propensities_match_the_frequency_of_the_play() {
-        let f = fit(&planted(6, 15, 4), None);
-        let gate = open_gate();
         let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
-        let check = Check { session: "new", stop: false, tokens: 0 };
-        let n = 300;
-        let (mut asked, mut free) = ([0.0; 3], [0.0; 3]);
-        let (mut p, mut pf) = ([0.0; 3], [0.0; 3]);
-        for seed in 0..n {
-            let d = choose(&units, &check, &f, &gate, ALPHA, seed, &[]);
+        let live = Check { session: "new", stop: false, tokens: 0 };
+        let stop = Check { stop: true, ..live };
+        let tight = Gate { gain: vec![0.0; DRAWS], allowance: 0.3, ..Gate::default() };
+        let (mut withheld_any, mut refused) = (false, 0);
+        let scenarios = [
+            (fit(&planted(6, 15, 4), None), live, open_gate()),
+            (withholding_fit(), live, open_gate()),
+            (withholding_fit(), stop, open_gate()),
+            (withholding_fit(), live, tight.clone()),
+            (withholding_fit(), stop, tight),
+        ];
+        for (f, check, gate) in scenarios {
+            let n = 400;
+            let (mut freq, mut prop) = ([[0.0; 3]; 3], [[0.0; 3]; 3]);
+            for seed in 0..n {
+                let d = choose(&units, &check, &f, &gate, ALPHA, seed, &[]);
+                refused += usize::from(d.refused);
+                for j in 0..3 {
+                    for (r, route) in [Route::Ask, Route::Free, Route::Placebo].into_iter().enumerate() {
+                        freq[r][j] += f64::from(u8::from(d.routes[j] == route)) / n as f64;
+                    }
+                    for (r, x) in [d.p[j], d.pf[j], d.pw[j]].into_iter().enumerate() {
+                        prop[r][j] += x / n as f64;
+                    }
+                }
+            }
             for j in 0..3 {
-                asked[j] += f64::from(u8::from(d.routes[j] == Route::Ask)) / n as f64;
-                free[j] += f64::from(u8::from(d.routes[j] == Route::Free)) / n as f64;
-                p[j] += d.p[j] / n as f64;
-                pf[j] += d.pf[j] / n as f64;
+                for r in 0..3 {
+                    let (fr, pr) = (freq[r][j], prop[r][j]);
+                    let se = (pr * (1.0 - pr) / n as f64).sqrt();
+                    assert!((fr - pr).abs() <= 4.0 * se + 0.01, "unit {j}, route {r}: played {fr:.3}, propensity {pr:.3}");
+                }
             }
+            assert!(freq[..2].iter().flatten().any(|x| *x > 0.05 && *x < 0.95), "the play varies: {freq:?}");
+            withheld_any |= freq[2].iter().any(|x| *x > 0.05);
         }
-        for j in 0..3 {
-            for (freq, prop) in [(asked[j], p[j]), (free[j], pf[j])] {
-                let se = (prop * (1.0 - prop) / n as f64).sqrt();
-                assert!((freq - prop).abs() <= 4.0 * se + 0.01, "unit {j}: played {freq:.3}, propensity {prop:.3}");
-            }
+        assert!(withheld_any, "the scenario: units were withheld");
+        assert!(refused > 0, "the scenario: the tight gate refused drawn subsets");
+    }
+
+    /// ψ_j is the share of the joint draws in which delivering unit j on its route is worth ≤ 0, read
+    /// from the draws' value table (`Table`, the solver's), rounded: a gate that admits everything keeps
+    /// every candidate's, and a unit the routing leaves for later is no candidate.
+    #[test]
+    fn psi_is_the_share_of_draws_in_which_delivering_is_worth_nothing() {
+        let f = withholding_fit();
+        let model = f.model.as_ref().unwrap();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2), unit("L4", 2, 3)];
+        let check = Check { session: "s", stop: false, tokens: 0 };
+        let lv = Levels::of(check.session, &model.judge, &units);
+        let base = fixed_routes(&units, &[]);
+        let d = Draws::of(model, &f, &units, &check, &lv, &base);
+        let routes = [Route::Ask, Route::Free, Route::Not, Route::Free];
+        let w = withhold(&d, &routes, &units, &[], &open_gate(), 5.0, None);
+        assert_eq!((w.dropped, w.psi[2]), (0, None), "{w:?}");
+        let n = units.len();
+        let mut seen = 0;
+        for j in [0, 1, 3] {
+            let worthless = (0..DRAWS)
+                .filter(|&k| {
+                    let t = Table::of(&Valuer { t: &d.thetas[k], feats: &d.feats, rates: d.rates }, &[]);
+                    let v = if routes[j] == Route::Ask { t.ask[n + j] } else { t.free[2 * n + j] };
+                    v <= 0.0
+                })
+                .count();
+            let psi = outcome::round_p(worthless as f64 / DRAWS as f64);
+            assert_eq!(w.psi[j], Some(psi), "unit {j}");
+            seen += usize::from(psi > 0.05 && psi < 0.95);
         }
-        assert!(asked.iter().chain(&free).any(|x| *x > 0.05 && *x < 0.95), "the play varies: {asked:?} {free:?}");
+        assert!(seen > 0, "the scenario: ψ strictly between 0 and 1");
     }
 
     /// A model that thinks handing over beats asking by a wide, uncertain margin.
@@ -3087,7 +3507,7 @@ mod tests {
         let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
         let f = Fit { key: "test".into(), model: Some(model), rates, ..Fit::default() };
         let ids: Vec<String> = (0..10).map(|i| format!("L{i}")).collect();
-        let mut refused = 0;
+        let (mut refused, mut withheld, mut refused_draws) = (0, 0, 0);
         let mut run = |gated: bool, rng: &mut Rng| -> (bool, usize) {
             let mut gate = Gate::default();
             let mut broke = false;
@@ -3103,15 +3523,24 @@ mod tests {
                     let d = choose(&units, &check, &f, &gate, ALPHA, c as u64, &[]);
                     // A deviation is admitted exactly when its risk fits what the gate may still risk; a
                     // refused one keeps the fixed rule and says so.
+                    // Withholding aside: the routes played, what the draw withheld included, take exactly
+                    // `risk` of the ledger (the exact admission, `exact`), never beyond what the gate may
+                    // still risk; a drawn subset the gate refused is not withheld.
+                    let base = fixed_routes(&units, &[]);
+                    let routing: Vec<Route> = d.routes.iter().zip(&base).map(|(r, b)| if *r == Route::Placebo { *b } else { *r }).collect();
+                    withheld += d.routes.iter().filter(|r| **r == Route::Placebo).count();
+                    refused_draws += usize::from(d.refused);
+                    assert!(d.risk <= d.gate + 1e-12, "{d:?}");
+                    let mut after = gate.clone();
+                    ledger_add_without(&f, &mut after, &check, &units, &d.routes, &[]);
+                    let take = (lower_quantile(&mut gate.gain.clone()) - lower_quantile(&mut after.gain.clone())).max(0.0);
+                    assert!(!d.fallback && (take - d.risk).abs() < 1e-9 && take <= d.gate + 1e-9, "took {take}: {d:?}");
                     match d.source {
                         GATE => {
-                            assert_eq!((&d.routes, d.risk), (&fixed_routes(&units, &[]), 0.0), "{d:?}");
+                            assert_eq!(routing, base, "{d:?}");
                             refused += 1;
                         }
-                        _ if d.routes != fixed_routes(&units, &[]) => {
-                            assert_eq!(d.source, EXPERIMENT, "{d:?}");
-                            assert!(d.risk <= d.gate + 1e-12, "{d:?}");
-                        }
+                        _ if routing != base => assert_eq!(d.source, EXPERIMENT, "{d:?}"),
                         _ => {}
                     }
                     d.routes
@@ -3130,6 +3559,8 @@ mod tests {
         let (broke, _) = run(false, &mut Rng::new(77));
         assert!(broke, "ungated, the same run overspends: the scenario needs the gate");
         assert!(refused > 0, "the gate refused deviations, logged as `gate`");
+        assert!(withheld > 0, "the gated run withheld placebos, so the exact admission was put to the test");
+        assert!(refused_draws > 0, "the gate refused drawn subsets, so a refusal was put to the test");
     }
 
     #[test]
@@ -3347,9 +3778,10 @@ mod tests {
 
     /// A placebo neither rule delivers (both leave it not now) has no leverage: its weight, however
     /// large, multiplies a difference of 0. Nor has a free lesson the policy hands over surely, as the
-    /// fixed rule does. The monitor's estimate is the 0.7.2 one (pinned within 1e-9), and its weights'
-    /// health leaves those applies out: before, the placebo, its route's only label, counted at the
-    /// whole route's weight (a team store's ESS 9 of 127, largest weight 42×).
+    /// fixed rule does. The monitor's estimate is the 0.7.2 one (pinned within 1e-9, as 0.10.0 weighs
+    /// the judge's missingness), and its weights' health leaves those applies out: before, the placebo,
+    /// its route's only label, counted at the whole route's weight (a team store's ESS 9 of 127,
+    /// largest weight 42×).
     #[test]
     fn a_placebo_neither_rule_delivers_moves_neither_the_estimate_nor_its_health() {
         // The monitor of this log under 0.7.2, before its health left zero-leverage applies out.
@@ -3593,8 +4025,11 @@ mod tests {
 
     /// The randomised test draws s uniformly in 0..=k (each count's frequency over seeds within four
     /// standard errors of 1/(k + 1)), asks the first s in the fixed rule's order (2s before 1s, then
-    /// the model's) and hands over the rest, its propensities each unit's exact share of the k + 1
-    /// counts, s = 0 (the fixed rule without a 3) the control.
+    /// the model's) and hands over the rest, s = 0 (the fixed rule without a 3) the control. Withholding
+    /// runs inside each count, so the propensities are each unit's exact mixture over the k + 1 counts:
+    /// its share asked or handed over times 1 − ψ of that count, and withheld ψ. Never of the top
+    /// lesson (`tested`'s first), whose outcome the dilution readout compares across the counts: its ψ
+    /// is never offered, its pw 0, though the others' are.
     #[test]
     fn the_tests_count_is_uniform_and_its_propensities_exact() {
         let ids: Vec<String> = (0..5).map(|i| format!("L{i}")).collect();
@@ -3602,16 +4037,43 @@ mod tests {
         let order = [1, 3, 0, 2, 4];
         let n = 1200;
         let mut counts = [0usize; 6];
-        for d in tested_at(&units, &[], n) {
+        // Each count's withholding (its ψ per unit), the same whenever it is drawn.
+        let mut psi: [Option<Vec<Option<f64>>>; 6] = Default::default();
+        let decisions = tested_at(&units, &[], n);
+        for d in &decisions {
             let (Some(5), Some(s)) = (d.xk, d.xs) else { panic!("{d:?}") };
             let s = s as usize;
             counts[s] += 1;
+            assert_eq!(psi[s].get_or_insert_with(|| d.psi_w.clone()), &d.psi_w, "{d:?}");
             for (i, &j) in order.iter().enumerate() {
-                assert_eq!(d.routes[j], if i < s { Route::Ask } else { Route::Free }, "{d:?}");
-                assert_eq!((d.p[j], d.pf[j]), (outcome::round_p((5 - i) as f64 / 6.0), outcome::round_p((i + 1) as f64 / 6.0)), "{d:?}");
+                let want = if i < s { Route::Ask } else { Route::Free };
+                let withheld = d.routes[j] == Route::Placebo && d.psi_w[j].is_some_and(|x| x > 0.0);
+                assert!(d.routes[j] == want || withheld, "{d:?}");
             }
             assert_eq!(d.source, if s == 0 { EXPERIMENT_CONTROL } else { EXPERIMENT }, "{d:?}");
+            assert_eq!((&d.p, &d.pf, &d.pw), (&decisions[0].p, &decisions[0].pf, &decisions[0].pw), "propensities depend on the check alone");
         }
+        // Each unit's exact mixture over the k + 1 counts: asked or handed over times 1 − ψ, withheld ψ.
+        let psi: Vec<Vec<Option<f64>>> = psi.into_iter().map(|x| x.expect("every count drawn")).collect();
+        let d = &decisions[0];
+        for (i, &j) in order.iter().enumerate() {
+            let at = |s: usize| psi[s][j].unwrap_or(0.0);
+            let (mut p, mut pf, mut pw) = (0.0, 0.0, 0.0);
+            for s in 0..6 {
+                if i < s {
+                    p += 1.0 - at(s)
+                } else {
+                    pf += 1.0 - at(s)
+                }
+                pw += at(s);
+            }
+            let r = |x: f64| outcome::round_p(x / 6.0);
+            assert_eq!((d.p[j], d.pf[j], d.pw[j]), (r(p), r(pf), r(pw)), "unit {j}: {d:?}");
+        }
+        assert!(d.pw.iter().any(|x| *x > 0.0), "the scenario: the prior withholds inside the counts: {d:?}");
+        // Guard: the top lesson is never offered to the withhold draw, so its outcome is the count's.
+        assert!(psi.iter().all(|w| w[order[0]].is_none()) && d.pw[order[0]] == 0.0, "the top lesson withheld: {psi:?} {d:?}");
+        assert!(decisions.iter().all(|d| d.routes[order[0]] != Route::Placebo), "the top lesson withheld");
         let q = 1.0 / 6.0;
         let se = (q * (1.0 - q) / n as f64).sqrt();
         for (s, c) in counts.iter().enumerate() {
@@ -3621,7 +4083,8 @@ mod tests {
     }
 
     /// The test never runs at the stop, and never moves a 3: with a 3 during the turn the 3 is asked on
-    /// every draw (p 1), and the control is s = k, the fixed rule asking everything.
+    /// every draw unless withheld (p + pw 1, pf 0), and the control is s = k, the fixed rule asking
+    /// everything. The stop's 3 is never withheld either (`forced`).
     #[test]
     fn the_test_never_touches_the_stop_or_a_three() {
         let ids: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
@@ -3629,13 +4092,17 @@ mod tests {
         let base = fixed_routes(&units, &[]);
         let p = prior();
         let open = Gate { gain: vec![0.0; DRAWS], allowance: 1e9, ..Gate::default() };
+        // Withholding aside: a withheld unit back on the fixed rule's route.
+        let routing = |d: &Decision| -> Vec<Route> { d.routes.iter().zip(&base).map(|(r, b)| if *r == Route::Placebo { *b } else { *r }).collect() };
         for seed in 0..40 {
             let d = choose(&units, &Check { session: "s", stop: true, tokens: 0 }, &p, &open, ALPHA, seed, &[]);
-            assert_eq!((&d.routes, d.source, d.xk, d.xs), (&base, EVIDENCE, None, None), "{d:?}");
+            assert_eq!((&routing(&d), d.source, d.xk, d.xs), (&base, EVIDENCE, None, None), "{d:?}");
+            assert_eq!((d.routes[1], d.p[1], d.pw[1]), (Route::Ask, 1.0, 0.0), "the stop's 3 is never withheld: {d:?}");
         }
         let mut seen = std::collections::BTreeSet::new();
         for d in tested_at(&units, &[], 60) {
-            assert_eq!((d.routes[1], d.p[1], d.pf[1], d.xk), (Route::Ask, 1.0, 0.0, Some(2)), "{d:?}");
+            assert_eq!((routing(&d)[1], d.pf[1], d.xk), (Route::Ask, 0.0, Some(2)), "{d:?}");
+            assert!((d.p[1] + d.pw[1] - 1.0).abs() <= 1e-4, "asked on every count, unless withheld: {d:?}");
             let s = d.xs.unwrap_or(9);
             assert_eq!(d.source == EXPERIMENT_CONTROL, s == 2, "{d:?}");
             seen.insert(s);
@@ -3801,5 +4268,332 @@ mod tests {
         assert!(p > 0.5 && p < sigmoid(eta - 0.5), "{p} against {}", sigmoid(eta - 0.5));
         fit.model = Some(Model { beta: vec![0.0; P - 1], ..certain });
         assert_eq!(predict(&fit, &f, Route::Ask, 2, "s", "A"), None);
+    }
+
+    /// Whether any of `ds` withheld a unit (a `Placebo` route or a `pw` above 0).
+    fn withholds(ds: &[Decision]) -> bool {
+        ds.iter().any(|d| d.routes.contains(&Route::Placebo) || d.pw.iter().any(|x| *x > 0.0))
+    }
+
+    /// `choose` for one check at the seeds 0..`n`.
+    fn at_seeds(units: &[Unit], check: &Check, f: &Fit, gate: &Gate, alpha: f64, had: &[String], n: u64) -> Vec<Decision> {
+        (0..n).map(|seed| choose(units, check, f, gate, alpha, seed, had)).collect()
+    }
+
+    /// A live check of a new session.
+    fn live() -> Check<'static> {
+        Check { session: "s", stop: false, tokens: 0 }
+    }
+
+    /// A ledger whose gains alone would cover withholding's worst case, with no allowance.
+    fn rich(allowance: f64) -> Gate {
+        Gate { gain: vec![100.0; DRAWS], allowance, ..Gate::default() }
+    }
+
+    /// Guard: at cold start (a gate that may risk nothing yet) nothing is withheld and the routes are
+    /// the fixed rule's, though the ledger's gains would cover withholding's worst case; the same check
+    /// under an allowance withholds.
+    #[test]
+    fn cold_start_withholds_nothing() {
+        let f = withholding_fit();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
+        let base = fixed_routes(&units, &[]);
+        let cold = at_seeds(&units, &live(), &f, &rich(0.0), ALPHA, &[], 40);
+        assert!(cold.iter().all(|d| d.source == FIXED && d.routes == base) && !withholds(&cold), "{cold:?}");
+        assert!(withholds(&at_seeds(&units, &live(), &f, &rich(5.0), ALPHA, &[], 40)), "the scenario: an allowance withholds");
+    }
+
+    /// Guard: a spent gate (an allowance the ledger's 5% quantile used up, `remaining_at` 0) admits only
+    /// what costs nothing at that quantile, withholding included (`exact` admits a subset whose quantile
+    /// stays at −allowance): every decision under it takes risk 0, the withhold draws that would cost
+    /// are refused, and a lesson whose delivery is worth ≤ 0 in every draw is still withheld (at risk 0)
+    /// as a judged placebo.
+    #[test]
+    fn a_spent_gate_withholds_only_at_no_cost() {
+        let spent = Gate { gain: vec![-0.5; DRAWS], allowance: 0.5, ..Gate::default() };
+        assert_eq!(remaining_at(&spent, ALPHA), 0.0, "the scenario: the gate is spent");
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
+        let wide = at_seeds(&units, &live(), &withholding_fit(), &spent, ALPHA, &[], 200);
+        assert!(wide.iter().all(|d| d.gate == 0.0 && d.risk <= 1e-12), "{wide:?}");
+        assert!(wide.iter().any(|d| d.refused), "the scenario: a costly draw is refused");
+        let spec = coefs();
+        let mut beta: Vec<f64> = spec.iter().map(|c| c.mean).collect();
+        beta[NOT] = 3.0;
+        let mut chol = vec![0.0; P * P];
+        for k in 0..P {
+            chol[k * P + k] = 0.05;
+        }
+        let model = Model { beta, chol, sd: spec.iter().map(|c| c.sd).collect(), spread: [0.05; FAMILIES], ..Model::default() };
+        let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
+        let worthless = Fit { key: "not".into(), model: Some(model), rates, ..Fit::default() };
+        let free = at_seeds(&units, &live(), &worthless, &spent, ALPHA, &[], 20);
+        assert!(free.iter().all(|d| d.risk <= 1e-12 && d.routes.contains(&Route::Placebo) && d.pw.iter().any(|x| *x > 0.0)), "{free:?}");
+    }
+
+    /// Guard: α 0 (`risk` 0 in collectives.json) withholds nothing, though the ledger's gains would cover
+    /// withholding's worst case without an allowance; the same gate at `ALPHA` withholds.
+    #[test]
+    fn risk_zero_withholds_nothing() {
+        let f = withholding_fit();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
+        for check in [live(), Check { stop: true, ..live() }] {
+            let off = at_seeds(&units, &check, &f, &rich(5.0), 0.0, &[], 40);
+            assert!(!withholds(&off) && off.iter().all(|d| d.psi_w.iter().all(Option::is_none)), "{off:?}");
+            assert!(withholds(&at_seeds(&units, &check, &f, &rich(5.0), ALPHA, &[], 40)), "the scenario: α withholds");
+        }
+    }
+
+    /// Guard: unset (`choose_with`, a replay of a record from before withholding) nothing is withheld
+    /// and the decision is policy v2's: the routes and propensities withholding leaves aside; set, the
+    /// same check withholds.
+    #[test]
+    fn unset_withholding_is_the_decision_before_it() {
+        let f = withholding_fit();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 3, 2)];
+        for check in [live(), Check { stop: true, ..live() }] {
+            let mut set = Vec::new();
+            for seed in 0..40 {
+                let off = choose_with(&units, &check, &f, &open_gate(), ALPHA, seed, &[], false);
+                let on = choose(&units, &check, &f, &open_gate(), ALPHA, seed, &[]);
+                assert!(!withholds(std::slice::from_ref(&off)) && off.psi_w.iter().all(Option::is_none), "{off:?}");
+                assert_eq!((off.source, off.xk, off.xs), (on.source, on.xk, on.xs), "the same routing: {on:?}");
+                for j in 0..units.len() {
+                    assert!(off.routes[j] == on.routes[j] || on.routes[j] == Route::Placebo, "{off:?} against {on:?}");
+                    assert!((off.p[j] + off.pf[j] - (on.p[j] + on.pf[j] + on.pw[j])).abs() <= 2e-4, "{off:?} against {on:?}");
+                }
+                set.push(on);
+            }
+            assert!(withholds(&set), "the scenario: set, it withholds");
+        }
+    }
+
+    /// Guard: a check past `SOLVE_MAX` applies withholds nothing (source `size`); the same model and gate
+    /// withhold at `SOLVE_MAX` applies.
+    #[test]
+    fn a_check_past_the_solvers_size_withholds_nothing() {
+        let f = withholding_fit();
+        let ids: Vec<String> = (0..=SOLVE_MAX).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().enumerate().map(|(r, l)| unit(l, if r == 0 { 3 } else { 2 }, r)).collect();
+        let past = at_seeds(&units, &live(), &f, &open_gate(), ALPHA, &[], 8);
+        assert!(past.iter().all(|d| d.source == SIZE) && !withholds(&past), "{past:?}");
+        assert!(withholds(&at_seeds(&units[..SOLVE_MAX], &live(), &f, &open_gate(), ALPHA, &[], 8)), "the scenario: at the size it withholds");
+    }
+
+    /// Guard: a stop's 3 is never withheld (`forced`, `withholdable`), its ψ never offered; the same 3
+    /// during the turn is withheld, so the guard, not the model, keeps it asked.
+    #[test]
+    fn a_stop_grade_three_is_never_withheld() {
+        let f = withholding_fit();
+        let units = [unit("L1", 3, 0), unit("L2", 1, 1)];
+        let stop = at_seeds(&units, &Check { stop: true, ..live() }, &f, &open_gate(), ALPHA, &[], 40);
+        assert!(stop.iter().all(|d| (d.routes[0], d.p[0], d.pw[0], d.psi_w[0]) == (Route::Ask, 1.0, 0.0, None)), "{stop:?}");
+        assert!(stop.iter().any(|d| d.routes[1] == Route::Placebo), "the scenario: the stop withholds the rest");
+        let turn = at_seeds(&units, &live(), &f, &open_gate(), ALPHA, &[], 40);
+        assert!(turn.iter().any(|d| d.routes[0] == Route::Placebo), "the scenario: during the turn the 3 is withheld");
+    }
+
+    /// Guard: a lesson the session had is never withheld (its delivery would drop the placebo, hook.rs
+    /// `queued`), nor one named twice at the check (a copy delivered would deliver it); without `had`,
+    /// or named once, the same lesson is. L0 heads the question-count test's lessons, so L2 is not the
+    /// test's top lesson (never withheld for that reason alone).
+    #[test]
+    fn a_lesson_the_session_had_or_named_twice_is_never_withheld() {
+        let f = withholding_fit();
+        let units = [unit("L1", 3, 0), unit("L0", 2, 1), unit("L2", 2, 2), unit("L3", 2, 3)];
+        let had = ["L2".to_string()];
+        let kept = at_seeds(&units, &live(), &f, &open_gate(), ALPHA, &had, 40);
+        assert!(kept.iter().all(|d| d.routes[2] == Route::Ask && d.pw[2] == 0.0 && d.psi_w[2].is_none()), "{kept:?}");
+        assert!(at_seeds(&units, &live(), &f, &open_gate(), ALPHA, &[], 40).iter().any(|d| d.routes[2] == Route::Placebo), "the scenario: without `had`");
+        let twice = [unit("L1", 3, 0), unit("L0", 2, 1), unit("L2", 2, 2), unit("L2", 2, 3)];
+        let dup = at_seeds(&twice, &live(), &f, &open_gate(), ALPHA, &[], 40);
+        assert!(dup.iter().all(|d| d.routes[2..].iter().all(|r| *r != Route::Placebo) && d.pw[2..] == [0.0, 0.0]), "{dup:?}");
+    }
+
+    /// The worst-case fallback (`worst_case`, past `WITHHOLD_EXACT_MAX` live candidates) drops
+    /// withholding's candidates by the highest mean τ first until its worst case fits: with room for all
+    /// but the costliest, exactly that one drops (ψ 0, `dropped` 1, its pw 0, the rest's pw their ψ) and
+    /// the gate's quantile is the rest's worst case; with no room every candidate drops; with room for
+    /// all, none. Called on three candidates directly: before the exact admission this was `withhold`'s
+    /// rule at every size, and the exact rule now decides these three (`all`).
+    #[test]
+    fn the_fallback_drops_the_costliest_candidate_first() {
+        let f = withholding_fit();
+        let model = f.model.as_ref().unwrap();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
+        let routes = fixed_routes(&units, &[]);
+        assert_eq!(routes, [Route::Free; 3], "the scenario: the fixed rule hands all three over");
+        let lv = Levels::of("s", &model.judge, &units);
+        let d = Draws::of(model, &f, &units, &live(), &lv, &routes);
+        let zero = Gate { gain: vec![0.0; DRAWS], allowance: 0.0, ..Gate::default() };
+        let tau = |j: usize, k: usize| Valuer { t: &d.thetas[k], feats: &d.feats, rates: d.rates }.free(j, 3);
+        let mean = |j: usize| (0..DRAWS).map(|k| tau(j, k)).sum::<f64>() / DRAWS as f64;
+        let worst = |set: &[usize]| {
+            let mut v: Vec<f64> = (0..DRAWS).map(|k| -set.iter().map(|&j| tau(j, k).max(0.0)).sum::<f64>()).collect();
+            lower_quantile(&mut v)
+        };
+        let all = withhold(&d, &routes, &units, &[], &zero, 1e9, None);
+        assert!(
+            !all.fallback && all.dropped == 0 && all.psi.iter().all(|x| x.is_some_and(|x| x > 0.0 && x < 1.0)),
+            "the scenario: three live candidates: {all:?}"
+        );
+        let taus: Vec<Vec<f64>> = (0..3).map(|j| (0..DRAWS).map(|k| tau(j, k)).collect()).collect();
+        let fallback = |allowance: f64| {
+            let mut w = Withhold { psi: all.psi.clone(), live: all.live.clone(), ..Withhold::none(3) };
+            worst_case(&d, &routes, &zero, allowance, &[0, 1, 2], &taus, &mut w);
+            w
+        };
+        let costliest = (0..3).max_by(|a, b| mean(*a).total_cmp(&mean(*b))).unwrap();
+        let rest: Vec<usize> = (0..3).filter(|j| *j != costliest).collect();
+        let (full, less) = (worst(&[0, 1, 2]), worst(&rest));
+        assert!(less > full, "the scenario: dropping it makes room");
+        let w = fallback(-(full + less) / 2.0);
+        assert_eq!((w.fallback, w.dropped, w.psi[costliest], w.pw[costliest], w.q), (true, 1, Some(0.0), 0.0, Some(less)), "{w:?}");
+        assert!(rest.iter().all(|&j| w.psi[j] == all.psi[j] && Some(w.pw[j]) == all.psi[j]) && w.live == rest, "{w:?} against {all:?}");
+        let open = fallback(1e9);
+        assert_eq!((open.dropped, open.q, &open.live), (0, Some(full), &all.live), "{open:?}");
+        assert!((0..3).all(|j| Some(open.pw[j]) == all.psi[j]), "with room for all, each pw is its ψ: {open:?}");
+        let none = fallback(0.0);
+        assert_eq!((none.dropped, none.q, none.live.len()), (3, None, 0), "{none:?}");
+        assert!(none.psi.iter().all(|x| *x == Some(0.0)) && none.pw == [0.0; 3], "{none:?}");
+    }
+
+    /// The exact admission (`exact`): the gate admits the subset the withhold draw took exactly where the
+    /// routing with it withheld passes `choose`'s admit rule, valued as the ledger values it
+    /// (`Draws::gains`), at that routing's risk; a refused subset plays the routes with nothing withheld
+    /// (`refused`, the routing's own risk); and each unit's pw is Σ P(S) over the admitted subsets that
+    /// hold it, which is its frequency over seeds, refusals included.
+    #[test]
+    fn a_refused_draw_plays_the_routes_with_nothing_withheld() {
+        let f = withholding_fit();
+        let model = f.model.as_ref().unwrap();
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1), unit("L3", 1, 2)];
+        let routes = fixed_routes(&units, &[]);
+        let lv = Levels::of("s", &model.judge, &units);
+        let d = Draws::of(model, &f, &units, &live(), &lv, &routes);
+        let zero = Gate { gain: vec![0.0; DRAWS], allowance: 0.0, ..Gate::default() };
+        // The risk of each nonempty subset with room for all; an allowance between the least and the most.
+        let all = withhold(&d, &routes, &units, &[], &zero, 1e9, None);
+        let risks: Vec<f64> = all.admitted[1..].iter().map(|r| r.expect("room for all")).collect();
+        let (lo, hi) = risks.iter().fold((f64::INFINITY, 0.0f64), |(a, b), r| (a.min(*r), b.max(*r)));
+        assert!(hi > lo, "the scenario: subsets differ in risk: {risks:?}");
+        let allowance = (lo + hi) / 2.0;
+        let w = withhold(&d, &routes, &units, &[], &zero, allowance, None);
+        assert!(!w.fallback && w.live == [0, 1, 2] && w.admitted.len() == 8, "{w:?}");
+        let with = |s: usize| -> Vec<Route> { (0..3).map(|j| if s >> j & 1 == 1 { Route::Placebo } else { routes[j] }).collect() };
+        let mut pw = [0.0; 3];
+        for s in 1..8 {
+            let q = lower_quantile(&mut d.gains(&with(s)));
+            let want = (q >= -allowance).then(|| (-q).max(0.0));
+            assert!(
+                w.admitted[s].zip(want).is_some_and(|(a, b)| (a - b).abs() < 1e-12) || (w.admitted[s].is_none() && want.is_none()),
+                "subset {s}: {:?} against {want:?}",
+                w.admitted[s]
+            );
+            if want.is_some() {
+                let p: f64 = (0..3).map(|j| if s >> j & 1 == 1 { w.at(j) } else { 1.0 - w.at(j) }).product();
+                (0..3).filter(|j| s >> j & 1 == 1).for_each(|j| pw[j] += p);
+            }
+        }
+        assert!(w.admitted[1..].iter().any(Option::is_some) && w.admitted[1..].iter().any(Option::is_none), "the scenario: some refused, some admitted: {w:?}");
+        assert!((0..3).all(|j| (w.pw[j] - pw[j]).abs() < 1e-12 && w.pw[j] < w.at(j)), "{w:?} against {pw:?}");
+        let plays = [Play { routes: routes.clone(), w: w.clone(), risk: 0.0 }];
+        let n = 2000;
+        let (mut freq, mut refused) = ([0.0; 3], 0);
+        for seed in 0..n {
+            let p = played(&plays, 0, &routes, &units, &[], false, seed, true);
+            let s = w.drawn(seed);
+            match w.admitted[s] {
+                _ if s == 0 => assert_eq!((&p.routes, p.risk, p.refused), (&routes, 0.0, false)),
+                Some(risk) => assert_eq!((&p.routes, p.risk, p.refused), (&with(s), risk, false), "seed {seed}"),
+                None => {
+                    assert_eq!((&p.routes, p.risk, p.refused), (&routes, 0.0, true), "seed {seed}: refused, nothing withheld");
+                    refused += 1;
+                }
+            }
+            for (j, x) in freq.iter_mut().enumerate() {
+                *x += f64::from(u8::from(p.routes[j] == Route::Placebo)) / n as f64;
+                assert!((p.props[2][j] - outcome::round_p(w.pw[j])).abs() < 1e-12 && (p.props[1][j] - outcome::round_p(1.0 - w.pw[j])).abs() < 1e-12);
+            }
+        }
+        assert!(refused > 0, "the scenario: the gate refused drawn subsets");
+        for (j, x) in freq.iter().enumerate() {
+            let se = (w.pw[j] * (1.0 - w.pw[j]) / n as f64).sqrt();
+            assert!((x - w.pw[j]).abs() <= 4.0 * se, "unit {j}: withheld {x:.3}, pw {:.3}", w.pw[j]);
+        }
+    }
+
+    /// Guard: past `WITHHOLD_EXACT_MAX` live candidates a routing takes the worst-case fallback
+    /// (`fallback`, its risk the worst case's, never below the routes'), its propensities still the
+    /// play's frequencies; at the guard the exact admission values every subset.
+    #[test]
+    fn past_the_guard_withholding_takes_the_worst_case_fallback() {
+        let f = withholding_fit();
+        let model = f.model.as_ref().unwrap();
+        let ids: Vec<String> = (0..WITHHOLD_EXACT_MAX + 2).map(|i| format!("L{i}")).collect();
+        let units: Vec<Unit> = ids.iter().enumerate().map(|(r, l)| unit(l, 3, r)).collect();
+        let at = &units[..WITHHOLD_EXACT_MAX];
+        let base = fixed_routes(at, &[]);
+        let d = Draws::of(model, &f, at, &live(), &Levels::of("s", &model.judge, at), &base);
+        let w = withhold(&d, &base, at, &[], &open_gate(), 5.0, None);
+        assert!(!w.fallback && w.live.len() == WITHHOLD_EXACT_MAX && w.admitted.len() == 1 << WITHHOLD_EXACT_MAX, "at the guard, exact: {:?}", w.live);
+        let n = 300;
+        let ds = at_seeds(&units, &live(), &f, &open_gate(), ALPHA, &[], n);
+        assert!(
+            ds.iter().all(|d| d.fallback && !d.refused && d.psi_w.iter().filter(|x| x.is_some_and(|x| x > 0.0)).count() > WITHHOLD_EXACT_MAX),
+            "past it, the fallback"
+        );
+        let gate = open_gate();
+        let mut freq = vec![0.0; units.len()];
+        for d in &ds {
+            assert_eq!((&d.p, &d.pf, &d.pw), (&ds[0].p, &ds[0].pf, &ds[0].pw), "one play, its propensities the seed's no matter");
+            let mut after = gate.clone();
+            let check = live();
+            ledger_add_without(&f, &mut after, &check, &units, &d.routes, &[]);
+            let take = (lower_quantile(&mut gate.gain.clone()) - lower_quantile(&mut after.gain.clone())).max(0.0);
+            assert!(take <= d.risk + 1e-9 && d.risk <= d.gate + 1e-12, "the worst case bounds the routes' risk: {take} against {d:?}");
+            for (j, r) in d.routes.iter().enumerate() {
+                freq[j] += f64::from(u8::from(*r == Route::Placebo)) / n as f64;
+            }
+        }
+        for (j, x) in freq.iter().enumerate() {
+            let pw = ds[0].pw[j];
+            let se = (pw * (1.0 - pw) / n as f64).sqrt();
+            assert!((x - pw).abs() <= 4.0 * se + 0.01, "unit {j}: withheld {x:.3}, pw {pw:.3}");
+        }
+        assert!(freq.iter().any(|x| *x > 0.05), "the scenario: the fallback withholds");
+    }
+
+    /// A unit the fixed rule delivers that the evidence rule leaves undelivered is a judged placebo:
+    /// routed `Placebo` with pw 1 (its routing the only one), never one the session had, which stays
+    /// not now.
+    #[test]
+    fn a_lesson_the_evidence_leaves_undelivered_is_a_judged_placebo() {
+        let spec = coefs();
+        let mut beta: Vec<f64> = spec.iter().map(|c| c.mean).collect();
+        beta[NOT] = 3.0;
+        let mut chol = vec![0.0; P * P];
+        for k in 0..P {
+            chol[k * P + k] = 0.05;
+        }
+        let model = Model { beta, chol, sd: spec.iter().map(|c| c.sd).collect(), spread: [0.05; FAMILIES], ..Model::default() };
+        let rates = Rates { free_stop: 1.0, free_live: 1.0, later: 0.5, wait: 0.0, ask_live: 1.0 };
+        let f = Fit { key: "not".into(), model: Some(model), rates, ..Fit::default() };
+        let units = [unit("L1", 2, 0), unit("L2", 1, 1)];
+        let d = choose(&units, &live(), &f, &open_gate(), ALPHA, 1, &[]);
+        assert_eq!(
+            (d.source, &d.routes[..], &d.pw[..], &d.p[..], &d.pf[..]),
+            (EVIDENCE, &[Route::Placebo; 2][..], &[1.0; 2][..], &[0.0; 2][..], &[0.0; 2][..]),
+            "{d:?}"
+        );
+        let had = ["L1".to_string()];
+        let d = choose(&units, &live(), &f, &open_gate(), ALPHA, 1, &had);
+        assert_eq!((&d.routes[..], &d.pw[..]), (&[Route::Not, Route::Placebo][..], &[0.0, 1.0][..]), "{d:?}");
+        // Guard: off (a replay of a record from before withholding) or at α 0 the same routing leaves
+        // them not now, as policy v2 did: no placebo, pw 0. The gate's gains admit it at α 0.
+        let rich = Gate { gain: vec![100.0; DRAWS], allowance: 5.0, ..Gate::default() };
+        for (alpha, withholding) in [(ALPHA, false), (0.0, true)] {
+            let d = choose_with(&units, &live(), &f, &rich, alpha, 1, &[], withholding);
+            assert_eq!((d.source, &d.routes[..], &d.pw[..]), (EVIDENCE, &[Route::Not; 2][..], &[0.0; 2][..]), "α {alpha}, {withholding}: {d:?}");
+        }
     }
 }

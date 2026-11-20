@@ -73,7 +73,8 @@ Quality (mistakes avoided) is the objective; there is no cost bar. What holds it
   yield. Under the default, the placebo (applies the fixed rule does not deliver, judged blindly)
   collects the not-now labels, the tail sample the yield past the pool's budget, each graded record the
   lessons its session already had (`nofree`), and each early delivery its lessons' relative scores
-  (`rel`), all at no cost to the fixed rule's quality.
+  (`rel`), all at no cost to the fixed rule's quality. Since 0.10.0 the learned policy also withholds
+  lessons it would deliver as placebos, at a cost the gate bounds (Rules v3 amendment, below).
 - **Checks written before the policy was built** (rules dated 2026-10-28, amended 2026-10-29; any
   change is a dated amendment below). `borg debug select --replay` runs them on a store's outcome log at
   0 tokens and prints the dates of the rules and of the latest amendment it implements, then per check
@@ -216,8 +217,8 @@ was NOT TESTED, so **the learned policy is the default** (`BORG_SELECT=fixed` ke
 What the default changes today: on the P4 checks the evidence rule found no deviation worth playing,
 so the learned default differed from the fixed rule by the question-count test on live checks, rationed
 by the gate (`risk`, 10% unless the collective sets it), which withholds no lesson. Its readout was
-due after 300 checks that drew a count or 30 sessions with one; since live mode was removed (0.7.6) no
-check draws a count, and the readout waits ([Roadmap](roadmap.md)).
+due after 300 checks that drew a count or 30 sessions with one; live mode's removal (0.7.6) stopped the
+draws until 0.7.7 ran the test on detached checks. Read on 2026-11-19: no effect (below).
 
 **Amendment 2026-10-29** (to Rules v2, written after Run v2): the evidence rule's candidate, the
 routes best "under the posterior mean" in the first rule (W1, *It deviates only on evidence*), is
@@ -255,7 +256,7 @@ before any pooled readout was read):
 | Decision | Evidence |
 |---|---|
 | The pool budget stays 12,000 tokens | A smaller pool loses 0.89 [0.79, 1.00] applies per check (team store). Past the budget lessons apply at 2.05% [1.00, 4.18] against 2.35% just inside it, from 7 judged applies, and no call has read more than 12,000 tokens. Revisit at 30 judged applies past the budget |
-| Withholding is not learned; `NOT_PRIOR` stays N(−0.3, 0.25²) | 8 placebos drawn, 1 judged; the fitted not-now effect is its prior (−0.280, sd 0.249). Reopen at 100 judged placebos or a placebo unclear rate under 50%; drop the placebo arm if the next 60 give fewer than 15 labels |
+| Withholding is not learned; `NOT_PRIOR` stays N(−0.3, 0.25²). **Superseded** by the Rules v3 amendment of 2026-11-19 (below): `NOT_PRIOR` is a prior, the effect is fitted | 8 placebos drawn, 1 judged; the fitted not-now effect is its prior (−0.280, sd 0.249). Reopen at 100 judged placebos or a placebo unclear rate under 50%; drop the placebo arm if the next 60 give fewer than 15 labels (superseded) |
 | The stop's prefilter stays at 8.0 | 9 corrections followed a turn it skipped (team store); none was about an existing lesson |
 | `VETOED_W` 3 and `CORRECTED_W` 2 stay fixed | 0 vetoes and 1–2 corrections after an ask per store; `borg debug ope` finds 0 usable decisions |
 | The gate's allowance keeps scaling with the fixed rule's modelled value; `risk` stays 0.1 | The allowance grows about 0.0004 per check in the team store, about one deviation in 9 to 10 checks. The team store deviated on 15% and spent its gate (allowance 0.076, ledger 5% quantile −0.102) |
@@ -334,15 +335,93 @@ Far lessons answered: `ends` 196 of 196, `newest` 195, `after` 192, so `ends` is
 arms differ by 1-4 lessons, within noise. Most far lessons were judged "never came up" (80-83%; 0.7.5:
 82% of those it sent). Cost: about 1.7-2.1× 0.7.5's per pass for 1.6× the verdicts.
 
+**Question-count test readout 2026-11-19** (Rules v2 as amended 2026-10-31; 0 tokens, copies of a
+team store and an open-source store, pooled and stratified by collective). Since 0.7.7 the test draws
+on detached checks (channel `live`). Due and read: 811 drawn checks in 56 sessions. **No effect.**
+Asking a grade 2 against handing it over: +0.041 [−0.121, +0.314] over 398 grade-2 lessons. Dilution:
+for every number 2 to 7 asked against 1, the interval spans 0. Per store: team +0.184 [−0.042,
++0.498], open-source −0.082 [−0.294, +0.267], both spanning 0. The test keeps running.
+
+**Rules v3 amendment (2026-11-19, before the build).** The placebo arm drew only among the applies a
+check delivers neither way, and the fixed rule leaves such applies only past `CAP` (10). Since 0.7.6 a
+check applies 2.6 lessons on average: 0 of 626 checks drew a placebo, and only 33 placebo verdicts
+exist. Those 33 sat at rank ≥ 10, so the fitted not-now effect is aliased with a rank extrapolation: it
+measures withholding low-ranked lessons and is read as if it held at every rank. A correction to the
+2026-10-31 decision and to [Numeric constants](design/constants.md): `NOT_PRIOR` was never fixed. It
+is a prior with a fixed sd; the coefficient is fitted by MAP at every `borg learn`.
+`NOT_LEARNED_UNTIL` (100) is display only.
+
+- **Design: gate-rationed Thompson withholding** (0.10.0). A lesson a learned check would ask or hand
+  over is withheld, as a judged placebo, with chance ψ: the share of the 512 posterior draws under
+  which delivering it is worth 0 or less. Withheld means not now: it stays eligible, and a later
+  delivery before its verdict censors it (`UNJUDGED_LATER`). Never withheld: a stop's grade 3, a lesson
+  the session had, and every check under `fixed`, `size`, reverted or `risk` 0; a spent gate admits
+  only a withheld subset that costs nothing at the 5% quantile, at risk 0. The draw
+  takes each candidate independently; the gate admits the subset it took exactly as it admits a
+  routing (the 5% quantile of the ledger plus the routing's gain, with that subset withheld, at least
+  −allowance), and a subset it refuses plays the routing with nothing withheld. The withheld chance
+  `pw` is exact: every subset S of the candidates is valued, at P(S) = Π ψ over S × Π (1 − ψ) over
+  the rest. Above 10 candidates with ψ > 0 (`WITHHOLD_EXACT_MAX`, a guard on a check's time) the gate
+  falls back to the worst case, every candidate withheld at its full value in every draw (dilution
+  slopes are at most 0, so the others lose nothing), dropping the candidate with the highest mean value
+  until the 5% quantile fits; P3 reports how often. Every lesson the fixed rule delivers and the decision does not is a judged placebo (with withholding
+  on; at `risk` 0 and in a replay of an older record it is not now, as before). Withholding applies
+  within each of the question-count test's k + 1 counts, except to the test's top lesson, whose change
+  rate the dilution readout compares across the counts; the propensities are their exact mixture. A
+  placebo's propensity is pw + (1 − p − pf − pw)·psi.
+- **Value metric:** the lift P(changed | delivered) − P(changed | withheld) per grade, among verdicts
+  whose point arose, weighted by the inverse of p, pf or the placebo propensity, with a session-bootstrap
+  95% interval, pooled over stores as the 2026-10-31 amendment pools. Only checks with at least one
+  candidate count as tested; the graded record logs `pw` (zeros included) exactly at those, a
+  candidate offered at ψ 0 or dropped by the worst-case fallback among them, so the readout and P3
+  count the same checks. A withheld placebo is one that could also have been delivered (p + pf above 0); one withheld
+  at a chance of 1 (left undelivered by the evidence rule, or ψ 1) is reported apart and counts toward
+  neither the lift, its due nor the kill rules. `borg debug select --replay --file A --file B` reads it.
+- **Due** at 93 arisen placebos pooled (a lift of 0.2 at 80% power): about 310 draws, 4–5 weeks. Cost:
+  about 1% of applies lose a change, within the gate.
+- **Kill rules:**
+  - the monitor's bound below 0: the existing revert, which also stops withholding;
+  - fewer than 5% of checks with a candidate draw a withheld placebo over the first 300: retune or drop;
+  - fewer than 20 of the first 100 withheld placebos arose: drop the arm. A placebo the judge never
+    saw (dropped at its delivery, or its session ended before the next prompt) is not among the 100.
+    This supersedes the 2026-10-31 rule (drop the placebo arm if the next 60 placebos give fewer than
+    15 changed or ignored verdicts).
+- **Sanity flags** (the readout is marked not trusted): the arisen rate differs by more than 0.15
+  between arms; more than 30% of placebos are censored by a later delivery or by slots. A placebo
+  dropped at its delivery because the same delivery hands its lesson over counts as censored by a
+  later delivery. The readout reports both shares, and the placebos never judged.
+- **Checks:** P1 also replays the placebo list and `pw` within 0.01 (`ope::AGREE`); records before
+  0.10.0 replay with withholding off; the replay prints "rules v3 2026-11-19". P3 reports the withheld
+  count, mean ψ, the checks whose drawn subset the gate refused and the checks that took the
+  worst-case fallback: the 0-token what-if. The model's chance that a lesson is judged keeps 0.9.0's
+  six features (route, channel, pending, last check).
+- **Amended 2026-11-20, before any record under 0.10.0:**
+  - *Exact admission replaces the worst case at every size.* Charging every candidate at once is far
+    looser than the subset a draw takes: in the 0-token replay of both stores it dropped 95% and 89%
+    of the candidates, so only 5–7% of checks with a candidate withheld.
+  - *No relevance terms in the judged model.* Grade 2, grade 3 and ln(1 + rank) terms changed the
+    refits of history, so P1 failed on both stores (team 1,752 of 1,788 checks, open-source 2,735 of
+    2,783; 0.9.0 passes 2,783 of 2,783). They are not needed: withholding randomises among the very
+    lessons a check delivers, so both arms share their relevance by design, and the readout's
+    arisen-rate-per-arm flag checks that.
+- **What-if** (P3 on copies of both stores, 0 tokens, 2026-11-20; P0, P1 and P3 pass on both). Team:
+  130 placebos withheld at random at 85 of 1,105 checks with a candidate (8%), 150 outright (chance
+  1), the drawn subset refused at 714 checks (65%), 0 worst-case fallbacks, mean ψ 40% over 3,984
+  candidates offered. Open-source: 143 at 90 of 1,211 checks (7%), 0 outright, 771 refused (64%), 0
+  fallbacks, mean ψ 39% over 5,142 candidates. The exact admission barely raises the rate (5–7% under
+  the worst case): the gate refuses about nine in ten nonempty draws, so its room, not the admission
+  rule, limits withholding, which still yields 273 random placebos where the history holds 33 placebo
+  verdicts.
+
 **In use**, under the learned policy, a monitor estimates the policy's value against the fixed rule
 per session and reverts the store to the fixed rule for good if its bound shows harm beyond 10% of the
 fixed rule's value. After 300 judged lessons whose route was randomised, or 30 sessions under the
 learned policy, a readout compares asking against handing over, and handing over against not
 delivering, per grade, with session-bootstrap intervals. The question-count test's own readout (Rules
 v2, amended 2026-10-31) is due after 300 checks that drew a count (played or refused by the gate) in
-at least 15 sessions with one, or 30 sessions alone; the test ran on live checks only, so since 0.7.6
-no check adds to it. It reports dilution, per number m ≥ 2 of the test's questions asked, as the top tested lesson's change
-rate asked with m against it asked alone, and asking against handing over a grade 2 as a
+at least 15 sessions with one, or 30 sessions alone; it ran on live checks until 0.7.6 and on detached
+checks since 0.7.7, and was read on 2026-11-19 (above). It reports dilution, per number m ≥ 2 of the test's questions
+asked, as the top tested lesson's change rate asked with m against it asked alone, and asking against handing over a grade 2 as a
 Horvitz–Thompson mean, each with session-bootstrap 95% intervals. `borg debug select`, `borg status`, `borg top` and
 the Conscience page of `borg web` show both from the selection summary; `borg debug select --replay
 --file A --file B` reads the test pooled over stores, as the amendment of 2026-10-31 says, leaving

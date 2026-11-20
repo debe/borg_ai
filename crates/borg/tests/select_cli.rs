@@ -464,6 +464,102 @@ fn the_fixed_rules_placebos_make_the_whole_round_trip_and_count_for_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The learned policy's withheld placebos (select/policy.rs withholding, 0.10.0), end to end: under a
+/// fit sure that a lesson not delivered changes the work more than one delivered (every draw: ψ 1), a
+/// learned stop asks its 3 (Mdrain, never withheld) and withholds the 1s the fixed rule asks beside it
+/// (G1, G2) as judged placebos, its record giving each `pw` 1. The drone sees neither; the next prompt
+/// marks them and the next call judges them blindly: G1's verdict lands on the placebo channel with its
+/// check, folded on the placebo route at its chance (summary.rs `placebo_p`, here 1). G2, never judged,
+/// is handed over by the next stop (the fixed rule's) and delivered at the prompt after it: delivered
+/// later in the session, its placebo is closed as censored by that later delivery (`UNJUDGED_LATER`),
+/// which the withholding readout counts.
+#[test]
+fn a_withheld_placebo_makes_the_whole_round_trip_and_a_later_delivery_censors_one() {
+    let root = setup("select-withheld");
+    fit_with(&root, &[("not", 3.0)]);
+    let learned = [("BORG_SELECT", "learned")];
+    prompt(&root, "w1", PROMPT, &learned);
+    edit(&root, "w1", "/x/net.rs", "drop the budget token with a reset arc");
+    answer(&root, &[("Mdrain", 3), ("G1", 1), ("G2", 1)]);
+    let out = stop(&root, "w1", LAST, &learned);
+    let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == "w1").unwrap();
+    let check = g["check"].as_str().unwrap().to_string();
+    let pw = |g: &Value, id: &str| g["pw"][lessons(g).iter().position(|l| l == id).unwrap()].as_f64();
+    assert_eq!(
+        (strings(&g["chosen"]), strings(&g["placebo"]), g["policy"].as_str()),
+        (vec!["Mdrain".to_string()], vec!["G1".to_string(), "G2".to_string()], Some("learned")),
+        "{g}"
+    );
+    assert_eq!((pw(&g, "Mdrain"), pw(&g, "G1"), pw(&g, "G2")), (Some(0.0), Some(1.0), Some(1.0)), "{g}");
+    assert!(out.contains("explicit consumer") && !out.contains("tomatoes") && !out.contains("invoices"), "only the 3 is asked: {out}");
+    assert!(state(&root, "w1", "queued").contains(&format!("placebo G1,G2 @{check}\n")), "{}", state(&root, "w1", "queued"));
+
+    // The next prompt marks them and shows the drone nothing of them.
+    let shown = context(&prompt(&root, "w1", "next: the retry budget", &learned));
+    assert!(!shown.contains("tomatoes") && !shown.contains("invoices"), "{shown}");
+    let marked: Vec<_> = routes(&root).into_iter().filter(|r| r.1 == "placebo").collect();
+    assert_eq!(marked, [(check.clone(), "placebo".to_string(), String::new(), vec!["G1".to_string(), "G2".to_string()])]);
+
+    // The next stop, under the fixed rule: its call judges both blindly, G1 changed the work, G2 no
+    // verdict; it grades G2 again and hands it over, so the next prompt delivers it later in the session.
+    let fixed = [("BORG_SELECT", "fixed")];
+    edit(&root, "w1", "/x/net.rs", "an explicit consumer drains the budget");
+    let a = json!([{"id": "G2", "why": "w", "grade": 1}]);
+    let resolved = json!([{"id": "G1", "verdict": "changed", "avoids_consequence": true}]);
+    let answer_json = json!({"structured_output": {"moves": [], "applies": a, "resolved": resolved}, "total_cost_usd": 0.05});
+    std::fs::write(root.join("answer.json"), answer_json.to_string()).unwrap();
+    stop(&root, "w1", "The budget is drained explicitly now.", &fixed);
+    let judged = prompts(&root).last().unwrap().clone();
+    assert!(judged.contains("[G1] lesson:") && judged.contains("[G2] lesson:"), "{judged}");
+    let later = of(&root, "graded").into_iter().rfind(|g| g["session"] == "w1").unwrap();
+    assert_eq!((strings(&later["free"]), later["policy"].as_str()), (vec!["G2".to_string()], Some("fixed")), "{later}");
+    assert!(context(&prompt(&root, "w1", "and the retries?", &fixed)).contains("invoices"), "G2 delivered later in the session");
+    let on = |kind: &str| -> Vec<(Vec<String>, String, String)> {
+        of(&root, kind)
+            .iter()
+            .filter(|o| o["channel"] == "placebo")
+            .map(|o| (lessons(o), o["check"].as_str().unwrap_or_default().to_string(), o["reason"].as_str().unwrap_or_default().to_string()))
+            .collect()
+    };
+    assert_eq!(on("asked_then_changed"), [(vec!["G1".to_string()], check.clone(), String::new())]);
+    learn(&root, "w1");
+    assert_eq!(on("asked_not_corrected"), [(vec!["G2".to_string()], check.clone(), borg::outcome::UNJUDGED_LATER.to_string())]);
+
+    // The summary folds both on the placebo route at their chance: G1 changed, G2 censored.
+    let v = select_summary(&root);
+    let name = |k: &str, i: &Value| v[k][i.as_u64().unwrap() as usize].clone();
+    let apply = |id: &str| {
+        let mut found =
+            v["applies"].as_array().unwrap().iter().filter(|a| name("checks", &a["check"])["id"] == check.as_str() && name("lessons", &a["lesson"]) == id);
+        found.next().cloned().unwrap_or_else(|| panic!("{id} of {check}: {v}"))
+    };
+    let f = |a: &Value, k: &str| a[k].as_f64().unwrap_or(0.0);
+    for (id, label) in [("G1", "changed"), ("G2", "censored")] {
+        let a = apply(id);
+        assert_eq!((a["route"].clone(), a.get("label").cloned()), (json!("placebo"), Some(json!(label))), "{a}");
+        assert_eq!(borg::select::summary::placebo_p(f(&a, "p"), f(&a, "pf"), f(&a, "pw"), f(&a, "psi")), 1.0, "{a}");
+    }
+    // The withholding readout (rules v3) reads them off the log: withheld at a chance of 1 (the
+    // evidence rule left them undelivered), so outright, apart from the withheld placebos and the lift.
+    let out = Command::new(env!("CARGO_BIN_EXE_borg"))
+        .args(["debug", "select", "--replay", "--file", store(&root).join("outcomes.jsonl").to_str().unwrap()])
+        .env_clear()
+        .env("BORG_UPDATE_CHECK", "off")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", root.join("home"))
+        .env("BORG_CONFIG", root.join("collectives.json"))
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("withholding readout (rules v3 2026-11-19): not due (0 of 93 arisen withheld placebos; 0 withheld at 0 of 1 checks with a candidate, in 1 sessions)\n")
+            && text.contains("\n  withheld outright: 2 placebos at a chance of 1 (left undelivered by the evidence rule, or ψ 1)"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The tail sample (whole.rs `tail`), under every policy: a pool the budget cut shows the model a few of
 /// the lessons it dropped, after the pool; the check's record names them (`tail`), each one's chance (k
 /// of the n dropped, `pt`) and, for those that apply, their place past the budget's in `fill`, never a
@@ -570,7 +666,9 @@ fn select_summary(root: &Path) -> Value {
 /// A selection summary beside the store's lessons whose fit has no evidence either way (asking and
 /// handing over are worth the same, every coefficient but the intercept 0, each drawn tightly around
 /// it), with a gate open wide: the learned policy keeps the fixed rule on evidence, and the gate would
-/// admit its randomised question-count test on a live check (select/policy.rs `choose`).
+/// admit its randomised question-count test on a live check (select/policy.rs `choose`). Its fit is
+/// keyed at byte 0, the empty log it is written beside, as a refit there would key it: `borg debug
+/// select` reads no record that names it as imported from another log.
 fn neutral_fit(root: &Path) {
     fit_beside(root, false);
 }
@@ -578,14 +676,18 @@ fn neutral_fit(root: &Path) {
 /// `neutral_fit`, or (`sure`) a fit sure that handing over beats asking, as hook.rs's unit tests'
 /// `decide_store` has it: the learned policy then deviates on evidence (select/policy.rs `EVIDENCE`).
 fn fit_beside(root: &Path, sure: bool) {
+    fit_with(root, if sure { &[("ask", -3.0), ("not", -1.0)] } else { &[] });
+}
+
+/// `neutral_fit` with the coefficients `set` (by name) instead of 0.
+fn fit_with(root: &Path, set: &[(&str, f64)]) {
     use borg::select::{policy, summary};
     let lessons = store(root).join("lessons.jsonl");
     let at = |name: &str| policy::NAMES.iter().position(|n| *n == name).unwrap();
     let mut beta = vec![0.0; policy::P];
     beta[at("intercept")] = -0.5;
-    if sure {
-        beta[at("ask")] = -3.0;
-        beta[at("not")] = -1.0;
+    for (name, b) in set {
+        beta[at(name)] = *b;
     }
     let mut chol = vec![0.0; policy::P * policy::P];
     for k in 0..policy::P {
@@ -593,7 +695,7 @@ fn fit_beside(root: &Path, sure: bool) {
     }
     let model = policy::Model { beta, chol, sd: vec![1.0; policy::P], spread: [0.1; 3], ..policy::Model::default() };
     let rates = policy::Rates { free_stop: 1.0, free_live: 1.0, later: 0.0, wait: 0.0, ask_live: 1.0 };
-    let fit = policy::Fit { key: "9-abcdef01".into(), model: Some(model), rates, ..policy::Fit::default() };
+    let fit = policy::Fit { key: "0-abcdef01".into(), model: Some(model), rates, ..policy::Fit::default() };
     let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: 5.0, ..summary::Gate::default() };
     std::fs::write(lessons.with_file_name("outcomes.jsonl"), "").unwrap();
     summary::save(&lessons, &summary::Summary { fit, gate, ..summary::Summary::default() }).unwrap();
@@ -602,7 +704,8 @@ fn fit_beside(root: &Path, sure: bool) {
 /// The randomised question-count test (select/policy.rs `choose`, plan W2) runs on a live check only:
 /// with live mode gone (0.7.6) a learned stop never runs it, though the fit and the gate would admit it.
 /// A stop with a 3 (Mdrain) and two lessons the fixed rule asks beside it (G0 a 2, G1 a 1) keeps the
-/// fixed rule, logs no draw (`xk`, `xs`) and asks all three.
+/// fixed rule, logs no draw (`xk`, `xs`) and asks all three, but for those it withholds as judged
+/// placebos (never the 3).
 #[test]
 fn a_learned_stop_never_runs_the_question_count_test() {
     let root = setup("select-experiment");
@@ -616,12 +719,18 @@ fn a_learned_stop_never_runs_the_question_count_test() {
         let g = of(&root, "graded").into_iter().rfind(|g| g["session"] == session).unwrap();
         assert!(g.get("xk").is_none() && g.get("xs").is_none() && !g["source"].as_str().unwrap_or_default().starts_with("experiment"), "{g}");
         assert_eq!((g["policy"].as_str(), g["channel"].as_str()), (Some("learned"), Some("stop")), "{g}");
-        assert_eq!(
-            (strings(&g["chosen"]), strings(&g["free"])),
-            (vec!["Mdrain".to_string(), "G0".into(), "G1".into()], Vec::<String>::new()),
-            "the fixed rule: {g}"
-        );
-        assert!(out.contains("explicit consumer") && out.contains("websocket") && out.contains("tomatoes"), "{out}");
+        // The fixed rule's routes, withholding aside: the stop's 3 asked always, the others asked unless
+        // withheld as judged placebos (select/policy.rs withholding, outcome.rs `pw`).
+        let (chosen, withheld) = (strings(&g["chosen"]), strings(&g["placebo"]));
+        assert!(chosen.first().map(String::as_str) == Some("Mdrain") && strings(&g["free"]).is_empty(), "{g}");
+        let mut routed: Vec<String> = chosen.iter().chain(&withheld).cloned().collect();
+        routed.sort();
+        assert_eq!(routed, ["G0", "G1", "Mdrain"], "the fixed rule: {g}");
+        // The block asks what was asked; a withheld lesson the drone never sees.
+        assert!(out.contains("explicit consumer"), "{out}");
+        for (id, word) in [("G0", "websocket"), ("G1", "tomatoes")] {
+            assert_eq!(out.contains(word), chosen.iter().any(|c| c == id), "{id}: {out}");
+        }
     }
     let _ = std::fs::remove_dir_all(root);
 }

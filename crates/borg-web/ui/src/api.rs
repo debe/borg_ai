@@ -800,11 +800,18 @@ pub struct Rates {
 }
 
 /// What the checks measure for the learned policy at no cost to the fixed rule's quality: the placebos
-/// drawn (applies no route delivered, judged blindly) and those judged.
+/// drawn (applies no route delivered, judged blindly) and those judged; of them the ones withheld from a
+/// delivery (0.10.0), the mean chance of being withheld over the lessons with one (`pw`: ψ thinned by the
+/// subsets the gate refuses; 0: none or an older server), and the withheld ones whose point arose
+/// against the number that makes the lift readout due (0: an older server).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Measurement {
     pub placebos: f64,
     pub judged: f64,
+    pub withheld: f64,
+    pub psi: f64,
+    pub arisen: f64,
+    pub arisen_needed: f64,
     pub tail_shown: f64,
     pub tail_applied: f64,
     /// The judged placebos needed before not now is learned (0: an older server, which names none).
@@ -1015,6 +1022,10 @@ pub fn parse_select(v: &Value) -> Selection {
             Measurement {
                 placebos: f(&m["placebos"]),
                 judged: f(&m["judged"]),
+                withheld: f(&m["withheld"]),
+                psi: f(&m["psi"]),
+                arisen: f(&m["arisen"]),
+                arisen_needed: f(&m["arisen_needed"]),
                 tail_shown: f(&m["tail_shown"]),
                 tail_applied: f(&m["tail_applied"]),
                 placebos_needed: f(&m["placebos_needed"]),

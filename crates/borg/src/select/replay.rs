@@ -5,8 +5,9 @@
 //! **The rules.** docs/evidence.md "Lesson selection" (`RULES_AT`): the pre-registered checks P0–P5,
 //! dated `RULES`; a later change is a dated amendment, and `AMENDMENT` names the latest one this file
 //! implements; `RULES_V2` the rules v2, written for policy v2 (it deviates only on evidence and learns
-//! the question count by a randomised test) with the same bars, P4 split into P4a–P4c. Every report
-//! prints all three.
+//! the question count by a randomised test) with the same bars, P4 split into P4a–P4c; `RULES_V3` the
+//! rules v3 amendment, written for withholding (0.10.0: P1 on the placebos, P3's what-if, the
+//! withholding readout). Every report prints all four.
 //!
 //! **Verdicts.** PASS or FAIL against the bar; NOT RUN when there is nothing to run it on (no
 //! evaluation given, or one still incomplete); NOT TESTED when it ran on data that could not have
@@ -28,14 +29,20 @@
 //!   policy, fit key, summary, revert (outcome.rs `source`), session, channel and check id (its seed)
 //!   give the logged decision, its source, the question-count test's k and s (outcome.rs `xk`, `xs`:
 //!   its draw is the check's seed) and propensities within `ope::AGREE`, and folding piece by piece
-//!   equals folding the whole log.
+//!   equals folding the whole log. A record from withholding on (its `version` 0.10.0 or later,
+//!   `withholds`) also gives its placebo list and each apply's chance of being withheld (outcome.rs
+//!   `pw`, within `ope::AGREE`; rules v3); an older one replays with withholding off (select.rs
+//!   `Ctx::withhold`), as its hook decided.
 //! - *cold start*: the same log, the learned policy deciding from the prior on, each graded record
 //!   replaced by the replayed decision before it is folded (`decided`), so the gate's state is the
 //!   policy's own, and the summary refitted where production refits it (`borg learn` when a session
 //!   ends), so the policy has a model to deviate by. P3: no decision risks more than the gate's budget
 //!   (the question-count test's charged risk among them), the first one is the fixed rule's, and with an
 //!   engineer's budget for the collective the policy's pools stay within it; spend and the decisions'
-//!   sources are reported.
+//!   sources are reported, and withholding's what-if (rules v3): the checks with a candidate, the
+//!   placebos withheld, the mean ψ offered, the checks whose drawn subset the gate refused, and the
+//!   checks that took the worst-case fallback (select/policy.rs `WITHHOLD_EXACT_MAX`) with the
+//!   candidates it dropped.
 //!
 //! **Labels** (P2, P5, the readout): a judge's verdict that settles its delivery (`asked_then_changed`,
 //! `asked_ignored`, `asked_not_arisen`, a 0 as the selection model's fit reads it) joined to
@@ -79,6 +86,21 @@
 //! Horvitz–Thompson difference by the logged propensities), each verdict weighed by its chance of one,
 //! session-bootstrap 95% intervals.
 //!
+//! **The withholding readout** (`withholding`, rules v3 2026-11-19), from the log itself (a censored
+//! placebo's reason is in no summary): over the graded checks where withholding had a candidate (a
+//! logged `pw`, zeros included: tested, as P3's what-if counts them), each apply with `pw` above 0
+//! joined by check id to its verdict, settle, or a placebo's delivery that dropped it or never came. A
+//! withheld placebo is a placebo with `pw` above 0 that could also have been delivered (p + pf above
+//! 0); one withheld at a chance of 1 is reported apart (`outright`). Due at `LIFT_ARISEN` withheld
+//! placebos whose point arose (changed, ignored or consequence remains), pooled; only then the lift
+//! per grade, P(changed |
+//! delivered) − P(changed | withheld) among the arisen verdicts of the applies that could go either
+//! way, each weighed by the inverse of its route's logged chance (p, pf, summary.rs `placebo_p`), a
+//! session-bootstrap 95% interval. Always: the arisen rate per arm (flagged past `ARISEN_GAP`), the
+//! withheld placebos censored by a later delivery or by slots (flagged past `CENSORED_MAX`), and the
+//! kill rules' readings (`KILL_CHECKS`, `KILL_PLACEBOS`). Pooled over stores as the question-count test
+//! is (`pooled`: stratified by collective, imported records left out).
+//!
 //! **Where it meets the policy core.** Every decision is select.rs `graded_under` with the full `Ctx`
 //! (session, check id, channel, lessons file, summary, logged pool tokens, had, logged tolerance α), the learned policy
 //! named explicitly whatever this process's `policy`; every fold summary.rs `fold`; every pool select.rs
@@ -111,8 +133,9 @@
 //!   no `nofree`, and the hook that ran the evaluation decided without), from a stand-in check id per
 //!   check, each check independent of the run's earlier draws; P4c's gate admits every draw (`OPEN`)
 //!   at the default tolerance (`policy::ALPHA`).
-//! - P1 compares the asked and free lists, propensities and source, not the placebo draw or its chance
-//!   (`psi`): the pre-registered measure.
+//! - P1 compares the asked and free lists, propensities and source, and from withholding on (rules v3)
+//!   the placebo list and `pw`; never the placebo draw's chance (`psi`), and on an older record not
+//!   the placebo list: the pre-registered measure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -139,6 +162,15 @@ pub const AMENDMENT: &str = "2026-10-29";
 /// rerun: P4a–P4c, P1 and P3 on the question-count test, its readout, the default rule). Protocol:
 /// printed with every report beside `RULES` and `AMENDMENT`.
 pub const RULES_V2: &str = "2026-10-29";
+/// The rules v3 amendment this file implements, by the date it was written (2026-11-19, before
+/// withholding was built: P1 on the placebo list and `pw`, records before it replayed without; P3's
+/// withholding what-if; the withholding readout, its due rule, sanity flags and kill rules). Protocol:
+/// printed with every report beside `RULES_V2`.
+pub const RULES_V3: &str = "2026-11-19";
+/// The release (major, minor) from which a graded record's check could withhold (select/policy.rs
+/// `choose_with`): an older record replays with withholding off (`withholds`). Protocol: the
+/// record's `version`, borg's own.
+const WITHHOLD_FROM: (u64, u64) = (0, 10);
 /// Where the rules and their dated amendments are written: a tracked file of this repository, so a
 /// reader of the report can open them. Protocol: printed with every report.
 pub const RULES_AT: &str = "docs/evidence.md#lesson-selection";
@@ -170,6 +202,27 @@ pub const TEST_MIN_SESSIONS: u32 = 15;
 /// (`TEST_MIN_SESSIONS`), and its pooled reading over several stores, stratified by collective,
 /// intention to treat with the share played per arm (`pooled`). Protocol: printed with the readout.
 pub const TEST_AMENDMENT: &str = "2026-10-31";
+
+/// The withholding readout (`withholding`) is due at this many withheld placebos whose point arose,
+/// pooled over stores. Method: pre-registered (rules v3, 2026-11-19, `RULES_V3`): a lift of 0.2 at 80%
+/// power.
+pub const LIFT_ARISEN: u64 = 93;
+/// The withholding readout is flagged as not trusted when the arms' arisen rates differ by more than
+/// this. Method: pre-registered (rules v3): the lift reads only arisen verdicts, so arms that arise
+/// apart compare different lessons.
+pub const ARISEN_GAP: f64 = 0.15;
+/// The withholding readout is flagged as not trusted when more than this share of the closed withheld
+/// placebos was censored by a later delivery or by slots. Method: pre-registered (rules v3): such a
+/// placebo is no verdict on not delivering.
+pub const CENSORED_MAX: f64 = 0.30;
+/// Kill rule: over the first this many checks with a candidate, fewer than `KILL_WITHHOLDING` of them
+/// withholding a placebo means retune or drop. Method: pre-registered (rules v3).
+pub const KILL_CHECKS: u64 = 300;
+pub const KILL_WITHHOLDING: f64 = 0.05;
+/// Kill rule: of the first this many withheld placebos, fewer than `KILL_AROSE` whose point arose means
+/// drop the arm. Method: pre-registered (rules v3, superseding 2026-10-31's 15 of 60).
+pub const KILL_PLACEBOS: u64 = 100;
+pub const KILL_AROSE: u64 = 20;
 
 /// The normal quantile of a 95% interval: a bootstrap interval read as ±`Z95` standard errors, to
 /// join two collectives' intervals (`pooled`). Method.
@@ -281,9 +334,21 @@ fn had_of(o: &Outcome) -> Vec<String> {
     had
 }
 
-/// The production decision's context for the graded record `o` with its session's `had` (`had_of`).
-fn ctx<'a>(o: &'a Outcome, had: &'a [String], lessons: &'a Path, s: &'a Summary) -> Ctx<'a> {
-    Ctx { session: &o.session, check: &o.check, channel: channel(o), lessons, summary: s, tokens: o.tokens, had, alpha: super::alpha_of(o.alpha) }
+/// The production decision's context for the graded record `o` with its session's `had` (`had_of`),
+/// withholding (select.rs `Ctx::withhold`) as `withhold` says: as its hook could (`withholds`) to
+/// replay its decision, always for the policy as it is now.
+fn ctx<'a>(o: &'a Outcome, had: &'a [String], lessons: &'a Path, s: &'a Summary, withhold: bool) -> Ctx<'a> {
+    Ctx { session: &o.session, check: &o.check, channel: channel(o), lessons, summary: s, tokens: o.tokens, had, alpha: super::alpha_of(o.alpha), withhold }
+}
+
+/// Whether the hook that logged `o` could withhold: its `version` (borg's, `CARGO_PKG_VERSION`) is
+/// `WITHHOLD_FROM` or later. A record without one, or one that does not parse, is older.
+fn withholds(o: &Outcome) -> bool {
+    let mut parts = o.version.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= WITHHOLD_FROM,
+        _ => false,
+    }
 }
 
 /// The policy a graded record can be replayed under: the fixed rule or the learned policy. The
@@ -358,10 +423,11 @@ fn evidence(units: &[Unit], c: &EvalCheck, fit: &Fit) -> Vec<Route> {
 /// One draw of the question-count test, ungated (P4c): select/policy.rs `choose` on `fit` (the n = 0
 /// prior, under which the decision rule deviates nowhere when P4a passes) at the evaluation's check
 /// `c`, against a gate that admits every draw (`OPEN`) at the default tolerance (`policy::ALPHA`), for
-/// a session that had none of its lessons.
+/// a session that had none of its lessons. Without withholding (`choose_with`): P4c measures the
+/// test's recall as pre-registered; what withholding costs is the gate's to bound (P3).
 fn tested(units: &[Unit], c: &EvalCheck, fit: &Fit, seed: u64) -> Vec<Route> {
     let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: OPEN, ..summary::Gate::default() };
-    policy::choose(units, &eval_check(c), fit, &gate, policy::ALPHA, seed, &[]).routes
+    policy::choose_with(units, &eval_check(c), fit, &gate, policy::ALPHA, seed, &[], false).routes
 }
 
 /// The quality `r` risks below the fixed rule at the gate's 5% quantile (P3): select/policy.rs
@@ -505,13 +571,17 @@ pub struct P1 {
     /// Of the replayed checks, those whose record logs the question-count test (outcome.rs `xk`): their
     /// draw and its propensities are replayed from the check's seed.
     pub tests: usize,
+    /// Of the replayed checks, those logged from withholding on (`withholds`): their placebo list and
+    /// `pw` are replayed too (rules v3).
+    pub withholding: usize,
     /// Checks under an evaluation switch (cap, learned cut): counted, not replayed.
     pub switches: usize,
     /// Checks imported from another store's log (`imported`): the summary or fit their record names
     /// lies at a byte that is no line boundary of this log, so no summary of it is the one their hook
     /// read. Counted, not replayed.
     pub imported: usize,
-    /// The largest |Δ| between a replayed and a logged propensity (p or pf).
+    /// The largest |Δ| between a replayed and a logged propensity (p or pf, and `pw` from withholding
+    /// on).
     pub max_delta: f64,
     /// Folding the log check by check gives the summary that folding it whole gives.
     pub fold: bool,
@@ -609,6 +679,7 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
         empty: 0,
         seen: 0,
         tests: 0,
+        withholding: 0,
         switches: 0,
         imported: 0,
         max_delta: 0.0,
@@ -630,7 +701,7 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
         let applied = applied(&cs, &o);
         let check = Check::new(o, &applied);
         // P0: at gate budget 0 the learned policy is the fixed rule, and the fixed rule is what was logged.
-        let r = gate_closed(&mut s, |s| super::graded_under(Policy::Learned, &applied, &ctx(&check.o, &check.had, lessons, s)));
+        let r = gate_closed(&mut s, |s| super::graded_under(Policy::Learned, &applied, &ctx(&check.o, &check.had, lessons, s, withholds(&check.o))));
         let mut same = (ids(&r.ask), ids(&r.free)) == check.fixed;
         if replayable(&check.o) == Some(Policy::Fixed) {
             same &= (&check.asked, &check.free) == (&check.fixed.0, &check.fixed.1);
@@ -661,6 +732,8 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
                 p1.empty += usize::from(applied.is_empty());
                 p1.seen += usize::from(!check.o.seen.is_empty());
                 p1.tests += usize::from(check.o.xk.is_some());
+                let v3 = withholds(&check.o);
+                p1.withholding += usize::from(v3);
                 let found = match seen_at(&check.o, text, here) {
                     Err(e) => Err(e),
                     // The prior has no model: its decision is the fixed rule whatever else the summary holds.
@@ -681,29 +754,39 @@ fn as_logged(text: &str, lessons: &Path) -> AsLogged {
                         if logged {
                             at.monitor.reverted = check.o.source == super::REVERTED_SOURCE;
                         }
-                        let r = super::graded_under(policy, &applied, &ctx(&check.o, &check.had, lessons, at));
+                        let r = super::graded_under(policy, &applied, &ctx(&check.o, &check.had, lessons, at, v3));
                         at.monitor.reverted = kept;
-                        let delta = r.p.iter().zip(&check.p).chain(r.pf.iter().zip(&check.pf)).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                        // From withholding on, each apply's chance of being withheld (rules v3): the hook
+                        // logs none where every one's is 0.
+                        let pw = if check.o.pw.is_empty() { vec![0.0; check.o.lessons.len()] } else { check.o.pw.clone() };
+                        let withheld = if v3 { r.pw.iter().zip(&pw).collect() } else { Vec::new() };
+                        let delta = r.p.iter().zip(&check.p).chain(r.pf.iter().zip(&check.pf)).chain(withheld).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
                         p1.max_delta = p1.max_delta.max(delta);
                         // The test's draw: k and s as logged (None outside the test, and on every record
                         // from before it).
                         let drawn = (r.log.xk, r.log.xs) == (check.o.xk, check.o.xs);
-                        let decided = ids(&r.ask) == check.asked && ids(&r.free) == check.free && (!logged || (r.log.source == check.o.source && drawn));
-                        let aligned = r.p.len() == check.p.len() && r.pf.len() == check.pf.len();
+                        let decided = ids(&r.ask) == check.asked
+                            && ids(&r.free) == check.free
+                            && (!v3 || ids(&r.placebo) == check.o.placebo)
+                            && (!logged || (r.log.source == check.o.source && drawn));
+                        let aligned = r.p.len() == check.p.len() && r.pf.len() == check.pf.len() && (!v3 || r.pw.len() == pw.len());
+                        let placebos = |v: Vec<String>| if v3 { format!(" placebo {v:?}") } else { String::new() };
                         let x = |k: Option<u32>, s: Option<u32>| match (k, s) {
                             (None, None) => String::new(),
                             (k, s) => format!(" k {} s {}", k.map_or("-".into(), |k| k.to_string()), s.map_or("-".into(), |s| s.to_string())),
                         };
                         (!decided || !aligned || delta > ope::AGREE).then(|| {
                             format!(
-                                "{}: replay asks {:?} free {:?} by {}{} (|Δp| {delta:.4}); logged {:?} free {:?} by {}{}",
+                                "{}: replay asks {:?} free {:?}{} by {}{} (|Δp| {delta:.4}); logged {:?} free {:?}{} by {}{}",
                                 check.line(),
                                 ids(&r.ask),
                                 ids(&r.free),
+                                placebos(ids(&r.placebo)),
                                 r.log.source,
                                 x(r.log.xk, r.log.xs),
                                 check.asked,
                                 check.free,
+                                placebos(check.o.placebo.clone()),
                                 if logged { check.o.source.as_str() } else { "-" },
                                 x(check.o.xk, check.o.xs)
                             )
@@ -789,9 +872,67 @@ pub struct P3 {
     /// The replayed decisions per source (select/policy.rs `Decision::source`): how many the evidence
     /// rule, the question-count test (its control arm apart) and the gate's refusals set.
     pub sources: BTreeMap<String, usize>,
+    /// Withholding's what-if (rules v3): the replayed decisions' withholding, as select/policy.rs
+    /// `Decision::psi_w` and `dropped` report it on the routing played.
+    pub withholding: Withheld,
     pub policy: Spend,
     pub fixed: Spend,
     pub first: Vec<String>,
+}
+
+/// The cold start's withholding (P3, rules v3): the checks with a candidate (select.rs
+/// `Routed::could_withhold`, as the withholding readout counts them), of them those that withheld a
+/// placebo at random, the placebos so withheld (a placebo with a chance of being withheld above 0 that
+/// could also have been delivered, p + pf above 0, as the readout's lift reads them), those withheld
+/// outright (`outright`: a chance of 1, left undelivered by its routing or at ψ 1), the candidates
+/// offered on the routing played (select/policy.rs `Decision::psi_w`) and their mean ψ (0 for one the
+/// fallback dropped), the checks whose drawn subset the gate refused (`refused`, `Decision::refused`:
+/// played with nothing withheld), the checks whose routing took the worst-case fallback (`fallbacks`,
+/// past select/policy.rs `WITHHOLD_EXACT_MAX` live candidates: its hit rate), and the candidates with
+/// ψ above 0 the fallback dropped, at how many checks (`dropped`, `refusals`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Withheld {
+    pub candidates: usize,
+    pub withholding: usize,
+    pub withheld: usize,
+    pub outright: usize,
+    pub offered: usize,
+    pub psi: Option<f64>,
+    pub refused: usize,
+    pub fallbacks: usize,
+    pub dropped: u64,
+    pub refusals: usize,
+}
+
+impl Withheld {
+    /// One replayed decision `r` on `applied`.
+    fn add(&mut self, applied: &[(&Challenge, u8)], r: &Routed) {
+        if !r.could_withhold() {
+            return;
+        }
+        let offered: Vec<f64> = r.log.psi_w.iter().flatten().copied().collect();
+        let at = |c: &Challenge| applied.iter().position(|(a, _)| a.id == c.id);
+        // Each withheld placebo, whether it could also have been delivered (p + pf above 0).
+        let either: Vec<bool> = r
+            .placebo
+            .iter()
+            .filter_map(|c| at(c))
+            .filter(|&j| r.pw.get(j).is_some_and(|w| *w > 0.0))
+            .map(|j| r.p.get(j).copied().unwrap_or(0.0) + r.pf.get(j).copied().unwrap_or(0.0) > 0.0)
+            .collect();
+        let withheld = either.iter().filter(|e| **e).count();
+        let sum = self.psi.unwrap_or(0.0) * self.offered as f64 + offered.iter().sum::<f64>();
+        self.candidates += 1;
+        self.withholding += usize::from(withheld > 0);
+        self.withheld += withheld;
+        self.outright += either.len() - withheld;
+        self.offered += offered.len();
+        self.psi = (self.offered > 0).then(|| sum / self.offered as f64);
+        self.refused += usize::from(r.log.refused);
+        self.fallbacks += usize::from(r.log.fallback);
+        self.dropped += u64::from(r.log.dropped);
+        self.refusals += usize::from(r.log.dropped > 0);
+    }
 }
 
 /// P3 over the cold-start steps, and the replayed pools' spend per session (`pool`) against the
@@ -811,7 +952,22 @@ fn conduct(steps: &[Step], policy: Spend, fixed: Spend, budget: Option<f64>, poo
         (Verdict::NotTested, _) => "no decision left the fixed rule, so the gate never had to hold one back".to_string(),
         _ => String::new(),
     };
-    P3 { verdict, why, checks: steps.len(), deviations, cold, over: bad.len(), budget, pool, refits: 0, sources: BTreeMap::new(), policy, fixed, first }
+    P3 {
+        verdict,
+        why,
+        checks: steps.len(),
+        deviations,
+        cold,
+        over: bad.len(),
+        budget,
+        pool,
+        refits: 0,
+        sources: BTreeMap::new(),
+        withholding: Withheld::default(),
+        policy,
+        fixed,
+        first,
+    }
 }
 
 /// A check's propensities of asking (`p`) and of handing over free (`pf`), aligned with its applies.
@@ -830,10 +986,11 @@ fn pool_of(s: &Summary, session: &str) -> usize {
 }
 
 /// The graded record `o` as the decision `r` would have logged it (hook.rs `record_graded`): its
-/// routes, its own propensities (the placebo's `psi` weighs the monitor's estimate, select/policy.rs
-/// `monitor`), policy, fit, source and the question-count test's k and s (select/summary.rs counts
-/// them); its applies, had lessons (`nofree`), pool and tail stay the
-/// logged check's.
+/// routes, its own propensities (the placebo's `psi` and `pw`, the latter only where withholding had a
+/// candidate as the hook writes it, select.rs `Routed::could_withhold`; they weigh the monitor's
+/// estimate, select/policy.rs `monitor`), policy, fit, source
+/// and the question-count test's k and s (select/summary.rs counts them); its applies, had lessons
+/// (`nofree`), pool and tail stay the logged check's.
 fn decided(o: Outcome, r: &Routed) -> Outcome {
     let round = |v: &[f64]| v.iter().map(|p| outcome::round_p(*p)).collect();
     Outcome {
@@ -842,6 +999,7 @@ fn decided(o: Outcome, r: &Routed) -> Outcome {
         placebo: ids(&r.placebo),
         p: round(&r.p),
         pf: round(&r.pf),
+        pw: if r.could_withhold() { round(&r.pw) } else { Vec::new() },
         psi: r.log.psi,
         policy: r.log.policy.into(),
         fit: r.log.fit.clone(),
@@ -861,7 +1019,8 @@ fn decided(o: Outcome, r: &Routed) -> Outcome {
 /// the gate's ledger replayed over the policy's own checks; and under the had lessons its record logs
 /// (`had_of`). Each check's pool is the budget the policy chooses there (select.rs `pool_tokens_under`
 /// the learned policy, called per check as the hook calls `pool_tokens`) under the loosest latency
-/// limit (`pool_of`).
+/// limit (`pool_of`). The policy as it is now: withholding whatever the record's version, so P3
+/// reads withholding's what-if over the whole log (`Withheld`).
 fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Propensities>) {
     let mut s = Summary::default();
     let mut chunk = String::new();
@@ -871,6 +1030,7 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
     // Pool tokens per session; decisions per source.
     let mut pools: BTreeMap<String, u64> = BTreeMap::new();
     let mut sources: BTreeMap<String, usize> = BTreeMap::new();
+    let mut withholding = Withheld::default();
     for line in lines(text) {
         let Some((o, cs)) = line.o.filter(|o| o.kind == outcome::GRADED).and_then(|o| challenges(&o).map(|cs| (o, cs))) else {
             chunk.push_str(line.text);
@@ -888,7 +1048,8 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
         }
         let applied = applied(&cs, &o);
         let had = had_of(&o);
-        let r = super::graded_under(Policy::Learned, &applied, &ctx(&o, &had, lessons, &s));
+        let r = super::graded_under(Policy::Learned, &applied, &ctx(&o, &had, lessons, &s, true));
+        withholding.add(&applied, &r);
         let (fa, ff) = conscience::graded_without(&applied, None, &had);
         let deviates = (ids(&r.ask), ids(&r.free)) != (ids(&fa), ids(&ff));
         spent.add(&o, r.ask.len(), r.free.len());
@@ -908,7 +1069,7 @@ fn cold_start(text: &str, lessons: &Path, budget: Option<f64>) -> (P3, Vec<Prope
         }
     }
     let pool = if pools.is_empty() { 0.0 } else { pools.values().sum::<u64>() as f64 / pools.len() as f64 };
-    let p3 = P3 { refits, sources, ..conduct(&steps, spent, fixed, budget, pool) };
+    let p3 = P3 { refits, sources, withholding, ..conduct(&steps, spent, fixed, budget, pool) };
     (p3, targets)
 }
 
@@ -1038,16 +1199,18 @@ fn labels(checks: &[Check], log: &[Outcome]) -> (Vec<Label>, usize) {
             let later: Vec<(i64, u8)> = against.get(&(c.o.session.as_str(), l)).into_iter().flatten().filter(|(t, _)| *t >= c.o.ms).copied().collect();
             let known = values(&verdicts, &later);
             let (p, pf) = (c.p.get(j).copied().unwrap_or(0.0), c.pf.get(j).copied().unwrap_or(0.0));
-            // Not delivered, a unit is judged only when the placebo draw took it (its chance ψ, `psi`):
-            // that route's probability is both, as select/policy.rs `monitor` weighs it, a placebo that
-            // happened at least at `PSI_FLOOR`.
+            let pw = c.o.pw.get(j).copied().unwrap_or(0.0);
+            // Not delivered, a unit is judged only when it was withheld (`pw`) or the placebo draw took
+            // it (its chance ψ, `psi`): that route's probability is select/summary.rs `placebo_p`, as
+            // select/policy.rs `monitor` weighs it, a placebo that happened at a ψ of at least
+            // `PSI_FLOOR`.
             let psi = if route == NOT { c.o.psi.max(policy::PSI_FLOOR) } else { c.o.psi };
             Label {
                 check: i,
                 j,
                 grade: c.o.grades[j],
                 route,
-                mu: [p, pf, (1.0 - p - pf).max(0.0) * psi],
+                mu: [p, pf, summary::placebo_p(p, pf, pw, psi)],
                 y: known.last().map_or(0.0, |k| k.1),
                 session: c.o.session.clone(),
                 check_ms: c.o.ms,
@@ -1369,6 +1532,8 @@ pub struct Readout {
     pub contrasts: Vec<Contrast>,
     /// The question-count test's own readout (rules v2, `test_readout`).
     pub test: TestReadout,
+    /// The withholding readout (rules v3, `withholding`), of this store alone.
+    pub withholding: Withholding,
 }
 
 /// The question-count test's readout (module doc), from the summary's fold (select/summary.rs
@@ -1540,6 +1705,8 @@ pub struct Pooled {
     pub ask_free: Option<Estimate>,
     pub played: Vec<Played>,
     pub differ: Vec<String>,
+    /// The withholding readout (rules v3, `withholding`), pooled over the same stores.
+    pub withholding: Withholding,
 }
 
 /// The share played per drawn count of the graded records of `text`.
@@ -1657,6 +1824,7 @@ pub fn pooled(stores: &[(String, String)]) -> Pooled {
         ask_free: None,
         played: played.into_iter().map(|(drawn, (checks, played))| Played { drawn, checks, played }).collect(),
         differ: Vec::new(),
+        withholding: withholding(&stores.iter().map(|(c, text)| (c.clone(), text.as_str())).collect::<Vec<_>>()),
     };
     if out.due {
         let both: Vec<&[(f64, f64, usize)]> = parts.iter().map(|(_, u, _)| u.both.as_slice()).collect();
@@ -1695,9 +1863,15 @@ fn played_line(played: &[Played]) -> String {
     format!("played per drawn count: {}", each.join(", "))
 }
 
-/// The pooled readout as text (`borg debug select --replay --file A --file B …`).
+/// The pooled readouts as text (`borg debug select --replay --file A --file B …`): the question-count
+/// test's, then withholding's (`render_withholding`).
 #[must_use]
 pub fn render_pooled(p: &Pooled) -> String {
+    render_pooled_test(p) + &render_withholding(&p.withholding)
+}
+
+/// The question-count test's pooled readout as text.
+fn render_pooled_test(p: &Pooled) -> String {
     let mut out = format!(
         "question-count test readout (rules v2, amendment {TEST_AMENDMENT}), pooled over {} collectives, stratified by collective: {} ({} checks that drew a count in {} sessions with one, due at {TEST_CHECKS} checks in {TEST_MIN_SESSIONS} sessions or {TEST_SESSIONS} sessions)\n",
         p.strata.len(),
@@ -1743,7 +1917,419 @@ pub fn render_pooled(p: &Pooled) -> String {
     out
 }
 
-fn readout(checks: &[Check], labels: &[Label], s: &Summary) -> Readout {
+// --- The withholding readout (rules v3 2026-11-19) -------------------------------------------------
+
+/// The withholding readout's arms, as indices: delivered (asked or handed over) and withheld.
+/// Protocol: the order of every per-arm array below.
+const DELIVERED: usize = 0;
+const WITHHELD: usize = 1;
+
+/// What closed an apply that could be withheld (`Held`), from its verdicts, settles and deliveries
+/// joined by check id: none yet, the judge could not tell, its point arose and it changed the work,
+/// arose and did not (ignored, or the consequence remains), never arose; or (a placebo) censored by a
+/// later delivery of its lesson (`UNJUDGED_LATER`, or dropped at its delivery because the same take
+/// delivered it, outcome.rs `DROPPED_DELIVERED`), by slots (`UNJUDGED_SLOTS`), or for another reason;
+/// or never judged at all (`Undelivered`: its delivery dropped it otherwise, or the session ended
+/// first, `ROUTE_NEVER`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Fate {
+    #[default]
+    Open,
+    Unclear,
+    Changed,
+    Unchanged,
+    NotArisen,
+    Later,
+    Slots,
+    Censored,
+    Undelivered,
+}
+
+impl Fate {
+    /// A verdict (changed, unchanged, not arisen) replaces anything, an unclear one what is not a
+    /// verdict, a censoring only an open or undelivered apply (a resumed session still delivers what
+    /// its end left queued, hook.rs `note_never_delivered`): select/summary.rs `Label::yields_to`.
+    fn yields_to(self, next: Fate) -> bool {
+        match next {
+            Fate::Changed | Fate::Unchanged | Fate::NotArisen => true,
+            Fate::Unclear => !self.verdict(),
+            _ => matches!(self, Fate::Open | Fate::Undelivered),
+        }
+    }
+
+    /// Closed and seen by the judge: neither open nor undelivered.
+    fn closed(self) -> bool {
+        !matches!(self, Fate::Open | Fate::Undelivered)
+    }
+
+    /// A verdict on the lesson's point: changed, unchanged or never arisen.
+    fn verdict(self) -> bool {
+        matches!(self, Fate::Changed | Fate::Unchanged | Fate::NotArisen)
+    }
+
+    /// A verdict whose point arose: changed or unchanged (the lift reads only these).
+    fn arisen(self) -> bool {
+        matches!(self, Fate::Changed | Fate::Unchanged)
+    }
+}
+
+/// One apply that could be withheld (a logged `pw` above 0): its grade, arm, weight (the inverse of
+/// its route's logged chance: p asked, pf handed over, summary.rs `placebo_p` withheld), session (an
+/// index within its store), whether it could go either way (a chance above 0 on both arms), and what
+/// closed it.
+#[derive(Debug, Clone)]
+struct Held {
+    grade: u8,
+    arm: usize,
+    w: f64,
+    session: usize,
+    either: bool,
+    fate: Fate,
+}
+
+/// One store's part of the withholding readout (`held`): its applies that could be withheld, its
+/// tested checks in log order (ms, whether one withheld a placebo at random), its placebos withheld at
+/// random (ms, index into `units`: `either`), those withheld outright (a chance of 1: no lift, no kill
+/// rule reads them) and its sessions with a tested check.
+#[derive(Debug, Clone, Default)]
+struct HeldStore {
+    units: Vec<Held>,
+    checks: Vec<(i64, bool)>,
+    withheld: Vec<(i64, usize)>,
+    outright: Vec<usize>,
+    sessions: Vec<String>,
+}
+
+/// The applies of `text`'s graded checks that could be withheld (`HeldStore`), each closed by the
+/// verdicts and placebo settles that name its check, on its arm (a placebo's on channel `placebo`), or
+/// by a placebo's `delivery` that dropped it or never came (`Fate`). A tested check is one that logs
+/// `pw`, zeros included: withholding had a candidate there (select.rs `Routed::could_withhold`, as P3's
+/// what-if counts them), never one imported from another log (`imported`) or without a check id.
+fn held(text: &str) -> HeldStore {
+    let log: Vec<Outcome> = lines(text).into_iter().filter_map(|l| l.o).collect();
+    let mut out = HeldStore::default();
+    let mut at: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut sessions: HashMap<&str, usize> = HashMap::new();
+    for o in log.iter().filter(|o| o.kind == outcome::GRADED) {
+        if o.check.is_empty() || o.pw.is_empty() || o.pw.len() != o.lessons.len() || imported(o, text) {
+            continue;
+        }
+        let n = sessions.len();
+        let session = *sessions.entry(o.session.as_str()).or_insert(n);
+        if session == n {
+            out.sessions.push(o.session.clone());
+        }
+        let mut withheld = false;
+        for (j, l) in o.lessons.iter().enumerate() {
+            let pw = o.pw[j];
+            let (p, pf) = (o.p.get(j).copied().unwrap_or(0.0), o.pf.get(j).copied().unwrap_or(0.0));
+            let placebo = summary::placebo_p(p, pf, pw, o.psi);
+            let (arm, mu) = match () {
+                _ if pw <= 0.0 => continue,
+                _ if o.chosen.contains(l) => (DELIVERED, p),
+                _ if o.free.contains(l) => (DELIVERED, pf),
+                _ if o.placebo.contains(l) => (WITHHELD, placebo),
+                _ => continue,
+            };
+            // A route logged at chance 0 is no draw of it (rounding, or a broken record): no weight.
+            if mu <= 0.0 {
+                continue;
+            }
+            let i = out.units.len();
+            let either = p + pf > 0.0 && placebo > 0.0;
+            out.units.push(Held { grade: o.grades.get(j).copied().unwrap_or(0), arm, w: 1.0 / mu, session, either, fate: Fate::Open });
+            at.insert((o.check.as_str(), l.as_str()), i);
+            match (arm == WITHHELD, either) {
+                (true, true) => {
+                    out.withheld.push((o.ms, i));
+                    withheld = true;
+                }
+                (true, false) => out.outright.push(i),
+                _ => {}
+            }
+        }
+        out.checks.push((o.ms, withheld));
+    }
+    for r in log.iter().filter(|r| !r.check.is_empty()) {
+        let placebo = r.channel == outcome::PLACEBO;
+        let fate = match r.kind.as_str() {
+            outcome::CHANGED => Fate::Changed,
+            outcome::IGNORED | outcome::REMAINS => Fate::Unchanged,
+            outcome::NOT_ARISEN => Fate::NotArisen,
+            outcome::UNCLEAR => Fate::Unclear,
+            outcome::NOT_CORRECTED if placebo => match r.reason.as_str() {
+                outcome::UNJUDGED_LATER => Fate::Later,
+                outcome::UNJUDGED_SLOTS => Fate::Slots,
+                _ => Fate::Censored,
+            },
+            // A placebo its delivery dropped, or that never reached a prompt: no settle closes it
+            // (outcome.rs `settle_with` settles only those routed `placebo`).
+            outcome::DELIVERY if placebo => match r.route.as_str() {
+                outcome::ROUTE_DROPPED_DONE if r.reason == outcome::DROPPED_DELIVERED => Fate::Later,
+                outcome::ROUTE_DROPPED_DONE | outcome::ROUTE_DROPPED_CHARS | outcome::ROUTE_NEVER => Fate::Undelivered,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        for l in &r.lessons {
+            let Some(u) = at.get(&(r.check.as_str(), l.as_str())).map(|&i| &mut out.units[i]) else { continue };
+            if (u.arm == WITHHELD) == placebo && u.fate.yields_to(fate) {
+                u.fate = fate;
+            }
+        }
+    }
+    out
+}
+
+/// One collective's counts in a pooled withholding readout.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct HeldCounts {
+    pub collective: String,
+    pub tested: u64,
+    pub withheld: u64,
+    pub arisen: u64,
+}
+
+/// The withholding readout (module doc; rules v3, `RULES_V3`) over one store or several, stratified by
+/// collective:
+/// - `tested` checks with a candidate (a logged `pw`), `withholding` of them that withheld a placebo at
+///   random, in `sessions` distinct sessions; `withheld` placebos withheld at random (they could also
+///   have been delivered: the lift's), `closed` of them by a verdict or a settle, `arisen` with a
+///   verdict whose point arose; `later` and `slots` censored so, `undelivered` never judged (dropped
+///   at delivery, or the session ended first); `outright` the placebos withheld at a chance of 1 (left
+///   undelivered by the evidence rule, or ψ 1), apart: no lift, due or kill rule reads them;
+/// - `due` at `LIFT_ARISEN` arisen withheld placebos, and only then `lift`, per grade, P(changed |
+///   delivered) − P(changed | withheld) among the arisen verdicts of the applies that could go either
+///   way, each arm a mean weighed by the inverse of the route's logged chance, its interval a session
+///   bootstrap within each collective (`lift_of`);
+/// - `arisen_rate` per arm (delivered, withheld) over the verdicts (changed, unchanged, not arisen) of
+///   the applies that could go either way, weighed so, and `verdicts` behind each;
+/// - the kill rules' readings: of the first `KILL_CHECKS` tested checks (by time), those that withheld
+///   (`early_checks`: withholding, of); of the first `KILL_PLACEBOS` withheld placebos not undelivered
+///   (one the judge never saw says nothing of arising), those closed and those that arose
+///   (`early_placebos`: arose, closed, of);
+/// - `flags`: the sanity flags (arisen rates past `ARISEN_GAP` apart, censored past `CENSORED_MAX`: not
+///   trusted) and the kill rules met; `strata` the counts per collective.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Withholding {
+    pub due: bool,
+    pub tested: u64,
+    pub withholding: u64,
+    pub sessions: u32,
+    pub withheld: u64,
+    pub closed: u64,
+    pub arisen: u64,
+    pub later: u64,
+    pub slots: u64,
+    pub undelivered: u64,
+    pub outright: u64,
+    pub lift: Vec<(u8, Estimate)>,
+    pub arisen_rate: [Option<f64>; 2],
+    pub verdicts: [u64; 2],
+    pub early_checks: (u64, u64),
+    pub early_placebos: (u64, u64, u64),
+    pub flags: Vec<String>,
+    pub strata: Vec<HeldCounts>,
+}
+
+/// Each arm's weighted mean, `DELIVERED`'s minus `WITHHELD`'s (Σwy/Σw each), over every stratum's units
+/// (arm, w, y, session), its 95% interval the 2.5th and 97.5th percentiles of `ope::RESAMPLES`
+/// resamples that draw each stratum's sessions within it (deterministic from `seed`), as `stratified`
+/// resamples; None without weight on an arm. Its ESS is the units' (Σw)²/Σw².
+fn lift_of(strata: &[Vec<(usize, f64, f64, usize)>], seed: u64) -> Estimate {
+    let diff = |t: [f64; 4]| (t[0] > 0.0 && t[2] > 0.0).then(|| t[1] / t[0] - t[3] / t[2]);
+    let groups: Vec<Vec<[f64; 4]>> = strata
+        .iter()
+        .map(|s| {
+            let mut by: BTreeMap<usize, [f64; 4]> = BTreeMap::new();
+            for &(arm, w, y, x) in s {
+                let e = by.entry(x).or_default();
+                e[2 * arm] += w;
+                e[2 * arm + 1] += w * y;
+            }
+            by.into_values().collect()
+        })
+        .collect();
+    let add = |a: [f64; 4], b: &[f64; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+    let value = diff(groups.iter().flatten().fold([0.0; 4], add));
+    let (sw, sw2) = strata.iter().flatten().fold((0.0, 0.0), |(a, b), u| (a + u.1, b + u.1 * u.1));
+    let mut rng = memory::Rng::new(seed);
+    let mut values: Vec<f64> = Vec::new();
+    if value.is_some() {
+        for _ in 0..ope::RESAMPLES {
+            let mut t = [0.0; 4];
+            for g in groups.iter().filter(|g| !g.is_empty()) {
+                for _ in 0..g.len() {
+                    t = add(t, &g[(rng.next_u64() % g.len() as u64) as usize]);
+                }
+            }
+            values.extend(diff(t));
+        }
+    }
+    values.sort_by(f64::total_cmp);
+    let pct = |q: f64| values.get((q * (values.len().max(1) - 1) as f64).round() as usize).copied().unwrap_or(0.0);
+    Estimate { value, lo: pct(0.025), hi: pct(0.975), ess: if sw2 > 0.0 { sw * sw / sw2 } else { 0.0 }, n: strata.iter().map(Vec::len).sum() }
+}
+
+/// The withholding readout of `stores` (collective, outcome log text; `Withholding`).
+#[must_use]
+pub fn withholding(stores: &[(String, &str)]) -> Withholding {
+    let parts: Vec<(String, HeldStore)> = stores.iter().map(|(c, text)| (c.clone(), held(text))).collect();
+    let all = || parts.iter().flat_map(|(_, h)| h.units.iter());
+    let withheld = || parts.iter().flat_map(|(_, h)| h.withheld.iter().map(|(ms, i)| (*ms, &h.units[*i])));
+    let count = |n: usize| n as u64;
+    let distinct: BTreeSet<&str> = parts.iter().flat_map(|(_, h)| h.sessions.iter().map(String::as_str)).collect();
+    let mut out = Withholding {
+        tested: count(parts.iter().map(|(_, h)| h.checks.len()).sum()),
+        withholding: count(parts.iter().flat_map(|(_, h)| &h.checks).filter(|c| c.1).count()),
+        sessions: u32::try_from(distinct.len()).unwrap_or(u32::MAX),
+        withheld: count(withheld().count()),
+        closed: count(withheld().filter(|(_, u)| u.fate.closed()).count()),
+        arisen: count(withheld().filter(|(_, u)| u.fate.arisen()).count()),
+        later: count(withheld().filter(|(_, u)| u.fate == Fate::Later).count()),
+        slots: count(withheld().filter(|(_, u)| u.fate == Fate::Slots).count()),
+        undelivered: count(withheld().filter(|(_, u)| u.fate == Fate::Undelivered).count()),
+        outright: count(parts.iter().map(|(_, h)| h.outright.len()).sum()),
+        ..Withholding::default()
+    };
+    out.due = out.arisen >= LIFT_ARISEN;
+    out.strata = parts
+        .iter()
+        .map(|(c, h)| HeldCounts {
+            collective: c.clone(),
+            tested: count(h.checks.len()),
+            withheld: count(h.withheld.len()),
+            arisen: count(h.withheld.iter().filter(|(_, i)| h.units[*i].fate.arisen()).count()),
+        })
+        .collect();
+    // The arisen rate per arm, over the verdicts of the applies that could go either way.
+    for arm in [DELIVERED, WITHHELD] {
+        let of: Vec<&Held> = all().filter(|u| u.either && u.arm == arm && u.fate.verdict()).collect();
+        let sw: f64 = of.iter().map(|u| u.w).sum();
+        out.verdicts[arm] = count(of.len());
+        out.arisen_rate[arm] = (sw > 0.0).then(|| of.iter().filter(|u| u.fate.arisen()).map(|u| u.w).sum::<f64>() / sw);
+    }
+    // The kill rules' readings, by time over every store.
+    let mut checks: Vec<(i64, bool)> = parts.iter().flat_map(|(_, h)| h.checks.iter().copied()).collect();
+    checks.sort_by_key(|c| c.0);
+    let first: Vec<&(i64, bool)> = checks.iter().take(KILL_CHECKS as usize).collect();
+    out.early_checks = (count(first.iter().filter(|c| c.1).count()), count(first.len()));
+    let mut placebos: Vec<(i64, &Held)> = withheld().filter(|(_, u)| u.fate != Fate::Undelivered).collect();
+    placebos.sort_by_key(|p| p.0);
+    let first: Vec<&Held> = placebos.iter().take(KILL_PLACEBOS as usize).map(|p| p.1).collect();
+    out.early_placebos = (count(first.iter().filter(|u| u.fate.arisen()).count()), count(first.iter().filter(|u| u.fate.closed()).count()), count(first.len()));
+    if let [Some(d), Some(w)] = out.arisen_rate
+        && (d - w).abs() > ARISEN_GAP
+    {
+        out.flags.push(format!("not trusted: the arisen rates differ by {:.2}, more than {ARISEN_GAP} (the lift compares different lessons)", (d - w).abs()));
+    }
+    let censored = (out.later + out.slots) as f64 / out.closed.max(1) as f64;
+    if censored > CENSORED_MAX {
+        out.flags.push(format!(
+            "not trusted: {:.0}% of the closed withheld placebos were censored by a later delivery or by slots, more than {:.0}%",
+            100.0 * censored,
+            100.0 * CENSORED_MAX
+        ));
+    }
+    if out.early_checks.1 >= KILL_CHECKS && (out.early_checks.0 as f64) < KILL_WITHHOLDING * KILL_CHECKS as f64 {
+        out.flags.push(format!(
+            "kill rule: {} of the first {KILL_CHECKS} checks with a candidate withheld a placebo, fewer than {:.0}%: retune or drop",
+            out.early_checks.0,
+            100.0 * KILL_WITHHOLDING
+        ));
+    }
+    if out.early_placebos.1 >= KILL_PLACEBOS && out.early_placebos.0 < KILL_AROSE {
+        out.flags
+            .push(format!("kill rule: {} of the first {KILL_PLACEBOS} withheld placebos arose, fewer than {KILL_AROSE}: drop the arm", out.early_placebos.0));
+    }
+    if out.due {
+        for grade in 1..=3u8 {
+            let strata: Vec<Vec<(usize, f64, f64, usize)>> = parts
+                .iter()
+                .map(|(_, h)| {
+                    h.units
+                        .iter()
+                        .filter(|u| u.either && u.grade == grade && u.fate.arisen())
+                        .map(|u| (u.arm, u.w, f64::from(u8::from(u.fate == Fate::Changed)), u.session))
+                        .collect()
+                })
+                .collect();
+            out.lift.push((grade, lift_of(&strata, ope::SEED)));
+        }
+    }
+    out
+}
+
+/// A share as a percentage, "-" without one.
+fn percent(x: Option<f64>) -> String {
+    x.map_or_else(|| "-".to_string(), |x| format!("{:.0}%", 100.0 * x))
+}
+
+/// The withholding readout as text (`borg debug select --replay`, and pooled with `--file A --file B`,
+/// then with a line per collective).
+#[must_use]
+pub fn render_withholding(w: &Withholding) -> String {
+    let mut out = format!(
+        "withholding readout (rules v3 {RULES_V3}){}: {} ({} of {LIFT_ARISEN} arisen withheld placebos; {} withheld at {} of {} checks with a candidate, in {} sessions)\n",
+        if w.strata.len() > 1 { format!(", pooled over {} collectives, stratified by collective", w.strata.len()) } else { String::new() },
+        if w.due { "due" } else { "not due" },
+        w.arisen,
+        w.withheld,
+        w.withholding,
+        w.tested,
+        w.sessions
+    );
+    if w.strata.len() > 1 {
+        for s in &w.strata {
+            out.push_str(&format!("  {}: {} withheld at {} checks with a candidate, {} arisen\n", s.collective, s.withheld, s.tested, s.arisen));
+        }
+    }
+    out.push_str(&format!(
+        "  arisen rate: delivered {} of {} verdicts, withheld {} of {} (inverse-propensity weighted; not trusted more than {ARISEN_GAP} apart)\n",
+        percent(w.arisen_rate[DELIVERED]),
+        w.verdicts[DELIVERED],
+        percent(w.arisen_rate[WITHHELD]),
+        w.verdicts[WITHHELD]
+    ));
+    out.push_str(&format!(
+        "  censored: {} by a later delivery, {} by slots, of {} closed withheld placebos ({}; not trusted above {:.0}%); {} never judged (dropped at delivery, or the session ended first)\n",
+        w.later,
+        w.slots,
+        w.closed,
+        percent((w.closed > 0).then(|| (w.later + w.slots) as f64 / w.closed as f64)),
+        100.0 * CENSORED_MAX,
+        w.undelivered
+    ));
+    if w.outright > 0 {
+        out.push_str(&format!(
+            "  withheld outright: {} placebos at a chance of 1 (left undelivered by the evidence rule, or ψ 1): outside the lift, its due and the kill rules\n",
+            w.outright
+        ));
+    }
+    out.push_str(&format!(
+        "  kill rules: {} of the first {} checks with a candidate withheld a placebo (retune or drop below {:.0}% of {KILL_CHECKS}); {} of the first {} withheld placebos arose, {} closed (drop the arm below {KILL_AROSE} of {KILL_PLACEBOS})\n",
+        w.early_checks.0,
+        w.early_checks.1,
+        100.0 * KILL_WITHHOLDING,
+        w.early_placebos.0,
+        w.early_placebos.2,
+        w.early_placebos.1
+    ));
+    let pooled = if w.strata.len() > 1 { "; pooled: resampled within each collective" } else { "" };
+    for (grade, e) in w.lift.iter().filter(|(_, e)| e.n > 0) {
+        out.push_str(&format!(
+            "  grade {grade} delivered − withheld: {} over {} arisen verdicts (inverse-propensity weighted, session 95% CI{pooled})\n",
+            ci(e, 1.0),
+            e.n
+        ));
+    }
+    for f in &w.flags {
+        out.push_str(&format!("  {f}\n"));
+    }
+    out
+}
+
+fn readout(checks: &[Check], labels: &[Label], s: &Summary, text: &str) -> Readout {
     let randomised = labels.iter().filter(|l| l.mu[l.route] > 0.0 && l.mu[l.route] < 1.0).count();
     let learned: BTreeSet<&str> = checks.iter().filter(|c| outcome::policy_of(&c.o) == "learned").map(|c| c.o.session.as_str()).collect();
     let ss = sessions(labels);
@@ -1766,7 +2352,14 @@ fn readout(checks: &[Check], labels: &[Label], s: &Summary) -> Readout {
             contrasts.push(Contrast { grade, routes: format!("{}−{}", ROUTE_NAMES[a], ROUTE_NAMES[b]), est: ope::snips(&units, ope::SEED) });
         }
     }
-    Readout { due: randomised >= READOUT_UNITS || learned.len() >= READOUT_SESSIONS, randomised, sessions: learned.len(), contrasts, test: test_readout(s) }
+    Readout {
+        due: randomised >= READOUT_UNITS || learned.len() >= READOUT_SESSIONS,
+        randomised,
+        sessions: learned.len(),
+        contrasts,
+        test: test_readout(s),
+        withholding: withholding(&[(String::new(), text)]),
+    }
 }
 
 // --- P4: full-information recall from an evaluation -----------------------------------------------
@@ -2007,6 +2600,7 @@ fn recalls(runs: &[EvalRun], right: &BTreeMap<String, BTreeSet<String>>, draw: O
                         tokens: 0,
                         had: &[],
                         alpha: policy::ALPHA,
+                        withhold: true,
                     });
                     let mut rng = memory::Rng::new(seed);
                     (0..n_draws.max(1)).map(|_| draw(&units, c, rng.next_u64())).collect()
@@ -2190,6 +2784,7 @@ pub struct Report {
     pub rules: &'static str,
     pub amendment: &'static str,
     pub rules_v2: &'static str,
+    pub rules_v3: &'static str,
     /// The policy this process would decide under (select.rs `policy`). The checks evaluate the
     /// learned policy (and P1 each record's logged policy) whatever it is.
     pub policy: &'static str,
@@ -2225,6 +2820,7 @@ pub fn evaluate(input: Input) -> Report {
         rules: RULES,
         amendment: AMENDMENT,
         rules_v2: RULES_V2,
+        rules_v3: RULES_V3,
         policy: super::policy().name(),
         summary: input.summary,
         records: log.len(),
@@ -2251,7 +2847,7 @@ pub fn evaluate(input: Input) -> Report {
     report.checks = Some(Checks {
         p2: calibration(&labels, unjoined, &|value, past, at| model(&pass.checks, past, at, value)),
         p5: off_policy(&pass.checks, &labels, &targets),
-        readout: readout(&pass.checks, &labels, &pass.posterior),
+        readout: readout(&pass.checks, &labels, &pass.posterior, input.text),
         p0: pass.p0,
         p1: pass.p1,
         p3,
@@ -2293,10 +2889,11 @@ pub fn render(r: &Report) -> String {
     let fit = if r.summary.fit.key.is_empty() { "the prior" } else { r.summary.fit.key.as_str() };
     let by: Vec<String> = r.policies.iter().map(|(p, n)| format!("{n} {p}")).collect();
     let mut out = format!(
-        "rules {}, amendment {}, rules v2 {} ({RULES_AT}: pre-registered checks)\npolicy: {}{}; summary v{} at byte {}, fit {fit}\nrecords: {}, graded checks: {} ({}){}\n",
+        "rules {}, amendment {}, rules v2 {}, rules v3 {} ({RULES_AT}: pre-registered checks)\npolicy: {}{}; summary v{} at byte {}, fit {fit}\nrecords: {}, graded checks: {} ({}){}\n",
         r.rules,
         r.amendment,
         r.rules_v2,
+        r.rules_v3,
         r.policy,
         if r.checks.is_some() { " here, the checks replay the learned policy" } else { "" },
         r.summary.sv,
@@ -2398,6 +2995,23 @@ pub fn render(r: &Report) -> String {
         let by: Vec<String> = p3.sources.iter().map(|(s, n)| format!("{n} {s}")).collect();
         out.push_str(&format!("  decided by: {}\n", by.join(", ")));
     }
+    let w = &p3.withholding;
+    out.push_str(&format!(
+        "  withholding: {} placebos withheld at {} of {} checks with a candidate ({}), {} outright (chance 1), mean ψ {} over {} candidates offered; the gate refused the drawn subset at {} checks ({}); {} checks took the worst-case fallback ({}), which dropped {} candidates at {} checks\n",
+        w.withheld,
+        w.withholding,
+        w.candidates,
+        percent((w.candidates > 0).then(|| w.withholding as f64 / w.candidates as f64)),
+        w.outright,
+        percent(w.psi),
+        w.offered,
+        w.refused,
+        percent((w.candidates > 0).then(|| w.refused as f64 / w.candidates as f64)),
+        w.fallbacks,
+        percent((w.candidates > 0).then(|| w.fallbacks as f64 / w.candidates as f64)),
+        w.dropped,
+        w.refusals
+    ));
     out.push_str(&format!("  spend, policy: {}\n  spend, fixed rule: {}\n", spend(&p3.policy), spend(&p3.fixed)));
     list(&mut out, &p3.first);
     let p4 = &c.p4;
@@ -2501,6 +3115,7 @@ pub fn render(r: &Report) -> String {
     if let Some(e) = &t.ask_free {
         out.push_str(&format!("  grade 2 asked − handed over: {} over {} 2s (Horvitz–Thompson by the logged propensities, session 95% CI)\n", ci(e, 1.0), e.n));
     }
+    out.push_str(&render_withholding(&ro.withholding));
     out
 }
 
@@ -2587,7 +3202,8 @@ fn bench(text: &str, lessons: &Path) -> Bench {
         let t0 = std::time::Instant::now();
         let s = summary::refresh(&at);
         let t1 = std::time::Instant::now();
-        let r = super::graded_under(Policy::Learned, &applied, &ctx(&check.o, &check.had, &at, &s));
+        // As the hook decides now: withholding.
+        let r = super::graded_under(Policy::Learned, &applied, &ctx(&check.o, &check.had, &at, &s, true));
         let t2 = std::time::Instant::now();
         std::hint::black_box(r);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -2906,7 +3522,7 @@ mod tests {
         // `decide`), logged as hook.rs `record_graded` logs it.
         let decide_at = |o: Outcome, s: &Summary, alpha: f64| {
             let cs = challenges(&o).unwrap();
-            let r = crate::select::graded_under(Policy::Learned, &applied(&cs, &o), &Ctx { alpha, ..ctx(&o, &had_of(&o), none, s) });
+            let r = crate::select::graded_under(Policy::Learned, &applied(&cs, &o), &Ctx { alpha, ..ctx(&o, &had_of(&o), none, s, withholds(&o)) });
             let round = |v: &[f64]| v.iter().map(|p| outcome::round_p(*p)).collect();
             Outcome {
                 chosen: ids(&r.ask),
@@ -3185,6 +3801,7 @@ mod tests {
             rules: RULES,
             amendment: AMENDMENT,
             rules_v2: RULES_V2,
+            rules_v3: RULES_V3,
             policy: "fixed",
             summary: Summary::default(),
             records: 0,
@@ -3200,6 +3817,7 @@ mod tests {
                     empty: 0,
                     seen: 0,
                     tests: 0,
+                    withholding: 0,
                     switches: 0,
                     imported: 0,
                     max_delta: 0.0,
@@ -3210,7 +3828,7 @@ mod tests {
                 p3: conduct(&[], Spend::default(), Spend::default(), None, 0.0),
                 p4: P4::not_run("x"),
                 p5: off_policy(&[], &[], &[]),
-                readout: readout(&[], &[], &Summary::default()),
+                readout: readout(&[], &[], &Summary::default(), ""),
             }),
         });
         assert!(text.contains("P2 calibration: PASS by the pruned model: leave-future-out log-loss model "), "{text}");
@@ -3345,7 +3963,7 @@ mod tests {
     }
 
     fn empty() -> Routed<'static> {
-        Routed { ask: Vec::new(), free: Vec::new(), placebo: Vec::new(), p: Vec::new(), pf: Vec::new(), log: crate::select::Log::default() }
+        Routed { ask: Vec::new(), free: Vec::new(), placebo: Vec::new(), p: Vec::new(), pf: Vec::new(), pw: Vec::new(), log: crate::select::Log::default() }
     }
 
     #[test]
@@ -3425,6 +4043,7 @@ mod tests {
             placebo: vec![&ls[2]],
             p: vec![0.0, 1.0, 0.0],
             pf: vec![0.0; 3],
+            pw: vec![0.0; 3],
             log: crate::select::Log {
                 policy: "learned",
                 source: policy::EXPERIMENT,
@@ -4092,11 +4711,295 @@ mod tests {
         let a = |u: &[Unit], c: &EvalCheck, _: u64| policy::decide_on_evidence(u, &eval_check(c), &prior, &[]);
         let b = |u: &[Unit], c: &EvalCheck, _: u64| policy::decide_on_evidence(u, &eval_check(c), &whole, &[]);
         let gate = summary::Gate { gain: vec![0.0; policy::DRAWS], allowance: OPEN, ..summary::Gate::default() };
-        let t = |u: &[Unit], c: &EvalCheck, s: u64| policy::choose(u, &eval_check(c), &prior, &gate, policy::ALPHA, s, &[]).routes;
+        let t = |u: &[Unit], c: &EvalCheck, s: u64| policy::choose_with(u, &eval_check(c), &prior, &gate, policy::ALPHA, s, &[], false).routes;
         assert_eq!(of(&p4.p4a), arm(&a), "P4a");
         assert_eq!(of(&p4.p4b), arm(&b), "P4b");
         assert_eq!(of(&p4.p4c), arm(&t), "P4c");
         assert!(p4.p4c.as_ref().unwrap().arm.deviations > 0, "the test's draws leave the fixed rule on the live check: {p4:?}");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Live checks of three lessons decided one after another on `labelled`'s refit, each by a hook
+    /// (withholding as `withhold` says) on the summary with every earlier one folded in, logged as
+    /// hook.rs `record_graded` logs it under borg `version` (the summary it read, its `pw` only where
+    /// withholding had a candidate): the refit's gate opens as the learned checks accrue on its ledger.
+    fn hooked(withhold: bool, version: &str) -> Vec<Outcome> {
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        let mut s = summary::with_fit(summary::fold(&text(&labelled(6, 12, 11)), Summary::default()), None);
+        let mut log = labelled(6, 12, 11);
+        for i in 0..16i64 {
+            let ls: Vec<String> = (0..3).map(|k| format!("L{}", (i as usize * 5 + k) % 12)).collect();
+            let grades = [1 + (i % 3) as u8, 1 + ((i / 3) % 3) as u8, 2];
+            let ms = 100_000 + i;
+            let o =
+                Outcome { check: crate::select::check_id("t", "live", ms, 1), ..graded("t", ms, &ls.iter().map(String::as_str).collect::<Vec<_>>(), &grades) };
+            let cs = challenges(&o).unwrap();
+            let r = crate::select::graded_under(Policy::Learned, &applied(&cs, &o), &ctx(&o, &had_of(&o), none, &s, withhold));
+            let round = |v: &[f64]| v.iter().map(|p| outcome::round_p(*p)).collect::<Vec<f64>>();
+            let d = Outcome {
+                chosen: ids(&r.ask),
+                free: ids(&r.free),
+                placebo: ids(&r.placebo),
+                p: round(&r.p),
+                pf: round(&r.pf),
+                pw: if r.could_withhold() { round(&r.pw) } else { Vec::new() },
+                psi: r.log.psi,
+                policy: r.log.policy.into(),
+                fit: r.log.fit.clone(),
+                seen: s.key(),
+                source: r.log.source.into(),
+                xk: r.log.xk,
+                xs: r.log.xs,
+                alpha: r.log.alpha,
+                version: version.into(),
+                ..o
+            };
+            s = summary::fold(&text(std::slice::from_ref(&d)), s);
+            log.push(d);
+        }
+        log
+    }
+
+    /// Rules v3: P1 replays a check that withheld from the check's seed, its placebo list and each
+    /// apply's `pw` too, so a record that logs another placebo list or `pw` is not the decision its hook
+    /// made; and a withheld placebo is a decision only a hook from 0.10.0 on could make, so the same
+    /// record under an older version replays without withholding and fails.
+    #[test]
+    fn p1_replays_a_withheld_check_and_its_chance_of_being_withheld() {
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        let log = hooked(true, "0.10.0");
+        let last = log.len() - 1;
+        assert!(!log[last].placebo.is_empty() && log[last].pw.iter().any(|w| *w > 0.0), "the scenario: the last check withheld: {:?}", log[last]);
+        let p1 = as_logged(&text(&log), none).p1;
+        assert_eq!((p1.verdict, p1.reproduced, p1.withholding), (Verdict::Pass, p1.replayed, 16), "{:?}", p1.first);
+        let failed = |log: &[Outcome]| {
+            let p1 = as_logged(&text(log), none).p1;
+            assert_eq!((p1.verdict, p1.reproduced + 1), (Verdict::Fail, p1.replayed), "{:?}", p1.first);
+            p1
+        };
+        let mut other = log.clone();
+        let j = other[last].pw.iter().position(|w| *w > 0.0).unwrap();
+        other[last].pw[j] += 0.05;
+        assert!(failed(&other).max_delta >= 0.05 - 1e-9);
+        let mut other = log.clone();
+        other[last].placebo.clear();
+        assert!(failed(&other).first[0].contains("ms 100015") && failed(&other).first[0].contains(" placebo ["));
+        let mut older = log.clone();
+        older[last].version = "0.9.0".into();
+        failed(&older);
+    }
+
+    /// A record from before withholding (0.10.0) replays with withholding off, as its hook decided:
+    /// such a log reproduces, its placebo list and `pw` uncompared, and the same records claiming
+    /// 0.10.0 would have withheld somewhere.
+    #[test]
+    fn p1_replays_a_record_before_withholding_without_it() {
+        let none = Path::new("/nonexistent/lessons.jsonl");
+        for version in ["0.9.0", ""] {
+            let log = hooked(false, version);
+            assert!(log.iter().all(|o| o.pw.is_empty()), "no withholding logged");
+            let p1 = as_logged(&text(&log), none).p1;
+            assert_eq!((p1.verdict, p1.reproduced, p1.withholding), (Verdict::Pass, p1.replayed, 0), "{version}: {:?}", p1.first);
+        }
+        let claimed: Vec<Outcome> = hooked(false, "0.10.0");
+        assert_eq!(as_logged(&text(&claimed), none).p1.verdict, Verdict::Fail, "the replay withholds where its hook did not");
+        assert!(
+            (withholds(&Outcome { version: "0.10.0".into(), ..Outcome::default() }), withholds(&Outcome { version: "1.0.0-rc1".into(), ..Outcome::default() }))
+                == (true, true)
+        );
+        assert!(!withholds(&Outcome { version: "0.9.12".into(), ..Outcome::default() }) && !withholds(&Outcome::default()));
+    }
+
+    /// P3's what-if (rules v3): the cold start withholds as the policy now does, whatever the record's
+    /// version, counts the checks with a candidate, the placebos withheld, the mean ψ offered, the drawn
+    /// subsets the gate refused and the fallbacks, and folds each decision with its `pw`; the gate still
+    /// holds every check.
+    #[test]
+    fn the_cold_start_reports_what_withholding_would_have_done() {
+        let log = labelled(8, 16, 3);
+        let (p3, _) = cold_start(&text(&log), Path::new("/nonexistent/lessons.jsonl"), None);
+        let w = &p3.withholding;
+        assert_eq!((p3.verdict, p3.over), (Verdict::Pass, 0), "{p3:?}");
+        assert!(w.candidates > 0 && w.withholding > 0 && w.withheld >= w.withholding && w.withholding <= w.candidates, "{w:?}");
+        assert!(w.offered >= w.candidates && w.psi.is_some_and(|x| x > 0.0 && x < 1.0), "{w:?}");
+        // The gate refuses some drawn subsets (the exact admission, select/policy.rs `exact`); checks of
+        // at most three applies never reach the worst-case fallback, so nothing is dropped.
+        assert!(w.refused > 0 && w.refused <= w.candidates, "the gate refuses drawn subsets: {w:?}");
+        assert_eq!((w.fallbacks, w.dropped, w.refusals), (0, 0, 0), "{w:?}");
+        let shown = render(&evaluate(Input {
+            text: &text(&log),
+            lessons: Path::new("/nonexistent/lessons.jsonl"),
+            summary: Summary::default(),
+            replay: true,
+            eval: None,
+        }));
+        assert!(
+            shown.contains(&format!("  withholding: {} placebos withheld at {} of {} checks with a candidate", w.withheld, w.withholding, w.candidates)),
+            "{shown}"
+        );
+        let r = Routed { pw: vec![0.0, 0.123_456, 0.0], ..empty() };
+        assert_eq!(decided(graded("s", 1, &["A", "B", "C"], &[2, 1, 1]), &r).pw, vec![0.0, 0.1235, 0.0]);
+        assert!(decided(graded("s", 1, &["A"], &[2]), &Routed { pw: vec![0.0], ..empty() }).pw.is_empty(), "no pw where every one is 0, as the hook writes it");
+    }
+
+    /// A withholding log (`withholding`): `n` live checks of a 2 (A) and a 1 (B) in sessions of five, A
+    /// withheld at every odd check and asked at every even one at chance ½ each, B handed over (never a
+    /// candidate). The k-th of each arm: delivered, its point never arose at k % 10 = 0 and it changed
+    /// at k % 5 ∈ {1, 2, 3}; withheld, censored by a later delivery at k % 10 = 0 and changed at
+    /// k % 5 = 1. So among the arisen: 2/3 changed delivered, 2/9 withheld.
+    fn withholding_log(n: usize, from: usize) -> Vec<Outcome> {
+        let mut log = Vec::new();
+        for c in from..from + n {
+            let (session, ms, k, held) = (format!("w{}", c / 5), 1000 * c as i64, c / 2, c % 2 == 1);
+            let check = format!("{c:012x}");
+            log.push(Outcome {
+                check: check.clone(),
+                policy: "learned".into(),
+                source: policy::EVIDENCE.into(),
+                chosen: if held { Vec::new() } else { vec!["A".into()] },
+                free: vec!["B".into()],
+                placebo: if held { vec!["A".into()] } else { Vec::new() },
+                p: vec![0.5, 0.0],
+                pf: vec![0.0, 1.0],
+                pw: vec![0.5, 0.0],
+                version: "0.10.0".into(),
+                ..graded(&session, ms, &["A", "B"], &[2, 1])
+            });
+            let kind = match (held, k % 10, k % 5) {
+                (true, 0, _) => outcome::NOT_CORRECTED,
+                (false, 0, _) => outcome::NOT_ARISEN,
+                (true, _, 1) | (false, _, 1..=3) => outcome::CHANGED,
+                _ => outcome::IGNORED,
+            };
+            let channel = if held { outcome::PLACEBO } else { "live" };
+            let reason = if kind == outcome::NOT_CORRECTED { outcome::UNJUDGED_LATER } else { "" };
+            log.push(Outcome { check, reason: reason.into(), judge: 3, ..result(kind, &session, "A", ms + 1, channel) });
+        }
+        log
+    }
+
+    /// The withholding readout (rules v3): not due, and then no lift, below `LIFT_ARISEN` arisen withheld
+    /// placebos; due, the planted lift of delivering a 2 among the arisen verdicts, weighed by the
+    /// logged chances, with a session interval; the arisen rate per arm and the censored share reported,
+    /// each flagged past its bar; pooled over two stores, the same counts and lift.
+    #[test]
+    fn the_withholding_readout_waits_for_arisen_placebos_and_then_finds_the_planted_lift() {
+        let early = withholding(&[(String::new(), text(&withholding_log(100, 0)).as_str())]);
+        assert_eq!((early.due, early.tested, early.withholding, early.withheld, early.arisen, early.later), (false, 100, 50, 50, 45, 5), "{early:?}");
+        assert!(early.lift.is_empty() && early.flags.is_empty(), "{early:?}");
+        assert_eq!((early.early_checks, early.early_placebos), ((50, 100), (45, 50, 50)));
+        let all = text(&withholding_log(220, 0));
+        let w = withholding(&[(String::new(), all.as_str())]);
+        assert_eq!((w.due, w.withheld, w.closed, w.arisen, w.later, w.slots, w.sessions), (true, 110, 110, 99, 11, 0, 44), "{w:?}");
+        assert_eq!((w.arisen_rate, w.verdicts), ([Some(0.9), Some(1.0)], [110, 99]), "{w:?}");
+        let two = w.lift.iter().find(|(g, _)| *g == 2).map(|(_, e)| e.clone()).unwrap();
+        assert!((two.value.unwrap() - 44.0 / 99.0).abs() < 1e-9 && two.lo > 0.0 && two.lo < two.value.unwrap() && two.hi > two.value.unwrap(), "{two:?}");
+        assert_eq!((two.n, w.lift.iter().find(|(g, _)| *g == 1).and_then(|(_, e)| e.value)), (198, None), "no 1 could be withheld");
+        assert!(w.flags.is_empty(), "{:?}", w.flags);
+        let shown = render_withholding(&w);
+        assert!(
+            shown.starts_with("withholding readout (rules v3 2026-11-19): due (99 of 93 arisen withheld placebos; 110 withheld at 110 of 220 checks with a candidate, in 44 sessions)\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "  arisen rate: delivered 90% of 110 verdicts, withheld 100% of 99 (inverse-propensity weighted; not trusted more than 0.15 apart)\n"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  censored: 11 by a later delivery, 0 by slots, of 110 closed withheld placebos (10%; not trusted above 30%); 0 never judged"),
+            "{shown}"
+        );
+        assert!(!shown.contains("withheld outright"), "{shown}");
+        assert!(shown.contains("  grade 2 delivered − withheld: +0.444 ["), "{shown}");
+        // Two stores, the same checks split between them: the same counts, the lift resampled within each.
+        let (a, b) = (text(&withholding_log(110, 0)), text(&withholding_log(110, 110)));
+        let p = withholding(&[("a".into(), a.as_str()), ("b".into(), b.as_str())]);
+        assert_eq!((p.due, p.withheld, p.arisen, p.sessions, p.strata.len()), (true, 110, 99, 44, 2), "{p:?}");
+        assert!((p.lift[1].1.value.unwrap() - 44.0 / 99.0).abs() < 1e-9, "{p:?}");
+        assert!(
+            render_withholding(&p).contains(", pooled over 2 collectives, stratified by collective: due")
+                && render_withholding(&p).contains("\n  a: 55 withheld at 110 checks")
+        );
+        // Half the delivered points never arise, and most withheld placebos are censored: not trusted.
+        let mut skewed = withholding_log(220, 0);
+        for o in skewed.iter_mut().filter(|o| o.kind == outcome::IGNORED && o.channel == "live") {
+            o.kind = outcome::NOT_ARISEN.into();
+        }
+        for o in skewed.iter_mut().filter(|o| o.kind == outcome::IGNORED && o.channel == outcome::PLACEBO).take(30) {
+            (o.kind, o.reason) = (outcome::NOT_CORRECTED.into(), outcome::UNJUDGED_SLOTS.into());
+        }
+        let s = withholding(&[(String::new(), text(&skewed).as_str())]);
+        assert_eq!((s.slots, s.flags.len()), (30, 2), "{s:?}");
+        assert!(s.flags[0].contains("arisen rates differ") && s.flags[1].contains("censored by a later delivery or by slots"), "{:?}", s.flags);
+    }
+
+    /// The withholding readout counts what the log says of each check and placebo (rules v3): a check
+    /// whose candidate was offered at ψ 0 (or dropped by the worst-case fallback) logs `pw` zeros and
+    /// is tested, as P3 counts it; a placebo withheld at a chance of 1 (left undelivered by the evidence rule) is
+    /// outright, apart from the withheld, arisen and due, though its point arose; a placebo whose
+    /// delivery never came (the session ended) is never judged, out of the kill rule's first 100,
+    /// unless a resumed session settles it; one dropped because the same take delivered its lesson is
+    /// censored by a later delivery.
+    #[test]
+    fn the_withholding_readout_counts_candidates_outright_placebos_and_undelivered_ones() {
+        let mut log = withholding_log(100, 0);
+        let check = |c: usize, pw: [f64; 2], p: f64, placebo: bool| Outcome {
+            check: format!("{c:012x}"),
+            policy: "learned".into(),
+            source: policy::EVIDENCE.into(),
+            chosen: if placebo || p == 0.0 { Vec::new() } else { vec!["A".into()] },
+            free: vec!["B".into()],
+            placebo: if placebo { vec!["A".into()] } else { Vec::new() },
+            p: vec![p, 0.0],
+            pf: vec![0.0, 1.0],
+            pw: pw.to_vec(),
+            version: "0.10.0".into(),
+            ..graded(&format!("x{c}"), 1000 * c as i64, &["A", "B"], &[2, 1])
+        };
+        let delivery = |c: usize, route: &str, reason: &str| Outcome {
+            kind: outcome::DELIVERY.into(),
+            check: format!("{c:012x}"),
+            channel: outcome::PLACEBO.into(),
+            route: route.into(),
+            reason: reason.into(),
+            ..result(outcome::DELIVERY, &format!("x{c}"), "A", 1000 * c as i64 + 1, outcome::PLACEBO)
+        };
+        // Candidates offered at ψ 0: tested, nothing withheld.
+        for c in 100..110 {
+            log.push(Outcome { chosen: vec!["A".into()], ..check(c, [0.0, 0.0], 1.0, false) });
+        }
+        // Withheld outright (pw 1, never deliverable), its point arose and it changed.
+        for c in 110..115 {
+            log.push(check(c, [1.0, 0.0], 0.0, true));
+            log.push(Outcome {
+                check: format!("{c:012x}"),
+                judge: 3,
+                ..result(outcome::CHANGED, &format!("x{c}"), "A", 1000 * c as i64 + 1, outcome::PLACEBO)
+            });
+        }
+        // Withheld at random; the session ends before the next prompt; the second one resumes and a
+        // later delivery takes its place in the judge's queue.
+        for c in 115..117 {
+            log.push(check(c, [0.5, 0.0], 0.5, true));
+            log.push(delivery(c, outcome::ROUTE_NEVER, "session ended"));
+        }
+        let resumed = Outcome {
+            check: format!("{:012x}", 116),
+            reason: outcome::UNJUDGED_LATER.into(),
+            ..result(outcome::NOT_CORRECTED, "x116", "A", 116_500, outcome::PLACEBO)
+        };
+        log.push(resumed);
+        // Withheld at random, dropped at delivery because the same take delivered it.
+        log.push(check(117, [0.5, 0.0], 0.5, true));
+        log.push(delivery(117, outcome::ROUTE_DROPPED_DONE, outcome::DROPPED_DELIVERED));
+        let w = withholding(&[(String::new(), text(&log).as_str())]);
+        assert_eq!((w.tested, w.withholding, w.withheld, w.outright), (118, 53, 53, 5), "{w:?}");
+        assert_eq!((w.closed, w.arisen, w.later, w.undelivered), (52, 45, 7, 1), "{w:?}");
+        assert_eq!((w.early_checks, w.early_placebos), ((53, 118), (45, 52, 52)), "{w:?}");
+        assert_eq!(w.verdicts, [50, 45], "the outright placebos' verdicts are no arm's: {w:?}");
+        let shown = render_withholding(&w);
+        assert!(shown.contains("; 1 never judged") && shown.contains("  withheld outright: 5 placebos at a chance of 1"), "{shown}");
     }
 }

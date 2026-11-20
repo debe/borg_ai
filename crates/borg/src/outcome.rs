@@ -62,7 +62,8 @@
 //!   asked, free, placebo, dropped because done or over the character budget, never delivered) and why,
 //!   so what a check decided (`graded`) and what reached the drone never disagree unseen.
 //! - A placebo (hook.rs `#borg-placebo`): an apply the check routed nowhere, judged blindly where a free
-//!   delivery would be. Its results carry channel `placebo` (`PLACEBO`): the judge's floor, no result for
+//!   delivery would be: one left for later and drawn (`psi`), or one the learned policy withheld from
+//!   delivery (`pw`, select/policy.rs withholding), which stays eligible for later checks. Its results carry channel `placebo` (`PLACEBO`): the judge's floor, no result for
 //!   any reader that learns from results (`is_result`), never shared. One the judge never gave a verdict
 //!   settles as `asked_not_corrected` on that channel with its reason (`settle_with`), as an unjudged ask
 //!   does: the selection summary censors it (select/summary.rs `settled`).
@@ -329,6 +330,15 @@ pub struct Outcome {
     pub placebo: Vec<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub psi: f64,
+    /// `graded`: per lesson (aligned with `lessons`), its probability of being withheld as a judged
+    /// placebo under the policy in force (select/policy.rs `Decision::pw`: a lesson the learned policy
+    /// would deliver, withheld by its withhold draw, or one the fixed rule delivers that the policy
+    /// leaves undelivered), rounded like `p`. Such a lesson is among `placebo` (first, before the draw's).
+    /// Its placebo chance is pw + (1 − p − pf − pw)·`psi` (select/summary.rs `placebo_p`). Written,
+    /// zeros included, exactly where withholding had a candidate (select.rs `Routed::could_withhold`:
+    /// the withholding readout's tested checks); empty otherwise, so older lines write back unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pw: Vec<f64>,
     /// `graded`: the graded applies that could not go free at this check because the session already
     /// had them delivered (select.rs `Ctx::had`, conscience.rs `graded_without`), in the applies' order:
     /// the applies among the session's deliveries when the check decided, and among the lessons waiting
@@ -466,6 +476,10 @@ pub const ROUTE_DROPPED_CHARS: &str = "dropped_chars";
 pub const ROUTE_NEVER: &str = "never_delivered";
 pub const ROUTE_SUPERSEDED: &str = "superseded";
 pub const ROUTES: [&str; 7] = [ROUTE_ASKED, ROUTE_FREE, ROUTE_PLACEBO, ROUTE_DROPPED_DONE, ROUTE_DROPPED_CHARS, ROUTE_NEVER, ROUTE_SUPERSEDED];
+/// The `reason` of a placebo's `delivery` routed `ROUTE_DROPPED_DONE` because the same take delivers
+/// its lesson or the session had it before (hook.rs `queued`). Protocol: the withholding readout reads
+/// it as a placebo censored by a delivery, as `UNJUDGED_LATER` (select/replay.rs `held`).
+pub const DROPPED_DELIVERED: &str = "delivered";
 
 /// The policy a `graded` record was decided under: its `policy`; for a record from before select.rs,
 /// the fixed rule (`fixed`), unless it shows the one other policy an older binary logged,
@@ -940,6 +954,8 @@ pub(crate) struct OutcomeRef<'a> {
     _placebo: Each<Str>,
     #[serde(default, rename = "psi")]
     _psi: f64,
+    #[serde(default, rename = "pw")]
+    _pw: Each<f64>,
     #[serde(default, rename = "nofree")]
     _nofree: Each<Str>,
     #[serde(default, rename = "xk")]
@@ -2281,6 +2297,7 @@ mod tests {
             groups: vec![vec!["L1".into()]],
             grades: vec![3],
             p: vec![0.5],
+            pw: vec![0.25],
             xk: Some(2),
             alpha: Some(0.1),
             ..o(GRADED, "s1", &["L1"], 7)
@@ -2322,6 +2339,8 @@ mod tests {
             with(r#""at":5"#),
             with(r#""line":"\ud800""#),
             with(r#""psi":true"#),
+            with(r#""pw":[true]"#),
+            with(r#""pw":[1e400]"#),
             // Wrong types and missing fields among those a fold reads, and the required `repo`.
             a.replace(r#""ms":7"#, r#""ms":7.5"#),
             a.replace(r#""ms":7"#, r#""ms":9223372036854775808"#),

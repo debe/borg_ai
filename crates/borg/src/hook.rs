@@ -2045,7 +2045,7 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
             let why = if placebo.iter().any(|(c, _)| c.id == id) {
                 Some("queued twice")
             } else {
-                (wanted[..n].iter().chain(&late).any(|(c, _)| c.id == id) || had.contains(id)).then_some("delivered")
+                (wanted[..n].iter().chain(&late).any(|(c, _)| c.id == id) || had.contains(id)).then_some(outcome::DROPPED_DELIVERED)
             };
             match why {
                 Some(why) => dropped.push(((check, outcome::PLACEBO, outcome::ROUTE_DROPPED_DONE, why), id)),
@@ -2821,8 +2821,17 @@ fn decide<'a>(
     let alpha = crate::select::alpha(at.lessons);
     // Decided under `policy` on `summary` and recorded with `why`; whether the record landed.
     let mut on = |summary: &crate::select::summary::Summary, policy: Policy, why: &'static str| {
-        let ctx =
-            crate::select::Ctx { session: at.session, check: at.check, channel: at.channel, lessons: at.lessons, summary, tokens: at.tokens, had: &had, alpha };
+        let ctx = crate::select::Ctx {
+            session: at.session,
+            check: at.check,
+            channel: at.channel,
+            lessons: at.lessons,
+            summary,
+            tokens: at.tokens,
+            had: &had,
+            alpha,
+            withhold: true,
+        };
         let r = crate::select::graded_under(policy, applied, &ctx);
         let landed = record(&r, &Basis { summary, had: &had, why });
         (r, landed)
@@ -2871,6 +2880,7 @@ fn tail_seed(session: &str, check: &str, summary: &crate::select::summary::Summa
         tokens: 0,
         had: &[],
         alpha: crate::select::policy::ALPHA,
+        withhold: true,
     };
     crate::select::seed(&ctx) ^ u64::from_be_bytes(*b"tailpool")
 }
@@ -2947,6 +2957,9 @@ fn graded_outcome(
         pf: routed.map(|r| rounded(&r.pf)).unwrap_or_default(),
         placebo: routed.map(|r| ids(&r.placebo)).unwrap_or_default(),
         psi: routed.map_or(0.0, |r| r.log.psi),
+        // Each apply's chance of being withheld (select.rs `Routed::pw`), zeros included, wherever
+        // withholding had a candidate (`could_withhold`); else empty.
+        pw: routed.filter(|r| r.could_withhold()).map(|r| rounded(&r.pw)).unwrap_or_default(),
         nofree: basis.map(|b| crate::select::nofree(applied, b.had)).unwrap_or_default(),
         // The question-count test's k and s (select.rs `Log::xk`, `xs`): None outside it.
         xk: routed.and_then(|r| r.log.xk),
@@ -4357,7 +4370,9 @@ mod tests {
     }
 
     /// The question-count test's k and s reach the graded record from the decision's log, the s = 0
-    /// draw included; a check outside the test and a failed one log neither.
+    /// draw included; a check outside the test and a failed one log neither. Each apply's chance of
+    /// being withheld (`pw`) reaches it too, zeros included where withholding had a candidate (one
+    /// offered at ψ 0 too), empty where it had none.
     #[test]
     fn the_graded_record_carries_the_question_count_tests_draw() {
         use crate::select::{Log, Routed, policy, summary};
@@ -4388,6 +4403,7 @@ mod tests {
             placebo: Vec::new(),
             p: vec![0.0, 0.0],
             pf: vec![1.0, 1.0],
+            pw: vec![0.0, 0.0],
             log: Log { policy: "learned", source, xk, xs, ..Log::default() },
         };
         let record = |r: Option<&Routed>| graded_outcome("s", "r", "0123456789ab", &applied, r.map(|r| (r, &basis)), &s, &call);
@@ -4399,6 +4415,13 @@ mod tests {
         assert_eq!((failed.failed, failed.xk, failed.xs), (true, None, None));
         // The pool budget the check filled to, whatever it decided.
         assert_eq!((drawn.budget, failed.budget), (16_000, 16_000));
+        // Each apply's chance of being withheld, rounded; none logged where every one's is 0.
+        let withheld = Routed { placebo: vec![&ls[0]], free: vec![&ls[1]], pw: vec![0.123_456, 0.0], ..routed(policy::EVIDENCE, None, None) };
+        assert_eq!((record(Some(&withheld)).pw, drawn.pw.is_empty(), failed.pw.is_empty()), (vec![0.1235, 0.0], true, true));
+        // A candidate offered at ψ 0 (or dropped by the worst-case fallback): its check had one, so `pw` is logged.
+        let mut offered = routed(policy::EVIDENCE, None, None);
+        offered.log.psi_w = vec![Some(0.0), None];
+        assert_eq!(record(Some(&offered)).pw, vec![0.0, 0.0]);
     }
 
     fn graded_records(lessons: &std::path::Path) -> Vec<outcome::Outcome> {
@@ -4519,6 +4542,7 @@ mod tests {
             tokens: 0,
             had: &[],
             alpha: crate::select::alpha(&lessons),
+            withhold: true,
         };
         let fixed = ids(&graded_under(Policy::Fixed, &applied, &ctx).ask);
         for policy in [Policy::Fixed, Policy::Cap(1), Policy::Attention] {
@@ -4566,6 +4590,7 @@ mod tests {
                 tokens: 0,
                 had: &[],
                 alpha: crate::select::alpha(&lessons),
+                withhold: true,
             };
             let r = graded_under(Policy::Fixed, &applied, &ctx);
             (ids(&r.ask), ids(&r.free), ids(&r.placebo))

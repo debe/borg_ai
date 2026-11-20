@@ -89,8 +89,8 @@ use crate::outcome::{self, Outcome};
 /// (`stop_routes`), a live question of a check without a 3 out of `ASK_LIVE` and `WAIT`, `counted`;
 /// 9: the judge's `not_arisen` and `consequence_remains` verdicts, `Label::NotArisen`, `Label::Remains`,
 /// `Apply::jv`, the session-end judge's own judge level; 10: `Delivered::Superseded`, out of `counted`;
-/// 11: `Pool::stop_last`).
-pub const SV: u32 = 11;
+/// 11: `Pool::stop_last`; 12: `Apply::pw`, withheld placebos).
+pub const SV: u32 = 12;
 /// The cache beside the lessons file. Protocol.
 pub const CACHE: &str = "select-summary.json";
 /// The monitor's auto-revert mark beside the lessons file: while it exists the store keeps the fixed
@@ -196,7 +196,8 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 }
 
 /// One graded apply: its lesson, grade and rank, the route its check decided with its propensities
-/// (logged `p`, `pf`; `psi` a placebo's chance of the draw), and what came of it.
+/// (logged `p`, `pf`, `pw` its chance of being withheld as a judged placebo; `psi` the chance of the
+/// placebo draw among the applies left for later), and what came of it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Apply {
     /// Its check (`Summary::checks`) and lesson (`Summary::lessons`).
@@ -212,6 +213,8 @@ pub struct Apply {
     pub pf: f64,
     #[serde(default, skip_serializing_if = "is_default")]
     pub psi: f64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub pw: f64,
     #[serde(default, skip_serializing_if = "is_default")]
     pub delivered: Delivered,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -247,6 +250,26 @@ pub struct Apply {
     /// The session's delivered applies still waiting for a verdict when its check ran.
     #[serde(default, skip_serializing_if = "is_default")]
     pub pending: u16,
+}
+
+impl Apply {
+    /// Its chance of the placebo route (`placebo_p` of its logged propensities).
+    #[must_use]
+    pub fn placebo_p(&self) -> f64 {
+        placebo_p(self.p, self.pf, self.pw, self.psi)
+    }
+}
+
+/// The chance that a graded apply logged with the propensities `p` (asked), `pf` (free) and `pw`
+/// (withheld as a judged placebo, select/policy.rs `Decision::pw`) and its check's placebo-draw chance
+/// `psi` (select.rs `draw_placebo`) was routed `Placebo`: withheld, or neither delivered nor withheld
+/// and drawn, pw + (1 − p − pf − pw)·psi (the remainder held ≥ 0 against rounding). Exact, because
+/// the draw's candidates are the units every routing of the check leaves for later, so its `psi` does
+/// not depend on which were withheld. The one definition the monitor (select/policy.rs `monitor`) and
+/// `borg debug select` P5 (select/replay.rs) weigh a placebo's label by.
+#[must_use]
+pub fn placebo_p(p: f64, pf: f64, pw: f64, psi: f64) -> f64 {
+    pw + (1.0 - p - pf - pw).max(0.0) * psi
 }
 
 /// One graded check with applies.
@@ -902,7 +925,9 @@ impl Summary {
             let nofree = o.nofree.contains(l);
             let had = nofree || self.sessions[tick as usize].had.binary_search(&lesson).is_ok();
             let p = o.p.get(i).copied().unwrap_or(0.0);
-            let a = Apply { check: ci, lesson, grade: o.grades[i], rank, route, p, pf, psi, had, nofree, pending, ..Apply::default() };
+            // Older records and checks that withheld nothing log no `pw`.
+            let pw = o.pw.get(i).copied().unwrap_or(0.0);
+            let a = Apply { check: ci, lesson, grade: o.grades[i], rank, route, p, pf, psi, pw, had, nofree, pending, ..Apply::default() };
             if waiting(&a) {
                 *ix.open.entry(tick).or_default() += 1;
             }
@@ -1540,6 +1565,22 @@ mod tests {
         let c = s.checks.iter().find(|c| c.id == check).unwrap();
         let a = s.applies[c.first as usize..(c.first + u32::from(c.n)) as usize].iter().find(|a| s.lessons[a.lesson as usize] == lesson).unwrap();
         (a.route, a.label, a.delivered)
+    }
+
+    /// A withheld placebo folds its `pw`, and its placebo chance is `placebo_p`: withheld (A), or left
+    /// for later and drawn (B); a record without `pw` folds 0, as older ones and checks that withheld
+    /// nothing do.
+    #[test]
+    fn a_withheld_placebo_folds_its_chance_of_being_withheld() {
+        let mut o = graded("s", "c1", &["A", "B", "C"], &[2, 1, 1], &[], &["C"], 10);
+        (o.placebo, o.psi, o.p, o.pf, o.pw) = (vec!["A".into(), "B".into()], 0.5, vec![0.0; 3], vec![0.6, 0.0, 1.0], vec![0.4, 0.0, 0.0]);
+        let s = fold(&lines(std::slice::from_ref(&o)), Summary::default());
+        let a = &s.applies;
+        assert_eq!(a.iter().map(|a| (a.route, a.pw)).collect::<Vec<_>>(), [(Route::Placebo, 0.4), (Route::Placebo, 0.0), (Route::Free, 0.0)]);
+        assert!((a[0].placebo_p() - 0.4).abs() < 1e-12 && (a[1].placebo_p() - 0.5).abs() < 1e-12, "{a:?}");
+        assert_eq!(placebo_p(0.5, 0.6, 0.0, 1.0), 0.0, "the remainder held ≥ 0");
+        let old = fold(&lines(&[Outcome { pw: Vec::new(), ..o }]), Summary::default());
+        assert!(old.applies.iter().all(|a| a.pw == 0.0), "{:?}", old.applies);
     }
 
     #[test]
