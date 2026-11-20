@@ -3,6 +3,15 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## Unreleased
+
+### Changed
+
+- Without your own `systems.json`, the system gate uses only the systems your collective's scope
+  names derive from repo names. The example map no longer applies at runtime, so borg names no
+  system or repo of its own. If you relied on it, copy `crates/borg/data/systems.json` to
+  `~/.config/borg/systems.json`. [System map](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#system-map)
+
 ## 0.10.0 (2026-11-20)
 
 Placebos no longer wait for a check with more than 10 applies: the learned policy withholds lessons it

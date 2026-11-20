@@ -233,10 +233,11 @@ Per-session scratch state lives in `/tmp/borg` (`BORG_STATE`).
 
 ## System map
 
-The system gate keeps lessons scoped to other systems out of a repo that maps to a known system. Put
-your map in `~/.config/borg/systems.json` (or `BORG_SYSTEMS`), in the format of
-[`crates/borg/data/systems.json`](../crates/borg/data/systems.json). That example applies when you have
-none.
+The system gate keeps lessons scoped to other systems out of a repo that maps to a known system. With no
+map, the known systems are the collective's own scope names that a repo name contains (a scope `Zeus` and
+a repo `zeus_core`); borg ships no system or repo names of its own. For aliases and repos whose names do
+not say their system, put your map in `~/.config/borg/systems.json` (or `BORG_SYSTEMS`), in the format of
+the example [`crates/borg/data/systems.json`](../crates/borg/data/systems.json).
 
 ## What `borg install` writes
 

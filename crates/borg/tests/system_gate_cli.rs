@@ -32,6 +32,8 @@ fn setup(name: &str) -> PathBuf {
         json!({"default": "off", "collectives": [{"name": "corp", "paths": [root.join("borg-ai"), root.join("harbor_orion")], "share": "local"}]}).to_string(),
     )
     .unwrap();
+    // The gate's map, pinned: borg ships none (systems.rs), so the example is these tests' user map.
+    std::fs::write(root.join("systems.json"), include_str!("../data/systems.json")).unwrap();
     root
 }
 
@@ -124,16 +126,17 @@ fn a_orion_repo_still_gets_orion_lessons() {
 }
 
 #[test]
-fn the_users_own_map_replaces_the_shipped_example() {
+fn the_users_own_map_decides_and_borg_ships_none() {
     let root = setup("usermap");
     // systems.json next to the collectives config knows only borg: Orion, Beacon and SR3 are no longer
     // known systems, so the gate leaves their lessons to today's rule.
     std::fs::write(root.join("systems.json"), json!({"systems": {"borg": ["borg"]}, "repos": {}}).to_string()).unwrap();
     let got = flood(&root, "u1", &[]);
     assert!(got.iter().any(|i| i == "Mreset") && got.iter().any(|i| i == "Asr3"), "{got:?}");
-    // BORG_SYSTEMS names a file that does not exist: the shipped example applies.
+    // BORG_SYSTEMS names a file that does not exist: no map, so no system of the example's applies and
+    // the borg-ai repo derives none from the lessons' scopes; the gate leaves the lessons to today's rule.
     let none = root.join("none.json");
     let got = flood(&root, "u2", &[("BORG_SYSTEMS", none.to_str().unwrap())]);
-    assert_eq!(got, ["Gall"], "{got:?}");
+    assert!(got.iter().any(|i| i == "Mreset") && got.iter().any(|i| i == "Asr3"), "{got:?}");
     let _ = std::fs::remove_dir_all(root);
 }

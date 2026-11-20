@@ -7,7 +7,9 @@
 //! Systems are the alias map plus the collective's own scope names that a known repo name contains
 //! (`zeus_core` makes a scope `Zeus` a system). The map is the user's `$BORG_SYSTEMS` (default:
 //! `systems.json` next to the collectives config, `~/.config/borg/systems.json`) when that file exists,
-//! else the example in data/systems.json. `BORG_SYSTEM_GATE=off` disables the gate.
+//! else empty: borg names no system or repo of its own, so without a map only the derived systems gate.
+//! data/systems.json is the format's example and the unit tests' map. `BORG_SYSTEM_GATE=off` disables
+//! the gate.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -27,7 +29,9 @@ struct Map {
 fn map() -> &'static Map {
     static M: OnceLock<Map> = OnceLock::new();
     M.get_or_init(|| {
-        let v = user_map().unwrap_or_else(|| serde_json::from_str(include_str!("../data/systems.json")).expect("data/systems.json"));
+        let v = user_map().unwrap_or_else(|| {
+            if cfg!(test) { serde_json::from_str(include_str!("../data/systems.json")).expect("data/systems.json") } else { Value::Null }
+        });
         let list =
             |x: &Value| -> Vec<String> { x.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_lowercase)).collect()).unwrap_or_default() };
         let obj = |k: &str| v[k].as_object().cloned().unwrap_or_default().into_iter();
@@ -36,7 +40,7 @@ fn map() -> &'static Map {
 }
 
 /// The user's own map: `$BORG_SYSTEMS`, else `systems.json` next to the collectives config. Absent or
-/// invalid: none (an invalid file is reported once on stderr). Unit tests always use the shipped example.
+/// invalid: none (an invalid file is reported once on stderr). Unit tests always use data/systems.json.
 fn user_map() -> Option<Value> {
     if cfg!(test) {
         return None;
