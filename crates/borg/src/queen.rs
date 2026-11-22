@@ -30,10 +30,11 @@
 //!
 //! Fails open: any error means the drone proceeds untouched.
 
+use std::cell::LazyCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -207,10 +208,65 @@ fn negation(word: &str) -> bool {
     w.ends_with("n't") || NEGATIONS.contains(&w)
 }
 
-const STOP: [&str; 24] = [
-    "the", "and", "will", "then", "this", "that", "with", "for", "from", "into", "our", "now", "also", "i'll", "we'll", "let", "lets", "can", "should",
-    "would", "first", "after", "before", "all",
-];
+/// Words too common in this store to tell two texts apart: tokens (LEGACY) in more than a third of
+/// its lessons (question, situations, consequence). Learned per store; below `MIN_DF_STORE` lessons
+/// nothing counts as filler.
+#[derive(Debug, Clone, Default)]
+pub struct Filler(HashSet<String>);
+
+impl Filler {
+    /// Nothing is filler.
+    pub fn none() -> Filler {
+        Filler::default()
+    }
+
+    pub fn of(lessons: &[Challenge]) -> Filler {
+        let fields = lessons.iter().map(|c| [&c.question, &c.consequence].into_iter().chain(&c.situations).map(String::as_str).collect());
+        Filler::learned(fields, lessons.len())
+    }
+
+    /// `of` over raw lesson lines (`lesson_lines`): their "question", "situations" and "consequence".
+    pub fn of_values(lessons: &[Value]) -> Filler {
+        let fields = lessons.iter().map(|l| {
+            let situations = l["situations"].as_array().into_iter().flatten().filter_map(Value::as_str);
+            [l["question"].as_str(), l["consequence"].as_str()].into_iter().flatten().chain(situations).collect()
+        });
+        Filler::learned(fields, lessons.len())
+    }
+
+    /// `of` the lessons of `store/lessons.jsonl`, learned once per process and store; none without the file.
+    pub fn for_store(store: &Path) -> Arc<Filler> {
+        static CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Filler>>>> = LazyLock::new(Default::default);
+        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        let learn = || Arc::new(Filler::of(&conscience::load_unweighted_with(&store.join("lessons.jsonl"), None, &collective::Aliases::default())));
+        cache.entry(store.to_path_buf()).or_insert_with(learn).clone()
+    }
+
+    /// The tokens in more than a third of `n` lessons, each given as its `fields`' texts; none for
+    /// fewer than `MIN_DF_STORE`. Streams the tokens: the Stop hook pays this once per process.
+    fn learned<'a>(lessons: impl Iterator<Item = Vec<&'a str>>, n: usize) -> Filler {
+        if n < conscience::MIN_DF_STORE {
+            return Filler::none();
+        }
+        // Token -> (lessons naming it, the last lesson that did).
+        let mut df: HashMap<String, (usize, usize)> = HashMap::new();
+        for (i, fields) in lessons.enumerate() {
+            for text in fields {
+                conscience::tokens_at(text, conscience::LEGACY, |_, t| match df.get_mut(t) {
+                    Some((d, last)) if *last != i => {
+                        *d += 1;
+                        *last = i;
+                    }
+                    Some(_) => {}
+                    None => {
+                        df.insert(t.to_string(), (1, i));
+                    }
+                });
+            }
+        }
+        Filler(df.into_iter().filter(|(_, (d, _))| 3 * d > n).map(|(w, _)| w).collect())
+    }
+}
 
 /// A high-consequence move of the plan: its kind and the sentence that makes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -223,9 +279,9 @@ pub struct Decision {
     pub key: String,
 }
 
-/// Significant words of `text`: tokens of 3+ characters minus filler, sorted and unique.
-pub(crate) fn words(text: &str) -> Vec<String> {
-    let mut w: Vec<String> = conscience::tokens(text).into_iter().filter(|t| !STOP.contains(&t.as_str())).collect();
+/// Significant words of `text`: tokens (LEGACY) minus the store's filler `f`, sorted and unique.
+pub(crate) fn words(text: &str, f: &Filler) -> Vec<String> {
+    let mut w: Vec<String> = conscience::tokens_with(text, conscience::LEGACY).into_iter().filter(|t| !f.0.contains(t)).collect();
     w.sort();
     w.dedup();
     w
@@ -307,33 +363,33 @@ pub fn classify(plan: &str, repo: &str) -> Vec<Decision> {
 /// Criterion 3: the engineer's inputs (their prompts, not the drone's own tool calls) already state
 /// this decision: they name the same move (a move of its kind with most of its words: "force-push"
 /// states "force push main", "wipe the cache" does not), or contain most of the sentence's words.
-pub fn stated(d: &Decision, inputs: &str) -> bool {
+pub fn stated(d: &Decision, inputs: &str, f: &Filler) -> bool {
     let lower = inputs.to_lowercase().replace(['\u{2019}', '\u{2018}'], "'");
-    let move_words = words(&d.what);
+    let move_words = words(&d.what, f);
     let same = |m: &str| {
-        let have: HashSet<String> = words(m).into_iter().collect();
+        let have: HashSet<String> = words(m, f).into_iter().collect();
         move_words.is_empty() || overlap(&move_words, &have, 1) >= STATED
     };
     if KINDS.iter().any(|(k, re)| *k == d.kind && re.find_iter(&lower).any(|m| same(m.as_str()))) {
         return true;
     }
-    let have: HashSet<String> = words(&lower).into_iter().collect();
-    overlap(&words(&d.sentence), &have, 3) >= STATED
+    let have: HashSet<String> = words(&lower, f).into_iter().collect();
+    overlap(&words(&d.sentence, f), &have, 3) >= STATED
 }
 
 /// A reworded duplicate of an earlier decision question: most of the decision's significant words
 /// (at least 4 of them) are in it. Catches rewordings the key does not.
-fn near(d: &Decision, earlier: &str) -> bool {
-    let have: HashSet<String> = words(earlier).into_iter().collect();
-    overlap(&words(&d.sentence), &have, 4) >= STATED
+fn near(d: &Decision, earlier: &str, f: &Filler) -> bool {
+    let have: HashSet<String> = words(earlier, f).into_iter().collect();
+    overlap(&words(&d.sentence, f), &have, 4) >= STATED
 }
 
 /// Two decisions of one plan that are one move: the same key, either sentence a reworded duplicate of
 /// the other, or the same kind on the same named ref ("`git push -u origin main`" and "they push to
 /// the remote `origin` and the branch `main`"). One message asks each move once.
-fn same_move(a: &Decision, b: &Decision) -> bool {
+fn same_move(a: &Decision, b: &Decision, f: &Filler) -> bool {
     let target = |d: &Decision| REF.find(&d.sentence).map(|m| m.as_str().replace("production", "prod"));
-    a.key == b.key || near(a, &b.sentence) || near(b, &a.sentence) || (a.kind == b.kind && target(a).is_some() && target(a) == target(b))
+    a.key == b.key || near(a, &b.sentence, f) || near(b, &a.sentence, f) || (a.kind == b.kind && target(a).is_some() && target(a) == target(b))
 }
 
 /// What the collective knows about one decision key (criterion 2).
@@ -466,7 +522,8 @@ pub fn constraint_key(repo: &str, text: &str) -> String {
 /// Queue `e` (an imported open decision) unless its decision, or a near-duplicate question of its repo
 /// (`duplicate`), was ever queued in this collective. Returns whether it was added.
 pub fn seed(store: &Path, e: &Entry) -> std::io::Result<bool> {
-    if entries(store).iter().any(|x| x.decision_key == e.decision_key || duplicate(x, e)) {
+    let f = Filler::for_store(store);
+    if entries(store).iter().any(|x| x.decision_key == e.decision_key || duplicate(x, e, &f)) {
         return Ok(false);
     }
     append_line(&queue_path(store), e)?;
@@ -565,21 +622,21 @@ fn question(d: &Decision) -> String {
 
 /// A lesson is about a move when its question, situations and consequence name most (`STATED`) of
 /// the move's significant words ("force push main").
-pub fn covers(c: &Challenge, d: &Decision) -> bool {
-    let have: HashSet<String> = words(&format!("{} {} {}", c.question, c.situations.join(" "), c.consequence)).into_iter().collect();
-    overlap(&words(&d.what), &have, 1) >= STATED
+pub fn covers(c: &Challenge, d: &Decision, f: &Filler) -> bool {
+    let have: HashSet<String> = words(&format!("{} {} {}", c.question, c.situations.join(" "), c.consequence), f).into_iter().collect();
+    overlap(&words(&d.what, f), &have, 1) >= STATED
 }
 
 /// Lessons among `selected` that contradict another one (`conflict_pairs`). Ids in selection order.
-pub fn conflicts(selected: &[&Challenge]) -> Vec<String> {
-    let pairs = conflict_pairs(selected);
+pub fn conflicts(selected: &[&Challenge], f: &Filler) -> Vec<String> {
+    let pairs = conflict_pairs(selected, f);
     (0..selected.len()).filter(|i| pairs.iter().any(|&(a, b)| a == *i || b == *i)).map(|i| selected[i].id.clone()).collect()
 }
 
 /// Pairs (i < j, indices into `selected`) of lessons that contradict each other: their situations
 /// mostly agree (≥ `STATED` of the shorter one's words) and their consequences mostly do not.
-pub fn conflict_pairs(selected: &[&Challenge]) -> Vec<(usize, usize)> {
-    let set = |v: &[String]| words(&v.join(" ")).into_iter().collect::<HashSet<String>>();
+pub fn conflict_pairs(selected: &[&Challenge], f: &Filler) -> Vec<(usize, usize)> {
+    let set = |v: &[String]| words(&v.join(" "), f).into_iter().collect::<HashSet<String>>();
     let same = |a: &HashSet<String>, b: &HashSet<String>| {
         let n = a.len().min(b.len());
         n > 0 && a.intersection(b).count() as f64 / n as f64 >= STATED
@@ -598,15 +655,16 @@ pub fn conflict_pairs(selected: &[&Challenge]) -> Vec<(usize, usize)> {
 
 /// Decide whether to ask the queen and, if so, queue the questions. Returns the asked entries
 /// (empty: nothing asked). Errors only on I/O; the caller fails open. Cheap checks first: the
-/// lessons file is read only when a candidate decision survives them and the budget. A question that
-/// near-duplicates one already queued for its repo (`duplicate`) is not queued again. Newly queued
-/// questions get one desktop notification (notify.rs).
+/// lessons file is read only when the plan makes a high-consequence move not asked before (`decide`).
+/// A question that near-duplicates one already queued for its repo (`duplicate`) is not queued again.
+/// Newly queued questions get one desktop notification (notify.rs).
 pub fn consider(cp: &Checkpoint) -> std::io::Result<Vec<Entry>> {
     note_session(cp.store, cp.engineer, cp.session, cp.now)?;
     let asked = entries(cp.store);
+    let filler = LazyCell::new(|| Filler::for_store(cp.store));
     let mut ask: Vec<Entry> = Vec::new();
     for e in decide(cp, &asked, || within_budget(cp.store, cp.engineer, cp.session), || lesson_lines(&cp.store.join("lessons.jsonl"))) {
-        if !asked.iter().chain(&ask).any(|x| duplicate(x, &e)) {
+        if !asked.iter().chain(&ask).any(|x| duplicate(x, &e, &filler)) {
             ask.push(e);
         }
     }
@@ -620,42 +678,29 @@ pub fn consider(cp: &Checkpoint) -> std::io::Result<Vec<Entry>> {
 
 /// The queen's decision at one checkpoint, without I/O (`consider` is this plus the store; the
 /// replay eval calls it directly): `asked` is every question asked so far, `budget` criterion 4 and
-/// `lessons` the collective's lessons as raw JSON, both evaluated only once a candidate survives
-/// criteria 1-3. `cp.store` is not read.
+/// `lessons` the collective's lessons as raw JSON. `lessons` is evaluated once a high-consequence
+/// move not asked before needs its words compared (the store's `Filler` is learned from it), `budget`
+/// only once a candidate survives criteria 1-3. `cp.store` is not read.
 pub fn decide(cp: &Checkpoint, asked: &[Entry], budget: impl FnOnce() -> bool, lessons: impl FnOnce() -> Vec<Value>) -> Vec<Entry> {
+    let lessons = LazyCell::new(lessons);
+    let filler = LazyCell::new(|| Filler::of_values(&lessons));
     let repo = repo_name(cp.cwd);
-    let ever: HashSet<&str> = asked.iter().map(|e| e.decision_key.as_str()).collect();
-    let mut candidates: Vec<(Decision, Vec<String>)> = Vec::new();
-    for d in classify(cp.plan, &repo) {
-        let masks = |e: &Entry| !legacy_hive(e) || same_repo(&self::repo(e), &repo);
-        if ever.contains(d.key.as_str()) || stated(&d, cp.inputs) || asked.iter().any(|e| masks(e) && near(&d, &e.question)) {
-            continue;
-        }
-        // Criterion 2, L1 side: the lessons the conscience asked that are about this move. Agreeing,
-        // they answered it; contradicting each other, the collective cannot resolve it. Lessons about
-        // other things do not answer it (the conscience selects something for almost any plan).
-        let about: Vec<&Challenge> = cp.selected.iter().copied().filter(|c| covers(c, &d)).collect();
-        let clashing = conflicts(&about);
-        if !about.is_empty() && clashing.is_empty() {
-            continue;
-        }
-        candidates.push((d, clashing));
-    }
+    let candidates = candidates(cp, asked, &repo, &filler);
     if candidates.is_empty() || !budget() {
         return Vec::new();
     }
-    let lessons = lessons();
+    let lessons: &[Value] = &lessons;
     let mut ask = Vec::new();
     let mut picked: Vec<Decision> = Vec::new();
     for (d, relevant) in candidates {
         if ask.len() == MAX_QUESTIONS {
             break;
         }
-        if picked.iter().any(|p| same_move(&d, p)) {
+        if picked.iter().any(|p| same_move(&d, p, &filler)) {
             continue;
         }
-        let answered = lessons.iter().any(|l| l["source"] == "queen" && near(&d, l["decision_question"].as_str().unwrap_or_default()));
-        let disagreeing = match (known(&lessons, &d.key), answered) {
+        let answered = lessons.iter().any(|l| l["source"] == "queen" && near(&d, l["decision_question"].as_str().unwrap_or_default(), &filler));
+        let disagreeing = match (known(lessons, &d.key), answered) {
             (Known::Resolved, _) | (Known::Nothing, true) => continue,
             (Known::Nothing, false) => relevant,
             (Known::Disagree(ids), _) => ids.into_iter().chain(relevant).collect::<Vec<_>>(),
@@ -693,6 +738,30 @@ pub fn decide(cp: &Checkpoint, asked: &[Entry], budget: impl FnOnce() -> bool, l
     ask
 }
 
+/// Criteria 1-3 at one checkpoint: each high-consequence move of the plan in `repo` not asked before
+/// (its key, or a reworded `near` duplicate of a question that masks it), not stated by the inputs
+/// and not answered by the lessons the conscience asked, with the ids of those that clash about it.
+fn candidates(cp: &Checkpoint, asked: &[Entry], repo: &str, f: &Filler) -> Vec<(Decision, Vec<String>)> {
+    let ever: HashSet<&str> = asked.iter().map(|e| e.decision_key.as_str()).collect();
+    let mut out: Vec<(Decision, Vec<String>)> = Vec::new();
+    for d in classify(cp.plan, repo) {
+        let masks = |e: &Entry| !legacy_hive(e) || same_repo(&self::repo(e), repo);
+        if ever.contains(d.key.as_str()) || stated(&d, cp.inputs, f) || asked.iter().any(|e| masks(e) && near(&d, &e.question, f)) {
+            continue;
+        }
+        // Criterion 2, L1 side: the lessons the conscience asked that are about this move. Agreeing,
+        // they answered it; contradicting each other, the collective cannot resolve it. Lessons about
+        // other things do not answer it (the conscience selects something for almost any plan).
+        let about: Vec<&Challenge> = cp.selected.iter().copied().filter(|c| covers(c, &d, f)).collect();
+        let clashing = conflicts(&about, f);
+        if !about.is_empty() && clashing.is_empty() {
+            continue;
+        }
+        out.push((d, clashing));
+    }
+    out
+}
+
 /// What the drone is told, once: whom was asked what, and which default it proceeds with.
 pub fn render(asked: &[Entry]) -> String {
     let who = asked.first().map(|e| e.engineer.as_str()).filter(|e| !e.is_empty()).unwrap_or("the engineer");
@@ -714,9 +783,9 @@ pub fn enabled() -> bool {
 
 /// The Stop hook's single call, after the conscience decided. `plan` reads the drone's last message
 /// (`harness::plan`), only once the queen is on; `prompts` the engineer's prompts this session, `selected` the lessons the
-/// conscience asked. Some(block once) when the queen was asked; its reason then carries the
-/// conscience's questions too.
-pub fn stop(session: &str, input: &Value, plan: &dyn Fn() -> String, prompts: &str, selected: &[&Challenge]) -> Option<Value> {
+/// conscience asked and `f` the filler words its block renders them with (the asked record's, hook.rs `stop_ask`).
+/// Some(block once) when the queen was asked; its reason then carries the conscience's questions too.
+pub fn stop(session: &str, input: &Value, plan: &dyn Fn() -> String, prompts: &str, selected: &[&Challenge], f: &Filler) -> Option<Value> {
     if !learn::learning() || !enabled() {
         return None;
     }
@@ -728,11 +797,13 @@ pub fn stop(session: &str, input: &Value, plan: &dyn Fn() -> String, prompts: &s
         let engineer = learn::engineer(s("cwd"));
         let cp = Checkpoint { store: &store, session, cwd: s("cwd"), engineer: &engineer, plan, inputs: prompts, selected, now: learn::now_ms() };
         let asked = consider(&cp).ok()?;
-        let reason = match selected.is_empty() {
+        if asked.is_empty() {
+            return None;
+        }
+        Some(json!({"decision": "block", "reason": match selected.is_empty() {
             true => render(&asked),
-            false => format!("{}\n\n{}", conscience::render(selected), render(&asked)),
-        };
-        (!asked.is_empty()).then(|| json!({"decision": "block", "reason": reason}))
+            false => format!("{}\n\n{}", conscience::render(selected, f), render(&asked)),
+        }}))
     }))
     .ok()
     .flatten()
@@ -896,8 +967,8 @@ pub fn clip(text: &str, max: usize) -> String {
 }
 
 /// Jaccard similarity of the significant words of `a` and `b` (0 when both have none).
-pub fn jaccard(a: &str, b: &str) -> f64 {
-    let (a, b): (HashSet<String>, HashSet<String>) = (words(a).into_iter().collect(), words(b).into_iter().collect());
+pub fn jaccard(a: &str, b: &str, f: &Filler) -> f64 {
+    let (a, b): (HashSet<String>, HashSet<String>) = (words(a, f).into_iter().collect(), words(b, f).into_iter().collect());
     match a.union(&b).count() {
         0 => 0.0,
         n => a.intersection(&b).count() as f64 / n as f64,
@@ -905,8 +976,8 @@ pub fn jaccard(a: &str, b: &str) -> f64 {
 }
 
 /// Two questions are one: the same repo and `DUPLICATE` of their words (`gist`) shared.
-pub fn duplicate(a: &Entry, b: &Entry) -> bool {
-    repo(a).eq_ignore_ascii_case(&repo(b)) && jaccard(gist(a), gist(b)) >= DUPLICATE
+pub fn duplicate(a: &Entry, b: &Entry, f: &Filler) -> bool {
+    repo(a).eq_ignore_ascii_case(&repo(b)) && jaccard(gist(a), gist(b), f) >= DUPLICATE
 }
 
 /// A question marked in a session: a skip (a line of skips.jsonl; session "cli" from the terminal) or a
@@ -998,10 +1069,10 @@ pub fn option_answer(e: &Entry, text: &str) -> Result<String, String> {
 
 /// Open questions that near-duplicate an earlier, not dismissed question of their repo (`duplicate`):
 /// (later id, earlier id) in asking order. A duplicate found here is never the earlier side.
-pub fn duplicates(all: &[Entry]) -> Vec<(String, String)> {
+pub fn duplicates(all: &[Entry], f: &Filler) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (j, e) in all.iter().enumerate().filter(|(_, e)| e.is_open()) {
-        let first = all[..j].iter().find(|x| x.dismissed.is_none() && !out.iter().any(|(d, _)| *d == x.id) && duplicate(x, e));
+        let first = all[..j].iter().find(|x| x.dismissed.is_none() && !out.iter().any(|(d, _)| *d == x.id) && duplicate(x, e, f));
         if let Some(x) = first {
             out.push((e.id.clone(), x.id.clone()));
         }
@@ -1011,7 +1082,7 @@ pub fn duplicates(all: &[Entry]) -> Vec<(String, String)> {
 
 /// `borg queen dedupe`: the duplicates; with `apply`, each dismissed as "duplicate of <id>".
 pub fn dedupe(store: &Path, apply: bool, now: i64) -> Result<Vec<(String, String)>, String> {
-    let found = duplicates(&entries(store));
+    let found = duplicates(&entries(store), &Filler::for_store(store));
     if apply {
         for (id, of) in &found {
             dismiss(store, id, &format!("duplicate of {of}"), now)?;
@@ -1716,12 +1787,30 @@ mod tests {
     }
 
     #[test]
+    fn filler_is_learned_from_the_store() {
+        let store = tmp("filler");
+        let line = |i: usize| {
+            let question = if i < 20 { format!("Did you deploy shard{i} first?") } else { format!("Is lesson{i} checked?") };
+            format!("{}\n", json!({"id": format!("l{i}"), "origin_ms": 1, "question": question, "consequence": format!("outcome{i}")}))
+        };
+        std::fs::write(store.join("lessons.jsonl"), (0..30).map(line).collect::<String>()).unwrap();
+        let f = Filler::for_store(&store);
+        let text = "deploy the payments service";
+        assert_eq!(words(text, &f), ["payments", "service", "the"], "deploy is in 20 of 30 lessons");
+        assert_eq!(words(text, &Filler::none()), ["deploy", "payments", "service", "the"]);
+        // The same store as raw lines learns the same filler; below `MIN_DF_STORE` lessons, none.
+        assert_eq!(words(text, &Filler::of_values(&lesson_lines(&store.join("lessons.jsonl")))), ["payments", "service", "the"]);
+        assert_eq!(words(text, &Filler::of(&conscience::load_unweighted(&store.join("lessons.jsonl"), None)[..29])), words(text, &Filler::none()));
+        let _ = std::fs::remove_dir_all(store);
+    }
+
+    #[test]
     fn criterion_3_the_inputs_must_state_the_same_move_not_just_its_kind() {
         let d = classify("Then force-push the rewritten history to origin main.", "app").remove(0);
         // A synthetic prompt (the held-out half's wording must not pin a tuned rule).
-        assert!(stated(&d, "go ahead and force-push it once the messages read well"));
-        assert!(!stated(&d, "coordinate a history wipe among the teams"), "another irreversible move");
-        assert!(!stated(&d, "wipe the build cache first"));
+        assert!(stated(&d, "go ahead and force-push it once the messages read well", &Filler::none()));
+        assert!(!stated(&d, "coordinate a history wipe among the teams", &Filler::none()), "another irreversible move");
+        assert!(!stated(&d, "wipe the build cache first", &Filler::none()));
     }
 
     #[test]
@@ -1756,10 +1845,10 @@ mod tests {
             lesson_ch("c", "rename a parser helper", "callers break"),
         ];
         let sel: Vec<&Challenge> = ls.iter().collect();
-        assert_eq!(conflicts(&sel), ["a", "b"]);
+        assert_eq!(conflicts(&sel, &Filler::none()), ["a", "b"]);
         // Same situation, same consequence in other words: no contradiction.
         let same = [lesson_ch("a", "force-push to main", "never force-push main"), lesson_ch("b", "force-push to main", "never force-push to main")];
-        assert!(conflicts(&same.iter().collect::<Vec<_>>()).is_empty());
+        assert!(conflicts(&same.iter().collect::<Vec<_>>(), &Filler::none()).is_empty());
         let mut c = cp(&store, "s1", PUSH, TASK);
         c.selected = &sel;
         let asked = consider(&c).unwrap();
@@ -1771,7 +1860,7 @@ mod tests {
         let store = tmp("c2unrelated");
         let other = [lesson_ch("p", "cache the parser tables", "stale reads"), lesson_ch("q", "cache parser tables", "faster startup, no issue")];
         let sel: Vec<&Challenge> = other.iter().collect();
-        assert_eq!(conflicts(&sel), ["p", "q"]);
+        assert_eq!(conflicts(&sel, &Filler::none()), ["p", "q"]);
         let mut c = cp(&store, "s1", PUSH, TASK);
         c.selected = &sel;
         let asked = consider(&c).unwrap();
@@ -1795,8 +1884,8 @@ mod tests {
         // Same words, other phrasing: the inputs state it too.
         let d =
             Decision { kind: Kind::Irreversible, sentence: "drop the legacy orders table".into(), what: "drop legacy orders table".into(), key: "k".into() };
-        assert!(stated(&d, "please remove the legacy orders table"));
-        assert!(!stated(&d, "speed up the checkout page"));
+        assert!(stated(&d, "please remove the legacy orders table", &Filler::none()));
+        assert!(!stated(&d, "speed up the checkout page", &Filler::none()));
     }
 
     #[test]
@@ -1871,7 +1960,7 @@ mod tests {
         let later = format!("{TASK}\n{PUSH}");
         let sel = conscience::select(&cs, &later, 5);
         assert_eq!(sel.len(), 1);
-        assert!(conscience::render(&sel).contains("Never force-push main"));
+        assert!(conscience::render(&sel, &Filler::none()).contains("Never force-push main"));
         assert_eq!(known(&lesson_lines(&store.join("lessons.jsonl")), &asked[0].decision_key), Known::Resolved);
     }
 
@@ -2089,7 +2178,7 @@ mod tests {
     fn near_duplicates_of_a_repo_are_queued_once_and_dedupe_dismisses_old_ones() {
         let store = queue("dedupe");
         let reworded = "Which retry budget applies to the payment webhook consumer now?";
-        assert!(jaccard(RETRY, reworded) >= DUPLICATE);
+        assert!(jaccard(RETRY, reworded, &Filler::none()) >= DUPLICATE);
         assert!(!seed(&store, &open_q("qd", "/w/app", reworded, &[])).unwrap(), "a reworded duplicate is not queued");
         assert!(seed(&store, &open_q("qe", "/w/lib", reworded, &[])).unwrap(), "another repo's question is its own");
         answer(&store, "qa", "three retries", "lead@x", 2).unwrap();
@@ -2104,10 +2193,17 @@ mod tests {
         assert_eq!(open_ids(&store), ["qb", "qc", "qe"]);
         assert_eq!(entries(&store).iter().find(|e| e.id == "qh").unwrap().dismissed.as_deref(), Some("duplicate of qb"));
         assert!(dedupe(&store, true, 4).unwrap().is_empty());
-        // Checkpoint questions compare by their plan sentence, not their shared frame.
+        // Checkpoint questions compare by their plan sentence, not their shared frame, nor the store's filler.
         let q = |plan: &str| Entry { question: question(&classify(plan, "app").remove(0)), ..open_q("x", "/w/app", "", &[]) };
-        assert!(!duplicate(&q("Drop the audit table."), &q("Drop the users table.")));
-        assert!(duplicate(&q("Drop the audit table."), &q("Then drop the audit table.")));
+        let f = Filler::of(&filler_corpus());
+        assert!(!duplicate(&q("Drop the audit table."), &q("Drop the users table."), &f));
+        assert!(duplicate(&q("Drop the audit table."), &q("Then drop the audit table."), &f));
+    }
+
+    /// A store of `MIN_DF_STORE` lessons sharing every word but one: those words are its filler.
+    fn filler_corpus() -> Vec<Challenge> {
+        let common = "the and will then this that with for from into our now also let lets can should would first after before all";
+        (0..30).map(|i| Challenge { id: format!("f{i}"), question: format!("{common} unique{i}"), ..Default::default() }).collect()
     }
 
     #[test]
@@ -2216,7 +2312,7 @@ mod tests {
             assert_eq!(repo(&at(d)), "lib", "{d}");
         }
         assert_eq!(repo(&at("other/docs")), "docs", "outside git: the directory's own name");
-        assert!(!duplicate(&at("work/lib/docs"), &at("other/docs")), "two repos' docs/ folders are two repos");
+        assert!(!duplicate(&at("work/lib/docs"), &at("other/docs"), &Filler::none()), "two repos' docs/ folders are two repos");
         assert_eq!(repo(&Entry { repo: "app".into(), ..at("other/docs") }), "app", "the recorded repo wins");
         // A checkpoint in a subdirectory queues its question under the repo.
         let d = decide(&Checkpoint { cwd: &root.join("work/lib/docs").display().to_string(), ..cp(&root, "s1", PUSH, TASK) }, &[], || true, Vec::new);

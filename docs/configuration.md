@@ -617,7 +617,6 @@ project.
 | Variable | Effect when `on` |
 |---|---|
 | `BORG_QUEEN` | The turn end may queue questions for the engineer (failed its test) |
-| `BORG_CONCEPTS` | Boost lessons that share engineering concepts with the work; `BORG_CONCEPTS_BETA` (0.5) sets the strength |
 | `BORG_FACETS` | `learn` and `assimilate` write facets (failed its test) |
 
 Evaluation only: `BORG_BEFORE`, `BORG_CRITIC`, `BORG_ONLY`, `BORG_EXPERT_CEILING`, `BORG_VECTORS_TRACE`.

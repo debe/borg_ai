@@ -183,14 +183,14 @@ impl Indexed {
 
     /// The repo's API vocabulary: code identifiers its claims name (`PetriNet`, `deadlockFree`,
     /// `fire_transition`) that its own code at the commit declares, so a plan that uses the API
-    /// without naming the repo still finds it. Prose about other code (`HashMap`, `created_at`,
-    /// `CompletableFuture` in a changelog) is no API of the repo: an identifier counts only when the
-    /// repo declares it and it is no well-known standard-library name. No code, no API.
+    /// without naming the repo still finds it. Prose about other code (`HashMap`, `created_at` in a
+    /// changelog) is no API of the repo: an identifier counts only when the repo's code declares it.
+    /// No code, no API.
     pub fn api(&self) -> Api {
         let mut named = BTreeSet::new();
         for c in &self.claims {
             for t in IDENT.find_iter(&c.text).chain(IDENT.find_iter(&c.index)) {
-                if is_api(t.as_str()) && !STD_API.contains(&t.as_str()) {
+                if is_api(t.as_str()) {
                     named.insert(t.as_str().to_string());
                 }
             }
@@ -215,20 +215,43 @@ impl Api {
         words.iter().any(|w| self.types.contains(*w)) || words.iter().filter(|w| self.members.contains(**w)).count() >= 2
     }
 
-    /// Without the identifiers the consumer in `dir` declares itself: its own `PetriNet` is not the
-    /// expert's. Only the identifiers `plan` uses are looked up, so this stays cheap.
+    /// Without the identifiers the consumer in `dir` declares itself (its own `PetriNet` is not the
+    /// expert's) or names in more than a third of its code files (its everyday vocabulary, such as
+    /// `CompletableFuture`, even where the expert redeclares it). Only the identifiers `plan` uses
+    /// are looked up, so this stays cheap.
     pub fn without_declared_in(mut self, dir: &Path, plan: &str) -> Api {
         let used: BTreeSet<String> =
             IDENT.find_iter(plan).map(|m| m.as_str().to_string()).filter(|w| self.types.contains(w) || self.members.contains(w)).collect();
         if used.is_empty() || dir.as_os_str().is_empty() {
             return self;
         }
-        let own = declarations(&toplevel(dir), None, &used);
-        let theirs = |t: &String| !own.types.contains(t) && !own.members.contains(t);
+        let top = toplevel(dir);
+        let own = declarations(&top, None, &used);
+        let everyday = everyday(&top, used.iter().filter(|t| !own.types.contains(*t) && !own.members.contains(*t)));
+        let theirs = |t: &String| !own.types.contains(t) && !own.members.contains(t) && !everyday.contains(t);
         self.types.retain(theirs);
         self.members.retain(theirs);
         self
     }
+}
+
+/// Which of `names` the tracked code of `top` names as a word in more than a third of its files
+/// (with at least 3 files). Any git failure counts a name as not everyday.
+fn everyday<'a>(top: &Path, names: impl Iterator<Item = &'a String>) -> BTreeSet<String> {
+    let mut ls: Vec<&str> = vec!["ls-files", "--"];
+    ls.extend(CODE);
+    let total = git(top, &ls).map(|o| o.lines().count()).unwrap_or(0);
+    if total < 3 {
+        return BTreeSet::new();
+    }
+    names
+        .filter(|n| {
+            let mut args: Vec<&str> = vec!["grep", "-l", "-w", "-F", "-e", n.as_str(), "--"];
+            args.extend(CODE);
+            git(top, &args).is_ok_and(|o| 3 * o.lines().count() > total)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Source files whose declarations make up an API.
@@ -288,245 +311,13 @@ fn declarations(top: &Path, rev: Option<&str>, names: &BTreeSet<String>) -> Api 
 }
 
 static IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap());
-/// Words with an inner capital that are prose, not API.
-const NOT_API: [&str; 8] = ["JavaScript", "TypeScript", "GitHub", "GitLab", "macOS", "iOS", "README", "CHANGELOG"];
-
-/// Standard-library and everyday names (JDK, Rust std, JS/TS, Python, schema columns) that a repo
-/// may mention, wrap or even redeclare, but that never say a plan is about that repo.
-const STD_API: &[&str] = &[
-    // Java
-    "HashMap",
-    "LinkedHashMap",
-    "TreeMap",
-    "ConcurrentHashMap",
-    "ConcurrentMap",
-    "EnumMap",
-    "IdentityHashMap",
-    "WeakHashMap",
-    "HashSet",
-    "LinkedHashSet",
-    "TreeSet",
-    "EnumSet",
-    "ArrayList",
-    "LinkedList",
-    "ArrayDeque",
-    "PriorityQueue",
-    "BlockingQueue",
-    "LinkedBlockingQueue",
-    "ArrayBlockingQueue",
-    "ConcurrentLinkedQueue",
-    "CopyOnWriteArrayList",
-    "CompletableFuture",
-    "CompletionStage",
-    "ExecutorService",
-    "ScheduledExecutorService",
-    "ThreadPoolExecutor",
-    "ForkJoinPool",
-    "CountDownLatch",
-    "CyclicBarrier",
-    "AtomicInteger",
-    "AtomicLong",
-    "AtomicBoolean",
-    "AtomicReference",
-    "ReentrantLock",
-    "ReadWriteLock",
-    "ReentrantReadWriteLock",
-    "ThreadLocal",
-    "StringBuilder",
-    "StringBuffer",
-    "BigDecimal",
-    "BigInteger",
-    "LocalDate",
-    "LocalDateTime",
-    "LocalTime",
-    "ZonedDateTime",
-    "OffsetDateTime",
-    "ZoneId",
-    "ChronoUnit",
-    "TimeUnit",
-    "InputStream",
-    "OutputStream",
-    "ByteBuffer",
-    "CharSequence",
-    "IntStream",
-    "LongStream",
-    "AutoCloseable",
-    "FunctionalInterface",
-    "IllegalArgumentException",
-    "IllegalStateException",
-    "InterruptedException",
-    "RuntimeException",
-    "NullPointerException",
-    "IOException",
-    "UncheckedIOException",
-    "TimeoutException",
-    "ExecutionException",
-    "CancellationException",
-    "UnsupportedOperationException",
-    "IndexOutOfBoundsException",
-    "ClassCastException",
-    "ConcurrentModificationException",
-    "NoSuchElementException",
-    "NumberFormatException",
-    "StackOverflowError",
-    "OutOfMemoryError",
-    "SuppressWarnings",
-    "toString",
-    "hashCode",
-    "compareTo",
-    "getClass",
-    "forEach",
-    "valueOf",
-    "orElse",
-    "orElseThrow",
-    "orElseGet",
-    "isEmpty",
-    "isPresent",
-    "ifPresent",
-    "ofNullable",
-    "getMessage",
-    "getName",
-    "getValue",
-    "getKey",
-    "setName",
-    "setValue",
-    "thenApply",
-    "thenCompose",
-    "thenAccept",
-    "supplyAsync",
-    "runAsync",
-    "parseInt",
-    "toList",
-    // Rust
-    "BTreeMap",
-    "BTreeSet",
-    "VecDeque",
-    "BinaryHeap",
-    "IntoIterator",
-    "FromIterator",
-    "DoubleEndedIterator",
-    "ExactSizeIterator",
-    "AsRef",
-    "AsMut",
-    "ToString",
-    "ToOwned",
-    "PartialEq",
-    "PartialOrd",
-    "DefaultHasher",
-    "JoinHandle",
-    "RwLock",
-    "OnceCell",
-    "OnceLock",
-    "LazyLock",
-    "LazyCell",
-    "RefCell",
-    "PhantomData",
-    "PathBuf",
-    "OsString",
-    "SystemTime",
-    "TryFrom",
-    "TryInto",
-    "FromStr",
-    "into_iter",
-    "iter_mut",
-    "unwrap_or",
-    "unwrap_or_else",
-    "unwrap_or_default",
-    "as_str",
-    "as_ref",
-    "as_mut",
-    "to_string",
-    "to_owned",
-    "to_vec",
-    "from_str",
-    "ok_or",
-    "ok_or_else",
-    "and_then",
-    "map_err",
-    "is_empty",
-    "is_some",
-    "is_none",
-    "with_capacity",
-    "read_to_string",
-    "spawn_blocking",
-    // JS / TS
-    "setTimeout",
-    "setInterval",
-    "clearTimeout",
-    "clearInterval",
-    "addEventListener",
-    "removeEventListener",
-    "toFixed",
-    "getElementById",
-    "querySelector",
-    "querySelectorAll",
-    "AbortController",
-    "AbortSignal",
-    "ReadableStream",
-    "WritableStream",
-    "WeakMap",
-    "WeakSet",
-    "WeakRef",
-    "ArrayBuffer",
-    "Uint8Array",
-    "EventEmitter",
-    "EventTarget",
-    "TypeError",
-    "RangeError",
-    "SyntaxError",
-    "ReferenceError",
-    "useState",
-    "useEffect",
-    "useMemo",
-    "useCallback",
-    "useRef",
-    "toISOString",
-    "localStorage",
-    "sessionStorage",
-    "innerHTML",
-    "textContent",
-    "readFileSync",
-    "writeFileSync",
-    // Python
-    "__init__",
-    "__name__",
-    "__main__",
-    "__repr__",
-    "__str__",
-    "__eq__",
-    "__hash__",
-    "__call__",
-    "__enter__",
-    "__exit__",
-    "ValueError",
-    "KeyError",
-    "IndexError",
-    "RuntimeError",
-    "TypeVar",
-    "NamedTuple",
-    "OrderedDict",
-    "defaultdict",
-    // Columns and fields every schema has
-    "created_at",
-    "updated_at",
-    "deleted_at",
-    "user_id",
-    "created_by",
-    "updated_by",
-    "createdAt",
-    "updatedAt",
-    "deletedAt",
-    "userId",
-    "timeoutMs",
-    "timeout_ms",
-];
 
 /// An identifier that can only be code: camelCase / PascalCase with an inner capital, or snake_case.
 fn is_api(t: &str) -> bool {
     let b = t.as_bytes();
     let inner_capital = b.windows(2).any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
     let snake = t.trim_matches('_').contains('_') && t.chars().any(|c| c.is_ascii_lowercase());
-    t.len() >= 5 && (inner_capital || snake) && !NOT_API.contains(&t)
+    t.len() >= 5 && (inner_capital || snake)
 }
 
 /// What to ask the expert about a plan: the plan's sentences that mention the dependency, by one of
@@ -1395,19 +1186,8 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
         let (f, c) = repo_with("mention", &[("CHANGELOG.md", &log), ("spec/core.md", E1_SPEC), ("java/src/main/java/org/flowlib/PetriNet.java", API_JAVA)]);
         let api = Indexed::open(&f.0, &c, Some("java 9.0.0"), None).unwrap().api();
         assert!(api.types.contains("PetriNet") && api.members.contains("deadlockFree") && api.members.contains("fireAsync"), "{api:?}");
-        // Named in the changelog but not declared by the repo, or a standard name: no API.
-        for w in [
-            "TypeScript",
-            "Timer",
-            "HashMap",
-            "LinkedHashMap",
-            "CompletableFuture",
-            "ConcurrentHashMap",
-            "ExecutorService",
-            "created_at",
-            "timeoutMs",
-            "toString",
-        ] {
+        // Named in the changelog but not declared by the repo: no API.
+        for w in ["TypeScript", "Timer", "HashMap", "LinkedHashMap", "CompletableFuture", "ConcurrentHashMap", "ExecutorService", "created_at", "timeoutMs"] {
             assert!(!api.types.contains(w) && !api.members.contains(w), "{w}: {api:?}");
         }
         let names = ["flowlib", "org.flowlib"];
@@ -1436,6 +1216,29 @@ public final class PetriNet {\n  private final HashMap<String, Long> timeoutMs =
         assert!(plan_query("Bump org.flowlib:flowlib to 10.", &names, &api).is_some());
         assert!(plan_query("Rename myflowlibx and the flowlibfication step.", &names, &api).is_none());
         assert!(plan_query("Fix the CSS of the login page. Then run the tests.", &names, &api).is_none());
+    }
+
+    #[test]
+    fn std_names_need_a_declaration() {
+        let log = "# Changelog\n\n## 1.0.0\n\n- PetriNet keeps its places in a HashMap.\n";
+        let (f, c) = repo_with("stdnames", &[("CHANGELOG.md", log), ("src/Net.java", "public class PetriNet { }\n")]);
+        let api = Indexed::open(&f.0, &c, None, None).unwrap().api();
+        assert!(api.types.contains("PetriNet"), "{api:?}");
+        assert!(!api.types.contains("HashMap") && !api.members.contains("HashMap"), "{api:?}");
+    }
+
+    #[test]
+    fn everyday_consumer_names_are_not_api() {
+        let (f, c) = repo_with("everyday-expert", &[("src/Future.java", "public class CompletableFuture { }\npublic class PetriNet { }\n")]);
+        let api = declarations(&f.0, Some(&c), &["CompletableFuture", "PetriNet"].map(String::from).into());
+        assert!(api.types.contains("CompletableFuture"), "{api:?}");
+        let use_it = "class A { CompletableFuture<String> f; }\n";
+        let (own, _) =
+            repo_with("everyday-consumer", &[("src/A.java", use_it), ("src/B.java", use_it), ("src/C.java", "class C { CompletableFuture<PetriNet> g; }\n")]);
+        let plan = "Return a CompletableFuture of the PetriNet.";
+        let kept = api.without_declared_in(&own.0, plan);
+        assert!(!kept.types.contains("CompletableFuture"), "{kept:?}");
+        assert!(kept.types.contains("PetriNet"), "named in a third of the files, not more: {kept:?}");
     }
 
     #[test]

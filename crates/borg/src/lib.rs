@@ -16,8 +16,6 @@ pub mod check_async;
 pub mod clock;
 pub mod collective;
 pub mod completions;
-#[doc(hidden)]
-pub mod concepts;
 pub mod conscience;
 pub mod cues;
 pub mod escalation;

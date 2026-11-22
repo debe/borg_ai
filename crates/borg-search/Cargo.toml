@@ -38,6 +38,11 @@ path = "src/bin/hs.rs"
 required-features = ["seekstorm"]
 
 [[bin]]
+name = "hs-pools"
+path = "src/bin/hs-pools.rs"
+required-features = ["seekstorm"]
+
+[[bin]]
 name = "hs-facets"
 path = "src/bin/hs-facets.rs"
 
@@ -45,10 +50,6 @@ path = "src/bin/hs-facets.rs"
 name = "hs-vectors"
 path = "src/bin/hs-vectors.rs"
 required-features = ["vectors"]
-
-[[bin]]
-name = "hs-concepts"
-path = "src/bin/hs-concepts.rs"
 
 [[bin]]
 name = "hs-whole"

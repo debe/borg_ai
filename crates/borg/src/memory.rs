@@ -490,7 +490,7 @@ impl Distinctive {
     pub fn new(all: &[Challenge]) -> Self {
         let mut df: HashMap<String, usize> = HashMap::new();
         for c in all {
-            for t in crate::conscience::tokens(&c.question).into_iter().collect::<HashSet<_>>() {
+            for t in crate::conscience::tokens_with(&c.question, crate::conscience::LEGACY).into_iter().collect::<HashSet<_>>() {
                 *df.entry(t).or_default() += 1;
             }
         }
@@ -504,7 +504,7 @@ impl Distinctive {
 
     /// The distinctive words of `text`.
     pub fn words(&self, text: &str) -> HashSet<String> {
-        crate::conscience::tokens(text).into_iter().filter(|t| self.is(t)).collect()
+        crate::conscience::tokens_with(text, crate::conscience::LEGACY).into_iter().filter(|t| self.is(t)).collect()
     }
 }
 
@@ -526,7 +526,7 @@ pub const NOVEL_WORDS: usize = 3;
 ///   them (the R1 replay's control matched other cases' edits as often as a run's own).
 pub fn resolve(asked: &[&Challenge], all: &[Challenge], before: &str, after: &str, final_msg: &str, min_new: usize) -> (Vec<String>, Vec<String>) {
     let words = Distinctive::new(all);
-    let had: HashSet<String> = crate::conscience::tokens(before).into_iter().collect();
+    let had: HashSet<String> = crate::conscience::tokens_with(before, crate::conscience::LEGACY).into_iter().collect();
     let new: HashSet<String> = words.words(&format!("{after}\n{final_msg}")).into_iter().filter(|w| !had.contains(w)).collect();
     let lower = final_msg.to_lowercase();
     let (mut changed, mut ignored) = (Vec::new(), Vec::new());
