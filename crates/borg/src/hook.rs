@@ -7,7 +7,6 @@
 //! `main` routes and records presence; [`dispatch`] has one function per event. Hooks always fail open:
 //! any error lets the drone continue untouched.
 
-use std::cell::LazyCell;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -16,7 +15,6 @@ use serde_json::{Value, json};
 
 use crate::harness::{self, Harness};
 use crate::learn::learning;
-use crate::queen::Filler;
 use crate::{collective, conscience, learn, live, outcome, predict, prefilter};
 
 pub(crate) fn state_file(session: &str) -> PathBuf {
@@ -269,13 +267,6 @@ fn lessons_path() -> PathBuf {
     std::env::var_os("BORG_CONSCIENCE").map(PathBuf::from).unwrap_or_else(|| learn::home().join("lessons.jsonl"))
 }
 
-/// The filler words (queen.rs `Filler`) of `all`, the lessons the hook loaded, learned on first use.
-/// Learning them from `all` cost a hook 3.5 ms on a 721-lesson store, re-reading the store for them
-/// (`Filler::for_store`) 6 ms (release build, 2026-11-22).
-fn filler_of(all: &[conscience::Challenge]) -> LazyCell<Filler, impl FnOnce() -> Filler + '_> {
-    LazyCell::new(|| Filler::of(all))
-}
-
 /// What the drone did, for R1 (`pending`, `early_acted`): one line per Edit/Write/MultiEdit/NotebookEdit
 /// (path and the start of the new text); at each Stop block the blocked message and `#borg-asked <ids>`;
 /// the drone's answer at the turn end after it (`#borg-answer <message>`); `#borg-early <ids>` per early
@@ -364,14 +355,14 @@ fn acted_since(state: &str, edits: &str, all: &[conscience::Challenge], final_ms
     // Per slot: its first word's byte in the state file, its first .edits line, its last work line, and
     // whether the final message has it.
     let (mut first_byte, mut first_line, mut last_work, mut in_final) = (vec![usize::MAX; n], vec![usize::MAX; n], vec![None; n], vec![false; n]);
-    conscience::tokens_at(state, conscience::LEGACY, |at, t| {
+    conscience::tokens_at(state, |at, t| {
         if let Some(s) = slot.get(t) {
             first_byte[*s] = first_byte[*s].min(at);
         }
     });
     for (q, l) in lines.iter().enumerate() {
         let work = !l.starts_with("#borg-");
-        conscience::tokens_at(l, conscience::LEGACY, |_, t| {
+        conscience::tokens_at(l, |_, t| {
             if let Some(s) = slot.get(t) {
                 first_line[*s] = first_line[*s].min(q);
                 if work {
@@ -380,7 +371,7 @@ fn acted_since(state: &str, edits: &str, all: &[conscience::Challenge], final_ms
             }
         });
     }
-    conscience::tokens_at(final_msg, conscience::LEGACY, |_, t| {
+    conscience::tokens_at(final_msg, |_, t| {
         if let Some(s) = slot.get(t) {
             in_final[*s] = true;
         }
@@ -1418,16 +1409,7 @@ fn early(h: &dyn Harness, so_far: &SoFar, hook_event: &str, session: &str, input
     note_work(session, so_far, &line);
     let p = conscience::early_propensity(&pool, session, &shown_topics);
     let p: Vec<f64> = delivered.iter().map(|c| p.get(&c.id).copied().unwrap_or(0.0)).collect();
-    record_delivery(
-        session,
-        input,
-        delivered,
-        "early",
-        &check,
-        p,
-        early_rel(&challenges, &conscience::work_text(&context), &topics, delivered),
-        &filler_of(&challenges),
-    );
+    record_delivery(session, input, delivered, "early", &check, p, early_rel(&challenges, &conscience::work_text(&context), &topics, delivered));
     log_cost(session, &format!("free event={hook_event} lessons={} chars={}", delivered.len(), text.len()));
     crate::stats::count(&learn::home(), crate::stats::EARLY, session, |e| {
         e.n = delivered.len() as u64;
@@ -1461,9 +1443,8 @@ fn note_work(session: &str, so_far: &SoFar, lines: &str) {
 /// with each one's propensity `p` and, early, its relative score `rel` (`early_rel`): delivered as
 /// context, the lessons wait for a result as a Stop's questions do. The next judge (`pending`) labels
 /// them changed or ignored, a merged correction corrected (outcome.rs `contradicted`), and `borg learn`
-/// settles the rest. Nothing with learning off. `f`: the store's filler words, for their disagreements.
-#[allow(clippy::too_many_arguments)] // reason: one delivery record, from the parts each channel holds apart
-fn record_delivery(session: &str, input: &Value, delivered: &[&conscience::Challenge], channel: &str, check: &str, p: Vec<f64>, rel: Vec<f64>, f: &Filler) {
+/// settles the rest. Nothing with learning off.
+fn record_delivery(session: &str, input: &Value, delivered: &[&conscience::Challenge], channel: &str, check: &str, p: Vec<f64>, rel: Vec<f64>) {
     if !learning() || delivered.is_empty() {
         return;
     }
@@ -1475,7 +1456,7 @@ fn record_delivery(session: &str, input: &Value, delivered: &[&conscience::Chall
         lessons,
         ms: learn::now_ms(),
         repo: repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()),
-        groups: conscience::disagreement_ids(delivered, f),
+        groups: conscience::disagreement_ids(delivered),
         channel: channel.into(),
         grades,
         ranks,
@@ -1703,9 +1684,8 @@ fn proposal_of<'e>(edits: &'e str, check: &str) -> Option<&'e str> {
 /// when a wake carried them) in the state file, the pair after the judged message in the .edits file,
 /// the work before the questions (`pending`), so the next stop records the drone's answer
 /// (`note_answer`); each recorded as asked on channel live (`record_asked`); the cost line, `event` the
-/// hook's or `wake`; and the stat. `f`: the store's filler words (`filler_of`).
-#[allow(clippy::too_many_arguments)] // reason: one late ask's records, from the parts the caller holds apart
-fn mark_late(session: &str, input: &Value, check: &str, members: &[&conscience::Challenge], said: &str, event: &str, chars: usize, f: &Filler) {
+/// hook's or `wake`; and the stat.
+fn mark_late(session: &str, input: &Value, check: &str, members: &[&conscience::Challenge], said: &str, event: &str, chars: usize) {
     let list = members.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(",");
     let via = if event == WAKE_EVENT { format!(" via={WAKE_EVENT}") } else { String::new() };
     let marker = format!("#borg-asked {list}{}\n#borg-live {list} ms={}{via}", tag(check), learn::now_ms());
@@ -1713,7 +1693,7 @@ fn mark_late(session: &str, input: &Value, check: &str, members: &[&conscience::
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(edits_file(session)) {
         let _ = writeln!(f, "{said}\n{marker}");
     }
-    record_asked(session, input, members, "live", check, f);
+    record_asked(session, input, members, "live", check);
     log_cost(session, &format!("late event={event} questions={} chars={chars}", members.len()));
     crate::stats::count(&learn::home(), crate::stats::LIVE_ASK, session, |e| {
         e.n = members.len() as u64;
@@ -1838,12 +1818,11 @@ pub(crate) fn reserve_asks(session: &str, wanted: &[(String, Vec<String>)]) -> O
         return None;
     }
     let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
-    let filler = Filler::of(&all);
     let mut parts = Vec::new();
     let mut wake = Vec::new();
     for (check, ids) in &taken {
         let members: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| all.iter().find(|c| &c.id == i)).collect();
-        parts.push(conscience::render_late(&members, &one_line(proposal_of(&edits, check).unwrap_or_default(), LATE_EXCERPT), &filler));
+        parts.push(conscience::render_late(&members, &one_line(proposal_of(&edits, check).unwrap_or_default(), LATE_EXCERPT)));
         wake.extend(ids.iter().map(|id| lesson_wake_id(check, id)));
     }
     Some((parts.join("\n\n"), wake))
@@ -1899,7 +1878,6 @@ fn take_reserved(session: &str, ids: Option<&[String]>, then: impl FnOnce(&[(Str
 /// taken (an earlier answer, `release_asks`).
 pub(crate) fn commit_asks(session: &str, cwd: &str, ids: &[String]) -> Vec<String> {
     let all = lessons(session);
-    let filler = filler_of(&all);
     let edits = std::fs::read_to_string(edits_file(session)).unwrap_or_default();
     let input = json!({"session_id": session, "cwd": cwd});
     let mut out = Vec::new();
@@ -1907,8 +1885,8 @@ pub(crate) fn commit_asks(session: &str, cwd: &str, ids: &[String]) -> Vec<Strin
         for (check, ids) in taken {
             let members: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| all.iter().find(|c| &c.id == i)).collect();
             let said = proposal_of(&edits, check).unwrap_or_default();
-            let chars = conscience::render_late(&members, &one_line(said, LATE_EXCERPT), &filler).len();
-            mark_late(session, &input, check, &members, said, WAKE_EVENT, chars, &filler);
+            let chars = conscience::render_late(&members, &one_line(said, LATE_EXCERPT)).len();
+            mark_late(session, &input, check, &members, said, WAKE_EVENT, chars);
             out.extend(members.iter().map(|c| c.id.clone()));
         }
         true
@@ -2003,7 +1981,6 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
     reclaim_reserved(session);
     let text = take_queue(session)?;
     let all = lessons(session);
-    let filler = filler_of(&all);
     let state = std::fs::read_to_string(state_file(session)).unwrap_or_default();
     let had = had_in(&state);
     let mut done: Option<std::collections::HashSet<&str>> = None;
@@ -2076,8 +2053,8 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
     for (check, ids) in by_check(&late) {
         let members: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| late.iter().find(|(c, _)| c.id == *i).map(|(c, _)| *c)).collect();
         let said = proposal_of(&edits, check).unwrap_or_default();
-        let text = conscience::render_late(&members, &one_line(said, LATE_EXCERPT), &filler);
-        mark_late(session, input, check, &members, said, hook_event, text.len(), &filler);
+        let text = conscience::render_late(&members, &one_line(said, LATE_EXCERPT));
+        mark_late(session, input, check, &members, said, hook_event, text.len());
         so_far.late.borrow_mut().extend(ids.iter().map(|id| lesson_wake_id(check, id)));
         parts.push(text);
     }
@@ -2089,7 +2066,7 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
             let list = ids.join(",");
             markers.push(format!("#borg-asked {list}{}\n#borg-live {list} ms={now}", tag(check)));
             let members: Vec<&conscience::Challenge> = ids.iter().filter_map(|i| free.iter().find(|c| c.id == *i).copied()).collect();
-            record_asked(session, input, &members, "live", check, &filler);
+            record_asked(session, input, &members, "live", check);
         }
         for (check, ids) in by_check(&wanted[asks..n]) {
             markers.push(format!("#borg-queued {}{}", ids.join(","), tag(check)));
@@ -2097,7 +2074,7 @@ fn queued(so_far: &SoFar, hook_event: &str, session: &str, input: &Value) -> Opt
             // The routing check's chance of handing each over free; 1 on an older binary's line (the
             // fixed rule's certain hand-over).
             let p = if check.is_empty() { vec![1.0; ids.len()] } else { tagged_p(&state, "#borg-pf ", check, &ids) };
-            record_delivery(session, input, &delivered, "queued", check, p, Vec::new(), &filler);
+            record_delivery(session, input, &delivered, "queued", check, p, Vec::new());
         }
         record_routes(session, input, &wanted[asks..n], "queued", outcome::ROUTE_FREE, "");
         log_cost(session, &format!("free event={hook_event} lessons={n} chars={} graded dropped={}", text.len(), wanted.len() - n));
@@ -3257,7 +3234,7 @@ fn on_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
         summary: &summary,
     };
     let out = match stop_select(h, session, input, &work) {
-        Ok(selected) => stop_ask(h, session, input, selected, &check_id, &all),
+        Ok(selected) => stop_ask(h, session, input, selected, &check_id),
         Err(out) => out,
     };
     drop(lock);
@@ -3372,11 +3349,10 @@ fn stop_detached(
     queen_at_stop(h, session, input)
 }
 
-/// A stop that asks nothing: the queen's question (queen.rs `stop`), when it has one. No lessons to
-/// render, so no filler words to learn.
+/// A stop that asks nothing: the queen's question (queen.rs `stop`), when it has one.
 fn queen_at_stop(h: &dyn Harness, session: &str, input: &Value) -> Option<Value> {
     let prompts = std::fs::read_to_string(prompts_file(session)).unwrap_or_default();
-    crate::queen::stop(session, input, &|| harness::plan(h.caps(), input), &prompts, &[], &Filler::none())
+    crate::queen::stop(session, input, &|| harness::plan(h.caps(), input), &prompts, &[])
 }
 
 /// A stop the free gate (or an empty pool) skipped: `#borg-skip <why>`, its stat, the queen's question.
@@ -3645,9 +3621,8 @@ fn graded_of(session: &str, ids: &[String]) -> (Vec<u8>, Vec<u16>, u16) {
 /// Outcome tracking (outcome.rs) of `lessons` asked on `channel` (stop; live, a check's ask from before
 /// 0.7.6), routed by `check`: `borg learn` later sees whether a correction followed. The `asked` record
 /// names the check and carries its p and pool, so a verdict and the settle land on the check that decided
-/// the lesson; then its `delivery` record. Nothing with learning off or without lessons. `f`: the store's
-/// filler words (queen.rs `Filler`), for the lessons' disagreements.
-fn record_asked(session: &str, input: &Value, lessons: &[&conscience::Challenge], channel: &str, check: &str, f: &Filler) {
+/// the lesson; then its `delivery` record. Nothing with learning off or without lessons.
+fn record_asked(session: &str, input: &Value, lessons: &[&conscience::Challenge], channel: &str, check: &str) {
     if !learning() || lessons.is_empty() {
         return;
     }
@@ -3664,7 +3639,7 @@ fn record_asked(session: &str, input: &Value, lessons: &[&conscience::Challenge]
         ms: learn::now_ms(),
         repo: repo_of(input.get("cwd").and_then(Value::as_str).unwrap_or_default()),
         // The asked lessons' disagreements (outcome.rs `contradicted` reads them across the session's records).
-        groups: conscience::disagreement_ids(lessons, f),
+        groups: conscience::disagreement_ids(lessons),
         channel: channel.into(),
         grades,
         ranks,
@@ -3681,16 +3656,8 @@ fn record_asked(session: &str, input: &Value, lessons: &[&conscience::Challenge]
 }
 
 /// The stop asks `selected`, routed by its `check`: one block (the queen's, when it asks too),
-/// `#borg-asked <ids> @<check>`, its `asked` record and its `delivery` record. The block and the record
-/// share one set of filler words (queen.rs `Filler`), learned from `all` only when there is a lesson to ask.
-fn stop_ask(
-    h: &dyn Harness,
-    session: &str,
-    input: &Value,
-    mut lessons: Vec<&conscience::Challenge>,
-    check: &str,
-    all: &[conscience::Challenge],
-) -> Option<Value> {
+/// `#borg-asked <ids> @<check>`, its `asked` record and its `delivery` record.
+fn stop_ask(h: &dyn Harness, session: &str, input: &Value, mut lessons: Vec<&conscience::Challenge>, check: &str) -> Option<Value> {
     // Shown in an order stable within the session but different across sessions: no lesson always
     // sits first (position bias; memory.rs `shuffle`).
     crate::memory::shuffle(&mut lessons, session);
@@ -3707,13 +3674,12 @@ fn stop_ask(
     // L4 (queen.rs): a rare, budgeted question to the engineer when the conscience had nothing
     // or its lessons contradict each other (its block then carries the lessons too).
     let prompts = std::fs::read_to_string(prompts_file(session)).unwrap_or_default();
-    let filler = Filler::of(if lessons.is_empty() { &[] } else { all });
-    let queen = crate::queen::stop(session, input, &|| harness::plan(h.caps(), input), &prompts, &lessons, &filler);
+    let queen = crate::queen::stop(session, input, &|| harness::plan(h.caps(), input), &prompts, &lessons);
     if lessons.is_empty() {
         return queen;
     }
-    record_asked(session, input, &lessons, "stop", check, &filler);
-    let out = queen.or_else(|| Some(json!({"decision": "block", "reason": conscience::render(&lessons, &filler)})));
+    record_asked(session, input, &lessons, "stop", check);
+    let out = queen.or_else(|| Some(json!({"decision": "block", "reason": conscience::render(&lessons)})));
     let chars = out.as_ref().and_then(|o| o["reason"].as_str()).map_or(0, str::len);
     log_cost(session, &format!("block questions={} chars={chars}", lessons.len()));
     stat(session, input, crate::stats::BLOCK, |e| {
@@ -3855,10 +3821,10 @@ mod tests {
         assert_eq!(proposal_of(edits, "0123456789"), None, "a whole id only");
         assert_eq!(proposal_of(edits, ""), None, "a line of an older binary has no check");
         let l = conscience::Challenge { id: "L1".into(), question: "Is the budget drained?".into(), ..Default::default() };
-        let text = conscience::render_late(&[&l], &one_line("I drop\n the token.", LATE_EXCERPT), &crate::queen::Filler::none());
+        let text = conscience::render_late(&[&l], &one_line("I drop\n the token.", LATE_EXCERPT));
         assert!(text.contains("your turn that ended with \"I drop the token.…\"") && text.contains("1. [L1] Is the budget drained?"), "{text}");
         assert!(text.contains("`<id>: applies`") && text.contains("already settled"), "{text}");
-        assert!(conscience::render_late(&[&l], "", &crate::queen::Filler::none()).contains("After your last turn"));
+        assert!(conscience::render_late(&[&l], "").contains("After your last turn"));
     }
 
     #[test]

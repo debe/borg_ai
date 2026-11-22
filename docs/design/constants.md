@@ -343,7 +343,7 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg/src/select/replay.rs` | `LOOSEST` | `Some(u64::MAX)` ms | The latency limit the replay chooses pools under, as the budget's `price` replays them: P3's pool spend is the most any hook's limit allows (none at all would forbid every pool above the baseline) |
 | `borg/src/hook.rs` | `DECIDE_POLL` | 5 ms | How often a check waiting for the store's decision lock tries it again |
 | `borg/src/conscience.rs` | `P_DRAWS` | 512 | Draws behind a propensity: standard error at most 1 / (2√512) ≈ 0.022 |
-| `borg/src/conscience.rs` | `RANKING` | k1 1.2, b 0.75, no df cut, `LEGACY` tokens, question only | BM25's standard parameters (Robertson and Zaragoza 2009) over 0.7.7's tokens and the question, never tuned on borg's data |
+| `borg/src/conscience.rs` | `BM25_K1`, `BM25_B` | 1.2, 0.75 | BM25's standard parameters (Robertson and Zaragoza 2009), never tuned on borg's data |
 | `borg/src/ope.rs` | `AGREE` | 0.01 | A replayed p this close to the logged one is the same draw: the logged p is rounded, the estimate Monte Carlo |
 | `borg/src/ope.rs` | `SEED` | `0x006f_7065` | The bootstrap's seed, fixed so a run is deterministic (select/replay.rs's too) |
 | `borg/src/memory_export.rs` | `beta_cf`'s `TINY`, `EPS`, `MAX_TERMS` | 10⁻³⁰⁰, 10⁻¹⁵, 10,000 terms | The incomplete Beta's continued fraction (Lentz's method): `TINY` keeps a denominator off zero, `EPS` is double precision, and the fraction needs about √max(a, b) terms, so `MAX_TERMS` covers beliefs of millions of outcomes and is never the stop |
@@ -455,7 +455,6 @@ later value would be compared against.
 | `borg-search/src/bin/hs-vectors.rs` | `SHORT`, `WIDE`, `VECTOR_TOP` | 20, 30, 60 | Vector shortlist arms |
 | `borg-search/src/bin/hs-whole.rs` | `BM25_N` | 30 | Whole-pool arms |
 | `borg-search/src/seek.rs` | `CHUNK` | 1,000 | Model2Vec's chunk size, SeekStorm's README example |
-| `borg-search/src/bin/hs-pools.rs` | `DEPTH` | 10 | The code-aware lexical re-test's NDCG rank depth; a check's pool shows about this many lessons |
 | `borg/src/whole.rs` | `BOUNDARY_SHARE` | 0.15 (`BORG_BOUNDARY=off`: 0) | Dated decision, 2026-11-03: the boundary draw's share of the pool budget and the tail sample's of the dropped lessons, sized for the pre-registered switch test of the pool's order (about 100 tail applies at grade ≥ 2 per evaluation window) |
 | eval switches | `BORG_STOP_ASK_CAP`, `BORG_STOP_ATTENTION=on` | | Eval arms; `BORG_SELECT=fixed` wins over the cap, which wins over attention, and both over the learned policy |
 | `eval/` | each script | | Each evaluation's parameters stay with its scripts and README |

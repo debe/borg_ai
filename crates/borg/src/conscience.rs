@@ -11,7 +11,6 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::collective::{self, Aliases};
-use crate::queen::Filler;
 use crate::trust;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -382,77 +381,17 @@ fn canonical(c: &mut Challenge, aliases: &Aliases) {
     (c.engineers, c.joined) = (engineers, joined);
 }
 
-/// How a word made of several parts becomes tokens (`TokenRule`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Compound {
-    /// 0.7.7's: a word is a run of alphanumerics and `_`; its lowercased whole, then its camelCase parts.
-    Legacy,
-    /// Code-aware: a word is a run of alphanumerics, `_` and `-` (trimmed of edge `_`/`-`); its parts
-    /// (`segments`) joined, then each part, so `risk_url`, `riskUrl` and `RISK-URL` all match.
-    Code,
-}
-
-/// A tokenizer: the shortest token kept (bytes) and how compound words split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenRule {
-    pub min_len: usize,
-    pub compound: Compound,
-}
-
-/// 0.7.7's tokenizer: words of 3+ bytes plus camelCase parts. Set-overlap consumers (memory.rs
-/// `Distinctive`, hook.rs `acted_since`, queen.rs `words`) keep it whatever the ranking uses.
-pub const LEGACY: TokenRule = TokenRule { min_len: 3, compound: Compound::Legacy };
-
-/// Which lesson text forms a lesson's first search document (`documents_with`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Fields {
-    Question,
-    QuestionSituationsConsequence,
-}
-
-/// Lexical ranking parameters: Okapi BM25's term-frequency saturation `k1` and length normalisation
-/// `b`, an optional document-frequency cut (query words in more than this share of documents are
-/// dropped, applied from `MIN_DF_STORE` documents on), the tokenizer and the fields searched.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bm25 {
-    pub k1: f64,
-    pub b: f64,
-    pub df_cut: Option<f64>,
-    pub rule: TokenRule,
-    pub fields: Fields,
-}
-
-/// The ranking's lexical parameters. Baseline (method): Robertson and Zaragoza's defaults, untuned
-/// ("The Probabilistic Relevance Framework: BM25 and Beyond", 2009), over the questions, 0.7.7's tokens.
-pub const RANKING: Bm25 = Bm25 { k1: 1.2, b: 0.75, df_cut: None, rule: LEGACY, fields: Fields::Question };
-
-/// A store below this many lessons applies no document-frequency cut (shares are noise).
-pub const MIN_DF_STORE: usize = 30;
-
-/// `tokens_with` under the ranking's rule (`RANKING.rule`).
+/// Lowercased words of 3+ characters, plus the parts of camelCase words.
 pub fn tokens(text: &str) -> Vec<String> {
-    tokens_with(text, RANKING.rule)
-}
-
-/// The tokens of `text` under `rule`, in order.
-pub fn tokens_with(text: &str, rule: TokenRule) -> Vec<String> {
     let mut out = Vec::new();
-    tokens_at(text, rule, |_, t| out.push(t.to_string()));
+    tokens_at(text, |_, t| out.push(t.to_string()));
     out
 }
 
-/// `tokens_with`, each handed to `f` with the byte offset in `text` of the word it comes from (a part
-/// has its word's): the same tokens in the same order. Under `Compound::Legacy` they are lowercased
-/// into one reused buffer, so an ASCII word costs no allocation (hook.rs `early_acted` indexes a whole
-/// session this way).
-pub fn tokens_at(text: &str, rule: TokenRule, f: impl FnMut(usize, &str)) {
-    match rule.compound {
-        Compound::Legacy => legacy_at(text, rule.min_len, f),
-        Compound::Code => code_at(text, rule.min_len, f),
-    }
-}
-
-fn legacy_at(text: &str, min_len: usize, mut f: impl FnMut(usize, &str)) {
+/// `tokens`, each handed to `f` with the byte offset in `text` of the word it comes from (a camelCase
+/// part has its word's): the same tokens in the same order, lowercased into one reused buffer, so an
+/// ASCII word costs no allocation (hook.rs `early_acted` indexes a whole session this way).
+pub fn tokens_at(text: &str, mut f: impl FnMut(usize, &str)) {
     let mut low = String::new();
     let mut emit = |at: usize, s: &str| {
         low.clear();
@@ -465,50 +404,24 @@ fn legacy_at(text: &str, min_len: usize, mut f: impl FnMut(usize, &str)) {
         f(at, &low);
     };
     for raw in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if raw.len() < min_len {
+        if raw.len() < 3 {
             continue;
         }
         let at = raw.as_ptr() as usize - text.as_ptr() as usize;
         emit(at, raw);
-        camel_parts(raw, min_len, |word| emit(at, word));
-    }
-}
-
-/// The camelCase parts of `raw` (split before each uppercase letter) of `min_len`+ bytes and shorter
-/// than `raw`, in order (`legacy_at`).
-fn camel_parts<'a>(raw: &'a str, min_len: usize, mut emit: impl FnMut(&'a str)) {
-    let mut keep = |word: &'a str| {
-        if word.len() >= min_len && word.len() < raw.len() {
-            emit(word);
-        }
-    };
-    let mut start = 0;
-    for (i, ch) in raw.char_indices() {
-        if ch.is_uppercase() && i > start {
-            keep(&raw[start..i]);
-            start = i;
-        }
-    }
-    keep(&raw[start..]);
-}
-
-fn code_at(text: &str, min_len: usize, mut f: impl FnMut(usize, &str)) {
-    let edge = |c: char| c == '_' || c == '-';
-    for raw in text.split(|c: char| !c.is_alphanumeric() && !edge(c)) {
-        let word = raw.trim_matches(edge);
-        if word.is_empty() {
-            continue;
-        }
-        let at = word.as_ptr() as usize - text.as_ptr() as usize;
-        let parts = segments(word);
-        let concat = parts.concat();
-        if concat.len() >= min_len {
-            f(at, &concat);
-        }
-        if parts.len() > 1 {
-            for p in parts.iter().filter(|p| p.len() >= min_len) {
-                f(at, p);
+        let mut start = 0;
+        for (i, ch) in raw.char_indices() {
+            if ch.is_uppercase() && i > start {
+                let word = &raw[start..i];
+                if word.len() >= 3 && word.len() < raw.len() {
+                    emit(at, word);
+                }
+                start = i;
             }
+        }
+        let word = &raw[start..];
+        if word.len() >= 3 && word.len() < raw.len() {
+            emit(at, word);
         }
     }
 }
@@ -581,7 +494,7 @@ pub fn rank_scoped<'a>(challenges: &'a [Challenge], context: &str, scope_text: &
 /// logs it (pools.rs `bm25q`).
 pub fn raw(challenges: &[Challenge], context: &str) -> Vec<f64> {
     let groups: Vec<Vec<Vec<String>>> = challenges.iter().map(documents).collect();
-    bm25_groups_with(&groups, context, 0.0, &RANKING)
+    bm25_groups(&groups, context, 0.0)
 }
 
 /// `rank_scoped` from the word matches `raw` computed (aligned with `challenges`).
@@ -689,26 +602,15 @@ impl Names {
     }
 }
 
-/// Whether `p.df_cut` drops a query word that `df` of `count` documents hold (none below `MIN_DF_STORE`).
-fn cut(df: f64, count: usize, p: &Bm25) -> bool {
-    p.df_cut.is_some_and(|c| count >= MIN_DF_STORE && df / count as f64 > c)
-}
+/// Okapi BM25's term-frequency saturation and length normalisation (`bm25`, `bm25_groups`). Method:
+/// the standard parameters (Robertson and Zaragoza, "The Probabilistic Relevance Framework: BM25 and
+/// Beyond", 2009); never tuned on borg's data.
+pub const BM25_K1: f64 = 1.2;
+pub const BM25_B: f64 = 0.75;
 
-/// BM25's idf of a word that `df` of `count` documents hold: `ln(1 + (N − df + 0.5)/(df + 0.5))`.
-fn idf(df: f64, count: usize) -> f64 {
-    let n = count.max(1) as f64;
-    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
-}
-
-/// `bm25_with` under `RANKING`.
+/// Okapi BM25 (`BM25_K1`, `BM25_B`) of each tokenised document against the query text, in document order.
 pub fn bm25(docs: &[Vec<String>], query: &str) -> Vec<f64> {
-    bm25_with(docs, query, &RANKING)
-}
-
-/// Okapi BM25 (`p.k1`, `p.b`, query words by `p.rule`, minus those `p.df_cut` drops) of each tokenised
-/// document against the query text, in document order.
-pub fn bm25_with(docs: &[Vec<String>], query: &str, p: &Bm25) -> Vec<f64> {
-    let (k1, b) = (p.k1, p.b);
+    let (k1, b) = (BM25_K1, BM25_B);
     let n = docs.len().max(1) as f64;
     let avg = docs.iter().map(Vec::len).sum::<usize>() as f64 / n;
     let mut df: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
@@ -717,8 +619,7 @@ pub fn bm25_with(docs: &[Vec<String>], query: &str, p: &Bm25) -> Vec<f64> {
             *df.entry(t).or_default() += 1.0;
         }
     }
-    let mut query: HashSet<String> = tokens_with(query, p.rule).into_iter().collect();
-    query.retain(|t| !cut(df.get(t.as_str()).copied().unwrap_or(0.0), docs.len(), p));
+    let query: HashSet<String> = tokens(query).into_iter().collect();
     docs.iter()
         .map(|d| {
             let mut tf: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
@@ -729,7 +630,8 @@ pub fn bm25_with(docs: &[Vec<String>], query: &str, p: &Bm25) -> Vec<f64> {
                 .iter()
                 .filter_map(|t| tf.get(t.as_str()).map(|f| (t, *f)))
                 .map(|(t, f)| {
-                    let idf = idf(df[t.as_str()], docs.len());
+                    let dft = df[t.as_str()];
+                    let idf = (1.0 + (n - dft + 0.5) / (dft + 0.5)).ln();
                     idf * f * (k1 + 1.0) / (f + k1 * (1.0 - b + b * d.len() as f64 / avg))
                 })
                 .sum()
@@ -737,75 +639,48 @@ pub fn bm25_with(docs: &[Vec<String>], query: &str, p: &Bm25) -> Vec<f64> {
         .collect()
 }
 
-/// `documents_with` under `RANKING`.
+/// A lesson's search documents: its question, then each facet (`Challenge::facets`).
 pub fn documents(c: &Challenge) -> Vec<Vec<String>> {
-    documents_with(c, &RANKING)
+    std::iter::once(tokens(&c.question)).chain(c.facets.iter().map(|f| tokens(f)).filter(|d| !d.is_empty())).collect()
 }
 
-/// A lesson's search documents under `p`: its `p.fields` text, then each facet (`Challenge::facets`),
-/// tokenized by `p.rule`.
-pub fn documents_with(c: &Challenge, p: &Bm25) -> Vec<Vec<String>> {
-    let first = match p.fields {
-        Fields::Question => tokens_with(&c.question, p.rule),
-        Fields::QuestionSituationsConsequence => tokens_with(&format!("{}\n{}\n{}", c.question, c.situations.join("\n"), c.consequence), p.rule),
-    };
-    std::iter::once(first).chain(c.facets.iter().map(|f| tokens_with(f, p.rule)).filter(|d| !d.is_empty())).collect()
-}
-
-/// `bm25_groups_with` under `RANKING`.
-pub fn bm25_groups(groups: &[Vec<Vec<String>>], query: &str, second: f64) -> Vec<f64> {
-    bm25_groups_with(groups, query, second, &RANKING)
-}
-
-/// BM25 (`p`, as `bm25_with`) of groups of documents, one group per lesson, against the query text: a
+/// BM25 (`BM25_K1`, `BM25_B`) of groups of documents, one group per lesson, against the query text: a
 /// group scores its best document plus `second` × its second best (0: the best alone). Document
 /// frequencies count groups (a word in three facets of one lesson is one lesson), so idf means what it
-/// means in `bm25_with`; term frequency and length are per document. Groups of one document score as
-/// `bm25_with` does. Only query words are counted, which keeps a 1k-lesson store with facets fast.
-pub fn bm25_groups_with(groups: &[Vec<Vec<String>>], query: &str, second: f64, p: &Bm25) -> Vec<f64> {
-    let (k1, b) = (p.k1, p.b);
+/// means in `bm25`; term frequency and length are per document. Groups of one document score as `bm25`
+/// does. Only query words are counted, which keeps a 1k-lesson store with facets fast.
+pub fn bm25_groups(groups: &[Vec<Vec<String>>], query: &str, second: f64) -> Vec<f64> {
+    let (k1, b) = (BM25_K1, BM25_B);
+    let n = groups.len().max(1) as f64;
     let ndocs = groups.iter().map(Vec::len).sum::<usize>().max(1) as f64;
     let avg = groups.iter().flatten().map(Vec::len).sum::<usize>() as f64 / ndocs;
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for t in tokens_with(query, p.rule) {
+    for t in tokens(query) {
         let next = index.len();
         index.entry(t).or_insert(next);
     }
     // Per document: (query word, tf), ordered by query word, so equal documents sum in the same order.
-    let counted: Vec<Vec<Vec<(usize, f64)>>> = groups.iter().map(|g| g.iter().map(|d| query_tf(d, &index)).collect()).collect();
-    let idf = group_idf(&counted, index.len(), p);
-    counted
+    let counted: Vec<Vec<Vec<(usize, f64)>>> = groups
         .iter()
-        .zip(groups)
-        .map(|(g, docs)| {
-            let scores = g.iter().zip(docs).map(|(tf, d)| {
-                let norm = k1 * (1.0 - b + b * d.len() as f64 / avg);
-                tf.iter().map(|&(q, f)| idf[q] * f * (k1 + 1.0) / (f + norm)).sum::<f64>()
-            });
-            best_plus_second(scores, second)
+        .map(|g| {
+            g.iter()
+                .map(|d| {
+                    let mut tf: Vec<(usize, f64)> = Vec::new();
+                    for q in d.iter().filter_map(|t| index.get(t.as_str())) {
+                        match tf.iter_mut().find(|(x, _)| x == q) {
+                            Some((_, f)) => *f += 1.0,
+                            None => tf.push((*q, 1.0)),
+                        }
+                    }
+                    tf.sort_by_key(|(q, _)| *q);
+                    tf
+                })
+                .collect()
         })
-        .collect()
-}
-
-/// A document's (query word, tf) pairs, ordered by query word (`bm25_groups_with`).
-fn query_tf(d: &[String], index: &std::collections::HashMap<String, usize>) -> Vec<(usize, f64)> {
-    let mut tf: Vec<(usize, f64)> = Vec::new();
-    for q in d.iter().filter_map(|t| index.get(t.as_str())) {
-        match tf.iter_mut().find(|(x, _)| x == q) {
-            Some((_, f)) => *f += 1.0,
-            None => tf.push((*q, 1.0)),
-        }
-    }
-    tf.sort_by_key(|(q, _)| *q);
-    tf
-}
-
-/// Each query word's idf over groups (`bm25_groups_with`): document frequency counts a group once. A
-/// word the cut drops weighs 0, which scores exactly as leaving it out of the query.
-fn group_idf(counted: &[Vec<Vec<(usize, f64)>>], words: usize, p: &Bm25) -> Vec<f64> {
-    let mut df = vec![0.0f64; words];
+        .collect();
+    let mut df = vec![0.0f64; index.len()];
     let mut seen: Vec<usize> = Vec::new();
-    for g in counted {
+    for g in &counted {
         seen.clear();
         for &(q, _) in g.iter().flatten() {
             if !seen.contains(&q) {
@@ -814,20 +689,24 @@ fn group_idf(counted: &[Vec<Vec<(usize, f64)>>], words: usize, p: &Bm25) -> Vec<
             }
         }
     }
-    df.iter().map(|&d| if cut(d, counted.len(), p) { 0.0 } else { idf(d, counted.len()) }).collect()
-}
-
-/// The best score plus `second` × the second best (0 when fewer than two are positive).
-fn best_plus_second(scores: impl Iterator<Item = f64>, second: f64) -> f64 {
-    let (mut best, mut next) = (0.0f64, 0.0f64);
-    for s in scores {
-        if s > best {
-            (best, next) = (s, best);
-        } else if s > next {
-            next = s;
-        }
-    }
-    best + second * next
+    let idf: Vec<f64> = df.iter().map(|&d| (1.0 + (n - d + 0.5) / (d + 0.5)).ln()).collect();
+    counted
+        .iter()
+        .zip(groups)
+        .map(|(g, docs)| {
+            let (mut best, mut next) = (0.0f64, 0.0f64);
+            for (tf, d) in g.iter().zip(docs) {
+                let norm = k1 * (1.0 - b + b * d.len() as f64 / avg);
+                let s: f64 = tf.iter().map(|&(q, f)| idf[q] * f * (k1 + 1.0) / (f + norm)).sum();
+                if s > best {
+                    (best, next) = (s, best);
+                } else if s > next {
+                    next = s;
+                }
+            }
+            best + second * next
+        })
+        .collect()
 }
 
 /// The top `k` ranked challenges.
@@ -1146,7 +1025,7 @@ instructions: where one applies to this task, check it against the code and keep
     (shown > 0).then_some((out, shown))
 }
 
-pub fn render(selected: &[&Challenge], f: &Filler) -> String {
+pub fn render(selected: &[&Challenge]) -> String {
     let s = String::from(
         "Before you finish: engineers of this collective have challenged earlier work in this area with the questions below. \
 They are questions, not facts. Skip any that do not apply to your current work; for each that does, investigate where \
@@ -1154,14 +1033,14 @@ needed and answer it with evidence (code, spec, a complexity or concurrency argu
 If this was a plan, your final message must again be the complete revised plan. End your final message with one line \
 per question: `<id>: applies` if you changed your work for it, `<id>: skip` if it does not apply.\n",
     );
-    numbered(s, selected, f)
+    numbered(s, selected)
 }
 
 /// A detached check's questions (hook.rs `queued`, check_async.rs), delivered with the next prompt or
 /// tool call after the turn they are about: `render`'s questions, naming that turn by `excerpt` (the
 /// start of the message it ended with; empty: "your last turn"), each answered with `<id>: applies|skip`
 /// as `render` asks. The work may have moved on since, so one it already settled is skipped too.
-pub fn render_late(selected: &[&Challenge], excerpt: &str, f: &Filler) -> String {
+pub fn render_late(selected: &[&Challenge], excerpt: &str) -> String {
     let turn = if excerpt.trim().is_empty() { "your last turn".to_string() } else { format!("your turn that ended with \"{}…\"", excerpt.trim()) };
     let s = format!(
         "[borg] After {turn}, engineers of this collective challenged that work with the questions below. They are \
@@ -1170,14 +1049,13 @@ does apply, investigate where needed and answer it with evidence (code, spec, a 
 then revise your work accordingly. End your next final message with one line per question: `<id>: applies` if you \
 changed your work for it, `<id>: skip` if it does not apply.\n"
     );
-    numbered(s, selected, f)
+    numbered(s, selected)
 }
 
-/// `intro` followed by the numbered questions of `selected` (a disagreement as one item; `f` the
-/// store's filler words, queen.rs `Filler`).
-fn numbered(mut s: String, selected: &[&Challenge], f: &Filler) -> String {
+/// `intro` followed by the numbered questions of `selected` (a disagreement as one item).
+fn numbered(mut s: String, selected: &[&Challenge]) -> String {
     // Lessons that disagree with each other are one item: a conflict between claims, not two orders.
-    let groups = disagreements(selected, f);
+    let groups = disagreements(selected);
     let mut n = 0;
     let mut shown: HashSet<usize> = HashSet::new();
     for (i, c) in selected.iter().enumerate() {
@@ -1202,16 +1080,15 @@ fn numbered(mut s: String, selected: &[&Challenge], f: &Filler) -> String {
 }
 
 /// The ids of each disagreement `render` shows, for the `asked` outcome record (outcome.rs).
-pub fn disagreement_ids(selected: &[&Challenge], f: &Filler) -> Vec<Vec<String>> {
-    disagreements(selected, f).into_iter().map(|g| g.into_iter().map(|i| selected[i].id.clone()).collect()).collect()
+pub fn disagreement_ids(selected: &[&Challenge]) -> Vec<Vec<String>> {
+    disagreements(selected).into_iter().map(|g| g.into_iter().map(|i| selected[i].id.clone()).collect()).collect()
 }
 
 /// Groups (indices into `selected`, in selection order) of lessons that disagree: the same situation
 /// with different consequences (queen.rs `conflict_pairs`), or one lists the other in `supersedes`
 /// while both are still live (a supersession cycle, or one that does not hide: trust.rs `successors`).
-/// `f`: the store's filler words (queen.rs `Filler`).
-pub fn disagreements(selected: &[&Challenge], f: &Filler) -> Vec<Vec<usize>> {
-    let mut pairs = crate::queen::conflict_pairs(selected, f);
+pub fn disagreements(selected: &[&Challenge]) -> Vec<Vec<usize>> {
+    let mut pairs = crate::queen::conflict_pairs(selected);
     for (i, a) in selected.iter().enumerate() {
         for (j, b) in selected.iter().enumerate().skip(i + 1) {
             if a.supersedes.contains(&b.id) || b.supersedes.contains(&a.id) {
@@ -1405,73 +1282,13 @@ mod tests {
         for _ in 0..2000 {
             let text: String =
                 (0..r.next_u64() % 12).map(|_| format!("{}{}", parts[(r.next_u64() % 14) as usize], seps[(r.next_u64() % 6) as usize])).collect();
-            assert_eq!(tokens_with(&text, LEGACY), tokens_0_7_7(&text), "{text}");
-            tokens_at(&text, LEGACY, |at, t| {
+            assert_eq!(tokens(&text), tokens_0_7_7(&text), "{text}");
+            tokens_at(&text, |at, t| {
                 let word = &text[at..];
                 let word = &word[..word.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(word.len())];
                 assert!(tokens_0_7_7(word).iter().any(|w| w == t), "{t} at {at} of {text}");
             });
         }
-    }
-
-    #[test]
-    fn code_tokens_join_and_split() {
-        let code = TokenRule { min_len: 3, compound: Compound::Code };
-        for (text, want) in [
-            ("risk_url", &["riskurl", "risk", "url"][..]),
-            ("riskUrl", &["riskurl", "risk", "url"]),
-            ("RISK-URL", &["riskurl", "risk", "url"]),
-            ("HTTPServer", &["httpserver", "http", "server"]),
-            ("--release", &["release"]),
-            ("get_userName", &["getusername", "get", "user", "name"]),
-        ] {
-            assert_eq!(tokens_with(text, code), want, "{text}");
-        }
-        let mut at = Vec::new();
-        tokens_at("a --risk_url", code, |i, _| at.push(i));
-        assert_eq!(at, [4, 4, 4], "every token has its trimmed word's offset");
-    }
-
-    /// For both compounds and lengths, `tokens_at` emits `tokens_with`'s tokens in order, each at the
-    /// offset of a word whose own tokens include it.
-    #[test]
-    fn tokens_at_emits_tokens_with_in_order() {
-        let parts = ["risk_url", "riskUrl", "RISK-URL", "HTTPServer", "--release", "_x_", "get_userName", "ÜberPlace", "ΑΣ", "go", "a-b", "v2Api"];
-        let seps = [" ", "-", "_", "\n", ".", "", "::"];
-        let mut r = crate::memory::Rng::new(11);
-        for _ in 0..2000 {
-            let text: String = (0..r.next_u64() % 10)
-                .map(|_| format!("{}{}", parts[(r.next_u64() % parts.len() as u64) as usize], seps[(r.next_u64() % seps.len() as u64) as usize]))
-                .collect();
-            for compound in [Compound::Legacy, Compound::Code] {
-                for min_len in [2, 3] {
-                    let rule = TokenRule { min_len, compound };
-                    let joins = |c: char| c.is_alphanumeric() || c == '_' || (compound == Compound::Code && c == '-');
-                    let mut got = Vec::new();
-                    tokens_at(&text, rule, |at, t| {
-                        let word = &text[at..];
-                        let word = &word[..word.find(|c: char| !joins(c)).unwrap_or(word.len())];
-                        assert!(tokens_with(word, rule).iter().any(|w| w == t), "{t} at {at} of {text}");
-                        got.push(t.to_string());
-                    });
-                    assert_eq!(got, tokens_with(&text, rule), "{text} {rule:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn bm25_with_df_cut_drops_common_query_words() {
-        let docs: Vec<Vec<String>> = (0..40).map(|i| tokens(&if i % 4 == 0 { format!("the risk of loss w{i}x") } else { format!("the item w{i}x") })).collect();
-        let cut = Bm25 { df_cut: Some(0.5), ..RANKING };
-        let (with, without) = (bm25_with(&docs, "the risk", &cut), bm25_with(&docs, "risk", &cut));
-        assert!(with[0] > 0.0);
-        assert_eq!(with.iter().map(|s| s.to_bits()).collect::<Vec<_>>(), without.iter().map(|s| s.to_bits()).collect::<Vec<_>>());
-        let groups: Vec<Vec<Vec<String>>> = docs.iter().map(|d| vec![d.clone()]).collect();
-        assert_eq!(bm25_groups_with(&groups, "the risk", 0.0, &cut), bm25_groups_with(&groups, "risk", 0.0, &cut));
-        assert_ne!(bm25(&docs, "the risk"), bm25(&docs, "risk"), "uncut, the counts");
-        let few = &docs[..MIN_DF_STORE - 1];
-        assert_ne!(bm25_with(few, "the risk", &cut), bm25_with(few, "risk", &cut), "a small store cuts nothing");
     }
 
     #[test]
@@ -1655,7 +1472,7 @@ mod tests {
         let plan = "guard the closed flag with the delivery ReentrantLock";
         let sel = select(&cs, plan, 5);
         assert_eq!(sel.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["atomic"], "the successor inherits the relevance");
-        assert!(!render(&sel, &Filler::none()).contains("ReentrantLock"));
+        assert!(!render(&sel).contains("ReentrantLock"));
         assert_eq!(cs.iter().find(|c| c.id == "lock").unwrap().trust, NEUTRAL_REVERSED);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1680,7 +1497,7 @@ mod tests {
         let a = mk("A", "bob@x", "concurrency", "guard it with the existing ReentrantLock", 0.4);
         let b = mk("B", "ann@x", "concurrency", "use a lock-free compareAndSet instead", 0.8);
         let other = Challenge { id: "C".into(), question: "Is the spec cited?".into(), ..Default::default() };
-        let text = render(&[&a, &other, &b], &Filler::none());
+        let text = render(&[&a, &other, &b]);
         assert!(
             text.contains("\n1. [A, B] Engineers disagree here (check-then-act on a shared mutable flag across threads): ann@x (trust 0.80 in concurrency) says \"use a lock-free compareAndSet instead\"; bob@x (0.40) says \"guard it with the existing ReentrantLock\" — weigh the evidence"),
             "{text}"
@@ -1689,7 +1506,7 @@ mod tests {
         // A supersession cycle between two asked lessons is a disagreement too, whatever the wording.
         let x = Challenge { id: "X".into(), question: "Lock?".into(), supersedes: vec!["Y".into()], engineers: vec!["ann@x".into()], ..Default::default() };
         let y = Challenge { id: "Y".into(), question: "Atomic?".into(), supersedes: vec!["X".into()], area: "scope".into(), ..Default::default() };
-        let text = render(&[&x, &y], &Filler::none());
+        let text = render(&[&x, &y]);
         assert!(
             text.contains("1. [X, Y] Engineers disagree here: ann@x (trust 0.50 in other) says \"Lock?\"; lesson Y (0.50 in scope) says \"Atomic?\""),
             "{text}"
@@ -1697,7 +1514,7 @@ mod tests {
         assert!(!text.contains("\n2."));
         // Agreeing lessons stay separate questions.
         let c = mk("C2", "cy@x", "concurrency", "guard it with the existing ReentrantLock", 0.5);
-        assert!(render(&[&a, &c], &Filler::none()).contains("\n2. [C2] question of C2"));
+        assert!(render(&[&a, &c]).contains("\n2. [C2] question of C2"));
     }
 
     #[test]
@@ -1719,9 +1536,9 @@ mod tests {
         let sel = select(&cs, plan, 5);
         let ids: Vec<&str> = sel.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.contains(&"lock") && ids.contains(&"cas"), "{ids:?}");
-        let text = render(&sel, &Filler::none());
+        let text = render(&sel);
         assert!(text.contains("Engineers disagree here") && text.contains("ann@x (trust 0.67 in concurrency)"), "{text}");
-        assert_eq!(disagreement_ids(&sel, &Filler::none()), [vec!["lock".to_string(), "cas".to_string()]]);
+        assert_eq!(disagreement_ids(&sel), [vec!["lock".to_string(), "cas".to_string()]]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1747,7 +1564,7 @@ mod tests {
         assert!(ids("the search-lab reset arc per-turn budget").contains(&"lab".to_string()));
         assert!(ids("SearchLab: reset arc per-turn budget").contains(&"lab".to_string()));
         assert!(!ids("search the lab: reset arc per-turn budget").contains(&"lab".to_string()));
-        let text = render(&[&cs[0]], &Filler::none());
+        let text = render(&[&cs[0]]);
         assert!(text.contains("instead of a new reset arc? (This team rule replaces: upstream petri-net-design seeds"), "{text}");
         // A superseded scoped lesson out of scope passes no relevance to its successor.
         let succ = Challenge { supersedes: vec!["drain".into()], ..ch("succ", "Unrelated wording") };
