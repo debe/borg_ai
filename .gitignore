@@ -32,3 +32,4 @@ node_modules/
 /crates/borg-eval/src/preempt.rs
 /crates/borg-eval/src/queen_replay.rs
 /crates/borg-eval/src/queen_test.rs
+/crates/borg-eval/src/capture_judge.rs

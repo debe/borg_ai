@@ -39,6 +39,9 @@ mod queen_replay;
 #[cfg(replay_evals)]
 #[rustfmt::skip]
 mod queen_test;
+#[cfg(replay_evals)]
+#[rustfmt::skip]
+mod capture_judge;
 
 const SYSTEM: &str = "You are working autonomously in a sandboxed repository. Do the task fully without asking questions. \
 Do not use plan mode, do not create task-tracking files, and do not commit.";
@@ -752,6 +755,8 @@ fn main() {
         Some("queen-replay") => return queen_replay::main(&raw[1..]),
         #[cfg(replay_evals)]
         Some("queen-test") => return queen_test::main(&raw[1..]),
+        #[cfg(replay_evals)]
+        Some("capture-judge") => return capture_judge::main(&raw[1..]),
         Some("sandbox-exec") => return sandbox_exec(&raw[1..]),
         #[cfg(replay_evals)]
         Some("expert-hook") => return preempt::expert_hook(),
