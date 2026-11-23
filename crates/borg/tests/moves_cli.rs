@@ -209,20 +209,22 @@ fn one_sessions_correction_goes_to_each_collective_it_concerns_and_nothing_else_
     prompt("no, don't do that: the ticket key goes in the commit subject, and in the parser library keep upstream's grammar");
     let corp = store(&root, "corp");
     let raw = lines(&corp.join("episodes.jsonl"));
-    assert_eq!(raw.len(), 1, "the hook captured the correcting prompt in corp");
+    assert!(raw.is_empty(), "Claude's prompt hook captures no correction; the turn-end sweep reads it as a candidate");
 
     let (out, err, code) = borg(&root, &app, &["correct", "--collective", "oss", "--session", "sess-9", "--repo", "lib", "keep", "upstream's", "grammar"]);
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("set aside in corp"), "{out}");
+    let judged = lines(&corp.join("candidates-judged.jsonl"));
+    assert_eq!((judged.len(), judged[0]["verdict"].as_str()), (1, Some("set_aside")), "the raw prompt is held, so the sweep never captures it");
     let oss = lines(&store(&root, "oss").join("episodes.jsonl"));
     assert_eq!((oss[0]["task"].as_str(), oss[0]["agent"].as_str()), (Some(""), Some("")), "nothing of corp's session crosses");
     assert_eq!(oss[0]["engineer"], "me@x", "the email the open-source repo knows, not the work one");
     let (_, err, code) = borg(&root, &app, &["correct", "--collective", "corp", "--session", "sess-9", "the", "ticket", "key", "goes", "in", "the", "subject"]);
     assert_eq!(code, Some(0), "{err}");
     let corp_eps = lines(&corp.join("episodes.jsonl"));
-    assert_eq!(corp_eps.len(), 2);
-    assert_eq!(corp_eps[1]["task"], "add the export endpoint to the billing service", "its own collective keeps the task");
-    assert_eq!(corp_eps[1]["engineer"], "ann@work.example");
+    assert_eq!(corp_eps.len(), 1);
+    assert_eq!(corp_eps[0]["task"], "add the export endpoint to the billing service", "its own collective keeps the task");
+    assert_eq!(corp_eps[0]["engineer"], "ann@work.example");
 
     // The session's end learns corp and oss; corp's model never sees the raw prompt.
     let mut learn = command(&root, &app, &["learn", "--session", "sess-9"]);
@@ -232,4 +234,29 @@ fn one_sessions_correction_goes_to_each_collective_it_concerns_and_nothing_else_
     assert_eq!(lines(&corp.join("lessons.jsonl")).len(), 1, "corp learns its restatement only");
     let asked = std::fs::read_to_string(root.join("prompts.txt")).unwrap_or_default();
     assert!(!asked.contains("in the parser library keep upstream's grammar"), "the raw prompt is never learned: {asked}");
+}
+
+/// An earlier tagged record (here a veto) is not what a later prompt's restatement sets aside: the latest
+/// prompt is held by its words, and the veto stays learnable.
+#[test]
+fn a_restatement_after_an_older_tagged_record_sets_aside_the_latest_prompt() {
+    let root = setup("stale-tag");
+    let app = root.join("work/app");
+    let cwd = app.display().to_string();
+    let prompt = |p: &str| hook(&root, &app, "prompt", &json!({"session_id": "sess-7", "cwd": cwd, "prompt": p}));
+    prompt("add the export endpoint to the billing service");
+    prompt("borg no never read the commit log");
+    let corp = store(&root, "corp");
+    let veto = lines(&corp.join("episodes.jsonl"));
+    assert_eq!(veto.len(), 1, "the veto is a tagged episode");
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    prompt("nein, der Ticket-Schlüssel gehört in den Commit-Betreff");
+
+    let (out, err, code) = borg(&root, &app, &["correct", "--collective", "corp", "--session", "sess-7", "the", "ticket", "key", "goes", "in", "the", "subject"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("set aside in corp"), "{out}");
+    let judged = lines(&corp.join("candidates-judged.jsonl"));
+    assert_eq!((judged.len(), judged[0]["verdict"].as_str()), (1, Some("set_aside")), "the latest prompt is held");
+    let skipped = std::fs::read_to_string(corp.join("episodes-not-lessons.txt")).unwrap_or_default();
+    assert!(!skipped.contains(veto[0]["id"].as_str().unwrap()), "the older veto is not set aside: {skipped}");
 }

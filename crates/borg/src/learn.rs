@@ -44,6 +44,7 @@ use crate::runner::MAX_FAILURES;
 use crate::trust;
 
 pub mod regret;
+pub mod candidates;
 
 static CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(no\b|nope|don'?t|do not|stop|wrong|that'?s not|not what|why did you|why do you|i said|instead|you should|never\b|always\b|please don'?t|double check|carefully check|check against|are you sure|hmm|but\b|just a second|still\b|can'?t we|don'?t we|isn'?t)").unwrap()
@@ -71,6 +72,37 @@ pub const PROPOSAL_CHARS: usize = 2000;
 pub fn is_correction(prompt: &str) -> bool {
     let t = prompt.trim();
     t.len() > 3 && !t.starts_with('<') && CORRECTION.is_match(t)
+}
+
+/// How a prompt becomes a correction episode (`BORG_CORRECTION_GATE`): `model` (default), every prompt
+/// after a proposal is a candidate a model judges (candidates.rs), or `regex`, the English openers of
+/// `is_correction` (reports/correction-gate.md: the model gate passed its pre-registered check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Gate {
+    Regex,
+    #[default]
+    Model,
+}
+
+/// The gate `BORG_CORRECTION_GATE` names: `regex`, else `model`.
+pub fn gate() -> Gate {
+    match std::env::var("BORG_CORRECTION_GATE").as_deref() {
+        Ok("regex") => Gate::Regex,
+        _ => Gate::Model,
+    }
+}
+
+/// The prefix of `s` of at most `n` chars, borrowed.
+pub(crate) fn head_chars(s: &str, n: usize) -> &str {
+    s.char_indices().nth(n).map_or(s, |(i, _)| &s[..i])
+}
+
+/// The suffix of `s` of at most `n` chars, borrowed.
+pub(crate) fn tail_chars(s: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    s.char_indices().rev().nth(n - 1).map_or(s, |(i, _)| &s[i..])
 }
 
 /// The engineer's words from a rejected tool call or plan, if any.
@@ -139,10 +171,46 @@ pub fn transcript_id(session: &str, call: &str, ms: i64) -> String {
     if call.is_empty() { format!("{s8}-{ms}") } else { format!("{s8}-T{call}") }
 }
 
-/// A correction's words with its whitespace collapsed: the hook and a transcript may wrap or pad the
-/// same words differently.
-fn words(t: &str) -> String {
-    t.split_whitespace().collect::<Vec<_>>().join(" ")
+/// A 64-bit key of a correction's words with its whitespace collapsed (the hook and a transcript may wrap
+/// or pad the same words differently): blake3 of the words joined by one space, streamed through a stack
+/// buffer ([`Batched`]), no allocation.
+pub(crate) fn words_key(t: &str) -> u64 {
+    let mut h = blake3::Hasher::new();
+    let mut b = Batched { buf: [0; 4096], len: 0 };
+    for (i, w) in t.split_whitespace().enumerate() {
+        if i > 0 {
+            b.push(&mut h, b" ");
+        }
+        b.push(&mut h, w.as_bytes());
+    }
+    h.update(&b.buf[..b.len]);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
+/// Bytes on their way into a blake3 hasher, gathered so it sees few large updates: per word, its
+/// per-update cost would dominate. The digest is the same however the stream is cut.
+struct Batched {
+    buf: [u8; 4096],
+    len: usize,
+}
+
+impl Batched {
+    /// Appends `bytes`, first flushing into `h` what no longer fits; bytes longer than the buffer go to
+    /// `h` directly.
+    fn push(&mut self, h: &mut blake3::Hasher, bytes: &[u8]) {
+        if self.len + bytes.len() > self.buf.len() {
+            h.update(&self.buf[..self.len]);
+            self.len = 0;
+        }
+        if bytes.len() > self.buf.len() {
+            h.update(bytes);
+            return;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
 }
 
 /// What a store already holds, so an episode read again (the transcript sweep, session end,
@@ -151,7 +219,7 @@ fn words(t: &str) -> String {
 pub struct Known {
     ids: HashSet<String>,
     /// Per session: each episode's time, whether it was a prompt's, whether a transcript named it by its
-    /// tool call ([`from_call`]), and its words ([`words`]).
+    /// tool call ([`from_call`]), and its words' key ([`words_key`]).
     sessions: HashMap<String, Vec<Held>>,
 }
 
@@ -175,18 +243,31 @@ impl Known {
         if self.ids.contains(&e.id) {
             return true;
         }
-        let said = words(&e.correction);
+        let said = words_key(&e.correction);
         let (prompt, answer) = (prompt_episode(e), e.via == ANSWER);
         self.sessions
             .get(&e.session)
-            .is_some_and(|seen| seen.iter().any(|h| (!answer && !h.from_call && h.words == said) || (prompt && h.prompt && (h.ms - e.ms).abs() < SAME_MS)))
+            .is_some_and(|seen| seen.iter().any(|h| (!answer && !h.from_call && h.key == said) || (prompt && h.prompt && (h.ms - e.ms).abs() < SAME_MS)))
     }
 
     /// Remember `e` as held.
     pub fn add(&mut self, e: &Episode) {
-        self.ids.insert(e.id.clone());
-        let held = Held { ms: e.ms, prompt: prompt_episode(e), from_call: from_call(e), words: words(&e.correction) };
-        self.sessions.entry(e.session.clone()).or_default().push(held);
+        self.add_key(&e.id, &e.session, e.ms, prompt_episode(e), from_call(e), words_key(&e.correction));
+    }
+
+    /// Remember as held the episode `id` of `session` at `ms`, whether it was a prompt's, whether a
+    /// transcript named it by its call, and its words' `key` ([`words_key`]): `add` without an `Episode`.
+    pub(crate) fn add_key(&mut self, id: &str, session: &str, ms: i64, prompt: bool, from_call: bool, key: u64) {
+        if !self.ids.contains(id) {
+            self.ids.insert(id.to_owned());
+        }
+        let held = Held { ms, prompt, from_call, key };
+        match self.sessions.get_mut(session) {
+            Some(seen) => seen.push(held),
+            None => {
+                self.sessions.insert(session.to_owned(), vec![held]);
+            }
+        }
     }
 }
 
@@ -196,14 +277,18 @@ struct Held {
     ms: i64,
     prompt: bool,
     from_call: bool,
-    words: String,
+    key: u64,
 }
 
 /// Whether a transcript named `e` by its tool call ([`transcript_id`]'s `<session8>-T<call>`); the hook
 /// names its episodes `<session8>-<ms>`.
 fn from_call(e: &Episode) -> bool {
-    let s8: String = e.session.chars().take(8).collect();
-    e.id.strip_prefix(&s8).is_some_and(|rest| rest.starts_with("-T"))
+    from_call_id(&e.id, &e.session)
+}
+
+/// [`from_call`] of the episode `id` of `session`.
+pub(crate) fn from_call_id(id: &str, session: &str) -> bool {
+    id.strip_prefix(head_chars(session, 8)).is_some_and(|rest| rest.starts_with("-T"))
 }
 
 /// An episode said in a prompt: a pushback or a veto, not a rejected tool call or an answer.
@@ -229,20 +314,38 @@ impl AsMut<Episode> for Episode {
 ///
 /// # Errors
 /// When an episode cannot be appended; none after it is.
-pub fn record_new_in<T: AsMut<Episode>>(store: &Path, eps: Vec<T>, mut ready: impl FnMut(&mut T)) -> std::io::Result<Vec<T>> {
+pub fn record_new_in<T: AsMut<Episode>>(store: &Path, eps: Vec<T>, ready: impl FnMut(&mut T)) -> std::io::Result<Vec<T>> {
+    append_new_in(store, "episodes.jsonl", Known::read, eps, ready, true)
+}
+
+/// Under the lock of `store`'s `file`: appends to it each of `eps` the `known` set read then does not
+/// hold, each counted as a correction when `count`, and returns those appended. `record_new_in` and
+/// `candidates::record_new_in`.
+fn append_new_in<T: AsMut<Episode>>(
+    store: &Path,
+    file: &str,
+    known: impl FnOnce(&Path) -> Known,
+    eps: Vec<T>,
+    mut ready: impl FnMut(&mut T),
+    count: bool,
+) -> std::io::Result<Vec<T>> {
     if eps.is_empty() {
         return Ok(Vec::new());
     }
     std::fs::create_dir_all(store)?;
-    crate::live::locked(&store.join("episodes.jsonl"), || {
-        let mut known = Known::read(store);
-        let mut appended = Vec::new();
+    let path = store.join(file);
+    crate::live::locked(&path, || {
+        let mut known = known(store);
+        let mut appended = Vec::with_capacity(eps.len());
         for mut x in eps {
             if known.holds(x.as_mut()) {
                 continue;
             }
             ready(&mut x);
-            record_episode_in(store, x.as_mut())?;
+            append_jsonl(&path, x.as_mut())?;
+            if count {
+                count_correction(store, x.as_mut());
+            }
             known.add(x.as_mut());
             appended.push(x);
         }
@@ -626,6 +729,9 @@ fn veto_schema() -> Value {
 /// The answer schema for `prompt`: a veto's prompt (it starts with `veto::OPENING`) gets the invariant
 /// field; correction and regret calls stay as they were.
 pub fn schema_for(prompt: &str) -> Value {
+    if prompt.starts_with(candidates::OPENING) {
+        return candidates::schema();
+    }
     if prompt.starts_with(crate::veto::OPENING) { veto_schema() } else { schema() }
 }
 
@@ -799,7 +905,8 @@ pub fn generalise_with(e: &Episode, library: &[Lesson], ask: &dyn Fn(&str) -> Op
 
 /// One structured call to the drone's model (runner.rs picks claude, omp or opencode).
 pub fn ask_claude(prompt: &str) -> Option<Value> {
-    ask_model(prompt, &schema_for(prompt)).map(|(v, _)| v)
+    let purpose = if prompt.starts_with(candidates::OPENING) { "classify" } else { crate::stats::purpose() };
+    ask_model_for(purpose, prompt, &schema_for(prompt)).map(|(v, _)| v)
 }
 
 /// The model call behind `ask_claude`, for any JSON schema: the structured answer and its cost in USD
@@ -957,6 +1064,12 @@ fn credit_regrets(regrets: &[Episode], library: &[Lesson], outcomes: &mut Vec<ou
     }
 }
 
+/// The state file of `session` in the store `home`: under `BORG_STATE`, else `home/state`.
+fn ctx_path(home: &Path, session: &str) -> PathBuf {
+    let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), PathBuf::from);
+    state.join(format!("{}.ctx", crate::notes::safe(session)))
+}
+
 /// Whether the session whose state file is `ctx` is still open at `now`: the file changed within
 /// `outcome::IDLE_MS` (every prompt and touch appends to it). No file: not open.
 fn open(ctx: &Path, now: i64) -> bool {
@@ -1090,7 +1203,12 @@ pub fn learn_in_config(
     now: i64,
     report: &mut dyn FnMut(Step),
 ) -> (usize, usize, usize) {
-    crate::live::locked(&home.join("lessons.jsonl"), || learn_unlocked(home, cfg, session, ask, track, now, report))
+    // Candidates first (candidates.rs): the corrections among them become episodes this run learns.
+    crate::live::locked(&home.join("lessons.jsonl"), || {
+        let left = candidates::judge(home, session, ask, now, report);
+        let (new, merged, waiting) = learn_unlocked(home, cfg, session, ask, track, now, report);
+        (new, merged, waiting + left)
+    })
 }
 
 fn learn_unlocked(
@@ -1130,7 +1248,7 @@ fn learn_unlocked(
     skipped.extend(held_here);
     let regrets: Vec<Episode> = episodes.iter().filter(|e| e.kind == regret::KIND && e.regret.is_some()).cloned().collect();
     let state = std::env::var_os("BORG_STATE").map_or_else(|| home.join("state"), std::path::PathBuf::from);
-    let ctx = |s: &str| state.join(format!("{}.ctx", crate::notes::safe(s)));
+    let ctx = |s: &str| ctx_path(home, s);
     // A veto is learned at the end of any session (veto.rs): a terminal veto may name one already ended.
     // So is a quiet session's episode (`quiet`): one that never sends its end would keep it waiting.
     let quiet = quiet(&episodes, session, &done, &skipped, now, |s| open(&ctx(s), now));
@@ -2309,7 +2427,7 @@ mod tests {
     /// settled under it; once the lock is gone, it is.
     #[test]
     fn a_session_another_pass_still_judges_is_not_settled_under_it() {
-        let home = temp_home("held");
+        let home = temp_home("held-lock");
         asked(&home, "s2", 10, &["Le1"]);
         let ctx = home.join("state/s2.ctx");
         std::fs::create_dir_all(ctx.parent().unwrap()).unwrap();

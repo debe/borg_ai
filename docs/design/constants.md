@@ -451,6 +451,7 @@ later value would be compared against.
 | File | Name | Value | Evaluation |
 |---|---|---|---|
 | `borg-eval/src/preempt.rs` | `EXPERT_TIMEOUT_S`, `PLAN_CHARS` | 300 s, 24,000 chars | The preempt eval's expert broker and the plan it hands over |
+| `borg-eval/src/capture_judge.rs` | `SHOWN`, `LINE_CHARS` | 20, 200 chars | The capture-judge eval's listed model misses per side and the characters of each |
 | `borg-search/src/bin/hs.rs`, `hs-bm25.rs`, `hs-facets.rs` | `TOP` | 20 | Hybrid-search runs |
 | `borg-search/src/bin/hs-vectors.rs` | `SHORT`, `WIDE`, `VECTOR_TOP` | 20, 30, 60 | Vector shortlist arms |
 | `borg-search/src/bin/hs-whole.rs` | `BM25_N` | 30 | Whole-pool arms |

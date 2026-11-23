@@ -11,7 +11,8 @@
 //! `stats::current` with this node's own events) instead follow `stats.jsonl`, read whole only on first
 //! use: `append_rollups` and `append_current` measure a call after one line was appended, as a rollup or
 //! a merge appends it, and `renamed_rollups` one after a file was renamed over it, as the quarantine
-//! does.
+//! does. Capture's hot reads too: `learn::Known::read` (`known_read`, every sweep's dedupe) and the
+//! candidates' (`capture`: `candidates::known` of one session and of all, and a 20-prompt judge prompt).
 //!
 //! The data is a copy of the store `BORG_BENCH_STORE` names, else a generated one of the same shape
 //! (shape/mod.rs); a reader that writes a derived file (`stats::current` backfills once) writes it in the
@@ -107,8 +108,25 @@ fn main() {
     r.bench("lessons", "conscience_load_unweighted_with", || borg::conscience::load_unweighted_with(black_box(&lessons), None, &aliases));
     r.bench("lessons", "learn_lessons", || borg::learn::lessons(black_box(&lessons)));
     r.bench("lessons", "learn_stored", || borg::learn::stored(black_box(&lessons)));
+    capture(&mut r, &home);
     r.bench("memory_export", "document", || borg::memory_export::document("bench", black_box(&home), &Filter::default()));
     r.finish();
+}
+
+/// Capture's reads: what a sweep's dedupe reads (`Known::read`, and `candidates::known` of one session and
+/// of all) and a 20-prompt judge prompt.
+fn capture(r: &mut Runner, home: &Path) {
+    let session = shape::capture(home);
+    let batch: Vec<borg::learn::Episode> = std::fs::read_to_string(home.join(borg::learn::candidates::FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .take(borg::learn::candidates::BATCH)
+        .collect();
+    r.bench("learn", "known_read", || borg::learn::Known::read(black_box(home)));
+    r.bench("capture", "known_session", || borg::learn::candidates::known(black_box(home), Some(session)));
+    r.bench("capture", "known_all", || borg::learn::candidates::known(black_box(home), None));
+    r.bench("capture", "prompt_batch", || borg::learn::candidates::prompt(black_box(&batch)));
 }
 
 /// Appends one line to the store's `stats.jsonl` per call, as a rollup or a peer's merge does: the next

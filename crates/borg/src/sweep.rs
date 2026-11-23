@@ -235,11 +235,13 @@ fn record_in(found: Vec<Found>, cfg: Option<&Config>, base: &Path) -> BTreeSet<P
     let mut engineers = HashMap::new();
     let mut got = BTreeSet::new();
     for (home, eps) in by {
+        let (cands, eps): (Vec<Found>, Vec<Found>) = eps.into_iter().partition(|f| f.episode.kind == learn::candidates::KIND);
         let appended = learn::record_new_in(&home, eps, |f| assimilate::complete(f, &mut engineers)).unwrap_or_default();
         for f in &appended {
             assimilate::count_veto(&home, &f.episode);
         }
-        if !appended.is_empty() {
+        let candidates = learn::candidates::record_new_in(&home, cands, |f| assimilate::complete(f, &mut engineers)).unwrap_or_default();
+        if !appended.is_empty() || !candidates.is_empty() {
             got.insert(home);
         }
     }
@@ -957,10 +959,14 @@ mod tests {
         .unwrap();
         let place = |f: Vec<Found>| record_in(f, Some(&cfg), &base);
         let swept = std::cell::Cell::new(false);
-        let ask = |_: &str| {
+        let ask = |p: &str| {
             if !swept.replace(true) {
                 let got = sweep(&Claude, &state, CLAUDE_SESSION, &|| Some(t.clone()), (Restart::Tail, false), &place);
                 assert_eq!(got, BTreeSet::from([base.join("collectives/dev")]), "the turn end appends dev's episodes");
+            }
+            // app's prompt is a candidate: the judge calls it a correction, then it is learned.
+            if p.starts_with(learn::candidates::OPENING) {
+                return Some(serde_json::json!({"verdicts": [{"prompt": 1, "kind": "correction"}]}));
             }
             Some(serde_json::json!({"is_lesson": true, "question": "Q?", "situations": [], "consequence": "c", "same_as": "", "supersedes": []}))
         };
@@ -981,7 +987,10 @@ mod tests {
         assert_eq!(ids(&stored(&base)), ids(&whole), "each once");
         assert_eq!((r.collectives["dev"].episodes, r.collectives["dev"].known), (0, whole.len()), "assimilate appended none");
         assert_eq!(r.collectives["dev"].calls, whole.len(), "each episode the turn end appended is one call to learn, not two");
-        assert_eq!(r.collectives["app"].episodes, 1);
+        assert_eq!((r.collectives["app"].episodes, r.collectives["app"].candidates, r.collectives["app"].new_lessons), (0, 1, 1));
+        let app = std::fs::read_to_string(base.join("collectives/app/episodes.jsonl")).unwrap();
+        let app: Vec<Episode> = app.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(app.iter().map(|e| (e.correction.as_str(), e.kind.as_str())).collect::<Vec<_>>(), [("no, keep the cache on disk", "")], "promoted by the judge");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -23,8 +23,11 @@ shared memory for a set of repos and engineers.
 
 ## Sources of lessons
 
-**Corrections.** Borg records an *episode* when you push back on the agent ("no, use a channel") or
-reject a tool call with a reason (Codex records no rejected calls). At session end, `borg learn` makes one
+**Corrections.** Borg records an *episode* when you push back on the agent ("no, use a channel", in any
+language) or reject a tool call with a reason (Codex records no rejected calls). Every prompt you type after
+the agent's message is first kept as a *candidate*; at session end `borg learn` judges each session's
+candidates in one model call (correction, task or neither) and keeps the corrections
+(`BORG_CORRECTION_GATE=regex`: only English openers like "no" or "don't", unjudged). It then makes one
 model call per episode and writes a lesson. A new correction on the same point updates the existing
 lesson.
 

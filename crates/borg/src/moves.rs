@@ -849,22 +849,35 @@ fn engineer_in(cfg: Option<&Config>, base: &Path, target: &Store, repo: &str) ->
 /// besides. Only the latest prompt's episode (newer than the session's task, which the hook rewrites on
 /// every other prompt), and only while unlearned. Marked as settled (`episodes-not-lessons.txt`) under
 /// the store's learning lock; the episode stays, so transcript capture never records it again.
-/// Returns its id.
+/// Returns its id. A pending candidate (hook.rs `record_candidate`: `#borg-candidate <id>`) is marked
+/// `set_aside` in `candidates-judged.jsonl` and removed from `candidates.jsonl` instead
+/// (learn/candidates.rs `set_aside`), so `borg learn` never judges it. Under the model gate with no hook
+/// record at all (the turn-end sweep captures the prompt later), the latest prompt is set aside by its
+/// words (learn/candidates.rs `set_aside_prompt`), so the sweep never captures it.
 ///
 /// # Errors
 /// When the mark cannot be written.
 pub fn set_aside(here: &Path, session: &str) -> std::io::Result<Option<String>> {
     let state = crate::hook::state_file(session);
-    let last = read_lines(&state).lines().rev().find_map(|l| l.strip_prefix("#borg-episode ").map(|id| id.trim().to_string()));
-    let Some(id) = last else { return Ok(None) };
-    let ms_of = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    let task_ms = std::fs::metadata(state.with_extension("task")).and_then(|m| m.modified()).map_or(0, ms_of);
-    let episodes = read_lines(&here.join(EPISODES_FILE));
+    let last = read_lines(&state).lines().rev().find_map(|l| {
+        l.strip_prefix("#borg-episode ").map(|id| (id.trim().to_string(), false)).or_else(|| l.strip_prefix("#borg-candidate ").map(|id| (id.trim().to_string(), true)))
+    });
+    let Some((id, candidate)) = last else { return set_aside_latest(here, session, &state) };
+    let task_ms = modified_ms(&state.with_extension("task"));
+    let file = if candidate { learn::candidates::FILE } else { EPISODES_FILE };
+    let episodes = read_lines(&here.join(file));
     let Some(e) = episodes.lines().filter_map(|l| serde_json::from_str::<Episode>(l).ok()).find(|e| e.id == id && e.session == session) else {
-        return Ok(None);
+        return set_aside_latest(here, session, &state);
     };
-    if e.ms < task_ms {
-        return Ok(None); // a later prompt was no correction: this episode is not what is restated
+    // The hook tags the prompt's own record just before `.lastprompt`; an older tag (a rejection, a denial
+    // reason, a veto) is not what is restated under the model gate, whose prompts carry no tag.
+    let stale = learn::gate() == learn::Gate::Model && e.ms + 1_000 < modified_ms(&state.with_extension("lastprompt"));
+    if stale || e.ms < task_ms {
+        return set_aside_latest(here, session, &state); // a later prompt was no correction (regex): nothing
+    }
+    if candidate {
+        // Still pending: judged as set aside and pruned, so `borg learn` never judges it.
+        return Ok(learn::candidates::set_aside(here, &id)?.then_some(id));
     }
     crate::live::locked(&here.join(LESSONS_FILE), || {
         if learned(here).contains(&id) || skipped_ids(here).contains(&id) {
@@ -872,6 +885,23 @@ pub fn set_aside(here: &Path, session: &str) -> std::io::Result<Option<String>> 
         }
         learn::append_line(&here.join(SKIPPED_FILE), &id).map(|()| Some(id.clone()))
     })
+}
+
+/// [`set_aside`] with no hook record: under the model gate, the session's latest prompt (`.lastprompt`,
+/// at its write time) by its words; else nothing.
+fn set_aside_latest(here: &Path, session: &str, state: &Path) -> std::io::Result<Option<String>> {
+    let last = state.with_extension("lastprompt");
+    let prompt = read_lines(&last);
+    if learn::gate() != learn::Gate::Model || prompt.trim().is_empty() {
+        return Ok(None);
+    }
+    learn::candidates::set_aside_prompt(here, session, &prompt, modified_ms(&last)).map(Some)
+}
+
+/// When `path` was last written, in ms; 0 when unknown.
+fn modified_ms(path: &Path) -> i64 {
+    let since = |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    std::fs::metadata(path).and_then(|m| m.modified()).map_or(0, since)
 }
 
 /// The session's list of stores `borg correct` recorded into (`<state>/<session>.correct`), which its

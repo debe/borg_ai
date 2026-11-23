@@ -424,6 +424,7 @@ dependencies = [
  "criterion",
  "half",
  "libc",
+ "memchr",
  "memmap2",
  "regex",
  "safetensors",

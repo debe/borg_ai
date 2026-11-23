@@ -11,6 +11,12 @@ What changed in each release and what you need to do about it. The details live 
   names derive from repo names. The example map no longer applies at runtime, so borg names no
   system or repo of its own. If you relied on it, copy `crates/borg/data/systems.json` to
   `~/.config/borg/systems.json`. [System map](https://github.com/debe/borg_ai/blob/main/docs/configuration.md#system-map)
+- Corrections are now recognised in any language. Every prompt after the agent's message is kept as
+  a candidate, and `borg learn` judges each session's candidates in one model call (correction, task
+  or neither), about $0.08 a day on the author's machine. On a hand-labelled sample it found 69% of
+  the corrections, against 12% for the old English-opener rule, at 90% precision.
+  `BORG_CORRECTION_GATE=regex` restores the old rule.
+  [Sources of lessons](https://github.com/debe/borg_ai/blob/main/docs/learning.md#sources-of-lessons)
 
 ## 0.10.0 (2026-11-20)
 

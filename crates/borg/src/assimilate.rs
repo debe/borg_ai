@@ -135,6 +135,10 @@ pub struct Tally {
     pub merged: usize,
     /// Episodes `borg learn` could not get a verdict on (model unavailable); a re-run retries them.
     pub pending: usize,
+    /// Candidate prompts not yet in the store (`BORG_CORRECTION_GATE=model`, learn/candidates.rs).
+    pub candidates: usize,
+    /// Judge calls `borg learn` needs for the store's pending candidates plus the new ones.
+    pub judge_calls: usize,
 }
 
 /// What one harness's transcripts gave, across collectives (off repos aside).
@@ -145,6 +149,8 @@ pub struct Kinds {
     pub rejections: usize,
     pub answers: usize,
     pub prompts: usize,
+    /// New candidate prompts a model judges (`BORG_CORRECTION_GATE=model`).
+    pub candidates: usize,
     /// Episodes the stores already hold (the live hook's, an earlier run's).
     pub known: usize,
     /// The harness version of the newest episode, where its transcript names one.
@@ -186,6 +192,12 @@ fn worded_rejection(text: &str) -> Option<String> {
 
 fn human(t: &str) -> bool {
     t.len() > 3 && !t.starts_with('<') && !t.contains("[Request interrupted")
+}
+
+/// A trimmed prompt the engineer typed: not a harness insert nor an AGENTS.md paste. The prompt hook
+/// and the transcript replay share it.
+pub(crate) fn human_prompt(t: &str) -> bool {
+    human(t) && !t.starts_with(AGENTS_MD)
 }
 
 fn take(s: &str, n: usize) -> String {
@@ -253,6 +265,8 @@ struct Replay {
     /// Prompts only set the task, and nothing but answers becomes an episode (Codex: its hooks capture
     /// every prompt live, and its rollouts record no rejection at all).
     answers_only: bool,
+    /// How a prompt becomes a correction (`BORG_CORRECTION_GATE`).
+    gate: learn::Gate,
     /// Each piece of state with the cwd it was seen in.
     task: (String, String),
     said: (String, String),
@@ -276,6 +290,7 @@ impl Replay {
             said: c.said,
             denied: c.denied,
             calls: c.calls,
+            gate: learn::gate(),
             ..Default::default()
         };
         if !c.cwd.is_empty() {
@@ -350,7 +365,7 @@ impl Replay {
 
     fn prompt(&mut self, ms: i64, t: &str) {
         let t = t.trim();
-        if !human(t) || t.starts_with(AGENTS_MD) {
+        if !human_prompt(t) {
             return;
         }
         if self.answers_only {
@@ -372,9 +387,25 @@ impl Replay {
             self.episode(ms, &call, Some((tool, cwd)), take(t, learn::EXCERPT_CHARS));
             return;
         }
-        if learn::is_correction(t) && !self.task.0.is_empty() {
-            self.episode(ms, "", None, take(t, learn::EXCERPT_CHARS));
-        } else {
+        self.pushback(ms, t);
+    }
+
+    /// A prompt that is neither a veto nor a denial's reason: a correction episode under `Gate::Regex`,
+    /// a candidate under `Gate::Model` (pushed before the task update, so it carries the task it
+    /// answers), and the session's task unless the regex calls it a correction.
+    fn pushback(&mut self, ms: i64, t: &str) {
+        let correction = learn::is_correction(t) && !self.task.0.is_empty();
+        match self.gate {
+            learn::Gate::Regex if correction => {
+                self.episode(ms, "", None, take(t, learn::EXCERPT_CHARS));
+            }
+            learn::Gate::Model if !self.task.0.is_empty() => {
+                let f = self.episode(ms, "", None, learn::head_chars(t, learn::EXCERPT_CHARS).to_owned());
+                f.episode.kind = learn::candidates::KIND.into();
+            }
+            learn::Gate::Regex | learn::Gate::Model => {}
+        }
+        if !correction {
             self.task = (take(t, learn::TASK_CHARS), self.cwd.clone());
         }
     }
@@ -842,6 +873,12 @@ fn codex_from(meta: &Value, carry: Carry, records: impl IntoIterator<Item = Valu
 
 // ---- one harness's own transcript, as the sweep reads it (sweep.rs): its reader, where it is, its marks
 
+/// Whether the transcript replay captures `h`'s prompts (the sweep is on and `h` is Claude, omp or
+/// opencode); else the prompt hook is their capture (Codex replays answers only).
+pub(crate) fn replays_prompts(h: &dyn harness::Harness) -> bool {
+    crate::sweep::on() && matches!(source_of(h), Some(Source::Claude | Source::Omp | Source::Opencode))
+}
+
 /// The reader of harness `h`'s transcripts. harness/*.rs knows where they are, this module how to read
 /// them (harness/ never depends on this module).
 fn source_of(h: &dyn harness::Harness) -> Option<Source> {
@@ -1169,12 +1206,17 @@ fn engineers_session(export: &Value) -> bool {
 /// auto-reject (the same `OC_REJECTED`): a session continued with `run -c` takes its next prompt
 /// for the reason of a refusal nobody made.
 pub fn opencode_session(export: &Value) -> Vec<Found> {
+    opencode_gated(export, learn::gate())
+}
+
+/// [`opencode_session`] under correction gate `gate`.
+fn opencode_gated(export: &Value, gate: learn::Gate) -> Vec<Found> {
     if !engineers_session(export) {
         return Vec::new();
     }
     let info = &export["info"];
     // 1.x names its version on the session; 2.x's export names none.
-    let mut r = Replay { session: s(&info["id"]), harness: harness::opencode::Opencode.name(), version: s(&info["version"]), ..Default::default() };
+    let mut r = Replay { session: s(&info["id"]), harness: harness::opencode::Opencode.name(), version: s(&info["version"]), gate, ..Default::default() };
     r.at(info["directory"].as_str().or(info["location"]["directory"].as_str()).unwrap_or_default());
     for step in export["messages"].as_array().into_iter().flatten().flat_map(opencode_steps) {
         match step {
@@ -1429,18 +1471,8 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
     // Episodes not in their collective's store yet; the rest are counted as known.
     let mut tallies: BTreeMap<String, (Tally, Vec<Found>)> = BTreeMap::new();
     for (name, (home, may_sync, eps)) in by {
-        let mut known = learn::Known::read(&home);
         let mut t = Tally { home, may_sync, ..Default::default() };
-        let mut fresh = Vec::new();
-        for f in eps {
-            if known.holds(&f.episode) {
-                t.known += 1;
-                report.harnesses.entry(f.episode.harness.clone()).or_default().known += 1;
-                continue;
-            }
-            known.add(&f.episode);
-            fresh.push(f);
-        }
+        let fresh = unknown(&t.home, eps, &mut t.known, &mut report.harnesses);
         tallies.insert(name, (t, fresh));
     }
 
@@ -1463,13 +1495,7 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
     new.sort_by_key(|e| e.ms);
     for e in new {
         let k = report.harnesses.entry(e.harness.clone()).or_default();
-        *(if e.via == learn::ANSWER {
-            &mut k.answers
-        } else if e.rejected_tool.is_some() {
-            &mut k.rejections
-        } else {
-            &mut k.prompts
-        }) += 1;
+        *k.slot(e) += 1;
         if !e.harness_version.is_empty() {
             k.version.clone_from(&e.harness_version);
         }
@@ -1478,23 +1504,14 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
 
     let mut engineers: HashMap<String, String> = HashMap::new();
     for (name, (mut t, fresh)) in tallies {
+        let (cands, fresh): (Vec<Found>, Vec<Found>) = fresh.into_iter().partition(|f| f.episode.kind == learn::candidates::KIND);
         t.sessions = fresh.iter().map(|f| &f.episode.session).collect::<HashSet<_>>().len();
+        t.candidates = cands.len();
         t.episodes = fresh.len();
         t.calls = fresh.len() + waiting(&t.home);
+        t.judge_calls = judge_calls(&t.home, &cands);
         if opts.apply {
-            // Appended under the store's lock, against what it holds now: a turn-end sweep may have
-            // appended some of these while an earlier collective was learning.
-            match learn::record_new_in(&t.home, fresh, |f| complete(f, &mut engineers)) {
-                Ok(appended) => {
-                    appended.iter().for_each(|f| count_veto(&t.home, &f.episode));
-                    t.known += t.episodes - appended.len();
-                    t.episodes = appended.len();
-                    // What the learning ahead calls the model for: the store's unlearned episodes now,
-                    // each once, whoever appended it.
-                    t.calls = waiting(&t.home);
-                }
-                Err(_) => eprintln!("borg assimilate: cannot write {}", t.home.join("episodes.jsonl").display()),
-            }
+            apply_fresh(&mut t, fresh, cands, &mut engineers);
             eprintln!("learning {name}: one model call per episode, in order (each sees the lessons before it)");
             (t.new_lessons, t.merged, t.pending) = learn::learn_in_reporting(&t.home, None, ask, learn::learning(), learn::now_ms(), &mut learn::print_step);
             crate::vectors::refresh(&t.home.join("lessons.jsonl"));
@@ -1502,6 +1519,69 @@ pub fn run(opts: &Options, cfg: Option<&Config>, base: &Path, ask: &dyn Fn(&str)
         report.collectives.insert(name, t);
     }
     report
+}
+
+/// The found episodes and candidates `home` does not hold yet, deduped among themselves too; the held
+/// ones are counted in `known` and per harness.
+fn unknown(home: &Path, eps: Vec<Found>, known: &mut usize, harnesses: &mut BTreeMap<String, Kinds>) -> Vec<Found> {
+    let mut held = learn::Known::read(home);
+    let mut cand_known = learn::candidates::known(home, None);
+    let mut fresh = Vec::new();
+    for f in eps {
+        let k = if f.episode.kind == learn::candidates::KIND { &mut cand_known } else { &mut held };
+        if k.holds(&f.episode) {
+            *known += 1;
+            harnesses.entry(f.episode.harness.clone()).or_default().known += 1;
+            continue;
+        }
+        k.add(&f.episode);
+        fresh.push(f);
+    }
+    fresh
+}
+
+/// Judge calls `borg learn` makes for `home`'s pending candidates and the new ones `cands`.
+fn judge_calls(home: &Path, cands: &[Found]) -> usize {
+    let pending = read_jsonl::<Episode>(&home.join(learn::candidates::FILE));
+    learn::candidates::calls(pending.iter().chain(cands.iter().map(|f| &f.episode)))
+}
+
+/// `--apply`'s appends to `t`'s store: the new episodes and the new candidates, each under its own
+/// lock, against what the store holds now (a turn-end sweep may have appended some meanwhile).
+fn apply_fresh(t: &mut Tally, fresh: Vec<Found>, cands: Vec<Found>, engineers: &mut HashMap<String, String>) {
+    match learn::record_new_in(&t.home, fresh, |f| complete(f, engineers)) {
+        Ok(appended) => {
+            appended.iter().for_each(|f| count_veto(&t.home, &f.episode));
+            t.known += t.episodes - appended.len();
+            t.episodes = appended.len();
+            // What the learning ahead calls the model for: the store's unlearned episodes now,
+            // each once, whoever appended it.
+            t.calls = waiting(&t.home);
+        }
+        Err(_) => eprintln!("borg assimilate: cannot write {}", t.home.join("episodes.jsonl").display()),
+    }
+    match learn::candidates::record_new_in(&t.home, cands, |f| complete(f, engineers)) {
+        Ok(appended) => {
+            t.known += t.candidates - appended.len();
+            t.candidates = appended.len();
+        }
+        Err(_) => eprintln!("borg assimilate: cannot write {}", t.home.join(learn::candidates::FILE).display()),
+    }
+}
+
+impl Kinds {
+    /// The count episode `e` adds to.
+    fn slot(&mut self, e: &Episode) -> &mut usize {
+        if e.kind == learn::candidates::KIND {
+            &mut self.candidates
+        } else if e.via == learn::ANSWER {
+            &mut self.answers
+        } else if e.rejected_tool.is_some() {
+            &mut self.rejections
+        } else {
+            &mut self.prompts
+        }
+    }
 }
 
 /// The mean cost of one learn call on this machine and the number of calls it is from: borg's own
@@ -1574,11 +1654,11 @@ pub fn render(r: &Report, apply: bool) -> String {
     s.push_str(&format!("sources: claude {} sessions, omp {}, {opencode}, codex {}\n", r.claude, r.omp, r.codex));
     for (h, k) in &r.harnesses {
         let version = if k.version.is_empty() { String::new() } else { format!(" {}", k.version) };
-        s.push_str(&format!("{h}{version}: {} rejections, {} answers, {} prompts new; {} already present\n", k.rejections, k.answers, k.prompts, k.known));
+        s.push_str(&format!("{h}{version}: {} rejections, {} answers, {} prompts, {} candidate prompts new; {} already present\n", k.rejections, k.answers, k.prompts, k.candidates, k.known));
     }
     for (name, t) in &r.collectives {
         let sync = if t.may_sync { "team" } else { "local, never syncs" };
-        s.push_str(&format!("{name} ({sync}) {}: {} new episodes from {} sessions, {} already known", t.home.display(), t.episodes, t.sessions, t.known));
+        s.push_str(&format!("{name} ({sync}) {}: {} new episodes from {} sessions, {} already known, {} candidate prompts (~{} judge calls)", t.home.display(), t.episodes, t.sessions, t.known, t.candidates, t.judge_calls));
         if apply {
             s.push_str(&format!("; {} new lessons, {} merged", t.new_lessons, t.merged));
             if t.pending > 0 {
@@ -1599,6 +1679,9 @@ pub fn render(r: &Report, apply: bool) -> String {
             }
             None => format!("learn cost: ~{calls} model calls; unknown per call (no learn call with a reported cost on this machine yet)\n"),
         });
+        let judge: usize = r.collectives.values().map(|t| t.judge_calls).sum();
+        // Writing to a `String` never fails.
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("judge: ~{judge} calls (one per session, at most {} prompts each)\n", learn::candidates::BATCH));
         // Last line, where it is read: the first line's note is easy to miss.
         s.push_str("Dry run: nothing was written. Run `borg assimilate --apply` to learn these episodes.\n");
     }
@@ -1700,6 +1783,17 @@ mod tests {
     fn ask(p: &str) -> Option<Value> {
         let c = p.split("## Engineer's correction\n").nth(1)?.lines().next()?.to_string();
         Some(json!({"is_lesson": true, "question": format!("Q {c}"), "situations": [], "consequence": "c", "same_as": ""}))
+    }
+
+    /// The model, also judging candidates (`learn::candidates::OPENING` prompts): a correction where
+    /// the English regex calls the prompt one, else a task; every other prompt as [`ask`].
+    fn ask_judging(p: &str) -> Option<Value> {
+        if !p.starts_with(learn::candidates::OPENING) {
+            return ask(p);
+        }
+        let kind = |c: &str| if learn::is_correction(c.lines().next().unwrap_or("")) { "correction" } else { "task" };
+        let verdicts: Vec<Value> = p.split("\n### Engineer\n").skip(1).enumerate().map(|(i, c)| json!({"prompt": i + 1, "kind": kind(c)})).collect();
+        Some(json!({ "verdicts": verdicts }))
     }
 
     const CFG: &str = r#"{ "default": "off", "off": ["/w/secret"],
@@ -1826,11 +1920,21 @@ mod tests {
             got,
             [
                 ("no-sess-vet-2", crate::veto::KIND, "fix the merge lookup", "never read the commit log"),
-                ("sess-vet-3", "", "fix the merge lookup", "no, use the review API"),
+                ("sess-vet-3", learn::candidates::KIND, "fix the merge lookup", "no, use the review API"),
                 ("no-sess-vet-5", crate::veto::KIND, "fix the merge lookup", "stop reading history"),
             ]
         );
         assert!(eps.iter().all(|e| e.rejected_tool.is_none()) && r.denied.is_none());
+    }
+
+    #[test]
+    fn a_prompt_after_a_task_is_replayed_as_a_candidate_under_the_model_gate() {
+        let mut r = Replay { session: "sess-cand-1".into(), gate: learn::Gate::Model, ..Default::default() };
+        r.prompt(1, "fix the merge lookup");
+        r.prompt(2, "nein, nimm die Review-API");
+        let got: Vec<(&str, &str, &str)> = r.out.iter().map(|f| (f.episode.kind.as_str(), f.episode.task.as_str(), f.episode.correction.as_str())).collect();
+        assert_eq!(got, [(learn::candidates::KIND, "fix the merge lookup", "nein, nimm die Review-API")]);
+        assert_eq!(r.task.0, "nein, nimm die Review-API", "the regex does not call it a correction: it is the task now");
     }
 
     #[test]
@@ -1843,7 +1947,7 @@ mod tests {
         assert!(!base.exists(), "dry run wrote something");
         assert_eq!(r.scanned, 4, "main sessions only");
         let corp = &r.collectives["corp"];
-        assert_eq!((corp.sessions, corp.episodes, corp.calls, corp.may_sync), (2, 2, 2, true));
+        assert_eq!((corp.sessions, corp.episodes, corp.candidates, corp.calls, corp.judge_calls, corp.may_sync), (1, 1, 1, 1, 1, true), "the corp prompt is a candidate");
         let mine = &r.collectives["mine"];
         assert_eq!((mine.sessions, mine.episodes, mine.may_sync), (1, 1, false));
         assert_eq!((r.off_sessions, r.off_episodes), (1, 1));
@@ -1859,14 +1963,18 @@ mod tests {
         let (claude, omp) = fixture(&root);
         let base = root.join("home");
         let cfg: Config = serde_json::from_str(CFG).unwrap();
-        let r = run(&opts(&claude, &omp, true), Some(&cfg), &base, &ask);
+        let r = run(&opts(&claude, &omp, true), Some(&cfg), &base, &ask_judging);
         assert_eq!((r.collectives["corp"].new_lessons, r.collectives["mine"].new_lessons), (2, 1));
+        assert_eq!((r.collectives["corp"].episodes, r.collectives["corp"].candidates), (1, 1));
 
+        // The denial's reason is appended first; the corp prompt, a candidate, after the judge promoted it.
         let corp: Vec<Episode> = read_jsonl(&base.join("collectives/corp/episodes.jsonl"));
-        let said: Vec<&str> = corp.iter().map(|e| e.correction.as_str()).collect();
-        assert_eq!(said, ["no, check the TOCTOU on the closed flag first", "only the one crate, pin the rest"]);
-        assert_eq!(corp[1].rejected_tool.as_deref(), Some(r#"bash {"command":"cargo update"}"#), "a denial's reason is the next prompt");
-        assert_eq!((corp[1].session.as_str(), corp[1].repo.as_str()), ("omp-sess-1", "svc"));
+        let said: Vec<(&str, &str)> = corp.iter().map(|e| (e.correction.as_str(), e.kind.as_str())).collect();
+        assert_eq!(said, [("only the one crate, pin the rest", ""), ("no, check the TOCTOU on the closed flag first", "")]);
+        assert_eq!(corp[0].rejected_tool.as_deref(), Some(r#"bash {"command":"cargo update"}"#), "a denial's reason is the next prompt");
+        assert_eq!((corp[0].session.as_str(), corp[0].repo.as_str()), ("omp-sess-1", "svc"));
+        assert!(read_jsonl::<Episode>(&base.join("collectives/corp").join(learn::candidates::FILE)).is_empty(), "the judged candidate is pruned");
+        assert_eq!(std::fs::read_to_string(base.join("collectives/corp").join(learn::candidates::JUDGED_FILE)).unwrap().lines().count(), 1);
         let mine: Vec<Episode> = read_jsonl(&base.join("collectives/mine/episodes.jsonl"));
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].correction, "keep the cache dir");
@@ -1882,7 +1990,7 @@ mod tests {
         let snapshot = |d: &Path| files(d).into_iter().map(|f| std::fs::read_to_string(f).unwrap()).collect::<Vec<_>>();
         let before = snapshot(&base);
         let again = run(&opts(&claude, &omp, true), Some(&cfg), &base, &|_| panic!("nothing new to learn"));
-        assert_eq!((again.collectives["corp"].episodes, again.collectives["corp"].known), (0, 2));
+        assert_eq!((again.collectives["corp"].episodes, again.collectives["corp"].candidates, again.collectives["corp"].known), (0, 0, 2));
         assert_eq!(snapshot(&base), before);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1897,7 +2005,7 @@ mod tests {
         assert!(r.collectives.is_empty() && !base.exists());
         assert_eq!(r.off_episodes, 4);
 
-        // The live hook already captured the corp correction (stamped a moment after the message).
+        // The live hook already captured the corp prompt as a candidate (stamped a moment after the message).
         let corp = base.join("collectives/corp");
         std::fs::create_dir_all(&corp).unwrap();
         let live = Episode {
@@ -1909,13 +2017,15 @@ mod tests {
             agent: String::new(),
             rejected_tool: None,
             correction: "no".into(),
+            kind: learn::candidates::KIND.into(),
             ..Episode::default()
         };
-        std::fs::write(corp.join("episodes.jsonl"), serde_json::to_string(&live).unwrap() + "\n").unwrap();
+        std::fs::write(corp.join(learn::candidates::FILE), serde_json::to_string(&live).unwrap() + "\n").unwrap();
         let cfg: Config = serde_json::from_str(CFG).unwrap();
         let since = Options { since: parse_date("2026-09-01"), limit: Some(10), ..opts(&claude, &omp, false) };
         let r = run(&since, Some(&cfg), &base, &|_| None);
-        assert_eq!((r.collectives["corp"].episodes, r.collectives["corp"].known, r.collectives["corp"].calls), (1, 1, 2));
+        let t = &r.collectives["corp"];
+        assert_eq!((t.episodes, t.candidates, t.known, t.calls, t.judge_calls), (1, 0, 1, 1, 1));
         // --since and --limit bound what is considered.
         let late = Options { since: parse_date("2026-09-04"), ..opts(&claude, &omp, false) };
         assert!(!run(&late, Some(&cfg), &base, &|_| None).collectives.contains_key("mine"));
@@ -1934,16 +2044,16 @@ mod tests {
         let stored = || -> Vec<String> {
             ["corp", "mine"].iter().flat_map(|c| read_jsonl::<Episode>(&base.join(format!("collectives/{c}/episodes.jsonl")))).map(|e| e.correction).collect()
         };
-        // Newest first: the omp reason (09-04), then the private rejection (09-02), then the corp prompt (09-01).
-        // The off episode (09-03) and the skipped one never use up the limit.
-        run(&one, Some(&cfg), &base, &ask);
+        // Newest first: the omp reason (09-04), then the private rejection (09-02), then the corp prompt (09-01),
+        // a candidate the judge promotes. The off episode (09-03) and the skipped one never use up the limit.
+        run(&one, Some(&cfg), &base, &ask_judging);
         assert_eq!(stored(), ["only the one crate, pin the rest"]);
-        run(&one, Some(&cfg), &base, &ask);
+        run(&one, Some(&cfg), &base, &ask_judging);
         assert_eq!(stored(), ["only the one crate, pin the rest", "keep the cache dir"], "the second batch is the next episode");
-        run(&one, Some(&cfg), &base, &ask);
+        run(&one, Some(&cfg), &base, &ask_judging);
         let last = run(&one, Some(&cfg), &base, &|_| panic!("nothing left to learn"));
-        assert_eq!(stored().len(), 3);
-        assert_eq!(last.collectives.values().map(|t| (t.episodes, t.known)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1)), (0, 3));
+        assert_eq!(stored(), ["only the one crate, pin the rest", "no, check the TOCTOU on the closed flag first", "keep the cache dir"], "corp's, then mine's");
+        assert_eq!(last.collectives.values().map(|t| (t.episodes, t.candidates, t.known)).fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2)), (0, 0, 3));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1978,10 +2088,12 @@ mod tests {
             &Options { claude: Some(claude), omp: None, opencode: None, codex: None, session: None, since: None, limit: None, apply: true, skip: Vec::new() },
             Some(&cfg),
             &base,
-            &ask,
+            &ask_judging,
         );
-        assert_eq!(r.collectives["corp"].episodes, 3);
+        // The denial's reason is an episode; the two corp prompts are candidates the judge promotes after it.
+        assert_eq!((r.collectives["corp"].episodes, r.collectives["corp"].candidates), (1, 2));
         let corp: Vec<Episode> = read_jsonl(&base.join("collectives/corp/episodes.jsonl"));
+        assert_eq!(corp.len(), 3);
         let t = std::fs::read_to_string(base.join("collectives/corp/episodes.jsonl")).unwrap();
         assert!(!t.contains("therapy") && !t.contains("rm -rf"), "off text in the team store: {t}");
         // The denial's reason is kept (said in corp), but not the off task, drone text or tool call.
@@ -2018,6 +2130,12 @@ mod tests {
 
     fn corrections(found: &[Found]) -> Vec<&str> {
         found.iter().map(|f| f.episode.correction.as_str()).collect()
+    }
+
+    /// The corrections of `found`'s episodes, then of its candidates (`learn::candidates::KIND`).
+    fn episodes_and_candidates(found: &[Found]) -> (Vec<&str>, Vec<&str>) {
+        let (c, e): (Vec<&Found>, Vec<&Found>) = found.iter().partition(|f| f.episode.kind == learn::candidates::KIND);
+        (e.iter().map(|f| f.episode.correction.as_str()).collect(), c.iter().map(|f| f.episode.correction.as_str()).collect())
     }
 
     #[test]
@@ -2065,9 +2183,11 @@ mod tests {
         assert!(e.rejected_tool.as_deref().unwrap().starts_with(r#"read {"filePath":"/home/dev/work/"#));
         assert_eq!(e.ms, 1791978152946, "when the engineer answered, not when the message began");
         // The sibling 1.x rejected along with it (plain words, 4 ms later) is the cascade, not the
-        // engineer: the next prompt is a new task, no second episode.
+        // engineer: the next prompt is a new task, no second episode, only a candidate for the judge.
         let next = say_v1(export!("v1/reject-with-feedback.json"), 1791978160000, "now add a test for the relay");
-        assert_eq!(corrections(&opencode_session(&next)), ["no, that is wrong, use the AtomicBoolean compareAndSet instead"]);
+        let found = opencode_session(&next);
+        let (eps, cands) = episodes_and_candidates(&found);
+        assert_eq!((eps, cands), (vec!["no, that is wrong, use the AtomicBoolean compareAndSet instead"], vec!["now add a test for the relay"]));
     }
 
     #[test]
@@ -2125,6 +2245,14 @@ mod tests {
     }
 
     #[test]
+    fn opencode_prompts_after_a_task_are_candidates_under_the_model_gate() {
+        let found = opencode_gated(&export!("v1/correction-rejection-dismissed.json"), learn::Gate::Model);
+        let cands: Vec<&str> = found.iter().filter(|f| f.episode.kind == learn::candidates::KIND).map(|f| f.episode.correction.as_str()).collect();
+        assert_eq!(cands, ["no, that is wrong, use the test script of this project instead", "no, you need to wait until the server is ready, read the project notes first"]);
+        assert!(found.iter().filter(|f| f.episode.kind == learn::candidates::KIND).all(|f| f.episode.task == "Run the test suite and then the app."));
+    }
+
+    #[test]
     fn opencode_1_a_rule_that_denies_a_call_is_not_the_engineer() {
         let by_rule = say_v1(export!("v1/permission-denied-by-rule.json"), 1776791500000, "use the plan file");
         assert!(opencode_session(&by_rule).is_empty());
@@ -2171,12 +2299,21 @@ mod tests {
         // The tail: a synthetic input (borg's context) and borg's echoed question, then the engineer.
         let export = say_v2(export!("v2/session-export.json"), 1791977840000, "no, check the queue bound first");
         let found = opencode_session(&export);
+        let (eps, cands) = episodes_and_candidates(&found);
         assert_eq!(
-            corrections(&found),
+            eps,
+            [
+                "SHELL clean up the file",                     // the reason after a declined call
+                "no, do not delete files, use git rm instead", // feedback; the auto-reject before it is not
+            ]
+        );
+        assert_eq!(
+            cands,
             [
                 "no, that is wrong, use a Mutex instead of the AtomicBoolean", // run's argv quoting stripped
-                "SHELL clean up the file",                                     // the reason after a declined call
-                "no, do not delete files, use git rm instead",                 // feedback; the auto-reject before it is not
+                "SHELL remove the old file",
+                "SHELL remove the old file again",
+                "SUBAGENT delegate a check of relay.rs",
                 "no, check the queue bound first",
             ]
         );
@@ -2186,10 +2323,10 @@ mod tests {
             (e[0].task.as_str(), e[0].agent.as_str(), e[0].rejected_tool.as_deref()),
             ("READS Please fix the race in relay.rs", "Done: the mock finished this turn.", None)
         );
-        assert_eq!(e[1].rejected_tool.as_deref(), Some(r#"shell {"command":"rm -f relay.rs"}"#));
-        assert_eq!(e[1].task, "SHELL remove the old file again");
-        assert_eq!(e[2].rejected_tool.as_deref(), Some(r#"shell {"command":"rm -f relay.rs"}"#));
-        assert_eq!(e[3].task, "SUBAGENT delegate a check of relay.rs", "the synthetic input and the echo are not the task");
+        assert_eq!(e[3].rejected_tool.as_deref(), Some(r#"shell {"command":"rm -f relay.rs"}"#));
+        assert_eq!(e[3].task, "SHELL remove the old file again");
+        assert_eq!(e[4].rejected_tool.as_deref(), Some(r#"shell {"command":"rm -f relay.rs"}"#));
+        assert_eq!(e[6].task, "SUBAGENT delegate a check of relay.rs", "the synthetic input and the echo are not the task");
         assert!(e.windows(2).all(|w| w[0].ms < w[1].ms));
     }
 
@@ -2553,7 +2690,7 @@ mod tests {
         assert_eq!(k("opencode"), (1, 1, 0, 0, String::new()));
         assert_eq!(k("codex"), (0, 1, 0, 0, "0.153.2".into()));
         let text = render(&dry, false);
-        assert!(text.contains("claude 2.1.312: 1 rejections, 2 answers, 0 prompts new; 0 already present\n"), "{text}");
+        assert!(text.contains("claude 2.1.312: 1 rejections, 2 answers, 0 prompts, 0 candidate prompts new; 0 already present\n"), "{text}");
         assert!(text.contains("learn cost: ~10 model calls; unknown per call"), "{text}");
 
         let applied = run(&every_harness(&root, true), Some(&cfg), &base, &ask);
@@ -2651,14 +2788,20 @@ mod tests {
         assert_eq!((dry.off_sessions, dry.off_episodes), (1, 2));
         assert!(!base.exists());
 
-        let r = run(&opts(true), Some(&cfg), &base, &ask);
+        let r = run(&opts(true), Some(&cfg), &base, &ask_judging);
         assert_eq!((r.collectives["corp"].new_lessons, r.collectives["mine"].new_lessons), (3, 1));
+        // The research run typed its second prompt 0.2 s after the first: within SAME_MS the two are one
+        // candidate, so the second counts as known.
+        assert_eq!((r.collectives["corp"].episodes, r.collectives["corp"].candidates, r.collectives["corp"].known), (2, 3, 1));
+        // The reason and the feedback are appended first; the corp prompt the judge calls a correction after them.
         let corp: Vec<Episode> = read_jsonl(&base.join("collectives/corp/episodes.jsonl"));
         assert_eq!(
             corp.iter().map(|e| e.correction.as_str()).collect::<Vec<_>>(),
-            ["no, that is wrong, use a Mutex instead of the AtomicBoolean", "SHELL clean up the file", "no, do not delete files, use git rm instead"]
+            ["SHELL clean up the file", "no, do not delete files, use git rm instead", "no, that is wrong, use a Mutex instead of the AtomicBoolean"]
         );
+        assert!(read_jsonl::<Episode>(&base.join("collectives/corp").join(learn::candidates::FILE)).is_empty(), "every candidate judged");
         assert_eq!((corp[0].session.as_str(), corp[0].repo.as_str()), ("ses_ec5cd46d0ffeGGDxs4GhqC9Ifu", "relay"));
+        assert_eq!((corp[2].session.as_str(), corp[2].repo.as_str(), corp[2].kind.as_str()), ("ses_ec5cd46d0ffeGGDxs4GhqC9Ifu", "relay", ""));
         let mine: Vec<Episode> = read_jsonl(&base.join("collectives/mine/episodes.jsonl"));
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].correction, "no, that is wrong, use the AtomicBoolean compareAndSet instead");
@@ -2670,7 +2813,7 @@ mod tests {
         let snapshot = |d: &Path| files(d).into_iter().map(|f| std::fs::read_to_string(f).unwrap()).collect::<Vec<_>>();
         let before = snapshot(&base);
         let again = run(&opts(true), Some(&cfg), &base, &|_| panic!("nothing new to learn"));
-        assert_eq!((again.collectives["corp"].episodes, again.collectives["corp"].known), (0, 3));
+        assert_eq!((again.collectives["corp"].episodes, again.collectives["corp"].candidates, again.collectives["corp"].known), (0, 0, 6), "2 episodes, 4 candidate prompts");
         assert_eq!(snapshot(&base), before);
         let _ = std::fs::remove_dir_all(root);
     }

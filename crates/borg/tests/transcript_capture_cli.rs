@@ -169,3 +169,48 @@ fn transcript_capture_off_leaves_a_sessions_end_to_the_hooks() {
     assert!(episodes(&root).is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn candidates(root: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(root.join("store/collectives/dev/candidates.jsonl")).unwrap_or_default();
+    text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+#[test]
+fn a_non_english_correction_is_a_candidate_the_turn_end_reads_once_under_the_model_gate() {
+    let root = setup("candidate");
+    let model = [("BORG_CORRECTION_GATE", "model")];
+    let said = "nein, keine feste Pause: Backoff mit Jitter";
+    let prompt = json!({"session_id": SESSION, "cwd": "/home/dev/work/relay", "transcript_path": root.join("t.jsonl"), "prompt": said});
+    hook(&root, "prompt", &prompt, &model);
+    assert!(!root.join("store/collectives/dev/candidates.jsonl").exists(), "Claude's prompt hook leaves candidates to the transcript");
+
+    // The prompt as Claude Code writes it: the fixture's first user line, chained after the last line.
+    let text = std::fs::read_to_string(root.join("t.jsonl")).unwrap();
+    let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let mut user = lines.iter().find(|l| l["type"] == "user").unwrap().clone();
+    let last = lines.last().unwrap();
+    assert_eq!(last["timestamp"], "2026-10-28T09:04:00.000Z", "the fixture's last line, one second before the prompt");
+    user["message"]["content"] = json!(said);
+    user["uuid"] = json!("u-99000000");
+    user["parentUuid"] = last["uuid"].clone();
+    user["timestamp"] = json!("2026-10-28T09:04:01.000Z");
+    let mut t = std::fs::OpenOptions::new().append(true).open(root.join("t.jsonl")).unwrap();
+    writeln!(t, "{user}").unwrap();
+
+    stop(&root, &model);
+    let cands = candidates(&root);
+    assert_eq!(cands.len(), 1, "{cands:?}");
+    assert_eq!((cands[0]["correction"].as_str(), cands[0]["kind"].as_str()), (Some(said), Some("candidate")));
+    let ids: Vec<String> = episodes(&root).iter().map(|e| e["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["7f3c2a10-Ttoolu_01RelayEdit", "7f3c2a10-Ttoolu_01RelayAsk", "7f3c2a10-Ttoolu_01RelayPlace"]);
+
+    // A whole re-read (the offset gone): the candidate is known, not appended again.
+    std::fs::remove_file(root.join(format!("store/collectives/dev/state/{SESSION}.swept"))).unwrap();
+    stop(&root, &model);
+    assert_eq!(candidates(&root).len(), 1);
+
+    // The judge's model fails: the candidate stays pending for a later run.
+    learn(&root, &model);
+    assert_eq!(candidates(&root).len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}

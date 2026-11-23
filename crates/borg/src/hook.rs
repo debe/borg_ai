@@ -130,8 +130,9 @@ fn denied_file(session: &str) -> PathBuf {
     state_file(session).with_extension("denied")
 }
 
-/// A correcting prompt becomes an episode (task, the drone's last proposal, the correction);
-/// so does the first prompt after a wordless tool denial. Any other prompt becomes the session's task.
+/// A correcting prompt becomes an episode (task, the drone's last proposal, the correction), or under
+/// the model gate a candidate ([`pushback`]); so does the first prompt after a wordless tool denial. Any
+/// other prompt becomes the session's task.
 fn capture_prompt(h: &dyn Harness, session: &str, input: &Value, prompt: &str) {
     if !learning() {
         return;
@@ -145,12 +146,24 @@ fn capture_prompt(h: &dyn Harness, session: &str, input: &Value, prompt: &str) {
             return;
         }
     }
-    if !learn::is_correction(prompt) || task.is_empty() {
-        let task: String = prompt.chars().take(learn::TASK_CHARS).collect();
-        let _ = std::fs::write(task_file(session), task);
-        return;
+    let correction = learn::is_correction(prompt) && !task.is_empty();
+    if !correction {
+        let _ = std::fs::write(task_file(session), learn::head_chars(prompt, learn::TASK_CHARS));
     }
-    record(session, input, task, proposal(h, input), None, prompt.chars().take(learn::EXCERPT_CHARS).collect());
+    pushback(h, session, input, prompt, task, correction);
+}
+
+/// A prompt after a task, by the gate (`learn::gate`): an episode when the regex calls it a correction,
+/// or a candidate the model judges later, for a harness whose transcript replay does not read prompts
+/// (the others' come from the turn-end sweep, without a transcript read here).
+fn pushback(h: &dyn Harness, session: &str, input: &Value, prompt: &str, task: String, correction: bool) {
+    match learn::gate() {
+        learn::Gate::Regex if correction => record(session, input, task, proposal(h, input), None, learn::head_chars(prompt, learn::EXCERPT_CHARS).to_owned()),
+        learn::Gate::Model if !task.is_empty() && !crate::assimilate::replays_prompts(h) && crate::assimilate::human_prompt(prompt.trim()) => {
+            record_candidate(session, input, task, proposal(h, input), learn::head_chars(prompt, learn::EXCERPT_CHARS).to_owned());
+        }
+        learn::Gate::Regex | learn::Gate::Model => {}
+    }
 }
 
 /// A veto said in the session (veto.rs): its episode, the shown lessons' credit and its stat. A pending
@@ -210,9 +223,25 @@ fn full_proposal(h: &dyn Harness, input: &Value) -> String {
 }
 
 fn record(session: &str, input: &Value, task: String, agent: String, rejected_tool: Option<String>, correction: String) {
+    let e = episode(session, input, task, agent, rejected_tool, correction);
+    let _ = learn::record_episode(&e);
+    append(session, &format!("#borg-episode {}", e.id));
+}
+
+/// A prompt after a proposal under `Gate::Model`, for a harness whose transcript replay does not
+/// capture prompts: a pending candidate (learn/candidates.rs) that `borg learn` judges, appended
+/// without dedupe as `record` does.
+fn record_candidate(session: &str, input: &Value, task: String, agent: String, correction: String) {
+    let mut e = episode(session, input, task, agent, None, correction);
+    e.kind = learn::candidates::KIND.into();
+    let _ = learn::candidates::record(&learn::home(), &e); // fails open, as the episode append does
+    append(session, &format!("#borg-candidate {}", e.id));
+}
+
+fn episode(session: &str, input: &Value, task: String, agent: String, rejected_tool: Option<String>, correction: String) -> learn::Episode {
     let ms = learn::now_ms();
     let cwd = input.get("cwd").and_then(Value::as_str).unwrap_or_default();
-    let e = learn::Episode {
+    learn::Episode {
         id: format!("{}-{ms}", session.chars().take(8).collect::<String>()),
         ms,
         repo: repo_of(cwd),
@@ -223,9 +252,7 @@ fn record(session: &str, input: &Value, task: String, agent: String, rejected_to
         correction,
         engineer: learn::engineer(cwd),
         ..learn::Episode::default()
-    };
-    let _ = learn::record_episode(&e);
-    append(session, &format!("#borg-episode {}", e.id));
+    }
 }
 
 /// The lessons the conscience reads (BORG_CONSCIENCE, the BORG_BEFORE cut-off) as `session` sees them:

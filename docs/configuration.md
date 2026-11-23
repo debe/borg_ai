@@ -528,6 +528,7 @@ All are optional.
 | `BORG_REGRESS_MIN_AGE` | `2d` | Least age of a decision a fix may link to, by commit times: `2d`, `12h`, `90m`, or seconds |
 | `BORG_REGRESS_TIMEOUT_S` | `10` | Time limit of each git call while linking; `0` makes none, so nothing is linked |
 | `BORG_TRANSCRIPT_CAPTURE` | on | `off`: Borg no longer reads the harnesses' own transcripts for corrections and answers (at a turn end, at session end, for idle sessions); the hooks alone capture ([The harness's own transcript](harnesses.md#the-harnesss-own-transcript)). `borg assimilate` still reads them |
+| `BORG_CORRECTION_GATE` | model | Every prompt after a drone proposal is a candidate; `borg learn` judges each session's candidates in one model call (correction / task / neither) and learns the corrections, in any language. `regex`: only prompts opening with an English correction word ("no", "don't", "instead", …) become corrections, unjudged |
 | `BORG_REVIEW_FIX` | on | [Review → fix findings](#review--fix-findings): `off`: the ended session's sub-agent review findings are not learned from |
 | `BORG_REGRET_CREDIT` | on | `off`: a regret (a later fix or a review finding) no longer counts against the lessons asked before the decision ([Regret reaches back](#decision--fix-links)) |
 | `BORG_TEST_CREDIT` | on | `off`: a session's own tests going green after a lesson was asked no longer credit it (`tested` outcomes; [Green tests credit the question](learning.md#outcomes-and-the-usefulness-belief)). For an eval's frozen arm. Also off with `BORG_LEARN=off` |

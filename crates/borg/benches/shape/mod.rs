@@ -154,6 +154,68 @@ fn write_lines(path: &Path, lines: &[String]) {
     std::fs::write(path, text).expect("write the bench store");
 }
 
+/// Adds the files candidate capture reads (borg learn/candidates.rs) to the store in `dir`, each only if
+/// absent, so a copied store keeps its own: `candidates-judged.jsonl` with a year of judged prompts (40 a
+/// day) over 600 sessions, and `candidates.jsonl` with 20 pending candidates in each of the last 10 of
+/// them. Returns the 6th pending session, the one the session-scoped units read.
+#[allow(dead_code)] // borg-mesh's bench shares this module and benches no capture.
+pub fn capture(dir: &Path) -> &'static str {
+    use serde_json::json;
+    const JUDGED: usize = 15_000;
+    const SESSIONS: usize = 600;
+    const PENDING_SESSIONS: usize = 10;
+    const PENDING_EACH: usize = 20;
+    const VERDICTS: [&str; 4] = ["correction", "task", "neither", "task"];
+    let mut r = Rng(SEED ^ 0xca97);
+    let now = borg::learn::now_ms();
+    let sessions: Vec<String> = (0..SESSIONS).map(|_| format!("{}-{}-{}-{}-{}", r.hex(8), r.hex(4), r.hex(4), r.hex(4), r.hex(12))).collect();
+    let judged = dir.join("candidates-judged.jsonl");
+    if !judged.exists() {
+        let lines: Vec<String> = (0..JUDGED)
+            .map(|i| {
+                let s = &sessions[i * SESSIONS / JUDGED];
+                let ms = now - (JUDGED - i) as i64 * 2_160_000;
+                json!({"session": s, "id": format!("{}-{ms}", &s[..8]), "ms": ms, "w": r.next(), "verdict": VERDICTS[r.below(VERDICTS.len())]}).to_string()
+            })
+            .collect();
+        write_lines(&judged, &lines);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("bench state dir");
+        for s in &sessions {
+            std::fs::write(state.join(format!("{s}.judged")), b"").expect("bench judged marker");
+        }
+    }
+    let pending = dir.join("candidates.jsonl");
+    if !pending.exists() {
+        let mut text = |chars: usize| {
+            let mut t = r.words(chars / 4);
+            t.truncate(chars);
+            t
+        };
+        let lines: Vec<String> = (0..PENDING_SESSIONS * PENDING_EACH)
+            .map(|i| {
+                let s = &sessions[SESSIONS - PENDING_SESSIONS + i / PENDING_EACH];
+                let ms = now - (PENDING_SESSIONS * PENDING_EACH - i) as i64 * 60_000;
+                json!({"id": format!("{}-{ms}", &s[..8]), "ms": ms, "repo": format!("/work/repo-{}", i % 9), "session": s, "task": text(600),
+                    "agent": text(2_000), "rejected_tool": null, "correction": text(140), "engineer": "dev0@example.com", "kind": "candidate"})
+                .to_string()
+            })
+            .collect();
+        write_lines(&pending, &lines);
+        return sessions[SESSIONS - PENDING_SESSIONS + 5].clone().leak();
+    }
+    // A copied store's own: the 6th session its pending candidates name.
+    let text = std::fs::read_to_string(&pending).unwrap_or_default();
+    let mut seen: Vec<String> = Vec::new();
+    for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        let s = v["session"].as_str().unwrap_or_default();
+        if !seen.iter().any(|x| x == s) {
+            seen.push(s.to_string());
+        }
+    }
+    seen.into_iter().nth(5).unwrap_or_else(|| sessions[SESSIONS - PENDING_SESSIONS + 5].clone()).leak()
+}
+
 /// Writes a store of the measured shape (module doc) into `dir`, origins and all, `scale` times its lines
 /// (`SCALE`; the messages stay as many, as their log is bounded).
 fn generate(dir: &Path, seed: u64, scale: usize) {
