@@ -252,7 +252,8 @@ fn a_restatement_after_an_older_tagged_record_sets_aside_the_latest_prompt() {
     std::thread::sleep(std::time::Duration::from_millis(1_200));
     prompt("nein, der Ticket-Schlüssel gehört in den Commit-Betreff");
 
-    let (out, err, code) = borg(&root, &app, &["correct", "--collective", "corp", "--session", "sess-7", "the", "ticket", "key", "goes", "in", "the", "subject"]);
+    let (out, err, code) =
+        borg(&root, &app, &["correct", "--collective", "corp", "--session", "sess-7", "the", "ticket", "key", "goes", "in", "the", "subject"]);
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("set aside in corp"), "{out}");
     let judged = lines(&corp.join("candidates-judged.jsonl"));

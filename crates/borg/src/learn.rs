@@ -43,8 +43,8 @@ use crate::outcome;
 use crate::runner::MAX_FAILURES;
 use crate::trust;
 
-pub mod regret;
 pub mod candidates;
+pub mod regret;
 
 static CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(no\b|nope|don'?t|do not|stop|wrong|that'?s not|not what|why did you|why do you|i said|instead|you should|never\b|always\b|please don'?t|double check|carefully check|check against|are you sure|hmm|but\b|just a second|still\b|can'?t we|don'?t we|isn'?t)").unwrap()

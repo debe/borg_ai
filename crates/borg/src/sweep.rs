@@ -990,7 +990,11 @@ mod tests {
         assert_eq!((r.collectives["app"].episodes, r.collectives["app"].candidates, r.collectives["app"].new_lessons), (0, 1, 1));
         let app = std::fs::read_to_string(base.join("collectives/app/episodes.jsonl")).unwrap();
         let app: Vec<Episode> = app.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(app.iter().map(|e| (e.correction.as_str(), e.kind.as_str())).collect::<Vec<_>>(), [("no, keep the cache on disk", "")], "promoted by the judge");
+        assert_eq!(
+            app.iter().map(|e| (e.correction.as_str(), e.kind.as_str())).collect::<Vec<_>>(),
+            [("no, keep the cache on disk", "")],
+            "promoted by the judge"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -29,9 +29,8 @@ struct Map {
 fn map() -> &'static Map {
     static M: OnceLock<Map> = OnceLock::new();
     M.get_or_init(|| {
-        let v = user_map().unwrap_or_else(|| {
-            if cfg!(test) { serde_json::from_str(include_str!("../data/systems.json")).expect("data/systems.json") } else { Value::Null }
-        });
+        let v = user_map()
+            .unwrap_or_else(|| if cfg!(test) { serde_json::from_str(include_str!("../data/systems.json")).expect("data/systems.json") } else { Value::Null });
         let list =
             |x: &Value| -> Vec<String> { x.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_lowercase)).collect()).unwrap_or_default() };
         let obj = |k: &str| v[k].as_object().cloned().unwrap_or_default().into_iter();

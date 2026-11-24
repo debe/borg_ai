@@ -860,7 +860,9 @@ fn engineer_in(cfg: Option<&Config>, base: &Path, target: &Store, repo: &str) ->
 pub fn set_aside(here: &Path, session: &str) -> std::io::Result<Option<String>> {
     let state = crate::hook::state_file(session);
     let last = read_lines(&state).lines().rev().find_map(|l| {
-        l.strip_prefix("#borg-episode ").map(|id| (id.trim().to_string(), false)).or_else(|| l.strip_prefix("#borg-candidate ").map(|id| (id.trim().to_string(), true)))
+        l.strip_prefix("#borg-episode ")
+            .map(|id| (id.trim().to_string(), false))
+            .or_else(|| l.strip_prefix("#borg-candidate ").map(|id| (id.trim().to_string(), true)))
     });
     let Some((id, candidate)) = last else { return set_aside_latest(here, session, &state) };
     let task_ms = modified_ms(&state.with_extension("task"));

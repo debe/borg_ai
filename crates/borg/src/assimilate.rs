@@ -1654,11 +1654,22 @@ pub fn render(r: &Report, apply: bool) -> String {
     s.push_str(&format!("sources: claude {} sessions, omp {}, {opencode}, codex {}\n", r.claude, r.omp, r.codex));
     for (h, k) in &r.harnesses {
         let version = if k.version.is_empty() { String::new() } else { format!(" {}", k.version) };
-        s.push_str(&format!("{h}{version}: {} rejections, {} answers, {} prompts, {} candidate prompts new; {} already present\n", k.rejections, k.answers, k.prompts, k.candidates, k.known));
+        s.push_str(&format!(
+            "{h}{version}: {} rejections, {} answers, {} prompts, {} candidate prompts new; {} already present\n",
+            k.rejections, k.answers, k.prompts, k.candidates, k.known
+        ));
     }
     for (name, t) in &r.collectives {
         let sync = if t.may_sync { "team" } else { "local, never syncs" };
-        s.push_str(&format!("{name} ({sync}) {}: {} new episodes from {} sessions, {} already known, {} candidate prompts (~{} judge calls)", t.home.display(), t.episodes, t.sessions, t.known, t.candidates, t.judge_calls));
+        s.push_str(&format!(
+            "{name} ({sync}) {}: {} new episodes from {} sessions, {} already known, {} candidate prompts (~{} judge calls)",
+            t.home.display(),
+            t.episodes,
+            t.sessions,
+            t.known,
+            t.candidates,
+            t.judge_calls
+        ));
         if apply {
             s.push_str(&format!("; {} new lessons, {} merged", t.new_lessons, t.merged));
             if t.pending > 0 {
@@ -1681,7 +1692,8 @@ pub fn render(r: &Report, apply: bool) -> String {
         });
         let judge: usize = r.collectives.values().map(|t| t.judge_calls).sum();
         // Writing to a `String` never fails.
-        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("judge: ~{judge} calls (one per session, at most {} prompts each)\n", learn::candidates::BATCH));
+        let _ =
+            std::fmt::Write::write_fmt(&mut s, format_args!("judge: ~{judge} calls (one per session, at most {} prompts each)\n", learn::candidates::BATCH));
         // Last line, where it is read: the first line's note is easy to miss.
         s.push_str("Dry run: nothing was written. Run `borg assimilate --apply` to learn these episodes.\n");
     }
@@ -1947,7 +1959,11 @@ mod tests {
         assert!(!base.exists(), "dry run wrote something");
         assert_eq!(r.scanned, 4, "main sessions only");
         let corp = &r.collectives["corp"];
-        assert_eq!((corp.sessions, corp.episodes, corp.candidates, corp.calls, corp.judge_calls, corp.may_sync), (1, 1, 1, 1, 1, true), "the corp prompt is a candidate");
+        assert_eq!(
+            (corp.sessions, corp.episodes, corp.candidates, corp.calls, corp.judge_calls, corp.may_sync),
+            (1, 1, 1, 1, 1, true),
+            "the corp prompt is a candidate"
+        );
         let mine = &r.collectives["mine"];
         assert_eq!((mine.sessions, mine.episodes, mine.may_sync), (1, 1, false));
         assert_eq!((r.off_sessions, r.off_episodes), (1, 1));
@@ -2052,7 +2068,11 @@ mod tests {
         assert_eq!(stored(), ["only the one crate, pin the rest", "keep the cache dir"], "the second batch is the next episode");
         run(&one, Some(&cfg), &base, &ask_judging);
         let last = run(&one, Some(&cfg), &base, &|_| panic!("nothing left to learn"));
-        assert_eq!(stored(), ["only the one crate, pin the rest", "no, check the TOCTOU on the closed flag first", "keep the cache dir"], "corp's, then mine's");
+        assert_eq!(
+            stored(),
+            ["only the one crate, pin the rest", "no, check the TOCTOU on the closed flag first", "keep the cache dir"],
+            "corp's, then mine's"
+        );
         assert_eq!(last.collectives.values().map(|t| (t.episodes, t.candidates, t.known)).fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2)), (0, 0, 3));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2248,7 +2268,10 @@ mod tests {
     fn opencode_prompts_after_a_task_are_candidates_under_the_model_gate() {
         let found = opencode_gated(&export!("v1/correction-rejection-dismissed.json"), learn::Gate::Model);
         let cands: Vec<&str> = found.iter().filter(|f| f.episode.kind == learn::candidates::KIND).map(|f| f.episode.correction.as_str()).collect();
-        assert_eq!(cands, ["no, that is wrong, use the test script of this project instead", "no, you need to wait until the server is ready, read the project notes first"]);
+        assert_eq!(
+            cands,
+            ["no, that is wrong, use the test script of this project instead", "no, you need to wait until the server is ready, read the project notes first"]
+        );
         assert!(found.iter().filter(|f| f.episode.kind == learn::candidates::KIND).all(|f| f.episode.task == "Run the test suite and then the app."));
     }
 
@@ -2813,7 +2836,11 @@ mod tests {
         let snapshot = |d: &Path| files(d).into_iter().map(|f| std::fs::read_to_string(f).unwrap()).collect::<Vec<_>>();
         let before = snapshot(&base);
         let again = run(&opts(true), Some(&cfg), &base, &|_| panic!("nothing new to learn"));
-        assert_eq!((again.collectives["corp"].episodes, again.collectives["corp"].candidates, again.collectives["corp"].known), (0, 0, 6), "2 episodes, 4 candidate prompts");
+        assert_eq!(
+            (again.collectives["corp"].episodes, again.collectives["corp"].candidates, again.collectives["corp"].known),
+            (0, 0, 6),
+            "2 episodes, 4 candidate prompts"
+        );
         assert_eq!(snapshot(&base), before);
         let _ = std::fs::remove_dir_all(root);
     }
