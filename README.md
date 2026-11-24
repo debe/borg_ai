@@ -211,11 +211,13 @@ machine they are on. A session or the engineer's terminal sends:
 borg tell 2 "the schema change is merged, rebase before you touch migrations"
 borg ask local "is anyone editing crates/borg/src/hook.rs?"        # the sessions on this machine
 borg tell collective "the staging database is down until noon"     # every session, every member's machine
+borg tell ann --on billing "I took story 275, leave invoice.rs to me" # Ann's live sessions on billing
 borg inbox      # in a session: its messages; in a terminal: every message of the last 7 days
 ```
 
 The recipient is a drone as `borg top` names it (its number, or its label, such as
-`"Ann Example · borg-ai · claude"`), a session id, `local`, `collective` (or `all`, the same) or
+`"Ann Example · borg-ai · claude"`), a session id, an engineer's name (their live sessions, `--on` only
+those whose repo, prompt or a file holds a topic), `local`, `collective` (or `all`, the same) or
 `engineer`. Local first: `local` reaches the sessions running on this machine, and a drone or
 session id that matches one here names it. A colleague's session is reached by `<session>@<node>`, when
 nothing here matches, or as the sender a reply answers; `collective` reaches every session of the

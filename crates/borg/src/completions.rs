@@ -150,15 +150,15 @@ pub const GROUPS: &[(&str, &[Command])] = &[
             cmd(
                 "tell",
                 &[(
-                    "<session|drone|local|collective|engineer> <text> [--re ID]",
-                    "a message to other sessions: local is this machine's, collective (or all) every member's",
+                    "<session|drone|name|local|collective|engineer> <text> [--re ID] [--on TOPIC] [--state LIST]",
+                    "a message to other sessions: local is this machine's, collective (or all) every member's, a name an engineer's live ones",
                 )],
                 &["local", "collective", "all"],
                 crate::msg::FLAGS,
             ),
             cmd(
                 "ask",
-                &[("<session|drone|local|collective|engineer> <question> [--re ID]", "a message that asks for a reply")],
+                &[("<session|drone|name|local|collective|engineer> <question> [--re ID] [--on TOPIC] [--state LIST]", "a message that asks for a reply")],
                 &["local", "collective", "all"],
                 crate::msg::FLAGS,
             ),

@@ -459,3 +459,64 @@ fn a_bracketed_git_name_cannot_forge_the_line_an_agent_reads() {
     assert!(r.out.contains(&format!("{forged} · app · claude ->")), "the engineer's own terminal: {}", r.out);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `borg tell <name>` reaches that engineer's live sessions in one call: one message each, the ended
+/// one and another engineer's left out; `--on` narrows them to the sessions whose repo, prompt or a
+/// file holds it, `--json` prints the messages, and `--state ended` reaches a session that ended,
+/// shown when it resumes. A name nobody has lists the engineers who have live sessions.
+#[test]
+fn a_name_reaches_that_engineers_live_sessions() {
+    let (root, work) = setup("person");
+    let bobs = root.join("work/shop");
+    std::fs::create_dir_all(&bobs).unwrap();
+    let git = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&bobs).args(a).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap().status.success());
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "bob@x"]);
+    git(&["config", "user.name", "Bob Example"]);
+    hook(&root, "opencode", "prompt", &prompt("s-bob-1", &bobs));
+    hook(&root, "opencode", "prompt", &prompt("s-bob-2", &bobs));
+    hook(&root, "opencode", "post_tool", &edit("s-bob-2", &bobs));
+    hook(&root, "opencode", "prompt", &prompt("s-bob-3", &bobs));
+    hook(&root, "opencode", "end", &plain("s-bob-3", &bobs, json!({})));
+    hook(&root, "opencode", "prompt", &prompt("s-alice", &work));
+    let (one, two, three) = (designation(&root, &work, "s-bob-1"), designation(&root, &work, "s-bob-2"), designation(&root, &work, "s-bob-3"));
+
+    let r = borg(&root, &work, &["tell", "bob", "story", "275", "is", "mine"], &[], "");
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", r.out);
+    assert!(lines.iter().any(|l| l.starts_with("sent m") && l.contains(&format!(" to {one} (#"))), "{}", r.out);
+    assert!(lines.iter().any(|l| l.contains(&format!(" to {two} (#"))) && !r.out.contains(&three), "{}", r.out);
+    assert_eq!(logged(&root, "tell"), 2, "one message per live session");
+    for s in ["s-bob-1", "s-bob-2"] {
+        assert!(context(&hook(&root, "opencode", "prompt", &prompt(s, &bobs))).contains("story 275 is mine"), "{s}");
+    }
+    assert!(!context(&hook(&root, "opencode", "prompt", &prompt("s-alice", &work))).contains("story 275"), "not another engineer's");
+
+    // --on a file only s-bob-2 touched; --json: the messages as an array.
+    let r = borg(&root, &work, &["tell", "Bob Example", "--on", "a.rs", "--json", "rebase", "first"], &[], "");
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    let v: Value = serde_json::from_str(&r.out).unwrap_or_else(|_| panic!("{}", r.out));
+    let sent = v.as_array().unwrap();
+    assert_eq!(sent.len(), 1, "{v}");
+    assert!(sent[0]["to"].as_str().unwrap().starts_with("s-bob-2@") && sent[0]["text"] == "rebase first", "{v}");
+
+    let r = borg(&root, &work, &["tell", "bob", "--on", "payroll", "x"], &[], "");
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("no live session of Bob Example matches --on \"payroll\"") && r.err.contains("src/a.rs"), "{}", r.err);
+
+    // An ended session is reached by --state; a resumed one with the same id shows it.
+    let r = borg(&root, &work, &["tell", "bob", "--state", "ended", "back", "yet?"], &[], "");
+    assert_eq!(r.code, Some(0), "{}", r.err);
+    assert!(r.out.contains(&format!(" to {three} (#")) && r.out.lines().count() == 1, "{}", r.out);
+    assert!(context(&hook(&root, "opencode", "prompt", &prompt("s-bob-3", &bobs))).contains("back yet?"), "shown when it resumes");
+
+    let r = borg(&root, &work, &["tell", "zoe", "x"], &[], "");
+    assert_eq!(r.code, Some(1));
+    assert!(r.err.contains("no drone, session or engineer \"zoe\"; engineers with live sessions:") && r.err.contains("Bob Example"), "{}", r.err);
+    let r = borg(&root, &work, &["pause", "bob", "--on", "a.rs"], &[], "");
+    assert_eq!(r.code, Some(2), "a pause names no engineer: {}", r.err);
+    let r = borg(&root, &work, &["tell", "local", "--on", "a.rs", "x"], &[], "");
+    assert_eq!(r.code, Some(2), "--on narrows a name only: {}", r.err);
+    let _ = std::fs::remove_dir_all(&root);
+}

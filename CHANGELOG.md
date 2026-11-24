@@ -3,6 +3,13 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.11.1 (unreleased)
+
+### Added
+
+- `borg tell <name>` (and `borg ask`) reaches an engineer's live sessions in one call; `--on <topic>`
+  narrows them, `--state` picks other states. [Messages](https://github.com/debe/borg_ai/blob/main/docs/commands.md#messages)
+
 ## 0.11.0 (2026-11-24)
 
 Corrections are recognised in any language, judged by a model, and borg ships no system map of its own.

@@ -360,7 +360,11 @@ pub fn unread_cell(inbox: &Inbox, d: &Drone) -> String {
 /// (which never reads a message), and among those one on this machine over one on another node; a
 /// remote drone is named only when none here matches as well (or by its number, which names one drone
 /// of all).
-pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone>, String> {
+///
+/// # Errors
+/// `Miss::Nobody` when no label, number or session matches; `Miss::Other` when more than one does, or a
+/// number names no drone.
+pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone>, Miss> {
     let t = target.trim();
     if [msg::ALL, msg::COLLECTIVE, msg::LOCAL].iter().any(|w| t.eq_ignore_ascii_case(w)) {
         return Ok(None);
@@ -373,18 +377,45 @@ pub fn resolve<'a>(drones: &'a [Drone], target: &str) -> Result<Option<&'a Drone
     match labelled.as_slice() {
         [d] => return Ok(Some(d)),
         [] => {}
-        more => return Err(format!("{target:?} names {} drones: give the number (`borg top`)", more.len())),
+        more => return Err(Miss::Other(format!("{target:?} names {} drones: give the number (`borg top`)", more.len()))),
     }
     let first = t.split_whitespace().next().unwrap_or_default();
     let number = first.parse::<usize>().ok().or_else(|| NUMBERS.iter().position(|w| w.eq_ignore_ascii_case(first)).map(|i| i + 1));
     if let Some(n) = number {
-        return drones.iter().find(|d| d.number == n).map(Some).ok_or_else(|| format!("no drone {target}: there are {} (`borg top`)", drones.len()));
+        return drones
+            .iter()
+            .find(|d| d.number == n)
+            .map(Some)
+            .ok_or_else(|| Miss::Other(format!("no drone {target}: there are {} (`borg top`)", drones.len())));
     }
     let hits: Vec<&Drone> = drones.iter().filter(|d| d.p.session == t || (t.len() >= 4 && d.p.session.starts_with(t))).collect();
     if hits.is_empty() {
-        return Err(format!("no drone or session {target:?} (`borg top`)"));
+        return Err(Miss::Nobody(format!("no drone or session {target:?} (`borg top`)")));
     }
-    pick(hits, target)
+    pick(hits, target).map_err(Miss::Other)
+}
+
+/// Why `resolve` names no drone, with the reason to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Miss {
+    /// No label, number or session matches: the word may name someone else (msg.rs `person`).
+    Nobody(String),
+    /// More than one drone matches, or a number past the drones.
+    Other(String),
+}
+
+impl std::fmt::Display for Miss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Miss::Nobody(why) | Miss::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<Miss> for String {
+    fn from(m: Miss) -> String {
+        m.to_string()
+    }
 }
 
 /// The one of `hits` (sessions an id or prefix matches) that `target` names: live over ended, then this
@@ -2645,7 +2676,7 @@ corp (team): 3 drone(s), 2 active, 1 remote
         assert_eq!(resolve(&ds, &carried).unwrap().unwrap().p.session, "s-l");
         let names = book(&[("j@x", "Jürgen Müller"), ("k@x", "Jörgen Müller")]);
         let ds = assemble(vec![one("s-j", "j@x", 1), one("s-k", "k@x", 2)], vec![], &names, NOW, |_| true, |_| false);
-        let err = resolve(&ds, "Jrgen Mller - borg-ai - claude").unwrap_err();
+        let err = resolve(&ds, "Jrgen Mller - borg-ai - claude").unwrap_err().to_string();
         assert!(err.contains("names 2 drones"), "{err}");
         assert_eq!(resolve(&ds, "Jörgen Müller · borg-ai · claude").unwrap().unwrap().p.session, "s-k", "the label itself names one");
     }
