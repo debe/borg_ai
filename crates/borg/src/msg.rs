@@ -2368,8 +2368,9 @@ impl Person<'_> {
 
 /// One drone as an error lists it: `#3 ended 2h05m ago, app: "fix the build" [src/a.rs]`.
 fn listed(d: &top::Drone, now: i64) -> String {
-    let files = if d.p.files.is_empty() { String::new() } else { format!(" [{}]", d.p.files.join(", ")) };
-    format!("#{} {} {} ago, {}: {:?}{files}", d.number, d.state.name(), ago(now - d.p.ms), d.p.repo, d.p.prompt)
+    // Every value but the number, state and age is a peer's claim: escaped, so none breaks the line.
+    let files = if d.p.files.is_empty() { String::new() } else { format!(" {:?}", d.p.files) };
+    format!("#{} {} {} ago, {}: {:?}{files}", d.number, d.state.name(), ago(now - d.p.ms), crate::names::clean(&d.p.repo), d.p.prompt)
 }
 
 /// The drones the name `who` reaches (pure): those of the one engineer it names (named, in any case, by
@@ -2458,7 +2459,12 @@ fn person<'a>(drones: &'a [top::Drone], names: &Book, aliases: &Aliases, who: &s
     };
     if looked.is_empty() {
         let but = if them.drones.iter().any(|d| me(d)) { " but this one" } else { "" };
-        let inbox = them.emails.first().map_or_else(String::new, |e| format!(";\n  `borg tell {ENGINEER}:{e}` leaves it in their inbox"));
+        // A peer's email goes into a command to copy only in the characters an address keeps (`engineer_of`).
+        let inbox = them
+            .emails
+            .iter()
+            .find(|e| e.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@+".contains(c)))
+            .map_or_else(String::new, |e| format!(";\n  `borg tell {ENGINEER}:{e}` leaves it in their inbox"));
         return Err(SendError::Address(format!("{name} has no {phrase} session{but}{resumed}{inbox}")));
     }
     let looked: Vec<String> = looked.iter().map(|d| format!("\n  {}", listed(d, r.now))).collect();
@@ -4479,7 +4485,7 @@ mod tests {
         assert_eq!(to("invoice"), Ok(vec!["b2"]), "a file");
         let err = to("payroll").unwrap_err();
         assert!(err.starts_with("no live session of Bob Builder matches --on \"payroll\"; theirs:\n  #1 working"), "{err}");
-        assert!(err.contains("\"fix the Login flow\"") && err.contains("#2 working 0s ago, billing: \"\" [src/invoice.rs]"), "{err}");
+        assert!(err.contains("\"fix the Login flow\"") && err.contains("#2 working 0s ago, billing: \"\" [\"src/invoice.rs\"]"), "{err}");
         let err = sessions(person(&ds, &book(), &Aliases::default(), "bob", &reach(&[State::Waiting], Some("login"), None))).unwrap_err();
         assert!(err.contains("2 other that --on matches: #1 working") && err.contains("#3 ended"), "{err}");
         assert!(err.contains("`--state any` reaches them (an ended one when it resumes);"), "a live one needs no resume: {err}");
