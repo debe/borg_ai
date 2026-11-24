@@ -249,7 +249,11 @@ test("fails open when borg is missing", async () => {
   assert.equal(prompts.length, 0)
 })
 
-test("real borg: conscience asks once per session, corrections and rejections become episodes", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
+test("real borg: conscience asks once per session, corrections and rejections become episodes", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async (t) => {
+  // The prompt hook records a pushback only under the regex gate: under the model gate (the default)
+  // opencode's candidates come from the turn-end sweep of its own store, which this fake client has not.
+  process.env.BORG_CORRECTION_GATE = "regex"
+  t.after(() => delete process.env.BORG_CORRECTION_GATE)
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home
@@ -611,7 +615,11 @@ test("opencode 2: borg's prompt context (a queen question) reaches the drone as 
   await cleanup()
 })
 
-test("opencode 2, real borg: conscience asks once, a rejection with feedback becomes an episode", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async () => {
+test("opencode 2, real borg: conscience asks once, a rejection with feedback becomes an episode", { skip: !existsSync(BORG) && `no borg binary at ${BORG} (cargo build -p borg-ai)` }, async (t) => {
+  // The prompt hook records a pushback only under the regex gate: under the model gate (the default)
+  // opencode's candidates come from the turn-end sweep of its own store, which this fake client has not.
+  process.env.BORG_CORRECTION_GATE = "regex"
+  t.after(() => delete process.env.BORG_CORRECTION_GATE)
   const home = mkdtempSync(join(tmpdir(), "borg-home-"))
   process.env.BORG_BIN = BORG
   process.env.BORG_HOME = home

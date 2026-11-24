@@ -9,7 +9,7 @@ opencode's hooks and events into borg's canonical hook event and pipes it to
 
 | opencode 1.x | opencode 2.x | borg event | what borg does |
 |---|---|---|---|
-| `chat.message` (the engineer's text) | session hook `prompt` | `prompt` | records the task; a correction becomes an episode; borg's context for the prompt (a queen question) reaches the drone but stays hidden in the TUI: on 1.x a synthetic text part of the message, on 2.x a synthetic session input without a description, just before the prompt; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
+| `chat.message` (the engineer's text) | session hook `prompt` | `prompt` | records the task (a correction becomes a candidate through the turn-end sweep of opencode's store, which `borg learn` judges; under `BORG_CORRECTION_GATE=regex` the hook records an English-opener correction as an episode); borg's context for the prompt (a queen question) reaches the drone but stays hidden in the TUI: on 1.x a synthetic text part of the message, on 2.x a synthetic session input without a description, just before the prompt; behind a stop that is still thinking the message does not wait, and the payload's `"context": false` tells borg to hand none over |
 | `tool.execute.before` | tool hook `execute.before` | `pre_tool` | throws borg's reason when the drone is paused by `borg pause` (refuses the call); fails open after 2 s |
 | `tool.execute.after` | tool hook `execute.after` | `post_tool` | notes what the drone touched (tool names mapped to Claude's: `read` → `Read`, `shell`/`bash` → `Bash`, `filePath`/`path` → `file_path`, an edit's `newString` → `new_string`); borg's context for the call (waiting graded lessons, messages) reaches the model before its next step, see below |
 | a tool part that ends in `error`, including a permission rejected with feedback | `execute.after` with an error (a rejection with feedback carries it), or `session.tool.failed` for a call declined without feedback | `post_tool_failure` | the engineer's feedback becomes an episode |
@@ -194,7 +194,8 @@ adapters/opencode/live/run-v2.sh             # real opencode 2.x, likewise (neve
   1.x and steered in on 2.x (the tool result untouched), and that an answer later than 2 s comes with
   the next tool call or prompt. It then runs the real borg binary and checks that borg's questions return
   once per idle cycle, that the echoed question is not treated as the engineer's prompt, and that a
-  correction and a rejected edit are recorded as episodes.
+  correction (under `BORG_CORRECTION_GATE=regex`, the hook's only capture of a prompt) and a rejected edit
+  are recorded as episodes.
 - `live/run.sh` starts `opencode serve` with every home and config directory in a temp dir, plus a
   local OpenAI-compatible mock LLM. It then runs `opencode run --attach` and checks that the plugin
   loads and that prompt, `post_tool` and `post_tool_failure` reach borg. A wrapper leaves a lesson in
