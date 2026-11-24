@@ -104,8 +104,8 @@ flowchart LR
   B -->|"ranks and fades"| L
 ```
 
-**Learning.** Borg records an *episode* when you push back ("no, use a channel") or reject a tool call
-with a reason. Your answers to the agent's own questions (Claude Code `AskUserQuestion`, omp `ask`,
+**Learning.** Borg records an *episode* when you push back ("no, use a channel", in any language: a model
+judges each prompt at session end) or reject a tool call with a reason. Your answers to the agent's own questions (Claude Code `AskUserQuestion`, omp `ask`,
 opencode `question`, Codex `request_user_input`) are episodes too. Borg reads each harness's own
 transcript beside its hooks, so a harness update cannot silence them. At session end `borg learn`
 makes one model call per episode and writes or updates a lesson. Team documents become lessons through `borg assimilate --from-dir`.

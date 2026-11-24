@@ -521,7 +521,7 @@ All are optional.
 | Variable | Default | Effect |
 |---|---|---|
 | `BORG_LEARN` | on | `off`: record no episodes or outcomes (for eval drones) |
-| `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach`, `facets` and `cues` (see *Model runner*); `off`: no model call, episodes wait |
+| `BORG_LEARN_MODEL` | the harness's (Codex: none, see *Model runner*) | Model for `borg learn`, `assimilate`, `reach`, `facets` and `cues` (see *Model runner*); `off`: no model call, episodes and correction candidates wait |
 | `BORG_CUES` | on | `off`: `borg learn` writes no retrieval cues for the lessons it learned (`borg cues --apply` still does). Cues are logged as a score only and change nothing a drone sees ([The pool log](learning.md#the-pool-log)) |
 | `BORG_LEARN_TIMEOUT_S` | `300` | Time limit of one learning-side model call; the session-end judge's call also stays within twice `BORG_PREDICT_TIMEOUT_S`, so the session lock it holds never reads stale |
 | `BORG_REGRESS` | `links` | [Decision → fix links](#decision--fix-links): `learn` also makes fix links regret episodes (team or private); `off`: no links |
