@@ -7,7 +7,9 @@
 //! (exported through the `opencode` CLI, see `opencode_session` and `cli_sessions`); main sessions only
 //! (sub-agents never talk to the engineer, and borg's own model calls are not the engineer either). Each
 //! is replayed the way the live hooks would have seen it:
-//! - a human prompt that `learn::is_correction` flags becomes an episode; any other prompt becomes the task;
+//! - a human prompt after a task becomes a candidate `borg learn` judges (`learn::Gate::Model`, the
+//!   default), or under `BORG_CORRECTION_GATE=regex` an episode when `learn::is_correction` flags it; a
+//!   prompt the regex does not flag becomes the task;
 //! - an `is_error` tool result that *starts* as the harness's rejection notice and carries the engineer's
 //!   words (`learn::rejection`) becomes an episode; the same words inside ordinary tool output are echoed
 //!   history (a script printing an old transcript), not a correction;
