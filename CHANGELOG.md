@@ -3,7 +3,9 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## Unreleased
+## 0.11.0 (unreleased)
+
+Corrections are recognised in any language, judged by a model, and borg ships no system map of its own.
 
 ### Changed
 
