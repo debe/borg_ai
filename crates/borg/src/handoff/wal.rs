@@ -567,11 +567,22 @@ mod tests {
         assert!(Op::resume(&home, id, a.id()).expect("lock").is_none(), "held");
         let op = a.id().to_string();
         drop(a);
-        assert!(Op::resume(&home, id, &op).expect("lock").is_some(), "free once its holder ended");
+        // A lock dropped here can look held for a moment: a process another test spawns holds a copy
+        // of every descriptor from its fork until its exec closes them. It frees itself.
+        let soon = |free: &dyn Fn() -> bool| {
+            (0..200).any(|_| {
+                let f = free();
+                if !f {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                f
+            })
+        };
+        assert!(soon(&|| Op::resume(&home, id, &op).expect("lock").is_some()), "free once its holder ended");
         let run = background(&home).expect("lock");
         assert!(run.is_some() && background(&home).expect("lock").is_none(), "one background run at a time");
         drop(run);
-        assert!(background(&home).expect("lock").is_some());
+        assert!(soon(&|| background(&home).expect("lock").is_some()));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
