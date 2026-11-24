@@ -63,7 +63,7 @@ The commands of borg, grouped as `borg help` shows them, and evaluation and debu
 | Command | Shows or does |
 |---|---|
 | `borg mesh <command>` | Team sync: `id`, `init`, `invite`, `invites`, `join`, `revoke`, `members`, `peer`, `serve`, `sync`, `fetch` ([details](team-sync.md)) |
-| `borg tell <drone\|session\|name\|local\|collective\|engineer> "<text>" [--re ID] [--on TOPIC] [--state LIST] [--json] [--from SESSION] [--dir DIR]` | A message to other sessions, on any harness: `local` is this machine's sessions, `collective` (or `all`) every session of the collective, an engineer's name their live sessions (`--on`: those whose repo, prompt or a file holds TOPIC). Shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
+| `borg tell <drone\|session\|name\|local\|collective\|engineer> "<text>" [--re ID] [--on TOPIC] [--state LIST] [--json] [--from SESSION] [--dir DIR]` | A message to other sessions, on any harness: `local` is this machine's sessions, `collective` (or `all`) every session of the collective, an engineer's name their live sessions (`--on`: those whose repo, prompt or one of their files `borg top` shows holds TOPIC; `--state`: other states, `any` also ended ones). Shown once at the recipient's next prompt or tool call ([Messages](#messages)) |
 | `borg ask <drone\|session\|name\|local\|collective\|engineer> "<question>" [--re ID] [--on TOPIC] [--state LIST] [--json] [--from SESSION] [--dir DIR]` | As `tell`, for a message that asks for a reply |
 | `borg inbox [--all] [--json] [--show ID] [--from SESSION] [--dir DIR]` | In a session: its messages, new or shown, then marks them shown and acknowledges them. In a terminal, or with `--all`: every message of the last 7 days and who it was shown to; those to the engineer are acknowledged. `--show ID`: one message whole, with the line that replies |
 | `borg pause <drone\|session\|local\|collective> ["<note>"] [--from SESSION] [--dir DIR] [--json]` | Refuses a session's tool calls, with the note, until it is resumed ([Pause and resume](#pause-and-resume)) |
@@ -111,7 +111,8 @@ borg completions fish > ~/.config/fish/completions/borg.fish
   [Configuration](configuration.md)), a word of it, the email, or a word of the email's part before
   the "@" (split on `.`, `_`, `-` and `+`), in any case; a whole name or email wins over a word, and a
   word two engineers share is an error naming both. `--on TOPIC` keeps the sessions whose repo, prompt
-  or a touched file holds TOPIC (any case). `--state LIST` counts other states instead, comma-separated:
+  or one of their files holds TOPIC (any case), as `borg top` shows them: the first line of the latest
+  prompt and the last 3 files touched, so a file touched before those does not match. `--state LIST` counts other states instead, comma-separated:
   `working`, `waiting`, `idle`, `ended`, `live` (the first three, the default) or `any`. A name that
   matches nobody lists the engineers with live sessions; no session in those states, or none `--on`
   matches, lists the ones there are, with their numbers, states and ages. It prints one line per
@@ -119,9 +120,13 @@ borg completions fish > ~/.config/fish/completions/borg.fish
 - `engineer`, read with `borg inbox`.
 
 A session that looks ended may come back: a harness quit and resumed under the same session id, or a
-pid that looked gone. A message to one session stays deliverable for 7 days, so `--state any` (or
-`ended`) reaches it, and it shows at the resumed session's next prompt. A new session of the engineer
+pid that looked gone. `--state any` (or `ended`) reaches a session that ended within the last day,
+while `borg top` still lists it; an older one is no longer known by name. The message then stays
+deliverable for 7 days and shows at the resumed session's next prompt. A new session of the engineer
 does not see it; `borg tell engineer:<email>` leaves it in their inbox instead.
+
+Flags count anywhere on the line, so quote the text, or put it after `--`, when it holds `--on`,
+`--state`, `--re` or `--json`: `borg tell 3 -- rerun it with --state any`.
 
 A reply goes to the sender's session on the machine its message came from, even when the session has
 ended here. A sender's name and session are its own claims; `borg top` and borg web show a message from

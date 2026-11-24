@@ -2226,6 +2226,12 @@ pub(crate) fn engineer_of(cwd: &str) -> (String, String) {
     (if email.is_empty() { ENGINEER.to_string() } else { format!("{ENGINEER}:{email}") }, email)
 }
 
+/// The address of drone `d`, `here` being this node: its session with its node (this one for a drone
+/// of this machine).
+fn drone_at<'a>(d: &'a top::Drone, here: &'a str) -> Address<'a> {
+    Address::Session { id: &d.p.session, node: Some(if d.node.is_empty() { here } else { &d.node }) }
+}
+
 /// The address `raw` names, `here` being this node: `local` (this node's sessions), `collective` or
 /// `all` (every member's), the engineer, `<session>@<node>` of a node this one knows, the sender of the message
 /// `re` answers, a drone `borg top` lists (its exact session before a sender's; this machine's before
@@ -2263,7 +2269,7 @@ fn address<'a>(drones: &'a [top::Drone], msgs: &'a [Message], here: &'a str, raw
     }
     let sent: HashSet<&str> = msgs.iter().filter(|m| m.by == t).map(|m| m.node.as_str()).collect();
     match top::resolve(drones, t) {
-        Ok(Some(d)) if d.p.session == t || sent.is_empty() => Ok(at(&d.p.session, if d.node.is_empty() { here } else { &d.node })),
+        Ok(Some(d)) if d.p.session == t || sent.is_empty() => Ok(drone_at(d, here)),
         Ok(None) => Ok(Address::All),
         r => match sent.into_iter().collect::<Vec<_>>().as_slice() {
             [n] => Ok(at(t, n)),
@@ -2309,7 +2315,7 @@ fn states(v: &str) -> Result<Vec<State>, String> {
     Ok(out)
 }
 
-/// `states` as a phrase: `live`, `any` or the names joined by "or".
+/// `states` as a phrase: `live`, `known` (every state) or the names joined by "or".
 fn states_phrase(states: &[State]) -> String {
     let all = |set: &[State]| set.len() == states.len() && set.iter().all(|s| states.contains(s));
     if all(&LIVE) {
@@ -2324,7 +2330,7 @@ fn states_phrase(states: &[State]) -> String {
 /// What narrows the sessions a name reaches (`person`).
 #[derive(Debug, Clone, Copy)]
 struct Reach<'a> {
-    /// `--on`: a session counts only when its repo, prompt or a file holds it (any case).
+    /// `--on`: a session counts only when its repo, prompt or one of its files holds it (any case).
     on: Option<&'a str>,
     /// `--state`: the states that count (`LIVE` by default).
     states: &'a [State],
@@ -2334,30 +2340,28 @@ struct Reach<'a> {
 }
 
 /// One engineer of the drones: everyone an `engineers` alias lists is one (collective.rs
-/// `Aliases::canon`).
-struct Person {
+/// `Aliases::canon`), with their drones.
+struct Person<'a> {
     canon: String,
     /// As every view names them (names.rs `Book::display_with`).
     name: String,
+    /// `name` lowercased, which a name is matched against.
+    lower: String,
     /// Lowercased.
     emails: Vec<String>,
+    drones: Vec<&'a top::Drone>,
 }
 
-impl Person {
-    fn has(&self, d: &top::Drone) -> bool {
-        let e = d.p.engineer.trim();
-        !e.is_empty() && self.emails.iter().any(|m| m.eq_ignore_ascii_case(e))
-    }
-
+impl Person<'_> {
     /// Whether `key` (lowercased) is their name or an email whole.
     fn is(&self, key: &str) -> bool {
-        self.name.to_lowercase() == key || self.emails.iter().any(|e| e == key)
+        self.lower == key || self.emails.iter().any(|e| e == key)
     }
 
     /// Whether `key` (lowercased) is a word of their name, or of an email's part before the "@" split on
     /// `.`, `_`, `-` and `+` ("ann" for "ann.example@x").
     fn answers(&self, key: &str) -> bool {
-        self.name.to_lowercase().split_whitespace().any(|w| w == key)
+        self.lower.split_whitespace().any(|w| w == key)
             || self.emails.iter().any(|e| e.split('@').next().unwrap_or_default().split(['.', '_', '-', '+']).any(|w| w == key))
     }
 }
@@ -2370,21 +2374,30 @@ fn listed(d: &top::Drone, now: i64) -> String {
 
 /// The drones the name `who` reaches (pure): those of the one engineer it names (named, in any case, by
 /// their whole name or email first, else by a word of either: `Person`), in a state `r.states` admits,
-/// but the caller, whose repo, prompt or a file holds `r.on` when given. `names` and `aliases` name
-/// the engineers as every view does (names.rs `Book::display_with`).
+/// but the caller, whose repo, prompt or one of its files (presence.rs keeps the last `FILES`) holds
+/// `r.on` when given. `names` and `aliases` name the engineers as every view does (names.rs
+/// `Book::display_with`).
 ///
 /// # Errors
-/// A name that names no engineer (with the ones that have live sessions) or more than one; an engineer
-/// with no session in those states (with the others that `--on` matches, and how to reach them); none
-/// that `--on` matches (with the sessions it looked at).
-fn person<'a>(drones: &'a [top::Drone], names: &Book, aliases: &Aliases, who: &str, r: &Reach) -> Result<Vec<&'a top::Drone>, String> {
-    let mut people: Vec<Person> = Vec::new();
+/// `SendError::Nobody` for a name that names no engineer (with the ones that have live sessions);
+/// `SendError::Address` for one that names more than one, an engineer with no session in those states
+/// (with the others that `--on` matches, and how to reach them), or none that `--on` matches (with the
+/// sessions it looked at).
+fn person<'a>(drones: &'a [top::Drone], names: &Book, aliases: &Aliases, who: &str, r: &Reach) -> Result<Vec<&'a top::Drone>, SendError> {
+    let mut people: Vec<Person<'a>> = Vec::new();
     for d in drones.iter().filter(|d| !d.p.engineer.trim().is_empty()) {
         let (canon, email) = (aliases.canon(&d.p.engineer), d.p.engineer.trim().to_lowercase());
         match people.iter_mut().find(|p| p.canon == canon) {
-            Some(p) if !p.emails.contains(&email) => p.emails.push(email),
-            Some(_) => {}
-            None => people.push(Person { canon, name: names.display_with(aliases, &d.p.engineer), emails: vec![email] }),
+            Some(p) => {
+                if !p.emails.contains(&email) {
+                    p.emails.push(email);
+                }
+                p.drones.push(d);
+            }
+            None => {
+                let name = names.display_with(aliases, &d.p.engineer);
+                people.push(Person { canon, lower: name.to_lowercase(), name, emails: vec![email], drones: vec![d] });
+            }
         }
     }
     let key = who.trim().to_lowercase();
@@ -2395,47 +2408,61 @@ fn person<'a>(drones: &'a [top::Drone], names: &Book, aliases: &Aliases, who: &s
     let them = match hits.as_slice() {
         [p] => *p,
         [] => {
-            let mut live: Vec<&str> = people.iter().filter(|p| drones.iter().any(|d| p.has(d) && d.state != State::Ended)).map(|p| p.name.as_str()).collect();
+            let mut live: Vec<&str> = people.iter().filter(|p| p.drones.iter().any(|d| d.state != State::Ended)).map(|p| p.name.as_str()).collect();
             live.sort_unstable();
             let live = if live.is_empty() { "none".to_string() } else { live.join(", ") };
-            return Err(format!(
+            return Err(SendError::Nobody(format!(
                 "no drone, session or engineer {who:?}; engineers with live sessions: {live} (an `engineers` alias names one, docs/configuration.md)"
-            ));
+            )));
         }
         more => {
             let named: Vec<&str> = more.iter().map(|p| p.name.as_str()).collect();
-            return Err(format!("{who:?} names {} engineers: {}; give more of the name, or the email", more.len(), named.join(", ")));
+            return Err(SendError::Address(format!("{who:?} names {} engineers: {}; give more of the name, or the email", more.len(), named.join(", "))));
         }
     };
     let me = |d: &top::Drone| d.node.is_empty() && r.me == Some(d.p.session.as_str());
-    let theirs: Vec<&top::Drone> = drones.iter().filter(|d| them.has(d)).collect();
-    let (admitted, other): (Vec<&top::Drone>, Vec<&top::Drone>) = theirs.iter().copied().filter(|d| !me(d)).partition(|d| r.states.contains(&d.state));
     let topic = r.on.map(str::to_lowercase);
-    let on = |d: &&top::Drone| {
+    let on = |d: &top::Drone| {
         topic.as_deref().is_none_or(|t| {
             let holds = |s: &str| s.to_lowercase().contains(t);
             holds(&d.p.repo) || holds(&d.p.prompt) || d.p.files.iter().any(|f| holds(f))
         })
     };
-    let hit: Vec<&top::Drone> = admitted.iter().copied().filter(on).collect();
+    // Each drone once: whether it is the caller, its state, then (lowercasing its fields once) `--on`.
+    let (mut hit, mut looked, mut other) = (Vec::new(), Vec::new(), Vec::new());
+    for &d in them.drones.iter().filter(|d| !me(d)) {
+        let admitted = r.states.contains(&d.state);
+        match (admitted, on(d)) {
+            (true, true) => hit.push(d),
+            (true, false) => looked.push(d),
+            (false, true) => other.push(d),
+            (false, false) => {}
+        }
+    }
     if !hit.is_empty() {
         return Ok(hit);
     }
     let (name, phrase) = (&them.name, states_phrase(r.states));
     let matching = if r.on.is_some() { " that --on matches" } else { "" };
-    let elsewhere: Vec<String> = other.into_iter().filter(on).map(|d| listed(d, r.now)).collect();
-    let resumed = if elsewhere.is_empty() {
+    let resumed = if other.is_empty() {
         String::new()
     } else {
-        format!(";\n  {} other{matching}: {}; `--state any` reaches them when they resume", elsewhere.len(), elsewhere.join("; "))
+        let ended = other.iter().filter(|d| d.state == State::Ended).count();
+        let when = match ended {
+            0 => "",
+            n if n == other.len() => " when they resume",
+            _ => " (an ended one when it resumes)",
+        };
+        let listed: Vec<String> = other.iter().map(|d| listed(d, r.now)).collect();
+        format!(";\n  {} other{matching}: {}; `--state any` reaches them{when}", other.len(), listed.join("; "))
     };
-    if admitted.is_empty() {
-        let but = if theirs.iter().any(|d| me(d)) { " but this one" } else { "" };
+    if looked.is_empty() {
+        let but = if them.drones.iter().any(|d| me(d)) { " but this one" } else { "" };
         let inbox = them.emails.first().map_or_else(String::new, |e| format!(";\n  `borg tell {ENGINEER}:{e}` leaves it in their inbox"));
-        return Err(format!("{name} has no {phrase} session{but}{resumed}{inbox}"));
+        return Err(SendError::Address(format!("{name} has no {phrase} session{but}{resumed}{inbox}")));
     }
-    let looked: Vec<String> = admitted.iter().map(|d| format!("\n  {}", listed(d, r.now))).collect();
-    Err(format!("no {phrase} session of {name} matches --on {:?}; theirs:{}{resumed}", r.on.unwrap_or_default(), looked.concat()))
+    let looked: Vec<String> = looked.iter().map(|d| format!("\n  {}", listed(d, r.now))).collect();
+    Err(SendError::Address(format!("no {phrase} session of {name} matches --on {:?}; theirs:{}{resumed}", r.on.unwrap_or_default(), looked.concat())))
 }
 
 /// `borg tell|ask|pause|resume|inbox …`.
@@ -2485,10 +2512,10 @@ fn tell(home: &Path, kind: Kind, a: &Args, (drones, names): (&[top::Drone], &Boo
         eprintln!("borg {kind}: --on and --state narrow an engineer's sessions, which tell and ask reach; a {kind} names a drone, local or collective");
         return 2;
     }
-    let (msgs, here) = (read(home), node(home));
+    let (msgs, here, text) = (read(home), node(home), text.join(" "));
     let addressed = address(drones, &msgs, &here, to, a.re);
     match &addressed {
-        Err(SendError::Nobody(_)) if !kind.privileged() => return tell_person(home, kind, a, (drones, names), cwd, now),
+        Err(SendError::Nobody(miss)) if !kind.privileged() => return tell_person(home, kind, a, (drones, names), (to, &text, miss), (&here, cwd, now)),
         Ok(named) if narrowed => {
             eprintln!("borg {kind}: --on and --state narrow an engineer's sessions; {to:?} names {}", named.name());
             return 2;
@@ -2497,7 +2524,7 @@ fn tell(home: &Path, kind: Kind, a: &Args, (drones, names): (&[top::Drone], &Boo
     }
     let sent = addressed.and_then(|to| {
         let from = sender(home, drones, a.from, cwd)?;
-        send(home, Message::new(kind, &from, &to.to_string(), a.re, now, &text.join(" ")), now)
+        send(home, Message::new(kind, &from, &to.to_string(), a.re, now, &text), now)
     });
     match sent {
         Ok(m) if a.json => {
@@ -2536,14 +2563,18 @@ fn tell(home: &Path, kind: Kind, a: &Args, (drones, names): (&[top::Drone], &Boo
 }
 
 /// `borg tell|ask <name> <text>`: one message to each session of the engineer `name` names (`person`),
-/// each `<session>@<node>` as `address` writes one, printed one line each (`--json`: an array of the
-/// messages). A recipient whose window or node refuses it is reported and the others still sent.
-fn tell_person(home: &Path, kind: Kind, a: &Args, (drones, names): (&[top::Drone], &Book), cwd: &str, now: i64) -> i32 {
-    let [who, text @ ..] = a.words.as_slice() else {
-        eprintln!("{USAGE}");
-        return 2;
-    };
-    let text = text.join(" ");
+/// each `<session>@<node>` as `address` writes one (`drone_at`), printed one line each (`--json`: an
+/// array of the messages). A recipient whose window or node refuses it is reported and the others still
+/// sent. `miss` is why `address` named no one: a `<session>@<node>` that names no engineer either keeps
+/// it, since its node is what may be wrong.
+fn tell_person(
+    home: &Path,
+    kind: Kind,
+    a: &Args,
+    (drones, names): (&[top::Drone], &Book),
+    (who, text, miss): (&str, &str, &str),
+    (here, cwd, now): (&str, &str, i64),
+) -> i32 {
     if text.is_empty() {
         eprintln!("borg {kind}: {}", SendError::Empty);
         return 1;
@@ -2559,17 +2590,19 @@ fn tell_person(home: &Path, kind: Kind, a: &Args, (drones, names): (&[top::Drone
     let reach = Reach { on: a.on, states: a.state.as_deref().unwrap_or(&LIVE), me, now };
     let to = match person(drones, names, collective::aliases(), who, &reach) {
         Ok(to) => to,
+        Err(SendError::Nobody(e)) if who.contains('@') => {
+            eprintln!("borg {kind}: {e};\n  {miss}");
+            return 1;
+        }
         Err(e) => {
             eprintln!("borg {kind}: {e}");
             return 1;
         }
     };
-    let here = node(home);
     let mut sent: Vec<(&top::Drone, Message)> = Vec::with_capacity(to.len());
     let mut refused = 0usize;
     for d in to {
-        let at = Address::Session { id: &d.p.session, node: Some(if d.node.is_empty() { &here } else { &d.node }) };
-        match send(home, Message::new(kind, &from, &at.to_string(), a.re, now, &text), now) {
+        match send(home, Message::new(kind, &from, &drone_at(d, here).to_string(), a.re, now, text), now) {
             Ok(m) => sent.push((d, m)),
             Err(e) => {
                 eprintln!("borg {kind}: {} (#{}): {e}", d.designation, d.number);
@@ -4343,8 +4376,8 @@ mod tests {
         Reach { on, states, me, now: 1_000 }
     }
 
-    fn sessions(r: Result<Vec<&top::Drone>, String>) -> Result<Vec<&str>, String> {
-        r.map(|ds| ds.iter().map(|d| d.p.session.as_str()).collect())
+    fn sessions(r: Result<Vec<&top::Drone>, SendError>) -> Result<Vec<&str>, String> {
+        r.map(|ds| ds.iter().map(|d| d.p.session.as_str()).collect()).map_err(|e| e.to_string())
     }
 
     /// A name reaches the engineer's sessions: by the whole name, a word of it, an alias, the email or a
@@ -4371,6 +4404,9 @@ mod tests {
         assert!(err.starts_with("no drone, session or engineer \"zoe\"; engineers with live sessions: Ann Example, Bob Builder"), "{err}");
         assert!(err.contains("`engineers` alias"), "{err}");
         assert!(to("").is_err(), "an empty word names no one");
+        assert!(matches!(person(&ds, &book(), &none, "zoe", &reach(&LIVE, None, None)), Err(SendError::Nobody(_))), "no one: the caller may add why");
+        let odd = [of("o1", "Öz@x", Working, 1)];
+        assert_eq!(sessions(person(&odd, &book(), &none, "öz@x", &reach(&LIVE, None, None))), Ok(vec!["o1"]), "one case folding for any letter");
     }
 
     /// Two engineers a word names is an error that names both; the whole name still names one.
@@ -4446,6 +4482,9 @@ mod tests {
         assert!(err.contains("\"fix the Login flow\"") && err.contains("#2 working 0s ago, billing: \"\" [src/invoice.rs]"), "{err}");
         let err = sessions(person(&ds, &book(), &Aliases::default(), "bob", &reach(&[State::Waiting], Some("login"), None))).unwrap_err();
         assert!(err.contains("2 other that --on matches: #1 working") && err.contains("#3 ended"), "{err}");
+        assert!(err.contains("`--state any` reaches them (an ended one when it resumes);"), "a live one needs no resume: {err}");
+        let err = sessions(person(&ds[..1], &book(), &Aliases::default(), "bob", &reach(&[State::Waiting], None, None))).unwrap_err();
+        assert!(err.contains("1 other: #1 working") && err.contains("`--state any` reaches them;"), "{err}");
     }
 
     /// A drone label, number or session prefix that is also a name names the drone: a name is tried

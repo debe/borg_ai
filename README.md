@@ -217,7 +217,8 @@ borg inbox      # in a session: its messages; in a terminal: every message of th
 
 The recipient is a drone as `borg top` names it (its number, or its label, such as
 `"Ann Example · borg-ai · claude"`), a session id, an engineer's name (their live sessions, `--on` only
-those whose repo, prompt or a file holds a topic), `local`, `collective` (or `all`, the same) or
+those whose repo, prompt or one of their files `borg top` shows holds a topic, `--state any` also
+sessions that ended within the day), `local`, `collective` (or `all`, the same) or
 `engineer`. Local first: `local` reaches the sessions running on this machine, and a drone or
 session id that matches one here names it. A colleague's session is reached by `<session>@<node>`, when
 nothing here matches, or as the sender a reply answers; `collective` reaches every session of the

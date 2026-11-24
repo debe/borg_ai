@@ -461,8 +461,8 @@ fn a_bracketed_git_name_cannot_forge_the_line_an_agent_reads() {
 }
 
 /// `borg tell <name>` reaches that engineer's live sessions in one call: one message each, the ended
-/// one and another engineer's left out; `--on` narrows them to the sessions whose repo, prompt or a
-/// file holds it, `--json` prints the messages, and `--state ended` reaches a session that ended,
+/// one and another engineer's left out; `--on` narrows them to the sessions whose repo, prompt or one
+/// of their files holds it, `--json` prints the messages, and `--state ended` reaches a session that ended,
 /// shown when it resumes. A name nobody has lists the engineers who have live sessions.
 #[test]
 fn a_name_reaches_that_engineers_live_sessions() {
@@ -514,8 +514,18 @@ fn a_name_reaches_that_engineers_live_sessions() {
     let r = borg(&root, &work, &["tell", "zoe", "x"], &[], "");
     assert_eq!(r.code, Some(1));
     assert!(r.err.contains("no drone, session or engineer \"zoe\"; engineers with live sessions:") && r.err.contains("Bob Example"), "{}", r.err);
+    let r = borg(&root, &work, &["tell", "abcd1234@oldnodekey", "hi"], &[], "");
+    assert_eq!(r.code, Some(1));
+    assert!(
+        r.err.contains("no drone, session or engineer") && r.err.contains("no drone or message here names node oldnodekey"),
+        "the node may be wrong: {}",
+        r.err
+    );
     let r = borg(&root, &work, &["pause", "bob", "--on", "a.rs"], &[], "");
     assert_eq!(r.code, Some(2), "a pause names no engineer: {}", r.err);
+    let r = borg(&root, &work, &["pause", "bob"], &[], "");
+    assert_eq!(r.code, Some(1), "{}", r.err);
+    assert!(r.err.contains("no drone or session \"bob\"") && logged(&root, "pause") == 0, "a pause never reaches an engineer's sessions: {}", r.err);
     let r = borg(&root, &work, &["tell", "local", "--on", "a.rs", "x"], &[], "");
     assert_eq!(r.code, Some(2), "--on narrows a name only: {}", r.err);
     let _ = std::fs::remove_dir_all(&root);
