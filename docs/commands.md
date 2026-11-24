@@ -125,8 +125,8 @@ while `borg top` still lists it; an older one is no longer known by name. The me
 deliverable for 7 days and shows at the resumed session's next prompt. A new session of the engineer
 does not see it; `borg tell engineer:<email>` leaves it in their inbox instead.
 
-Flags count anywhere on the line, so quote the text, or put it after `--`, when it holds `--on`,
-`--state`, `--re` or `--json`: `borg tell 3 -- rerun it with --state any`.
+Flags count anywhere on the line, so quote the text, or put it after `--`, when it holds a word that
+starts with `--`: `borg tell 3 -- rerun it with --from scratch` (else `--from` sets the sender).
 
 A reply goes to the sender's session on the machine its message came from, even when the session has
 ended here. A sender's name and session are its own claims; `borg top` and borg web show a message from
