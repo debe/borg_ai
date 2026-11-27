@@ -3,7 +3,7 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
-## 0.12.0 (unreleased)
+## 0.12.0 (2026-11-27)
 
 ### Added
 
