@@ -1,5 +1,6 @@
 pub mod conscience;
 pub mod cost;
+pub mod cube;
 pub mod drones;
 pub mod handoffs;
 pub mod knowledge;

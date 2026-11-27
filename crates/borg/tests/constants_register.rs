@@ -102,6 +102,8 @@ fn every_kind_labelled_constant_is_in_the_register() {
     for e in std::fs::read_dir(root().join("crates")).unwrap().flatten() {
         sources(&e.path().join("src"), &mut files);
     }
+    // The page is a workspace of its own inside borg-web.
+    sources(&root().join("crates/borg-web/ui/src"), &mut files);
     let mut missing = Vec::new();
     for f in &files {
         let text = std::fs::read_to_string(f).unwrap();

@@ -19,6 +19,14 @@ done
 step "borg web page: crates/borg-web/dist built from the current sources"
 scripts/ui.sh --check
 
+# The page is its own workspace (wasm32): lint it for the browser, and run its tests natively (the Cube's
+# scene, painter and model are plain Rust; a warm frame must allocate nothing).
+step "borg web page: cargo fmt, clippy (wasm32, -D warnings) and tests (crates/borg-web/ui)"
+cargo fmt --manifest-path crates/borg-web/ui/Cargo.toml --check
+cargo clippy --manifest-path crates/borg-web/ui/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --manifest-path crates/borg-web/ui/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/borg-web/ui/Cargo.toml
+
 step "cargo clippy (workspace, all targets, -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 

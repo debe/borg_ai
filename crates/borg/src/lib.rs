@@ -35,6 +35,7 @@ pub mod listen;
 pub mod live;
 pub mod memory;
 pub mod memory_export;
+pub mod mesh;
 pub mod moves;
 pub mod msg;
 pub mod names;

@@ -78,6 +78,37 @@ pub fn local_day_key(ms: f64) -> (u32, u32, u32) {
     (d.get_full_year(), d.get_month(), d.get_date())
 }
 
+/// The viewer's local midnight that starts the day of a time in ms (DST included: the calendar's).
+#[allow(clippy::cast_possible_wrap, reason = "a month (0 to 11) and a day of the month (1 to 31)")]
+pub fn local_midnight(ms: f64) -> f64 {
+    let d = local_date(ms);
+    js_sys::Date::new_with_year_month_day(d.get_full_year(), d.get_month() as i32, d.get_date() as i32).get_time()
+}
+
+/// "Mon": the local weekday of a time in ms.
+pub fn weekday(ms: f64) -> &'static str {
+    WEEKDAYS[local_date(ms).get_day() as usize % 7]
+}
+
+/// A value this browser keeps for the page (`localStorage`); None when it keeps none, or may not
+/// (a private window, blocked site data: the accessor throws, which `Reflect` catches).
+pub fn kept(key: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let s = js_sys::Reflect::get(&web_sys::window()?.into(), &"localStorage".into()).ok()?;
+    let get = js_sys::Reflect::get(&s, &"getItem".into()).ok()?.dyn_into::<js_sys::Function>().ok()?;
+    get.call1(&s, &key.into()).ok()?.as_string()
+}
+
+/// Keeps a value for `kept`, where the browser lets it; a page without it works the same.
+pub fn keep(key: &str, value: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(w) = web_sys::window() else { return };
+    let Ok(s) = js_sys::Reflect::get(&w, &"localStorage".into()) else { return };
+    if let Some(set) = js_sys::Reflect::get(&s, &"setItem".into()).ok().and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
+        let _ = set.call2(&s, &key.into(), &value.into());
+    }
+}
+
 /// "Today", "Yesterday" or "Mon, Oct 12": the local calendar day of a time in ms.
 pub fn day_label(ms: f64) -> String {
     let (d, today) = (local_date(ms), local_date(now_ms()));

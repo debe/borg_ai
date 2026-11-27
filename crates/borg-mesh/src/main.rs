@@ -335,9 +335,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             let reinstalled = std::sync::atomic::AtomicBool::new(false);
             let shutdown = async { reinstalled.store(stop(&image).await, std::sync::atomic::Ordering::SeqCst) };
             daemon::serve(node, opts, shutdown, |e| match e {
-                Event::Served(Ok(r)) if r.joined > 0 => println!("a new member joined with an invite (`borg mesh members`)"),
-                Event::Served(Ok(r)) => println!("served: {}", show(&r)),
-                Event::Served(Err(e)) => eprintln!("borg mesh: turned away: {e}"),
+                Event::Served { result: Ok(r), .. } if r.joined > 0 => println!("a new member joined with an invite (`borg mesh members`)"),
+                Event::Served { result: Ok(r), .. } => println!("served: {}", show(&r)),
+                Event::Served { result: Err(e), .. } => eprintln!("borg mesh: turned away: {e}"),
                 Event::Synced { peer, result: Ok(r) } => println!("synced {}: {}", short(&peer), show(&r)),
                 Event::Synced { peer, result: Err(e) } => eprintln!("borg mesh: {}: {e} (backing off)", short(&peer)),
                 Event::Gate(Ok(())) => println!("gate open: syncing"),

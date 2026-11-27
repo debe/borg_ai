@@ -5,9 +5,13 @@
 
 mod api;
 mod banner;
+mod canvas;
 mod charts;
 mod drawer;
 mod feed;
+mod model;
+mod paint;
+mod scene;
 mod util;
 mod views;
 
@@ -16,12 +20,13 @@ use leptos::prelude::*;
 use crate::banner::Banner;
 use crate::drawer::Drawer;
 use crate::views::{
-    conscience::Conscience, cost::Cost, drones::Drones, handoffs::HandOffs, knowledge::Knowledge, learning::Learning, messages::Messages, overview::Overview,
-    queen::Queen, steering::Steering,
+    conscience::Conscience, cost::Cost, cube::Cube, drones::Drones, handoffs::HandOffs, knowledge::Knowledge, learning::Learning, messages::Messages,
+    overview::Overview, queen::Queen, steering::Steering,
 };
 
-const TABS: [(&str, &str); 10] = [
+const TABS: [(&str, &str); 11] = [
     ("overview", "Overview"),
+    ("cube", "Cube"),
     ("knowledge", "Knowledge"),
     ("conscience", "Conscience"),
     ("learning", "Learning"),
@@ -77,6 +82,7 @@ fn App() -> impl IntoView {
         </nav>
         <main>
             {move || match tab.get().as_str() {
+                "cube" => view! { <Cube /> }.into_any(),
                 "knowledge" => view! { <Knowledge /> }.into_any(),
                 "conscience" => view! { <Conscience /> }.into_any(),
                 "learning" => view! { <Learning /> }.into_any(),

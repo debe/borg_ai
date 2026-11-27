@@ -68,6 +68,7 @@ mod refresh;
 mod wal;
 
 pub use close::doctor;
+pub use log::Kind;
 
 pub(crate) use clones::note as note_clone;
 pub(crate) use fence::{active as fenced, refusal};

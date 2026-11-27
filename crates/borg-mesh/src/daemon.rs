@@ -18,6 +18,10 @@
 //! - **Stops cleanly** when `shutdown` resolves: no new sessions, running ones get `grace`, then
 //!   the endpoint closes (peers see a closed connection, not a timeout).
 //!
+//! - **Logs** each session that moved lines, and each failure after a completed one with that peer,
+//!   to `mesh/sessions.jsonl` (borg mesh.rs `Session`, `log_session`): what borg web's Cube plays. An
+//!   idle round writes nothing.
+//!
 //! Not a coordinator: every node runs the same loop, and the hooks never depend on it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -71,7 +75,11 @@ impl Default for Options {
 /// What the loop tells its caller (the CLI prints it, tests count it).
 #[derive(Debug, Clone)]
 pub enum Event {
-    Served(Result<Report, String>),
+    /// A session a peer dialled in for: `peer` is its key once the handshake authenticated it.
+    Served {
+        peer: Option<String>,
+        result: Result<Report, String>,
+    },
     Synced {
         peer: String,
         result: Result<Report, String>,
@@ -117,7 +125,7 @@ fn backoff_wait(opts: &Options, failures: u32) -> Duration {
 }
 
 pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output = ()>, on: impl Fn(Event)) {
-    let mut sessions: JoinSet<Result<Report, String>> = JoinSet::new();
+    let mut sessions: JoinSet<(Option<String>, Result<Report, String>)> = JoinSet::new();
     // One dial per peer, side by side: a peer that does not answer holds up no other.
     let mut dials: JoinSet<Result<Report, String>> = JoinSet::new();
     let mut dialling: HashMap<tokio::task::Id, String> = HashMap::new();
@@ -129,6 +137,8 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
     let mut last_round: Option<Instant> = None;
     let mut dirty = true;
     let mut gate_open: Option<bool> = None;
+    // Per peer, whether its last session completed (`log_session`).
+    let mut last_ok: HashMap<String, bool> = HashMap::new();
     // The gate and the store are looked at every `poll`.
     let mut tick = tokio::time::interval(opts.poll);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -139,16 +149,19 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
             incoming = node.incoming() => match incoming {
                 Some(i) => {
                     let n = node.clone();
-                    sessions.spawn(async move { n.handle(i).await });
+                    sessions.spawn(async move { n.served(i).await });
                 }
                 None => break,
             },
             Some(done) = sessions.join_next() => {
-                let result = done.unwrap_or_else(|e| Err(format!("session task: {e}")));
+                let (peer, result) = done.unwrap_or_else(|e| (None, Err(format!("session task: {e}"))));
                 if result.as_ref().is_ok_and(|r| r.received > 0 || r.quarantined > 0 || r.steered > 0 || r.joined > 0) {
                     dirty = true; // pass it on to the others
                 }
-                on(Event::Served(result));
+                if let Some(p) = &peer {
+                    log_session(node.home(), &mut last_ok, p, false, &result, borg::learn::now_ms());
+                }
+                on(Event::Served { peer, result });
             }
             Some(done) = dials.join_next_with_id() => {
                 let (id, result) = match done {
@@ -156,6 +169,8 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
                     Err(e) => (e.id(), Err(format!("dial task: {e}"))),
                 };
                 let Some(peer) = dialling.remove(&id) else { continue };
+                // Before `unreachable` below forgets the peer's last completed session.
+                log_session(node.home(), &mut last_ok, &peer, true, &result, borg::learn::now_ms());
                 let b = backoff.entry(peer.clone()).or_default();
                 match &result {
                     Ok(r) => {
@@ -234,9 +249,84 @@ pub async fn serve(node: Arc<Node>, opts: Options, shutdown: impl Future<Output 
     node.close().await;
 }
 
+/// Logs the session with `peer` that ended at `now` (dialled by this node when `dial`) in the store's
+/// session log (borg mesh.rs `note`) when it moved lines, or when it failed and the last one with `peer`
+/// had completed: a change of state. Idle sessions and repeated failures (a peer that stays down, dialled
+/// on every backoff) write nothing. Before this process saw a session with `peer`, its last one completed
+/// if mesh/synced.json still holds it (a failed dial drops it there).
+fn log_session(home: &Path, last_ok: &mut HashMap<String, bool>, peer: &str, dial: bool, result: &Result<Report, String>, now: i64) {
+    let ok = result.is_ok();
+    let was_ok = last_ok.get(peer).copied().unwrap_or_else(|| borg::presence::synced(home).contains_key(peer));
+    // A node turned away that never completed a session is not remembered: keys that dial in grow no map.
+    if ok != was_ok || (ok && !last_ok.contains_key(peer)) {
+        last_ok.insert(peer.to_string(), ok);
+    }
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let s = match result {
+        Ok(r) if r.sent + r.received > 0 => {
+            borg::mesh::Session { ms: now, peer: peer.into(), dial, sent: count(r.sent), received: count(r.received), error: None }
+        }
+        Err(e) if was_ok => {
+            borg::mesh::Session { ms: now, peer: peer.into(), dial, sent: 0, received: 0, error: Some(e.lines().next().unwrap_or_default().into()) }
+        }
+        _ => return,
+    };
+    let _ = borg::mesh::note(home, &s, now);
+}
+
 /// The members a round dials: listed in peers.json, still members, not this node.
 fn targets(node: &Node) -> Vec<Target> {
     let Ok(Some(m)) = Membership::load(node.home()) else { return Vec::new() };
     let me = node.public();
     peers::targets(node.home()).into_iter().filter(|t| t.key != me && m.role_of(&t.key).is_some()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session that moved lines logs one record with the peer's key and counts; an idle one logs
+    /// none; a failure logs one only where the last session with that peer had completed.
+    #[test]
+    fn a_session_is_logged_when_it_moved_lines_or_its_state_changed() {
+        let home = std::env::temp_dir().join(format!("borg-mesh-log-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // (peer, dial, sent, received, ms, error) of every record.
+        let held = || {
+            let text = std::fs::read_to_string(borg::mesh::sessions_path(&home)).unwrap_or_default();
+            borg::mesh::sessions(&text)
+                .map(|s| (s.peer.into_owned(), s.dial, s.sent, s.received, s.ms, s.error.map(std::borrow::Cow::into_owned)))
+                .collect::<Vec<_>>()
+        };
+        let mut last = HashMap::new();
+        let moved = Ok(Report { sent: 2, received: 3, ..Report::default() });
+        let idle = Ok(Report::default());
+        let failed: Result<Report, String> = Err("no answer within 30s\nmore".into());
+
+        log_session(&home, &mut last, "bob", true, &idle, 1);
+        assert!(held().is_empty(), "an idle session writes nothing");
+        log_session(&home, &mut last, "bob", true, &moved, 2);
+        log_session(&home, &mut last, "carol", false, &moved, 3);
+        let h = held();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0], ("bob".into(), true, 2, 3, 2, None));
+        assert_eq!((h[1].0.as_str(), h[1].1), ("carol", false));
+
+        log_session(&home, &mut last, "bob", true, &failed, 4);
+        log_session(&home, &mut last, "bob", true, &failed, 5);
+        let h = held();
+        assert_eq!(h.len(), 3, "the second failure in a row writes nothing");
+        assert_eq!(h[2], ("bob".into(), true, 0, 0, 4, Some("no answer within 30s".into())));
+
+        // A node that never completed a session is turned away without a record or a place in the map.
+        log_session(&home, &mut last, "stranger", false, &failed, 6);
+        assert_eq!(held().len(), 3);
+        assert!(!last.contains_key("stranger"));
+        // Unseen by this process, a member whose last session completed (synced.json) logs its failure.
+        borg::presence::note_synced(&home, "dave", 1).unwrap();
+        log_session(&home, &mut last, "dave", true, &failed, 7);
+        assert_eq!(held().last().map(|s| s.0.clone()), Some("dave".into()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

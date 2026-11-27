@@ -39,6 +39,8 @@ it fetches the views that changed. It reads the same files as `borg top`, so it 
 | `/api/learning?c=` | Whether learning works, per week: lessons written per source, the asked→changed and repeat-veto counts; each section with its `scope` (`team` or `this machine`); `weeks` run to the current one (`partial_week`), and series history cannot derive are `null` before `live_from` |
 | `/api/memory?c=&absorbed=` | The `borg memory export --json` document (`{"schema": 1, "collective", "lessons"}`, [Memory](learning.md)); `absorbed=true` keeps only absorbed lessons |
 | `/api/update?c=` | borg itself: this borg (`borg`), its mesh `protocol`, whether the release check is on (`check`), the last check's `latest`, `checked_ms` and `error` (`null` before the first), `update` (a newer release exists and the check is on), and `members`: each member the mesh last heard from with its `key`, `engineer` (when known), `name` (the engineer, else `peer <short key>`), `host` (its hostname, else its short key), `borg` (`null`: older than 0.7, it sent no version), the `protocol` its last session agreed on (or the one it speaks when nothing syncs with it), `ms`, `syncs` (`false`: nothing syncs with it) and `note` (what it misses on an older protocol, or why nothing syncs; `null` on this node's footing). No members without the store's `mesh/` ([Versions on the mesh](team-sync.md#how-a-sync-works)) |
+| `/api/handoffs?c=` | The hand-offs this node knows (`borg handoff`'s board): each with its state, whom it asks, who took or declined it and which engineers have a machine that could take it, and every machine the presence shows with its borg and clones. Engineers show by name. No remote is asked |
+| `/api/mesh?c=&since=` | The Cube: `me`, `nodes` (this node, the members it heard from, the peers it dials: `host`, `engineer`, `borg`, `protocol`, `syncs`), `links` (only this node's own: `dial`, the last session `ms`, `ok`), `drones` (as `/api/drones`, with `number` and `state`) and `events` from the last 7 days in time order. An event is a message (`tell`, `ask`, `pause`, `resume`, `veto`), `seen`, `lesson`, `lesson_update`, `absorb`, `release`, `handoff` (`why`: `offer`, `taken`, `back`, `declined`, `aborted`, `done`), `sync` or `sync_failed`, with a stable `id`. Every node key and session is sent once in `strs` and named by its index. `since` (the `now` of the previous response) gives the events this process first held after it, by arrival, not by when they were written, so a line that synced in late still comes |
 | `/api/events?c=` | A server-sent event stream naming the views whose files changed |
 
 **Is learning working?** The Learning tab answers it per collective, week by week, from the logs
@@ -55,11 +57,44 @@ repeated vetoes: those series start at the week live counting began on this mach
 week. A "verdict on an asked lesson" is a Stop's changed or ignored, or a later correction anyway, which
 one lesson can get on top of either, as on the Conscience tab.
 
-**The tabs.** Overview (the day's activity and a live feed), Knowledge (the lessons), Conscience
-(below), Learning (above), Steering (corrections, pauses, resumes, vetoes and refused steers),
+**The tabs.** Overview (the day's activity and a live feed), Cube (below), Knowledge (the lessons),
+Conscience (below), Learning (above), Steering (corrections, pauses, resumes, vetoes and refused steers),
 Messages (the conversations between sessions and the engineer, as a chat, with filters, and the refused
-sends; the messages to the engineer in the open conversation are acknowledged), Queen, Cost and Drones
-(which sessions run where, and their unread messages).
+sends; the messages to the engineer in the open conversation are acknowledged), Queen, Cost, Drones
+(which sessions run where, and their unread messages) and Hand-offs (open and taken hand-offs, and
+which machine can take what).
+
+**The Cube tab** draws the collective as a Borg cube on a canvas. The cube in the centre is the
+collective; each machine floats around it, this one in front, and its drones orbit it ("Seven of
+Twelve · repo"). Lines from this machine are the links it has itself; a node never learns the links
+between two others, so what moves between them is drawn through the cube. Every event plays where it
+happened: a message is a packet from the sending drone to the receiving one (a broadcast a ring), a
+session shown a message flashes, a new lesson sends a shockwave and a packet into the cube (a new
+version a smaller one), an absorb or release is a ring at the cube, a hand-off a diamond that travels
+to the machine it asks (declined and aborted stop part-way), a sync dots run along its link (more for
+more lines) and a failed one flickers red. What it shows is what this node's store holds: messages,
+hand-offs, lessons and absorbs arrive from other machines through the mesh, so they play when they
+sync in; syncs are only this node's own sessions with its members, those that moved lines or failed
+after one that worked, from the local log `mesh/sessions.jsonl` (never synced; trimmed to the last week once a day). A
+lesson's machine and time come from its origin record (`mesh/origins.jsonl`); a lesson with none counts
+as this node's.
+
+- Opening the tab replays the last 8 hours at 3600× (8 seconds), then plays live. The strip at the
+  bottom shows the 7 days per hour by kind; click or drag it to play from there at 3600×, 600×, 60×
+  or 1×, or go back to LIVE. A rate is that many times the real clock (600×: ten minutes per second),
+  kept to real time however the frames fall.
+- The counters count up: machines, links (machines this one dials or has synced with, on its
+  protocol), drones active and working, tells and asks sent, sessions shown a message and new lessons
+  since your local midnight, and the pulse (events in the last minute, against the busiest minute of
+  the week).
+- The chips (messages, received, lessons, syncs, hand-offs, steering) choose what plays, lists, stacks
+  in the strip and toasts; the page remembers them. The ticker lists the newest events in words (a
+  lesson opens its card), and toasts name new lessons, drones that join and first links.
+- Drag the bottom edge to make the view taller or shorter (the page remembers it; a double-click on
+  the edge goes back), or show it full screen. Drag to turn, scroll or +/- to zoom, double-click or 0
+  to reset. Click a machine, a drone or the cube
+  for its panel, or step through them with `]` and `[`. Under reduced motion nothing turns and the tab
+  opens live, listing the newest events.
 
 **The Conscience tab** answers a developer's questions top-down. Every card names its question, its
 unit and how to read it; hover a tile, a heading's ⓘ, a bar or a legend row for what the number means

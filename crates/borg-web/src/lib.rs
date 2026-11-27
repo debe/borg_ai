@@ -31,6 +31,7 @@ use borg::{absorb, conscience, install, learn, memory, memory_export, msg, outco
 use futures_util::{Stream, StreamExt};
 
 pub mod learning;
+mod mesh;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -545,6 +546,20 @@ async fn update_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respon
     Json(update_view(&m.name, &m.home)).into_response()
 }
 
+#[derive(Deserialize)]
+struct MeshQuery {
+    c: Option<String>,
+    since: Option<i64>,
+}
+
+/// The Cube view (mesh.rs): machines, links, drones and what moved between them; with `since` (the
+/// `now` of the last response), only what this node got after it.
+async fn mesh_of(State(app): State<Arc<App>>, Query(q): Query<MeshQuery>) -> Response {
+    let Some(m) = app.mind(q.c.as_deref()) else { return not_found(q.c.as_deref().unwrap_or_default()) };
+    let body = mesh::view(&m.name, &m.home, m.share, q.since, learn::now_ms());
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 /// Size and modification time of `path`, or of every file directly in it.
 fn stamp(path: &Path) -> Vec<(u64, u128)> {
     let one = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), mtime(&m)));
@@ -588,6 +603,25 @@ fn watched(home: &Path) -> Vec<(&'static str, Vec<PathBuf>)> {
         // The selection summary's cache, and the outcome log whose tail it folds on every read; the pool
         // log its miss causes fold (borg pools.rs).
         ("select", vec![home.join(borg::select::summary::CACHE), home.join("outcomes.jsonl"), borg::pools::path(home)]),
+        // The Cube (mesh.rs): the messages, who was shown them and the hand-offs, the lessons and who
+        // stamped them, the absorbs, this node's sessions, the drones and its links. Not the stats event
+        // log, which changes on every hook and moves none of it.
+        (
+            "mesh",
+            vec![
+                msg::path(home),
+                home.join("lessons.jsonl"),
+                borg::mesh::origins_path(home),
+                absorb::path(home),
+                borg::mesh::sessions_path(home),
+                home.join("presence"),
+                presence::remote_path(home),
+                presence::synced_path(home),
+                home.join("mesh").join("peers.json"),
+                protocol::versions_path(home),
+                protocol::protocols_path(home),
+            ],
+        ),
         // The release check and what the mesh last heard of the members' versions.
         ("update", vec![update::path_for(home), protocol::versions_path(home), protocol::protocols_path(home)]),
     ]
@@ -651,6 +685,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/learning", get(learning_of))
         .route("/api/select", get(select_of))
         .route("/api/update", get(update_of))
+        .route("/api/mesh", get(mesh_of))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn(loopback_only))
         .with_state(app)
@@ -753,7 +788,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A release check or a member's version changes the update view only.
+    /// A release check changes the update view only; a member's version also the Cube, which shows
+    /// its machine's version.
     #[test]
     fn the_update_view_follows_the_release_check_and_the_members_versions() {
         let home = std::env::temp_dir().join(format!("borg-web-watch-update-{}", std::process::id()));
@@ -766,11 +802,12 @@ mod tests {
         assert_eq!(changed(&before, &checked), ["update"]);
         let v = protocol::PeerVersion { borg: Some("0.7.0".into()), protocol: protocol::current(), ms: 1, engineer: None };
         protocol::note_version(&home, "k", &v).unwrap();
-        assert_eq!(changed(&checked, &fingerprint(&home)), ["update"]);
+        assert_eq!(changed(&checked, &fingerprint(&home)), ["mesh", "update"]);
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// An absorb or release changes the memory view only: the lessons themselves did not change.
+    /// An absorb or release changes the memory view and the Cube, which plays it: the lessons
+    /// themselves did not change.
     #[test]
     fn the_memory_view_follows_the_absorb_log() {
         let home = std::env::temp_dir().join(format!("borg-web-watch-memory-{}", std::process::id()));
@@ -779,7 +816,31 @@ mod tests {
         let changed = |a: &Fingerprint, b: &Fingerprint| a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, _)| x.0).collect::<Vec<_>>();
         let before = fingerprint(&home);
         std::fs::write(absorb::path(&home), "{\"id\":\"L1\",\"kind\":\"absorb\",\"ms\":1,\"by\":\"a@x\"}\n").unwrap();
-        assert_eq!(changed(&before, &fingerprint(&home)), ["memory"]);
+        assert_eq!(changed(&before, &fingerprint(&home)), ["memory", "mesh"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The Cube follows who stamped the synced lines and this node's mesh sessions, which no other view
+    /// shows; the stats event log, which every hook appends to, changes the views that count it and not
+    /// the Cube.
+    #[test]
+    fn the_cube_follows_the_origins_and_the_sessions_and_not_the_event_log() {
+        let home = std::env::temp_dir().join(format!("borg-web-watch-mesh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("mesh")).unwrap();
+        let changed = |a: &Fingerprint, b: &Fingerprint| a.iter().zip(b).filter(|(x, y)| x != y).map(|(x, _)| x.0).collect::<Vec<_>>();
+        let before = fingerprint(&home);
+        std::fs::write(borg::mesh::origins_path(&home), "{\"h\":\"00\",\"key\":\"k\",\"ms\":1,\"sig\":\"00\"}\n").unwrap();
+        let stamped = fingerprint(&home);
+        assert_eq!(changed(&before, &stamped), ["mesh"]);
+        let s = borg::mesh::Session { ms: 1, peer: "k".into(), dial: true, sent: 1, received: 0, error: None };
+        borg::mesh::note(&home, &s, 1).unwrap();
+        let logged = fingerprint(&home);
+        assert_eq!(changed(&stamped, &logged), ["mesh"]);
+        std::fs::create_dir_all(home.join("stats")).unwrap();
+        std::fs::write(stats::events_path(&home), "{}\n").unwrap();
+        let counted = changed(&logged, &fingerprint(&home));
+        assert!(!counted.is_empty() && !counted.contains(&"mesh"), "{counted:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

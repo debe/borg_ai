@@ -11,6 +11,9 @@
 //! view after the other, on as many worker threads. Prints the requests served, the resident set before,
 //! its peak during the rounds (`VmHWM`) and what the allocator kept after them (`VmRSS`). Fixed work, no
 //! clock: heaptrack of `BORG_BENCH_ROUNDS=0` against `1` gives one round's allocations and heap peak.
+//! `BORG_BENCH_VIEWS` (a comma list, default every view) measures only those, so one view's cost can be
+//! told from another's. `mesh-since` is the Cube's refetch: `/api/mesh?since=<now>`, as a page asks
+//! when only presence changed (its events held, none new to send).
 //!
 //! `/api/events` (a stream that never ends) and `/api/messages/seen` (it writes) are left out.
 
@@ -29,13 +32,27 @@ mod shape;
 
 /// Rounds of requests after the warm-up.
 const ROUNDS: &str = "BORG_BENCH_ROUNDS";
+/// The views to measure: a comma list of `VIEWS`, else all of them.
+const ONLY: &str = "BORG_BENCH_VIEWS";
 /// Requests at once per view: the 8 parallel requests the live service was seen to hold 788 MB for.
 const CONCURRENT: usize = 8;
 /// Every view the page fetches.
-const VIEWS: [&str; 11] = ["collectives", "stats", "lessons", "memory", "drones", "feed", "queen", "messages", "learning", "select", "update"];
+const VIEWS: [&str; 13] = ["collectives", "stats", "lessons", "memory", "drones", "feed", "queen", "messages", "learning", "select", "update", "mesh", REFETCH];
+/// The Cube's refetch after its first fetch: `/api/mesh` with `since` now.
+const REFETCH: &str = "mesh-since";
 
 fn main() {
     let rounds: usize = std::env::var(ROUNDS).map_or(20, |n| n.trim().parse().unwrap_or_else(|_| panic!("{ROUNDS} is a count of rounds, not {n:?}")));
+    let views: Vec<&str> = std::env::var(ONLY).map_or_else(
+        |_| VIEWS.to_vec(),
+        |list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| VIEWS.into_iter().find(|w| *w == v).unwrap_or_else(|| panic!("{ONLY}: no view {v:?} (one of {VIEWS:?})")))
+                .collect()
+        },
+    );
     let scratch = shape::Scratch::new("web-load");
     let home = scratch.0.join("store");
     match std::env::var_os(shape::ENV) {
@@ -50,7 +67,7 @@ fn main() {
     let mind = Mind { name: "bench".into(), home: home.clone(), share: Share::Team };
     let app = Arc::new(App { minds: vec![mind], first: "bench".into(), cwd: String::new(), stop });
     rt.block_on(async {
-        for view in VIEWS {
+        for &view in &views {
             let body = get(app.clone(), view).await;
             let mut h = DefaultHasher::new();
             body.hash(&mut h);
@@ -60,7 +77,7 @@ fn main() {
         let _ = std::fs::write("/proc/self/clear_refs", "5");
         let mut served = 0;
         for _ in 0..rounds {
-            for view in VIEWS {
+            for &view in &views {
                 let at_once: Vec<_> = (0..CONCURRENT).map(|_| tokio::spawn(get(app.clone(), view))).collect();
                 for r in at_once {
                     r.await.expect("a request task");
@@ -71,7 +88,7 @@ fn main() {
         let kb = |r: Option<u64>| r.map_or("?".into(), |k| k.to_string());
         eprintln!(
             "{served} requests ({rounds} rounds x {} views x {CONCURRENT} at once); RSS {} kB before, peak {} kB during, {} kB after",
-            VIEWS.len(),
+            views.len(),
             kb(before),
             kb(resident("VmHWM:")),
             kb(resident("VmRSS:"))
@@ -81,7 +98,8 @@ fn main() {
 
 /// The body of `/api/<view>` of the one collective; panics on any status but 200.
 async fn get(app: Arc<App>, view: &str) -> axum::body::Bytes {
-    let req = Request::get(format!("/api/{view}")).header("host", "127.0.0.1:7979").body(Body::empty()).expect("a request");
+    let uri = if view == REFETCH { format!("/api/mesh?since={}", borg::learn::now_ms()) } else { format!("/api/{view}") };
+    let req = Request::get(uri).header("host", "127.0.0.1:7979").body(Body::empty()).expect("a request");
     let res = router(app).oneshot(req).await.expect("the router answers");
     assert_eq!(res.status(), StatusCode::OK, "/api/{view}");
     axum::body::to_bytes(res.into_body(), usize::MAX).await.expect("the body")

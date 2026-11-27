@@ -67,7 +67,7 @@ on this machine unless the collective they belong to is synced with a team over 
 | An edit was refused because the work was handed off and taken, or the hand-off aborted after its take | Stop editing that repo and tell the engineer who has the work now (or that the abort waits for `borg handoff done`). Never work around the refusal; after an abort the taker may leave the hand-off's branch with a plain `git switch <branch>` on the engineer's word |
 | An admin wants hand-offs off (or on again) for the whole collective | `borg handoff off` (`borg handoff on`), only on their word; a refusal naming machines on an older borg means those must upgrade first |
 | To see the drones running across the team, live | `borg top` (`--once` prints one frame) |
-| A local page of lessons, checks, the queen, learning and cost | `borg web` (127.0.0.1) |
+| A local page of lessons, checks, the queen, learning, cost, hand-offs, and the collective live as a cube (machines, drones, messages, lessons, syncs) | `borg web` (127.0.0.1) |
 | Whether the mesh daemon and borg web run as services, or the engineer wants them restarted, installed or gone | `borg service` (status), `borg service restart`, `borg service install`; `borg service remove` only on their word (it keeps them off) |
 | To learn waiting corrections now, not at session end | `borg learn` |
 | Vector model and index status | `borg vectors`, `borg vectors --fetch`, `borg vectors --rebuild` |

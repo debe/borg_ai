@@ -115,8 +115,10 @@ pub(crate) fn bench_store(file: &str) -> Option<String> {
     std::fs::read_to_string(Path::new(&dir).join(file)).ok()
 }
 
+/// blake3 of the line's text: borg owns it (borg mesh.rs `line_hash`), since borg web looks a line's
+/// origin up by it.
 pub fn hash(line: &str) -> Hash {
-    *blake3::hash(line.as_bytes()).as_bytes()
+    borg::mesh::line_hash(line)
 }
 
 /// Whether `line` is one whole JSON value (borg jsonl.rs `valid`: as a `serde_json::Value` parse

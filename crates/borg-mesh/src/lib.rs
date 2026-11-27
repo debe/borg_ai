@@ -74,22 +74,10 @@ pub fn from_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
 }
 
 /// The bytes of exactly `2 · N` lowercase hex digits, the form `to_hex` writes; `None` for any other text
-/// (which `from_hex` may still read: it trims and takes capitals).
+/// (which `from_hex` may still read: it trims and takes capitals). borg owns it (borg mesh.rs
+/// `lower_hex`), since borg web reads the hashes of origin records with it.
 pub(crate) fn from_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    let b = s.as_bytes();
-    if b.len() != 2 * N {
-        return None;
-    }
-    let nibble = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    };
-    let mut out = [0u8; N];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = (nibble(b[2 * i])? << 4) | nibble(b[2 * i + 1])?;
-    }
-    Some(out)
+    borg::mesh::lower_hex(s)
 }
 
 #[cfg(test)]

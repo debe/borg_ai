@@ -180,7 +180,11 @@ pub fn Overview() -> impl IntoView {
     // as their verdicts count as used or ignored.
     let questions = |t: &crate::api::Totals| {
         let live = t.n("live_ask_n");
-        if live > 0.0 { format!("{} questions, {} more with the next prompt", num(t.n("block_n")), num(live)) } else { format!("{} questions", num(t.n("block_n"))) }
+        if live > 0.0 {
+            format!("{} questions, {} more with the next prompt", num(t.n("block_n")), num(live))
+        } else {
+            format!("{} questions", num(t.n("block_n")))
+        }
     };
     let funnel = Signal::derive(move || {
         let t = t();

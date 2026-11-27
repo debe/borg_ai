@@ -674,6 +674,36 @@ impl<'a> HandoffLine<'a> {
         &self.event
     }
 
+    /// The hand-off its event is of.
+    #[must_use]
+    pub fn handoff(&self) -> &str {
+        &self.event.id
+    }
+
+    /// What its event says happened.
+    #[must_use]
+    pub const fn what(&self) -> crate::handoff::Kind {
+        self.event.kind
+    }
+
+    /// The session that wrote its event, on `node`.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.event.session
+    }
+
+    /// Whom an offer asks to take it: an engineer's email or a node key.
+    #[must_use]
+    pub fn to(&self) -> Option<&str> {
+        self.event.to.as_deref()
+    }
+
+    /// The offer's note (empty for an outcome).
+    #[must_use]
+    pub fn note(&self) -> &str {
+        &self.event.note
+    }
+
     /// Whether the line is one `new` could have written: `HANDOFF`, a token for its node, a well-formed
     /// event (handoff/log.rs `Event::well_formed`) of that same node.
     pub fn well_formed(&self) -> bool {
@@ -2157,11 +2187,14 @@ pub fn node_pub_path(home: &Path) -> PathBuf {
 /// This node as a message names it: the member key borg-mesh publishes (`node_pub_path`), which the
 /// mesh checks a message's node against before it carries it, else (no mesh yet) the stats.rs node.
 pub fn node(home: &Path) -> String {
-    std::fs::read_to_string(node_pub_path(home))
-        .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
-        .unwrap_or_else(|| stats::node(home))
+    std::fs::read_to_string(node_pub_path(home)).ok().map(|t| t.trim().to_string()).filter(|k| is_node_key(k)).unwrap_or_else(|| stats::node(home))
+}
+
+/// Whether `s` has the form of a member key as `node` reads one (64 hex digits), not of an engineer's
+/// email or a stats.rs node.
+#[must_use]
+pub fn is_node_key(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The session whose shell runs this command, with its harness: the session variables set here

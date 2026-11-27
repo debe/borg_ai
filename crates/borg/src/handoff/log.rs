@@ -63,7 +63,7 @@ pub(crate) const LINE_BYTES: usize = 16 * crate::msg::WIRE_TEXT;
 /// What a line says happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Kind {
+pub enum Kind {
     Offer,
     /// Another engineer's claim won.
     Taken,
@@ -76,6 +76,21 @@ pub(crate) enum Kind {
     Aborted,
     /// Finished: its refs deleted from the remote; the fences go.
     Done,
+}
+
+impl Kind {
+    /// The word a line names it by (its serde name: a test holds the two together).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offer => "offer",
+            Self::Taken => "taken",
+            Self::Back => "back",
+            Self::Declined => "declined",
+            Self::Aborted => "aborted",
+            Self::Done => "done",
+        }
+    }
 }
 
 /// One repo of an offer: where its state is, on which remote.
@@ -1068,5 +1083,13 @@ mod tests {
         let k2 = known(&home2).get(h2.id()).cloned().unwrap_or_default();
         assert!(k2.gone && k2.refuted.is_empty() && h2.closed(Some(&k2)) && h2.state(Some(&k2)) == "done", "{k2:?}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `as_str` names each kind as its lines do.
+    #[test]
+    fn a_kind_is_named_as_its_lines_name_it() {
+        for k in [Kind::Offer, Kind::Taken, Kind::Back, Kind::Declined, Kind::Aborted, Kind::Done] {
+            assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{}\"", k.as_str()));
+        }
     }
 }

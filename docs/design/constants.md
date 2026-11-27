@@ -1,7 +1,7 @@
 # Numeric constants by kind
 
 Every numeric constant's doc comment says its kind and why it has its value. This file lists them by
-kind, as the code labels them in 0.7.0. Paths are relative to `crates/`; the adapters are under
+kind, as the code labels them in 0.12.0. Paths are relative to `crates/`; the adapters are under
 `crates/borg/assets/adapters/`. Rows name a constant or a function, never a line, because lines move.
 When a doc comment and this file disagree, the doc comment is right and this file is stale.
 
@@ -253,6 +253,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-trace/src/dialogue.rs` | `REFUSAL_CHARS` | 2,000 chars | A refused call's error text, whatever the harness printed |
 | `borg-trace/src/scars.rs` | `CMD_CHARS` | 300 chars | A memory's line holding a heredoc or a pasted script |
 | `borg-web/src/lib.rs` | `PAGE_MAX` | 2,000 rows | One request making the server serialise a whole log (`/api/feed`, `/api/messages`) |
+| `borg-web/ui/src/views/cube.rs` | `GAP_S` | 1 s | A Cube tab hidden for a while replaying, on return, every event its clock passed at once: after a frame this late only the newest (as many as the ticker lists) play |
+| `borg-web/ui/src/scene.rs` | `MAX` | `u32::MAX` machines or drones | An index that no longer fits the scene's `u32`s (wasm32's `usize` is no wider, so in the browser it cuts nothing) |
 | `borg/src/sweep.rs` | `FIRST_READ` | 4 MiB | A turn-end sweep without a valid offset (the first turn after an upgrade, a rewritten file) reading a long session's whole transcript in the hook; the session's end and the idle sweep read the rest |
 | `borg/src/sweep.rs` | `DOCTOR_FILES` | 200 transcripts per harness, the newest | `borg doctor` reading every transcript of a busy fortnight; a note says when there were more |
 | `borg/src/collective.rs` | `REPO_DEPTH` | 2 levels (a config path's repo, or one group deeper) | Finding a repo known only by its name (an episode's) costing a walk of a whole source tree: one listing per config path and one stat per entry in it, per repo name; a repo deeper is unknown and learned where it was captured |
@@ -265,6 +267,8 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 |---|---|---|---|
 | `borg/src/clock.rs` | `DAY_MS` | 24 h | A unit. Every "a day" or "a week" in borg is a multiple of it |
 | `borg-web/ui/src/util.rs` | `DAY_MS`, `DAY_S` | 24 h | clock.rs `DAY_MS` (the page is a wasm workspace of its own) |
+| `borg-web/ui/src/model.rs` | `WINDOW_MS` | 7 days | msg.rs `TTL_MS`: the window `/api/mesh` serves, and so what the Cube keeps |
+| `borg-web/ui/src/views/cube.rs` | `CATCHUP_MS`, `HEAD_STEP` | 8 h, 1/2000 of a week | `CATCHUP_S` × the fastest of `RATES`; the playhead's step, a fraction of a pixel of the timeline |
 | `borg/src/notes/regress.rs` | `DAY` | 86,400 s | clock.rs `DAY_MS`, in git's seconds |
 | `borg/src/handoff/mod.rs` | `reannounce` | msg.rs `TTL_MS` / 2 | An open offer's mesh line (and this node's decline of one) is announced again past half the messages' TTL, so a member that syncs once in that time never loses it |
 | `borg/src/msg.rs` | `WINDOW_CAP` | 64 | `MEMBER_BYTES / WIRE_TEXT`: as many full texts as one member's share of the log holds (it promises no room: `send` refuses a message that would push one of its sender's unread messages to the same recipient out). Also what the mesh lets through unread from one sender to one recipient within `V1_RATE_MS` (`within_windows`) |
@@ -444,6 +448,14 @@ later value would be compared against.
 | `borg/src/reach.rs` | `PLAN_CHARS` | 110 chars | A line of `borg reach`'s plan |
 | `borg/src/conscience.rs` | `EARLY_QUESTION_CHARS`, `EARLY_CONSEQUENCE_CHARS`, `EARLY_OVERRIDES_CHARS` | 300, 200, 150 chars | An early lesson's question, its consequence and the team rule it replaces (`render_early`) |
 | `borg-web/ui/src/views/messages.rs` | `GROUP_GAP_MS` | 10 min | The Messages chat starts a new bubble group after this gap between one sender's messages |
+| `borg-web/src/mesh.rs` | `EXCERPT_CHARS` | 160 chars | An event's text in `/api/mesh`: a packet's caption, not the message (the Messages tab has it) |
+| `borg-web/ui/src/views/cube.rs` | `RATES` | 3600×, 600×, 60×, 1× | The Cube's replay rates, fastest first, as multiples of the real clock |
+| `borg-web/ui/src/views/cube.rs` | `CATCHUP_S` | 8 s | The replay at the fastest rate when the Cube tab opens (8 hours of history, `CATCHUP_MS`) |
+| `borg-web/ui/src/views/cube.rs` | `STAGGER`, `LAG_S` | 0.15 s, 1 s | Live events that arrive together play this far apart, closer when more wait, so live plays at most `LAG_S` behind the ticker |
+| `borg-web/ui/src/views/cube.rs` | `TICKER`, `TOASTS`, `TOAST_MS`, `TOAST_GAP` | 7 lines, 3, 4 s, 1.5 s | The Cube's ticker lines, the toasts on screen and how long each stays, and how often a replay toasts a lesson |
+| `borg-web/ui/src/views/cube.rs` | `MIN_H`, `STEP_H` | 360 px, 40 px | The Cube's lowest height when its bottom edge is dragged (the counters, ticker and timeline still fit), and a key press's step |
+| `borg-web/ui/src/scene.rs` | `CORE`, `ORBIT`, `DISTANCE`, `RING`, `RING_STEP`, `SPIN` | 1, 3.4, 11, 0.34, 0.012, 0.06 rad/s | The Cube's geometry: the core's half edge, the machines' sphere, the camera, the drones' rings, the auto-rotation |
+| `borg-web/ui/src/scene.rs` | `BLINK`, `PX` | 4 per second, 1 px | An idle Cube redraws for its core's lights at `BLINK`, and for motion only once something moved a pixel |
 | opencode adapter | `LOG_CHARS`, `LOG_ARGS` | 200 chars, 2 arguments | What a line of `$BORG_OPENCODE_LOG` keeps of borg's answer and of the command it ran |
 
 ## Experiment

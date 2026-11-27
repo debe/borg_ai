@@ -18,6 +18,15 @@ pub async fn get(url: String) -> Option<Value> {
     r.json::<Value>().await.ok()
 }
 
+/// The body of a GET as text, for a view that parses it borrowed (model.rs).
+pub async fn text(url: String) -> Option<String> {
+    let r = gloo_net::http::Request::get(&url).send().await.ok()?;
+    if !r.ok() {
+        return None;
+    }
+    r.text().await.ok()
+}
+
 /// POSTs `body` as JSON (a CORS preflight from any other site's page, which borg web never answers);
 /// whether the server took it.
 pub async fn post(url: String, body: &Value) -> bool {
@@ -1161,6 +1170,8 @@ pub struct Data {
     pub seen: RwSignal<f64>,
     /// The lesson open in the drawer.
     pub open: RwSignal<Option<String>>,
+    /// Bumped when the stream names the Cube's files (`mesh`): views/cube.rs fetches what is new.
+    pub mesh: RwSignal<u32>,
 }
 
 impl Data {
@@ -1211,6 +1222,7 @@ pub fn provide() -> Data {
         handoffs: Memo::new(move |_| parse_handoffs(&ho.raw.get())),
         seen: RwSignal::new(0.0),
         open: RwSignal::new(None),
+        mesh: RwSignal::new(0),
     };
     provide_context(d);
 
@@ -1241,6 +1253,9 @@ pub fn provide() -> Data {
                 let which: Value = serde_json::from_str(&e.data().as_string().unwrap_or_default()).unwrap_or(Value::Null);
                 let names: Vec<String> = which["changed"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
                 let c = d.collective.get_untracked();
+                if names.iter().any(|n| n == "mesh") {
+                    d.mesh.set(d.mesh.get_untracked().wrapping_add(1));
+                }
                 for src in d.sources {
                     // An old server names no feed or queen view: refresh them with the lessons and stats.
                     let hit =

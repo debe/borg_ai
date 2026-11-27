@@ -38,7 +38,7 @@ fn row(h: HandOff) -> impl IntoView {
             <div class="feed-body">
                 <div class="feed-head">{format!("{} · {} from {}", h.id, h.repos.join(", "), who(&h.engineer))}</div>
                 <div class="feed-detail">{trunc(&h.note, 300)}</div>
-                <div class="feed-meta">{format!("{age} · {outcome}")}{h.fenced.then(|| " · the original's edits are refused")}</div>
+                <div class="feed-meta">{format!("{age} · {outcome}")}{h.fenced.then_some(" · the original's edits are refused")}</div>
                 {(!h.takers.is_empty() && matches!(h.state.as_str(), "open" | "asked" | "declined")).then(|| view! {
                     <div class="chips">{h.takers.iter().map(|t| view! { <span class="chip g" title="has a machine with a clone of every repo, on a borg that takes hand-offs">{who(t)}</span> }).collect_view()}</div>
                 })}

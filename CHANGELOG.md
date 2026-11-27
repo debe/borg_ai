@@ -3,6 +3,14 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.12.0 (unreleased)
+
+### Added
+
+- `borg web` has a Cube tab: the collective as a live Borg cube, its machines, links and drones, and
+  every message, lesson, absorb, hand-off and mesh sync as it travels, with a 7-day replay.
+  [Details](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
+
 ## 0.11.1 (2026-11-24)
 
 ### Added

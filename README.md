@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/cube.svg" width="420" alt="An isometric cube of cells; lit cells are drones linked to one mind at the core"></p>
+<p align="center"><img src="docs/img/cube.webp" width="880" alt="borg web's Cube tab: the collective as a rotating green wireframe cube, machines floating around it with their drones in orbit, and messages, lessons and syncs travelling between them as glowing packets, with counters, a ticker and a 7-day timeline around it"></p>
 
 # Borg
 
@@ -337,11 +337,13 @@ borg memory release L42                                     # Borg delivers it a
 borg web        # http://127.0.0.1:7979/, the collective of the current directory first
 ```
 
-A live page on 127.0.0.1 with tabs for the Overview, Knowledge (every lesson, its belief and state),
+A live page on 127.0.0.1 with tabs for the Overview, the Cube (the collective drawn as a Borg cube:
+machines around it, drones orbiting them, and every message, lesson, absorb, hand-off and sync playing
+as it travels, with a 7-day replay), Knowledge (every lesson, its belief and state),
 Conscience (checks, questions and what they led to per channel), Learning (week by week: lessons per
 source, the share of asked lessons that changed the work, repeated vetoes), Steering
 (corrections, rejected tool calls, pauses and vetoes, the tool calls a pause refused), Messages (the last
-7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost and Drones.
+7 days' conversation, sends and refusals), the Queen (open questions, the queen's attention score), Cost, Drones and Hand-offs.
 The Conscience tab also shows lesson selection: the policy and the default, what the checks measure
 for the learned policy (placebos drawn, withheld and judged, tail lessons shown and applied), spend per session,
 effects with their intervals, label health, the fitted delivery rates, pool yield and stop latency per

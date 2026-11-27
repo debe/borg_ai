@@ -566,7 +566,8 @@ fn Costs() -> impl IntoView {
     let spend = move |t: &Totals| by(t, "check");
     // Live mode's calls in the window: teammates still on a borg before 0.7.6.
     let live_note = move |t: &Totals| {
-        (t.n("live_check") > 0.0).then(|| format!("+ {} for {} live-mode calls from teammates on borg < 0.7.6", usd(by(t, "live_check")), num(t.n("live_check"))))
+        (t.n("live_check") > 0.0)
+            .then(|| format!("+ {} for {} live-mode calls from teammates on borg < 0.7.6", usd(by(t, "live_check")), num(t.n("live_check"))))
     };
     let verdict = move || {
         let l = l();
@@ -1179,7 +1180,8 @@ fn LessonSelection() -> impl IntoView {
     };
 
     // E4: did deliveries arrive?
-    let delivery = move || match sel.with(|s| s.delivery.clone()) {
+    let delivery = move || {
+        match sel.with(|s| s.delivery.clone()) {
         None => view! { <p class="empty">"Fills after the first sessions with deliveries."</p> }.into_any(),
         Some(r) => [
             ("side note, detached", r.free_live, "a side note from a detached check", "free_live", false),
@@ -1200,6 +1202,7 @@ fn LessonSelection() -> impl IntoView {
         })
         .collect_view()
         .into_any(),
+    }
     };
     let half_life =
         move || sel.with(|s| s.half_life).map_or("not chosen yet".to_string(), |h| if h <= 0.0 { "none".into() } else { format!("{} sessions", num(h)) });

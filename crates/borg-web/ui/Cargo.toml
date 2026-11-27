@@ -11,11 +11,12 @@ description = "The borg web page: a Leptos client built to ../dist with trunk an
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["EventSource", "MessageEvent", "Location", "HashChangeEvent", "KeyboardEvent", "Element", "Navigator", "Clipboard"] }
+web-sys = { version = "0.3", features = ["EventSource", "MessageEvent", "Location", "HashChangeEvent", "KeyboardEvent", "Element", "Navigator", "Clipboard", "HtmlCanvasElement", "CanvasRenderingContext2d", "CanvasGradient", "Document", "PointerEvent", "MouseEvent", "WheelEvent", "AddEventListenerOptions", "MediaQueryList", "ResizeObserver"] }
 console_error_panic_hook = "0.1"
 
 [profile.release]
@@ -23,3 +24,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The frame cost of the Cube's scene under fixed work (benches/scene.rs); it includes the app's modules.
+[[bench]]
+name = "scene"
+harness = false

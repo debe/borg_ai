@@ -15,8 +15,10 @@ pub struct Identity {
     key: SigningKey,
 }
 
+/// `<store>/mesh`: borg owns the path (borg mesh.rs `dir`), since borg web reads what is in it.
+#[must_use]
 pub fn dir(home: &Path) -> PathBuf {
-    home.join("mesh")
+    borg::mesh::dir(home)
 }
 
 pub fn path(home: &Path) -> PathBuf {

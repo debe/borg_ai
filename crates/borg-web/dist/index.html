@@ -363,8 +363,139 @@ svg .focus { fill: var(--accent-soft); opacity: .8; }
   .chat-list { max-height: 260px; border-right: 0; border-bottom: 1px solid var(--rule); }
   .thread-body { max-height: 70vh; }
 }
+/* the Cube (views/cube.rs): a dark viewscreen in either theme, the canvas under the text around it.
+   The text is one grid over the canvas: counters on top, the ticker (left), toasts and the selection
+   (right) in the middle, the legend chips and the timeline at the bottom, so none covers another. */
+.cube { --borg: #39ff88; --borg-dim: rgba(57, 255, 136, .55); --borg-faint: rgba(57, 255, 136, .08); --scr: #020806;
+  --tell: #39ff88; --ask: #ffb547; --seen: #4fd8ff; --lesson: #f2fff7; --sync: #7ea8ff; --handoff: #c79bff; --veto: #ff4d5e; --resume: #d9ffe9;
+  --glass: rgba(2, 12, 8, .62); --edge: rgba(57, 255, 136, .24);
+  position: relative; height: clamp(480px, 74vh, 880px); border-radius: 12px; overflow: hidden; isolation: isolate;
+  border: 1px solid rgba(57, 255, 136, .28); color: #c8ffdf; font-family: var(--mono);
+  background: radial-gradient(ellipse at 50% 46%, #0b2a1b 0%, #04120b 38%, var(--scr) 75%);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .4), 0 12px 40px rgba(0, 0, 0, .35), inset 0 0 120px rgba(0, 0, 0, .85); }
+.cube::before { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background-image: linear-gradient(var(--borg-faint) 1px, transparent 1px), linear-gradient(90deg, var(--borg-faint) 1px, transparent 1px);
+  background-size: 44px 44px; background-position: center; mask-image: radial-gradient(ellipse at center, #000 30%, transparent 78%); }
+.cube::after { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
+  background: repeating-linear-gradient(0deg, rgba(0, 0, 0, .22) 0 1px, transparent 1px 3px); mix-blend-mode: multiply; }
+.cube button { color: inherit; }
+.cube-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; outline: none; }
+.cube-canvas:active { cursor: grabbing; }
+.cube-canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--borg-dim); }
+.cube-ui { position: absolute; inset: 0; z-index: 3; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 10px;
+  padding: 14px 16px 10px; pointer-events: none; }
+.cube-ui button, .cube-ui a, .tl-strip, .cube-stat, .cube-panel { pointer-events: auto; }
+.cube-ui :focus-visible { outline: 1px solid var(--borg); outline-offset: 2px; }
+.cube-vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* counters: the number counts up to a new value (a registered integer that transitions) */
+@property --n { syntax: "<integer>"; inherits: false; initial-value: 0; }
+.cube-hud { display: grid; gap: 8px; min-width: 0; }
+.cube-title { font-size: .72rem; letter-spacing: .32em; color: var(--borg); text-shadow: 0 0 8px rgba(57, 255, 136, .6); overflow-wrap: anywhere; }
+.cube-stats { display: flex; flex-wrap: wrap; gap: 6px; }
+.cube-stat { min-width: 84px; padding: 5px 9px; border: 1px solid var(--edge); border-radius: 6px; background: var(--glass);
+  backdrop-filter: blur(3px); display: grid; line-height: 1.15; cursor: help; }
+.cube-stat b { font-size: 1.2rem; color: #eafff2; font-weight: 600; text-shadow: 0 0 10px rgba(57, 255, 136, .45); font-variant-numeric: tabular-nums;
+  counter-reset: n var(--n); transition: --n .6s ease-out; }
+.cube-stat b::after { content: counter(n); }
+.cube-stat span { font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; color: var(--borg-dim); }
+.cube-meter { display: block; height: 3px; margin-top: 4px; border-radius: 2px; background: rgba(57, 255, 136, .14); overflow: hidden; }
+.cube-meter i { display: block; height: 100%; background: var(--borg); box-shadow: 0 0 6px var(--borg); transition: width .6s ease-out; }
+/* the middle: ticker bottom left, toasts top right, the selection bottom right */
+.cube-mid { position: relative; min-height: 0; }
+.cube-ticker { position: absolute; left: 0; bottom: 0; width: clamp(220px, 30%, 360px); max-height: 100%; overflow: hidden; margin: 0; padding: 0;
+  list-style: none; display: flex; flex-direction: column-reverse; gap: 3px; mask-image: linear-gradient(to top, #000 60%, transparent); }
+.tk { flex: none; font-size: .7rem; line-height: 1.35; color: #b9f5d2; animation: tk-in .5s ease-out; }
+.tk, .tk button { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.tk button { text-align: left; cursor: pointer; font: inherit; }
+.tk button:hover { color: #f2fff7; text-shadow: 0 0 8px rgba(242, 255, 247, .5); }
+.tk:nth-child(n+4) { opacity: .6; }
+.tk-kind { display: inline-block; min-width: 52px; margin-right: 7px; padding: 0 5px; border-radius: 3px; font-size: .58rem; text-transform: uppercase;
+  letter-spacing: .08em; text-align: center; color: #021006; background: var(--tell); }
+.tk-ask .tk-kind { background: var(--ask); } .tk-seen .tk-kind { background: var(--seen); } .tk-veto .tk-kind { background: var(--veto); }
+.tk-resume .tk-kind { background: var(--resume); } .tk-sync .tk-kind { background: var(--sync); } .tk-handoff .tk-kind { background: var(--handoff); }
+.tk-lesson .tk-kind { background: var(--lesson); box-shadow: 0 0 8px rgba(242, 255, 247, .55); }
+.tk-lesson { color: #eafff2; }
+.tk-ago { margin-left: 7px; color: rgba(185, 245, 210, .62); }
+@keyframes tk-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.cube-toasts { position: absolute; z-index: 2; top: 0; right: 0; width: min(320px, 100%); display: grid; gap: 6px; justify-items: end; pointer-events: none; }
+.cube-toast { max-width: 100%; padding: 6px 10px; font-size: .72rem; line-height: 1.35; letter-spacing: .02em; color: #d9ffe9; overflow-wrap: anywhere;
+  background: rgba(2, 14, 9, .9); border: 1px solid rgba(57, 255, 136, .35); border-left: 3px solid var(--tell); border-radius: 6px;
+  box-shadow: 0 0 18px rgba(57, 255, 136, .16); animation: toast 4s ease-out forwards; }
+.toast-lesson { border-left-color: var(--lesson); color: #f2fff7; } .toast-sync { border-left-color: var(--sync); }
+.toast-handoff { border-left-color: var(--handoff); } .toast-join { border-left-color: var(--borg); }
+@keyframes toast { 0% { opacity: 0; transform: translateY(-6px); } 8% { opacity: 1; transform: none; } 85% { opacity: 1; } 100% { opacity: 0; } }
+.cube-panel { position: absolute; z-index: 1; right: 0; bottom: 0; width: min(300px, 100%); max-height: 100%; overflow: auto; padding: 12px 14px;
+  font-size: .74rem; background: rgba(2, 14, 9, .92); border: 1px solid rgba(57, 255, 136, .38); border-radius: 8px; backdrop-filter: blur(4px);
+  box-shadow: 0 0 24px rgba(57, 255, 136, .12); animation: tk-in .25s ease-out; }
+.cube-panel h3 { margin: 0 22px 8px 0; font-size: .86rem; color: var(--borg); letter-spacing: .06em; }
+.cube-panel dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; }
+.cube-panel dt { color: var(--borg-dim); font-size: .62rem; text-transform: uppercase; letter-spacing: .08em; padding-top: 1px; }
+.cube-panel dd { margin: 0; color: #c8ffdf; overflow-wrap: anywhere; }
+.cube-drones { list-style: none; margin: 10px 0 0; padding: 8px 0 0; border-top: 1px solid var(--edge); display: grid; gap: 3px; }
+.cube-link { color: var(--borg); text-align: left; text-decoration: underline dotted rgba(57, 255, 136, .5); text-underline-offset: 3px; }
+.cube-link:hover { color: #eafff2; }
+.cube-panel > a.cube-link { display: inline-block; margin-top: 10px; }
+.cube-close { position: absolute; top: 6px; right: 10px; font-size: 1.1rem; color: var(--borg-dim); }
+.cube-close:hover { color: var(--borg); }
+.cube-tip { position: absolute; z-index: 4; pointer-events: none; padding: 6px 9px; font-size: .72rem; line-height: 1.35; color: #d9ffe9; max-width: 280px;
+  background: rgba(2, 14, 9, .92); border: 1px solid rgba(57, 255, 136, .4); border-radius: 6px; box-shadow: 0 0 16px rgba(57, 255, 136, .15);
+  transform: translate(14px, 14px); }
+.cube-tip.flip { transform: translate(calc(-100% - 14px), 14px); }
+.cube-tip b { color: var(--borg); display: block; }
+/* the bottom: legend chips that filter, the timeline that scrubs */
+.cube-deck { display: grid; gap: 6px; min-width: 0; }
+.cube-legend { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-size: .62rem; letter-spacing: .06em; color: var(--borg-dim); }
+.lg { padding: 2px 8px; border: 1px solid var(--edge); border-radius: 999px; background: var(--glass); color: #c8ffdf; }
+.lg:hover { border-color: var(--borg-dim); }
+.lg::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--c, var(--tell));
+  box-shadow: 0 0 6px var(--c, var(--tell)); vertical-align: 0; }
+.lg.messages { --c: var(--tell); } .lg.received { --c: var(--seen); } .lg.lessons { --c: var(--lesson); }
+.lg.syncs { --c: var(--sync); } .lg.handoffs { --c: var(--handoff); } .lg.steering { --c: var(--veto); }
+.lg.off { opacity: .45; text-decoration: line-through; }
+.lg.off::before { background: transparent; box-shadow: inset 0 0 0 1px var(--c); }
+.lg-help { margin-left: auto; }
+.lg-fs { padding: 2px 8px; border: 1px solid var(--edge); border-radius: 999px; background: var(--glass); color: #c8ffdf; font: inherit; letter-spacing: inherit; }
+.lg-fs:hover { border-color: var(--borg-dim); }
+/* the bottom edge resizes the view (below the timeline, inside the padding) */
+.cube-grip { position: absolute; left: 0; right: 0; bottom: 0; height: 9px; z-index: 4; cursor: ns-resize; touch-action: none; outline: none; }
+.cube-grip::after { content: ""; position: absolute; left: 50%; bottom: 3px; width: 48px; height: 3px; margin-left: -24px; border-radius: 2px;
+  background: var(--borg-dim); opacity: .45; }
+.cube-grip:hover::after, .cube-grip:focus-visible::after { opacity: 1; box-shadow: 0 0 6px var(--borg); }
+.cube:fullscreen { height: 100vh !important; border-radius: 0; }
+.cube:fullscreen .cube-grip { display: none; }
+.cube-tl { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "btns strip at"; gap: 8px; align-items: center; }
+.tl-btns { grid-area: btns; display: flex; gap: 3px; }
+.tl-btns button { font: .62rem var(--mono); letter-spacing: .04em; padding: 3px 7px; color: var(--borg); border: 1px solid rgba(57, 255, 136, .3);
+  border-radius: 4px; background: var(--glass); white-space: nowrap; }
+.tl-btns button:hover { background: rgba(57, 255, 136, .1); }
+.tl-btns button[aria-pressed="true"] { color: #eafff2; background: rgba(57, 255, 136, .2); box-shadow: 0 0 8px rgba(57, 255, 136, .25); }
+.tl-strip { grid-area: strip; position: relative; height: 34px; border: 1px solid var(--edge); border-radius: 4px; background: var(--glass);
+  cursor: ew-resize; touch-action: none; overflow: hidden; }
+.tl-strip > * { pointer-events: none; }
+.tl-strip svg { position: absolute; left: 0; right: 0; top: 2px; width: 100%; height: calc(100% - 14px); }
+.tl-strip path { opacity: .85; } .tl-strip path.messages { fill: var(--tell); } .tl-strip path.received { fill: var(--seen); }
+.tl-strip path.lessons { fill: var(--lesson); } .tl-strip path.syncs { fill: var(--sync); } .tl-strip path.handoffs { fill: var(--handoff); }
+.tl-strip path.steering { fill: var(--veto); }
+.tl-day { position: absolute; top: 0; bottom: 0; padding-left: 3px; border-left: 1px solid rgba(57, 255, 136, .16); font-size: .6rem; line-height: 1;
+  color: var(--borg-dim); display: flex; align-items: flex-end; padding-bottom: 2px; }
+.tl-head { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: #eafff2; box-shadow: 0 0 8px var(--borg); }
+/* as wide as its longest label ("Wed, Nov 26 09:13 · catching up"): the strip keeps its width */
+.tl-at { grid-area: at; width: 31ch; text-align: right; font-size: .62rem; color: var(--borg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 640px) {
+  .cube { height: clamp(560px, 86vh, 780px); }
+  .cube-ui { padding: 10px; gap: 8px; }
+  .cube-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+  .cube-stat { min-width: 0; padding: 4px 6px; } .cube-stat b { font-size: 1rem; }
+  .cube-stat span { font-size: .52rem; letter-spacing: .04em; overflow-wrap: anywhere; }
+  .cube-ticker { width: 100%; } .tk:nth-child(n+4) { display: none; }
+  .cube-panel { width: 100%; }
+  .lg-help { display: none; } .lg-fs { margin-left: auto; }
+  /* the buttons take the full width of a phone: the clock gets its own row under the strip */
+  .cube-tl { grid-template-columns: minmax(0, 1fr); grid-template-areas: "btns" "strip" "at"; gap: 6px; }
+  .tl-at { width: auto; text-align: left; }
+}
 @media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
 </style>
-<link rel="modulepreload" href="/borg-web-ui.js" crossorigin="anonymous" integrity="sha384-BfqtTZNxHrhWiGcKxr+7X1CPWjEEr/45IQ4smK7/BuCJwphDDNDKDMg6OZfmyO5d"><link rel="preload" href="/borg-web-ui_bg.wasm" crossorigin="anonymous" integrity="sha384-hmKViPTbJVDdMYaTgyDbH7XqNBFrSRPCwOyhKPY6hNbd6nij/y7FlBFWNwOrw4lN" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/borg-web-ui.js" crossorigin="anonymous" integrity="sha384-JFLtrUZj3LXWSvnWuZwrrdVTC0S4XerZmcxXlQ1rctaP4Qp/5uD7WjxtOMHLVM8S"><link rel="preload" href="/borg-web-ui_bg.wasm" crossorigin="anonymous" integrity="sha384-oeAdU5ZEC6SQ8jFpbE+UMBPY//xvaibkC2X8vqVcmJ27IjFPcI0kzMMeG9TTlG/Q" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>

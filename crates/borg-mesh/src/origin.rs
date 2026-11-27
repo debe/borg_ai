@@ -54,8 +54,11 @@ impl Origin {
     }
 }
 
+/// `<store>/mesh/origins.jsonl`: borg owns the path (borg mesh.rs `origins_path`), since borg web reads
+/// who stamped a line from it.
+#[must_use]
 pub fn path(home: &Path) -> PathBuf {
-    identity::dir(home).join("origins.jsonl")
+    borg::mesh::origins_path(home)
 }
 
 /// The first record per line hash, as owned `Origin`s (`Index` holds them compact). For simulation and

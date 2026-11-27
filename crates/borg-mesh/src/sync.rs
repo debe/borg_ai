@@ -918,23 +918,38 @@ impl Node {
 
     /// Serves one peer that dialled in.
     pub async fn handle(&self, incoming: Incoming) -> Result<Report, String> {
+        self.served(incoming).await.1
+    }
+
+    /// `handle`, with the key of the node that dialled in once the handshake authenticated it (a
+    /// member or not): the daemon logs the session under it (daemon.rs `log_session`).
+    pub async fn served(&self, incoming: Incoming) -> (Option<String>, Result<Report, String>) {
         // The IP the dialler's packets came from: where it can be reached, whatever it bound to.
         let observed = match incoming.remote_addr() {
             IncomingAddr::Ip(a) => Some(a),
             _ => None,
         };
         let started = borg::learn::now_ms();
-        let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
+        let conn = match incoming.await {
+            Ok(c) => c,
+            Err(e) => return (None, Err(format!("handshake: {e}"))),
+        };
+        let peer = to_hex(conn.remote_id().as_bytes());
+        (Some(peer), self.answer(&conn, observed, started).await)
+    }
+
+    /// The session `handle` serves on `conn`, once the handshake is done.
+    async fn answer(&self, conn: &Connection, observed: Option<SocketAddr>, started: i64) -> Result<Report, String> {
         if !spoken(conn.alpn()) && conn.alpn() != JOIN_ALPN {
             let (name, home) = self.gate()?;
-            let remote = authorise(&conn, &members(&home)?, &name)?;
-            return Err(self.mismatch(&conn, &remote));
+            let remote = authorise(conn, &members(&home)?, &name)?;
+            return Err(self.mismatch(conn, &remote));
         }
         let session = async {
             let (name, home) = self.gate()?;
             let (name, home) = (name.as_str(), home.as_path());
             let membership = members(home)?;
-            let remote = authorise(&conn, &membership, name)?;
+            let remote = authorise(conn, &membership, name)?;
             let (mut tx, mut rx) = conn.accept_bi().await.map_err(|e| e.to_string())?;
             let Msg::Hello { collective, listen, relay, borg } = recv(&mut rx).await? else { return Err("protocol: expected hello".into()) };
             if collective != name {
@@ -951,11 +966,11 @@ impl Node {
             Ok(report)
         };
         let result = if conn.alpn() == JOIN_ALPN {
-            self.admit(&conn, observed).await
+            self.admit(conn, observed).await
         } else {
             session.await.map_err(|e| {
-                let member = self.gate().ok().and_then(|(name, home)| authorise(&conn, &members(&home).ok()?, &name).ok());
-                member.and_then(|remote| self.refused(&conn, &remote)).unwrap_or(e)
+                let member = self.gate().ok().and_then(|(name, home)| authorise(conn, &members(&home).ok()?, &name).ok());
+                member.and_then(|remote| self.refused(conn, &remote)).unwrap_or(e)
             })
         };
         if let Err(e) = &result {
@@ -3460,7 +3475,7 @@ mod tests {
     /// A session that stored at least one line, served or dialled.
     fn received(e: &crate::daemon::Event) -> bool {
         use crate::daemon::Event;
-        matches!(e, Event::Served(Ok(r)) | Event::Synced { result: Ok(r), .. } if r.received > 0)
+        matches!(e, Event::Served { result: Ok(r), .. } | Event::Synced { result: Ok(r), .. } if r.received > 0)
     }
 
     /// A dial to `to` that failed (refused, closed or timed out).
@@ -3494,6 +3509,10 @@ mod tests {
         let l1 = lesson("L1", 1, "who owns the lock?");
         append_lines(&a, "lessons.jsonl", std::slice::from_ref(&l1));
         serve.next("alice's lesson at bob", |who, e| who == "bob" && received(e) && holds(&b, "lessons.jsonl", &l1)).await;
+        // The session that brought it is in bob's session log (daemon.rs `log_session`), before its event.
+        let log = |home: &Path| std::fs::read_to_string(borg::mesh::sessions_path(home)).unwrap_or_default();
+        let bobs = log(&b);
+        assert!(borg::mesh::sessions(&bobs).any(|s| s.peer == alice.public() && s.received > 0 && s.error.is_none()), "{bobs}");
         let l2 = lesson("L2", 1, "is the retry idempotent?");
         append_lines(&b, "lessons.jsonl", std::slice::from_ref(&l2));
         serve.next("bob's lesson at alice", |who, e| who == "alice" && received(e) && holds(&a, "lessons.jsonl", &l2)).await;
@@ -3514,6 +3533,9 @@ mod tests {
             serve.next("bob's dial to alice failed", |who, e| who == "bob" && dial_failed(e, &key)).await;
         }
         assert!(!holds(&b, "lessons.jsonl", &l3), "a local collective's lesson never leaves");
+        // Of the failures in a row, the first one after the completed sessions is logged, once.
+        let bobs = log(&b);
+        assert_eq!(borg::mesh::sessions(&bobs).filter(|s| s.peer == key && s.error.is_some()).count(), 1, "{bobs}");
         serve.stop().await;
     }
 
