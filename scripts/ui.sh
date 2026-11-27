@@ -6,7 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../crates/borg-web/ui"
 
-hash() { cat Cargo.toml Cargo.lock Trunk.toml index.html $(find src -name '*.rs' | sort) | sha256sum | cut -d' ' -f1; }
+# Sorted bytewise (LC_ALL=C): a locale's collation orders `views/cube.rs` and `views/cube/` differently, and
+# the hash must be the same on every machine.
+hash() { cat Cargo.toml Cargo.lock Trunk.toml index.html $(find src -name '*.rs' | LC_ALL=C sort) | sha256sum | cut -d' ' -f1; }
 
 if [ "${1:-}" = "--check" ]; then
     if [ "$(hash)" != "$(cat ../dist/.source-hash 2>/dev/null)" ]; then
