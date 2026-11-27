@@ -190,9 +190,9 @@ message only within that bound.
 Messages live in `<store>/messages.jsonl` for 7 days. Of each member's lines, the newest of each class
 (conversation, steers, acknowledgements, and apart from them the conversation and steers to `local`,
 which never leave the machine) stay while they fit 1 MiB, so a flood of tells never pushes out a pause
-or the acknowledgements that pace it. Those to `collective`, to a session on another machine
-and replies sync with the team collective like lessons ([Team sync](team-sync.md#how-a-sync-works)); one
-to `local` stays on this machine. An idle session sees a message when it next runs, unless it listens
+or the acknowledgements that pace it. Every message except one to `local` (to a drone, a session, an
+engineer's name, `engineer` or `collective`, and every reply) syncs with the team collective like
+lessons ([Team sync](team-sync.md#how-a-sync-works)); one to `local` stays on this machine. An idle session sees a message when it next runs, unless it listens
 ([Waking a session](#waking-a-session)).
 
 **Seen in monitoring.** `borg top` shows each drone's unread messages and the last day's messages, a
