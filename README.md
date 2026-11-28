@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/cube.webp" width="880" alt="borg web's Cube tab: the collective as a rotating green wireframe cube, machines floating around it with their drones in orbit, and messages, lessons and syncs travelling between them as glowing packets, with counters, a ticker and a 7-day timeline around it"></p>
+<p align="center"><img src="docs/img/cube.webp" width="880" alt="borg web's Cube tab: the collective as a Borg cube, machines and their drones around it and messages, lessons and syncs travelling between them as glowing packets; diving in opens the cube's plated shell onto its interior, each concern area a Borg structure and each lesson a light in its outcome colour, with counters, a ticker and a 7-day timeline around it"></p>
 
 # Borg
 
@@ -391,7 +391,9 @@ borg web        # http://127.0.0.1:7979/, the collective of the current director
 A live page on 127.0.0.1. The **Cube** draws the collective as a Borg cube: its machines around it, their
 drones in orbit, and every message and its receipt, lesson, absorb, hand-off, sync and pause playing as it
 travels,
-with a 7-day replay. The other tabs: Overview, Knowledge (every lesson, its belief and state), Conscience
+with a 7-day replay. Inside the cube sit the collective's lessons: one of eight Borg structures per concern area,
+sized by its lessons, and a light per lesson, brighter the stronger and coloured by what sessions did with
+it. The other tabs: Overview, Knowledge (every lesson, its belief and state), Conscience
 (checks, questions and what they led to per channel), Learning (week by week: lessons per source, the
 share of asked lessons that changed the work, repeated vetoes), Steering (corrections, rejected tool
 calls, pauses and vetoes, the tool calls a pause refused), Messages (the last 7 days' conversation, sends

@@ -79,6 +79,34 @@ after one that worked, from the local log `mesh/sessions.jsonl` (never synced; t
 lesson's machine and time come from its origin record (`mesh/origins.jsonl`); a lesson with none counts
 as this node's.
 
+**The core** holds the collective's lessons, the same ones the Knowledge tab lists, built as a Borg
+cube with a light for each lesson:
+
+- The shell is dark plating on every face. The faces turned toward you are broken open from their
+  edges, so the inside shows; which ones follows the camera.
+- Inside, a box per concern area (`other` without one), each sized by its lessons, the largest first,
+  with shafts between them where corridors run. An area holds its lessons of every system (a lesson's
+  first scope, `general` without one), each system's together, so a store of several systems still
+  shows a few large areas. Each area is one of eight Borg structures (tiers of regeneration alcoves,
+  alcoves ringed round a column, a gallery, spires, a honeycomb, maturation chambers, a vinculum,
+  vents), handed out by the area's name so the areas of one view differ.
+- Each lesson is one light of its area: an alcove's glowing back, a node, a cell, a slit, a panel or a
+  status light. Brightness is strength: the rank of the lesson's activation among all lessons, the
+  strongest brightest. Dormant lessons are nearly out. A consolidated lesson has a faint halo.
+- Colour is what sessions did with it, counted per session: blue, not judged yet (no change, ignore,
+  correction or veto); red, corrected or vetoed more often than acted on; green, acted on in at least
+  half the judged sessions; dull green, the rest (acted on in under half), and a lesson an outside
+  store holds (`borg memory absorb`), which borg no longer delivers.
+- A new lesson, a new version, an absorb or a release lights its light, and the light fades within two
+  seconds. When the lessons change, the core is rebuilt and each lesson's light moves to its new place at once.
+- The knowledge button, `k`, or a double-click on the core dives into it; Esc, `k` or a double-click
+  between the lights comes back out. In the core a key line explains the areas, the lights, brightness,
+  halo and colours (and, wider than a phone, what hover, a click and the keys do; a phone shows the
+  colours alone, a word or two each), areas wide enough
+  on screen for their name show it, and the toasts make way for the core. Hover a light for
+  its question, where it sits and how strong it is; click it to open the lesson (in full screen, in the
+  cube's own panel).
+
 - Opening the tab replays the last 8 hours at 3600× (8 seconds), then plays live. The strip at the
   bottom shows the 7 days per hour by kind; click or drag it to play from there at 3600×, 600×, 60×
   or 1×, or go back to LIVE. A rate is that many times the real clock (600×: ten minutes per second),

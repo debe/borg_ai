@@ -5,6 +5,14 @@ use leptos::prelude::*;
 use crate::api::data;
 use crate::util::{ago, day_of_ms, long_day, num, pct, who};
 
+/// A click on the scrim closes the drawer, unless it is the second click of a double-click (the
+/// browser's count, `detail`): that one follows the click that opened it, as the Cube opens a lesson.
+fn scrim_click(e: &web_sys::MouseEvent, open: RwSignal<Option<String>>) {
+    if e.detail() < 2 {
+        open.set(None);
+    }
+}
+
 #[component]
 pub fn Drawer() -> impl IntoView {
     let d = data();
@@ -39,7 +47,7 @@ pub fn Drawer() -> impl IntoView {
         let (lo, span) = range.get();
         let act = ((l.activation - lo) / span * 100.0).clamp(2.0, 100.0);
         Some(view! {
-            <div class="scrim" on:click=move |_| d.open.set(None)></div>
+            <div class="scrim" on:click=move |e| scrim_click(&e, d.open)></div>
             <aside class="drawer" role="dialog" aria-label="Lesson">
                 <div class="drawer-top">
                     <div class="chips">

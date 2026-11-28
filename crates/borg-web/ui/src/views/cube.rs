@@ -8,7 +8,11 @@
 //! the fetch (`/api/mesh`, from `since` on each change the stream names), the playback clock and the
 //! frame loop, the input, and the text around the canvas in the DOM: the counters, the ticker (the
 //! live region), the toasts, the legend chips that filter, the timeline that scrubs, the hover and
-//! the selected machine or drone. What it names and counts is kinds.rs and tally.rs, pure.
+//! the selected machine, drone or lesson. What it names and counts is kinds.rs and tally.rs, pure.
+//!
+//! The core holds the collective's lessons (volume.rs). The Knowledge button, the K key or a
+//! double-click on the core dives into it (`Scene::set_dive`): the outside fades, a key line says how
+//! the lessons are drawn, a hover names a lesson and a click opens it in the drawer.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -32,10 +36,11 @@ use wasm_bindgen::closure::Closure;
 
 use crate::api::{self, Data, data};
 use crate::canvas::Canvas;
-use crate::model::{Ev, EvKind, Model, Play};
+use crate::model::{Ev, EvKind, Model, Node, Play};
 use crate::paint::paint;
 use crate::scene::{Anchor, Camera, Handed, Scene, Shown};
-use crate::util::{DAY_MS, ago, clock, day_label, keep, kept, local_midnight, now_ms, weekday};
+use crate::util::{DAY_MS, ago, clock, day_label, keep, kept, local_midnight, now_ms, num, weekday};
+use crate::volume::{Item, Volume};
 
 use kinds::{Cat, Filter};
 use tally::{HOUR_MS, HOURS, Hud, TL_H, WEEK_MS};
@@ -69,6 +74,10 @@ const HEIGHT_KEY: &str = "borg.cube.height";
 /// and a key press on its bottom edge moves it `STEP_H`.
 const MIN_H: f64 = 360.0;
 const STEP_H: f64 = 40.0;
+/// Display: the hover tip's widest (index.html `.cube-tip` max-width) and its gap from the pointer,
+/// px (its margin there).
+const TIP_W: f32 = 280.0;
+const TIP_GAP: f32 = 14.0;
 
 /// A number in words up to 99 ("Twenty-Five"), in digits from 100 on.
 fn word(k: usize) -> String {
@@ -126,20 +135,32 @@ struct Toast {
     text: String,
 }
 
-/// What a click selected, by the model's ids: the panel reads it anew from every response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a click selected, by the model's ids (a lesson by its own): the panel reads it anew from every
+/// response and every change of the lessons.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Sel {
     Core,
     Node(u32),
     Drone(u32),
+    Lesson(String),
 }
 
 /// The hover's tip: what it names. Where it is (`Ui::tip_at`) changes on every move, this only
 /// with what is under the pointer.
 #[derive(Clone, Debug, PartialEq)]
 struct Pick {
+    /// What is under the pointer, as a click would select it.
+    sel: Sel,
     title: String,
     lines: Vec<String>,
+}
+
+impl Pick {
+    /// Whether the tip shows while the panel shows `picked`: not for what the panel already names,
+    /// since the pointer still on it would hold the tip over the panel.
+    fn shows(&self, picked: Option<&Sel>) -> bool {
+        picked != Some(&self.sel)
+    }
 }
 
 /// What the panel shows of a selection.
@@ -252,7 +273,88 @@ fn needs_draw(l: &Live) -> bool {
     l.dirty || l.scene.needs_draw(&l.shown)
 }
 
+/// Where a frame left the clock, for the signals around the canvas: the replay's speed (None: live),
+/// the playhead, the pulse, and the wall clock's minute when it turned.
+struct Now {
+    speed: Option<f64>,
+    head: f64,
+    pulse: usize,
+    minute: Option<f64>,
+}
+
 impl Live {
+    /// One animation frame at `t` seconds: the clock runs, what it passed and what waited plays, the
+    /// day and the minute turn, and the scene advances; it is projected and painted only when it would
+    /// look different.
+    fn frame(&mut self, t: f64, f: Filter) -> (Out, Now) {
+        let gap = t - self.last_t;
+        self.last_t = t;
+        let mut out = Out::default();
+        self.run_clock(t, gap, f, &mut out);
+        self.play_due(t, gap.clamp(0.0, 0.25));
+        let minute = self.turn_clock(&mut out);
+        // Every animation frame advances; only a frame that is drawn projects the lessons.
+        self.scene.advance(t);
+        if needs_draw(self) {
+            self.draw();
+        }
+        let speed = (!self.clock.live()).then_some(self.clock.speed);
+        let head = (self.clock.sim / HEAD_STEP).round() * HEAD_STEP;
+        (out, Now { speed, head, pulse: tally::pulse(&self.model.events, self.clock.sim), minute })
+    }
+
+    /// Live, the clock is the store's present; replaying, it runs on (a gap longer than `GAP_S` plays
+    /// as a burst) and stops at the present; held while the timeline is dragged.
+    fn run_clock(&mut self, t: f64, gap: f64, f: Filter, out: &mut Out) {
+        let edge = self.edge();
+        if self.clock.live() {
+            self.clock.sim = edge;
+        } else if !self.scrubbing {
+            let from = self.clock.sim;
+            self.clock.run(t, edge);
+            self.replay(from, f, t, gap > GAP_S, out);
+            if self.clock.sim >= edge {
+                self.clock.speed = 0.0;
+            }
+        }
+    }
+
+    /// Each waiting event on its turn, more than one a frame when they play close; no burst for the
+    /// time nothing waited.
+    fn play_due(&mut self, t: f64, dt: f64) {
+        let mut due = self.next_pop.max(t - dt);
+        while due <= t
+            && let Some((p, how)) = self.pending.pop_front()
+        {
+            self.scene.play_handed(p, how);
+            due += self.gap;
+        }
+        self.next_pop = due;
+    }
+
+    /// A new day resets the counters; returns the wall clock's minute when it turned (the ticker's
+    /// "ago" reads anew).
+    fn turn_clock(&mut self, out: &mut Out) -> Option<f64> {
+        let wall = now_ms();
+        if self.day_end > 0.0 && wall >= self.day_end {
+            out.hud = Some(self.new_day());
+        }
+        let minute = (wall / 60_000.0).floor();
+        let turned = minute.to_bits() != self.minute.to_bits();
+        self.minute = minute;
+        turned.then_some(minute)
+    }
+
+    /// Projects the scene and paints it, and keeps what it showed for `needs_draw`.
+    fn draw(&mut self) {
+        self.scene.prepare();
+        if let Some(c) = self.canvas.as_mut() {
+            paint(&self.scene, c);
+        }
+        self.shown = self.scene.shown();
+        self.dirty = false;
+    }
+
     fn edge(&self) -> f64 {
         now_ms() + self.skew
     }
@@ -374,8 +476,89 @@ impl Live {
             Anchor::Core => Some(Sel::Core),
             Anchor::Node(i) => self.scene.node_key.get(i as usize).map(|k| Sel::Node(*k)),
             Anchor::Drone(i) => self.scene.drone_session.get(i as usize).map(|s| Sel::Drone(*s)),
+            Anchor::Lesson(i) => self.scene.vol.ids.get(i as usize).map(|id| Sel::Lesson(id.to_string())),
+            Anchor::Awaited(_) => None,
         }
     }
+
+    /// Takes the collective's lessons into the core. The lesson under the pointer follows its own;
+    /// returns whether it is gone, so the view drops its tip.
+    fn lessons(&mut self, items: &[Item]) -> bool {
+        self.scene.lessons(items, &self.model);
+        self.dirty = true;
+        let on_lesson = matches!(self.hover, Some(Anchor::Lesson(_)));
+        if on_lesson {
+            self.hover = self.scene.hovered.map(Anchor::Lesson);
+        }
+        on_lesson && self.hover.is_none()
+    }
+}
+
+/// Where a lesson opened from the cube (a click on its light, its line in the ticker) shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opens {
+    /// The page's drawer.
+    Drawer,
+    /// The cube's own panel: in full screen only the cube shows, and the drawer, outside it, would
+    /// open unseen (and take the keys from the canvas).
+    Panel,
+}
+
+impl Opens {
+    /// Where a lesson shows, the cube in full screen (`full`) or not.
+    const fn now(full: bool) -> Self {
+        if full { Self::Panel } else { Self::Drawer }
+    }
+
+    /// What a click that hit `sel` selects, the selection being `was`: a lesson in the panel; a lesson
+    /// the drawer opens leaves the selection as it was, so the lesson shows in one place.
+    fn picks(self, sel: Option<Sel>, was: Option<Sel>) -> Option<Sel> {
+        match (self, &sel) {
+            (Self::Drawer, Some(Sel::Lesson(_))) => was,
+            _ => sel,
+        }
+    }
+}
+
+/// What Escape closes, the innermost first: nothing while the drawer is open (it takes Escape), else
+/// the lesson the panel shows, else the dive, else the selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Esc {
+    Drawer,
+    Lesson,
+    Dive,
+    Selection,
+}
+
+impl Esc {
+    /// For the drawer open (`drawer`), a lesson selected (`lesson`), the scene heading into the core
+    /// (`diving`).
+    const fn of(drawer: bool, lesson: bool, diving: bool) -> Self {
+        if drawer {
+            Self::Drawer
+        } else if lesson {
+            Self::Lesson
+        } else if diving {
+            Self::Dive
+        } else {
+            Self::Selection
+        }
+    }
+}
+
+/// The selection kept out of a dive: a lesson's panel has no place there, its light out of reach.
+fn out_of_dive(sel: Option<Sel>) -> Option<Sel> {
+    sel.filter(|s| !matches!(s, Sel::Lesson(_)))
+}
+
+/// Whether the page shows the cube in full screen.
+fn full_screen() -> bool {
+    web_sys::window().and_then(|w| w.document()).is_some_and(|d| d.fullscreen_element().is_some())
+}
+
+/// The lesson an anchor names, by its index in the volume.
+const fn lesson_of(a: Option<Anchor>) -> Option<u32> {
+    if let Some(Anchor::Lesson(i)) = a { Some(i) } else { None }
 }
 
 /// "3m ago", or a dash for a time the server does not know (0).
@@ -383,75 +566,132 @@ fn when(ms: f64) -> String {
     if ms > 0.0 { ago(ms) } else { "—".into() }
 }
 
-/// The panel's facts of a selection, from the model as it is now.
-fn detail(m: &Model, sel: Sel) -> Option<Detail> {
+/// The panel's facts of a selection, from the model and the lessons as they are now.
+fn detail(l: &Live, ls: &[api::Lesson], sel: &Sel) -> Option<Detail> {
+    let m = &l.model;
+    match sel {
+        Sel::Core => Some(core_detail(m)),
+        Sel::Node(key) => node_detail(m, *key),
+        Sel::Drone(session) => drone_detail(m, *session),
+        Sel::Lesson(id) => lesson_detail(&l.scene.vol, ls, id),
+    }
+}
+
+/// The drones not ended, on the machine `on` or on all of them.
+fn active(m: &Model, on: Option<u32>) -> usize {
+    m.drones.iter().filter(|d| d.state != "ended" && on.is_none_or(|n| d.node == n)).count()
+}
+
+fn core_detail(m: &Model) -> Detail {
+    Detail {
+        title: "The collective".into(),
+        facts: vec![("Machines", m.nodes.len().to_string()), ("Drones", format!("{} active of {}", active(m, None), m.drones.len()))],
+        machine: None,
+        drones: Vec::new(),
+        messages: false,
+    }
+}
+
+/// A machine's version as its sync says it.
+fn version(node: &Node) -> String {
+    match (&node.borg, node.protocol) {
+        (Some(b), Some(p)) => format!("borg {b} · protocol {p}"),
+        (None, Some(p)) => format!("borg before 0.7 · protocol {p}"),
+        _ => "unknown".into(),
+    }
+}
+
+/// When a machine last synced with this one, or why it never did.
+fn last_sync(m: &Model, key: u32, me: bool) -> String {
+    let links: Vec<_> = m.links.iter().filter(|l| l.a == key || l.b == key).collect();
+    match links.iter().filter_map(|l| l.ms).reduce(f64::max) {
+        Some(ms) => ago(ms),
+        None if links.iter().any(|l| l.dial) => "dialled, never synced".into(),
+        None if links.is_empty() && !me => "reached through the collective".into(),
+        None => "never".into(),
+    }
+}
+
+fn node_detail(m: &Model, key: u32) -> Option<Detail> {
+    let node = m.node(key)?;
     let total = kinds::total(m);
-    let active = |on: Option<u32>| m.drones.iter().filter(|d| d.state != "ended" && on.is_none_or(|n| d.node == n)).count();
-    Some(match sel {
-        Sel::Core => Detail {
-            title: "The collective".into(),
-            facts: vec![("Machines", m.nodes.len().to_string()), ("Drones", format!("{} active of {}", active(None), m.drones.len()))],
-            machine: None,
-            drones: Vec::new(),
-            messages: false,
-        },
-        Sel::Node(key) => {
-            let node = m.node(key)?;
-            let mut facts = vec![("Role", if node.me { "this machine" } else { "a member" }.to_string())];
-            if let Some(e) = &node.engineer {
-                facts.push(("Engineer", e.clone()));
-            }
-            facts.push((
-                "Version",
-                match (&node.borg, node.protocol) {
-                    (Some(b), Some(p)) => format!("borg {b} · protocol {p}"),
-                    (None, Some(p)) => format!("borg before 0.7 · protocol {p}"),
-                    _ => "unknown".into(),
-                },
-            ));
-            if !node.syncs {
-                facts.push(("Protocol", "another one: nothing syncs".into()));
-            }
-            let links: Vec<_> = m.links.iter().filter(|l| l.a == key || l.b == key).collect();
-            facts.push((
-                "Last sync",
-                match links.iter().filter_map(|l| l.ms).reduce(f64::max) {
-                    Some(ms) => ago(ms),
-                    None if links.iter().any(|l| l.dial) => "dialled, never synced".into(),
-                    None if links.is_empty() && !node.me => "reached through the collective".into(),
-                    None => "never".into(),
-                },
-            ));
-            let mut ds: Vec<_> = m.drones.iter().filter(|d| d.node == key).collect();
-            ds.sort_by_key(|d| (d.state == "ended", d.number));
-            facts.push(("Drones", format!("{} active, {} ended", active(Some(key)), ds.len() - active(Some(key)))));
-            Detail {
-                title: node.host.clone(),
-                facts,
-                machine: None,
-                drones: ds.into_iter().map(|d| (d.session, format!("{} · {}", kinds::drone_name(d, total), d.state))).collect(),
-                messages: false,
-            }
-        }
-        Sel::Drone(session) => {
-            let d = m.drone(session)?;
-            let or = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
-            Detail {
-                title: of(d.number, total),
-                facts: vec![
-                    ("Repo", or(&d.repo)),
-                    ("State", format!("{}{}", d.state, if d.paused { " · paused" } else { "" })),
-                    ("Harness", or(&d.harness)),
-                    ("Engineer", or(&d.engineer)),
-                    ("Started", when(d.started)),
-                    ("Last heard", when(d.ms)),
-                ],
-                machine: m.node(d.node).map(|n| (n.key, n.host.clone())),
-                drones: Vec::new(),
-                messages: true,
-            }
-        }
+    let mut facts = vec![("Role", if node.me { "this machine" } else { "a member" }.to_string())];
+    if let Some(e) = &node.engineer {
+        facts.push(("Engineer", e.clone()));
+    }
+    facts.push(("Version", version(node)));
+    if !node.syncs {
+        facts.push(("Protocol", "another one: nothing syncs".into()));
+    }
+    facts.push(("Last sync", last_sync(m, key, node.me)));
+    let mut ds: Vec<_> = m.drones.iter().filter(|d| d.node == key).collect();
+    ds.sort_by_key(|d| (d.state == "ended", d.number));
+    let on = active(m, Some(key));
+    facts.push(("Drones", format!("{on} active, {} ended", ds.len() - on)));
+    Some(Detail {
+        title: node.host.clone(),
+        facts,
+        machine: None,
+        drones: ds.into_iter().map(|d| (d.session, format!("{} · {}", kinds::drone_name(d, total), d.state))).collect(),
+        messages: false,
     })
+}
+
+fn drone_detail(m: &Model, session: u32) -> Option<Detail> {
+    let d = m.drone(session)?;
+    let or = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+    Some(Detail {
+        title: of(d.number, kinds::total(m)),
+        facts: vec![
+            ("Repo", or(&d.repo)),
+            ("State", format!("{}{}", d.state, if d.paused { " · paused" } else { "" })),
+            ("Harness", or(&d.harness)),
+            ("Engineer", or(&d.engineer)),
+            ("Started", when(d.started)),
+            ("Last heard", when(d.ms)),
+        ],
+        machine: m.node(d.node).map(|n| (n.key, n.host.clone())),
+        drones: Vec::new(),
+        messages: true,
+    })
+}
+
+/// The share of `n` lessons at least as strong as one of strength `s` (volume.rs: the rank of its
+/// activation, 0 the weakest, 1 the strongest), in whole percent rounded up: 1 for the strongest of
+/// many, 100 for the weakest.
+fn top_share(s: f32, n: usize) -> u32 {
+    let n = n.max(1) as f32;
+    ((n - s * (n - 1.0)) / n * 100.0).ceil().clamp(1.0, 100.0) as u32
+}
+
+/// A lesson's states as the drawer's chips name them, or none.
+fn states(l: &api::Lesson) -> Option<String> {
+    let on = [(l.dormant, "dormant"), (l.consolidated, "long-term"), (l.absorbed.is_some(), "held elsewhere")];
+    let words: Vec<&str> = on.iter().filter(|(b, _)| *b).map(|(_, w)| *w).collect();
+    (!words.is_empty()).then(|| words.join(" · "))
+}
+
+/// The panel's facts of a lesson: its system and area, its strength as the volume ranks it, what
+/// sessions did with it, and the times it was asked. The first two are the hover's. O(lessons): it
+/// finds the lesson by id.
+fn lesson_detail(vol: &Volume, ls: &[api::Lesson], id: &str) -> Option<Detail> {
+    let l = ls.iter().find(|l| l.id == id)?;
+    let it = item(l);
+    let mut facts = vec![("Where", format!("{} · {}", it.system, it.area))];
+    if let Some(s) = vol.find(id).and_then(|i| vol.strength.get(i as usize)) {
+        facts.push(("Strength", format!("top {} % of {} by activation", top_share(*s, vol.len()), vol.len())));
+    }
+    facts.extend([
+        ("Acted on", num(l.changed)),
+        ("Ignored", num(l.ignored)),
+        ("Corrected", num(l.corrected)),
+        ("Vetoed", num(l.vetoed)),
+        ("Asked", format!("{} times", num(l.asked()))),
+    ]);
+    if let Some(s) = states(l) {
+        facts.push(("State", s));
+    }
+    Some(Detail { title: l.question.clone(), facts, machine: None, drones: Vec::new(), messages: false })
 }
 
 /// A listener on the canvas: the element and its callback, to remove it again.
@@ -493,15 +733,24 @@ struct Ui {
     toasts: RwSignal<Vec<Toast>>,
     toast_ids: StoredValue<u64>,
     hover: RwSignal<Option<Pick>>,
-    /// Where the tip is, and whether it opens to the left.
+    /// Where the tip stands: its near edge from the canvas's left, or from its right when it opens to
+    /// the left of the pointer (`tip_left`), its top, and whether it opens to the left.
     tip_at: RwSignal<(f32, f32, bool)>,
     /// The wall clock's minute, for the ticker's "ago".
     minute: RwSignal<f64>,
     /// A panel button changed the selection: the new panel takes the focus.
     refocus: StoredValue<bool>,
+    /// The last press on the canvas hardly moved, so its click selects (`click`); the selection the
+    /// last first click replaced, which a double-click puts back (`double`); and whether the canvas
+    /// handed the keys to the drawer: they come back to it when the drawer closes.
+    tap: StoredValue<bool>,
+    before: StoredValue<Option<Sel>>,
+    keys_away: StoredValue<bool>,
     picked: RwSignal<Option<Sel>>,
-    /// Bumped on every response: the panel reads the model anew.
+    /// Bumped on every response and every change of the lessons: the panel reads them anew.
     rev: RwSignal<u32>,
+    /// The scene heads into the core (`Scene::diving`), for the Knowledge button and the key line.
+    diving: RwSignal<bool>,
     filter: RwSignal<Filter>,
     /// The rate a replay plays at; the clock's speed (None: live) and its playhead.
     rate: RwSignal<f64>,
@@ -511,6 +760,8 @@ struct Ui {
     hist: RwSignal<(f64, Vec<[u32; 6]>)>,
     canvas: NodeRef<leptos::html::Canvas>,
     strip: NodeRef<leptos::html::Div>,
+    /// The band between the counters and the deck: a dive frames the core in it (`Camera::top`).
+    mid: NodeRef<leptos::html::Div>,
     /// The view itself (resized and made full screen), the height its bottom edge was dragged to
     /// (`None`: the page's own), and where a drag of the edge started: pointer y and height.
     root: NodeRef<leptos::html::Section>,
@@ -534,8 +785,12 @@ impl Ui {
             tip_at: RwSignal::new((0.0, 0.0, false)),
             minute: RwSignal::new(0.0),
             refocus: StoredValue::new(false),
+            tap: StoredValue::new(false),
+            before: StoredValue::new(None),
+            keys_away: StoredValue::new(false),
             picked: RwSignal::new(None),
             rev: RwSignal::new(0),
+            diving: RwSignal::new(false),
             filter: RwSignal::new(Filter::from_stored(&kept(FILTER_KEY).unwrap_or_default())),
             rate: RwSignal::new(RATES[0]),
             speed: RwSignal::new(None),
@@ -543,6 +798,7 @@ impl Ui {
             hist: RwSignal::new((0.0, Vec::new())),
             canvas: NodeRef::new(),
             strip: NodeRef::new(),
+            mid: NodeRef::new(),
             root: NodeRef::new(),
             height: RwSignal::new(kept(HEIGHT_KEY).and_then(|h| h.parse::<f64>().ok()).filter(|h| *h >= MIN_H)),
             grip: StoredValue::new(None),
@@ -666,17 +922,28 @@ impl Ui {
             l.canvas = Canvas::new(&el, dpr);
             l.scene.still = self.still;
         });
-        // Size the backing store to the element, in device pixels.
+        // Size the backing store to the element, in device pixels (a size set anew clears it, so only
+        // when it changed), and measure the band the text over it leaves free.
+        let mid = self.mid;
         let size = {
             let el = el.clone();
             move || {
                 let (w, h) = (el.client_width().max(1), el.client_height().max(1));
                 let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
-                el.set_width((f64::from(w) * dpr) as u32);
-                el.set_height((f64::from(h) * dpr) as u32);
+                let (bw, bh) = ((f64::from(w) * dpr) as u32, (f64::from(h) * dpr) as u32);
+                if (el.width(), el.height()) != (bw, bh) {
+                    el.set_width(bw);
+                    el.set_height(bh);
+                }
+                let (top, bottom) = mid.get_untracked().map_or((0.0, 0.0), |m| {
+                    let (c, b) = (el.get_bounding_client_rect(), m.get_bounding_client_rect());
+                    ((b.top() - c.top()).max(0.0) as f32, (c.bottom() - b.bottom()).max(0.0) as f32)
+                });
                 st.update_value(|l| {
                     l.scene.cam.w = w as f32;
                     l.scene.cam.h = h as f32;
+                    l.scene.cam.top = top;
+                    l.scene.cam.bottom = bottom;
                     if let Some(c) = l.canvas.as_mut() {
                         c.set_dpr(dpr);
                     }
@@ -689,6 +956,10 @@ impl Ui {
         let ro = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()).ok();
         if let Some(ro) = &ro {
             ro.observe(&el);
+            // The band changes with the text over the canvas: the key line a dive shows, wrapped counters.
+            if let Some(m) = self.mid.get_untracked() {
+                ro.observe(&m);
+            }
         }
         // The wheel on the canvas itself and not passive: leptos delegates `on:wheel` to the
         // document, where Chromium makes it passive and ignores the `preventDefault` that keeps the
@@ -718,65 +989,26 @@ impl Ui {
     /// A frame at `t` seconds: the clock runs, what it passed plays, the scene paints if it changed.
     fn frame(self, t: f64) {
         let Some(f) = self.filter.try_get_untracked() else { return };
-        let alive = self.st.try_update_value(|l| {
-            let gap = t - l.last_t;
-            let dt = gap.clamp(0.0, 0.25);
-            l.last_t = t;
-            let mut out = Out::default();
-            let edge = l.edge();
-            if l.clock.live() {
-                l.clock.sim = edge;
-            } else if !l.scrubbing {
-                let from = l.clock.sim;
-                l.clock.run(t, edge);
-                l.replay(from, f, t, gap > GAP_S, &mut out);
-                if l.clock.sim >= edge {
-                    l.clock.speed = 0.0;
-                }
-            }
-            // Each waiting event on its turn, more than one a frame when they play close; no burst
-            // for the time nothing waited.
-            let mut due = l.next_pop.max(t - dt);
-            while due <= t
-                && let Some((p, how)) = l.pending.pop_front()
-            {
-                l.scene.play_handed(p, how);
-                due += l.gap;
-            }
-            l.next_pop = due;
-            let wall = now_ms();
-            if l.day_end > 0.0 && wall >= l.day_end {
-                out.hud = Some(l.new_day());
-            }
-            let minute = (wall / 60_000.0).floor();
-            let new_minute = minute.to_bits() != l.minute.to_bits();
-            l.minute = minute;
-            l.scene.frame(t);
-            if needs_draw(l) {
-                if let Some(c) = l.canvas.as_mut() {
-                    paint(&l.scene, c);
-                }
-                l.shown = l.scene.shown();
-                l.dirty = false;
-            }
-            let speed = (!l.clock.live()).then_some(l.clock.speed);
-            (out, speed, (l.clock.sim / HEAD_STEP).round() * HEAD_STEP, tally::pulse(&l.model.events, l.clock.sim), new_minute.then_some(minute))
-        });
-        let Some((out, speed, at, pulse, minute)) = alive else { return };
+        let Some((out, now)) = self.st.try_update_value(|l| l.frame(t, f)) else { return };
         self.show(out);
-        if let Some(m) = minute {
+        self.publish(now);
+        self.schedule();
+    }
+
+    /// Hands what a frame reached to the signals around the canvas, each only when it changed.
+    fn publish(self, now: Now) {
+        if let Some(m) = now.minute {
             self.minute.set(m);
         }
-        if self.speed.get_untracked() != speed {
-            self.speed.set(speed);
+        if self.speed.get_untracked() != now.speed {
+            self.speed.set(now.speed);
         }
-        if self.head.get_untracked().to_bits() != at.to_bits() {
-            self.head.set(at);
+        if self.head.get_untracked().to_bits() != now.head.to_bits() {
+            self.head.set(now.head);
         }
-        if self.pulse.with_untracked(|p| p.0) != pulse {
-            self.pulse.update(|p| p.0 = pulse);
+        if self.pulse.with_untracked(|p| p.0) != now.pulse {
+            self.pulse.update(|p| p.0 = now.pulse);
         }
-        self.schedule();
     }
 
     /// The view is gone. The pending frame is cancelled before its closure is dropped (a frame that
@@ -797,15 +1029,16 @@ impl Ui {
         });
     }
 
-    fn pick_at(self, x: f32, y: f32) -> Option<Pick> {
-        self.st
-            .try_with_value(|l| {
-                let s = l.sel_of(l.scene.hit(x, y)?)?;
-                let det = detail(&l.model, s)?;
-                let lines = det.facts.into_iter().take(2).map(|(k, v)| format!("{k}: {v}")).collect();
-                Some(Pick { title: det.title, lines })
+    /// The tip of what `a` names: its title and its first two facts.
+    fn pick(self, a: Anchor) -> Option<Pick> {
+        let (sel, det) = self.d.lessons.with_untracked(|ls| {
+            self.st.try_with_value(|l| {
+                let sel = l.sel_of(a)?;
+                detail(l, ls, &sel).map(|d| (sel, d))
             })
-            .flatten()
+        })??;
+        let lines = det.facts.into_iter().take(2).map(|(k, v)| format!("{k}: {v}")).collect();
+        Some(Pick { sel, title: det.title, lines })
     }
 
     fn pointer_down(self, e: &web_sys::PointerEvent) {
@@ -832,32 +1065,129 @@ impl Ui {
             .flatten()
             .is_some();
         if dragging {
-            self.hover.set(None);
+            self.leave();
             return;
         }
-        let Some((a, flip)) = self.st.try_with_value(|l| (l.scene.hit(x, y), x > l.scene.cam.w * 0.62)) else { return };
+        let Some((a, w)) = self.st.try_with_value(|l| (l.scene.hit(x, y), l.scene.cam.w)) else { return };
         if self.st.try_with_value(|l| l.hover) != Some(a) {
-            self.st.update_value(|l| l.hover = a);
-            self.hover.set(a.and_then(|_| self.pick_at(x, y)));
+            self.st.update_value(|l| {
+                l.hover = a;
+                l.scene.hovered = lesson_of(a);
+            });
+            self.hover.set(a.and_then(|a| self.pick(a)));
         }
         if self.hover.with_untracked(Option::is_some) {
-            self.tip_at.set((x, y, flip));
+            let left = tip_left(x, w);
+            self.tip_at.set((if left { w - x } else { x }, y, left));
         }
     }
 
-    /// A press that hardly moved is a click: it selects what is under it, or nothing.
-    fn pointer_up(self, e: &web_sys::PointerEvent) {
+    /// The pointer left the canvas or drags: nothing is hovered, so the same thing hovered again
+    /// shows its tip again.
+    fn leave(self) {
+        let _ = self.st.try_update_value(|l| {
+            l.hover = None;
+            l.scene.hovered = None;
+        });
+        if self.hover.with_untracked(Option::is_some) {
+            self.hover.set(None);
+        }
+    }
+
+    /// A press that hardly moved ends in a click (`click`); one that moved was a drag.
+    fn pointer_up(self) {
         let drag = self.st.try_update_value(|l| l.drag.take()).flatten();
-        if drag.is_some_and(|(_, _, dist)| dist < 5.0) {
-            let (x, y) = point(e);
-            self.picked.set(self.st.try_with_value(|l| l.scene.hit(x, y).and_then(|a| l.sel_of(a))).flatten());
+        self.tap.set_value(drag.is_some_and(|(_, _, dist)| dist < 5.0));
+    }
+
+    /// A click selects what is under it, or nothing, and opens a lesson at once where it shows
+    /// (`Opens::picks`: in the drawer it leaves the selection as it was). It keeps the selection it
+    /// replaced, for a double-click to put back (`double`). The browser counts the clicks (`detail`), so
+    /// the second click of a double-click changes nothing.
+    fn click(self, e: &web_sys::MouseEvent) {
+        let tap = self.tap.try_update_value(std::mem::take).unwrap_or(false);
+        if !tap || e.detail() > 1 {
+            return;
+        }
+        let (x, y) = point(e);
+        let sel = self.st.try_with_value(|l| l.scene.hit(x, y).and_then(|a| l.sel_of(a))).flatten();
+        let was = self.picked.get_untracked();
+        self.before.set_value(was.clone());
+        if let Some(Sel::Lesson(id)) = &sel {
+            self.open(id.clone(), true);
+        }
+        self.picked.set(Opens::now(full_screen()).picks(sel, was));
+    }
+
+    /// Opens the lesson `id` where it shows (`Opens::now`). In the drawer, which then takes the keys
+    /// (Escape closes it) from the canvas when it had them (`keys`); they come back to the canvas when
+    /// the drawer closes (`Cube`). A double-click's second click lands on the drawer's scrim, which lets
+    /// it be (drawer.rs). In the panel, the keys stay where they are.
+    fn open(self, id: String, keys: bool) {
+        match Opens::now(full_screen()) {
+            Opens::Panel => self.picked.set(Some(Sel::Lesson(id))),
+            Opens::Drawer => {
+                if keys {
+                    if let Some(c) = self.canvas.get_untracked() {
+                        let _ = c.blur();
+                    }
+                    self.keys_away.set_value(true);
+                }
+                self.d.open.set(Some(id));
+            }
+        }
+    }
+
+    /// Into the core (`true`) or back out, which drops a lesson's selection (`out_of_dive`).
+    fn dive(self, on: bool) {
+        self.st.update_value(|l| {
+            l.scene.set_dive(on);
+            l.dirty = true;
+        });
+        self.diving.set(on);
+        if !on && matches!(self.picked.get_untracked(), Some(Sel::Lesson(_))) {
+            self.picked.set(out_of_dive(self.picked.get_untracked()));
+        }
+        self.leave();
+    }
+
+    /// Whether the scene heads into the core: what `diving` shows.
+    fn heads_in(self) -> bool {
+        self.st.try_with_value(|l| l.scene.diving()).unwrap_or(false)
+    }
+
+    fn toggle_dive(self) {
+        self.dive(!self.heads_in());
+    }
+
+    /// A double-click on the core goes into it or back out (`Scene::toggles_dive`: in a dive anywhere
+    /// on it but a lesson, which a click opens); elsewhere it resets the camera. One that goes in or out
+    /// leaves the selection as it was before its first click.
+    fn double(self, e: &web_sys::MouseEvent) {
+        let (x, y) = point(e);
+        if self.st.try_with_value(|l| l.scene.toggles_dive(x, y)).unwrap_or(false) {
+            self.picked.set(self.before.get_value());
+            self.toggle_dive();
+        } else {
+            self.reset();
+        }
+    }
+
+    /// Escape closes the innermost thing open (`Esc::of`): a lesson's panel, else the dive, else the
+    /// selection; while the drawer is open it is the drawer's.
+    fn escape(self) {
+        let lesson = matches!(self.picked.get_untracked(), Some(Sel::Lesson(_)));
+        match Esc::of(self.d.open.get_untracked().is_some(), lesson, self.heads_in()) {
+            Esc::Drawer => {}
+            Esc::Lesson | Esc::Selection => self.picked.set(None),
+            Esc::Dive => self.dive(false),
         }
     }
 
     fn reset(self) {
         self.st.update_value(|l| {
-            let (w, h) = (l.scene.cam.w, l.scene.cam.h);
-            l.scene.cam = Camera { w, h, ..Camera::default() };
+            let Camera { w, h, top, bottom, .. } = l.scene.cam;
+            l.scene.cam = Camera { w, h, top, bottom, ..Camera::default() };
             l.dirty = true;
         });
     }
@@ -871,7 +1201,7 @@ impl Ui {
         }) else {
             return;
         };
-        let at = self.picked.get_untracked().and_then(|p| all.iter().position(|s| *s == p));
+        let at = self.picked.with_untracked(|p| p.as_ref().and_then(|p| all.iter().position(|s| s == p)));
         let n = all.len();
         let next = match (at, forward) {
             (None, true) => 0,
@@ -879,12 +1209,12 @@ impl Ui {
             (Some(i), true) => (i + 1) % n,
             (Some(i), false) => (i + n - 1) % n,
         };
-        self.picked.set(all.get(next).copied());
+        self.picked.set(all.get(next).cloned());
     }
 
     /// Keys on the focused canvas: arrows turn, + and - zoom, 0 resets, ] and [ select the next or
-    /// the previous machine or drone, Escape closes the panel. The page does not scroll under the
-    /// keys the cube takes.
+    /// the previous machine or drone, K goes into the core or back out, Escape leaves it or closes the
+    /// panel. The page does not scroll under the keys the cube takes.
     fn key(self, e: &web_sys::KeyboardEvent) {
         let k = e.key();
         let step = 0.12;
@@ -912,7 +1242,11 @@ impl Ui {
                 true
             }
             "Escape" => {
-                self.picked.set(None);
+                self.escape();
+                true
+            }
+            "k" | "K" => {
+                self.toggle_dive();
                 true
             }
             "]" => {
@@ -1074,13 +1408,14 @@ impl Ui {
                 class="cube-canvas"
                 tabindex="0"
                 role="img"
-                aria-label=move || self.hud.with(|h| format!("{} machines, {} drones active, {} tells and asks today. Arrow keys turn, plus and minus zoom, 0 resets, ] and [ select a machine or drone.", h.machines, h.drones, h.tx_today))
+                aria-label=move || self.hud.with(|h| format!("{} machines, {} drones active, {} tells and asks today. Arrow keys turn, plus and minus zoom, 0 resets, ] and [ select a machine or drone, K goes into the core to its lessons and back.", h.machines, h.drones, h.tx_today))
                 on:pointerdown=move |e| self.pointer_down(&e)
                 on:pointermove=move |e| self.pointer_move(&e)
-                on:pointerup=move |e| self.pointer_up(&e)
+                on:pointerup=move |_| self.pointer_up()
                 on:pointercancel=move |_| self.st.update_value(|l| l.drag = None)
-                on:pointerleave=move |_| self.hover.set(None)
-                on:dblclick=move |_| self.reset()
+                on:click=move |e| self.click(&e)
+                on:pointerleave=move |_| self.leave()
+                on:dblclick=move |e| self.double(&e)
                 on:keydown=move |e| self.key(&e)
             ></canvas>
         }
@@ -1129,25 +1464,22 @@ impl Ui {
     /// live region on the live clock only: a replay rewrites it every frame, too fast to announce.
     /// Its tones are prefixed (`tk-`, `toast-`): a bare `lesson` is the Knowledge view's card.
     fn mid_view(self) -> impl IntoView {
-        let (open, minute) = (self.d.open, self.minute);
+        let minute = self.minute;
         let since = move |ms: f64| {
             move || {
                 minute.track();
                 ago(ms)
             }
         };
-        let shown = Memo::new(move |_| {
-            self.rev.track();
-            self.st.try_with_value(|l| detail(&l.model, self.picked.get()?)).flatten()
-        });
+        let shown = self.shown();
         view! {
-            <div class="cube-mid">
+            <div node_ref=self.mid class=move || self.mid_class()>
                 <ol class="cube-ticker" aria-live=move || if self.speed.get().is_some() { "off" } else { "polite" } aria-label="what moved, newest first">
                     <For each=move || self.ticker.get() key=|t| t.id let:t>
                         {match t.lesson.clone() {
                             Some(id) => view! {
                                 <li class=format!("tk tk-{} open", t.tone)>
-                                    <button on:click=move |_| open.set(Some(id.clone())) title="open the lesson">
+                                    <button on:click=move |_| self.open(id.clone(), false) title="open the lesson">
                                         <span class="tk-kind">{t.kind}</span>{t.line.clone()}<span class="tk-ago">{since(t.ms)}</span>
                                     </button>
                                 </li>
@@ -1166,6 +1498,21 @@ impl Ui {
                 {move || shown.get().map(|det| self.panel_view(det))}
             </div>
         }
+    }
+
+    /// What the panel shows: the selection's detail, anew on every response. The lessons are read
+    /// untracked: their Effect bumps `rev` once the volume holds them.
+    fn shown(self) -> Memo<Option<Detail>> {
+        Memo::new(move |_| {
+            self.rev.track();
+            let sel = self.picked.get()?;
+            self.d.lessons.with_untracked(|ls| self.st.try_with_value(|l| detail(l, ls, &sel)))?
+        })
+    }
+
+    /// The band's class: in a dive a phone hides the ticker there (index.html).
+    fn mid_class(self) -> &'static str {
+        if self.diving.get() { "cube-mid diving" } else { "cube-mid" }
     }
 
     /// The selected machine, drone or the collective; it links to what it names. Built anew only
@@ -1207,11 +1554,12 @@ impl Ui {
         }
     }
 
-    /// The bottom: the legend chips that filter, the timeline that scrubs.
+    /// The bottom: in a dive the key line, the legend chips that filter, the timeline that scrubs.
     fn deck_view(self) -> impl IntoView {
         let filter = self.filter;
         view! {
             <div class="cube-deck">
+                {move || self.diving.get().then(key_view)}
                 <div class="cube-legend" role="group" aria-label="show">
                     {Cat::ALL.into_iter().map(|c| view! {
                         <button
@@ -1221,7 +1569,13 @@ impl Ui {
                             on:click=move |_| self.toggle(c)
                         >{c.label()}</button>
                     }).collect_view()}
-                    <span class="lg-help">"drag to turn · scroll to zoom · double-click to reset"</span>
+                    <span class="lg-help">"drag to turn · scroll to zoom · double-click the core to go in or out, elsewhere to reset"</span>
+                    <button
+                        class="lg-fs lg-dive"
+                        aria-pressed=move || self.diving.get().to_string()
+                        on:click=move |_| self.toggle_dive()
+                        title="into the core: the collective's lessons (K; Esc leaves)"
+                    >"◈ knowledge"</button>
                     <button class="lg-fs" on:click=move |_| self.fullscreen() title="full screen (Esc leaves it)">"⛶ full screen"</button>
                 </div>
                 {self.timeline_view()}
@@ -1275,15 +1629,17 @@ impl Ui {
         }
     }
 
-    /// The hover's tip: built when what is under the pointer changes, moved by its style alone.
+    /// The hover's tip: built when what is under the pointer changes, moved by its style alone; none
+    /// for what the panel shows (`Pick::shows`).
     fn tip_view(self) -> impl IntoView {
         let at = self.tip_at;
         move || {
-            self.hover.get().map(|h| {
+            let hover = self.hover.get().filter(|h| self.picked.with(|p| h.shows(p.as_ref())));
+            hover.map(|h| {
                 view! {
                     <div
                         class=move || if at.with(|a| a.2) { "cube-tip flip" } else { "cube-tip" }
-                        style=move || at.with(|a| format!("left:{}px;top:{}px", a.0 as i32, a.1 as i32))
+                        style=move || at.with(|a| format!("{}:{}px;top:{}px", if a.2 { "right" } else { "left" }, a.0 as i32, a.1 as i32))
                     >
                         <b>{h.title}</b>
                         {h.lines.into_iter().map(|l| view! { <div>{l}</div> }).collect_view()}
@@ -1292,6 +1648,13 @@ impl Ui {
             })
         }
     }
+}
+
+/// Whether the hover tip for a pointer at `x` on a canvas `w` wide opens to the left of it: where it
+/// does not fit right of it at its widest (`TIP_W`) and the left has more room. The tip stands by its
+/// near edge (index.html `.cube-tip`), so it narrows to the room on its side and stays on the canvas.
+fn tip_left(x: f32, w: f32) -> bool {
+    w - x < TIP_W + TIP_GAP && x > w - x
 }
 
 /// A pointer's place on the canvas: `offsetX` is in the canvas's own CSS pixels, what the camera's
@@ -1315,6 +1678,55 @@ fn midnights(start: f64) -> Vec<(f64, &'static str)> {
     out
 }
 
+/// Whether an `/api/lessons` answer holds the collective `c`'s lessons.
+fn lessons_of(answer: &serde_json::Value, c: &str) -> bool {
+    !c.is_empty() && answer["collective"].as_str() == Some(c)
+}
+
+/// A lesson as the core's volume reads it, borrowed.
+fn item(l: &api::Lesson) -> Item<'_> {
+    Item {
+        id: &l.id,
+        system: l.scope.first().map_or("general", String::as_str),
+        area: if l.area.is_empty() { "other" } else { &l.area },
+        activation: l.activation,
+        changed: l.changed,
+        ignored: l.ignored,
+        corrected: l.corrected,
+        vetoed: l.vetoed,
+        dormant: l.dormant,
+        consolidated: l.consolidated,
+        absorbed: l.absorbed.is_some(),
+    }
+}
+
+/// In a dive, how the lessons are drawn, over the canvas in two rows. First what is drawn: a bay per
+/// concern area (volume.rs `nest`), built as one of the Borg kinds handed out by name (interior.rs
+/// `kinds`) and sized by its lessons; a light per lesson (interior.rs `Seat`), brighter by its
+/// activation rank (volume.rs `ranks`, paint.rs `light_of`), dormant ones at `LIGHT_DORMANT`; and what
+/// hover, a click and the keys do (a phone hides that part). Then the colours of `Item::tone` in its
+/// order as paint.rs draws them (`lesson_ink`: one an outside store holds in the dull green), each a
+/// swatch in canvas.rs's palette and its meaning, and the halo of a consolidated lesson (paint.rs
+/// `shine`). A phone shows only the colours, each in a word or two (its whole meaning as its title),
+/// so the key takes a line or two of the band the core is framed in, not six.
+fn key_view() -> impl IntoView {
+    let swatch = |class: &'static str, long: &'static str, short: &'static str| {
+        view! { <span title=long><i class=format!("ky {class}")></i><span class="ky-long">{long}</span><span class="ky-short">{short}</span></span> }
+    };
+    view! {
+        <p class="cube-key" role="note" aria-label="how the lessons in the core are drawn">
+            <span class="ky-what">"an area per concern, a Borg structure by name, size by lessons; a light per lesson, brighter = stronger, dim = dormant"</span>
+            <span class="ky-help">"hover names · click opens · K or Esc leaves"</span>
+            <b class="ky-br"></b>
+            {swatch("ky-blue", "not judged yet", "not judged")}
+            {swatch("ky-red", "corrected or vetoed more than acted on", "corrected")}
+            {swatch("ky-green", "acted on in ≥ half of judged sessions", "acted on")}
+            {swatch("ky-dull", "acted on in under half, or in an outside store", "seldom acted on")}
+            {swatch("ky-halo", "halo: long-term", "halo: long-term")}
+        </p>
+    }
+}
+
 #[component]
 pub fn Cube() -> impl IntoView {
     let u = Ui::new();
@@ -1332,6 +1744,32 @@ pub fn Cube() -> impl IntoView {
         u.toasts.set(Vec::new());
         u.picked.set(None);
         u.fetch(true);
+    });
+    // The collective's lessons, as the Knowledge tab has them, into the core, borrowed: only once the
+    // lessons held are the shown collective's own (`/api/lessons` names it), so after a switch, or
+    // while an answer for the one before is late, the core is empty. The borrow of the lessons ends
+    // before the signals are set.
+    let lessons = u.d.source("lessons").raw;
+    let theirs = Memo::new(move |_| lessons.with(|v| u.d.collective.with(|c| lessons_of(v, c))));
+    Effect::new(move |_| {
+        let theirs = theirs.get();
+        let gone = u.d.lessons.with(|ls| {
+            let items: Vec<Item> = if theirs { ls.iter().map(item).collect() } else { Vec::new() };
+            u.st.try_update_value(|l| l.lessons(&items))
+        });
+        if gone == Some(true) {
+            u.hover.set(None);
+        }
+        u.rev.update(|r| *r = r.wrapping_add(1));
+    });
+    // The drawer a click on the canvas opened has closed: the keys come back to the canvas.
+    Effect::new(move |_| {
+        if u.d.open.get().is_none()
+            && u.keys_away.try_update_value(std::mem::take).unwrap_or(false)
+            && let Some(c) = u.canvas.get_untracked()
+        {
+            let _ = c.focus();
+        }
     });
     // The stream named the Cube's files.
     Effect::new(move |prev: Option<u32>| {
@@ -1381,7 +1819,93 @@ pub fn Cube() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clock, RATES, of};
+    use std::collections::BTreeMap;
+
+    use super::{Anchor, Clock, Esc, Live, Opens, Pick, RATES, Sel, TIP_GAP, TIP_W, detail, item, lessons_of, of, out_of_dive, tip_left, top_share};
+    use crate::api::{Lesson, parse_lessons};
+    use crate::volume::Item;
+
+    fn lessons() -> Vec<Lesson> {
+        let v = serde_json::json!({ "lessons": [
+            { "id": "strong", "question": "Is the retry idempotent?", "scope": ["billing"], "area": "testing", "activation": 5.0,
+              "changed": 3.0, "ignored": 1.0, "corrected": 1.0, "usage": { "block": 2.0, "live_ask": 1.0 }, "consolidated": true },
+            { "id": "weak", "question": "Is the cache warm?", "activation": 1.0, "dormant": true },
+        ]});
+        parse_lessons(&v, &BTreeMap::new())
+    }
+
+    fn live(ls: &[Lesson]) -> Live {
+        let mut l = Live::default();
+        let items: Vec<Item> = ls.iter().map(item).collect();
+        l.lessons(&items);
+        l
+    }
+
+    #[test]
+    fn a_lesson_ranks_as_the_share_of_lessons_at_least_as_strong() {
+        assert_eq!(top_share(1.0, 340), 1, "the strongest of many");
+        assert_eq!(top_share(0.0, 340), 100, "the weakest");
+        assert_eq!(top_share(0.5, 3), 67, "two of three at least as strong");
+        assert_eq!(top_share(0.0, 1), 100);
+        assert_eq!(top_share(1.0, 0), 100);
+    }
+
+    /// The hover's two facts come first: where it sits and its strength as the volume ranks it.
+    #[test]
+    fn a_lesson_detail_says_where_it_sits_how_strong_and_what_sessions_did() {
+        let ls = lessons();
+        let l = live(&ls);
+        let det = detail(&l, &ls, &Sel::Lesson("strong".into())).expect("a lesson in the store");
+        assert_eq!(det.title, "Is the retry idempotent?");
+        let facts: Vec<(&str, &str)> = det.facts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            facts,
+            [
+                ("Where", "billing · testing"),
+                ("Strength", "top 50 % of 2 by activation"),
+                ("Acted on", "3"),
+                ("Ignored", "1"),
+                ("Corrected", "1"),
+                ("Vetoed", "0"),
+                ("Asked", "3 times"),
+                ("State", "long-term"),
+            ]
+        );
+        let weak = detail(&l, &ls, &Sel::Lesson("weak".into())).expect("a lesson in the store");
+        assert_eq!(weak.facts[0], ("Where", "general · other".to_string()));
+        assert_eq!(weak.facts[1], ("Strength", "top 100 % of 2 by activation".to_string()));
+        assert_eq!(weak.facts.last(), Some(&("State", "dormant".to_string())));
+        assert_eq!(detail(&l, &ls, &Sel::Lesson("gone".into())), None);
+    }
+
+    #[test]
+    fn a_lesson_under_the_pointer_selects_it_by_id() {
+        let ls = lessons();
+        let l = live(&ls);
+        let i = l.scene.vol.find("weak").expect("in the volume");
+        assert_eq!(l.sel_of(Anchor::Lesson(i)), Some(Sel::Lesson("weak".into())));
+        assert_eq!(l.sel_of(Anchor::Lesson(99)), None);
+    }
+
+    /// A rebuild moves the hovered lesson to its new index; when it is gone the tip goes too.
+    #[test]
+    fn the_hover_follows_its_lesson_through_a_rebuild_and_ends_with_it() {
+        let ls = lessons();
+        let mut l = live(&ls);
+        let i = l.scene.vol.find("weak").expect("in the volume");
+        l.hover = Some(Anchor::Lesson(i));
+        l.scene.hovered = Some(i);
+        let only_weak: Vec<Item> = ls.iter().rev().map(item).collect();
+        assert!(!l.lessons(&only_weak), "still there");
+        let j = l.scene.vol.find("weak").expect("still in the volume");
+        assert_ne!(i, j, "the order changed its index");
+        assert_eq!((l.hover, l.scene.hovered), (Some(Anchor::Lesson(j)), Some(j)));
+        assert!(l.lessons(&[item(&ls[0])]), "gone: the tip goes");
+        assert_eq!((l.hover, l.scene.hovered), (None, None));
+        l.hover = Some(Anchor::Core);
+        assert!(!l.lessons(&[]), "a hover on the core stays");
+        assert_eq!(l.hover, Some(Anchor::Core));
+    }
 
     /// A replay runs on the real clock: at 600× ten minutes pass in each real second, however the
     /// frames fall (uneven, dropped, a hidden tab's gap), and a new rate runs on from where it is.
@@ -1407,10 +1931,73 @@ mod tests {
     }
 
     #[test]
+    fn the_core_takes_only_the_shown_collectives_own_lessons() {
+        let answer = serde_json::json!({"collective": "team", "lessons": []});
+        assert!(lessons_of(&answer, "team"));
+        // The one before, while the new one's answer is out; none yet; no collective chosen.
+        assert!(!lessons_of(&answer, "solo"));
+        assert!(!lessons_of(&serde_json::Value::Null, "team"));
+        assert!(!lessons_of(&serde_json::json!({"collective": ""}), ""));
+    }
+
+    #[test]
+    fn in_full_screen_a_lesson_opens_in_the_cubes_panel_not_the_drawer_behind_it() {
+        assert_eq!(Opens::now(true), Opens::Panel);
+        assert_eq!(Opens::now(false), Opens::Drawer);
+    }
+
+    /// A lesson clicked outside full screen opens in the drawer alone: the panel keeps what it showed,
+    /// so closing the drawer leaves no copy of the lesson behind.
+    #[test]
+    fn a_clicked_lesson_shows_in_one_place() {
+        let lesson = Some(Sel::Lesson("strong".into()));
+        assert_eq!(Opens::Drawer.picks(lesson.clone(), Some(Sel::Core)), Some(Sel::Core));
+        assert_eq!(Opens::Drawer.picks(lesson.clone(), None), None);
+        assert_eq!(Opens::Panel.picks(lesson.clone(), Some(Sel::Core)), lesson);
+        // Anything else a click hits is selected wherever lessons open.
+        assert_eq!(Opens::Drawer.picks(Some(Sel::Node(3)), Some(Sel::Core)), Some(Sel::Node(3)));
+        assert_eq!(Opens::Drawer.picks(None, Some(Sel::Core)), None);
+    }
+
+    /// Escape closes the innermost thing first: a lesson's panel before the dive it lies in; and leaving
+    /// the dive any way drops a lesson's panel, whose light is out of reach outside it.
+    #[test]
+    fn escape_closes_a_lessons_panel_before_the_dive() {
+        assert_eq!(Esc::of(true, true, true), Esc::Drawer);
+        assert_eq!(Esc::of(false, true, true), Esc::Lesson);
+        assert_eq!(Esc::of(false, false, true), Esc::Dive);
+        assert_eq!(Esc::of(false, false, false), Esc::Selection);
+        assert_eq!(out_of_dive(Some(Sel::Lesson("strong".into()))), None);
+        assert_eq!(out_of_dive(Some(Sel::Node(3))), Some(Sel::Node(3)));
+    }
+
+    #[test]
     fn a_drone_is_named_one_of_many() {
         assert_eq!(of(7, 9), "Seven of Nine");
         assert_eq!(of(25, 39), "Twenty-Five of Thirty-Nine");
         assert_eq!(of(20, 90), "Twenty of Ninety");
         assert_eq!(of(99, 100), "Ninety-Nine of 100");
+    }
+
+    #[test]
+    fn the_hover_tip_opens_where_it_has_the_room() {
+        for w in [373.0f32, 680.0, 1200.0] {
+            for x in (0..w as u16).map(f32::from) {
+                let (right, left) = (w - x - TIP_GAP, x - TIP_GAP);
+                let room = if tip_left(x, w) { left } else { right };
+                assert!(room >= TIP_W || room >= right.max(left), "x {x} on {w}: {room} px of room");
+            }
+        }
+        // A wide canvas keeps the tip right of the pointer until it would not fit.
+        assert!(!tip_left(900.0, 1200.0) && tip_left(1000.0, 1200.0));
+    }
+
+    #[test]
+    fn the_tip_does_not_show_what_the_panel_shows() {
+        let lesson = |id: &str| Sel::Lesson(id.into());
+        let pick = Pick { sel: lesson("L1"), title: "Is the price read from the price table?".into(), lines: Vec::new() };
+        // The lesson the panel shows, the pointer still on its light: the panel names it, no tip over it.
+        assert!(!pick.shows(Some(&lesson("L1"))));
+        assert!(pick.shows(Some(&lesson("L2"))) && pick.shows(Some(&Sel::Core)) && pick.shows(None));
     }
 }

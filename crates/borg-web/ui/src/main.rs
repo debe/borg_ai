@@ -9,11 +9,14 @@ mod canvas;
 mod charts;
 mod drawer;
 mod feed;
+mod interior;
 mod model;
 mod paint;
 mod scene;
+mod treemap;
 mod util;
 mod views;
+mod volume;
 
 use leptos::prelude::*;
 

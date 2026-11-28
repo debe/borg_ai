@@ -13,7 +13,10 @@ borg web        # http://127.0.0.1:7979/
 
 To try it without a store of your own, or to film the Cube, generate a made-up team collective (six
 machines, their drones and a week of messages, lessons, hand-offs and syncs; every name invented) and
-point the page at it. `--live 60` keeps writing a message about every second for a minute:
+point the page at it. It also writes about 170 lessons across five systems and borg's concern areas,
+with two months of sessions that asked them and what came of it (changed, ignored, corrected, vetoed),
+so the Cube's core and the Knowledge tab show every colour and some dormant lessons. `--live 60` keeps
+writing a message about every second for a minute:
 
 ```sh
 cargo run -p borg-web --example demo_store -- /tmp/borg-demo --live 60 &

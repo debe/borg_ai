@@ -1,14 +1,28 @@
-//! The browser's `Painter` (paint.rs): a 2D canvas. Each tone's CSS colour and glow sprite are made
-//! once at start from one palette (`rgb`). The style is lazy: `style` only notes what is wanted, and a
-//! stroke, fill or glow sets on the context just what it uses and what differs from what the context
-//! has, so a run of glows or of fills never touches the stroke colour or line width. Every glow is one
-//! `drawImage` of its tone's sprite.
+//! The browser's `Painter` (paint.rs): a 2D canvas. Each tone's CSS colour and glow sprite, and each
+//! level of the core's plating (`plate_rgb`), are made once at start from one palette (`rgb`), the
+//! colours as JS strings the context takes by reference (`Styles`): a change of colour
+//! passes no string from wasm to decode, so a frame makes none on the JS heap either. The style is
+//! lazy: `style` only notes what is wanted, and a stroke, fill or glow sets on the context just what it
+//! uses and what differs from what the context has, so a run of glows or of fills never touches the
+//! stroke colour or line width. Every glow is one `drawImage` of its tone's sprite.
 //! Labels are drawn centred by the context (`textAlign`), never measured.
 
-use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
-use crate::paint::Painter;
+#[wasm_bindgen]
+extern "C" {
+    /// The 2D context, for its `fillStyle` and `strokeStyle` set to a colour made once (`Canvas::new`):
+    /// web-sys's own setters take a `&str`, a string to pass over each time.
+    type Styles;
+    #[wasm_bindgen(method, setter = fillStyle)]
+    fn set_fill(this: &Styles, colour: &JsValue);
+    #[wasm_bindgen(method, setter = strokeStyle)]
+    fn set_stroke(this: &Styles, colour: &JsValue);
+}
+
+use crate::paint::{PLATES, Painter, plate_of};
 use crate::scene::Tone;
 
 /// The palette: strokes, fills and the glow sprites all take their colour from here.
@@ -24,14 +38,36 @@ const fn rgb(t: Tone) -> (u8, u8, u8) {
     }
 }
 
+/// The colour of plating level `level` (paint.rs `plate_level`): the hull darkened where the light
+/// misses it, then tinted green where it falls and the haze leaves it near.
+fn plate_rgb(level: u8) -> (u8, u8, u8) {
+    let (shade, fog) = plate_of(level);
+    let (dark, green) = (0.55 * (1.0 - shade), 0.02 + 0.16 * shade * fog);
+    let (h, g) = (rgb(Tone::Hull), rgb(Tone::Green));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a mix of two channels stays in 0..=255")]
+    let mix = |h: u8, g: u8| (f32::from(h) * (1.0 - dark) * (1.0 - green) + f32::from(g) * green).round().clamp(0.0, 255.0) as u8;
+    (mix(h.0, g.0), mix(h.1, g.1), mix(h.2, g.2))
+}
+
+fn hex((red, green, blue): (u8, u8, u8)) -> String {
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
 /// A glow sprite's side in pixels.
 const SPRITE: u32 = 64;
+
+/// A fill colour: a tone's, or a level of plating's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    Tone(Tone),
+    Plate(u8),
+}
 
 /// What the context has set, as far as this painter knows; `None` (or a negative number) is unknown.
 #[derive(Clone, Copy)]
 struct Set {
     stroke: Option<Tone>,
-    fill: Option<Tone>,
+    fill: Option<Ink>,
     alpha: f32,
     width: f32,
 }
@@ -42,10 +78,14 @@ pub struct Canvas {
     ctx: CanvasRenderingContext2d,
     /// Each tone's glow sprite and CSS colour, by `Tone::ix`.
     sprites: [HtmlCanvasElement; Tone::ALL.len()],
-    css: [String; Tone::ALL.len()],
+    css: [JsValue; Tone::ALL.len()],
+    /// Each plating level's CSS colour, by level.
+    plates: Vec<JsValue>,
     dpr: f64,
-    /// The style `style` asked for: tone, alpha, width.
+    /// The style `style` asked for: tone, alpha, width; and the fill `plate` asked for since, its level
+    /// and alpha, which fills take instead.
     want: (Tone, f32, f32),
+    plate: Option<(u8, f32)>,
     set: Set,
 }
 
@@ -75,11 +115,9 @@ impl Canvas {
         let ctx = context(canvas)?;
         let doc = web_sys::window()?.document()?;
         let sprites = Tone::ALL.iter().map(|t| sprite(&doc, *t)).collect::<Option<Vec<_>>>()?.try_into().ok()?;
-        let css = Tone::ALL.map(|t| {
-            let (red, green, blue) = rgb(t);
-            format!("#{red:02x}{green:02x}{blue:02x}")
-        });
-        let mut c = Self { ctx, sprites, css, dpr, want: (Tone::Green, 1.0, 1.0), set: UNKNOWN };
+        let css = Tone::ALL.map(|t| JsValue::from_str(&hex(rgb(t))));
+        let plates = (0..PLATES).map(|l| JsValue::from_str(&hex(plate_rgb(u8::try_from(l).unwrap_or(u8::MAX))))).collect();
+        let mut c = Self { ctx, sprites, css, plates, dpr, want: (Tone::Green, 1.0, 1.0), plate: None, set: UNKNOWN };
         c.reset();
         Some(c)
     }
@@ -106,10 +144,14 @@ impl Canvas {
         }
     }
 
-    fn fill_tone(&mut self, t: Tone) {
-        if self.set.fill != Some(t) {
-            self.ctx.set_fill_style_str(&self.css[t.ix()]);
-            self.set.fill = Some(t);
+    fn fill_ink(&mut self, ink: Ink) {
+        if self.set.fill != Some(ink) {
+            let colour = match ink {
+                Ink::Tone(t) => &self.css[t.ix()],
+                Ink::Plate(l) => self.plates.get(usize::from(l)).unwrap_or(&self.css[Tone::Hull.ix()]),
+            };
+            self.ctx.unchecked_ref::<Styles>().set_fill(colour);
+            self.set.fill = Some(ink);
         }
     }
 }
@@ -122,6 +164,11 @@ impl Painter for Canvas {
 
     fn style(&mut self, tone: Tone, alpha: f32, width: f32) {
         self.want = (tone, alpha, width);
+        self.plate = None;
+    }
+
+    fn plate(&mut self, level: u8, alpha: f32) {
+        self.plate = Some((level, alpha));
     }
 
     fn begin(&mut self) {
@@ -145,7 +192,7 @@ impl Painter for Canvas {
     fn stroke(&mut self) {
         let (tone, alpha, width) = self.want;
         if self.set.stroke != Some(tone) {
-            self.ctx.set_stroke_style_str(&self.css[tone.ix()]);
+            self.ctx.unchecked_ref::<Styles>().set_stroke(&self.css[tone.ix()]);
             self.set.stroke = Some(tone);
         }
         if (width - self.set.width).abs() > f32::EPSILON {
@@ -157,8 +204,11 @@ impl Painter for Canvas {
     }
 
     fn fill(&mut self) {
-        let (tone, alpha, _) = self.want;
-        self.fill_tone(tone);
+        let (ink, alpha) = match self.plate {
+            Some((level, alpha)) => (Ink::Plate(level), alpha),
+            None => (Ink::Tone(self.want.0), self.want.1),
+        };
+        self.fill_ink(ink);
         self.alpha(alpha);
         self.ctx.fill();
     }
@@ -174,7 +224,7 @@ impl Painter for Canvas {
     }
 
     fn text(&mut self, s: &str, x: f32, y: f32, tone: Tone, alpha: f32) {
-        self.fill_tone(tone);
+        self.fill_ink(Ink::Tone(tone));
         self.alpha(alpha);
         let _ = self.ctx.fill_text(s, f64::from(x), f64::from(y));
     }

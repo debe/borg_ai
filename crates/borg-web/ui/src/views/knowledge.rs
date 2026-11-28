@@ -9,59 +9,8 @@ use leptos::prelude::*;
 
 use crate::api::{Lesson, data};
 use crate::charts::{HBars, Row, Series, StackedChart};
+use crate::treemap::squarify;
 use crate::util::{ago, day_of_ms, num, palette, pct, short_day, trunc, who};
-
-/// Squarified treemap (Bruls et al.): rectangles for `areas` (largest first) filling `w`×`h`.
-pub fn squarify(areas: &[f64], w: f64, h: f64) -> Vec<(f64, f64, f64, f64)> {
-    fn worst(row: &[f64], side: f64) -> f64 {
-        let s: f64 = row.iter().sum();
-        let mx = row.iter().copied().fold(f64::MIN, f64::max);
-        let mn = row.iter().copied().fold(f64::MAX, f64::min);
-        f64::max(side * side * mx / (s * s), s * s / (side * side * mn))
-    }
-    let (mut x, mut y, mut w, mut h) = (0.0, 0.0, w, h);
-    let mut out = Vec::with_capacity(areas.len());
-    let mut i = 0;
-    while i < areas.len() {
-        let side = w.min(h).max(1e-9);
-        let mut row = vec![areas[i]];
-        let mut j = i + 1;
-        while j < areas.len() {
-            let mut next = row.clone();
-            next.push(areas[j]);
-            if worst(&next, side) <= worst(&row, side) {
-                row = next;
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        let s: f64 = row.iter().sum();
-        if w >= h {
-            let cw = s / h.max(1e-9);
-            let mut yy = y;
-            for a in &row {
-                let rh = a / cw.max(1e-9);
-                out.push((x, yy, cw, rh));
-                yy += rh;
-            }
-            x += cw;
-            w -= cw;
-        } else {
-            let rh = s / w.max(1e-9);
-            let mut xx = x;
-            for a in &row {
-                let cw = a / rh.max(1e-9);
-                out.push((xx, y, cw, rh));
-                xx += cw;
-            }
-            y += rh;
-            h -= rh;
-        }
-        i = j;
-    }
-    out
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ColorBy {

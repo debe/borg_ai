@@ -3,6 +3,19 @@
 What changed in each release and what you need to do about it. The details live in the
 [docs](https://github.com/debe/borg_ai/tree/main/docs).
 
+## 0.13.0 (unreleased)
+
+### Added
+
+- The Cube's core holds the collective's lessons as a Borg cube, open toward you: one of eight Borg structures
+  per concern area, a light per lesson, coloured by outcome, brighter when stronger. [Details](https://github.com/debe/borg_ai/blob/main/docs/statistics.md)
+- The knowledge button, `k` or a double-click on the core flies into it; hover names a lesson, a click opens it.
+
+### Changed
+
+- `/api/lessons` serialises borrowed rows instead of a JSON value per lesson: same bytes, 5.6 % fewer
+  instructions and 8.6 % fewer allocations per request.
+
 ## 0.12.0 (2026-11-27)
 
 ### Added

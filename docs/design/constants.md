@@ -1,7 +1,7 @@
 # Numeric constants by kind
 
 Every numeric constant's doc comment says its kind and why it has its value. This file lists them by
-kind, as the code labels them in 0.12.0. Paths are relative to `crates/`; the adapters are under
+kind, as the code labels them in 0.13.0. Paths are relative to `crates/`; the adapters are under
 `crates/borg/assets/adapters/`. Rows name a constant or a function, never a line, because lines move.
 When a doc comment and this file disagree, the doc comment is right and this file is stale.
 
@@ -255,6 +255,11 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-web/src/lib.rs` | `PAGE_MAX` | 2,000 rows | One request making the server serialise a whole log (`/api/feed`, `/api/messages`) |
 | `borg-web/ui/src/views/cube.rs` | `GAP_S` | 1 s | A Cube tab hidden for a while replaying, on return, every event its clock passed at once: after a frame this late only the newest (as many as the ticker lists) play |
 | `borg-web/ui/src/scene.rs` | `MAX` | `u32::MAX` machines or drones | An index that no longer fits the scene's `u32`s (wasm32's `usize` is no wider, so in the browser it cuts nothing) |
+| `borg-web/ui/src/scene.rs` | `BAND_MIN` | 0.3 of the canvas's height | A dive frames the core in the band the text over the canvas leaves free, but never in less than this, however much the text covers |
+| `borg-web/ui/src/interior.rs` | `MIN_SCALE` | 0.01 | An area too full for its lights shrinking them forever (`fit`): far below a pixel, so every lesson of any store finds a seat long before it |
+| `borg-web/ui/src/volume.rs` | `MIN_SIDE` | 0.12 | The thinnest half a cut of the core leaves where the box is twice as long (else it halves): a new, small area beside large ones gets a box its kind can be built in (at least 0.1 with the shaft taken off), not a slab; today's stores' cuts leave 0.37 and more |
+| `borg-web/ui/src/interior.rs` | `FINE_PT` | bit 31 | Marks a point only fine detail uses while the core's interior is built: the points of any store number far fewer |
+| `borg-web/ui/src/paint.rs` | `LABELS`, `PENDING` | 64 names, 32 glows | The names one frame keeps apart and the lights' glows a batch holds back until its fill, on the stack: a frame never allocates for them |
 | `borg/src/sweep.rs` | `FIRST_READ` | 4 MiB | A turn-end sweep without a valid offset (the first turn after an upgrade, a rewritten file) reading a long session's whole transcript in the hook; the session's end and the idle sweep read the rest |
 | `borg/src/sweep.rs` | `DOCTOR_FILES` | 200 transcripts per harness, the newest | `borg doctor` reading every transcript of a busy fortnight; a note says when there were more |
 | `borg/src/collective.rs` | `REPO_DEPTH` | 2 levels (a config path's repo, or one group deeper) | Finding a repo known only by its name (an episode's) costing a walk of a whole source tree: one listing per config path and one stat per entry in it, per repo name; a repo deeper is unknown and learned where it was captured |
@@ -269,6 +274,12 @@ shown, never capped by default. Only an engineer who sets the optional per-colle
 | `borg-web/ui/src/util.rs` | `DAY_MS`, `DAY_S` | 24 h | clock.rs `DAY_MS` (the page is a wasm workspace of its own) |
 | `borg-web/ui/src/model.rs` | `WINDOW_MS` | 7 days | msg.rs `TTL_MS`: the window `/api/mesh` serves, and so what the Cube keeps |
 | `borg-web/ui/src/views/cube.rs` | `CATCHUP_MS`, `HEAD_STEP` | 8 h, 1/2000 of a week | `CATCHUP_S` × the fastest of `RATES`; the playhead's step, a fraction of a pixel of the timeline |
+| `borg-web/ui/src/interior.rs` | `ALCOVE_SPILL`, `NODE_SPILL` | 1.55, 4/π | The one glow a lesson's light spills, for the faces that spill none: an alcove's slit's own and its back's (0.55 of it), a node's side the sides a turning camera sees on average |
+| `borg-web/ui/src/interior.rs` | `KINDS` | 8 | `Kind::ALL`: the Borg structures an area is built as |
+| `borg-web/ui/src/paint.rs` | `PLATES` | 192 | `PLATE_SHADES` × `PLATE_FOGS`: the plating colours the painter makes once |
+| `borg-web/ui/src/scene.rs` | `SHELL_GROUPS`, `BUCKETS` | 197, 6,460 buckets | The groups a shell face is drawn in (ribs under its panels, a group per plating level of `PLATES`, lines over them, hull lights), and the buckets a frame counts its primitives into: the faces that look away, the depths, the faces that look at the camera |
+| `borg-web/ui/src/paint.rs` | `FOG_OF` | 8 levels, 0.15 to 1 | The haze's `fog` at each fog level a line or a glow is drawn at, 0.15 + 0.85 (k / 7)^1.3, worked out once so no frame calls `powf` |
+| `borg-web/ui/src/paint.rs` | `FOG_STEPS` | 6 depths, -1.016 to 1.217 | Where the haze's `fog` reaches the middle between two of the `PLATE_FOGS` levels: plating finds its fog level by comparing its depth with these |
 | `borg/src/notes/regress.rs` | `DAY` | 86,400 s | clock.rs `DAY_MS`, in git's seconds |
 | `borg/src/handoff/mod.rs` | `reannounce` | msg.rs `TTL_MS` / 2 | An open offer's mesh line (and this node's decline of one) is announced again past half the messages' TTL, so a member that syncs once in that time never loses it |
 | `borg/src/msg.rs` | `WINDOW_CAP` | 64 | `MEMBER_BYTES / WIRE_TEXT`: as many full texts as one member's share of the log holds (it promises no room: `send` refuses a message that would push one of its sender's unread messages to the same recipient out). Also what the mesh lets through unread from one sender to one recipient within `V1_RATE_MS` (`within_windows`) |
@@ -455,7 +466,20 @@ later value would be compared against.
 | `borg-web/ui/src/views/cube.rs` | `TICKER`, `TOASTS`, `TOAST_MS`, `TOAST_GAP` | 7 lines, 3, 4 s, 1.5 s | The Cube's ticker lines, the toasts on screen and how long each stays, and how often a replay toasts a lesson |
 | `borg-web/ui/src/views/cube.rs` | `MIN_H`, `STEP_H` | 360 px, 40 px | The Cube's lowest height when its bottom edge is dragged (the counters, ticker and timeline still fit), and a key press's step |
 | `borg-web/ui/src/scene.rs` | `CORE`, `ORBIT`, `DISTANCE`, `RING`, `RING_STEP`, `SPIN` | 1, 3.4, 11, 0.34, 0.012, 0.06 rad/s | The Cube's geometry: the core's half edge, the machines' sphere, the camera, the drones' rings, the auto-rotation |
-| `borg-web/ui/src/scene.rs` | `BLINK`, `PX` | 4 per second, 1 px | An idle Cube redraws for its core's lights at `BLINK`, and for motion only once something moved a pixel |
+| `borg-web/ui/src/scene.rs` | `BLINK`, `PX` | 4 per second, 1 px | An idle Cube redraws for the lights of a core without lessons at `BLINK`, and for motion only once something moved a pixel |
+| `borg-web/ui/src/scene.rs` | `DIVE_ZOOM`, `DIVE_RATE`, `DIVE_SPIN`, `DIVE_HIDE` | 2.65×, 1.5 per second, 0.8, 0.97 | The Cube's dive into its core: the lens's zoom (the core's bounding sphere then spans about 85% of the shorter side of the band the text over the canvas leaves free), its progress per second, the share of the auto-rotation it takes away, and how far in the machines, drones and their effects are no longer drawn |
+| `borg-web/ui/src/views/cube.rs` | `TIP_W`, `TIP_GAP` | 280 px, 14 px | The Cube's hover tip at its widest (index.html `.cube-tip`) and its gap from the pointer: it opens to the left only where it would not fit to the right and the left has more room |
+| `borg-web/ui/src/scene.rs` | `LESSON_MIN_PX`, `LESSON_MAX_PX`, `LESSON_DIVE_PX` | 0.8 px, 7 px, 12 px | A lesson's light's radius as a click and its glow reach it, at least and at most, out of a dive and in one |
+| `borg-web/ui/src/scene.rs` | `DEPTHS`, `FINE_PX` | 4,096 buckets, 120 px | The depth buckets the core's primitives are counted into, far to near (0.00085 world units each, about a fifth of `LIGHT_BIAS`); the core's half edge on screen below which its fine detail is not drawn (out of a dive about 83 px on a 900 px canvas, a dive about 220 px) |
+| `borg-web/ui/src/volume.rs` | `FILL`, `FADE`, `SHAFT`, `SHAFT_DECAY` | 0.9, 0.5 per second, 0.34, 0.55 | The lessons inside the core: the half edge the areas fill (clear of the shell's recessed plating), how fast an event's light on a lesson fades, the shaft the first cut leaves between its halves and how much narrower each deeper cut's is |
+| `borg-web/ui/src/interior.rs` | `LIGHT`, `PANELS`, `RIB_EVERY` | (0.35, 0.90, 0.25), 16, 4 | The core as a Borg cube: the fixed world light the areas' solids are shaded by (the shell's panels take random shades of 0.12 to 0.42, walkways, fans and ledges fixed ones), the shell's panels along a face's edge and a structural rib every 4 of them |
+| `borg-web/ui/src/interior.rs` | `ALCOVE_W`, `ALCOVE_H`, `HEX_MIN`, `HEX_MAX`, `LIGHT_BIAS` | 0.05, 0.1, 0.014, 0.04, 0.004 | A regeneration alcove's opening before a full area shrinks it, a hex cell's radius at least and at most (unless `HEX_PER_LESSON` and `HEX_ROOM` bound the cells), and how much nearer than its surface a lesson's light sorts (world units, the core's half edge is 1) |
+| `borg-web/ui/src/interior.rs` | `POST`, `NODE` | 0.02, 0.05 | An area's frame posts, each that thick just outside a corner so nothing in the area stands in one, and the room a spire's lit node takes across, which a spire's slot leaves it |
+| `borg-web/ui/src/interior.rs` | `HEX_PER_LESSON`, `HEX_ROOM` | 12 cells, 256 cells | A honeycomb's walls hold at most 12 cells a lesson and 256 more: an area large for its few lessons gets larger cells, so its cells grow with its lessons, not its walls; a store's areas stay under it at `HEX_MAX` |
+| `borg-web/ui/src/paint.rs` | `HULL`, `DIVE_HULL`, `HALO` | 0.93, 0.06, 0.22 | The opacity of the empty core's near plating out of a dive and at the bottom of one, and of a consolidated lesson's halo |
+| `borg-web/ui/src/paint.rs` | `LABEL_MIN_PX`, `LABEL_FIT`, `LABEL_CHAR_PX`, `LABEL_PAD_PX`, `LABEL_LINE_PX` | 48 px, 0.6, 6.6 px, 6 px, 13 px | An area's name shows when the area is at least 48 px wide on screen and 0.6 of its name's box; the box is a character's width per character and the pad more each side; a machine's host name, which no area's name covers, a line of 13 px high |
+| `borg-web/ui/src/paint.rs` | `LIGHT_MIN`, `LIGHT_DORMANT`, `LIGHT_LEVELS`, `SPILL`, `SPILL_R`, `SPILL_PX`, `GRATING` | 0.35, 0.1, 8, 0.6, 0.035, 5 px, 0.55 | A lesson's light: its opacity for the weakest lesson (1 for the strongest) and a dormant one, at 8 levels so lights batch; the glow round it as a share of its opacity, its world radius and least pixels; a deck grating's opacity |
+| `borg-web/ui/src/paint.rs` | `PLATE_SHADES`, `PLATE_FOGS` | 24, 8 | The shades (stepped by their square root, so the dark shell keeps its variety) and fog levels the core's plating is drawn in |
 | opencode adapter | `LOG_CHARS`, `LOG_ARGS` | 200 chars, 2 arguments | What a line of `$BORG_OPENCODE_LOG` keeps of borg's answer and of the command it ran |
 
 ## Experiment

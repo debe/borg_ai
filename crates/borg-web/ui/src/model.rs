@@ -235,6 +235,8 @@ pub struct Play {
     pub to_s: Option<u32>,
     /// Lines a sync moved; 0 otherwise.
     pub n: u32,
+    /// The lesson it names (a string id, as `Ev::lesson`).
+    pub lesson: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +288,12 @@ fn key<'b>(buf: &'b mut String, kind: &str, id: &str, re: Option<&str>) -> &'b s
 impl Model {
     pub fn str(&self, i: u32) -> &str {
         self.strs.get(i as usize).map_or("", |s| s)
+    }
+
+    /// The id of a string the model holds.
+    #[must_use]
+    pub fn id(&self, s: &str) -> Option<u32> {
+        self.idx.get(s).copied()
     }
 
     fn intern(&mut self, s: &str) -> u32 {
@@ -378,6 +386,7 @@ impl Model {
                     to_n: e.to_n.map(g),
                     to_s: e.to_s.map(g),
                     n: u32::try_from(e.n).unwrap_or(u32::MAX),
+                    lesson,
                 },
                 seq: self.seq,
             });

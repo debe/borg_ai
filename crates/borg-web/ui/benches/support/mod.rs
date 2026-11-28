@@ -1,7 +1,7 @@
 //! What the Cube's frame tests and its bench share: an allocator that counts this thread's
 //! allocations, a painter that counts what a frame asks of the canvas, and a busy world that keeps a
-//! fixed number of effects running. The app's unit tests include it as `paint::record`; the bench
-//! (benches/scene.rs) as `support`.
+//! fixed number of effects running, with lessons in the core when asked. The app's unit tests include
+//! it as `paint::record`; the bench (benches/scene.rs) as `support`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -9,6 +9,7 @@ use std::cell::Cell;
 use crate::model::{Ev, Model};
 use crate::paint::{Painter, paint};
 use crate::scene::{Handed, Scene, Tone};
+use crate::volume::Item;
 
 thread_local! {
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
@@ -65,6 +66,16 @@ pub struct Count {
     pub fills: usize,
     pub glows: usize,
     pub texts: usize,
+    /// Circles added to paths: drones, packet heads, rings.
+    pub arcs: usize,
+    /// Subpaths started: segments, and each face of the core's interior (and the hole in one).
+    pub moves: usize,
+    /// Fills and texts whose colour differs from the last one's: where the canvas sets `fillStyle`
+    /// (canvas.rs sets it only then).
+    pub fill_styles: usize,
+    /// The colour the next fill takes (a tone's index, or 256 and a plating level), and the last set.
+    next_ink: u16,
+    set_ink: Option<u16>,
     pub sum: f64,
 }
 
@@ -73,26 +84,40 @@ impl Count {
         self.calls += 1;
         self.sum += f64::from(x) + f64::from(y);
     }
+
+    fn ink(&mut self, ink: u16) {
+        if self.set_ink != Some(ink) {
+            self.set_ink = Some(ink);
+            self.fill_styles += 1;
+        }
+    }
 }
 
 impl Painter for Count {
     fn clear(&mut self, _: f32, _: f32) {
         self.calls += 1;
     }
-    fn style(&mut self, _: Tone, alpha: f32, _: f32) {
+    fn style(&mut self, tone: Tone, alpha: f32, _: f32) {
         self.at(alpha, 0.0);
+        self.next_ink = u16::try_from(tone.ix()).unwrap_or(u16::MAX);
+    }
+    fn plate(&mut self, level: u8, alpha: f32) {
+        self.at(f32::from(level), alpha);
+        self.next_ink = 256 + u16::from(level);
     }
     fn begin(&mut self) {
         self.calls += 1;
     }
     fn move_to(&mut self, x: f32, y: f32) {
         self.at(x, y);
+        self.moves += 1;
     }
     fn line_to(&mut self, x: f32, y: f32) {
         self.at(x, y);
     }
     fn circle(&mut self, x: f32, y: f32, r: f32) {
         self.at(x + r, y);
+        self.arcs += 1;
     }
     fn stroke(&mut self) {
         self.calls += 1;
@@ -101,14 +126,16 @@ impl Painter for Count {
     fn fill(&mut self) {
         self.calls += 1;
         self.fills += 1;
+        self.ink(self.next_ink);
     }
     fn glow(&mut self, _: Tone, x: f32, y: f32, r: f32, _: f32) {
         self.at(x + r, y);
         self.glows += 1;
     }
-    fn text(&mut self, s: &str, x: f32, y: f32, _: Tone, _: f32) {
+    fn text(&mut self, s: &str, x: f32, y: f32, tone: Tone, _: f32) {
         self.at(x, y + s.len() as f32);
         self.texts += 1;
+        self.ink(u16::try_from(tone.ix()).unwrap_or(u16::MAX));
     }
 }
 
@@ -192,6 +219,38 @@ pub fn model(nodes: usize, drones: usize, events: usize) -> Model {
     m
 }
 
+/// Lesson ids `L0` on: the busy model's lesson events name the first forty.
+pub fn lesson_ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("L{i}")).collect()
+}
+
+/// The areas of `items`: eight, so the core builds every kind of area (interior.rs `kinds` hands
+/// eight areas the eight kinds), as a real store of eight areas or more does.
+pub const AREAS: [&str; 8] = ["testing", "data", "api", "deploy", "other", "security", "concurrency", "docs"];
+
+/// A store of lessons for `ids`: spread over six systems and the `AREAS`, with activations and verdicts
+/// of every kind, so every tone shows; every eleventh dormant, every seventh consolidated, every
+/// thirteenth absorbed.
+pub fn items(ids: &[String]) -> Vec<Item<'_>> {
+    const SYSTEMS: [&str; 6] = ["billing", "search", "general", "infra", "web", "mobile"];
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| Item {
+            id,
+            system: SYSTEMS[i * 7 % SYSTEMS.len()],
+            area: AREAS[i * 3 % AREAS.len()],
+            activation: (i * 7919 % 211) as f64 / 20.0 - 5.0,
+            changed: (i % 5) as f64,
+            ignored: (i % 3) as f64,
+            corrected: (i % 7 / 3) as f64,
+            vetoed: 0.0,
+            dormant: i % 11 == 0,
+            consolidated: i % 7 == 0,
+            absorbed: i % 13 == 0,
+        })
+        .collect()
+}
+
 /// How a hand-off event went, as the view reads it.
 fn handed(e: &Ev) -> Handed {
     e.why.as_deref().map_or(Handed::Moves, Handed::parse)
@@ -214,6 +273,14 @@ impl World {
         let mut scene = Scene::default();
         scene.sync(&model);
         Self { model, scene, pen: Count::default(), t: 0.0, frames: 0, played: 0, live }
+    }
+
+    /// The same world with `n` lessons in the core (`items`), forty of them named by its lesson events.
+    #[must_use]
+    pub fn with_lessons(mut self, n: usize) -> Self {
+        let ids = lesson_ids(n);
+        self.scene.lessons(&items(&ids), &self.model);
+        self
     }
 
     /// Tops the effects up to `live`, advances the clock a sixtieth of a second and paints the frame.

@@ -32,7 +32,7 @@ use futures_util::{Stream, StreamExt};
 
 pub mod learning;
 mod mesh;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const USAGE: &str = "usage: borg web [--port PORT] [--dir DIR]   (default port 7979; DIR picks the collective shown first)";
@@ -176,47 +176,133 @@ async fn stats_of(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Respons
     Json(json!({"collective": m.name, "totals": totals(&all), "days": days, "engineers": engineers, "nodes": nodes, "ope": ope})).into_response()
 }
 
+/// `/api/lessons`: every lesson of the collective with its memory, usage and version, most active first.
+/// The rows borrow from what one request loads ([`LessonSources`]) and are serialised once.
 async fn lessons(State(app): State<Arc<App>>, Query(p): Query<Pick>) -> Response {
     let Some(m) = app.mind(p.c.as_deref()) else { return not_found(p.c.as_deref().unwrap_or_default()) };
-    let path = m.home.join("lessons.jsonl");
-    let list = conscience::load_unweighted(&path, None);
-    // The outcomes as folded beside the store (borg facts.rs), as the conscience weighs them: what
-    // `read_team` would read, at the cost of what was appended since the last fold.
-    let facts = borg::facts::load(&path);
-    let mem = memory::derive_folded(facts.view(outcome::on()).folded, &list, None);
-    // How often each lesson took part in what stats.rs counted (asked in a block, so far), team-wide.
-    let mut usage: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-    for b in stats::current(&m.home) {
-        for (id, kinds) in b.lessons {
-            let u = usage.entry(id).or_default();
-            for (k, v) in kinds {
-                *u.entry(k).or_default() += v;
+    let s = LessonSources::load(&m.home);
+    Json(LessonsBody { collective: &m.name, lessons: s.rows() }).into_response()
+}
+
+/// What `/api/lessons` reads of a store, once per request; its rows ([`LessonRow`]) borrow from it.
+struct LessonSources {
+    list: Vec<conscience::Challenge>,
+    mem: HashMap<String, memory::Memory>,
+    /// How often each lesson took part in what stats.rs counted (asked in a block, so far), team-wide.
+    usage: BTreeMap<String, BTreeMap<String, u64>>,
+    names: Book,
+    /// Each lesson's latest version and repo (learn.rs `stored`).
+    stored: HashMap<String, (u32, String)>,
+}
+
+/// A lesson without usage: its `usage` is `{}`.
+static NO_USAGE: BTreeMap<String, u64> = BTreeMap::new();
+
+impl LessonSources {
+    fn load(home: &Path) -> Self {
+        let path = home.join("lessons.jsonl");
+        let list = conscience::load_unweighted(&path, None);
+        // The outcomes as folded beside the store (borg facts.rs), as the conscience weighs them: what
+        // `read_team` would read, at the cost of what was appended since the last fold.
+        let facts = borg::facts::load(&path);
+        let mem = memory::derive_folded(facts.view(outcome::on()).folded, &list, None);
+        let mut usage: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for b in stats::current(home) {
+            for (id, kinds) in b.lessons {
+                let u = usage.entry(id).or_default();
+                for (k, v) in kinds {
+                    *u.entry(k).or_default() += v;
+                }
             }
         }
+        LessonSources { list, mem, usage, names: Book::load(home, learn::now_ms()), stored: learn::stored(&path) }
     }
-    let names = Book::load(&m.home, learn::now_ms());
-    let stored = learn::stored(&path);
-    let mut out: Vec<Value> = list
-        .iter()
-        .map(|c| {
-            let mm = mem.get(&c.id);
-            json!({
-                "id": c.id, "question": c.question, "situations": c.situations, "consequence": c.consequence,
-                "area": c.area, "scope": c.scope, "source": c.source, "origin_ms": c.origin_ms,
-                "engineers": c.engineers.iter().map(|e| names.display(e)).collect::<Vec<_>>(),
-                "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
-                "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
-                "regretted": mm.map_or(0.0, |x| x.regretted),
-                "tested": mm.map_or(0, |x| x.tested),
-                "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
-                "usage": usage.get(&c.id).cloned().unwrap_or_default(),
-                "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
-                "reach": c.reach,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| b["activation"].as_f64().partial_cmp(&a["activation"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
-    Json(json!({"collective": m.name, "lessons": out})).into_response()
+
+    /// The rows, most active first: a stable sort, so lessons of equal activation keep the store's
+    /// order. O(N log N) in the lessons.
+    fn rows(&self) -> Vec<LessonRow<'_>> {
+        let mut out: Vec<LessonRow<'_>> = self.list.iter().map(|c| self.row(c)).collect();
+        // As serde_json orders the activation it writes: a non-finite one is written as null and sorts last.
+        let key = |r: &LessonRow<'_>| r.activation.is_finite().then_some(r.activation);
+        out.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    fn row<'a>(&'a self, c: &'a conscience::Challenge) -> LessonRow<'a> {
+        let mm = self.mem.get(&c.id);
+        let stored = self.stored.get(&c.id);
+        LessonRow {
+            id: &c.id,
+            question: &c.question,
+            situations: &c.situations,
+            consequence: &c.consequence,
+            area: &c.area,
+            scope: &c.scope,
+            source: &c.source,
+            origin_ms: c.origin_ms,
+            engineers: Engineers { emails: &c.engineers, names: &self.names },
+            activation: mm.map_or(0.0, |x| x.activation),
+            changed: mm.map_or(0, |x| x.changed),
+            ignored: mm.map_or(0, |x| x.ignored),
+            corrected: mm.map_or(0, |x| x.corrected),
+            vetoed: mm.map_or(0, |x| x.vetoed),
+            regretted: mm.map_or(0.0, |x| x.regretted),
+            tested: mm.map_or(0, |x| x.tested),
+            dormant: mm.is_some_and(|x| x.dormant),
+            consolidated: mm.is_some_and(|x| x.consolidated),
+            usage: self.usage.get(&c.id).unwrap_or(&NO_USAGE),
+            version: stored.map_or(1, |s| s.0),
+            repo: stored.map_or("", |s| s.1.as_str()),
+            reach: &c.reach,
+        }
+    }
+}
+
+/// The body of `/api/lessons`.
+#[derive(Serialize)]
+struct LessonsBody<'a> {
+    collective: &'a str,
+    lessons: Vec<LessonRow<'a>>,
+}
+
+/// One lesson of `/api/lessons`, borrowed from [`LessonSources`]. The field order is the order the
+/// page has always been served (the `json!` object this replaced, serde_json's `preserve_order` on).
+#[derive(Serialize)]
+struct LessonRow<'a> {
+    id: &'a str,
+    question: &'a str,
+    situations: &'a [String],
+    consequence: &'a str,
+    area: &'a str,
+    scope: &'a [String],
+    source: &'a str,
+    origin_ms: i64,
+    engineers: Engineers<'a>,
+    activation: f64,
+    changed: u32,
+    ignored: u32,
+    corrected: u32,
+    vetoed: u32,
+    regretted: f64,
+    tested: u32,
+    dormant: bool,
+    consolidated: bool,
+    usage: &'a BTreeMap<String, u64>,
+    version: u32,
+    repo: &'a str,
+    reach: &'a str,
+}
+
+/// A lesson's engineers for display ([`Book::display`]), named as they are written out: no list is built.
+struct Engineers<'a> {
+    emails: &'a [String],
+    names: &'a Book,
+}
+
+impl Serialize for Engineers<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.emails.iter().map(|e| self.names.display(e)))
+    }
 }
 
 #[derive(Deserialize)]
@@ -730,6 +816,101 @@ pub async fn publish(minds: Vec<Mind>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/api/lessons` as it was built before [`LessonRow`]: a `json!` object per lesson, sorted as values.
+    /// The reference the borrowed rows must match byte for byte.
+    fn lessons_by_value(collective: &str, s: &LessonSources) -> Value {
+        let LessonSources { list, mem, usage, names, stored } = s;
+        let mut out: Vec<Value> = list
+            .iter()
+            .map(|c| {
+                let mm = mem.get(&c.id);
+                json!({
+                    "id": c.id, "question": c.question, "situations": c.situations, "consequence": c.consequence,
+                    "area": c.area, "scope": c.scope, "source": c.source, "origin_ms": c.origin_ms,
+                    "engineers": c.engineers.iter().map(|e| names.display(e)).collect::<Vec<_>>(),
+                    "activation": mm.map_or(0.0, |x| x.activation), "changed": mm.map_or(0, |x| x.changed),
+                    "ignored": mm.map_or(0, |x| x.ignored), "corrected": mm.map_or(0, |x| x.corrected), "vetoed": mm.map_or(0, |x| x.vetoed),
+                    "regretted": mm.map_or(0.0, |x| x.regretted),
+                    "tested": mm.map_or(0, |x| x.tested),
+                    "dormant": mm.is_some_and(|x| x.dormant), "consolidated": mm.is_some_and(|x| x.consolidated),
+                    "usage": usage.get(&c.id).cloned().unwrap_or_default(),
+                    "version": stored.get(&c.id).map_or(1, |s| s.0), "repo": stored.get(&c.id).map(|s| s.1.clone()).unwrap_or_default(),
+                    "reach": c.reach,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| b["activation"].as_f64().partial_cmp(&a["activation"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+        json!({"collective": collective, "lessons": out})
+    }
+
+    /// The borrowed rows serialise to the very bytes the `json!` values did, on a store whose lessons
+    /// differ in every field: outcomes that order them by activation (ties among the unused ones), a
+    /// second version in another repo, usage from a peer's rollup, named and unnamed engineers.
+    #[test]
+    fn the_lessons_view_serialises_as_the_json_values_did() {
+        let home = std::env::temp_dir().join(format!("borg-web-lessons-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let lesson = |id: &str, version: u32, repo: &str| learn::Lesson {
+            id: id.into(),
+            origin_ms: 1_000 + i64::from(version),
+            repo: repo.into(),
+            question: format!("Does {id} \"quote\" its inputs?"),
+            version,
+            ..Default::default()
+        };
+        let full = learn::Lesson {
+            situations: vec!["a merge".into(), "a rebase".into()],
+            consequence: "lost work".into(),
+            area: "git".into(),
+            engineers: vec!["ann@example.com".into(), "bo@example.com".into()],
+            source: "queen".into(),
+            scope: vec!["api".into()],
+            reach: "repo".into(),
+            ..lesson("L1", 1, "app")
+        };
+        let lines = [full, lesson("L2", 1, "app"), lesson("L2", 2, "web"), lesson("L3", 1, ""), lesson("L4", 1, "app"), lesson("L5", 1, "app")];
+        std::fs::write(home.join("lessons.jsonl"), lines.iter().map(|l| serde_json::to_string(l).unwrap() + "\n").collect::<String>()).unwrap();
+        let o = |kind: &str, session: &str, id: &str, ms: i64| outcome::Outcome {
+            kind: kind.into(),
+            session: session.into(),
+            lessons: vec![id.into()],
+            ms,
+            ..Default::default()
+        };
+        for x in [
+            o(outcome::ASKED, "s1", "L4", 1),
+            o(outcome::CHANGED, "s1", "L4", 2),
+            o(outcome::ASKED, "s2", "L2", 3),
+            o(outcome::IGNORED, "s2", "L2", 4),
+            o(outcome::ASKED, "s3", "L5", 5),
+            o(outcome::CORRECTED, "s3", "L5", 6),
+        ] {
+            outcome::append(&home.join("outcomes.jsonl"), &x).unwrap();
+        }
+        let peer = json!({"id": "stat:peer:b@x:2026-10-13", "version": 1, "day": "2026-10-13", "node": "peer", "engineer": "b@x",
+            "counts": {"asked": 3}, "usd": 0.0, "dur_ms": 0, "lessons": {"L1": {"asked": 2, "block": 1}, "L4": {"asked": 1}}});
+        std::fs::write(home.join("stats.jsonl"), format!("{peer}\n")).unwrap();
+        // No derived history: the usage is the peer's alone, and L2 has none.
+        std::fs::create_dir_all(home.join("stats")).unwrap();
+        std::fs::write(home.join("stats/backfill.jsonl"), "").unwrap();
+
+        let mut s = LessonSources::load(&home);
+        s.names = Book::from_parts([("ann@example.com".to_string(), "Ann".to_string())].into(), &[]);
+        let want = serde_json::to_string(&lessons_by_value("corp", &s)).unwrap();
+        let got = serde_json::to_string(&LessonsBody { collective: "corp", lessons: s.rows() }).unwrap();
+        assert_eq!(got, want);
+        // The store exercised what the rows carry: the sort moved lessons, and every borrowed field shows.
+        let v: Value = serde_json::from_str(&got).unwrap();
+        let ids: Vec<&str> = v["lessons"].as_array().unwrap().iter().filter_map(|l| l["id"].as_str()).collect();
+        assert_ne!(ids, ["L1", "L2", "L3", "L4", "L5"], "{v}");
+        let l1 = v["lessons"].as_array().unwrap().iter().find(|l| l["id"] == "L1").unwrap();
+        let l2 = v["lessons"].as_array().unwrap().iter().find(|l| l["id"] == "L2").unwrap();
+        assert_eq!((&l1["engineers"], &l1["usage"], &l1["reach"]), (&json!(["Ann", "bo@example.com"]), &json!({"asked": 2, "block": 1}), &json!("repo")));
+        assert_eq!((&l2["version"], &l2["repo"], &l2["usage"]), (&json!(2), &json!("web"), &json!({})));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// The UI (a WASM crate of its own, borg-web/ui) matches the detached check's protocol words by
     /// their text: its feed every `why` of a check not run, its cost view the stats mode.
